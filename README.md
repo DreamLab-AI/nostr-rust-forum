@@ -88,6 +88,10 @@ The forum uses a 3-zone access model configurable via `BbsConfig`:
 
 Zone names, IDs, and cohort mappings are all runtime-configurable. See `crates/forum-client/src/stores/zone_access.rs` for the `BbsConfig` struct.
 
+## Related
+
+- **[nostr-bbs-core](https://github.com/DreamLab-AI/nostr-bbs-core)** -- Standalone Rust crate extracting the `nostr-core` NIP library from this project. 140 tests, compiles to native + wasm32, all crypto delegates to NCC-audited RustCrypto crates. Use it independently if you only need Nostr protocol primitives (NIP-01/07/09/29/33/40/42/44/45/50/52/98).
+
 ## License
 
 MIT
