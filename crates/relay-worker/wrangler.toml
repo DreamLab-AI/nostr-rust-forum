@@ -1,0 +1,33 @@
+# Relay Worker — Nostr WebSocket relay with Durable Objects
+name = "nostr-bbs-relay"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-11-01"
+
+[build]
+command = "worker-build --release"
+
+[vars]
+RELAY_NAME = "Nostr BBS Relay"            # Shown in NIP-11 relay info
+ADMIN_PUBKEYS = ""                        # Comma-separated hex pubkeys (optional; first-user-is-admin by default)
+ALLOWED_ORIGIN = "https://your-domain.com"
+ALLOWED_ORIGINS = "https://your-domain.com"  # Comma-separated list of allowed CORS origins
+
+# D1 database for event storage and whitelist
+[[d1_databases]]
+binding = "DB"
+database_name = "nostr-bbs-relay"         # Create with: wrangler d1 create nostr-bbs-relay
+database_id = "REPLACE_ME_RELAY_D1_ID"
+
+# Durable Object for WebSocket relay sessions
+[durable_objects]
+bindings = [
+  { name = "RELAY", class_name = "NostrRelayDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NostrRelayDO"]
+
+# Keep-warm cron to prevent cold starts
+[triggers]
+crons = ["*/5 * * * *"]

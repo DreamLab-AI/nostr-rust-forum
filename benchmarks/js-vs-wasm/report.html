@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nostr BBS Crypto Benchmarks: JS vs WASM</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-dim: #8b949e;
+      --green: #3fb950;
+      --yellow: #d29922;
+      --red: #f85149;
+      --blue: #58a6ff;
+      --purple: #bc8cff;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 2rem;
+      line-height: 1.6;
+    }
+    h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+    h2 { font-size: 1.3rem; margin: 2rem 0 1rem; color: var(--blue); }
+    .subtitle { color: var(--text-dim); margin-bottom: 2rem; }
+    .meta { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 1rem; }
+
+    /* Table */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 0.6rem 0.8rem;
+      border: 1px solid var(--border);
+      text-align: right;
+    }
+    th {
+      background: var(--surface);
+      color: var(--text-dim);
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+    }
+    td:first-child, th:first-child { text-align: left; }
+    tr:nth-child(even) { background: rgba(22, 27, 34, 0.5); }
+    .speedup-cell { font-weight: 700; font-size: 1rem; }
+    .green { color: var(--green); }
+    .yellow { color: var(--yellow); }
+    .red { color: var(--red); }
+
+    /* Bar charts */
+    .chart-section { margin: 2rem 0; }
+    .chart-row {
+      display: flex;
+      align-items: center;
+      margin: 0.8rem 0;
+      gap: 0.5rem;
+    }
+    .chart-label {
+      width: 180px;
+      flex-shrink: 0;
+      font-size: 0.85rem;
+      text-align: right;
+      padding-right: 1rem;
+    }
+    .chart-bars {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .bar-container {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .bar {
+      height: 22px;
+      border-radius: 3px;
+      min-width: 2px;
+      transition: width 0.3s ease;
+    }
+    .bar-js { background: var(--blue); opacity: 0.8; }
+    .bar-wasm { background: var(--purple); opacity: 0.8; }
+    .bar-value { font-size: 0.75rem; color: var(--text-dim); white-space: nowrap; }
+    .bar-tag { font-size: 0.7rem; color: var(--text-dim); width: 40px; flex-shrink: 0; }
+
+    /* Verdict */
+    .verdict {
+      margin: 2rem 0;
+      padding: 1.5rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .verdict.go { border-color: var(--green); }
+    .verdict.conditional { border-color: var(--yellow); }
+    .verdict.nogo { border-color: var(--red); }
+    .verdict h3 { font-size: 1.2rem; margin-bottom: 0.5rem; }
+    .verdict .tag {
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      font-weight: 700;
+      font-size: 0.85rem;
+    }
+    .verdict .tag.go { background: rgba(63,185,80,0.15); color: var(--green); }
+    .verdict .tag.conditional { background: rgba(210,153,34,0.15); color: var(--yellow); }
+    .verdict .tag.nogo { background: rgba(248,81,73,0.15); color: var(--red); }
+
+    .legend {
+      display: flex;
+      gap: 2rem;
+      margin: 1rem 0;
+      font-size: 0.85rem;
+    }
+    .legend-item { display: flex; align-items: center; gap: 0.5rem; }
+    .legend-swatch {
+      width: 16px;
+      height: 16px;
+      border-radius: 3px;
+    }
+
+    #loading { text-align: center; padding: 4rem; color: var(--text-dim); }
+    #error { color: var(--red); padding: 1rem; display: none; }
+    .note { font-size: 0.8rem; color: var(--text-dim); font-style: italic; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Nostr BBS Crypto Benchmarks</h1>
+  <p class="subtitle">JavaScript (noble/nostr-tools) vs Rust WASM (@nostr-bbs/nostr-core-wasm)</p>
+
+  <div id="loading">Loading results from <code>results.json</code>...</div>
+  <div id="error"></div>
+  <div id="content" style="display:none">
+    <div class="meta" id="meta"></div>
+
+    <h2>Results Table</h2>
+    <table id="results-table">
+      <thead>
+        <tr>
+          <th>Operation</th>
+          <th>Iterations</th>
+          <th>JS Mean</th>
+          <th>JS ops/s</th>
+          <th>WASM Mean</th>
+          <th>WASM ops/s</th>
+          <th>Speedup</th>
+        </tr>
+      </thead>
+      <tbody id="results-body"></tbody>
+    </table>
+
+    <h2>Mean Time Comparison</h2>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-swatch bar-js"></div> JavaScript</div>
+      <div class="legend-item"><div class="legend-swatch bar-wasm"></div> Rust WASM</div>
+    </div>
+    <div id="chart" class="chart-section"></div>
+
+    <h2>Ops/sec Comparison</h2>
+    <div id="ops-chart" class="chart-section"></div>
+
+    <div id="verdict"></div>
+  </div>
+
+  <script>
+    function formatMs(ms) {
+      if (ms < 0.001) return `${(ms * 1e6).toFixed(0)} ns`;
+      if (ms < 1) return `${(ms * 1000).toFixed(1)} us`;
+      return `${ms.toFixed(3)} ms`;
+    }
+    function formatOps(ops) {
+      if (ops >= 1e6) return `${(ops / 1e6).toFixed(2)}M`;
+      if (ops >= 1e3) return `${(ops / 1e3).toFixed(1)}K`;
+      return `${ops.toFixed(0)}`;
+    }
+    function speedupClass(s) {
+      if (s >= 3) return 'green';
+      if (s >= 2) return 'yellow';
+      return 'red';
+    }
+
+    async function loadResults() {
+      try {
+        const res = await fetch('results.json');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        render(data);
+      } catch (e) {
+        document.getElementById('loading').style.display = 'none';
+        const err = document.getElementById('error');
+        err.style.display = 'block';
+        err.innerHTML = `<p>Could not load results.json: ${e.message}</p>
+          <p>Run <code>node --experimental-wasm-modules bench.mjs</code> first to generate benchmark data.</p>`;
+      }
+    }
+
+    function render(data) {
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('content').style.display = 'block';
+
+      // Meta
+      document.getElementById('meta').textContent =
+        `Run: ${data.timestamp} | ${data.node} | ${data.platform}`;
+
+      // Table
+      const tbody = document.getElementById('results-body');
+      for (const r of data.results) {
+        const cls = speedupClass(r.speedup);
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td>${r.name}${r.note ? '<div class="note">' + r.note + '</div>' : ''}</td>
+          <td>${r.iterations}</td>
+          <td>${formatMs(r.js.mean)}</td>
+          <td>${formatOps(r.js.opsPerSec)}</td>
+          <td>${formatMs(r.wasm.mean)}</td>
+          <td>${formatOps(r.wasm.opsPerSec)}</td>
+          <td class="speedup-cell ${cls}">${r.speedup.toFixed(2)}x</td>
+        `;
+        tbody.appendChild(row);
+      }
+
+      // Mean time bar chart
+      const chart = document.getElementById('chart');
+      const maxMean = Math.max(...data.results.flatMap(r => [r.js.mean, r.wasm.mean]));
+      for (const r of data.results) {
+        const jsWidth = (r.js.mean / maxMean) * 100;
+        const wasmWidth = (r.wasm.mean / maxMean) * 100;
+        chart.innerHTML += `
+          <div class="chart-row">
+            <div class="chart-label">${r.name.replace(/ \(composite.*\)/, '')}</div>
+            <div class="chart-bars">
+              <div class="bar-container">
+                <div class="bar-tag">JS</div>
+                <div class="bar bar-js" style="width:${jsWidth}%"></div>
+                <div class="bar-value">${formatMs(r.js.mean)}</div>
+              </div>
+              <div class="bar-container">
+                <div class="bar-tag">WASM</div>
+                <div class="bar bar-wasm" style="width:${wasmWidth}%"></div>
+                <div class="bar-value">${formatMs(r.wasm.mean)} <span class="${speedupClass(r.speedup)}">(${r.speedup.toFixed(1)}x)</span></div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // Ops/sec bar chart
+      const opsChart = document.getElementById('ops-chart');
+      const maxOps = Math.max(...data.results.flatMap(r => [r.js.opsPerSec, r.wasm.opsPerSec]));
+      for (const r of data.results) {
+        const jsWidth = (r.js.opsPerSec / maxOps) * 100;
+        const wasmWidth = (r.wasm.opsPerSec / maxOps) * 100;
+        opsChart.innerHTML += `
+          <div class="chart-row">
+            <div class="chart-label">${r.name.replace(/ \(composite.*\)/, '')}</div>
+            <div class="chart-bars">
+              <div class="bar-container">
+                <div class="bar-tag">JS</div>
+                <div class="bar bar-js" style="width:${jsWidth}%"></div>
+                <div class="bar-value">${formatOps(r.js.opsPerSec)} ops/s</div>
+              </div>
+              <div class="bar-container">
+                <div class="bar-tag">WASM</div>
+                <div class="bar bar-wasm" style="width:${wasmWidth}%"></div>
+                <div class="bar-value">${formatOps(r.wasm.opsPerSec)} ops/s</div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // Verdict
+      const s = data.summary;
+      const verdictClass = s.allAbove3x ? 'go' : s.allAbove2x ? 'go' : 'conditional';
+      const tagClass = s.allAbove3x ? 'go' : s.allAbove2x ? 'go' : 'conditional';
+      const verdictText = s.allAbove3x
+        ? 'GO -- Exceeds preferred 3x threshold'
+        : s.allAbove2x
+        ? 'GO -- Meets minimum 2x threshold'
+        : 'CONDITIONAL -- Some operations below 2x minimum';
+
+      document.getElementById('verdict').innerHTML = `
+        <div class="verdict ${verdictClass}">
+          <h3>Go/No-Go Assessment <span class="tag ${tagClass}">${s.verdict}</span></h3>
+          <p style="margin-top:0.5rem">${verdictText}</p>
+          <p style="margin-top:0.5rem; color: var(--text-dim)">
+            Crypto average speedup: <strong>${s.cryptoAvgSpeedup.toFixed(2)}x</strong> |
+            Range: ${s.minSpeedup.toFixed(2)}x - ${s.maxSpeedup.toFixed(2)}x |
+            All >= 2x: ${s.allAbove2x ? 'Yes' : 'No'} |
+            All >= 3x: ${s.allAbove3x ? 'Yes' : 'No'}
+          </p>
+        </div>
+      `;
+    }
+
+    loadResults();
+  </script>
+</body>
+</html>

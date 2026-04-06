@@ -1,0 +1,114 @@
+[package]
+name = "forum-client"
+version = "0.1.0"
+edition = "2021"
+description = "Nostr BBS community forum Leptos CSR application"
+
+[[bin]]
+name = "forum-client"
+path = "src/main.rs"
+
+[dependencies]
+nostr-core = { workspace = true }
+leptos = { workspace = true }
+leptos_router = { workspace = true }
+leptos_meta = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = [
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+    "BinaryType",
+    "Window",
+    "Document",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "Element",
+    "ScrollBehavior",
+    "ScrollIntoViewOptions",
+    "EventTarget",
+    "Location",
+    "Navigator",
+    "CredentialsContainer",
+    "PublicKeyCredential",
+    "PublicKeyCredentialCreationOptions",
+    "PublicKeyCredentialRequestOptions",
+    "AuthenticatorResponse",
+    "AuthenticatorAttestationResponse",
+    "AuthenticatorAssertionResponse",
+    "CredentialCreationOptions",
+    "CredentialRequestOptions",
+    "AuthenticationExtensionsClientInputs",
+    "AuthenticationExtensionsClientOutputs",
+    "Storage",
+    "HtmlDocument",
+    "Headers",
+    "RequestInit",
+    "Request",
+    "Response",
+    "PageTransitionEvent",
+    "DomRect",
+    "MediaQueryList",
+    "KeyboardEvent",
+    "CssStyleDeclaration",
+    "HtmlTextAreaElement",
+    "HtmlIFrameElement",
+    "IntersectionObserver",
+    "IntersectionObserverEntry",
+    "IntersectionObserverInit",
+    "FileReader",
+    "File",
+    "FileList",
+    "DataTransfer",
+    "DragEvent",
+    "Blob",
+    "ScrollToOptions",
+    "Event",
+    "Clipboard",
+    # IndexedDB (offline-first persistence)
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbObjectStore",
+    "IdbObjectStoreParameters",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbIndex",
+    "IdbKeyRange",
+    "IdbCursorDirection",
+    "DomStringList",
+    # Storage quota
+    "StorageManager",
+    # Service worker registration
+    "ServiceWorkerContainer",
+    # Pointer events (swipe gestures)
+    "PointerEvent",
+    # NodeList (focus trap)
+    "NodeList",
+    # Image compression + encrypted media
+    "ImageBitmap",
+    "BlobPropertyBag",
+    "Crypto",
+    "SubtleCrypto",
+    "CryptoKey",
+    "Url",
+] }
+gloo = { workspace = true }
+comrak = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+k256 = { workspace = true }
+send_wrapper = "0.6"
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+bech32 = "0.11"

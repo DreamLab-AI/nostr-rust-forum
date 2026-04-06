@@ -1,0 +1,33 @@
+# Auth Worker — WebAuthn + NIP-98 + pod provisioning
+name = "nostr-bbs-auth"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-09-02"
+
+[build]
+command = "worker-build --release"
+
+# D1 database for WebAuthn credentials and challenges
+[[d1_databases]]
+binding = "DB"
+database_name = "nostr-bbs-auth"          # Create with: wrangler d1 create nostr-bbs-auth
+database_id = "REPLACE_ME_AUTH_D1_ID"
+
+# KV namespace for session tokens
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "REPLACE_ME_SESSIONS_KV_ID"         # Create with: wrangler kv namespace create SESSIONS
+
+# KV namespace for pod metadata (ACLs, quotas)
+[[kv_namespaces]]
+binding = "POD_META"
+id = "REPLACE_ME_POD_META_KV_ID"         # Create with: wrangler kv namespace create POD_META
+
+# R2 bucket for Solid pod storage
+[[r2_buckets]]
+binding = "PODS"
+bucket_name = "nostr-bbs-pods"            # Create with: wrangler r2 bucket create nostr-bbs-pods
+
+[vars]
+RP_ID = "your-domain.com"                # Your domain (WebAuthn relying party ID)
+RP_NAME = "Your Nostr BBS"               # Display name shown during passkey ceremony
+EXPECTED_ORIGIN = "https://your-domain.com"  # Must match RP_ID scheme+domain

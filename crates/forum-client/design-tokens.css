@@ -1,0 +1,349 @@
+/* ============================================
+ * Nostr BBS Design System — Shared Tokens
+ * Used by both React marketing site and Leptos forum
+ *
+ * Canonical source: src/styles/design-tokens.css
+ * Forum copy: community-forum-rs/crates/forum-client/design-tokens.css
+ * ============================================ */
+
+/* -- Color Tokens --------------------------------- */
+
+:root {
+  /* Zone / track accent colors */
+  --dl-accent-green: 34, 197, 94;        /* Public zone / Cyber & Trust */
+  --dl-accent-purple: 168, 85, 247;      /* Private / Immersive & XR */
+  --dl-accent-pink: 236, 72, 153;        /* Nostr BBS / Creative Tech */
+  --dl-accent-sky: 56, 189, 248;         /* AI Agents / AI & Autonomous */
+  --dl-accent-amber: 245, 158, 11;       /* Enterprise Innovation / Brand primary */
+  --dl-accent-blue: 96, 165, 250;        /* Engineering / Deep-tech */
+
+  /* Surface & glass primitives */
+  --dl-surface-dark: #111827;
+  --dl-card-bg: rgba(31, 41, 55, 0.5);
+  --dl-card-border: rgba(55, 65, 81, 0.5);
+  --dl-glass-bg: rgba(17, 24, 39, 0.8);
+  --dl-glass-border: rgba(55, 65, 81, 0.3);
+
+  /* Glow intensities */
+  --dl-glow-ambient: 0 0 20px rgba(var(--dl-accent-amber), 0.15);
+  --dl-glow-strong: 0 0 30px rgba(var(--dl-accent-amber), 0.25);
+}
+
+/* -- Glass Card ----------------------------------- */
+
+.glass-card {
+  background: var(--dl-card-bg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--dl-card-border);
+  border-radius: 12px;
+}
+
+.glass-card-interactive {
+  background: var(--dl-card-bg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--dl-card-border);
+  border-radius: 12px;
+  transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1),
+              box-shadow 0.25s ease,
+              border-color 0.25s ease;
+  cursor: pointer;
+}
+
+.glass-card-interactive:hover {
+  transform: translateY(-3px) scale(1.01);
+  box-shadow: 0 0 24px rgba(var(--dl-accent-amber), 0.12),
+              0 8px 32px rgba(0, 0, 0, 0.3);
+  border-color: rgba(var(--dl-accent-amber), 0.3);
+}
+
+.glass-card-interactive:active {
+  transform: translateY(-1px) scale(0.99);
+}
+
+/* -- Mesh Background ------------------------------ */
+
+.mesh-bg {
+  background:
+    radial-gradient(ellipse at 20% 50%, rgba(var(--dl-accent-amber), 0.06) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 20%, rgba(var(--dl-accent-blue), 0.04) 0%, transparent 50%),
+    radial-gradient(ellipse at 60% 80%, rgba(var(--dl-accent-purple), 0.03) 0%, transparent 50%),
+    var(--dl-surface-dark);
+  animation: dl-mesh-drift 20s ease-in-out infinite alternate;
+}
+
+@keyframes dl-mesh-drift {
+  0% { background-position: 0% 0%, 100% 0%, 50% 100%; }
+  100% { background-position: 100% 100%, 0% 100%, 50% 0%; }
+}
+
+/* -- Aurora Shimmer ------------------------------- */
+
+.aurora-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.aurora-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: -50%;
+  background: linear-gradient(
+    45deg,
+    transparent 30%,
+    rgba(var(--dl-accent-amber), 0.04) 40%,
+    rgba(var(--dl-accent-blue), 0.06) 50%,
+    rgba(var(--dl-accent-purple), 0.04) 60%,
+    transparent 70%
+  );
+  animation: dl-aurora-sweep 6s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes dl-aurora-sweep {
+  0% { transform: translateX(-100%) rotate(30deg); }
+  100% { transform: translateX(200%) rotate(30deg); }
+}
+
+/* -- Ambient Orbs --------------------------------- */
+
+.ambient-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: dl-ambient-float 20s ease-in-out infinite,
+             dl-ambient-fade-in 2s ease-out forwards;
+}
+
+.ambient-orb-1 {
+  width: 400px;
+  height: 400px;
+  background: radial-gradient(circle, rgba(var(--dl-accent-amber), 0.08) 0%, transparent 70%);
+  top: -10%;
+  left: -5%;
+  animation-delay: 0s;
+}
+
+.ambient-orb-2 {
+  width: 300px;
+  height: 300px;
+  background: radial-gradient(circle, rgba(var(--dl-accent-blue), 0.06) 0%, transparent 70%);
+  bottom: 5%;
+  right: -8%;
+  animation-delay: -7s;
+  animation-duration: 25s;
+}
+
+.ambient-orb-3 {
+  width: 250px;
+  height: 250px;
+  background: radial-gradient(circle, rgba(var(--dl-accent-amber), 0.05) 0%, transparent 70%);
+  top: 40%;
+  right: 15%;
+  animation-delay: -13s;
+  animation-duration: 30s;
+}
+
+@keyframes dl-ambient-float {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  25% { transform: translate(30px, -20px) scale(1.05); }
+  50% { transform: translate(-15px, 25px) scale(0.95); }
+  75% { transform: translate(20px, 10px) scale(1.02); }
+}
+
+@keyframes dl-ambient-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* -- Ambient Breathing Glow ----------------------- */
+
+@keyframes dl-ambient-breathe {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50% { opacity: 0.9; transform: scale(1.08); }
+}
+
+.animate-ambient-breathe {
+  animation: dl-ambient-breathe 6s ease-in-out infinite;
+}
+
+/* -- Gradient Border (Animated) ------------------- */
+
+.gradient-border {
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.gradient-border::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    135deg,
+    rgba(var(--dl-accent-amber), 0.6),
+    rgba(var(--dl-accent-amber), 0.2),
+    rgba(var(--dl-accent-blue), 0.4),
+    rgba(var(--dl-accent-amber), 0.6)
+  );
+  background-size: 300% 300%;
+  animation: dl-gradient-border-rotate 4s ease-in-out infinite;
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  pointer-events: none;
+}
+
+@keyframes dl-gradient-border-rotate {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+/* -- Candy Gradient Text -------------------------- */
+
+.candy-gradient {
+  background: linear-gradient(
+    135deg,
+    rgb(var(--dl-accent-amber)) 0%,
+    rgb(245, 158, 11) 20%,
+    rgb(249, 115, 22) 40%,
+    rgb(239, 68, 68) 60%,
+    rgb(var(--dl-accent-purple)) 80%,
+    rgb(var(--dl-accent-amber)) 100%
+  );
+  background-size: 200% 200%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: dl-candy-shift 5s ease-in-out infinite;
+}
+
+@keyframes dl-candy-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+/* -- Brand Gradient Text (Amber) ------------------ */
+
+.gradient-text {
+  background: linear-gradient(135deg,
+    rgb(var(--dl-accent-amber)),
+    rgb(245, 158, 11),
+    rgb(217, 119, 6)
+  );
+  background-size: 200% 200%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* -- Skeleton Loading ----------------------------- */
+
+.skeleton {
+  background: linear-gradient(90deg, #1f2937 25%, #374151 50%, #1f2937 75%);
+  background-size: 200% 100%;
+  animation: dl-shimmer 1.5s ease-in-out infinite;
+  border-radius: 6px;
+}
+
+@keyframes dl-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* -- Hover Lift ----------------------------------- */
+
+.hover-lift {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--dl-glow-ambient);
+}
+
+/* -- Neon Pulse (Badge / Notification) ------------ */
+
+.neon-pulse {
+  position: relative;
+}
+
+.neon-pulse::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  background: rgba(var(--dl-accent-amber), 0.4);
+  filter: blur(6px);
+  opacity: 0;
+  animation: dl-neon-throb 2s ease-in-out infinite;
+  pointer-events: none;
+  z-index: -1;
+}
+
+@keyframes dl-neon-throb {
+  0%, 100% { opacity: 0; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.05); }
+}
+
+/* -- Scrollbar Utilities -------------------------- */
+
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* -- Fade-in Utility ------------------------------ */
+
+@keyframes dl-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in {
+  animation: dl-fade-in 0.3s ease-out;
+}
+
+/* -- Reduced Motion ------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .ambient-orb,
+  .aurora-shimmer::after,
+  .gradient-border::before,
+  .neon-pulse::after {
+    animation: none !important;
+  }
+
+  .ambient-orb {
+    opacity: 0.5;
+  }
+
+  .animate-ambient-breathe {
+    animation: none;
+  }
+
+  .glass-card-interactive:hover {
+    transform: none;
+  }
+
+  .candy-gradient,
+  .gradient-text {
+    animation: none;
+  }
+
+  .skeleton {
+    animation: none;
+    background: #1f2937;
+  }
+}

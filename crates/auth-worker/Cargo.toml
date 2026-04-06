@@ -1,0 +1,20 @@
+[package]
+name = "auth-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Nostr BBS auth Worker: WebAuthn + NIP-98 + pod provisioning"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nostr-core = { workspace = true }
+worker = { workspace = true, features = ["d1"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }

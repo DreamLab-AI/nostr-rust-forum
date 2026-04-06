@@ -1,0 +1,27 @@
+# Search Worker — RuVector search, RVF binary format, cosine k-NN
+name = "nostr-bbs-search"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-09-23"
+
+[build]
+command = "worker-build --release"
+
+# R2 bucket for vector storage (.rvf files)
+[[r2_buckets]]
+binding = "VECTORS"
+bucket_name = "nostr-bbs-vectors"         # Create with: wrangler r2 bucket create nostr-bbs-vectors
+
+# KV namespace for search configuration
+[[kv_namespaces]]
+binding = "SEARCH_CONFIG"
+id = "REPLACE_ME_SEARCH_CONFIG_KV_ID"    # Create with: wrangler kv namespace create SEARCH_CONFIG
+
+[vars]
+ALLOWED_ORIGIN = "https://your-domain.com"
+ALLOWED_ORIGINS = "https://your-domain.com"  # Comma-separated list of allowed CORS origins
+RVF_STORE_KEY = "forum.rvf"              # Key for the RVF vector store in R2
+ADMIN_PUBKEYS = ""                       # Hex pubkey(s) with admin access to /ingest
+
+# Keep-warm cron
+[triggers]
+crons = ["*/5 * * * *"]

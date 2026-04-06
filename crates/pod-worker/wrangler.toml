@@ -1,0 +1,20 @@
+# Pod Worker — Solid pod storage, WAC ACL, WebID profiles
+name = "nostr-bbs-pods"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-09-02"
+
+[build]
+command = "worker-build --release"
+
+# R2 bucket for pod file storage
+[[r2_buckets]]
+binding = "PODS"
+bucket_name = "nostr-bbs-pods"            # Same bucket as auth-worker; create with: wrangler r2 bucket create nostr-bbs-pods
+
+# KV namespace for pod metadata (shared with auth-worker)
+[[kv_namespaces]]
+binding = "POD_META"
+id = "REPLACE_ME_POD_META_KV_ID"         # Same namespace as auth-worker
+
+[vars]
+EXPECTED_ORIGIN = "https://your-domain.com"

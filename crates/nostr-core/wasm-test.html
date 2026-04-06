@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>nostr-core-wasm smoke test</title>
+  <style>
+    body { font-family: monospace; background: #111; color: #0f0; padding: 2em; }
+    .pass { color: #0f0; }
+    .fail { color: #f00; }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>nostr-core-wasm smoke test</h1>
+  <pre id="log"></pre>
+  <script type="module">
+    const log = document.getElementById('log');
+    function print(msg, ok = true) {
+      const span = document.createElement('span');
+      span.className = ok ? 'pass' : 'fail';
+      span.textContent = msg + '\n';
+      log.appendChild(span);
+    }
+
+    try {
+      // Use dynamic import for the bundler-target output.
+      // If serving locally with a bundler (e.g. vite), adjust the path.
+      const wasm = await import('./pkg/nostr-core-wasm.js');
+
+      // 1. derive_keypair_from_prf
+      const prf = new Uint8Array(32);
+      crypto.getRandomValues(prf);
+      const kp = wasm.derive_keypair_from_prf(prf);
+      print('[PASS] derive_keypair_from_prf returned pubkey: ' + kp.publicKey.slice(0, 16) + '...');
+
+      // 2. nip44_encrypt / nip44_decrypt roundtrip
+      const prf2 = new Uint8Array(32);
+      crypto.getRandomValues(prf2);
+      const kp2 = wasm.derive_keypair_from_prf(prf2);
+
+      // Get recipient pubkey bytes from hex
+      const recipientPkHex = kp2.publicKey;
+      const recipientPk = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) {
+        recipientPk[i] = parseInt(recipientPkHex.slice(i * 2, i * 2 + 2), 16);
+      }
+
+      const senderPkHex = kp.publicKey;
+      const senderPk = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) {
+        senderPk[i] = parseInt(senderPkHex.slice(i * 2, i * 2 + 2), 16);
+      }
+
+      const plaintext = 'Hello from WASM NIP-44!';
+      const encrypted = wasm.nip44_encrypt(kp.secretKey, recipientPk, plaintext);
+      print('[PASS] nip44_encrypt produced ciphertext (' + encrypted.length + ' chars)');
+
+      const decrypted = wasm.nip44_decrypt(kp2.secretKey, senderPk, encrypted);
+      if (decrypted === plaintext) {
+        print('[PASS] nip44_decrypt roundtrip: "' + decrypted + '"');
+      } else {
+        print('[FAIL] nip44_decrypt mismatch: got "' + decrypted + '"', false);
+      }
+
+      // 3. compute_event_id
+      const eventId = wasm.compute_event_id(
+        kp.publicKey,
+        Math.floor(Date.now() / 1000),
+        1,
+        '[]',
+        'test content'
+      );
+      print('[PASS] compute_event_id: ' + eventId.slice(0, 16) + '...');
+
+      // 4. schnorr_sign
+      const msgBytes = new Uint8Array(32);
+      crypto.getRandomValues(msgBytes);
+      const sig = wasm.schnorr_sign(kp.secretKey, msgBytes);
+      print('[PASS] schnorr_sign produced ' + sig.length + '-byte signature');
+
+      print('\nAll tests passed.');
+    } catch (e) {
+      print('[FAIL] ' + e.message, false);
+      print(e.stack, false);
+    }
+  </script>
+</body>
+</html>

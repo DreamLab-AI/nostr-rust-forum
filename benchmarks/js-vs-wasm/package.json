@@ -1,0 +1,17 @@
+{
+  "name": "nostr-bbs-crypto-benchmarks",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "JS vs WASM benchmark comparison for Nostr BBS Nostr crypto primitives",
+  "scripts": {
+    "bench": "node --experimental-wasm-modules bench.mjs",
+    "bench:html": "open report.html"
+  },
+  "dependencies": {
+    "@nostr-bbs/nostr-core-wasm": "file:../../crates/nostr-core/pkg",
+    "@noble/hashes": "^1.4.0",
+    "@noble/curves": "^1.4.0",
+    "nostr-tools": "^2.7.0"
+  }
+}

@@ -1,0 +1,15 @@
+# Preview Worker — OG metadata, oEmbed, SSRF protection
+name = "nostr-bbs-preview"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-09-02"
+
+[build]
+command = "worker-build --release"
+
+# KV namespace for rate limiting
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "REPLACE_ME_RATE_LIMIT_KV_ID"       # Create with: wrangler kv namespace create RATE_LIMIT
+
+[vars]
+ALLOWED_ORIGIN = "https://your-domain.com"

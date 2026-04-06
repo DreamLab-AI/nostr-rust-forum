@@ -1,8 +1,0 @@
-[
-  {
-    "origin": ["https://jjohare.github.io", "http://localhost:5173", "http://localhost:3000"],
-    "method": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    "responseHeader": ["Content-Type", "Authorization", "X-Requested-With"],
-    "maxAgeSeconds": 3600
-  }
-]

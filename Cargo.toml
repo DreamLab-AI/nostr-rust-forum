@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nostr-core",
+    "crates/forum-client",
+    "crates/auth-worker",
+    "crates/pod-worker",
+    "crates/preview-worker",
+    "crates/relay-worker",
+    "crates/search-worker",
+]
+
+[workspace.dependencies]
+# Nostr protocol (0.44.x — alpha, pinned to minor)
+nostr = "0.44"
+nostr-sdk = "0.44"
+
+# UI framework (0.7.x — stay on 0.7 track, 0.8 is breaking)
+leptos = { version = "0.7", features = ["csr"] }
+leptos_router = "0.7"
+leptos_meta = "0.7"
+
+# Cloudflare Workers
+worker = "0.7"
+
+# WebAuthn with PRF support
+passkey-types = "0.3"
+
+# Cryptography (NCC audited, pinned to latest patch)
+k256 = { version = "0.13.4", features = ["schnorr", "ecdh"] }
+chacha20poly1305 = "0.10.1"
+hmac = "0.12.1"
+hkdf = "0.12.4"
+sha2 = "0.10.9"
+getrandom = { version = "0.2", features = ["js"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# WASM bindings
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = "0.3"
+gloo = "0.11"
+
+# Markdown
+comrak = { version = "0.38", default-features = false }
+
+# Validation
+validator = { version = "0.20", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+
+# Encoding
+hex = "0.4"
+base64 = "0.22"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Testing
+proptest = "1"
+criterion = "0.5"
+wasm-bindgen-test = "0.3"
+
+# Internal crates
+nostr-core = { path = "crates/nostr-core" }
