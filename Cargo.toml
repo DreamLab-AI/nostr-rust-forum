@@ -108,8 +108,8 @@ wasm-bindgen-test = "0.3"
 # `core` consumers (CF Workers): use this dep.
 # Server-side consumers: enable `tokio-runtime` and the IO backends
 # they need.
-solid-pod-rs = { version = "0.4.0-alpha.3", default-features = false, features = ["core"] }
-solid-pod-rs-nostr = { version = "0.4.0-alpha.3", default-features = false }
+solid-pod-rs = { version = "0.4.0-alpha.4", default-features = false, features = ["core"] }
+solid-pod-rs-nostr = { version = "0.4.0-alpha.4", default-features = false }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
 nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc3" }
@@ -129,19 +129,3 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-# ---------------------------------------------------------------------------
-# Phase 4 ABSORPTION SCAFFOLDING (ADR-076/078)
-#
-# 0.4.0-alpha.3 of solid-pod-rs introduces the `core` feature flag for
-# wasm32 / CF-Workers consumers. Until the operator runs the manual
-# crates.io publish (see solid-pod-rs phase-4-stage-1-publish-recipe),
-# the published index still shows 0.4.0-alpha.2. The patch table below
-# overrides the lookup to the local in-tree checkout so absorption
-# work can proceed against the new feature surface.
-#
-# REMOVE this `[patch.crates-io]` block once both solid-pod-rs and
-# solid-pod-rs-nostr 0.4.0-alpha.3 have landed on crates.io.
-# ---------------------------------------------------------------------------
-[patch.crates-io]
-solid-pod-rs = { path = "../solid-pod-rs/crates/solid-pod-rs" }
-solid-pod-rs-nostr = { path = "../solid-pod-rs/crates/solid-pod-rs-nostr" }
