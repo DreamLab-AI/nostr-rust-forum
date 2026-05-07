@@ -31,8 +31,9 @@ pub mod wasm_bridge;
 // ── Re-exports for ergonomic top-level use ─────────────────────────────────
 
 pub use event::{
-    compute_event_id, sign_event, sign_event_deterministic, verify_event, verify_event_strict,
-    verify_events_batch, EventError, NostrEvent, PubkeyMismatch, UnsignedEvent,
+    compute_event_id, sign_event, sign_event_deterministic, sign_event_upstream,
+    signing_key_to_upstream, verify_event, verify_event_strict, verify_events_batch, EventError,
+    NostrEvent, PubkeyMismatch, UnsignedEvent,
 };
 pub use gift_wrap::{gift_wrap, unwrap_gift, GiftWrapError, UnwrappedGift};
 pub use keys::{derive_from_prf, generate_keypair, Keypair, PublicKey, SecretKey, Signature};

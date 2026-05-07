@@ -368,7 +368,13 @@ impl ProfileCache {
                     return;
                 }
                 let fetched = fetch_batch(&still_missing).await;
+                #[cfg(target_arch = "wasm32")]
                 let now = (js_sys::Date::now() / 1000.0) as u64;
+                #[cfg(not(target_arch = "wasm32"))]
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 let mut to_persist = Vec::with_capacity(fetched.len());
                 for mut entry in fetched {
                     if entry.fetched_at == 0 {
@@ -566,7 +572,13 @@ fn parse_batch_response(text: &str) -> Vec<ProfileEntry> {
     };
 
     let mut out = Vec::with_capacity(array.len());
+    #[cfg(target_arch = "wasm32")]
     let now = (js_sys::Date::now() / 1000.0) as u64;
+    #[cfg(not(target_arch = "wasm32"))]
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     for item in array {
         // Try wrapped shape first.
         if let Ok(wrapped) = serde_json::from_value::<BatchResponseEntry>(item.clone()) {
@@ -703,7 +715,8 @@ mod tests {
         e.display_name = None;
         assert_eq!(e.best_label().as_deref(), Some("alice"));
         e.name = None;
-        assert_eq!(e.best_label().as_deref(), Some("@alice"));
+        // Without NOSTR_BBS_NIP05_DOMAIN env var, NIP-05 renders fully qualified
+        assert_eq!(e.best_label().as_deref(), Some("@alice@example.test"));
         e.nip05 = None;
         assert!(e.best_label().is_none());
     }

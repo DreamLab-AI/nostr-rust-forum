@@ -1,14 +1,18 @@
 //! Nostr event types and NIP-01 canonical serialization.
 //!
-//! Implements the event structure, ID computation (SHA-256 of canonical JSON),
-//! and Schnorr signing/verification per BIP-340.
+//! Phase 5 absorption (ADR-076/078): this module preserves the kit's
+//! hex-string `NostrEvent` / `UnsignedEvent` public surface for ABI
+//! stability with downstream consumers. Conversion helpers
+//! (`to_upstream` / `from_upstream`) bridge to `nostr::Event` so that
+//! higher-level NIP modules can delegate protocol logic to rust-nostr.
 
 use k256::schnorr::{SigningKey, VerifyingKey};
+use nostr::JsonUtil;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// Errors returned by event verification.
+/// Errors returned by event operations.
 #[derive(Debug, Error)]
 pub enum EventError {
     /// The recomputed event ID does not match the `id` field.
@@ -35,6 +39,10 @@ pub enum EventError {
     /// The Schnorr signature does not verify against the pubkey and event ID.
     #[error("signature verification failed")]
     SignatureInvalid,
+
+    /// Conversion to/from upstream `nostr::Event` failed.
+    #[error("upstream conversion: {0}")]
+    Upstream(String),
 }
 
 /// A fully signed Nostr event.
@@ -239,6 +247,81 @@ pub fn verify_events_batch(events: &[NostrEvent]) -> Vec<Result<(), EventError>>
     events.iter().map(verify_event_strict).collect()
 }
 
+// ── Upstream conversion layer (ADR-076/078) ─────────────────────────────────
+//
+// Bridges between the kit's hex-string `NostrEvent` and rust-nostr 0.44's
+// typed `nostr::Event`. Both serialize to NIP-01 JSON, so serde round-trip
+// is the natural conversion — correct by construction with zero field-mapping
+// risk.
+
+impl NostrEvent {
+    /// Convert to upstream `nostr::Event` via NIP-01 JSON round-trip.
+    pub fn to_upstream(&self) -> Result<nostr::Event, EventError> {
+        let json = serde_json::to_string(self).expect("NostrEvent always serializes");
+        nostr::Event::from_json(&json).map_err(|e| EventError::Upstream(e.to_string()))
+    }
+
+    /// Convert from upstream `nostr::Event` via NIP-01 JSON round-trip.
+    pub fn from_upstream(event: &nostr::Event) -> Self {
+        let json = event.as_json();
+        serde_json::from_str(&json).expect("upstream Event produces valid NIP-01 JSON")
+    }
+}
+
+impl UnsignedEvent {
+    /// Convert to an upstream `EventBuilder` for signing via rust-nostr.
+    pub fn to_upstream_builder(&self) -> nostr::EventBuilder {
+        let tags: Vec<nostr::Tag> = self
+            .tags
+            .iter()
+            .filter_map(|t| {
+                if t.is_empty() {
+                    return None;
+                }
+                Some(nostr::Tag::parse(t.clone()).unwrap_or_else(|_| {
+                    nostr::Tag::custom(
+                        nostr::TagKind::custom(t[0].clone()),
+                        t[1..].iter().cloned().collect::<Vec<_>>(),
+                    )
+                }))
+            })
+            .collect();
+        nostr::EventBuilder::new(nostr::Kind::from(self.kind as u16), &self.content)
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(self.created_at))
+    }
+}
+
+/// Convert a `k256::schnorr::SigningKey` to upstream `nostr::Keys`.
+pub fn signing_key_to_upstream(sk: &SigningKey) -> Result<nostr::Keys, EventError> {
+    let sk_hex = hex::encode(sk.to_bytes());
+    nostr::Keys::parse(&sk_hex).map_err(|e| EventError::Upstream(e.to_string()))
+}
+
+/// Sign an `UnsignedEvent` via upstream rust-nostr, returning a `NostrEvent`.
+///
+/// Same pubkey safety guarantee as [`sign_event`]: validates that the
+/// unsigned event's `pubkey` matches the signing key.
+pub fn sign_event_upstream(
+    event: UnsignedEvent,
+    signing_key: &SigningKey,
+) -> Result<NostrEvent, PubkeyMismatch> {
+    let derived_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
+    if event.pubkey != derived_pubkey {
+        return Err(PubkeyMismatch {
+            event_pubkey: event.pubkey,
+            derived_pubkey,
+        });
+    }
+    let keys = signing_key_to_upstream(signing_key)
+        .expect("valid SigningKey converts to valid Keys");
+    let builder = event.to_upstream_builder();
+    let upstream_event = builder
+        .sign_with_keys(&keys)
+        .expect("signing with valid keys succeeds");
+    Ok(NostrEvent::from_upstream(&upstream_event))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +524,81 @@ mod tests {
     fn verify_events_batch_empty() {
         let results = verify_events_batch(&[]);
         assert!(results.is_empty());
+    }
+
+    // ── Upstream conversion layer tests ─────────────────────────────────
+
+    #[test]
+    fn nostr_event_to_upstream_roundtrip() {
+        let sk = test_signing_key();
+        let pubkey = hex::encode(sk.verifying_key().to_bytes());
+        let signed = sign_event_deterministic(
+            UnsignedEvent {
+                pubkey,
+                created_at: 1700000000,
+                kind: 1,
+                tags: vec![vec!["p".into(), "aa".repeat(32)]],
+                content: "hello upstream".to_string(),
+            },
+            &sk,
+        )
+        .unwrap();
+
+        let upstream = signed.to_upstream().expect("to_upstream succeeds");
+        upstream.verify().expect("upstream verify passes");
+        let back = NostrEvent::from_upstream(&upstream);
+        assert_eq!(back.id, signed.id);
+        assert_eq!(back.pubkey, signed.pubkey);
+        assert_eq!(back.content, signed.content);
+        assert_eq!(back.kind, signed.kind);
+        assert_eq!(back.sig, signed.sig);
+    }
+
+    #[test]
+    fn unsigned_to_upstream_builder_preserves_fields() {
+        let unsigned = UnsignedEvent {
+            pubkey: "aa".repeat(32),
+            created_at: 1700000000,
+            kind: 30023,
+            tags: vec![
+                vec!["d".into(), "test-article".into()],
+                vec!["t".into(), "rust".into()],
+            ],
+            content: "long form content".to_string(),
+        };
+        let builder = unsigned.to_upstream_builder();
+        let keys = nostr::Keys::generate();
+        let event = builder.sign_with_keys(&keys).unwrap();
+        assert_eq!(event.created_at.as_u64(), 1700000000);
+        assert_eq!(event.kind.as_u16(), 30023);
+        assert_eq!(event.content, "long form content");
+    }
+
+    #[test]
+    fn sign_event_upstream_matches_kit_verify() {
+        let sk = test_signing_key();
+        let pubkey = hex::encode(sk.verifying_key().to_bytes());
+        let unsigned = UnsignedEvent {
+            pubkey,
+            created_at: 1700000000,
+            kind: 1,
+            tags: vec![],
+            content: "upstream-signed".to_string(),
+        };
+        let signed = sign_event_upstream(unsigned, &sk).unwrap();
+        assert!(verify_event(&signed), "kit verify must accept upstream-signed event");
+    }
+
+    #[test]
+    fn sign_event_upstream_rejects_wrong_pubkey() {
+        let sk = test_signing_key();
+        let unsigned = UnsignedEvent {
+            pubkey: "bb".repeat(32),
+            created_at: 1700000000,
+            kind: 1,
+            tags: vec![],
+            content: "wrong pk".to_string(),
+        };
+        assert!(sign_event_upstream(unsigned, &sk).is_err());
     }
 }
