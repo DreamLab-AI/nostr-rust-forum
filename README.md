@@ -2,6 +2,39 @@
 
 A full-stack, open-source forum built on the Nostr protocol. Passkey-first authentication, Solid pod storage, config-driven zone access, and Cloudflare Workers backend -- all in Rust.
 
+## Status
+
+This repository is the **forum-substrate kit** -- the de-branded, generic Rust
+substrate that underpins both the upstream DreamLab forum and any third-party
+deployment that wants a Nostr-native BBS without inheriting DreamLab branding,
+admin tooling, or content.
+
+**Current line:** `v3.0-rc1` (see [`CHANGELOG.md`](CHANGELOG.md)).
+
+The `v2.0 -> v3.0-rc1` transition is the first **kit-extraction** import from the
+legacy fork at `dreamlab-ai-website/community-forum-rs/`, where Sprint v9-v11
+authored a large body of substrate work during the 2026-05-07 mega-sprint.
+This kit-extraction lands the **critical** items only -- two security fixes
+(C1 NIP-44 conversation-key interop, C5 NIP-42 challenge CSPRNG), the F26
+upstream `nostr` canary crate, the L1 reference-vector test scaffolds, and the
+Phase-1 substrate scripts. Full Sprint v9-v11 feature absorption is deferred
+to Phase 3+.
+
+The **upstream spec home** for cross-substrate normative decisions (ADRs, PRDs,
+DDD bounded-context maps, fixture corpus) is the
+[VisionClaw monorepo](https://github.com/DreamLab-AI/VisionClaw) under
+`docs/adr/`, `docs/prd/`, and `docs/specs/`. This kit pulls fixtures from
+`docs/specs/fixtures/` via `scripts/sync-fixtures.sh`. Anything in this
+repository that diverges from a VisionClaw normative document is a bug in this
+repository.
+
+For the structured sprint history, see RuVector memory keys:
+
+- `project-state/mega-sprint-phase-2-kit-extraction-charter`
+- `mega-sprint-2026-05-07/phase-0-final-report`
+- `mega-sprint-2026-05-07/phase-1-final-report`
+- `mega-sprint-2026-05-07/phase-2-kit-extraction-final-report`
+
 ## Architecture
 
 Seven crates in a Cargo workspace:

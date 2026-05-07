@@ -8,6 +8,7 @@ members = [
     "crates/preview-worker",
     "crates/relay-worker",
     "crates/search-worker",
+    "crates/nostr-upstream-canary",
 ]
 
 [workspace.dependencies]

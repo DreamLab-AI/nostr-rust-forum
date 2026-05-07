@@ -15,6 +15,8 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+type HmacSha256 = Hmac<Sha256>;
+
 /// NIP-44 version byte
 const VERSION: u8 = 0x02;
 
@@ -118,12 +120,19 @@ pub fn conversation_key(sk: &[u8; 32], pk: &[u8; 32]) -> Result<[u8; 32], Nip44E
         x
     };
 
-    // HKDF-Extract(salt="nip44-v2", ikm=shared_x)
-    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), &shared_point);
+    // NIP-44 v2 §2.1: conversation_key = HKDF-Extract(salt="nip44-v2", ikm=shared_x)
+    //
+    // HKDF-Extract is HMAC(salt, ikm) and returns the pseudo-random key (PRK) directly —
+    // it does NOT call HKDF-Expand. The previous implementation chained Extract→Expand
+    // and produced HMAC(PRK, 0x01) instead of the PRK itself, breaking interoperability
+    // with every reference NIP-44 v2 implementation. Validated against paulmillr/nip44
+    // test vectors (`docs/specs/fixtures/nip44-v2.json`).
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(HKDF_SALT)
+        .expect("HMAC accepts variable key length");
+    mac.update(&shared_point);
+    let prk = mac.finalize().into_bytes();
     let mut conv_key = [0u8; 32];
-    // Extract only — use expand with empty info to get the PRK as the key
-    hk.expand(&[], &mut conv_key)
-        .map_err(|_| Nip44Error::HkdfExpandFailed)?;
+    conv_key.copy_from_slice(&prk);
 
     Ok(conv_key)
 }

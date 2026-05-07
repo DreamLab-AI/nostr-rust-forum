@@ -263,12 +263,18 @@ impl NostrRelayDO {
 // ---------------------------------------------------------------------------
 
 /// Generate a unique challenge string for NIP-42 AUTH.
+///
+/// NIP-42 challenge unpredictability is the entire security property of the
+/// AUTH handshake — a predictable challenge lets a network attacker forge an
+/// AUTH response. `js_sys::Math::random()` is a non-cryptographic PRNG; this
+/// implementation uses `getrandom` which on the CF Workers runtime delegates
+/// to `crypto.getRandomValues` (a CSPRNG). The session id is XOR-mixed in to
+/// preserve uniqueness across collisions in the unlikely event two sessions
+/// observe the same 128-bit draw.
 pub(crate) fn generate_challenge(session_id: u64) -> String {
-    let r1 = js_sys::Math::random();
-    let r2 = js_sys::Math::random();
-    format!(
-        "{:016x}{:016x}",
-        (r1 * u64::MAX as f64) as u64,
-        (r2 * u64::MAX as f64) as u64 ^ session_id
-    )
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("crypto.getRandomValues unavailable");
+    let r1 = u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes"));
+    let r2 = u64::from_be_bytes(bytes[8..].try_into().expect("8 bytes"));
+    format!("{:016x}{:016x}", r1, r2 ^ session_id)
 }

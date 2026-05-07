@@ -1,0 +1,41 @@
+[package]
+name = "nostr-upstream-canary"
+version = "0.1.0"
+edition = "2021"
+description = "F26 / ADR-076 D5 validation: smoke-test the upstream `nostr` crate on the forum's WASM/CF Workers build matrix before any module deletion."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# F26 spike exercises the upstream `nostr` 0.44.2 crate. Feature flag map
+# (verified via `cargo metadata` against actual 0.44.2 manifest):
+# - std (default) — core runtime
+# - nip04 — legacy ECDH+CBC DM (closes pre-Sprint-v8 ciphertext)
+# - nip44 — v2 ChaCha20-Poly1305 DM (THE C1 fix target)
+# - nip59 — gift-wrap (depends transitively on nip44)
+# - nip98 — HTTP auth tokens
+# Note: NIP-19 (bech32 entities), NIP-26 (delegation), NIP-90 (DVM types) are
+# NOT separate features in 0.44.2 — NIP-19 is always present in core, NIP-26 +
+# NIP-90 may move to feature gates in later releases. Update when upstream
+# splits the API surface.
+nostr = { workspace = true, default-features = false, features = [
+  "std",
+  "nip04",
+  "nip44",
+  "nip59",
+  "nip98",
+] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+getrandom = { workspace = true }
+
+# WASM-only — required by upstream `nostr` when building for wasm32 because
+# `getrandom` needs the `js` feature to route through `crypto.getRandomValues`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
