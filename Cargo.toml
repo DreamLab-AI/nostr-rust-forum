@@ -29,11 +29,12 @@ members = [
 
 [workspace.dependencies]
 # Nostr protocol (0.44.x — alpha, pinned to minor).
-# Sprint v9 D2: nostr-sdk dropped (zero `use nostr_sdk::` references anywhere).
-# `nostr` retained: declared by nostr-bbs-core/Cargo.toml even though zero
-# source usage right now — STREAM-A/B owns nostr-bbs-core deps and may remove
-# later.
-nostr = "0.44"
+# Phase 5 Stage 2B (ADR-076/078): activate the NIP feature flags for the
+# absorption targets. `std` is on by default; the explicit feature list here
+# enables nip04 (legacy DM), nip44 (encrypted DM v2), nip59 (gift wrap),
+# nip90 (DVM), and nip98 (HTTP auth) — the rust-nostr modules that replace
+# hand-rolled crypto in `nostr-bbs-core`.
+nostr = { version = "0.44", features = ["nip04", "nip44", "nip59", "nip98"] }
 
 # UI framework (0.7.x — stay on 0.7 track, 0.8 is breaking)
 leptos = { version = "0.7", features = ["csr"] }
