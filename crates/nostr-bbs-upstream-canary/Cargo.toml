@@ -1,8 +1,15 @@
 [package]
 name = "nostr-bbs-upstream-canary"
-version = "3.0.0-rc3"
+version = "3.0.0-rc4"
 edition = "2021"
 description = "F26 / ADR-076 D5 validation: smoke-test the upstream `nostr` crate on the forum's WASM/CF Workers build matrix before any module deletion."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-upstream-canary"
+keywords = ["nostr", "bbs", "testing", "canary", "wasm"]
+categories = ["development-tools::testing"]
+rust-version = "1.85"
 publish = false
 
 [lib]

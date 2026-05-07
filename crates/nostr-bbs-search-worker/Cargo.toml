@@ -1,8 +1,15 @@
 [package]
 name = "nostr-bbs-search-worker"
-version = "3.0.0-rc3"
+version = "3.0.0-rc4"
 edition = "2021"
 description = "Search Worker: RVF vector store, cosine k-NN, hash embeddings (nostr-bbs)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-search-worker"
+keywords = ["nostr", "bbs", "search", "embeddings", "cloudflare-workers"]
+categories = ["algorithms", "web-programming"]
+rust-version = "1.85"
 
 [lib]
 crate-type = ["cdylib"]

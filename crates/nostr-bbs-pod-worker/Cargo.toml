@@ -1,8 +1,15 @@
 [package]
 name = "nostr-bbs-pod-worker"
-version = "3.0.0-rc3"
+version = "3.0.0-rc4"
 edition = "2021"
 description = "Pod Worker: Solid pods + R2 storage + WAC ACL (nostr-bbs)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-pod-worker"
+keywords = ["nostr", "bbs", "solid-pod", "cloudflare-workers", "storage"]
+categories = ["web-programming", "data-structures"]
+rust-version = "1.85"
 
 [lib]
 crate-type = ["cdylib"]

@@ -113,9 +113,9 @@ solid-pod-rs = { version = "0.4.0-alpha.4", default-features = false, features =
 solid-pod-rs-nostr = { version = "0.4.0-alpha.4", default-features = false }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc3" }
-nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc3" }
-nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc3" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc4" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc4" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc4" }
 
 # ---------------------------------------------------------------------------
 # Release profile (Sprint v9 D1) — WASM-optimized for forum-client and workers.

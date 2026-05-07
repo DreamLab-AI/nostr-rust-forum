@@ -1,8 +1,15 @@
 [package]
 name = "nostr-bbs-relay-worker"
-version = "3.0.0-rc3"
+version = "3.0.0-rc4"
 edition = "2021"
 description = "Nostr relay Worker: NIP-01/11/16/33/98 WebSocket relay with D1 + Durable Objects (nostr-bbs)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-relay-worker"
+keywords = ["nostr", "bbs", "relay", "websocket", "cloudflare-workers"]
+categories = ["network-programming", "web-programming"]
+rust-version = "1.85"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
