@@ -18,6 +18,13 @@ base64 = { workspace = true }
 js-sys = { workspace = true }
 async-trait = { workspace = true }
 
+# Phase 4 absorption (ADR-076/078): pure-logic surfaces of solid-pod-rs
+# replace the hand-rolled WAC, WebID, DID, NIP-98 verifier modules.
+# `core` strips tokio/reqwest/notify so the dep compiles to
+# wasm32-unknown-unknown. `nip98-schnorr` keeps the BIP-340 verifier
+# available for the worker's auth path.
+solid-pod-rs = { workspace = true }
+
 # proptest is native-only (rusty-fork → wait-timeout); the worker target is
 # wasm32, so we gate dev-deps behind cfg(not(wasm32)) to avoid breaking
 # `cargo check --target wasm32-unknown-unknown`.
