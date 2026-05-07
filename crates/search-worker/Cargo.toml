@@ -2,7 +2,7 @@
 name = "search-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Nostr BBS search Worker: RVF vector store, cosine k-NN, hash embeddings"
+description = "Search Worker: RVF vector store, cosine k-NN, hash embeddings (nostr-bbs)"
 
 [lib]
 crate-type = ["cdylib"]
@@ -18,3 +18,4 @@ sha2 = { workspace = true }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 rvf-types = { version = "0.2", default-features = false }
+async-trait = { workspace = true }

@@ -2,7 +2,7 @@
 name = "pod-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Nostr BBS pod Worker: Solid pods + R2 storage + WAC ACL"
+description = "Pod Worker: Solid pods + R2 storage + WAC ACL (nostr-bbs)"
 
 [lib]
 crate-type = ["cdylib"]
@@ -16,3 +16,10 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 js-sys = { workspace = true }
+async-trait = { workspace = true }
+
+# proptest is native-only (rusty-fork → wait-timeout); the worker target is
+# wasm32, so we gate dev-deps behind cfg(not(wasm32)) to avoid breaking
+# `cargo check --target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+proptest = { workspace = true }

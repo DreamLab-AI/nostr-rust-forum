@@ -30,43 +30,30 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
 
-    <!-- Tailwind Play CDN (development only — production uses Tailwind CLI tree-shaking) -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    fontFamily: {
-                        sans: ['Inter', 'system-ui', 'Avenir', 'Helvetica', 'Arial', 'sans-serif'],
-                    },
-                    colors: {
-                        amber: {
-                            50: '#fffbeb',
-                            100: '#fef3c7',
-                            200: '#fde68a',
-                            300: '#fcd34d',
-                            400: '#fbbf24',
-                            500: '#f59e0b',
-                            600: '#d97706',
-                            700: '#b45309',
-                            800: '#92400e',
-                            900: '#78350f',
-                            950: '#451a03',
-                        }
-                    }
-                }
-            }
-        }
-    </script>
+    <!-- Tailwind utilities (tree-shaken at build time by Tailwind CLI v3.4.17,
+         driven by Trunk pre_build hook in Trunk.toml). Replaces the legacy
+         cdn.tailwindcss.com Play CDN — Chrome flags that as dev-only and it
+         shipped ~3MB of unused CSS to every visitor. The pre_build hook scans
+         src/**/*.rs (Leptos view! macros) plus index.html and emits a
+         minified tailwind.dist.css. Config: tailwind.config.js. -->
+    <link data-trunk rel="css" href="tailwind.dist.css" />
 
     <!-- Shared design tokens (same source as React marketing site) -->
     <link data-trunk rel="css" href="design-tokens.css" />
     <!-- Forum-specific styles (imports design-tokens.css for @import fallback) -->
     <link data-trunk rel="css" href="style.css" />
 
-    <!-- Trunk WASM bundle injection (workspace: specify package + binary) -->
-    <link data-trunk rel="rust" data-wasm-opt="z" data-cargo-package="forum-client" data-bin="forum-client" />
+    <!-- Trunk WASM bundle injection (workspace: specify package + binary).
+         data-wasm-opt="0" disables Trunk's bundled wasm-opt 122 which rejects
+         Rust 1.90's bulk-memory ops. We run a manually-installed binaryen 119
+         in a post_build Trunk hook instead — see Trunk.toml. -->
+    <link data-trunk rel="rust" data-wasm-opt="0" data-cargo-package="forum-client" data-bin="forum-client" />
+
+    <!-- Service worker copied to dist/community/sw.js so main.rs's
+         navigator.serviceWorker.register('./sw.js') resolves at runtime.
+         Trunk's correct asset-copy directive is rel="copy-file"; the [[copy]]
+         table in Trunk.toml is silently ignored. -->
+    <link data-trunk rel="copy-file" href="sw.js" />
 </head>
 <body>
     <!-- Loading screen — replaced by Leptos mount_to_body() -->

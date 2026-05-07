@@ -2,7 +2,7 @@
 name = "auth-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Nostr BBS auth Worker: WebAuthn + NIP-98 + pod provisioning"
+description = "Auth Worker: WebAuthn + NIP-98 + pod provisioning (nostr-bbs)"
 
 [lib]
 crate-type = ["cdylib"]
@@ -18,3 +18,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
+chacha20poly1305 = { workspace = true }
+k256 = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }

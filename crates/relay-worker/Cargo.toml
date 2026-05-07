@@ -2,10 +2,13 @@
 name = "relay-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Nostr BBS Nostr relay Worker: NIP-01/11/16/33/98 WebSocket relay with D1 + Durable Objects"
+description = "Nostr relay Worker: NIP-01/11/16/33/98 WebSocket relay with D1 + Durable Objects (nostr-bbs)"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+test-exports = []
 
 [dependencies]
 nostr-core = { workspace = true }
@@ -17,6 +20,7 @@ hex = { workspace = true }
 base64 = { workspace = true }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
+async-trait = { workspace = true }
 # C5 fix: NIP-42 AUTH challenge generation requires CSPRNG. The js-feature
 # routes getrandom calls to crypto.getRandomValues on the CF Workers runtime.
 getrandom = { workspace = true }

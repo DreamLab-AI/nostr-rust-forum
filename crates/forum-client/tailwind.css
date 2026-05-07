@@ -1,0 +1,8 @@
+/* Tailwind source for the nostr-bbs community forum.
+ * Compiled to tailwind.dist.css by the standalone Tailwind CLI inside
+ * Trunk's pre-build hook (see Trunk.toml). Replaces the dev-only Play
+ * CDN script that previously shipped to production. */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

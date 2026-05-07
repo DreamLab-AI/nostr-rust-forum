@@ -1,4 +1,4 @@
-/// Service worker for Nostr BBS community forum.
+/// Service worker for the nostr-bbs community forum.
 /// Provides cache-first for static assets and network-first for navigation.
 
 const CACHE_NAME = 'nostr-bbs-forum-v1';

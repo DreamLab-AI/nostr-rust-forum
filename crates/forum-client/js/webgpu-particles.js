@@ -1,5 +1,5 @@
 // WebGPU particle system with golden-ratio spiral, mouse interaction, and bloom glow.
-// ADR-020: GPU-accelerated hero background for Nostr BBS forum.
+// ADR-020: GPU-accelerated hero background for nostr-bbs forum.
 
 const PARTICLE_WGSL = `
 struct Particle {

@@ -2,7 +2,7 @@
 name = "preview-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Nostr BBS link preview Worker: OG metadata + Twitter oEmbed + SSRF protection"
+description = "Link preview Worker: OG metadata + Twitter oEmbed + SSRF protection (nostr-bbs)"
 
 [lib]
 crate-type = ["cdylib"]

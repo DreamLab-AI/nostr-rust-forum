@@ -1,27 +1,29 @@
-# Search Worker — RuVector search, RVF binary format, cosine k-NN
-name = "nostr-bbs-search"
+name = "nostr-bbs-search-api"
 main = "build/worker/shim.mjs"
-compatibility_date = "2024-09-23"
+compatibility_date = "2025-09-01"
 
 [build]
 command = "worker-build --release"
 
-# R2 bucket for vector storage (.rvf files)
 [[r2_buckets]]
 binding = "VECTORS"
-bucket_name = "nostr-bbs-vectors"         # Create with: wrangler r2 bucket create nostr-bbs-vectors
+bucket_name = "nostr-bbs-vectors"
 
-# KV namespace for search configuration
 [[kv_namespaces]]
 binding = "SEARCH_CONFIG"
-id = "REPLACE_ME_SEARCH_CONFIG_KV_ID"    # Create with: wrangler kv namespace create SEARCH_CONFIG
+id = "440b1f07ff224fb8ad644e094c6766c0"
+
+# NIP-98 replay cache (TTL = 2 * tolerance window). Shared id with auth-worker.
+# TODO(ops): provision via `wrangler kv:namespace create nostr-bbs-nip98-replay`.
+[[kv_namespaces]]
+binding = "NIP98_REPLAY"
+id = "REPLACE_WITH_NEW_NIP98_REPLAY_KV_ID"
 
 [vars]
-ALLOWED_ORIGIN = "https://your-domain.com"
-ALLOWED_ORIGINS = "https://your-domain.com"  # Comma-separated list of allowed CORS origins
-RVF_STORE_KEY = "forum.rvf"              # Key for the RVF vector store in R2
-ADMIN_PUBKEYS = ""                       # Hex pubkey(s) with admin access to /ingest
+ALLOWED_ORIGIN = "https://example.com"
+ALLOWED_ORIGINS = "https://example.com"
+RVF_STORE_KEY = "nostr-bbs.rvf"
+ADMIN_PUBKEYS = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c"
 
-# Keep-warm cron
 [triggers]
 crons = ["*/5 * * * *"]

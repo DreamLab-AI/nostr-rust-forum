@@ -8,13 +8,18 @@ members = [
     "crates/preview-worker",
     "crates/relay-worker",
     "crates/search-worker",
+    # F26 / ADR-076 D5 — upstream `nostr` crate WASM/CF Workers compatibility
+    # canary. Validates that the absorption path (Shape A) is viable on the
+    # forum's specific build matrix before any nostr-core module deletion.
     "crates/nostr-upstream-canary",
 ]
 
 [workspace.dependencies]
-# Nostr protocol (0.44.x — alpha, pinned to minor)
+# Nostr protocol (0.44.x — alpha, pinned to minor).
+# Sprint v9 D2: nostr-sdk dropped (zero `use nostr_sdk::` references anywhere).
+# `nostr` retained: declared by nostr-core/Cargo.toml even though zero source
+# usage right now — STREAM-A/B owns nostr-core deps and may remove later.
 nostr = "0.44"
-nostr-sdk = "0.44"
 
 # UI framework (0.7.x — stay on 0.7 track, 0.8 is breaking)
 leptos = { version = "0.7", features = ["csr"] }
@@ -22,7 +27,12 @@ leptos_router = "0.7"
 leptos_meta = "0.7"
 
 # Cloudflare Workers
-worker = "0.7"
+# Bumped 0.7 → 0.8 (2026-04-20): worker-build latest requires worker@0.8.1+.
+# Breaking changes audited: Storage.get returns Result<Option<T>> (code was
+# already Option-aware), default out-dir pkg→build (wrangler.toml already uses
+# build/), DurableObject import (we use `use worker::*` glob which still brings
+# it in). Safe to upgrade.
+worker = "0.8"
 
 # WebAuthn with PRF support
 passkey-types = "0.3"
@@ -34,6 +44,10 @@ hmac = "0.12.1"
 hkdf = "0.12.4"
 sha2 = "0.10.9"
 getrandom = { version = "0.2", features = ["js"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+bech32 = "0.11"
+async-trait = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -65,5 +79,23 @@ proptest = "1"
 criterion = "0.5"
 wasm-bindgen-test = "0.3"
 
+# Solid Pod library (server-side only — pulls tokio; do NOT add to WASM crates).
+# Use for relay-worker and any non-WASM consumers.
+solid-pod-rs = { version = "0.4.0-alpha.2", default-features = false, features = ["nip98-schnorr"] }
+solid-pod-rs-nostr = { version = "0.4.0-alpha.2", default-features = false }
+
 # Internal crates
 nostr-core = { path = "crates/nostr-core" }
+
+# ---------------------------------------------------------------------------
+# Release profile (Sprint v9 D1) — WASM-optimized for forum-client and workers.
+# opt-level "z" minimizes size at modest perf cost; LTO and single codegen
+# unit yield further size reduction; `strip` drops debug symbols; `panic =
+# abort` removes unwinding tables (workers/WASM cannot unwind anyway).
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

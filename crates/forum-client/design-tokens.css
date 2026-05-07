@@ -1,5 +1,5 @@
 /* ============================================
- * Nostr BBS Design System — Shared Tokens
+ * nostr-bbs Design System — Shared Tokens
  * Used by both React marketing site and Leptos forum
  *
  * Canonical source: src/styles/design-tokens.css
@@ -10,9 +10,9 @@
 
 :root {
   /* Zone / track accent colors */
-  --dl-accent-green: 34, 197, 94;        /* Public zone / Cyber & Trust */
-  --dl-accent-purple: 168, 85, 247;      /* Private / Immersive & XR */
-  --dl-accent-pink: 236, 72, 153;        /* Nostr BBS / Creative Tech */
+  --dl-accent-green: 34, 197, 94;        /* Fairfield Family / Cyber & Trust */
+  --dl-accent-purple: 168, 85, 247;      /* Minimoonoir / Immersive & XR */
+  --dl-accent-pink: 236, 72, 153;        /* Default accent */
   --dl-accent-sky: 56, 189, 248;         /* AI Agents / AI & Autonomous */
   --dl-accent-amber: 245, 158, 11;       /* Enterprise Innovation / Brand primary */
   --dl-accent-blue: 96, 165, 250;        /* Engineering / Deep-tech */

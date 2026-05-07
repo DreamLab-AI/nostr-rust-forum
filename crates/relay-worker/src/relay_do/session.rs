@@ -57,6 +57,13 @@ impl NostrRelayDO {
     /// to reconstruct session entries, then restores subscriptions and auth
     /// state from DO transactional storage so that event broadcasting and
     /// authenticated operations continue working across hibernation boundaries.
+    ///
+    /// Lints:
+    /// - `await_holding_refcell_ref`: the DO runs single-threaded in a V8
+    ///   isolate, so there is no concurrent borrow hazard.
+    /// - `map_entry`: values depend on async storage loads, which cannot be
+    ///   computed inside an `Entry::or_insert_with` closure.
+    #[allow(clippy::await_holding_refcell_ref, clippy::map_entry)]
     pub(crate) async fn recover_session(&self, ws: &WebSocket) -> u64 {
         let tags = self.state.get_tags(ws);
 
@@ -114,13 +121,16 @@ impl NostrRelayDO {
                     // Restore auth state from DO storage
                     let authed_pubkey = Self::load_auth(&storage, sid).await;
 
-                    sessions.insert(sid, SessionInfo {
-                        ws: other_ws,
-                        ip: other_ip,
-                        subscriptions,
-                        authed_pubkey,
-                        challenge: ch,
-                    });
+                    sessions.insert(
+                        sid,
+                        SessionInfo {
+                            ws: other_ws,
+                            ip: other_ip,
+                            subscriptions,
+                            authed_pubkey,
+                            challenge: ch,
+                        },
+                    );
                     let mut next = self.next_session_id.borrow_mut();
                     if sid >= *next {
                         *next = sid + 1;
@@ -135,17 +145,23 @@ impl NostrRelayDO {
             let subscriptions = Self::load_subscriptions(&storage, session_id).await;
             let authed_pubkey = Self::load_auth(&storage, session_id).await;
 
-            sessions.insert(session_id, SessionInfo {
-                ws: ws.clone(),
-                ip: recovered_ip,
-                subscriptions,
-                authed_pubkey,
-                challenge,
-            });
+            sessions.insert(
+                session_id,
+                SessionInfo {
+                    ws: ws.clone(),
+                    ip: recovered_ip,
+                    subscriptions,
+                    authed_pubkey,
+                    challenge,
+                },
+            );
         }
 
         let sub_count: usize = sessions.values().map(|s| s.subscriptions.len()).sum();
-        let auth_count = sessions.values().filter(|s| s.authed_pubkey.is_some()).count();
+        let auth_count = sessions
+            .values()
+            .filter(|s| s.authed_pubkey.is_some())
+            .count();
         console_log!(
             "[RelayDO] Recovered {} session(s) from hibernation (active: #{}, {} subs, {} authed)",
             sessions.len(),
@@ -170,15 +186,9 @@ impl NostrRelayDO {
     }
 
     /// Load persisted auth pubkey for a session from DO transactional storage.
-    async fn load_auth(
-        storage: &worker::durable::Storage,
-        session_id: u64,
-    ) -> Option<String> {
+    async fn load_auth(storage: &worker::durable::Storage, session_id: u64) -> Option<String> {
         let key = format!("ws_auth:{session_id}");
-        match storage.get::<String>(&key).await {
-            Ok(pubkey) => pubkey,
-            Err(_) => None,
-        }
+        storage.get::<String>(&key).await.unwrap_or_default()
     }
 
     /// Persist current subscription state for a session to DO transactional storage.
@@ -193,7 +203,11 @@ impl NostrRelayDO {
         if let Some(json) = subs_json {
             let key = format!("ws_sub:{session_id}");
             if let Err(e) = self.state.storage().put(&key, json).await {
-                console_log!("[RelayDO] Failed to persist subscriptions for #{}: {:?}", session_id, e);
+                console_log!(
+                    "[RelayDO] Failed to persist subscriptions for #{}: {:?}",
+                    session_id,
+                    e
+                );
             }
         }
     }
@@ -202,7 +216,11 @@ impl NostrRelayDO {
     pub(crate) async fn save_auth(&self, session_id: u64, pubkey: &str) {
         let key = format!("ws_auth:{session_id}");
         if let Err(e) = self.state.storage().put(&key, pubkey.to_string()).await {
-            console_log!("[RelayDO] Failed to persist auth for #{}: {:?}", session_id, e);
+            console_log!(
+                "[RelayDO] Failed to persist auth for #{}: {:?}",
+                session_id,
+                e
+            );
         }
     }
 
