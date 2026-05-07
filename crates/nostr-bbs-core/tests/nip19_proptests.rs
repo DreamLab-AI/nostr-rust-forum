@@ -35,10 +35,14 @@ fn arb_hex32() -> impl Strategy<Value = String> {
     prop::collection::vec(any::<u8>(), 32..=32).prop_map(|bytes| hex::encode(bytes))
 }
 
-/// Generate a relay URL — a non-empty printable ASCII string up to 80 bytes.
-/// We keep it ASCII so UTF-8 encode/decode stays trivial.
+/// Generate a relay URL.
+///
+/// Phase 5 absorption (ADR-076/078): rust-nostr 0.44's `RelayUrl::parse`
+/// validates URL syntax. The legacy hand-roll treated relays as opaque
+/// byte strings; the absorbed adapter inherits the stricter URL contract.
+/// The generator now produces well-formed `wss://<host>` URLs.
 fn arb_relay_url() -> impl Strategy<Value = String> {
-    "[a-zA-Z0-9:/.\\-]{1,80}".prop_map(String::from)
+    "wss://[a-z][a-z0-9.\\-]{0,40}\\.[a-z]{2,8}".prop_map(String::from)
 }
 
 /// Generate a small set of 0..=5 relay URLs.
@@ -100,7 +104,10 @@ proptest! {
         id_hex in arb_hex32(),
         relays in arb_relays(),
         author in proptest::option::of(arb_hex32()),
-        kind in proptest::option::of(any::<u32>()),
+        // NIP-01 / NIP-19 spec: event kinds are 16-bit unsigned integers
+        // (0..=65535). The legacy hand-roll accepted any u32 in its TLV
+        // path; the absorbed adapter inherits the spec-correct u16 range.
+        kind in proptest::option::of(0u32..=65535u32),
     ) {
         let event = NEvent {
             id: id_hex.clone(),
