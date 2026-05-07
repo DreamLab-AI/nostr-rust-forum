@@ -120,26 +120,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "auth-worker"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "chacha20poly1305",
- "getrandom 0.2.17",
- "hex",
- "js-sys",
- "k256",
- "nostr-core",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "wasm-bindgen",
- "worker",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -450,7 +430,7 @@ dependencies = [
  "convert_case 0.6.0",
  "pathdiff",
  "serde_core",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "winnow 0.7.15",
 ]
 
@@ -823,35 +803,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "forum-client"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "bech32",
- "comrak",
- "console_error_panic_hook",
- "gloo",
- "hex",
- "js-sys",
- "k256",
- "leptos",
- "leptos_meta",
- "leptos_router",
- "nostr-core",
- "send_wrapper",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "zeroize",
 ]
 
 [[package]]
@@ -1853,8 +1804,41 @@ dependencies = [
 ]
 
 [[package]]
-name = "nostr-core"
-version = "0.1.0"
+name = "nostr-bbs-auth-worker"
+version = "3.0.0-rc3"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chacha20poly1305",
+ "getrandom 0.2.17",
+ "hex",
+ "js-sys",
+ "k256",
+ "nostr-bbs-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
+name = "nostr-bbs-config"
+version = "3.0.0-rc3"
+dependencies = [
+ "proptest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "url",
+]
+
+[[package]]
+name = "nostr-bbs-core"
+version = "3.0.0-rc3"
 dependencies = [
  "aes",
  "async-trait",
@@ -1882,8 +1866,122 @@ dependencies = [
 ]
 
 [[package]]
-name = "nostr-upstream-canary"
-version = "0.1.0"
+name = "nostr-bbs-forum-client"
+version = "3.0.0-rc3"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bech32",
+ "comrak",
+ "console_error_panic_hook",
+ "gloo",
+ "hex",
+ "js-sys",
+ "k256",
+ "leptos",
+ "leptos_meta",
+ "leptos_router",
+ "nostr-bbs-core",
+ "send_wrapper",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "zeroize",
+]
+
+[[package]]
+name = "nostr-bbs-mesh"
+version = "3.0.0-rc3"
+dependencies = [
+ "async-trait",
+ "nostr-bbs-config",
+ "nostr-bbs-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nostr-bbs-pod-worker"
+version = "3.0.0-rc3"
+dependencies = [
+ "async-trait",
+ "base64",
+ "hex",
+ "js-sys",
+ "nostr-bbs-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "worker",
+]
+
+[[package]]
+name = "nostr-bbs-preview-worker"
+version = "3.0.0-rc3"
+dependencies = [
+ "js-sys",
+ "regex",
+ "serde",
+ "serde_json",
+ "worker",
+]
+
+[[package]]
+name = "nostr-bbs-relay-worker"
+version = "3.0.0-rc3"
+dependencies = [
+ "async-trait",
+ "base64",
+ "getrandom 0.2.17",
+ "hex",
+ "js-sys",
+ "nostr-bbs-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
+name = "nostr-bbs-search-worker"
+version = "3.0.0-rc3"
+dependencies = [
+ "async-trait",
+ "base64",
+ "hex",
+ "js-sys",
+ "nostr-bbs-core",
+ "rvf-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
+name = "nostr-bbs-setup-skill"
+version = "3.0.0-rc3"
+dependencies = [
+ "async-trait",
+ "nostr-bbs-config",
+ "nostr-bbs-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nostr-bbs-upstream-canary"
+version = "3.0.0-rc3"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -2091,22 +2189,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pod-worker"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "hex",
- "js-sys",
- "nostr-core",
- "proptest",
- "serde",
- "serde_json",
- "sha2",
- "worker",
-]
-
-[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2146,24 +2228,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "preview-worker"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "regex",
- "serde",
- "serde_json",
- "worker",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f4c021e1093a56626774e81216a4ce732a735e5bad4868a03f3ed65ca0c3919"
 dependencies = [
  "once_cell",
- "toml_edit",
+ "toml_edit 0.19.15",
 ]
 
 [[package]]
@@ -2465,23 +2536,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
-name = "relay-worker"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "getrandom 0.2.17",
- "hex",
- "js-sys",
- "nostr-core",
- "serde",
- "serde_json",
- "sha2",
- "wasm-bindgen",
- "worker",
-]
-
-[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2574,6 +2628,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "schemars"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
+dependencies = [
+ "dyn-clone",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2589,23 +2668,6 @@ dependencies = [
  "pbkdf2",
  "salsa20",
  "sha2",
-]
-
-[[package]]
-name = "search-worker"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "hex",
- "js-sys",
- "nostr-core",
- "rvf-types",
- "serde",
- "serde_json",
- "sha2",
- "wasm-bindgen",
- "worker",
 ]
 
 [[package]]
@@ -2699,6 +2761,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_derive_internals"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2720,6 +2793,15 @@ dependencies = [
  "percent-encoding",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "serde_spanned"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -3074,12 +3156,24 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
+dependencies = [
+ "serde",
+ "serde_spanned 0.6.9",
+ "toml_datetime 0.6.11",
+ "toml_edit 0.22.27",
+]
+
+[[package]]
+name = "toml"
 version = "0.9.12+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
 dependencies = [
  "serde_core",
- "serde_spanned",
+ "serde_spanned 1.0.4",
  "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "winnow 0.7.15",
@@ -3090,6 +3184,9 @@ name = "toml_datetime"
 version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "toml_datetime"
@@ -3112,6 +3209,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.22.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_spanned 0.6.9",
+ "toml_datetime 0.6.11",
+ "toml_write",
+ "winnow 0.7.15",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.0.9+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3119,6 +3230,12 @@ checksum = "702d4415e08923e7e1ef96cd5727c0dfed80b4d2fa25db9647fe5eb6f7c5a4c4"
 dependencies = [
  "winnow 0.7.15",
 ]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "typed-arena"

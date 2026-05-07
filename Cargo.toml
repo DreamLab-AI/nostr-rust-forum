@@ -1,24 +1,38 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nostr-core",
-    "crates/forum-client",
-    "crates/auth-worker",
-    "crates/pod-worker",
-    "crates/preview-worker",
-    "crates/relay-worker",
-    "crates/search-worker",
+    # Foundation — pure Nostr protocol primitives.
+    "crates/nostr-bbs-core",
+
+    # Configuration + federation kit (PRD-012 X1, ADR-073, ADR-085).
+    "crates/nostr-bbs-config",
+    "crates/nostr-bbs-mesh",
+
+    # Provider-abstracted operator-onboarding skill (ADR-079).
+    "crates/nostr-bbs-setup-skill",
+
+    # Cloudflare Worker reference implementations.
+    "crates/nostr-bbs-auth-worker",
+    "crates/nostr-bbs-pod-worker",
+    "crates/nostr-bbs-preview-worker",
+    "crates/nostr-bbs-relay-worker",
+    "crates/nostr-bbs-search-worker",
+
+    # Leptos CSR forum client.
+    "crates/nostr-bbs-forum-client",
+
     # F26 / ADR-076 D5 — upstream `nostr` crate WASM/CF Workers compatibility
     # canary. Validates that the absorption path (Shape A) is viable on the
     # forum's specific build matrix before any nostr-core module deletion.
-    "crates/nostr-upstream-canary",
+    "crates/nostr-bbs-upstream-canary",
 ]
 
 [workspace.dependencies]
 # Nostr protocol (0.44.x — alpha, pinned to minor).
 # Sprint v9 D2: nostr-sdk dropped (zero `use nostr_sdk::` references anywhere).
-# `nostr` retained: declared by nostr-core/Cargo.toml even though zero source
-# usage right now — STREAM-A/B owns nostr-core deps and may remove later.
+# `nostr` retained: declared by nostr-bbs-core/Cargo.toml even though zero
+# source usage right now — STREAM-A/B owns nostr-bbs-core deps and may remove
+# later.
 nostr = "0.44"
 
 # UI framework (0.7.x — stay on 0.7 track, 0.8 is breaking)
@@ -48,6 +62,10 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 bech32 = "0.11"
 async-trait = "0.1"
+
+# Configuration
+toml = "0.8"
+schemars = { version = "0.8", features = ["url"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -84,8 +102,10 @@ wasm-bindgen-test = "0.3"
 solid-pod-rs = { version = "0.4.0-alpha.2", default-features = false, features = ["nip98-schnorr"] }
 solid-pod-rs-nostr = { version = "0.4.0-alpha.2", default-features = false }
 
-# Internal crates
-nostr-core = { path = "crates/nostr-core" }
+# Internal crates (workspace path deps; published to crates.io as version 3.0+).
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc3" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc3" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc3" }
 
 # ---------------------------------------------------------------------------
 # Release profile (Sprint v9 D1) — WASM-optimized for forum-client and workers.

@@ -2,13 +2,16 @@
 # scripts/anti-drift-lint.sh — ADR-077 P3 anti-drift lint (forum substrate)
 #
 # Forum-substrate scope:
-#   1. Reject hand-rolled DreamLab-only Schnorr verification key suite
-#      identifiers (NostrSchnorrKey2024, SchnorrSecp256k1VerificationKey2022 /
-#      2025). The canonical identifier per ADR-074 D1 is
+#   1. Reject hand-rolled stale Schnorr verification key suite identifiers
+#      (NostrSchnorrKey2024, SchnorrSecp256k1VerificationKey2022 / 2025). The
+#      canonical identifier per ADR-074 D1 is
 #      SchnorrSecp256k1VerificationKey2019.
 #   2. Reject construction of arbitrary `did:nostr:...` strings outside
-#      crates/nostr-core/ and crates/pod-worker/src/did.rs (the canonical
-#      DID-Doc rendering sites).
+#      crates/nostr-bbs-core/ and crates/nostr-bbs-pod-worker/src/did.rs
+#      (the canonical DID-Doc rendering sites).
+#   3. Reject re-introduction of branded operator strings (DreamLab) in kit
+#      source — operators must inject branding via forum-config/ overlay,
+#      not hardcode it back into the substrate.
 #
 # Exit code 0 = clean, 1 = drift detected.
 
@@ -52,16 +55,37 @@ HANDROLL_DIDDOC=$(
     -E 'verificationMethod' \
     crates 2>/dev/null \
     | xargs -I{} grep -l "SchnorrSecp256k1VerificationKey" {} 2>/dev/null \
-    | grep -v 'crates/pod-worker/src/did.rs' \
-    | grep -v 'crates/nostr-core/' \
+    | grep -v 'crates/nostr-bbs-pod-worker/src/did.rs' \
+    | grep -v 'crates/nostr-bbs-core/' \
     | grep -v '/tests?/' \
     || true
 )
 
 if [ -n "$HANDROLL_DIDDOC" ]; then
   echo "::error::ADR-074 D1 + ADR-077 P3: hand-rolled DID Document emitter detected."
-  echo "Use the canonical renderer at crates/pod-worker/src/did.rs."
+  echo "Use the canonical renderer at crates/nostr-bbs-pod-worker/src/did.rs."
   echo "$HANDROLL_DIDDOC"
+  EXIT=1
+fi
+
+# --- Rule 3: branded operator strings re-introduced into substrate --------
+# Operators must inject branding via forum-config/, not hardcode it back into
+# the substrate crates. The kit-repo URL in NIP-11 is allowlisted.
+BRANDED_RES=$(
+  grep -RIn \
+    --include='*.rs' --include='*.toml' --include='*.html' --include='*.css' --include='*.js' \
+    -E '\bDreamLab\b|\bdreamlab\b|\bminimoonoir\b' \
+    crates 2>/dev/null \
+    | grep -v '/target/' \
+    | grep -v 'node_modules' \
+    | grep -v 'github\.com/DreamLab-AI/nostr-rust-forum' \
+    || true
+)
+
+if [ -n "$BRANDED_RES" ]; then
+  echo "::error::ADR-085 + PRD-012 X1: branded operator strings detected in kit substrate."
+  echo "Move branding into the forum-config/ overlay, not the kit crates."
+  echo "$BRANDED_RES"
   EXIT=1
 fi
 

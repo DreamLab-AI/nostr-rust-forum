@@ -1,0 +1,21 @@
+[package]
+name = "nostr-bbs-setup-skill"
+version = "3.0.0-rc3"
+edition = "2021"
+description = "Provider-abstracted operator-onboarding skill for nostr-bbs (ADR-079)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-setup-skill"
+keywords = ["nostr", "bbs", "deployment", "cli", "onboarding"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+rust-version = "1.85"
+
+[dependencies]
+nostr-bbs-core = { workspace = true }
+nostr-bbs-config = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
