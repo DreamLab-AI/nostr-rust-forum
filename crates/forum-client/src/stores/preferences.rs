@@ -5,7 +5,7 @@
 
 use leptos::prelude::*;
 
-const PREFS_KEY: &str = "bbs:preferences";
+const PREFS_KEY: &str = "nostrbbs:preferences";
 
 /// User-configurable preferences.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

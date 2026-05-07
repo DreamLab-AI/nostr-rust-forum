@@ -1,6 +1,6 @@
 //! WebSocket relay connection manager for NIP-01 Nostr protocol.
 //!
-//! Manages a single WebSocket connection to the Nostr BBS relay, handling
+//! Manages a single WebSocket connection to the nostr-bbs relay, handling
 //! subscriptions, event parsing, publishing, auto-reconnect with exponential
 //! backoff, and connection state as a reactive Leptos signal.
 //!
@@ -20,7 +20,7 @@ use wasm_bindgen::JsCast;
 use web_sys::WebSocket;
 
 /// Default relay URL when VITE_RELAY_URL is not set.
-const DEFAULT_RELAY_URL: &str = "wss://your-relay.your-subdomain.workers.dev";
+const DEFAULT_RELAY_URL: &str = "wss://relay.example.com";
 
 /// Maximum reconnect delay in milliseconds.
 const MAX_RECONNECT_DELAY_MS: u32 = 30_000;

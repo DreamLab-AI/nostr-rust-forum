@@ -255,6 +255,36 @@ pub fn method_to_mode(method: &str) -> AccessMode {
     }
 }
 
+/// Determine if a path targets an `.acl` sidecar (matches `lib.rs::is_acl_path`).
+fn path_is_acl(path: &str) -> bool {
+    path.ends_with(".acl")
+}
+
+/// Coerce the required `AccessMode` for a request when the target resource is
+/// an `.acl` sidecar.
+///
+/// Per the WAC spec, only holders of `acl:Control` on the parent resource may
+/// **write** an ACL document, and reading an ACL requires either `acl:Read`
+/// on the parent OR `acl:Control`. The standard HTTP-method mapping (PUT →
+/// Write) is therefore unsafe for `.acl` paths because a principal with mere
+/// `acl:Write` would otherwise be able to escalate to `acl:Control` by
+/// overwriting the sidecar. Coerce write-class methods to `Control` so the
+/// caller never grants `.acl` writes purely on `acl:Write`.
+///
+/// GET/HEAD remain `Read` because callers compose this with an additional
+/// `Control` check at the handler level.
+pub fn coerce_required_mode_for_acl(path: &str, method: &str) -> AccessMode {
+    let base = method_to_mode(method);
+    if !path_is_acl(path) {
+        return base;
+    }
+    match base {
+        AccessMode::Read => AccessMode::Read,
+        // Any write/append against an .acl resource MUST require Control.
+        AccessMode::Write | AccessMode::Append | AccessMode::Control => AccessMode::Control,
+    }
+}
+
 /// Return the lowercase WAC mode name for use in WAC-Allow headers.
 pub fn mode_name(mode: AccessMode) -> &'static str {
     match mode {
@@ -297,11 +327,40 @@ pub fn wac_allow_header(
 // Inherited ACL resolution
 // ---------------------------------------------------------------------------
 
+/// Hard cap on the size (in bytes) of an ACL JSON-LD document we will parse.
+///
+/// 64 KiB is far larger than any realistic policy graph and prevents an
+/// attacker from forcing the WAC evaluator to allocate or recurse into a
+/// pathologically large `@graph`. Sidecars beyond this size are treated as
+/// "no ACL found" so resolution falls back to the parent container.
+pub const MAX_ACL_DOC_BYTES: usize = 64 * 1024;
+
+/// Parse an ACL document from raw bytes, enforcing [`MAX_ACL_DOC_BYTES`].
+///
+/// Returns `Some(doc)` on success and `None` for any size or parse failure.
+fn parse_acl_with_cap(bytes: &[u8]) -> Option<AclDocument> {
+    if bytes.len() > MAX_ACL_DOC_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<AclDocument>(bytes).ok()
+}
+
+/// Same as [`parse_acl_with_cap`] but operates on a `&str`.
+fn parse_acl_text_with_cap(text: &str) -> Option<AclDocument> {
+    if text.len() > MAX_ACL_DOC_BYTES {
+        return None;
+    }
+    serde_json::from_str::<AclDocument>(text).ok()
+}
+
 /// Find the effective ACL for a resource by walking up the container tree.
 ///
 /// Resolution order:
 /// 1. KV fast-path: `acl:{owner_pubkey}` (the pod-level ACL)
 /// 2. R2 sidecar walk: `{resource_path}.acl` -> `{parent}/.acl` -> ... -> `/.acl`
+///
+/// All ACL documents are parsed via [`parse_acl_with_cap`] so any single
+/// graph larger than [`MAX_ACL_DOC_BYTES`] is rejected (treated as missing).
 ///
 /// Returns `None` if no ACL document is found at any level (deny-all).
 pub async fn find_effective_acl(
@@ -313,7 +372,7 @@ pub async fn find_effective_acl(
     // Fast path: pod-level ACL in KV
     let kv_key = format!("acl:{owner_pubkey}");
     if let Ok(Some(text)) = kv.get(&kv_key).text().await {
-        if let Ok(doc) = serde_json::from_str::<AclDocument>(&text) {
+        if let Some(doc) = parse_acl_text_with_cap(&text) {
             return Some(doc);
         }
     }
@@ -325,10 +384,8 @@ pub async fn find_effective_acl(
         if let Ok(Some(obj)) = bucket.get(&acl_key).execute().await {
             if let Some(body) = obj.body() {
                 if let Ok(bytes) = body.bytes().await {
-                    if let Ok(text) = String::from_utf8(bytes) {
-                        if let Ok(doc) = serde_json::from_str::<AclDocument>(&text) {
-                            return Some(doc);
-                        }
+                    if let Some(doc) = parse_acl_with_cap(&bytes) {
+                        return Some(doc);
                     }
                 }
             }
@@ -650,14 +707,23 @@ mod tests {
             })),
             default: None,
             mode: Some(IdOrIds::Multiple(vec![
-                IdRef { id: "acl:Read".to_string() },
-                IdRef { id: "acl:Write".to_string() },
-                IdRef { id: "acl:Control".to_string() },
+                IdRef {
+                    id: "acl:Read".to_string(),
+                },
+                IdRef {
+                    id: "acl:Write".to_string(),
+                },
+                IdRef {
+                    id: "acl:Control".to_string(),
+                },
             ])),
         };
         let doc = make_doc(vec![public_read, owner_full]);
         let header = wac_allow_header(Some(&doc), Some("did:nostr:owner"), "/");
-        assert_eq!(header, "user=\"read write append control\", public=\"read\"");
+        assert_eq!(
+            header,
+            "user=\"read write append control\", public=\"read\""
+        );
     }
 
     #[test]
@@ -669,5 +735,87 @@ mod tests {
     #[test]
     fn all_modes_contains_four_entries() {
         assert_eq!(ALL_MODES.len(), 4);
+    }
+
+    // ── ACL Control coercion (audit C3) ─────────────────────────────────
+
+    #[test]
+    fn coerce_acl_path_put_requires_control() {
+        assert_eq!(
+            coerce_required_mode_for_acl("/profile/card.acl", "PUT"),
+            AccessMode::Control
+        );
+    }
+
+    #[test]
+    fn coerce_acl_path_patch_requires_control() {
+        assert_eq!(
+            coerce_required_mode_for_acl("/.acl", "PATCH"),
+            AccessMode::Control
+        );
+    }
+
+    #[test]
+    fn coerce_acl_path_post_requires_control() {
+        // POST normally maps to Append; on .acl it must be Control too.
+        assert_eq!(
+            coerce_required_mode_for_acl("/data.acl", "POST"),
+            AccessMode::Control
+        );
+    }
+
+    #[test]
+    fn coerce_acl_path_delete_requires_control() {
+        assert_eq!(
+            coerce_required_mode_for_acl("/data.acl", "DELETE"),
+            AccessMode::Control
+        );
+    }
+
+    #[test]
+    fn coerce_acl_path_get_remains_read() {
+        // Reading still requires Read (handler composes with Control fallback).
+        assert_eq!(
+            coerce_required_mode_for_acl("/profile/card.acl", "GET"),
+            AccessMode::Read
+        );
+    }
+
+    #[test]
+    fn coerce_non_acl_path_unchanged() {
+        assert_eq!(
+            coerce_required_mode_for_acl("/profile/card", "PUT"),
+            AccessMode::Write
+        );
+        assert_eq!(
+            coerce_required_mode_for_acl("/profile/card", "POST"),
+            AccessMode::Append
+        );
+    }
+
+    // ── ACL doc size cap ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_acl_within_cap_succeeds() {
+        let json = concat!(
+            r##"{"@graph":[{"@id":"#root","##,
+            r##""acl:agentClass":{"@id":"foaf:Agent"},"##,
+            r##""acl:accessTo":{"@id":"/"},"##,
+            r##""acl:mode":{"@id":"acl:Read"}}]}"##,
+        );
+        let doc = parse_acl_with_cap(json.as_bytes());
+        assert!(doc.is_some());
+    }
+
+    #[test]
+    fn parse_acl_oversized_rejected() {
+        // Build a > 64 KiB "ACL document"-shaped blob.
+        let pad: String = "a".repeat(MAX_ACL_DOC_BYTES + 10);
+        let bytes = pad.into_bytes();
+        let doc = parse_acl_with_cap(&bytes);
+        assert!(
+            doc.is_none(),
+            "documents larger than MAX_ACL_DOC_BYTES must be rejected"
+        );
     }
 }

@@ -27,8 +27,8 @@ pub fn ZoneHero(
 
     let zone_label = match zone_id.as_str() {
         "home" => "Home",
-        "members" => "Nostr BBS",
-        "private" => "Private",
+        "members" => "Members",
+        "private" => "Minimoonoir",
         _ => "Forum",
     };
 

@@ -1,4 +1,4 @@
-//! Shared UI components for the Nostr BBS forum client.
+//! Shared UI components for the nostr-bbs forum client.
 //!
 //! Header and AuthGate are provided by `app.rs` (the layout shell).
 //! This module houses all reusable display components.
@@ -66,12 +66,12 @@ pub mod access_denied;
 pub mod section_request;
 
 // -- Board Stats (Stream 13) ------------------------------------------------
-pub mod board_stats;
-pub mod top_posters;
 pub mod activity_graph;
-pub mod welcome_modal;
+pub mod board_stats;
 pub mod moderator_team;
 pub mod todays_activity;
+pub mod top_posters;
+pub mod welcome_modal;
 
 // -- PWA / Offline (Stream 12) -----------------------------------------------
 pub mod offline_banner;
@@ -82,13 +82,13 @@ pub mod screen_reader;
 pub mod swipeable_message;
 
 // -- Integration (Stream 14) ------------------------------------------------
+pub mod channel_stats;
 pub mod mark_all_read;
 pub mod zone_hero;
-pub mod channel_stats;
 
 // -- Moderation (Phase 3 / P2) ----------------------------------------------
-pub mod report_button;
 pub mod hidden_message;
+pub mod report_button;
 pub mod thread_view;
 
 // -- UX Completion (Stream 6) -----------------------------------------------

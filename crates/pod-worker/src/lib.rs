@@ -1,4 +1,4 @@
-//! Nostr BBS pod-api Worker (Rust)
+//! nostr-bbs Pod Worker (Rust)
 //!
 //! Per-user Solid pod storage backed by R2 + KV, with NIP-98 authentication,
 //! WAC (Web Access Control) enforcement, LDP container support, ACL CRUD,
@@ -12,14 +12,20 @@ mod auth;
 mod conditional;
 mod container;
 mod content_negotiation;
+mod contexts;
+mod did;
 mod notifications;
 mod patch;
 mod provision;
 mod quota;
 mod remote_storage;
+mod storage;
 mod webid;
 
-use acl::{evaluate_access, find_effective_acl, method_to_mode, wac_allow_header, AccessMode};
+use acl::{
+    coerce_required_mode_for_acl, evaluate_access, find_effective_acl, wac_allow_header, AccessMode,
+};
+use base64::Engine as _;
 use worker::*;
 
 /// Maximum request body size: 50 MB.
@@ -109,9 +115,7 @@ fn add_ldp_headers(headers: &Headers, is_container: bool, resource_path: &str) {
     let mut link_parts = Vec::new();
 
     if is_container {
-        link_parts.push(
-            "<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"".to_string(),
-        );
+        link_parts.push("<http://www.w3.org/ns/ldp#BasicContainer>; rel=\"type\"".to_string());
         link_parts.push("<http://www.w3.org/ns/ldp#Resource>; rel=\"type\"".to_string());
     } else {
         link_parts.push("<http://www.w3.org/ns/ldp#Resource>; rel=\"type\"".to_string());
@@ -138,6 +142,21 @@ fn add_wac_allow(
     headers.set("WAC-Allow", &value).ok();
 }
 
+/// Add Cache-Control header to a response based on resource path.
+///
+/// Media paths under `/media/` are treated as content-addressed and immutable
+/// (1-year cache, immutable directive). All other resources use a short
+/// `max-age=300` with `must-revalidate` since they are mutable Solid pod
+/// resources (profile cards, ACLs, type indexes, etc.).
+fn add_cache_control(headers: &Headers, resource_path: &str) {
+    let value = if resource_path.starts_with("/media/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=300, must-revalidate"
+    };
+    headers.set("Cache-Control", value).ok();
+}
+
 /// Create a JSON error response with CORS headers.
 fn json_error(env: &Env, message: &str, status: u16) -> Result<Response> {
     let body = serde_json::json!({ "error": message });
@@ -148,6 +167,56 @@ fn json_error(env: &Env, message: &str, status: u16) -> Result<Response> {
         .with_headers(cors);
     resp.headers().set("Content-Type", "application/json").ok();
     Ok(resp)
+}
+
+/// Sprint v10: lightweight token-bucket rate limit for `/.well-known/nostr.json`.
+///
+/// Counts requests per IP per 60-second bucket. Returns `true` if the request
+/// is allowed, `false` if the bucket is full. KV failures fail-open (we'd
+/// rather serve a few extra hits than silently 429 every legitimate client
+/// when KV is degraded).
+const NIP05_RL_LIMIT: u32 = 60;
+const NIP05_RL_WINDOW_SECS: u64 = 60;
+
+async fn rl_nostr_json(kv: &worker::kv::KvStore, ip: &str) -> bool {
+    let bucket = (js_sys::Date::now() as u64) / (NIP05_RL_WINDOW_SECS * 1000);
+    let key = format!("rl:nostr_json:{ip}:{bucket}");
+
+    let current: u32 = match kv.get(&key).text().await {
+        Ok(Some(val)) => val.parse().unwrap_or(0),
+        _ => 0,
+    };
+    if current >= NIP05_RL_LIMIT {
+        return false;
+    }
+
+    let next = (current + 1).to_string();
+    if let Ok(builder) = kv.put(&key, &next) {
+        let _ = builder.expiration_ttl(NIP05_RL_WINDOW_SECS).execute().await;
+    }
+    true
+}
+
+/// Build a did:nostr DID document (Tier 3) for the given x-only pubkey hex.
+///
+/// Delegates to `crate::did::render_did_document_tier3`, which mirrors the
+/// logic from solid-pod-rs-nostr v0.4.0-alpha.2 but without the tokio
+/// dependency that makes that crate incompatible with WASM Workers.
+fn build_did_nostr_document(pubkey_hex: &str, pod_base: &str) -> serde_json::Value {
+    match did::NostrPubkey::from_hex(pubkey_hex) {
+        Ok(pk) => {
+            let pod_url = format!("{pod_base}/pods/{pubkey_hex}/");
+            let webid_url = format!("{pod_url}profile/card#me");
+            did::render_did_document_tier3(
+                &pk,
+                Some(&webid_url),
+                &pod_url,
+                None, // relay URL: not included at Tier 3 without lookup
+                None, // display name: not known at DID resolution time
+            )
+        }
+        Err(_) => serde_json::json!({ "error": "invalid pubkey" }),
+    }
 }
 
 /// Create a JSON success response with CORS headers.
@@ -214,11 +283,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             .map(|(_, v)| v.to_string())
             .unwrap_or_default();
         if let Some(pk) = remote_storage::parse_webfinger_resource(&resource) {
-            let host = url.host_str().unwrap_or("your-domain.com");
+            let host = url.host_str().unwrap_or("example.test");
             let pod_base = format!("https://{host}");
             let body = remote_storage::webfinger_response(&pk, host, &pod_base);
-            let json_str = serde_json::to_string(&body)
-                .map_err(|e| Error::RustError(e.to_string()))?;
+            let json_str =
+                serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?;
             let cors = cors_headers(&env);
             let resp = Response::ok(json_str)?.with_headers(cors);
             resp.headers()
@@ -231,10 +300,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     // Solid discovery metadata
     if path == "/.well-known/solid" {
-        let host = url.host_str().unwrap_or("your-domain.com");
+        let host = url.host_str().unwrap_or("example.test");
         let body = remote_storage::solid_discovery(&format!("https://{host}"));
-        let json_str =
-            serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?;
+        let json_str = serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?;
         let cors = cors_headers(&env);
         let resp = Response::ok(json_str)?.with_headers(cors);
         resp.headers().set("Content-Type", "application/json").ok();
@@ -243,6 +311,27 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     // NIP-05 verification
     if path == "/.well-known/nostr.json" {
+        // Sprint v10: rate-limit at 60 req/min per IP via POD_META KV. The
+        // endpoint is otherwise unauthenticated and trivially scrape-able,
+        // so without a budget here a single client could enumerate the
+        // entire username table.
+        let kv = env.kv("POD_META")?;
+        let ip = req
+            .headers()
+            .get("CF-Connecting-IP")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
+        if !rl_nostr_json(&kv, &ip).await {
+            let cors = cors_headers(&env);
+            let resp = Response::ok(r#"{"error":"Too many requests"}"#)?
+                .with_status(429)
+                .with_headers(cors);
+            resp.headers().set("Content-Type", "application/json").ok();
+            resp.headers().set("Retry-After", "60").ok();
+            return Ok(resp);
+        }
+
         let name = url
             .query_pairs()
             .find(|(k, _)| k == "name")
@@ -252,22 +341,42 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             return json_error(&env, "Missing name parameter", 400);
         }
         // Look up pubkey from KV: nip05:{name} -> pubkey
-        let kv = env.kv("POD_META")?;
         let key = format!("nip05:{name}");
         let pubkey = kv.get(&key).text().await.ok().flatten();
         if let Some(pk) = pubkey {
             let body = remote_storage::nostr_json(&pk, &name);
-            let json_str = serde_json::to_string(&body)
-                .map_err(|e| Error::RustError(e.to_string()))?;
+            let json_str =
+                serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?;
             let cors = cors_headers(&env);
             let resp = Response::ok(json_str)?.with_headers(cors);
             resp.headers().set("Content-Type", "application/json").ok();
-            resp.headers()
-                .set("Access-Control-Allow-Origin", "*")
-                .ok();
+            resp.headers().set("Access-Control-Allow-Origin", "*").ok();
             return Ok(resp);
         }
         return json_error(&env, "Name not found", 404);
+    }
+
+    // DID document: GET /.well-known/did/nostr/{pubkey}.json
+    // Returns a did:nostr DID document for any 64-char hex pubkey known to this pod.
+    // Tier1 (public, no auth) — anyone can resolve. Tier3 (extended) not yet gated.
+    if let Some(rest) = path.strip_prefix("/.well-known/did/nostr/") {
+        if let Some(pk) = rest.strip_suffix(".json") {
+            // Validate: must be exactly 64 lowercase hex chars
+            if pk.len() == 64 && pk.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let host = url.host_str().unwrap_or("example.test");
+                let pod_base = format!("https://{host}");
+                let did_doc = build_did_nostr_document(pk, &pod_base);
+                let json_str =
+                    serde_json::to_string(&did_doc).map_err(|e| Error::RustError(e.to_string()))?;
+                let cors = cors_headers(&env);
+                let resp = Response::ok(json_str)?.with_headers(cors);
+                resp.headers()
+                    .set("Content-Type", "application/did+ld+json")
+                    .ok();
+                return Ok(resp);
+            }
+            return json_error(&env, "Invalid pubkey in DID path", 400);
+        }
     }
 
     // Route: /pods/{pubkey}/...
@@ -312,8 +421,18 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let requester_pubkey: Option<String> = if let Some(ref header) = auth_header {
         let method_name = method_str(&method);
         let body_ref = body_bytes.as_deref();
-        match auth::verify_nip98(header, &request_url, method_name, body_ref) {
-            Ok(token) => Some(token.pubkey),
+        match auth::verify_nip98_replay(header, &request_url, method_name, body_ref, &env).await {
+            Ok(token) => {
+                // If the event carries a `["webid", uri]` tag, verify the URI
+                // is controlled by the signing pubkey. Reject tokens where the
+                // webid tag references a different identity.
+                if let Some(webid_uri) = extract_webid_tag_from_header(header) {
+                    if !did::verify_webid_tag(&webid_uri, &token.pubkey) {
+                        return json_error(&env, "NIP-98 webid tag identity mismatch", 401);
+                    }
+                }
+                Some(token.pubkey)
+            }
             Err(_) => None,
         }
     } else {
@@ -343,7 +462,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
         // Only the pod owner or an admin can provision
         let is_owner = req_pk == owner_pubkey;
-        let is_admin = is_admin_user(&kv, &req_pk).await;
+        let is_admin = is_admin_user(&env, &kv, &req_pk).await;
         if !is_owner && !is_admin {
             return json_error(&env, "Only the pod owner or admin can provision", 403);
         }
@@ -411,7 +530,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // -----------------------------------------------------------------------
     // Standard resource ACL check
     // -----------------------------------------------------------------------
-    let required_mode = method_to_mode(method_str(&method));
+    // For `.acl` sidecars we coerce write-class methods up to acl:Control so
+    // a principal with mere acl:Write cannot escalate by overwriting the
+    // sidecar (audit C3). Non-acl resources retain the standard mapping.
+    let required_mode = coerce_required_mode_for_acl(&resource_path, method_str(&method));
     let acl_doc = find_effective_acl(&bucket, &kv, &owner_pubkey, &resource_path).await;
 
     let has_access = evaluate_access(
@@ -441,8 +563,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if is_container_path {
                 let listing =
                     container::list_container(&bucket, &owner_pubkey, &resource_path).await?;
-                let json_str = serde_json::to_string(&listing)
-                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let json_str =
+                    serde_json::to_string(&listing).map_err(|e| Error::RustError(e.to_string()))?;
                 let cors = cors_headers(&env);
                 let resp = Response::ok(json_str)?.with_headers(cors);
                 resp.headers()
@@ -455,6 +577,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     agent_uri.as_deref(),
                     &resource_path,
                 );
+                add_cache_control(resp.headers(), &resource_path);
                 return Ok(resp);
             }
 
@@ -468,16 +591,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                             .ok_or_else(|| Error::RustError("R2 object has no body".into()))?;
                         let bytes = body.bytes().await?;
                         String::from_utf8(bytes).unwrap_or_else(|_| {
-                            webid::generate_webid_html(
-                                &owner_pubkey,
-                                None,
-                                &expected_origin,
-                            )
+                            webid::generate_webid_html(&owner_pubkey, None, &expected_origin)
                         })
                     }
-                    None => {
-                        webid::generate_webid_html(&owner_pubkey, None, &expected_origin)
-                    }
+                    None => webid::generate_webid_html(&owner_pubkey, None, &expected_origin),
                 };
                 let cors = cors_headers(&env);
                 let resp = Response::ok(html)?.with_headers(cors);
@@ -489,6 +606,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     agent_uri.as_deref(),
                     &resource_path,
                 );
+                add_cache_control(resp.headers(), &resource_path);
                 return Ok(resp);
             }
 
@@ -502,10 +620,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .http_metadata()
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            let obj_content_type = content_negotiation::negotiate(
-                accept_header.as_deref(),
-                &stored_content_type,
-            );
+            let obj_content_type =
+                content_negotiation::negotiate(accept_header.as_deref(), &stored_content_type);
             let etag = object.etag();
             let cors = cors_headers(&env);
 
@@ -535,6 +651,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     agent_uri.as_deref(),
                     &resource_path,
                 );
+                add_cache_control(resp.headers(), &resource_path);
                 return Ok(resp);
             }
 
@@ -544,9 +661,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let bytes = body.bytes().await?;
 
             // Range request support
-            if let Some((start, end)) =
-                conditional::parse_range(&req_headers, bytes.len() as u64)
-            {
+            if let Some((start, end)) = conditional::parse_range(&req_headers, bytes.len() as u64) {
                 let slice = &bytes[start as usize..=end as usize];
                 let resp = Response::from_bytes(slice.to_vec())?
                     .with_status(206)
@@ -566,6 +681,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     agent_uri.as_deref(),
                     &resource_path,
                 );
+                add_cache_control(resp.headers(), &resource_path);
                 return Ok(resp);
             }
 
@@ -580,6 +696,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 agent_uri.as_deref(),
                 &resource_path,
             );
+            add_cache_control(resp.headers(), &resource_path);
             Ok(resp)
         }
 
@@ -704,8 +821,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     .ok();
 
                 // Fire notification webhooks (non-blocking)
-                notifications::notify_change(&kv, &owner_pubkey, &resource_path, "Update")
-                    .await;
+                notifications::notify_change(&kv, &owner_pubkey, &resource_path, "Update").await;
 
                 let resp_body = serde_json::json!({ "status": "ok" });
                 let resp = json_ok(&env, &resp_body, 201)?;
@@ -742,8 +858,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 return json_error(&env, &e.to_string(), 413);
             }
 
-            let child_path =
-                container::resolve_slug(&resource_path, slug_header.as_deref());
+            let child_path = container::resolve_slug(&resource_path, slug_header.as_deref());
             let child_r2_key = format!("pods/{owner_pubkey}{child_path}");
 
             bucket
@@ -789,9 +904,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let patch_data = body_bytes.unwrap_or_default();
 
             // Parse patch operations
-            let operations: Vec<patch::PatchOperation> =
-                serde_json::from_slice(&patch_data)
-                    .map_err(|e| Error::RustError(format!("Invalid JSON Patch: {e}")))?;
+            let operations: Vec<patch::PatchOperation> = serde_json::from_slice(&patch_data)
+                .map_err(|e| Error::RustError(format!("Invalid JSON Patch: {e}")))?;
 
             // Read current document
             let current_bytes = match bucket.get(&r2_key).execute().await? {
@@ -973,6 +1087,7 @@ async fn handle_acl_request(
                     .set("Content-Type", "application/ld+json")
                     .ok();
                 resp.headers().set("ETag", &format!("\"{etag}\"")).ok();
+                add_cache_control(resp.headers(), acl_path);
                 return Ok(resp);
             }
 
@@ -986,6 +1101,7 @@ async fn handle_acl_request(
                 .ok();
             resp.headers().set("ETag", &format!("\"{etag}\"")).ok();
             add_wac_allow(resp.headers(), parent_acl.as_ref(), agent_uri, parent_path);
+            add_cache_control(resp.headers(), acl_path);
             Ok(resp)
         }
 
@@ -1105,15 +1221,59 @@ fn validate_webid_html(data: &[u8]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// NIP-98 webid tag extractor
+// ---------------------------------------------------------------------------
+
+/// Extract the value of the `["webid", uri]` tag from a raw NIP-98
+/// `Authorization: Nostr <base64>` header, if present.
+///
+/// The NIP-98 spec allows extension tags. When a client sends a `webid`
+/// tag, we verify that the URI refers to the same identity as the signing
+/// pubkey (via `did::verify_webid_tag`).
+///
+/// Returns `None` if the header is malformed, the event has no webid tag,
+/// or base64 decoding fails — non-fatal; auth proceeds without webid check.
+fn extract_webid_tag_from_header(auth_header: &str) -> Option<String> {
+    let b64 = auth_header.strip_prefix("Nostr ")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .ok()?;
+    let event: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let tags = event.get("tags")?.as_array()?;
+    for tag in tags {
+        let arr = tag.as_array()?;
+        if arr.first()?.as_str() == Some("webid") {
+            if let Some(uri) = arr.get(1).and_then(|v| v.as_str()) {
+                return Some(uri.to_string());
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Admin check helper
 // ---------------------------------------------------------------------------
 
-/// Check if a pubkey is an admin user (via KV).
+/// Check if a pubkey is an admin user.
 ///
-/// Uses KV key `admin:{pubkey}` as a lightweight check.
-async fn is_admin_user(kv: &kv::KvStore, pubkey: &str) -> bool {
+/// Reads from the dedicated `ADMIN_KV_RO` binding (audit H6 — split from the
+/// shared `POD_META` namespace so this worker can never *write* admin
+/// flags). Falls back to the legacy `POD_META` lookup during the migration
+/// window so existing admin entries remain effective until ops provisions
+/// `ADMIN_KV_RO` and copies entries across.
+///
+/// Uses KV key `admin:{pubkey}` (value `"1"` / `"true"` => admin).
+async fn is_admin_user(env: &Env, fallback_kv: &kv::KvStore, pubkey: &str) -> bool {
     let key = format!("admin:{pubkey}");
-    kv.get(&key)
+    if let Ok(kv) = env.kv("ADMIN_KV_RO") {
+        if let Ok(Some(v)) = kv.get(&key).text().await {
+            return v == "1" || v == "true";
+        }
+    }
+    // Fallback for unmigrated environments. Removed once ops cuts over.
+    fallback_kv
+        .get(&key)
         .text()
         .await
         .ok()

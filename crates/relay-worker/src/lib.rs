@@ -1,4 +1,4 @@
-//! Nostr BBS Relay Worker (Rust)
+//! nostr-bbs Relay Worker (Rust)
 //!
 //! Cloudflare Workers-based private Nostr relay with:
 //! - WebSocket NIP-01 protocol via Durable Objects
@@ -18,14 +18,24 @@
 
 mod audit;
 mod auth;
+mod cron;
 mod moderation;
 mod nip11;
+mod profiles;
 mod relay_do;
 mod trust;
 mod whitelist;
 
 /// Re-export so the `worker` crate runtime can discover the Durable Object.
 pub use relay_do::NostrRelayDO;
+
+// Test-only public API for integration tests (Sprint v9 Stream-E2).
+// Activated by `--features test-exports` for tests in `tests/`.
+#[cfg(feature = "test-exports")]
+pub mod test_exports {
+    pub use crate::relay_do::test_exports::*;
+    pub use crate::trust::{compute_trust_level, TrustLevel, TrustThresholds};
+}
 
 use worker::*;
 
@@ -170,8 +180,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // NIP-11 relay info document
     if path == "/" && accepts_nostr_json(&req) {
         let info = nip11::relay_info(&env);
-        let json_str =
-            serde_json::to_string(&info).map_err(|e| Error::RustError(e.to_string()))?;
+        let json_str = serde_json::to_string(&info).map_err(|e| Error::RustError(e.to_string()))?;
         let headers = Headers::new();
         headers.set("Content-Type", "application/nostr+json").ok();
         headers
@@ -227,7 +236,7 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
                 "status": "healthy",
                 "version": "3.0.0",
                 "runtime": "workers-rs",
-                "nips": [1, 9, 11, 16, 29, 33, 40, 42, 45, 50, 98],
+                "nips": [1, 9, 11, 16, 17, 26, 29, 33, 40, 42, 45, 50, 59, 65, 90, 98],
             }),
             200,
         );
@@ -286,12 +295,79 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
         return audit::handle_audit_log_list(&req, env).await;
     }
 
-    json_response(
-        &req,
+    // --- Sprint v10: profiles (public, no auth) ---
+
+    if path == "/api/profiles/batch" && method == Method::Post {
+        let mut req = req;
+        let body_bytes = req.bytes().await.unwrap_or_default();
+        return profiles::handle_batch(&req, &body_bytes, env).await;
+    }
+
+    if path == "/api/profiles/search" && method == Method::Get {
+        return profiles::handle_search(&req, env).await;
+    }
+
+    // --- Sprint v11: profiles backfill (NIP-98 admin only, one-shot) ---
+    //
+    // Manually-triggered replay of historic kind-0 events into the `profiles`
+    // projection. Idempotent — the upsert's `last_kind0_at` guard means
+    // re-running is always safe.
+    if path == "/api/admin/profiles/backfill" && method == Method::Post {
+        return handle_profiles_backfill(req, env).await;
+    }
+
+    json_response(&req, env, &serde_json::json!({ "error": "Not found" }), 404)
+}
+
+// ---------------------------------------------------------------------------
+// Sprint v11: profiles backfill admin endpoint
+// ---------------------------------------------------------------------------
+
+/// `POST /api/admin/profiles/backfill` — NIP-98 admin only.
+///
+/// Replays every stored kind-0 event through the `profiles` projection upsert
+/// (Sprint v10). Returns `{ scanned, backfilled, skipped, truncated }`.
+async fn handle_profiles_backfill(mut req: Request, env: &Env) -> Result<Response> {
+    let url = req.url()?;
+    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let auth_header = req.headers().get("Authorization").ok().flatten();
+    let body_bytes = req.bytes().await.unwrap_or_default();
+    // Treat empty body as no body for NIP-98 payload-hash semantics; non-empty
+    // is hashed and verified.
+    let body_for_auth: Option<&[u8]> = if body_bytes.is_empty() {
+        None
+    } else {
+        Some(&body_bytes)
+    };
+
+    let _admin_pubkey = match auth::require_nip98_admin(
+        auth_header.as_deref(),
+        &request_url,
+        "POST",
+        body_for_auth,
         env,
-        &serde_json::json!({ "error": "Not found" }),
-        404,
     )
+    .await
+    {
+        Ok(pk) => pk,
+        Err((body, status)) => return json_response(&req, env, &body, status),
+    };
+
+    match cron::backfill_profiles(env).await {
+        Ok(result) => {
+            let body = serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({}));
+            json_response(&req, env, &body, 200)
+        }
+        Err(e) => {
+            console_error!("backfill_profiles failed: {e}");
+            json_response(
+                &req,
+                env,
+                &serde_json::json!({ "error": "backfill failed", "detail": e }),
+                500,
+            )
+        }
+    }
 }
 
 /// Idempotent schema migrations.
@@ -368,6 +444,34 @@ async fn ensure_schema(env: &Env) {
             reason TEXT, \
             created_at INTEGER NOT NULL\
         )",
+        // WI-2: mirror of auth-worker's moderation_actions. Populated when
+        // kind-30910/30911 Nostr events signed by an admin are saved here.
+        // Consumed by the relay's ingress gate to block muted/banned authors.
+        "CREATE TABLE IF NOT EXISTS moderation_actions (\
+            id TEXT PRIMARY KEY, \
+            action TEXT NOT NULL, \
+            target_pubkey TEXT NOT NULL, \
+            performed_by TEXT NOT NULL, \
+            reason TEXT, \
+            expires_at INTEGER, \
+            event_id TEXT NOT NULL, \
+            created_at INTEGER NOT NULL\
+        )",
+        // Sprint v10: projection of the most-recent kind-0 per pubkey, with
+        // the JSON content fields parsed into typed columns. Maintained by
+        // the kind-0 ingest hook in `relay_do::storage::save_event`.
+        "CREATE TABLE IF NOT EXISTS profiles (\
+            pubkey TEXT PRIMARY KEY NOT NULL, \
+            name TEXT, \
+            display_name TEXT, \
+            picture TEXT, \
+            banner TEXT, \
+            about TEXT, \
+            nip05 TEXT, \
+            lud16 TEXT, \
+            last_kind0_at INTEGER NOT NULL, \
+            raw_event TEXT NOT NULL\
+        )",
     ];
     for stmt in create_stmts {
         let _ = db.prepare(stmt).run().await;
@@ -382,6 +486,16 @@ async fn ensure_schema(env: &Env) {
         "CREATE INDEX IF NOT EXISTS idx_admin_log_actor ON admin_log(actor_pubkey)",
         "CREATE INDEX IF NOT EXISTS idx_admin_log_target ON admin_log(target_pubkey)",
         "CREATE INDEX IF NOT EXISTS idx_admin_log_created ON admin_log(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_mod_actions_target ON moderation_actions(target_pubkey)",
+        "CREATE INDEX IF NOT EXISTS idx_mod_actions_active ON moderation_actions(action, expires_at)",
+        // NIP-59 (Sealed DMs, kind-1059): index on kind for efficient recipient delivery.
+        // p-tag recipient filtering is applied via the tags LIKE pattern at query time;
+        // this index narrows the scan to kind-1059 rows first.
+        "CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)",
+        // Sprint v10: profiles indexes for batch lookup and prefix typeahead.
+        "CREATE INDEX IF NOT EXISTS idx_profiles_name ON profiles(name)",
+        "CREATE INDEX IF NOT EXISTS idx_profiles_display_name ON profiles(display_name)",
+        "CREATE INDEX IF NOT EXISTS idx_profiles_last_kind0 ON profiles(last_kind0_at DESC)",
     ];
     for stmt in index_stmts {
         let _ = db.prepare(stmt).run().await;

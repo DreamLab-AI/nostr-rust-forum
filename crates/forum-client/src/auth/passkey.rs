@@ -13,7 +13,6 @@ use zeroize::Zeroize;
 
 use super::http::{
     encode_assertion_response, encode_attestation_response, fetch_json_post, get_credential_id,
-    get_user_handle,
 };
 use super::nip98;
 use super::webauthn::{
@@ -34,9 +33,7 @@ pub struct PasskeyRegistrationResult {
     pub privkey_bytes: [u8; 32],
     #[allow(dead_code)]
     pub credential_id: String,
-    #[allow(dead_code)]
     pub web_id: Option<String>,
-    #[allow(dead_code)]
     pub pod_url: Option<String>,
     #[allow(dead_code)]
     pub did_nostr: String,
@@ -53,7 +50,6 @@ pub struct PasskeyAuthResult {
     pub privkey_bytes: [u8; 32],
     #[allow(dead_code)]
     pub did_nostr: String,
-    #[allow(dead_code)]
     pub web_id: Option<String>,
 }
 
@@ -97,11 +93,6 @@ struct LoginVerifyResponse {
     web_id: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct LookupResponse {
-    pubkey: Option<String>,
-}
-
 // -- Public API ---------------------------------------------------------------
 
 /// Register a new passkey with PRF extension and derive Nostr keypair.
@@ -115,18 +106,31 @@ pub async fn register_passkey(
     display_name: &str,
 ) -> Result<PasskeyRegistrationResult, PasskeyError> {
     let base = auth_api_base();
-    web_sys::console::log_1(&format!("[register_passkey] starting, base={base}").into());
+    if cfg!(debug_assertions) {
+        web_sys::console::log_1(&format!("[register_passkey] starting, base={base}").into());
+    }
 
     // Step 1: Get registration options from server
     let body = serde_json::json!({ "displayName": display_name });
     let resp_text = fetch_json_post(&format!("{base}/auth/register/options"), &body).await?;
-    web_sys::console::log_1(&format!("[register_passkey] options response: {} chars", resp_text.len()).into());
-    let opts_resp: RegisterOptionsResponse =
-        serde_json::from_str(&resp_text).map_err(|e| {
-            web_sys::console::error_1(&format!("[register_passkey] options parse error: {e}").into());
+    if cfg!(debug_assertions) {
+        web_sys::console::log_1(
+            &format!(
+                "[register_passkey] options response: {} chars",
+                resp_text.len()
+            )
+            .into(),
+        );
+    }
+    let opts_resp: RegisterOptionsResponse = serde_json::from_str(&resp_text).map_err(|e| {
+        if cfg!(debug_assertions) {
+            web_sys::console::error_1(
+                &format!("[register_passkey] options parse error: {e}").into(),
+            );
             web_sys::console::error_1(&format!("[register_passkey] raw text: {resp_text}").into());
-            PasskeyError::Protocol(e.to_string())
-        })?;
+        }
+        PasskeyError::Protocol(e.to_string())
+    })?;
 
     let prf_salt_b64 = opts_resp
         .prf_salt
@@ -154,7 +158,9 @@ pub async fn register_passkey(
     let credential_id = get_credential_id(&credential)?;
 
     // Step 4: Verify with server
-    web_sys::console::log_1(&"[register_passkey] step 4: verify with server".into());
+    if cfg!(debug_assertions) {
+        web_sys::console::log_1(&"[register_passkey] step 4: verify with server".into());
+    }
     let encoded_response = encode_attestation_response(&credential)?;
     let verify_body = serde_json::json!({
         "response": encoded_response,
@@ -163,13 +169,26 @@ pub async fn register_passkey(
     });
     let verify_text =
         fetch_json_post(&format!("{base}/auth/register/verify"), &verify_body).await?;
-    web_sys::console::log_1(&format!("[register_passkey] verify response: {} chars", verify_text.len()).into());
-    let verify_resp: RegisterVerifyResponse =
-        serde_json::from_str(&verify_text).map_err(|e| {
-            web_sys::console::error_1(&format!("[register_passkey] verify parse error: {e}").into());
-            web_sys::console::error_1(&format!("[register_passkey] raw text: {verify_text}").into());
-            PasskeyError::Protocol(e.to_string())
-        })?;
+    if cfg!(debug_assertions) {
+        web_sys::console::log_1(
+            &format!(
+                "[register_passkey] verify response: {} chars",
+                verify_text.len()
+            )
+            .into(),
+        );
+    }
+    let verify_resp: RegisterVerifyResponse = serde_json::from_str(&verify_text).map_err(|e| {
+        if cfg!(debug_assertions) {
+            web_sys::console::error_1(
+                &format!("[register_passkey] verify parse error: {e}").into(),
+            );
+            web_sys::console::error_1(
+                &format!("[register_passkey] raw text: {verify_text}").into(),
+            );
+        }
+        PasskeyError::Protocol(e.to_string())
+    })?;
 
     Ok(PasskeyRegistrationResult {
         pubkey,
@@ -183,18 +202,35 @@ pub async fn register_passkey(
 
 /// Authenticate with an existing passkey, re-deriving the Nostr privkey from PRF.
 ///
-/// Supports two flows:
-/// 1. Known pubkey: single assertion with PRF (fast path)
-/// 2. Unknown pubkey: discoverable credential -> identify user -> PRF assertion
+/// The pre-audit-C2 implementation supported a "discover by passkey"
+/// flow that called `/auth/login/options` with `pubkey: ""` and then
+/// `/auth/lookup` to resolve the user's pubkey from a credentialId — that
+/// path was an enumeration oracle (any caller could probe whether a
+/// credentialId was registered to a pubkey). It has been removed.
+///
+/// Callers MUST therefore supply the pubkey they intend to authenticate as,
+/// either from a previously-saved local session or from the
+/// `userHandle` returned by a discoverable-credential WebAuthn assertion
+/// performed by the calling page (which proves possession before the
+/// pubkey is disclosed).
 pub async fn authenticate_passkey(pubkey: Option<&str>) -> Result<PasskeyAuthResult, PasskeyError> {
     let base = auth_api_base();
 
     let resolved_pubkey = match pubkey {
         Some(pk) if !pk.is_empty() => pk.to_string(),
-        _ => discover_pubkey_from_passkey(&base).await?,
+        _ => {
+            return Err(PasskeyError::Protocol(
+                "Pubkey required to authenticate. Use the saved session pubkey or perform a \
+                 discoverable-credential WebAuthn assertion locally and supply the resulting \
+                 userHandle as the pubkey."
+                    .into(),
+            ));
+        }
     };
 
-    // Get login options with PRF salt
+    // Get login options with PRF salt. The salt is bound server-side to
+    // (pubkey, credentialId) — clients no longer probe other pubkeys'
+    // salts via the discovery flow.
     let body = serde_json::json!({ "pubkey": resolved_pubkey });
     let resp_text = fetch_json_post(&format!("{base}/auth/login/options"), &body).await?;
     let opts_resp: LoginOptionsResponse =
@@ -259,44 +295,6 @@ pub async fn authenticate_passkey(pubkey: Option<&str>) -> Result<PasskeyAuthRes
         did_nostr: verify_resp.did_nostr,
         web_id: verify_resp.web_id,
     })
-}
-
-// -- Discoverable credential flow ---------------------------------------------
-
-async fn discover_pubkey_from_passkey(base: &str) -> Result<String, PasskeyError> {
-    let body = serde_json::json!({ "pubkey": "" });
-    let resp_text = fetch_json_post(&format!("{base}/auth/login/options"), &body).await?;
-    let opts_resp: LoginOptionsResponse =
-        serde_json::from_str(&resp_text).map_err(|e| PasskeyError::Protocol(e.to_string()))?;
-
-    let assertion = get_assertion_no_prf(&opts_resp.options).await?;
-
-    // Try extracting pubkey from userHandle
-    if let Ok(user_handle) = get_user_handle(&assertion) {
-        let hex_str = hex::encode(&user_handle);
-        if hex_str.len() == 64 && hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(hex_str);
-        }
-    }
-
-    // Fallback: look up by credential ID
-    let cred_id = get_credential_id(&assertion)?;
-    let lookup_body = serde_json::json!({ "credentialId": cred_id });
-    if let Ok(lookup_text) = fetch_json_post(&format!("{base}/auth/lookup"), &lookup_body).await {
-        if let Ok(lookup) = serde_json::from_str::<LookupResponse>(&lookup_text) {
-            if let Some(pk) = lookup.pubkey {
-                if pk.len() == 64 && pk.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Ok(pk);
-                }
-            }
-        }
-    }
-
-    Err(PasskeyError::Protocol(
-        "Could not identify your account from the passkey. \
-         Please try logging in from the original device."
-            .into(),
-    ))
 }
 
 // -- WebAuthn ceremony helpers ------------------------------------------------
@@ -421,35 +419,9 @@ async fn get_assertion(
     Ok(result)
 }
 
-async fn get_assertion_no_prf(options_json: &serde_json::Value) -> Result<JsValue, PasskeyError> {
-    let win = window().ok_or(PasskeyError::NoBrowser)?;
-    let navigator = win.navigator();
-    let credentials = navigator.credentials();
-
-    let pk_options = build_request_options(options_json, None)?;
-
-    let cred_options = Object::new();
-    Reflect::set(&cred_options, &"publicKey".into(), &pk_options)
-        .map_err(|_| PasskeyError::JsError("Failed to set publicKey".into()))?;
-
-    let promise = credentials
-        .get_with_options(&web_sys::CredentialRequestOptions::from(JsValue::from(
-            cred_options,
-        )))
-        .map_err(|e| PasskeyError::JsError(format!("{e:?}")))?;
-
-    let result = JsFuture::from(promise)
-        .await
-        .map_err(|e| PasskeyError::Cancelled(format!("{e:?}")))?;
-
-    if result.is_null() || result.is_undefined() {
-        return Err(PasskeyError::Cancelled(
-            "Passkey selection cancelled".into(),
-        ));
-    }
-
-    Ok(result)
-}
+// `get_assertion_no_prf` was removed alongside `discover_pubkey_from_passkey`
+// (audit C2): the only caller was the discovery path, which leaked
+// credentialId↔pubkey mappings to unauthenticated callers.
 
 // -- Error type ---------------------------------------------------------------
 

@@ -1,117 +1,545 @@
-//! 3-step onboarding modal shown on first login.
+//! Onboarding modal — claim-username flow shown after first login.
 //!
-//! Step 1: Community guidelines summary with accept button.
-//! Step 2: Profile setup (display name + optional avatar URL).
-//! Step 3: Channel exploration with links to main channels.
+//! Displayed when the authenticated user has no claimed username yet and
+//! has not skipped the prompt within the last 7 days. The component
+//! self-gates via localStorage flags keyed on the first 8 chars of the
+//! pubkey:
 //!
-//! Completion is tracked via `localStorage` key `bbs:onboarded`.
-//! Only shown if this key is absent.
+//! - `nostr_bbs_username_claimed_{pubkey8}` — claim succeeded; never re-prompt
+//! - `nostr_bbs_username_skipped_until_{pubkey8}` — UNIX-ms timestamp; suppress until
+//!
+//! The legacy `members:onboarded` localStorage key is still honoured so
+//! pre-existing users who already completed v1 onboarding are not nagged.
+//!
+//! Validation is two-stage:
+//! 1. Local regex `^[a-z0-9][a-z0-9_-]{2,29}$`
+//! 2. Debounced (300 ms) `GET /api/username/check?name=` against auth-worker.
+//!
+//! On submit the client sends a NIP-98 authed `POST /api/username/claim`
+//! with body `{"username": "..."}`. On success we publish a kind-0 update
+//! containing the chosen `name` and `nip05` fields and update auth state.
+//!
+//! All network errors are surfaced as a graceful "service temporarily
+//! unavailable" string so the page never crashes when the worker has not
+//! yet been deployed (Sprint v10 STREAM-N1 dependency).
 
 use leptos::prelude::*;
+use serde::Deserialize;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 
-use crate::app::base_href;
+use crate::auth::nip98::fetch_with_nip98_post_signer;
 use crate::auth::use_auth;
+use crate::utils::relay_url::auth_api_base;
 
-/// localStorage key for onboarding completion.
-const ONBOARDED_KEY: &str = "bbs:onboarded";
+// -- localStorage helpers -----------------------------------------------------
 
-/// Check if the user has completed onboarding.
-fn is_onboarded() -> bool {
-    web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item(ONBOARDED_KEY).ok().flatten())
+/// Legacy v1 onboarding flag.
+const LEGACY_ONBOARDED_KEY: &str = "nostrbbs:onboarded";
+/// Suppress duration when user clicks "I'll choose later" (7 days, ms).
+const SKIP_DURATION_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+/// NIP-05 host that backs successful claims.
+const NIP05_HOST: &str = "example.test";
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+fn pubkey8(pubkey: &str) -> String {
+    pubkey.chars().take(8).collect()
+}
+
+fn claimed_key(pubkey: &str) -> String {
+    format!("nostr_bbs_username_claimed_{}", pubkey8(pubkey))
+}
+
+fn skipped_key(pubkey: &str) -> String {
+    format!("nostr_bbs_username_skipped_until_{}", pubkey8(pubkey))
+}
+
+/// Has the user already claimed (locally cached)?
+fn has_claimed_locally(pubkey: &str) -> bool {
+    local_storage()
+        .and_then(|s| s.get_item(&claimed_key(pubkey)).ok().flatten())
         .is_some()
 }
 
-/// Mark onboarding as complete in localStorage.
-fn mark_onboarded() {
-    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.set_item(ONBOARDED_KEY, "1");
+/// Mark the username as claimed locally so we never re-prompt this user.
+fn mark_claimed_locally(pubkey: &str, username: &str) {
+    if let Some(s) = local_storage() {
+        let _ = s.set_item(&claimed_key(pubkey), username);
     }
 }
 
-/// 3-step onboarding modal for new users.
-///
-/// Mount this component inside an authenticated page (e.g., ForumsPage).
-/// It self-manages visibility based on the localStorage flag.
+/// Clear the local claim cache (used on release).
+fn clear_claimed_locally(pubkey: &str) {
+    if let Some(s) = local_storage() {
+        let _ = s.remove_item(&claimed_key(pubkey));
+    }
+}
+
+/// Read the "skip until" timestamp from localStorage, returning `true`
+/// if the user has skipped recently and the suppression has not expired.
+fn is_skipping(pubkey: &str) -> bool {
+    let Some(s) = local_storage() else {
+        return false;
+    };
+    let Some(raw) = s.get_item(&skipped_key(pubkey)).ok().flatten() else {
+        return false;
+    };
+    raw.parse::<f64>()
+        .map(|until| js_sys::Date::now() < until)
+        .unwrap_or(false)
+}
+
+fn set_skipped(pubkey: &str) {
+    if let Some(s) = local_storage() {
+        let until = js_sys::Date::now() + SKIP_DURATION_MS;
+        let _ = s.set_item(&skipped_key(pubkey), &format!("{:.0}", until));
+    }
+}
+
+fn clear_skipped(pubkey: &str) {
+    if let Some(s) = local_storage() {
+        let _ = s.remove_item(&skipped_key(pubkey));
+    }
+}
+
+// -- Username validation ------------------------------------------------------
+
+/// Client-side regex check matching the auth-worker rule
+/// `^[a-z0-9][a-z0-9_-]{2,29}$`. Length 3..=30, lowercase alnum + `_` + `-`,
+/// no leading hyphen/underscore.
+fn is_valid_format(name: &str) -> bool {
+    let len = name.chars().count();
+    if !(3..=30).contains(&len) {
+        return false;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CheckState {
+    Idle,
+    Pending,
+    Available,
+    Taken,
+    InvalidFormat,
+    Unavailable, // service temporarily unavailable
+}
+
+#[derive(Deserialize, Debug)]
+struct CheckResponse {
+    available: bool,
+    #[allow(dead_code)]
+    #[serde(default)]
+    claimed_by: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ClaimResponse {
+    #[allow(dead_code)]
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+async fn check_username_available(name: &str) -> Result<bool, String> {
+    let url = format!(
+        "{}/api/username/check?name={}",
+        auth_api_base(),
+        urlencoding_encode(name)
+    );
+    let win = web_sys::window().ok_or_else(|| "no window".to_string())?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("GET");
+    let req = web_sys::Request::new_with_str_and_init(&url, &init)
+        .map_err(|e| format!("request build failed: {:?}", e))?;
+    let resp_val = JsFuture::from(win.fetch_with_request(&req))
+        .await
+        .map_err(|e| format!("fetch failed: {:?}", e))?;
+    let resp: web_sys::Response = resp_val
+        .dyn_into()
+        .map_err(|_| "bad response type".to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let txt_promise = resp.text().map_err(|e| format!("text() failed: {:?}", e))?;
+    let txt_val = JsFuture::from(txt_promise)
+        .await
+        .map_err(|e| format!("await text failed: {:?}", e))?;
+    let txt = txt_val
+        .as_string()
+        .ok_or_else(|| "non-string body".to_string())?;
+    let parsed: CheckResponse =
+        serde_json::from_str(&txt).map_err(|e| format!("parse failed: {}", e))?;
+    Ok(parsed.available)
+}
+
+/// Minimal URI-encoder for query-string values (RFC 3986 unreserved set).
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+// -- Component ----------------------------------------------------------------
+
+/// Optional pre-fill — used by the Settings "Change username" flow.
+#[derive(Clone, Copy, Debug)]
+pub struct OnboardingPrefill {
+    pub initial: RwSignal<Option<String>>,
+    pub force_open: RwSignal<bool>,
+}
+
+/// Provide an `OnboardingPrefill` context so other pages (Settings) can
+/// open the modal pre-filled with an existing value.
+pub fn provide_onboarding_prefill() {
+    provide_context(OnboardingPrefill {
+        initial: RwSignal::new(None),
+        force_open: RwSignal::new(false),
+    });
+}
+
+/// Open the onboarding modal in "change username" mode pre-filled with `current`.
+pub fn open_onboarding_with_prefill(current: Option<String>) {
+    if let Some(prefill) = use_context::<OnboardingPrefill>() {
+        prefill.initial.set(current);
+        prefill.force_open.set(true);
+    }
+}
+
 #[component]
 pub fn OnboardingModal() -> impl IntoView {
-    let is_open = RwSignal::new(false);
-    let step = RwSignal::new(1u8);
-    let display_name = RwSignal::new(String::new());
-    let avatar_url = RwSignal::new(String::new());
-    let guidelines_accepted = RwSignal::new(false);
-
     let auth = use_auth();
+    let prefill = use_context::<OnboardingPrefill>();
 
-    // Check localStorage on mount
+    let is_open = RwSignal::new(false);
+    let username = RwSignal::new(String::new());
+    let check_state = RwSignal::new(CheckState::Idle);
+    let submit_error = RwSignal::new(Option::<String>::None);
+    let is_submitting = RwSignal::new(false);
+    // Generation counter to invalidate in-flight debounced checks when the
+    // user keeps typing.
+    let check_seq = RwSignal::new(0u32);
+
+    // Decide whether to open on auth-state change.
     Effect::new(move |_| {
-        if !is_onboarded() && auth.is_authenticated().get() {
-            is_open.set(true);
+        let state = auth.state.get();
+        if !state.is_authenticated {
+            is_open.set(false);
+            return;
         }
+
+        // Force-opened from Settings ("Change username")
+        if let Some(p) = prefill {
+            if p.force_open.get() {
+                if let Some(initial) = p.initial.get_untracked() {
+                    username.set(initial);
+                } else {
+                    username.set(String::new());
+                }
+                is_open.set(true);
+                return;
+            }
+        }
+
+        // Auto-open when user has no nickname AND has not claimed AND not skipping.
+        let pubkey = match state.pubkey.as_ref() {
+            Some(pk) => pk.clone(),
+            None => return,
+        };
+        if state.nickname.is_some() {
+            return;
+        }
+        if has_claimed_locally(&pubkey) {
+            return;
+        }
+        if is_skipping(&pubkey) {
+            return;
+        }
+        // Honour legacy v1 flag — pre-existing onboarded users are not pestered.
+        if let Some(s) = local_storage() {
+            if s.get_item(LEGACY_ONBOARDED_KEY).ok().flatten().is_some() {
+                return;
+            }
+        }
+        is_open.set(true);
     });
 
-    // Escape key handler
-    let esc_closure = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-        move |ev: web_sys::KeyboardEvent| {
-            if is_open.get_untracked() && ev.key() == "Escape" {
-                // Don't allow escape to skip onboarding — user must complete it
+    // Debounced live validation.
+    let debounce_handle: RwSignal<Option<i32>> = RwSignal::new(None);
+    Effect::new(move |_| {
+        let value = username.get();
+        // Cancel any pending check.
+        if let Some(h) = debounce_handle.get_untracked() {
+            if let Some(w) = web_sys::window() {
+                w.clear_timeout_with_handle(h);
             }
-        },
-    );
-    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-        let _ = doc.add_event_listener_with_callback(
-            "keydown",
-            esc_closure.as_ref().unchecked_ref(),
-        );
-    }
-    let esc_ref = send_wrapper::SendWrapper::new(esc_closure);
-    on_cleanup(move || drop(esc_ref));
+            debounce_handle.set(None);
+        }
 
-    let on_accept_guidelines = move |_: web_sys::MouseEvent| {
-        guidelines_accepted.set(true);
-        step.set(2);
-    };
+        if value.trim().is_empty() {
+            check_state.set(CheckState::Idle);
+            return;
+        }
+        if !is_valid_format(value.trim()) {
+            check_state.set(CheckState::InvalidFormat);
+            return;
+        }
 
-    let on_save_profile = move |_: web_sys::MouseEvent| {
-        // Publish kind-0 metadata update if display name was entered
-        let name = display_name.get_untracked().trim().to_string();
-        if !name.is_empty() {
-            let auth = use_auth();
-            let relay = expect_context::<crate::relay::RelayConnection>();
-            if let Some(pubkey) = auth.pubkey().get_untracked() {
-                let avatar = avatar_url.get_untracked().trim().to_string();
-                let mut meta = serde_json::json!({
-                    "name": name,
-                    "display_name": name,
-                });
-                if !avatar.is_empty() {
-                    meta["picture"] = serde_json::Value::String(avatar);
+        check_state.set(CheckState::Pending);
+        let seq_now = check_seq.get_untracked().wrapping_add(1);
+        check_seq.set(seq_now);
+
+        let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+            // Schedule the actual fetch.
+            let value = username.get_untracked().trim().to_string();
+            if value.is_empty() {
+                check_state.set(CheckState::Idle);
+                return;
+            }
+            if !is_valid_format(&value) {
+                check_state.set(CheckState::InvalidFormat);
+                return;
+            }
+            spawn_local(async move {
+                match check_username_available(&value).await {
+                    Ok(true) => {
+                        if check_seq.get_untracked() == seq_now {
+                            check_state.set(CheckState::Available);
+                        }
+                    }
+                    Ok(false) => {
+                        if check_seq.get_untracked() == seq_now {
+                            check_state.set(CheckState::Taken);
+                        }
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[onboarding] username check failed: {}", e).into(),
+                        );
+                        if check_seq.get_untracked() == seq_now {
+                            check_state.set(CheckState::Unavailable);
+                        }
+                    }
                 }
-                let now = (js_sys::Date::now() / 1000.0) as u64;
-                let unsigned = nostr_core::UnsignedEvent {
-                    pubkey,
-                    created_at: now,
-                    kind: 0,
-                    tags: vec![],
-                    content: meta.to_string(),
-                };
-                if let Ok(signed) = auth.sign_event(unsigned) {
-                    relay.publish(&signed);
-                }
+            });
+        }) as Box<dyn FnMut()>);
+
+        if let Some(w) = web_sys::window() {
+            if let Ok(h) = w.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                300,
+            ) {
+                debounce_handle.set(Some(h));
             }
         }
-        step.set(3);
+        cb.forget();
+    });
+
+    // Submit handler.
+    let on_submit = move |_: web_sys::MouseEvent| {
+        let name = username.get_untracked().trim().to_string();
+        if !is_valid_format(&name) {
+            submit_error.set(Some(
+                "Please enter a valid username (3-30 chars, a-z, 0-9, _, -, no leading -/_)".into(),
+            ));
+            return;
+        }
+        let pubkey = match auth.pubkey().get_untracked() {
+            Some(pk) => pk,
+            None => {
+                submit_error.set(Some("Not authenticated".into()));
+                return;
+            }
+        };
+        // Sprint v11: route signing through the Signer trait so NIP-07 and
+        // future hardware-bunker backends work alongside PRF/local keys.
+        let signer = match auth.get_signer() {
+            Some(s) => s,
+            None => {
+                submit_error.set(Some("No signer available — please sign in again.".into()));
+                return;
+            }
+        };
+
+        is_submitting.set(true);
+        submit_error.set(None);
+
+        let url = format!("{}/api/username/claim", auth_api_base());
+        let body = serde_json::json!({ "username": name }).to_string();
+        let pubkey_for_meta = pubkey.clone();
+        let name_for_meta = name.clone();
+
+        spawn_local(async move {
+            let result = fetch_with_nip98_post_signer(&url, &body, signer.as_ref()).await;
+
+            match result {
+                Ok(text) => {
+                    // Optimistically treat any 2xx body as success; surface error string only if present.
+                    let parsed: ClaimResponse =
+                        serde_json::from_str(&text).unwrap_or(ClaimResponse {
+                            success: Some(true),
+                            error: None,
+                        });
+                    if let Some(err) = parsed.error.filter(|e| !e.is_empty()) {
+                        submit_error.set(Some(err));
+                        is_submitting.set(false);
+                        return;
+                    }
+
+                    // Persist + update auth state.
+                    mark_claimed_locally(&pubkey_for_meta, &name_for_meta);
+                    clear_skipped(&pubkey_for_meta);
+                    auth.set_profile(Some(name_for_meta.clone()), None);
+
+                    // Publish a kind-0 update with name + nip05 fields so other clients
+                    // see the new identity. Best-effort; failures are logged.
+                    let nip05 = format!("{}@{}", name_for_meta, NIP05_HOST);
+                    let meta = serde_json::json!({
+                        "name": name_for_meta,
+                        "display_name": name_for_meta,
+                        "nip05": nip05,
+                    })
+                    .to_string();
+                    let now = (js_sys::Date::now() / 1000.0) as u64;
+                    let unsigned = nostr_core::UnsignedEvent {
+                        pubkey: pubkey_for_meta.clone(),
+                        created_at: now,
+                        kind: 0,
+                        tags: vec![],
+                        content: meta,
+                    };
+                    // Use async signing so the kind-0 publish works for both
+                    // PRF/local-key and NIP-07 sessions.
+                    if let Ok(signed) = auth.sign_event_async(unsigned).await {
+                        if let Some(relay) = use_context::<crate::relay::RelayConnection>() {
+                            relay.publish(&signed);
+                        }
+                    }
+
+                    is_submitting.set(false);
+                    is_open.set(false);
+                    if let Some(p) = prefill {
+                        p.force_open.set(false);
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    web_sys::console::warn_1(
+                        &format!("[onboarding] username claim failed: {}", msg).into(),
+                    );
+                    // Distinguish "service unavailable" from "already taken" / validation.
+                    let user_msg = if msg.contains("HTTP 409") {
+                        "That username has just been taken. Please pick another.".to_string()
+                    } else if msg.contains("HTTP 400") {
+                        "Invalid username format.".to_string()
+                    } else if msg.contains("HTTP") {
+                        format!("Server rejected the request ({})", msg)
+                    } else {
+                        "Username service is temporarily unavailable. Please try again later."
+                            .to_string()
+                    };
+                    submit_error.set(Some(user_msg));
+                    is_submitting.set(false);
+                }
+            }
+        });
     };
 
-    let on_skip_profile = move |_: web_sys::MouseEvent| {
-        step.set(3);
-    };
-
-    let on_finish = move |_: web_sys::MouseEvent| {
-        mark_onboarded();
+    // Skip / close handlers.
+    let on_skip = move |_: web_sys::MouseEvent| {
+        if let Some(pk) = auth.pubkey().get_untracked() {
+            set_skipped(&pk);
+        }
         is_open.set(false);
+        if let Some(p) = prefill {
+            p.force_open.set(false);
+        }
+    };
+
+    // Allow close from Settings ("Change username" cancel) — but never auto-close
+    // if this is a forced first-login prompt without a nickname.
+    let on_close = move |_: web_sys::MouseEvent| {
+        if let Some(p) = prefill {
+            if p.force_open.get_untracked() {
+                p.force_open.set(false);
+                is_open.set(false);
+                return;
+            }
+        }
+        // For the auto-prompt path, treat the X as "skip for 7 days".
+        if let Some(pk) = auth.pubkey().get_untracked() {
+            set_skipped(&pk);
+        }
+        is_open.set(false);
+    };
+
+    // Status indicator below the input.
+    let status_view = move || {
+        match check_state.get() {
+        CheckState::Idle => view! {
+            <p class="text-xs text-gray-500">"3-30 chars: a-z, 0-9, _ or -"</p>
+        }
+        .into_any(),
+        CheckState::Pending => view! {
+            <p class="text-xs text-gray-400">"Checking availability\u{2026}"</p>
+        }
+        .into_any(),
+        CheckState::Available => view! {
+            <p class="text-xs text-emerald-400">"\u{2713} available"</p>
+        }
+        .into_any(),
+        CheckState::Taken => view! {
+            <p class="text-xs text-red-400">"\u{2717} already taken"</p>
+        }
+        .into_any(),
+        CheckState::InvalidFormat => view! {
+            <p class="text-xs text-red-400">
+                "\u{2717} invalid format \u{2014} 3-30 chars: a-z, 0-9, _ or -, must start with letter or digit"
+            </p>
+        }
+        .into_any(),
+        CheckState::Unavailable => view! {
+            <p class="text-xs text-amber-400">
+                "Username service is temporarily unavailable. You may submit anyway \u{2014} the server will validate."
+            </p>
+        }
+        .into_any(),
+    }
+    };
+
+    let can_submit = move || {
+        !is_submitting.get()
+            && matches!(
+                check_state.get(),
+                CheckState::Available | CheckState::Unavailable
+            )
+            && is_valid_format(username.get().trim())
+    };
+
+    let nip05_preview = move || {
+        let name = username.get();
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{}@{}", trimmed, NIP05_HOST)
+        }
     };
 
     view! {
@@ -120,280 +548,228 @@ pub fn OnboardingModal() -> impl IntoView {
                 class="fixed inset-0 z-[70] flex items-center justify-center p-4"
                 style="animation: fadeIn 0.3s ease-out"
             >
-                // Backdrop (no click-to-dismiss — user must complete onboarding)
                 <div class="absolute inset-0 bg-black/70 backdrop-blur-sm" />
 
-                // Panel
                 <div
                     class="relative bg-gray-900/95 backdrop-blur-xl border border-white/10 rounded-2xl p-6 sm:p-8 max-w-lg w-full shadow-2xl shadow-amber-500/10"
                     style="animation: scaleIn 0.3s ease-out"
-                    on:click=|e| e.stop_propagation()
+                    on:click=|e: web_sys::MouseEvent| e.stop_propagation()
                 >
-                    // Animated gradient border
                     <div class="absolute inset-0 rounded-2xl bg-gradient-to-r from-amber-500/20 via-orange-500/20 to-amber-500/20 -z-10 blur-sm" />
 
-                    // Step indicator
-                    <div class="flex items-center justify-center gap-2 mb-6">
-                        <StepDot active=Signal::derive(move || step.get() >= 1) />
-                        <div class="w-8 h-px bg-gray-700" />
-                        <StepDot active=Signal::derive(move || step.get() >= 2) />
-                        <div class="w-8 h-px bg-gray-700" />
-                        <StepDot active=Signal::derive(move || step.get() >= 3) />
+                    // Close button (top-right)
+                    <button
+                        on:click=on_close
+                        class="absolute top-3 right-3 text-gray-500 hover:text-white transition-colors p-1 rounded"
+                        aria-label="Close"
+                    >
+                        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18" stroke-linecap="round"/>
+                            <line x1="6" y1="6" x2="18" y2="18" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+
+                    <div class="text-center mb-5">
+                        <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/20 mb-3">
+                            {handle_icon()}
+                        </div>
+                        <h2 class="text-2xl font-bold bg-gradient-to-r from-amber-400 via-orange-400 to-rose-400 bg-clip-text text-transparent">
+                            "Pick your username"
+                        </h2>
+                        <p class="text-gray-400 text-sm mt-2">
+                            "Choose a unique handle so others can mention and find you. You can change it later in settings."
+                        </p>
                     </div>
 
-                    // Step 1: Community Guidelines
-                    <Show when=move || step.get() == 1>
-                        <div class="space-y-4">
-                            <div class="text-center">
-                                <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/20 mb-3">
-                                    {welcome_icon()}
-                                </div>
-                                <h2 class="text-2xl font-bold bg-gradient-to-r from-amber-400 via-orange-400 to-rose-400 bg-clip-text text-transparent">
-                                    "Welcome to the Nostr BBS Community"
-                                </h2>
+                    <div class="space-y-3">
+                        <div class="space-y-1">
+                            <label for="onboard-username" class="block text-sm font-medium text-gray-300">
+                                "Username"
+                            </label>
+                            <div class="flex items-center bg-gray-800 border border-gray-600 focus-within:border-amber-500 focus-within:ring-1 focus-within:ring-amber-500 rounded-xl overflow-hidden">
+                                <span class="pl-3 text-gray-500 select-none">"@"</span>
+                                <input
+                                    id="onboard-username"
+                                    type="text"
+                                    placeholder="alice"
+                                    autocomplete="off"
+                                    spellcheck="false"
+                                    on:input=move |ev| {
+                                        let v = event_target_value(&ev).to_lowercase();
+                                        username.set(v);
+                                    }
+                                    prop:value=move || username.get()
+                                    maxlength="30"
+                                    class="flex-1 bg-transparent text-white placeholder-gray-500 px-2 py-3 text-sm focus:outline-none"
+                                />
                             </div>
-
-                            <div class="bg-gray-800/50 border border-gray-700/30 rounded-xl p-4 space-y-3 text-sm text-gray-300 leading-relaxed max-h-48 overflow-y-auto">
-                                <p class="font-medium text-white">"Community Guidelines"</p>
-                                <ul class="space-y-2 list-none">
-                                    <li class="flex gap-2">
-                                        <span class="text-amber-400 flex-shrink-0">"1."</span>
-                                        <span>"Be respectful and constructive in all interactions. We are a professional learning community."</span>
-                                    </li>
-                                    <li class="flex gap-2">
-                                        <span class="text-amber-400 flex-shrink-0">"2."</span>
-                                        <span>"Keep discussions on topic within each channel. Use the appropriate zone for your content."</span>
-                                    </li>
-                                    <li class="flex gap-2">
-                                        <span class="text-amber-400 flex-shrink-0">"3."</span>
-                                        <span>"Do not share private keys, credentials, or sensitive information in public channels."</span>
-                                    </li>
-                                    <li class="flex gap-2">
-                                        <span class="text-amber-400 flex-shrink-0">"4."</span>
-                                        <span>"Report inappropriate content using the report button. Do not engage with trolls or spam."</span>
-                                    </li>
-                                    <li class="flex gap-2">
-                                        <span class="text-amber-400 flex-shrink-0">"5."</span>
-                                        <span>"Your identity is Nostr-native and sovereign. You own your data and can export it at any time."</span>
-                                    </li>
-                                </ul>
-                            </div>
-
-                            <button
-                                on:click=on_accept_guidelines
-                                class="w-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-gray-900 font-semibold py-3 rounded-xl transition-all duration-200 shadow-lg shadow-amber-500/25"
-                            >
-                                "I Agree \u{2014} Continue"
-                            </button>
+                            {status_view}
                         </div>
-                    </Show>
 
-                    // Step 2: Profile Setup
-                    <Show when=move || step.get() == 2>
-                        <div class="space-y-4">
-                            <div class="text-center">
-                                <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-blue-500/10 border border-blue-500/20 mb-3">
-                                    {profile_icon()}
-                                </div>
-                                <h2 class="text-2xl font-bold text-white">"Set Up Your Profile"</h2>
-                                <p class="text-gray-400 text-sm mt-1">"Help others recognise you in the community"</p>
-                            </div>
-
-                            <div class="space-y-3">
-                                <div class="space-y-2">
-                                    <label for="onboard-name" class="block text-sm font-medium text-gray-300">
-                                        "Display Name"
-                                    </label>
-                                    <input
-                                        id="onboard-name"
-                                        type="text"
-                                        placeholder="How should we call you?"
-                                        on:input=move |ev| display_name.set(event_target_value(&ev))
-                                        prop:value=move || display_name.get()
-                                        maxlength="50"
-                                        class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-xl px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500 text-sm"
-                                    />
-                                </div>
-
-                                <div class="space-y-2">
-                                    <label for="onboard-avatar" class="block text-sm font-medium text-gray-300">
-                                        "Avatar URL "
-                                        <span class="text-gray-500 font-normal">"(optional)"</span>
-                                    </label>
-                                    <input
-                                        id="onboard-avatar"
-                                        type="url"
-                                        placeholder="https://example.com/avatar.jpg"
-                                        on:input=move |ev| avatar_url.set(event_target_value(&ev))
-                                        prop:value=move || avatar_url.get()
-                                        class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-xl px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500 text-sm"
-                                    />
-                                    <p class="text-xs text-gray-500">"You can change this later in settings."</p>
-                                </div>
-                            </div>
-
-                            <div class="flex gap-3">
-                                <button
-                                    on:click=on_skip_profile
-                                    class="flex-1 border border-gray-600 hover:border-gray-500 text-gray-300 py-3 rounded-xl transition-colors text-sm font-medium"
-                                >
-                                    "Skip for now"
-                                </button>
-                                <button
-                                    on:click=on_save_profile
-                                    class="flex-1 bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold py-3 rounded-xl transition-colors text-sm"
-                                >
-                                    "Save & Continue"
-                                </button>
-                            </div>
+                        <div class="bg-gray-800/40 rounded-lg px-3 py-2 text-xs text-gray-400 border border-gray-700/40">
+                            "NIP-05 handle: "
+                            <code class="text-amber-300 font-mono">
+                                {move || nip05_preview()}
+                            </code>
                         </div>
-                    </Show>
 
-                    // Step 3: Explore Channels
-                    <Show when=move || step.get() == 3>
-                        <div class="space-y-4">
-                            <div class="text-center">
-                                <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/20 mb-3">
-                                    {explore_icon()}
-                                </div>
-                                <h2 class="text-2xl font-bold text-white">"Explore"</h2>
-                                <p class="text-gray-400 text-sm mt-1">"Here are some places to get started"</p>
+                        {move || submit_error.get().map(|err| view! {
+                            <div class="bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-xs text-red-300">
+                                {err}
                             </div>
+                        })}
+                    </div>
 
-                            <div class="space-y-2">
-                                <ChannelLink
-                                    name="Lobby"
-                                    description="General discussion and introductions. Say hello!"
-                                    href=base_href("/chat")
-                                    accent="amber"
-                                />
-                                <ChannelLink
-                                    name="Forums"
-                                    description="Browse all zones and categories"
-                                    href=base_href("/forums")
-                                    accent="blue"
-                                />
-                                <ChannelLink
-                                    name="Events"
-                                    description="Upcoming workshops, meetups, and community events"
-                                    href=base_href("/events")
-                                    accent="purple"
-                                />
-                                <ChannelLink
-                                    name="Direct Messages"
-                                    description="Private encrypted conversations"
-                                    href=base_href("/dm")
-                                    accent="green"
-                                />
-                            </div>
-
-                            <button
-                                on:click=on_finish
-                                class="w-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-gray-900 font-semibold py-3 rounded-xl transition-all duration-200 shadow-lg shadow-amber-500/25"
-                            >
-                                "Get Started"
-                            </button>
-                        </div>
-                    </Show>
+                    <div class="flex gap-3 mt-5">
+                        <button
+                            on:click=on_skip
+                            disabled=move || is_submitting.get()
+                            class="flex-1 border border-gray-600 hover:border-gray-500 text-gray-300 py-3 rounded-xl transition-colors text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            "I\u{2019}ll choose later"
+                        </button>
+                        <button
+                            on:click=on_submit
+                            disabled=move || !can_submit()
+                            class="flex-1 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 disabled:from-gray-600 disabled:to-gray-700 disabled:cursor-not-allowed text-gray-900 font-semibold py-3 rounded-xl transition-all duration-200 shadow-lg shadow-amber-500/25 text-sm"
+                        >
+                            {move || if is_submitting.get() { "Claiming\u{2026}" } else { "Claim username" }}
+                        </button>
+                    </div>
                 </div>
             </div>
         </Show>
     }
 }
 
-// -- Sub-components -----------------------------------------------------------
+/// Public helper used by the Settings "Release username" button.
+///
+/// Sends a NIP-98 authed `POST /api/username/release` with no body. On
+/// success the local claim flag is cleared and the auth-state nickname is
+/// reset to `None`. Errors are surfaced via the `Result`.
+pub async fn release_username() -> Result<(), String> {
+    let auth = use_auth();
+    let pubkey = auth
+        .pubkey()
+        .get_untracked()
+        .ok_or_else(|| "Not authenticated".to_string())?;
+    // Sprint v11: route through the Signer trait so NIP-07 / hardware-bunker
+    // backends can release usernames. PRF-derived keys still work transparently
+    // because PrfSigner is the active signer for those sessions.
+    let signer = auth
+        .get_signer()
+        .ok_or_else(|| "No signer available — please sign in again.".to_string())?;
 
-/// Step indicator dot.
-#[component]
-fn StepDot(active: Signal<bool>) -> impl IntoView {
-    view! {
-        <div class=move || if active.get() {
-            "w-3 h-3 rounded-full bg-amber-400 transition-colors duration-300"
-        } else {
-            "w-3 h-3 rounded-full bg-gray-700 transition-colors duration-300"
-        } />
+    let url = format!("{}/api/username/release", auth_api_base());
+    let body = "{}".to_string();
+    let result = fetch_with_nip98_post_signer(&url, &body, signer.as_ref()).await;
+    match result {
+        Ok(_) => {
+            clear_claimed_locally(&pubkey);
+            auth.set_profile(None, None);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("HTTP") {
+                Err(format!("Server rejected the request ({})", msg))
+            } else {
+                Err(
+                    "Username service is temporarily unavailable. Please try again later."
+                        .to_string(),
+                )
+            }
+        }
     }
 }
 
-/// Channel exploration link card.
-#[component]
-fn ChannelLink(
-    name: &'static str,
-    description: &'static str,
-    href: String,
-    accent: &'static str,
-) -> impl IntoView {
-    let border_class = match accent {
-        "amber" => "hover:border-amber-500/30",
-        "blue" => "hover:border-blue-500/30",
-        "purple" => "hover:border-purple-500/30",
-        "green" => "hover:border-green-500/30",
-        _ => "hover:border-gray-500/30",
-    };
-    let icon_class = match accent {
-        "amber" => "text-amber-400",
-        "blue" => "text-blue-400",
-        "purple" => "text-purple-400",
-        "green" => "text-green-400",
-        _ => "text-gray-400",
-    };
-    let cls = format!(
-        "block bg-gray-800/50 border border-gray-700/30 rounded-xl p-3 transition-all duration-200 {} hover:bg-gray-800/80",
-        border_class
-    );
+// -- Icons --------------------------------------------------------------------
 
-    view! {
-        <a href=href class=cls>
-            <div class="flex items-center gap-3">
-                <div class=format!("flex-shrink-0 {}", icon_class)>
-                    {channel_icon()}
-                </div>
-                <div>
-                    <div class="text-sm font-medium text-white">{name}</div>
-                    <div class="text-xs text-gray-500">{description}</div>
-                </div>
-                <svg class="w-4 h-4 text-gray-600 ml-auto flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="9 18 15 12 9 6" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-            </div>
-        </a>
-    }
-}
-
-// -- SVG icons ----------------------------------------------------------------
-
-fn welcome_icon() -> impl IntoView {
+fn handle_icon() -> impl IntoView {
     view! {
         <svg class="w-6 h-6 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z"
+            <circle cx="12" cy="12" r="9" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M16 9a4 4 0 11-4-4M16 9v3a2 2 0 002 2"
                 stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
     }
 }
 
-fn profile_icon() -> impl IntoView {
-    view! {
-        <svg class="w-6 h-6 text-blue-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z"
-                stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-    }
-}
+// -- Tests --------------------------------------------------------------------
 
-fn explore_icon() -> impl IntoView {
-    view! {
-        <svg class="w-6 h-6 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418"
-                stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn channel_icon() -> impl IntoView {
-    view! {
-        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M5.25 8.25h15m-16.5 7.5h15m-1.8-13.5l-3.9 19.5m-2.1-19.5l-3.9 19.5"
-                stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
+    #[test]
+    fn valid_format_basic() {
+        assert!(is_valid_format("alice"));
+        assert!(is_valid_format("alice_99"));
+        assert!(is_valid_format("a-b-c"));
+        assert!(is_valid_format("0xb33f"));
+        assert!(is_valid_format("abc")); // min length 3
+        assert!(is_valid_format(&"a".repeat(30))); // max length 30
+    }
+
+    #[test]
+    fn invalid_format_too_short_or_long() {
+        assert!(!is_valid_format(""));
+        assert!(!is_valid_format("ab"));
+        assert!(!is_valid_format(&"a".repeat(31)));
+    }
+
+    #[test]
+    fn invalid_format_uppercase() {
+        assert!(!is_valid_format("Alice"));
+        assert!(!is_valid_format("ALICE"));
+    }
+
+    #[test]
+    fn invalid_format_leading_special() {
+        assert!(!is_valid_format("-alice"));
+        assert!(!is_valid_format("_alice"));
+    }
+
+    #[test]
+    fn invalid_format_disallowed_chars() {
+        assert!(!is_valid_format("alice!"));
+        assert!(!is_valid_format("alice.bob"));
+        assert!(!is_valid_format("alice bob"));
+        assert!(!is_valid_format("alice@bob"));
+    }
+
+    #[test]
+    fn url_encode_passthrough() {
+        assert_eq!(urlencoding_encode("alice"), "alice");
+        assert_eq!(urlencoding_encode("a_b-c.d"), "a_b-c.d");
+    }
+
+    #[test]
+    fn url_encode_special() {
+        assert_eq!(urlencoding_encode("a b"), "a%20b");
+        assert_eq!(urlencoding_encode("a+b"), "a%2Bb");
+        assert_eq!(urlencoding_encode("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn pubkey8_truncates() {
+        assert_eq!(pubkey8("0123456789abcdef"), "01234567");
+        assert_eq!(pubkey8("abc"), "abc");
+    }
+
+    #[test]
+    fn claimed_key_format() {
+        assert_eq!(
+            claimed_key("0123456789abcdef"),
+            "nostr_bbs_username_claimed_01234567"
+        );
+    }
+
+    #[test]
+    fn skipped_key_format() {
+        assert_eq!(
+            skipped_key("0123456789abcdef"),
+            "nostr_bbs_username_skipped_until_01234567"
+        );
     }
 }

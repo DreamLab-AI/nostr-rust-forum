@@ -189,9 +189,7 @@ pub fn EventsPage() -> impl IntoView {
                     "past" => e.end_time < now,
                     "rsvps" => {
                         let r = rsvps.get();
-                        r.get(&e.id)
-                            .map(|d| d.my_status.is_some())
-                            .unwrap_or(false)
+                        r.get(&e.id).map(|d| d.my_status.is_some()).unwrap_or(false)
                     }
                     _ => true,
                 };
@@ -494,7 +492,9 @@ fn format_birthday_date(month: u32, day: u32) -> String {
     let months = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let m = months.get((month.saturating_sub(1)) as usize).unwrap_or(&"???");
+    let m = months
+        .get((month.saturating_sub(1)) as usize)
+        .unwrap_or(&"???");
     format!("{} {}", m, day)
 }
 
@@ -537,7 +537,8 @@ fn BirthdayList() -> impl IntoView {
             }
             // Parse metadata JSON to extract name + birthday
             if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&event.content) {
-                let birthday_str = meta.get("birthday")
+                let birthday_str = meta
+                    .get("birthday")
                     .or_else(|| meta.get("bday"))
                     .and_then(|v| v.as_str());
 
@@ -546,16 +547,23 @@ fn BirthdayList() -> impl IntoView {
                     let parts: Vec<&str> = bday.split('-').collect();
                     let (month, day) = if parts.len() == 3 {
                         // YYYY-MM-DD
-                        (parts[1].parse::<u32>().unwrap_or(0), parts[2].parse::<u32>().unwrap_or(0))
+                        (
+                            parts[1].parse::<u32>().unwrap_or(0),
+                            parts[2].parse::<u32>().unwrap_or(0),
+                        )
                     } else if parts.len() == 2 {
                         // MM-DD
-                        (parts[0].parse::<u32>().unwrap_or(0), parts[1].parse::<u32>().unwrap_or(0))
+                        (
+                            parts[0].parse::<u32>().unwrap_or(0),
+                            parts[1].parse::<u32>().unwrap_or(0),
+                        )
                     } else {
                         (0, 0)
                     };
 
                     if month >= 1 && month <= 12 && day >= 1 && day <= 31 {
-                        let name = meta.get("display_name")
+                        let name = meta
+                            .get("display_name")
                             .or_else(|| meta.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
@@ -691,8 +699,7 @@ fn parse_calendar_event(event: &NostrEvent) -> CalendarEvent {
         .unwrap_or(start + 3600);
 
     // Try parsing content as JSON for name/description/location fallback
-    let content_json: Option<serde_json::Value> =
-        serde_json::from_str(&event.content).ok();
+    let content_json: Option<serde_json::Value> = serde_json::from_str(&event.content).ok();
 
     let json_str = |field: &str| -> Option<String> {
         content_json

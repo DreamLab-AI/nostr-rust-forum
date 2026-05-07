@@ -9,8 +9,8 @@ use std::rc::Rc;
 
 use super::use_admin;
 use crate::auth::use_auth;
-use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::components::user_display::use_display_name;
+use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::utils::{format_relative_time, search_client};
 
 /// A single recent activity entry.

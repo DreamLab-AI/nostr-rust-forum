@@ -12,6 +12,7 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use nostr_core::gift_wrap::{gift_wrap, unwrap_gift};
 use nostr_core::{nip44_decrypt, NostrEvent};
+use zeroize::Zeroize as _;
 
 use crate::components::user_display::use_display_name;
 use crate::relay::{Filter, RelayConnection};
@@ -288,6 +289,8 @@ impl DMStore {
     ///
     /// The privkey bytes are passed directly to `gift_wrap()` which creates the
     /// Seal signature internally. No separate `auth.sign_event()` call is needed.
+    ///
+    /// Also publishes kind-10050 (preferred DM relay) on first send if not already done.
     pub fn send_message(
         &self,
         relay: &RelayConnection,
@@ -308,6 +311,9 @@ impl DMStore {
         {
             return Err("Invalid recipient pubkey hex".into());
         }
+
+        // Publish kind-10050 (preferred DM relay) once per pubkey per session.
+        ensure_dm_relay_published(relay, privkey_bytes, my_pubkey);
 
         let wrapped = gift_wrap(privkey_bytes, my_pubkey, recipient_pk_hex, content)
             .map_err(|e| format!("Gift wrap failed: {e}"))?;
@@ -551,6 +557,83 @@ fn truncate_message(content: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = t.chars().take(max_chars).collect();
         format!("{truncated}...")
+    }
+}
+
+// -- kind-10050 auto-publish --------------------------------------------------
+
+/// localStorage key tracking whether kind-10050 has been published for a pubkey.
+const KIND_10050_KEY_PREFIX: &str = "nostr_bbs_dm_relay_published_";
+
+/// Publish kind-10050 (preferred DM relay) once per pubkey.
+///
+/// Uses localStorage to avoid publishing on every DM send. The event is signed
+/// with the provided privkey bytes and published to the relay synchronously
+/// (fire-and-forget — failures are logged but don't block the DM send).
+fn ensure_dm_relay_published(relay: &RelayConnection, privkey_bytes: &[u8; 32], my_pubkey: &str) {
+    let storage_key = format!(
+        "{}{}",
+        KIND_10050_KEY_PREFIX,
+        &my_pubkey[..8.min(my_pubkey.len())]
+    );
+
+    // Check localStorage flag first to avoid re-publishing
+    let already_published = web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item(&storage_key).ok())
+        .flatten()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if already_published {
+        return;
+    }
+
+    let relay_url = crate::utils::relay_url::relay_url();
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(privkey_bytes);
+
+    let signing_key = match k256::schnorr::SigningKey::from_bytes(&key_bytes) {
+        Ok(sk) => sk,
+        Err(e) => {
+            web_sys::console::warn_1(&format!("[DM] kind-10050: invalid signing key: {e}").into());
+            return;
+        }
+    };
+    key_bytes.zeroize();
+
+    let unsigned = nostr_core::UnsignedEvent {
+        pubkey: my_pubkey.to_string(),
+        created_at: now,
+        kind: 10050,
+        tags: vec![vec!["r".to_string(), relay_url]],
+        content: String::new(),
+    };
+
+    match nostr_core::sign_event(unsigned, &signing_key) {
+        Ok(signed) => {
+            relay.publish(&signed);
+            // Mark as published in localStorage
+            if let Some(storage) = web_sys::window()
+                .and_then(|w| w.local_storage().ok())
+                .flatten()
+            {
+                let _ = storage.set_item(&storage_key, "1");
+            }
+            web_sys::console::log_1(
+                &format!(
+                    "[DM] Published kind-10050 DM relay for: {}",
+                    &my_pubkey[..8.min(my_pubkey.len())]
+                )
+                .into(),
+            );
+        }
+        Err(e) => {
+            web_sys::console::warn_1(&format!("[DM] Failed to publish kind-10050: {e}").into());
+        }
     }
 }
 

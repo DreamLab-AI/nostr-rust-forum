@@ -13,6 +13,12 @@ use zeroize::Zeroize;
 use super::{AccountStatus, AuthPhase, AuthState, AuthStore, STORAGE_KEY};
 
 /// sessionStorage key for local-key privkey (survives same-tab nav, cleared on tab close).
+///
+/// **DEPRECATED PATH** (audit C2/B8): persisting a Schnorr private key in
+/// `sessionStorage` is acceptable only as a transitional bridge for the
+/// "local-key" import flow (NIP-19 `nsec` paste). Passkey users never hit
+/// this code path — their key is re-derived from the authenticator on
+/// every authenticate. New code MUST NOT route through `save_privkey_session`.
 const SESSION_PRIVKEY_KEY: &str = "nostr_bbs_sk";
 
 // -- Persisted session data ---------------------------------------------------
@@ -80,9 +86,24 @@ impl PrivkeyMem {
 
 // -- sessionStorage privkey helpers -------------------------------------------
 
-/// Store privkey hex in sessionStorage (survives SPA navigation + refresh, cleared on tab close).
+/// Store privkey hex in sessionStorage (survives SPA navigation + refresh,
+/// cleared on tab close).
+///
+/// **DEPRECATED.** See `SESSION_PRIVKEY_KEY` doc comment for the migration
+/// note. This function logs a console warning at runtime so accidental new
+/// callers are visible in dev tools. Passkey-derived keys MUST NOT be
+/// persisted via this path; they re-derive from PRF on every login.
 pub(super) fn save_privkey_session(hex: &str) {
-    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok()).flatten() {
+    web_sys::console::warn_1(
+        &"[auth/session] save_privkey_session is DEPRECATED — \
+         storing privkey in sessionStorage is a transitional path for \
+         imported nsec only. Passkey users must re-derive on login."
+            .into(),
+    );
+    if let Some(storage) = web_sys::window()
+        .and_then(|w| w.session_storage().ok())
+        .flatten()
+    {
         let _ = storage.set_item(SESSION_PRIVKEY_KEY, hex);
     }
 }
@@ -98,7 +119,10 @@ pub(super) fn read_privkey_session() -> Option<String> {
 
 /// Clear privkey from sessionStorage.
 pub(super) fn clear_privkey_session() {
-    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok()).flatten() {
+    if let Some(storage) = web_sys::window()
+        .and_then(|w| w.session_storage().ok())
+        .flatten()
+    {
         let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
     }
 }
@@ -196,7 +220,11 @@ impl AuthStore {
             if let Some(ref pubkey) = stored.public_key {
                 let has_ext = super::nip07::has_nip07_extension();
                 self.state.set(AuthState {
-                    state: if has_ext { AuthPhase::Authenticated } else { AuthPhase::Unauthenticated },
+                    state: if has_ext {
+                        AuthPhase::Authenticated
+                    } else {
+                        AuthPhase::Unauthenticated
+                    },
                     pubkey: Some(pubkey.clone()),
                     is_authenticated: has_ext,
                     public_key: Some(pubkey.clone()),
@@ -219,8 +247,20 @@ impl AuthStore {
         if stored.is_local_key {
             if let Some(ref pubkey) = stored.public_key {
                 // Try to restore privkey from sessionStorage (survives refresh).
-                if let Some(hex) = read_privkey_session() {
-                    if let Ok(bytes) = hex::decode(&hex) {
+                // The hex string is zeroized in-place after decoding so it
+                // does not linger on the JS heap longer than necessary
+                // (audit B8 hardening).
+                if let Some(mut hex) = read_privkey_session() {
+                    let decoded = hex::decode(&hex);
+                    // Overwrite the hex string buffer; Rust's String does
+                    // not expose direct zeroize but writing ASCII zeros
+                    // before drop reduces residual exposure.
+                    unsafe {
+                        for b in hex.as_bytes_mut() {
+                            *b = 0;
+                        }
+                    }
+                    if let Ok(bytes) = decoded {
                         if bytes.len() == 32 {
                             self.privkey.set_value(Some(bytes));
                             self.state.set(AuthState {
@@ -296,6 +336,10 @@ pub(super) fn register_pagehide_listener(store: AuthStore) {
                 }
                 *opt = None;
             });
+            // Audit B8: also flush the deprecated sessionStorage key so a
+            // stale copy cannot survive the unload event for a brief
+            // window before the browser tears the storage area down.
+            clear_privkey_session();
             // AuthState no longer carries private_key — privkey bytes
             // are already zeroed in the StoredValue above.
         },

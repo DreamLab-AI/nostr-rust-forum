@@ -313,7 +313,10 @@ fn delete_event(entry: CalendarEventEntry, events: RwSignal<Vec<CalendarEventEnt
         kind: 5,
         tags: vec![
             vec!["e".to_string(), entry.id.clone()],
-            vec!["a".to_string(), format!("31923:{}:{}", entry.host_pubkey, entry.d_tag)],
+            vec![
+                "a".to_string(),
+                format!("31923:{}:{}", entry.host_pubkey, entry.d_tag),
+            ],
         ],
         content: "Deleted calendar event".to_string(),
     };
@@ -325,10 +328,7 @@ fn delete_event(entry: CalendarEventEntry, events: RwSignal<Vec<CalendarEventEnt
             Ok(signed) => {
                 relay.publish(&signed);
                 events.update(|list| list.retain(|e| e.d_tag != entry_d_tag));
-                toasts.show(
-                    format!("Deleted: {}", entry_title),
-                    ToastVariant::Success,
-                );
+                toasts.show(format!("Deleted: {}", entry_title), ToastVariant::Success);
             }
             Err(e) => {
                 toasts.show(format!("Failed to delete: {}", e), ToastVariant::Error);
@@ -352,9 +352,7 @@ fn parse_calendar_event(event: &NostrEvent) -> CalendarEventEntry {
         d_tag: tag("d").unwrap_or_default(),
         title: tag("title").unwrap_or_else(|| "Untitled".into()),
         description: event.content.clone(),
-        start_time: tag("start")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
+        start_time: tag("start").and_then(|s| s.parse().ok()).unwrap_or(0),
         end_time: tag("end").and_then(|s| s.parse().ok()),
         location: tag("location").unwrap_or_default(),
         max_attendees: tag("max_attendees").and_then(|s| s.parse().ok()),

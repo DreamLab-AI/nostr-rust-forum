@@ -33,9 +33,12 @@ pub fn use_announcer() -> AnnouncerSignal {
 pub fn announce(ann: AnnouncerSignal, message: &str) {
     ann.0.set(String::new());
     let msg = message.to_string();
-    crate::utils::set_timeout_once(move || {
-        ann.0.set(msg);
-    }, 50);
+    crate::utils::set_timeout_once(
+        move || {
+            ann.0.set(msg);
+        },
+        50,
+    );
 }
 
 /// Invisible live region that relays announcements to screen readers.

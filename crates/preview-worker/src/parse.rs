@@ -44,10 +44,8 @@ pub(crate) fn og_regexes() -> &'static OgRegexes {
             r#"(?i)<meta\s+content=["']([^"']+)["']\s+property=["']og:description["']"#,
         )
         .unwrap(),
-        meta_desc: Regex::new(
-            r#"(?i)<meta\s+name=["']description["']\s+content=["']([^"']+)["']"#,
-        )
-        .unwrap(),
+        meta_desc: Regex::new(r#"(?i)<meta\s+name=["']description["']\s+content=["']([^"']+)["']"#)
+            .unwrap(),
         og_image_1: Regex::new(
             r#"(?i)<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']"#,
         )
@@ -203,25 +201,29 @@ fn parse_open_graph_tags(html: &str, target_url: &str) -> OgPreview {
 // ── Fetch helper ─────────────────────────────────────────────────────────────
 
 pub(crate) async fn fetch_open_graph_data(target_url: &str) -> Result<OgCachePayload> {
+    use crate::ssrf::{read_text_capped, ssrf_fetch_with_redirects, SsrfFetchError};
+
     let headers = Headers::new();
     let _ = headers.set("Accept", "text/html,application/xhtml+xml");
     let _ = headers.set("User-Agent", "LinkPreviewAPI/1.0 (Link Preview Bot)");
 
-    let mut init = RequestInit::new();
-    init.with_method(Method::Get);
-    init.with_headers(headers);
+    // Manual-redirect fetch with SSRF re-validation on every hop and a hard
+    // redirect cap. Auto-redirect mode would silently chase a 3xx into a
+    // private/metadata host even though the initial URL passed the policy.
+    let response = ssrf_fetch_with_redirects(target_url, &headers)
+        .await
+        .map_err(|e: SsrfFetchError| Error::RustError(e.to_string()))?;
 
-    let request = Request::new_with_init(target_url, &init)?;
-    let mut response = Fetch::Request(request).send().await?;
-
-    if response.status_code() != 200 {
-        return Err(Error::RustError(format!(
-            "Failed to fetch: {}",
-            response.status_code()
-        )));
+    let status = response.status_code();
+    if status != 200 {
+        return Err(Error::RustError(format!("Failed to fetch: {status}")));
     }
 
-    let html = response.text().await?;
+    // Cap response body so a hostile origin cannot exhaust the worker's
+    // memory budget by streaming gigabytes of HTML.
+    let html = read_text_capped(response)
+        .await
+        .map_err(|e: SsrfFetchError| Error::RustError(e.to_string()))?;
     let preview = parse_open_graph_tags(&html, target_url);
 
     Ok(OgCachePayload {

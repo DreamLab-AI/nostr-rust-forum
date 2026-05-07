@@ -19,7 +19,7 @@ use web_sys::{
     IdbTransactionMode,
 };
 
-const DB_NAME: &str = "nostr-bbs-forum";
+const DB_NAME: &str = "members-forum";
 const DB_VERSION: u32 = 1;
 
 const STORE_MESSAGES: &str = "messages";
@@ -108,7 +108,9 @@ async fn open_db_request(
             return;
         };
         let Ok(result) = open_req.result() else {
-            web_sys::console::warn_1(&"IndexedDB upgrade: could not get result from request".into());
+            web_sys::console::warn_1(
+                &"IndexedDB upgrade: could not get result from request".into(),
+            );
             return;
         };
         let Ok(db) = result.dyn_into::<IdbDatabase>() else {
@@ -121,7 +123,9 @@ async fn open_db_request(
     upgrade_closure.forget();
 
     let result = idb_request_result(request.as_ref()).await?;
-    result.dyn_into::<IdbDatabase>().map_err(|_| JsValue::from_str("open() did not return IdbDatabase"))
+    result
+        .dyn_into::<IdbDatabase>()
+        .map_err(|_| JsValue::from_str("open() did not return IdbDatabase"))
 }
 
 fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
@@ -143,7 +147,7 @@ pub struct ForumDb {
 }
 
 impl ForumDb {
-    /// Open (or create) the `nostr-bbs-forum` IndexedDB database.
+    /// Open (or create) the `members-forum` IndexedDB database.
     pub async fn open() -> Result<Self, JsValue> {
         let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
         let idb_factory = window
@@ -258,10 +262,9 @@ impl ForumDb {
 
     /// Insert or update a cached message.
     pub async fn put_message(&self, msg: &CachedMessage) -> Result<(), JsValue> {
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_MESSAGES,
-            IdbTransactionMode::Readwrite,
-        )?;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_MESSAGES, IdbTransactionMode::Readwrite)?;
         let store = tx.object_store(STORE_MESSAGES)?;
         let js_val = to_js(msg)?;
         let req = store.put(&js_val)?;
@@ -276,10 +279,9 @@ impl ForumDb {
         channel_id: &str,
         limit: u32,
     ) -> Result<Vec<CachedMessage>, JsValue> {
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_MESSAGES,
-            IdbTransactionMode::Readonly,
-        )?;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_MESSAGES, IdbTransactionMode::Readonly)?;
         let store = tx.object_store(STORE_MESSAGES)?;
         let index = store.index("channel_created")?;
 
@@ -309,10 +311,9 @@ impl ForumDb {
 
     /// Insert or update a cached profile.
     pub async fn put_profile(&self, profile: &CachedProfile) -> Result<(), JsValue> {
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_PROFILES,
-            IdbTransactionMode::Readwrite,
-        )?;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_PROFILES, IdbTransactionMode::Readwrite)?;
         let store = tx.object_store(STORE_PROFILES)?;
         let js_val = to_js(profile)?;
         let req = store.put(&js_val)?;
@@ -322,10 +323,9 @@ impl ForumDb {
 
     /// Retrieve a cached profile by pubkey.
     pub async fn get_profile(&self, pubkey: &str) -> Result<Option<CachedProfile>, JsValue> {
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_PROFILES,
-            IdbTransactionMode::Readonly,
-        )?;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_PROFILES, IdbTransactionMode::Readonly)?;
         let store = tx.object_store(STORE_PROFILES)?;
         let req = store.get(&JsValue::from_str(pubkey))?;
         let result = idb_request_result(&req).await?;
@@ -335,14 +335,51 @@ impl ForumDb {
         Ok(Some(from_js::<CachedProfile>(result)?))
     }
 
+    /// Retrieve all cached profiles. Used to warm-start the in-memory profile
+    /// cache on app boot so nicknames render synchronously without waiting
+    /// for the network.
+    pub async fn get_all_profiles(&self) -> Result<Vec<CachedProfile>, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_PROFILES, IdbTransactionMode::Readonly)?;
+        let store = tx.object_store(STORE_PROFILES)?;
+        let req = store.get_all()?;
+        let result = idb_request_result(&req).await?;
+        let arr: js_sys::Array = result.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
+        let mut profiles: Vec<CachedProfile> = Vec::with_capacity(arr.length() as usize);
+        for i in 0..arr.length() {
+            if let Ok(p) = from_js::<CachedProfile>(arr.get(i)) {
+                profiles.push(p);
+            }
+        }
+        Ok(profiles)
+    }
+
+    /// Bulk-insert cached profiles in a single transaction. Used when
+    /// hydrating the profile cache from a batch fetch response.
+    pub async fn put_profiles(&self, profiles: &[CachedProfile]) -> Result<(), JsValue> {
+        if profiles.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_PROFILES, IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store(STORE_PROFILES)?;
+        for profile in profiles {
+            let js_val = to_js(profile)?;
+            let req = store.put(&js_val)?;
+            idb_request_result(&req).await?;
+        }
+        Ok(())
+    }
+
     // -- Outbox (offline queue) ---------------------------------------------
 
     /// Queue an outgoing event for later publishing when connectivity returns.
     pub async fn queue_outgoing(&self, event: &serde_json::Value) -> Result<(), JsValue> {
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_OUTBOX,
-            IdbTransactionMode::Readwrite,
-        )?;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_OUTBOX, IdbTransactionMode::Readwrite)?;
         let store = tx.object_store(STORE_OUTBOX)?;
 
         // Wrap with a created_at for indexing
@@ -359,10 +396,9 @@ impl ForumDb {
     /// Drain all queued outgoing events, removing them from the store.
     /// Returns the events in insertion order.
     pub async fn drain_outbox(&self) -> Result<Vec<serde_json::Value>, JsValue> {
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_OUTBOX,
-            IdbTransactionMode::Readwrite,
-        )?;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_OUTBOX, IdbTransactionMode::Readwrite)?;
         let store = tx.object_store(STORE_OUTBOX)?;
 
         // Read all
@@ -389,15 +425,10 @@ impl ForumDb {
     // -- Deletions ----------------------------------------------------------
 
     /// Record a deletion event (event_id that was deleted, target_id it deletes).
-    pub async fn put_deletion(
-        &self,
-        event_id: &str,
-        target_id: &str,
-    ) -> Result<(), JsValue> {
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_DELETIONS,
-            IdbTransactionMode::Readwrite,
-        )?;
+    pub async fn put_deletion(&self, event_id: &str, target_id: &str) -> Result<(), JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_DELETIONS, IdbTransactionMode::Readwrite)?;
         let store = tx.object_store(STORE_DELETIONS)?;
         let val = to_js(&CachedDeletion {
             event_id: event_id.to_string(),
@@ -410,10 +441,9 @@ impl ForumDb {
 
     /// Check if an event has been deleted.
     pub async fn is_deleted(&self, event_id: &str) -> Result<bool, JsValue> {
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_DELETIONS,
-            IdbTransactionMode::Readonly,
-        )?;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_DELETIONS, IdbTransactionMode::Readonly)?;
         let store = tx.object_store(STORE_DELETIONS)?;
         let index = store.index("target")?;
         let req = index.get(&JsValue::from_str(event_id))?;
@@ -428,10 +458,9 @@ impl ForumDb {
     pub async fn evict_old(&self, max_age_secs: u64) -> Result<u32, JsValue> {
         let cutoff = (js_sys::Date::now() / 1000.0) as u64 - max_age_secs;
 
-        let tx = self.db.transaction_with_str_and_mode(
-            STORE_MESSAGES,
-            IdbTransactionMode::Readwrite,
-        )?;
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_MESSAGES, IdbTransactionMode::Readwrite)?;
         let store = tx.object_store(STORE_MESSAGES)?;
 
         // Get all messages, filter old ones, delete them

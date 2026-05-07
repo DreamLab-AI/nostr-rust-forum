@@ -1,4 +1,4 @@
-//! Nostr BBS community forum -- Leptos CSR application entry point.
+//! nostr-bbs community forum -- Leptos CSR application entry point.
 
 mod admin;
 mod app;
@@ -16,11 +16,11 @@ fn main() {
     // Surface WASM panics as console.error instead of swallowing them silently.
     console_error_panic_hook::set_once();
 
-    web_sys::console::log_1(&"[Nostr BBS] WASM main() started".into());
+    web_sys::console::log_1(&"[nostr-bbs] WASM main() started".into());
 
     leptos::mount::mount_to_body(App);
 
-    web_sys::console::log_1(&"[Nostr BBS] mount_to_body complete".into());
+    web_sys::console::log_1(&"[nostr-bbs] mount_to_body complete".into());
 
     // Remove the static loading screen now that the Leptos app has mounted.
     if let Some(el) = web_sys::window()
@@ -66,21 +66,23 @@ fn run_offline_startup() {
                     Ok(n) => web_sys::console::log_1(
                         &format!("[PWA] Evicted {} stale cached messages", n).into(),
                     ),
-                    Err(e) => web_sys::console::warn_1(
-                        &format!("[PWA] Eviction failed: {:?}", e).into(),
-                    ),
+                    Err(e) => {
+                        web_sys::console::warn_1(&format!("[PWA] Eviction failed: {:?}", e).into())
+                    }
                 }
             }
             Err(e) => {
-                web_sys::console::warn_1(
-                    &format!("[PWA] IndexedDB open failed: {:?}", e).into(),
-                );
+                web_sys::console::warn_1(&format!("[PWA] IndexedDB open failed: {:?}", e).into());
             }
         }
 
         // Check storage quota
         if let Some((usage, quota)) = utils::check_storage_quota().await {
-            let pct = if quota > 0.0 { usage / quota * 100.0 } else { 0.0 };
+            let pct = if quota > 0.0 {
+                usage / quota * 100.0
+            } else {
+                0.0
+            };
             if pct > 80.0 {
                 web_sys::console::warn_1(
                     &format!(

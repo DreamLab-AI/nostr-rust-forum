@@ -38,26 +38,34 @@ const ZONES: &[Zone] = &[
         description: "Welcome! General discussion, introductions, and community chat",
         icon: "sparkle",
         accent: "amber",
-        sections: &["public-lobby"],
+        sections: &["home-lobby"],
     },
     Zone {
         id: "members",
-        name: "Nostr BBS",
+        name: "Members",
         description: "Business training, collaboration, and AI agent workspace",
         icon: "sparkle",
         accent: "pink",
         sections: &[
-            "members-training", "members-projects", "members-bookings",
-            "ai-general", "ai-claude-flow", "ai-visionflow",
+            "members-training",
+            "members-projects",
+            "members-bookings",
+            "ai-general",
+            "ai-claude-flow",
+            "ai-visionflow",
         ],
     },
     Zone {
         id: "private",
-        name: "Private",
+        name: "Minimoonoir",
         description: "For friends and visitors staying with us",
         icon: "moon",
         accent: "purple",
-        sections: &["private-welcome", "private-events", "private-booking"],
+        sections: &[
+            "private-welcome",
+            "private-events",
+            "private-booking",
+        ],
     },
 ];
 
@@ -77,7 +85,7 @@ fn is_welcome_dismissed() -> bool {
     web_sys::window()
         .and_then(|w| w.local_storage().ok())
         .flatten()
-        .and_then(|s| s.get_item("bbs_welcome_dismissed").ok())
+        .and_then(|s| s.get_item("nostrbbs_welcome_dismissed").ok())
         .flatten()
         .is_some()
 }
@@ -87,7 +95,7 @@ fn dismiss_welcome() {
         .and_then(|w| w.local_storage().ok())
         .flatten()
     {
-        let _ = storage.set_item("bbs_welcome_dismissed", "true");
+        let _ = storage.set_item("nostrbbs_welcome_dismissed", "true");
     }
 }
 
@@ -106,7 +114,7 @@ pub fn ForumsPage() -> impl IntoView {
     // Extract Copy signals so closures can capture them by value
     let za_home = zone_access.home;
     let za_members = zone_access.members;
-    let za_private = zone_access.private_zone;
+    let za_private = zone_access.private;
     let za_loaded = zone_access.loaded;
 
     // Derive zone_id -> { section_id -> channel_count } from the shared store
@@ -126,8 +134,7 @@ pub fn ForumsPage() -> impl IntoView {
     });
 
     view! {
-        // Onboarding modal — shown once to new users on first login
-        <crate::components::onboarding_modal::OnboardingModal />
+        // Onboarding modal mounted globally in app.rs Layout — see N3e.
 
         <div class="max-w-6xl mx-auto p-4 sm:p-6">
             // Hero header
@@ -171,7 +178,7 @@ pub fn ForumsPage() -> impl IntoView {
                             {move || {
                                 let name = welcome_name.get().unwrap_or_default();
                                 if name.is_empty() {
-                                    "Welcome to Nostr BBS!".to_string()
+                                    "Welcome!".to_string()
                                 } else {
                                     format!("Welcome, {}!", name)
                                 }
@@ -254,7 +261,7 @@ pub fn ForumsPage() -> impl IntoView {
                             <EmptyState
                                 icon=lock_icon
                                 title="Sign in to get started".to_string()
-                                description="Create an account or log in to access the Nostr BBS community forums.".to_string()
+                                description="Create an account or log in to access the community forums.".to_string()
                             />
                         }.into_any();
                     }
@@ -392,13 +399,13 @@ fn ZoneIcon(icon: &'static str, accent: &'static str) -> impl IntoView {
     };
 
     let svg = match icon {
-        // Moon icon for Private
+        // Moon icon for Minimoonoir
         "moon" => view! {
             <svg class=format!("w-5 h-5 {}", icon_color) viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                 <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
         }.into_any(),
-        // Sparkle icon for Nostr BBS / Home
+        // Sparkle icon for Members / Home
         "sparkle" => view! {
             <svg class=format!("w-5 h-5 {}", icon_color) viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                 <path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8L12 2z" stroke-linecap="round" stroke-linejoin="round"/>
@@ -416,10 +423,7 @@ fn ZoneIcon(icon: &'static str, accent: &'static str) -> impl IntoView {
 
 /// Convert a section ID like "private-welcome" to "Welcome".
 fn humanize_section_id(id: &str) -> String {
-    let suffix = id
-        .find('-')
-        .map(|i| &id[i + 1..])
-        .unwrap_or(id);
+    let suffix = id.find('-').map(|i| &id[i + 1..]).unwrap_or(id);
     suffix
         .split('-')
         .map(|w| {
@@ -439,7 +443,7 @@ fn section_description(id: &str) -> &'static str {
         "private-welcome" => "Welcome info for guests",
         "private-events" => "Upcoming events and activities",
         "private-booking" => "Room availability and reservations",
-        "public-lobby" => "General discussion and introductions",
+        "home-lobby" => "General discussion and introductions",
         "members-training" => "Training courses and materials",
         "members-projects" => "Active projects and collaboration",
         "members-bookings" => "Session and room bookings",

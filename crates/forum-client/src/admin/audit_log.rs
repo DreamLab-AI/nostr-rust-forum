@@ -230,10 +230,7 @@ fn format_timestamp(ts: u64) -> String {
     let day = date.get_date();
     let hours = date.get_hours();
     let minutes = date.get_minutes();
-    format!(
-        "{:02}-{:02} {:02}:{:02}",
-        month, day, hours, minutes
-    )
+    format!("{:02}-{:02} {:02}:{:02}", month, day, hours, minutes)
 }
 
 fn action_badge_class(action: &str) -> &'static str {

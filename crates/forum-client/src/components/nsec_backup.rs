@@ -7,7 +7,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 /// localStorage key to track whether the user has dismissed the backup prompt.
-const BACKUP_DISMISSED_KEY: &str = "bbs:nsec_backup_dismissed";
+const BACKUP_DISMISSED_KEY: &str = "nostrbbs:nsec_backup_dismissed";
 
 /// Private key backup display.
 ///
@@ -40,7 +40,7 @@ pub(crate) fn NsecBackup(
         if let Some(window) = web_sys::window() {
             if let Some(doc) = window.document() {
                 let content = format!(
-                    "Nostr BBS - Recovery Key Backup\n\
+                    "Forum - Recovery Key Backup\n\
                      ==================================\n\n\
                      Key: {}\n\n\
                      IMPORTANT: Anyone with this key can access your account.\n\
@@ -57,7 +57,7 @@ pub(crate) fn NsecBackup(
                     if let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) {
                         if let Ok(a) = doc.create_element("a") {
                             let _ = a.set_attribute("href", &url);
-                            let _ = a.set_attribute("download", "nostr-bbs-nsec-backup.txt");
+                            let _ = a.set_attribute("download", "members-nsec-backup.txt");
                             let a_html: web_sys::HtmlElement = a.unchecked_into();
                             a_html.click();
                             let _ = web_sys::Url::revoke_object_url(&url);

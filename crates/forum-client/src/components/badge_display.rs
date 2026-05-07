@@ -99,10 +99,7 @@ pub fn BadgeGrid(
 
 /// Single badge card for the grid layout.
 #[component]
-fn BadgeCard(
-    badge_id: String,
-    awarded_at: u64,
-) -> impl IntoView {
+fn BadgeCard(badge_id: String, awarded_at: u64) -> impl IntoView {
     let def = badge_def(&badge_id);
 
     match def {

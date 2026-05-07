@@ -8,7 +8,7 @@ use gloo::storage::Storage as _;
 use leptos::prelude::*;
 use std::collections::HashMap;
 
-const STORAGE_KEY: &str = "bbs:read_positions";
+const STORAGE_KEY: &str = "nostrbbs:read_positions";
 
 /// Persisted per-channel read position.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

@@ -1,8 +1,8 @@
 //! Constellation particle field — WASM Canvas2D.
 //!
 //! Design DNA drawn (subtly) from:
-//! - **Private** hero: concentric rings, ice-blue glow on deep navy
-//! - **Nostr BBS** hero: node-edge constellation, ethereal sparkle
+//! - **Minimoonoir** hero: concentric rings, ice-blue glow on deep navy
+//! - **Members** hero: node-edge constellation, ethereal sparkle
 //! - **Main site Voronoi**: golden-angle math, slow deliberate motion
 //!
 //! Wired as a tech demo with graceful fallback:
@@ -43,7 +43,7 @@ const TAU: f64 = std::f64::consts::TAU;
 const AMBER: (f64, f64, f64) = (251.0, 191.0, 36.0);
 
 /// Blue-300: cool accent (~15 % of particles). Nods to private ice-blue
-/// and cool cyan without overwhelming the amber theme.
+/// and members cyan without overwhelming the amber theme.
 const ICE_BLUE: (f64, f64, f64) = (147.0, 197.0, 253.0);
 
 // -- Data structures ----------------------------------------------------------

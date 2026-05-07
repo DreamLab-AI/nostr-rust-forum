@@ -12,12 +12,15 @@ use nostr_core::UnsignedEvent;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::confirm_dialog::{ConfirmDialog, ConfirmVariant};
+use crate::components::onboarding_modal::{open_onboarding_with_prefill, release_username};
 use crate::components::toast::{use_toasts, ToastVariant};
+use crate::components::user_display::use_display_name;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
-use crate::stores::preferences::{
-    save_preferences, use_preferences, NotificationLevel, Theme,
-};
+use crate::stores::preferences::{save_preferences, use_preferences, NotificationLevel, Theme};
 use crate::utils::shorten_pubkey;
+
+/// NIP-05 host that backs claimed usernames (mirrors onboarding_modal::NIP05_HOST).
+const NIP05_USERNAME_HOST: &str = "example.test";
 
 /// Key used to persist muted pubkeys in localStorage.
 const MUTED_STORAGE_KEY: &str = "nostr_bbs_muted";
@@ -86,6 +89,21 @@ pub fn SettingsPage() -> impl IntoView {
     // Confirm dialog for nsec export
     let confirm_nsec_open = RwSignal::new(false);
 
+    // Confirm dialog for username release
+    let confirm_release_open = RwSignal::new(false);
+    let release_pending = RwSignal::new(false);
+
+    // Display the currently-claimed username (if any). We show whatever
+    // value AuthState currently holds — successful claims update it via
+    // `auth.set_profile`, and the onboarding modal's `release_username()`
+    // helper resets it to None.
+    let claimed_username = Memo::new(move |_| auth.nickname().get());
+    let claimed_nip05 = Memo::new(move |_| {
+        auth.nickname()
+            .get()
+            .map(|n| format!("{}@{}", n, NIP05_USERNAME_HOST))
+    });
+
     let pubkey_display = Memo::new(move |_| {
         auth.pubkey()
             .get()
@@ -119,9 +137,7 @@ pub fn SettingsPage() -> impl IntoView {
                     if event.kind != 0 {
                         return;
                     }
-                    if let Ok(obj) =
-                        serde_json::from_str::<serde_json::Value>(&event.content)
-                    {
+                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&event.content) {
                         if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
                             nickname_sig.set(name.to_string());
                         }
@@ -277,6 +293,21 @@ pub fn SettingsPage() -> impl IntoView {
         auth.logout();
     };
 
+    // -- Username change handler (opens onboarding modal pre-filled) --
+    let on_change_username = move |_| {
+        let current = auth.nickname().get_untracked();
+        open_onboarding_with_prefill(current);
+    };
+
+    // -- Username release handler (called from confirm dialog) --
+    let toasts_for_release = toasts.clone();
+    let on_confirm_release = Callback::new(move |_: ()| {
+        release_pending.set(true);
+        let toasts_ok = toasts_for_release.clone();
+        let toasts_err = toasts_for_release.clone();
+        spawn_local_release(release_pending, toasts_ok, toasts_err);
+    });
+
     view! {
         <div class="max-w-2xl mx-auto p-4 sm:p-6">
             // Breadcrumb
@@ -291,6 +322,71 @@ pub fn SettingsPage() -> impl IntoView {
             </h1>
 
             <div class="space-y-6">
+                // -- Section 0: Username --
+                <div class="glass-card p-6 space-y-4">
+                    <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                        {handle_icon()}
+                        "Username"
+                    </h2>
+                    <div class="border-t border-gray-700/50"></div>
+
+                    {move || {
+                        match claimed_username.get() {
+                            Some(name) if !name.is_empty() => {
+                                let nip05 = claimed_nip05.get().unwrap_or_default();
+                                view! {
+                                    <div class="space-y-3">
+                                        <div>
+                                            <span class="text-xs text-gray-500 uppercase tracking-wide">"Current"</span>
+                                            <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1 flex items-center gap-2">
+                                                <span class="text-amber-300 font-mono">"@" {name.clone()}</span>
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <span class="text-xs text-gray-500 uppercase tracking-wide">"NIP-05"</span>
+                                            <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1">
+                                                <code class="text-xs text-gray-300 font-mono break-all">{nip05}</code>
+                                            </div>
+                                        </div>
+                                        <div class="flex gap-3 pt-1">
+                                            <button
+                                                on:click=on_change_username
+                                                class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors"
+                                            >
+                                                "Change"
+                                            </button>
+                                            <button
+                                                on:click=move |_| confirm_release_open.set(true)
+                                                disabled=move || release_pending.get()
+                                                class="text-sm text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded-lg px-4 py-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                            >
+                                                {move || if release_pending.get() {
+                                                    "Releasing..."
+                                                } else {
+                                                    "Release username"
+                                                }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                }.into_any()
+                            }
+                            _ => view! {
+                                <div class="space-y-3">
+                                    <p class="text-sm text-gray-400">
+                                        "You haven\u{2019}t claimed a username yet. Choose a unique handle so others can mention and find you."
+                                    </p>
+                                    <button
+                                        on:click=on_change_username
+                                        class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors"
+                                    >
+                                        "Claim username"
+                                    </button>
+                                </div>
+                            }.into_any(),
+                        }
+                    }}
+                </div>
+
                 // -- Section 1: Profile --
                 <div class="glass-card p-6 space-y-4">
                     <h2 class="text-lg font-semibold text-white flex items-center gap-2">
@@ -372,7 +468,10 @@ pub fn SettingsPage() -> impl IntoView {
                             view! {
                                 <div class="space-y-2">
                                     {list.into_iter().map(|pk| {
-                                        let pk_display = shorten_pubkey(&pk);
+                                        // Use the display-name resolver so muted users show
+                                        // nicknames where available; falls back to shortened
+                                        // hex for unknown pubkeys.
+                                        let pk_display = use_display_name(&pk);
                                         let pk_for_unmute = pk.clone();
                                         let on_unmute = on_unmute.clone();
                                         view! {
@@ -642,8 +741,42 @@ pub fn SettingsPage() -> impl IntoView {
                 on_confirm=on_confirm_nsec
                 variant=ConfirmVariant::Danger
             />
+
+            // Confirm dialog for username release
+            <ConfirmDialog
+                is_open=confirm_release_open
+                title="Release Username".to_string()
+                message="This will release your username and free it for anyone else to claim. Your NIP-05 handle will stop resolving. You can claim a new username at any time.".to_string()
+                confirm_label="Release".to_string()
+                on_confirm=on_confirm_release
+                variant=ConfirmVariant::Danger
+            />
         </div>
     }
+}
+
+/// Spawn the async release-username flow and surface success/error toasts.
+///
+/// Extracted to a free function so that the `release_username` future is not
+/// reified inside the event-handler closure (which would force `Send` bounds
+/// the rest of the page does not satisfy).
+fn spawn_local_release(
+    pending: RwSignal<bool>,
+    toasts_ok: crate::components::toast::ToastStore,
+    toasts_err: crate::components::toast::ToastStore,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        match release_username().await {
+            Ok(()) => {
+                pending.set(false);
+                toasts_ok.show("Username released", ToastVariant::Success);
+            }
+            Err(e) => {
+                pending.set(false);
+                toasts_err.show(format!("Release failed: {}", e), ToastVariant::Error);
+            }
+        }
+    });
 }
 
 // -- SVG icon helpers ---------------------------------------------------------
@@ -657,6 +790,9 @@ fn section_icon(d: &'static str) -> impl IntoView {
 }
 fn user_icon() -> impl IntoView {
     section_icon("M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2M16 7a4 4 0 11-8 0 4 4 0 018 0")
+}
+fn handle_icon() -> impl IntoView {
+    section_icon("M16 9a4 4 0 11-4-4M16 9v3a2 2 0 002 2M21 12a9 9 0 11-18 0 9 9 0 0118 0")
 }
 fn mute_icon() -> impl IntoView {
     section_icon("M1 1l22 22M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2c0 .38-.03.75-.08 1.12M12 19v4M8 23h8")

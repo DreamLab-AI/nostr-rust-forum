@@ -74,12 +74,21 @@ pub fn ProfilePage() -> impl IntoView {
                 if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&event.content) {
                     meta.set(ProfileMeta {
                         name: obj.get("name").and_then(|v| v.as_str()).map(String::from),
-                        display_name: obj.get("display_name").and_then(|v| v.as_str()).map(String::from),
+                        display_name: obj
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                         about: obj.get("about").and_then(|v| v.as_str()).map(String::from),
-                        picture: obj.get("picture").and_then(|v| v.as_str()).map(String::from),
+                        picture: obj
+                            .get("picture")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                         banner: obj.get("banner").and_then(|v| v.as_str()).map(String::from),
                         nip05: obj.get("nip05").and_then(|v| v.as_str()).map(String::from),
-                        website: obj.get("website").and_then(|v| v.as_str()).map(String::from),
+                        website: obj
+                            .get("website")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                         lud16: obj.get("lud16").and_then(|v| v.as_str()).map(String::from),
                     });
                 }
@@ -146,7 +155,9 @@ pub fn ProfilePage() -> impl IntoView {
             let sub_id = relay.subscribe(vec![filter], on_event, Some(on_eose));
             let relay_cleanup = relay.clone();
             crate::utils::set_timeout_once(
-                move || { relay_cleanup.unsubscribe(&sub_id); },
+                move || {
+                    relay_cleanup.unsubscribe(&sub_id);
+                },
                 5_000,
             );
         });

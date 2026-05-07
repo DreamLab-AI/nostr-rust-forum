@@ -180,7 +180,10 @@ pub async fn handle_list_reports(req: &Request, env: &Env) -> Result<Response> {
 
     let (sql, bind_values) = if let Some(ref status) = status_filter {
         // Validate status value
-        let valid = matches!(status.as_str(), "pending" | "resolved_approve" | "resolved_dismiss");
+        let valid = matches!(
+            status.as_str(),
+            "pending" | "resolved_approve" | "resolved_dismiss"
+        );
         if !valid {
             return json_response(
                 env,
@@ -193,11 +196,7 @@ pub async fn handle_list_reports(req: &Request, env: &Env) -> Result<Response> {
              reason, reason_text, status, resolved_by, resolution, resolved_at, created_at \
              FROM reports WHERE status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
                 .to_string(),
-            vec![
-                js_str(status),
-                js_f64(limit as f64),
-                js_f64(offset as f64),
-            ],
+            vec![js_str(status), js_f64(limit as f64), js_f64(offset as f64)],
         )
     } else {
         (
@@ -376,5 +375,9 @@ pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Respon
     )
     .await;
 
-    json_response(env, &json!({ "success": true, "resolution": resolution }), 200)
+    json_response(
+        env,
+        &json!({ "success": true, "resolution": resolution }),
+        200,
+    )
 }

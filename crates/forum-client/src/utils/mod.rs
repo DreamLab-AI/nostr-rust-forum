@@ -5,6 +5,7 @@ pub mod pod_client;
 pub mod relay_url;
 pub mod sanitize;
 pub mod search_client;
+pub mod solid;
 
 use leptos::prelude::*;
 use std::cell::Cell;

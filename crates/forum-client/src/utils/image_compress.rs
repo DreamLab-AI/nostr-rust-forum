@@ -44,11 +44,7 @@ pub async fn generate_thumbnail(file: &web_sys::File) -> Result<Blob, String> {
 }
 
 /// Core resize logic: decode image -> scale on canvas -> export as JPEG blob.
-async fn resize_to_blob(
-    file: &web_sys::File,
-    max_dim: u32,
-    quality: f64,
-) -> Result<Blob, String> {
+async fn resize_to_blob(file: &web_sys::File, max_dim: u32, quality: f64) -> Result<Blob, String> {
     let window = web_sys::window().ok_or("No window")?;
 
     // 1. Decode File -> ImageBitmap via createImageBitmap
@@ -113,10 +109,8 @@ async fn canvas_to_blob(
         let reject_clone = reject.clone();
         let callback = wasm_bindgen::closure::Closure::once(Box::new(move |blob: JsValue| {
             if blob.is_null() || blob.is_undefined() {
-                let _ = reject_clone.call1(
-                    &JsValue::NULL,
-                    &JsValue::from_str("toBlob returned null"),
-                );
+                let _ =
+                    reject_clone.call1(&JsValue::NULL, &JsValue::from_str("toBlob returned null"));
             } else {
                 let _ = resolve.call1(&JsValue::NULL, &blob);
             }

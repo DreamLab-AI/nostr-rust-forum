@@ -11,5 +11,6 @@ pub mod indexed_db;
 pub mod mute;
 pub mod notifications;
 pub mod preferences;
+pub mod profile_cache;
 pub mod read_position;
 pub mod zone_access;

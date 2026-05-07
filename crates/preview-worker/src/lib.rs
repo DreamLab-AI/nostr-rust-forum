@@ -1,4 +1,4 @@
-//! Nostr BBS link-preview-api Worker (Rust port)
+//! nostr-bbs link-preview-api Worker (Rust port)
 //!
 //! Proxies requests to fetch OpenGraph metadata, bypassing CORS.
 //! Replaces the TypeScript Cloudflare Workers implementation.

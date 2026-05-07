@@ -5,23 +5,22 @@
 
 use leptos::prelude::*;
 
-
 /// Predefined channel sections.
 /// Format: (section_id, display_label).
 const SECTIONS: &[(&str, &str)] = &[
     // Home
-    ("public-lobby", "Home Lobby"),
-    // Nostr BBS
-    ("members-training", "Nostr BBS Training"),
-    ("members-projects", "Nostr BBS Projects"),
-    ("members-bookings", "Nostr BBS Bookings"),
+    ("home-lobby", "Home Lobby"),
+    // Members
+    ("members-training", "Members Training"),
+    ("members-projects", "Members Projects"),
+    ("members-bookings", "Members Bookings"),
     ("ai-general", "AI General"),
     ("ai-claude-flow", "AI Claude Flow"),
     ("ai-visionflow", "AI VisionFlow"),
-    // Private
-    ("private-welcome", "Private Welcome"),
-    ("private-events", "Private Events"),
-    ("private-booking", "Private Booking"),
+    // Minimoonoir
+    ("private-welcome", "Minimoonoir Welcome"),
+    ("private-events", "Minimoonoir Events"),
+    ("private-booking", "Minimoonoir Booking"),
 ];
 
 /// Data submitted from the channel creation form.
@@ -108,7 +107,11 @@ where
             section: section.get_untracked(),
             picture: picture.get_untracked().trim().to_string(),
             zone: z,
-            cohort: if z >= 2 && !c.trim().is_empty() { Some(c.trim().to_string()) } else { None },
+            cohort: if z >= 2 && !c.trim().is_empty() {
+                Some(c.trim().to_string())
+            } else {
+                None
+            },
         });
         is_submitting.set(false);
         // Form reset is handled by the parent when it signals success via callback.
@@ -278,10 +281,12 @@ where
 /// Color is derived from the parent zone.
 fn section_color_dot_class(section: &str) -> &'static str {
     match section {
-        // Private (purple)
+        // Minimoonoir (purple)
         s if s.starts_with("private-") => "w-2 h-2 rounded-full bg-purple-400 inline-block",
-        // Nostr BBS and AI (pink)
-        s if s.starts_with("members-") || s.starts_with("ai-") => "w-2 h-2 rounded-full bg-pink-400 inline-block",
+        // Members and AI (pink)
+        s if s.starts_with("members-") || s.starts_with("ai-") => {
+            "w-2 h-2 rounded-full bg-pink-400 inline-block"
+        }
         _ => "w-2 h-2 rounded-full bg-amber-400 inline-block",
     }
 }

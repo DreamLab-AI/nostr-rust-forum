@@ -44,14 +44,10 @@ pub fn OfflineBanner() -> impl IntoView {
             was_offline.set_value(true);
         }) as Box<dyn FnMut(web_sys::Event)>);
 
-        let _ = window.add_event_listener_with_callback(
-            "online",
-            on_online.as_ref().unchecked_ref(),
-        );
-        let _ = window.add_event_listener_with_callback(
-            "offline",
-            on_offline.as_ref().unchecked_ref(),
-        );
+        let _ =
+            window.add_event_listener_with_callback("online", on_online.as_ref().unchecked_ref());
+        let _ =
+            window.add_event_listener_with_callback("offline", on_offline.as_ref().unchecked_ref());
 
         // Leak intentionally -- these listeners live for the app lifetime
         on_online.forget();

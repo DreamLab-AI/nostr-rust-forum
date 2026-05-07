@@ -95,7 +95,7 @@ pub fn HomePage() -> impl IntoView {
                     <div class="absolute -z-10 w-96 h-96 rounded-full bg-amber-500/10 blur-3xl animate-ambient-breathe"></div>
 
                     <p class="text-amber-400/60 uppercase tracking-widest text-xs font-medium mb-4">
-                        ""
+                        "a members ai ltd partnership"
                     </p>
 
                     <h1 class="text-5xl sm:text-6xl font-bold bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent drop-shadow-lg">

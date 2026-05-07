@@ -9,27 +9,29 @@ use leptos_router::NavigateOptions;
 use crate::auth::{provide_auth, use_auth};
 use crate::components::bookmarks_modal::provide_bookmarks;
 use crate::components::bookmarks_modal::BookmarksModal;
+use crate::components::fx::provide_render_tier;
 use crate::components::global_search::GlobalSearch;
 use crate::components::message_bubble::{provide_profile_modal_target, ProfileModalTarget};
 use crate::components::mobile_bottom_nav::{provide_unread_dm_count, MobileBottomNav};
 use crate::components::notification_bell::{provide_notifications, NotificationBell};
+use crate::components::onboarding_modal::{provide_onboarding_prefill, OnboardingModal};
 use crate::components::profile_modal::ProfileModal;
+use crate::components::screen_reader::{provide_announcer, ScreenReaderAnnouncer};
 use crate::components::session_timeout::SessionTimeout;
 use crate::components::toast::{provide_toasts, ToastContainer};
-use crate::components::fx::provide_render_tier;
 use crate::components::user_display::provide_name_cache;
-use crate::components::screen_reader::{provide_announcer, ScreenReaderAnnouncer};
+use crate::pages::{
+    AdminPage, CategoryPage, ChannelPage, ChatPage, DmChatPage, DmListPage, EventsPage, ForumsPage,
+    HomePage, LoginPage, MarketplacePage, NoteViewPage, PendingPage, ProfilePage, SearchPage,
+    SectionPage, SettingsPage, SetupPage, SignupPage,
+};
+use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
 use crate::stores::mute::provide_mute_store;
 use crate::stores::preferences::provide_preferences;
+use crate::stores::profile_cache::{provide_profile_cache, try_use_profile_cache};
 use crate::stores::read_position::provide_read_positions;
 use crate::stores::zone_access::provide_zone_access;
-use crate::pages::{
-    AdminPage, CategoryPage, ChannelPage, ChatPage, DmChatPage, DmListPage, EventsPage, ForumsPage,
-    HomePage, LoginPage, NoteViewPage, PendingPage, ProfilePage, SearchPage, SectionPage,
-    SettingsPage, SetupPage, SignupPage,
-};
-use crate::relay::{ConnectionState, RelayConnection};
 
 // -- Base path for sub-directory deployment -----------------------------------
 
@@ -197,7 +199,9 @@ pub fn App() -> impl IntoView {
     provide_bookmarks();
     provide_unread_dm_count();
     provide_name_cache();
+    provide_profile_cache();
     provide_profile_modal_target();
+    provide_onboarding_prefill();
     provide_read_positions();
     provide_mute_store();
     provide_preferences();
@@ -251,7 +255,8 @@ pub fn App() -> impl IntoView {
             let content = serde_json::json!({
                 "name": nickname,
                 "display_name": nickname,
-            }).to_string();
+            })
+            .to_string();
 
             let now = (js_sys::Date::now() / 1000.0) as u64;
             let unsigned = nostr_core::UnsignedEvent {
@@ -267,15 +272,110 @@ pub fn App() -> impl IntoView {
                     r.publish(&signed);
                     published_profile.set(true);
                     web_sys::console::log_1(
-                        &format!("[app] Published kind-0 profile for auto-whitelist: {}", &pubkey[..8]).into()
+                        &format!(
+                            "[app] Published kind-0 profile for auto-whitelist: {}",
+                            &pubkey[..8]
+                        )
+                        .into(),
                     );
                 }
                 Err(e) => {
                     web_sys::console::warn_1(
-                        &format!("[app] Failed to publish kind-0: {e}").into()
+                        &format!("[app] Failed to publish kind-0: {e}").into(),
                     );
                 }
             }
+        });
+    }
+
+    // Publish kind-10002 (relay list) on first login so peers can discover our relay.
+    // This is a replaceable event, so publishing again is idempotent.
+    {
+        let published_relay_list = RwSignal::new(false);
+        let relay_state = relay.connection_state();
+        Effect::new(move |_| {
+            if relay_state.get() != ConnectionState::Connected {
+                return;
+            }
+            if !is_authed.get() {
+                published_relay_list.set(false);
+                return;
+            }
+            if published_relay_list.get_untracked() {
+                return;
+            }
+
+            let auth = use_auth();
+            let r = expect_context::<RelayConnection>();
+            let pubkey = match auth.pubkey().get_untracked() {
+                Some(pk) => pk,
+                None => return,
+            };
+
+            let relay_url = crate::utils::relay_url::relay_url();
+            let now = (js_sys::Date::now() / 1000.0) as u64;
+            let unsigned = nostr_core::UnsignedEvent {
+                pubkey: pubkey.clone(),
+                created_at: now,
+                kind: 10002,
+                tags: vec![vec!["r".to_string(), relay_url]],
+                content: String::new(),
+            };
+
+            match auth.sign_event(unsigned) {
+                Ok(signed) => {
+                    r.publish(&signed);
+                    published_relay_list.set(true);
+                    web_sys::console::log_1(
+                        &format!(
+                            "[app] Published kind-10002 relay list for: {}",
+                            &pubkey[..8]
+                        )
+                        .into(),
+                    );
+                }
+                Err(e) => {
+                    web_sys::console::warn_1(
+                        &format!("[app] Failed to publish kind-10002: {e}").into(),
+                    );
+                }
+            }
+        });
+    }
+
+    // Subscribe to kind-0 metadata events on the relay and feed them into the
+    // ProfileCache so every component that renders a pubkey gets a live
+    // nickname as soon as the relay sends it. The subscription is unfiltered
+    // (no `authors`) so we receive any kind-0 the relay emits — typically
+    // the contact graph plus anyone who posts in our channels.
+    {
+        let kind0_sub_started = RwSignal::new(false);
+        let relay_state = relay.connection_state();
+        Effect::new(move |_| {
+            if relay_state.get() != ConnectionState::Connected {
+                return;
+            }
+            if kind0_sub_started.get_untracked() {
+                return;
+            }
+            let cache = match try_use_profile_cache() {
+                Some(c) => c,
+                None => return,
+            };
+            let r = expect_context::<RelayConnection>();
+            let filter = crate::relay::Filter {
+                kinds: Some(vec![0]),
+                limit: Some(500),
+                ..Default::default()
+            };
+            let on_event: crate::relay::EventCallback =
+                std::rc::Rc::new(move |event: nostr_core::NostrEvent| {
+                    if event.kind == 0 && !event.content.is_empty() {
+                        cache.upsert_from_kind0(&event.pubkey, &event.content, event.created_at);
+                    }
+                });
+            r.subscribe(vec![filter], on_event, None);
+            kind0_sub_started.set(true);
         });
     }
 
@@ -346,6 +446,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/search") view=AuthGatedSearch />
                     <Route path=path!("/settings") view=AuthGatedSettings />
                     <Route path=path!("/admin") view=AdminPage />
+                    <Route path=path!("/marketplace") view=MarketplacePage />
                 </FlatRoutes>
             </Layout>
         </Router>
@@ -391,13 +492,19 @@ fn Layout(children: Children) -> impl IntoView {
         }
     };
 
+    // Resolve the logged-in user's display name through the layered profile
+    // cache. Falls back to `auth.nickname()` (set during onboarding) and
+    // finally to a shortened hex key + "Anonymous".
     let display_name = Memo::new(move |_| {
-        nickname.get().unwrap_or_else(|| {
-            pubkey
-                .get()
-                .map(|pk| format!("{}...", &pk[..8]))
-                .unwrap_or_else(|| "Anonymous".to_string())
-        })
+        if let Some(pk) = pubkey.get() {
+            if !pk.is_empty() {
+                let resolved = crate::components::user_display::use_display_name(&pk);
+                if !resolved.is_empty() {
+                    return resolved;
+                }
+            }
+        }
+        nickname.get().unwrap_or_else(|| "Anonymous".to_string())
     });
 
     let zone_access = crate::stores::zone_access::use_zone_access();
@@ -459,7 +566,7 @@ fn Layout(children: Children) -> impl IntoView {
                     // Brand
                     <a href="/" class="flex items-center gap-2 text-xl sm:text-2xl font-bold text-amber-400 hover:text-amber-300 transition-colors">
                         {brand_icon()}
-                        "Nostr BBS"
+                        "Forum"
                     </a>
 
                     // Desktop nav
@@ -594,6 +701,9 @@ fn Layout(children: Children) -> impl IntoView {
             <SessionTimeout />
             <MobileBottomNav />
             <BookmarksModal is_open=bookmarks_open />
+            // Username onboarding modal — self-gates on auth + localStorage flags
+            <OnboardingModal />
+
             {move || {
                 let pk = profile_target_pk.get();
                 (!pk.is_empty()).then(|| view! {
@@ -607,7 +717,7 @@ fn Layout(children: Children) -> impl IntoView {
                     <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
                         <div class="flex items-center gap-2 text-gray-500">
                             {brand_icon()}
-                            <span class="text-sm">"Nostr BBS"</span>
+                            <span class="text-sm">"Forum"</span>
                         </div>
                         <div class="flex items-center gap-3 text-xs text-gray-600">
                             <span>"End-to-end encrypted"</span>

@@ -235,13 +235,7 @@ impl BadgeStore {
     #[allow(dead_code)]
     pub fn badge_ids(&self) -> Memo<Vec<String>> {
         let badges = self.badges;
-        Memo::new(move |_| {
-            badges
-                .get()
-                .iter()
-                .map(|b| b.badge_id.clone())
-                .collect()
-        })
+        Memo::new(move |_| badges.get().iter().map(|b| b.badge_id.clone()).collect())
     }
 }
 

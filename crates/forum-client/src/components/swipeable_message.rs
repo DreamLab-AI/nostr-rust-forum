@@ -59,8 +59,8 @@ pub(crate) fn SwipeableMessage(
         }
 
         // Only track if we have a handler for that direction
-        let should_track = (dx < 0.0 && on_swipe_left.is_some())
-            || (dx > 0.0 && on_swipe_right.is_some());
+        let should_track =
+            (dx < 0.0 && on_swipe_left.is_some()) || (dx > 0.0 && on_swipe_right.is_some());
 
         if should_track {
             // Apply resistance: offset slows down past threshold

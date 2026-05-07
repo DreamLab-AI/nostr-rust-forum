@@ -46,12 +46,14 @@ pub async fn decrypt_dm_image(
         .try_into()
         .map_err(|_| "Sender pubkey must be 32 bytes".to_string())?;
 
-    let key_hex =
-        nostr_core::nip44_decrypt(recipient_privkey, &sender_pk_bytes, &encrypted.encrypted_key)
-            .map_err(|e| format!("NIP-44 decrypt: {e}"))?;
+    let key_hex = nostr_core::nip44_decrypt(
+        recipient_privkey,
+        &sender_pk_bytes,
+        &encrypted.encrypted_key,
+    )
+    .map_err(|e| format!("NIP-44 decrypt: {e}"))?;
 
-    let raw_key_bytes =
-        hex::decode(&key_hex).map_err(|e| format!("Invalid key hex: {e}"))?;
+    let raw_key_bytes = hex::decode(&key_hex).map_err(|e| format!("Invalid key hex: {e}"))?;
 
     // Import AES key into Web Crypto
     let crypto = web_sys::window()

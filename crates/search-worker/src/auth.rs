@@ -3,10 +3,88 @@
 //! Ingest endpoint requires NIP-98 admin auth. Uses the same pattern as
 //! relay-worker and auth-worker: verify signature, check admin pubkeys.
 
-use nostr_core::nip98::{Nip98Error, Nip98Token};
-use worker::Env;
+use async_trait::async_trait;
+use nostr_core::nip98::{Nip98Error, Nip98ReplayStore, Nip98Token};
+use worker::{kv::KvStore, Env};
 
-/// Verify a NIP-98 `Authorization` header.
+pub struct KvReplayStore<'a> {
+    pub kv: &'a KvStore,
+    pub ttl_secs: u64,
+}
+
+#[async_trait(?Send)]
+impl<'a> Nip98ReplayStore for KvReplayStore<'a> {
+    async fn seen_or_record(&self, event_id: &str) -> Result<bool, String> {
+        let key = format!("nip98:{event_id}");
+        match self.kv.get(&key).text().await {
+            Ok(Some(_)) => return Ok(false),
+            Ok(None) => {}
+            Err(e) => return Err(format!("kv get failed: {e:?}")),
+        }
+        let put = self
+            .kv
+            .put(&key, "1")
+            .map_err(|e| format!("kv put builder: {e:?}"))?;
+        put.expiration_ttl(self.ttl_secs)
+            .execute()
+            .await
+            .map_err(|e| format!("kv put exec: {e:?}"))?;
+        Ok(true)
+    }
+}
+
+struct AlwaysFreshStore;
+#[async_trait(?Send)]
+impl Nip98ReplayStore for AlwaysFreshStore {
+    async fn seen_or_record(&self, _event_id: &str) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+pub async fn verify_nip98_replay(
+    auth_header: &str,
+    expected_url: &str,
+    expected_method: &str,
+    body: Option<&[u8]>,
+    env: &Env,
+) -> Result<Nip98Token, Nip98Error> {
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    let ttl = nostr_core::REPLAY_CACHE_TTL_SECS;
+    if let Ok(kv) = env.kv("NIP98_REPLAY") {
+        let store = KvReplayStore {
+            kv: &kv,
+            ttl_secs: ttl,
+        };
+        nostr_core::verify_nip98_token_at_with_replay(
+            auth_header,
+            expected_url,
+            expected_method,
+            body,
+            now,
+            &store,
+        )
+        .await
+    } else {
+        worker::console_warn!(
+            "NIP98_REPLAY KV binding missing; replay protection disabled (search-worker)"
+        );
+        nostr_core::verify_nip98_token_at_with_replay(
+            auth_header,
+            expected_url,
+            expected_method,
+            body,
+            now,
+            &AlwaysFreshStore,
+        )
+        .await
+    }
+}
+
+/// Synchronous, replay-FREE verification (legacy callers).
+#[deprecated(
+    since = "0.2.0",
+    note = "Use verify_nip98_replay; this skips replay protection"
+)]
 pub fn verify_nip98(
     auth_header: &str,
     expected_url: &str,
@@ -36,7 +114,7 @@ pub fn is_admin(pubkey: &str, env: &Env) -> bool {
 /// Verify NIP-98 auth and assert the authenticated pubkey is an admin.
 ///
 /// Returns `Ok(pubkey_hex)` on success, or an error tuple `(json_body, status_code)`.
-pub fn require_nip98_admin(
+pub async fn require_nip98_admin(
     auth_header: Option<&str>,
     request_url: &str,
     method: &str,
@@ -50,12 +128,14 @@ pub fn require_nip98_admin(
         )
     })?;
 
-    let token = verify_nip98(auth, request_url, method, body).map_err(|_| {
-        (
-            serde_json::json!({ "error": "Invalid NIP-98 token" }),
-            401u16,
-        )
-    })?;
+    let token = verify_nip98_replay(auth, request_url, method, body, env)
+        .await
+        .map_err(|_| {
+            (
+                serde_json::json!({ "error": "Invalid NIP-98 token" }),
+                401u16,
+            )
+        })?;
 
     if !is_admin(&token.pubkey, env) {
         return Err((serde_json::json!({ "error": "Not authorized" }), 403));

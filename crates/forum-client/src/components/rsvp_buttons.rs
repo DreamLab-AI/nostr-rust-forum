@@ -31,9 +31,7 @@ pub fn RsvpButtons(
 
     let max = max_attendees;
 
-    let is_full = move || {
-        max.map(|m| attendee_count.get() >= m).unwrap_or(false)
-    };
+    let is_full = move || max.map(|m| attendee_count.get() >= m).unwrap_or(false);
 
     let rsvp_action = move |eid: String, status: RsvpStatus| {
         let auth = use_auth();
@@ -60,10 +58,7 @@ pub fn RsvpButtons(
                     if accepted {
                         toasts_ok.show(format!("RSVP: {}", label_owned), ToastVariant::Success);
                     } else {
-                        toasts_ok.show(
-                            format!("RSVP rejected: {}", message),
-                            ToastVariant::Error,
-                        );
+                        toasts_ok.show(format!("RSVP rejected: {}", message), ToastVariant::Error);
                     }
                 });
                 if let Err(e) = relay.publish_with_ack(&event, Some(ack)) {

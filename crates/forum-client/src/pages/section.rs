@@ -44,7 +44,7 @@ pub fn SectionPage() -> impl IntoView {
         match cat.as_str() {
             "home" => zone_access.home.get(),
             "members" => zone_access.members.get(),
-            "private" => zone_access.private_zone.get(),
+            "private" => zone_access.private.get(),
             _ => true, // unknown zones default to accessible
         }
     });

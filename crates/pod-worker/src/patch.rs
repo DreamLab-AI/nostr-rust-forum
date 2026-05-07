@@ -119,9 +119,7 @@ fn json_pointer_remove(doc: &mut serde_json::Value, path: &str) -> Result<(), St
                     return Ok(());
                 }
                 serde_json::Value::Array(arr) => {
-                    let idx: usize = part
-                        .parse()
-                        .map_err(|_| format!("invalid index: {part}"))?;
+                    let idx: usize = part.parse().map_err(|_| format!("invalid index: {part}"))?;
                     if idx < arr.len() {
                         arr.remove(idx);
                         return Ok(());
@@ -132,13 +130,11 @@ fn json_pointer_remove(doc: &mut serde_json::Value, path: &str) -> Result<(), St
             }
         }
         current = match current {
-            serde_json::Value::Object(map) => {
-                map.get_mut(*part).ok_or_else(|| format!("key not found: {part}"))?
-            }
+            serde_json::Value::Object(map) => map
+                .get_mut(*part)
+                .ok_or_else(|| format!("key not found: {part}"))?,
             serde_json::Value::Array(arr) => {
-                let idx: usize = part
-                    .parse()
-                    .map_err(|_| format!("invalid index: {part}"))?;
+                let idx: usize = part.parse().map_err(|_| format!("invalid index: {part}"))?;
                 arr.get_mut(idx)
                     .ok_or_else(|| format!("index out of bounds: {idx}"))?
             }

@@ -83,7 +83,7 @@ fn pubkey_with_quote_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Cohort → access flag mapping (from src/whitelist.rs:113-123)
+// Cohort → access flag mapping (from src/whitelist.rs:113-138)
 // ---------------------------------------------------------------------------
 //
 // The cohort taxonomy maps to three zone booleans: home, members, private.

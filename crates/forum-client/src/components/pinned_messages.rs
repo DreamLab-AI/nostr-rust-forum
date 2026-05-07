@@ -9,10 +9,10 @@ use leptos::prelude::*;
 use crate::auth::use_auth;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::NameCache;
+use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
 use crate::stores::zone_access::ZoneAccess;
-use crate::utils::{format_relative_time, shorten_pubkey};
+use crate::utils::format_relative_time;
 
 /// A single pinned message's data.
 #[derive(Clone, Debug)]
@@ -62,7 +62,12 @@ pub fn PinButton(
             created_at: now,
             kind: 41,
             tags: vec![
-                vec!["e".to_string(), cid.get_value(), String::new(), "root".to_string()],
+                vec![
+                    "e".to_string(),
+                    cid.get_value(),
+                    String::new(),
+                    "root".to_string(),
+                ],
                 vec!["pin".to_string(), eid.get_value()],
             ],
             content: String::new(),
@@ -163,18 +168,10 @@ pub fn PinnedMessages(
                                 let eid = msg.event_id.clone();
                                 let eid_unpin = eid.clone();
                                 let pk = msg.pubkey.clone();
-                                let pk_for_name = pk.clone();
                                 let content_preview = truncate_content(&msg.content, 120);
                                 let time = format_relative_time(msg.created_at);
 
-                                let display_name = Memo::new(move |_| {
-                                    if let Some(cache) = use_context::<NameCache>() {
-                                        if let Some(name) = cache.0.get().get(&pk_for_name).cloned() {
-                                            return name;
-                                        }
-                                    }
-                                    shorten_pubkey(&pk_for_name)
-                                });
+                                let display_name = use_display_name_memo(pk.clone());
 
                                 let on_click = move |_| {
                                     scroll_to_event(&eid);

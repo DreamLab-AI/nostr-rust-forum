@@ -34,8 +34,7 @@ pub(super) fn build_creation_options(
 
     // Override user.id: base64url string → ArrayBuffer (keep name/displayName as-is)
     if let Some(user_json) = json.get("user") {
-        let user_obj = Reflect::get(&options, &"user".into())
-            .unwrap_or(JsValue::UNDEFINED);
+        let user_obj = Reflect::get(&options, &"user".into()).unwrap_or(JsValue::UNDEFINED);
         if !user_obj.is_undefined() && !user_obj.is_null() {
             if let Some(id) = user_json.get("id").and_then(|v| v.as_str()) {
                 let buf = base64url_to_uint8array(id)?;

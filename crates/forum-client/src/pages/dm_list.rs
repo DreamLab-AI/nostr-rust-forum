@@ -268,6 +268,8 @@ fn ConversationRow(convo: DMConversation) -> impl IntoView {
     let avatar_text = convo.pubkey[..2].to_uppercase();
     let avatar_bg = pubkey_color(&convo.pubkey);
     let name = convo.name.clone();
+    // TODO(nicknames): keep raw shortened npub as the secondary identity
+    // fingerprint under the resolved nickname — intentional technical context.
     let short_pk = crate::utils::shorten_pubkey(&convo.pubkey);
     // Show pubkey separately only when name differs from shortened pubkey
     let _name_is_pubkey = name == short_pk || name == convo.pubkey;

@@ -87,7 +87,24 @@ impl NostrRelayDO {
             return;
         }
         if silenced {
-            Self::send_ok(ws, &event.id, false, "blocked: account silenced (read-only)");
+            Self::send_ok(
+                ws,
+                &event.id,
+                false,
+                "blocked: account silenced (read-only)",
+            );
+            return;
+        }
+
+        // WI-2: kind-1 / kind-42 ingress check against moderation_actions
+        // (60s DO cache). Applies to any content-producing kind we care
+        // about. Admins bypass so they can e.g. publish warnings even
+        // while under moderation for other reasons.
+        if matches!(event.kind, 1 | 42)
+            && !auth::is_admin(&event.pubkey, &self.env).await
+            && self.mod_cache.is_blocked(&event.pubkey, &self.env).await
+        {
+            Self::send_ok(ws, &event.id, false, "blocked: author is banned or muted");
             return;
         }
 
@@ -172,9 +189,7 @@ impl NostrRelayDO {
                 let zone = trust::get_channel_zone(&channel_id, &self.env)
                     .await
                     .unwrap_or_else(|| "home".to_string());
-                if !is_admin
-                    && !trust::has_zone_access(&event.pubkey, &zone, &self.env).await
-                {
+                if !is_admin && !trust::has_zone_access(&event.pubkey, &zone, &self.env).await {
                     Self::send_ok(ws, &event.id, false, "zone access denied");
                     return;
                 }
@@ -225,6 +240,18 @@ impl NostrRelayDO {
             // NIP-56: Process report events -- insert into reports table and check auto-hide
             if event.kind == 1984 {
                 self.process_report(&event).await;
+            }
+
+            // WI-2: mirror moderation-action Nostr events (kind 30910 ban,
+            // 30911 mute) into the local `moderation_actions` table so the
+            // ingress gate can reject content from muted/banned authors.
+            // Only respected when the signer is an admin on this relay.
+            if matches!(event.kind, 30910 | 30911) && is_admin {
+                self.mirror_moderation_action(&event).await;
+                // Best-effort cache invalidation for the target pubkey.
+                if let Some(target) = filter::tag_value(&event, "p") {
+                    self.mod_cache.invalidate(&target);
+                }
             }
         } else {
             Self::send_ok(ws, &event.id, false, "error: failed to save event");
@@ -318,6 +345,47 @@ impl NostrRelayDO {
                 .and_then(|s| s.authed_pubkey.clone())
         };
 
+        // NIP-59: kind-1059 AUTH gating.
+        // If any filter requests kind-1059 (Sealed DMs), the session must be
+        // authenticated. We inject a mandatory #p tag constraint so that only
+        // events addressed to the authenticated pubkey are returned, preventing
+        // cross-recipient leakage.
+        let filters = {
+            let needs_kind_1059 = filters
+                .iter()
+                .any(|f| f.kinds.as_ref().map_or(false, |k| k.contains(&1059)));
+            if needs_kind_1059 {
+                match &session_pubkey {
+                    None => {
+                        Self::send_notice(
+                            &ws,
+                            "auth-required: must authenticate to receive kind-1059 DMs",
+                        );
+                        return;
+                    }
+                    Some(authed_pk) => {
+                        // Rewrite each filter that includes kind-1059 to also require
+                        // a #p tag matching the authenticated pubkey.
+                        filters
+                            .into_iter()
+                            .map(|mut f| {
+                                if f.kinds.as_ref().map_or(false, |k| k.contains(&1059)) {
+                                    // Enforce the #p filter for the authed pubkey.
+                                    // We override any existing #p to prevent a client
+                                    // from requesting another user's DMs.
+                                    f.extra
+                                        .insert("#p".to_string(), serde_json::json!([authed_pk]));
+                                }
+                                f
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                }
+            } else {
+                filters
+            }
+        };
+
         // Query D1 for matching events
         let events = self.query_events(&filters).await;
 
@@ -331,9 +399,7 @@ impl NostrRelayDO {
                             .await
                             .unwrap_or_else(|| "home".to_string());
                         let is_admin = auth::is_admin(pk, &self.env).await;
-                        if !is_admin
-                            && !trust::has_zone_access(pk, &zone, &self.env).await
-                        {
+                        if !is_admin && !trust::has_zone_access(pk, &zone, &self.env).await {
                             continue; // skip this event
                         }
                     }
@@ -372,7 +438,12 @@ impl NostrRelayDO {
 
         // Verify signature
         if nostr_core::verify_event_strict(&event).is_err() {
-            Self::send_ok(ws, &event.id, false, "invalid: signature verification failed");
+            Self::send_ok(
+                ws,
+                &event.id,
+                false,
+                "invalid: signature verification failed",
+            );
             return;
         }
 
@@ -455,9 +526,7 @@ impl NostrRelayDO {
 
         // Delete events owned by the same pubkey
         for target_id in &target_ids {
-            let stmt = db.prepare(
-                "DELETE FROM events WHERE id = ?1 AND pubkey = ?2",
-            );
+            let stmt = db.prepare("DELETE FROM events WHERE id = ?1 AND pubkey = ?2");
             let _ = match stmt.bind(&[
                 JsValue::from_str(target_id),
                 JsValue::from_str(&deletion_event.pubkey),
@@ -492,9 +561,8 @@ impl NostrRelayDO {
                 continue;
             }
 
-            let stmt = db.prepare(
-                "DELETE FROM events WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
-            );
+            let stmt =
+                db.prepare("DELETE FROM events WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3");
             let _ = match stmt.bind(&[
                 JsValue::from_f64(kind),
                 JsValue::from_str(pubkey),
@@ -598,14 +666,13 @@ impl NostrRelayDO {
         };
 
         // Extract reason from `report` tag first, fall back to content
-        let reason = filter::tag_value(report_event, "report")
-            .unwrap_or_else(|| {
-                if report_event.content.is_empty() {
-                    "other".to_string()
-                } else {
-                    report_event.content.clone()
-                }
-            });
+        let reason = filter::tag_value(report_event, "report").unwrap_or_else(|| {
+            if report_event.content.is_empty() {
+                "other".to_string()
+            } else {
+                report_event.content.clone()
+            }
+        });
 
         // Separate structured reason from free-text
         let (reason_code, reason_text) = match reason.as_str() {
@@ -634,5 +701,62 @@ impl NostrRelayDO {
             reason_text,
         )
         .await;
+    }
+
+    /// WI-2: mirror a kind-30910 (ban) or kind-30911 (mute) event into the
+    /// local `moderation_actions` table. Idempotent via `event_id` dedup --
+    /// re-receiving the same event is a no-op. Missing target pubkey (no
+    /// `p` tag) silently drops the mirror.
+    pub(crate) async fn mirror_moderation_action(&self, event: &NostrEvent) {
+        let action = match event.kind {
+            30910 => "ban",
+            30911 => "mute",
+            _ => return,
+        };
+
+        let Some(target) = filter::tag_value(event, "p") else {
+            return;
+        };
+
+        // expires_at: mutes may carry a NIP-40 style `expiration` tag. Bans
+        // never expire; we persist NULL.
+        let expires_at: Option<i64> = if action == "mute" {
+            filter::tag_value(event, "expiration").and_then(|s| s.parse::<i64>().ok())
+        } else {
+            None
+        };
+
+        let reason: Option<&str> = if event.content.is_empty() {
+            None
+        } else {
+            Some(event.content.as_str())
+        };
+
+        let Ok(db) = self.env.d1("DB") else {
+            return;
+        };
+
+        let row_id = format!("mirror:{}", event.id);
+        let now = auth::js_now_secs();
+
+        let sql = "INSERT INTO moderation_actions \
+             (id, action, target_pubkey, performed_by, reason, expires_at, event_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (id) DO NOTHING";
+        let Ok(stmt) = db.prepare(sql).bind(&[
+            JsValue::from_str(&row_id),
+            JsValue::from_str(action),
+            JsValue::from_str(&target),
+            JsValue::from_str(&event.pubkey),
+            reason.map(JsValue::from_str).unwrap_or(JsValue::NULL),
+            expires_at
+                .map(|v| JsValue::from_f64(v as f64))
+                .unwrap_or(JsValue::NULL),
+            JsValue::from_str(&event.id),
+            JsValue::from_f64(now as f64),
+        ]) else {
+            return;
+        };
+        let _ = stmt.run().await;
     }
 }

@@ -1,11 +1,11 @@
-//! Config-driven zone access model.
+//! 3-flag zone access model: home, members, private.
 //!
-//! The default zones are `public`, `members`, and `private`, but operators can
-//! rename them via [`BbsConfig`]. All zone enforcement is client-side (UX
-//! optimization); the relay is the source of truth.
+//! Provides reactive zone access context that maps user flags to visibility.
+//! Zone enforcement is client-side (UX optimization); the relay is the
+//! source of truth per ADR-022.
 //!
-//! On authentication the user's whitelist entry is fetched from the relay's
-//! `/api/check-whitelist?pubkey=` endpoint and the flags are populated.
+//! On authentication, fetches the user's whitelist entry (including the
+//! `access` object) from the relay's `/api/check-whitelist?pubkey=` endpoint.
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -13,81 +13,15 @@ use wasm_bindgen_futures::JsFuture;
 
 use crate::auth::use_auth;
 
-// ---------------------------------------------------------------------------
-// BbsConfig — runtime zone configuration
-// ---------------------------------------------------------------------------
-
-/// Runtime configuration for zone names and access semantics.
-///
-/// The default configuration provides three zones: `public` (home),
-/// `members`, and `private`. Operators can override zone display names
-/// by providing a `BbsConfig` in Leptos context before calling
-/// [`provide_zone_access`].
-#[derive(Clone, Debug)]
-pub struct BbsConfig {
-    /// Zone 0 identifier (used in access JSON and cohort matching).
-    pub zone_public_id: String,
-    /// Zone 1 identifier.
-    pub zone_members_id: String,
-    /// Zone 2 identifier.
-    pub zone_private_id: String,
-    /// Display name for zone 0.
-    pub zone_public_name: String,
-    /// Display name for zone 1.
-    pub zone_members_name: String,
-    /// Display name for zone 2.
-    pub zone_private_name: String,
-    /// Cohort strings that grant zone 0 access.
-    pub zone_public_cohorts: Vec<String>,
-    /// Cohort strings that grant zone 1 access.
-    pub zone_members_cohorts: Vec<String>,
-    /// Cohort strings that grant zone 2 access.
-    pub zone_private_cohorts: Vec<String>,
-}
-
-impl Default for BbsConfig {
-    fn default() -> Self {
-        Self {
-            zone_public_id: "home".into(),
-            zone_members_id: "members".into(),
-            zone_private_id: "private".into(),
-            zone_public_name: "Home".into(),
-            zone_members_name: "Members".into(),
-            zone_private_name: "Private".into(),
-            zone_public_cohorts: vec![
-                "home".into(), "lobby".into(), "approved".into(), "cross-access".into(),
-            ],
-            zone_members_cohorts: vec![
-                "members".into(), "business".into(), "business-only".into(),
-                "trainers".into(), "trainees".into(), "ai-agents".into(),
-                "agent".into(), "visionflow-full".into(), "cross-access".into(),
-            ],
-            zone_private_cohorts: vec![
-                "private".into(), "private-only".into(), "private-business".into(),
-                "cross-access".into(),
-            ],
-        }
-    }
-}
-
-/// Retrieve the BBS config from context (or create the default).
-pub fn use_bbs_config() -> BbsConfig {
-    use_context::<BbsConfig>().unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
-// ZoneAccess — reactive access state
-// ---------------------------------------------------------------------------
-
 /// Reactive zone access state provided via Leptos context.
 #[derive(Clone, Debug)]
 pub struct ZoneAccess {
-    /// Whether the user has Home (public zone) access.
+    /// Whether the user has Home access.
     pub home: Memo<bool>,
-    /// Whether the user has Members zone access.
+    /// Whether the user has Members access.
     pub members: Memo<bool>,
-    /// Whether the user has Private zone access.
-    pub private_zone: Memo<bool>,
+    /// Whether the user has Minimoonoir access.
+    pub private: Memo<bool>,
     /// Whether the user is on the whitelist (any flag true).
     #[allow(dead_code)]
     pub is_whitelisted: Signal<bool>,
@@ -104,15 +38,11 @@ impl ZoneAccess {
     /// Check access for a zone by its string ID.
     #[allow(dead_code)]
     pub fn has_access(&self, zone_id: &str) -> bool {
-        let cfg = use_bbs_config();
-        if zone_id == cfg.zone_public_id || zone_id == "public-lobby" {
-            self.home.get_untracked()
-        } else if zone_id == cfg.zone_members_id {
-            self.members.get_untracked()
-        } else if zone_id == cfg.zone_private_id {
-            self.private_zone.get_untracked()
-        } else {
-            false
+        match zone_id {
+            "home" | "home-lobby" => self.home.get_untracked(),
+            "members" => self.members.get_untracked(),
+            "private" => self.private.get_untracked(),
+            _ => false,
         }
     }
 }
@@ -131,7 +61,7 @@ pub fn provide_zone_access() {
 
     let home = Memo::new(move |_| flags.get().0);
     let members = Memo::new(move |_| flags.get().1);
-    let private_zone = Memo::new(move |_| flags.get().2);
+    let private = Memo::new(move |_| flags.get().2);
     let is_whitelisted = Signal::derive(move || {
         let (h, d, m) = flags.get();
         h || d || m || is_authed.get()
@@ -140,7 +70,7 @@ pub fn provide_zone_access() {
     let access = ZoneAccess {
         home,
         members,
-        private_zone,
+        private,
         is_whitelisted,
         is_admin: is_admin_sig,
         loaded,
@@ -199,7 +129,6 @@ fn relay_api_base() -> String {
 /// Parses the `access` object first (new format). Falls back to normalizing
 /// the `cohorts` array for backwards compatibility with old relay versions.
 async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool), String> {
-    let cfg = use_bbs_config();
     let url = format!("{}/api/check-whitelist?pubkey={}", relay_api_base(), pubkey);
     let win = web_sys::window().ok_or("No window")?;
     let resp_val = JsFuture::from(win.fetch_with_str(&url))
@@ -218,14 +147,26 @@ async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool), Str
     let val: serde_json::Value =
         serde_json::from_str(&text_str).map_err(|e| format!("JSON parse: {e}"))?;
 
-    let is_admin = val.get("isAdmin").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_admin = val
+        .get("isAdmin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // New format: { access: { home, members, private } }
     if let Some(access) = val.get("access") {
-        let home = access.get(&cfg.zone_public_id).and_then(|v| v.as_bool()).unwrap_or(false);
-        let members = access.get(&cfg.zone_members_id).and_then(|v| v.as_bool()).unwrap_or(false);
-        let private_zone = access.get(&cfg.zone_private_id).and_then(|v| v.as_bool()).unwrap_or(false);
-        return Ok((home, members, private_zone, is_admin));
+        let home = access
+            .get("home")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let members = access
+            .get("members")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let private = access
+            .get("private")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return Ok((home, members, private, is_admin));
     }
 
     // Fallback: normalize from cohorts array
@@ -235,14 +176,38 @@ async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool), Str
 
     let cohorts: Vec<String> = val["cohorts"]
         .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let home = cohorts.iter().any(|c| cfg.zone_public_cohorts.contains(c));
-    let members = cohorts.iter().any(|c| cfg.zone_members_cohorts.contains(c));
-    let private_zone = cohorts.iter().any(|c| cfg.zone_private_cohorts.contains(c));
+    let home = cohorts
+        .iter()
+        .any(|c| matches!(c.as_str(), "home" | "lobby" | "approved" | "cross-access"));
+    let members = cohorts.iter().any(|c| {
+        matches!(
+            c.as_str(),
+            "members"
+                | "business"
+                | "business-only"
+                | "trainers"
+                | "trainees"
+                | "ai-agents"
+                | "agent"
+                | "visionflow-full"
+                | "cross-access"
+        )
+    });
+    let private = cohorts.iter().any(|c| {
+        matches!(
+            c.as_str(),
+            "private" | "private-only" | "private-business" | "cross-access"
+        )
+    });
 
-    Ok((home, members, private_zone, false))
+    Ok((home, members, private, false))
 }
 
 /// Retrieve the zone access store from context.

@@ -1,7 +1,7 @@
 //! First-visit welcome modal component.
 //!
 //! Displays a glass-panel overlay with feature highlights on the user's
-//! first visit. The `bbs:welcomed` flag in localStorage prevents
+//! first visit. The `members:welcomed` flag in localStorage prevents
 //! re-display on subsequent visits.
 
 use leptos::prelude::*;
@@ -9,7 +9,7 @@ use wasm_bindgen::JsCast;
 
 /// Welcome modal shown once on first visit.
 ///
-/// Checks `localStorage` for the `bbs:welcomed` key. If absent, shows
+/// Checks `localStorage` for the `members:welcomed` key. If absent, shows
 /// the modal with a fade-in animation. Clicking "Get Started" or the X button
 /// closes the modal and sets the flag.
 #[component]
@@ -20,7 +20,7 @@ pub fn WelcomeModal() -> impl IntoView {
     Effect::new(move |_| {
         let should_show = web_sys::window()
             .and_then(|w| w.local_storage().ok().flatten())
-            .map(|s| s.get_item("bbs:welcomed").ok().flatten().is_none())
+            .map(|s| s.get_item("nostrbbs:welcomed").ok().flatten().is_none())
             .unwrap_or(false);
 
         if should_show {
@@ -30,10 +30,8 @@ pub fn WelcomeModal() -> impl IntoView {
 
     let dismiss = move |_: web_sys::MouseEvent| {
         is_open.set(false);
-        if let Some(storage) = web_sys::window()
-            .and_then(|w| w.local_storage().ok().flatten())
-        {
-            let _ = storage.set_item("bbs:welcomed", "1");
+        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+            let _ = storage.set_item("nostrbbs:welcomed", "1");
         }
     };
 
@@ -42,19 +40,17 @@ pub fn WelcomeModal() -> impl IntoView {
         move |ev: web_sys::KeyboardEvent| {
             if is_open.get_untracked() && ev.key() == "Escape" {
                 is_open.set(false);
-                if let Some(storage) = web_sys::window()
-                    .and_then(|w| w.local_storage().ok().flatten())
+                if let Some(storage) =
+                    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
                 {
-                    let _ = storage.set_item("bbs:welcomed", "1");
+                    let _ = storage.set_item("nostrbbs:welcomed", "1");
                 }
             }
         },
     );
     if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-        let _ = doc.add_event_listener_with_callback(
-            "keydown",
-            esc_closure.as_ref().unchecked_ref(),
-        );
+        let _ =
+            doc.add_event_listener_with_callback("keydown", esc_closure.as_ref().unchecked_ref());
     }
     let esc_ref = send_wrapper::SendWrapper::new(esc_closure);
     on_cleanup(move || drop(esc_ref));
@@ -93,7 +89,7 @@ pub fn WelcomeModal() -> impl IntoView {
 
                     // Heading
                     <h2 class="text-2xl sm:text-3xl font-bold text-center mb-2 bg-gradient-to-r from-amber-400 via-orange-400 to-rose-400 bg-clip-text text-transparent">
-                        "Welcome to Nostr BBS"
+                        ""Welcome""
                     </h2>
                     <p class="text-gray-400 text-center text-sm mb-6">
                         "Your decentralized community awaits"

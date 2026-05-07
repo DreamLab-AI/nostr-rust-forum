@@ -1,14 +1,14 @@
 //! WebID profile document generation.
 //!
 //! Produces an HTML page with embedded JSON-LD that serves as a Solid
-//! WebID profile for a Nostr BBS user identified by their Nostr pubkey.
+//! WebID profile for a forum user identified by their Nostr pubkey.
 
 /// Generate a WebID profile document as HTML with embedded JSON-LD.
 ///
 /// The document conforms to the Solid WebID profile spec and links the
 /// Nostr DID identity to the user's pod.
 pub fn generate_webid_html(pubkey: &str, name: Option<&str>, pod_base: &str) -> String {
-    let display_name = name.unwrap_or("Nostr BBS User");
+    let display_name = name.unwrap_or("Forum User");
     let pod_url = format!("{pod_base}/pods/{pubkey}/");
     let webid = format!("{pod_base}/pods/{pubkey}/profile/card#me");
 
@@ -17,7 +17,7 @@ pub fn generate_webid_html(pubkey: &str, name: Option<&str>, pod_base: &str) -> 
 <html>
 <head>
   <meta charset="utf-8">
-  <title>{display_name} - Nostr BBS</title>
+  <title>{display_name} - nostr-bbs</title>
   <script type="application/ld+json">
   {{
     "@context": {{
@@ -57,14 +57,14 @@ mod tests {
         let html = generate_webid_html("abc123", None, "https://pods.example.com");
         assert!(html.contains("abc123"));
         assert!(html.contains("did:nostr:abc123"));
-        assert!(html.contains("Nostr BBS User"));
+        assert!(html.contains("Forum User"));
     }
 
     #[test]
     fn webid_uses_custom_name() {
         let html = generate_webid_html("abc123", Some("Alice"), "https://pods.example.com");
         assert!(html.contains("Alice"));
-        assert!(!html.contains("Nostr BBS User"));
+        assert!(!html.contains("Forum User"));
     }
 
     #[test]

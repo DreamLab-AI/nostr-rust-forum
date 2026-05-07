@@ -174,16 +174,14 @@ pub(crate) fn EncryptedMediaEmbed(
         };
 
         match decrypt_dm_image(&encrypted, &sender_pubkey, &recipient_privkey).await {
-            Ok(blob) => {
-                match web_sys::Url::create_object_url_with_blob(&blob) {
-                    Ok(url) => {
-                        decrypted_url.set(Some(url));
-                    }
-                    Err(e) => {
-                        error.set(Some(format!("URL creation: {e:?}")));
-                    }
+            Ok(blob) => match web_sys::Url::create_object_url_with_blob(&blob) {
+                Ok(url) => {
+                    decrypted_url.set(Some(url));
                 }
-            }
+                Err(e) => {
+                    error.set(Some(format!("URL creation: {e:?}")));
+                }
+            },
             Err(e) => {
                 error.set(Some(format!("Decryption failed: {e}")));
             }

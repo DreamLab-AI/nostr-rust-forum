@@ -82,11 +82,7 @@ pub fn BoardStats(
 
 /// Individual stat box with icon, animated number, and label.
 #[component]
-fn StatBox(
-    icon: &'static str,
-    value: RwSignal<u32>,
-    label: &'static str,
-) -> impl IntoView {
+fn StatBox(icon: &'static str, value: RwSignal<u32>, label: &'static str) -> impl IntoView {
     let icon_view = match icon {
         "message" => view! {
             <svg class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">

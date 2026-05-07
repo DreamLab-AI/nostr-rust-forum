@@ -60,6 +60,8 @@ pub(crate) fn is_twitter_url(raw_url: &str) -> bool {
 // ── Fetch helper ─────────────────────────────────────────────────────────────
 
 pub(crate) async fn fetch_twitter_embed(target_url: &str) -> Result<TwitterCachePayload> {
+    use crate::ssrf::{read_text_capped, ssrf_fetch_with_redirects, SsrfFetchError};
+
     let oembed_url = format!(
         "{}?url={}&omit_script=true&dnt=true&theme=dark",
         TWITTER_OEMBED_URL,
@@ -70,21 +72,26 @@ pub(crate) async fn fetch_twitter_embed(target_url: &str) -> Result<TwitterCache
     let _ = headers.set("Accept", "application/json");
     let _ = headers.set("User-Agent", "LinkPreviewAPI/1.0");
 
-    let mut init = RequestInit::new();
-    init.with_method(Method::Get);
-    init.with_headers(headers);
+    // Manual-redirect fetch with SSRF re-validation on every hop. The oEmbed
+    // host is a public Twitter endpoint, but a misconfigured upstream or
+    // hijacked DNS could redirect into private space; treat it the same as
+    // arbitrary OG fetches.
+    let response = ssrf_fetch_with_redirects(&oembed_url, &headers)
+        .await
+        .map_err(|e: SsrfFetchError| Error::RustError(e.to_string()))?;
 
-    let request = Request::new_with_init(&oembed_url, &init)?;
-    let mut response = Fetch::Request(request).send().await?;
-
-    if response.status_code() != 200 {
-        return Err(Error::RustError(format!(
-            "Twitter oEmbed failed: {}",
-            response.status_code()
-        )));
+    let status = response.status_code();
+    if status != 200 {
+        return Err(Error::RustError(format!("Twitter oEmbed failed: {status}")));
     }
 
-    let data: TwitterOembedData = response.json().await?;
+    // Read with body cap, then parse — workers-rs's `Response::json()` would
+    // bypass our limit.
+    let body = read_text_capped(response)
+        .await
+        .map_err(|e: SsrfFetchError| Error::RustError(e.to_string()))?;
+    let data: TwitterOembedData =
+        serde_json::from_str(&body).map_err(|e| Error::RustError(e.to_string()))?;
     Ok(TwitterCachePayload {
         r#type: "twitter".to_string(),
         url: target_url.to_string(),

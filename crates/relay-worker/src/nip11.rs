@@ -9,24 +9,24 @@ use worker::Env;
 /// Build the NIP-11 relay information JSON value.
 ///
 /// The relay name is taken from the `RELAY_NAME` env var (falling back to
-/// "Nostr BBS Relay"). The pubkey and contact fields are left empty since
+/// "nostr-bbs Relay"). The pubkey and contact fields are left empty since
 /// admin status is now dynamic (stored in D1).
 pub fn relay_info(env: &Env) -> serde_json::Value {
     let relay_name = env
         .var("RELAY_NAME")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "Nostr BBS Relay".to_string());
+        .unwrap_or_else(|_| "nostr-bbs Relay".to_string());
 
     let admin_pubkey = String::new();
     let contact = String::new();
 
     json!({
         "name": relay_name,
-        "description": "Private whitelist-only Nostr relay for the Nostr BBS community.",
+        "description": "Private whitelist-only Nostr relay (nostr-bbs).",
         "pubkey": admin_pubkey,
         "contact": contact,
-        "supported_nips": [1, 9, 11, 16, 29, 33, 40, 42, 45, 50, 98],
-        "software": "https://github.com/example/nostr-bbs-rs",
+        "supported_nips": [1, 9, 11, 16, 17, 26, 29, 33, 40, 42, 45, 50, 59, 65, 90, 98],
+        "software": "https://github.com/DreamLab-AI/nostr-rust-forum",
         "version": "3.0.0",
         "limitation": {
             "max_message_length": 65536,

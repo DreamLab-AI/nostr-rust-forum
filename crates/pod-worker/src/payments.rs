@@ -206,7 +206,7 @@ pub fn webledgers_discovery(pod_base: &str) -> serde_json::Value {
     serde_json::json!({
         "@context": "https://webledgers.org/ns/v1",
         "type": "WebLedger",
-        "name": "Nostr BBS Micropayments",
+        "name": "Micropayments",
         "description": "Satoshi-denominated micropayments for pod resource access",
         "unit": "sat",
         "endpoints": {

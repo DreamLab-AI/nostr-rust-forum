@@ -40,7 +40,10 @@ pub fn SectionRequestButton(
         let conn = relay.connection_state();
         if conn.get_untracked() != ConnectionState::Connected {
             let toasts = use_toasts();
-            toasts.show("Relay not connected. Please try again.", ToastVariant::Error);
+            toasts.show(
+                "Relay not connected. Please try again.",
+                ToastVariant::Error,
+            );
             return;
         }
 
@@ -63,7 +66,12 @@ pub fn SectionRequestButton(
             created_at: now,
             kind: 9021,
             tags: vec![
-                vec!["e".to_string(), section_id_clone.clone(), String::new(), "root".to_string()],
+                vec![
+                    "e".to_string(),
+                    section_id_clone.clone(),
+                    String::new(),
+                    "root".to_string(),
+                ],
                 vec!["cohort".to_string(), cohort_clone.clone()],
                 vec!["section".to_string(), section_name_clone.clone()],
             ],
@@ -86,7 +94,10 @@ pub fn SectionRequestButton(
                 Err(e) => {
                     is_pending.set(false);
                     let toasts = use_toasts();
-                    toasts.show(format!("Failed to send request: {}", e), ToastVariant::Error);
+                    toasts.show(
+                        format!("Failed to send request: {}", e),
+                        ToastVariant::Error,
+                    );
                 }
             }
         });

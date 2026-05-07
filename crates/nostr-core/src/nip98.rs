@@ -5,6 +5,7 @@
 //!
 //! Wire format: `Authorization: Nostr base64(json(signed_event))`
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use k256::schnorr::SigningKey;
 use sha2::{Digest, Sha256};
@@ -16,13 +17,36 @@ use crate::event::{sign_event, verify_event, NostrEvent, UnsignedEvent};
 const HTTP_AUTH_KIND: u64 = 27235;
 
 /// Maximum allowed clock skew in seconds.
-const TIMESTAMP_TOLERANCE: u64 = 60;
+pub const TIMESTAMP_TOLERANCE: u64 = 60;
+
+/// Recommended replay-cache TTL: 2x the timestamp tolerance window.
+///
+/// Stores accepting older event IDs only need to outlive the tolerance, so
+/// `2 * TIMESTAMP_TOLERANCE` is a safe upper bound for replay-cache entries.
+pub const REPLAY_CACHE_TTL_SECS: u64 = 2 * TIMESTAMP_TOLERANCE;
 
 /// Maximum encoded event size in bytes (64 KiB, matching TS implementation).
 const MAX_EVENT_SIZE: usize = 64 * 1024;
 
 /// Authorization header prefix.
 const NOSTR_PREFIX: &str = "Nostr ";
+
+/// Replay-cache abstraction for NIP-98 event IDs.
+///
+/// Implementations record-and-check whether a NIP-98 event id has been seen
+/// within the tolerance window. Workers wire this to KV with TTL =
+/// [`REPLAY_CACHE_TTL_SECS`]; tests use an in-memory map.
+///
+/// Semantics: [`Nip98ReplayStore::seen_or_record`] MUST be atomic from the
+/// caller's point of view — it returns `Ok(true)` on first observation and
+/// records the id, returning `Ok(false)` on subsequent observations within
+/// the TTL. A storage error is surfaced as `Err`.
+#[async_trait(?Send)]
+pub trait Nip98ReplayStore {
+    /// Record `event_id` if absent and return `true` on first observation.
+    /// Return `false` if `event_id` was already recorded within the TTL.
+    async fn seen_or_record(&self, event_id: &str) -> Result<bool, String>;
+}
 
 /// A verified NIP-98 token with extracted fields.
 ///
@@ -92,6 +116,12 @@ pub enum Nip98Error {
 
     #[error("event signature verification failed")]
     InvalidSignature,
+
+    #[error("replay detected: event id has already been seen within the tolerance window")]
+    Replayed,
+
+    #[error("replay store backend error: {0}")]
+    ReplayBackend(String),
 }
 
 /// Create a NIP-98 authorization token for an HTTP request.
@@ -291,6 +321,66 @@ pub fn verify_token_at(
     })
 }
 
+/// Verify a NIP-98 token AND enforce replay protection via [`Nip98ReplayStore`].
+///
+/// This is the recommended verification path for all worker endpoints. The
+/// store is consulted only AFTER the cryptographic checks pass — replay
+/// recording is a side effect of a structurally-valid event, never of a
+/// forged or expired one. If the event id has already been seen within the
+/// store's TTL, returns [`Nip98Error::Replayed`].
+///
+/// Backward-compatible callers that prefer the legacy non-replay-checked
+/// API can keep using [`verify_token`] / [`verify_token_at`]; those entry
+/// points are now `#[deprecated]` for direct use in worker request paths.
+///
+/// # Arguments
+/// As [`verify_token_at`], plus `replay_store` — a store keyed by the
+/// 32-byte hex event id with a TTL of at least [`REPLAY_CACHE_TTL_SECS`].
+pub async fn verify_token_at_with_replay(
+    auth_header: &str,
+    expected_url: &str,
+    expected_method: &str,
+    body: Option<&[u8]>,
+    now: u64,
+    replay_store: &dyn Nip98ReplayStore,
+) -> Result<Nip98Token, Nip98Error> {
+    // Run all stateless cryptographic + structural checks first.
+    let token = verify_token_at(auth_header, expected_url, expected_method, body, now)?;
+
+    // Recompute event id from the verified header so we cache the canonical
+    // identifier rather than anything the client claimed.
+    let event_id = compute_event_id_from_header(auth_header)?;
+
+    let first_seen = replay_store
+        .seen_or_record(&event_id)
+        .await
+        .map_err(Nip98Error::ReplayBackend)?;
+    if !first_seen {
+        return Err(Nip98Error::Replayed);
+    }
+
+    Ok(token)
+}
+
+/// Decode a NIP-98 `Authorization: Nostr <base64>` header and return the
+/// embedded event's id (64 hex chars). Used by replay protection so the
+/// stored id is always the canonical one validated above.
+fn compute_event_id_from_header(auth_header: &str) -> Result<String, Nip98Error> {
+    let token = auth_header
+        .strip_prefix(NOSTR_PREFIX)
+        .ok_or(Nip98Error::MissingPrefix)?
+        .trim();
+    if token.len() > MAX_EVENT_SIZE {
+        return Err(Nip98Error::EventTooLarge);
+    }
+    let json_bytes = BASE64.decode(token)?;
+    if json_bytes.len() > MAX_EVENT_SIZE {
+        return Err(Nip98Error::EventTooLarge);
+    }
+    let event: NostrEvent = serde_json::from_slice(&json_bytes)?;
+    Ok(event.id)
+}
+
 /// Helper: extract the first value for a tag name from an event's tags.
 fn get_tag(event: &NostrEvent, name: &str) -> Option<String> {
     event
@@ -303,6 +393,28 @@ fn get_tag(event: &NostrEvent, name: &str) -> Option<String> {
 /// Build a full `Authorization` header value from a token string.
 pub fn authorization_header(token: &str) -> String {
     format!("{NOSTR_PREFIX}{token}")
+}
+
+/// Build a ready-to-send `Authorization: Nostr <base64>` header value for
+/// an outbound HTTP request.
+///
+/// Convenience wrapper for CLI/worker clients that need the full header
+/// value in one call. Reuses [`create_token`] internally — the signing
+/// logic lives in a single place.
+///
+/// # Arguments
+/// * `secret_key` - 32-byte secp256k1 secret key
+/// * `url` - The full request URL
+/// * `method` - HTTP method (GET, POST, etc.)
+/// * `body` - Optional request body (hashed into the payload tag if present)
+pub fn sign_request_header(
+    secret_key: &[u8; 32],
+    url: &str,
+    method: &str,
+    body: Option<&[u8]>,
+) -> Result<String, Nip98Error> {
+    let token = create_token(secret_key, url, method, body)?;
+    Ok(authorization_header(&token))
 }
 
 #[cfg(test)]
@@ -635,9 +747,7 @@ mod tests {
             pubkey,
             created_at: now,
             kind: HTTP_AUTH_KIND,
-            tags: vec![
-                vec!["method".to_string(), "GET".to_string()],
-            ],
+            tags: vec![vec!["method".to_string(), "GET".to_string()]],
             content: String::new(),
         };
         let signed = sign_event(unsigned, &sk).unwrap();
@@ -664,9 +774,7 @@ mod tests {
             pubkey,
             created_at: now,
             kind: HTTP_AUTH_KIND,
-            tags: vec![
-                vec!["u".to_string(), url.to_string()],
-            ],
+            tags: vec![vec!["u".to_string(), url.to_string()]],
             content: String::new(),
         };
         let signed = sign_event(unsigned, &sk).unwrap();
@@ -705,6 +813,148 @@ mod tests {
         };
         assert!(get_tag(&event, "u").is_none());
         assert_eq!(get_tag(&event, "e"), Some("ref1".to_string()));
+    }
+
+    // ── Replay protection ──────────────────────────────────────────────
+    //
+    // In-memory replay store for unit tests. The trait is `?Send` so it
+    // works in both native and wasm32; the cell is a single-threaded
+    // `RefCell` which is fine here.
+
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    struct InMemoryReplayStore {
+        seen: RefCell<HashSet<String>>,
+    }
+
+    impl InMemoryReplayStore {
+        fn new() -> Self {
+            Self {
+                seen: RefCell::new(HashSet::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Nip98ReplayStore for InMemoryReplayStore {
+        async fn seen_or_record(&self, event_id: &str) -> Result<bool, String> {
+            let mut g = self.seen.borrow_mut();
+            if g.contains(event_id) {
+                Ok(false)
+            } else {
+                g.insert(event_id.to_string());
+                Ok(true)
+            }
+        }
+    }
+
+    /// Tiny block_on for unit tests (the replay store futures resolve immediately).
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop_clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTAB)
+        }
+        fn noop(_: *const ()) {}
+        static VTAB: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTAB)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = Box::pin(f);
+        loop {
+            match pinned.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => continue, // not used here, but safe
+            }
+        }
+    }
+
+    #[test]
+    fn nip98_replay_first_use_succeeds() {
+        let sk = test_secret_key();
+        let url = "https://api.example.com/replay";
+        let ts = 1_700_000_000u64;
+        let token = create_token_at(&sk, url, "POST", Some(b"x"), ts).unwrap();
+        let header = authorization_header(&token);
+
+        let store = InMemoryReplayStore::new();
+        let result = block_on(verify_token_at_with_replay(
+            &header,
+            url,
+            "POST",
+            Some(b"x"),
+            ts,
+            &store,
+        ));
+        assert!(result.is_ok(), "first use must succeed");
+    }
+
+    #[test]
+    fn nip98_replay_second_use_rejected() {
+        let sk = test_secret_key();
+        let url = "https://api.example.com/replay";
+        let ts = 1_700_000_000u64;
+        let token = create_token_at(&sk, url, "POST", Some(b"y"), ts).unwrap();
+        let header = authorization_header(&token);
+
+        let store = InMemoryReplayStore::new();
+
+        // First use records the id.
+        let _ = block_on(verify_token_at_with_replay(
+            &header,
+            url,
+            "POST",
+            Some(b"y"),
+            ts,
+            &store,
+        ))
+        .unwrap();
+
+        // Second use of the SAME header (within tolerance) MUST be rejected.
+        let err = block_on(verify_token_at_with_replay(
+            &header,
+            url,
+            "POST",
+            Some(b"y"),
+            ts,
+            &store,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, Nip98Error::Replayed),
+            "second use must be Replayed, got {err}"
+        );
+    }
+
+    #[test]
+    fn nip98_replay_different_events_independent() {
+        let sk = test_secret_key();
+        let url = "https://api.example.com/replay";
+        let ts = 1_700_000_000u64;
+        let t1 = create_token_at(&sk, url, "POST", Some(b"a"), ts).unwrap();
+        let t2 = create_token_at(&sk, url, "POST", Some(b"b"), ts).unwrap();
+        let h1 = authorization_header(&t1);
+        let h2 = authorization_header(&t2);
+
+        let store = InMemoryReplayStore::new();
+        assert!(block_on(verify_token_at_with_replay(
+            &h1,
+            url,
+            "POST",
+            Some(b"a"),
+            ts,
+            &store,
+        ))
+        .is_ok());
+        // Different body -> different event id -> independent record.
+        assert!(block_on(verify_token_at_with_replay(
+            &h2,
+            url,
+            "POST",
+            Some(b"b"),
+            ts,
+            &store,
+        ))
+        .is_ok());
     }
 
     #[test]

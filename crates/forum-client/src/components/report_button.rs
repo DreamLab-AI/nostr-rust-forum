@@ -111,9 +111,7 @@ pub fn ReportButton(
                     show.set(false);
                 }
                 Err(e) => {
-                    web_sys::console::error_1(
-                        &format!("[ReportButton] Sign failed: {}", e).into(),
-                    );
+                    web_sys::console::error_1(&format!("[ReportButton] Sign failed: {}", e).into());
                     let toasts = use_toasts();
                     toasts.show("Failed to submit report", ToastVariant::Error);
                 }

@@ -155,7 +155,13 @@ pub(super) async fn fetch_json_post(
     let win = web_sys::window().ok_or(PasskeyError::NoBrowser)?;
     let body_str =
         serde_json::to_string(body).map_err(|e| PasskeyError::Protocol(e.to_string()))?;
-    web_sys::console::log_1(&format!("[fetch_json_post] body: {}", &body_str[..body_str.len().min(300)]).into());
+    web_sys::console::log_1(
+        &format!(
+            "[fetch_json_post] body: {}",
+            &body_str[..body_str.len().min(300)]
+        )
+        .into(),
+    );
 
     let init = web_sys::RequestInit::new();
     init.set_method("POST");
@@ -193,10 +199,18 @@ pub(super) async fn fetch_json_post(
         .await
         .map_err(|e| PasskeyError::Network(format!("{e:?}")))?;
 
-    let result = text.as_string()
+    let result = text
+        .as_string()
         .ok_or_else(|| PasskeyError::Network("Response body not a string".into()));
     if let Ok(ref s) = result {
-        web_sys::console::log_1(&format!("[fetch_json_post] response text ({} chars): {}", s.len(), &s[..s.len().min(500)]).into());
+        web_sys::console::log_1(
+            &format!(
+                "[fetch_json_post] response text ({} chars): {}",
+                s.len(),
+                &s[..s.len().min(500)]
+            )
+            .into(),
+        );
     }
     result
 }
@@ -215,7 +229,9 @@ async fn extract_server_error(resp: &web_sys::Response) -> PasskeyError {
     if let Ok(text_promise) = resp.text() {
         if let Ok(text) = JsFuture::from(text_promise).await {
             if let Some(text_str) = text.as_string() {
-                web_sys::console::error_1(&format!("[extract_server_error] HTTP {}: {text_str}", resp.status()).into());
+                web_sys::console::error_1(
+                    &format!("[extract_server_error] HTTP {}: {text_str}", resp.status()).into(),
+                );
                 if let Ok(err_resp) = serde_json::from_str::<ErrorResponse>(&text_str) {
                     if let Some(code) = err_resp.code {
                         if code == "NO_CREDENTIAL" {

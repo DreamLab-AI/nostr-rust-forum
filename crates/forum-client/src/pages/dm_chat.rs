@@ -15,12 +15,10 @@ use wasm_bindgen::JsCast;
 use crate::auth::use_auth;
 use crate::components::image_upload::ImageUpload;
 use crate::components::swipeable_message::SwipeableMessage;
+use crate::components::user_display::use_display_name_memo;
 use crate::dm::{provide_dm_store, use_dm_store, DMMessage};
 use crate::relay::{ConnectionState, RelayConnection};
-use crate::components::user_display::use_display_name_memo;
-use crate::utils::{
-    arrow_left_svg, format_relative_time, pubkey_color, set_timeout_once,
-};
+use crate::utils::{arrow_left_svg, format_relative_time, pubkey_color, set_timeout_once};
 
 /// DM chat view component for a single conversation.
 #[component]
@@ -185,6 +183,8 @@ pub fn DmChatPage() -> impl IntoView {
                             </h1>
                             <p class="text-[10px] font-mono text-gray-500 truncate -mt-0.5 mb-0.5">
                                 {move || {
+                                    // TODO(nicknames): keep raw npub as the technical
+                                    // identity fingerprint beneath the recipient nickname.
                                     let rpk = recipient_pubkey();
                                     crate::utils::shorten_pubkey(&rpk)
                                 }}
@@ -372,11 +372,14 @@ fn MessageListWithDateSeparators(msgs: Vec<DMMessage>, my_pk: String) -> impl In
         prev_timestamp = msg.timestamp;
 
         let is_mine = msg.sender_pubkey == my_pk;
-        fragments.push(view! {
-            <SwipeableMessage>
-                <DmBubble message=msg is_mine=is_mine/>
-            </SwipeableMessage>
-        }.into_any());
+        fragments.push(
+            view! {
+                <SwipeableMessage>
+                    <DmBubble message=msg is_mine=is_mine/>
+                </SwipeableMessage>
+            }
+            .into_any(),
+        );
     }
 
     fragments.collect_view()

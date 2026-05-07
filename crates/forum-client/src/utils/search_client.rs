@@ -1,4 +1,4 @@
-//! RuVector semantic search client for the Nostr BBS forum.
+//! RuVector semantic search client for the nostr-bbs forum.
 //!
 //! Talks to the search-api Cloudflare Worker for embedding generation,
 //! k-NN vector search, and message ingestion (NIP-98 authenticated).
@@ -112,13 +112,9 @@ pub async fn ingest_message(
     let body_str = body.to_string();
 
     // Create NIP-98 auth token
-    let token = crate::auth::nip98::create_nip98_token(
-        secret_key,
-        &url,
-        "POST",
-        Some(body_str.as_bytes()),
-    )
-    .map_err(|e| format!("NIP-98 error: {}", e))?;
+    let token =
+        crate::auth::nip98::create_nip98_token(secret_key, &url, "POST", Some(body_str.as_bytes()))
+            .map_err(|e| format!("NIP-98 error: {}", e))?;
 
     let response = fetch_json_post(&url, &body_str, Some(&token)).await?;
 
@@ -174,8 +170,7 @@ async fn fetch_json_post(
     opts.set_method("POST");
     opts.set_body(&JsValue::from_str(body));
 
-    let headers =
-        web_sys::Headers::new().map_err(|_| "Headers error".to_string())?;
+    let headers = web_sys::Headers::new().map_err(|_| "Headers error".to_string())?;
     headers
         .set("Content-Type", "application/json")
         .map_err(|_| "Header set error".to_string())?;
@@ -202,11 +197,9 @@ async fn fetch_json_post(
         return Err(format!("HTTP {}", resp.status()));
     }
 
-    let text = JsFuture::from(
-        resp.text().map_err(|_| "Text error".to_string())?,
-    )
-    .await
-    .map_err(|e| format!("Text read error: {:?}", e))?;
+    let text = JsFuture::from(resp.text().map_err(|_| "Text error".to_string())?)
+        .await
+        .map_err(|e| format!("Text read error: {:?}", e))?;
 
     text.as_string()
         .ok_or_else(|| "Non-string response".to_string())
@@ -226,11 +219,9 @@ async fn fetch_get(url: &str) -> Result<String, String> {
         return Err(format!("HTTP {}", resp.status()));
     }
 
-    let text = JsFuture::from(
-        resp.text().map_err(|_| "Text error".to_string())?,
-    )
-    .await
-    .map_err(|e| format!("Text read error: {:?}", e))?;
+    let text = JsFuture::from(resp.text().map_err(|_| "Text error".to_string())?)
+        .await
+        .map_err(|e| format!("Text read error: {:?}", e))?;
 
     text.as_string()
         .ok_or_else(|| "Non-string response".to_string())

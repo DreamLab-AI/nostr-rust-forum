@@ -32,6 +32,7 @@ fn js_f64(v: f64) -> JsValue {
 /// This is an append-only insert; the table has no UPDATE or DELETE operations.
 /// Called from every admin-mutating handler in `whitelist.rs`, `moderation.rs`,
 /// and the trust/settings endpoints.
+#[allow(clippy::too_many_arguments)]
 pub async fn log_admin_action(
     env: &Env,
     actor_pubkey: &str,
@@ -195,5 +196,9 @@ pub async fn handle_audit_log_list(req: &Request, env: &Env) -> Result<Response>
         })
         .collect();
 
-    json_response(env, &json!({ "entries": entries, "limit": limit, "offset": offset }), 200)
+    json_response(
+        env,
+        &json!({ "entries": entries, "limit": limit, "offset": offset }),
+        200,
+    )
 }

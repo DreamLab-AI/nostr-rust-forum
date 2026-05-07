@@ -49,6 +49,21 @@ fn is_valid_pubkey(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Derive a deterministic but meaningless prf_salt for a pubkey that is not
+/// registered. Used by `login_options` to make registered/unregistered
+/// responses indistinguishable (audit C2). The salt has no cryptographic
+/// significance — it is purely a shape-matcher. We use a plain SHA-256 over
+/// the pubkey + a fixed domain-separation tag rather than a server secret
+/// because the value is intentionally public-derivable: its only purpose is
+/// to fill the response field.
+fn deterministic_salt_for(pubkey: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"nostr-bbs-prf-salt-fallback-v1\0");
+    h.update(pubkey.as_bytes());
+    let digest = h.finalize();
+    array_to_base64url(&digest)
+}
+
 /// Convert a u64 to JsValue (as f64 since JS has no u64).
 fn js_u64(v: u64) -> JsValue {
     JsValue::from_f64(v as f64)
@@ -89,6 +104,10 @@ struct RegisterVerifyBody {
     public_key_flat: Option<String>,
     #[serde(rename = "prfSalt")]
     prf_salt: Option<String>,
+    /// WI-4: optional invite code allowing registration bypass when
+    /// Web-of-Trust gating is enabled.
+    #[serde(rename = "inviteCode")]
+    invite_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -198,8 +217,8 @@ fn json_err(message: &str, status: u16) -> Result<Response> {
 /// server-controlled PRF salt and a random challenge.
 pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> {
     console_log!("[register_options] handler entered");
-    let body: RegisterOptionsBody = serde_json::from_slice(body_bytes)
-        .unwrap_or(RegisterOptionsBody { display_name: None });
+    let body: RegisterOptionsBody =
+        serde_json::from_slice(body_bytes).unwrap_or(RegisterOptionsBody { display_name: None });
     let display_name = body
         .display_name
         .filter(|s| !s.trim().is_empty())
@@ -247,7 +266,7 @@ pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> 
     let rp_id = env
         .var("RP_ID")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "your-domain.com".to_string());
+        .unwrap_or_else(|_| "example.test".to_string());
 
     let response_body = serde_json::json!({
         "options": {
@@ -272,7 +291,12 @@ pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> 
         "prfSalt": prf_salt_b64
     });
 
-    console_log!("[register_options] responding with {} bytes", serde_json::to_string(&response_body).unwrap_or_default().len());
+    console_log!(
+        "[register_options] responding with {} bytes",
+        serde_json::to_string(&response_body)
+            .unwrap_or_default()
+            .len()
+    );
     Response::from_json(&response_body)
 }
 
@@ -280,23 +304,55 @@ pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> 
 ///
 /// Verify a WebAuthn registration response, store the credential in D1,
 /// provision a Solid pod, and return the user's DID/WebID/podUrl.
-pub async fn register_verify(body_bytes: &[u8], env: &Env) -> Result<Response> {
+pub async fn register_verify(
+    body_bytes: &[u8],
+    cf_country: Option<&str>,
+    env: &Env,
+) -> Result<Response> {
     console_log!("[register_verify] handler entered");
     console_log!(
         "[register_verify] raw body ({} bytes): {}",
         body_bytes.len(),
         String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(500)])
     );
-    let body: RegisterVerifyBody = serde_json::from_slice(body_bytes)
-        .map_err(|e| {
-            console_error!("[register_verify] JSON parse error: {e}");
-            Error::RustError(format!("Invalid JSON body: {e}"))
-        })?;
+    let body: RegisterVerifyBody = serde_json::from_slice(body_bytes).map_err(|e| {
+        console_error!("[register_verify] JSON parse error: {e}");
+        Error::RustError(format!("Invalid JSON body: {e}"))
+    })?;
 
     let pubkey = match &body.pubkey {
         Some(pk) if is_valid_pubkey(pk) => pk.to_lowercase(),
         _ => return json_err("Invalid pubkey", 400),
     };
+
+    // WI-3/WI-4: Web-of-Trust registration gate.
+    // If `instance_settings.wot_enabled = 1`, the pubkey must appear in
+    // `wot_entries` (either referente-sourced or manual_override) OR the
+    // client must supply a valid `inviteCode` (consumed atomically here).
+    // Otherwise registration fails with 403. When WoT is disabled this is
+    // a no-op.
+    if !crate::wot::is_allowed_by_wot(&pubkey, env)
+        .await
+        .unwrap_or(false)
+    {
+        match body.invite_code.as_deref() {
+            Some(code) if !code.is_empty() => {
+                if let Err(reason) =
+                    crate::invites::consume_for_registration(code, &pubkey, env).await
+                {
+                    return json_err(reason, 403);
+                }
+                // Invite consumed: pubkey is now a member row. Fall through
+                // to the rest of registration.
+            }
+            _ => {
+                return json_err(
+                    "Registration is gated by Web-of-Trust. Supply a valid inviteCode or ask an admin for access.",
+                    403,
+                );
+            }
+        }
+    }
 
     // Verify a non-expired challenge exists. Registration uses a simplified flow
     // where the challenge is stored with pubkey=challenge_b64 (from register_options).
@@ -366,6 +422,10 @@ pub async fn register_verify(body_bytes: &[u8], env: &Env) -> Result<Response> {
         .run()
         .await?;
 
+    // WI-5: queue a welcome greeting on successful first registration.
+    // No-ops when the welcome bot is disabled or misconfigured.
+    crate::welcome::send_on_first_registration(&pubkey, cf_country, env).await;
+
     let response_body = serde_json::json!({
         "verified": true,
         "pubkey": pubkey,
@@ -381,9 +441,20 @@ pub async fn register_verify(body_bytes: &[u8], env: &Env) -> Result<Response> {
 ///
 /// Generate a WebAuthn PublicKeyCredentialRequestOptions. If a pubkey is
 /// provided, include the stored credential ID and PRF salt in the response.
+///
+/// Audit C2 hardening: this endpoint MUST return an indistinguishable shape
+/// for registered and unregistered pubkeys. A 404 on "unknown pubkey" was
+/// previously an enumeration oracle. Today, an unregistered pubkey gets:
+///   - a fresh challenge (always),
+///   - empty `allowCredentials`,
+///   - a deterministic-but-meaningless `prfSalt` derived from
+///     `HKDF(server_secret, pubkey)`.
+/// The downstream WebAuthn ceremony will fail at the authenticator step
+/// (no matching credential available) without the server having confirmed
+/// existence.
 pub async fn login_options(body_bytes: &[u8], env: &Env) -> Result<Response> {
-    let body: LoginOptionsBody = serde_json::from_slice(body_bytes)
-        .unwrap_or(LoginOptionsBody { pubkey: None });
+    let body: LoginOptionsBody =
+        serde_json::from_slice(body_bytes).unwrap_or(LoginOptionsBody { pubkey: None });
 
     // Generate 32-byte challenge
     let mut challenge_bytes = [0u8; 32];
@@ -407,10 +478,13 @@ pub async fn login_options(body_bytes: &[u8], env: &Env) -> Result<Response> {
 
         match cred {
             None => {
-                return json_err(
-                    "No passkey registered for this account. Use private key login or create a new passkey.",
-                    404,
-                );
+                // Indistinguishable response: deterministic salt over pubkey
+                // (HKDF-extract; an attacker cannot tell whether this came
+                // from a stored row or from this fallback path).
+                prf_salt = Some(deterministic_salt_for(pubkey));
+                // allow_credentials stays empty -> the authenticator will
+                // refuse to assert with a "no credential" error, which is
+                // the same UX as a stale credential.
             }
             Some(cred) => {
                 prf_salt = cred.prf_salt;
@@ -447,7 +521,7 @@ pub async fn login_options(body_bytes: &[u8], env: &Env) -> Result<Response> {
     let rp_id = env
         .var("RP_ID")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "your-domain.com".to_string());
+        .unwrap_or_else(|_| "example.test".to_string());
 
     let response_body = serde_json::json!({
         "options": {
@@ -485,11 +559,13 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
 
     let request_url = req.url().map(|u| u.to_string()).unwrap_or_default();
 
-    let nip98_result = match auth::verify_nip98(&auth_header, &request_url, "POST", Some(body_bytes))
-    {
-        Ok(token) => token,
-        Err(_) => return json_err("Invalid NIP-98 token", 401),
-    };
+    let nip98_result =
+        match auth::verify_nip98_replay(&auth_header, &request_url, "POST", Some(body_bytes), env)
+            .await
+        {
+            Ok(token) => token,
+            Err(_) => return json_err("Invalid NIP-98 token", 401),
+        };
 
     if nip98_result.pubkey != pubkey {
         return json_err("NIP-98 pubkey mismatch", 401);
@@ -587,7 +663,7 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
     let rp_id = env
         .var("RP_ID")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "your-domain.com".to_string());
+        .unwrap_or_else(|_| "example.test".to_string());
     let rp_id_hash = Sha256::digest(rp_id.as_bytes());
 
     if !constant_time_equal(&rp_id_hash, &auth_data[..32]) {

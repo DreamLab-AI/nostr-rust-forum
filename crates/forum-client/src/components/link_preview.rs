@@ -7,7 +7,7 @@ use wasm_bindgen::prelude::*;
 /// Default link-preview API endpoint.
 const PREVIEW_API: &str = match option_env!("VITE_LINK_PREVIEW_API_URL") {
     Some(u) => u,
-    None => "https://your-preview.your-subdomain.workers.dev",
+    None => "https://members-link-preview.solitary-paper-764d.workers.dev",
 };
 
 /// JSON shape returned by the link-preview worker.

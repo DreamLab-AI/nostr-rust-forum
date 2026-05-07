@@ -18,9 +18,9 @@ use wasm_bindgen_futures::JsFuture;
 
 const SEARCH_API: &str = match option_env!("VITE_SEARCH_API_URL") {
     Some(u) => u,
-    None => "https://your-search.your-subdomain.workers.dev",
+    None => "https://members-search-api.solitary-paper-764d.workers.dev",
 };
-const RECENT_KEY: &str = "bbs_recent_searches";
+const RECENT_KEY: &str = "nostrbbs_recent_searches";
 const MAX_RECENT: usize = 5;
 const DEBOUNCE_MS: i32 = 300;
 const SEMANTIC_DEBOUNCE_MS: i32 = 500;
@@ -88,9 +88,15 @@ impl Hit {
     fn subtitle(&self) -> String {
         match self {
             Self::Channel { desc, .. } => desc.clone(),
-            Self::Message { author, .. } => format!("by {}", crate::components::user_display::use_display_name(author)),
+            Self::Message { author, .. } => format!(
+                "by {}",
+                crate::components::user_display::use_display_name(author)
+            ),
             Self::SemanticMessage { label, .. } if !label.is_empty() => {
-                format!("by {}", crate::components::user_display::use_display_name(label))
+                format!(
+                    "by {}",
+                    crate::components::user_display::use_display_name(label)
+                )
             }
             Self::SemanticMessage { .. } => "semantic match".to_string(),
             Self::User { pubkey, .. } => crate::components::user_display::use_display_name(pubkey),

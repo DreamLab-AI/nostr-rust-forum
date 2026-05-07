@@ -80,10 +80,7 @@ pub fn ChannelPage() -> impl IntoView {
         let cid = channel_id();
         if let Some(store) = use_context::<ChannelStore>() {
             let channels = store.channels.get_untracked();
-            if let Some(found) = channels
-                .iter()
-                .find(|c| c.id == cid || c.name == cid)
-            {
+            if let Some(found) = channels.iter().find(|c| c.id == cid || c.name == cid) {
                 channel_info.set(Some(ChannelHeader {
                     name: found.name.clone(),
                     description: found.description.clone(),
@@ -295,9 +292,7 @@ pub fn ChannelPage() -> impl IntoView {
     let is_authed = auth.is_authenticated();
 
     // Channel archived state (derived from metadata)
-    let is_archived = Memo::new(move |_| {
-        channel_info.get().map(|c| c.archived).unwrap_or(false)
-    });
+    let is_archived = Memo::new(move |_| channel_info.get().map(|c| c.archived).unwrap_or(false));
 
     // Derive avatar letter from channel name
     let avatar_letter = move || {

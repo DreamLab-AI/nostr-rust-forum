@@ -61,8 +61,8 @@ pub fn create_deletion_event(
         }
     }
 
-    let signing_key = SigningKey::from_bytes(privkey)
-        .map_err(|e| DeletionError::InvalidKey(e.to_string()))?;
+    let signing_key =
+        SigningKey::from_bytes(privkey).map_err(|e| DeletionError::InvalidKey(e.to_string()))?;
     let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
 
     let tags: Vec<Vec<String>> = target_ids
@@ -80,8 +80,7 @@ pub fn create_deletion_event(
         content: reason.unwrap_or("").to_string(),
     };
 
-    sign_event(unsigned, &signing_key)
-        .map_err(|e| DeletionError::SigningFailed(e.to_string()))
+    sign_event(unsigned, &signing_key).map_err(|e| DeletionError::SigningFailed(e.to_string()))
 }
 
 /// Get current Unix timestamp, platform-aware.
@@ -170,8 +169,7 @@ mod tests {
     fn create_deletion_verifies_signature() {
         let (_, privkey) = test_signing_key();
         let target = "ee".repeat(32);
-        let event =
-            create_deletion_event(&privkey, &[target], Some("test reason")).unwrap();
+        let event = create_deletion_event(&privkey, &[target], Some("test reason")).unwrap();
         assert!(verify_event(&event));
     }
 

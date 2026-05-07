@@ -9,12 +9,7 @@ use worker::*;
 ///
 /// Returns `true` if the request is allowed, `false` if rate-limited.
 /// On KV errors, the request is allowed (fail-open).
-pub async fn check_rate_limit(
-    env: &Env,
-    ip: &str,
-    limit: u32,
-    window_secs: u64,
-) -> bool {
+pub async fn check_rate_limit(env: &Env, ip: &str, limit: u32, window_secs: u64) -> bool {
     let kv = match env.kv("SESSIONS") {
         Ok(kv) => kv,
         Err(_) => return true, // fail-open

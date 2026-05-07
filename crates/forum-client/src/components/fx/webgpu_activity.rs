@@ -51,9 +51,7 @@ pub fn WebGPUActivity(
 type AnimSlot = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
 #[component]
-fn CanvasActivityGraph(
-    #[prop(into)] data: Signal<Vec<ChannelActivity>>,
-) -> impl IntoView {
+fn CanvasActivityGraph(#[prop(into)] data: Signal<Vec<ChannelActivity>>) -> impl IntoView {
     let canvas_ref = NodeRef::<leptos::html::Canvas>::new();
     let running = Arc::new(AtomicBool::new(true));
     let running_cleanup = running.clone();
@@ -120,8 +118,7 @@ fn CanvasActivityGraph(
             if channels.is_empty() {
                 if let Some(ref cb) = *slot.borrow() {
                     if let Some(window) = web_sys::window() {
-                        let _ =
-                            window.request_animation_frame(cb.as_ref().unchecked_ref());
+                        let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
                     }
                 }
                 return;
@@ -134,18 +131,18 @@ fn CanvasActivityGraph(
 
             // Draw connections first (lighter)
             for i in 0..n {
-                let angle_i = (i as f64 / n as f64) * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
+                let angle_i =
+                    (i as f64 / n as f64) * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
                 let xi = cx + angle_i.cos() * radius;
                 let yi = cy + angle_i.sin() * radius;
 
                 for j in (i + 1)..n {
-                    let angle_j = (j as f64 / n as f64) * std::f64::consts::TAU
-                        - std::f64::consts::FRAC_PI_2;
+                    let angle_j =
+                        (j as f64 / n as f64) * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
                     let xj = cx + angle_j.cos() * radius;
                     let yj = cy + angle_j.sin() * radius;
 
-                    let avg_level =
-                        (channels[i].level as f64 + channels[j].level as f64) / 2.0;
+                    let avg_level = (channels[i].level as f64 + channels[j].level as f64) / 2.0;
                     let alpha = avg_level * 0.15;
 
                     ctx.set_stroke_style_str(&format!("rgba(251,191,36,{})", alpha));
@@ -220,9 +217,7 @@ fn CanvasActivityGraph(
 // -- CSS-only grid fallback ---------------------------------------------------
 
 #[component]
-fn CSSActivityGrid(
-    #[prop(into)] data: Signal<Vec<ChannelActivity>>,
-) -> impl IntoView {
+fn CSSActivityGrid(#[prop(into)] data: Signal<Vec<ChannelActivity>>) -> impl IntoView {
     view! {
         <div class="grid grid-cols-3 sm:grid-cols-4 gap-3 p-4">
             <For

@@ -150,7 +150,10 @@ impl VectorStore {
             uncompressed_len: 0,
             alignment_pad: 0,
         };
-        write_header(&mut buf[meta_hdr_start..meta_hdr_start + SEGMENT_HEADER_SIZE], &meta_hdr);
+        write_header(
+            &mut buf[meta_hdr_start..meta_hdr_start + SEGMENT_HEADER_SIZE],
+            &meta_hdr,
+        );
 
         // --- Meta segment payload ---
         let meta_payload_start = meta_hdr_start + SEGMENT_HEADER_SIZE;
@@ -314,7 +317,10 @@ fn build_rvf_bytes_for_test(entries: &[(u64, [f32; DIM])]) -> Vec<u8> {
         uncompressed_len: 0,
         alignment_pad: 0,
     };
-    write_header(&mut buf[meta_hdr_start..meta_hdr_start + SEGMENT_HEADER_SIZE], &meta_hdr);
+    write_header(
+        &mut buf[meta_hdr_start..meta_hdr_start + SEGMENT_HEADER_SIZE],
+        &meta_hdr,
+    );
 
     let meta_payload_start = meta_hdr_start + SEGMENT_HEADER_SIZE;
     buf[meta_payload_start..meta_payload_start + meta_bytes.len()].copy_from_slice(&meta_bytes);

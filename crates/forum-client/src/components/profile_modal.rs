@@ -12,8 +12,8 @@ use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
-use crate::relay::{Filter, RelayConnection};
 use crate::components::user_display::use_display_name;
+use crate::relay::{Filter, RelayConnection};
 use crate::stores::mute::use_mute_store;
 use crate::utils::shorten_pubkey;
 
@@ -42,6 +42,8 @@ pub(crate) fn ProfileModal(
 
     // Store pubkey in StoredValue so it can be captured in Fn closures
     let pk_stored = StoredValue::new(pubkey.clone());
+    // TODO(nicknames): keep raw shortened npub for the "Public Key" technical
+    // section of the modal — users explicitly want to verify the hex pubkey.
     let short_pk = StoredValue::new(shorten_pubkey(&pubkey));
     let pk_for_avatar = pubkey.clone();
 

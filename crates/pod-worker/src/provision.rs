@@ -1,15 +1,84 @@
-//! Pod provisioning -- creates default directory structure and ACLs for new pods.
+//! Pod provisioning — creates default directory structure, ACLs, and TypeIndex
+//! documents for new Solid pods.
+//!
+//! TypeIndex bootstrap (rows 14/164/166 — JSS #301 + #297) mirrors the logic
+//! published in solid-pod-rs v0.4.0-alpha.2 `provision.rs`. Both public and
+//! private type indexes are created; the public one gets a sibling ACL granting
+//! `foaf:Agent` read so Solid clients can discover a freshly bootstrapped pod's
+//! public profile without fighting the default-private `/settings/.acl`.
 
 use worker::*;
 
 /// Default container structure for a new pod.
-const DEFAULT_CONTAINERS: &[&str] = &[
-    "profile/",
-    "public/",
-    "private/",
-    "inbox/",
-    "settings/",
-];
+const DEFAULT_CONTAINERS: &[&str] = &["profile/", "public/", "private/", "inbox/", "settings/"];
+
+/// Storage path of the public type-index document.
+///
+/// Mirrors `solid_pod_rs::provision::PUBLIC_TYPE_INDEX_PATH`.
+pub const PUBLIC_TYPE_INDEX_PATH: &str = "settings/publicTypeIndex.jsonld";
+
+/// Storage path of the private type-index document.
+///
+/// Mirrors `solid_pod_rs::provision::PRIVATE_TYPE_INDEX_PATH`.
+pub const PRIVATE_TYPE_INDEX_PATH: &str = "settings/privateTypeIndex.jsonld";
+
+/// Storage path of the sibling ACL for the public type-index document.
+///
+/// Mirrors `solid_pod_rs::provision::PUBLIC_TYPE_INDEX_ACL_PATH`.
+pub const PUBLIC_TYPE_INDEX_ACL_PATH: &str = "settings/publicTypeIndex.jsonld.acl";
+
+/// Render the JSON-LD body for a Solid TypeIndex document.
+///
+/// `visibility_marker` is either `"solid:ListedDocument"` (public) or
+/// `"solid:UnlistedDocument"` (private). Mirrors
+/// `solid_pod_rs::provision::render_type_index_body`.
+fn render_type_index_body(pod_base_url: &str, visibility_marker: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "@context": { "solid": "http://www.w3.org/ns/solid/terms#" },
+        "@id": pod_base_url,
+        "@type": ["solid:TypeIndex", visibility_marker],
+        "http://www.w3.org/ns/solid/terms#TypeRegistration": []
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
+/// Build the ACL JSON-LD body for `publicTypeIndex.jsonld`.
+///
+/// Grants:
+/// - Pod owner (`did:nostr:{pubkey}`) → `acl:Read`, `acl:Write`, `acl:Control`
+/// - Public (`foaf:Agent`) → `acl:Read`
+///
+/// Placed at `settings/publicTypeIndex.jsonld.acl` so it overrides the
+/// default-private `/settings/.acl` for this one resource.
+fn render_public_type_index_acl(owner_did: &str) -> Vec<u8> {
+    let acl = serde_json::json!({
+        "@context": {
+            "acl": "http://www.w3.org/ns/auth/acl#",
+            "foaf": "http://xmlns.com/foaf/0.1/"
+        },
+        "@graph": [
+            {
+                "@id": "#owner",
+                "@type": "acl:Authorization",
+                "acl:agent": { "@id": owner_did },
+                "acl:accessTo": { "@id": PUBLIC_TYPE_INDEX_PATH },
+                "acl:mode": [
+                    { "@id": "acl:Read" },
+                    { "@id": "acl:Write" },
+                    { "@id": "acl:Control" }
+                ]
+            },
+            {
+                "@id": "#public",
+                "@type": "acl:Authorization",
+                "acl:agentClass": { "@id": "foaf:Agent" },
+                "acl:accessTo": { "@id": PUBLIC_TYPE_INDEX_PATH },
+                "acl:mode": { "@id": "acl:Read" }
+            }
+        ]
+    });
+    serde_json::to_vec_pretty(&acl).unwrap_or_default()
+}
 
 /// Provision a new pod with default containers, ACLs, and WebID profile.
 pub async fn provision_pod(
@@ -58,8 +127,7 @@ pub async fn provision_pod(
     }
 
     // Create WebID profile
-    let webid_html =
-        crate::webid::generate_webid_html(owner_pubkey, display_name, pod_base);
+    let webid_html = crate::webid::generate_webid_html(owner_pubkey, display_name, pod_base);
     bucket
         .put(
             &format!("{base}/profile/card"),
@@ -228,6 +296,56 @@ pub async fn provision_pod(
         .execute()
         .await?;
 
+    // -----------------------------------------------------------------------
+    // TypeIndex bootstrap (rows 14/164/166 — JSS #301 + #297).
+    //
+    // The public TypeIndex gets a sibling ACL granting foaf:Agent read so
+    // Solid clients can discover the pod's public profile. The private
+    // TypeIndex inherits the default-private /settings/.acl.
+    //
+    // Mirrors solid-pod-rs v0.4.0-alpha.2 provision::provision_pod logic.
+    // -----------------------------------------------------------------------
+    let pod_url = format!("{pod_base}/pods/{owner_pubkey}/");
+    let owner_did = format!("did:nostr:{owner_pubkey}");
+
+    let public_ti_url = format!("{pod_url}{PUBLIC_TYPE_INDEX_PATH}");
+    let public_ti_body = render_type_index_body(&public_ti_url, "solid:ListedDocument");
+    bucket
+        .put(&format!("{base}/{PUBLIC_TYPE_INDEX_PATH}"), public_ti_body)
+        .http_metadata(HttpMetadata {
+            content_type: Some("application/ld+json".into()),
+            ..Default::default()
+        })
+        .execute()
+        .await?;
+
+    let private_ti_url = format!("{pod_url}{PRIVATE_TYPE_INDEX_PATH}");
+    let private_ti_body = render_type_index_body(&private_ti_url, "solid:UnlistedDocument");
+    bucket
+        .put(
+            &format!("{base}/{PRIVATE_TYPE_INDEX_PATH}"),
+            private_ti_body,
+        )
+        .http_metadata(HttpMetadata {
+            content_type: Some("application/ld+json".into()),
+            ..Default::default()
+        })
+        .execute()
+        .await?;
+
+    let public_ti_acl_body = render_public_type_index_acl(&owner_did);
+    bucket
+        .put(
+            &format!("{base}/{PUBLIC_TYPE_INDEX_ACL_PATH}"),
+            public_ti_acl_body,
+        )
+        .http_metadata(HttpMetadata {
+            content_type: Some("application/ld+json".into()),
+            ..Default::default()
+        })
+        .execute()
+        .await?;
+
     // Initialize quota
     crate::quota::update_usage(kv, owner_pubkey, 0).await?;
 
@@ -269,5 +387,39 @@ mod tests {
         assert!(names.contains(&"private/"));
         assert!(names.contains(&"inbox/"));
         assert!(names.contains(&"settings/"));
+    }
+
+    #[test]
+    fn type_index_paths_are_under_settings() {
+        assert!(PUBLIC_TYPE_INDEX_PATH.starts_with("settings/"));
+        assert!(PRIVATE_TYPE_INDEX_PATH.starts_with("settings/"));
+        assert!(PUBLIC_TYPE_INDEX_ACL_PATH.starts_with("settings/"));
+        assert!(PUBLIC_TYPE_INDEX_ACL_PATH.ends_with(".acl"));
+    }
+
+    #[test]
+    fn render_type_index_body_is_valid_json() {
+        let body = render_type_index_body(
+            "https://pods.example/settings/publicTypeIndex.jsonld",
+            "solid:ListedDocument",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let types = v["@type"].as_array().unwrap();
+        let type_strs: Vec<&str> = types.iter().filter_map(|t| t.as_str()).collect();
+        assert!(type_strs.contains(&"solid:TypeIndex"));
+        assert!(type_strs.contains(&"solid:ListedDocument"));
+    }
+
+    #[test]
+    fn render_public_type_index_acl_is_valid_json() {
+        let body = render_public_type_index_acl("did:nostr:aabb");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["@graph"].is_array());
+        let graph = v["@graph"].as_array().unwrap();
+        assert_eq!(graph.len(), 2);
+        // One entry for owner, one for foaf:Agent
+        let ids: Vec<&str> = graph.iter().filter_map(|e| e["@id"].as_str()).collect();
+        assert!(ids.contains(&"#owner"));
+        assert!(ids.contains(&"#public"));
     }
 }

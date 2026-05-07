@@ -290,7 +290,10 @@ mod tests {
         assert_eq!(event.tags[0], vec!["h", "dev"]);
         assert_eq!(event.tags[1], vec!["name", "Developers"]);
         assert_eq!(event.tags[2], vec!["about", "A group for devs"]);
-        assert_eq!(event.tags[3], vec!["picture", "https://example.com/pic.png"]);
+        assert_eq!(
+            event.tags[3],
+            vec!["picture", "https://example.com/pic.png"]
+        );
         assert_eq!(event.content, "");
         assert!(verify_event(&event));
     }
@@ -416,8 +419,7 @@ mod tests {
     #[test]
     fn registration_request_with_metadata() {
         let metadata = r#"{"name":"Alice","bio":"Developer"}"#;
-        let event =
-            create_registration_request(&test_key(), "verified-group", metadata).unwrap();
+        let event = create_registration_request(&test_key(), "verified-group", metadata).unwrap();
 
         assert_eq!(event.kind, 9024);
         assert_eq!(event.tags[0], vec!["h", "verified-group"]);

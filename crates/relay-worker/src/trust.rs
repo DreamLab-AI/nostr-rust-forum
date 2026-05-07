@@ -323,8 +323,7 @@ pub async fn check_demotion(pubkey: &str, env: &Env) -> Option<TrustLevel> {
             let needs_demote = (row.days_active as f64)
                 < (thresholds.tl2_days_active as f64 * hysteresis)
                 || (row.posts_read as f64) < (thresholds.tl2_posts_read as f64 * hysteresis)
-                || (row.posts_created as f64)
-                    < (thresholds.tl2_posts_created as f64 * hysteresis)
+                || (row.posts_created as f64) < (thresholds.tl2_posts_created as f64 * hysteresis)
                 || row.mod_actions_against > 0;
 
             if needs_demote {
@@ -350,8 +349,7 @@ pub async fn check_demotion(pubkey: &str, env: &Env) -> Option<TrustLevel> {
             let needs_demote = (row.days_active as f64)
                 < (thresholds.tl1_days_active as f64 * hysteresis)
                 || (row.posts_read as f64) < (thresholds.tl1_posts_read as f64 * hysteresis)
-                || (row.posts_created as f64)
-                    < (thresholds.tl1_posts_created as f64 * hysteresis);
+                || (row.posts_created as f64) < (thresholds.tl1_posts_created as f64 * hysteresis);
 
             if needs_demote {
                 TrustLevel::Newcomer
@@ -479,10 +477,7 @@ pub async fn update_last_active(pubkey: &str, env: &Env) {
     } else {
         if let Ok(bound) = db
             .prepare("UPDATE whitelist SET last_active_at = ?1 WHERE pubkey = ?2")
-            .bind(&[
-                JsValue::from_f64(now as f64),
-                JsValue::from_str(pubkey),
-            ])
+            .bind(&[JsValue::from_f64(now as f64), JsValue::from_str(pubkey)])
         {
             let _ = bound.run().await;
         }
@@ -601,8 +596,7 @@ pub async fn has_zone_access(pubkey: &str, zone: &str, env: &Env) -> bool {
                     return true;
                 }
 
-                let cohorts: Vec<String> =
-                    serde_json::from_str(&row.cohorts).unwrap_or_default();
+                let cohorts: Vec<String> = serde_json::from_str(&row.cohorts).unwrap_or_default();
 
                 match zone {
                     "home" | "lobby" => cohorts.iter().any(|c| {
@@ -621,7 +615,6 @@ pub async fn has_zone_access(pubkey: &str, zone: &str, env: &Env) -> bool {
                                 | "trainees"
                                 | "ai-agents"
                                 | "agent"
-                                | "visionflow-full"
                                 | "cross-access"
                         )
                     }),

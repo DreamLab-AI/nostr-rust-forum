@@ -82,10 +82,9 @@ impl ProfileEntry {
 
 /// The operator-configured "own" NIP-05 root domain (without subdomain).
 ///
-/// This is rendered with no domain suffix in handles. Set at build time via
-/// the `NOSTR_BBS_NIP05_DOMAIN` env var — when unset, every domain renders
-/// fully qualified (`@alice@example.com`). Operators of branded forks
-/// override this in their `forum-config/` package.
+/// Set at build time via the `NOSTR_BBS_NIP05_DOMAIN` env var; when unset,
+/// every NIP-05 renders fully qualified. Operators of branded forks override
+/// this in their `forum-config/` package.
 fn own_nip05_root_domain() -> Option<&'static str> {
     option_env!("NOSTR_BBS_NIP05_DOMAIN")
 }
@@ -624,7 +623,6 @@ mod tests {
 
     #[test]
     fn nip05_local_domain_is_short() {
-        // Test with operator's own domain configured: should strip suffix.
         assert_eq!(
             format_nip05_handle_with_domain("alice@example.test", Some("example.test")),
             "@alice"
@@ -637,7 +635,6 @@ mod tests {
 
     #[test]
     fn nip05_external_domain_is_long() {
-        // External domain (not the configured own-root) renders fully qualified.
         assert_eq!(
             format_nip05_handle_with_domain("alice@example.com", Some("example.test")),
             "@alice@example.com"
@@ -646,7 +643,6 @@ mod tests {
 
     #[test]
     fn nip05_no_own_domain_is_always_long() {
-        // When no own-domain is configured every NIP-05 renders fully qualified.
         assert_eq!(
             format_nip05_handle_with_domain("alice@example.test", None),
             "@alice@example.test"

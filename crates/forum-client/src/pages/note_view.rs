@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use crate::app::base_href;
 use crate::components::mention_text::MentionText;
-use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::components::user_display::use_display_name;
+use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::utils::{format_relative_time, pubkey_color, set_timeout_once};
 
 /// Internal representation of the fetched event for display.

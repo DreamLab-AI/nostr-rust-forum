@@ -22,9 +22,26 @@ use crate::utils::{capitalize, set_timeout_once};
 
 /// Maps zone IDs to their child section IDs.
 const ZONE_SECTIONS: &[(&str, &[&str])] = &[
-    ("home", &["public-lobby"]),
-    ("members", &["members-training", "members-projects", "members-bookings", "ai-general", "ai-claude-flow", "ai-visionflow"]),
-    ("private", &["private-welcome", "private-events", "private-booking"]),
+    ("home", &["home-lobby"]),
+    (
+        "members",
+        &[
+            "members-training",
+            "members-projects",
+            "members-bookings",
+            "ai-general",
+            "ai-claude-flow",
+            "ai-visionflow",
+        ],
+    ),
+    (
+        "private",
+        &[
+            "private-welcome",
+            "private-events",
+            "private-booking",
+        ],
+    ),
 ];
 
 /// Resolve a channel's section tag to its parent zone ID.
@@ -95,7 +112,7 @@ pub fn CategoryPage() -> impl IntoView {
         match cat.as_str() {
             "home" => zone_access.home.get(),
             "members" => zone_access.members.get(),
-            "private" => zone_access.private_zone.get(),
+            "private" => zone_access.private.get(),
             _ => false,
         }
     });
@@ -259,10 +276,10 @@ pub fn CategoryPage() -> impl IntoView {
         let slug = category_slug();
         match slug.as_str() {
             "home" => "Home".to_string(),
-            "private" => "Private".to_string(),
-            "members" => "Nostr BBS".to_string(),
+            "private" => "Minimoonoir".to_string(),
+            "members" => "Members".to_string(),
             other => {
-                // For section IDs like "public-lobby", humanize to "Lobby"
+                // For section IDs like "home-lobby", humanize to "Lobby"
                 if other.contains('-') {
                     let suffix = other.split_once('-').map(|(_, s)| s).unwrap_or(other);
                     suffix
@@ -290,9 +307,7 @@ pub fn CategoryPage() -> impl IntoView {
             "home" | "members" | "private" => slug,
             _ => {
                 // Resolve section ID to parent zone
-                section_to_zone_id(&slug)
-                    .unwrap_or("home")
-                    .to_string()
+                section_to_zone_id(&slug).unwrap_or("home").to_string()
             }
         }
     };
@@ -304,7 +319,7 @@ pub fn CategoryPage() -> impl IntoView {
             // Moon
             "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"
         } else {
-            // Sparkle for Home and Nostr BBS
+            // Sparkle for Home and Members
             "M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8L12 2z"
         }
     };

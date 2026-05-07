@@ -72,7 +72,7 @@ pub fn LoginPage() -> impl IntoView {
                 <div class="bg-gray-800/30 border border-gray-700/50 rounded-2xl p-8 space-y-6">
                     <div class="text-center">
                         <h1 class="text-3xl font-bold text-white">"Welcome Back"</h1>
-                        <p class="mt-2 text-gray-400 text-sm">"Sign in to continue to Nostr BBS"</p>
+                        <p class="mt-2 text-gray-400 text-sm">"Sign in to continue"</p>
                     </div>
 
                     // Error display

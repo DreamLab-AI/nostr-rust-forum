@@ -13,7 +13,7 @@ use crate::components::user_display::use_display_name;
 use crate::utils::format_relative_time;
 
 /// localStorage key for bookmarks.
-const BOOKMARKS_KEY: &str = "bbs_bookmarks";
+const BOOKMARKS_KEY: &str = "nostrbbs_bookmarks";
 
 // -- Bookmark data types ------------------------------------------------------
 

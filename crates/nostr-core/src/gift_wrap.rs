@@ -11,6 +11,7 @@
 
 use crate::event::{sign_event, NostrEvent, UnsignedEvent};
 use crate::keys::generate_keypair;
+use crate::nip04;
 use crate::nip44;
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -354,6 +355,35 @@ pub fn unwrap_gift(
         rumor,
         seal,
     })
+}
+
+// ── Kind-4 (NIP-04) direct message handling ───────────────────────────────────
+
+/// Nostr kind for legacy encrypted DM (NIP-04).
+const KIND_ENCRYPTED_DM: u64 = 4;
+
+/// Decrypt a kind-4 (NIP-04) encrypted direct message.
+///
+/// Kind-4 events use NIP-04 (AES-256-CBC) — **not** NIP-44. This function
+/// corrects the historical mistake of calling `nip44_decrypt` on kind-4 content.
+///
+/// # Arguments
+/// * `event` - The kind-4 event to decrypt
+/// * `recipient_sk` - 32-byte recipient secret key
+pub fn process_kind4_event(
+    event: &NostrEvent,
+    recipient_sk: &[u8; 32],
+) -> Result<String, GiftWrapError> {
+    if event.kind != KIND_ENCRYPTED_DM {
+        return Err(GiftWrapError::InvalidKind {
+            expected: KIND_ENCRYPTED_DM,
+            actual: event.kind,
+        });
+    }
+
+    // The sender's pubkey is the event pubkey; use NIP-04 (AES-256-CBC), NOT NIP-44
+    nip04::nip04_decrypt(recipient_sk, &event.pubkey, &event.content)
+        .map_err(|e| GiftWrapError::Decryption(format!("NIP-04 decryption: {e}")))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

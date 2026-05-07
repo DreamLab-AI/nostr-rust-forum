@@ -29,8 +29,9 @@ impl Default for QuotaInfo {
 pub async fn get_quota(kv: &kv::KvStore, pubkey: &str) -> Result<QuotaInfo> {
     let key = format!("quota:{pubkey}");
     match kv.get(&key).text().await? {
-        Some(json) => serde_json::from_str(&json)
-            .map_err(|e| Error::RustError(format!("quota parse: {e}"))),
+        Some(json) => {
+            serde_json::from_str(&json).map_err(|e| Error::RustError(format!("quota parse: {e}")))
+        }
         None => Ok(QuotaInfo::default()),
     }
 }
@@ -44,8 +45,8 @@ pub async fn update_usage(kv: &kv::KvStore, pubkey: &str, delta: i64) -> Result<
         info.used = info.used.saturating_sub((-delta) as u64);
     }
     let key = format!("quota:{pubkey}");
-    let json =
-        serde_json::to_string(&info).map_err(|e| Error::RustError(format!("quota serialize: {e}")))?;
+    let json = serde_json::to_string(&info)
+        .map_err(|e| Error::RustError(format!("quota serialize: {e}")))?;
     kv.put(&key, &json)?.execute().await?;
     Ok(())
 }
@@ -55,8 +56,8 @@ pub async fn set_quota(kv: &kv::KvStore, pubkey: &str, limit: u64) -> Result<Quo
     let mut info = get_quota(kv, pubkey).await?;
     info.limit = limit;
     let key = format!("quota:{pubkey}");
-    let json =
-        serde_json::to_string(&info).map_err(|e| Error::RustError(format!("quota serialize: {e}")))?;
+    let json = serde_json::to_string(&info)
+        .map_err(|e| Error::RustError(format!("quota serialize: {e}")))?;
     kv.put(&key, &json)?.execute().await?;
     Ok(info)
 }

@@ -21,12 +21,12 @@ pub fn AccessDenied(
             "You need to be a registered member to access this area. Please log in or sign up.",
         ),
         "members" => (
-            "Nostr BBS Access Required",
-            "This section is restricted to Nostr BBS members. Contact an admin for access.",
+            "Members Access Required",
+            "This section is restricted to members. Contact an admin for access.",
         ),
         "private" => (
-            "Private Access Required",
-            "This section is restricted to Private guests. Contact an admin for access.",
+            "Minimoonoir Access Required",
+            "This section is restricted to Minimoonoir guests. Contact an admin for access.",
         ),
         _ => ("Access Denied", "This content is not available."),
     };
@@ -42,8 +42,8 @@ pub fn AccessDenied(
 
     let zone_label = match zone_id.as_str() {
         "home" => "Home",
-        "members" => "Nostr BBS",
-        "private" => "Private",
+        "members" => "Members",
+        "private" => "Minimoonoir",
         _ => "Restricted",
     };
 

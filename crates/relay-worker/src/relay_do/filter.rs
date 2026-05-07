@@ -170,7 +170,8 @@ impl NostrRelayDO {
 // In-memory filter matching (for broadcast)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn event_matches_filters(event: &NostrEvent, filters: &[NostrFilter]) -> bool {
+#[doc(hidden)]
+pub fn event_matches_filters(event: &NostrEvent, filters: &[NostrFilter]) -> bool {
     'outer: for filter in filters {
         if let Some(ref ids) = filter.ids {
             if !ids.iter().any(|id| id == &event.id) {
@@ -215,7 +216,7 @@ pub(crate) fn event_matches_filters(event: &NostrEvent, filters: &[NostrFilter])
             // Check that the event has at least one tag matching this filter
             let has_match = event.tags.iter().any(|tag| {
                 tag.first().map(|t| t.as_str()) == Some(tag_name)
-                    && tag.get(1).map_or(false, |v| required.contains(&v.as_str()))
+                    && tag.get(1).is_some_and(|v| required.contains(&v.as_str()))
             });
             if !has_match {
                 continue 'outer;
@@ -232,7 +233,8 @@ pub(crate) fn event_matches_filters(event: &NostrEvent, filters: &[NostrFilter])
 // ---------------------------------------------------------------------------
 
 /// Extract the first value for a given tag name from an event.
-pub(crate) fn tag_value(event: &NostrEvent, name: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn tag_value(event: &NostrEvent, name: &str) -> Option<String> {
     event
         .tags
         .iter()
@@ -240,7 +242,8 @@ pub(crate) fn tag_value(event: &NostrEvent, name: &str) -> Option<String> {
         .map(|t| t[1].clone())
 }
 
-pub(crate) fn d_tag_value(event: &NostrEvent) -> String {
+#[doc(hidden)]
+pub fn d_tag_value(event: &NostrEvent) -> String {
     for tag in &event.tags {
         if tag.first().map(|s| s.as_str()) == Some("d") {
             return tag.get(1).cloned().unwrap_or_default();
@@ -333,10 +336,7 @@ mod tests {
     #[test]
     fn filter_roundtrip_serde() {
         let mut extra = HashMap::new();
-        extra.insert(
-            "#e".to_string(),
-            serde_json::json!(["event_id_1"]),
-        );
+        extra.insert("#e".to_string(), serde_json::json!(["event_id_1"]));
         let f = NostrFilter {
             ids: Some(vec!["id1".into()]),
             authors: Some(vec!["author1".into()]),
@@ -490,10 +490,9 @@ mod tests {
             "hello",
         );
         let mut filter = empty_filter();
-        filter.extra.insert(
-            "#e".to_string(),
-            serde_json::json!(["event_ref"]),
-        );
+        filter
+            .extra
+            .insert("#e".to_string(), serde_json::json!(["event_ref"]));
         assert!(event_matches_filters(&event, &[filter]));
     }
 
@@ -508,10 +507,9 @@ mod tests {
             "hello",
         );
         let mut filter = empty_filter();
-        filter.extra.insert(
-            "#e".to_string(),
-            serde_json::json!(["other_ref"]),
-        );
+        filter
+            .extra
+            .insert("#e".to_string(), serde_json::json!(["other_ref"]));
         assert!(!event_matches_filters(&event, &[filter]));
     }
 
@@ -526,10 +524,9 @@ mod tests {
             "hello",
         );
         let mut filter = empty_filter();
-        filter.extra.insert(
-            "#p".to_string(),
-            serde_json::json!(["pubkey123"]),
-        );
+        filter
+            .extra
+            .insert("#p".to_string(), serde_json::json!(["pubkey123"]));
         assert!(event_matches_filters(&event, &[filter]));
     }
 
@@ -566,10 +563,9 @@ mod tests {
         filter.kinds = Some(vec![1]);
         filter.since = Some(1000);
         filter.until = Some(2000);
-        filter.extra.insert(
-            "#e".to_string(),
-            serde_json::json!(["ref1"]),
-        );
+        filter
+            .extra
+            .insert("#e".to_string(), serde_json::json!(["ref1"]));
         assert!(event_matches_filters(&event, &[filter]));
     }
 
@@ -651,14 +647,7 @@ mod tests {
 
     #[test]
     fn tag_value_returns_none_for_single_element_tag() {
-        let event = make_event(
-            "aaa",
-            "bbb",
-            1,
-            1000,
-            vec![vec!["e".into()]],
-            "hello",
-        );
+        let event = make_event("aaa", "bbb", 1, 1000, vec![vec!["e".into()]], "hello");
         assert_eq!(tag_value(&event, "e"), None);
     }
 
@@ -711,14 +700,7 @@ mod tests {
 
     #[test]
     fn d_tag_value_empty_when_d_tag_has_no_value() {
-        let event = make_event(
-            "aaa",
-            "bbb",
-            30023,
-            1000,
-            vec![vec!["d".into()]],
-            "hello",
-        );
+        let event = make_event("aaa", "bbb", 30023, 1000, vec![vec!["d".into()]], "hello");
         assert_eq!(d_tag_value(&event), "");
     }
 
@@ -744,10 +726,9 @@ mod tests {
     fn tag_filter_ignores_non_hash_keys() {
         let event = make_event("aaa", "bbb", 1, 1000, vec![], "hello");
         let mut filter = empty_filter();
-        filter.extra.insert(
-            "not_a_tag".to_string(),
-            serde_json::json!(["val"]),
-        );
+        filter
+            .extra
+            .insert("not_a_tag".to_string(), serde_json::json!(["val"]));
         // Non-# keys in extra are ignored by the tag matching logic
         assert!(event_matches_filters(&event, &[filter]));
     }
@@ -756,10 +737,7 @@ mod tests {
     fn tag_filter_empty_values_array_is_skipped() {
         let event = make_event("aaa", "bbb", 1, 1000, vec![], "hello");
         let mut filter = empty_filter();
-        filter.extra.insert(
-            "#e".to_string(),
-            serde_json::json!([]),
-        );
+        filter.extra.insert("#e".to_string(), serde_json::json!([]));
         // Empty required array is skipped (continues), so the filter still matches
         assert!(event_matches_filters(&event, &[filter]));
     }
@@ -768,10 +746,9 @@ mod tests {
     fn tag_filter_non_array_value_is_skipped() {
         let event = make_event("aaa", "bbb", 1, 1000, vec![], "hello");
         let mut filter = empty_filter();
-        filter.extra.insert(
-            "#e".to_string(),
-            serde_json::json!("not_an_array"),
-        );
+        filter
+            .extra
+            .insert("#e".to_string(), serde_json::json!("not_an_array"));
         assert!(event_matches_filters(&event, &[filter]));
     }
 }

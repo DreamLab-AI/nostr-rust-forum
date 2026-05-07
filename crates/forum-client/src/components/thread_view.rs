@@ -11,9 +11,9 @@ use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::mention_text::MentionText;
 use crate::components::reaction_bar::{Reaction, ReactionBar};
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::NameCache;
+use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
-use crate::utils::{format_relative_time, shorten_pubkey};
+use crate::utils::format_relative_time;
 
 /// Data for a single thread reply.
 #[derive(Clone, Debug)]
@@ -113,9 +113,7 @@ pub fn ThreadView(
                     toasts.show("Reply sent", ToastVariant::Success);
                 }
                 Err(e) => {
-                    web_sys::console::error_1(
-                        &format!("[ThreadView] Sign failed: {}", e).into(),
-                    );
+                    web_sys::console::error_1(&format!("[ThreadView] Sign failed: {}", e).into());
                     let toasts = use_toasts();
                     toasts.show("Failed to send reply", ToastVariant::Error);
                 }
@@ -176,20 +174,12 @@ pub fn ThreadView(
                     {move || {
                         replies.get().into_iter().map(|reply| {
                             let pk = reply.pubkey.clone();
-                            let pk_for_name = pk.clone();
                             let time = format_relative_time(reply.created_at);
                             let content = reply.content.clone();
                             let eid = reply.id.clone();
                             let reactions = reply.reactions;
 
-                            let display_name = Memo::new(move |_| {
-                                if let Some(cache) = use_context::<NameCache>() {
-                                    if let Some(name) = cache.0.get().get(&pk_for_name).cloned() {
-                                        return name;
-                                    }
-                                }
-                                shorten_pubkey(&pk_for_name)
-                            });
+                            let display_name = use_display_name_memo(pk.clone());
 
                             view! {
                                 <div class="flex gap-2 py-1.5 hover:bg-gray-800/20 rounded-lg px-1 transition-colors group">

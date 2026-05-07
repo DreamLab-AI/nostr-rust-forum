@@ -16,7 +16,7 @@ pub fn CategoryCard(
     name: String,
     /// Short description text.
     description: String,
-    /// Raw section ID used for URL routing (e.g. "public-lobby").
+    /// Raw section ID used for URL routing (e.g. "home-lobby").
     section_id: String,
     /// Icon identifier: "globe", "users", "code", or "shield".
     icon: &'static str,
@@ -257,4 +257,3 @@ fn WatermarkIcon(icon: &'static str) -> impl IntoView {
         _ => view! { <span></span> }.into_any(),
     }
 }
-

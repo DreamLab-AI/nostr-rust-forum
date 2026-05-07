@@ -316,10 +316,10 @@ mod tests {
 
     #[test]
     fn calendar_event_d_tag_is_unique() {
-        let e1 = create_calendar_event(&test_key(), "A", 1700000000, None, None, None, None)
-            .unwrap();
-        let e2 = create_calendar_event(&test_key(), "B", 1700000000, None, None, None, None)
-            .unwrap();
+        let e1 =
+            create_calendar_event(&test_key(), "A", 1700000000, None, None, None, None).unwrap();
+        let e2 =
+            create_calendar_event(&test_key(), "B", 1700000000, None, None, None, None).unwrap();
         let d1 = &e1.tags.iter().find(|t| t[0] == "d").unwrap()[1];
         let d2 = &e2.tags.iter().find(|t| t[0] == "d").unwrap()[1];
         assert_ne!(d1, d2);

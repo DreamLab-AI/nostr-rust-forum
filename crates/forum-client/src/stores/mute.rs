@@ -5,7 +5,7 @@
 use gloo::storage::Storage as _;
 use leptos::prelude::*;
 
-const STORAGE_KEY: &str = "bbs:mutes";
+const STORAGE_KEY: &str = "nostrbbs:mutes";
 
 /// Serializable mute list for users and channels.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -58,13 +58,7 @@ impl MuteStore {
     #[allow(dead_code)]
     pub fn channel_muted_signal(&self, channel_id: String) -> Memo<bool> {
         let inner = self.inner;
-        Memo::new(move |_| {
-            inner
-                .get()
-                .muted_channels
-                .iter()
-                .any(|c| c == &channel_id)
-        })
+        Memo::new(move |_| inner.get().muted_channels.iter().any(|c| c == &channel_id))
     }
 
     // -- User mute ------------------------------------------------------------

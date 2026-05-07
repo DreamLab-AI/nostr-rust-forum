@@ -58,7 +58,7 @@ pub fn parse_webfinger_resource(resource: &str) -> Option<String> {
 pub fn solid_discovery(pod_base: &str) -> serde_json::Value {
     json!({
         "@context": "http://www.w3.org/ns/solid/terms#",
-        "server": "Nostr BBS Pod Worker",
+        "server": "nostr-bbs Pod Worker",
         "version": "6.0.0",
         "runtime": "workers-rs",
         "features": [
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn parse_acct_resource() {
         let pk = "a".repeat(64);
-        let resource = format!("acct:{pk}@your-domain.com");
+        let resource = format!("acct:{pk}@example.test");
         assert_eq!(parse_webfinger_resource(&resource), Some(pk));
     }
 
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn webfinger_has_remote_storage_link() {
         let pk = "c".repeat(64);
-        let resp = webfinger_response(&pk, "your-domain.com", "https://pods.example.com");
+        let resp = webfinger_response(&pk, "example.test", "https://pods.example.com");
         let links = resp["links"].as_array().unwrap();
         assert!(links
             .iter()
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn webfinger_has_solid_storage_link() {
         let pk = "d".repeat(64);
-        let resp = webfinger_response(&pk, "your-domain.com", "https://pods.example.com");
+        let resp = webfinger_response(&pk, "example.test", "https://pods.example.com");
         let links = resp["links"].as_array().unwrap();
         assert!(links
             .iter()
@@ -156,10 +156,11 @@ mod tests {
     #[test]
     fn webfinger_has_activity_json_link() {
         let pk = "d".repeat(64);
-        let resp = webfinger_response(&pk, "your-domain.com", "https://pods.example.com");
+        let resp = webfinger_response(&pk, "example.test", "https://pods.example.com");
         let links = resp["links"].as_array().unwrap();
-        assert!(links.iter().any(|l| l["rel"] == "self"
-            && l["type"] == "application/activity+json"));
+        assert!(links
+            .iter()
+            .any(|l| l["rel"] == "self" && l["type"] == "application/activity+json"));
     }
 
     #[test]
@@ -183,10 +184,7 @@ mod tests {
     #[test]
     fn solid_discovery_has_api_base() {
         let resp = solid_discovery("https://pods.example.com");
-        assert_eq!(
-            resp["apiBase"],
-            "https://pods.example.com/pods/"
-        );
+        assert_eq!(resp["apiBase"], "https://pods.example.com/pods/");
     }
 
     #[test]

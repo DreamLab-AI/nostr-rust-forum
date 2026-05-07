@@ -1,9 +1,119 @@
 //! SSRF (Server-Side Request Forgery) protection.
 //!
 //! Validates target URLs to block requests to private, loopback, link-local,
-//! cloud metadata, and other internal addresses.
+//! cloud metadata, and other internal addresses, and provides a fetch
+//! wrapper that disables auto-redirects and re-validates SSRF on every hop.
 
-use worker::Url;
+use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Response, Url};
+
+/// Maximum number of HTTP redirects we will follow per outbound request.
+pub const MAX_REDIRECTS: usize = 3;
+
+/// Maximum response body size (bytes) we will read into memory. Bodies larger
+/// than this are truncated; callers should treat truncation as a fetch failure
+/// because OG/oEmbed parsers depend on a complete document.
+pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Errors emitted by the SSRF-aware fetch helper.
+#[derive(Debug)]
+pub enum SsrfFetchError {
+    /// Target (or a redirect target) failed the SSRF policy.
+    Blocked(String),
+    /// Followed more than [`MAX_REDIRECTS`] redirects.
+    TooManyRedirects,
+    /// Underlying worker fetch error.
+    Worker(worker::Error),
+    /// Response body exceeded [`MAX_BODY_BYTES`].
+    BodyTooLarge,
+    /// Non-2xx final status.
+    HttpStatus(u16),
+}
+
+impl From<worker::Error> for SsrfFetchError {
+    fn from(e: worker::Error) -> Self {
+        SsrfFetchError::Worker(e)
+    }
+}
+
+impl std::fmt::Display for SsrfFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SsrfFetchError::Blocked(u) => write!(f, "blocked by SSRF policy: {u}"),
+            SsrfFetchError::TooManyRedirects => write!(f, "too many redirects"),
+            SsrfFetchError::Worker(e) => write!(f, "fetch error: {e:?}"),
+            SsrfFetchError::BodyTooLarge => {
+                write!(f, "response body exceeds {MAX_BODY_BYTES} bytes")
+            }
+            SsrfFetchError::HttpStatus(s) => write!(f, "HTTP {s}"),
+        }
+    }
+}
+
+/// Build a request with manual redirect handling so we can re-run the SSRF
+/// policy on each `Location` target rather than letting the runtime follow
+/// 3xx silently to a private address.
+fn build_request(url: &str, headers: &Headers, method: Method) -> worker::Result<Request> {
+    let mut init = RequestInit::new();
+    init.with_method(method);
+    init.with_headers(headers.clone());
+    init.with_redirect(RequestRedirect::Manual);
+    Request::new_with_init(url, &init)
+}
+
+/// SSRF-aware fetch that:
+///   1. Re-validates the SSRF policy on every hop, including redirects.
+///   2. Caps total redirects at [`MAX_REDIRECTS`].
+///   3. Returns the final non-redirect response without following past the
+///      cap.
+///
+/// Note: the caller is still responsible for body-size enforcement when
+/// reading text/JSON from the response — see [`read_text_capped`].
+pub async fn ssrf_fetch_with_redirects(
+    initial_url: &str,
+    headers: &Headers,
+) -> Result<Response, SsrfFetchError> {
+    let mut current_url = initial_url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        if is_private_url(&current_url) {
+            return Err(SsrfFetchError::Blocked(current_url));
+        }
+        let req = build_request(&current_url, headers, Method::Get)?;
+        let response = Fetch::Request(req).send().await?;
+        let status = response.status_code();
+        if !(300..400).contains(&status) {
+            return Ok(response);
+        }
+        // 3xx: extract Location, re-run SSRF, loop.
+        let location = response
+            .headers()
+            .get("Location")
+            .ok()
+            .flatten()
+            .ok_or_else(|| SsrfFetchError::Blocked("redirect missing Location".into()))?;
+        // Resolve relative redirects against the current URL.
+        let next = match Url::parse(&location) {
+            Ok(u) => u.to_string(),
+            Err(_) => match Url::parse(&current_url).and_then(|base| base.join(&location)) {
+                Ok(u) => u.to_string(),
+                Err(_) => return Err(SsrfFetchError::Blocked(location)),
+            },
+        };
+        current_url = next;
+    }
+    Err(SsrfFetchError::TooManyRedirects)
+}
+
+/// Read the response body as text, rejecting bodies that exceed
+/// [`MAX_BODY_BYTES`]. workers-rs `Response::text()` does not expose a
+/// streaming reader, so we read the bytes and check the size before UTF-8
+/// decoding.
+pub async fn read_text_capped(mut response: Response) -> Result<String, SsrfFetchError> {
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_BODY_BYTES {
+        return Err(SsrfFetchError::BodyTooLarge);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
 
 /// Returns `true` if the URL resolves to a private, loopback, link-local,
 /// metadata, or otherwise internal address that should not be fetched.
@@ -233,5 +343,48 @@ mod tests {
         assert_eq!(parse_ipv4("256.1.1.1"), None);
         assert_eq!(parse_ipv4("1.2.3"), None);
         assert_eq!(parse_ipv4("1.2.3.4.5"), None);
+    }
+
+    // ── Redirect-target SSRF tests ─────────────────────────────────────
+    //
+    // We can't drive a real fetch in unit tests, so the redirect policy is
+    // exercised at the function `is_private_url` level. The redirect loop
+    // in `ssrf_fetch_with_redirects` calls this on every hop.
+
+    #[test]
+    fn redirect_target_to_metadata_blocked() {
+        // Simulates: external 3xx -> http://169.254.169.254/
+        let next = "http://169.254.169.254/latest/";
+        assert!(
+            is_private_url(next),
+            "redirect targets to AWS metadata must be blocked"
+        );
+    }
+
+    #[test]
+    fn redirect_target_to_loopback_blocked() {
+        let next = "http://127.0.0.1:8080/admin";
+        assert!(is_private_url(next));
+    }
+
+    #[test]
+    fn redirect_target_to_private_ipv4_blocked() {
+        let next = "http://192.168.1.1/secret";
+        assert!(is_private_url(next));
+    }
+
+    #[test]
+    fn redirect_target_to_link_local_ipv6_blocked() {
+        let next = "http://[fe80::1]/";
+        assert!(is_private_url(next));
+    }
+
+    #[test]
+    fn ssrf_constants_safe() {
+        assert!(MAX_REDIRECTS <= 5, "redirect cap must remain small");
+        assert!(
+            MAX_BODY_BYTES <= 5 * 1024 * 1024,
+            "body cap must remain small"
+        );
     }
 }

@@ -109,18 +109,32 @@ pub async fn handle_check_whitelist(req: &Request, env: &Env) -> Result<Response
         .and_then(|row| serde_json::from_str(&row.cohorts).ok())
         .unwrap_or_default();
 
-    // Compute 3-boolean access flags from legacy cohort values
+    // Compute 3-boolean access flags from cohort values.
     let has_home = is_admin_key
-        || cohorts.iter().any(|c| matches!(c.as_str(), "home" | "lobby" | "approved" | "cross-access"));
+        || cohorts
+            .iter()
+            .any(|c| matches!(c.as_str(), "home" | "lobby" | "approved" | "cross-access"));
     let has_members = is_admin_key
-        || cohorts.iter().any(|c| matches!(c.as_str(),
-            "members" | "business" | "business-only" | "trainers" | "trainees"
-            | "ai-agents" | "agent" | "visionflow-full" | "cross-access"
-        ));
+        || cohorts.iter().any(|c| {
+            matches!(
+                c.as_str(),
+                "members"
+                    | "business"
+                    | "business-only"
+                    | "trainers"
+                    | "trainees"
+                    | "ai-agents"
+                    | "agent"
+                    | "cross-access"
+            )
+        });
     let has_private = is_admin_key
-        || cohorts.iter().any(|c| matches!(c.as_str(),
-            "private" | "private-only" | "private-business" | "cross-access"
-        ));
+        || cohorts.iter().any(|c| {
+            matches!(
+                c.as_str(),
+                "private" | "private-only" | "private-business" | "cross-access"
+            )
+        });
 
     json_response(
         env,

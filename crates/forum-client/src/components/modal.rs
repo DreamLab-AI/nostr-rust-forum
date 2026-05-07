@@ -4,8 +4,8 @@
 //! glass blur, scale-in animation, and dark overlay.
 
 use leptos::prelude::*;
-use wasm_bindgen::JsCast;
 use std::sync::atomic::{AtomicU32, Ordering};
+use wasm_bindgen::JsCast;
 
 /// Reusable glass modal overlay.
 ///
@@ -66,7 +66,10 @@ pub(crate) fn Modal(
 
     // Generate unique ID for aria-labelledby
     static MODAL_COUNTER: AtomicU32 = AtomicU32::new(0);
-    let title_id = format!("modal-title-{}", MODAL_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let title_id = format!(
+        "modal-title-{}",
+        MODAL_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let title_id_attr = title_id.clone();
 
     view! {

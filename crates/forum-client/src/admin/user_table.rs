@@ -15,8 +15,8 @@ use crate::auth::use_auth;
 /// Available zone flags for cohort editing.
 const AVAILABLE_COHORTS: &[(&str, &str)] = &[
     ("home", "Home"),
-    ("members", "Nostr BBS"),
-    ("private", "Private"),
+    ("members", "Members"),
+    ("private", "Minimoonoir"),
 ];
 
 /// Callback type for cohort updates: (pubkey, new_cohorts).
@@ -156,21 +156,14 @@ impl SuspendDuration {
         }
     }
 
-    const ALL: &'static [SuspendDuration] = &[
-        Self::OneDay,
-        Self::OneWeek,
-        Self::OneMonth,
-        Self::Permanent,
-    ];
+    const ALL: &'static [SuspendDuration] =
+        &[Self::OneDay, Self::OneWeek, Self::OneMonth, Self::Permanent];
 }
 
 // -- Suspend modal ------------------------------------------------------------
 
 #[component]
-fn SuspendModal(
-    pubkey: String,
-    on_close: impl Fn() + 'static + Clone,
-) -> impl IntoView {
+fn SuspendModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl IntoView {
     let auth = use_auth();
     let duration = RwSignal::new(SuspendDuration::OneDay);
     let reason = RwSignal::new(String::new());
@@ -282,10 +275,7 @@ fn SuspendModal(
 // -- Notes modal --------------------------------------------------------------
 
 #[component]
-fn NotesModal(
-    pubkey: String,
-    on_close: impl Fn() + 'static + Clone,
-) -> impl IntoView {
+fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl IntoView {
     let auth = use_auth();
     let notes = RwSignal::new(String::new());
     let is_loading = RwSignal::new(true);
@@ -458,7 +448,10 @@ fn UserRow(
                     "{}/api/admin/silence",
                     crate::utils::relay_url::relay_api_base()
                 );
-                if fetch_with_nip98_post(&url, &body_json, &privkey).await.is_ok() {
+                if fetch_with_nip98_post(&url, &body_json, &privkey)
+                    .await
+                    .is_ok()
+                {
                     is_silenced.set(new_state);
                 }
             });

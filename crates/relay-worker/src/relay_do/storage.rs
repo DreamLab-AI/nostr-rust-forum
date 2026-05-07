@@ -86,7 +86,7 @@ impl NostrRelayDO {
             JsValue::from_f64(now as f64),
         ];
 
-        match treatment {
+        let stored = match treatment {
             EventTreatment::Replaceable => {
                 let delete_stmt = db.prepare(
                     "DELETE FROM events WHERE pubkey = ?1 AND kind = ?2 AND created_at < ?3",
@@ -135,6 +135,106 @@ impl NostrRelayDO {
                 Err(_) => false,
             },
             EventTreatment::Ephemeral => true,
+        };
+
+        // Sprint v10: kind-0 ingest hook. Project the most-recent kind-0
+        // metadata into the `profiles` table so name resolution and @mention
+        // typeahead don't have to JSON-parse `events.content` on every read.
+        // Failures are swallowed -- a bad kind-0 must never block event storage.
+        if stored && event.kind == 0 {
+            self.upsert_profile(event).await;
+        }
+
+        stored
+    }
+
+    /// Parse `event.content` as a NIP-01 metadata JSON object and UPSERT
+    /// the relevant fields into the `profiles` projection.
+    ///
+    /// Last-write-wins on `last_kind0_at` (driven by `event.created_at`); if
+    /// an older kind-0 races in after a newer one, the WHERE guard keeps the
+    /// newer record intact.
+    async fn upsert_profile(&self, event: &NostrEvent) {
+        let db = match self.env.d1("DB") {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+
+        let parsed: serde_json::Value = match serde_json::from_str(&event.content) {
+            Ok(v) => v,
+            Err(_) => return, // Malformed kind-0 content; skip silently.
+        };
+
+        let obj = match parsed.as_object() {
+            Some(o) => o,
+            None => return,
+        };
+
+        fn str_field(o: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+            o.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+
+        let name = str_field(obj, "name");
+        let display_name = str_field(obj, "display_name").or_else(|| str_field(obj, "displayName"));
+        let picture = str_field(obj, "picture");
+        let banner = str_field(obj, "banner");
+        let about = str_field(obj, "about");
+        let nip05 = str_field(obj, "nip05");
+        let lud16 = str_field(obj, "lud16");
+
+        let raw_event = match serde_json::to_string(&serde_json::json!({
+            "id": event.id,
+            "pubkey": event.pubkey,
+            "created_at": event.created_at,
+            "kind": event.kind,
+            "tags": event.tags,
+            "content": event.content,
+            "sig": event.sig,
+        })) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        fn js_opt(v: Option<&str>) -> JsValue {
+            match v {
+                Some(s) => JsValue::from_str(s),
+                None => JsValue::NULL,
+            }
+        }
+
+        let stmt = db.prepare(
+            "INSERT INTO profiles \
+                (pubkey, name, display_name, picture, banner, about, nip05, lud16, \
+                 last_kind0_at, raw_event) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT (pubkey) DO UPDATE SET \
+                 name = excluded.name, \
+                 display_name = excluded.display_name, \
+                 picture = excluded.picture, \
+                 banner = excluded.banner, \
+                 about = excluded.about, \
+                 nip05 = excluded.nip05, \
+                 lud16 = excluded.lud16, \
+                 last_kind0_at = excluded.last_kind0_at, \
+                 raw_event = excluded.raw_event \
+             WHERE excluded.last_kind0_at >= profiles.last_kind0_at",
+        );
+
+        let binds = [
+            JsValue::from_str(&event.pubkey),
+            js_opt(name.as_deref()),
+            js_opt(display_name.as_deref()),
+            js_opt(picture.as_deref()),
+            js_opt(banner.as_deref()),
+            js_opt(about.as_deref()),
+            js_opt(nip05.as_deref()),
+            js_opt(lud16.as_deref()),
+            JsValue::from_f64(event.created_at as f64),
+            JsValue::from_str(&raw_event),
+        ];
+
+        if let Ok(bound) = stmt.bind(&binds) {
+            let _ = bound.run().await;
         }
     }
 
@@ -228,7 +328,7 @@ impl NostrRelayDO {
     /// Auto-whitelist a new user with the "members" cohort.
     ///
     /// Called when a user publishes their first kind-0 profile event. Gives them
-    /// immediate access to the Nostr BBS zone without admin intervention.
+    /// immediate access to the Members zone without admin intervention.
     /// Admin can later assign additional cohorts for other zones.
     ///
     /// **First-user-is-admin**: If the whitelist table is empty, the first user

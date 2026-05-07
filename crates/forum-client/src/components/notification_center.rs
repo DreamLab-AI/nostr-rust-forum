@@ -96,7 +96,11 @@ fn NotificationRow(notification: Notification, is_open: RwSignal<bool>) -> impl 
     let store = use_notification_store();
     let navigate = StoredValue::new(use_navigate());
 
-    let bg = if notification.read { "" } else { "bg-amber-500/5" };
+    let bg = if notification.read {
+        ""
+    } else {
+        "bg-amber-500/5"
+    };
     let dot_vis = if notification.read { "invisible" } else { "" };
     let time_str = format_relative_time(notification.timestamp);
     let title = notification.title.clone();

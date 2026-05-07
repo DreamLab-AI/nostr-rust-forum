@@ -17,7 +17,7 @@ use crate::relay::{Filter, RelayConnection};
 
 // -- Constants ----------------------------------------------------------------
 
-const CACHE_KEY: &str = "bbs_channel_cache";
+const CACHE_KEY: &str = "nostrbbs_channel_cache";
 
 // -- Types --------------------------------------------------------------------
 
