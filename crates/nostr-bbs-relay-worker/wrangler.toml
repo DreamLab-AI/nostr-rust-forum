@@ -1,0 +1,36 @@
+name = "nostr-bbs-relay"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-09-01"
+
+[build]
+command = "worker-build --release"
+
+[vars]
+RELAY_NAME = "Nostr BBS Relay"
+ADMIN_PUBKEYS = ""
+ALLOWED_ORIGIN = "https://example.com"
+ALLOWED_ORIGINS = "https://example.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nostr-bbs-relay"
+database_id = "97c77d23-0e24-4325-ada7-1747eab4095b"
+migrations_dir = "migrations"
+
+# NIP-98 replay cache (TTL = 2 * tolerance window). Shared id with auth-worker.
+# TODO(ops): provision via `wrangler kv:namespace create nostr-bbs-nip98-replay`.
+[[kv_namespaces]]
+binding = "NIP98_REPLAY"
+id = "REPLACE_WITH_NEW_NIP98_REPLAY_KV_ID"
+
+[durable_objects]
+bindings = [
+  { name = "RELAY", class_name = "NostrRelayDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NostrRelayDO"]
+
+[triggers]
+crons = ["*/5 * * * *"]

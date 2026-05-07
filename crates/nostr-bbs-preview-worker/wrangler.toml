@@ -1,0 +1,13 @@
+name = "nostr-bbs-link-preview"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-09-01"
+
+[build]
+command = "worker-build --release"
+
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "c56bfb95f0984b3a8822866b094f3a61"
+
+[vars]
+ALLOWED_ORIGIN = "https://example.com"

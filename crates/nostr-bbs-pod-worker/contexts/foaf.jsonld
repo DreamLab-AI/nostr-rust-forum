@@ -1,0 +1,14 @@
+{
+  "@context": {
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "name": "foaf:name",
+    "img": "foaf:img",
+    "homepage": "foaf:homepage",
+    "mbox": "foaf:mbox",
+    "knows": "foaf:knows",
+    "Person": "foaf:Person",
+    "Agent": "foaf:Agent",
+    "Document": "foaf:Document",
+    "OnlineAccount": "foaf:OnlineAccount"
+  }
+}

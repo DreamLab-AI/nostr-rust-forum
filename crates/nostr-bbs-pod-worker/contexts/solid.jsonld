@@ -1,0 +1,19 @@
+{
+  "@context": {
+    "solid": "http://www.w3.org/ns/solid/terms#",
+    "ldp": "http://www.w3.org/ns/ldp#",
+    "pim": "http://www.w3.org/ns/pim/space#",
+    "Storage": "pim:Storage",
+    "TypeIndex": "solid:TypeIndex",
+    "ListedDocument": "solid:ListedDocument",
+    "UnlistedDocument": "solid:UnlistedDocument",
+    "TypeRegistration": "solid:TypeRegistration",
+    "publicTypeIndex": "solid:publicTypeIndex",
+    "privateTypeIndex": "solid:privateTypeIndex",
+    "account": "solid:account",
+    "oidcIssuer": "solid:oidcIssuer",
+    "BasicContainer": "ldp:BasicContainer",
+    "Resource": "ldp:Resource",
+    "Container": "ldp:Container"
+  }
+}

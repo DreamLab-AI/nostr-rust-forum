@@ -1,0 +1,22 @@
+[package]
+name = "nostr-bbs-preview-worker"
+version = "3.0.0-rc4"
+edition = "2021"
+description = "Link preview Worker: OG metadata + Twitter oEmbed + SSRF protection (nostr-bbs)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-preview-worker"
+keywords = ["nostr", "bbs", "link-preview", "oembed", "cloudflare-workers"]
+categories = ["web-programming"]
+rust-version = "1.85"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+js-sys = { workspace = true }
+regex = "1"

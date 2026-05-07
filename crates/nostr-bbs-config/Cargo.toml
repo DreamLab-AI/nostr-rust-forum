@@ -1,0 +1,24 @@
+[package]
+name = "nostr-bbs-config"
+version = "3.0.0-rc4"
+edition = "2021"
+description = "Operator-supplied TOML configuration kit for nostr-bbs deployments (PRD-012 X1, ADR-085)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-config"
+keywords = ["nostr", "bbs", "config", "decentralized", "toml"]
+categories = ["config", "data-structures"]
+readme = "README.md"
+rust-version = "1.85"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+url = "2.5"
+
+[dev-dependencies]
+proptest = { workspace = true }

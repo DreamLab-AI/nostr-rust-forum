@@ -1,0 +1,62 @@
+[build]
+target = "index.html"
+dist = "../../dist"
+
+[watch]
+watch = ["src", "../nostr-core/src"]
+
+[serve]
+address = "127.0.0.1"
+port = 8080
+
+# WASM optimisation strategy:
+#
+# Trunk (0.21.12)'s bundled wasm-opt resolution downloads version_122, which
+# rejects Rust 1.90's bulk-memory codegen with:
+#   "memory.copy operations require bulk memory operations [--enable-bulk-memory-opt]"
+# Trunk does not expose passthrough flags for wasm-opt, and `wasm_opt = false`
+# is rejected by Trunk's TOML schema.
+#
+# Workaround: omit the [tools] wasm_opt entry so Trunk skips its built-in
+# wasm-opt invocation entirely. Then run a post-build hook that calls a
+# manually-installed binaryen wasm-opt with the right feature flags.
+#
+# CI installs binaryen version_119 (see .github/workflows/deploy.yml). 119
+# is the last release before stricter validation defaults landed in 122.
+
+[[hooks]]
+stage = "post_build"
+command = "bash"
+command_arguments = [
+    "-c",
+    "if command -v wasm-opt >/dev/null 2>&1; then find \"$TRUNK_STAGING_DIR\" -name '*.wasm' -print0 | while IFS= read -r -d '' f; do echo \"wasm-opt: $f\"; wasm-opt -Oz --enable-bulk-memory --enable-mutable-globals --enable-nontrapping-float-to-int --enable-sign-ext --enable-reference-types --output \"$f\" \"$f\"; done; else echo 'wasm-opt not found on PATH; skipping size optimisation' >&2; fi"
+]
+
+# Tailwind CSS pre-build:
+#
+# Replaces the legacy <script src='cdn.tailwindcss.com'> Play-CDN script in
+# index.html (Chrome warns it should not be used in production). Uses the
+# standalone Tailwind CLI binary so the forum has zero Node dependencies —
+# CI downloads tailwindcss-linux-x64 once if not already on PATH.
+#
+# Inputs : tailwind.css       (source: @tailwind base/components/utilities)
+#          tailwind.config.js (mirrors the inline config previously in HTML)
+#          src/**/*.rs        (Leptos view! macros containing utility classes)
+#          index.html         (any inline class names)
+# Output : tailwind.dist.css  (tree-shaken, ready for Trunk to fingerprint
+#          via the data-trunk <link rel='css'> directive in index.html)
+#
+# Runs at stage = "pre_build" so Trunk picks up the freshly-compiled CSS.
+[[hooks]]
+stage = "pre_build"
+command = "bash"
+command_arguments = [
+    "-c",
+    "set -euo pipefail; if command -v tailwindcss >/dev/null 2>&1; then BIN=tailwindcss; elif [ -x ./.tailwindcss ]; then BIN=./.tailwindcss; else echo 'Downloading standalone Tailwind CLI v3.4.17...'; curl -fsSL -o ./.tailwindcss https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64; chmod +x ./.tailwindcss; BIN=./.tailwindcss; fi; \"$BIN\" -c tailwind.config.js -i tailwind.css -o tailwind.dist.css --minify"
+]
+
+# Note: Trunk's TOML schema does NOT support [[copy]] entries — those were
+# silently ignored. Use the HTML directive `<link data-trunk rel="copy-file">`
+# instead. See index.html for sw.js (registered via main.rs navigator.serviceWorker).
+# webgpu-particles.js gets bundled by wasm-bindgen via the snippets/ pipeline so
+# it doesn't need a top-level copy directive.

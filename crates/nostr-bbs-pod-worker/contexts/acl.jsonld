@@ -1,0 +1,18 @@
+{
+  "@context": {
+    "acl": "http://www.w3.org/ns/auth/acl#",
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "Authorization": "acl:Authorization",
+    "agent": "acl:agent",
+    "agentClass": "acl:agentClass",
+    "agentGroup": "acl:agentGroup",
+    "accessTo": "acl:accessTo",
+    "default": "acl:default",
+    "mode": "acl:mode",
+    "Read": "acl:Read",
+    "Write": "acl:Write",
+    "Append": "acl:Append",
+    "Control": "acl:Control",
+    "AuthenticatedAgent": "acl:AuthenticatedAgent"
+  }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "nostr-bbs-mesh"
+version = "3.0.0-rc4"
+edition = "2021"
+description = "Federation mesh worker stub for nostr-bbs deployments (ADR-073)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-mesh"
+keywords = ["nostr", "bbs", "federation", "mesh", "decentralized"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
+rust-version = "1.85"
+
+[dependencies]
+nostr-bbs-core = { workspace = true }
+nostr-bbs-config = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }

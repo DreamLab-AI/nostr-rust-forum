@@ -1,0 +1,33 @@
+[package]
+name = "nostr-bbs-relay-worker"
+version = "3.0.0-rc4"
+edition = "2021"
+description = "Nostr relay Worker: NIP-01/11/16/33/98 WebSocket relay with D1 + Durable Objects (nostr-bbs)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-relay-worker"
+keywords = ["nostr", "bbs", "relay", "websocket", "cloudflare-workers"]
+categories = ["network-programming", "web-programming"]
+rust-version = "1.85"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+test-exports = []
+
+[dependencies]
+nostr-bbs-core = { workspace = true }
+worker = { workspace = true, features = ["d1"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+async-trait = { workspace = true }
+# C5 fix: NIP-42 AUTH challenge generation requires CSPRNG. The js-feature
+# routes getrandom calls to crypto.getRandomValues on the CF Workers runtime.
+getrandom = { workspace = true }
