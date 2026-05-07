@@ -51,11 +51,16 @@ pub fn smoke_keypair_roundtrip() -> Result<(), String> {
 /// taken from the FIRST entry of paulmillr/nip44 vector
 /// `v2.valid.get_conversation_key`.
 pub fn smoke_nip44_conv_key() -> Result<(), String> {
-    // First paulmillr/nip44 conversation-key vector. See:
-    //   docs/specs/fixtures/nip44-v2.json#/vectors/valid/get_conversation_key/0
-    // sec1: 315e39f7c61b... pub2: 667f3061... → conv_key: c41c775356... (32 bytes)
-    let sec1 = "315e39f7c61b1bb4f02e632feed2c5fbe8a9e94ae0c0bb6321a8de4fdc6e4cf3";
-    let pub2 = "c2f9d9948dc8f7585302a90c8232f1c8be7b536221b81b14fcaaf355f12a61aa";
+    // First paulmillr/nip44 conversation-key vector. Source of truth:
+    //   <VisionClaw>/docs/specs/fixtures/nip44-v2.json#/vectors/valid/get_conversation_key/0
+    // (paulmillr/nip44 @ 671a1f04bcfacaf125b0db68adc45bc9ce0e763b — see UPSTREAM_PINS.md)
+    // The original Phase 0 transcription used incorrect sk + pk (the pk happened
+    // not to lift to a valid x-only point, so xonly() rejected it as malformed).
+    // These are the actual vector #0 values, verified against the fixture file.
+    // Phase 3 follow-up: switch to loading from fixture file via include_str! +
+    // serde_json so future paulmillr updates auto-sync.
+    let sec1 = "315e59ff51cb9209768cf7da80791ddcaae56ac9775eb25b6dee1234bc5d2268";
+    let pub2 = "c2f9d9948dc8c7c38321e4b85c8558872eafa0641cd269db76848a6073e69133";
     let expected_conv_key = "3dfef0ce2a4d80a25e7a328accf73448ef67096f65f79588e358d9a0eb9013f1";
 
     let sk_bytes = hex::decode(sec1).map_err(|e| format!("hex decode sk: {e}"))?;
