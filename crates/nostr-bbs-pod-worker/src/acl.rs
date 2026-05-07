@@ -1,23 +1,28 @@
-//! JSON-LD WAC (Web Access Control) evaluator.
+//! WAC (Web Access Control) — absorbed adapter over `solid_pod_rs::wac`.
 //!
-//! Evaluates ACL documents stored as JSON-LD against incoming requests.
-//! Zero external dependencies beyond `serde_json` -- uses direct JSON
-//! parsing instead of a full RDF library.
+//! Phase 5 absorption (ADR-076/078): the JSON-LD WAC parsing + evaluation
+//! moves to the upstream pure-logic surface. Kit-specific extensions stay
+//! local:
 //!
-//! Port of `workers/pod-api/acl.ts`.
+//! - [`coerce_required_mode_for_acl`] — Sprint v9 STREAM-B B3 escalation guard
+//!   for `*.acl` writes. Upstream WAC has no equivalent because the spec
+//!   leaves the choice of HTTP-method → mode mapping to the operator.
+//! - [`MAX_ACL_DOC_BYTES`] — kit caps ACL JSON-LD at 64 KiB (upstream's
+//!   `MAX_ACL_BYTES` is 1 MiB; kit deliberately stricter per audit C3).
+//! - [`parse_acl_with_cap`] / [`parse_acl_text_with_cap`] — apply the
+//!   stricter cap before delegating to `serde_json::from_slice`.
+//! - [`find_effective_acl`] — CF Workers R2 + KV walk-up resolver. Tied to
+//!   the worker-rs API; can't live in upstream which is runtime-agnostic.
 //!
 //! @see <https://solid.github.io/web-access-control-spec/>
 
-use serde::Deserialize;
-
-/// Access mode required for an operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessMode {
-    Read,
-    Write,
-    Append,
-    Control,
-}
+// Pure-logic re-exports from solid-pod-rs 0.4.0-alpha.4 `wac` module. These
+// were the kit's hand-rolled implementations; the upstream surface is API-
+// shape compatible and battle-tested in the JSS port.
+pub use solid_pod_rs::wac::{
+    method_to_mode, mode_name, wac_allow_header, AccessMode, AclAuthorization, AclDocument,
+    IdOrIds, IdRef,
+};
 
 /// All access modes, used for iterating when building WAC-Allow headers.
 pub const ALL_MODES: &[AccessMode] = &[
@@ -27,233 +32,25 @@ pub const ALL_MODES: &[AccessMode] = &[
     AccessMode::Control,
 ];
 
-/// A JSON-LD ACL document with an `@graph` array of authorizations.
-#[derive(Debug, Deserialize)]
-pub struct AclDocument {
-    #[serde(rename = "@context")]
-    #[allow(dead_code)]
-    pub context: Option<serde_json::Value>,
-
-    #[serde(rename = "@graph")]
-    pub graph: Option<Vec<AclAuthorization>>,
-}
-
-/// A single authorization entry within the `@graph` array.
-#[derive(Debug, Deserialize)]
-pub struct AclAuthorization {
-    #[serde(rename = "@id")]
-    #[allow(dead_code)]
-    pub id: Option<String>,
-
-    #[serde(rename = "@type")]
-    #[allow(dead_code)]
-    pub r#type: Option<String>,
-
-    #[serde(rename = "acl:agent")]
-    pub agent: Option<IdOrIds>,
-
-    #[serde(rename = "acl:agentClass")]
-    pub agent_class: Option<IdOrIds>,
-
-    #[serde(rename = "acl:accessTo")]
-    pub access_to: Option<IdOrIds>,
-
-    #[serde(rename = "acl:default")]
-    pub default: Option<IdOrIds>,
-
-    #[serde(rename = "acl:mode")]
-    pub mode: Option<IdOrIds>,
-}
-
-/// A JSON-LD `@id` reference -- may be a single object or an array.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum IdOrIds {
-    Single(IdRef),
-    Multiple(Vec<IdRef>),
-}
-
-/// A JSON-LD `@id` reference object.
-#[derive(Debug, Deserialize)]
-pub struct IdRef {
-    #[serde(rename = "@id")]
-    pub id: String,
-}
-
-// ---------------------------------------------------------------------------
-// Mode mapping
-// ---------------------------------------------------------------------------
-
-/// Map a mode URI to the set of `AccessMode`s it grants.
-///
-/// `acl:Write` grants both `Write` and `Append` per the WAC spec.
-fn map_mode(mode_ref: &str) -> &'static [AccessMode] {
-    match mode_ref {
-        "acl:Read" | "http://www.w3.org/ns/auth/acl#Read" => &[AccessMode::Read],
-        "acl:Write" | "http://www.w3.org/ns/auth/acl#Write" => {
-            &[AccessMode::Write, AccessMode::Append]
-        }
-        "acl:Append" | "http://www.w3.org/ns/auth/acl#Append" => &[AccessMode::Append],
-        "acl:Control" | "http://www.w3.org/ns/auth/acl#Control" => &[AccessMode::Control],
-        _ => &[],
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Extract all `@id` strings from an `IdOrIds` value.
-fn get_ids(val: &Option<IdOrIds>) -> Vec<&str> {
-    match val {
-        None => Vec::new(),
-        Some(IdOrIds::Single(r)) => vec![r.id.as_str()],
-        Some(IdOrIds::Multiple(refs)) => refs.iter().map(|r| r.id.as_str()).collect(),
-    }
-}
-
-/// Normalize a path: convert relative (`./`) to absolute, strip trailing slashes.
-/// Allocates only when the input contains a `./` prefix that needs rewriting.
-fn normalize_path_owned(path: &str) -> String {
-    let stripped = path.strip_prefix("./").or_else(|| path.strip_prefix('.'));
-
-    let base = match stripped {
-        Some("") => "/".to_string(),
-        Some(s) if !s.starts_with('/') => format!("/{s}"),
-        Some(s) => s.to_string(),
-        None => path.to_string(),
-    };
-
-    let trimmed = base.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Check whether a rule path matches a resource path.
-///
-/// - `accessTo` (is_default=false): exact match or the resource is a child.
-/// - `default`: applies to the container and all its children (prefix match).
-fn path_matches(rule_path: &str, resource_path: &str, is_default: bool) -> bool {
-    let rule = normalize_path_owned(rule_path);
-    let resource = normalize_path_owned(resource_path);
-
-    if !is_default {
-        // accessTo: exact match or resource is under the specified container
-        resource == rule || resource.starts_with(&format!("{rule}/"))
-    } else {
-        // default: applies to children of the container
-        resource.starts_with(&format!("{rule}/")) || resource == rule
-    }
-}
-
-/// Collect the granted `AccessMode`s from an authorization entry.
-fn get_modes(auth: &AclAuthorization) -> Vec<AccessMode> {
-    let mut modes = Vec::new();
-    for mode_ref in get_ids(&auth.mode) {
-        modes.extend_from_slice(map_mode(mode_ref));
-    }
-    modes
-}
-
-/// Check whether the agent matches the authorization entry.
-fn agent_matches(auth: &AclAuthorization, agent_uri: Option<&str>) -> bool {
-    // Specific agent match
-    let agents = get_ids(&auth.agent);
-    if let Some(uri) = agent_uri {
-        if agents.contains(&uri) {
-            return true;
-        }
-    }
-
-    // Agent class match
-    let classes = get_ids(&auth.agent_class);
-    for cls in &classes {
-        // foaf:Agent matches everyone (public access)
-        if *cls == "foaf:Agent" || *cls == "http://xmlns.com/foaf/0.1/Agent" {
-            return true;
-        }
-        // acl:AuthenticatedAgent matches any authenticated user
-        if agent_uri.is_some()
-            && (*cls == "acl:AuthenticatedAgent"
-                || *cls == "http://www.w3.org/ns/auth/acl#AuthenticatedAgent")
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /// Evaluate whether access should be granted based on an ACL document.
 ///
-/// # Arguments
-/// * `acl_doc` - Parsed JSON-LD ACL document (or `None` for no ACL)
-/// * `agent_uri` - The requesting agent's URI (e.g. `"did:nostr:{pubkey}"`) or `None` for anonymous
-/// * `resource_path` - The resource path being accessed (e.g. `"/profile/card"`)
-/// * `required_mode` - The access mode required for the operation
-///
-/// # Returns
-/// `true` if access is granted, `false` otherwise.
-/// No ACL document = deny all (secure by default).
+/// Thin wrapper passing `request_origin = None` to upstream WAC 1.x
+/// evaluation. The kit's pod-worker does not yet emit `acl:origin`-gated
+/// rules; if/when that ships, callers should switch to
+/// [`solid_pod_rs::wac::evaluate_access`] directly.
+#[inline]
 pub fn evaluate_access(
     acl_doc: Option<&AclDocument>,
     agent_uri: Option<&str>,
     resource_path: &str,
     required_mode: AccessMode,
 ) -> bool {
-    let graph = match acl_doc.and_then(|d| d.graph.as_ref()) {
-        Some(g) => g,
-        None => return false, // No ACL = deny all
-    };
-
-    for auth in graph {
-        // Check if this authorization grants the required mode
-        let granted = get_modes(auth);
-        if !granted.contains(&required_mode) {
-            continue;
-        }
-
-        // Check if the agent matches
-        if !agent_matches(auth, agent_uri) {
-            continue;
-        }
-
-        // Check accessTo paths (exact / child match)
-        let access_to = get_ids(&auth.access_to);
-        for target in &access_to {
-            if path_matches(target, resource_path, false) {
-                return true;
-            }
-        }
-
-        // Check default paths (prefix match)
-        let defaults = get_ids(&auth.default);
-        for target in &defaults {
-            if path_matches(target, resource_path, true) {
-                return true;
-            }
-        }
-    }
-
-    false
+    solid_pod_rs::wac::evaluate_access(acl_doc, agent_uri, resource_path, required_mode, None)
 }
 
-/// Map an HTTP method to the required ACL `AccessMode`.
-pub fn method_to_mode(method: &str) -> AccessMode {
-    match method.to_uppercase().as_str() {
-        "GET" | "HEAD" => AccessMode::Read,
-        "PUT" | "DELETE" | "PATCH" => AccessMode::Write,
-        "POST" => AccessMode::Append,
-        _ => AccessMode::Read,
-    }
-}
+// ---------------------------------------------------------------------------
+// Kit-specific: WAC Control coercion for `*.acl` paths (Sprint v9 STREAM-B B3)
+// ---------------------------------------------------------------------------
 
 /// Determine if a path targets an `.acl` sidecar (matches `lib.rs::is_acl_path`).
 fn path_is_acl(path: &str) -> bool {
@@ -285,46 +82,8 @@ pub fn coerce_required_mode_for_acl(path: &str, method: &str) -> AccessMode {
     }
 }
 
-/// Return the lowercase WAC mode name for use in WAC-Allow headers.
-pub fn mode_name(mode: AccessMode) -> &'static str {
-    match mode {
-        AccessMode::Read => "read",
-        AccessMode::Write => "write",
-        AccessMode::Append => "append",
-        AccessMode::Control => "control",
-    }
-}
-
-/// Build a `WAC-Allow` header value showing what modes the current agent
-/// and the public (anonymous) have on a resource.
-///
-/// Format: `user="read write", public="read"`
-pub fn wac_allow_header(
-    acl_doc: Option<&AclDocument>,
-    agent_uri: Option<&str>,
-    resource_path: &str,
-) -> String {
-    let mut user_modes = Vec::new();
-    let mut public_modes = Vec::new();
-
-    for mode in ALL_MODES {
-        if evaluate_access(acl_doc, agent_uri, resource_path, *mode) {
-            user_modes.push(mode_name(*mode));
-        }
-        if evaluate_access(acl_doc, None, resource_path, *mode) {
-            public_modes.push(mode_name(*mode));
-        }
-    }
-
-    format!(
-        "user=\"{}\", public=\"{}\"",
-        user_modes.join(" "),
-        public_modes.join(" ")
-    )
-}
-
 // ---------------------------------------------------------------------------
-// Inherited ACL resolution
+// Kit-specific: stricter 64 KiB ACL document cap + R2/KV resolver
 // ---------------------------------------------------------------------------
 
 /// Hard cap on the size (in bytes) of an ACL JSON-LD document we will parse.
@@ -333,6 +92,10 @@ pub fn wac_allow_header(
 /// attacker from forcing the WAC evaluator to allocate or recurse into a
 /// pathologically large `@graph`. Sidecars beyond this size are treated as
 /// "no ACL found" so resolution falls back to the parent container.
+///
+/// The upstream `solid_pod_rs::wac::MAX_ACL_BYTES` is 1 MiB; the kit chooses
+/// a tighter ceiling per audit C3 because the forum's pod surface area is
+/// far smaller than a generic Solid pod.
 pub const MAX_ACL_DOC_BYTES: usize = 64 * 1024;
 
 /// Parse an ACL document from raw bytes, enforcing [`MAX_ACL_DOC_BYTES`].
@@ -410,6 +173,10 @@ pub async fn find_effective_acl(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+//
+// These exercise the absorbed surface. Semantic parity with the legacy
+// hand-roll is required for the absorption to be safe; any divergence must
+// be documented and either ratified or reverted.
 
 #[cfg(test)]
 mod tests {
@@ -430,6 +197,8 @@ mod tests {
             agent_class: Some(IdOrIds::Single(IdRef {
                 id: "foaf:Agent".to_string(),
             })),
+            agent_group: None,
+            origin: None,
             access_to: Some(IdOrIds::Single(IdRef {
                 id: path.to_string(),
             })),
@@ -437,6 +206,7 @@ mod tests {
             mode: Some(IdOrIds::Single(IdRef {
                 id: "acl:Read".to_string(),
             })),
+            condition: None,
         }
     }
 
@@ -448,6 +218,8 @@ mod tests {
                 id: agent.to_string(),
             })),
             agent_class: None,
+            agent_group: None,
+            origin: None,
             access_to: Some(IdOrIds::Single(IdRef {
                 id: path.to_string(),
             })),
@@ -455,6 +227,7 @@ mod tests {
             mode: Some(IdOrIds::Single(IdRef {
                 id: "acl:Write".to_string(),
             })),
+            condition: None,
         }
     }
 
@@ -539,6 +312,8 @@ mod tests {
             agent_class: Some(IdOrIds::Single(IdRef {
                 id: "foaf:Agent".to_string(),
             })),
+            agent_group: None,
+            origin: None,
             access_to: None,
             default: Some(IdOrIds::Single(IdRef {
                 id: "/public".to_string(),
@@ -546,6 +321,7 @@ mod tests {
             mode: Some(IdOrIds::Single(IdRef {
                 id: "acl:Read".to_string(),
             })),
+            condition: None,
         };
         let doc = make_doc(vec![auth]);
         assert!(evaluate_access(
@@ -565,6 +341,8 @@ mod tests {
             agent_class: Some(IdOrIds::Single(IdRef {
                 id: "acl:AuthenticatedAgent".to_string(),
             })),
+            agent_group: None,
+            origin: None,
             access_to: Some(IdOrIds::Single(IdRef {
                 id: "/members".to_string(),
             })),
@@ -572,6 +350,7 @@ mod tests {
             mode: Some(IdOrIds::Single(IdRef {
                 id: "acl:Read".to_string(),
             })),
+            condition: None,
         };
         let doc = make_doc(vec![auth]);
 
@@ -589,15 +368,6 @@ mod tests {
             "/members",
             AccessMode::Read
         ));
-    }
-
-    #[test]
-    fn normalize_relative_path() {
-        assert_eq!(normalize_path_owned("./profile/"), "/profile");
-        assert_eq!(normalize_path_owned("./"), "/");
-        assert_eq!(normalize_path_owned("."), "/");
-        assert_eq!(normalize_path_owned("/foo/bar/"), "/foo/bar");
-        assert_eq!(normalize_path_owned("/"), "/");
     }
 
     #[test]
@@ -619,6 +389,8 @@ mod tests {
             agent_class: Some(IdOrIds::Single(IdRef {
                 id: "http://xmlns.com/foaf/0.1/Agent".to_string(),
             })),
+            agent_group: None,
+            origin: None,
             access_to: Some(IdOrIds::Single(IdRef {
                 id: "/".to_string(),
             })),
@@ -626,6 +398,7 @@ mod tests {
             mode: Some(IdOrIds::Single(IdRef {
                 id: "http://www.w3.org/ns/auth/acl#Read".to_string(),
             })),
+            condition: None,
         };
         let doc = make_doc(vec![auth]);
         assert!(evaluate_access(Some(&doc), None, "/", AccessMode::Read));
@@ -640,6 +413,8 @@ mod tests {
                 id: "did:nostr:owner".to_string(),
             })),
             agent_class: None,
+            agent_group: None,
+            origin: None,
             access_to: Some(IdOrIds::Single(IdRef {
                 id: "/".to_string(),
             })),
@@ -655,6 +430,7 @@ mod tests {
                     id: "acl:Control".to_string(),
                 },
             ])),
+            condition: None,
         };
         let doc = make_doc(vec![auth]);
         let agent = Some("did:nostr:owner");
@@ -702,6 +478,8 @@ mod tests {
                 id: "did:nostr:owner".to_string(),
             })),
             agent_class: None,
+            agent_group: None,
+            origin: None,
             access_to: Some(IdOrIds::Single(IdRef {
                 id: "/".to_string(),
             })),
@@ -717,6 +495,7 @@ mod tests {
                     id: "acl:Control".to_string(),
                 },
             ])),
+            condition: None,
         };
         let doc = make_doc(vec![public_read, owner_full]);
         let header = wac_allow_header(Some(&doc), Some("did:nostr:owner"), "/");
