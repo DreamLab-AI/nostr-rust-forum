@@ -3,6 +3,13 @@ name = "nostr-bbs-core"
 version = "3.0.0-rc3"
 edition = "2021"
 description = "Shared Nostr protocol primitives for the nostr-bbs forum (client + workers)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-core"
+keywords = ["nostr", "bbs", "forum", "nip04", "nip44"]
+categories = ["cryptography", "web-programming"]
+rust-version = "1.85"
 
 [lib]
 crate-type = ["lib", "cdylib"]
