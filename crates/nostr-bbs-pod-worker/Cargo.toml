@@ -32,6 +32,10 @@ async-trait = { workspace = true }
 # available for the worker's auth path.
 solid-pod-rs = { workspace = true }
 
+# uuid is a transitive dep from solid-pod-rs; on wasm32-unknown-unknown it
+# needs the `js` feature for randomness (getrandom → crypto.getRandomValues).
+uuid = { version = "1", features = ["js"] }
+
 # proptest is native-only (rusty-fork → wait-timeout); the worker target is
 # wasm32, so we gate dev-deps behind cfg(not(wasm32)) to avoid breaking
 # `cargo check --target wasm32-unknown-unknown`.
