@@ -47,7 +47,7 @@
          data-wasm-opt="0" disables Trunk's bundled wasm-opt 122 which rejects
          Rust 1.90's bulk-memory ops. We run a manually-installed binaryen 119
          in a post_build Trunk hook instead — see Trunk.toml. -->
-    <link data-trunk rel="rust" data-wasm-opt="0" data-cargo-package="forum-client" data-bin="forum-client" />
+    <link data-trunk rel="rust" data-wasm-opt="0" data-cargo-package="nostr-bbs-forum-client" data-bin="nostr-bbs-forum-client" />
 
     <!-- Service worker copied to dist/community/sw.js so main.rs's
          navigator.serviceWorker.register('./sw.js') resolves at runtime.
