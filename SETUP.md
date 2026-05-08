@@ -1,6 +1,6 @@
 # Setup Guide
 
-This guide walks through deploying nostr-BBS-rs on Cloudflare Workers with a static Leptos WASM frontend.
+This guide walks through deploying nostr-rust-forum on Cloudflare Workers with a static Leptos WASM frontend.
 
 ## Prerequisites
 
@@ -104,22 +104,22 @@ wrangler r2 bucket create nostr-bbs-vectors
 
 Update each worker's `wrangler.toml` with the resource IDs from step 1:
 
-- `crates/auth-worker/wrangler.toml` -- D1 ID, KV IDs (SESSIONS, POD_META), R2 bucket, RP_ID, RP_NAME, EXPECTED_ORIGIN
-- `crates/pod-worker/wrangler.toml` -- KV ID (POD_META), EXPECTED_ORIGIN
-- `crates/preview-worker/wrangler.toml` -- KV ID (RATE_LIMIT), ALLOWED_ORIGIN
-- `crates/relay-worker/wrangler.toml` -- D1 ID, RELAY_NAME, ALLOWED_ORIGIN(S)
-- `crates/search-worker/wrangler.toml` -- R2 bucket, KV ID (SEARCH_CONFIG), ALLOWED_ORIGIN(S)
+- `crates/nostr-bbs-auth-worker/wrangler.toml` -- D1 ID, KV IDs (SESSIONS, POD_META), R2 bucket, RP_ID, RP_NAME, EXPECTED_ORIGIN
+- `crates/nostr-bbs-pod-worker/wrangler.toml` -- KV ID (POD_META), EXPECTED_ORIGIN
+- `crates/nostr-bbs-preview-worker/wrangler.toml` -- KV ID (RATE_LIMIT), ALLOWED_ORIGIN
+- `crates/nostr-bbs-relay-worker/wrangler.toml` -- D1 ID, RELAY_NAME, ALLOWED_ORIGIN(S)
+- `crates/nostr-bbs-search-worker/wrangler.toml` -- R2 bucket, KV ID (SEARCH_CONFIG), ALLOWED_ORIGIN(S)
 
 Set your domain in all `RP_ID`, `EXPECTED_ORIGIN`, `ALLOWED_ORIGIN`, and `ALLOWED_ORIGINS` vars.
 
 ## 3. Deploy Workers
 
 ```bash
-cd crates/auth-worker && wrangler deploy
-cd crates/pod-worker && wrangler deploy
-cd crates/preview-worker && wrangler deploy
-cd crates/relay-worker && wrangler deploy
-cd crates/search-worker && wrangler deploy
+cd crates/nostr-bbs-auth-worker && wrangler deploy
+cd crates/nostr-bbs-pod-worker && wrangler deploy
+cd crates/nostr-bbs-preview-worker && wrangler deploy
+cd crates/nostr-bbs-relay-worker && wrangler deploy
+cd crates/nostr-bbs-search-worker && wrangler deploy
 ```
 
 ## 4. Configure DNS
@@ -128,21 +128,21 @@ Add CNAME or Workers Routes for your subdomains:
 
 | Subdomain | Worker |
 |-----------|--------|
-| `api.your-domain.com` | auth-worker + relay-worker |
-| `pods.your-domain.com` | pod-worker |
-| `search.your-domain.com` | search-worker |
-| `preview.your-domain.com` | preview-worker |
+| `api.your-domain.com` | nostr-bbs-auth-worker + nostr-bbs-relay-worker |
+| `pods.your-domain.com` | nostr-bbs-pod-worker |
+| `search.your-domain.com` | nostr-bbs-search-worker |
+| `preview.your-domain.com` | nostr-bbs-preview-worker |
 
 ## 5. Update Forum Client URLs
 
 Edit the following files to point to your deployed worker URLs:
 
-- `crates/forum-client/src/relay.rs` -- `DEFAULT_RELAY_URL`
-- `crates/forum-client/src/utils/relay_url.rs` -- relay HTTP/WS URLs
-- `crates/forum-client/src/utils/pod_client.rs` -- pod API URL
-- `crates/forum-client/src/utils/search_client.rs` -- search API URL
-- `crates/forum-client/src/components/global_search.rs` -- search API URL
-- `crates/forum-client/src/components/link_preview.rs` -- preview API URL
+- `crates/nostr-bbs-forum-client/src/relay.rs` -- `DEFAULT_RELAY_URL`
+- `crates/nostr-bbs-forum-client/src/utils/relay_url.rs` -- relay HTTP/WS URLs
+- `crates/nostr-bbs-forum-client/src/utils/pod_client.rs` -- pod API URL
+- `crates/nostr-bbs-forum-client/src/utils/search_client.rs` -- search API URL
+- `crates/nostr-bbs-forum-client/src/components/global_search.rs` -- search API URL
+- `crates/nostr-bbs-forum-client/src/components/link_preview.rs` -- preview API URL
 
 Alternatively, set environment variables at compile time:
 - `RELAY_URL` -- WebSocket relay URL
@@ -154,7 +154,7 @@ Alternatively, set environment variables at compile time:
 ## 6. Build and Deploy Forum Client
 
 ```bash
-cd crates/forum-client
+cd crates/nostr-bbs-forum-client
 
 # Local development
 trunk serve
@@ -166,7 +166,7 @@ FORUM_BASE=/community trunk build --release --public-url /community/
 trunk build --release
 ```
 
-The built files are in `crates/forum-client/dist/`. Deploy to any static hosting (GitHub Pages, Cloudflare Pages, Netlify, etc.).
+The built files are in `crates/nostr-bbs-forum-client/dist/`. Deploy to any static hosting (GitHub Pages, Cloudflare Pages, Netlify, etc.).
 
 ## 7. First-User-Is-Admin Flow
 
@@ -219,9 +219,18 @@ provide_zone_access();
 # All workspace tests (native)
 cargo test --workspace
 
-# nostr-core only
-cargo test -p nostr-core
+# nostr-bbs-core only
+cargo test -p nostr-bbs-core
 
 # WASM target check (no native tests)
-cargo check --target wasm32-unknown-unknown -p forum-client
+cargo check --target wasm32-unknown-unknown -p nostr-bbs-forum-client
+
+# Anti-drift lint (rejects stale identifiers and branding leaks)
+scripts/anti-drift-lint.sh
+
+# Sync cross-substrate test fixtures from VisionClaw
+scripts/sync-fixtures.sh
+
+# CI gate: verify fixtures are up to date
+scripts/sync-fixtures.sh --verify
 ```
