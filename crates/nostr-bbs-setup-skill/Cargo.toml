@@ -12,6 +12,9 @@ categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 rust-version = "1.85"
 
+[features]
+default = []
+
 [dependencies]
 nostr-bbs-core = { workspace = true }
 nostr-bbs-config = { workspace = true }

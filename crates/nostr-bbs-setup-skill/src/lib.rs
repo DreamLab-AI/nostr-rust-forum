@@ -8,9 +8,9 @@
 //!
 //! # Status
 //!
-//! Sprint v9-v11: scaffold only. Each [`Provider`] impl carries a `todo!()`
-//! body documenting the contract; full implementation lands in Sprint v12+
-//! per the PRD-012 Phase X3 plan.
+//! Sprint v9-v11: scaffold only. Each [`Provider`] impl returns
+//! [`SetupError::NotYetImplemented`] for unfinished methods; full
+//! implementation lands in Sprint v12+ per the PRD-012 Phase X3 plan.
 //!
 //! # Provider matrix (per ADR-079 §4)
 //!
@@ -46,6 +46,14 @@ pub enum SetupError {
     /// Operation not supported by this provider.
     #[error("unsupported")]
     Unsupported,
+    /// Provider method is scaffolded but not yet implemented.
+    #[error("{provider}::{method} not yet implemented — scheduled for Sprint v12+")]
+    NotYetImplemented {
+        /// Provider name (e.g. `"CloudflareWorkersProvider"`).
+        provider: &'static str,
+        /// Method name (e.g. `"provision"`).
+        method: &'static str,
+    },
 }
 
 /// One-shot record describing a provisioned resource.
@@ -105,7 +113,10 @@ impl Provider for SelfHostProvider {
     ) -> Result<String, SetupError> {
         // Self-host emits a docker-compose.yml or systemd unit instead of
         // a wrangler manifest. Implementation: Sprint v12.
-        todo!("SelfHostProvider::render_wrangler — emit docker-compose.yml / systemd unit")
+        Err(SetupError::NotYetImplemented {
+            provider: "SelfHostProvider",
+            method: "render_wrangler",
+        })
     }
 }
 
@@ -124,9 +135,10 @@ impl Provider for CloudflareWorkersProvider {
     ) -> Result<Vec<ProvisionedResource>, SetupError> {
         // Provisions: D1 db, KV namespaces (admin + nip98-replay + admin-ro),
         // R2 bucket, Routes, Custom Domain. Implementation: Sprint v12+.
-        todo!(
-            "CloudflareWorkersProvider::provision — wrangler v3 REST API or terraform-cf-workers"
-        )
+        Err(SetupError::NotYetImplemented {
+            provider: "CloudflareWorkersProvider",
+            method: "provision",
+        })
     }
 
     async fn render_wrangler(
@@ -134,7 +146,10 @@ impl Provider for CloudflareWorkersProvider {
         _cfg: &ForumConfig,
         _resources: &[ProvisionedResource],
     ) -> Result<String, SetupError> {
-        todo!("CloudflareWorkersProvider::render_wrangler — emit wrangler.toml per worker")
+        Err(SetupError::NotYetImplemented {
+            provider: "CloudflareWorkersProvider",
+            method: "render_wrangler",
+        })
     }
 }
 
@@ -151,7 +166,10 @@ impl Provider for FlyDotIoProvider {
         &self,
         _cfg: &ForumConfig,
     ) -> Result<Vec<ProvisionedResource>, SetupError> {
-        todo!("FlyDotIoProvider::provision — flyctl + Fly Postgres + Tigris")
+        Err(SetupError::NotYetImplemented {
+            provider: "FlyDotIoProvider",
+            method: "provision",
+        })
     }
 
     async fn render_wrangler(
@@ -159,7 +177,10 @@ impl Provider for FlyDotIoProvider {
         _cfg: &ForumConfig,
         _resources: &[ProvisionedResource],
     ) -> Result<String, SetupError> {
-        todo!("FlyDotIoProvider::render_wrangler — emit fly.toml")
+        Err(SetupError::NotYetImplemented {
+            provider: "FlyDotIoProvider",
+            method: "render_wrangler",
+        })
     }
 }
 
@@ -176,7 +197,10 @@ impl Provider for TurnkeyProvider {
         &self,
         _cfg: &ForumConfig,
     ) -> Result<Vec<ProvisionedResource>, SetupError> {
-        todo!("TurnkeyProvider::provision — kit-managed onboarding API")
+        Err(SetupError::NotYetImplemented {
+            provider: "TurnkeyProvider",
+            method: "provision",
+        })
     }
 
     async fn render_wrangler(
@@ -203,7 +227,10 @@ impl Provider for KubernetesProvider {
         &self,
         _cfg: &ForumConfig,
     ) -> Result<Vec<ProvisionedResource>, SetupError> {
-        todo!("KubernetesProvider::provision — kubectl apply via Helm chart")
+        Err(SetupError::NotYetImplemented {
+            provider: "KubernetesProvider",
+            method: "provision",
+        })
     }
 
     async fn render_wrangler(
@@ -211,7 +238,10 @@ impl Provider for KubernetesProvider {
         _cfg: &ForumConfig,
         _resources: &[ProvisionedResource],
     ) -> Result<String, SetupError> {
-        todo!("KubernetesProvider::render_wrangler — emit Helm chart values.yaml")
+        Err(SetupError::NotYetImplemented {
+            provider: "KubernetesProvider",
+            method: "render_wrangler",
+        })
     }
 }
 
