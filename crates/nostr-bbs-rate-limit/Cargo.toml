@@ -1,0 +1,14 @@
+[package]
+name = "nostr-bbs-rate-limit"
+version = "3.0.0-rc5"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared application-layer rate limiting via Cloudflare KV (nostr-bbs)"
+keywords = ["nostr", "bbs", "rate-limit", "cloudflare-workers"]
+categories = ["web-programming"]
+
+[dependencies]
+worker = { workspace = true }
+js-sys = { workspace = true }

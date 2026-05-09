@@ -16,7 +16,6 @@
 
 mod auth;
 mod embed;
-mod rate_limit;
 mod store;
 
 use embed::DIM;
@@ -444,8 +443,8 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 
     // Rate limit: 100 requests per 60 seconds per IP
-    let ip = rate_limit::client_ip(&req);
-    if !rate_limit::check_rate_limit(&env, &ip, 100, 60).await {
+    let ip = nostr_bbs_rate_limit::client_ip(&req);
+    if !nostr_bbs_rate_limit::check_rate_limit(&env, "SEARCH_CONFIG", &ip, 100, 60).await {
         return json_response(
             &req,
             &env,

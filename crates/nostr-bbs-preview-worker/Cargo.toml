@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-preview-worker"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 edition = "2021"
 description = "Link preview Worker: OG metadata + Twitter oEmbed + SSRF protection (nostr-bbs)"
 license = "MIT OR Apache-2.0"
@@ -19,4 +19,5 @@ worker = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 js-sys = { workspace = true }
+nostr-bbs-rate-limit = { workspace = true }
 regex = "1"

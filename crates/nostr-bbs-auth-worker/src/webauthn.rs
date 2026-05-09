@@ -5,6 +5,7 @@
 //! implementation in `workers/auth-api/index.ts`.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use p256::ecdsa::signature::Verifier;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use wasm_bindgen::JsValue;
@@ -145,6 +146,9 @@ struct InnerAssertionResponse {
     client_data_json: Option<String>,
     #[serde(rename = "authenticatorData")]
     authenticator_data: Option<String>,
+    /// ECDSA P-256 (ES256) signature over (authenticatorData || SHA-256(clientDataJSON)).
+    /// base64url-encoded, DER format as produced by the authenticator.
+    signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +197,301 @@ struct CheckRow {
 #[derive(Deserialize)]
 struct PubkeyRow {
     pubkey: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// COSE public key parsing (ES256 / ECDSA P-256)
+// ---------------------------------------------------------------------------
+
+/// Extract the ECDSA P-256 `VerifyingKey` from a COSE_Key stored as base64url.
+///
+/// The stored `public_key` column holds the output of
+/// `AuthenticatorAttestationResponse.getPublicKey()` — a COSE_Key encoded in
+/// CBOR. For ES256 (alg -7) the CBOR map contains:
+///
+///   1  (kty)  => 2  (EC2)
+///   3  (alg)  => -7 (ES256)
+///  -1  (crv)  => 1  (P-256)
+///  -2  (x)    => bstr (32 bytes)
+///  -3  (y)    => bstr (32 bytes)
+///
+/// We do a minimal hand-rolled CBOR parse to extract the x and y coordinates
+/// rather than pulling in a full CBOR crate. This keeps the WASM binary small
+/// for the Cloudflare Workers target.
+fn parse_cose_p256_key(
+    public_key_b64: &str,
+) -> std::result::Result<p256::ecdsa::VerifyingKey, String> {
+    let cose_bytes = base64url_decode(public_key_b64)
+        .map_err(|e| format!("Failed to decode stored public key: {e}"))?;
+
+    let (x, y) = extract_cose_ec2_coords(&cose_bytes)?;
+
+    if x.len() != 32 || y.len() != 32 {
+        return Err(format!(
+            "COSE key coordinate size mismatch: x={}, y={}",
+            x.len(),
+            y.len()
+        ));
+    }
+
+    // Build uncompressed SEC1 point: 0x04 || x (32 bytes) || y (32 bytes)
+    let mut uncompressed = Vec::with_capacity(65);
+    uncompressed.push(0x04);
+    uncompressed.extend_from_slice(&x);
+    uncompressed.extend_from_slice(&y);
+
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(&uncompressed)
+        .map_err(|e| format!("Invalid P-256 public key: {e}"))
+}
+
+/// Minimal CBOR parser to extract x (-2) and y (-3) coordinates from a
+/// COSE_Key map. Handles only the subset of CBOR needed for WebAuthn ES256
+/// keys: definite-length maps, positive/negative integers, and byte strings.
+fn extract_cose_ec2_coords(data: &[u8]) -> std::result::Result<(Vec<u8>, Vec<u8>), String> {
+    if data.is_empty() {
+        return Err("Empty COSE key data".into());
+    }
+
+    let mut pos = 0;
+    let (map_len, consumed) = cbor_read_map_len(data, pos)?;
+    pos += consumed;
+
+    let mut x_coord: Option<Vec<u8>> = None;
+    let mut y_coord: Option<Vec<u8>> = None;
+
+    for _ in 0..map_len {
+        if pos >= data.len() {
+            return Err("CBOR truncated reading map key".into());
+        }
+
+        // Read integer key (positive or negative)
+        let (key_val, consumed) = cbor_read_int(data, pos)?;
+        pos += consumed;
+
+        // Read value — we only care about bstr values for keys -2 and -3,
+        // but we must skip all other value types to advance `pos`.
+        if key_val == -2 || key_val == -3 {
+            let (bstr, consumed) = cbor_read_bstr(data, pos)?;
+            pos += consumed;
+            if key_val == -2 {
+                x_coord = Some(bstr);
+            } else {
+                y_coord = Some(bstr);
+            }
+        } else {
+            let consumed = cbor_skip_value(data, pos)?;
+            pos += consumed;
+        }
+    }
+
+    match (x_coord, y_coord) {
+        (Some(x), Some(y)) => Ok((x, y)),
+        (None, _) => Err("COSE key missing x coordinate (label -2)".into()),
+        (_, None) => Err("COSE key missing y coordinate (label -3)".into()),
+    }
+}
+
+/// Read the length of a CBOR definite-length map. Returns (map_len, bytes_consumed).
+fn cbor_read_map_len(data: &[u8], pos: usize) -> std::result::Result<(usize, usize), String> {
+    if pos >= data.len() {
+        return Err("CBOR truncated at map header".into());
+    }
+    let initial = data[pos];
+    let major = initial >> 5;
+    if major != 5 {
+        return Err(format!(
+            "Expected CBOR map (major 5), got major {major} at byte {pos}"
+        ));
+    }
+    let additional = (initial & 0x1F) as usize;
+    if additional < 24 {
+        Ok((additional, 1))
+    } else if additional == 24 {
+        if pos + 1 >= data.len() {
+            return Err("CBOR truncated reading map length".into());
+        }
+        Ok((data[pos + 1] as usize, 2))
+    } else {
+        Err(format!("Unsupported CBOR map length encoding: {additional}"))
+    }
+}
+
+/// Read a CBOR integer (positive or negative). Returns (value_as_i64, bytes_consumed).
+fn cbor_read_int(data: &[u8], pos: usize) -> std::result::Result<(i64, usize), String> {
+    if pos >= data.len() {
+        return Err("CBOR truncated at integer".into());
+    }
+    let initial = data[pos];
+    let major = initial >> 5;
+    let additional = (initial & 0x1F) as u64;
+
+    let (raw_val, consumed) = if additional < 24 {
+        (additional, 1)
+    } else if additional == 24 {
+        if pos + 1 >= data.len() {
+            return Err("CBOR truncated reading integer payload".into());
+        }
+        (data[pos + 1] as u64, 2)
+    } else if additional == 25 {
+        if pos + 2 >= data.len() {
+            return Err("CBOR truncated reading integer payload".into());
+        }
+        let v = u16::from_be_bytes([data[pos + 1], data[pos + 2]]);
+        (v as u64, 3)
+    } else if additional == 26 {
+        if pos + 4 >= data.len() {
+            return Err("CBOR truncated reading integer payload".into());
+        }
+        let v = u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+        (v as u64, 5)
+    } else {
+        return Err(format!(
+            "Unsupported CBOR integer additional info: {additional}"
+        ));
+    };
+
+    match major {
+        0 => Ok((raw_val as i64, consumed)),           // unsigned
+        1 => Ok((-1 - (raw_val as i64), consumed)),    // negative
+        _ => Err(format!("Expected CBOR integer, got major type {major}")),
+    }
+}
+
+/// Read a CBOR byte string. Returns (bytes, bytes_consumed).
+fn cbor_read_bstr(data: &[u8], pos: usize) -> std::result::Result<(Vec<u8>, usize), String> {
+    if pos >= data.len() {
+        return Err("CBOR truncated at byte string".into());
+    }
+    let initial = data[pos];
+    let major = initial >> 5;
+    if major != 2 {
+        return Err(format!(
+            "Expected CBOR byte string (major 2), got major {major} at byte {pos}"
+        ));
+    }
+    let additional = (initial & 0x1F) as usize;
+    let (bstr_len, header_len) = if additional < 24 {
+        (additional, 1)
+    } else if additional == 24 {
+        if pos + 1 >= data.len() {
+            return Err("CBOR truncated reading bstr length".into());
+        }
+        (data[pos + 1] as usize, 2)
+    } else if additional == 25 {
+        if pos + 2 >= data.len() {
+            return Err("CBOR truncated reading bstr length".into());
+        }
+        let v = u16::from_be_bytes([data[pos + 1], data[pos + 2]]);
+        (v as usize, 3)
+    } else {
+        return Err(format!(
+            "Unsupported CBOR bstr length encoding: {additional}"
+        ));
+    };
+
+    let start = pos + header_len;
+    let end = start + bstr_len;
+    if end > data.len() {
+        return Err(format!(
+            "CBOR byte string overflows buffer: need {end}, have {}",
+            data.len()
+        ));
+    }
+    Ok((data[start..end].to_vec(), header_len + bstr_len))
+}
+
+/// Skip a single CBOR value (for map entries we don't care about).
+/// Returns bytes_consumed.
+fn cbor_skip_value(data: &[u8], pos: usize) -> std::result::Result<usize, String> {
+    if pos >= data.len() {
+        return Err("CBOR truncated skipping value".into());
+    }
+    let initial = data[pos];
+    let major = initial >> 5;
+    let additional = (initial & 0x1F) as usize;
+
+    // Read the argument (length / count / value)
+    let (arg, header_len) = if additional < 24 {
+        (additional as u64, 1usize)
+    } else if additional == 24 {
+        if pos + 1 >= data.len() {
+            return Err("CBOR truncated skipping value".into());
+        }
+        (data[pos + 1] as u64, 2)
+    } else if additional == 25 {
+        if pos + 2 >= data.len() {
+            return Err("CBOR truncated skipping value".into());
+        }
+        (
+            u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as u64,
+            3,
+        )
+    } else if additional == 26 {
+        if pos + 4 >= data.len() {
+            return Err("CBOR truncated skipping value".into());
+        }
+        (
+            u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]) as u64,
+            5,
+        )
+    } else if additional == 27 {
+        if pos + 8 >= data.len() {
+            return Err("CBOR truncated skipping value".into());
+        }
+        (
+            u64::from_be_bytes([
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+                data[pos + 8],
+            ]),
+            9,
+        )
+    } else {
+        return Err(format!("Unsupported CBOR additional info: {additional}"));
+    };
+
+    match major {
+        0 | 1 => {
+            // Unsigned / negative integer — no payload beyond header.
+            Ok(header_len)
+        }
+        2 | 3 => {
+            // Byte string / text string — skip arg bytes of payload.
+            Ok(header_len + arg as usize)
+        }
+        4 => {
+            // Array — skip `arg` items.
+            let mut total = header_len;
+            for _ in 0..arg {
+                total += cbor_skip_value(data, pos + total)?;
+            }
+            Ok(total)
+        }
+        5 => {
+            // Map — skip `arg` key-value pairs.
+            let mut total = header_len;
+            for _ in 0..arg {
+                total += cbor_skip_value(data, pos + total)?; // key
+                total += cbor_skip_value(data, pos + total)?; // value
+            }
+            Ok(total)
+        }
+        6 => {
+            // Tag — skip the tagged value.
+            let inner = cbor_skip_value(data, pos + header_len)?;
+            Ok(header_len + inner)
+        }
+        7 => {
+            // Simple / float — header only (no further payload for our use).
+            Ok(header_len)
+        }
+        _ => Err(format!("Unknown CBOR major type: {major}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -689,7 +988,55 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
         return json_err("Credential replay detected", 400);
     }
 
-    // Step 6: All checks passed -- update counter and consume challenge
+    // Step 6: Verify ECDSA P-256 assertion signature
+    //
+    // Per WebAuthn spec section 7.2 step 20, the signed message is:
+    //   authenticatorData || SHA-256(clientDataJSON)
+    // The signature is DER-encoded ECDSA over this message using the
+    // credential's ES256 (P-256) private key.
+    let signature_b64 = match &inner_response.signature {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => return json_err("Missing assertion signature", 400),
+    };
+
+    let signature_bytes = match base64url_decode(&signature_b64) {
+        Ok(b) => b,
+        Err(_) => return json_err("Invalid assertion signature encoding", 400),
+    };
+
+    let stored_public_key = match &cred.public_key {
+        Some(pk) if !pk.is_empty() => pk.clone(),
+        _ => return json_err("No stored public key for credential", 400),
+    };
+
+    let verifying_key = match parse_cose_p256_key(&stored_public_key) {
+        Ok(vk) => vk,
+        Err(e) => {
+            console_error!("[login_verify] COSE key parse failed: {e}");
+            return json_err("Stored credential public key is invalid or unsupported", 400);
+        }
+    };
+
+    // Build signed data: authenticatorData || SHA-256(clientDataJSON)
+    let client_data_hash = Sha256::digest(&client_data_bytes);
+    let mut signed_data = Vec::with_capacity(auth_data.len() + 32);
+    signed_data.extend_from_slice(&auth_data);
+    signed_data.extend_from_slice(&client_data_hash);
+
+    // Parse the DER-encoded ECDSA signature
+    let ecdsa_sig = match p256::ecdsa::DerSignature::try_from(signature_bytes.as_slice()) {
+        Ok(sig) => sig,
+        Err(e) => {
+            console_error!("[login_verify] DER signature parse failed: {e}");
+            return json_err("Assertion signature is malformed", 400);
+        }
+    };
+
+    if verifying_key.verify(&signed_data, &ecdsa_sig).is_err() {
+        return json_err("Assertion signature verification failed", 400);
+    }
+
+    // Step 7: All checks passed -- update counter and consume challenge
     let update_stmt = db
         .prepare("UPDATE webauthn_credentials SET counter = ?1 WHERE pubkey = ?2")
         .bind(&[js_u32(sign_count), js_str(&pubkey)])?;
@@ -873,6 +1220,222 @@ mod tests {
 
     // Note: JsValue-based tests require wasm32 target, so we only test
     // the pure Rust utility functions above in native test mode.
+
+    // ── CBOR / COSE key parsing ────────────────────────────────────────
+
+    /// Build a minimal CBOR-encoded COSE_Key map for EC2/P-256 (ES256).
+    ///
+    /// Map with 5 entries:
+    ///   1 (kty) => 2 (EC2)
+    ///   3 (alg) => -7 (ES256)
+    ///  -1 (crv) => 1 (P-256)
+    ///  -2 (x)   => 32-byte bstr
+    ///  -3 (y)   => 32-byte bstr
+    fn build_test_cose_key(x: &[u8; 32], y: &[u8; 32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Map(5) = 0xA5
+        buf.push(0xA5);
+        // 1 => 2  (kty: EC2)
+        buf.push(0x01); // unsigned int 1
+        buf.push(0x02); // unsigned int 2
+        // 3 => -7  (alg: ES256)
+        buf.push(0x03); // unsigned int 3
+        buf.push(0x26); // negative int: -1 - 6 = -7 (major 1, value 6)
+        // -1 => 1  (crv: P-256)
+        buf.push(0x20); // negative int: -1 - 0 = -1 (major 1, value 0)
+        buf.push(0x01); // unsigned int 1
+        // -2 => bstr(32)  (x coordinate)
+        buf.push(0x21); // negative int: -1 - 1 = -2
+        buf.push(0x58); // bstr with 1-byte length follows
+        buf.push(0x20); // 32
+        buf.extend_from_slice(x);
+        // -3 => bstr(32)  (y coordinate)
+        buf.push(0x22); // negative int: -1 - 2 = -3
+        buf.push(0x58); // bstr with 1-byte length follows
+        buf.push(0x20); // 32
+        buf.extend_from_slice(y);
+        buf
+    }
+
+    #[test]
+    fn cose_extract_coords_roundtrip() {
+        let x = [0xAA; 32];
+        let y = [0xBB; 32];
+        let cose = build_test_cose_key(&x, &y);
+        let (ex, ey) = extract_cose_ec2_coords(&cose).unwrap();
+        assert_eq!(ex, x);
+        assert_eq!(ey, y);
+    }
+
+    #[test]
+    fn cose_extract_coords_empty_data() {
+        let result = extract_cose_ec2_coords(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cose_extract_coords_not_a_map() {
+        // Major type 0 (unsigned int), not 5 (map)
+        let result = extract_cose_ec2_coords(&[0x00]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cose_extract_coords_missing_y() {
+        // Map(1) with just -2 => bstr(32)
+        let mut buf = Vec::new();
+        buf.push(0xA1); // Map(1)
+        buf.push(0x21); // -2
+        buf.push(0x58);
+        buf.push(0x20);
+        buf.extend_from_slice(&[0xAA; 32]);
+        let result = extract_cose_ec2_coords(&buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("y coordinate"));
+    }
+
+    #[test]
+    fn cose_extract_coords_missing_x() {
+        // Map(1) with just -3 => bstr(32)
+        let mut buf = Vec::new();
+        buf.push(0xA1); // Map(1)
+        buf.push(0x22); // -3
+        buf.push(0x58);
+        buf.push(0x20);
+        buf.extend_from_slice(&[0xBB; 32]);
+        let result = extract_cose_ec2_coords(&buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("x coordinate"));
+    }
+
+    #[test]
+    fn cose_parse_valid_p256_key() {
+        // Generate a real P-256 key and build a COSE key from it.
+        use p256::ecdsa::SigningKey;
+        let signing_key = SigningKey::from_bytes(&[0x42; 32].into()).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let encoded_point = verifying_key.to_encoded_point(false);
+        let x: [u8; 32] = encoded_point.x().unwrap().as_slice().try_into().unwrap();
+        let y: [u8; 32] = encoded_point.y().unwrap().as_slice().try_into().unwrap();
+
+        let cose = build_test_cose_key(&x, &y);
+        let cose_b64 = array_to_base64url(&cose);
+
+        let parsed_key = parse_cose_p256_key(&cose_b64).unwrap();
+        assert_eq!(parsed_key, *verifying_key);
+    }
+
+    #[test]
+    fn cose_parse_invalid_coords_rejected() {
+        // All-zero coordinates are not on the P-256 curve.
+        let cose = build_test_cose_key(&[0x00; 32], &[0x00; 32]);
+        let cose_b64 = array_to_base64url(&cose);
+        let result = parse_cose_p256_key(&cose_b64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cose_parse_bad_base64_rejected() {
+        let result = parse_cose_p256_key("!!!invalid!!!");
+        assert!(result.is_err());
+    }
+
+    // ── End-to-end signature verification ──────────────────────────────
+
+    #[test]
+    fn ecdsa_p256_signature_verify_roundtrip() {
+        use p256::ecdsa::{signature::Signer, SigningKey};
+
+        // Generate key
+        let signing_key = SigningKey::from_bytes(&[0x42; 32].into()).unwrap();
+        let verifying_key = signing_key.verifying_key();
+
+        // Simulate WebAuthn signed data: authenticatorData || SHA-256(clientDataJSON)
+        let fake_auth_data = [0x01u8; 37]; // minimal authenticator data
+        let fake_client_data_json = b"{\"type\":\"webauthn.get\",\"challenge\":\"test\"}";
+        let client_data_hash = Sha256::digest(fake_client_data_json);
+
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&fake_auth_data);
+        signed_data.extend_from_slice(&client_data_hash);
+
+        // Sign
+        let signature: p256::ecdsa::DerSignature = signing_key.sign(&signed_data);
+
+        // Verify (mirrors what login_verify does)
+        assert!(verifying_key.verify(&signed_data, &signature).is_ok());
+    }
+
+    #[test]
+    fn ecdsa_p256_bad_signature_rejected() {
+        use p256::ecdsa::{signature::Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[0x42; 32].into()).unwrap();
+        let verifying_key = signing_key.verifying_key();
+
+        let message = b"correct message";
+        let signature: p256::ecdsa::DerSignature = signing_key.sign(&message[..]);
+
+        // Verify against wrong message
+        let wrong_message = b"wrong message";
+        assert!(verifying_key.verify(&wrong_message[..], &signature).is_err());
+    }
+
+    #[test]
+    fn ecdsa_p256_wrong_key_rejected() {
+        use p256::ecdsa::{signature::Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[0x42; 32].into()).unwrap();
+        let wrong_key = SigningKey::from_bytes(&[0x43; 32].into()).unwrap();
+        let wrong_verifying_key = wrong_key.verifying_key();
+
+        let message = b"test message";
+        let signature: p256::ecdsa::DerSignature = signing_key.sign(&message[..]);
+
+        // Verify with wrong key
+        assert!(wrong_verifying_key.verify(&message[..], &signature).is_err());
+    }
+
+    // ── CBOR skip_value ────────────────────────────────────────────────
+
+    #[test]
+    fn cbor_skip_unsigned_int() {
+        // Unsigned int 5 = 0x05 (1 byte)
+        assert_eq!(cbor_skip_value(&[0x05], 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn cbor_skip_negative_int() {
+        // Negative int -1 = 0x20 (1 byte)
+        assert_eq!(cbor_skip_value(&[0x20], 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn cbor_skip_bstr() {
+        // bstr(3) = 0x43 followed by 3 bytes
+        assert_eq!(cbor_skip_value(&[0x43, 0x01, 0x02, 0x03], 0).unwrap(), 4);
+    }
+
+    #[test]
+    fn cbor_skip_text() {
+        // tstr(2) = 0x62 followed by 2 bytes
+        assert_eq!(cbor_skip_value(&[0x62, 0x68, 0x69], 0).unwrap(), 3);
+    }
+
+    #[test]
+    fn cbor_read_int_positive() {
+        let (val, consumed) = cbor_read_int(&[0x18, 0xFF], 0).unwrap();
+        assert_eq!(val, 255);
+        assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn cbor_read_int_negative() {
+        // -7 in CBOR: major type 1, additional 6 => 0x26
+        let (val, consumed) = cbor_read_int(&[0x26], 0).unwrap();
+        assert_eq!(val, -7);
+        assert_eq!(consumed, 1);
+    }
 }
 
 /// POST /auth/lookup

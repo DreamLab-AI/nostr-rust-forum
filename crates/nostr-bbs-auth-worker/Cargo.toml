@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-auth-worker"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 edition = "2021"
 description = "Auth Worker: WebAuthn + NIP-98 + pod provisioning (nostr-bbs)"
 license = "MIT OR Apache-2.0"
@@ -24,8 +24,10 @@ getrandom = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 js-sys = { workspace = true }
+nostr-bbs-rate-limit = { workspace = true }
 wasm-bindgen = { workspace = true }
 chacha20poly1305 = { workspace = true }
 k256 = { workspace = true }
+p256 = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

@@ -37,15 +37,30 @@ if [[ "$SOURCE" =~ ^https://.*\.git$ ]]; then
   trap "rm -rf $TMPDIR" EXIT
   git clone --depth=1 --filter=blob:none --sparse --quiet "$SOURCE" "$TMPDIR"
   (cd "$TMPDIR" && git sparse-checkout add docs/specs/fixtures)
-  rsync -a --delete --exclude='CHECKSUM.txt' \
-    "$TMPDIR/docs/specs/fixtures/" "$TARGET_DIR/"
+  # Use cp if rsync is not available
+  if command -v rsync &>/dev/null; then
+    rsync -a --delete --exclude='CHECKSUM.txt' \
+      "$TMPDIR/docs/specs/fixtures/" "$TARGET_DIR/"
+  else
+    rm -rf "$TARGET_DIR"/*.json "$TARGET_DIR"/*.md "$TARGET_DIR"/*.txt "$TARGET_DIR"/schemas 2>/dev/null
+    mkdir -p "$TARGET_DIR/schemas"
+    cp -a "$TMPDIR/docs/specs/fixtures/"*.json "$TMPDIR/docs/specs/fixtures/"*.md "$TMPDIR/docs/specs/fixtures/"*.txt "$TARGET_DIR/" 2>/dev/null || true
+    cp -a "$TMPDIR/docs/specs/fixtures/schemas/"* "$TARGET_DIR/schemas/" 2>/dev/null || true
+  fi
 else
   if [ ! -d "$SOURCE/docs/specs/fixtures" ]; then
     echo "ERROR: VISIONCLAW_FIXTURES_PATH=$SOURCE has no docs/specs/fixtures/" >&2
     exit 1
   fi
-  rsync -a --delete --exclude='CHECKSUM.txt' \
-    "$SOURCE/docs/specs/fixtures/" "$TARGET_DIR/"
+  if command -v rsync &>/dev/null; then
+    rsync -a --delete --exclude='CHECKSUM.txt' \
+      "$SOURCE/docs/specs/fixtures/" "$TARGET_DIR/"
+  else
+    rm -rf "$TARGET_DIR"/*.json "$TARGET_DIR"/*.md "$TARGET_DIR"/*.txt "$TARGET_DIR"/schemas 2>/dev/null
+    mkdir -p "$TARGET_DIR/schemas"
+    cp -a "$SOURCE/docs/specs/fixtures/"*.json "$SOURCE/docs/specs/fixtures/"*.md "$SOURCE/docs/specs/fixtures/"*.txt "$TARGET_DIR/" 2>/dev/null || true
+    cp -a "$SOURCE/docs/specs/fixtures/schemas/"* "$TARGET_DIR/schemas/" 2>/dev/null || true
+  fi
 fi
 
 cd "$TARGET_DIR"

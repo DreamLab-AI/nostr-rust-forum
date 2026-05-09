@@ -1,0 +1,203 @@
+# CI pipeline for nostr-rust-forum (nostr-bbs-rs kit)
+#
+# Jobs:
+#   fmt       — cargo fmt --check
+#   clippy    — cargo clippy -D warnings (blocking)
+#   test      — cargo test --workspace (native, 322+ tests)
+#   wasm      — cargo check --target wasm32-unknown-unknown (portable crates)
+#   doc       — cargo doc --no-deps (catch broken links)
+#   deny      — cargo-deny licence/advisory/ban/source policy
+#   ci-pass   — single required status check aggregator
+#
+# Separate audit.yml handles weekly RustSec advisory scans.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Format check — fast, no dependencies needed
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  # Clippy — lint the entire workspace with -D warnings (blocking)
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Test — run the full workspace test suite on native target
+  # ---------------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # WASM check — verify portable crates compile for wasm32-unknown-unknown
+  #
+  # Most crates in this workspace target wasm32 (CF Workers, Leptos CSR).
+  # Some pull in secp256k1-sys which requires C compilation with 32-bit
+  # stubs; on GitHub Actions ubuntu-latest this works if libc6-dev-i386 is
+  # installed. We install it and check the full workspace.
+  #
+  # If specific crates break, switch to per-crate checks:
+  #   cargo check --target wasm32-unknown-unknown -p nostr-bbs-config
+  #   cargo check --target wasm32-unknown-unknown -p nostr-bbs-preview-worker
+  #   ... etc
+  # ---------------------------------------------------------------------------
+  wasm:
+    name: wasm32 check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      - name: Install 32-bit libc headers (for secp256k1-sys cross-compile)
+        run: sudo apt-get update && sudo apt-get install -y libc6-dev-i386
+
+      - name: cargo check --workspace --target wasm32-unknown-unknown
+        run: cargo check --workspace --target wasm32-unknown-unknown
+
+  # ---------------------------------------------------------------------------
+  # Doc — catch broken intra-doc links and missing docs
+  # ---------------------------------------------------------------------------
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: doc
+
+      - name: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings -D rustdoc::broken-intra-doc-links"
+        run: cargo doc --workspace --no-deps
+
+  # ---------------------------------------------------------------------------
+  # cargo-deny — licence policy, advisories, bans, sources
+  # Requires deny.toml at the workspace root.
+  # ---------------------------------------------------------------------------
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          log-level: warn
+          command: check
+          arguments: --all-features
+
+  # ---------------------------------------------------------------------------
+  # Aggregator — single required status check for branch protection.
+  # Point GitHub branch protection at this job name: "CI required".
+  # ---------------------------------------------------------------------------
+  ci-pass:
+    name: CI required
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - fmt
+      - clippy
+      - test
+      - wasm
+      - doc
+      - deny
+    steps:
+      - name: Verify all jobs succeeded
+        run: |
+          echo "fmt:    ${{ needs.fmt.result }}"
+          echo "clippy: ${{ needs.clippy.result }}"
+          echo "test:   ${{ needs.test.result }}"
+          echo "wasm:   ${{ needs.wasm.result }}"
+          echo "doc:    ${{ needs.doc.result }}"
+          echo "deny:   ${{ needs.deny.result }}"
+
+          for result in \
+            "${{ needs.fmt.result }}" \
+            "${{ needs.clippy.result }}" \
+            "${{ needs.test.result }}" \
+            "${{ needs.wasm.result }}" \
+            "${{ needs.doc.result }}" \
+            "${{ needs.deny.result }}"; do
+            if [[ "$result" != "success" ]]; then
+              echo "One or more required jobs did not succeed."
+              exit 1
+            fi
+          done

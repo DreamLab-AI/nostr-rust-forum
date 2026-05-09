@@ -632,6 +632,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -730,6 +731,7 @@ dependencies = [
  "generic-array",
  "group",
  "hkdf",
+ "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
@@ -1847,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-auth-worker"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "async-trait",
  "base64",
@@ -1857,6 +1859,8 @@ dependencies = [
  "js-sys",
  "k256",
  "nostr-bbs-core",
+ "nostr-bbs-rate-limit",
+ "p256",
  "serde",
  "serde_json",
  "sha2",
@@ -1867,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-config"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "proptest",
  "schemars",
@@ -1880,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-core"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "aes",
  "async-trait",
@@ -1909,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-forum-client"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "async-trait",
  "base64",
@@ -1938,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-mesh"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "async-trait",
  "nostr-bbs-config",
@@ -1950,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-pod-worker"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "async-trait",
  "base64",
@@ -1962,14 +1966,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "solid-pod-rs",
+ "uuid",
  "worker",
 ]
 
 [[package]]
 name = "nostr-bbs-preview-worker"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "js-sys",
+ "nostr-bbs-rate-limit",
  "regex",
  "serde",
  "serde_json",
@@ -1977,8 +1983,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr-bbs-rate-limit"
+version = "3.0.0-rc5"
+dependencies = [
+ "js-sys",
+ "worker",
+]
+
+[[package]]
 name = "nostr-bbs-relay-worker"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "async-trait",
  "base64",
@@ -1995,13 +2009,14 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-search-worker"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "async-trait",
  "base64",
  "hex",
  "js-sys",
  "nostr-bbs-core",
+ "nostr-bbs-rate-limit",
  "rvf-types",
  "serde",
  "serde_json",
@@ -2012,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-setup-skill"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "async-trait",
  "nostr-bbs-config",
@@ -2024,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-upstream-canary"
-version = "3.0.0-rc4"
+version = "3.0.0-rc5"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -2116,6 +2131,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "p256"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2203,6 +2230,15 @@ name = "peg-runtime"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7011d97b484a5ebdc4b1fdb3b12d5e4bbbea56e9d22b688f2e79e04b65a7d8a6"
+
+[[package]]
+name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
+]
 
 [[package]]
 name = "percent-encoding"
@@ -2322,6 +2358,15 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn",
+]
+
+[[package]]
+name = "primeorder"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
+dependencies = [
+ "elliptic-curve",
 ]
 
 [[package]]

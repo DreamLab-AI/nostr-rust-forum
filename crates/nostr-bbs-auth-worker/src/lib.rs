@@ -19,7 +19,6 @@ mod http;
 mod invites;
 mod moderation;
 mod pod;
-mod rate_limit;
 mod schema;
 mod username;
 mod webauthn;
@@ -121,8 +120,8 @@ async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
     }
 
     // Rate limit: 20 requests per 60 seconds per IP
-    let ip = rate_limit::client_ip(&req);
-    if !rate_limit::check_rate_limit(env, &ip, 20, 60).await {
+    let ip = nostr_bbs_rate_limit::client_ip(&req);
+    if !nostr_bbs_rate_limit::check_rate_limit(env, "SESSIONS", &ip, 20, 60).await {
         return json_response(
             env,
             &serde_json::json!({ "error": "Too many requests" }),

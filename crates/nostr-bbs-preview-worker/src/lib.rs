@@ -8,8 +8,6 @@
 //! - `ssrf` -- SSRF protection (private/internal URL blocking)
 //! - `parse` -- OpenGraph metadata extraction, HTML entity decoding
 //! - `oembed` -- Twitter/X oEmbed detection and fetching
-//! - `rate_limit` -- Application-layer rate limiting via KV
-//!
 //! ## Endpoints
 //!
 //!   GET /preview?url=...  -- fetch OG metadata or Twitter oEmbed
@@ -19,7 +17,6 @@
 
 mod oembed;
 mod parse;
-mod rate_limit;
 mod ssrf;
 
 use serde::Serialize;
@@ -324,8 +321,8 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 
     // Rate limit: 30 requests per 60 seconds per IP
-    let ip = rate_limit::client_ip(&req);
-    if !rate_limit::check_rate_limit(&env, &ip, 30, 60).await {
+    let ip = nostr_bbs_rate_limit::client_ip(&req);
+    if !nostr_bbs_rate_limit::check_rate_limit(&env, "RATE_LIMIT", &ip, 30, 60).await {
         return json_response(
             &ErrorResponse {
                 error: "Too many requests".to_string(),

@@ -11,6 +11,9 @@ members = [
     # Provider-abstracted operator-onboarding skill (ADR-079).
     "crates/nostr-bbs-setup-skill",
 
+    # Shared Cloudflare Worker utilities.
+    "crates/nostr-bbs-rate-limit",
+
     # Cloudflare Worker reference implementations.
     "crates/nostr-bbs-auth-worker",
     "crates/nostr-bbs-pod-worker",
@@ -26,6 +29,17 @@ members = [
     # forum's specific build matrix before any nostr-core module deletion.
     "crates/nostr-bbs-upstream-canary",
 ]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.metadata.ci]
+# Crates verified to compile for wasm32-unknown-unknown without extra system
+# headers. Expand this list as secp256k1-sys cross-compile is resolved upstream.
+wasm-check-packages = ["nostr-bbs-config", "nostr-bbs-preview-worker"]
 
 [workspace.dependencies]
 # Nostr protocol (0.44.x — alpha, pinned to minor).
@@ -54,6 +68,7 @@ passkey-types = "0.3"
 
 # Cryptography (NCC audited, pinned to latest patch)
 k256 = { version = "0.13.4", features = ["schnorr", "ecdh"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
 chacha20poly1305 = "0.10.1"
 hmac = "0.12.1"
 hkdf = "0.12.4"
@@ -113,9 +128,10 @@ solid-pod-rs = { version = "0.4.0-alpha.4", default-features = false, features =
 solid-pod-rs-nostr = { version = "0.4.0-alpha.4", default-features = false }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc4" }
-nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc4" }
-nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc4" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc5" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc5" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc5" }
+nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "3.0.0-rc5" }
 
 # ---------------------------------------------------------------------------
 # Release profile (Sprint v9 D1) — WASM-optimized for forum-client and workers.

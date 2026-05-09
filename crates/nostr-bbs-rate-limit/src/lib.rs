@@ -1,16 +1,28 @@
-//! Application-layer rate limiting via Cloudflare KV.
+//! Shared application-layer rate limiting via Cloudflare KV.
 //!
 //! Uses a sliding-window approach with minute-bucketed KV keys.
 //! Key format: `rl:{ip}:{minute_bucket}` with TTL = window seconds.
+//!
+//! The KV binding name is caller-supplied so each worker can use its own
+//! Cloudflare KV namespace without duplicating the implementation.
 
 use worker::*;
 
 /// Check whether the request from `ip` exceeds `limit` requests per `window_secs`.
 ///
+/// `kv_binding` is the Cloudflare KV binding name configured in the worker's
+/// `wrangler.toml` (e.g. `"SESSIONS"`, `"SEARCH_CONFIG"`, `"RATE_LIMIT"`).
+///
 /// Returns `true` if the request is allowed, `false` if rate-limited.
 /// On KV errors, the request is allowed (fail-open).
-pub async fn check_rate_limit(env: &Env, ip: &str, limit: u32, window_secs: u64) -> bool {
-    let kv = match env.kv("RATE_LIMIT") {
+pub async fn check_rate_limit(
+    env: &Env,
+    kv_binding: &str,
+    ip: &str,
+    limit: u32,
+    window_secs: u64,
+) -> bool {
+    let kv = match env.kv(kv_binding) {
         Ok(kv) => kv,
         Err(_) => return true, // fail-open
     };

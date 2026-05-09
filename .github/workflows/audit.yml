@@ -1,0 +1,43 @@
+# Weekly RustSec advisory scan for nostr-rust-forum
+#
+# Runs on a schedule (Monday 06:17 UTC) and on-demand via workflow_dispatch.
+# Also runs on push/PR when Cargo.lock changes (dependency update).
+#
+# Separate from CI to avoid slowing down the main pipeline — cargo-audit
+# fetches the advisory DB on every run.
+
+name: Security Audit
+
+on:
+  schedule:
+    # Weekly: Monday 06:17 UTC (avoid the :00 stampede)
+    - cron: '17 6 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.lock'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/Cargo.lock'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit --deny warnings
