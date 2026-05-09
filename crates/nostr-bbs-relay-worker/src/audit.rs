@@ -4,24 +4,13 @@
 //! `admin_log` table, and `handle_audit_log_list()` for querying the log via
 //! NIP-98 authenticated admin endpoint.
 
+use nostr_bbs_core::d1_helpers::{js_f64, js_str};
 use serde_json::json;
 use wasm_bindgen::JsValue;
 use worker::{Env, Request, Response, Result};
 
 use crate::auth;
 use crate::cors::json_response;
-
-// ---------------------------------------------------------------------------
-// JsValue helpers (local to module)
-// ---------------------------------------------------------------------------
-
-fn js_str(s: &str) -> JsValue {
-    JsValue::from_str(s)
-}
-
-fn js_f64(v: f64) -> JsValue {
-    JsValue::from_f64(v)
-}
 
 // ---------------------------------------------------------------------------
 // Core audit logging

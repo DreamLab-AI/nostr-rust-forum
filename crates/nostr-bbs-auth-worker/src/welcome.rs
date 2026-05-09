@@ -15,6 +15,7 @@
 //! | POST   | /api/welcome/test              | admin | Dry-run: return a signed event     |
 
 use nostr_bbs_core::keys::signing_key_from_bytes;
+use nostr_bbs_core::d1_helpers::{js_i64, js_str};
 use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
 use serde::Deserialize;
 use serde_json::json;
@@ -71,13 +72,6 @@ struct WelcomeConfigRow {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn js_str(s: &str) -> JsValue {
-    JsValue::from_str(s)
-}
-fn js_i64(v: i64) -> JsValue {
-    JsValue::from_f64(v as f64)
-}
 
 /// Best-effort lookup of the full welcome config row.
 async fn load_config(env: &Env) -> Option<WelcomeConfigRow> {

@@ -5,6 +5,7 @@
 //! implementation in `workers/auth-api/index.ts`.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use nostr_bbs_core::d1_helpers::js_str;
 use p256::ecdsa::signature::Verifier;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -78,11 +79,6 @@ fn js_i32(v: i32) -> JsValue {
 /// Convert a u32 to JsValue.
 fn js_u32(v: u32) -> JsValue {
     JsValue::from_f64(v as f64)
-}
-
-/// Convert a string to JsValue.
-fn js_str(s: &str) -> JsValue {
-    JsValue::from_str(s)
 }
 
 // ---------------------------------------------------------------------------

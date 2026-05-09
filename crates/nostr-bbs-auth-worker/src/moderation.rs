@@ -21,12 +21,11 @@
 //! `moderation_actions` / `mod_reports`. This keeps the signing key on the
 //! admin's machine and uses D1 purely as a queryable mirror.
 
+use nostr_bbs_core::d1_helpers::{js_i64, js_opt_i64, js_opt_str, js_str};
 use nostr_bbs_core::{
-    validate_moderation_event, NostrEvent, KIND_BAN, KIND_MUTE, KIND_REPORT, KIND_WARNING,
-    MOD_KINDS,
+    validate_moderation_event, NostrEvent, KIND_BAN, KIND_MUTE, KIND_REPORT, KIND_REPORT_NIP56,
+    KIND_WARNING, MOD_KINDS,
 };
-// Standard Nostr kind-1984 report events (NIP-56).
-use nostr_bbs_core::KIND_REPORT_NIP56;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -117,31 +116,6 @@ struct StatusOnly {
     status: String,
 }
 
-// ---------------------------------------------------------------------------
-// JS value helpers (duplicated locally to avoid pub fn churn)
-// ---------------------------------------------------------------------------
-
-fn js_str(s: &str) -> JsValue {
-    JsValue::from_str(s)
-}
-
-fn js_opt_str(s: &Option<String>) -> JsValue {
-    match s {
-        Some(v) => JsValue::from_str(v),
-        None => JsValue::NULL,
-    }
-}
-
-fn js_i64(v: i64) -> JsValue {
-    JsValue::from_f64(v as f64)
-}
-
-fn js_opt_i64(v: Option<i64>) -> JsValue {
-    match v {
-        Some(x) => JsValue::from_f64(x as f64),
-        None => JsValue::NULL,
-    }
-}
 
 /// Load the admin set from D1. Used to validate that the Nostr event was
 /// signed by an admin. Combines `members` and `whitelist` for compatibility.
@@ -266,7 +240,7 @@ pub async fn handle_action(
             js_str(action_name),
             js_str(&target_pubkey),
             js_str(&admin_pubkey),
-            js_opt_str(&reason),
+            js_opt_str(reason.as_deref()),
             js_opt_i64(expires_at),
             js_str(&body.event.id),
             js_i64(now as i64),

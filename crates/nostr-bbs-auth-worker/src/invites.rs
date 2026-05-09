@@ -18,9 +18,9 @@
 //! | POST   | /api/invites/:code/redeem   | authed | Redeem an invite, become a member      |
 //! | POST   | /api/invites/:id/revoke     | authed | Revoke an invite you issued (or admin) |
 
+use nostr_bbs_core::d1_helpers::{js_i64, js_str};
 use serde::Deserialize;
 use serde_json::json;
-use wasm_bindgen::JsValue;
 use worker::{Env, Response, Result};
 
 use crate::admin::{canonical_url, is_admin, now_secs, require_authed};
@@ -77,13 +77,6 @@ struct CountRow {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn js_str(s: &str) -> JsValue {
-    JsValue::from_str(s)
-}
-fn js_i64(v: i64) -> JsValue {
-    JsValue::from_f64(v as f64)
-}
 
 /// nanoid-style 16-char code from the URL-safe alphabet. Cryptographically
 /// random via `getrandom`.

@@ -5,6 +5,7 @@
 //! Auto-hide logic triggers when 3+ pending reports accumulate for the same
 //! event from TL1+ reporters.
 
+use nostr_bbs_core::d1_helpers::{js_f64, js_str};
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::JsValue;
@@ -13,18 +14,6 @@ use worker::{Env, Request, Response, Result};
 use crate::audit;
 use crate::auth;
 use crate::cors::json_response;
-
-// ---------------------------------------------------------------------------
-// JsValue helpers
-// ---------------------------------------------------------------------------
-
-fn js_str(s: &str) -> JsValue {
-    JsValue::from_str(s)
-}
-
-fn js_f64(v: f64) -> JsValue {
-    JsValue::from_f64(v)
-}
 
 // ---------------------------------------------------------------------------
 // D1 row types

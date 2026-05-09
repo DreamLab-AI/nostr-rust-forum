@@ -9,6 +9,7 @@
 //! - Zone enforcement on EVENT and REQ.
 
 use nostr_bbs_core::event::NostrEvent;
+use nostr_bbs_core::{KIND_BAN, KIND_MUTE, KIND_REPORT_NIP56};
 use wasm_bindgen::JsValue;
 use worker::*;
 
@@ -152,7 +153,7 @@ impl NostrRelayDO {
             }
 
             // kind-1984 (report): TL1+ required
-            if event.kind == 1984 && trust_level < TrustLevel::Member {
+            if event.kind == KIND_REPORT_NIP56 && trust_level < TrustLevel::Member {
                 Self::send_ok(
                     ws,
                     &event.id,
@@ -224,7 +225,7 @@ impl NostrRelayDO {
             // Activity tracking: increment posts_created and update last_active
             // for content-producing event kinds (kind-1 text, kind-42 channel msg,
             // kind-40 channel create, kind-7 reaction, kind-1984 report).
-            if matches!(event.kind, 1 | 7 | 40 | 42 | 1984) {
+            if matches!(event.kind, 1 | 7 | 40 | 42 | KIND_REPORT_NIP56) {
                 trust::increment_posts_created(&event.pubkey, &self.env).await;
             }
             trust::update_last_active(&event.pubkey, &self.env).await;
@@ -238,7 +239,7 @@ impl NostrRelayDO {
             }
 
             // NIP-56: Process report events -- insert into reports table and check auto-hide
-            if event.kind == 1984 {
+            if event.kind == KIND_REPORT_NIP56 {
                 self.process_report(&event).await;
             }
 
@@ -246,7 +247,7 @@ impl NostrRelayDO {
             // 30911 mute) into the local `moderation_actions` table so the
             // ingress gate can reject content from muted/banned authors.
             // Only respected when the signer is an admin on this relay.
-            if matches!(event.kind, 30910 | 30911) && is_admin {
+            if matches!(event.kind, KIND_BAN | KIND_MUTE) && is_admin {
                 self.mirror_moderation_action(&event).await;
                 // Best-effort cache invalidation for the target pubkey.
                 if let Some(target) = filter::tag_value(&event, "p") {

@@ -19,6 +19,7 @@
 //! | POST   | /api/wot/override/add           | admin | Whitelist a pubkey (source=override) |
 //! | POST   | /api/wot/override/remove        | admin | Remove an override entry             |
 
+use nostr_bbs_core::d1_helpers::{js_i64, js_opt_str, js_str};
 use nostr_bbs_core::{verify_event_strict, NostrEvent};
 use serde::Deserialize;
 use serde_json::json;
@@ -87,18 +88,6 @@ struct CountRow {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn js_str(s: &str) -> JsValue {
-    JsValue::from_str(s)
-}
-fn js_opt_str(s: Option<&str>) -> JsValue {
-    match s {
-        Some(v) => JsValue::from_str(v),
-        None => JsValue::NULL,
-    }
-}
-fn js_i64(v: i64) -> JsValue {
-    JsValue::from_f64(v as f64)
-}
 fn js_bool(b: bool) -> JsValue {
     JsValue::from_f64(if b { 1.0 } else { 0.0 })
 }
