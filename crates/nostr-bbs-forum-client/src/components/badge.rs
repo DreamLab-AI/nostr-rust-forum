@@ -41,7 +41,7 @@ impl BadgeVariant {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum BadgeSize {
-    /// Compact: text-[10px] px-1.5 py-0.
+    /// Compact: `text-[10px] px-1.5 py-0`.
     Sm,
     /// Standard (default): text-xs px-2 py-0.5.
     #[default]

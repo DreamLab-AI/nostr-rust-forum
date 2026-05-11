@@ -260,7 +260,7 @@ pub(super) fn buffer_to_base64url(js_val: &JsValue) -> Result<String, PasskeyErr
     Ok(URL_SAFE_NO_PAD.encode(&bytes))
 }
 
-/// Convert a JsValue (ArrayBuffer or Uint8Array) to a Vec<u8>.
+/// Convert a `JsValue` (ArrayBuffer or Uint8Array) to a `Vec<u8>`.
 pub(super) fn arraybuffer_to_vec(js_val: &JsValue) -> Result<Vec<u8>, PasskeyError> {
     if let Ok(arr) = js_val.clone().dyn_into::<Uint8Array>() {
         return Ok(arr.to_vec());
