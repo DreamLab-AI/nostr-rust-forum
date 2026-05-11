@@ -12,6 +12,16 @@
 //!
 //! @see <https://webledgers.org>
 //! @see JSS `src/handlers/pay.js`
+//!
+//! ## Reference
+//!
+//! The payment primitives consumed here are documented in Melvin Carvalho's
+//! *Practical Guide to Solid* — a 10-part walkthrough of the JavaScript Solid
+//! Server's HTTP 402, WebLedger, MRC20, and blocktrail features:
+//! <https://melvin.me/public/solid/>
+//!
+//! solid-pod-rs re-implements these in Rust; this module extends them with
+//! D1 atomic escrow and agent job lifecycle for the forum kit.
 
 use nostr_bbs_core::d1_helpers::{js_i64, js_opt_str, js_str};
 use serde::Deserialize;
