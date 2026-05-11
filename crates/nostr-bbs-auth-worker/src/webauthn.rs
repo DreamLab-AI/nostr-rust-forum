@@ -114,6 +114,8 @@ struct CredentialResponse {
 
 #[derive(Deserialize)]
 struct InnerAttestationResponse {
+    #[serde(rename = "clientDataJSON")]
+    client_data_json: Option<String>,
     #[serde(rename = "attestationObject")]
     attestation_object: Option<String>,
 }
@@ -484,6 +486,159 @@ fn cbor_skip_value(data: &[u8], pos: usize) -> std::result::Result<usize, String
 }
 
 // ---------------------------------------------------------------------------
+// Attestation object parsing (WebAuthn registration)
+// ---------------------------------------------------------------------------
+
+/// Read a CBOR text string (major type 3). Returns (string, bytes_consumed).
+fn cbor_read_tstr(data: &[u8], pos: usize) -> std::result::Result<(String, usize), String> {
+    if pos >= data.len() {
+        return Err("CBOR truncated at text string".into());
+    }
+    let initial = data[pos];
+    let major = initial >> 5;
+    if major != 3 {
+        return Err(format!(
+            "Expected CBOR text string (major 3), got major {major} at byte {pos}"
+        ));
+    }
+    let additional = (initial & 0x1F) as usize;
+    let (str_len, header_len) = if additional < 24 {
+        (additional, 1)
+    } else if additional == 24 {
+        if pos + 1 >= data.len() {
+            return Err("CBOR truncated reading tstr length".into());
+        }
+        (data[pos + 1] as usize, 2)
+    } else if additional == 25 {
+        if pos + 2 >= data.len() {
+            return Err("CBOR truncated reading tstr length".into());
+        }
+        let v = u16::from_be_bytes([data[pos + 1], data[pos + 2]]);
+        (v as usize, 3)
+    } else {
+        return Err(format!(
+            "Unsupported CBOR tstr length encoding: {additional}"
+        ));
+    };
+
+    let start = pos + header_len;
+    let end = start + str_len;
+    if end > data.len() {
+        return Err(format!(
+            "CBOR text string overflows buffer: need {end}, have {}",
+            data.len()
+        ));
+    }
+    let s = std::str::from_utf8(&data[start..end])
+        .map_err(|e| format!("CBOR tstr invalid UTF-8: {e}"))?;
+    Ok((s.to_string(), header_len + str_len))
+}
+
+/// Parsed attestation object (CBOR map with text string keys).
+struct AttestationObject {
+    fmt: String,
+    auth_data: Vec<u8>,
+}
+
+/// Parse a CBOR-encoded attestation object into its components.
+fn parse_attestation_object(data: &[u8]) -> std::result::Result<AttestationObject, String> {
+    if data.is_empty() {
+        return Err("Empty attestation object".into());
+    }
+
+    let mut pos = 0;
+    let (map_len, consumed) = cbor_read_map_len(data, pos)?;
+    pos += consumed;
+
+    let mut fmt: Option<String> = None;
+    let mut auth_data: Option<Vec<u8>> = None;
+
+    for _ in 0..map_len {
+        if pos >= data.len() {
+            return Err("CBOR truncated reading attestation map key".into());
+        }
+        let (key, consumed) = cbor_read_tstr(data, pos)?;
+        pos += consumed;
+
+        match key.as_str() {
+            "fmt" => {
+                let (val, consumed) = cbor_read_tstr(data, pos)?;
+                pos += consumed;
+                fmt = Some(val);
+            }
+            "authData" => {
+                let (val, consumed) = cbor_read_bstr(data, pos)?;
+                pos += consumed;
+                auth_data = Some(val);
+            }
+            _ => {
+                let consumed = cbor_skip_value(data, pos)?;
+                pos += consumed;
+            }
+        }
+    }
+
+    Ok(AttestationObject {
+        fmt: fmt.ok_or("attestationObject missing 'fmt'")?,
+        auth_data: auth_data.ok_or("attestationObject missing 'authData'")?,
+    })
+}
+
+/// Attested credential data extracted from authenticator data.
+#[cfg_attr(test, derive(Debug))]
+struct AttestedCredential {
+    credential_id: Vec<u8>,
+    cose_key_bytes: Vec<u8>,
+}
+
+/// Extract attested credential data from the authenticator data byte array.
+///
+/// Layout (after the first 37 bytes of rpIdHash + flags + signCount):
+///   [16 bytes AAGUID] [2 bytes credIdLen] [credIdLen bytes credId] [COSE_Key CBOR]
+fn parse_attested_credential(auth_data: &[u8]) -> std::result::Result<AttestedCredential, String> {
+    if auth_data.len() < 37 {
+        return Err("authData too short for attested credential".into());
+    }
+    let flags = auth_data[32];
+    if flags & 0x40 == 0 {
+        return Err("AT flag not set — no attested credential data".into());
+    }
+
+    let mut pos = 37;
+
+    // AAGUID (16 bytes) — skip
+    if pos + 16 > auth_data.len() {
+        return Err("authData truncated at AAGUID".into());
+    }
+    pos += 16;
+
+    // Credential ID length (big-endian u16)
+    if pos + 2 > auth_data.len() {
+        return Err("authData truncated at credential ID length".into());
+    }
+    let cred_id_len = u16::from_be_bytes([auth_data[pos], auth_data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Credential ID
+    if pos + cred_id_len > auth_data.len() {
+        return Err("authData truncated at credential ID".into());
+    }
+    let credential_id = auth_data[pos..pos + cred_id_len].to_vec();
+    pos += cred_id_len;
+
+    // Remaining bytes are the COSE_Key (CBOR-encoded)
+    if pos >= auth_data.len() {
+        return Err("authData truncated at COSE key".into());
+    }
+    let cose_key_bytes = auth_data[pos..].to_vec();
+
+    Ok(AttestedCredential {
+        credential_id,
+        cose_key_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // JSON error helper
 // ---------------------------------------------------------------------------
 
@@ -590,35 +745,173 @@ pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> 
 
 /// POST /auth/register/verify
 ///
-/// Verify a WebAuthn registration response, store the credential in D1,
-/// provision a Solid pod, and return the user's DID/WebID/podUrl.
+/// Verify a WebAuthn registration response by parsing the attestation object,
+/// extracting the credential from authenticator data (NOT from client-supplied
+/// fields), and storing it in D1.
 pub async fn register_verify(
     body_bytes: &[u8],
     _cf_country: Option<&str>,
-    _env: &Env,
+    env: &Env,
 ) -> Result<Response> {
-    console_log!("[register_verify] handler entered");
-    console_log!(
-        "[register_verify] body received ({} bytes)",
-        body_bytes.len()
-    );
     let body: RegisterVerifyBody = serde_json::from_slice(body_bytes).map_err(|e| {
-        console_error!("[register_verify] JSON parse error: {e}");
         Error::RustError(format!("Invalid JSON body: {e}"))
     })?;
 
-    match &body.pubkey {
-        Some(pk) if is_valid_pubkey(pk) => {}
+    let pubkey = match &body.pubkey {
+        Some(pk) if is_valid_pubkey(pk) => pk.to_lowercase(),
         _ => return json_err("Invalid pubkey", 400),
+    };
+
+    // Extract attestation response (credential ID comes from authenticator, not client fields)
+    let cred_response = match &body.response {
+        Some(r) => r,
+        None => return json_err("Missing credential response", 400),
+    };
+    let inner = match &cred_response.response {
+        Some(r) => r,
+        None => return json_err("Missing attestation response", 400),
+    };
+
+    // Step 1: Verify clientDataJSON
+    let client_data_b64 = match &inner.client_data_json {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => return json_err("Missing clientDataJSON", 400),
+    };
+    let client_data_bytes = base64url_decode(&client_data_b64)
+        .map_err(|_| Error::RustError("Invalid clientDataJSON encoding".into()))?;
+    let client_data: ClientData = serde_json::from_slice(&client_data_bytes)
+        .map_err(|_| Error::RustError("Invalid clientDataJSON".into()))?;
+
+    if client_data.ceremony_type.as_deref() != Some("webauthn.create") {
+        return json_err("Invalid ceremony type (expected webauthn.create)", 400);
     }
 
-    // SECURITY TODO: Wire this endpoint to a trusted WebAuthn verifier
-    // (prefer solid-pod-rs-idp's webauthn-rs wrapper, if it can be made
-    // Worker-compatible). Do not restore caller-supplied credential storage.
-    json_err(
-        "WebAuthn registration verification is disabled until wired to a trusted WebAuthn verifier",
-        501,
-    )
+    let expected_origin = env
+        .var("EXPECTED_ORIGIN")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "https://example.com".to_string());
+    if client_data.origin.as_deref() != Some(&expected_origin) {
+        return json_err("Origin mismatch", 400);
+    }
+
+    // Verify challenge was issued by this server and hasn't expired
+    let now_ms = js_now_ms();
+    let five_min_ago = now_ms.saturating_sub(5 * 60 * 1000);
+    let challenge_str = match &client_data.challenge {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => return json_err("Missing challenge", 400),
+    };
+
+    let db = env.d1("DB")?;
+    let challenge_check: Option<CheckRow> = db
+        .prepare("SELECT 1 as ok FROM challenges WHERE challenge = ?1 AND created_at > ?2")
+        .bind(&[js_str(&challenge_str), js_u64(five_min_ago)])?
+        .first::<CheckRow>(None)
+        .await?;
+    if challenge_check.is_none() {
+        return json_err("Invalid or expired challenge", 400);
+    }
+
+    // Step 2: Parse attestation object (CBOR)
+    let attestation_b64 = match &inner.attestation_object {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => return json_err("Missing attestationObject", 400),
+    };
+    let attestation_bytes = base64url_decode(&attestation_b64)
+        .map_err(|_| Error::RustError("Invalid attestationObject encoding".into()))?;
+    let att_obj = parse_attestation_object(&attestation_bytes)
+        .map_err(|e| Error::RustError(format!("Attestation parse: {e}")))?;
+
+    // Accept "none" and "packed" self-attestation (no CA verification needed for passkeys)
+    if !matches!(att_obj.fmt.as_str(), "none" | "packed") {
+        return json_err(
+            &format!("Unsupported attestation format: {}", att_obj.fmt),
+            400,
+        );
+    }
+
+    // Step 3: Verify authenticator data
+    let auth_data = &att_obj.auth_data;
+    if auth_data.len() < 37 {
+        return json_err("authenticatorData too short", 400);
+    }
+
+    // Verify RP ID hash
+    let rp_id = env
+        .var("RP_ID")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "example.test".to_string());
+    let rp_id_hash = Sha256::digest(rp_id.as_bytes());
+    if !constant_time_equal(&rp_id_hash, &auth_data[..32]) {
+        return json_err("RP ID mismatch", 400);
+    }
+
+    // Verify flags: UP (bit 0) and UV (bit 2) must be set for registration
+    let flags = auth_data[32];
+    if flags & 0x01 == 0 {
+        return json_err("User presence not verified", 400);
+    }
+    if flags & 0x04 == 0 {
+        return json_err("User verification not performed", 400);
+    }
+
+    // Sign count (bytes 33-36)
+    let sign_count =
+        u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+
+    // Step 4: Extract attested credential data from authenticator data
+    let att_cred = parse_attested_credential(auth_data)
+        .map_err(|e| Error::RustError(format!("Credential extraction: {e}")))?;
+
+    let credential_id_b64 = array_to_base64url(&att_cred.credential_id);
+    let public_key_b64 = array_to_base64url(&att_cred.cose_key_bytes);
+
+    // Step 5: Validate the extracted COSE key is a valid P-256 key
+    parse_cose_p256_key(&public_key_b64).map_err(|e| {
+        Error::RustError(format!(
+            "Credential public key is not a valid ES256 key: {e}"
+        ))
+    })?;
+
+    // Step 6: Check for existing credential (prevent duplicate registration)
+    let existing: Option<CheckRow> = db
+        .prepare("SELECT 1 as ok FROM webauthn_credentials WHERE pubkey = ?1")
+        .bind(&[js_str(&pubkey)])?
+        .first::<CheckRow>(None)
+        .await?;
+    if existing.is_some() {
+        return json_err("Pubkey already registered", 409);
+    }
+
+    // Step 7: Store credential in D1 and consume challenge
+    let prf_salt = body.prf_salt.unwrap_or_default();
+
+    let insert_stmt = db
+        .prepare(
+            "INSERT INTO webauthn_credentials (pubkey, credential_id, public_key, prf_salt, counter, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&[
+            js_str(&pubkey),
+            js_str(&credential_id_b64),
+            js_str(&public_key_b64),
+            js_str(&prf_salt),
+            js_u32(sign_count),
+            js_u64(now_ms),
+        ])?;
+    let delete_stmt = db
+        .prepare("DELETE FROM challenges WHERE challenge = ?1")
+        .bind(&[js_str(&challenge_str)])?;
+    db.batch(vec![insert_stmt, delete_stmt]).await?;
+
+    let response_body = serde_json::json!({
+        "verified": true,
+        "pubkey": pubkey,
+        "didNostr": format!("did:nostr:{pubkey}"),
+        "credentialId": credential_id_b64,
+    });
+
+    Response::from_json(&response_body)
 }
 
 /// POST /auth/login/options
@@ -1331,6 +1624,143 @@ mod tests {
         let (val, consumed) = cbor_read_int(&[0x26], 0).unwrap();
         assert_eq!(val, -7);
         assert_eq!(consumed, 1);
+    }
+
+    // ── CBOR text string reader ───────────────────────────────────────
+
+    #[test]
+    fn cbor_read_tstr_short() {
+        // tstr(3) "fmt" = 0x63 0x66 0x6d 0x74
+        let data = [0x63, 0x66, 0x6d, 0x74];
+        let (s, consumed) = cbor_read_tstr(&data, 0).unwrap();
+        assert_eq!(s, "fmt");
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn cbor_read_tstr_empty() {
+        // tstr(0) = 0x60
+        let (s, consumed) = cbor_read_tstr(&[0x60], 0).unwrap();
+        assert_eq!(s, "");
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn cbor_read_tstr_not_text() {
+        // major type 2 (bstr) instead of 3 (tstr)
+        let result = cbor_read_tstr(&[0x43, 0x01, 0x02, 0x03], 0);
+        assert!(result.is_err());
+    }
+
+    // ── Attestation object parsing ────────────────────────────────────
+
+    fn build_test_attestation_object(
+        fmt: &str,
+        auth_data: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Map(3) — fmt, attStmt, authData
+        buf.push(0xA3);
+
+        // "fmt" => tstr(fmt)
+        buf.push(0x63); // tstr(3)
+        buf.extend_from_slice(b"fmt");
+        let fmt_bytes = fmt.as_bytes();
+        if fmt_bytes.len() < 24 {
+            buf.push(0x60 | fmt_bytes.len() as u8); // tstr(n)
+        } else {
+            buf.push(0x78); // tstr with 1-byte length
+            buf.push(fmt_bytes.len() as u8);
+        }
+        buf.extend_from_slice(fmt_bytes);
+
+        // "attStmt" => {} (empty map)
+        buf.push(0x67); // tstr(7)
+        buf.extend_from_slice(b"attStmt");
+        buf.push(0xA0); // Map(0)
+
+        // "authData" => bstr(auth_data)
+        buf.push(0x68); // tstr(8)
+        buf.extend_from_slice(b"authData");
+        if auth_data.len() < 24 {
+            buf.push(0x40 | auth_data.len() as u8);
+        } else if auth_data.len() < 256 {
+            buf.push(0x58);
+            buf.push(auth_data.len() as u8);
+        } else {
+            buf.push(0x59);
+            buf.extend_from_slice(&(auth_data.len() as u16).to_be_bytes());
+        }
+        buf.extend_from_slice(auth_data);
+
+        buf
+    }
+
+    #[test]
+    fn parse_attestation_object_none_fmt() {
+        let auth_data = [0u8; 37]; // minimal authData
+        let att_obj_bytes = build_test_attestation_object("none", &auth_data);
+        let att_obj = parse_attestation_object(&att_obj_bytes).unwrap();
+        assert_eq!(att_obj.fmt, "none");
+        assert_eq!(att_obj.auth_data.len(), 37);
+    }
+
+    #[test]
+    fn parse_attestation_object_packed_fmt() {
+        let auth_data = [0u8; 37];
+        let att_obj_bytes = build_test_attestation_object("packed", &auth_data);
+        let att_obj = parse_attestation_object(&att_obj_bytes).unwrap();
+        assert_eq!(att_obj.fmt, "packed");
+    }
+
+    #[test]
+    fn parse_attestation_object_empty_data() {
+        assert!(parse_attestation_object(&[]).is_err());
+    }
+
+    // ── Attested credential data parsing ──────────────────────────────
+
+    fn build_auth_data_with_credential(
+        rp_id_hash: &[u8; 32],
+        cred_id: &[u8],
+        cose_key: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(37 + 16 + 2 + cred_id.len() + cose_key.len());
+        buf.extend_from_slice(rp_id_hash);
+        buf.push(0x45); // flags: UP(0x01) | UV(0x04) | AT(0x40)
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // signCount = 0
+        buf.extend_from_slice(&[0u8; 16]); // AAGUID
+        buf.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
+        buf.extend_from_slice(cred_id);
+        buf.extend_from_slice(cose_key);
+        buf
+    }
+
+    #[test]
+    fn parse_attested_credential_extracts_id_and_key() {
+        let rp_hash = [0xAA; 32];
+        let cred_id = b"test-credential-id";
+        let cose_key = build_test_cose_key(&[0x11; 32], &[0x22; 32]);
+        let auth_data = build_auth_data_with_credential(&rp_hash, cred_id, &cose_key);
+
+        let att_cred = parse_attested_credential(&auth_data).unwrap();
+        assert_eq!(att_cred.credential_id, cred_id);
+        assert_eq!(att_cred.cose_key_bytes, cose_key);
+    }
+
+    #[test]
+    fn parse_attested_credential_no_at_flag() {
+        let mut auth_data = [0u8; 37];
+        auth_data[32] = 0x05; // UP + UV but no AT
+        let result = parse_attested_credential(&auth_data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("AT flag"));
+    }
+
+    #[test]
+    fn parse_attested_credential_truncated() {
+        let result = parse_attested_credential(&[0u8; 10]);
+        assert!(result.is_err());
     }
 }
 

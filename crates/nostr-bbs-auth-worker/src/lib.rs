@@ -15,6 +15,7 @@ mod admins;
 mod auth;
 mod crypto;
 mod delegation;
+mod did;
 mod http;
 mod invites;
 mod moderation;
@@ -181,6 +182,13 @@ async fn route(
     method: &Method,
     body_bytes: &[u8],
 ) -> Result<Response> {
+    // DID document serving (public, no auth required)
+    if let Some(rest) = path.strip_prefix("/.well-known/did/nostr/") {
+        if let Some(pubkey) = rest.strip_suffix(".json") {
+            return did::handle_did_document(pubkey, env).await;
+        }
+    }
+
     // Health check
     if path == "/health" {
         return json_response(
