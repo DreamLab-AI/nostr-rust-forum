@@ -1330,10 +1330,34 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
         .ok()
         .and_then(|v| v.to_string().parse().ok())
         .unwrap_or(1);
+
+    let token = env
+        .var("PAY_TOKEN_TICKER")
+        .ok()
+        .map(|ticker_var| {
+            let ticker = ticker_var.to_string();
+            let rate = env
+                .var("PAY_TOKEN_RATE")
+                .ok()
+                .and_then(|v| v.to_string().parse().ok())
+                .unwrap_or(10);
+            let supply = env
+                .var("PAY_TOKEN_SUPPLY")
+                .ok()
+                .and_then(|v| v.to_string().parse().ok())
+                .unwrap_or(1_000_000);
+            let issuer = env
+                .var("PAY_TOKEN_ISSUER")
+                .ok()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            payments::TokenConfig { ticker, rate, supply, issuer }
+        });
+
     payments::PayConfig {
         enabled,
         cost_sats,
-        token: None,
+        token,
         chains: vec![
             payments::ChainConfig::bitcoin_mainnet(),
             payments::ChainConfig::bitcoin_testnet4(),

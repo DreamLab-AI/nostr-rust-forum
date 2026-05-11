@@ -21,7 +21,8 @@ use worker::*;
 
 pub use solid_pod_rs::payments::{
     balance_response, pay_info, payment_required_body, pubkey_to_did, parse_txo_uri,
-    webledgers_discovery, ChainConfig, PayConfig, PaymentError, PaymentStore, WebLedger,
+    webledgers_discovery, ChainConfig, PayConfig, PaymentError, PaymentStore, TokenConfig,
+    WebLedger,
 };
 
 #[allow(dead_code)] // Used by deprecated KvPaymentStore
@@ -505,6 +506,20 @@ pub struct DepositBody {
     pub amount_sats: Option<u64>,
 }
 
+/// Token buy/withdraw request body.
+#[derive(Debug, Deserialize)]
+pub struct TokenOpBody {
+    pub amount: u64,
+}
+
+/// Agent job estimate request body.
+#[derive(Debug, Deserialize)]
+pub struct EstimateBody {
+    pub endpoint: String,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+}
+
 /// Handle all /pay/* routes using D1 atomic store.
 /// Returns Some(Response) if handled, None if not a pay route.
 pub async fn handle_pay_route(
@@ -550,7 +565,34 @@ pub async fn handle_pay_route(
             pay_deposit_handler(pk, body, db, config, env).await
         }
 
-        (_, ".offers") => pay_info_handler(config, env), // stub: list offers
+        (&Method::Post, ".buy") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            let body = body_bytes.unwrap_or_default();
+            pay_token_buy_handler(pk, body, db, config, env).await
+        }
+
+        (&Method::Post, ".withdraw") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            let body = body_bytes.unwrap_or_default();
+            pay_token_withdraw_handler(pk, body, db, config, env).await
+        }
+
+        (&Method::Post, ".estimate") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            let body = body_bytes.unwrap_or_default();
+            pay_estimate_handler(pk, body, config, env)
+        }
+
+        (_, ".offers") => pay_info_handler(config, env),
 
         (&Method::Get, _) => {
             let pk = match pubkey {
@@ -696,6 +738,145 @@ async fn pay_resource_handler(
         }
         Err(e) => Err(Error::RustError(e.to_string())),
     }
+}
+
+// ---------------------------------------------------------------------------
+// MRC20 token buy/withdraw + agent job estimation handlers
+// ---------------------------------------------------------------------------
+
+async fn pay_token_buy_handler(
+    pubkey: &str,
+    body: &[u8],
+    db: &D1Database,
+    config: &PayConfig,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let token = match &config.token {
+        Some(t) => t,
+        None => return json_err(env, "Token not configured", 404),
+    };
+
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let op: TokenOpBody =
+        serde_json::from_str(body_str).map_err(|e| Error::RustError(format!("parse: {e}")))?;
+
+    if op.amount == 0 {
+        return json_err(env, "Amount must be > 0", 400);
+    }
+
+    // cost = ceil(amount / rate) sats
+    let cost_sats = (op.amount + token.rate - 1) / token.rate;
+    let store = D1PaymentStore::new(db);
+    let did = pubkey_to_did(pubkey);
+
+    match store.debit_atomic(&did, cost_sats).await {
+        Ok(remaining) => {
+            let body = serde_json::json!({
+                "status": "bought",
+                "did": did,
+                "ticker": token.ticker,
+                "amount": op.amount,
+                "cost_sats": cost_sats,
+                "balance_sats": remaining,
+            });
+            json_ok(&body)
+        }
+        Err(PaymentError::InsufficientBalance { balance, cost }) => {
+            let body = payment_required_body(balance, cost);
+            let json_str =
+                serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?;
+            let resp = Response::ok(json_str)?.with_status(402);
+            resp.headers().set("Content-Type", "application/json").ok();
+            Ok(resp)
+        }
+        Err(e) => Err(Error::RustError(e.to_string())),
+    }
+}
+
+async fn pay_token_withdraw_handler(
+    pubkey: &str,
+    body: &[u8],
+    db: &D1Database,
+    config: &PayConfig,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let token = match &config.token {
+        Some(t) => t,
+        None => return json_err(env, "Token not configured", 404),
+    };
+
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let op: TokenOpBody =
+        serde_json::from_str(body_str).map_err(|e| Error::RustError(format!("parse: {e}")))?;
+
+    if op.amount == 0 {
+        return json_err(env, "Amount must be > 0", 400);
+    }
+
+    let credited_sats = op.amount / token.rate;
+    if credited_sats == 0 {
+        return json_err(env, "Amount too small to redeem any sats", 400);
+    }
+
+    let store = D1PaymentStore::new(db);
+    let did = pubkey_to_did(pubkey);
+
+    store
+        .credit_atomic(&did, credited_sats)
+        .await
+        .map_err(|e| Error::RustError(e.to_string()))?;
+
+    let balance = store.read_balance(&did).await;
+    let body = serde_json::json!({
+        "status": "withdrawn",
+        "did": did,
+        "ticker": token.ticker,
+        "amount": op.amount,
+        "credited_sats": credited_sats,
+        "balance_sats": balance,
+    });
+    json_ok(&body)
+}
+
+/// Per-endpoint cost table for agent job estimation.
+/// Maps endpoint prefixes to satoshi costs.
+fn estimate_endpoint_cost(endpoint: &str, base_cost: u64) -> u64 {
+    match endpoint {
+        e if e.starts_with("/api/inference/") => base_cost * 10,
+        e if e.starts_with("/api/image-gen/") => base_cost * 100,
+        e if e.starts_with("/api/analytics/") => base_cost * 5,
+        _ => base_cost,
+    }
+}
+
+fn pay_estimate_handler(
+    pubkey: &str,
+    body: &[u8],
+    config: &PayConfig,
+    _env: &Env,
+) -> std::result::Result<Response, Error> {
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let req: EstimateBody =
+        serde_json::from_str(body_str).map_err(|e| Error::RustError(format!("parse: {e}")))?;
+
+    let did = pubkey_to_did(pubkey);
+    let estimated_sats = estimate_endpoint_cost(&req.endpoint, config.cost_sats);
+
+    let body = serde_json::json!({
+        "did": did,
+        "endpoint": req.endpoint,
+        "estimated_sats": estimated_sats,
+        "unit": "sat",
+        "note": "Pre-execution estimate. Final cost may differ for GPU-metered endpoints."
+    });
+    json_ok(&body)
+}
+
+fn json_ok(body: &serde_json::Value) -> std::result::Result<Response, Error> {
+    let json_str = serde_json::to_string(body).map_err(|e| Error::RustError(e.to_string()))?;
+    let resp = Response::ok(json_str)?;
+    resp.headers().set("Content-Type", "application/json").ok();
+    Ok(resp)
 }
 
 fn json_err(_env: &Env, msg: &str, status: u16) -> std::result::Result<Response, Error> {
@@ -965,6 +1146,28 @@ mod tests {
             result.is_err(),
             "zero master secret is invalid and must return an error"
         );
+    }
+
+    #[test]
+    fn estimate_inference_10x_base() {
+        assert_eq!(estimate_endpoint_cost("/api/inference/run", 1), 10);
+        assert_eq!(estimate_endpoint_cost("/api/inference/batch", 2), 20);
+    }
+
+    #[test]
+    fn estimate_image_gen_100x_base() {
+        assert_eq!(estimate_endpoint_cost("/api/image-gen/submit", 1), 100);
+    }
+
+    #[test]
+    fn estimate_analytics_5x_base() {
+        assert_eq!(estimate_endpoint_cost("/api/analytics/pagerank", 1), 5);
+    }
+
+    #[test]
+    fn estimate_unknown_endpoint_base_cost() {
+        assert_eq!(estimate_endpoint_cost("/api/health", 3), 3);
+        assert_eq!(estimate_endpoint_cost("/some/other", 1), 1);
     }
 
     #[test]
