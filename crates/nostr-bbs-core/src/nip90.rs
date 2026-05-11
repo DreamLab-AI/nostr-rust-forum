@@ -8,7 +8,7 @@
 //! - 7000:      Job feedback events (intermediate status from DVMs)
 //! - 31990:     DVM handler information (kind-31990 parameterized replaceable)
 //!
-//! Reference: https://github.com/nostr-protocol/nostr/blob/master/nips/90.md
+//! Reference: <https://github.com/nostr-protocol/nostr/blob/master/nips/90.md>
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

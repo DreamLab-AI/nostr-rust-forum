@@ -4,7 +4,7 @@
 //! their behalf, subject to optional conditions (event kind restriction and/or
 //! created_at time window).
 //!
-//! Reference: https://github.com/nostr-protocol/nostr/blob/master/nips/26.md
+//! Reference: <https://github.com/nostr-protocol/nostr/blob/master/nips/26.md>
 //!
 //! Wire format:
 //!   delegation_tag = ["delegation", <delegator_pubkey_hex>, <conditions_str>, <sig_hex>]

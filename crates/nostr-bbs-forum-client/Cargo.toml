@@ -121,3 +121,4 @@ serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1"
 bech32 = "0.11"
 async-trait = { workspace = true }
+uuid = { version = "1", features = ["js"] }
