@@ -17,8 +17,14 @@ database_name = "nostr-bbs-relay"
 database_id = "97c77d23-0e24-4325-ada7-1747eab4095b"
 migrations_dir = "migrations"
 
-# NIP-98 replay protection now uses the D1 database (nip98_replay table)
-# instead of KV. The relay-worker's own DB binding serves double duty.
+# P0-03 fix: NIP-98 replay protection uses the shared auth-worker D1
+# database (nostr-bbs-auth) so cross-worker replay is detected. The
+# relay's own DB binding (nostr-bbs-relay) does not contain the
+# nip98_replay table.
+[[d1_databases]]
+binding = "REPLAY_DB"
+database_name = "nostr-bbs-auth"
+database_id = "e3981999-e8f0-4c07-9e4b-2e50859b8524"
 
 [durable_objects]
 bindings = [
