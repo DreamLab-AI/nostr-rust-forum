@@ -525,6 +525,14 @@ pub async fn handle_pay_route(
     Some(match (method, pay_path) {
         (_, ".info") => pay_info_handler(config, env),
 
+        (&Method::Get, ".address") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            handle_address_route(pk, env)
+        }
+
         (&Method::Get, ".balance") => {
             let pk = match pubkey {
                 Some(pk) => pk,
@@ -699,10 +707,281 @@ fn json_err(_env: &Env, msg: &str, status: u16) -> std::result::Result<Response,
 }
 
 // ---------------------------------------------------------------------------
+// Taproot (P2TR) per-user deposit address derivation (BIP-341)
+// ---------------------------------------------------------------------------
+
+/// Compute a BIP-340 tagged hash: `SHA256(SHA256(tag) || SHA256(tag) || msg)`.
+fn tagged_hash(tag: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let tag_hash = Sha256::digest(tag);
+    let mut h = Sha256::new();
+    h.update(tag_hash);
+    h.update(tag_hash);
+    h.update(msg);
+    let result = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Derive a deterministic per-user P2TR (BIP-341 Taproot) deposit address.
+///
+/// The derivation follows BIP-341:
+/// 1. Compute the master public key `P` from `master_secret`.
+/// 2. Compute a per-user tweak: `t = SHA256(P_x || user_pubkey_bytes)`.
+/// 3. Compute the tweaked internal key: `Q = P + t*G`.
+/// 4. Compute the output key (key-path-only spend): apply BIP-341 TapTweak
+///    with an empty script tree: `output_key = Q_x + tagged_hash("TapTweak", Q_x) * G`
+///    expressed as the x-only coordinate.
+/// 5. Encode as bech32m `bc1p...` (witness version 1, 32-byte program).
+///
+/// Both `master_secret` and `user_pubkey` are validated; errors are returned
+/// for invalid inputs rather than panicking.
+pub fn derive_deposit_address(
+    master_secret: &[u8; 32],
+    user_pubkey: &str,
+) -> Result<String, String> {
+    use k256::elliptic_curve::ops::Reduce;
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::{FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey, U256};
+    use sha2::{Digest, Sha256};
+
+    // Validate user pubkey: must be 64 hex chars (32 bytes, x-only)
+    if user_pubkey.len() != 64 || !user_pubkey.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid user pubkey: expected 64 hex chars, got {} chars",
+            user_pubkey.len()
+        ));
+    }
+
+    let user_bytes =
+        hex::decode(user_pubkey).map_err(|e| format!("invalid user pubkey hex: {e}"))?;
+
+    // Derive master public key from secret
+    let master_sk =
+        SecretKey::from_bytes(master_secret.into()).map_err(|e| format!("invalid master secret: {e}"))?;
+    let master_pk: PublicKey = master_sk.public_key();
+    let master_point = master_pk.to_encoded_point(true);
+    // x-only: 32 bytes of the x coordinate
+    let master_x = master_point.x().ok_or("master key has no x coordinate")?;
+
+    // Step 1: Per-user tweak = SHA256(master_pubkey_x || user_pubkey_bytes)
+    let mut tweak_preimage = Vec::with_capacity(32 + 32);
+    tweak_preimage.extend_from_slice(master_x);
+    tweak_preimage.extend_from_slice(&user_bytes);
+    let tweak_hash = Sha256::digest(&tweak_preimage);
+
+    // Convert tweak to a scalar (reduce mod n to handle the rare case where
+    // the hash exceeds the group order)
+    let tweak_scalar =
+        <Scalar as Reduce<U256>>::reduce_bytes(FieldBytes::from_slice(tweak_hash.as_ref()));
+
+    // Step 2: Internal key Q = P + t*G (P is master pubkey as projective point)
+    let master_proj: ProjectivePoint = master_pk.to_projective();
+    let tweak_point = ProjectivePoint::GENERATOR * tweak_scalar;
+    let internal_key = master_proj + tweak_point;
+
+    // Convert to affine to get the x-only coordinate
+    let internal_affine = internal_key.to_affine();
+    let internal_encoded = internal_affine.to_encoded_point(true);
+    let internal_x = internal_encoded
+        .x()
+        .ok_or("tweaked key is point at infinity")?;
+
+    // Step 3: BIP-341 output key (key-path only, empty script tree).
+    // output_key = internal_key + tagged_hash("TapTweak", internal_x) * G
+    let tap_tweak = tagged_hash(b"TapTweak", internal_x);
+    let tap_scalar =
+        <Scalar as Reduce<U256>>::reduce_bytes(FieldBytes::from_slice(&tap_tweak));
+
+    let output_point = internal_key + ProjectivePoint::GENERATOR * tap_scalar;
+    let output_affine = output_point.to_affine();
+    let output_encoded = output_affine.to_encoded_point(true);
+    let output_x = output_encoded
+        .x()
+        .ok_or("output key is point at infinity")?;
+
+    // Step 4: Encode as bech32m bc1p address (witness v1, 32-byte program)
+    let witness_program: &[u8] = output_x.as_slice();
+    let address = bech32::segwit::encode_v1(bech32::hrp::BC, witness_program)
+        .map_err(|e| format!("bech32m encoding failed: {e}"))?;
+
+    Ok(address)
+}
+
+/// Handle `GET /pay/.address?pubkey=<hex>` — returns the per-user P2TR deposit
+/// address derived from the pod's master secret and the caller's pubkey.
+pub fn handle_address_route(pubkey: &str, env: &Env) -> std::result::Result<Response, Error> {
+    // Read the 32-byte master secret from env (stored as 64-char hex)
+    let master_hex = env
+        .secret("MASTER_SECRET")
+        .map_err(|_| Error::RustError("MASTER_SECRET not configured".into()))?
+        .to_string();
+
+    if master_hex.len() != 64 {
+        return Err(Error::RustError(
+            "MASTER_SECRET must be exactly 64 hex characters (32 bytes)".into(),
+        ));
+    }
+
+    let master_bytes: Vec<u8> =
+        hex::decode(&master_hex).map_err(|e| Error::RustError(format!("MASTER_SECRET hex invalid: {e}")))?;
+
+    let mut master_secret = [0u8; 32];
+    master_secret.copy_from_slice(&master_bytes);
+
+    let address = derive_deposit_address(&master_secret, pubkey)
+        .map_err(|e| Error::RustError(format!("address derivation failed: {e}")))?;
+
+    let body = serde_json::json!({
+        "address": address,
+        "chain": "btc"
+    });
+    let json_str = serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?;
+    let resp = Response::ok(json_str)?;
+    resp.headers().set("Content-Type", "application/json").ok();
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Current epoch timestamp in seconds (JS runtime).
 fn now_epoch_secs() -> i64 {
     (js_sys::Date::now() / 1000.0) as i64
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixed 32-byte master secret for deterministic test vectors.
+    fn test_master_secret() -> [u8; 32] {
+        let mut s = [0u8; 32];
+        // Use a well-known non-zero scalar (BIP-340 test vector secret key #1)
+        let bytes = hex::decode(
+            "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef",
+        )
+        .expect("valid hex");
+        s.copy_from_slice(&bytes);
+        s
+    }
+
+    /// Two distinct user pubkeys (valid 64-char hex x-only pubkeys).
+    fn user_a() -> &'static str {
+        "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659"
+    }
+
+    fn user_b() -> &'static str {
+        "dd308afec5777e13121fa72b9cc1b7cc0139715309b086c960e18fd969774eb8"
+    }
+
+    #[test]
+    fn determinism_same_inputs_same_address() {
+        let secret = test_master_secret();
+        let addr1 = derive_deposit_address(&secret, user_a()).expect("derivation should succeed");
+        let addr2 = derive_deposit_address(&secret, user_a()).expect("derivation should succeed");
+        assert_eq!(addr1, addr2, "same inputs must produce the same address");
+    }
+
+    #[test]
+    fn uniqueness_different_users_different_addresses() {
+        let secret = test_master_secret();
+        let addr_a = derive_deposit_address(&secret, user_a()).expect("derivation should succeed");
+        let addr_b = derive_deposit_address(&secret, user_b()).expect("derivation should succeed");
+        assert_ne!(
+            addr_a, addr_b,
+            "different user pubkeys must produce different addresses"
+        );
+    }
+
+    #[test]
+    fn format_bc1p_prefix_and_length() {
+        let secret = test_master_secret();
+        let addr = derive_deposit_address(&secret, user_a()).expect("derivation should succeed");
+        assert!(
+            addr.starts_with("bc1p"),
+            "taproot address must start with bc1p, got: {addr}"
+        );
+        // bech32m taproot address: "bc1p" (4) + 58 data chars = 62 total
+        assert_eq!(
+            addr.len(),
+            62,
+            "taproot address must be 62 characters, got {} for: {addr}",
+            addr.len()
+        );
+    }
+
+    #[test]
+    fn roundtrip_bech32m_decode() {
+        let secret = test_master_secret();
+        let addr = derive_deposit_address(&secret, user_a()).expect("derivation should succeed");
+        let (hrp, version, program) =
+            bech32::segwit::decode(&addr).expect("address must be valid bech32m");
+        assert_eq!(hrp, bech32::hrp::BC);
+        assert_eq!(version, bech32::segwit::VERSION_1);
+        assert_eq!(program.len(), 32, "witness program must be 32 bytes");
+    }
+
+    #[test]
+    fn error_empty_pubkey() {
+        let secret = test_master_secret();
+        let result = derive_deposit_address(&secret, "");
+        assert!(result.is_err(), "empty pubkey must return an error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("invalid user pubkey"),
+            "error should mention invalid pubkey, got: {err}"
+        );
+    }
+
+    #[test]
+    fn error_short_pubkey() {
+        let secret = test_master_secret();
+        let result = derive_deposit_address(&secret, "abcd");
+        assert!(result.is_err(), "short pubkey must return an error");
+    }
+
+    #[test]
+    fn error_non_hex_pubkey() {
+        let secret = test_master_secret();
+        let bad_pk = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert_eq!(bad_pk.len(), 64);
+        let result = derive_deposit_address(&secret, bad_pk);
+        assert!(result.is_err(), "non-hex pubkey must return an error");
+    }
+
+    #[test]
+    fn error_zero_master_secret() {
+        // The zero scalar is not a valid secret key on secp256k1.
+        let zero = [0u8; 32];
+        let result = derive_deposit_address(&zero, user_a());
+        assert!(
+            result.is_err(),
+            "zero master secret is invalid and must return an error"
+        );
+    }
+
+    #[test]
+    fn different_master_secrets_produce_different_addresses() {
+        let secret1 = test_master_secret();
+        let mut secret2 = [0u8; 32];
+        let bytes = hex::decode(
+            "c90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b14e5c9",
+        )
+        .expect("valid hex");
+        secret2.copy_from_slice(&bytes);
+
+        let addr1 = derive_deposit_address(&secret1, user_a()).expect("derivation should succeed");
+        let addr2 = derive_deposit_address(&secret2, user_a()).expect("derivation should succeed");
+        assert_ne!(
+            addr1, addr2,
+            "different master secrets must produce different addresses"
+        );
+    }
 }

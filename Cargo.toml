@@ -119,13 +119,16 @@ wasm-bindgen-test = "0.3"
 # checks only — Schnorr verification is the kit's nostr-bbs-core
 # responsibility on wasm32 because secp256k1-sys C compilation under
 # Nix has a stubs-32.h issue), ldp parsers, interop types, error type)
-# compile to wasm32-unknown-unknown.
+# compile to wasm32-unknown-unknown. `core` transitively enables
+# `did-nostr-types` — the canonical DID:nostr document types consumed
+# by nostr-bbs-core::did. The `mrc20` feature (MRC-20 payment types)
+# is available upstream but not yet enabled in this workspace.
 #
 # `core` consumers (CF Workers): use this dep.
 # Server-side consumers: enable `tokio-runtime` and the IO backends
 # they need.
-solid-pod-rs = { version = "0.4.0-alpha.7", default-features = false, features = ["core"] }
-solid-pod-rs-nostr = { version = "0.4.0-alpha.7", default-features = false }
+solid-pod-rs = { path = "../solid-pod-rs/crates/solid-pod-rs", default-features = false, features = ["core"] }
+solid-pod-rs-nostr = { path = "../solid-pod-rs/crates/solid-pod-rs-nostr", default-features = false }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
 nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc6" }

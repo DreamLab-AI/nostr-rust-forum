@@ -32,6 +32,8 @@ aes = { workspace = true }
 cbc = { workspace = true }
 bech32 = { workspace = true }
 async-trait = { workspace = true }
+# Canonical did:nostr types + payments (upstream).
+solid-pod-rs = { workspace = true }
 
 wasm-bindgen = { workspace = true }
 

@@ -24,6 +24,10 @@ EXIT=0
 
 # --- Rule 1: stale Schnorr verification suite identifiers ------------------
 # Match string-literal occurrences only (preceded + followed by quote).
+# Exclude:
+#   - negative test assertions (assert_ne! proving the canonical type is NOT stale)
+#   - test fixture JSON files (which carry stale identifiers as negative vectors)
+#   - test source files under tests/ directories
 STALE_SUITES=$(
   grep -RIn \
     --include='*.rs' --include='*.js' --include='*.ts' --include='*.json' \
@@ -32,6 +36,9 @@ STALE_SUITES=$(
     | grep -v '/target/' \
     | grep -v 'node_modules' \
     | grep -v '/scripts/anti-drift-lint.sh' \
+    | grep -v 'assert_ne!' \
+    | grep -v '/tests/' \
+    | grep -v '/fixtures/' \
     || true
 )
 

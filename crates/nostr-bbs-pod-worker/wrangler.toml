@@ -16,13 +16,8 @@ bucket_name = "nostr-bbs-pods"
 binding = "POD_META"
 id = "8ec8759ab40d4709a831bf6b0e5241eb"
 
-# Admin KV (read-only mirror of the auth-worker ADMIN_KV namespace). The
-# pod-worker only needs `is_admin_user` lookups; it MUST NOT have write
-# access to the admin set.
-# TODO(ops): bind to the same id provisioned for auth-worker's ADMIN_KV.
-[[kv_namespaces]]
-binding = "ADMIN_KV_RO"
-id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+# Admin checks now use D1 (members.is_admin / whitelist.is_admin) via the
+# shared REPLAY_DB binding. ADMIN_KV_RO namespace eliminated.
 
 # D1 database for NIP-98 replay protection (atomic INSERT OR IGNORE).
 # Shares the auth-worker's D1 database so cross-worker replay is detected.

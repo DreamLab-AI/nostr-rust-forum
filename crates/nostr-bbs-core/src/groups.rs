@@ -10,8 +10,9 @@
 //! - 9005: Delete event from group
 //! - 9021: Join request
 //! - 9024: Registration request
-//! - 39000: Group metadata (name, about, picture)
-//! - 39002: Members list (read-only, relay-published)
+//! - 39000: Group metadata (name, about, picture) — relay-signed
+//! - 39001: Group admins list — relay-signed
+//! - 39002: Group members list — relay-signed
 
 use k256::schnorr::SigningKey;
 use thiserror::Error;
@@ -27,6 +28,8 @@ const KIND_GROUP_DELETE: u64 = 9005;
 const KIND_JOIN_REQUEST: u64 = 9021;
 const KIND_REGISTRATION_REQUEST: u64 = 9024;
 const KIND_GROUP_METADATA: u64 = 39000;
+const KIND_GROUP_ADMINS: u64 = 39001;
+const KIND_GROUP_MEMBERS: u64 = 39002;
 
 // -- Error type ---------------------------------------------------------------
 
@@ -235,6 +238,85 @@ pub fn create_registration_request(
     )
 }
 
+// -- Relay-signed NIP-29 group metadata events --------------------------------
+//
+// Kinds 39000-39002 are parameterized-replaceable events published by the relay
+// itself.  They carry a `["d", "<group-id>"]` tag (the replaceable identifier)
+// and are signed with the relay's own keypair, not an arbitrary admin client.
+
+/// Build a kind 39000 group-metadata event signed by the relay.
+///
+/// Tags: `["d", group_id]`, `["name", name]`, and optionally
+/// `["about", about]`, `["picture", picture]`.
+///
+/// The event is parameterized-replaceable: the relay replaces any prior
+/// kind-39000 event with the same `d` tag value.
+pub fn build_group_metadata(
+    relay_privkey: &[u8; 32],
+    group_id: &str,
+    name: &str,
+    about: Option<&str>,
+    picture: Option<&str>,
+) -> Result<NostrEvent, GroupError> {
+    validate_group_id(group_id)?;
+    let mut tags = vec![
+        vec!["d".to_string(), group_id.to_string()],
+        vec!["name".to_string(), name.to_string()],
+    ];
+    if let Some(a) = about {
+        tags.push(vec!["about".to_string(), a.to_string()]);
+    }
+    if let Some(p) = picture {
+        tags.push(vec!["picture".to_string(), p.to_string()]);
+    }
+    build_and_sign(relay_privkey, KIND_GROUP_METADATA, tags, String::new())
+}
+
+/// Build a kind 39001 group-admins event signed by the relay.
+///
+/// Tags: `["d", group_id]`, one `["p", pubkey, "", "admin"]` per admin.
+///
+/// The event is parameterized-replaceable: the relay replaces any prior
+/// kind-39001 event with the same `d` tag value.
+pub fn build_group_admins(
+    relay_privkey: &[u8; 32],
+    group_id: &str,
+    admin_pubkeys: &[&str],
+) -> Result<NostrEvent, GroupError> {
+    validate_group_id(group_id)?;
+    let mut tags = vec![vec!["d".to_string(), group_id.to_string()]];
+    for pk in admin_pubkeys {
+        validate_hex_pubkey(pk)?;
+        tags.push(vec![
+            "p".to_string(),
+            pk.to_string(),
+            String::new(),
+            "admin".to_string(),
+        ]);
+    }
+    build_and_sign(relay_privkey, KIND_GROUP_ADMINS, tags, String::new())
+}
+
+/// Build a kind 39002 group-members event signed by the relay.
+///
+/// Tags: `["d", group_id]`, one `["p", pubkey]` per member.
+///
+/// The event is parameterized-replaceable: the relay replaces any prior
+/// kind-39002 event with the same `d` tag value.
+pub fn build_group_members(
+    relay_privkey: &[u8; 32],
+    group_id: &str,
+    member_pubkeys: &[&str],
+) -> Result<NostrEvent, GroupError> {
+    validate_group_id(group_id)?;
+    let mut tags = vec![vec!["d".to_string(), group_id.to_string()]];
+    for pk in member_pubkeys {
+        validate_hex_pubkey(pk)?;
+        tags.push(vec!["p".to_string(), pk.to_string()]);
+    }
+    build_and_sign(relay_privkey, KIND_GROUP_MEMBERS, tags, String::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +519,203 @@ mod tests {
     fn registration_request_signature_valid() {
         let event = create_registration_request(&test_key(), "g", "data").unwrap();
         assert!(verify_event(&event));
+    }
+
+    // -- Relay-signed group metadata (kind 39000) -----------------------------
+
+    #[test]
+    fn build_group_metadata_correct_kind_and_d_tag() {
+        let event = build_group_metadata(
+            &test_key(),
+            "rust-dev",
+            "Rust Developers",
+            Some("A group for Rustaceans"),
+            Some("https://example.com/rust.png"),
+        )
+        .unwrap();
+
+        assert_eq!(event.kind, 39000);
+        assert_eq!(event.tags[0], vec!["d", "rust-dev"]);
+        assert_eq!(event.tags[1], vec!["name", "Rust Developers"]);
+        assert_eq!(event.tags[2], vec!["about", "A group for Rustaceans"]);
+        assert_eq!(
+            event.tags[3],
+            vec!["picture", "https://example.com/rust.png"]
+        );
+        assert_eq!(event.content, "");
+    }
+
+    #[test]
+    fn build_group_metadata_optional_fields_omitted() {
+        let event = build_group_metadata(&test_key(), "minimal", "Minimal Group", None, None)
+            .unwrap();
+
+        assert_eq!(event.kind, 39000);
+        assert_eq!(event.tags.len(), 2); // d + name only
+        assert_eq!(event.tags[0], vec!["d", "minimal"]);
+        assert_eq!(event.tags[1], vec!["name", "Minimal Group"]);
+    }
+
+    #[test]
+    fn build_group_metadata_signed_by_relay_key() {
+        let event = build_group_metadata(&test_key(), "g", "G", None, None).unwrap();
+        assert_eq!(event.pubkey, test_pubkey_hex());
+        assert!(verify_event(&event));
+    }
+
+    #[test]
+    fn build_group_metadata_empty_group_rejected() {
+        let result = build_group_metadata(&test_key(), "", "name", None, None);
+        assert!(matches!(result, Err(GroupError::EmptyGroupId)));
+    }
+
+    #[test]
+    fn build_group_metadata_is_parameterized_replaceable() {
+        let event =
+            build_group_metadata(&test_key(), "test-group", "Test", None, None).unwrap();
+        // Kind 39000 is in the parameterized-replaceable range (30000-39999)
+        assert!((30000..=39999).contains(&event.kind));
+        // Must have a d tag
+        let d_tags: Vec<_> = event.tags.iter().filter(|t| t[0] == "d").collect();
+        assert_eq!(d_tags.len(), 1);
+        assert_eq!(d_tags[0][1], "test-group");
+    }
+
+    // -- Relay-signed group admins (kind 39001) -------------------------------
+
+    #[test]
+    fn build_group_admins_correct_kind_and_tags() {
+        let pk1 = "aa".repeat(32);
+        let pk2 = "bb".repeat(32);
+        let event =
+            build_group_admins(&test_key(), "moderators", &[pk1.as_str(), pk2.as_str()])
+                .unwrap();
+
+        assert_eq!(event.kind, 39001);
+        assert_eq!(event.tags[0], vec!["d", "moderators"]);
+        assert_eq!(event.tags[1], vec!["p", &pk1, "", "admin"]);
+        assert_eq!(event.tags[2], vec!["p", &pk2, "", "admin"]);
+        assert_eq!(event.content, "");
+    }
+
+    #[test]
+    fn build_group_admins_empty_list() {
+        let event = build_group_admins(&test_key(), "empty-admins", &[]).unwrap();
+        assert_eq!(event.kind, 39001);
+        assert_eq!(event.tags.len(), 1); // only d tag
+        assert_eq!(event.tags[0], vec!["d", "empty-admins"]);
+    }
+
+    #[test]
+    fn build_group_admins_signed_by_relay_key() {
+        let event = build_group_admins(&test_key(), "g", &[]).unwrap();
+        assert_eq!(event.pubkey, test_pubkey_hex());
+        assert!(verify_event(&event));
+    }
+
+    #[test]
+    fn build_group_admins_invalid_pubkey_rejected() {
+        let result = build_group_admins(&test_key(), "g", &["not-a-pubkey"]);
+        assert!(matches!(result, Err(GroupError::InvalidPubkey(_))));
+    }
+
+    #[test]
+    fn build_group_admins_empty_group_rejected() {
+        let result = build_group_admins(&test_key(), "", &[]);
+        assert!(matches!(result, Err(GroupError::EmptyGroupId)));
+    }
+
+    #[test]
+    fn build_group_admins_is_parameterized_replaceable() {
+        let event = build_group_admins(&test_key(), "admin-group", &[]).unwrap();
+        assert!((30000..=39999).contains(&event.kind));
+        let d_tags: Vec<_> = event.tags.iter().filter(|t| t[0] == "d").collect();
+        assert_eq!(d_tags.len(), 1);
+        assert_eq!(d_tags[0][1], "admin-group");
+    }
+
+    // -- Relay-signed group members (kind 39002) ------------------------------
+
+    #[test]
+    fn build_group_members_correct_kind_and_tags() {
+        let pk1 = "cc".repeat(32);
+        let pk2 = "dd".repeat(32);
+        let pk3 = "ee".repeat(32);
+        let event = build_group_members(
+            &test_key(),
+            "devs",
+            &[pk1.as_str(), pk2.as_str(), pk3.as_str()],
+        )
+        .unwrap();
+
+        assert_eq!(event.kind, 39002);
+        assert_eq!(event.tags[0], vec!["d", "devs"]);
+        assert_eq!(event.tags[1], vec!["p", &pk1]);
+        assert_eq!(event.tags[2], vec!["p", &pk2]);
+        assert_eq!(event.tags[3], vec!["p", &pk3]);
+        assert_eq!(event.content, "");
+    }
+
+    #[test]
+    fn build_group_members_empty_list() {
+        let event = build_group_members(&test_key(), "empty-members", &[]).unwrap();
+        assert_eq!(event.kind, 39002);
+        assert_eq!(event.tags.len(), 1); // only d tag
+    }
+
+    #[test]
+    fn build_group_members_signed_by_relay_key() {
+        let event = build_group_members(&test_key(), "g", &[]).unwrap();
+        assert_eq!(event.pubkey, test_pubkey_hex());
+        assert!(verify_event(&event));
+    }
+
+    #[test]
+    fn build_group_members_invalid_pubkey_rejected() {
+        let result = build_group_members(&test_key(), "g", &["short"]);
+        assert!(matches!(result, Err(GroupError::InvalidPubkey(_))));
+    }
+
+    #[test]
+    fn build_group_members_empty_group_rejected() {
+        let result = build_group_members(&test_key(), "", &[]);
+        assert!(matches!(result, Err(GroupError::EmptyGroupId)));
+    }
+
+    #[test]
+    fn build_group_members_is_parameterized_replaceable() {
+        let event = build_group_members(&test_key(), "member-group", &[]).unwrap();
+        assert!((30000..=39999).contains(&event.kind));
+        let d_tags: Vec<_> = event.tags.iter().filter(|t| t[0] == "d").collect();
+        assert_eq!(d_tags.len(), 1);
+        assert_eq!(d_tags[0][1], "member-group");
+    }
+
+    // -- Cross-cutting relay-signed checks ------------------------------------
+
+    #[test]
+    fn all_relay_signed_events_share_same_author() {
+        let key = test_key();
+        let meta = build_group_metadata(&key, "g", "G", None, None).unwrap();
+        let admins = build_group_admins(&key, "g", &[]).unwrap();
+        let members = build_group_members(&key, "g", &[]).unwrap();
+
+        assert_eq!(meta.pubkey, admins.pubkey);
+        assert_eq!(admins.pubkey, members.pubkey);
+        assert_eq!(meta.pubkey, test_pubkey_hex());
+    }
+
+    #[test]
+    fn all_relay_signed_events_are_valid() {
+        let key = test_key();
+        let pk = "ff".repeat(32);
+        let meta =
+            build_group_metadata(&key, "g", "G", Some("about"), Some("pic")).unwrap();
+        let admins = build_group_admins(&key, "g", &[pk.as_str()]).unwrap();
+        let members = build_group_members(&key, "g", &[pk.as_str()]).unwrap();
+
+        assert!(verify_event(&meta));
+        assert!(verify_event(&admins));
+        assert!(verify_event(&members));
     }
 }

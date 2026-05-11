@@ -205,9 +205,9 @@ async fn rl_nostr_json(kv: &worker::kv::KvStore, ip: &str) -> bool {
 
 /// Build a did:nostr DID document (Tier 3) for the given x-only pubkey hex.
 ///
-/// Delegates to `crate::did::render_did_document_tier3`, which mirrors the
-/// logic from solid-pod-rs-nostr v0.4.0-alpha.2 but without the tokio
-/// dependency that makes that crate incompatible with WASM Workers.
+/// Delegates to `crate::did::render_did_document_tier3`, which calls through
+/// to the canonical `solid_pod_rs::did_nostr_types` module (upstream since
+/// v0.4.0-alpha.8).
 fn build_did_nostr_document(pubkey_hex: &str, pod_base: &str) -> serde_json::Value {
     match did::NostrPubkey::from_hex(pubkey_hex) {
         Ok(pk) => {
@@ -381,7 +381,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let cors = cors_headers(&env);
                 let resp = Response::ok(json_str)?.with_headers(cors);
                 resp.headers()
-                    .set("Content-Type", "application/did+ld+json")
+                    .set("Content-Type", "application/did+json")
                     .ok();
                 return Ok(resp);
             }
@@ -537,7 +537,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
         // Only the pod owner or an admin can provision
         let is_owner = req_pk == owner_pubkey;
-        let is_admin = is_admin_user(&env, &kv, &req_pk).await;
+        let is_admin = is_admin_user(&env, &req_pk).await;
         if !is_owner && !is_admin {
             return json_error(&env, "Only the pod owner or admin can provision", 403);
         }
@@ -1346,31 +1346,43 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
 // Admin check helper
 // ---------------------------------------------------------------------------
 
-/// Check if a pubkey is an admin user.
+/// Check if a pubkey is an admin user via the shared D1 database.
 ///
-/// Reads from the dedicated `ADMIN_KV_RO` binding (audit H6 — split from the
-/// shared `POD_META` namespace so this worker can never *write* admin
-/// flags). Falls back to the legacy `POD_META` lookup during the migration
-/// window so existing admin entries remain effective until ops provisions
-/// `ADMIN_KV_RO` and copies entries across.
-///
-/// Uses KV key `admin:{pubkey}` (value `"1"` / `"true"` => admin).
-async fn is_admin_user(env: &Env, fallback_kv: &kv::KvStore, pubkey: &str) -> bool {
-    let key = format!("admin:{pubkey}");
-    if let Ok(kv) = env.kv("ADMIN_KV_RO") {
-        if let Ok(Some(v)) = kv.get(&key).text().await {
-            return v == "1" || v == "true";
+/// Queries `members.is_admin` then falls back to `whitelist.is_admin`,
+/// matching the auth-worker's `admin::is_admin` logic. Uses the `REPLAY_DB`
+/// binding which points at the same D1 database as the auth-worker's `DB`.
+async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct IsAdminRow {
+        is_admin: i32,
+    }
+
+    let db = match env.d1("REPLAY_DB") {
+        Ok(db) => db,
+        Err(_) => return false,
+    };
+
+    if let Ok(stmt) = db
+        .prepare("SELECT is_admin FROM members WHERE pubkey = ?1")
+        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+    {
+        if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
+            if row.is_admin == 1 {
+                return true;
+            }
         }
     }
-    // Fallback for unmigrated environments. Removed once ops cuts over.
-    fallback_kv
-        .get(&key)
-        .text()
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
+
+    if let Ok(stmt) = db
+        .prepare("SELECT is_admin FROM whitelist WHERE pubkey = ?1")
+        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+    {
+        if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
+            return row.is_admin == 1;
+        }
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------

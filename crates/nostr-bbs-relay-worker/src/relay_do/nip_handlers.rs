@@ -34,7 +34,7 @@ const MAX_SUBSCRIPTIONS: usize = 20;
 
 /// NIP-29: Admin-only group management/moderation kinds.
 fn is_nip29_admin_kind(kind: u64) -> bool {
-    (9000..=9020).contains(&kind) || kind == 39000
+    (9000..=9020).contains(&kind) || (39000..=39002).contains(&kind)
 }
 
 // ---------------------------------------------------------------------------

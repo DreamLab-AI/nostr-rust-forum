@@ -6,6 +6,7 @@
 //! - **NIP-01** event creation, signing, and verification
 //! - **NIP-44** encrypted direct messages (ChaCha20-Poly1305)
 //! - **NIP-98** HTTP auth token creation and verification
+//! - **DID:nostr** document generation (delegates to `solid_pod_rs::did_nostr_types`)
 //! - **Key management** including HKDF derivation from WebAuthn PRF output
 //! - **Value types** (`EventId`, `Timestamp`, `Tag`, etc.)
 
@@ -26,6 +27,7 @@ pub mod signer;
 pub mod types;
 
 pub mod d1_helpers;
+pub mod did;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_bridge;
 
@@ -70,5 +72,9 @@ pub use nip90::{
     DvmJobRequest, DvmJobResult, JobInput, JobStatus, Nip90Error, KIND_HANDLER_INFO,
     KIND_JOB_FEEDBACK, KIND_JOB_REQUEST_MAX, KIND_JOB_REQUEST_MIN, KIND_JOB_RESULT_MAX,
     KIND_JOB_RESULT_MIN,
+};
+pub use did::{
+    did_nostr_uri, format_multibase_schnorr, is_valid_hex_pubkey, render_did_document_tier1,
+    render_did_document_tier3, verify_webid_tag, well_known_path, NostrPubkey,
 };
 pub use signer::{PrfSigner, Signer, SignerError};

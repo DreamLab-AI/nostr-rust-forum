@@ -1905,6 +1905,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "sha2",
+ "solid-pod-rs",
  "thiserror 2.0.18",
  "wasm-bindgen",
  "wasm-bindgen-test",
@@ -1958,8 +1959,10 @@ version = "3.0.0-rc6"
 dependencies = [
  "async-trait",
  "base64",
+ "bech32",
  "hex",
  "js-sys",
+ "k256",
  "nostr-bbs-core",
  "nostr-bbs-rate-limit",
  "proptest",
@@ -3090,8 +3093,6 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "solid-pod-rs"
 version = "0.4.0-alpha.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7026f4f63f64cc99d3738589f998b1da10a0c3f0ce5263ce703403eace03d9d3"
 dependencies = [
  "async-trait",
  "base64",
