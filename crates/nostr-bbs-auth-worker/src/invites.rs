@@ -79,22 +79,18 @@ struct CountRow {
 // ---------------------------------------------------------------------------
 
 /// nanoid-style 16-char code from the URL-safe alphabet. Cryptographically
-/// random via `getrandom`.
-fn generate_code(len: usize) -> String {
+/// random via `getrandom` (backed by `crypto.getRandomValues` on wasm).
+///
+/// Returns an error if the CSPRNG is unavailable rather than falling back to a
+/// predictable source -- invite codes must be unpredictable.
+fn generate_code(len: usize) -> std::result::Result<String, &'static str> {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-";
     let mut bytes = vec![0u8; len];
-    // Fallback to a deterministic-but-bounded loop if getrandom fails; extremely
-    // unlikely in Workers runtime.
-    if getrandom::getrandom(&mut bytes).is_err() {
-        let now = now_secs();
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = ((now.wrapping_mul(1103515245).wrapping_add(i as u64 * 12345)) & 0xFF) as u8;
-        }
-    }
-    bytes
+    getrandom::getrandom(&mut bytes).map_err(|_| "CSPRNG unavailable: cannot generate secure invite code")?;
+    Ok(bytes
         .into_iter()
         .map(|b| ALPHABET[(b as usize) % ALPHABET.len()] as char)
-        .collect()
+        .collect())
 }
 
 /// Load the effective settings row, falling back to sane defaults if the
@@ -217,8 +213,14 @@ pub async fn handle_create(
     };
     let max_uses = max_uses.clamp(1, 100);
 
-    let id = generate_code(8);
-    let code = generate_code(16);
+    let id = match generate_code(8) {
+        Ok(v) => v,
+        Err(msg) => return error_json(env, msg, 500),
+    };
+    let code = match generate_code(16) {
+        Ok(v) => v,
+        Err(msg) => return error_json(env, msg, 500),
+    };
     let now = now_secs() as i64;
     let expires_at = now + (settings.invite_expiry_hours * 3600);
 
@@ -710,7 +712,7 @@ mod tests {
 
     #[test]
     fn generate_code_has_expected_length() {
-        let c = generate_code(16);
+        let c = generate_code(16).expect("getrandom should work in test");
         assert_eq!(c.len(), 16);
         assert!(c
             .chars()
@@ -719,8 +721,8 @@ mod tests {
 
     #[test]
     fn generate_code_is_non_deterministic() {
-        let a = generate_code(16);
-        let b = generate_code(16);
+        let a = generate_code(16).expect("getrandom should work in test");
+        let b = generate_code(16).expect("getrandom should work in test");
         assert_ne!(a, b, "two consecutive codes should differ");
     }
 

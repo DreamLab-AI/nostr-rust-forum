@@ -884,7 +884,24 @@ pub async fn register_verify(
     }
 
     // Step 7: Store credential in D1 and consume challenge
-    let prf_salt = body.prf_salt.unwrap_or_default();
+    //
+    // P0-01 fix: Generate the PRF salt server-side by deriving from a
+    // server secret and the credential ID. The client-supplied prfSalt
+    // field is ignored — accepting it would let an attacker supply their
+    // own salt to derive a different key, bypassing the passkey security
+    // model.
+    let prf_salt = {
+        let server_secret = env
+            .secret("PRF_SERVER_SECRET")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(b"nostr-bbs-prf-salt-v1\0");
+        h.update(server_secret.as_bytes());
+        h.update(credential_id_b64.as_bytes());
+        h.update(pubkey.as_bytes());
+        array_to_base64url(&h.finalize())
+    };
 
     let insert_stmt = db
         .prepare(
