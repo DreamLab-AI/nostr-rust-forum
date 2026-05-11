@@ -143,7 +143,9 @@ pub enum Nip98Error {
     #[error("invalid pubkey: expected 64 hex chars")]
     InvalidPubkey,
 
-    #[error("timestamp expired: event created_at {event_ts} is more than {tolerance}s from now ({now})")]
+    #[error(
+        "timestamp expired: event created_at {event_ts} is more than {tolerance}s from now ({now})"
+    )]
     TimestampExpired {
         event_ts: u64,
         now: u64,
@@ -312,7 +314,14 @@ pub fn verify_nip98(
         .expect("system clock before epoch")
         .as_secs();
     let tolerance = max_age_secs.unwrap_or(TIMESTAMP_TOLERANCE);
-    verify_token_full(auth_header, expected_url, expected_method, None, now, tolerance)
+    verify_token_full(
+        auth_header,
+        expected_url,
+        expected_method,
+        None,
+        now,
+        tolerance,
+    )
 }
 
 /// Verify a NIP-98 `Authorization` header value using the system clock
@@ -336,7 +345,14 @@ pub fn verify_token(
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_secs();
-    verify_token_full(auth_header, expected_url, expected_method, body, now, TIMESTAMP_TOLERANCE)
+    verify_token_full(
+        auth_header,
+        expected_url,
+        expected_method,
+        body,
+        now,
+        TIMESTAMP_TOLERANCE,
+    )
 }
 
 /// Verify a NIP-98 `Authorization` header value against an explicit timestamp
@@ -358,7 +374,14 @@ pub fn verify_token_at(
     body: Option<&[u8]>,
     now: u64,
 ) -> Result<Nip98Token, Nip98Error> {
-    verify_token_full(auth_header, expected_url, expected_method, body, now, TIMESTAMP_TOLERANCE)
+    verify_token_full(
+        auth_header,
+        expected_url,
+        expected_method,
+        body,
+        now,
+        TIMESTAMP_TOLERANCE,
+    )
 }
 
 /// Full-control NIP-98 verification with explicit timestamp and tolerance.
@@ -1035,7 +1058,10 @@ mod tests {
 
         // 10-second tolerance: 15s offset should fail
         let err = verify_token_full(&header, url, "GET", None, created_at + 15, 10).unwrap_err();
-        assert!(matches!(err, Nip98Error::TimestampExpired { tolerance: 10, .. }));
+        assert!(matches!(
+            err,
+            Nip98Error::TimestampExpired { tolerance: 10, .. }
+        ));
     }
 
     #[test]
@@ -1049,7 +1075,11 @@ mod tests {
 
         let err = verify_token_full(&header, url, "GET", None, created_at + 200, 30).unwrap_err();
         match err {
-            Nip98Error::TimestampExpired { event_ts, now, tolerance } => {
+            Nip98Error::TimestampExpired {
+                event_ts,
+                now,
+                tolerance,
+            } => {
                 assert_eq!(event_ts, created_at);
                 assert_eq!(now, created_at + 200);
                 assert_eq!(tolerance, 30);

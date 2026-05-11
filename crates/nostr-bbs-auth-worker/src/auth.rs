@@ -29,4 +29,3 @@ pub async fn verify_nip98_replay(
     )
     .await
 }
-

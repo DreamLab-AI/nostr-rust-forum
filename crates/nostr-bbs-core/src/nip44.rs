@@ -133,9 +133,7 @@ fn map_upstream_err(e: UpstreamError) -> Nip44Error {
                 ErrorV2::HkdfLength(_) => Nip44Error::DecryptionFailed,
                 ErrorV2::TryFromSlice => Nip44Error::InvalidPayload("slice conversion"),
                 ErrorV2::FromSlice(_) => Nip44Error::InvalidPayload("from slice"),
-                ErrorV2::Utf8Encode(_) => {
-                    Nip44Error::InvalidPayload("invalid UTF-8 in plaintext")
-                }
+                ErrorV2::Utf8Encode(_) => Nip44Error::InvalidPayload("invalid UTF-8 in plaintext"),
             }
         }
     }

@@ -25,8 +25,8 @@ mod nip_handlers;
 mod session;
 mod storage;
 
-pub(crate) use mod_cache::ModCache;
 use crate::auth::AdminCache;
+pub(crate) use mod_cache::ModCache;
 
 #[cfg(feature = "test-exports")]
 #[doc(hidden)]

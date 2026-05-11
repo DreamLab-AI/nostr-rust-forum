@@ -61,11 +61,7 @@ const ZONES: &[Zone] = &[
         description: "For friends and visitors staying with us",
         icon: "moon",
         accent: "purple",
-        sections: &[
-            "private-welcome",
-            "private-events",
-            "private-booking",
-        ],
+        sections: &["private-welcome", "private-events", "private-booking"],
     },
 ];
 

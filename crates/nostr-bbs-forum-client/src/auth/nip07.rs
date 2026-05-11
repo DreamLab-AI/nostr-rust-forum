@@ -162,7 +162,7 @@ impl Signer for Nip07Signer {
     async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<NostrEvent, SignerError> {
         nip07_sign_event(&unsigned)
             .await
-            .map_err(|e| SignerError::Backend(e))
+            .map_err(SignerError::Backend)
     }
 
     async fn nip44_encrypt(
@@ -172,7 +172,7 @@ impl Signer for Nip07Signer {
     ) -> Result<String, SignerError> {
         nip07_nip44_encrypt(recipient_pubkey_hex, plaintext)
             .await
-            .map_err(|e| SignerError::EncryptionFailed(e))
+            .map_err(SignerError::EncryptionFailed)
     }
 
     async fn nip44_decrypt(
@@ -182,7 +182,7 @@ impl Signer for Nip07Signer {
     ) -> Result<String, SignerError> {
         nip07_nip44_decrypt(sender_pubkey_hex, ciphertext)
             .await
-            .map_err(|e| SignerError::DecryptionFailed(e))
+            .map_err(SignerError::DecryptionFailed)
     }
 
     async fn nip04_encrypt(
@@ -193,7 +193,7 @@ impl Signer for Nip07Signer {
         // Fall back to NIP-44 if NIP-04 is not available
         nip07_nip44_encrypt(recipient_pubkey_hex, plaintext)
             .await
-            .map_err(|e| SignerError::EncryptionFailed(e))
+            .map_err(SignerError::EncryptionFailed)
     }
 
     async fn nip04_decrypt(
@@ -203,7 +203,7 @@ impl Signer for Nip07Signer {
     ) -> Result<String, SignerError> {
         nip07_nip44_decrypt(sender_pubkey_hex, ciphertext)
             .await
-            .map_err(|e| SignerError::DecryptionFailed(e))
+            .map_err(SignerError::DecryptionFailed)
     }
 }
 

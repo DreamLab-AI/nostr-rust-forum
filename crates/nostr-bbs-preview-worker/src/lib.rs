@@ -15,6 +15,9 @@
 //!   GET /stats            -- cache statistics (CF Cache API)
 //!   OPTIONS               -- CORS preflight
 
+// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
+#![allow(dead_code)]
+
 mod oembed;
 mod parse;
 mod ssrf;

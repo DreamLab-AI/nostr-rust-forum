@@ -74,10 +74,7 @@ pub trait Provider {
     fn tier(&self) -> &'static str;
 
     /// Provision deployment resources defined by `cfg`.
-    async fn provision(
-        &self,
-        cfg: &ForumConfig,
-    ) -> Result<Vec<ProvisionedResource>, SetupError>;
+    async fn provision(&self, cfg: &ForumConfig) -> Result<Vec<ProvisionedResource>, SetupError>;
 
     /// Render the per-worker `wrangler.toml` overlay (or equivalent for the
     /// provider) given a populated `cfg` and the resources from `provision`.
@@ -97,10 +94,7 @@ impl Provider for SelfHostProvider {
         "tier-1"
     }
 
-    async fn provision(
-        &self,
-        _cfg: &ForumConfig,
-    ) -> Result<Vec<ProvisionedResource>, SetupError> {
+    async fn provision(&self, _cfg: &ForumConfig) -> Result<Vec<ProvisionedResource>, SetupError> {
         // Provisions: nothing (operator already runs the host).
         // Returns an empty vec; render_wrangler still writes a manifest.
         Ok(Vec::new())
@@ -129,10 +123,7 @@ impl Provider for CloudflareWorkersProvider {
         "tier-2"
     }
 
-    async fn provision(
-        &self,
-        _cfg: &ForumConfig,
-    ) -> Result<Vec<ProvisionedResource>, SetupError> {
+    async fn provision(&self, _cfg: &ForumConfig) -> Result<Vec<ProvisionedResource>, SetupError> {
         // Provisions: D1 db, KV namespaces (admin + nip98-replay + admin-ro),
         // R2 bucket, Routes, Custom Domain. Implementation: Sprint v12+.
         Err(SetupError::NotYetImplemented {
@@ -162,10 +153,7 @@ impl Provider for FlyDotIoProvider {
         "tier-3"
     }
 
-    async fn provision(
-        &self,
-        _cfg: &ForumConfig,
-    ) -> Result<Vec<ProvisionedResource>, SetupError> {
+    async fn provision(&self, _cfg: &ForumConfig) -> Result<Vec<ProvisionedResource>, SetupError> {
         Err(SetupError::NotYetImplemented {
             provider: "FlyDotIoProvider",
             method: "provision",
@@ -193,10 +181,7 @@ impl Provider for TurnkeyProvider {
         "tier-4"
     }
 
-    async fn provision(
-        &self,
-        _cfg: &ForumConfig,
-    ) -> Result<Vec<ProvisionedResource>, SetupError> {
+    async fn provision(&self, _cfg: &ForumConfig) -> Result<Vec<ProvisionedResource>, SetupError> {
         Err(SetupError::NotYetImplemented {
             provider: "TurnkeyProvider",
             method: "provision",
@@ -223,10 +208,7 @@ impl Provider for KubernetesProvider {
         "tier-x"
     }
 
-    async fn provision(
-        &self,
-        _cfg: &ForumConfig,
-    ) -> Result<Vec<ProvisionedResource>, SetupError> {
+    async fn provision(&self, _cfg: &ForumConfig) -> Result<Vec<ProvisionedResource>, SetupError> {
         Err(SetupError::NotYetImplemented {
             provider: "KubernetesProvider",
             method: "provision",

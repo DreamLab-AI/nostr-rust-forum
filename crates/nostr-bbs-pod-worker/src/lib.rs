@@ -12,6 +12,9 @@
 //!
 //! Port of `workers/pod-api/index.ts`.
 
+// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
+#![allow(dead_code)]
+
 mod acl;
 mod auth;
 mod conditional;
@@ -427,9 +430,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None
             };
 
-            let pay_db = env.d1("REPLAY_DB").map_err(|e| {
-                Error::RustError(format!("REPLAY_DB D1 binding missing: {e}"))
-            })?;
+            let pay_db = env
+                .d1("REPLAY_DB")
+                .map_err(|e| Error::RustError(format!("REPLAY_DB D1 binding missing: {e}")))?;
             if let Some(result) = payments::handle_pay_route(
                 path,
                 &method,
@@ -513,9 +516,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     let kv = env.kv("POD_META")?;
     let bucket = env.bucket("PODS")?;
-    let quota_db = env.d1("REPLAY_DB").map_err(|e| {
-        Error::RustError(format!("REPLAY_DB D1 binding missing: {e}"))
-    })?;
+    let quota_db = env
+        .d1("REPLAY_DB")
+        .map_err(|e| Error::RustError(format!("REPLAY_DB D1 binding missing: {e}")))?;
 
     let agent_uri = requester_pubkey
         .as_ref()
@@ -873,7 +876,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     );
                 }
 
-                if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await {
+                if let Err(e) =
+                    quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await
+                {
                     return json_error(&env, &e.to_string(), 413);
                 }
 
@@ -994,7 +999,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             // Atomic quota check for size increase
             let size_delta = updated_len as i64 - current_bytes.len() as i64;
             if size_delta > 0 {
-                if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, size_delta as u64).await {
+                if let Err(e) =
+                    quota::check_and_reserve_d1(&quota_db, &owner_pubkey, size_delta as u64).await
+                {
                     return json_error(&env, &e.to_string(), 413);
                 }
             }
@@ -1040,7 +1047,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Method::Delete => {
             // Estimate size of deleted resource for quota tracking
             let deleted_size: u64 = match bucket.get(&r2_key).execute().await? {
-                Some(obj) => obj.size() as u64,
+                Some(obj) => obj.size(),
                 None => return json_error(&env, "Not found", 404),
             };
 
@@ -1331,28 +1338,30 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
         .and_then(|v| v.to_string().parse().ok())
         .unwrap_or(1);
 
-    let token = env
-        .var("PAY_TOKEN_TICKER")
-        .ok()
-        .map(|ticker_var| {
-            let ticker = ticker_var.to_string();
-            let rate = env
-                .var("PAY_TOKEN_RATE")
-                .ok()
-                .and_then(|v| v.to_string().parse().ok())
-                .unwrap_or(10);
-            let supply = env
-                .var("PAY_TOKEN_SUPPLY")
-                .ok()
-                .and_then(|v| v.to_string().parse().ok())
-                .unwrap_or(1_000_000);
-            let issuer = env
-                .var("PAY_TOKEN_ISSUER")
-                .ok()
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            payments::TokenConfig { ticker, rate, supply, issuer }
-        });
+    let token = env.var("PAY_TOKEN_TICKER").ok().map(|ticker_var| {
+        let ticker = ticker_var.to_string();
+        let rate = env
+            .var("PAY_TOKEN_RATE")
+            .ok()
+            .and_then(|v| v.to_string().parse().ok())
+            .unwrap_or(10);
+        let supply = env
+            .var("PAY_TOKEN_SUPPLY")
+            .ok()
+            .and_then(|v| v.to_string().parse().ok())
+            .unwrap_or(1_000_000);
+        let issuer = env
+            .var("PAY_TOKEN_ISSUER")
+            .ok()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        payments::TokenConfig {
+            ticker,
+            rate,
+            supply,
+            issuer,
+        }
+    });
 
     payments::PayConfig {
         enabled,

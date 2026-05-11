@@ -19,10 +19,7 @@
 // Pure-logic re-exports from solid-pod-rs 0.4.0-alpha.4 `wac` module. These
 // were the kit's hand-rolled implementations; the upstream surface is API-
 // shape compatible and battle-tested in the JSS port.
-pub use solid_pod_rs::wac::{
-    method_to_mode, mode_name, wac_allow_header, AccessMode, AclAuthorization, AclDocument,
-    IdOrIds, IdRef,
-};
+pub use solid_pod_rs::wac::{method_to_mode, wac_allow_header, AccessMode, AclDocument};
 
 /// All access modes, used for iterating when building WAC-Allow headers.
 pub const ALL_MODES: &[AccessMode] = &[
@@ -181,6 +178,7 @@ pub async fn find_effective_acl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solid_pod_rs::wac::{mode_name, AclAuthorization, IdOrIds, IdRef};
 
     fn make_doc(graph: Vec<AclAuthorization>) -> AclDocument {
         AclDocument {

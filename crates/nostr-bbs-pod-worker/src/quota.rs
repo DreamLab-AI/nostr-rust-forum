@@ -72,11 +72,7 @@ pub async fn update_usage_d1(db: &D1Database, pubkey: &str, delta: i64) -> Resul
              SET used_bytes = MAX(0, used_bytes - ?2), updated_at = ?3 \
              WHERE pubkey = ?1",
         )
-        .bind(&[
-            js_str(pubkey),
-            js_i64(abs_delta),
-            js_i64(now),
-        ])
+        .bind(&[js_str(pubkey), js_i64(abs_delta), js_i64(now)])
         .map_err(|e| Error::RustError(format!("d1 bind usage-: {e:?}")))?
         .run()
         .await
@@ -102,11 +98,7 @@ pub async fn check_and_reserve_d1(db: &D1Database, pubkey: &str, bytes: u64) -> 
          VALUES (?1, ?2, 0, ?3) \
          ON CONFLICT(pubkey) DO NOTHING",
     )
-    .bind(&[
-        js_str(pubkey),
-        js_i64(DEFAULT_QUOTA as i64),
-        js_i64(now),
-    ])
+    .bind(&[js_str(pubkey), js_i64(DEFAULT_QUOTA as i64), js_i64(now)])
     .map_err(|e| Error::RustError(format!("d1 bind quota init: {e:?}")))?
     .run()
     .await
@@ -119,11 +111,7 @@ pub async fn check_and_reserve_d1(db: &D1Database, pubkey: &str, bytes: u64) -> 
              SET used_bytes = used_bytes + ?2, updated_at = ?3 \
              WHERE pubkey = ?1 AND (used_bytes + ?2) <= limit_bytes",
         )
-        .bind(&[
-            js_str(pubkey),
-            js_i64(bytes as i64),
-            js_i64(now),
-        ])
+        .bind(&[js_str(pubkey), js_i64(bytes as i64), js_i64(now)])
         .map_err(|e| Error::RustError(format!("d1 bind reserve: {e:?}")))?
         .run()
         .await
@@ -162,10 +150,7 @@ pub async fn get_quota_d1(db: &D1Database, pubkey: &str) -> QuotaInfo {
                 .get("limit_bytes")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(DEFAULT_QUOTA);
-            let used = row
-                .get("used_bytes")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let used = row.get("used_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
             QuotaInfo { limit, used }
         }
         _ => QuotaInfo::default(),
@@ -180,11 +165,7 @@ pub async fn set_quota_d1(db: &D1Database, pubkey: &str, limit: u64) -> Result<Q
          VALUES (?1, ?2, 0, ?3) \
          ON CONFLICT(pubkey) DO UPDATE SET limit_bytes = ?2, updated_at = ?3",
     )
-    .bind(&[
-        js_str(pubkey),
-        js_i64(limit as i64),
-        js_i64(now),
-    ])
+    .bind(&[js_str(pubkey), js_i64(limit as i64), js_i64(now)])
     .map_err(|e| Error::RustError(format!("d1 bind set_quota: {e:?}")))?
     .run()
     .await

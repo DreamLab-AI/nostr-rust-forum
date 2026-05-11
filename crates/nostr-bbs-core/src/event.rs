@@ -279,10 +279,7 @@ impl UnsignedEvent {
                     return None;
                 }
                 Some(nostr::Tag::parse(t.clone()).unwrap_or_else(|_| {
-                    nostr::Tag::custom(
-                        nostr::TagKind::custom(t[0].clone()),
-                        t[1..].iter().cloned().collect::<Vec<_>>(),
-                    )
+                    nostr::Tag::custom(nostr::TagKind::custom(t[0].clone()), t[1..].to_vec())
                 }))
             })
             .collect();
@@ -313,8 +310,8 @@ pub fn sign_event_upstream(
             derived_pubkey,
         });
     }
-    let keys = signing_key_to_upstream(signing_key)
-        .expect("valid SigningKey converts to valid Keys");
+    let keys =
+        signing_key_to_upstream(signing_key).expect("valid SigningKey converts to valid Keys");
     let builder = event.to_upstream_builder();
     let upstream_event = builder
         .sign_with_keys(&keys)
@@ -569,7 +566,7 @@ mod tests {
         let builder = unsigned.to_upstream_builder();
         let keys = nostr::Keys::generate();
         let event = builder.sign_with_keys(&keys).unwrap();
-        assert_eq!(event.created_at.as_u64(), 1700000000);
+        assert_eq!(event.created_at.as_secs(), 1700000000);
         assert_eq!(event.kind.as_u16(), 30023);
         assert_eq!(event.content, "long form content");
     }
@@ -586,7 +583,10 @@ mod tests {
             content: "upstream-signed".to_string(),
         };
         let signed = sign_event_upstream(unsigned, &sk).unwrap();
-        assert!(verify_event(&signed), "kit verify must accept upstream-signed event");
+        assert!(
+            verify_event(&signed),
+            "kit verify must accept upstream-signed event"
+        );
     }
 
     #[test]

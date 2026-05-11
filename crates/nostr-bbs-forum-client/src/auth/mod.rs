@@ -193,7 +193,8 @@ impl AuthStore {
             let signing_key = k256::schnorr::SigningKey::from_bytes(&key_bytes)
                 .map_err(|e| format!("Invalid signing key: {e}"))?;
             key_bytes.zeroize();
-            nostr_bbs_core::sign_event(event, &signing_key).map_err(|e| format!("Signing failed: {e}"))
+            nostr_bbs_core::sign_event(event, &signing_key)
+                .map_err(|e| format!("Signing failed: {e}"))
         })
     }
 
@@ -329,8 +330,8 @@ impl AuthStore {
     /// Returns the hex-encoded private key so the signup UI can show it for
     /// backup. The privkey is held in memory and never persisted to storage.
     pub fn register_with_generated_key(&self, display_name: &str) -> Result<String, String> {
-        let keypair =
-            nostr_bbs_core::generate_keypair().map_err(|e| format!("Key generation failed: {e}"))?;
+        let keypair = nostr_bbs_core::generate_keypair()
+            .map_err(|e| format!("Key generation failed: {e}"))?;
 
         let pubkey = keypair.public.to_hex();
         let privkey_hex = hex::encode(keypair.secret.as_bytes());
@@ -662,6 +663,21 @@ fn decode_nsec(nsec: &str) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
+// -- Context providers --------------------------------------------------------
+
+/// Create and provide the auth context. Call once at the app root.
+pub fn provide_auth() {
+    let store = AuthStore::new();
+    store.restore_session();
+    session::register_pagehide_listener(store);
+    provide_context(store);
+}
+
+/// Get the auth store from context. Panics if `provide_auth()` was not called.
+pub fn use_auth() -> AuthStore {
+    expect_context::<AuthStore>()
+}
+
 // -- Tests -------------------------------------------------------------------
 
 #[cfg(test)]
@@ -729,11 +745,11 @@ mod tests {
         let restored: session::StoredSession = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.version, 2);
         assert_eq!(restored.public_key, session.public_key);
-        assert_eq!(restored.is_passkey, true);
-        assert_eq!(restored.is_nip07, false);
-        assert_eq!(restored.is_local_key, false);
+        assert!(restored.is_passkey);
+        assert!(!restored.is_nip07);
+        assert!(!restored.is_local_key);
         assert_eq!(restored.nickname, Some("Alice".into()));
-        assert_eq!(restored.nsec_backed_up, true);
+        assert!(restored.nsec_backed_up);
     }
 
     #[test]
@@ -815,19 +831,4 @@ mod tests {
         // We can't access them after drop, but the drop impl is guaranteed
         // by the #[zeroize(drop)] attribute.
     }
-}
-
-// -- Context providers --------------------------------------------------------
-
-/// Create and provide the auth context. Call once at the app root.
-pub fn provide_auth() {
-    let store = AuthStore::new();
-    store.restore_session();
-    session::register_pagehide_listener(store);
-    provide_context(store);
-}
-
-/// Get the auth store from context. Panics if `provide_auth()` was not called.
-pub fn use_auth() -> AuthStore {
-    expect_context::<AuthStore>()
 }

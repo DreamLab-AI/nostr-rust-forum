@@ -121,7 +121,7 @@ pub fn SettingsPage() -> impl IntoView {
         let about_sig = about;
         let avatar_sig = avatar_url;
         let birthday_sig = birthday;
-        let auth_for_fetch = auth.clone();
+        let auth_for_fetch = auth;
 
         Effect::new(move |_| {
             if conn_state.get() != ConnectionState::Connected {

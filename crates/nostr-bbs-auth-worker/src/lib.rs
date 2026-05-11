@@ -10,6 +10,9 @@
 //! - `pod.rs` -- Pod provisioning and profile retrieval
 //! - `auth.rs` -- NIP-98 verification wrapper
 
+// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
+#![allow(dead_code)]
+
 mod admin;
 mod admins;
 mod auth;

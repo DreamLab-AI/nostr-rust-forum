@@ -76,7 +76,7 @@ pub fn PinButton(
         wasm_bindgen_futures::spawn_local(async move {
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
-                    let _ = relay.publish(&signed);
+                    relay.publish(&signed);
                     let toasts = use_toasts();
                     toasts.show("Message pinned", ToastVariant::Success);
                 }
@@ -207,7 +207,7 @@ pub fn PinnedMessages(
                                     wasm_bindgen_futures::spawn_local(async move {
                                         match auth.sign_event_async(unsigned).await {
                                             Ok(signed) => {
-                                                let _ = relay.publish(&signed);
+                                                relay.publish(&signed);
                                                 // Optimistically remove from local state
                                                 pinned_sig.update(|list| {
                                                     list.retain(|p| p.event_id != unpin_eid);

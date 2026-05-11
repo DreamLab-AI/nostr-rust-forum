@@ -116,7 +116,6 @@ struct StatusOnly {
     status: String,
 }
 
-
 /// Load the admin set from D1. Used to validate that the Nostr event was
 /// signed by an admin. Combines `members` and `whitelist` for compatibility.
 async fn admin_set(env: &Env) -> HashSet<String> {

@@ -266,7 +266,7 @@ pub fn ChannelPage() -> impl IntoView {
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
                     let event_id = signed.id.clone();
-                    let _ = relay.publish(&signed);
+                    relay.publish(&signed);
 
                     // Auto-index for semantic search in background
                     let channel_for_index = cid;

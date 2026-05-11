@@ -547,8 +547,8 @@ mod tests {
 
     #[test]
     fn build_group_metadata_optional_fields_omitted() {
-        let event = build_group_metadata(&test_key(), "minimal", "Minimal Group", None, None)
-            .unwrap();
+        let event =
+            build_group_metadata(&test_key(), "minimal", "Minimal Group", None, None).unwrap();
 
         assert_eq!(event.kind, 39000);
         assert_eq!(event.tags.len(), 2); // d + name only
@@ -571,8 +571,7 @@ mod tests {
 
     #[test]
     fn build_group_metadata_is_parameterized_replaceable() {
-        let event =
-            build_group_metadata(&test_key(), "test-group", "Test", None, None).unwrap();
+        let event = build_group_metadata(&test_key(), "test-group", "Test", None, None).unwrap();
         // Kind 39000 is in the parameterized-replaceable range (30000-39999)
         assert!((30000..=39999).contains(&event.kind));
         // Must have a d tag
@@ -588,8 +587,7 @@ mod tests {
         let pk1 = "aa".repeat(32);
         let pk2 = "bb".repeat(32);
         let event =
-            build_group_admins(&test_key(), "moderators", &[pk1.as_str(), pk2.as_str()])
-                .unwrap();
+            build_group_admins(&test_key(), "moderators", &[pk1.as_str(), pk2.as_str()]).unwrap();
 
         assert_eq!(event.kind, 39001);
         assert_eq!(event.tags[0], vec!["d", "moderators"]);
@@ -709,8 +707,7 @@ mod tests {
     fn all_relay_signed_events_are_valid() {
         let key = test_key();
         let pk = "ff".repeat(32);
-        let meta =
-            build_group_metadata(&key, "g", "G", Some("about"), Some("pic")).unwrap();
+        let meta = build_group_metadata(&key, "g", "G", Some("about"), Some("pic")).unwrap();
         let admins = build_group_admins(&key, "g", &[pk.as_str()]).unwrap();
         let members = build_group_members(&key, "g", &[pk.as_str()]).unwrap();
 

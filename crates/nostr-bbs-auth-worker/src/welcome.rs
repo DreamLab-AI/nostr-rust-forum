@@ -14,8 +14,8 @@
 //! | POST   | /api/welcome/set-bot-key       | admin | Upload & encrypt the bot nsec      |
 //! | POST   | /api/welcome/test              | admin | Dry-run: return a signed event     |
 
-use nostr_bbs_core::keys::signing_key_from_bytes;
 use nostr_bbs_core::d1_helpers::{js_i64, js_str};
+use nostr_bbs_core::keys::signing_key_from_bytes;
 use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
 use serde::Deserialize;
 use serde_json::json;

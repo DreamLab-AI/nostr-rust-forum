@@ -18,62 +18,83 @@
 use std::collections::HashSet;
 
 use nostr_bbs_core::{
+    // Moderation events
+    build_ban,
+    build_moderation_action,
+    build_mute,
+    build_report,
+    build_unban,
+    build_unmute,
+    build_warning,
+    // Calendar events (NIP-52)
+    create_calendar_event,
     // NIP-98 auth flow
     create_nip98_token,
-    nip98::{create_token_at, verify_token_at, authorization_header},
-    verify_nip98_token,
-    nip98_authorization_header,
-    Nip98Error,
-    // Event signing
-    sign_event,
-    sign_event_deterministic,
-    verify_event,
-    verify_event_strict,
-    verify_events_batch,
-    NostrEvent,
-    UnsignedEvent,
-    EventError,
-
-    // Gift wrap (NIP-59)
-    gift_wrap,
-    unwrap_gift,
-    GiftWrapError,
-
-    // NIP-44 encryption
-    nip44_encrypt,
-    nip44_decrypt,
-
-    // NIP-04 encryption
-    nip04_encrypt,
-    nip04_decrypt,
-    nip04_shared_secret,
-
+    create_rsvp,
+    d_tag_of,
+    decode_naddr,
+    decode_nevent,
+    decode_note,
+    decode_nprofile,
+    decode_npub,
+    decode_nsec,
+    encode_naddr,
+    encode_nevent,
+    encode_note,
+    encode_nprofile,
+    // NIP-19 encoding
+    encode_npub,
+    encode_nsec,
     // Keys
     generate_keypair,
 
-    // NIP-19 encoding
-    encode_npub, decode_npub,
-    encode_nsec, decode_nsec,
-    encode_note, decode_note,
-    encode_nevent, decode_nevent,
-    encode_nprofile, decode_nprofile,
-    encode_naddr, decode_naddr,
-    nip19::{NEvent, NProfile, NAddr},
+    // Gift wrap (NIP-59)
+    gift_wrap,
+    mute_expires_at,
+    nip04_decrypt,
+    // NIP-04 encryption
+    nip04_encrypt,
+    nip04_shared_secret,
 
-    // Moderation events
-    build_ban, build_mute, build_report, build_warning,
-    build_unban, build_unmute, build_moderation_action,
-    validate_moderation_event, d_tag_of, mute_expires_at,
-    ModerationEventError,
-    KIND_BAN, KIND_MUTE, KIND_REPORT, KIND_WARNING,
-    KIND_UNBAN, KIND_UNMUTE, KIND_MODERATION_ACTION,
-
-    // Calendar events (NIP-52)
-    create_calendar_event, create_rsvp, RsvpStatus, CalendarError,
+    nip19::{NAddr, NEvent, NProfile},
 
     // Delegation (NIP-26)
     nip26::{Conditions, DelegationTag, DelegationToken, Nip26Error},
+    nip44_decrypt,
+
+    // NIP-44 encryption
+    nip44_encrypt,
+    nip98::{authorization_header, create_token_at, verify_token_at},
+    nip98_authorization_header,
+    // Event signing
+    sign_event,
+    sign_event_deterministic,
+    unwrap_gift,
     validate_delegation_tag,
+    validate_moderation_event,
+    verify_event,
+    verify_event_strict,
+    verify_events_batch,
+    verify_nip98_token,
+    CalendarError,
+
+    EventError,
+
+    GiftWrapError,
+
+    ModerationEventError,
+    Nip98Error,
+    NostrEvent,
+    RsvpStatus,
+    UnsignedEvent,
+    KIND_BAN,
+    KIND_MODERATION_ACTION,
+
+    KIND_MUTE,
+    KIND_REPORT,
+    KIND_UNBAN,
+    KIND_UNMUTE,
+    KIND_WARNING,
 };
 
 use k256::schnorr::SigningKey;
@@ -453,7 +474,7 @@ fn e2e_gift_wrap_roundtrip() {
     let wrapped = gift_wrap(&sender_sk, &sender_pk, &recipient_pk, content).unwrap();
 
     assert_eq!(wrapped.kind, 1059); // KIND_GIFT_WRAP
-    // Outer pubkey is a throwaway -- not the sender
+                                    // Outer pubkey is a throwaway -- not the sender
     assert_ne!(wrapped.pubkey, sender_pk);
     // Outer p-tag routes to the recipient
     let p_tag = wrapped.tags.iter().find(|t| t[0] == "p").unwrap();
@@ -463,7 +484,7 @@ fn e2e_gift_wrap_roundtrip() {
     assert_eq!(unwrapped.sender_pubkey, sender_pk);
     assert_eq!(unwrapped.rumor.content, content);
     assert_eq!(unwrapped.rumor.kind, 14); // KIND_RUMOR
-    assert_eq!(unwrapped.seal.kind, 13);  // KIND_SEAL
+    assert_eq!(unwrapped.seal.kind, 13); // KIND_SEAL
 }
 
 #[test]
@@ -639,7 +660,10 @@ fn e2e_nip19_note_roundtrip() {
 fn e2e_nip19_nevent_roundtrip() {
     let e = NEvent {
         id: "b3e392b11f5d4f28321cedd09303a748acfd0487aea5a7450b3481c60b6e4f87".to_string(),
-        relays: vec!["wss://relay.damus.io".to_string(), "wss://nos.lol".to_string()],
+        relays: vec![
+            "wss://relay.damus.io".to_string(),
+            "wss://nos.lol".to_string(),
+        ],
         author: Some(FIATJAF_HEX.to_string()),
         kind: Some(1),
     };
@@ -715,7 +739,10 @@ fn e2e_moderation_ban_sign_validate() {
     let admin_set = admin_set_with(&admin_pk);
 
     let unsigned = build_ban(&admin_pk, &target_pk, "spammer", 1_700_000_000);
-    assert_eq!(d_tag_of(&unsigned), Some(format!("{admin_pk}:{target_pk}").as_str()));
+    assert_eq!(
+        d_tag_of(&unsigned),
+        Some(format!("{admin_pk}:{target_pk}").as_str())
+    );
 
     let signed = sign_deterministic(unsigned, &admin_signing_key());
     assert_eq!(signed.kind, KIND_BAN);
@@ -728,7 +755,13 @@ fn e2e_moderation_mute_with_expiry_sign_validate() {
     let target_pk = "ee".repeat(32);
     let admin_set = admin_set_with(&admin_pk);
 
-    let unsigned = build_mute(&admin_pk, &target_pk, 1_700_003_600, "cool down", 1_700_000_000);
+    let unsigned = build_mute(
+        &admin_pk,
+        &target_pk,
+        1_700_003_600,
+        "cool down",
+        1_700_000_000,
+    );
     let signed = sign_deterministic(unsigned, &admin_signing_key());
 
     assert_eq!(signed.kind, KIND_MUTE);
@@ -869,8 +902,8 @@ fn e2e_moderation_unknown_kind_rejected() {
 #[test]
 fn e2e_calendar_event_basic() {
     let sk = user_sk_bytes();
-    let event = create_calendar_event(&sk, "Nostr Meetup", 1_700_000_000, None, None, None, None)
-        .unwrap();
+    let event =
+        create_calendar_event(&sk, "Nostr Meetup", 1_700_000_000, None, None, None, None).unwrap();
 
     assert_eq!(event.kind, 31923);
     assert!(verify_event(&event));
@@ -992,8 +1025,7 @@ fn e2e_delegation_token_roundtrip() {
 fn e2e_delegation_token_with_time_bounds() {
     let delegator_sk = sk_scalar(3);
     let delegatee_pk = pk_hex_for_scalar(4);
-    let conditions =
-        Conditions::from_str("kind=1&created_at>1000&created_at<9999999999").unwrap();
+    let conditions = Conditions::from_str("kind=1&created_at>1000&created_at<9999999999").unwrap();
 
     let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
     token.verify().unwrap();
@@ -1021,8 +1053,7 @@ fn e2e_delegation_tag_roundtrip() {
 fn e2e_delegation_validate_accepts_matching_event() {
     let delegator_sk = sk_scalar(1);
     let delegatee_pk = pk_hex_for_scalar(2);
-    let conditions =
-        Conditions::from_str("kind=1&created_at>0&created_at<9999999999").unwrap();
+    let conditions = Conditions::from_str("kind=1&created_at>0&created_at<9999999999").unwrap();
 
     let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
     let tag = DelegationTag::from_token(&token);
@@ -1137,13 +1168,11 @@ fn e2e_full_auth_relay_pod_flow() {
     // Step 6: Client authenticates to pod-worker via NIP-98 with a body
     let pod_url = "https://pod.forum.example.com/api/upload";
     let pod_body = b"file-content-bytes-here";
-    let pod_token =
-        create_nip98_token(&sk_bytes, pod_url, "POST", Some(pod_body)).unwrap();
+    let pod_token = create_nip98_token(&sk_bytes, pod_url, "POST", Some(pod_body)).unwrap();
     let pod_header = nip98_authorization_header(&pod_token);
 
     // Step 7: Pod-worker verifies the NIP-98 token
-    let pod_verified =
-        verify_nip98_token(&pod_header, pod_url, "POST", Some(pod_body)).unwrap();
+    let pod_verified = verify_nip98_token(&pod_header, pod_url, "POST", Some(pod_body)).unwrap();
     assert_eq!(pod_verified.pubkey, pubkey_hex);
     assert!(pod_verified.payload_hash.is_some());
 

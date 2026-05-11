@@ -318,6 +318,7 @@ impl AdminStore {
     }
 
     /// Create a kind-40 channel with explicit zone and optional cohort tags.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_channel_with_zone(
         &self,
         name: &str,
@@ -364,8 +365,8 @@ impl AdminStore {
             content: content_json,
         };
 
-        let signed =
-            nostr_bbs_core::sign_event(unsigned, &sk).map_err(|e| format!("Signing failed: {e}"))?;
+        let signed = nostr_bbs_core::sign_event(unsigned, &sk)
+            .map_err(|e| format!("Signing failed: {e}"))?;
 
         // Publish with ack — only update local state on relay acceptance
         let success_sig = self.state.success;

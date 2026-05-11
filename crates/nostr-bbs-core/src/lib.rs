@@ -42,17 +42,21 @@ pub use gift_wrap::{gift_wrap, unwrap_gift, GiftWrapError, UnwrappedGift};
 pub use keys::{derive_from_prf, generate_keypair, Keypair, PublicKey, SecretKey, Signature};
 pub use nip44::{decrypt as nip44_decrypt, encrypt as nip44_encrypt};
 pub use nip98::{
-    authorization_header as nip98_authorization_header, create_token as create_nip98_token,
+    authorization_header as nip98_authorization_header,
+    create_token as create_nip98_token,
     sign_request_header as nip98_sign_request_header,
     // Canonical verification entry point (new — preferred for all new code)
     verify_nip98,
     verify_nip98_with_replay,
-    verify_token_full as verify_nip98_token_full,
     // Legacy aliases (backward-compatible, delegate to verify_token_full internally)
     verify_token as verify_nip98_token,
     verify_token_at as verify_nip98_token_at,
     verify_token_at_with_replay as verify_nip98_token_at_with_replay,
-    Nip98Error, Nip98ReplayStore, Nip98Token as VerifiedToken, REPLAY_CACHE_TTL_SECS,
+    verify_token_full as verify_nip98_token_full,
+    Nip98Error,
+    Nip98ReplayStore,
+    Nip98Token as VerifiedToken,
+    REPLAY_CACHE_TTL_SECS,
     TIMESTAMP_TOLERANCE as NIP98_TIMESTAMP_TOLERANCE,
 };
 pub use types::{EventId, Tag, Timestamp};
@@ -66,6 +70,10 @@ pub use moderation_events::{
     KIND_REPORT_NIP56, KIND_UNBAN, KIND_UNMUTE, KIND_WARNING, MOD_KINDS,
 };
 
+pub use did::{
+    did_nostr_uri, format_multibase_schnorr, is_valid_hex_pubkey, render_did_document_tier1,
+    render_did_document_tier3, verify_webid_tag, well_known_path, NostrPubkey,
+};
 pub use nip04::{nip04_decrypt, nip04_encrypt, nip04_shared_secret, Nip04Error};
 pub use nip19::{
     decode_naddr, decode_nevent, decode_note, decode_nprofile, decode_npub, decode_nsec,
@@ -78,9 +86,5 @@ pub use nip90::{
     DvmJobRequest, DvmJobResult, JobInput, JobStatus, Nip90Error, KIND_HANDLER_INFO,
     KIND_JOB_FEEDBACK, KIND_JOB_REQUEST_MAX, KIND_JOB_REQUEST_MIN, KIND_JOB_RESULT_MAX,
     KIND_JOB_RESULT_MIN,
-};
-pub use did::{
-    did_nostr_uri, format_multibase_schnorr, is_valid_hex_pubkey, render_did_document_tier1,
-    render_did_document_tier3, verify_webid_tag, well_known_path, NostrPubkey,
 };
 pub use signer::{PrfSigner, Signer, SignerError};

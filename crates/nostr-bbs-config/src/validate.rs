@@ -26,7 +26,8 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
     }
 
     // pod.base_url must be HTTPS.
-    if !cfg.pod.base_url.starts_with("https://") && !cfg.pod.base_url.starts_with("http://localhost")
+    if !cfg.pod.base_url.starts_with("https://")
+        && !cfg.pod.base_url.starts_with("http://localhost")
     {
         return Err(format!(
             "pod.base_url must use https:// (got {})",
@@ -36,10 +37,7 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
 
     // relay.url must be wss://
     if !cfg.relay.url.starts_with("wss://") && !cfg.relay.url.starts_with("ws://localhost") {
-        return Err(format!(
-            "relay.url must use wss:// (got {})",
-            cfg.relay.url
-        ));
+        return Err(format!("relay.url must use wss:// (got {})", cfg.relay.url));
     }
 
     // relay.ingress_policy must be allowlist or open.
@@ -64,9 +62,7 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
     }
     for pk in &cfg.admin.static_pubkeys {
         if pk.len() != 64 || !pk.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!(
-                "admin.static_pubkeys entry not 64-char hex: {pk}"
-            ));
+            return Err(format!("admin.static_pubkeys entry not 64-char hex: {pk}"));
         }
     }
 

@@ -88,7 +88,7 @@ pub(crate) fn ReactionBar(
         wasm_bindgen_futures::spawn_local(async move {
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
-                    let _ = relay.publish(&signed);
+                    relay.publish(&signed);
                 }
                 Err(e) => {
                     web_sys::console::error_1(&format!("[ReactionBar] Sign failed: {}", e).into());
@@ -136,7 +136,7 @@ pub(crate) fn ReactionBar(
         wasm_bindgen_futures::spawn_local(async move {
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
-                    let _ = relay.publish(&signed);
+                    relay.publish(&signed);
                 }
                 Err(e) => {
                     web_sys::console::error_1(&format!("[ReactionBar] Sign failed: {}", e).into());

@@ -28,7 +28,7 @@ use serde::Deserialize;
 use worker::*;
 
 pub use solid_pod_rs::payments::{
-    balance_response, pay_info, payment_required_body, pubkey_to_did, parse_txo_uri,
+    balance_response, parse_txo_uri, pay_info, payment_required_body, pubkey_to_did,
     webledgers_discovery, ChainConfig, PayConfig, PaymentError, PaymentStore, TokenConfig,
     WebLedger,
 };
@@ -167,11 +167,7 @@ impl<'a> D1PaymentStore<'a> {
                    balance_sats = balance_sats + ?2, \
                    updated_at = ?3",
             )
-            .bind(&[
-                js_str(did),
-                js_i64(amount as i64),
-                js_i64(now),
-            ])
+            .bind(&[js_str(did), js_i64(amount as i64), js_i64(now)])
             .map_err(|e| PaymentError::Store(format!("d1 bind credit: {e:?}")))?
             .run()
             .await
@@ -192,11 +188,7 @@ impl<'a> D1PaymentStore<'a> {
                  SET balance_sats = balance_sats - ?1, updated_at = ?2 \
                  WHERE did = ?3 AND balance_sats >= ?1",
             )
-            .bind(&[
-                js_i64(cost as i64),
-                js_i64(now),
-                js_str(did),
-            ])
+            .bind(&[js_i64(cost as i64), js_i64(now), js_str(did)])
             .map_err(|e| PaymentError::Store(format!("d1 bind debit: {e:?}")))?
             .run()
             .await
@@ -318,11 +310,7 @@ impl<'a> PaymentStore for D1PaymentStore<'a> {
                      VALUES (?1, ?2, ?3) \
                      ON CONFLICT(did) DO UPDATE SET balance_sats = ?2, updated_at = ?3",
                 )
-                .bind(&[
-                    js_str(&entry.url),
-                    js_i64(balance as i64),
-                    js_i64(now),
-                ])
+                .bind(&[js_str(&entry.url), js_i64(balance as i64), js_i64(now)])
                 .map_err(|e| PaymentError::Store(format!("d1 bind write_ledger: {e:?}")))?
                 .run()
                 .await
@@ -358,11 +346,7 @@ impl<'a> PaymentStore for D1PaymentStore<'a> {
                 "INSERT OR IGNORE INTO txo_deposits (txid, vout, did, amount_sats, deposited_at) \
                  VALUES (?1, ?2, '', 0, ?3)",
             )
-            .bind(&[
-                js_str(txid),
-                js_i64(vout as i64),
-                js_i64(now),
-            ])
+            .bind(&[js_str(txid), js_i64(vout as i64), js_i64(now)])
             .map_err(|e| PaymentError::Store(format!("d1 bind record_replay: {e:?}")))?
             .run()
             .await
@@ -588,7 +572,6 @@ pub async fn handle_pay_route(
         }
 
         // ----- Agent job CRUD routes -----
-
         (&Method::Get, ".jobs") => {
             let pk = match pubkey {
                 Some(pk) => pk,
@@ -823,7 +806,7 @@ async fn pay_token_buy_handler(
     }
 
     // cost = ceil(amount / rate) sats
-    let cost_sats = (op.amount + token.rate - 1) / token.rate;
+    let cost_sats = op.amount.div_ceil(token.rate);
     let store = D1PaymentStore::new(db);
     let did = pubkey_to_did(pubkey);
 
@@ -951,7 +934,7 @@ fn generate_job_id() -> Result<String, Error> {
 async fn pay_jobs_list_handler(
     pubkey: &str,
     db: &D1Database,
-    env: &Env,
+    _env: &Env,
 ) -> std::result::Result<Response, Error> {
     let did = pubkey_to_did(pubkey);
 
@@ -969,9 +952,7 @@ async fn pay_jobs_list_handler(
         .await
         .map_err(|e| Error::RustError(format!("d1 run jobs list: {e:?}")))?;
 
-    let jobs: Vec<serde_json::Value> = rows
-        .results::<serde_json::Value>()
-        .unwrap_or_default();
+    let jobs: Vec<serde_json::Value> = rows.results::<serde_json::Value>().unwrap_or_default();
 
     let body = serde_json::json!({
         "jobs": jobs,
@@ -1105,11 +1086,7 @@ async fn pay_job_start_handler(
             "UPDATE agent_jobs SET status = 'running', started_at = ?1 \
              WHERE job_id = ?2 AND status = 'held' AND agent_did = ?3",
         )
-        .bind(&[
-            js_i64(now),
-            js_str(&req.job_id),
-            js_str(&agent_did),
-        ])
+        .bind(&[js_i64(now), js_str(&req.job_id), js_str(&agent_did)])
         .map_err(|e| Error::RustError(format!("d1 bind job start: {e:?}")))?
         .run()
         .await
@@ -1209,11 +1186,7 @@ async fn pay_job_settle_handler(
                 if ja != agent_did {
                     json_err(env, "Only the agent can settle this job", 403)
                 } else if js != "running" {
-                    json_err(
-                        env,
-                        &format!("Job is '{js}', expected 'running'"),
-                        409,
-                    )
+                    json_err(env, &format!("Job is '{js}', expected 'running'"), 409)
                 } else {
                     json_err(
                         env,
@@ -1231,9 +1204,7 @@ async fn pay_job_settle_handler(
     // The job is now atomically settled. Read back held_sats + requester_did
     // for the refund calculation.
     let job = db
-        .prepare(
-            "SELECT requester_did, held_sats FROM agent_jobs WHERE job_id = ?1",
-        )
+        .prepare("SELECT requester_did, held_sats FROM agent_jobs WHERE job_id = ?1")
         .bind(&[js_str(&req.job_id)])
         .map_err(|e| Error::RustError(format!("d1 bind job refund read: {e:?}")))?
         .first::<serde_json::Value>(None)
@@ -1303,11 +1274,7 @@ async fn pay_job_cancel_handler(
                AND (status = 'held' OR status = 'running') \
                AND (requester_did = ?3 OR agent_did = ?3)",
         )
-        .bind(&[
-            js_i64(now),
-            js_str(&req.job_id),
-            js_str(&caller_did),
-        ])
+        .bind(&[js_i64(now), js_str(&req.job_id), js_str(&caller_did)])
         .map_err(|e| Error::RustError(format!("d1 bind job cancel: {e:?}")))?
         .run()
         .await
@@ -1336,17 +1303,16 @@ async fn pay_job_cancel_handler(
         return match job {
             None => json_err(env, "Job not found", 404),
             Some(j) => {
-                let jr = j.get("requester_did").and_then(|v| v.as_str()).unwrap_or("");
+                let jr = j
+                    .get("requester_did")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let ja = j.get("agent_did").and_then(|v| v.as_str()).unwrap_or("");
                 let js = j.get("status").and_then(|v| v.as_str()).unwrap_or("");
                 if caller_did != jr && caller_did != ja {
                     json_err(env, "Only the requester or agent can cancel this job", 403)
                 } else {
-                    json_err(
-                        env,
-                        &format!("Cannot cancel job in '{js}' status"),
-                        409,
-                    )
+                    json_err(env, &format!("Cannot cancel job in '{js}' status"), 409)
                 }
             }
         };
@@ -1355,9 +1321,7 @@ async fn pay_job_cancel_handler(
     // The job is now atomically cancelled. Read back held_sats + requester_did
     // for the refund.
     let job = db
-        .prepare(
-            "SELECT requester_did, held_sats FROM agent_jobs WHERE job_id = ?1",
-        )
+        .prepare("SELECT requester_did, held_sats FROM agent_jobs WHERE job_id = ?1")
         .bind(&[js_str(&req.job_id)])
         .map_err(|e| Error::RustError(format!("d1 bind job refund read: {e:?}")))?
         .first::<serde_json::Value>(None)
@@ -1438,7 +1402,10 @@ async fn pay_job_get_by_id(
     };
 
     // Only requester or agent can view
-    let job_requester = job.get("requester_did").and_then(|v| v.as_str()).unwrap_or("");
+    let job_requester = job
+        .get("requester_did")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let job_agent = job.get("agent_did").and_then(|v| v.as_str()).unwrap_or("");
 
     if caller_did != job_requester && caller_did != job_agent {
@@ -1477,9 +1444,7 @@ pub async fn recover_orphaned_jobs(db: &D1Database) -> std::result::Result<u64, 
         .await
         .map_err(|e| Error::RustError(format!("d1 run orphan select: {e:?}")))?;
 
-    let jobs: Vec<serde_json::Value> = rows
-        .results::<serde_json::Value>()
-        .unwrap_or_default();
+    let jobs: Vec<serde_json::Value> = rows.results::<serde_json::Value>().unwrap_or_default();
 
     let store = D1PaymentStore::new(db);
     let now = now_epoch_secs();
@@ -1503,10 +1468,7 @@ pub async fn recover_orphaned_jobs(db: &D1Database) -> std::result::Result<u64, 
                  SET status = 'failed', error = 'expired', completed_at = ?1 \
                  WHERE job_id = ?2 AND (status = 'held' OR status = 'running')",
             )
-            .bind(&[
-                js_i64(now),
-                js_str(job_id),
-            ])
+            .bind(&[js_i64(now), js_str(job_id)])
             .map_err(|e| Error::RustError(format!("d1 bind orphan update: {e:?}")))?
             .run()
             .await
@@ -1665,8 +1627,8 @@ pub fn derive_deposit_address(
         hex::decode(user_pubkey).map_err(|e| format!("invalid user pubkey hex: {e}"))?;
 
     // Derive master public key from secret
-    let master_sk =
-        SecretKey::from_bytes(master_secret.into()).map_err(|e| format!("invalid master secret: {e}"))?;
+    let master_sk = SecretKey::from_bytes(master_secret.into())
+        .map_err(|e| format!("invalid master secret: {e}"))?;
     let master_pk: PublicKey = master_sk.public_key();
     let master_point = master_pk.to_encoded_point(true);
     // x-only: 32 bytes of the x coordinate
@@ -1698,8 +1660,7 @@ pub fn derive_deposit_address(
     // Step 3: BIP-341 output key (key-path only, empty script tree).
     // output_key = internal_key + tagged_hash("TapTweak", internal_x) * G
     let tap_tweak = tagged_hash(b"TapTweak", internal_x);
-    let tap_scalar =
-        <Scalar as Reduce<U256>>::reduce_bytes(FieldBytes::from_slice(&tap_tweak));
+    let tap_scalar = <Scalar as Reduce<U256>>::reduce_bytes(FieldBytes::from_slice(&tap_tweak));
 
     let output_point = internal_key + ProjectivePoint::GENERATOR * tap_scalar;
     let output_affine = output_point.to_affine();
@@ -1731,8 +1692,8 @@ pub fn handle_address_route(pubkey: &str, env: &Env) -> std::result::Result<Resp
         ));
     }
 
-    let master_bytes: Vec<u8> =
-        hex::decode(&master_hex).map_err(|e| Error::RustError(format!("MASTER_SECRET hex invalid: {e}")))?;
+    let master_bytes: Vec<u8> = hex::decode(&master_hex)
+        .map_err(|e| Error::RustError(format!("MASTER_SECRET hex invalid: {e}")))?;
 
     let mut master_secret = [0u8; 32];
     master_secret.copy_from_slice(&master_bytes);
@@ -1792,10 +1753,8 @@ mod tests {
     fn test_master_secret() -> [u8; 32] {
         let mut s = [0u8; 32];
         // Use a well-known non-zero scalar (BIP-340 test vector secret key #1)
-        let bytes = hex::decode(
-            "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef",
-        )
-        .expect("valid hex");
+        let bytes = hex::decode("b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef")
+            .expect("valid hex");
         s.copy_from_slice(&bytes);
         s
     }
@@ -1921,10 +1880,8 @@ mod tests {
     fn different_master_secrets_produce_different_addresses() {
         let secret1 = test_master_secret();
         let mut secret2 = [0u8; 32];
-        let bytes = hex::decode(
-            "c90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b14e5c9",
-        )
-        .expect("valid hex");
+        let bytes = hex::decode("c90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b14e5c9")
+            .expect("valid hex");
         secret2.copy_from_slice(&bytes);
 
         let addr1 = derive_deposit_address(&secret1, user_a()).expect("derivation should succeed");

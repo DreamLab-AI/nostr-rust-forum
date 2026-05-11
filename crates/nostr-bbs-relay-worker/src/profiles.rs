@@ -186,7 +186,7 @@ pub async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
     // SQLite's default LIKE being case-insensitive for ASCII; the prefix
     // is already lowercased above for parity with stored values when the
     // column happens to carry mixed case.
-    let pattern = format!("{}%", q.replace('%', "").replace('_', ""));
+    let pattern = format!("{}%", q.replace(['%', '_'], ""));
 
     let stmt = db.prepare(
         "SELECT pubkey, name, display_name, picture, nip05 FROM profiles \

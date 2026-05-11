@@ -36,10 +36,13 @@ pub fn smoke_keypair_roundtrip() -> Result<(), String> {
     let keys = Keys::generate();
     let hex = keys.secret_key().to_secret_hex();
     if hex.len() != 64 {
-        return Err(format!("expected 64-char hex secret, got len={}", hex.len()));
+        return Err(format!(
+            "expected 64-char hex secret, got len={}",
+            hex.len()
+        ));
     }
-    let parsed = SecretKey::from_hex(&hex)
-        .map_err(|e| format!("from_hex round-trip failed: {e}"))?;
+    let parsed =
+        SecretKey::from_hex(&hex).map_err(|e| format!("from_hex round-trip failed: {e}"))?;
     if parsed.to_secret_hex() != hex {
         return Err("secret-key round-trip diverged".to_string());
     }
@@ -66,8 +69,7 @@ pub fn smoke_nip44_conv_key() -> Result<(), String> {
     let sk_bytes = hex::decode(sec1).map_err(|e| format!("hex decode sk: {e}"))?;
     let pk_bytes = hex::decode(pub2).map_err(|e| format!("hex decode pk: {e}"))?;
 
-    let sk = SecretKey::from_slice(&sk_bytes)
-        .map_err(|e| format!("SecretKey::from_slice: {e}"))?;
+    let sk = SecretKey::from_slice(&sk_bytes).map_err(|e| format!("SecretKey::from_slice: {e}"))?;
     let pk = nostr::PublicKey::from_slice(&pk_bytes)
         .map_err(|e| format!("PublicKey::from_slice: {e}"))?;
 
@@ -93,8 +95,7 @@ pub fn smoke_nip19_npub_roundtrip() -> Result<(), String> {
     if !npub.starts_with("npub1") {
         return Err(format!("npub does not start with 'npub1': {npub}"));
     }
-    let pk2 = nostr::PublicKey::from_bech32(&npub)
-        .map_err(|e| format!("from_bech32: {e}"))?;
+    let pk2 = nostr::PublicKey::from_bech32(&npub).map_err(|e| format!("from_bech32: {e}"))?;
     if pk2.to_hex() != pk.to_hex() {
         return Err("npub round-trip diverged".to_string());
     }

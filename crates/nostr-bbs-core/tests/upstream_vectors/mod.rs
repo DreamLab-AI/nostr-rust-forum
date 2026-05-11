@@ -33,7 +33,10 @@ pub fn try_load_fixture(name: &str) -> Option<serde_json::Value> {
 
 pub fn assert_meta_block(fixture: &serde_json::Value, expected_spec_substring: &str) {
     let meta = fixture.get("_meta").expect("fixture must have _meta block");
-    let spec = meta.get("spec").and_then(|v| v.as_str()).expect("_meta.spec required");
+    let spec = meta
+        .get("spec")
+        .and_then(|v| v.as_str())
+        .expect("_meta.spec required");
     assert!(
         spec.contains(expected_spec_substring),
         "_meta.spec '{}' did not contain '{}'",

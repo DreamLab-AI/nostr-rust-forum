@@ -64,7 +64,7 @@ fn npub_prefix_is_correct() {
 #[test]
 fn npub_decode_wrong_hrp_returns_error() {
     // nsec prefix with pubkey data — wrong hrp for decode_npub
-    let nsec_of_pubkey = encode_npub(FIATJAF_HEX).unwrap().replace("npub1", "nsec1");
+    let _nsec_of_pubkey = encode_npub(FIATJAF_HEX).unwrap().replace("npub1", "nsec1");
     // Substitute hrp manually so bech32 checksum still validates for nsec
     // (use a real nsec to ensure it at least gets past bech32 decode)
     let result = decode_npub("nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5");

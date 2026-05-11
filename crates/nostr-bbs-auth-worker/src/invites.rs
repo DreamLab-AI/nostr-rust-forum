@@ -86,7 +86,8 @@ struct CountRow {
 fn generate_code(len: usize) -> std::result::Result<String, &'static str> {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-";
     let mut bytes = vec![0u8; len];
-    getrandom::getrandom(&mut bytes).map_err(|_| "CSPRNG unavailable: cannot generate secure invite code")?;
+    getrandom::getrandom(&mut bytes)
+        .map_err(|_| "CSPRNG unavailable: cannot generate secure invite code")?;
     Ok(bytes
         .into_iter()
         .map(|b| ALPHABET[(b as usize) % ALPHABET.len()] as char)

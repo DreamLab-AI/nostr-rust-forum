@@ -138,6 +138,7 @@ fn animate_count(signal: RwSignal<u32>, target: u32) {
 
     // Store interval handle + closure so they can self-drop
     let handle: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
+    #[allow(clippy::type_complexity)]
     let slot: Rc<Cell<Option<Closure<dyn FnMut()>>>> = Rc::new(Cell::new(None));
 
     let handle_c = handle.clone();

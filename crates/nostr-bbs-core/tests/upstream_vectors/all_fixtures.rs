@@ -42,16 +42,66 @@ macro_rules! fixture_test {
     };
 }
 
-fixture_test!(nip01_events_load_and_validate, "nip01-events.json", "NIP-01", 11);
+fixture_test!(
+    nip01_events_load_and_validate,
+    "nip01-events.json",
+    "NIP-01",
+    11
+);
 fixture_test!(nip04_dm_load_and_validate, "nip04-dm.json", "NIP-04", 4);
-fixture_test!(nip19_bech32_load_and_validate, "nip19-bech32.json", "NIP-19", 12);
-fixture_test!(nip26_delegation_load_and_validate, "nip26-delegation.json", "NIP-26", 5);
+fixture_test!(
+    nip19_bech32_load_and_validate,
+    "nip19-bech32.json",
+    "NIP-19",
+    12
+);
+fixture_test!(
+    nip26_delegation_load_and_validate,
+    "nip26-delegation.json",
+    "NIP-26",
+    5
+);
 fixture_test!(nip44v2_load_and_validate, "nip44-v2.json", "NIP-44", 30);
-fixture_test!(nip59_gift_wrap_load_and_validate, "nip59-gift-wrap.json", "NIP-59", 6);
-fixture_test!(nip98_tokens_load_and_validate, "nip98-tokens.json", "NIP-98", 6);
-fixture_test!(bip340_load_and_validate, "bip340-schnorr.json", "BIP-340", 19);
+fixture_test!(
+    nip59_gift_wrap_load_and_validate,
+    "nip59-gift-wrap.json",
+    "NIP-59",
+    6
+);
+fixture_test!(
+    nip98_tokens_load_and_validate,
+    "nip98-tokens.json",
+    "NIP-98",
+    6
+);
+fixture_test!(
+    bip340_load_and_validate,
+    "bip340-schnorr.json",
+    "BIP-340",
+    19
+);
 fixture_test!(rfc8785_load_and_validate, "rfc8785-jcs.json", "RFC 8785", 6);
-fixture_test!(multibase_load_and_validate, "multibase.json", "Multibase", 27);
-fixture_test!(did_doc_load_and_validate, "did-doc-conformance.json", "ADR-074", 7);
-fixture_test!(is_envelope_load_and_validate, "is-envelope-v1.json", "ADR-075", 11);
-fixture_test!(mesh_federation_load_and_validate, "mesh-federation.json", "ADR-073", 9);
+fixture_test!(
+    multibase_load_and_validate,
+    "multibase.json",
+    "Multibase",
+    27
+);
+fixture_test!(
+    did_doc_load_and_validate,
+    "did-doc-conformance.json",
+    "ADR-074",
+    7
+);
+fixture_test!(
+    is_envelope_load_and_validate,
+    "is-envelope-v1.json",
+    "ADR-075",
+    11
+);
+fixture_test!(
+    mesh_federation_load_and_validate,
+    "mesh-federation.json",
+    "ADR-073",
+    9
+);

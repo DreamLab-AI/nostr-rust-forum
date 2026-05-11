@@ -32,7 +32,7 @@ use proptest::prelude::*;
 
 /// Generate a 32-byte hex string (64 lowercase hex chars).
 fn arb_hex32() -> impl Strategy<Value = String> {
-    prop::collection::vec(any::<u8>(), 32..=32).prop_map(|bytes| hex::encode(bytes))
+    prop::collection::vec(any::<u8>(), 32..=32).prop_map(hex::encode)
 }
 
 /// Generate a relay URL.
@@ -42,8 +42,7 @@ fn arb_hex32() -> impl Strategy<Value = String> {
 /// byte strings; the absorbed adapter inherits the stricter URL contract.
 /// The generator now produces well-formed `wss://<host>` URLs.
 fn arb_relay_url() -> impl Strategy<Value = String> {
-    ("[a-z]{1,8}", "[a-z]{2,6}")
-        .prop_map(|(host, tld)| format!("wss://{host}.{tld}"))
+    ("[a-z]{1,8}", "[a-z]{2,6}").prop_map(|(host, tld)| format!("wss://{host}.{tld}"))
 }
 
 /// Generate a small set of 0..=5 relay URLs.

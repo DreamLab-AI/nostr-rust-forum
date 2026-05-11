@@ -145,16 +145,16 @@ impl NostrRelayDO {
                     return;
                 }
                 // If TL2 (not TL3), verify they are the channel creator
-                if trust_level < TrustLevel::Trusted {
-                    if !self.is_channel_creator(&event.pubkey, &channel_id).await {
-                        Self::send_ok(
-                            ws,
-                            &event.id,
-                            false,
-                            "restricted: TL3+ required to modify others' channels",
-                        );
-                        return;
-                    }
+                if trust_level < TrustLevel::Trusted
+                    && !self.is_channel_creator(&event.pubkey, &channel_id).await
+                {
+                    Self::send_ok(
+                        ws,
+                        &event.id,
+                        false,
+                        "restricted: TL3+ required to modify others' channels",
+                    );
+                    return;
                 }
             }
 
@@ -360,7 +360,7 @@ impl NostrRelayDO {
         let filters = {
             let needs_kind_1059 = filters
                 .iter()
-                .any(|f| f.kinds.as_ref().map_or(false, |k| k.contains(&1059)));
+                .any(|f| f.kinds.as_ref().is_some_and(|k| k.contains(&1059)));
             if needs_kind_1059 {
                 match &session_pubkey {
                     None => {
@@ -376,7 +376,7 @@ impl NostrRelayDO {
                         filters
                             .into_iter()
                             .map(|mut f| {
-                                if f.kinds.as_ref().map_or(false, |k| k.contains(&1059)) {
+                                if f.kinds.as_ref().is_some_and(|k| k.contains(&1059)) {
                                     // Enforce the #p filter for the authed pubkey.
                                     // We override any existing #p to prevent a client
                                     // from requesting another user's DMs.

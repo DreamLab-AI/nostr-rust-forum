@@ -753,9 +753,8 @@ pub async fn register_verify(
     _cf_country: Option<&str>,
     env: &Env,
 ) -> Result<Response> {
-    let body: RegisterVerifyBody = serde_json::from_slice(body_bytes).map_err(|e| {
-        Error::RustError(format!("Invalid JSON body: {e}"))
-    })?;
+    let body: RegisterVerifyBody = serde_json::from_slice(body_bytes)
+        .map_err(|e| Error::RustError(format!("Invalid JSON body: {e}")))?;
 
     let pubkey = match &body.pubkey {
         Some(pk) if is_valid_pubkey(pk) => pk.to_lowercase(),
@@ -943,9 +942,9 @@ pub async fn register_verify(
 ///   - empty `allowCredentials`,
 ///   - a deterministic-but-meaningless `prfSalt` derived from
 ///     `HKDF(server_secret, pubkey)`.
-/// The downstream WebAuthn ceremony will fail at the authenticator step
-/// (no matching credential available) without the server having confirmed
-/// existence.
+///     The downstream WebAuthn ceremony will fail at the authenticator step
+///     (no matching credential available) without the server having confirmed
+///     existence.
 pub async fn login_options(body_bytes: &[u8], env: &Env) -> Result<Response> {
     let body: LoginOptionsBody =
         serde_json::from_slice(body_bytes).unwrap_or(LoginOptionsBody { pubkey: None });
@@ -1257,6 +1256,34 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
     Response::from_json(&response_body)
 }
 
+/// POST /auth/lookup
+///
+/// Look up a pubkey by credential ID (for discoverable credential flows).
+pub async fn credential_lookup(body_bytes: &[u8], env: &Env) -> Result<Response> {
+    let body: CredentialLookupBody = serde_json::from_slice(body_bytes)
+        .map_err(|_| Error::RustError("Invalid JSON body".to_string()))?;
+
+    let credential_id = match &body.credential_id {
+        Some(id) if !id.is_empty() => id.clone(),
+        _ => return json_err("Missing credentialId", 400),
+    };
+
+    let db = env.d1("DB")?;
+    let cred = db
+        .prepare("SELECT pubkey FROM webauthn_credentials WHERE credential_id = ?1 LIMIT 1")
+        .bind(&[js_str(&credential_id)])?
+        .first::<PubkeyRow>(None)
+        .await?;
+
+    match cred {
+        Some(row) => {
+            let resp = serde_json::json!({ "pubkey": row.pubkey });
+            Ok(Response::from_json(&resp)?)
+        }
+        None => json_err("Credential not found", 404),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1435,22 +1462,18 @@ mod tests {
     ///  -2 (x)   => 32-byte bstr
     ///  -3 (y)   => 32-byte bstr
     fn build_test_cose_key(x: &[u8; 32], y: &[u8; 32]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        // Map(5) = 0xA5
-        buf.push(0xA5);
-        // 1 => 2  (kty: EC2)
-        buf.push(0x01); // unsigned int 1
-        buf.push(0x02); // unsigned int 2
-                        // 3 => -7  (alg: ES256)
-        buf.push(0x03); // unsigned int 3
-        buf.push(0x26); // negative int: -1 - 6 = -7 (major 1, value 6)
-                        // -1 => 1  (crv: P-256)
-        buf.push(0x20); // negative int: -1 - 0 = -1 (major 1, value 0)
-        buf.push(0x01); // unsigned int 1
-                        // -2 => bstr(32)  (x coordinate)
-        buf.push(0x21); // negative int: -1 - 1 = -2
-        buf.push(0x58); // bstr with 1-byte length follows
-        buf.push(0x20); // 32
+        let mut buf = vec![
+            0xA5, // Map(5)
+            0x01, // 1 (kty)
+            0x02, // 2 (EC2)
+            0x03, // 3 (alg)
+            0x26, // -7 (ES256)
+            0x20, // -1 (crv)
+            0x01, // 1 (P-256)
+            0x21, // -2 (x coordinate)
+            0x58, // bstr with 1-byte length follows
+            0x20, // 32
+        ];
         buf.extend_from_slice(x);
         // -3 => bstr(32)  (y coordinate)
         buf.push(0x22); // negative int: -1 - 2 = -3
@@ -1486,11 +1509,7 @@ mod tests {
     #[test]
     fn cose_extract_coords_missing_y() {
         // Map(1) with just -2 => bstr(32)
-        let mut buf = Vec::new();
-        buf.push(0xA1); // Map(1)
-        buf.push(0x21); // -2
-        buf.push(0x58);
-        buf.push(0x20);
+        let mut buf = vec![0xA1, 0x21, 0x58, 0x20];
         buf.extend_from_slice(&[0xAA; 32]);
         let result = extract_cose_ec2_coords(&buf);
         assert!(result.is_err());
@@ -1500,11 +1519,7 @@ mod tests {
     #[test]
     fn cose_extract_coords_missing_x() {
         // Map(1) with just -3 => bstr(32)
-        let mut buf = Vec::new();
-        buf.push(0xA1); // Map(1)
-        buf.push(0x22); // -3
-        buf.push(0x58);
-        buf.push(0x20);
+        let mut buf = vec![0xA1, 0x22, 0x58, 0x20];
         buf.extend_from_slice(&[0xBB; 32]);
         let result = extract_cose_ec2_coords(&buf);
         assert!(result.is_err());
@@ -1672,10 +1687,7 @@ mod tests {
 
     // ── Attestation object parsing ────────────────────────────────────
 
-    fn build_test_attestation_object(
-        fmt: &str,
-        auth_data: &[u8],
-    ) -> Vec<u8> {
+    fn build_test_attestation_object(fmt: &str, auth_data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         // Map(3) — fmt, attStmt, authData
         buf.push(0xA3);
@@ -1860,33 +1872,5 @@ mod tests {
             unknown_response["options"]["allowCredentials"],
             "known and unknown user responses must have identical allowCredentials shape"
         );
-    }
-}
-
-/// POST /auth/lookup
-///
-/// Look up a pubkey by credential ID (for discoverable credential flows).
-pub async fn credential_lookup(body_bytes: &[u8], env: &Env) -> Result<Response> {
-    let body: CredentialLookupBody = serde_json::from_slice(body_bytes)
-        .map_err(|_| Error::RustError("Invalid JSON body".to_string()))?;
-
-    let credential_id = match &body.credential_id {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ => return json_err("Missing credentialId", 400),
-    };
-
-    let db = env.d1("DB")?;
-    let cred = db
-        .prepare("SELECT pubkey FROM webauthn_credentials WHERE credential_id = ?1 LIMIT 1")
-        .bind(&[js_str(&credential_id)])?
-        .first::<PubkeyRow>(None)
-        .await?;
-
-    match cred {
-        Some(row) => {
-            let resp = serde_json::json!({ "pubkey": row.pubkey });
-            Ok(Response::from_json(&resp)?)
-        }
-        None => json_err("Credential not found", 404),
     }
 }

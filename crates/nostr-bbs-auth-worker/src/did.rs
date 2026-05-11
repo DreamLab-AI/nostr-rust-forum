@@ -28,8 +28,7 @@ pub async fn handle_did_document(pubkey: &str, env: &Env) -> Result<Response> {
         return did_error("Pubkey not registered", 404);
     }
 
-    let pk = NostrPubkey::from_hex(&pubkey_lower)
-        .map_err(|e| Error::RustError(e))?;
+    let pk = NostrPubkey::from_hex(&pubkey_lower).map_err(Error::RustError)?;
     let doc = render_did_document_tier1(&pk);
     let body = serde_json::to_string(&doc).map_err(|e| Error::RustError(e.to_string()))?;
 
@@ -56,7 +55,9 @@ fn did_error(message: &str, status: u16) -> Result<Response> {
         .map_err(|e| Error::RustError(e.to_string()))?;
     let headers = Headers::new();
     headers.set("Content-Type", "application/json")?;
-    Ok(Response::ok(body)?.with_status(status).with_headers(headers))
+    Ok(Response::ok(body)?
+        .with_status(status)
+        .with_headers(headers))
 }
 
 #[cfg(test)]

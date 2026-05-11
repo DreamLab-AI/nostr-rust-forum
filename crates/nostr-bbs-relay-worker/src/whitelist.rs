@@ -500,7 +500,13 @@ pub async fn handle_whitelist_update_cohorts(mut req: Request, env: &Env) -> Res
 
     let pubkey = match &body.pubkey {
         Some(pk) if pk.len() == 64 && pk.bytes().all(|b| b.is_ascii_hexdigit()) => pk.clone(),
-        _ => return json_response(env, &json!({ "error": "Missing or invalid pubkey (64 hex chars required)" }), 400),
+        _ => {
+            return json_response(
+                env,
+                &json!({ "error": "Missing or invalid pubkey (64 hex chars required)" }),
+                400,
+            )
+        }
     };
     let cohorts = match &body.cohorts {
         Some(c) => c.clone(),

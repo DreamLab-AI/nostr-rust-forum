@@ -105,7 +105,7 @@ pub fn ReportButton(
         wasm_bindgen_futures::spawn_local(async move {
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
-                    let _ = relay.publish(&signed);
+                    relay.publish(&signed);
                     let toasts = use_toasts();
                     toasts.show("Report submitted", ToastVariant::Success);
                     show.set(false);

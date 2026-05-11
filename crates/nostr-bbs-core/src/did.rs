@@ -35,7 +35,7 @@ impl NostrPubkey {
         hex::encode(self.0)
     }
 
-    fn to_upstream(&self) -> upstream::NostrPubkey {
+    fn to_upstream(self) -> upstream::NostrPubkey {
         upstream::NostrPubkey(self.0)
     }
 }
@@ -297,7 +297,10 @@ mod tests {
     fn verify_webid_tag_did_nostr() {
         let pk = "a".repeat(64);
         assert!(verify_webid_tag(&format!("did:nostr:{pk}"), &pk));
-        assert!(!verify_webid_tag(&format!("did:nostr:{pk}"), &"b".repeat(64)));
+        assert!(!verify_webid_tag(
+            &format!("did:nostr:{pk}"),
+            &"b".repeat(64)
+        ));
     }
 
     #[test]

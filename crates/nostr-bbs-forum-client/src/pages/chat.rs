@@ -41,11 +41,7 @@ const ZONE_SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "private",
-        &[
-            "private-welcome",
-            "private-events",
-            "private-booking",
-        ],
+        &["private-welcome", "private-events", "private-booking"],
     ),
 ];
 

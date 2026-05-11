@@ -49,7 +49,7 @@ pub fn load_draft(channel_id: &str) -> Option<String> {
 pub fn save_draft(channel_id: &str, content: &str) {
     let key = draft_key(channel_id);
     if content.trim().is_empty() {
-        let _ = gloo::storage::LocalStorage::delete(&key);
+        gloo::storage::LocalStorage::delete(&key);
     } else {
         let _ = gloo::storage::LocalStorage::set(&key, content.to_string());
     }

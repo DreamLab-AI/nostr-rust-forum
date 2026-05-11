@@ -669,8 +669,7 @@ mod tests {
 
     #[test]
     fn parse_wrapped_response() {
-        let json =
-            r#"[{"pubkey":"abc","profile":{"name":"alice","nip05":"alice@example.test"}}]"#;
+        let json = r#"[{"pubkey":"abc","profile":{"name":"alice","nip05":"alice@example.test"}}]"#;
         let parsed = parse_batch_response(json);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].pubkey, "abc");

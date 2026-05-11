@@ -97,7 +97,7 @@ pub async fn provision_pod(
     });
     bucket
         .put(
-            &format!("{base}/"),
+            format!("{base}/"),
             serde_json::to_vec(&root_meta).unwrap_or_default(),
         )
         .http_metadata(HttpMetadata {
@@ -115,7 +115,7 @@ pub async fn provision_pod(
         });
         bucket
             .put(
-                &format!("{base}/{container}"),
+                format!("{base}/{container}"),
                 serde_json::to_vec(&container_meta).unwrap_or_default(),
             )
             .http_metadata(HttpMetadata {
@@ -130,7 +130,7 @@ pub async fn provision_pod(
     let webid_html = crate::webid::generate_webid_html(owner_pubkey, display_name, pod_base);
     bucket
         .put(
-            &format!("{base}/profile/card"),
+            format!("{base}/profile/card"),
             webid_html.as_bytes().to_vec(),
         )
         .http_metadata(HttpMetadata {
@@ -153,7 +153,7 @@ pub async fn provision_pod(
     });
     bucket
         .put(
-            &format!("{base}/.acl"),
+            format!("{base}/.acl"),
             serde_json::to_vec(&root_acl).unwrap_or_default(),
         )
         .http_metadata(HttpMetadata {
@@ -182,7 +182,7 @@ pub async fn provision_pod(
     });
     bucket
         .put(
-            &format!("{base}/public/.acl"),
+            format!("{base}/public/.acl"),
             serde_json::to_vec(&public_acl).unwrap_or_default(),
         )
         .http_metadata(HttpMetadata {
@@ -205,7 +205,7 @@ pub async fn provision_pod(
     });
     bucket
         .put(
-            &format!("{base}/private/.acl"),
+            format!("{base}/private/.acl"),
             serde_json::to_vec(&private_acl).unwrap_or_default(),
         )
         .http_metadata(HttpMetadata {
@@ -234,7 +234,7 @@ pub async fn provision_pod(
     });
     bucket
         .put(
-            &format!("{base}/inbox/.acl"),
+            format!("{base}/inbox/.acl"),
             serde_json::to_vec(&inbox_acl).unwrap_or_default(),
         )
         .http_metadata(HttpMetadata {
@@ -263,7 +263,7 @@ pub async fn provision_pod(
     });
     bucket
         .put(
-            &format!("{base}/profile/.acl"),
+            format!("{base}/profile/.acl"),
             serde_json::to_vec(&profile_acl).unwrap_or_default(),
         )
         .http_metadata(HttpMetadata {
@@ -286,7 +286,7 @@ pub async fn provision_pod(
     });
     bucket
         .put(
-            &format!("{base}/settings/.acl"),
+            format!("{base}/settings/.acl"),
             serde_json::to_vec(&settings_acl).unwrap_or_default(),
         )
         .http_metadata(HttpMetadata {
@@ -311,7 +311,7 @@ pub async fn provision_pod(
     let public_ti_url = format!("{pod_url}{PUBLIC_TYPE_INDEX_PATH}");
     let public_ti_body = render_type_index_body(&public_ti_url, "solid:ListedDocument");
     bucket
-        .put(&format!("{base}/{PUBLIC_TYPE_INDEX_PATH}"), public_ti_body)
+        .put(format!("{base}/{PUBLIC_TYPE_INDEX_PATH}"), public_ti_body)
         .http_metadata(HttpMetadata {
             content_type: Some("application/ld+json".into()),
             ..Default::default()
@@ -322,10 +322,7 @@ pub async fn provision_pod(
     let private_ti_url = format!("{pod_url}{PRIVATE_TYPE_INDEX_PATH}");
     let private_ti_body = render_type_index_body(&private_ti_url, "solid:UnlistedDocument");
     bucket
-        .put(
-            &format!("{base}/{PRIVATE_TYPE_INDEX_PATH}"),
-            private_ti_body,
-        )
+        .put(format!("{base}/{PRIVATE_TYPE_INDEX_PATH}"), private_ti_body)
         .http_metadata(HttpMetadata {
             content_type: Some("application/ld+json".into()),
             ..Default::default()
@@ -336,7 +333,7 @@ pub async fn provision_pod(
     let public_ti_acl_body = render_public_type_index_acl(&owner_did);
     bucket
         .put(
-            &format!("{base}/{PUBLIC_TYPE_INDEX_ACL_PATH}"),
+            format!("{base}/{PUBLIC_TYPE_INDEX_ACL_PATH}"),
             public_ti_acl_body,
         )
         .http_metadata(HttpMetadata {
@@ -346,7 +343,8 @@ pub async fn provision_pod(
         .execute()
         .await?;
 
-    // Initialize quota
+    // Initialize quota (KV-based; D1 migration pending)
+    #[allow(deprecated)]
     crate::quota::update_usage(kv, owner_pubkey, 0).await?;
 
     Ok(())

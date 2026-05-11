@@ -7,5 +7,3 @@
 //! tokio and is incompatible with WASM Workers).
 
 pub mod cf_backend;
-
-pub use cf_backend::CloudflareStorage;

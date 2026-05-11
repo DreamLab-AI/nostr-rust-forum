@@ -14,6 +14,9 @@
 //! - `embed.rs` -- Hash-based embedding generator
 //! - `auth.rs`  -- NIP-98 admin verification
 
+// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
+#![allow(dead_code)]
+
 mod auth;
 mod embed;
 mod store;

@@ -106,7 +106,7 @@ pub fn ThreadView(
         wasm_bindgen_futures::spawn_local(async move {
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
-                    let _ = relay.publish(&signed);
+                    relay.publish(&signed);
                     reply_text_sig.set(String::new());
                     show_composer_sig.set(false);
                     let toasts = use_toasts();

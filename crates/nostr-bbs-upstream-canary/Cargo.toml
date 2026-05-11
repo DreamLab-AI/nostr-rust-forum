@@ -27,7 +27,7 @@ crate-type = ["cdylib", "rlib"]
 # NOT separate features in 0.44.2 — NIP-19 is always present in core, NIP-26 +
 # NIP-90 may move to feature gates in later releases. Update when upstream
 # splits the API surface.
-nostr = { workspace = true, default-features = false, features = [
+nostr = { workspace = true, features = [
   "std",
   "nip04",
   "nip44",

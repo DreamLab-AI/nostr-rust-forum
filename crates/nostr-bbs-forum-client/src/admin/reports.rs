@@ -193,11 +193,11 @@ pub fn ReportsTab() -> impl IntoView {
                             </div>
                         }.into_any()
                     } else {
-                        let resolve = resolve_report.clone();
+                        let resolve = resolve_report;
                         view! {
                             <div class="space-y-3">
                                 {report_list.into_iter().map(move |report| {
-                                    let resolve = resolve.clone();
+                                    let resolve = resolve;
                                     view! { <ReportCard report=report resolve=resolve /> }
                                 }).collect_view()}
                             </div>

@@ -366,8 +366,8 @@ mod tests {
         // D1's 1 MB row-set ceiling means we want batches small enough that
         // even a worst-case kind-0 (a few KB of profile metadata) fits. 200
         // gives us ~5 KB of headroom per row.
-        assert!(BACKFILL_BATCH_SIZE > 0);
-        assert!(BACKFILL_BATCH_SIZE <= 1000);
+        const { assert!(BACKFILL_BATCH_SIZE > 0) };
+        const { assert!(BACKFILL_BATCH_SIZE <= 1000) };
     }
 
     #[test]

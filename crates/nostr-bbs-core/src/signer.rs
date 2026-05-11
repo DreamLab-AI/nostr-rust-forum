@@ -221,7 +221,7 @@ fn parse_pk32(hex_str: &str) -> Result<[u8; 32], SignerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::UnsignedEvent;
+
     use crate::keys::generate_keypair;
 
     #[allow(dead_code)]

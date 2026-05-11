@@ -9,11 +9,11 @@
 //! Simple types (no TLV): npub, nsec, note
 //! TLV types: nprofile, nevent, naddr
 
+use nostr::nips::nip01::Coordinate;
 use nostr::nips::nip19::{
     self as up, FromBech32, Nip19Coordinate, Nip19Event, Nip19Profile, ToBech32,
 };
 use nostr::types::RelayUrl;
-use nostr::nips::nip01::Coordinate;
 use nostr::{EventId, Kind, PublicKey, SecretKey};
 use thiserror::Error;
 
@@ -77,7 +77,8 @@ fn parse_relays(relays: &[String]) -> Result<Vec<RelayUrl>, Nip19Error> {
 pub fn encode_npub(pubkey_hex: &str) -> Result<String, Nip19Error> {
     let bytes = hex_to_bytes_exact(pubkey_hex, 32)?;
     let pk = PublicKey::from_slice(&bytes).map_err(|e| Nip19Error::Bech32(e.to_string()))?;
-    pk.to_bech32().map_err(|e| Nip19Error::Bech32(e.to_string()))
+    pk.to_bech32()
+        .map_err(|e| Nip19Error::Bech32(e.to_string()))
 }
 
 /// Encode a 64-char hex secret key as `nsec1…`.
@@ -91,7 +92,8 @@ pub fn encode_nsec(sk_hex: &str) -> Result<String, Nip19Error> {
 pub fn encode_note(event_id_hex: &str) -> Result<String, Nip19Error> {
     let bytes = hex_to_bytes_exact(event_id_hex, 32)?;
     let id = EventId::from_slice(&bytes).map_err(|e| Nip19Error::Bech32(e.to_string()))?;
-    id.to_bech32().map_err(|e| Nip19Error::Bech32(e.to_string()))
+    id.to_bech32()
+        .map_err(|e| Nip19Error::Bech32(e.to_string()))
 }
 
 /// Decode a simple bech32 entity (npub/nsec/note) to its 32-byte payload,
@@ -211,7 +213,8 @@ pub fn encode_nevent(e: &NEvent) -> Result<String, Nip19Error> {
         nev = nev.kind(Kind::from(kind as u16));
     }
     nev = nev.relays(parse_relays(&e.relays)?);
-    nev.to_bech32().map_err(|err| Nip19Error::Bech32(err.to_string()))
+    nev.to_bech32()
+        .map_err(|err| Nip19Error::Bech32(err.to_string()))
 }
 
 /// Decode an `nevent`.

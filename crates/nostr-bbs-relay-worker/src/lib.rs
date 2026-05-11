@@ -16,6 +16,9 @@
 //! - `whitelist.rs` -- Whitelist management HTTP handlers
 //! - `auth.rs` -- NIP-98 admin verification wrapper
 
+// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
+#![allow(dead_code)]
+
 mod audit;
 mod auth;
 mod cron;

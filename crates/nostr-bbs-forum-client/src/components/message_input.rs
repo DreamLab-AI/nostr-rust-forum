@@ -345,7 +345,7 @@ pub(crate) fn MessageInput(
         let Some(el) = textarea_ref.get_untracked() else {
             return;
         };
-        let el: web_sys::HtmlTextAreaElement = el.into();
+        let el: web_sys::HtmlTextAreaElement = el;
         let caret = el.selection_start().ok().flatten().unwrap_or(0) as usize;
         let text = content.get_untracked();
         match detect_mention_token(&text, caret) {
@@ -408,7 +408,7 @@ pub(crate) fn MessageInput(
         });
         // Place caret after the replacement.
         if let Some(el) = textarea_ref.get_untracked() {
-            let el: web_sys::HtmlTextAreaElement = el.into();
+            let el: web_sys::HtmlTextAreaElement = el;
             let new_pos = (start + replacement.len()) as u32;
             let _ = el.set_selection_range(new_pos, new_pos);
             let _ = el.focus();

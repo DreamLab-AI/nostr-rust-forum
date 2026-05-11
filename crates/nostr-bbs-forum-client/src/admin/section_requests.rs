@@ -310,7 +310,7 @@ fn approve_request(
     spawn_local(async move {
         // Add cohort to user's whitelist entry
         match admin
-            .add_to_whitelist(&pk, &[cohort.clone()], &privkey)
+            .add_to_whitelist(&pk, std::slice::from_ref(&cohort), &privkey)
             .await
         {
             Ok(_) => {

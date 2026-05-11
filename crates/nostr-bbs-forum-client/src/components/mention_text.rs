@@ -202,7 +202,7 @@ fn parse_mentions(input: &str) -> Vec<Segment> {
                             c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-'
                         })
                         .count();
-                    if name_len >= 3 && name_len <= 30 {
+                    if (3..=30).contains(&name_len) {
                         let username = after_at[..name_len].to_string();
                         // Must start with lowercase or digit (regex: ^[a-z0-9]...).
                         let first_ok = username

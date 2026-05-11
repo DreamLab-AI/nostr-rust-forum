@@ -561,7 +561,7 @@ fn BirthdayList() -> impl IntoView {
                         (0, 0)
                     };
 
-                    if month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+                    if (1..=12).contains(&month) && (1..=31).contains(&day) {
                         let name = meta
                             .get("display_name")
                             .or_else(|| meta.get("name"))

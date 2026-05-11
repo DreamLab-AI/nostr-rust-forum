@@ -116,7 +116,7 @@ mod tests {
         let pubkey = hex::encode(sk.verifying_key().to_bytes());
         let target = "aa".repeat(32);
 
-        let event = create_deletion_event(&privkey, &[target.clone()], None).unwrap();
+        let event = create_deletion_event(&privkey, std::slice::from_ref(&target), None).unwrap();
 
         assert_eq!(event.kind, 5);
         assert_eq!(event.pubkey, pubkey);

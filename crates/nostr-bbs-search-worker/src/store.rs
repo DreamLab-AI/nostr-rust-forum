@@ -187,9 +187,9 @@ impl VectorStore {
                 while pos + ENTRY_SIZE <= payload.len() {
                     let label = u64::from_le_bytes(payload[pos..pos + 8].try_into().ok()?);
                     let mut emb = [0.0f32; DIM];
-                    for j in 0..DIM {
+                    for (j, slot) in emb.iter_mut().enumerate().take(DIM) {
                         let fo = pos + 8 + j * 4;
-                        emb[j] = f32::from_le_bytes(payload[fo..fo + 4].try_into().ok()?);
+                        *slot = f32::from_le_bytes(payload[fo..fo + 4].try_into().ok()?);
                     }
                     store.entries.push((label, emb));
                     pos += ENTRY_SIZE;

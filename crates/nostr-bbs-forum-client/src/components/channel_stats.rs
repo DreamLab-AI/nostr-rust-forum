@@ -54,7 +54,7 @@ pub fn ChannelStats(
             </span>
 
             // Creation date (if provided)
-            {created_at.map(|ts| {
+            {created_at.and_then(|ts| {
                 let date_str = format_date_short(ts);
                 if date_str.is_empty() {
                     None
@@ -64,7 +64,7 @@ pub fn ChannelStats(
                         <span>{"Created "}{date_str}</span>
                     })
                 }
-            }).flatten()}
+            })}
         </div>
     }
 }

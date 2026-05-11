@@ -4,14 +4,12 @@
 //! This module re-exports the public API so existing pod-worker call sites
 //! (`use crate::did::*`) continue to compile unchanged.
 
-pub use nostr_bbs_core::did::{
-    did_nostr_uri, format_multibase_schnorr, is_valid_hex_pubkey, render_did_document_tier1,
-    render_did_document_tier3, verify_webid_tag, well_known_path, NostrPubkey,
-};
+pub use nostr_bbs_core::did::{render_did_document_tier3, verify_webid_tag, NostrPubkey};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_bbs_core::did::render_did_document_tier1;
 
     const PK_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 

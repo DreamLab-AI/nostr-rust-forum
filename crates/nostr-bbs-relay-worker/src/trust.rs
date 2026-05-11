@@ -474,13 +474,11 @@ pub async fn update_last_active(pubkey: &str, env: &Env) {
         {
             let _ = bound.run().await;
         }
-    } else {
-        if let Ok(bound) = db
-            .prepare("UPDATE whitelist SET last_active_at = ?1 WHERE pubkey = ?2")
-            .bind(&[JsValue::from_f64(now as f64), JsValue::from_str(pubkey)])
-        {
-            let _ = bound.run().await;
-        }
+    } else if let Ok(bound) = db
+        .prepare("UPDATE whitelist SET last_active_at = ?1 WHERE pubkey = ?2")
+        .bind(&[JsValue::from_f64(now as f64), JsValue::from_str(pubkey)])
+    {
+        let _ = bound.run().await;
     }
 }
 
@@ -621,10 +619,7 @@ pub async fn has_zone_access(pubkey: &str, zone: &str, env: &Env) -> bool {
                     "private" => cohorts.iter().any(|c| {
                         matches!(
                             c.as_str(),
-                            "private"
-                                | "private-only"
-                                | "private-business"
-                                | "cross-access"
+                            "private" | "private-only" | "private-business" | "cross-access"
                         )
                     }),
                     // Unknown zone: deny by default

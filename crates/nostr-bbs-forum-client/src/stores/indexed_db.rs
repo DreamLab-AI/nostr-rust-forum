@@ -77,7 +77,7 @@ async fn idb_request_result(request: &IdbRequest) -> Result<JsValue, JsValue> {
                 .error()
                 .ok()
                 .flatten()
-                .map(|e| JsValue::from(e))
+                .map(JsValue::from)
                 .unwrap_or_else(|| JsValue::from_str("IDB request failed"));
             let _ = rej_clone.call1(&JsValue::NULL, &err);
         });
