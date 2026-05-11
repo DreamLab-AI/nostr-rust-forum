@@ -192,7 +192,7 @@ fn timestamp_beyond_7_days_future_rejected() {
 // ---------------------------------------------------------------------------
 
 fn is_nip29_admin_kind(kind: u64) -> bool {
-    (9000..=9020).contains(&kind) || kind == 39000
+    (9000..=9020).contains(&kind) || (39000..=39002).contains(&kind)
 }
 
 #[test]
@@ -226,6 +226,23 @@ fn nip29_kind_9020_is_admin_gated() {
 #[test]
 fn nip29_kind_39000_is_admin_gated() {
     assert!(is_nip29_admin_kind(39000));
+    assert!(is_nip29_admin_kind(39001));
+    assert!(is_nip29_admin_kind(39002));
+}
+
+#[test]
+fn nip29_kind_39001_is_admin_gated() {
+    assert!(is_nip29_admin_kind(39001));
+}
+
+#[test]
+fn nip29_kind_39002_is_admin_gated() {
+    assert!(is_nip29_admin_kind(39002));
+}
+
+#[test]
+fn nip29_kind_39003_is_not_admin_gated() {
+    assert!(!is_nip29_admin_kind(39003));
 }
 
 #[test]
