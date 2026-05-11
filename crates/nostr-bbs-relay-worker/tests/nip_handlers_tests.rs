@@ -14,7 +14,7 @@
 #![cfg(feature = "test-exports")]
 
 use nostr_bbs_core::event::NostrEvent;
-use relay_worker::test_exports::{
+use nostr_bbs_relay_worker::test_exports::{
     d_tag_value, event_matches_filters, event_treatment, tag_value, EventTreatment, NostrFilter,
 };
 

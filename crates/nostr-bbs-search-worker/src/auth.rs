@@ -27,21 +27,6 @@ pub async fn verify_nip98_replay(
     .await
 }
 
-/// Synchronous, replay-FREE verification (legacy callers).
-#[deprecated(
-    since = "0.2.0",
-    note = "Use verify_nip98_replay; this skips replay protection"
-)]
-pub fn verify_nip98(
-    auth_header: &str,
-    expected_url: &str,
-    expected_method: &str,
-    body: Option<&[u8]>,
-) -> Result<Nip98Token, Nip98Error> {
-    let now = (js_sys::Date::now() / 1000.0) as u64;
-    nostr_bbs_core::verify_nip98_token_at(auth_header, expected_url, expected_method, body, now)
-}
-
 /// Return the list of admin pubkeys from the `ADMIN_PUBKEYS` environment variable.
 pub fn admin_pubkeys(env: &Env) -> Vec<String> {
     env.var("ADMIN_PUBKEYS")

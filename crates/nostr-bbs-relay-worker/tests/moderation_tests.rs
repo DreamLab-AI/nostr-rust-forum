@@ -18,7 +18,7 @@
 
 #![cfg(feature = "test-exports")]
 
-use relay_worker::test_exports::{Block, ModCache};
+use nostr_bbs_relay_worker::test_exports::{Block, ModCache};
 
 // ---------------------------------------------------------------------------
 // Block enum semantics (from src/relay_do/mod_cache.rs)

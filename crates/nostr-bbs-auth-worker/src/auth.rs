@@ -30,30 +30,3 @@ pub async fn verify_nip98_replay(
     .await
 }
 
-/// Synchronous, replay-FREE verification kept for legacy call sites that do
-/// not have access to `Env` (e.g. test helpers). Workers should prefer
-/// [`verify_nip98_replay`].
-#[deprecated(
-    since = "0.2.0",
-    note = "Use verify_nip98_replay for replay protection. \
-            This API is kept only for legacy call sites without Env access."
-)]
-pub fn verify_nip98(
-    auth_header: &str,
-    expected_url: &str,
-    expected_method: &str,
-    body: Option<&[u8]>,
-) -> Result<Nip98Token, Nip98Error> {
-    let now = js_now_secs();
-    nostr_bbs_core::verify_nip98_token_at(auth_header, expected_url, expected_method, body, now)
-}
-
-/// Compute the SHA-256 hex digest of a byte slice.
-#[allow(dead_code)]
-pub fn sha256_hex(data: &[u8]) -> String {
-    nostr_bbs_rate_limit::sha256_hex(data)
-}
-
-fn js_now_secs() -> u64 {
-    (js_sys::Date::now() / 1000.0) as u64
-}

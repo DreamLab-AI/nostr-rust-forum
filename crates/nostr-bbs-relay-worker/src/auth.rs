@@ -13,6 +13,11 @@ use worker::Env;
 /// D1 binding name for the replay store (same DB as the relay's main tables).
 const REPLAY_DB: &str = "DB";
 
+/// Current Unix timestamp in seconds from the JS runtime.
+pub fn js_now_secs() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
+}
+
 /// Verify a NIP-98 `Authorization` header with D1-backed atomic replay protection.
 pub async fn verify_nip98_replay(
     auth_header: &str,
@@ -30,26 +35,6 @@ pub async fn verify_nip98_replay(
         REPLAY_DB,
     )
     .await
-}
-
-/// Synchronous, replay-FREE verification (legacy callers).
-#[deprecated(
-    since = "0.2.0",
-    note = "Use verify_nip98_replay; this skips replay protection"
-)]
-pub fn verify_nip98(
-    auth_header: &str,
-    expected_url: &str,
-    expected_method: &str,
-    body: Option<&[u8]>,
-) -> Result<Nip98Token, Nip98Error> {
-    let now = js_now_secs();
-    nostr_bbs_core::verify_nip98_token_at(auth_header, expected_url, expected_method, body, now)
-}
-
-/// Get the current Unix timestamp in seconds from the JS runtime.
-pub fn js_now_secs() -> u64 {
-    (js_sys::Date::now() / 1000.0) as u64
 }
 
 // ---------------------------------------------------------------------------
