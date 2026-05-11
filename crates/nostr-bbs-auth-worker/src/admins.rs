@@ -93,10 +93,9 @@ pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
 
     // Store in KV with 60-second TTL (best-effort; ignore errors).
     if let Ok(serialised) = serde_json::to_string(&pubkeys) {
-        let _ = kv
-            .put(ADMIN_CACHE_KEY, serialised)
-            .map(|b| b.expiration_ttl(60))
-            .map(|b| b.execute());
+        if let Ok(builder) = kv.put(ADMIN_CACHE_KEY, serialised) {
+            let _ = builder.expiration_ttl(60).execute().await;
+        }
     }
 
     Ok(pubkeys)
@@ -187,7 +186,7 @@ pub async fn handle_add(
     }
 
     // Also ensure a members row exists (sprint-native admin set).
-    let _ = db
+    let members = db
         .prepare(
             "INSERT INTO members (pubkey, is_admin, created_at) \
              VALUES (?1, 1, ?2) \
@@ -196,8 +195,12 @@ pub async fn handle_add(
         .bind(&[
             JsValue::from_str(&body.pubkey),
             JsValue::from_f64(now as f64),
-        ])
-        .map(|s| async move { s.run().await });
+        ])?
+        .run()
+        .await;
+    if let Err(e) = members {
+        return error_json(env, &format!("DB error: {e}"), 500);
+    }
 
     bust_cache(env).await;
 
@@ -251,10 +254,14 @@ pub async fn handle_remove(
         return error_json(env, &format!("DB error: {e}"), 500);
     }
 
-    let _ = db
+    let members = db
         .prepare("UPDATE members SET is_admin = 0 WHERE pubkey = ?1")
-        .bind(&[JsValue::from_str(&body.pubkey)])
-        .map(|s| async move { s.run().await });
+        .bind(&[JsValue::from_str(&body.pubkey)])?
+        .run()
+        .await;
+    if let Err(e) = members {
+        return error_json(env, &format!("DB error: {e}"), 500);
+    }
 
     bust_cache(env).await;
 

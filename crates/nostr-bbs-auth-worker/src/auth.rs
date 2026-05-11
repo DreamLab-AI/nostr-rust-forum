@@ -8,9 +8,7 @@
 //!
 //! The replay store is backed by the `NIP98_REPLAY` KV namespace with TTL =
 //! [`nostr_bbs_core::REPLAY_CACHE_TTL_SECS`] (= 2x tolerance window). Workers
-//! that lack the KV binding (e.g. local dev without the binding wired) fall
-//! back to a permissive in-memory store; production deployments MUST bind
-//! `NIP98_REPLAY` to enforce replay protection.
+//! that lack the KV binding fail closed.
 
 use async_trait::async_trait;
 use nostr_bbs_core::nip98::{Nip98Error, Nip98ReplayStore, Nip98Token};
@@ -28,6 +26,9 @@ pub struct KvReplayStore<'a> {
 impl<'a> Nip98ReplayStore for KvReplayStore<'a> {
     async fn seen_or_record(&self, event_id: &str) -> Result<bool, String> {
         let key = format!("nip98:{event_id}");
+        // SECURITY TODO: Cloudflare KV get+put is not atomic. Missing bindings
+        // now fail closed, but concurrent replay races remain possible until
+        // this store moves to a Durable Object or D1 UNIQUE insert.
         // Probe first.
         match self.kv.get(&key).text().await {
             Ok(Some(_)) => return Ok(false),
@@ -43,15 +44,6 @@ impl<'a> Nip98ReplayStore for KvReplayStore<'a> {
             .execute()
             .await
             .map_err(|e| format!("kv put exec: {e:?}"))?;
-        Ok(true)
-    }
-}
-
-/// Permissive fallback when KV is unavailable. NEVER use this in production.
-struct AlwaysFreshStore;
-#[async_trait(?Send)]
-impl Nip98ReplayStore for AlwaysFreshStore {
-    async fn seen_or_record(&self, _event_id: &str) -> Result<bool, String> {
         Ok(true)
     }
 }
@@ -73,38 +65,23 @@ pub async fn verify_nip98_replay(
     env: &Env,
 ) -> Result<Nip98Token, Nip98Error> {
     let now = js_now_secs();
-    let kv = env.kv("NIP98_REPLAY").ok();
+    let kv = env
+        .kv("NIP98_REPLAY")
+        .map_err(|_| Nip98Error::ReplayBackend("NIP98_REPLAY KV binding missing".into()))?;
     let ttl = nostr_bbs_core::REPLAY_CACHE_TTL_SECS;
-    if let Some(kv) = kv {
-        let store = KvReplayStore {
-            kv: &kv,
-            ttl_secs: ttl,
-        };
-        nostr_bbs_core::verify_nip98_token_at_with_replay(
-            auth_header,
-            expected_url,
-            expected_method,
-            body,
-            now,
-            &store,
-        )
-        .await
-    } else {
-        // No binding -> log + fall back. Replay protection is best-effort
-        // until ops finishes wrangler.toml provisioning.
-        worker::console_warn!(
-            "NIP98_REPLAY KV binding missing; replay protection disabled (auth-worker)"
-        );
-        nostr_bbs_core::verify_nip98_token_at_with_replay(
-            auth_header,
-            expected_url,
-            expected_method,
-            body,
-            now,
-            &AlwaysFreshStore,
-        )
-        .await
-    }
+    let store = KvReplayStore {
+        kv: &kv,
+        ttl_secs: ttl,
+    };
+    nostr_bbs_core::verify_nip98_token_at_with_replay(
+        auth_header,
+        expected_url,
+        expected_method,
+        body,
+        now,
+        &store,
+    )
+    .await
 }
 
 /// Synchronous, replay-FREE verification kept for legacy call sites that do

@@ -148,6 +148,14 @@ pub async fn handle_check_whitelist(req: &Request, env: &Env) -> Result<Response
 /// Paginated whitelist with optional cohort filter. Joins with the events table
 /// to extract `display_name` from the most recent kind-0 profile event.
 pub async fn handle_whitelist_list(req: &Request, env: &Env) -> Result<Response> {
+    let request_url = req.url()?.to_string();
+    let auth_header = req.headers().get("Authorization").ok().flatten();
+    if let Err((body, status)) =
+        auth::require_nip98_admin(auth_header.as_deref(), &request_url, "GET", None, env).await
+    {
+        return json_response(env, &body, status);
+    }
+
     let url = req.url()?;
     let params: std::collections::HashMap<String, String> = url
         .query_pairs()
@@ -491,8 +499,8 @@ pub async fn handle_whitelist_update_cohorts(mut req: Request, env: &Env) -> Res
         serde_json::from_slice(&body_bytes).map_err(|e| worker::Error::RustError(e.to_string()))?;
 
     let pubkey = match &body.pubkey {
-        Some(pk) if !pk.is_empty() => pk.clone(),
-        _ => return json_response(env, &json!({ "error": "Missing pubkey or cohorts" }), 400),
+        Some(pk) if pk.len() == 64 && pk.bytes().all(|b| b.is_ascii_hexdigit()) => pk.clone(),
+        _ => return json_response(env, &json!({ "error": "Missing or invalid pubkey (64 hex chars required)" }), 400),
     };
     let cohorts = match &body.cohorts {
         Some(c) => c.clone(),

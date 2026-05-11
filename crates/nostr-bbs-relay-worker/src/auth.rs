@@ -24,6 +24,9 @@ pub struct KvReplayStore<'a> {
 impl<'a> Nip98ReplayStore for KvReplayStore<'a> {
     async fn seen_or_record(&self, event_id: &str) -> Result<bool, String> {
         let key = format!("nip98:{event_id}");
+        // SECURITY TODO: Cloudflare KV get+put is not atomic. Missing bindings
+        // now fail closed, but concurrent replay races remain possible until
+        // this store moves to a Durable Object or D1 UNIQUE insert.
         match self.kv.get(&key).text().await {
             Ok(Some(_)) => return Ok(false),
             Ok(None) => {}
@@ -41,14 +44,6 @@ impl<'a> Nip98ReplayStore for KvReplayStore<'a> {
     }
 }
 
-struct AlwaysFreshStore;
-#[async_trait(?Send)]
-impl Nip98ReplayStore for AlwaysFreshStore {
-    async fn seen_or_record(&self, _event_id: &str) -> Result<bool, String> {
-        Ok(true)
-    }
-}
-
 /// Verify a NIP-98 `Authorization` header WITH replay protection.
 pub async fn verify_nip98_replay(
     auth_header: &str,
@@ -59,34 +54,22 @@ pub async fn verify_nip98_replay(
 ) -> Result<Nip98Token, Nip98Error> {
     let now = js_now_secs();
     let ttl = nostr_bbs_core::REPLAY_CACHE_TTL_SECS;
-    if let Ok(kv) = env.kv("NIP98_REPLAY") {
-        let store = KvReplayStore {
-            kv: &kv,
-            ttl_secs: ttl,
-        };
-        nostr_bbs_core::verify_nip98_token_at_with_replay(
-            auth_header,
-            expected_url,
-            expected_method,
-            body,
-            now,
-            &store,
-        )
-        .await
-    } else {
-        worker::console_warn!(
-            "NIP98_REPLAY KV binding missing; replay protection disabled (relay-worker)"
-        );
-        nostr_bbs_core::verify_nip98_token_at_with_replay(
-            auth_header,
-            expected_url,
-            expected_method,
-            body,
-            now,
-            &AlwaysFreshStore,
-        )
-        .await
-    }
+    let kv = env
+        .kv("NIP98_REPLAY")
+        .map_err(|_| Nip98Error::ReplayBackend("NIP98_REPLAY KV binding missing".into()))?;
+    let store = KvReplayStore {
+        kv: &kv,
+        ttl_secs: ttl,
+    };
+    nostr_bbs_core::verify_nip98_token_at_with_replay(
+        auth_header,
+        expected_url,
+        expected_method,
+        body,
+        now,
+        &store,
+    )
+    .await
 }
 
 /// Synchronous, replay-FREE verification (legacy callers).

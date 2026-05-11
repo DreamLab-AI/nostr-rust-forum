@@ -22,13 +22,16 @@ id = "8ec8759ab40d4709a831bf6b0e5241eb"
 # TODO(ops): bind to the same id provisioned for auth-worker's ADMIN_KV.
 [[kv_namespaces]]
 binding = "ADMIN_KV_RO"
-id = "REPLACE_WITH_NEW_ADMIN_KV_ID"
+id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 
 # NIP-98 replay cache (shared with auth-worker; same id).
 # TODO(ops): provision a fresh namespace.
+# SECURITY TODO: Placeholder IDs now make NIP-98 protected pod requests fail closed.
 [[kv_namespaces]]
 binding = "NIP98_REPLAY"
-id = "REPLACE_WITH_NEW_NIP98_REPLAY_KV_ID"
+id = "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3"
 
 [vars]
 EXPECTED_ORIGIN = "https://example.com"
+PAY_ENABLED = "false"
+PAY_COST_SATS = "1"

@@ -470,8 +470,18 @@ pub async fn handle_redeem(
         .bind(&[js_str(&row.id), js_i64(now)])?
         .run()
         .await;
-    if let Err(e) = update {
-        return error_json(env, &format!("Increment failed: {e}"), 500);
+    let update = match update {
+        Ok(result) => result,
+        Err(e) => return error_json(env, &format!("Increment failed: {e}"), 500),
+    };
+    let changed = update
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.changes.or(m.rows_written))
+        .unwrap_or(0);
+    if changed != 1 {
+        return error_json(env, "Invite is fully used", 409);
     }
 
     // Record redemption
@@ -653,7 +663,16 @@ pub async fn consume_for_registration(
     else {
         return Err("Database error");
     };
-    inc_stmt.run().await.map_err(|_| "Increment failed")?;
+    let inc = inc_stmt.run().await.map_err(|_| "Increment failed")?;
+    let changed = inc
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.changes.or(m.rows_written))
+        .unwrap_or(0);
+    if changed != 1 {
+        return Err("Invite is fully used");
+    }
 
     let Ok(rec_stmt) = db
         .prepare(

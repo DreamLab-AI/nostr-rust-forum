@@ -15,9 +15,10 @@ id = "440b1f07ff224fb8ad644e094c6766c0"
 
 # NIP-98 replay cache (TTL = 2 * tolerance window). Shared id with auth-worker.
 # TODO(ops): provision via `wrangler kv:namespace create nostr-bbs-nip98-replay`.
+# SECURITY TODO: Placeholder IDs now make ingest/admin auth fail closed. Replace this before deploy.
 [[kv_namespaces]]
 binding = "NIP98_REPLAY"
-id = "REPLACE_WITH_NEW_NIP98_REPLAY_KV_ID"
+id = "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3"
 
 [vars]
 ALLOWED_ORIGIN = "https://example.com"

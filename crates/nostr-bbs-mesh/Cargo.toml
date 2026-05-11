@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-mesh"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 edition = "2021"
 description = "Federation mesh worker stub for nostr-bbs deployments (ADR-073)"
 license = "MIT OR Apache-2.0"

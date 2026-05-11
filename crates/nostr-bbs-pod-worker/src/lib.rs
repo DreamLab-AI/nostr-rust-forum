@@ -3,7 +3,12 @@
 //! Per-user Solid pod storage backed by R2 + KV, with NIP-98 authentication,
 //! WAC (Web Access Control) enforcement, LDP container support, ACL CRUD,
 //! pod provisioning, WebID profile management, remoteStorage compatibility,
-//! and Solid Notifications (webhooks).
+//! Solid Notifications (webhooks), HTTP 402 payments (Web Ledgers spec),
+//! and `did:nostr` DID document resolution.
+//!
+//! Payments: `/pay/` routes provide balance queries, multi-chain TXO deposits,
+//! and metered resource access via `did:nostr:<pubkey>` identities. Users and
+//! agents are indistinguishable at the protocol level.
 //!
 //! Port of `workers/pod-api/index.ts`.
 
@@ -16,6 +21,7 @@ mod contexts;
 mod did;
 mod notifications;
 mod patch;
+mod payments;
 mod provision;
 mod quota;
 mod remote_storage;
@@ -264,7 +270,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     "remote-storage",
                     "solid-notifications",
                     "webfinger",
-                    "nip-05"
+                    "nip-05",
+                    "payments"
                 ]
             }),
             200,
@@ -377,6 +384,66 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             return json_error(&env, "Invalid pubkey in DID path", 400);
         }
+    }
+
+    // Web Ledgers discovery
+    if path == "/.well-known/webledgers/webledgers.json" {
+        let host = url.host_str().unwrap_or("example.test");
+        let body = payments::webledgers_discovery(&format!("https://{host}"));
+        return json_ok(&env, &body, 200);
+    }
+
+    // -------------------------------------------------------------------
+    // /pay/ routes (HTTP 402 payment system — Web Ledgers spec)
+    // -------------------------------------------------------------------
+    if path.starts_with("/pay/") {
+        let pay_config = load_pay_config(&env);
+        if pay_config.enabled {
+            let method = req.method();
+            let pay_auth_header = req.headers().get("Authorization").ok().flatten();
+
+            let pay_body: Option<Vec<u8>> = if method == Method::Post {
+                req.bytes().await.ok()
+            } else {
+                None
+            };
+
+            let expected_origin = env
+                .var("EXPECTED_ORIGIN")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "https://example.com".to_string());
+            let request_url = format!("{expected_origin}{path}");
+            let requester_pubkey: Option<String> = if let Some(ref header) = pay_auth_header {
+                let method_name = method_str(&method);
+                let body_ref = pay_body.as_deref();
+                auth::verify_nip98_replay(header, &request_url, method_name, body_ref, &env)
+                    .await
+                    .ok()
+                    .map(|t| t.pubkey)
+            } else {
+                None
+            };
+
+            let kv = env.kv("POD_META")?;
+            if let Some(result) = payments::handle_pay_route(
+                path,
+                &method,
+                requester_pubkey.as_deref(),
+                pay_body.as_deref(),
+                &kv,
+                &env,
+                &pay_config,
+            )
+            .await
+            {
+                let resp = result?;
+                resp.headers()
+                    .set("Access-Control-Allow-Origin", &expected_origin)
+                    .ok();
+                return Ok(resp);
+            }
+        }
+        return json_error(&env, "Not found", 404);
     }
 
     // Route: /pods/{pubkey}/...
@@ -1249,6 +1316,35 @@ fn extract_webid_tag_from_header(auth_header: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Payment config loader
+// ---------------------------------------------------------------------------
+
+fn load_pay_config(env: &Env) -> payments::PayConfig {
+    let enabled = env
+        .var("PAY_ENABLED")
+        .map(|v| {
+            let s = v.to_string();
+            s == "true" || s == "1"
+        })
+        .unwrap_or(false);
+    let cost_sats = env
+        .var("PAY_COST_SATS")
+        .ok()
+        .and_then(|v| v.to_string().parse().ok())
+        .unwrap_or(1);
+    payments::PayConfig {
+        enabled,
+        cost_sats,
+        token: None,
+        chains: vec![
+            payments::ChainConfig::bitcoin_mainnet(),
+            payments::ChainConfig::bitcoin_testnet4(),
+            payments::ChainConfig::bitcoin_signet(),
+        ],
+    }
 }
 
 // ---------------------------------------------------------------------------

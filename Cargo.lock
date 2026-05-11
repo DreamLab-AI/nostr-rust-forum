@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-auth-worker"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "async-trait",
  "base64",
@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-config"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "proptest",
  "schemars",
@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-core"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "aes",
  "async-trait",
@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-forum-client"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "async-trait",
  "base64",
@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-mesh"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "async-trait",
  "nostr-bbs-config",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-pod-worker"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "async-trait",
  "base64",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-preview-worker"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "js-sys",
  "nostr-bbs-rate-limit",
@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-rate-limit"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "js-sys",
  "worker",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-relay-worker"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "async-trait",
  "base64",
@@ -2009,7 +2009,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-search-worker"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "async-trait",
  "base64",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-setup-skill"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "async-trait",
  "nostr-bbs-config",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-upstream-canary"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -3081,15 +3081,16 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "solid-pod-rs"
-version = "0.4.0-alpha.4"
+version = "0.4.0-alpha.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d40b996ab55a5c365d587a349b10f9bd6bc55853052cd4be3eca9ad6bcedaa4"
+checksum = "7026f4f63f64cc99d3738589f998b1da10a0c3f0ce5263ce703403eace03d9d3"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
  "chrono",
  "hex",
+ "js-sys",
  "serde",
  "serde_json",
  "sha2",

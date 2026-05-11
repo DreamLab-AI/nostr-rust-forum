@@ -8,6 +8,44 @@ and this project tracks the spec home at [VisionClaw monorepo](https://github.co
 
 ## [Unreleased]
 
+## [3.0.0-rc6] -- 2026-05-11
+
+Payments, security hardening, and upstream alignment.
+
+### Added
+
+- **HTTP 402 payments** (`/pay/` routes in pod-worker). Web Ledgers spec
+  implementation: `.info`, `.balance`, `.deposit`, metered resource access,
+  multi-chain TXO verification, `/.well-known/webledgers/webledgers.json`
+  discovery. All identities are `did:nostr:<pubkey>` — users and agents
+  are indistinguishable at the protocol level.
+- **`Nip98Token.event_id`** field: canonical event ID (recomputed by
+  `verify_event_strict`) carried through to replay caches. Eliminates the
+  redundant `compute_event_id_from_header` re-parse.
+- **Wrangler.toml KV bindings**: `ADMIN_KV`, `ADMIN_KV_RO`, `NIP98_REPLAY`
+  provisioned across all 4 workers.
+- **`PAY_ENABLED` / `PAY_COST_SATS`** env vars in pod-worker wrangler.toml.
+
+### Fixed
+
+- **NIP-98 URL matching** (JSS alignment): removed trailing-slash
+  normalisation; exact match only, per JSS source of truth.
+- **Quota overflow**: `check_quota` uses `checked_add()` to prevent
+  arithmetic overflow on projected usage.
+- **admins.rs KV cache write**: `.execute().await` was missing — the
+  future was dropped without awaiting. Cache writes now persist.
+- **Whitelist `update_cohorts`**: added 64-char hex validation on pubkey
+  input (was only checking non-empty).
+- **NIP-19 proptest relay generator**: simplified to avoid generating
+  invalid IDN labels (`xn--` prefixes). All 13 proptests pass.
+
+### Changed
+
+- **solid-pod-rs**: upgraded to 0.4.0-alpha.7 (payments, LWS-CID, CID v1
+  WebID terms, NIP-98 WebID elevation).
+- **`d1_helpers`** extracted to `nostr-bbs-core` (shared by auth-worker
+  and relay-worker). Gated on `cfg(target_arch = "wasm32")`.
+
 ## [3.0-rc1] -- 2026-05-07
 
 Phase 2 kit-extraction import. Brings critical security fixes, the F26 upstream

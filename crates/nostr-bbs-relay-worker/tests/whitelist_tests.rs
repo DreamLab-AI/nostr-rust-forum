@@ -425,29 +425,30 @@ fn whitelist_add_then_remove_clears() {
 }
 
 // ---------------------------------------------------------------------------
-// Bypass-list admission for first-event registration (kind 0/9021/9024)
+// Relay ingress does not bypass whitelist admission.
 // ---------------------------------------------------------------------------
 //
-// src/relay_do/nip_handlers.rs:70 — these kinds bypass whitelist-check so a
-// new user can publish their first profile event before being approved.
+// Account creation and invitation state are owned by the auth worker; relay
+// events must not self-create access.
 
 fn is_bypass_kind(kind: u64) -> bool {
-    matches!(kind, 0 | 9021 | 9024)
+    let _ = kind;
+    false
 }
 
 #[test]
-fn kind0_profile_bypasses_whitelist() {
-    assert!(is_bypass_kind(0));
+fn kind0_profile_does_not_bypass_whitelist() {
+    assert!(!is_bypass_kind(0));
 }
 
 #[test]
-fn kind9021_join_request_bypasses_whitelist() {
-    assert!(is_bypass_kind(9021));
+fn kind9021_join_request_does_not_bypass_whitelist() {
+    assert!(!is_bypass_kind(9021));
 }
 
 #[test]
-fn kind9024_registration_metadata_bypasses_whitelist() {
-    assert!(is_bypass_kind(9024));
+fn kind9024_registration_metadata_does_not_bypass_whitelist() {
+    assert!(!is_bypass_kind(9024));
 }
 
 #[test]

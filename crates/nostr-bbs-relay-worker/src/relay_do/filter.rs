@@ -70,6 +70,8 @@ impl NostrRelayDO {
                     })
                     .collect();
                 conditions.push(format!("id IN ({})", placeholders.join(",")));
+            } else {
+                conditions.push("1 = 0".to_string());
             }
         }
 
@@ -85,6 +87,8 @@ impl NostrRelayDO {
                     })
                     .collect();
                 conditions.push(format!("pubkey IN ({})", placeholders.join(",")));
+            } else {
+                conditions.push("1 = 0".to_string());
             }
         }
 
@@ -100,6 +104,8 @@ impl NostrRelayDO {
                     })
                     .collect();
                 conditions.push(format!("kind IN ({})", placeholders.join(",")));
+            } else {
+                conditions.push("1 = 0".to_string());
             }
         }
 
@@ -133,6 +139,7 @@ impl NostrRelayDO {
                 None => continue,
             };
             if tag_values.is_empty() {
+                conditions.push("1 = 0".to_string());
                 continue;
             }
 
@@ -150,6 +157,8 @@ impl NostrRelayDO {
 
             if !tag_conditions.is_empty() {
                 conditions.push(format!("({})", tag_conditions.join(" OR ")));
+            } else {
+                conditions.push("1 = 0".to_string());
             }
         }
 

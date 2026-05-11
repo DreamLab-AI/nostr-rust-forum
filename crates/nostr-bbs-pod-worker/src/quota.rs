@@ -38,6 +38,9 @@ pub async fn get_quota(kv: &kv::KvStore, pubkey: &str) -> Result<QuotaInfo> {
 
 /// Update quota usage after a write (positive delta) or delete (negative delta).
 pub async fn update_usage(kv: &kv::KvStore, pubkey: &str, delta: i64) -> Result<()> {
+    // SECURITY TODO: This KV read-modify-write counter is non-atomic. Use a
+    // Durable Object, D1 transaction, or solid-pod-rs quota backend for
+    // authoritative quota reservation/recording under concurrent writes.
     let mut info = get_quota(kv, pubkey).await?;
     if delta > 0 {
         info.used = info.used.saturating_add(delta as u64);
@@ -67,8 +70,14 @@ pub async fn set_quota(kv: &kv::KvStore, pubkey: &str, limit: u64) -> Result<Quo
 /// Returns `Ok(())` if the write is permitted, or `Err` with a descriptive
 /// message if the quota would be exceeded.
 pub async fn check_quota(kv: &kv::KvStore, pubkey: &str, additional_bytes: u64) -> Result<()> {
+    // SECURITY TODO: check_quota and update_usage are not atomic as a pair.
+    // Concurrent writers can all pass this preflight before any usage record.
     let info = get_quota(kv, pubkey).await?;
-    if info.used + additional_bytes > info.limit {
+    let projected = info
+        .used
+        .checked_add(additional_bytes)
+        .ok_or_else(|| Error::RustError("Storage quota arithmetic overflow".into()))?;
+    if projected > info.limit {
         Err(Error::RustError(format!(
             "Storage quota exceeded: {}/{} bytes (need {} more)",
             info.used, info.limit, additional_bytes

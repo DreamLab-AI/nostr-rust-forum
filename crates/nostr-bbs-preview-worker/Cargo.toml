@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-preview-worker"
-version = "3.0.0-rc5"
+version = "3.0.0-rc6"
 edition = "2021"
 description = "Link preview Worker: OG metadata + Twitter oEmbed + SSRF protection (nostr-bbs)"
 license = "MIT OR Apache-2.0"

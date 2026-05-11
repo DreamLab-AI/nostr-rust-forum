@@ -42,7 +42,8 @@ fn arb_hex32() -> impl Strategy<Value = String> {
 /// byte strings; the absorbed adapter inherits the stricter URL contract.
 /// The generator now produces well-formed `wss://<host>` URLs.
 fn arb_relay_url() -> impl Strategy<Value = String> {
-    "wss://[a-z][a-z0-9.\\-]{0,40}\\.[a-z]{2,8}".prop_map(String::from)
+    ("[a-z]{1,8}", "[a-z]{2,6}")
+        .prop_map(|(host, tld)| format!("wss://{host}.{tld}"))
 }
 
 /// Generate a small set of 0..=5 relay URLs.

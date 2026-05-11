@@ -191,43 +191,51 @@ fn timestamp_beyond_7_days_future_rejected() {
 // NIP-29: admin-only group management kinds
 // ---------------------------------------------------------------------------
 
-const NIP29_ADMIN_KINDS: &[u64] = &[9000, 9001, 9005, 39000];
+fn is_nip29_admin_kind(kind: u64) -> bool {
+    (9000..=9020).contains(&kind) || kind == 39000
+}
 
 #[test]
 fn nip29_admin_kinds_recognised() {
-    for k in NIP29_ADMIN_KINDS {
-        assert!(NIP29_ADMIN_KINDS.contains(k));
+    for k in 9000..=9020 {
+        assert!(is_nip29_admin_kind(k));
     }
+    assert!(is_nip29_admin_kind(39000));
 }
 
 #[test]
 fn nip29_kind_9000_is_admin_gated() {
-    assert!(NIP29_ADMIN_KINDS.contains(&9000));
+    assert!(is_nip29_admin_kind(9000));
 }
 
 #[test]
 fn nip29_kind_9001_is_admin_gated() {
-    assert!(NIP29_ADMIN_KINDS.contains(&9001));
+    assert!(is_nip29_admin_kind(9001));
 }
 
 #[test]
 fn nip29_kind_9005_is_admin_gated() {
-    assert!(NIP29_ADMIN_KINDS.contains(&9005));
+    assert!(is_nip29_admin_kind(9005));
+}
+
+#[test]
+fn nip29_kind_9020_is_admin_gated() {
+    assert!(is_nip29_admin_kind(9020));
 }
 
 #[test]
 fn nip29_kind_39000_is_admin_gated() {
-    assert!(NIP29_ADMIN_KINDS.contains(&39000));
+    assert!(is_nip29_admin_kind(39000));
 }
 
 #[test]
 fn nip29_kind_9999_is_not_admin_gated() {
-    assert!(!NIP29_ADMIN_KINDS.contains(&9999));
+    assert!(!is_nip29_admin_kind(9999));
 }
 
 #[test]
 fn nip29_kind_8999_is_not_admin_gated() {
-    assert!(!NIP29_ADMIN_KINDS.contains(&8999));
+    assert!(!is_nip29_admin_kind(8999));
 }
 
 // ---------------------------------------------------------------------------

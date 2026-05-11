@@ -32,8 +32,10 @@ const MAX_TAG_VALUE_SIZE: usize = 1024;
 const MAX_TIMESTAMP_DRIFT: u64 = 60 * 60 * 24 * 7;
 const MAX_SUBSCRIPTIONS: usize = 20;
 
-/// NIP-29: Admin-only group management kinds.
-const NIP29_ADMIN_KINDS: &[u64] = &[9000, 9001, 9005, 39000];
+/// NIP-29: Admin-only group management/moderation kinds.
+fn is_nip29_admin_kind(kind: u64) -> bool {
+    (9000..=9020).contains(&kind) || kind == 39000
+}
 
 // ---------------------------------------------------------------------------
 // NIP-01: EVENT handling
@@ -63,22 +65,21 @@ impl NostrRelayDO {
             }
         }
 
-        // Events that bypass whitelist gating:
-        // - kind 0: profile metadata (triggers auto-whitelist)
-        // - kind 9021: join request
-        // - kind 9024: registration metadata
-        // NOTE: kind-40 (channel creation) no longer bypasses -- it requires TL2+.
-        let is_bypass = matches!(event.kind, 0 | 9021 | 9024);
-        if !is_bypass && !self.is_whitelisted(&event.pubkey).await {
-            Self::send_ok(ws, &event.id, false, "blocked: pubkey not whitelisted");
+        // Verify event ID and Schnorr signature before any side effects
+        // including admission state changes or activity tracking.
+        if nostr_bbs_core::verify_event_strict(&event).is_err() {
+            Self::send_ok(
+                ws,
+                &event.id,
+                false,
+                "invalid: event id or signature verification failed",
+            );
             return;
         }
 
-        // Auto-whitelist: when a new user publishes their first kind-0 profile event
-        // (or any bypass event before they're whitelisted), add them to the whitelist
-        // with the "lobby" cohort so they can participate immediately.
-        if is_bypass && !self.is_whitelisted(&event.pubkey).await {
-            self.auto_whitelist(&event.pubkey).await;
+        if !self.is_whitelisted(&event.pubkey).await {
+            Self::send_ok(ws, &event.id, false, "blocked: pubkey not whitelisted");
+            return;
         }
 
         // Suspension and silence check
@@ -127,6 +128,10 @@ impl NostrRelayDO {
 
             // kind-41 (channel metadata/pin): TL2+ for own channel, TL3+ for any
             if event.kind == 41 {
+                let Some(channel_id) = filter::tag_value(&event, "e") else {
+                    Self::send_ok(ws, &event.id, false, "invalid: missing channel tag");
+                    return;
+                };
                 if trust_level < TrustLevel::Regular {
                     Self::send_ok(
                         ws,
@@ -138,16 +143,14 @@ impl NostrRelayDO {
                 }
                 // If TL2 (not TL3), verify they are the channel creator
                 if trust_level < TrustLevel::Trusted {
-                    if let Some(channel_id) = filter::tag_value(&event, "e") {
-                        if !self.is_channel_creator(&event.pubkey, &channel_id).await {
-                            Self::send_ok(
-                                ws,
-                                &event.id,
-                                false,
-                                "restricted: TL3+ required to modify others' channels",
-                            );
-                            return;
-                        }
+                    if !self.is_channel_creator(&event.pubkey, &channel_id).await {
+                        Self::send_ok(
+                            ws,
+                            &event.id,
+                            false,
+                            "restricted: TL3+ required to modify others' channels",
+                        );
+                        return;
                     }
                 }
             }
@@ -179,33 +182,33 @@ impl NostrRelayDO {
         }
 
         // NIP-29: Admin-only group management kinds
-        if NIP29_ADMIN_KINDS.contains(&event.kind) && !is_admin {
-            Self::send_ok(ws, &event.id, false, "blocked: admin-only group action");
-            return;
+        if is_nip29_admin_kind(event.kind) {
+            // NIP-29 TODO: This enforces the h-tag/admin gate, but full group
+            // metadata should be relay-key-generated rather than accepted from
+            // arbitrary clients.
+            if filter::tag_value(&event, "h").is_none() {
+                Self::send_ok(ws, &event.id, false, "invalid: missing group tag");
+                return;
+            }
+            if !is_admin {
+                Self::send_ok(ws, &event.id, false, "blocked: admin-only group action");
+                return;
+            }
         }
 
         // Zone enforcement for channel messages (kind-42)
         if event.kind == 42 {
-            if let Some(channel_id) = filter::tag_value(&event, "e") {
-                let zone = trust::get_channel_zone(&channel_id, &self.env)
-                    .await
-                    .unwrap_or_else(|| "home".to_string());
-                if !is_admin && !trust::has_zone_access(&event.pubkey, &zone, &self.env).await {
-                    Self::send_ok(ws, &event.id, false, "zone access denied");
-                    return;
-                }
+            let Some(channel_id) = filter::tag_value(&event, "e") else {
+                Self::send_ok(ws, &event.id, false, "invalid: missing channel tag");
+                return;
+            };
+            let zone = trust::get_channel_zone(&channel_id, &self.env)
+                .await
+                .unwrap_or_else(|| "home".to_string());
+            if !is_admin && !trust::has_zone_access(&event.pubkey, &zone, &self.env).await {
+                Self::send_ok(ws, &event.id, false, "zone access denied");
+                return;
             }
-        }
-
-        // Verify event ID and Schnorr signature via nostr_bbs_core
-        if nostr_bbs_core::verify_event_strict(&event).is_err() {
-            Self::send_ok(
-                ws,
-                &event.id,
-                false,
-                "invalid: event id or signature verification failed",
-            );
-            return;
         }
 
         // NIP-16 event treatment

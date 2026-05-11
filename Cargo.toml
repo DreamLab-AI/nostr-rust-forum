@@ -124,14 +124,14 @@ wasm-bindgen-test = "0.3"
 # `core` consumers (CF Workers): use this dep.
 # Server-side consumers: enable `tokio-runtime` and the IO backends
 # they need.
-solid-pod-rs = { version = "0.4.0-alpha.4", default-features = false, features = ["core"] }
-solid-pod-rs-nostr = { version = "0.4.0-alpha.4", default-features = false }
+solid-pod-rs = { version = "0.4.0-alpha.7", default-features = false, features = ["core"] }
+solid-pod-rs-nostr = { version = "0.4.0-alpha.7", default-features = false }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc5" }
-nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc5" }
-nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc5" }
-nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "3.0.0-rc5" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc6" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc6" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc6" }
+nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "3.0.0-rc6" }
 
 # ---------------------------------------------------------------------------
 # Release profile (Sprint v9 D1) — WASM-optimized for forum-client and workers.

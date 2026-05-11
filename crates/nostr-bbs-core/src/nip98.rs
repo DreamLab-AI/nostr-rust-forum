@@ -4,6 +4,10 @@
 //! implementation in `workers/shared/nip98.ts` and `packages/nip98/`.
 //!
 //! Wire format: `Authorization: Nostr base64(json(signed_event))`
+//!
+//! [`Nip98Token`] carries the validated `event_id` (recomputed by
+//! `verify_event_strict`, never trusted from the client), enabling
+//! callers to key replay caches on the canonical ID.
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -54,6 +58,8 @@ pub trait Nip98ReplayStore {
 /// verification of an `Authorization: Nostr <base64(event)>` header.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Nip98Token {
+    /// Canonical event ID (validated via `verify_event_strict` before population).
+    pub event_id: String,
     /// Hex-encoded x-only public key of the signer.
     pub pubkey: String,
     /// The URL this token authorizes.
@@ -274,9 +280,7 @@ pub fn verify_token_at(
 
     // 8. Extract and verify URL tag
     let token_url = get_tag(&event, "u").ok_or_else(|| Nip98Error::MissingTag("u".into()))?;
-    let normalized_token = token_url.trim_end_matches('/');
-    let normalized_expected = expected_url.trim_end_matches('/');
-    if normalized_token != normalized_expected {
+    if token_url != expected_url {
         return Err(Nip98Error::UrlMismatch {
             token_url: token_url.clone(),
             expected_url: expected_url.to_string(),
@@ -313,6 +317,7 @@ pub fn verify_token_at(
     };
 
     Ok(Nip98Token {
+        event_id: event.id,
         pubkey: event.pubkey,
         url: token_url,
         method: token_method,
@@ -345,14 +350,12 @@ pub async fn verify_token_at_with_replay(
     replay_store: &dyn Nip98ReplayStore,
 ) -> Result<Nip98Token, Nip98Error> {
     // Run all stateless cryptographic + structural checks first.
+    // verify_event_strict inside verify_token_at recomputes and validates the
+    // event ID, so token.event_id is the canonical ID — not client-supplied.
     let token = verify_token_at(auth_header, expected_url, expected_method, body, now)?;
 
-    // Recompute event id from the verified header so we cache the canonical
-    // identifier rather than anything the client claimed.
-    let event_id = compute_event_id_from_header(auth_header)?;
-
     let first_seen = replay_store
-        .seen_or_record(&event_id)
+        .seen_or_record(&token.event_id)
         .await
         .map_err(Nip98Error::ReplayBackend)?;
     if !first_seen {
@@ -360,25 +363,6 @@ pub async fn verify_token_at_with_replay(
     }
 
     Ok(token)
-}
-
-/// Decode a NIP-98 `Authorization: Nostr <base64>` header and return the
-/// embedded event's id (64 hex chars). Used by replay protection so the
-/// stored id is always the canonical one validated above.
-fn compute_event_id_from_header(auth_header: &str) -> Result<String, Nip98Error> {
-    let token = auth_header
-        .strip_prefix(NOSTR_PREFIX)
-        .ok_or(Nip98Error::MissingPrefix)?
-        .trim();
-    if token.len() > MAX_EVENT_SIZE {
-        return Err(Nip98Error::EventTooLarge);
-    }
-    let json_bytes = BASE64.decode(token)?;
-    if json_bytes.len() > MAX_EVENT_SIZE {
-        return Err(Nip98Error::EventTooLarge);
-    }
-    let event: NostrEvent = serde_json::from_slice(&json_bytes)?;
-    Ok(event.id)
 }
 
 /// Helper: extract the first value for a tag name from an event's tags.
@@ -654,7 +638,7 @@ mod tests {
     // ── Edge cases ─────────────────────────────────────────────────────
 
     #[test]
-    fn nip98_url_trailing_slash_normalization() {
+    fn nip98_url_trailing_slash_mismatch_rejected() {
         let sk = test_secret_key();
         let url_with_slash = "https://api.example.com/path/";
         let url_without_slash = "https://api.example.com/path";
@@ -662,9 +646,8 @@ mod tests {
         let token = create_token(&sk, url_with_slash, "GET", None).unwrap();
         let header = authorization_header(&token);
 
-        // Should succeed: trailing slash is normalized away
-        let result = verify_token(&header, url_without_slash, "GET", None).unwrap();
-        assert_eq!(result.url, url_with_slash);
+        let err = verify_token(&header, url_without_slash, "GET", None).unwrap_err();
+        assert!(matches!(err, Nip98Error::UrlMismatch { .. }));
     }
 
     #[test]

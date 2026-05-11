@@ -27,14 +27,15 @@ id = "8ec8759ab40d4709a831bf6b0e5241eb"
 # nostr-bbs-admin-kv` and replace the placeholder id below.
 [[kv_namespaces]]
 binding = "ADMIN_KV"
-id = "REPLACE_WITH_NEW_ADMIN_KV_ID"
+id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 
 # NIP-98 replay cache. TTL = 2 * tolerance (~120s) per
 # nostr_bbs_core::REPLAY_CACHE_TTL_SECS. Production deployments MUST set this.
 # TODO(ops): provision via `wrangler kv:namespace create nostr-bbs-nip98-replay`.
+# SECURITY TODO: Placeholder IDs now make auth fail closed. Replace this before deploy.
 [[kv_namespaces]]
 binding = "NIP98_REPLAY"
-id = "REPLACE_WITH_NEW_NIP98_REPLAY_KV_ID"
+id = "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3"
 
 # Legacy alias used by admins.rs cache (60-second admin pubkey list).
 # Points at SESSIONS today; migrate to ADMIN_KV in a follow-up sprint.

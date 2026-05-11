@@ -13,7 +13,6 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 use crate::auth;
-use crate::pod;
 
 // ---------------------------------------------------------------------------
 // Utility functions
@@ -166,11 +165,6 @@ struct CredentialLookupBody {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct ChallengeRow {
-    challenge: String,
-}
-
-#[derive(Deserialize)]
 struct CredentialRow {
     credential_id: Option<String>,
     prf_salt: Option<String>,
@@ -308,7 +302,9 @@ fn cbor_read_map_len(data: &[u8], pos: usize) -> std::result::Result<(usize, usi
         }
         Ok((data[pos + 1] as usize, 2))
     } else {
-        Err(format!("Unsupported CBOR map length encoding: {additional}"))
+        Err(format!(
+            "Unsupported CBOR map length encoding: {additional}"
+        ))
     }
 }
 
@@ -347,8 +343,8 @@ fn cbor_read_int(data: &[u8], pos: usize) -> std::result::Result<(i64, usize), S
     };
 
     match major {
-        0 => Ok((raw_val as i64, consumed)),           // unsigned
-        1 => Ok((-1 - (raw_val as i64), consumed)),    // negative
+        0 => Ok((raw_val as i64, consumed)),        // unsigned
+        1 => Ok((-1 - (raw_val as i64), consumed)), // negative
         _ => Err(format!("Expected CBOR integer, got major type {major}")),
     }
 }
@@ -418,10 +414,7 @@ fn cbor_skip_value(data: &[u8], pos: usize) -> std::result::Result<usize, String
         if pos + 2 >= data.len() {
             return Err("CBOR truncated skipping value".into());
         }
-        (
-            u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as u64,
-            3,
-        )
+        (u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as u64, 3)
     } else if additional == 26 {
         if pos + 4 >= data.len() {
             return Err("CBOR truncated skipping value".into());
@@ -601,135 +594,31 @@ pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> 
 /// provision a Solid pod, and return the user's DID/WebID/podUrl.
 pub async fn register_verify(
     body_bytes: &[u8],
-    cf_country: Option<&str>,
-    env: &Env,
+    _cf_country: Option<&str>,
+    _env: &Env,
 ) -> Result<Response> {
     console_log!("[register_verify] handler entered");
     console_log!(
-        "[register_verify] raw body ({} bytes): {}",
-        body_bytes.len(),
-        String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(500)])
+        "[register_verify] body received ({} bytes)",
+        body_bytes.len()
     );
     let body: RegisterVerifyBody = serde_json::from_slice(body_bytes).map_err(|e| {
         console_error!("[register_verify] JSON parse error: {e}");
         Error::RustError(format!("Invalid JSON body: {e}"))
     })?;
 
-    let pubkey = match &body.pubkey {
-        Some(pk) if is_valid_pubkey(pk) => pk.to_lowercase(),
+    match &body.pubkey {
+        Some(pk) if is_valid_pubkey(pk) => {}
         _ => return json_err("Invalid pubkey", 400),
-    };
-
-    // WI-3/WI-4: Web-of-Trust registration gate.
-    // If `instance_settings.wot_enabled = 1`, the pubkey must appear in
-    // `wot_entries` (either referente-sourced or manual_override) OR the
-    // client must supply a valid `inviteCode` (consumed atomically here).
-    // Otherwise registration fails with 403. When WoT is disabled this is
-    // a no-op.
-    if !crate::wot::is_allowed_by_wot(&pubkey, env)
-        .await
-        .unwrap_or(false)
-    {
-        match body.invite_code.as_deref() {
-            Some(code) if !code.is_empty() => {
-                if let Err(reason) =
-                    crate::invites::consume_for_registration(code, &pubkey, env).await
-                {
-                    return json_err(reason, 403);
-                }
-                // Invite consumed: pubkey is now a member row. Fall through
-                // to the rest of registration.
-            }
-            _ => {
-                return json_err(
-                    "Registration is gated by Web-of-Trust. Supply a valid inviteCode or ask an admin for access.",
-                    403,
-                );
-            }
-        }
     }
 
-    // Verify a non-expired challenge exists. Registration uses a simplified flow
-    // where the challenge is stored with pubkey=challenge_b64 (from register_options).
-    // We fetch the most recent challenge and consume it atomically after use to
-    // prevent replay attacks.
-    let now_ms = js_now_ms();
-    let five_min_ago = now_ms.saturating_sub(5 * 60 * 1000);
-
-    let db = env.d1("DB")?;
-    let challenge_row = db
-        .prepare("SELECT challenge FROM challenges WHERE created_at > ?1 ORDER BY created_at DESC LIMIT 1")
-        .bind(&[js_u64(five_min_ago)])?
-        .first::<ChallengeRow>(None)
-        .await?;
-
-    let challenge_row = match challenge_row {
-        Some(row) => row,
-        None => return json_err("No pending challenge or challenge expired", 400),
-    };
-
-    // Extract credential data -- accept both nested and flat formats
-    let credential_id = body
-        .response
-        .as_ref()
-        .and_then(|r| r.id.clone())
-        .or(body.credential_id_flat.clone());
-
-    let attestation = body
-        .response
-        .as_ref()
-        .and_then(|r| r.response.as_ref())
-        .and_then(|r| r.attestation_object.clone())
-        .or(body.public_key_flat.clone());
-
-    let credential_id = match credential_id {
-        Some(id) => id,
-        None => return json_err("Missing credential data", 400),
-    };
-
-    let public_key = attestation.unwrap_or_else(|| credential_id.clone());
-    let prf_salt_val: JsValue = match &body.prf_salt {
-        Some(s) => js_str(s),
-        None => JsValue::NULL,
-    };
-
-    // Store credential in D1
-    db.prepare(
-        "INSERT INTO webauthn_credentials (pubkey, credential_id, public_key, counter, prf_salt, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    // SECURITY TODO: Wire this endpoint to a trusted WebAuthn verifier
+    // (prefer solid-pod-rs-idp's webauthn-rs wrapper, if it can be made
+    // Worker-compatible). Do not restore caller-supplied credential storage.
+    json_err(
+        "WebAuthn registration verification is disabled until wired to a trusted WebAuthn verifier",
+        501,
     )
-    .bind(&[
-        js_str(&pubkey),
-        js_str(&credential_id),
-        js_str(&public_key),
-        js_i32(0),
-        prf_salt_val,
-        js_u64(now_ms),
-    ])?
-    .run()
-    .await?;
-
-    // Provision pod
-    let pod_info = pod::provision_pod(&pubkey, env).await?;
-
-    // Clean up used challenge
-    db.prepare("DELETE FROM challenges WHERE challenge = ?1")
-        .bind(&[js_str(&challenge_row.challenge)])?
-        .run()
-        .await?;
-
-    // WI-5: queue a welcome greeting on successful first registration.
-    // No-ops when the welcome bot is disabled or misconfigured.
-    crate::welcome::send_on_first_registration(&pubkey, cf_country, env).await;
-
-    let response_body = serde_json::json!({
-        "verified": true,
-        "pubkey": pubkey,
-        "didNostr": format!("did:nostr:{pubkey}"),
-        "webId": pod_info.web_id,
-        "podUrl": pod_info.pod_url
-    });
-
-    Response::from_json(&response_body)
 }
 
 /// POST /auth/login/options
@@ -782,6 +671,10 @@ pub async fn login_options(body_bytes: &[u8], env: &Env) -> Result<Response> {
                 // the same UX as a stale credential.
             }
             Some(cred) => {
+                // SECURITY TODO: This remains an account-existence side channel:
+                // known users receive allowCredentials while unknown users do not.
+                // Move to a discoverable-credential flow or return a padded,
+                // policy-safe shape that does not reveal registration status.
                 prf_salt = cred.prf_salt;
                 if let Some(ref cid) = cred.credential_id {
                     allow_credentials.push(serde_json::json!({
@@ -1009,7 +902,10 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
         Ok(vk) => vk,
         Err(e) => {
             console_error!("[login_verify] COSE key parse failed: {e}");
-            return json_err("Stored credential public key is invalid or unsupported", 400);
+            return json_err(
+                "Stored credential public key is invalid or unsupported",
+                400,
+            );
         }
     };
 
@@ -1234,13 +1130,13 @@ mod tests {
         // 1 => 2  (kty: EC2)
         buf.push(0x01); // unsigned int 1
         buf.push(0x02); // unsigned int 2
-        // 3 => -7  (alg: ES256)
+                        // 3 => -7  (alg: ES256)
         buf.push(0x03); // unsigned int 3
         buf.push(0x26); // negative int: -1 - 6 = -7 (major 1, value 6)
-        // -1 => 1  (crv: P-256)
+                        // -1 => 1  (crv: P-256)
         buf.push(0x20); // negative int: -1 - 0 = -1 (major 1, value 0)
         buf.push(0x01); // unsigned int 1
-        // -2 => bstr(32)  (x coordinate)
+                        // -2 => bstr(32)  (x coordinate)
         buf.push(0x21); // negative int: -1 - 1 = -2
         buf.push(0x58); // bstr with 1-byte length follows
         buf.push(0x20); // 32
@@ -1374,7 +1270,9 @@ mod tests {
 
         // Verify against wrong message
         let wrong_message = b"wrong message";
-        assert!(verifying_key.verify(&wrong_message[..], &signature).is_err());
+        assert!(verifying_key
+            .verify(&wrong_message[..], &signature)
+            .is_err());
     }
 
     #[test]
@@ -1389,7 +1287,9 @@ mod tests {
         let signature: p256::ecdsa::DerSignature = signing_key.sign(&message[..]);
 
         // Verify with wrong key
-        assert!(wrong_verifying_key.verify(&message[..], &signature).is_err());
+        assert!(wrong_verifying_key
+            .verify(&message[..], &signature)
+            .is_err());
     }
 
     // ── CBOR skip_value ────────────────────────────────────────────────
