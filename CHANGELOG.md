@@ -8,6 +8,47 @@ and this project tracks the spec home at [VisionClaw monorepo](https://github.co
 
 ## [Unreleased]
 
+## [Security Audit Sprint] - 2026-05-11
+
+DreamLab ecosystem-wide security audit. 12 fixes applied to nostr-rust-forum
+covering P0 critical, P1 high, P2 medium, and P3 housekeeping findings.
+
+### Security
+
+- **P0-01**: PRF salt is now server-derived in webauthn.rs, preventing
+  client-controlled salt injection in passkey registration flows
+- **P0-02**: Admin model checks both members and whitelist in relay auth.rs,
+  closing a privilege-escalation path where non-whitelisted members could
+  bypass admin gates
+- **P0-03**: Replay DB binding corrected to REPLAY_DB in relay wrangler.toml;
+  the previous binding name silently created a second empty D1 database,
+  leaving the replay cache ineffective
+- **R2-P0-01**: /pay/.cleanup endpoint now requires NIP-98 auth guard in
+  payments.rs, preventing unauthenticated callers from triggering cleanup
+
+### Fixed
+
+- **P1-18**: Job settle/cancel operations are now atomic via
+  UPDATE...WHERE in payments.rs, eliminating TOCTOU races between
+  concurrent settle and cancel on the same job
+- **P1-19**: Job IDs generated via CSPRNG (getrandom) in payments.rs,
+  replacing the previous sequential/predictable scheme
+- **P1-20**: Deterministic invite code fallback removed in invites.rs;
+  all invite codes are now CSPRNG-generated with no weak fallback path
+- **P2-01**: DID pubkey validated as 64-character lowercase hex in
+  payments.rs, rejecting malformed did:nostr identifiers at the boundary
+- **P2-02**: NIP-26 delegation handler returns 501 Not Implemented in
+  delegation.rs instead of silently accepting unverified delegations
+- **P2-03**: Admin cache uses 5-minute TTL in relay auth.rs, bounding
+  stale-admin-list exposure after revocation
+- **P3-02**: Job expiry column added to payments schema, with orphan
+  recovery sweep and /pay/.cleanup endpoint for operator-initiated GC
+
+### Removed
+
+- **P3-01**: KvPaymentStore dead code removed from payments.rs; the KV
+  backend was superseded by D1 but never cleaned up
+
 ## [3.0.0-rc6] -- 2026-05-11
 
 Payments, security hardening, and upstream alignment.
