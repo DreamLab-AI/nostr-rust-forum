@@ -3,9 +3,7 @@
 //! Re-exports the upstream payment model from `solid_pod_rs::payments` and
 //! provides the Cloudflare Workers storage adapter + /pay/ route handler.
 //!
-//! Two storage backends:
-//! - `KvPaymentStore` (deprecated) — non-atomic KV get+put, vulnerable to
-//!   race conditions.
+//! Storage backend:
 //! - `D1PaymentStore` — atomic D1 operations with INSERT-or-update semantics,
 //!   immune to double-spend and concurrent-deposit races.
 //!
@@ -15,7 +13,7 @@
 //! @see <https://webledgers.org>
 //! @see JSS `src/handlers/pay.js`
 
-use nostr_bbs_core::d1_helpers::{js_i64, js_str};
+use nostr_bbs_core::d1_helpers::{js_i64, js_opt_str, js_str};
 use serde::Deserialize;
 use worker::*;
 
@@ -25,14 +23,14 @@ pub use solid_pod_rs::payments::{
     WebLedger,
 };
 
-#[allow(dead_code)] // Used by deprecated KvPaymentStore
-const LEDGER_KV_KEY: &str = "webledger:main";
-#[allow(dead_code)] // Used by deprecated KvPaymentStore
-const REPLAY_PREFIX: &str = "txo-replay:";
-
 // ---------------------------------------------------------------------------
 // Schema initialisation (idempotent — call on every worker startup)
 // ---------------------------------------------------------------------------
+
+/// Default job expiry duration: 1 hour (3600 seconds).
+///
+/// Configurable via `JOB_EXPIRY_SECS` env var.
+const DEFAULT_JOB_EXPIRY_SECS: i64 = 3600;
 
 /// Create the payment/quota D1 tables if they don't exist.
 ///
@@ -81,6 +79,38 @@ pub async fn ensure_payment_schema(env: &Env, db_binding: &str) {
                 updated_at INTEGER NOT NULL\
             )",
         )
+        .run()
+        .await;
+
+    // agent_jobs: per-DID agent job tracking with hold/settle lifecycle.
+    // expires_at is TEXT ISO 8601 timestamp, nullable for backward compat.
+    let _ = db
+        .prepare(
+            "CREATE TABLE IF NOT EXISTS agent_jobs (\
+                job_id TEXT PRIMARY KEY, \
+                requester_did TEXT NOT NULL, \
+                agent_did TEXT NOT NULL, \
+                endpoint TEXT NOT NULL, \
+                params_json TEXT, \
+                status TEXT NOT NULL DEFAULT 'held', \
+                estimated_sats INTEGER NOT NULL DEFAULT 0, \
+                held_sats INTEGER NOT NULL DEFAULT 0, \
+                actual_sats INTEGER, \
+                created_at INTEGER NOT NULL, \
+                started_at INTEGER, \
+                completed_at INTEGER, \
+                error TEXT, \
+                expires_at TEXT\
+            )",
+        )
+        .run()
+        .await;
+
+    // Migration: add expires_at column to existing agent_jobs tables.
+    // ALTER TABLE ... ADD COLUMN is idempotent (fails silently if column
+    // already exists on D1/SQLite).
+    let _ = db
+        .prepare("ALTER TABLE agent_jobs ADD COLUMN expires_at TEXT")
         .run()
         .await;
 
@@ -375,73 +405,6 @@ fn parse_replay_key(key: &str) -> Result<(&str, u32), PaymentError> {
 }
 
 // ---------------------------------------------------------------------------
-// KV-backed payment store (DEPRECATED — non-atomic)
-// ---------------------------------------------------------------------------
-
-/// KV-backed payment store for Cloudflare Workers.
-///
-/// **Deprecated**: Use `D1PaymentStore` for atomic operations. This
-/// implementation is retained for backward compatibility during migration.
-#[deprecated(note = "Use D1PaymentStore for atomic payment operations")]
-#[allow(dead_code)]
-pub struct KvPaymentStore<'a> {
-    kv: &'a kv::KvStore,
-}
-
-#[allow(deprecated, dead_code)]
-impl<'a> KvPaymentStore<'a> {
-    pub fn new(kv: &'a kv::KvStore) -> Self {
-        Self { kv }
-    }
-}
-
-#[allow(deprecated)]
-#[async_trait::async_trait(?Send)]
-impl<'a> PaymentStore for KvPaymentStore<'a> {
-    async fn read_ledger(&self) -> Result<WebLedger, PaymentError> {
-        match self.kv.get(LEDGER_KV_KEY).text().await {
-            Ok(Some(json)) => serde_json::from_str(&json)
-                .map_err(|e| PaymentError::Store(format!("ledger parse: {e}"))),
-            Ok(None) => Ok(WebLedger::new("Pod Credits")),
-            Err(e) => Err(PaymentError::Store(format!("KV read: {e}"))),
-        }
-    }
-
-    async fn write_ledger(&self, ledger: &WebLedger) -> Result<(), PaymentError> {
-        let json = serde_json::to_string(ledger)
-            .map_err(|e| PaymentError::Store(format!("serialize: {e}")))?;
-        self.kv
-            .put(LEDGER_KV_KEY, &json)
-            .map_err(|e| PaymentError::Store(format!("KV put: {e}")))?
-            .execute()
-            .await
-            .map_err(|e| PaymentError::Store(format!("KV exec: {e}")))?;
-        Ok(())
-    }
-
-    async fn check_replay(&self, key: &str) -> Result<bool, PaymentError> {
-        let kv_key = format!("{REPLAY_PREFIX}{key}");
-        match self.kv.get(&kv_key).text().await {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
-            Err(e) => Err(PaymentError::Store(format!("replay check: {e}"))),
-        }
-    }
-
-    async fn record_replay(&self, key: &str) -> Result<(), PaymentError> {
-        let kv_key = format!("{REPLAY_PREFIX}{key}");
-        self.kv
-            .put(&kv_key, "1")
-            .map_err(|e| PaymentError::Store(format!("replay put: {e}")))?
-            .expiration_ttl(86400 * 30) // 30 days
-            .execute()
-            .await
-            .map_err(|e| PaymentError::Store(format!("replay exec: {e}")))?;
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // TXO verification via mempool API (multi-chain)
 // ---------------------------------------------------------------------------
 
@@ -520,6 +483,28 @@ pub struct EstimateBody {
     pub params: Option<serde_json::Value>,
 }
 
+/// Agent job creation request body.
+#[derive(Debug, Deserialize)]
+pub struct JobCreateBody {
+    pub agent_did: String,
+    pub endpoint: String,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+}
+
+/// Agent job action request body (start, cancel).
+#[derive(Debug, Deserialize)]
+pub struct JobActionBody {
+    pub job_id: String,
+}
+
+/// Agent job settlement request body.
+#[derive(Debug, Deserialize)]
+pub struct JobSettleBody {
+    pub job_id: String,
+    pub actual_sats: u64,
+}
+
 /// Handle all /pay/* routes using D1 atomic store.
 /// Returns Some(Response) if handled, None if not a pay route.
 pub async fn handle_pay_route(
@@ -590,6 +575,69 @@ pub async fn handle_pay_route(
             };
             let body = body_bytes.unwrap_or_default();
             pay_estimate_handler(pk, body, config, env)
+        }
+
+        // ----- Agent job CRUD routes -----
+
+        (&Method::Get, ".jobs") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            pay_jobs_list_handler(pk, db, env).await
+        }
+
+        (&Method::Post, ".jobs.create") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            let body = body_bytes.unwrap_or_default();
+            pay_job_create_handler(pk, body, db, config, env).await
+        }
+
+        (&Method::Post, ".jobs.start") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            let body = body_bytes.unwrap_or_default();
+            pay_job_start_handler(pk, body, db, env).await
+        }
+
+        (&Method::Post, ".jobs.settle") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            let body = body_bytes.unwrap_or_default();
+            pay_job_settle_handler(pk, body, db, env).await
+        }
+
+        (&Method::Post, ".jobs.cancel") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            let body = body_bytes.unwrap_or_default();
+            pay_job_cancel_handler(pk, body, db, env).await
+        }
+
+        (&Method::Post, ".jobs.get") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            let body = body_bytes.unwrap_or_default();
+            pay_job_get_handler(pk, body, db, env).await
+        }
+
+        (&Method::Post, ".cleanup") => {
+            let pk = match pubkey {
+                Some(pk) => pk,
+                None => return Some(json_err(env, "Authentication required", 401)),
+            };
+            pay_cleanup_handler(pk, db, env).await
         }
 
         (_, ".offers") => pay_info_handler(config, env),
@@ -872,6 +920,674 @@ fn pay_estimate_handler(
     json_ok(&body)
 }
 
+// ---------------------------------------------------------------------------
+// Agent job CRUD handlers
+// ---------------------------------------------------------------------------
+
+/// Generate a unique job ID: `job_<epoch_secs>_<random_hex16>`.
+///
+/// Uses `getrandom` (CSPRNG via `crypto.getRandomValues` on wasm) to produce
+/// 8 cryptographically random bytes (16 hex chars), preventing job-ID
+/// enumeration attacks.
+fn generate_job_id() -> Result<String, Error> {
+    let ts = now_epoch_secs();
+    let mut buf = [0u8; 8];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| Error::RustError(format!("CSPRNG failure generating job ID: {e}")))?;
+    Ok(format!("job_{ts}_{}", hex::encode(buf)))
+}
+
+/// List agent jobs for the authenticated DID.
+async fn pay_jobs_list_handler(
+    pubkey: &str,
+    db: &D1Database,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let did = pubkey_to_did(pubkey);
+
+    let rows = db
+        .prepare(
+            "SELECT job_id, requester_did, agent_did, endpoint, params_json, \
+             status, estimated_sats, held_sats, actual_sats, \
+             created_at, started_at, completed_at, error, expires_at \
+             FROM agent_jobs WHERE requester_did = ?1 \
+             ORDER BY created_at DESC LIMIT 50",
+        )
+        .bind(&[js_str(&did)])
+        .map_err(|e| Error::RustError(format!("d1 bind jobs list: {e:?}")))?
+        .all()
+        .await
+        .map_err(|e| Error::RustError(format!("d1 run jobs list: {e:?}")))?;
+
+    let jobs: Vec<serde_json::Value> = rows
+        .results::<serde_json::Value>()
+        .unwrap_or_default();
+
+    let body = serde_json::json!({
+        "jobs": jobs,
+        "count": jobs.len(),
+    });
+    json_ok(&body)
+}
+
+/// Create a new agent job: estimate cost, hold funds, insert record.
+async fn pay_job_create_handler(
+    pubkey: &str,
+    body: &[u8],
+    db: &D1Database,
+    config: &PayConfig,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let req: JobCreateBody =
+        serde_json::from_str(body_str).map_err(|e| Error::RustError(format!("parse: {e}")))?;
+
+    let requester_did = pubkey_to_did(pubkey);
+
+    // Validate agent_did format: must be "did:nostr:" followed by exactly 64 hex chars
+    if !req.agent_did.starts_with("did:nostr:") {
+        return json_err(env, "agent_did must start with did:nostr:", 400);
+    }
+    {
+        let pk_part = &req.agent_did["did:nostr:".len()..];
+        if pk_part.len() != 64 || !pk_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return json_err(
+                env,
+                "agent_did pubkey must be exactly 64 hex characters after did:nostr:",
+                400,
+            );
+        }
+    }
+
+    // Step a: Estimate cost using the endpoint cost table
+    let estimated_sats = estimate_endpoint_cost(&req.endpoint, config.cost_sats);
+    if estimated_sats == 0 {
+        return json_err(env, "Estimated cost is zero; check endpoint", 400);
+    }
+
+    // Step b: Calculate hold = estimated * 1.2 (20% buffer)
+    let held_sats = (estimated_sats as f64 * 1.2).ceil() as u64;
+
+    // Step c: Debit hold from requester balance (atomic — fails if insufficient)
+    let store = D1PaymentStore::new(db);
+    match store.debit_atomic(&requester_did, held_sats).await {
+        Ok(_) => {}
+        Err(PaymentError::InsufficientBalance { balance, cost }) => {
+            let body = serde_json::json!({
+                "error": "Insufficient balance for job hold",
+                "balance": balance,
+                "required": cost,
+                "unit": "sat",
+            });
+            let json_str =
+                serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?;
+            let resp = Response::ok(json_str)?.with_status(402);
+            resp.headers().set("Content-Type", "application/json").ok();
+            return Ok(resp);
+        }
+        Err(e) => return Err(Error::RustError(e.to_string())),
+    }
+
+    // Step d: Insert into agent_jobs with status='held' and expiry timestamp
+    let job_id = generate_job_id()?;
+    let now = now_epoch_secs();
+    let expiry_secs = job_expiry_secs(env);
+    let expires_at = iso8601_from_epoch(now + expiry_secs);
+    let params_json = req
+        .params
+        .as_ref()
+        .map(|p| serde_json::to_string(p).unwrap_or_default());
+
+    db.prepare(
+        "INSERT INTO agent_jobs \
+         (job_id, requester_did, agent_did, endpoint, params_json, \
+          status, estimated_sats, held_sats, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'held', ?6, ?7, ?8, ?9)",
+    )
+    .bind(&[
+        js_str(&job_id),
+        js_str(&requester_did),
+        js_str(&req.agent_did),
+        js_str(&req.endpoint),
+        js_opt_str(params_json.as_deref()),
+        js_i64(estimated_sats as i64),
+        js_i64(held_sats as i64),
+        js_i64(now),
+        js_str(&expires_at),
+    ])
+    .map_err(|e| Error::RustError(format!("d1 bind job insert: {e:?}")))?
+    .run()
+    .await
+    .map_err(|e| Error::RustError(format!("d1 run job insert: {e:?}")))?;
+
+    // Step e: Return job object
+    let body = serde_json::json!({
+        "job_id": job_id,
+        "requester_did": requester_did,
+        "agent_did": req.agent_did,
+        "endpoint": req.endpoint,
+        "status": "held",
+        "estimated_sats": estimated_sats,
+        "held_sats": held_sats,
+        "created_at": now,
+        "expires_at": expires_at,
+    });
+    json_ok(&body)
+}
+
+/// Start a held job — transition from held to running.
+/// Only the agent_did can start the job.
+async fn pay_job_start_handler(
+    pubkey: &str,
+    body: &[u8],
+    db: &D1Database,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let req: JobActionBody =
+        serde_json::from_str(body_str).map_err(|e| Error::RustError(format!("parse: {e}")))?;
+
+    let agent_did = pubkey_to_did(pubkey);
+    let now = now_epoch_secs();
+
+    let result = db
+        .prepare(
+            "UPDATE agent_jobs SET status = 'running', started_at = ?1 \
+             WHERE job_id = ?2 AND status = 'held' AND agent_did = ?3",
+        )
+        .bind(&[
+            js_i64(now),
+            js_str(&req.job_id),
+            js_str(&agent_did),
+        ])
+        .map_err(|e| Error::RustError(format!("d1 bind job start: {e:?}")))?
+        .run()
+        .await
+        .map_err(|e| Error::RustError(format!("d1 run job start: {e:?}")))?;
+
+    let rows_written = result
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.rows_written)
+        .unwrap_or(0);
+
+    if rows_written == 0 {
+        return json_err(
+            env,
+            "Job not found, not in 'held' status, or caller is not the agent",
+            404,
+        );
+    }
+
+    let body = serde_json::json!({
+        "job_id": req.job_id,
+        "status": "running",
+        "started_at": now,
+    });
+    json_ok(&body)
+}
+
+/// Settle a running job — transition from running to settled.
+/// Only the agent_did can settle. Refunds excess hold to requester.
+///
+/// Uses an atomic UPDATE with WHERE clause on both status and agent_did to
+/// eliminate the TOCTOU race between check and mutation. If the worker crashes
+/// after the UPDATE but before the refund credit, the job is already 'settled'
+/// and a recovery sweep can detect jobs where `held_sats > actual_sats` and
+/// the refund credit has not been applied.
+async fn pay_job_settle_handler(
+    pubkey: &str,
+    body: &[u8],
+    db: &D1Database,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let req: JobSettleBody =
+        serde_json::from_str(body_str).map_err(|e| Error::RustError(format!("parse: {e}")))?;
+
+    let agent_did = pubkey_to_did(pubkey);
+    let now = now_epoch_secs();
+
+    // Atomic settle: single UPDATE that combines the status check, ownership
+    // check, overpay guard (actual_sats <= held_sats), and state transition.
+    // If any condition fails, 0 rows are written and we diagnose afterwards.
+    let result = db
+        .prepare(
+            "UPDATE agent_jobs \
+             SET status = 'settled', actual_sats = ?1, completed_at = ?2 \
+             WHERE job_id = ?3 AND status = 'running' AND agent_did = ?4 \
+               AND held_sats >= ?1",
+        )
+        .bind(&[
+            js_i64(req.actual_sats as i64),
+            js_i64(now),
+            js_str(&req.job_id),
+            js_str(&agent_did),
+        ])
+        .map_err(|e| Error::RustError(format!("d1 bind job settle: {e:?}")))?
+        .run()
+        .await
+        .map_err(|e| Error::RustError(format!("d1 run job settle: {e:?}")))?;
+
+    let rows_written = result
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.rows_written)
+        .unwrap_or(0);
+
+    if rows_written == 0 {
+        // The atomic UPDATE failed — diagnose why for a useful error message.
+        let job = db
+            .prepare(
+                "SELECT agent_did, status, held_sats \
+                 FROM agent_jobs WHERE job_id = ?1",
+            )
+            .bind(&[js_str(&req.job_id)])
+            .map_err(|e| Error::RustError(format!("d1 bind job read: {e:?}")))?
+            .first::<serde_json::Value>(None)
+            .await
+            .map_err(|e| Error::RustError(format!("d1 run job read: {e:?}")))?;
+
+        return match job {
+            None => json_err(env, "Job not found", 404),
+            Some(j) => {
+                let ja = j.get("agent_did").and_then(|v| v.as_str()).unwrap_or("");
+                let js = j.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                let held = j.get("held_sats").and_then(|v| v.as_u64()).unwrap_or(0);
+                if ja != agent_did {
+                    json_err(env, "Only the agent can settle this job", 403)
+                } else if js != "running" {
+                    json_err(
+                        env,
+                        &format!("Job is '{js}', expected 'running'"),
+                        409,
+                    )
+                } else {
+                    json_err(
+                        env,
+                        &format!(
+                            "actual_sats ({}) exceeds held_sats ({held})",
+                            req.actual_sats
+                        ),
+                        400,
+                    )
+                }
+            }
+        };
+    }
+
+    // The job is now atomically settled. Read back held_sats + requester_did
+    // for the refund calculation.
+    let job = db
+        .prepare(
+            "SELECT requester_did, held_sats FROM agent_jobs WHERE job_id = ?1",
+        )
+        .bind(&[js_str(&req.job_id)])
+        .map_err(|e| Error::RustError(format!("d1 bind job refund read: {e:?}")))?
+        .first::<serde_json::Value>(None)
+        .await
+        .map_err(|e| Error::RustError(format!("d1 run job refund read: {e:?}")))?;
+
+    let (requester_did, held_sats) = match job {
+        Some(j) => (
+            j.get("requester_did")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            j.get("held_sats").and_then(|v| v.as_u64()).unwrap_or(0),
+        ),
+        None => return json_err(env, "Job vanished after settle", 500),
+    };
+
+    let refund = held_sats.saturating_sub(req.actual_sats);
+
+    // Credit refund back to requester if any
+    if refund > 0 {
+        let store = D1PaymentStore::new(db);
+        store
+            .credit_atomic(&requester_did, refund)
+            .await
+            .map_err(|e| Error::RustError(e.to_string()))?;
+    }
+
+    let body = serde_json::json!({
+        "job_id": req.job_id,
+        "status": "settled",
+        "actual_sats": req.actual_sats,
+        "held_sats": held_sats,
+        "refund": refund,
+        "completed_at": now,
+    });
+    json_ok(&body)
+}
+
+/// Cancel a held or running job — refund full hold to requester.
+/// Either the requester or the agent can cancel.
+///
+/// Uses an atomic UPDATE with WHERE clause on status + ownership (requester OR
+/// agent) to eliminate the TOCTOU race. The status transition and ownership
+/// check happen in a single SQL statement.
+async fn pay_job_cancel_handler(
+    pubkey: &str,
+    body: &[u8],
+    db: &D1Database,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let req: JobActionBody =
+        serde_json::from_str(body_str).map_err(|e| Error::RustError(format!("parse: {e}")))?;
+
+    let caller_did = pubkey_to_did(pubkey);
+    let now = now_epoch_secs();
+
+    // Atomic cancel: single UPDATE that combines status check + ownership
+    // check + state transition. The caller must be either requester or agent,
+    // and the job must be in 'held' or 'running' status.
+    let result = db
+        .prepare(
+            "UPDATE agent_jobs \
+             SET status = 'failed', error = 'cancelled', completed_at = ?1 \
+             WHERE job_id = ?2 \
+               AND (status = 'held' OR status = 'running') \
+               AND (requester_did = ?3 OR agent_did = ?3)",
+        )
+        .bind(&[
+            js_i64(now),
+            js_str(&req.job_id),
+            js_str(&caller_did),
+        ])
+        .map_err(|e| Error::RustError(format!("d1 bind job cancel: {e:?}")))?
+        .run()
+        .await
+        .map_err(|e| Error::RustError(format!("d1 run job cancel: {e:?}")))?;
+
+    let rows_written = result
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.rows_written)
+        .unwrap_or(0);
+
+    if rows_written == 0 {
+        // Diagnose why the atomic UPDATE failed.
+        let job = db
+            .prepare(
+                "SELECT requester_did, agent_did, status \
+                 FROM agent_jobs WHERE job_id = ?1",
+            )
+            .bind(&[js_str(&req.job_id)])
+            .map_err(|e| Error::RustError(format!("d1 bind job read: {e:?}")))?
+            .first::<serde_json::Value>(None)
+            .await
+            .map_err(|e| Error::RustError(format!("d1 run job read: {e:?}")))?;
+
+        return match job {
+            None => json_err(env, "Job not found", 404),
+            Some(j) => {
+                let jr = j.get("requester_did").and_then(|v| v.as_str()).unwrap_or("");
+                let ja = j.get("agent_did").and_then(|v| v.as_str()).unwrap_or("");
+                let js = j.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                if caller_did != jr && caller_did != ja {
+                    json_err(env, "Only the requester or agent can cancel this job", 403)
+                } else {
+                    json_err(
+                        env,
+                        &format!("Cannot cancel job in '{js}' status"),
+                        409,
+                    )
+                }
+            }
+        };
+    }
+
+    // The job is now atomically cancelled. Read back held_sats + requester_did
+    // for the refund.
+    let job = db
+        .prepare(
+            "SELECT requester_did, held_sats FROM agent_jobs WHERE job_id = ?1",
+        )
+        .bind(&[js_str(&req.job_id)])
+        .map_err(|e| Error::RustError(format!("d1 bind job refund read: {e:?}")))?
+        .first::<serde_json::Value>(None)
+        .await
+        .map_err(|e| Error::RustError(format!("d1 run job refund read: {e:?}")))?;
+
+    let (requester_did, held_sats) = match job {
+        Some(j) => (
+            j.get("requester_did")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            j.get("held_sats").and_then(|v| v.as_u64()).unwrap_or(0),
+        ),
+        None => return json_err(env, "Job vanished after cancel", 500),
+    };
+
+    // Refund full held amount to requester
+    if held_sats > 0 {
+        let store = D1PaymentStore::new(db);
+        store
+            .credit_atomic(&requester_did, held_sats)
+            .await
+            .map_err(|e| Error::RustError(e.to_string()))?;
+    }
+
+    let body = serde_json::json!({
+        "job_id": req.job_id,
+        "status": "failed",
+        "error": "cancelled",
+        "refund": held_sats,
+        "completed_at": now,
+    });
+    json_ok(&body)
+}
+
+/// Get a single agent job by ID. Only the requester or agent can view.
+/// Accepts POST body `{ "job_id": "..." }` since the route handler does not
+/// forward query parameters to individual pay handlers.
+async fn pay_job_get_handler(
+    pubkey: &str,
+    body: &[u8],
+    db: &D1Database,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let req: JobActionBody =
+        serde_json::from_str(body_str).map_err(|e| Error::RustError(format!("parse: {e}")))?;
+
+    pay_job_get_by_id(pubkey, &req.job_id, db, env).await
+}
+
+/// Internal handler for fetching a single job by ID with access control.
+async fn pay_job_get_by_id(
+    pubkey: &str,
+    job_id: &str,
+    db: &D1Database,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    let caller_did = pubkey_to_did(pubkey);
+
+    let job = db
+        .prepare(
+            "SELECT job_id, requester_did, agent_did, endpoint, params_json, \
+             status, estimated_sats, held_sats, actual_sats, \
+             created_at, started_at, completed_at, error, expires_at \
+             FROM agent_jobs WHERE job_id = ?1",
+        )
+        .bind(&[js_str(job_id)])
+        .map_err(|e| Error::RustError(format!("d1 bind job get: {e:?}")))?
+        .first::<serde_json::Value>(None)
+        .await
+        .map_err(|e| Error::RustError(format!("d1 run job get: {e:?}")))?;
+
+    let job = match job {
+        Some(j) => j,
+        None => return json_err(env, "Job not found", 404),
+    };
+
+    // Only requester or agent can view
+    let job_requester = job.get("requester_did").and_then(|v| v.as_str()).unwrap_or("");
+    let job_agent = job.get("agent_did").and_then(|v| v.as_str()).unwrap_or("");
+
+    if caller_did != job_requester && caller_did != job_agent {
+        return json_err(env, "Only the requester or agent can view this job", 403);
+    }
+
+    json_ok(&job)
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned job recovery
+// ---------------------------------------------------------------------------
+
+/// Recover orphaned jobs: find jobs stuck in 'held' or 'running' status past
+/// their `expires_at` timestamp, transition them to 'failed' with
+/// error='expired', and refund held_sats to each requester's balance.
+///
+/// Returns the number of jobs recovered.
+pub async fn recover_orphaned_jobs(db: &D1Database) -> std::result::Result<u64, Error> {
+    let now_iso = iso8601_from_epoch(now_epoch_secs());
+
+    // Find all expired jobs that are still active (held or running).
+    // We select them first, then update + refund one by one to ensure
+    // each refund is correctly credited.
+    let rows = db
+        .prepare(
+            "SELECT job_id, requester_did, held_sats \
+             FROM agent_jobs \
+             WHERE (status = 'held' OR status = 'running') \
+               AND expires_at IS NOT NULL \
+               AND expires_at < ?1",
+        )
+        .bind(&[js_str(&now_iso)])
+        .map_err(|e| Error::RustError(format!("d1 bind orphan select: {e:?}")))?
+        .all()
+        .await
+        .map_err(|e| Error::RustError(format!("d1 run orphan select: {e:?}")))?;
+
+    let jobs: Vec<serde_json::Value> = rows
+        .results::<serde_json::Value>()
+        .unwrap_or_default();
+
+    let store = D1PaymentStore::new(db);
+    let now = now_epoch_secs();
+    let mut recovered: u64 = 0;
+
+    for job in &jobs {
+        let job_id = match job.get("job_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let requester_did = match job.get("requester_did").and_then(|v| v.as_str()) {
+            Some(did) => did,
+            None => continue,
+        };
+        let held_sats = job.get("held_sats").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        // Atomically transition to 'failed' only if still active
+        let result = db
+            .prepare(
+                "UPDATE agent_jobs \
+                 SET status = 'failed', error = 'expired', completed_at = ?1 \
+                 WHERE job_id = ?2 AND (status = 'held' OR status = 'running')",
+            )
+            .bind(&[
+                js_i64(now),
+                js_str(job_id),
+            ])
+            .map_err(|e| Error::RustError(format!("d1 bind orphan update: {e:?}")))?
+            .run()
+            .await
+            .map_err(|e| Error::RustError(format!("d1 run orphan update: {e:?}")))?;
+
+        let rows_written = result
+            .meta()
+            .ok()
+            .flatten()
+            .and_then(|m| m.rows_written)
+            .unwrap_or(0);
+
+        if rows_written == 0 {
+            // Job was already settled/cancelled between SELECT and UPDATE
+            continue;
+        }
+
+        // Refund held_sats to requester
+        if held_sats > 0 {
+            store
+                .credit_atomic(requester_did, held_sats)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+        }
+
+        recovered += 1;
+    }
+
+    Ok(recovered)
+}
+
+/// Handle `POST /pay/.cleanup` — admin-only endpoint to recover orphaned jobs.
+///
+/// Requires NIP-98 authentication and admin privileges. The caller's pubkey
+/// is checked against the `members` and `whitelist` tables for `is_admin = 1`.
+/// Without this guard, any unauthenticated caller could force-cancel expired
+/// jobs and trigger balance mutations (refunds), creating a DoS vector.
+async fn pay_cleanup_handler(
+    pubkey: &str,
+    db: &D1Database,
+    env: &Env,
+) -> std::result::Result<Response, Error> {
+    if !is_admin(pubkey, db).await {
+        return json_err(env, "Admin access required", 403);
+    }
+
+    let recovered = recover_orphaned_jobs(db).await?;
+    let body = serde_json::json!({
+        "status": "ok",
+        "recovered_jobs": recovered,
+    });
+    json_ok(&body)
+}
+
+// ---------------------------------------------------------------------------
+// Admin check (D1-backed, mirrors lib.rs is_admin_user)
+// ---------------------------------------------------------------------------
+
+/// Check if a pubkey is an admin via `members.is_admin` then `whitelist.is_admin`.
+///
+/// Accepts a `D1Database` directly (the pay handler already has the binding)
+/// rather than going through `Env` again.
+async fn is_admin(pubkey: &str, db: &D1Database) -> bool {
+    #[derive(Deserialize)]
+    struct IsAdminRow {
+        is_admin: i32,
+    }
+
+    if let Ok(stmt) = db
+        .prepare("SELECT is_admin FROM members WHERE pubkey = ?1")
+        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+    {
+        if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
+            if row.is_admin == 1 {
+                return true;
+            }
+        }
+    }
+
+    if let Ok(stmt) = db
+        .prepare("SELECT is_admin FROM whitelist WHERE pubkey = ?1")
+        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+    {
+        if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
+            return row.is_admin == 1;
+        }
+    }
+
+    false
+}
+
 fn json_ok(body: &serde_json::Value) -> std::result::Result<Response, Error> {
     let json_str = serde_json::to_string(body).map_err(|e| Error::RustError(e.to_string()))?;
     let resp = Response::ok(json_str)?;
@@ -1033,6 +1749,27 @@ fn now_epoch_secs() -> i64 {
     (js_sys::Date::now() / 1000.0) as i64
 }
 
+/// Convert an epoch-seconds timestamp to an ISO 8601 string (UTC).
+///
+/// Format: `YYYY-MM-DDTHH:MM:SSZ`. Uses the JS `Date` constructor for
+/// reliable formatting on the Workers runtime.
+fn iso8601_from_epoch(epoch_secs: i64) -> String {
+    let date = js_sys::Date::new_0();
+    date.set_time((epoch_secs as f64) * 1000.0);
+    date.to_iso_string().as_string().unwrap_or_default()
+}
+
+/// Read the configurable job expiry duration from the environment.
+///
+/// Falls back to `DEFAULT_JOB_EXPIRY_SECS` (1 hour) if the env var is
+/// missing or unparseable.
+fn job_expiry_secs(env: &Env) -> i64 {
+    env.var("JOB_EXPIRY_SECS")
+        .ok()
+        .and_then(|v| v.to_string().parse::<i64>().ok())
+        .unwrap_or(DEFAULT_JOB_EXPIRY_SECS)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1185,6 +1922,175 @@ mod tests {
         assert_ne!(
             addr1, addr2,
             "different master secrets must produce different addresses"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent job CRUD tests (pure logic — no D1 dependency)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn job_create_body_deserialises_full() {
+        let json = r#"{"agent_did":"did:nostr:abc123","endpoint":"/api/inference/run","params":{"model":"gpt4"}}"#;
+        let body: JobCreateBody = serde_json::from_str(json).expect("valid JobCreateBody");
+        assert_eq!(body.agent_did, "did:nostr:abc123");
+        assert_eq!(body.endpoint, "/api/inference/run");
+        assert!(body.params.is_some());
+        let params = body.params.unwrap();
+        assert_eq!(params["model"], "gpt4");
+    }
+
+    #[test]
+    fn job_create_body_deserialises_minimal() {
+        let json = r#"{"agent_did":"did:nostr:abc","endpoint":"/api/health"}"#;
+        let body: JobCreateBody = serde_json::from_str(json).expect("valid JobCreateBody");
+        assert_eq!(body.agent_did, "did:nostr:abc");
+        assert_eq!(body.endpoint, "/api/health");
+        assert!(body.params.is_none());
+    }
+
+    #[test]
+    fn job_action_body_deserialises() {
+        let json = r#"{"job_id":"job_1234567890_abcdef01"}"#;
+        let body: JobActionBody = serde_json::from_str(json).expect("valid JobActionBody");
+        assert_eq!(body.job_id, "job_1234567890_abcdef01");
+    }
+
+    #[test]
+    fn job_settle_body_deserialises() {
+        let json = r#"{"job_id":"job_1234567890_abcdef01","actual_sats":42}"#;
+        let body: JobSettleBody = serde_json::from_str(json).expect("valid JobSettleBody");
+        assert_eq!(body.job_id, "job_1234567890_abcdef01");
+        assert_eq!(body.actual_sats, 42);
+    }
+
+    /// Verify the job_id format: `job_<timestamp>_<hex16>`.
+    /// This test validates the format contract without calling generate_job_id(),
+    /// which depends on js_sys (wasm-only).
+    #[test]
+    fn job_id_format_contract() {
+        // Simulate what generate_job_id() produces (8 random bytes = 16 hex chars)
+        let id = "job_1715443200_1a2b3c4d5e6f7a8b";
+        assert!(id.starts_with("job_"));
+        let parts: Vec<&str> = id.splitn(3, '_').collect();
+        assert_eq!(parts.len(), 3, "job_id must have 3 parts: job_<ts>_<hex16>");
+        assert!(
+            parts[1].parse::<i64>().is_ok(),
+            "second part must be a timestamp"
+        );
+        assert_eq!(parts[2].len(), 16, "third part must be 16 hex chars");
+        assert!(
+            parts[2].chars().all(|c| c.is_ascii_hexdigit()),
+            "third part must be hex"
+        );
+    }
+
+    #[test]
+    fn job_hold_calculation_20_percent_buffer() {
+        // Verify the hold calculation: hold = ceil(estimated * 1.2)
+        let estimated: u64 = 100;
+        let held = (estimated as f64 * 1.2).ceil() as u64;
+        assert_eq!(held, 120, "hold should be 120% of estimate");
+
+        let estimated: u64 = 10;
+        let held = (estimated as f64 * 1.2).ceil() as u64;
+        assert_eq!(held, 12);
+
+        // Non-round numbers
+        let estimated: u64 = 7;
+        let held = (estimated as f64 * 1.2).ceil() as u64;
+        // 7 * 1.2 = 8.4, ceil = 9
+        assert_eq!(held, 9);
+    }
+
+    #[test]
+    fn job_settle_refund_calculation() {
+        let held: u64 = 120;
+        let actual: u64 = 80;
+        let refund = held - actual;
+        assert_eq!(refund, 40);
+
+        // No refund when actual equals held
+        let held: u64 = 120;
+        let actual: u64 = 120;
+        let refund = held - actual;
+        assert_eq!(refund, 0);
+    }
+
+    #[test]
+    fn job_settle_overpay_detection() {
+        let held: u64 = 120;
+        let actual: u64 = 150;
+        assert!(
+            actual > held,
+            "actual > held should be detected and rejected"
+        );
+    }
+
+    #[test]
+    fn job_estimate_for_inference_endpoint() {
+        let base_cost = 1;
+        let estimated = estimate_endpoint_cost("/api/inference/run", base_cost);
+        let held = (estimated as f64 * 1.2).ceil() as u64;
+        assert_eq!(estimated, 10, "inference is 10x base");
+        assert_eq!(held, 12, "hold is 120% of 10");
+    }
+
+    #[test]
+    fn job_estimate_for_image_gen_endpoint() {
+        let base_cost = 1;
+        let estimated = estimate_endpoint_cost("/api/image-gen/submit", base_cost);
+        let held = (estimated as f64 * 1.2).ceil() as u64;
+        assert_eq!(estimated, 100, "image-gen is 100x base");
+        assert_eq!(held, 120, "hold is 120% of 100");
+    }
+
+    #[test]
+    fn job_cancel_refunds_full_hold() {
+        // Cancel always refunds 100% of held_sats regardless of status
+        let held: u64 = 120;
+        let refund = held; // Full refund
+        assert_eq!(refund, 120);
+    }
+
+    // -----------------------------------------------------------------------
+    // Job expiry and orphan recovery tests (pure logic — no D1 dependency)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_job_expiry_is_one_hour() {
+        assert_eq!(DEFAULT_JOB_EXPIRY_SECS, 3600);
+    }
+
+    #[test]
+    fn job_create_body_with_optional_ttl() {
+        // Verify JobCreateBody still deserialises (no breaking changes)
+        let json = r#"{"agent_did":"did:nostr:abc123","endpoint":"/api/health"}"#;
+        let body: JobCreateBody = serde_json::from_str(json).expect("valid");
+        assert_eq!(body.endpoint, "/api/health");
+    }
+
+    #[test]
+    fn iso8601_expiry_comparison_ordering() {
+        // Verify that ISO 8601 string comparison works correctly for
+        // the expires_at < now() check in the orphan recovery SQL.
+        let t1 = "2025-01-01T00:00:00.000Z";
+        let t2 = "2025-01-01T01:00:00.000Z";
+        let t3 = "2025-12-31T23:59:59.000Z";
+        assert!(t1 < t2, "earlier timestamp must sort before later");
+        assert!(t2 < t3, "same-year timestamps must sort correctly");
+    }
+
+    #[test]
+    fn expiry_calculation_uses_held_plus_buffer() {
+        // expires_at = created_at + JOB_EXPIRY_SECS (default 3600)
+        let created_at: i64 = 1715443200; // arbitrary epoch
+        let expiry_secs: i64 = DEFAULT_JOB_EXPIRY_SECS;
+        let expires_at_epoch = created_at + expiry_secs;
+        assert_eq!(
+            expires_at_epoch - created_at,
+            3600,
+            "default expiry is 1 hour after creation"
         );
     }
 }

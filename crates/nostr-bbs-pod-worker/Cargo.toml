@@ -28,6 +28,7 @@ base64 = { workspace = true }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 async-trait = { workspace = true }
+getrandom = { workspace = true }
 
 # Phase 4 absorption (ADR-076/078): pure-logic surfaces of solid-pod-rs
 # replace the hand-rolled WAC, WebID, DID, NIP-98 verifier modules.
