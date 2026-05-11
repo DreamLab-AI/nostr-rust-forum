@@ -464,11 +464,8 @@ pub fn ChannelPage() -> impl IntoView {
                                             let show_divider = if !found_divider && !last_read.is_empty() && msg.id == last_read {
                                                 found_divider = true;
                                                 false
-                                            } else if found_divider {
-                                                found_divider = false;
-                                                true
                                             } else {
-                                                false
+                                                std::mem::take(&mut found_divider)
                                             };
                                             view! {
                                                 <>

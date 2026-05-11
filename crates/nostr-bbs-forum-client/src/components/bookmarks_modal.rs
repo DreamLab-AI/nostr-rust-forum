@@ -49,7 +49,7 @@ impl BookmarkStore {
         let sig = self.bookmarks;
         Signal::derive(move || {
             let mut bm = sig.get();
-            bm.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            bm.sort_by_key(|x| std::cmp::Reverse(x.timestamp));
             bm
         })
     }

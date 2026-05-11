@@ -77,7 +77,7 @@ impl DMStore {
         Memo::new(move |_| {
             let inner = state.get();
             let mut convos: Vec<DMConversation> = inner.conversations.values().cloned().collect();
-            convos.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
+            convos.sort_by_key(|x| std::cmp::Reverse(x.last_timestamp));
             convos
         })
     }

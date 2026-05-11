@@ -74,7 +74,7 @@ pub fn AdminCalendar() -> impl IntoView {
                 } else {
                     list.push(entry);
                 }
-                list.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+                list.sort_by_key(|x| std::cmp::Reverse(x.start_time));
             });
         });
 

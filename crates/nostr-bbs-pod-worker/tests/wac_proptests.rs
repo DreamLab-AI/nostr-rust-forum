@@ -401,14 +401,10 @@ fn normalise_path(path: &str) -> String {
     }
 }
 
-fn path_matches_local(rule_path: &str, resource_path: &str, is_default: bool) -> bool {
+fn path_matches_local(rule_path: &str, resource_path: &str, _is_default: bool) -> bool {
     let rule = normalise_path(rule_path);
     let resource = normalise_path(resource_path);
-    if !is_default {
-        resource == rule || resource.starts_with(&format!("{rule}/"))
-    } else {
-        resource.starts_with(&format!("{rule}/")) || resource == rule
-    }
+    resource == rule || resource.starts_with(&format!("{rule}/"))
 }
 
 proptest! {

@@ -11,10 +11,6 @@ all-features = true
 [advisories]
 # Fail CI on any known vulnerability.
 vulnerability = "deny"
-# Unmaintained crates are flagged but do not block.
-unmaintained = "warn"
-# Yanked crates should not ship.
-yanked = "deny"
 # Allow-list specific advisories here if needed (e.g. waiting on upstream fix):
 # ignore = ["RUSTSEC-2024-XXXX"]
 

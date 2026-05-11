@@ -117,7 +117,7 @@ fn StatsDashboardInner() -> impl IntoView {
             let entry = ActivityEntry::from_event(&event);
             activity_sig.update(|list| {
                 list.push(entry);
-                list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                list.sort_by_key(|x| std::cmp::Reverse(x.created_at));
                 list.truncate(10);
             });
         });

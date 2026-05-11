@@ -1,7 +1,7 @@
 //! remoteStorage protocol compatibility layer.
 //!
 //! Maps remoteStorage requests to the existing Solid pod storage.
-//! @see https://tools.ietf.org/html/draft-dejong-remotestorage-22
+//! @see <https://tools.ietf.org/html/draft-dejong-remotestorage-22>
 
 use serde_json::json;
 

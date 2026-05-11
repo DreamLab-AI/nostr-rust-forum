@@ -132,7 +132,7 @@ pub fn ChatPage() -> impl IntoView {
             }
         }
         let mut sorted: Vec<_> = counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
         sorted.truncate(10);
         sorted
             .into_iter()
@@ -211,7 +211,7 @@ pub fn ChatPage() -> impl IntoView {
             })
             .collect();
 
-        result.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        result.sort_by_key(|x| std::cmp::Reverse(x.last_active));
         result
     };
 
@@ -246,7 +246,7 @@ pub fn ChatPage() -> impl IntoView {
             })
             .collect();
 
-        result.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        result.sort_by_key(|x| std::cmp::Reverse(x.last_active));
         result
     };
 
