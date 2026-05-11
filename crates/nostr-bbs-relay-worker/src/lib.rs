@@ -160,6 +160,7 @@ fn json_response(
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Idempotent schema migrations (trust columns, new tables, etc.)
     ensure_schema(&env).await;
+    nostr_bbs_rate_limit::ensure_replay_schema(&env, "DB").await;
 
     // CORS preflight
     if req.method() == Method::Options {

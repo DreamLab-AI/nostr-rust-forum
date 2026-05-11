@@ -435,6 +435,8 @@ async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
+
     // CORS preflight
     if req.method() == Method::Options {
         return Ok(Response::empty()?

@@ -13,12 +13,12 @@ bucket_name = "nostr-bbs-vectors"
 binding = "SEARCH_CONFIG"
 id = "440b1f07ff224fb8ad644e094c6766c0"
 
-# NIP-98 replay cache (TTL = 2 * tolerance window). Shared id with auth-worker.
-# TODO(ops): provision via `wrangler kv:namespace create nostr-bbs-nip98-replay`.
-# SECURITY TODO: Placeholder IDs now make ingest/admin auth fail closed. Replace this before deploy.
-[[kv_namespaces]]
-binding = "NIP98_REPLAY"
-id = "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3"
+# D1 database for NIP-98 replay protection (atomic INSERT OR IGNORE).
+# Shares the auth-worker's D1 database so cross-worker replay is detected.
+[[d1_databases]]
+binding = "REPLAY_DB"
+database_name = "nostr-bbs-auth"
+database_id = "e3981999-e8f0-4c07-9e4b-2e50859b8524"
 
 [vars]
 ALLOWED_ORIGIN = "https://example.com"

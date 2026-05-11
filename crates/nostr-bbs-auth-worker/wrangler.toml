@@ -29,13 +29,8 @@ id = "8ec8759ab40d4709a831bf6b0e5241eb"
 binding = "ADMIN_KV"
 id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 
-# NIP-98 replay cache. TTL = 2 * tolerance (~120s) per
-# nostr_bbs_core::REPLAY_CACHE_TTL_SECS. Production deployments MUST set this.
-# TODO(ops): provision via `wrangler kv:namespace create nostr-bbs-nip98-replay`.
-# SECURITY TODO: Placeholder IDs now make auth fail closed. Replace this before deploy.
-[[kv_namespaces]]
-binding = "NIP98_REPLAY"
-id = "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3"
+# NIP-98 replay protection now uses the D1 database (nip98_replay table)
+# instead of KV. The auth-worker's own DB binding serves double duty.
 
 # Legacy alias used by admins.rs cache (60-second admin pubkey list).
 # Points at SESSIONS today; migrate to ADMIN_KV in a follow-up sprint.

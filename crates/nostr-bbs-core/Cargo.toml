@@ -33,8 +33,9 @@ cbc = { workspace = true }
 bech32 = { workspace = true }
 async-trait = { workspace = true }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { workspace = true }
 serde-wasm-bindgen = "0.6"
 

@@ -19,6 +19,7 @@ test-exports = []
 
 [dependencies]
 nostr-bbs-core = { workspace = true }
+nostr-bbs-rate-limit = { workspace = true }
 worker = { workspace = true, features = ["d1"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

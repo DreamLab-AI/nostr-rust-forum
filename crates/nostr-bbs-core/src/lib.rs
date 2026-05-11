@@ -25,7 +25,6 @@ pub mod nip98;
 pub mod signer;
 pub mod types;
 
-#[cfg(target_arch = "wasm32")]
 pub mod d1_helpers;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_bridge;

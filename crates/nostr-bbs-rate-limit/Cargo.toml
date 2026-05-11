@@ -10,5 +10,10 @@ keywords = ["nostr", "bbs", "rate-limit", "cloudflare-workers"]
 categories = ["web-programming"]
 
 [dependencies]
-worker = { workspace = true }
+worker = { workspace = true, features = ["d1"] }
 js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+async-trait = { workspace = true }
+nostr-bbs-core = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

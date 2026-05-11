@@ -1,10 +1,24 @@
-//! Shared application-layer rate limiting via Cloudflare KV.
+//! Shared application-layer rate limiting and NIP-98 replay protection for
+//! Cloudflare Workers.
 //!
-//! Uses a sliding-window approach with minute-bucketed KV keys.
+//! ## Rate limiting
+//!
+//! Sliding-window approach with minute-bucketed KV keys.
 //! Key format: `rl:{ip}:{minute_bucket}` with TTL = window seconds.
 //!
-//! The KV binding name is caller-supplied so each worker can use its own
-//! Cloudflare KV namespace without duplicating the implementation.
+//! ## NIP-98 replay protection
+//!
+//! [`D1ReplayStore`] provides atomic replay detection via D1 `INSERT OR IGNORE`
+//! on a `UNIQUE` event_id column. This replaces the non-atomic KV get+put
+//! pattern that was vulnerable to concurrent replay races.
+//!
+//! [`verify_nip98`] is the one-stop verification function that all workers
+//! should call — it handles timestamp extraction, D1 binding lookup, and
+//! delegates to `nostr_bbs_core::verify_nip98_token_at_with_replay`.
+
+mod replay;
+
+pub use replay::{ensure_replay_schema, sha256_hex, verify_nip98, D1ReplayStore};
 
 use worker::*;
 

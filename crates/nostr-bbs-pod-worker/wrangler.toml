@@ -24,12 +24,12 @@ id = "8ec8759ab40d4709a831bf6b0e5241eb"
 binding = "ADMIN_KV_RO"
 id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 
-# NIP-98 replay cache (shared with auth-worker; same id).
-# TODO(ops): provision a fresh namespace.
-# SECURITY TODO: Placeholder IDs now make NIP-98 protected pod requests fail closed.
-[[kv_namespaces]]
-binding = "NIP98_REPLAY"
-id = "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3"
+# D1 database for NIP-98 replay protection (atomic INSERT OR IGNORE).
+# Shares the auth-worker's D1 database so cross-worker replay is detected.
+[[d1_databases]]
+binding = "REPLAY_DB"
+database_name = "nostr-bbs-auth"
+database_id = "e3981999-e8f0-4c07-9e4b-2e50859b8524"
 
 [vars]
 EXPECTED_ORIGIN = "https://example.com"

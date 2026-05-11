@@ -111,6 +111,7 @@ async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
     // invitations, invitation_redemptions, instance_settings) exist before
     // any handler tries to use them. Failures are swallowed inside.
     schema::ensure_schema(env).await;
+    nostr_bbs_rate_limit::ensure_replay_schema(env, "DB").await;
 
     // CORS preflight
     if req.method() == Method::Options {

@@ -17,12 +17,8 @@ database_name = "nostr-bbs-relay"
 database_id = "97c77d23-0e24-4325-ada7-1747eab4095b"
 migrations_dir = "migrations"
 
-# NIP-98 replay cache (TTL = 2 * tolerance window). Shared id with auth-worker.
-# TODO(ops): provision via `wrangler kv:namespace create nostr-bbs-nip98-replay`.
-# SECURITY TODO: Placeholder IDs now make admin-auth endpoints fail closed. Replace this before deploy.
-[[kv_namespaces]]
-binding = "NIP98_REPLAY"
-id = "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3"
+# NIP-98 replay protection now uses the D1 database (nip98_replay table)
+# instead of KV. The relay-worker's own DB binding serves double duty.
 
 [durable_objects]
 bindings = [

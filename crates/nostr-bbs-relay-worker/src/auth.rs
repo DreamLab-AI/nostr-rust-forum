@@ -1,50 +1,19 @@
 //! NIP-98 admin verification for the relay worker.
 //!
 //! Verifies the `Authorization: Nostr <base64(event)>` header using
-//! `nostr_bbs_core::verify_nip98_token_at`, then checks whether the authenticated
-//! pubkey holds admin privileges via the D1 `whitelist.is_admin` column.
+//! D1-backed atomic replay protection via `nostr_bbs_rate_limit::verify_nip98`,
+//! then checks whether the authenticated pubkey holds admin privileges via the
+//! D1 `whitelist.is_admin` column.
 
-use async_trait::async_trait;
-use nostr_bbs_core::nip98::{Nip98Error, Nip98ReplayStore, Nip98Token};
+use nostr_bbs_core::nip98::{Nip98Error, Nip98Token};
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
-use worker::{kv::KvStore, Env};
+use worker::Env;
 
-// ---------------------------------------------------------------------------
-// NIP-98 verification
-// ---------------------------------------------------------------------------
+/// D1 binding name for the replay store (same DB as the relay's main tables).
+const REPLAY_DB: &str = "DB";
 
-/// KV-backed NIP-98 replay store (TTL = 2 * tolerance window).
-pub struct KvReplayStore<'a> {
-    pub kv: &'a KvStore,
-    pub ttl_secs: u64,
-}
-
-#[async_trait(?Send)]
-impl<'a> Nip98ReplayStore for KvReplayStore<'a> {
-    async fn seen_or_record(&self, event_id: &str) -> Result<bool, String> {
-        let key = format!("nip98:{event_id}");
-        // SECURITY TODO: Cloudflare KV get+put is not atomic. Missing bindings
-        // now fail closed, but concurrent replay races remain possible until
-        // this store moves to a Durable Object or D1 UNIQUE insert.
-        match self.kv.get(&key).text().await {
-            Ok(Some(_)) => return Ok(false),
-            Ok(None) => {}
-            Err(e) => return Err(format!("kv get failed: {e:?}")),
-        }
-        let put = self
-            .kv
-            .put(&key, "1")
-            .map_err(|e| format!("kv put builder: {e:?}"))?;
-        put.expiration_ttl(self.ttl_secs)
-            .execute()
-            .await
-            .map_err(|e| format!("kv put exec: {e:?}"))?;
-        Ok(true)
-    }
-}
-
-/// Verify a NIP-98 `Authorization` header WITH replay protection.
+/// Verify a NIP-98 `Authorization` header with D1-backed atomic replay protection.
 pub async fn verify_nip98_replay(
     auth_header: &str,
     expected_url: &str,
@@ -52,22 +21,13 @@ pub async fn verify_nip98_replay(
     body: Option<&[u8]>,
     env: &Env,
 ) -> Result<Nip98Token, Nip98Error> {
-    let now = js_now_secs();
-    let ttl = nostr_bbs_core::REPLAY_CACHE_TTL_SECS;
-    let kv = env
-        .kv("NIP98_REPLAY")
-        .map_err(|_| Nip98Error::ReplayBackend("NIP98_REPLAY KV binding missing".into()))?;
-    let store = KvReplayStore {
-        kv: &kv,
-        ttl_secs: ttl,
-    };
-    nostr_bbs_core::verify_nip98_token_at_with_replay(
+    nostr_bbs_rate_limit::verify_nip98(
         auth_header,
         expected_url,
         expected_method,
         body,
-        now,
-        &store,
+        env,
+        REPLAY_DB,
     )
     .await
 }
@@ -96,7 +56,6 @@ pub fn js_now_secs() -> u64 {
 // Admin checks
 // ---------------------------------------------------------------------------
 
-/// D1 row type for admin status queries.
 #[derive(Deserialize)]
 struct IsAdminRow {
     is_admin: i32,

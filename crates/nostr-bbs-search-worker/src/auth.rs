@@ -1,40 +1,13 @@
 //! NIP-98 authentication for the search worker.
 //!
-//! Ingest endpoint requires NIP-98 admin auth. Uses the same pattern as
-//! relay-worker and auth-worker: verify signature, check admin pubkeys.
+//! Ingest endpoint requires NIP-98 admin auth. Uses D1-backed atomic replay
+//! protection via `nostr_bbs_rate_limit::verify_nip98`.
 
-use async_trait::async_trait;
-use nostr_bbs_core::nip98::{Nip98Error, Nip98ReplayStore, Nip98Token};
-use worker::{kv::KvStore, Env};
+use nostr_bbs_core::nip98::{Nip98Error, Nip98Token};
+use worker::Env;
 
-pub struct KvReplayStore<'a> {
-    pub kv: &'a KvStore,
-    pub ttl_secs: u64,
-}
-
-#[async_trait(?Send)]
-impl<'a> Nip98ReplayStore for KvReplayStore<'a> {
-    async fn seen_or_record(&self, event_id: &str) -> Result<bool, String> {
-        let key = format!("nip98:{event_id}");
-        // SECURITY TODO: Cloudflare KV get+put is not atomic. Missing bindings
-        // now fail closed, but concurrent replay races remain possible until
-        // this store moves to a Durable Object or D1 UNIQUE insert.
-        match self.kv.get(&key).text().await {
-            Ok(Some(_)) => return Ok(false),
-            Ok(None) => {}
-            Err(e) => return Err(format!("kv get failed: {e:?}")),
-        }
-        let put = self
-            .kv
-            .put(&key, "1")
-            .map_err(|e| format!("kv put builder: {e:?}"))?;
-        put.expiration_ttl(self.ttl_secs)
-            .execute()
-            .await
-            .map_err(|e| format!("kv put exec: {e:?}"))?;
-        Ok(true)
-    }
-}
+/// D1 binding name for the replay store.
+const REPLAY_DB: &str = "REPLAY_DB";
 
 pub async fn verify_nip98_replay(
     auth_header: &str,
@@ -43,22 +16,13 @@ pub async fn verify_nip98_replay(
     body: Option<&[u8]>,
     env: &Env,
 ) -> Result<Nip98Token, Nip98Error> {
-    let now = (js_sys::Date::now() / 1000.0) as u64;
-    let ttl = nostr_bbs_core::REPLAY_CACHE_TTL_SECS;
-    let kv = env
-        .kv("NIP98_REPLAY")
-        .map_err(|_| Nip98Error::ReplayBackend("NIP98_REPLAY KV binding missing".into()))?;
-    let store = KvReplayStore {
-        kv: &kv,
-        ttl_secs: ttl,
-    };
-    nostr_bbs_core::verify_nip98_token_at_with_replay(
+    nostr_bbs_rate_limit::verify_nip98(
         auth_header,
         expected_url,
         expected_method,
         body,
-        now,
-        &store,
+        env,
+        REPLAY_DB,
     )
     .await
 }

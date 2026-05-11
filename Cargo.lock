@@ -1961,6 +1961,7 @@ dependencies = [
  "hex",
  "js-sys",
  "nostr-bbs-core",
+ "nostr-bbs-rate-limit",
  "proptest",
  "serde",
  "serde_json",
@@ -1986,7 +1987,12 @@ dependencies = [
 name = "nostr-bbs-rate-limit"
 version = "3.0.0-rc6"
 dependencies = [
+ "async-trait",
+ "hex",
  "js-sys",
+ "nostr-bbs-core",
+ "sha2",
+ "wasm-bindgen",
  "worker",
 ]
 
@@ -2000,6 +2006,7 @@ dependencies = [
  "hex",
  "js-sys",
  "nostr-bbs-core",
+ "nostr-bbs-rate-limit",
  "serde",
  "serde_json",
  "sha2",

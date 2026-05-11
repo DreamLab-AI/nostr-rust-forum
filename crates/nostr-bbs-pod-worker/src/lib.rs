@@ -238,6 +238,8 @@ fn json_ok(env: &Env, body: &serde_json::Value, status: u16) -> Result<Response>
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
+
     // CORS preflight
     if req.method() == Method::Options {
         return Ok(Response::empty()?
