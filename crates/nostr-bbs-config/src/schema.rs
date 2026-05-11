@@ -48,7 +48,7 @@ pub struct ForumConfig {
 pub struct Deployment {
     /// Human-readable name (e.g. "Nostr BBS Community Forum").
     pub name: String,
-    /// Canonical hostname (e.g. "https://example.com"). HTTPS REQUIRED.
+    /// Canonical hostname (e.g. `https://example.com`). HTTPS REQUIRED.
     pub hostname: String,
 }
 

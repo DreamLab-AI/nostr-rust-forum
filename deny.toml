@@ -9,9 +9,6 @@ all-features = true
 # Advisories — check against the RustSec advisory database
 # ---------------------------------------------------------------------------
 [advisories]
-# Fail CI on any known vulnerability.
-vulnerability = "deny"
-# Allow-list specific advisories here if needed (e.g. waiting on upstream fix):
 # ignore = ["RUSTSEC-2024-XXXX"]
 
 # ---------------------------------------------------------------------------

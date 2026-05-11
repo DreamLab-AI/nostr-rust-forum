@@ -22,7 +22,7 @@ use nostr_bbs_core::nip19::{
 // ── npub ──────────────────────────────────────────────────────────────────────
 
 /// fiatjaf's well-known public key — the canonical NIP-19 test vector.
-/// Source: https://github.com/nostr-protocol/nips/blob/master/19.md
+/// Source: <https://github.com/nostr-protocol/nips/blob/master/19.md>
 const FIATJAF_HEX: &str = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
 const FIATJAF_NPUB: &str = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
 
