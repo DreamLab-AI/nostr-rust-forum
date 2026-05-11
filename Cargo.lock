@@ -3094,6 +3094,8 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "solid-pod-rs"
 version = "0.4.0-alpha.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24df58741e95071395f2bd705784004801a678bfc52dae8fd122a9edc2eefb06"
 dependencies = [
  "async-trait",
  "base64",
