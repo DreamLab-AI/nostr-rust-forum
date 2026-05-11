@@ -160,7 +160,7 @@ fn json_response(
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Idempotent schema migrations (trust columns, new tables, etc.)
     ensure_schema(&env).await;
-    nostr_bbs_rate_limit::ensure_replay_schema(&env, "DB").await;
+    nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
 
     // CORS preflight
     if req.method() == Method::Options {
@@ -237,7 +237,7 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
                 "status": "healthy",
                 "version": "3.0.0",
                 "runtime": "workers-rs",
-                "nips": [1, 9, 11, 16, 17, 26, 29, 33, 40, 42, 45, 50, 59, 65, 90, 98],
+                "nips": [1, 9, 11, 16, 17, 29, 33, 40, 42, 45, 50, 59, 65, 90, 98],
             }),
             200,
         );

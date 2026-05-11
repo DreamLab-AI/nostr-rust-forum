@@ -26,6 +26,7 @@ mod session;
 mod storage;
 
 pub(crate) use mod_cache::ModCache;
+use crate::auth::AdminCache;
 
 #[cfg(feature = "test-exports")]
 #[doc(hidden)]
@@ -60,6 +61,9 @@ pub struct NostrRelayDO {
     pub(crate) connection_counts: RefCell<HashMap<String, u32>>,
     /// WI-2: 60s-TTL cache of active ban/mute actions keyed by target pubkey.
     pub(crate) mod_cache: ModCache,
+    /// P2-03: 5-minute TTL cache for admin status, eliminating redundant D1
+    /// queries on the EVENT hot path.
+    pub(crate) admin_cache: AdminCache,
 }
 
 impl DurableObject for NostrRelayDO {
@@ -72,6 +76,7 @@ impl DurableObject for NostrRelayDO {
             rate_limits: RefCell::new(HashMap::new()),
             connection_counts: RefCell::new(HashMap::new()),
             mod_cache: ModCache::new(),
+            admin_cache: AdminCache::new(),
         }
     }
 

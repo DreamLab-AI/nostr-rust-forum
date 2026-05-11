@@ -102,8 +102,10 @@ impl NostrRelayDO {
         // (60s DO cache). Applies to any content-producing kind we care
         // about. Admins bypass so they can e.g. publish warnings even
         // while under moderation for other reasons.
+        //
+        // P2-03: use admin_cache to avoid redundant D1 queries on every event.
         if matches!(event.kind, 1 | 42)
-            && !auth::is_admin(&event.pubkey, &self.env).await
+            && !self.admin_cache.is_admin(&event.pubkey, &self.env).await
             && self.mod_cache.is_blocked(&event.pubkey, &self.env).await
         {
             Self::send_ok(ws, &event.id, false, "blocked: author is banned or muted");
@@ -111,7 +113,8 @@ impl NostrRelayDO {
         }
 
         // Trust-level gating for specific event kinds
-        let is_admin = auth::is_admin(&event.pubkey, &self.env).await;
+        // P2-03: cached lookup — same TTL entry reused from above if still fresh.
+        let is_admin = self.admin_cache.is_admin(&event.pubkey, &self.env).await;
         if !is_admin {
             let trust_level = trust::get_trust_level(&event.pubkey, &self.env).await;
 
@@ -402,7 +405,7 @@ impl NostrRelayDO {
                         let zone = trust::get_channel_zone(&channel_id, &self.env)
                             .await
                             .unwrap_or_else(|| "home".to_string());
-                        let is_admin = auth::is_admin(pk, &self.env).await;
+                        let is_admin = self.admin_cache.is_admin(pk, &self.env).await;
                         if !is_admin && !trust::has_zone_access(pk, &zone, &self.env).await {
                             continue; // skip this event
                         }

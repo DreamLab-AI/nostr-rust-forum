@@ -1,9 +1,50 @@
 //! NIP-98: HTTP Auth via Nostr events (kind 27235).
 //!
-//! Implements token creation and verification matching the TypeScript
-//! implementation in `workers/shared/nip98.ts` and `packages/nip98/`.
+//! **Canonical Rust implementation for the DreamLab ecosystem.**
+//!
+//! This module is the single source of truth for NIP-98 verification across
+//! nostr-rust-forum, solid-pod-rs, VisionClaw, and any future Rust consumers.
+//! All verification paths converge here; downstream crates should depend on
+//! `nostr_bbs_core::nip98` rather than rolling their own.
 //!
 //! Wire format: `Authorization: Nostr base64(json(signed_event))`
+//!
+//! ## Verification checks (in order)
+//!
+//! 1. Strip `Nostr ` prefix from the Authorization header
+//! 2. Size-gate the encoded token (max 64 KiB)
+//! 3. Base64-decode and JSON-parse into a [`NostrEvent`]
+//! 4. Assert `kind == 27235`
+//! 5. Validate pubkey format (64 hex chars)
+//! 6. Check timestamp freshness within `max_age_secs` (default 60s)
+//! 7. Recompute event ID from canonical NIP-01 serialisation and verify
+//!    the BIP-340 Schnorr signature (never trusts the client-provided id)
+//! 8. Match the `u` tag against the expected URL
+//! 9. Match the `method` tag against the expected HTTP method (case-insensitive)
+//! 10. If a request body is provided, verify the `payload` tag contains its SHA-256
+//!
+//! ## Replay protection
+//!
+//! The [`Nip98ReplayStore`] trait abstracts the storage backend for replay
+//! detection. The `nostr-bbs-rate-limit` crate provides a D1-backed
+//! implementation; tests use an in-memory map. Replay checking is performed
+//! **after** all cryptographic checks pass so that the store is never
+//! polluted by forged or expired events.
+//!
+//! ## Quick start
+//!
+//! ```rust,ignore
+//! use nostr_bbs_core::nip98::{verify_nip98, Nip98Token, Nip98Error};
+//!
+//! // Stateless verification (no replay protection)
+//! let token: Nip98Token = verify_nip98(
+//!     auth_header,    // "Nostr base64..."
+//!     expected_url,   // "https://api.example.com/endpoint"
+//!     expected_method,// "POST"
+//!     None,           // max_age_secs — defaults to 60
+//! )?;
+//! println!("Authenticated pubkey: {}", token.pubkey);
+//! ```
 //!
 //! [`Nip98Token`] carries the validated `event_id` (recomputed by
 //! `verify_event_strict`, never trusted from the client), enabling
@@ -54,8 +95,14 @@ pub trait Nip98ReplayStore {
 
 /// A verified NIP-98 token with extracted fields.
 ///
-/// Returned by [`verify_token`] and [`verify_token_at`] after successful
-/// verification of an `Authorization: Nostr <base64(event)>` header.
+/// Returned by all `verify_*` functions ([`verify_nip98`], [`verify_token`],
+/// [`verify_token_at`], [`verify_token_full`], [`verify_token_at_with_replay`],
+/// [`verify_nip98_with_replay`]) after successful verification of an
+/// `Authorization: Nostr <base64(event)>` header.
+///
+/// The `event_id` field contains the **canonical** event ID recomputed from
+/// the NIP-01 serialisation — it is never taken from the client-provided
+/// payload. This makes it safe to use as a replay-cache key.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Nip98Token {
     /// Canonical event ID (validated via `verify_event_strict` before population).
@@ -96,8 +143,12 @@ pub enum Nip98Error {
     #[error("invalid pubkey: expected 64 hex chars")]
     InvalidPubkey,
 
-    #[error("timestamp expired: event created_at {event_ts} is more than {TIMESTAMP_TOLERANCE}s from now ({now})")]
-    TimestampExpired { event_ts: u64, now: u64 },
+    #[error("timestamp expired: event created_at {event_ts} is more than {tolerance}s from now ({now})")]
+    TimestampExpired {
+        event_ts: u64,
+        now: u64,
+        tolerance: u64,
+    },
 
     #[error("missing required tag: {0}")]
     MissingTag(String),
@@ -191,11 +242,84 @@ pub fn create_token_at(
     Ok(BASE64.encode(json.as_bytes()))
 }
 
-/// Verify a NIP-98 `Authorization` header value using the system clock.
+// ── Canonical verification API ─────────────────────────────────────────────
+//
+// The public API is layered for ergonomics and backward compatibility:
+//
+//   verify_nip98()                — canonical entry point (system clock, configurable tolerance)
+//   verify_token()               — legacy alias using default tolerance + system clock
+//   verify_token_at()            — explicit timestamp, default tolerance
+//   verify_token_full()          — full control: explicit timestamp + custom tolerance
+//   verify_token_at_with_replay()— full control + async replay protection
+//
+// All paths converge on `verify_token_full`.
+
+/// **Canonical NIP-98 verification entry point.**
 ///
-/// Delegates to [`verify_token_at`] with the current Unix timestamp from
-/// `SystemTime::now()`. Prefer [`verify_token_at`] in tests or environments
-/// where you want deterministic timestamp control.
+/// Verifies the `Authorization: Nostr <base64(event)>` header against the
+/// expected URL and HTTP method. Uses the system clock for timestamp checking.
+///
+/// This is the recommended function for all new code across the DreamLab
+/// ecosystem. It performs every check specified by NIP-98:
+///
+/// - Kind == 27235
+/// - URL tag matches `expected_url`
+/// - Method tag matches `expected_method` (case-insensitive)
+/// - Timestamp within `max_age_secs` of the current time
+/// - BIP-340 Schnorr signature over the canonical NIP-01 event hash
+/// - Optional payload SHA-256 verification (when a request body is present)
+///
+/// # Arguments
+///
+/// * `auth_header` - The full `Authorization` header value (e.g. `"Nostr base64..."`)
+/// * `expected_url` - The URL that should appear in the `u` tag
+/// * `expected_method` - The HTTP method that should appear in the `method` tag
+/// * `max_age_secs` - Maximum allowed clock skew in seconds. Pass `None` to use
+///   the default [`TIMESTAMP_TOLERANCE`] (60 seconds).
+///
+/// # Returns
+///
+/// A [`Nip98Token`] containing the verified pubkey, URL, method, payload hash,
+/// and canonical event ID (safe to use as a replay-cache key).
+///
+/// # Errors
+///
+/// Returns [`Nip98Error`] on any verification failure. The error variants are
+/// specific enough for callers to distinguish authentication failures (401)
+/// from authorisation failures (403) and replay attacks.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use nostr_bbs_core::nip98::{verify_nip98, Nip98Token};
+///
+/// let token = verify_nip98(
+///     "Nostr eyJpZC...",
+///     "https://api.example.com/v1/data",
+///     "POST",
+///     None, // use default 60s tolerance
+/// )?;
+/// println!("Authenticated: {}", token.pubkey);
+/// ```
+pub fn verify_nip98(
+    auth_header: &str,
+    expected_url: &str,
+    expected_method: &str,
+    max_age_secs: Option<u64>,
+) -> Result<Nip98Token, Nip98Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_secs();
+    let tolerance = max_age_secs.unwrap_or(TIMESTAMP_TOLERANCE);
+    verify_token_full(auth_header, expected_url, expected_method, None, now, tolerance)
+}
+
+/// Verify a NIP-98 `Authorization` header value using the system clock
+/// and the default [`TIMESTAMP_TOLERANCE`].
+///
+/// Delegates to [`verify_token_full`] with `tolerance = TIMESTAMP_TOLERANCE`.
+/// For new code, prefer [`verify_nip98`] which exposes the tolerance parameter.
 ///
 /// # Arguments
 /// * `auth_header` - The full `Authorization` header value (e.g. `"Nostr base64..."`)
@@ -212,14 +336,11 @@ pub fn verify_token(
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_secs();
-    verify_token_at(auth_header, expected_url, expected_method, body, now)
+    verify_token_full(auth_header, expected_url, expected_method, body, now, TIMESTAMP_TOLERANCE)
 }
 
-/// Verify a NIP-98 `Authorization` header value against an explicit timestamp.
-///
-/// Decodes the base64 token, recomputes the event ID from canonical form
-/// (never trusts the provided id), verifies the Schnorr signature, and
-/// checks URL, method, timestamp tolerance, and optional payload hash.
+/// Verify a NIP-98 `Authorization` header value against an explicit timestamp
+/// using the default [`TIMESTAMP_TOLERANCE`].
 ///
 /// Use this variant in tests or worker environments where you want
 /// deterministic timestamp validation instead of relying on `SystemTime::now()`.
@@ -236,6 +357,30 @@ pub fn verify_token_at(
     expected_method: &str,
     body: Option<&[u8]>,
     now: u64,
+) -> Result<Nip98Token, Nip98Error> {
+    verify_token_full(auth_header, expected_url, expected_method, body, now, TIMESTAMP_TOLERANCE)
+}
+
+/// Full-control NIP-98 verification with explicit timestamp and tolerance.
+///
+/// This is the core verification function that all other `verify_*` functions
+/// delegate to. It performs every check listed in the module-level documentation.
+///
+/// # Arguments
+/// * `auth_header` - The full `Authorization` header value (e.g. `"Nostr base64..."`)
+/// * `expected_url` - The URL that should appear in the `u` tag
+/// * `expected_method` - The HTTP method that should appear in the `method` tag
+/// * `body` - Optional request body bytes to verify against the `payload` tag
+/// * `now` - The current Unix timestamp (seconds) used for tolerance checking
+/// * `max_age_secs` - Maximum allowed absolute difference between `now` and the
+///   event's `created_at` timestamp. Use [`TIMESTAMP_TOLERANCE`] for the default.
+pub fn verify_token_full(
+    auth_header: &str,
+    expected_url: &str,
+    expected_method: &str,
+    body: Option<&[u8]>,
+    now: u64,
+    max_age_secs: u64,
 ) -> Result<Nip98Token, Nip98Error> {
     // 1. Strip "Nostr " prefix
     let token = auth_header
@@ -266,10 +411,11 @@ pub fn verify_token_at(
     }
 
     // 6. Timestamp within tolerance
-    if now.abs_diff(event.created_at) > TIMESTAMP_TOLERANCE {
+    if now.abs_diff(event.created_at) > max_age_secs {
         return Err(Nip98Error::TimestampExpired {
             event_ts: event.created_at,
             now,
+            tolerance: max_age_secs,
         });
     }
 
@@ -334,9 +480,8 @@ pub fn verify_token_at(
 /// forged or expired one. If the event id has already been seen within the
 /// store's TTL, returns [`Nip98Error::Replayed`].
 ///
-/// Backward-compatible callers that prefer the legacy non-replay-checked
-/// API can keep using [`verify_token`] / [`verify_token_at`]; those entry
-/// points are now `#[deprecated]` for direct use in worker request paths.
+/// Uses the default [`TIMESTAMP_TOLERANCE`]. For custom tolerance, use
+/// [`verify_nip98_with_replay`].
 ///
 /// # Arguments
 /// As [`verify_token_at`], plus `replay_store` — a store keyed by the
@@ -349,10 +494,53 @@ pub async fn verify_token_at_with_replay(
     now: u64,
     replay_store: &dyn Nip98ReplayStore,
 ) -> Result<Nip98Token, Nip98Error> {
+    verify_nip98_with_replay(
+        auth_header,
+        expected_url,
+        expected_method,
+        body,
+        now,
+        TIMESTAMP_TOLERANCE,
+        replay_store,
+    )
+    .await
+}
+
+/// Full-control NIP-98 verification with replay protection.
+///
+/// Combines [`verify_token_full`] with async replay detection. The replay
+/// store is only consulted after all stateless cryptographic checks pass,
+/// so the store is never polluted by forged or expired events.
+///
+/// # Arguments
+///
+/// * `auth_header` - Full `Authorization` header value
+/// * `expected_url` - URL that should appear in the `u` tag
+/// * `expected_method` - HTTP method that should appear in the `method` tag
+/// * `body` - Optional request body for payload hash verification
+/// * `now` - Current Unix timestamp (seconds)
+/// * `max_age_secs` - Maximum allowed timestamp skew
+/// * `replay_store` - Backend for atomic replay detection (D1, KV, in-memory, etc.)
+pub async fn verify_nip98_with_replay(
+    auth_header: &str,
+    expected_url: &str,
+    expected_method: &str,
+    body: Option<&[u8]>,
+    now: u64,
+    max_age_secs: u64,
+    replay_store: &dyn Nip98ReplayStore,
+) -> Result<Nip98Token, Nip98Error> {
     // Run all stateless cryptographic + structural checks first.
-    // verify_event_strict inside verify_token_at recomputes and validates the
-    // event ID, so token.event_id is the canonical ID — not client-supplied.
-    let token = verify_token_at(auth_header, expected_url, expected_method, body, now)?;
+    // verify_token_full recomputes and validates the event ID, so
+    // token.event_id is the canonical ID — not client-supplied.
+    let token = verify_token_full(
+        auth_header,
+        expected_url,
+        expected_method,
+        body,
+        now,
+        max_age_secs,
+    )?;
 
     let first_seen = replay_store
         .seen_or_record(&token.event_id)
@@ -796,6 +984,78 @@ mod tests {
         };
         assert!(get_tag(&event, "u").is_none());
         assert_eq!(get_tag(&event, "e"), Some("ref1".to_string()));
+    }
+
+    // ── verify_nip98 (canonical API) ─────────────────────────────────────
+
+    #[test]
+    fn nip98_verify_nip98_default_tolerance() {
+        let sk = test_secret_key();
+        let url = "https://api.example.com/canonical";
+        let token = create_token(&sk, url, "GET", None).unwrap();
+        let header = authorization_header(&token);
+
+        // None means default 60s tolerance — token was just created, so it's fresh.
+        let result = verify_nip98(&header, url, "GET", None).unwrap();
+        assert_eq!(result.url, url);
+        assert_eq!(result.method, "GET");
+    }
+
+    #[test]
+    fn nip98_verify_nip98_custom_tolerance() {
+        let sk = test_secret_key();
+        let url = "https://api.example.com/custom";
+        let created_at = 1_700_000_000u64;
+
+        let token = create_token_at(&sk, url, "POST", None, created_at).unwrap();
+        let header = authorization_header(&token);
+
+        // 90-second offset should fail with default 60s tolerance
+        let err = verify_token_at(&header, url, "POST", None, created_at + 90).unwrap_err();
+        assert!(matches!(err, Nip98Error::TimestampExpired { .. }));
+
+        // But should succeed with a 120s tolerance via verify_token_full
+        let result = verify_token_full(&header, url, "POST", None, created_at + 90, 120).unwrap();
+        assert_eq!(result.url, url);
+        assert_eq!(result.created_at, created_at);
+    }
+
+    #[test]
+    fn nip98_verify_token_full_strict_tolerance() {
+        let sk = test_secret_key();
+        let url = "https://api.example.com/strict";
+        let created_at = 1_700_000_000u64;
+
+        let token = create_token_at(&sk, url, "GET", None, created_at).unwrap();
+        let header = authorization_header(&token);
+
+        // 10-second tolerance: 5s offset should pass
+        let result = verify_token_full(&header, url, "GET", None, created_at + 5, 10).unwrap();
+        assert_eq!(result.created_at, created_at);
+
+        // 10-second tolerance: 15s offset should fail
+        let err = verify_token_full(&header, url, "GET", None, created_at + 15, 10).unwrap_err();
+        assert!(matches!(err, Nip98Error::TimestampExpired { tolerance: 10, .. }));
+    }
+
+    #[test]
+    fn nip98_timestamp_expired_error_includes_tolerance() {
+        let sk = test_secret_key();
+        let url = "https://api.example.com/err";
+        let created_at = 1_700_000_000u64;
+
+        let token = create_token_at(&sk, url, "GET", None, created_at).unwrap();
+        let header = authorization_header(&token);
+
+        let err = verify_token_full(&header, url, "GET", None, created_at + 200, 30).unwrap_err();
+        match err {
+            Nip98Error::TimestampExpired { event_ts, now, tolerance } => {
+                assert_eq!(event_ts, created_at);
+                assert_eq!(now, created_at + 200);
+                assert_eq!(tolerance, 30);
+            }
+            other => panic!("expected TimestampExpired, got: {other}"),
+        }
     }
 
     // ── Replay protection ──────────────────────────────────────────────

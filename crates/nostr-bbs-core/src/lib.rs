@@ -43,10 +43,16 @@ pub use keys::{derive_from_prf, generate_keypair, Keypair, PublicKey, SecretKey,
 pub use nip44::{decrypt as nip44_decrypt, encrypt as nip44_encrypt};
 pub use nip98::{
     authorization_header as nip98_authorization_header, create_token as create_nip98_token,
-    sign_request_header as nip98_sign_request_header, verify_token as verify_nip98_token,
+    sign_request_header as nip98_sign_request_header,
+    // Canonical verification entry point (new — preferred for all new code)
+    verify_nip98,
+    verify_nip98_with_replay,
+    verify_token_full as verify_nip98_token_full,
+    // Legacy aliases (backward-compatible, delegate to verify_token_full internally)
+    verify_token as verify_nip98_token,
     verify_token_at as verify_nip98_token_at,
-    verify_token_at_with_replay as verify_nip98_token_at_with_replay, Nip98Error, Nip98ReplayStore,
-    Nip98Token as VerifiedToken, REPLAY_CACHE_TTL_SECS,
+    verify_token_at_with_replay as verify_nip98_token_at_with_replay,
+    Nip98Error, Nip98ReplayStore, Nip98Token as VerifiedToken, REPLAY_CACHE_TTL_SECS,
     TIMESTAMP_TOLERANCE as NIP98_TIMESTAMP_TOLERANCE,
 };
 pub use types::{EventId, Tag, Timestamp};
