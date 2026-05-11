@@ -24,6 +24,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
 async-trait = { workspace = true }
 
 # Phase 4 absorption (ADR-076/078): pure-logic surfaces of solid-pod-rs

@@ -239,6 +239,7 @@ fn json_ok(env: &Env, body: &serde_json::Value, status: u16) -> Result<Response>
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
+    payments::ensure_payment_schema(&env, "REPLAY_DB").await;
 
     // CORS preflight
     if req.method() == Method::Options {
@@ -426,13 +427,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None
             };
 
-            let kv = env.kv("POD_META")?;
+            let pay_db = env.d1("REPLAY_DB").map_err(|e| {
+                Error::RustError(format!("REPLAY_DB D1 binding missing: {e}"))
+            })?;
             if let Some(result) = payments::handle_pay_route(
                 path,
                 &method,
                 requester_pubkey.as_deref(),
                 pay_body.as_deref(),
-                &kv,
+                &pay_db,
                 &env,
                 &pay_config,
             )
@@ -510,6 +513,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     let kv = env.kv("POD_META")?;
     let bucket = env.bucket("PODS")?;
+    let quota_db = env.d1("REPLAY_DB").map_err(|e| {
+        Error::RustError(format!("REPLAY_DB D1 binding missing: {e}"))
+    })?;
 
     let agent_uri = requester_pubkey
         .as_ref()
@@ -809,8 +815,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             }
 
-            // Quota check
-            if let Err(e) = quota::check_quota(&kv, &owner_pubkey, data_len).await {
+            // Atomic quota check + reserve (D1)
+            if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await {
                 return json_error(&env, &e.to_string(), 413);
             }
 
@@ -829,11 +835,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 })
                 .execute()
                 .await?;
-
-            // Update quota usage
-            quota::update_usage(&kv, &owner_pubkey, data_len as i64)
-                .await
-                .ok();
 
             // Fire notification webhooks (non-blocking)
             notifications::notify_change(&kv, &owner_pubkey, &resource_path, "Update").await;
@@ -872,7 +873,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     );
                 }
 
-                if let Err(e) = quota::check_quota(&kv, &owner_pubkey, data_len).await {
+                if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await {
                     return json_error(&env, &e.to_string(), 413);
                 }
 
@@ -884,10 +885,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     })
                     .execute()
                     .await?;
-
-                quota::update_usage(&kv, &owner_pubkey, data_len as i64)
-                    .await
-                    .ok();
 
                 // Fire notification webhooks (non-blocking)
                 notifications::notify_change(&kv, &owner_pubkey, &resource_path, "Update").await;
@@ -923,7 +920,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 );
             }
 
-            if let Err(e) = quota::check_quota(&kv, &owner_pubkey, data_len).await {
+            if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await {
                 return json_error(&env, &e.to_string(), 413);
             }
 
@@ -938,10 +935,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 })
                 .execute()
                 .await?;
-
-            quota::update_usage(&kv, &owner_pubkey, data_len as i64)
-                .await
-                .ok();
 
             // Fire notification webhooks (non-blocking)
             notifications::notify_change(&kv, &owner_pubkey, &child_path, "Create").await;
@@ -998,10 +991,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 serde_json::to_vec(&document).map_err(|e| Error::RustError(e.to_string()))?;
             let updated_len = updated.len() as u64;
 
-            // Quota check for size difference
-            if updated_len > current_bytes.len() as u64 {
-                let delta = updated_len - current_bytes.len() as u64;
-                if let Err(e) = quota::check_quota(&kv, &owner_pubkey, delta).await {
+            // Atomic quota check for size increase
+            let size_delta = updated_len as i64 - current_bytes.len() as i64;
+            if size_delta > 0 {
+                if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, size_delta as u64).await {
                     return json_error(&env, &e.to_string(), 413);
                 }
             }
@@ -1022,9 +1015,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .execute()
                 .await?;
 
-            let size_delta = updated_len as i64 - current_bytes.len() as i64;
-            if size_delta != 0 {
-                quota::update_usage(&kv, &owner_pubkey, size_delta)
+            // Release quota for shrinkage
+            if size_delta < 0 {
+                quota::update_usage_d1(&quota_db, &owner_pubkey, size_delta)
                     .await
                     .ok();
             }
@@ -1053,8 +1046,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             bucket.delete(&r2_key).await?;
 
-            // Update quota (negative delta)
-            quota::update_usage(&kv, &owner_pubkey, -(deleted_size as i64))
+            // Release quota (negative delta, D1 atomic)
+            quota::update_usage_d1(&quota_db, &owner_pubkey, -(deleted_size as i64))
                 .await
                 .ok();
 

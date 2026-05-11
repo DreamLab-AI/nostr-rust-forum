@@ -1968,6 +1968,7 @@ dependencies = [
  "sha2",
  "solid-pod-rs",
  "uuid",
+ "wasm-bindgen",
  "worker",
 ]
 
