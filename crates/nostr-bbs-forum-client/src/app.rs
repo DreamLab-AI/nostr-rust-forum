@@ -232,10 +232,22 @@ pub fn App() -> impl IntoView {
         if is_authed.get() {
             let r = expect_context::<RelayConnection>();
             let a = use_auth();
-            let auth_signer = std::rc::Rc::new(move |event: nostr_bbs_core::UnsignedEvent| {
-                a.sign_event(event).ok()
-            });
-            r.set_auth_signer(auth_signer);
+            if a.state.get_untracked().is_nip07 {
+                let a2 = a.clone();
+                let async_signer: std::rc::Rc<
+                    dyn Fn(nostr_bbs_core::UnsignedEvent)
+                        -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<nostr_bbs_core::NostrEvent>>>>,
+                > = std::rc::Rc::new(move |event| {
+                    let auth = a2.clone();
+                    Box::pin(async move { auth.sign_event_async(event).await.ok() })
+                });
+                r.set_auth_signer_async(async_signer);
+            } else {
+                let sync_signer = std::rc::Rc::new(move |event: nostr_bbs_core::UnsignedEvent| {
+                    a.sign_event(event).ok()
+                });
+                r.set_auth_signer(sync_signer);
+            }
             r.connect();
         } else {
             let r = expect_context::<RelayConnection>();

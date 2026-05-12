@@ -80,8 +80,12 @@ struct Subscription {
     on_eose: Option<EoseCallback>,
 }
 
-/// Callback that signs a NIP-42 AUTH challenge and returns `["AUTH", signed_event]`.
+/// Synchronous signer for NIP-42 AUTH (nsec / passkey logins).
 type AuthSignCallback = Rc<dyn Fn(UnsignedEvent) -> Option<NostrEvent>>;
+
+/// Async signer for NIP-42 AUTH (NIP-07 browser extension logins).
+type AuthSignAsyncCallback =
+    Rc<dyn Fn(UnsignedEvent) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<NostrEvent>>>>>;
 
 /// Internal mutable state for the relay connection.
 struct RelayInner {
@@ -93,6 +97,7 @@ struct RelayInner {
     pending_messages: Vec<String>,
     relay_url: String,
     auth_signer: Option<AuthSignCallback>,
+    auth_signer_async: Option<AuthSignAsyncCallback>,
     _on_open: Option<Closure<dyn FnMut()>>,
     _on_message: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
     _on_error: Option<Closure<dyn FnMut(web_sys::ErrorEvent)>>,
@@ -133,6 +138,7 @@ impl RelayConnection {
             pending_messages: Vec::new(),
             relay_url,
             auth_signer: None,
+            auth_signer_async: None,
             _on_open: None,
             _on_message: None,
             _on_error: None,
@@ -149,10 +155,17 @@ impl RelayConnection {
         self.state
     }
 
-    /// Register a synchronous signer for NIP-42 AUTH challenges.
+    /// Register a synchronous signer for NIP-42 AUTH challenges (nsec / passkey).
     pub fn set_auth_signer(&self, signer: AuthSignCallback) {
         self.with_inner(|rc| {
             rc.borrow_mut().auth_signer = Some(signer);
+        });
+    }
+
+    /// Register an async signer for NIP-42 AUTH challenges (NIP-07 extension).
+    pub fn set_auth_signer_async(&self, signer: AuthSignAsyncCallback) {
+        self.with_inner(|rc| {
+            rc.borrow_mut().auth_signer_async = Some(signer);
         });
     }
 
@@ -533,32 +546,48 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                 if let Some(challenge) = arr[1].as_str() {
                     let inner = inner_rc.borrow();
                     let relay_url = inner.relay_url.clone();
-                    let signer = inner.auth_signer.clone();
+                    let sync_signer = inner.auth_signer.clone();
+                    let async_signer = inner.auth_signer_async.clone();
                     let ws = inner.ws.clone();
                     drop(inner);
 
-                    if let Some(sign_fn) = signer {
-                        let now = (js_sys::Date::now() / 1000.0) as u64;
-                        let unsigned = UnsignedEvent {
-                            pubkey: String::new(),
-                            created_at: now,
-                            kind: 22242,
-                            tags: vec![
-                                vec!["relay".into(), relay_url],
-                                vec!["challenge".into(), challenge.to_string()],
-                            ],
-                            content: String::new(),
-                        };
-                        if let Some(signed) = sign_fn(unsigned) {
-                            if let Ok(msg) = serde_json::to_string(&serde_json::json!(["AUTH", signed])) {
-                                if let Some(ws) = &ws {
-                                    let _ = ws.send_with_str(&msg);
-                                    web_sys::console::log_1(&"[Relay] NIP-42 AUTH response sent".into());
-                                }
+                    let now = (js_sys::Date::now() / 1000.0) as u64;
+                    let make_unsigned = |url: String, ch: &str| UnsignedEvent {
+                        pubkey: String::new(),
+                        created_at: now,
+                        kind: 22242,
+                        tags: vec![
+                            vec!["relay".into(), url],
+                            vec!["challenge".into(), ch.to_string()],
+                        ],
+                        content: String::new(),
+                    };
+
+                    let send_auth = |signed: &NostrEvent, ws: &Option<WebSocket>| {
+                        if let Ok(msg) = serde_json::to_string(&serde_json::json!(["AUTH", signed])) {
+                            if let Some(ws) = ws {
+                                let _ = ws.send_with_str(&msg);
+                                web_sys::console::log_1(&"[Relay] NIP-42 AUTH response sent".into());
                             }
-                        } else {
-                            web_sys::console::warn_1(&"[Relay] AUTH challenge received but signing failed".into());
                         }
+                    };
+
+                    if let Some(sign_fn) = sync_signer {
+                        let unsigned = make_unsigned(relay_url, challenge);
+                        if let Some(signed) = sign_fn(unsigned) {
+                            send_auth(&signed, &ws);
+                        } else {
+                            web_sys::console::warn_1(&"[Relay] AUTH sync signing failed".into());
+                        }
+                    } else if let Some(async_sign) = async_signer {
+                        let unsigned = make_unsigned(relay_url, challenge);
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Some(signed) = async_sign(unsigned).await {
+                                send_auth(&signed, &ws);
+                            } else {
+                                web_sys::console::warn_1(&"[Relay] AUTH async signing failed".into());
+                            }
+                        });
                     } else {
                         web_sys::console::warn_1(&"[Relay] AUTH challenge received but no signer registered".into());
                     }
