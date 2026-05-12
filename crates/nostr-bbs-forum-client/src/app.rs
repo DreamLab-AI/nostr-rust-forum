@@ -231,6 +231,11 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         if is_authed.get() {
             let r = expect_context::<RelayConnection>();
+            let a = use_auth();
+            let auth_signer = std::rc::Rc::new(move |event: nostr_bbs_core::UnsignedEvent| {
+                a.sign_event(event).ok()
+            });
+            r.set_auth_signer(auth_signer);
             r.connect();
         } else {
             let r = expect_context::<RelayConnection>();
