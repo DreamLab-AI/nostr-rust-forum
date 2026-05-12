@@ -3094,14 +3094,15 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "solid-pod-rs"
-version = "0.4.0-alpha.9"
+version = "0.4.0-alpha.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24df58741e95071395f2bd705784004801a678bfc52dae8fd122a9edc2eefb06"
+checksum = "1ac0355c163f7844a026a5f3062be6ac41b916d4a9ddd060130690c97bf552f4"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
  "chrono",
+ "getrandom 0.2.17",
  "hex",
  "js-sys",
  "serde",
@@ -3246,7 +3247,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys",
