@@ -454,8 +454,7 @@ async fn route_sprint_api(
         return Ok(Some(resp));
     }
     if path == "/api/governance/agents/register" && *method == Method::Post {
-        let resp =
-            governance_api::handle_register_agent(body_bytes, auth_header, env).await?;
+        let resp = governance_api::handle_register_agent(body_bytes, auth_header, env).await?;
         return Ok(Some(resp));
     }
     if path == "/api/governance/agents/revoke" && *method == Method::Post {

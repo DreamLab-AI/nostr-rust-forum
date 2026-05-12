@@ -206,12 +206,10 @@ pub async fn handle_list_cases(
         .map(|(_, v)| v.as_str());
 
     let result = if let Some(state) = state_filter {
-        db.prepare(
-            "SELECT * FROM broker_cases WHERE state = ?1 ORDER BY updated_at DESC LIMIT 100",
-        )
-        .bind(&[JsValue::from_str(state)])?
-        .all()
-        .await?
+        db.prepare("SELECT * FROM broker_cases WHERE state = ?1 ORDER BY updated_at DESC LIMIT 100")
+            .bind(&[JsValue::from_str(state)])?
+            .all()
+            .await?
     } else {
         db.prepare("SELECT * FROM broker_cases ORDER BY updated_at DESC LIMIT 100")
             .all()

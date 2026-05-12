@@ -81,11 +81,14 @@ struct Subscription {
 }
 
 /// Synchronous signer for NIP-42 AUTH (nsec / passkey logins).
-type AuthSignCallback = Rc<dyn Fn(UnsignedEvent) -> Option<NostrEvent>>;
+pub(crate) type AuthSignCallback = Rc<dyn Fn(UnsignedEvent) -> Option<NostrEvent>>;
 
 /// Async signer for NIP-42 AUTH (NIP-07 browser extension logins).
-type AuthSignAsyncCallback =
-    Rc<dyn Fn(UnsignedEvent) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<NostrEvent>>>>>;
+pub(crate) type AuthSignAsyncCallback = Rc<
+    dyn Fn(
+        UnsignedEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<NostrEvent>>>>,
+>;
 
 /// Internal mutable state for the relay connection.
 struct RelayInner {
@@ -564,10 +567,13 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                     };
 
                     let send_auth = |signed: &NostrEvent, ws: &Option<WebSocket>| {
-                        if let Ok(msg) = serde_json::to_string(&serde_json::json!(["AUTH", signed])) {
+                        if let Ok(msg) = serde_json::to_string(&serde_json::json!(["AUTH", signed]))
+                        {
                             if let Some(ws) = ws {
                                 let _ = ws.send_with_str(&msg);
-                                web_sys::console::log_1(&"[Relay] NIP-42 AUTH response sent".into());
+                                web_sys::console::log_1(
+                                    &"[Relay] NIP-42 AUTH response sent".into(),
+                                );
                             }
                         }
                     };
@@ -585,11 +591,15 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                             if let Some(signed) = async_sign(unsigned).await {
                                 send_auth(&signed, &ws);
                             } else {
-                                web_sys::console::warn_1(&"[Relay] AUTH async signing failed".into());
+                                web_sys::console::warn_1(
+                                    &"[Relay] AUTH async signing failed".into(),
+                                );
                             }
                         });
                     } else {
-                        web_sys::console::warn_1(&"[Relay] AUTH challenge received but no signer registered".into());
+                        web_sys::console::warn_1(
+                            &"[Relay] AUTH challenge received but no signer registered".into(),
+                        );
                     }
                 }
             }

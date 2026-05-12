@@ -343,6 +343,7 @@ pub mod broker {
     }
 
     impl BrokerCase {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             id: impl Into<String>,
             category: CaseCategory,
@@ -563,8 +564,8 @@ pub mod broker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::broker::*;
+    use super::*;
 
     #[test]
     fn governance_kind_range() {
@@ -731,7 +732,13 @@ mod tests {
         c.record_decision("dec-1", DecisionOutcome::Approve, "bob", "ok", 1002)
             .unwrap();
         let err = c
-            .record_decision("dec-2", DecisionOutcome::Reject, "bob", "changed mind", 1003)
+            .record_decision(
+                "dec-2",
+                DecisionOutcome::Reject,
+                "bob",
+                "changed mind",
+                1003,
+            )
             .unwrap_err();
         assert!(matches!(err, CaseError::AlreadyTerminal(_)));
     }
@@ -757,9 +764,7 @@ mod tests {
         let err = c
             .record_decision(
                 "dec-1",
-                DecisionOutcome::Amend {
-                    diff: "   ".into(),
-                },
+                DecisionOutcome::Amend { diff: "   ".into() },
                 "bob",
                 "fix",
                 1002,
@@ -860,7 +865,14 @@ mod tests {
 
         let orch = DecisionOrchestrator;
         let report = orch
-            .decide(&mut c, "dec-1", DecisionOutcome::Reject, "bob", "nope", 1002)
+            .decide(
+                &mut c,
+                "dec-1",
+                DecisionOutcome::Reject,
+                "bob",
+                "nope",
+                1002,
+            )
             .unwrap();
         assert!(report.share_plan.is_none());
     }

@@ -112,8 +112,13 @@ impl PanelRegistry {
             governance::KIND_PANEL_UPDATE => {
                 if let Ok(diff) = serde_json::from_str::<serde_json::Value>(&event.content) {
                     self.state.update(|s| {
-                        let current = s.panel_states.entry(d_tag.clone()).or_insert_with(|| serde_json::Value::Object(Default::default()));
-                        if let (Some(base), Some(patch)) = (current.as_object_mut(), diff.as_object()) {
+                        let current = s
+                            .panel_states
+                            .entry(d_tag.clone())
+                            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                        if let (Some(base), Some(patch)) =
+                            (current.as_object_mut(), diff.as_object())
+                        {
                             for (k, v) in patch {
                                 base.insert(k.clone(), v.clone());
                             }

@@ -639,10 +639,7 @@ fn governance_event_d_tag_extraction() {
 
 #[test]
 fn governance_event_matches_kind_filter() {
-    let event = make_event(
-        31402,
-        vec![vec!["d".into(), "case-123".into()]],
-    );
+    let event = make_event(31402, vec![vec!["d".into(), "case-123".into()]]);
     let filter = NostrFilter {
         ids: None,
         authors: None,

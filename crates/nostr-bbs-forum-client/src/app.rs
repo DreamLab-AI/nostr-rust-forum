@@ -233,14 +233,12 @@ pub fn App() -> impl IntoView {
             let r = expect_context::<RelayConnection>();
             let a = use_auth();
             if a.state.get_untracked().is_nip07 {
-                let a2 = a.clone();
-                let async_signer: std::rc::Rc<
-                    dyn Fn(nostr_bbs_core::UnsignedEvent)
-                        -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<nostr_bbs_core::NostrEvent>>>>,
-                > = std::rc::Rc::new(move |event| {
-                    let auth = a2.clone();
-                    Box::pin(async move { auth.sign_event_async(event).await.ok() })
-                });
+                let a2 = a;
+                let async_signer: crate::relay::AuthSignAsyncCallback =
+                    std::rc::Rc::new(move |event| {
+                        let auth = a2;
+                        Box::pin(async move { auth.sign_event_async(event).await.ok() })
+                    });
                 r.set_auth_signer_async(async_signer);
             } else {
                 let sync_signer = std::rc::Rc::new(move |event: nostr_bbs_core::UnsignedEvent| {

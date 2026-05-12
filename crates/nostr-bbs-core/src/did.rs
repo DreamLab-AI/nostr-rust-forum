@@ -280,7 +280,8 @@ mod tests {
         let webid = "https://pods.example.com/0000.../profile/card#me";
         let pod = "https://pods.example.com/0000.../";
         let relay = "wss://relay.example.com";
-        let doc = render_did_document_tier3(&pk, Some(webid), pod, Some(relay), None, Some("Alice"));
+        let doc =
+            render_did_document_tier3(&pk, Some(webid), pod, Some(relay), None, Some("Alice"));
         assert_eq!(doc["alsoKnownAs"][0], webid);
         assert_eq!(doc["profile"]["name"], "Alice");
         let services = doc["service"].as_array().unwrap();
@@ -305,14 +306,7 @@ mod tests {
     fn tier3_with_governance_endpoint() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let gov = "https://auth.example.com/api/governance";
-        let doc = render_did_document_tier3(
-            &pk,
-            None,
-            "https://pod.test/",
-            None,
-            Some(gov),
-            None,
-        );
+        let doc = render_did_document_tier3(&pk, None, "https://pod.test/", None, Some(gov), None);
         let services = doc["service"].as_array().unwrap();
         let types: Vec<&str> = services
             .iter()

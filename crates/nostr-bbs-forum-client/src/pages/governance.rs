@@ -128,7 +128,11 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
     let title = panel.definition.title.clone();
     let description = panel.definition.description.clone();
     let pubkey_short = if panel.agent_pubkey.len() >= 12 {
-        format!("{}...{}", &panel.agent_pubkey[..6], &panel.agent_pubkey[panel.agent_pubkey.len()-6..])
+        format!(
+            "{}...{}",
+            &panel.agent_pubkey[..6],
+            &panel.agent_pubkey[panel.agent_pubkey.len() - 6..]
+        )
     } else {
         panel.agent_pubkey.clone()
     };
@@ -179,7 +183,11 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
     };
 
     let title_tag = nostr_bbs_core::governance::extract_tag(
-        &item.d_tag.split('|').map(|s| vec![s.to_string()]).collect::<Vec<_>>(),
+        &item
+            .d_tag
+            .split('|')
+            .map(|s| vec![s.to_string()])
+            .collect::<Vec<_>>(),
         "title",
     )
     .map(|s| s.to_string())

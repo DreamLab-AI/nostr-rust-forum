@@ -205,16 +205,15 @@ impl NostrRelayDO {
         // Human responses (kind 31403) are allowed from any whitelisted user.
         if governance::is_governance_kind(event.kind)
             && event.kind != governance::KIND_ACTION_RESPONSE
+            && !self.is_registered_agent(&event.pubkey).await
         {
-            if !self.is_registered_agent(&event.pubkey).await {
-                Self::send_ok(
-                    ws,
-                    &event.id,
-                    false,
-                    "blocked: pubkey not in agent registry",
-                );
-                return;
-            }
+            Self::send_ok(
+                ws,
+                &event.id,
+                false,
+                "blocked: pubkey not in agent registry",
+            );
+            return;
         }
 
         // Zone enforcement for channel messages (kind-42)
@@ -666,14 +665,11 @@ impl NostrRelayDO {
         };
 
         let d_tag = governance::extract_d_tag(&event.tags).unwrap_or(&event.id);
-        let category = governance::extract_tag(&event.tags, "category")
-            .unwrap_or("manual_submission");
-        let subject_kind = governance::extract_tag(&event.tags, "subject-kind")
-            .unwrap_or("opaque");
-        let subject_id = governance::extract_tag(&event.tags, "subject-id")
-            .unwrap_or("");
-        let title = governance::extract_tag(&event.tags, "title")
-            .unwrap_or("Untitled");
+        let category =
+            governance::extract_tag(&event.tags, "category").unwrap_or("manual_submission");
+        let subject_kind = governance::extract_tag(&event.tags, "subject-kind").unwrap_or("opaque");
+        let subject_id = governance::extract_tag(&event.tags, "subject-id").unwrap_or("");
+        let title = governance::extract_tag(&event.tags, "title").unwrap_or("Untitled");
         let priority: u32 = governance::extract_tag(&event.tags, "priority")
             .and_then(|p| p.parse().ok())
             .unwrap_or(50);
