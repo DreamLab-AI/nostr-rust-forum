@@ -29,6 +29,14 @@ The following fixtures MUST be populated before PRD-010 P0 implementation lands:
 | is-envelope-v1.json | DreamLab-internal (ADR-075 D1+D3) | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
 | mesh-federation.json | DreamLab-internal (ADR-073 D2/D6/D9 + ADR-074 D9) | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
 
+## Agent Control Surface Protocol
+
+The governance domain model in `nostr-bbs-core::governance` has 19 unit tests
+covering: kind range validation, tag extraction, panel definition round-trip,
+BrokerCase lifecycle (creation, claiming, release, decisions), self-review
+prevention, terminal state idempotency, DecisionOrchestrator, and share-state
+transitions. These tests do not require cross-substrate fixtures.
+
 ## Consumption
 
 Each substrate runs `scripts/sync-fixtures.sh` to pull fixtures into its own `tests/fixtures/` directory + verify checksums.

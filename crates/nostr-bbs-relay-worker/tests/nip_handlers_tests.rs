@@ -598,3 +598,60 @@ fn twentieth_subscription_at_cap() {
     let count = 20;
     assert!(!(count < MAX_SUBSCRIPTIONS));
 }
+
+// ---------------------------------------------------------------------------
+// Agent Control Surface Protocol: governance kind classification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn governance_kinds_are_parameterized_replaceable() {
+    for kind in 31400..=31405 {
+        assert_eq!(
+            event_treatment(kind),
+            EventTreatment::ParameterizedReplaceable,
+            "kind {kind} should be ParameterizedReplaceable (NIP-33)"
+        );
+    }
+}
+
+#[test]
+fn governance_kind_range_is_correct() {
+    assert!(nostr_bbs_core::is_governance_kind(31400));
+    assert!(nostr_bbs_core::is_governance_kind(31405));
+    assert!(!nostr_bbs_core::is_governance_kind(31399));
+    assert!(!nostr_bbs_core::is_governance_kind(31406));
+}
+
+#[test]
+fn governance_event_d_tag_extraction() {
+    let event = make_event(
+        31400,
+        vec![
+            vec!["d".into(), "broker-inbox-v1".into()],
+            vec!["p".into(), "deadbeef".into()],
+        ],
+    );
+    assert_eq!(
+        nostr_bbs_core::extract_d_tag(&event.tags),
+        Some("broker-inbox-v1")
+    );
+}
+
+#[test]
+fn governance_event_matches_kind_filter() {
+    let event = make_event(
+        31402,
+        vec![vec!["d".into(), "case-123".into()]],
+    );
+    let filter = NostrFilter {
+        ids: None,
+        authors: None,
+        kinds: Some(vec![31402]),
+        since: None,
+        until: None,
+        limit: None,
+        search: None,
+        extra: std::collections::HashMap::new(),
+    };
+    assert!(event_matches_filters(&event, &[filter]));
+}

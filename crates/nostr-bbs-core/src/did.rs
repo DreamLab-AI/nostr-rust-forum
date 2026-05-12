@@ -99,6 +99,7 @@ pub fn render_did_document_tier3(
     webid: Option<&str>,
     pod_url: &str,
     relay_url: Option<&str>,
+    governance_url: Option<&str>,
     name: Option<&str>,
 ) -> Value {
     let did = did_nostr_uri(pk);
@@ -124,6 +125,15 @@ pub fn render_did_document_tier3(
             id: format!("{did}#nostr-relay"),
             service_type: "NostrRelay".to_string(),
             service_endpoint: relay.to_string(),
+            extra: None,
+        });
+    }
+
+    if let Some(gov) = governance_url {
+        services.push(upstream::ServiceEntry {
+            id: format!("{did}#governance"),
+            service_type: "AgentGovernance".to_string(),
+            service_endpoint: gov.to_string(),
             extra: None,
         });
     }
@@ -270,7 +280,7 @@ mod tests {
         let webid = "https://pods.example.com/0000.../profile/card#me";
         let pod = "https://pods.example.com/0000.../";
         let relay = "wss://relay.example.com";
-        let doc = render_did_document_tier3(&pk, Some(webid), pod, Some(relay), Some("Alice"));
+        let doc = render_did_document_tier3(&pk, Some(webid), pod, Some(relay), None, Some("Alice"));
         assert_eq!(doc["alsoKnownAs"][0], webid);
         assert_eq!(doc["profile"]["name"], "Alice");
         let services = doc["service"].as_array().unwrap();
@@ -286,9 +296,31 @@ mod tests {
     #[test]
     fn tier3_without_relay_omits_it() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
-        let doc = render_did_document_tier3(&pk, None, "https://pod.test/", None, None);
+        let doc = render_did_document_tier3(&pk, None, "https://pod.test/", None, None, None);
         let services = doc["service"].as_array().unwrap();
         assert_eq!(services.len(), 1);
+    }
+
+    #[test]
+    fn tier3_with_governance_endpoint() {
+        let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
+        let gov = "https://auth.example.com/api/governance";
+        let doc = render_did_document_tier3(
+            &pk,
+            None,
+            "https://pod.test/",
+            None,
+            Some(gov),
+            None,
+        );
+        let services = doc["service"].as_array().unwrap();
+        let types: Vec<&str> = services
+            .iter()
+            .map(|s| s["type"].as_str().unwrap_or(""))
+            .collect();
+        assert!(types.contains(&"SolidStorage"));
+        assert!(types.contains(&"AgentGovernance"));
+        assert_eq!(services.len(), 2);
     }
 
     // ── WebID verification ────────────────────────────────────────────

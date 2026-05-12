@@ -26,6 +26,9 @@ cargo test --workspace
 # Single crate
 cargo test -p nostr-bbs-core
 
+# Governance domain model tests (19 tests)
+cargo test -p nostr-bbs-core governance
+
 # WASM compilation check (forum client does not run native tests)
 cargo check --target wasm32-unknown-unknown -p nostr-bbs-forum-client
 ```

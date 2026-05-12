@@ -10,6 +10,7 @@ pub mod channels;
 pub mod indexed_db;
 pub mod mute;
 pub mod notifications;
+pub mod panel_registry;
 pub mod preferences;
 pub mod profile_cache;
 pub mod read_position;

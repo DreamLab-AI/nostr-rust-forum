@@ -28,6 +28,7 @@ pub mod types;
 
 pub mod d1_helpers;
 pub mod did;
+pub mod governance;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_bridge;
 
@@ -88,3 +89,12 @@ pub use nip90::{
     KIND_JOB_RESULT_MIN,
 };
 pub use signer::{PrfSigner, Signer, SignerError};
+
+pub use governance::{
+    is_governance_kind, extract_d_tag, extract_tag,
+    ActionDef, ActionPriority, ActionRequest, ActionResponse, ActionStyle,
+    FieldDef, FieldType, LayoutHint, PanelCapability, PanelDefinition, PanelSchema,
+    RegisteredAgent,
+    KIND_PANEL_DEFINITION, KIND_PANEL_STATE, KIND_ACTION_REQUEST, KIND_ACTION_RESPONSE,
+    KIND_PANEL_UPDATE, KIND_PANEL_RETIRED, GOVERNANCE_KIND_RANGE,
+};

@@ -476,6 +476,54 @@ async fn ensure_schema(env: &Env) {
             last_kind0_at INTEGER NOT NULL, \
             raw_event TEXT NOT NULL\
         )",
+        // Agent Control Surface Protocol: registry of agents allowed to publish
+        // governance events (kinds 31400-31405).
+        "CREATE TABLE IF NOT EXISTS agent_registry (\
+            pubkey TEXT PRIMARY KEY NOT NULL, \
+            name TEXT NOT NULL, \
+            description TEXT NOT NULL DEFAULT '', \
+            registered_by TEXT NOT NULL, \
+            registered_at INTEGER NOT NULL, \
+            rate_limit_per_min INTEGER NOT NULL DEFAULT 60, \
+            active INTEGER NOT NULL DEFAULT 1\
+        )",
+        // Broker case aggregate — human-in-the-loop governance decisions.
+        "CREATE TABLE IF NOT EXISTS broker_cases (\
+            id TEXT PRIMARY KEY NOT NULL, \
+            category TEXT NOT NULL, \
+            subject_kind TEXT NOT NULL, \
+            subject_id TEXT NOT NULL, \
+            title TEXT NOT NULL, \
+            summary TEXT NOT NULL DEFAULT '', \
+            state TEXT NOT NULL DEFAULT 'open', \
+            priority INTEGER NOT NULL DEFAULT 50, \
+            from_share_state TEXT, \
+            to_share_state TEXT, \
+            created_by TEXT NOT NULL, \
+            assigned_to TEXT, \
+            nostr_event_id TEXT, \
+            created_at INTEGER NOT NULL, \
+            updated_at INTEGER NOT NULL\
+        )",
+        // Individual decisions on broker cases (append-only audit trail).
+        "CREATE TABLE IF NOT EXISTS broker_decisions (\
+            decision_id TEXT PRIMARY KEY NOT NULL, \
+            case_id TEXT NOT NULL REFERENCES broker_cases(id), \
+            outcome TEXT NOT NULL, \
+            outcome_detail TEXT, \
+            broker_pubkey TEXT NOT NULL, \
+            reasoning TEXT NOT NULL DEFAULT '', \
+            prior_decision_id TEXT, \
+            decided_at INTEGER NOT NULL\
+        )",
+        // Role assignments for broker governance (which pubkeys can claim cases).
+        "CREATE TABLE IF NOT EXISTS broker_roles (\
+            pubkey TEXT NOT NULL, \
+            role TEXT NOT NULL, \
+            granted_by TEXT NOT NULL, \
+            granted_at INTEGER NOT NULL, \
+            PRIMARY KEY (pubkey, role)\
+        )",
     ];
     for stmt in create_stmts {
         let _ = db.prepare(stmt).run().await;
@@ -500,6 +548,13 @@ async fn ensure_schema(env: &Env) {
         "CREATE INDEX IF NOT EXISTS idx_profiles_name ON profiles(name)",
         "CREATE INDEX IF NOT EXISTS idx_profiles_display_name ON profiles(display_name)",
         "CREATE INDEX IF NOT EXISTS idx_profiles_last_kind0 ON profiles(last_kind0_at DESC)",
+        // Agent Control Surface Protocol indexes.
+        "CREATE INDEX IF NOT EXISTS idx_agent_registry_active ON agent_registry(active)",
+        "CREATE INDEX IF NOT EXISTS idx_broker_cases_state ON broker_cases(state)",
+        "CREATE INDEX IF NOT EXISTS idx_broker_cases_category ON broker_cases(category)",
+        "CREATE INDEX IF NOT EXISTS idx_broker_cases_assigned ON broker_cases(assigned_to)",
+        "CREATE INDEX IF NOT EXISTS idx_broker_decisions_case ON broker_decisions(case_id)",
+        "CREATE INDEX IF NOT EXISTS idx_broker_roles_pubkey ON broker_roles(pubkey)",
     ];
     for stmt in index_stmts {
         let _ = db.prepare(stmt).run().await;

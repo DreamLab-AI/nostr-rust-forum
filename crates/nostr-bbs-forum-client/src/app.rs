@@ -22,12 +22,13 @@ use crate::components::toast::{provide_toasts, ToastContainer};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, CategoryPage, ChannelPage, ChatPage, DmChatPage, DmListPage, EventsPage, ForumsPage,
-    HomePage, LoginPage, MarketplacePage, NoteViewPage, PendingPage, ProfilePage, SearchPage,
-    SectionPage, SettingsPage, SetupPage, SignupPage,
+    GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage, PendingPage, ProfilePage,
+    SearchPage, SectionPage, SettingsPage, SetupPage, SignupPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
 use crate::stores::mute::provide_mute_store;
+use crate::stores::panel_registry::provide_panel_registry;
 use crate::stores::preferences::provide_preferences;
 use crate::stores::profile_cache::{provide_profile_cache, try_use_profile_cache};
 use crate::stores::read_position::provide_read_positions;
@@ -125,6 +126,16 @@ fn close_icon() -> impl IntoView {
     }
 }
 
+fn governance_icon() -> impl IntoView {
+    view! {
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3" stroke-linecap="round"/>
+            <path d="M12 2v4m0 12v4M2 12h4m12 0h4m-2.93-7.07l-2.83 2.83m-8.48 8.48l-2.83 2.83m0-14.14l2.83 2.83m8.48 8.48l2.83 2.83"
+                stroke-linecap="round"/>
+        </svg>
+    }
+}
+
 fn admin_icon() -> impl IntoView {
     view! {
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -207,6 +218,7 @@ pub fn App() -> impl IntoView {
     provide_preferences();
     provide_announcer();
     crate::stores::badges::provide_badges();
+    provide_panel_registry();
 
     // Provide relay connection as context — connect/disconnect reactively with auth state
     let relay = RelayConnection::new();
@@ -379,6 +391,34 @@ pub fn App() -> impl IntoView {
         });
     }
 
+    // Subscribe to governance events (kinds 31400-31405) and feed them into the
+    // PanelRegistry store so the governance page renders live agent panels.
+    {
+        let gov_sub_started = RwSignal::new(false);
+        let relay_state = relay.connection_state();
+        Effect::new(move |_| {
+            if relay_state.get() != ConnectionState::Connected {
+                return;
+            }
+            if gov_sub_started.get_untracked() {
+                return;
+            }
+            let registry = crate::stores::panel_registry::use_panel_registry();
+            let r = expect_context::<RelayConnection>();
+            let filter = crate::relay::Filter {
+                kinds: Some(vec![31400, 31401, 31402, 31403, 31404, 31405]),
+                limit: Some(200),
+                ..Default::default()
+            };
+            let on_event: crate::relay::EventCallback =
+                std::rc::Rc::new(move |event: nostr_bbs_core::NostrEvent| {
+                    registry.ingest_event(&event);
+                });
+            r.subscribe(vec![filter], on_event, None);
+            gov_sub_started.set(true);
+        });
+    }
+
     // Start channel sync once relay connects (single subscription for all pages)
     let relay_conn = relay.connection_state();
     Effect::new(move |_| {
@@ -446,6 +486,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/search") view=AuthGatedSearch />
                     <Route path=path!("/settings") view=AuthGatedSettings />
                     <Route path=path!("/admin") view=AdminPage />
+                    <Route path=path!("/governance") view=AuthGatedGovernance />
                     <Route path=path!("/marketplace") view=MarketplacePage />
                 </FlatRoutes>
             </Layout>
@@ -598,6 +639,10 @@ fn Layout(children: Children) -> impl IntoView {
                                 {events_icon()}
                                 "Events"
                             </A>
+                            <A href=base_href("/governance") attr:class=nav_link_class("/governance")>
+                                {governance_icon()}
+                                "Agents"
+                            </A>
                             {move || is_admin.get().then(|| view! {
                                 <A href=base_href("/admin") attr:class=nav_link_class("/admin")>
                                     {admin_icon()}
@@ -668,6 +713,10 @@ fn Layout(children: Children) -> impl IntoView {
                             <A href=base_href("/events") attr:class=mobile_link_class("/events") on:click=close_mobile>
                                 {events_icon()}
                                 "Events"
+                            </A>
+                            <A href=base_href("/governance") attr:class=mobile_link_class("/governance") on:click=close_mobile>
+                                {governance_icon()}
+                                "Agents"
                             </A>
                             <A href=base_href("/settings") attr:class=mobile_link_class("/settings") on:click=close_mobile>
                                 {settings_icon()}
@@ -914,3 +963,4 @@ auth_gated!(AuthGatedEvents, EventsPage);
 auth_gated!(AuthGatedProfile, ProfilePage);
 auth_gated!(AuthGatedSearch, SearchPage);
 auth_gated!(AuthGatedSettings, SettingsPage);
+auth_gated!(AuthGatedGovernance, GovernancePage);

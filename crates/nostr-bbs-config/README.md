@@ -36,6 +36,7 @@ See [`src/schema.rs`](src/schema.rs) for the canonical schema. Major sections:
 | `[ratelimit]`  | per-route limits                                               |
 | `[features]`   | optional UI features                                           |
 | `[custody]`    | operator tier (tier-1 .. tier-4 per ADR-079)                   |
+| `[governance]` | Agent Control Surface settings: agent registry mode, default rate limit, governance API path |
 
 ## Validation
 

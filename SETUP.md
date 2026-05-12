@@ -84,6 +84,16 @@ CREATE TABLE IF NOT EXISTS whitelist (
 );
 ```
 
+Apply the governance migration (Agent Control Surface Protocol):
+
+```bash
+wrangler d1 execute nostr-bbs-relay --file crates/nostr-bbs-relay-worker/migrations/0002_governance.sql
+```
+
+This creates four tables: `agent_registry`, `broker_cases`, `broker_decisions`,
+`broker_roles`. The migration is idempotent (uses `IF NOT EXISTS`). The same
+tables are also created inline by the auth-worker on startup.
+
 ### KV Namespaces
 
 ```bash
@@ -180,7 +190,59 @@ The built files are in `crates/nostr-bbs-forum-client/dist/`. Deploy to any stat
    - Create channels and categories
    - Configure community settings
 
-## 8. Zone Configuration
+## 8. Agent Control Surface (Governance)
+
+The forum provides an Agent Control Surface Protocol for human-in-the-loop
+governance. Agents publish interactive control panels via nostr events (kinds
+31400-31405); humans respond with signed decisions.
+
+### Registering an Agent
+
+Agents must be registered by an admin before they can publish governance events:
+
+```bash
+# Register an agent pubkey via the governance REST API
+curl -X POST https://api.your-domain.com/api/governance/agents/register \
+  -H "Authorization: Nostr <base64-nip98-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"pubkey": "<agent_64hex_pubkey>", "name": "My Agent", "description": "Enrichment queue agent", "rate_limit_per_min": 60}'
+```
+
+### Granting Broker Roles
+
+Broker roles control which humans can act on governance cases:
+
+```bash
+# Grant the broker role to a human pubkey
+curl -X POST https://api.your-domain.com/api/governance/roles/grant \
+  -H "Authorization: Nostr <base64-nip98-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"pubkey": "<human_64hex_pubkey>", "role": "broker"}'
+```
+
+Available roles: `contributor`, `auditor`, `broker`, `admin`.
+
+### Governance Dashboard
+
+Once agents are registered and publishing events, the governance dashboard is
+available at `/governance` in the forum client. It shows:
+
+- **Active Panels** -- agent-published PanelDefinitions with schema, fields, and actions
+- **Pending Actions** -- action requests awaiting human review with approve/reject buttons
+- **Registered Agents** -- count of active agents publishing to the relay
+
+### Governance D1 Migration
+
+The governance tables are created by `0002_governance.sql` in
+`crates/nostr-bbs-relay-worker/migrations/`. Apply with:
+
+```bash
+wrangler d1 execute nostr-bbs-relay --file crates/nostr-bbs-relay-worker/migrations/0002_governance.sql
+```
+
+The auth-worker also creates these tables inline via `schema.rs` on first request.
+
+## 9. Zone Configuration
 
 The 3-zone model is configurable:
 
@@ -212,6 +274,10 @@ provide_zone_access();
 - **Relay not connecting**: Check `DEFAULT_RELAY_URL` points to your deployed relay-worker
 - **Zone access empty**: The relay's `/api/check-whitelist` endpoint must return `access` object with zone flags
 - **First user not admin**: Check relay D1 `whitelist` table -- the `is_admin` column should be 1
+- **Agent events rejected by relay**: The agent pubkey must be registered in `agent_registry` with `active = 1`. Use `GET /api/governance/agents` to verify registration status
+- **Governance page empty**: The relay subscription for kinds 31400-31405 requires the WebSocket connection to be established. Check browser console for relay connection status
+- **Action response signing fails**: The user must be authenticated via passkey or NIP-07 before signing action responses. Check `auth.is_authenticated()` state
+- **Governance migration not applied**: Run `wrangler d1 execute nostr-bbs-relay --file crates/nostr-bbs-relay-worker/migrations/0002_governance.sql` to create governance tables
 
 ## Running Tests
 

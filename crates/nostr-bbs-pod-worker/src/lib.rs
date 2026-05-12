@@ -221,6 +221,7 @@ fn build_did_nostr_document(pubkey_hex: &str, pod_base: &str) -> serde_json::Val
                 Some(&webid_url),
                 &pod_url,
                 None, // relay URL: not included at Tier 3 without lookup
+                None, // governance URL: set at instance config level
                 None, // display name: not known at DID resolution time
             )
         }

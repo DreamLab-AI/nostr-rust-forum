@@ -8,6 +8,74 @@ and this project tracks the spec home at [VisionClaw monorepo](https://github.co
 
 ## [Unreleased]
 
+## [3.0.0-rc7] -- 2026-05-12
+
+Agent Control Surface Protocol: governance types, relay integration, REST API,
+forum UI, and D1 migration. The forum becomes a universal human-in-the-loop
+control plane for any agent system.
+
+### Added
+
+- **Agent Control Surface Protocol** (kinds 31400-31405). Six new parameterized
+  replaceable event kinds for agent-published control panels: PanelDefinition,
+  PanelState, ActionRequest, ActionResponse, PanelUpdate, PanelRetired. Agents
+  declare interactive panels via nostr events; the forum renders them as
+  decision surfaces; humans respond with cryptographically signed events.
+- **`nostr_bbs_core::governance` module** (1003 LOC, 19 tests). Full domain
+  model: `PanelDefinition`, `ActionRequest`/`ActionResponse`, `BrokerCase`
+  aggregate root with `DecisionOrchestrator`, `RegisteredAgent` types,
+  tag-extraction helpers, governance kind-range constants. Ported from
+  VisionClaw ADR-041/057 with framework-agnostic design.
+- **`governance_api.rs`** in auth-worker. Seven NIP-98-gated REST endpoints:
+  `GET/POST /api/governance/agents{,/register,/revoke}`,
+  `GET /api/governance/cases{,:id}`,
+  `POST /api/governance/roles/grant`, `GET /api/governance/roles`.
+  Admin-only registration/revocation/role-grant; authenticated read for all.
+- **Agent registry gate in relay-worker**. Governance events (kinds 31400-31405)
+  from agent pubkeys are validated against the `agent_registry` D1 table at
+  relay ingress. Unregistered agents are rejected. `ActionResponse` (kind 31403)
+  from humans passes through standard NIP-98 auth.
+- **Action request projection to `broker_cases`**. Kind 31402 events are
+  projected into the `broker_cases` D1 table for queryable governance inbox.
+- **`0002_governance.sql` migration** for relay-worker. Creates four D1 tables:
+  `agent_registry`, `broker_cases`, `broker_decisions`, `broker_roles` with
+  appropriate indexes. Idempotent (IF NOT EXISTS).
+- **Governance D1 tables in auth-worker schema**. Inline DDL in `schema.rs`
+  mirrors the relay migration for the auth-worker's D1 database.
+- **`GovernancePage`** in forum-client. Reactive dashboard at `/governance`
+  showing active panels, pending actions, and registered agent count. Includes
+  `PanelCard` (renders agent panel definitions with action buttons) and
+  `ActionRow` (renders action requests with approve/reject signing via the
+  user's nostr key).
+- **`PanelRegistry` reactive store** in forum-client. Ingests governance events
+  from the relay subscription, maintains `HashMap<d_tag, PanelEntry>` for panels
+  and `Vec<ActionEntry>` for pending actions. Provided as Leptos context from
+  `app.rs`.
+- **Governance relay subscription** in `app.rs`. Subscribes to kinds 31400-31405
+  and feeds events into `PanelRegistry`.
+- **`AgentGovernance` service endpoint** in `did:nostr` Tier-3 DID documents.
+  `nostr_bbs_core::did` now accepts a governance API URL and emits an
+  `AgentGovernance` service endpoint in the DID document.
+- **Navigation entry** for `/governance` in the forum client sidebar with
+  dedicated icon.
+- **Value assessment document**: `docs/sprint/enterprise-lift-value-assessment.md`
+  covering the ADR, DDD domain model, MCP tool surface design, and cross-repo
+  SSO alignment plan.
+- **NIP-98 SSO parity report**: `docs/sprint/milestone-0-sso-parity.md`
+  documenting the Schnorr pre-hashing mismatch between nostr-bbs-core and
+  solid-pod-rs, with fix instructions.
+
+### Changed
+
+- **`nostr-bbs-core`** gains `governance` module (behind default feature).
+  `BrokerCase` domain model with invariants: no self-review, append-only
+  history, terminal state idempotency, provenance chain.
+- **Relay-worker `handle_event`** extended with agent-kind routing block
+  (same pattern as NIP-29 admin kinds) for governance event validation.
+- **Auth-worker `lib.rs`** routes 7 new `/api/governance/*` paths.
+- **Forum-client `app.rs`** provides `PanelRegistry` context and subscribes
+  to governance events on relay connect.
+
 ## [Security Audit Sprint] - 2026-05-11
 
 DreamLab ecosystem-wide security audit. 12 fixes applied to nostr-rust-forum
@@ -173,6 +241,8 @@ they were authored during the mega-sprint Phase 0 + Phase 1 windows).
 
 Complete Rust rewrite (pre-existing kit baseline, see commit `ab4b403`).
 
-[Unreleased]: https://github.com/DreamLab-AI/nostr-rust-forum/compare/v3.0-rc1...HEAD
+[Unreleased]: https://github.com/DreamLab-AI/nostr-rust-forum/compare/v3.0.0-rc7...HEAD
+[3.0.0-rc7]: https://github.com/DreamLab-AI/nostr-rust-forum/compare/v3.0.0-rc6...v3.0.0-rc7
+[3.0.0-rc6]: https://github.com/DreamLab-AI/nostr-rust-forum/compare/v3.0-rc1...v3.0.0-rc6
 [3.0-rc1]: https://github.com/DreamLab-AI/nostr-rust-forum/compare/v2.0...v3.0-rc1
 [2.0]: https://github.com/DreamLab-AI/nostr-rust-forum/releases/tag/v2.0

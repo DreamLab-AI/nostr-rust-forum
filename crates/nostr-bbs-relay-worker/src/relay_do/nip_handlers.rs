@@ -9,6 +9,7 @@
 //! - Zone enforcement on EVENT and REQ.
 
 use nostr_bbs_core::event::NostrEvent;
+use nostr_bbs_core::governance;
 use nostr_bbs_core::{KIND_BAN, KIND_MUTE, KIND_REPORT_NIP56};
 use wasm_bindgen::JsValue;
 use worker::*;
@@ -199,6 +200,23 @@ impl NostrRelayDO {
             }
         }
 
+        // Agent Control Surface Protocol: governance kinds (31400-31405) are
+        // only accepted from pubkeys registered in the agent_registry table.
+        // Human responses (kind 31403) are allowed from any whitelisted user.
+        if governance::is_governance_kind(event.kind)
+            && event.kind != governance::KIND_ACTION_RESPONSE
+        {
+            if !self.is_registered_agent(&event.pubkey).await {
+                Self::send_ok(
+                    ws,
+                    &event.id,
+                    false,
+                    "blocked: pubkey not in agent registry",
+                );
+                return;
+            }
+        }
+
         // Zone enforcement for channel messages (kind-42)
         if event.kind == 42 {
             let Some(channel_id) = filter::tag_value(&event, "e") else {
@@ -255,10 +273,21 @@ impl NostrRelayDO {
             // Only respected when the signer is an admin on this relay.
             if matches!(event.kind, KIND_BAN | KIND_MUTE) && is_admin {
                 self.mirror_moderation_action(&event).await;
-                // Best-effort cache invalidation for the target pubkey.
                 if let Some(target) = filter::tag_value(&event, "p") {
                     self.mod_cache.invalidate(&target);
                 }
+            }
+
+            // Agent Control Surface: project ActionRequest events (31402)
+            // into the broker_cases table for D1-queryable governance inbox.
+            if event.kind == governance::KIND_ACTION_REQUEST {
+                self.project_action_request(&event).await;
+            }
+
+            // Agent Control Surface: project ActionResponse events (31403)
+            // into broker_decisions and update the broker_cases state.
+            if event.kind == governance::KIND_ACTION_RESPONSE {
+                self.project_action_response(&event).await;
             }
         } else {
             Self::send_ok(ws, &event.id, false, "error: failed to save event");
@@ -606,6 +635,123 @@ impl NostrRelayDO {
                 _ => false,
             },
             Err(_) => false,
+        }
+    }
+
+    pub(crate) async fn is_registered_agent(&self, pubkey: &str) -> bool {
+        let db = match self.env.d1("DB") {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+
+        #[derive(serde::Deserialize)]
+        struct AgentActiveRow {
+            active: u32,
+        }
+
+        let stmt = db.prepare("SELECT active FROM agent_registry WHERE pubkey = ?1 LIMIT 1");
+        match stmt.bind(&[JsValue::from_str(pubkey)]) {
+            Ok(s) => match s.first::<AgentActiveRow>(None).await {
+                Ok(Some(row)) => row.active == 1,
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    pub(crate) async fn project_action_request(&self, event: &NostrEvent) {
+        let db = match self.env.d1("DB") {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+
+        let d_tag = governance::extract_d_tag(&event.tags).unwrap_or(&event.id);
+        let category = governance::extract_tag(&event.tags, "category")
+            .unwrap_or("manual_submission");
+        let subject_kind = governance::extract_tag(&event.tags, "subject-kind")
+            .unwrap_or("opaque");
+        let subject_id = governance::extract_tag(&event.tags, "subject-id")
+            .unwrap_or("");
+        let title = governance::extract_tag(&event.tags, "title")
+            .unwrap_or("Untitled");
+        let priority: u32 = governance::extract_tag(&event.tags, "priority")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(50);
+
+        let stmt = db.prepare(
+            "INSERT OR REPLACE INTO broker_cases \
+             (id, category, subject_kind, subject_id, title, summary, state, priority, \
+              created_by, nostr_event_id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?10)",
+        );
+        if let Ok(bound) = stmt.bind(&[
+            JsValue::from_str(d_tag),
+            JsValue::from_str(category),
+            JsValue::from_str(subject_kind),
+            JsValue::from_str(subject_id),
+            JsValue::from_str(title),
+            JsValue::from_str(&event.content),
+            JsValue::from_f64(priority as f64),
+            JsValue::from_str(&event.pubkey),
+            JsValue::from_str(&event.id),
+            JsValue::from_f64(event.created_at as f64),
+        ]) {
+            let _ = bound.run().await;
+        }
+    }
+
+    pub(crate) async fn project_action_response(&self, event: &NostrEvent) {
+        let db = match self.env.d1("DB") {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+
+        let case_id = governance::extract_d_tag(&event.tags).unwrap_or("");
+        if case_id.is_empty() {
+            return;
+        }
+
+        let action = serde_json::from_str::<governance::ActionResponse>(&event.content)
+            .map(|r| r.action)
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let reasoning = serde_json::from_str::<governance::ActionResponse>(&event.content)
+            .map(|r| r.reasoning)
+            .unwrap_or_default();
+
+        let decision_id = format!("dec-{}", &event.id[..16.min(event.id.len())]);
+
+        let stmt = db.prepare(
+            "INSERT OR IGNORE INTO broker_decisions \
+             (decision_id, case_id, outcome, broker_pubkey, reasoning, decided_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        );
+        if let Ok(bound) = stmt.bind(&[
+            JsValue::from_str(&decision_id),
+            JsValue::from_str(case_id),
+            JsValue::from_str(&action),
+            JsValue::from_str(&event.pubkey),
+            JsValue::from_str(&reasoning),
+            JsValue::from_f64(event.created_at as f64),
+        ]) {
+            let _ = bound.run().await;
+        }
+
+        let new_state = match action.as_str() {
+            "approve" => "resolved",
+            "reject" => "rejected",
+            _ => "under_review",
+        };
+        let update_stmt = db.prepare(
+            "UPDATE broker_cases SET state = ?1, assigned_to = ?2, updated_at = ?3 WHERE id = ?4",
+        );
+        if let Ok(bound) = update_stmt.bind(&[
+            JsValue::from_str(new_state),
+            JsValue::from_str(&event.pubkey),
+            JsValue::from_f64(event.created_at as f64),
+            JsValue::from_str(case_id),
+        ]) {
+            let _ = bound.run().await;
         }
     }
 

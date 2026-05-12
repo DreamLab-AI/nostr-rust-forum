@@ -19,6 +19,7 @@ mod auth;
 mod crypto;
 mod delegation;
 mod did;
+mod governance_api;
 mod http;
 mod invites;
 mod moderation;
@@ -444,6 +445,43 @@ async fn route_sprint_api(
     }
     if path == "/api/admins/remove" && *method == Method::Post {
         let resp = admins::handle_remove(body_bytes, auth_header, env).await?;
+        return Ok(Some(resp));
+    }
+
+    // -- Governance (Agent Control Surface) --------------------------------
+    if path == "/api/governance/agents" && *method == Method::Get {
+        let resp = governance_api::handle_list_agents(auth_header, env).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/governance/agents/register" && *method == Method::Post {
+        let resp =
+            governance_api::handle_register_agent(body_bytes, auth_header, env).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/governance/agents/revoke" && *method == Method::Post {
+        let resp = governance_api::handle_revoke_agent(body_bytes, auth_header, env).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/governance/cases" && *method == Method::Get {
+        let resp = governance_api::handle_list_cases(&query, auth_header, env).await?;
+        return Ok(Some(resp));
+    }
+    if let Some(case_id) = path.strip_prefix("/api/governance/cases/") {
+        if *method == Method::Get && !case_id.is_empty() && !case_id.contains('/') {
+            let resp = governance_api::handle_get_case(case_id, auth_header, env).await?;
+            return Ok(Some(resp));
+        }
+    }
+    if path == "/api/governance/roles/grant" && *method == Method::Post {
+        let resp = governance_api::handle_grant_role(body_bytes, auth_header, env).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/governance/roles/revoke" && *method == Method::Post {
+        let resp = governance_api::handle_revoke_role(body_bytes, auth_header, env).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/governance/roles" && *method == Method::Get {
+        let resp = governance_api::handle_list_roles(auth_header, env).await?;
         return Ok(Some(resp));
     }
 

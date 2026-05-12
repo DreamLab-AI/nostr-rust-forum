@@ -27,7 +27,7 @@ mod tests {
     #[test]
     fn reexported_tier3_matches_core() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
-        let doc = render_did_document_tier3(&pk, None, "https://pod.test/", None, None);
+        let doc = render_did_document_tier3(&pk, None, "https://pod.test/", None, None, None);
         assert_eq!(doc["service"].as_array().unwrap().len(), 1);
     }
 
