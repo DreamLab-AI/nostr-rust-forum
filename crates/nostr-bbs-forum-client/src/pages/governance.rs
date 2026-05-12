@@ -24,14 +24,14 @@ pub fn GovernancePage() -> impl IntoView {
     let panels = Memo::new(move |_| {
         let s = state.read();
         let mut v: Vec<PanelEntry> = s.panels.values().cloned().collect();
-        v.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
+        v.sort_by_key(|p| std::cmp::Reverse(p.last_updated));
         v
     });
 
     let actions = Memo::new(move |_| {
         let s = state.read();
         let mut v = s.actions.clone();
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        v.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         v
     });
 
