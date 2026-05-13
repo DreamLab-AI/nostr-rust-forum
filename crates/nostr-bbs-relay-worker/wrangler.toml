@@ -11,6 +11,12 @@ ADMIN_PUBKEYS = ""
 ALLOWED_ORIGIN = "https://example.com"
 ALLOWED_ORIGINS = "https://example.com"
 
+# Mesh federation (PRD-010 Phase 3 / ADR-073)
+MESH_MODE               = "standalone"
+MESH_PEER_RELAYS        = ""
+MESH_FEDERATED_KINDS    = "1,1059,30001,30050,30078,30910,31400,31401,31402,31403,31404,31405,38000,38100"
+MESH_ALLOWED_REMOTE_DIDS = ""
+
 [[d1_databases]]
 binding = "DB"
 database_name = "nostr-bbs-relay"

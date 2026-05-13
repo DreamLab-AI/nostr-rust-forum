@@ -7,6 +7,7 @@
 //! - Event validation.
 //! - Trust-level gating (TL0-TL3) for event kinds.
 //! - Zone enforcement on EVENT and REQ.
+//! - F11 (PRD-010): Federated kind allowlist filtering for mesh peers.
 
 use nostr_bbs_core::event::NostrEvent;
 use nostr_bbs_core::governance;
@@ -80,6 +81,20 @@ impl NostrRelayDO {
 
         if !self.is_whitelisted(&event.pubkey).await {
             Self::send_ok(ws, &event.id, false, "blocked: pubkey not whitelisted");
+            return;
+        }
+
+        // F11 (PRD-010): When mesh federation is active, events arriving from
+        // a recognised mesh peer (listed in MESH_ALLOWED_REMOTE_DIDS) are
+        // filtered against the federated_kinds allowlist. Local clients whose
+        // pubkey is NOT in the remote DIDs list bypass this check entirely.
+        if self.is_mesh_peer(&event.pubkey) && !self.is_federated_kind_allowed(event.kind) {
+            Self::send_ok(
+                ws,
+                &event.id,
+                false,
+                "blocked: event kind not in federated_kinds allowlist",
+            );
             return;
         }
 
@@ -788,6 +803,66 @@ impl NostrRelayDO {
         }
 
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F11 (PRD-010): Federated kind allowlist helpers
+// ---------------------------------------------------------------------------
+
+impl NostrRelayDO {
+    /// Check whether the event's pubkey belongs to a known mesh peer.
+    ///
+    /// Returns `true` when:
+    ///   1. `MESH_MODE` is set to a value other than `"standalone"` (or empty), AND
+    ///   2. `MESH_ALLOWED_REMOTE_DIDS` contains the pubkey.
+    ///
+    /// When `MESH_MODE` is `"standalone"` (the default) or the env var is absent,
+    /// this always returns `false` — all events are treated as local.
+    pub(crate) fn is_mesh_peer(&self, pubkey: &str) -> bool {
+        let mesh_mode = match self.env.var("MESH_MODE") {
+            Ok(val) => val.to_string(),
+            Err(_) => return false,
+        };
+
+        if mesh_mode.is_empty() || mesh_mode == "standalone" {
+            return false;
+        }
+
+        let allowed_dids = match self.env.var("MESH_ALLOWED_REMOTE_DIDS") {
+            Ok(val) => val.to_string(),
+            Err(_) => return false,
+        };
+
+        if allowed_dids.is_empty() {
+            return false;
+        }
+
+        allowed_dids
+            .split(',')
+            .any(|did| did.trim() == pubkey)
+    }
+
+    /// Check whether a given event kind is in the `MESH_FEDERATED_KINDS`
+    /// allowlist.
+    ///
+    /// Reads `MESH_FEDERATED_KINDS` from the Worker env (comma-separated list
+    /// of u64 values). When the env var is absent or empty, returns `false`
+    /// (fail-closed: no kinds allowed from peers by default).
+    pub(crate) fn is_federated_kind_allowed(&self, kind: u64) -> bool {
+        let kinds_str = match self.env.var("MESH_FEDERATED_KINDS") {
+            Ok(val) => val.to_string(),
+            Err(_) => return false,
+        };
+
+        if kinds_str.is_empty() {
+            return false;
+        }
+
+        kinds_str
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u64>().ok())
+            .any(|k| k == kind)
     }
 }
 

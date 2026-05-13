@@ -18,10 +18,8 @@ pub fn now_secs() -> u64 {
 }
 
 /// Verify a NIP-98 `Authorization` header at the current time WITH replay
-/// protection enforced via the `NIP98_REPLAY` KV namespace bound to this
-/// worker. If the binding is missing the call falls back to a permissive
-/// store and emits a console warning — production environments MUST bind
-/// `NIP98_REPLAY` (see `wrangler.toml`).
+/// protection enforced via D1-backed atomic `INSERT OR IGNORE` on the shared
+/// `nostr-bbs-auth` database (binding `"DB"` in this worker's `wrangler.toml`).
 pub async fn verify(
     auth_header: &str,
     expected_url: &str,
