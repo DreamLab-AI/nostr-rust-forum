@@ -84,10 +84,9 @@ async fn pod_provision(
     signer: &dyn nostr_bbs_core::signer::Signer,
 ) -> Result<(), String> {
     let url = format!("{base_url}/.provision");
-    let token =
-        crate::auth::nip98::create_nip98_token_with_signer(signer, &url, "POST", None)
-            .await
-            .map_err(|e| format!("NIP-98: {e}"))?;
+    let token = crate::auth::nip98::create_nip98_token_with_signer(signer, &url, "POST", None)
+        .await
+        .map_err(|e| format!("NIP-98: {e}"))?;
 
     let win = web_sys::window().ok_or("No window")?;
     let init = web_sys::RequestInit::new();
@@ -102,8 +101,7 @@ async fn pod_provision(
         .map_err(|e| format!("{e:?}"))?;
     init.set_headers(&headers);
 
-    let req = web_sys::Request::new_with_str_and_init(&url, &init)
-        .map_err(|e| format!("{e:?}"))?;
+    let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
     let resp_val = JsFuture::from(win.fetch_with_request(&req))
         .await
         .map_err(|e| format!("Fetch: {e:?}"))?;
@@ -264,9 +262,7 @@ pub fn PodBrowserPage() -> impl IntoView {
             wasm_bindgen_futures::spawn_local(async move {
                 let result = match pod_fetch(&url, &*signer).await {
                     Ok(body) => Ok(body),
-                    Err(ref e)
-                        if path == "/" && (e.contains("403") || e.contains("404")) =>
-                    {
+                    Err(ref e) if path == "/" && (e.contains("403") || e.contains("404")) => {
                         // Pod likely not provisioned — try auto-provisioning
                         if pod_provision(&base, &*signer).await.is_ok() {
                             pod_fetch(&url, &*signer).await

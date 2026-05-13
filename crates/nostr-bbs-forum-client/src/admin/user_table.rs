@@ -292,7 +292,9 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
                     crate::utils::relay_url::relay_api_base(),
                     pk
                 );
-                if let Ok(body) = crate::auth::nip98::fetch_with_nip98_get_signer(&url, &*signer).await {
+                if let Ok(body) =
+                    crate::auth::nip98::fetch_with_nip98_get_signer(&url, &*signer).await
+                {
                     if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&body) {
                         if let Some(n) = resp.get("notes").and_then(|v| v.as_str()) {
                             notes.set(n.to_string());

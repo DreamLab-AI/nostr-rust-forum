@@ -144,7 +144,7 @@ pub async fn require_authed(
 /// handler signature.
 use std::cell::RefCell;
 thread_local! {
-    static NIP98_ORIGIN: RefCell<String> = RefCell::new(String::new());
+    static NIP98_ORIGIN: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// Store the actual request origin for the duration of this request.
@@ -162,7 +162,11 @@ pub fn set_nip98_origin(origin: &str) {
 pub fn canonical_url(env: &Env, path: &str) -> String {
     let origin = NIP98_ORIGIN.with(|o| {
         let v = o.borrow();
-        if v.is_empty() { None } else { Some(v.clone()) }
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.clone())
+        }
     });
     let origin = origin.unwrap_or_else(|| {
         env.var("EXPECTED_ORIGIN")
