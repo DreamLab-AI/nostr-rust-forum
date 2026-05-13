@@ -7,7 +7,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::auth::nip98::fetch_with_nip98_get;
+use crate::auth::nip98::fetch_with_nip98_get_signer;
 use crate::auth::use_auth;
 
 // -- Types --------------------------------------------------------------------
@@ -66,13 +66,13 @@ pub fn AuditLogTab() -> impl IntoView {
     // Load audit log
     let auth_for_load = auth;
     Effect::new(move |_| {
-        if let Some(privkey) = auth_for_load.get_privkey_bytes() {
+        if let Some(signer) = auth_for_load.get_signer() {
             spawn_local(async move {
                 let url = format!(
                     "{}/api/admin/audit-log?limit=50",
                     crate::utils::relay_url::relay_api_base()
                 );
-                match fetch_with_nip98_get(&url, &privkey).await {
+                match fetch_with_nip98_get_signer(&url, &*signer).await {
                     Ok(body) => {
                         if let Ok(resp) = serde_json::from_str::<AuditLogResponse>(&body) {
                             entries.set(resp.entries);

@@ -102,6 +102,11 @@ fn AdminPanelInner() -> impl IntoView {
             spawn_local(async move {
                 let _ = admin_clone.fetch_whitelist(&privkey).await;
             });
+        } else if let Some(signer) = auth_for_init.get_signer() {
+            let admin_clone = admin_for_init.clone();
+            spawn_local(async move {
+                let _ = admin_clone.fetch_whitelist_signer(&*signer).await;
+            });
         }
     });
 
@@ -353,12 +358,12 @@ fn UsersTab() -> impl IntoView {
             add_error.set(Some("Select at least one cohort".into()));
             return;
         }
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             let admin_clone = admin_for_add.clone();
             let pk_owned = pk_trimmed.to_string();
             spawn_local(async move {
                 if (admin_clone
-                    .add_to_whitelist(&pk_owned, &cohorts, &privkey)
+                    .add_to_whitelist_signer(&pk_owned, &cohorts, &*signer)
                     .await)
                     .is_ok()
                 {
@@ -367,17 +372,17 @@ fn UsersTab() -> impl IntoView {
                 }
             });
         } else {
-            add_error.set(Some("No private key available".into()));
+            add_error.set(Some("No signing key available — log in first".into()));
         }
     };
 
     let admin_for_update = admin.clone();
     let on_update_cohorts = move |pubkey: String, cohorts: Vec<String>| {
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             let admin_clone = admin_for_update.clone();
             spawn_local(async move {
                 let _ = admin_clone
-                    .update_cohorts(&pubkey, &cohorts, &privkey)
+                    .update_cohorts_signer(&pubkey, &cohorts, &*signer)
                     .await;
             });
         }
@@ -385,11 +390,11 @@ fn UsersTab() -> impl IntoView {
 
     let admin_for_admin_toggle = admin.clone();
     let on_toggle_admin = move |pubkey: String, new_admin_status: bool| {
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             let admin_clone = admin_for_admin_toggle.clone();
             spawn_local(async move {
                 let _ = admin_clone
-                    .set_admin(&pubkey, new_admin_status, &privkey)
+                    .set_admin_signer(&pubkey, new_admin_status, &*signer)
                     .await;
             });
         }
@@ -397,10 +402,10 @@ fn UsersTab() -> impl IntoView {
 
     let admin_for_refresh = admin.clone();
     let on_refresh = move |_| {
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             let admin_clone = admin_for_refresh.clone();
             spawn_local(async move {
-                let _ = admin_clone.fetch_whitelist(&privkey).await;
+                let _ = admin_clone.fetch_whitelist_signer(&*signer).await;
             });
         }
     };
@@ -525,10 +530,10 @@ fn DangerZone() -> impl IntoView {
                     <button
                         on:click=move |_| {
                             admin_stored.with_value(|admin| {
-                                if let Some(privkey) = auth.get_privkey_bytes() {
+                                if let Some(signer) = auth.get_signer() {
                                     let admin_clone = admin.clone();
                                     spawn_local(async move {
-                                        let _ = admin_clone.reset_db(&privkey).await;
+                                        let _ = admin_clone.reset_db_signer(&*signer).await;
                                     });
                                 }
                             });

@@ -8,7 +8,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::auth::nip98::{fetch_with_nip98_get, fetch_with_nip98_post};
+use crate::auth::nip98::{fetch_with_nip98_get_signer, fetch_with_nip98_post_signer};
 use crate::auth::use_auth;
 
 // -- Types --------------------------------------------------------------------
@@ -242,10 +242,10 @@ pub fn SettingsTab() -> impl IntoView {
             return;
         }
 
-        if let Some(privkey) = auth_for_load.get_privkey_bytes() {
+        if let Some(signer) = auth_for_load.get_signer() {
             spawn_local(async move {
                 let url = format!("{}/api/settings", crate::utils::relay_url::relay_api_base());
-                match fetch_with_nip98_get(&url, &privkey).await {
+                match fetch_with_nip98_get_signer(&url, &*signer).await {
                     Ok(body) => {
                         if let Ok(resp) = serde_json::from_str::<SettingsResponse>(&body) {
                             save_cached_settings(&resp.settings);
@@ -305,7 +305,7 @@ pub fn SettingsTab() -> impl IntoView {
         if ed.is_empty() {
             return;
         }
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             is_saving.set(true);
             save_error.set(None);
             save_success.set(None);
@@ -324,7 +324,7 @@ pub fn SettingsTab() -> impl IntoView {
             let settings_for_save = current.clone();
             spawn_local(async move {
                 let url = format!("{}/api/settings", crate::utils::relay_url::relay_api_base());
-                match fetch_with_nip98_post(&url, &body_json, &privkey).await {
+                match fetch_with_nip98_post_signer(&url, &body_json, &*signer).await {
                     Ok(_) => {
                         save_cached_settings(&settings_for_save);
                         settings.set(settings_for_save);

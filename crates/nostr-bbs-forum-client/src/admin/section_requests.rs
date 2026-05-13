@@ -292,10 +292,10 @@ fn approve_request(
     toasts: crate::components::toast::ToastStore,
     relay: RelayConnection,
 ) {
-    let privkey = match auth.get_privkey_bytes() {
-        Some(pk) => pk,
+    let signer = match auth.get_signer() {
+        Some(s) => s,
         None => {
-            toasts.show("No private key available", ToastVariant::Error);
+            toasts.show("No signing key available", ToastVariant::Error);
             return;
         }
     };
@@ -310,7 +310,7 @@ fn approve_request(
     spawn_local(async move {
         // Add cohort to user's whitelist entry
         match admin
-            .add_to_whitelist(&pk, std::slice::from_ref(&cohort), &privkey)
+            .add_to_whitelist_signer(&pk, std::slice::from_ref(&cohort), &*signer)
             .await
         {
             Ok(_) => {

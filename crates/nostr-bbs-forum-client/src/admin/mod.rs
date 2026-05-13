@@ -20,9 +20,13 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
-use crate::auth::nip98::{fetch_with_nip98_get, fetch_with_nip98_post};
+use crate::auth::nip98::{
+    fetch_with_nip98_get, fetch_with_nip98_get_signer, fetch_with_nip98_post,
+    fetch_with_nip98_post_signer,
+};
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::zone_access::use_zone_access;
+use nostr_bbs_core::signer::Signer;
 
 // -- Types --------------------------------------------------------------------
 
@@ -292,6 +296,172 @@ impl AdminStore {
                 )));
                 self.state.is_loading.set(false);
                 let _ = self.fetch_whitelist(privkey).await;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.state.error.set(Some(msg.clone()));
+                self.state.is_loading.set(false);
+                Err(msg)
+            }
+        }
+    }
+
+    // -- Signer-based variants (NIP-07 / extension wallets) ------------------
+
+    pub async fn fetch_whitelist_signer(&self, signer: &dyn Signer) -> Result<(), String> {
+        self.state.is_loading.set(true);
+        self.state.error.set(None);
+
+        let url = format!("{}/api/whitelist/list", Self::api_base());
+        match fetch_with_nip98_get_signer(&url, signer).await {
+            Ok(body) => {
+                let parsed: WhitelistResponse = serde_json::from_str(&body)
+                    .map_err(|e| format!("Failed to parse whitelist: {e}"))?;
+                if parsed.users.is_empty() {
+                    self.state.error.set(Some(
+                        "Whitelist is empty. No users have been approved yet.".to_string(),
+                    ));
+                }
+                self.state.users.set(parsed.users);
+                self.state.stats.update(|s| {
+                    s.total_users = self.state.users.get_untracked().len() as u32;
+                });
+                self.state.is_loading.set(false);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("Failed to fetch whitelist: {e}");
+                self.state.error.set(Some(msg.clone()));
+                self.state.is_loading.set(false);
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn add_to_whitelist_signer(
+        &self,
+        pubkey: &str,
+        cohorts: &[String],
+        signer: &dyn Signer,
+    ) -> Result<(), String> {
+        self.state.is_loading.set(true);
+        self.state.error.set(None);
+        self.state.success.set(None);
+
+        let body = serde_json::json!({ "pubkey": pubkey, "cohorts": cohorts });
+        let body_json =
+            serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
+        let url = format!("{}/api/whitelist/add", Self::api_base());
+        match fetch_with_nip98_post_signer(&url, &body_json, signer).await {
+            Ok(_) => {
+                self.state.success.set(Some(format!(
+                    "Added {}...{} to whitelist",
+                    &pubkey[..8],
+                    &pubkey[pubkey.len().saturating_sub(4)..]
+                )));
+                self.state.is_loading.set(false);
+                let _ = self.fetch_whitelist_signer(signer).await;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.state.error.set(Some(msg.clone()));
+                self.state.is_loading.set(false);
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn update_cohorts_signer(
+        &self,
+        pubkey: &str,
+        cohorts: &[String],
+        signer: &dyn Signer,
+    ) -> Result<(), String> {
+        self.state.is_loading.set(true);
+        self.state.error.set(None);
+        self.state.success.set(None);
+
+        let body = serde_json::json!({ "pubkey": pubkey, "cohorts": cohorts });
+        let body_json =
+            serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
+        let url = format!("{}/api/whitelist/update-cohorts", Self::api_base());
+        match fetch_with_nip98_post_signer(&url, &body_json, signer).await {
+            Ok(_) => {
+                self.state.success.set(Some(format!(
+                    "Updated cohorts for {}...{}",
+                    &pubkey[..8],
+                    &pubkey[pubkey.len().saturating_sub(4)..]
+                )));
+                self.state.is_loading.set(false);
+                let _ = self.fetch_whitelist_signer(signer).await;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.state.error.set(Some(msg.clone()));
+                self.state.is_loading.set(false);
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn set_admin_signer(
+        &self,
+        pubkey: &str,
+        is_admin: bool,
+        signer: &dyn Signer,
+    ) -> Result<(), String> {
+        self.state.is_loading.set(true);
+        self.state.error.set(None);
+        self.state.success.set(None);
+
+        let body = serde_json::json!({ "pubkey": pubkey, "is_admin": is_admin });
+        let body_json =
+            serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
+        let url = format!("{}/api/whitelist/set-admin", Self::api_base());
+        match fetch_with_nip98_post_signer(&url, &body_json, signer).await {
+            Ok(_) => {
+                let action = if is_admin {
+                    "promoted to admin"
+                } else {
+                    "demoted from admin"
+                };
+                self.state.success.set(Some(format!(
+                    "{}...{} {}",
+                    &pubkey[..8],
+                    &pubkey[pubkey.len().saturating_sub(4)..],
+                    action
+                )));
+                self.state.is_loading.set(false);
+                let _ = self.fetch_whitelist_signer(signer).await;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.state.error.set(Some(msg.clone()));
+                self.state.is_loading.set(false);
+                Err(msg)
+            }
+        }
+    }
+
+    pub async fn reset_db_signer(&self, signer: &dyn Signer) -> Result<(), String> {
+        self.state.is_loading.set(true);
+        self.state.error.set(None);
+        self.state.success.set(None);
+
+        let url = format!("{}/api/admin/reset-db", Self::api_base());
+        match fetch_with_nip98_post_signer(&url, "{}", signer).await {
+            Ok(_) => {
+                self.state.users.set(Vec::new());
+                self.state.channels.set(Vec::new());
+                self.state.stats.set(AdminStats::default());
+                self.state.success.set(Some(
+                    "Database reset. First user to register will become admin.".to_string(),
+                ));
+                self.state.is_loading.set(false);
                 Ok(())
             }
             Err(e) => {

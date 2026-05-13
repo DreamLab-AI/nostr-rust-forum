@@ -76,14 +76,14 @@ fn RegistrationsInner() -> impl IntoView {
     // Approve a single user — use expect_context inside to keep closure Copy-friendly
     let approve_user = Callback::<String>::new(move |pubkey: String| {
         let admin_ctx = use_admin();
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             is_loading.set(true);
             action_msg.set(None);
             let pending_sig = pending;
             spawn_local(async move {
                 let cohorts = vec!["cross-access".to_string()];
                 match admin_ctx
-                    .add_to_whitelist(&pubkey, &cohorts, &privkey)
+                    .add_to_whitelist_signer(&pubkey, &cohorts, &*signer)
                     .await
                 {
                     Ok(_) => {
@@ -127,7 +127,7 @@ fn RegistrationsInner() -> impl IntoView {
         }
 
         let admin_ctx = use_admin();
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             is_loading.set(true);
             action_msg.set(None);
             let pending_sig = pending;
@@ -137,7 +137,7 @@ fn RegistrationsInner() -> impl IntoView {
                 let mut ok_count = 0usize;
                 for pk in &selected {
                     if admin_ctx
-                        .add_to_whitelist(pk, &cohorts, &privkey)
+                        .add_to_whitelist_signer(pk, &cohorts, &*signer)
                         .await
                         .is_ok()
                     {

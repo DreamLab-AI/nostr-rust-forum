@@ -9,7 +9,7 @@ use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
 use super::WhitelistUser;
-use crate::auth::nip98::fetch_with_nip98_post;
+use crate::auth::nip98::fetch_with_nip98_post_signer;
 use crate::auth::use_auth;
 
 /// Available zone flags for cohort editing.
@@ -174,7 +174,7 @@ fn SuspendModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl I
     let on_close_submit = on_close.clone();
     let on_submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             is_submitting.set(true);
             error_msg.set(None);
             let body = serde_json::json!({
@@ -189,7 +189,7 @@ fn SuspendModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl I
                     "{}/api/admin/suspend",
                     crate::utils::relay_url::relay_api_base()
                 );
-                match fetch_with_nip98_post(&url, &body_json, &privkey).await {
+                match fetch_with_nip98_post_signer(&url, &body_json, &*signer).await {
                     Ok(_) => {
                         is_submitting.set(false);
                         close_fn();
@@ -284,7 +284,7 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
     // Load existing notes
     let pk_for_load = pubkey.clone();
     Effect::new(move |_| {
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             let pk = pk_for_load.clone();
             spawn_local(async move {
                 let url = format!(
@@ -292,7 +292,7 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
                     crate::utils::relay_url::relay_api_base(),
                     pk
                 );
-                if let Ok(body) = crate::auth::nip98::fetch_with_nip98_get(&url, &privkey).await {
+                if let Ok(body) = crate::auth::nip98::fetch_with_nip98_get_signer(&url, &*signer).await {
                     if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&body) {
                         if let Some(n) = resp.get("notes").and_then(|v| v.as_str()) {
                             notes.set(n.to_string());
@@ -309,7 +309,7 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
     let pk_for_save = pubkey.clone();
     let on_close_save = on_close.clone();
     let on_save = move |_| {
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             is_saving.set(true);
             let body = serde_json::json!({
                 "pubkey": pk_for_save,
@@ -322,7 +322,7 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
                     "{}/api/admin/notes",
                     crate::utils::relay_url::relay_api_base()
                 );
-                let _ = fetch_with_nip98_post(&url, &body_json, &privkey).await;
+                let _ = fetch_with_nip98_post_signer(&url, &body_json, &*signer).await;
                 is_saving.set(false);
                 close_fn();
             });
@@ -436,7 +436,7 @@ fn UserRow(
     // Silence toggle
     let on_silence_toggle = move |_| {
         let auth = use_auth();
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             let new_state = !is_silenced.get_untracked();
             let body = serde_json::json!({
                 "pubkey": pk_for_silence,
@@ -448,7 +448,7 @@ fn UserRow(
                     "{}/api/admin/silence",
                     crate::utils::relay_url::relay_api_base()
                 );
-                if fetch_with_nip98_post(&url, &body_json, &privkey)
+                if fetch_with_nip98_post_signer(&url, &body_json, &*signer)
                     .await
                     .is_ok()
                 {

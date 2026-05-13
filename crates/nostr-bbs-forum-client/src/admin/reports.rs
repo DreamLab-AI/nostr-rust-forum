@@ -8,7 +8,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::auth::nip98::{fetch_with_nip98_get, fetch_with_nip98_post};
+use crate::auth::nip98::{fetch_with_nip98_get_signer, fetch_with_nip98_post_signer};
 use crate::auth::use_auth;
 
 // -- Types --------------------------------------------------------------------
@@ -92,13 +92,13 @@ pub fn ReportsTab() -> impl IntoView {
     // Load pending reports
     let auth_for_load = auth;
     Effect::new(move |_| {
-        if let Some(privkey) = auth_for_load.get_privkey_bytes() {
+        if let Some(signer) = auth_for_load.get_signer() {
             spawn_local(async move {
                 let url = format!(
                     "{}/api/reports?status=pending",
                     crate::utils::relay_url::relay_api_base()
                 );
-                match fetch_with_nip98_get(&url, &privkey).await {
+                match fetch_with_nip98_get_signer(&url, &*signer).await {
                     Ok(body) => {
                         if let Ok(resp) = serde_json::from_str::<ReportsResponse>(&body) {
                             reports.set(resp.reports);
@@ -116,7 +116,7 @@ pub fn ReportsTab() -> impl IntoView {
     });
 
     let resolve_report = move |report_id: String, event_id: String, action: ReportAction| {
-        if let Some(privkey) = auth.get_privkey_bytes() {
+        if let Some(signer) = auth.get_signer() {
             action_error.set(None);
             action_success.set(None);
 
@@ -134,7 +134,7 @@ pub fn ReportsTab() -> impl IntoView {
                     "{}/api/reports/resolve",
                     crate::utils::relay_url::relay_api_base()
                 );
-                match fetch_with_nip98_post(&url, &body_json, &privkey).await {
+                match fetch_with_nip98_post_signer(&url, &body_json, &*signer).await {
                     Ok(_) => {
                         // Remove resolved report from list
                         reports.update(|list| {
