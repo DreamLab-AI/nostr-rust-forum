@@ -30,14 +30,14 @@ use worker::*;
 // CORS
 // ---------------------------------------------------------------------------
 
-/// Build allowed origins list from `ALLOWED_ORIGINS` env var (comma-separated)
-/// or fall back to the production domain.
 fn allowed_origins(env: &Env) -> Vec<String> {
     env.var("ALLOWED_ORIGINS")
+        .or_else(|_| env.var("ALLOWED_ORIGIN"))
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string())
+        .unwrap_or_default()
         .split(',')
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .collect()
 }
 
@@ -52,10 +52,7 @@ fn cors_origin(req: &Request, env: &Env) -> String {
     if origins.iter().any(|o| o == &origin) {
         origin
     } else {
-        origins
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "https://example.com".to_string())
+        origins.into_iter().next().unwrap_or_default()
     }
 }
 
@@ -98,7 +95,10 @@ fn json_response(
 
 #[derive(Deserialize)]
 struct SearchRequest {
+    #[serde(default)]
     embedding: Vec<f32>,
+    #[serde(default)]
+    query: Option<String>,
     #[serde(default = "default_k")]
     k: usize,
     #[serde(default, rename = "minScore")]
@@ -239,9 +239,40 @@ async fn load_mapping(
 
 async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
     let mut req_clone = req.clone()?;
-    let body: SearchRequest = req_clone.json().await?;
+    let body: SearchRequest = match req_clone.json().await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_response(
+                req,
+                env,
+                &serde_json::json!({ "error": "Invalid request. Provide 'embedding' (384-dim vector) or 'query' (text string)." }),
+                400,
+            );
+        }
+    };
 
-    if body.embedding.len() != DIM {
+    let embedding = if !body.embedding.is_empty() {
+        body.embedding
+    } else if let Some(ref text) = body.query {
+        if text.is_empty() {
+            return json_response(
+                req,
+                env,
+                &serde_json::json!({ "error": "Empty query string" }),
+                400,
+            );
+        }
+        embed::generate_embedding(text)
+    } else {
+        return json_response(
+            req,
+            env,
+            &serde_json::json!({ "error": "Provide 'embedding' (384-dim vector) or 'query' (text string)." }),
+            400,
+        );
+    };
+
+    if embedding.len() != DIM {
         return json_response(
             req,
             env,
@@ -263,7 +294,7 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
     }
 
     let (_, label_to_id, _) = load_mapping(env).await?;
-    let results = store.search(&body.embedding, k, body.min_score);
+    let results = store.search(&embedding, k, body.min_score);
 
     let results_json: Vec<serde_json::Value> = results
         .iter()
@@ -467,7 +498,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Err(e) => {
             console_error!("Search worker error: {e}");
             let msg = e.to_string();
-            if msg.contains("JSON") || msg.contains("json") || msg.contains("Syntax") {
+            if msg.contains("JSON")
+                || msg.contains("json")
+                || msg.contains("Syntax")
+                || msg.contains("missing field")
+                || msg.contains("invalid type")
+                || msg.contains("expected")
+            {
                 json_response(
                     &req,
                     &env,
