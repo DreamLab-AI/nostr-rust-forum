@@ -15,6 +15,7 @@ use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use worker::Env;
+use zeroize::Zeroize;
 
 /// Errors surfaced by the welcome-bot crypto helpers.
 #[derive(Debug)]
@@ -52,26 +53,30 @@ impl std::fmt::Display for CryptoError {
 impl std::error::Error for CryptoError {}
 
 /// Load the master key from the Worker environment.
-fn master_key(env: &Env) -> Result<[u8; 32], CryptoError> {
+///
+/// Returns `Zeroizing<[u8; 32]>` so the key material is scrubbed on drop.
+fn master_key(env: &Env) -> Result<zeroize::Zeroizing<[u8; 32]>, CryptoError> {
     let hex_str = env
         .secret("WELCOME_MASTER_KEY")
         .map(|v| v.to_string())
         .or_else(|_| env.var("WELCOME_MASTER_KEY").map(|v| v.to_string()))
         .map_err(|_| CryptoError::MissingMasterKey)?;
 
-    let bytes = hex::decode(hex_str.trim()).map_err(|_| CryptoError::InvalidMasterKey)?;
+    let mut bytes = hex::decode(hex_str.trim()).map_err(|_| CryptoError::InvalidMasterKey)?;
     if bytes.len() != 32 {
+        bytes.zeroize();
         return Err(CryptoError::InvalidMasterKey);
     }
-    let mut out = [0u8; 32];
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&bytes);
+    bytes.zeroize();
     Ok(out)
 }
 
 /// Encrypt `plaintext` with the master key. Returns `base64url(nonce || ct || tag)`.
 pub fn encrypt_with_master(plaintext: &[u8], env: &Env) -> Result<String, CryptoError> {
     let key_bytes = master_key(env)?;
-    let key = Key::from_slice(&key_bytes);
+    let key = Key::from_slice(key_bytes.as_ref());
     let cipher = ChaCha20Poly1305::new(key);
 
     let mut nonce_bytes = [0u8; 12];
@@ -91,7 +96,7 @@ pub fn encrypt_with_master(plaintext: &[u8], env: &Env) -> Result<String, Crypto
 /// Inverse of [`encrypt_with_master`]. Returns the plaintext bytes.
 pub fn decrypt_with_master(blob_b64: &str, env: &Env) -> Result<Vec<u8>, CryptoError> {
     let key_bytes = master_key(env)?;
-    let key = Key::from_slice(&key_bytes);
+    let key = Key::from_slice(key_bytes.as_ref());
     let cipher = ChaCha20Poly1305::new(key);
 
     let blob = URL_SAFE_NO_PAD

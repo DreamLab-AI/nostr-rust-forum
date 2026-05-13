@@ -60,10 +60,12 @@ impl SecretKey {
     pub fn sign(&self, message: &[u8; 32]) -> Result<Signature, KeyError> {
         let sk = SigningKey::from_bytes(&self.bytes)
             .expect("SecretKey invariant: bytes are always valid");
-        let aux_rand = [0u8; 32];
+        let mut aux_rand = [0u8; 32];
+        getrandom::getrandom(&mut aux_rand).expect("getrandom for aux_rand");
         let sig = sk
             .sign_raw(message, &aux_rand)
             .map_err(|e| KeyError::SigningFailed(e.to_string()))?;
+        aux_rand.zeroize();
         let mut sig_bytes = [0u8; 64];
         sig_bytes.copy_from_slice(&sig.to_bytes());
         Ok(Signature { bytes: sig_bytes })

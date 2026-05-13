@@ -16,7 +16,7 @@
 
 use nostr_bbs_core::d1_helpers::{js_i64, js_str};
 use nostr_bbs_core::keys::signing_key_from_bytes;
-use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
+use nostr_bbs_core::{sign_event, UnsignedEvent};
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::JsValue;
@@ -164,7 +164,7 @@ fn sign_welcome(
         tags,
         content: content.to_string(),
     };
-    let event = sign_event_deterministic(unsigned, &sk).map_err(|e| format!("sign: {e}"))?;
+    let event = sign_event(unsigned, &sk).map_err(|e| format!("sign: {e}"))?;
     serde_json::to_value(event).map_err(|e| format!("serialize: {e}"))
 }
 

@@ -26,6 +26,7 @@
 use nostr_bbs_core::d1_helpers::{js_i64, js_opt_str, js_str};
 use serde::Deserialize;
 use worker::*;
+use zeroize::Zeroize;
 
 pub use solid_pod_rs::payments::{
     balance_response, parse_txo_uri, pay_info, payment_required_body, pubkey_to_did,
@@ -1692,14 +1693,16 @@ pub fn handle_address_route(pubkey: &str, env: &Env) -> std::result::Result<Resp
         ));
     }
 
-    let master_bytes: Vec<u8> = hex::decode(&master_hex)
+    let mut master_bytes: Vec<u8> = hex::decode(&master_hex)
         .map_err(|e| Error::RustError(format!("MASTER_SECRET hex invalid: {e}")))?;
 
     let mut master_secret = [0u8; 32];
     master_secret.copy_from_slice(&master_bytes);
+    master_bytes.zeroize();
 
     let address = derive_deposit_address(&master_secret, pubkey)
         .map_err(|e| Error::RustError(format!("address derivation failed: {e}")))?;
+    master_secret.zeroize();
 
     let body = serde_json::json!({
         "address": address,

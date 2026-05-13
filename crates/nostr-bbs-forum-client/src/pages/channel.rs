@@ -270,13 +270,12 @@ pub fn ChannelPage() -> impl IntoView {
 
                     // Auto-index for semantic search in background
                     let channel_for_index = cid;
-                    let privkey_bytes = auth.get_privkey_bytes();
-                    if let Some(key) = privkey_bytes {
-                        let _ = crate::utils::search_client::ingest_message(
+                    if let Some(signer) = auth.get_signer() {
+                        let _ = crate::utils::search_client::ingest_message_signer(
                             &event_id,
                             &content_for_index,
                             Some(&channel_for_index),
-                            &key,
+                            &*signer,
                         )
                         .await;
                     }

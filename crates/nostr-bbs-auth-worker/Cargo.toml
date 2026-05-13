@@ -31,3 +31,4 @@ k256 = { workspace = true }
 p256 = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+zeroize = { workspace = true }

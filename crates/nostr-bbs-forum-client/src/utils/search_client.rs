@@ -130,6 +130,49 @@ pub async fn ingest_message(
     Ok(data.accepted > 0)
 }
 
+/// Index a new message for semantic search (Signer-based NIP-98 auth).
+pub async fn ingest_message_signer(
+    event_id: &str,
+    content: &str,
+    channel: Option<&str>,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+) -> Result<bool, String> {
+    let embedding = embed_query(content).await?;
+
+    let url = format!("{}/ingest", SEARCH_API);
+    let body = serde_json::json!({
+        "entries": [{
+            "id": event_id,
+            "embedding": embedding,
+            "channel": channel,
+            "timestamp": (js_sys::Date::now() / 1000.0) as u64,
+        }]
+    });
+    let body_str = body.to_string();
+
+    let token = crate::auth::nip98::create_nip98_token_with_signer(
+        signer,
+        &url,
+        "POST",
+        Some(body_str.as_bytes()),
+    )
+    .await
+    .map_err(|e| format!("NIP-98 error: {}", e))?;
+
+    let response = fetch_json_post(&url, &body_str, Some(&token)).await?;
+
+    #[derive(serde::Deserialize)]
+    struct IngestResponse {
+        #[serde(default)]
+        accepted: u32,
+    }
+
+    let data: IngestResponse =
+        serde_json::from_str(&response).map_err(|e| format!("Parse error: {}", e))?;
+
+    Ok(data.accepted > 0)
+}
+
 /// Get search API status.
 pub async fn get_search_status() -> Result<SearchStats, String> {
     let url = format!("{}/status", SEARCH_API);

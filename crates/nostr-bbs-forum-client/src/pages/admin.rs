@@ -97,12 +97,7 @@ fn AdminPanelInner() -> impl IntoView {
 
         admin_for_init.fetch_stats();
 
-        if let Some(privkey) = auth_for_init.get_privkey_bytes() {
-            let admin_clone = admin_for_init.clone();
-            spawn_local(async move {
-                let _ = admin_clone.fetch_whitelist(&privkey).await;
-            });
-        } else if let Some(signer) = auth_for_init.get_signer() {
+        if let Some(signer) = auth_for_init.get_signer() {
             let admin_clone = admin_for_init.clone();
             spawn_local(async move {
                 let _ = admin_clone.fetch_whitelist_signer(&*signer).await;
@@ -258,23 +253,29 @@ fn ChannelsTab() -> impl IntoView {
 
     let admin_for_create = admin.clone();
     let on_create_channel = move |data: ChannelFormData| {
-        if let Some(privkey) = auth.get_privkey_bytes() {
-            if let Err(e) = admin_for_create.create_channel_with_zone(
-                &data.name,
-                &data.description,
-                &data.section,
-                &data.picture,
-                data.zone,
-                data.cohort.as_deref(),
-                &privkey,
-            ) {
-                admin_for_create.state.error.set(Some(e));
-            }
+        if let Some(signer) = auth.get_signer() {
+            let admin_clone = admin_for_create.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = admin_clone
+                    .create_channel_with_zone_signer(
+                        &data.name,
+                        &data.description,
+                        &data.section,
+                        &data.picture,
+                        data.zone,
+                        data.cohort.as_deref(),
+                        &*signer,
+                    )
+                    .await
+                {
+                    admin_clone.state.error.set(Some(e));
+                }
+            });
         } else {
             admin_for_create
                 .state
                 .error
-                .set(Some("No private key available".into()));
+                .set(Some("No signer available".into()));
         }
     };
 

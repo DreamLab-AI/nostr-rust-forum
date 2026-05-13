@@ -577,6 +577,95 @@ impl AdminStore {
         Ok(())
     }
 
+    /// Create a kind-40 channel using the Signer trait (async, NIP-07 compatible).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_channel_with_zone_signer(
+        &self,
+        name: &str,
+        description: &str,
+        section: &str,
+        picture: &str,
+        zone: u8,
+        cohort: Option<&str>,
+        signer: &dyn Signer,
+    ) -> Result<(), String> {
+        let relay = expect_context::<RelayConnection>();
+        let conn = relay.connection_state();
+        if conn.get_untracked() != ConnectionState::Connected {
+            return Err("Relay not connected".to_string());
+        }
+
+        let pubkey_hex = signer.public_key().to_string();
+
+        let content = serde_json::json!({
+            "name": name,
+            "about": description,
+            "picture": picture
+        });
+
+        let now = (js_sys::Date::now() / 1000.0) as u64;
+
+        let mut tags = vec![
+            vec!["section".into(), section.into()],
+            vec!["zone".into(), zone.to_string()],
+        ];
+        if let Some(c) = cohort {
+            tags.push(vec!["cohort".into(), c.into()]);
+        }
+
+        let content_json = serde_json::to_string(&content)
+            .map_err(|e| format!("JSON serialization failed: {e}"))?;
+        let unsigned = nostr_bbs_core::UnsignedEvent {
+            pubkey: pubkey_hex,
+            created_at: now,
+            kind: 40,
+            tags,
+            content: content_json,
+        };
+
+        let signed = signer
+            .sign_event(unsigned)
+            .await
+            .map_err(|e| format!("Signing failed: {e}"))?;
+
+        let success_sig = self.state.success;
+        let error_sig = self.state.error;
+        let channels_sig = self.state.channels;
+        let stats_sig = self.state.stats;
+        let channel_name = name.to_string();
+        let channel_desc = description.to_string();
+        let channel_section = section.to_string();
+        let event_id = signed.id.clone();
+        let event_created_at = signed.created_at;
+        let event_pubkey = signed.pubkey.clone();
+
+        let ack = Rc::new(move |accepted: bool, message: String| {
+            if accepted {
+                success_sig.set(Some(format!("Channel '{}' created", channel_name)));
+                channels_sig.update(|list| {
+                    if !list.iter().any(|c| c.id == event_id) {
+                        list.push(AdminChannel {
+                            id: event_id.clone(),
+                            name: channel_name.clone(),
+                            description: channel_desc.clone(),
+                            section: channel_section.clone(),
+                            created_at: event_created_at,
+                            creator: event_pubkey.clone(),
+                        });
+                    }
+                });
+                stats_sig.update(|s| {
+                    s.total_channels = channels_sig.get_untracked().len() as u32;
+                });
+            } else {
+                error_sig.set(Some(format!("Relay rejected: {}", message)));
+            }
+        });
+        let _ = relay.publish_with_ack(&signed, Some(ack));
+
+        Ok(())
+    }
+
     /// Fetch stats by subscribing to the relay for kind 40 (channels) and kind 42
     /// (messages). Updates the stats signal reactively.
     pub fn fetch_stats(&self) {
