@@ -94,7 +94,7 @@ enum CachePayload {
 fn allowed_origin(env: &Env) -> String {
     env.var("ALLOWED_ORIGIN")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string())
+        .unwrap_or_default()
 }
 
 fn cors_headers(env: &Env) -> Headers {

@@ -50,17 +50,15 @@ use worker::*;
 /// or fall back to the production domain.
 fn allowed_origins(env: &Env) -> Vec<String> {
     env.var("ALLOWED_ORIGINS")
+        .or_else(|_| env.var("ALLOWED_ORIGIN"))
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string())
+        .unwrap_or_default()
         .split(',')
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .collect()
 }
 
-/// Determine the allowed CORS origin for a request.
-///
-/// If the request's `Origin` header matches one of the allowed origins, that
-/// origin is returned. Otherwise falls back to the first allowed origin.
 fn cors_origin(req: &Request, env: &Env) -> String {
     let origins = allowed_origins(env);
     let origin = req
@@ -72,14 +70,10 @@ fn cors_origin(req: &Request, env: &Env) -> String {
     if origins.iter().any(|o| o == &origin) {
         origin
     } else {
-        origins
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "https://example.com".to_string())
+        origins.into_iter().next().unwrap_or_default()
     }
 }
 
-/// Build CORS response headers.
 fn cors_headers(req: &Request, env: &Env) -> Headers {
     let headers = Headers::new();
     headers
@@ -99,12 +93,8 @@ fn cors_headers(req: &Request, env: &Env) -> Headers {
     headers
 }
 
-/// Return the default allowed origin from the env or the production domain.
 fn default_origin(env: &Env) -> String {
-    allowed_origins(env)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "https://example.com".to_string())
+    allowed_origins(env).into_iter().next().unwrap_or_default()
 }
 
 /// CORS utilities for submodules that lack direct access to the request.
