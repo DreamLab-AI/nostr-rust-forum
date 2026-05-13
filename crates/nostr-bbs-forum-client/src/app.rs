@@ -304,24 +304,26 @@ pub fn App() -> impl IntoView {
                 content,
             };
 
-            match auth.sign_event(unsigned) {
-                Ok(signed) => {
-                    r.publish(&signed);
-                    published_profile.set(true);
-                    web_sys::console::log_1(
-                        &format!(
-                            "[app] Published kind-0 profile for auto-whitelist: {}",
-                            &pubkey[..8]
-                        )
-                        .into(),
-                    );
+            wasm_bindgen_futures::spawn_local(async move {
+                match auth.sign_event_async(unsigned).await {
+                    Ok(signed) => {
+                        r.publish(&signed);
+                        published_profile.set(true);
+                        web_sys::console::log_1(
+                            &format!(
+                                "[app] Published kind-0 profile for auto-whitelist: {}",
+                                &pubkey[..8]
+                            )
+                            .into(),
+                        );
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[app] Failed to publish kind-0: {e}").into(),
+                        );
+                    }
                 }
-                Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("[app] Failed to publish kind-0: {e}").into(),
-                    );
-                }
-            }
+            });
         });
     }
 
@@ -359,24 +361,26 @@ pub fn App() -> impl IntoView {
                 content: String::new(),
             };
 
-            match auth.sign_event(unsigned) {
-                Ok(signed) => {
-                    r.publish(&signed);
-                    published_relay_list.set(true);
-                    web_sys::console::log_1(
-                        &format!(
-                            "[app] Published kind-10002 relay list for: {}",
-                            &pubkey[..8]
-                        )
-                        .into(),
-                    );
+            wasm_bindgen_futures::spawn_local(async move {
+                match auth.sign_event_async(unsigned).await {
+                    Ok(signed) => {
+                        r.publish(&signed);
+                        published_relay_list.set(true);
+                        web_sys::console::log_1(
+                            &format!(
+                                "[app] Published kind-10002 relay list for: {}",
+                                &pubkey[..8]
+                            )
+                            .into(),
+                        );
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[app] Failed to publish kind-10002: {e}").into(),
+                        );
+                    }
                 }
-                Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("[app] Failed to publish kind-10002: {e}").into(),
-                    );
-                }
-            }
+            });
         });
     }
 
