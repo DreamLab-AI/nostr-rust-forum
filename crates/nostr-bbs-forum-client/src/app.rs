@@ -22,8 +22,8 @@ use crate::components::toast::{provide_toasts, ToastContainer};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, CategoryPage, ChannelPage, ChatPage, DmChatPage, DmListPage, EventsPage, ForumsPage,
-    GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage, PendingPage, ProfilePage,
-    SearchPage, SectionPage, SettingsPage, SetupPage, SignupPage,
+    GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage, PendingPage, PodBrowserPage,
+    ProfilePage, SearchPage, SectionPage, SettingsPage, SetupPage, SignupPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
@@ -163,6 +163,16 @@ fn events_icon() -> impl IntoView {
             <line x1="16" y1="2" x2="16" y2="6" stroke-linecap="round"/>
             <line x1="8" y1="2" x2="8" y2="6" stroke-linecap="round"/>
             <line x1="3" y1="10" x2="21" y2="10" stroke-linecap="round"/>
+        </svg>
+    }
+}
+
+fn pod_icon() -> impl IntoView {
+    view! {
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <ellipse cx="12" cy="5" rx="9" ry="3" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
     }
 }
@@ -502,6 +512,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/settings") view=AuthGatedSettings />
                     <Route path=path!("/admin") view=AdminPage />
                     <Route path=path!("/governance") view=AuthGatedGovernance />
+                    <Route path=path!("/pod") view=AuthGatedPod />
                     <Route path=path!("/marketplace") view=MarketplacePage />
                 </FlatRoutes>
             </Layout>
@@ -658,6 +669,10 @@ fn Layout(children: Children) -> impl IntoView {
                                 {governance_icon()}
                                 "Agents"
                             </A>
+                            <A href=base_href("/pod") attr:class=nav_link_class("/pod")>
+                                {pod_icon()}
+                                "Pod"
+                            </A>
                             {move || is_admin.get().then(|| view! {
                                 <A href=base_href("/admin") attr:class=nav_link_class("/admin")>
                                     {admin_icon()}
@@ -732,6 +747,10 @@ fn Layout(children: Children) -> impl IntoView {
                             <A href=base_href("/governance") attr:class=mobile_link_class("/governance") on:click=close_mobile>
                                 {governance_icon()}
                                 "Agents"
+                            </A>
+                            <A href=base_href("/pod") attr:class=mobile_link_class("/pod") on:click=close_mobile>
+                                {pod_icon()}
+                                "Pod"
                             </A>
                             <A href=base_href("/settings") attr:class=mobile_link_class("/settings") on:click=close_mobile>
                                 {settings_icon()}
@@ -979,3 +998,4 @@ auth_gated!(AuthGatedProfile, ProfilePage);
 auth_gated!(AuthGatedSearch, SearchPage);
 auth_gated!(AuthGatedSettings, SettingsPage);
 auth_gated!(AuthGatedGovernance, GovernancePage);
+auth_gated!(AuthGatedPod, PodBrowserPage);
