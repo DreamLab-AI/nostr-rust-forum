@@ -653,29 +653,24 @@ impl NostrRelayDO {
     }
 
     pub(crate) async fn is_registered_agent(&self, pubkey: &str) -> bool {
+        let db = match self.env.d1("DB") {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+
         #[derive(serde::Deserialize)]
         struct AgentActiveRow {
             active: u32,
         }
 
-        // The governance register API (auth-worker) writes to REPLAY_DB
-        // (dreamlab-auth D1). Check there first, then fall back to DB
-        // (dreamlab-relay D1) for locally-seeded rows.
-        for binding in ["REPLAY_DB", "DB"] {
-            let db = match self.env.d1(binding) {
-                Ok(db) => db,
-                Err(_) => continue,
-            };
-            let stmt = db.prepare("SELECT active FROM agent_registry WHERE pubkey = ?1 LIMIT 1");
-            match stmt.bind(&[JsValue::from_str(pubkey)]) {
-                Ok(s) => match s.first::<AgentActiveRow>(None).await {
-                    Ok(Some(row)) if row.active == 1 => return true,
-                    _ => {}
-                },
-                Err(_) => {}
-            }
+        let stmt = db.prepare("SELECT active FROM agent_registry WHERE pubkey = ?1 LIMIT 1");
+        match stmt.bind(&[JsValue::from_str(pubkey)]) {
+            Ok(s) => match s.first::<AgentActiveRow>(None).await {
+                Ok(Some(row)) => row.active == 1,
+                _ => false,
+            },
+            Err(_) => false,
         }
-        false
     }
 
     pub(crate) async fn project_action_request(&self, event: &NostrEvent) {

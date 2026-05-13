@@ -61,31 +61,40 @@ pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
         }
     }
 
-    // Cache miss — query D1.
-    let db = env.d1("DB")?;
+    // Cache miss — query D1. Check both RELAY_DB (relay's whitelist, the
+    // source of truth for admin flags) and DB (auth's members table, set
+    // by the invite-redemption flow).
     let mut pubkeys: Vec<String> = Vec::new();
 
-    let members = db
-        .prepare("SELECT pubkey FROM members WHERE is_admin = 1")
-        .all()
-        .await;
-    if let Ok(result) = members {
-        if let Ok(rows) = result.results::<PubkeyRow>() {
-            for r in rows {
-                pubkeys.push(r.pubkey);
+    // RELAY_DB: whitelist.is_admin (source of truth)
+    if let Ok(relay_db) = env.d1("RELAY_DB") {
+        let whitelist = relay_db
+            .prepare("SELECT pubkey FROM whitelist WHERE is_admin = 1")
+            .all()
+            .await;
+        if let Ok(result) = whitelist {
+            if let Ok(rows) = result.results::<PubkeyRow>() {
+                for r in rows {
+                    if !pubkeys.contains(&r.pubkey) {
+                        pubkeys.push(r.pubkey);
+                    }
+                }
             }
         }
     }
 
-    let whitelist = db
-        .prepare("SELECT pubkey FROM whitelist WHERE is_admin = 1")
-        .all()
-        .await;
-    if let Ok(result) = whitelist {
-        if let Ok(rows) = result.results::<PubkeyRow>() {
-            for r in rows {
-                if !pubkeys.contains(&r.pubkey) {
-                    pubkeys.push(r.pubkey);
+    // DB: members.is_admin (invite flow)
+    if let Ok(db) = env.d1("DB") {
+        let members = db
+            .prepare("SELECT pubkey FROM members WHERE is_admin = 1")
+            .all()
+            .await;
+        if let Ok(result) = members {
+            if let Ok(rows) = result.results::<PubkeyRow>() {
+                for r in rows {
+                    if !pubkeys.contains(&r.pubkey) {
+                        pubkeys.push(r.pubkey);
+                    }
                 }
             }
         }
@@ -159,19 +168,20 @@ pub async fn handle_add(
         return error_json(env, "pubkey must be a 64-char hex string", 400);
     }
 
-    let db = match env.d1("DB") {
-        Ok(db) => db,
-        Err(_) => return error_json(env, "Database unavailable", 500),
-    };
-
     let now = now_secs() as i64;
 
-    // Upsert into whitelist with is_admin=1.
-    // If the row already exists, set is_admin=1.
-    let upsert = db
+    // RELAY_DB (dreamlab-relay): the relay's whitelist is the source of
+    // truth for admin flags. Write there so the relay DO and this worker's
+    // is_admin() both see the change immediately.
+    let relay_db = match env.d1("RELAY_DB") {
+        Ok(db) => db,
+        Err(_) => return error_json(env, "RELAY_DB unavailable", 500),
+    };
+
+    let upsert = relay_db
         .prepare(
-            "INSERT INTO whitelist (pubkey, is_admin, created_at) \
-             VALUES (?1, 1, ?2) \
+            "INSERT INTO whitelist (pubkey, is_admin, cohorts, added_at) \
+             VALUES (?1, 1, '[\"home\"]', ?2) \
              ON CONFLICT (pubkey) DO UPDATE SET is_admin = 1",
         )
         .bind(&[
@@ -182,24 +192,24 @@ pub async fn handle_add(
         .await;
 
     if let Err(e) = upsert {
-        return error_json(env, &format!("DB error: {e}"), 500);
+        return error_json(env, &format!("RELAY_DB error: {e}"), 500);
     }
 
-    // Also ensure a members row exists (sprint-native admin set).
-    let members = db
-        .prepare(
-            "INSERT INTO members (pubkey, is_admin, created_at) \
-             VALUES (?1, 1, ?2) \
-             ON CONFLICT (pubkey) DO UPDATE SET is_admin = 1",
-        )
-        .bind(&[
-            JsValue::from_str(&body.pubkey),
-            JsValue::from_f64(now as f64),
-        ])?
-        .run()
-        .await;
-    if let Err(e) = members {
-        return error_json(env, &format!("DB error: {e}"), 500);
+    // DB (dreamlab-auth): also ensure a members row exists for the
+    // invite-flow admin set.
+    if let Ok(db) = env.d1("DB") {
+        let _ = db
+            .prepare(
+                "INSERT INTO members (pubkey, is_admin, created_at) \
+                 VALUES (?1, 1, ?2) \
+                 ON CONFLICT (pubkey) DO UPDATE SET is_admin = 1",
+            )
+            .bind(&[
+                JsValue::from_str(&body.pubkey),
+                JsValue::from_f64(now as f64),
+            ])?
+            .run()
+            .await;
     }
 
     bust_cache(env).await;
@@ -240,27 +250,28 @@ pub async fn handle_remove(
         return error_json(env, "Cannot remove your own admin rights", 403);
     }
 
-    let db = match env.d1("DB") {
+    // RELAY_DB: source of truth for whitelist admin flags
+    let relay_db = match env.d1("RELAY_DB") {
         Ok(db) => db,
-        Err(_) => return error_json(env, "Database unavailable", 500),
+        Err(_) => return error_json(env, "RELAY_DB unavailable", 500),
     };
 
-    let update_whitelist = db
+    let update_whitelist = relay_db
         .prepare("UPDATE whitelist SET is_admin = 0 WHERE pubkey = ?1")
         .bind(&[JsValue::from_str(&body.pubkey)])?
         .run()
         .await;
     if let Err(e) = update_whitelist {
-        return error_json(env, &format!("DB error: {e}"), 500);
+        return error_json(env, &format!("RELAY_DB error: {e}"), 500);
     }
 
-    let members = db
-        .prepare("UPDATE members SET is_admin = 0 WHERE pubkey = ?1")
-        .bind(&[JsValue::from_str(&body.pubkey)])?
-        .run()
-        .await;
-    if let Err(e) = members {
-        return error_json(env, &format!("DB error: {e}"), 500);
+    // DB: also clear members.is_admin
+    if let Ok(db) = env.d1("DB") {
+        let _ = db
+            .prepare("UPDATE members SET is_admin = 0 WHERE pubkey = ?1")
+            .bind(&[JsValue::from_str(&body.pubkey)])?
+            .run()
+            .await;
     }
 
     bust_cache(env).await;

@@ -35,35 +35,42 @@ struct IsAdminRow {
     is_admin: i32,
 }
 
-/// Is `pubkey` an admin? Checks `members` first, falls back to `whitelist`.
+/// Is `pubkey` an admin?
 ///
-/// Returns `false` on DB error or missing rows -- never leaks ambient
+/// The relay worker's D1 (`RELAY_DB` binding) is the single source of truth
+/// for whitelist membership and admin flags — the relay's `/api/whitelist/*`
+/// handlers write there. We check `RELAY_DB` first, then fall back to `DB`
+/// (dreamlab-auth) for sprint-native `members` rows created by the invite
+/// redemption flow.
+///
+/// Returns `false` on DB error or missing rows — never leaks ambient
 /// authority across error branches.
 pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
-    let db = match env.d1("DB") {
-        Ok(db) => db,
-        Err(_) => return false,
-    };
-
-    // Check members table first (sprint-native admin set)
-    if let Ok(stmt) = db
-        .prepare("SELECT is_admin FROM members WHERE pubkey = ?1")
-        .bind(&[JsValue::from_str(pubkey)])
-    {
-        if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
-            if row.is_admin == 1 {
-                return true;
+    // RELAY_DB (dreamlab-relay): authority for whitelist.is_admin
+    if let Ok(relay_db) = env.d1("RELAY_DB") {
+        if let Ok(stmt) = relay_db
+            .prepare("SELECT is_admin FROM whitelist WHERE pubkey = ?1")
+            .bind(&[JsValue::from_str(pubkey)])
+        {
+            if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
+                if row.is_admin == 1 {
+                    return true;
+                }
             }
         }
     }
 
-    // Fall back to whitelist table (pre-existing admin source of truth)
-    if let Ok(stmt) = db
-        .prepare("SELECT is_admin FROM whitelist WHERE pubkey = ?1")
-        .bind(&[JsValue::from_str(pubkey)])
-    {
-        if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
-            return row.is_admin == 1;
+    // DB (dreamlab-auth): members table from invite redemption flow
+    if let Ok(db) = env.d1("DB") {
+        if let Ok(stmt) = db
+            .prepare("SELECT is_admin FROM members WHERE pubkey = ?1")
+            .bind(&[JsValue::from_str(pubkey)])
+        {
+            if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
+                if row.is_admin == 1 {
+                    return true;
+                }
+            }
         }
     }
 

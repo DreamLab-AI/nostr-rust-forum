@@ -21,6 +21,14 @@ use worker::{Env, Response, Result};
 use crate::admin::{canonical_url, now_secs, require_admin, require_authed};
 use crate::http::{error_json, json_response};
 
+/// Governance tables (agent_registry, broker_cases, broker_decisions,
+/// broker_roles) live in the relay worker's D1 (`dreamlab-relay`), bound
+/// as `RELAY_DB` in this worker. The relay DO reads these tables when
+/// gating governance event kinds (31400-31405).
+fn relay_db(env: &Env) -> Result<worker::D1Database> {
+    env.d1("RELAY_DB")
+}
+
 // ── Request bodies ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -100,7 +108,7 @@ pub async fn handle_list_agents(auth_header: Option<&str>, env: &Env) -> Result<
         return json_response(env, &body, status);
     }
 
-    let db = env.d1("DB")?;
+    let db = relay_db(env)?;
     let result = db
         .prepare("SELECT * FROM agent_registry ORDER BY name")
         .all()
@@ -133,7 +141,7 @@ pub async fn handle_register_agent(
         return error_json(env, "name is required", 400);
     }
 
-    let db = env.d1("DB")?;
+    let db = relay_db(env)?;
     let now = now_secs();
 
     db.prepare(
@@ -176,7 +184,7 @@ pub async fn handle_revoke_agent(
         Err(e) => return error_json(env, &format!("bad body: {e}"), 400),
     };
 
-    let db = env.d1("DB")?;
+    let db = relay_db(env)?;
     db.prepare("UPDATE agent_registry SET active = 0 WHERE pubkey = ?1")
         .bind(&[JsValue::from_str(&body.pubkey)])?
         .run()
@@ -199,7 +207,7 @@ pub async fn handle_list_cases(
         return json_response(env, &body, status);
     }
 
-    let db = env.d1("DB")?;
+    let db = relay_db(env)?;
     let state_filter = query
         .iter()
         .find(|(k, _)| k == "state")
@@ -230,7 +238,7 @@ pub async fn handle_get_case(
         return json_response(env, &body, status);
     }
 
-    let db = env.d1("DB")?;
+    let db = relay_db(env)?;
     let case = db
         .prepare("SELECT * FROM broker_cases WHERE id = ?1")
         .bind(&[JsValue::from_str(case_id)])?
@@ -263,7 +271,7 @@ pub async fn handle_grant_role(
         return error_json(env, "invalid pubkey: must be 64 hex chars", 400);
     }
 
-    let db = env.d1("DB")?;
+    let db = relay_db(env)?;
     let now = now_secs();
 
     db.prepare(
@@ -292,7 +300,7 @@ pub async fn handle_list_roles(auth_header: Option<&str>, env: &Env) -> Result<R
         return json_response(env, &body, status);
     }
 
-    let db = env.d1("DB")?;
+    let db = relay_db(env)?;
     let result = db
         .prepare("SELECT * FROM broker_roles ORDER BY pubkey, role")
         .all()
@@ -319,7 +327,7 @@ pub async fn handle_revoke_role(
         Err(e) => return error_json(env, &format!("bad body: {e}"), 400),
     };
 
-    let db = env.d1("DB")?;
+    let db = relay_db(env)?;
     db.prepare("DELETE FROM broker_roles WHERE pubkey = ?1 AND role = ?2")
         .bind(&[
             JsValue::from_str(&body.pubkey),
