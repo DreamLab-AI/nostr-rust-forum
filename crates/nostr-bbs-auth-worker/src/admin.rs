@@ -5,9 +5,14 @@
 //! We fall back to `whitelist.is_admin` when the `members` row is missing,
 //! so pre-sprint admins (tracked by the relay-worker) continue to work
 //! without manual backfill.
+//!
+//! ## Admin check algorithm
+//!
+//! See [`nostr_bbs_core::admin_shared`] for the canonical algorithm and shared
+//! SQL query constants.
 
+use nostr_bbs_core::admin_shared::IsAdminRow;
 use nostr_bbs_core::nip98::Nip98Token;
-use serde::Deserialize;
 use wasm_bindgen::JsValue;
 use worker::{js_sys, Env};
 
@@ -30,11 +35,6 @@ pub async fn verify(
     crate::auth::verify_nip98_replay(auth_header, expected_url, expected_method, body, env).await
 }
 
-#[derive(Deserialize)]
-struct IsAdminRow {
-    is_admin: i32,
-}
-
 /// Is `pubkey` an admin?
 ///
 /// The relay worker's D1 (`RELAY_DB` binding) is the single source of truth
@@ -49,7 +49,7 @@ pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
     // RELAY_DB (dreamlab-relay): authority for whitelist.is_admin
     if let Ok(relay_db) = env.d1("RELAY_DB") {
         if let Ok(stmt) = relay_db
-            .prepare("SELECT is_admin FROM whitelist WHERE pubkey = ?1")
+            .prepare(nostr_bbs_core::WHITELIST_IS_ADMIN_SQL)
             .bind(&[JsValue::from_str(pubkey)])
         {
             if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
@@ -63,7 +63,7 @@ pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
     // DB (dreamlab-auth): members table from invite redemption flow
     if let Ok(db) = env.d1("DB") {
         if let Ok(stmt) = db
-            .prepare("SELECT is_admin FROM members WHERE pubkey = ?1")
+            .prepare(nostr_bbs_core::MEMBERS_IS_ADMIN_SQL)
             .bind(&[JsValue::from_str(pubkey)])
         {
             if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
@@ -138,48 +138,25 @@ pub async fn require_authed(
     Ok(token.pubkey)
 }
 
-/// Per-request NIP-98 origin, set at the top of `handle_request` from the
-/// actual `req.url()`. Workers are single-threaded, so a `thread_local!`
-/// `RefCell` is safe and avoids threading an extra parameter through every
-/// handler signature.
-use std::cell::RefCell;
-thread_local! {
-    static NIP98_ORIGIN: RefCell<String> = const { RefCell::new(String::new()) };
-}
-
-/// Store the actual request origin for the duration of this request.
-/// Called once at the top of the request handler.
-pub fn set_nip98_origin(origin: &str) {
-    NIP98_ORIGIN.with(|o| *o.borrow_mut() = origin.to_string());
-}
-
 /// Build the absolute request URL that NIP-98 expects for verification.
 ///
-/// Prefers the actual request origin (set by [`set_nip98_origin`]) so
-/// NIP-98 tokens signed for `.workers.dev` URLs verify correctly, even
-/// when `EXPECTED_ORIGIN` points at a custom domain. Falls back to
-/// `EXPECTED_ORIGIN` if no per-request origin has been set.
-pub fn canonical_url(env: &Env, path: &str) -> String {
-    let origin = NIP98_ORIGIN.with(|o| {
-        let v = o.borrow();
-        if v.is_empty() {
-            None
-        } else {
-            Some(v.clone())
-        }
-    });
-    let origin = origin.unwrap_or_else(|| {
-        env.var("EXPECTED_ORIGIN")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "https://example.com".to_string())
-    });
+/// `origin` is the actual request origin (`scheme://host[:port]`), extracted
+/// from the incoming request URL at the top of the request handler. This
+/// ensures NIP-98 tokens signed for `.workers.dev` URLs verify correctly even
+/// when `EXPECTED_ORIGIN` points at a custom domain.
+///
+/// Unlike the previous implementation, this function does NOT fall back to a
+/// hardcoded `"https://example.com"` default or read from a thread_local,
+/// eliminating the config-dependent auth bypass (P2-07) and the thread_local
+/// hack (P2-06). The origin is always available from the request URL.
+pub fn canonical_url(origin: &str, path: &str) -> String {
     format!("{origin}{path}")
 }
 
 /// Extract the origin (`scheme://host[:port]`) from a parsed URL.
 pub fn request_origin(url: &worker::Url) -> String {
     let scheme = url.scheme();
-    let host = url.host_str().unwrap_or("example.com");
+    let host = url.host_str().unwrap_or("localhost");
     match url.port() {
         Some(port) => format!("{scheme}://{host}:{port}"),
         None => format!("{scheme}://{host}"),
@@ -192,9 +169,7 @@ pub fn request_origin(url: &worker::Url) -> String {
 
 #[cfg(test)]
 mod tests {
-    // `is_admin`/`require_admin` hit the D1 runtime, so they are exercised
-    // via the worker-test harness rather than unit tests. Here we cover
-    // the pure helpers only.
+    use super::*;
 
     #[test]
     fn now_secs_is_nonzero_monotonic() {
@@ -204,5 +179,17 @@ mod tests {
         // drift; the real behaviour is covered by integration tests.
         let v: u64 = 0;
         assert_eq!(v, v);
+    }
+
+    #[test]
+    fn canonical_url_concatenates_origin_and_path() {
+        let url = canonical_url("https://forum.example.com", "/api/mod/ban");
+        assert_eq!(url, "https://forum.example.com/api/mod/ban");
+    }
+
+    #[test]
+    fn canonical_url_with_port() {
+        let url = canonical_url("https://forum.example.com:8443", "/api/mod/ban");
+        assert_eq!(url, "https://forum.example.com:8443/api/mod/ban");
     }
 }

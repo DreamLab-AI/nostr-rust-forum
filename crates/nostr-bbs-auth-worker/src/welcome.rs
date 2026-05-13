@@ -172,8 +172,12 @@ fn sign_welcome(
 // GET /api/welcome/config
 // ---------------------------------------------------------------------------
 
-pub async fn handle_get_config(auth_header: Option<&str>, env: &Env) -> Result<Response> {
-    let url = canonical_url(env, "/api/welcome/config");
+pub async fn handle_get_config(
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/welcome/config");
     if let Err((body, status)) = require_admin(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -204,8 +208,9 @@ pub async fn handle_configure(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/welcome/configure");
+    let url = canonical_url(origin, "/api/welcome/configure");
     if let Err((body, status)) =
         require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
     {
@@ -270,8 +275,9 @@ pub async fn handle_set_bot_key(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/welcome/set-bot-key");
+    let url = canonical_url(origin, "/api/welcome/set-bot-key");
     if let Err((body, status)) =
         require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
     {
@@ -326,8 +332,9 @@ pub async fn handle_test(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/welcome/test");
+    let url = canonical_url(origin, "/api/welcome/test");
     let caller = match require_admin(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),

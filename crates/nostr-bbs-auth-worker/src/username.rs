@@ -353,8 +353,9 @@ pub async fn handle_claim(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/username/claim");
+    let url = canonical_url(origin, "/api/username/claim");
     let pubkey = match require_authed(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -387,8 +388,9 @@ pub async fn handle_release(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/username/release");
+    let url = canonical_url(origin, "/api/username/release");
     let pubkey = match require_authed(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),

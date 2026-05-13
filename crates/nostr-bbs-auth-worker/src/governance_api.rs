@@ -102,8 +102,12 @@ struct RoleRow {
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
-pub async fn handle_list_agents(auth_header: Option<&str>, env: &Env) -> Result<Response> {
-    let url = canonical_url(env, "/api/governance/agents");
+pub async fn handle_list_agents(
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/governance/agents");
     if let Err((body, status)) = require_authed(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -122,8 +126,9 @@ pub async fn handle_register_agent(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/governance/agents/register");
+    let url = canonical_url(origin, "/api/governance/agents/register");
     let admin_pk = match require_admin(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -171,8 +176,9 @@ pub async fn handle_revoke_agent(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/governance/agents/revoke");
+    let url = canonical_url(origin, "/api/governance/agents/revoke");
     if let Err((body, status)) =
         require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
     {
@@ -201,8 +207,9 @@ pub async fn handle_list_cases(
     query: &[(String, String)],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/governance/cases");
+    let url = canonical_url(origin, "/api/governance/cases");
     if let Err((body, status)) = require_authed(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -232,8 +239,9 @@ pub async fn handle_get_case(
     case_id: &str,
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, &format!("/api/governance/cases/{case_id}"));
+    let url = canonical_url(origin, &format!("/api/governance/cases/{case_id}"));
     if let Err((body, status)) = require_authed(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -255,8 +263,9 @@ pub async fn handle_grant_role(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/governance/roles/grant");
+    let url = canonical_url(origin, "/api/governance/roles/grant");
     let admin_pk = match require_admin(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -294,8 +303,12 @@ pub async fn handle_grant_role(
     )
 }
 
-pub async fn handle_list_roles(auth_header: Option<&str>, env: &Env) -> Result<Response> {
-    let url = canonical_url(env, "/api/governance/roles");
+pub async fn handle_list_roles(
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/governance/roles");
     if let Err((body, status)) = require_authed(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -314,8 +327,9 @@ pub async fn handle_revoke_role(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/governance/roles/revoke");
+    let url = canonical_url(origin, "/api/governance/roles/revoke");
     if let Err((body, status)) =
         require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
     {

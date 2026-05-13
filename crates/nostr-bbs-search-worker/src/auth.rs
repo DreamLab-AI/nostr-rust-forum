@@ -2,6 +2,21 @@
 //!
 //! Ingest endpoint requires NIP-98 admin auth. Uses D1-backed atomic replay
 //! protection via `nostr_bbs_rate_limit::verify_nip98`.
+//!
+//! ## Admin check limitation (P2-02)
+//!
+//! Unlike the auth-worker and pod-worker, this worker does **not** have a D1
+//! binding to the members/whitelist tables. Admin membership is determined by
+//! the `ADMIN_PUBKEYS` environment variable (comma-separated hex pubkeys).
+//!
+//! This is a deliberate tradeoff: the search worker's only admin-gated
+//! endpoint is the ingest trigger, and adding a D1 binding would increase
+//! cold-start latency for a single rarely-used route.
+//!
+//! If the search worker grows additional admin endpoints, the admin check
+//! should be migrated to D1-backed queries using
+//! [`nostr_bbs_core::admin_shared`] shared constants, matching the canonical
+//! algorithm documented there.
 
 use nostr_bbs_core::nip98::{Nip98Error, Nip98Token};
 use worker::Env;

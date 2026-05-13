@@ -1532,14 +1532,14 @@ async fn pay_cleanup_handler(
 ///
 /// Accepts a `D1Database` directly (the pay handler already has the binding)
 /// rather than going through `Env` again.
+///
+/// Uses shared SQL constants and row types from [`nostr_bbs_core::admin_shared`]
+/// to prevent structural drift between workers (P2-01).
 async fn is_admin(pubkey: &str, db: &D1Database) -> bool {
-    #[derive(Deserialize)]
-    struct IsAdminRow {
-        is_admin: i32,
-    }
+    use nostr_bbs_core::admin_shared::IsAdminRow;
 
     if let Ok(stmt) = db
-        .prepare("SELECT is_admin FROM members WHERE pubkey = ?1")
+        .prepare(nostr_bbs_core::MEMBERS_IS_ADMIN_SQL)
         .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
     {
         if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
@@ -1550,7 +1550,7 @@ async fn is_admin(pubkey: &str, db: &D1Database) -> bool {
     }
 
     if let Ok(stmt) = db
-        .prepare("SELECT is_admin FROM whitelist WHERE pubkey = ?1")
+        .prepare(nostr_bbs_core::WHITELIST_IS_ADMIN_SQL)
         .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
     {
         if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {

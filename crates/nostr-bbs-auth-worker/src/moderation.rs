@@ -119,18 +119,15 @@ struct StatusOnly {
 /// Load the admin set from D1. Used to validate that the Nostr event was
 /// signed by an admin. Combines `members` and `whitelist` for compatibility.
 async fn admin_set(env: &Env) -> HashSet<String> {
+    use nostr_bbs_core::admin_shared::PubkeyRow;
+
     let mut set = HashSet::new();
     let Ok(db) = env.d1("DB") else {
         return set;
     };
 
-    #[derive(Deserialize)]
-    struct PubkeyRow {
-        pubkey: String,
-    }
-
     let members = db
-        .prepare("SELECT pubkey FROM members WHERE is_admin = 1")
+        .prepare(nostr_bbs_core::MEMBERS_ADMIN_LIST_SQL)
         .all()
         .await;
     if let Ok(result) = members {
@@ -142,7 +139,7 @@ async fn admin_set(env: &Env) -> HashSet<String> {
     }
 
     let whitelist = db
-        .prepare("SELECT pubkey FROM whitelist WHERE is_admin = 1")
+        .prepare(nostr_bbs_core::WHITELIST_ADMIN_LIST_SQL)
         .all()
         .await;
     if let Ok(result) = whitelist {
@@ -168,6 +165,7 @@ pub async fn handle_action(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
     let (action_name, expected_kind) = match path {
         "/api/mod/ban" => ("ban", KIND_BAN),
@@ -176,7 +174,7 @@ pub async fn handle_action(
         _ => return error_json(env, "Unknown moderation action path", 404),
     };
 
-    let url = canonical_url(env, path);
+    let url = canonical_url(origin, path);
     let admin_pubkey = match require_admin(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -274,8 +272,9 @@ pub async fn handle_report(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/mod/report");
+    let url = canonical_url(origin, "/api/mod/report");
     let reporter = match require_authed(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -356,8 +355,9 @@ pub async fn handle_list_actions(
     query: &[(String, String)],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/mod/actions");
+    let url = canonical_url(origin, "/api/mod/actions");
     if let Err((body, status)) = require_admin(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -446,8 +446,9 @@ pub async fn handle_list_reports(
     query: &[(String, String)],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/mod/reports");
+    let url = canonical_url(origin, "/api/mod/reports");
     if let Err((body, status)) = require_admin(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -517,9 +518,10 @@ pub async fn handle_report_action(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
     let path = format!("/api/mod/reports/{report_id}/action");
-    let url = canonical_url(env, &path);
+    let url = canonical_url(origin, &path);
     let admin = match require_admin(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -602,8 +604,12 @@ struct Nip1984Row {
 ///
 /// The query reads from a `nip1984_reports` table populated by the relay-worker
 /// when it receives kind-1984 events. This table is created by `ensure_schema`.
-pub async fn handle_nip1984_reports(auth_header: Option<&str>, env: &Env) -> Result<Response> {
-    let url = canonical_url(env, "/api/moderation/reports");
+pub async fn handle_nip1984_reports(
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/moderation/reports");
     if let Err((body, status)) = require_admin(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }

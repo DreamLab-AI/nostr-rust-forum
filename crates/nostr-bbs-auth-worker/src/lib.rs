@@ -95,6 +95,54 @@ fn with_cors(resp: Response, env: &Env) -> Response {
     resp.with_headers(cors)
 }
 
+// ---------------------------------------------------------------------------
+// Typed route error (P2-05: replaces string-contains classification)
+// ---------------------------------------------------------------------------
+
+/// Typed error for route handler failures, mapping each variant to an HTTP
+/// status code. Replaces the previous string-contains error classification
+/// that matched on Debug representations of `worker::Error`.
+#[derive(Debug)]
+enum RouteError {
+    /// Client sent an invalid request body (bad JSON, missing fields, etc.)
+    BadRequest(String),
+    /// Internal server error (DB failure, unexpected state, etc.)
+    Internal(String),
+}
+
+impl RouteError {
+    fn status(&self) -> u16 {
+        match self {
+            Self::BadRequest(_) => 400,
+            Self::Internal(_) => 500,
+        }
+    }
+
+    fn user_message(&self) -> &'static str {
+        match self {
+            Self::BadRequest(_) => "Invalid request body",
+            Self::Internal(_) => "Internal server error",
+        }
+    }
+}
+
+impl From<worker::Error> for RouteError {
+    fn from(e: worker::Error) -> Self {
+        match &e {
+            Error::SerdeJsonError(_) | Error::BadEncoding => Self::BadRequest(format!("{e:?}")),
+            Error::RustError(msg) if is_client_error(msg) => Self::BadRequest(format!("{e:?}")),
+            _ => Self::Internal(format!("{e:?}")),
+        }
+    }
+}
+
+/// Heuristic check for whether a RustError message represents a client error.
+fn is_client_error(msg: &str) -> bool {
+    msg.starts_with("Invalid JSON")
+        || msg.starts_with("Invalid request")
+        || msg.starts_with("parse:")
+}
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Wrap the entire handler so NO errors ever leak to the workers-rs framework.
@@ -139,10 +187,11 @@ async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
     let path = url.path();
     let method = req.method();
 
-    // Store the actual request origin for NIP-98 verification. This ensures
+    // Extract the actual request origin for NIP-98 verification. This ensures
     // tokens signed for .workers.dev URLs verify correctly even when
-    // EXPECTED_ORIGIN points at a custom domain.
-    admin::set_nip98_origin(&admin::request_origin(&url));
+    // EXPECTED_ORIGIN points at a custom domain. The origin is threaded
+    // through the route functions rather than stored in a thread_local (P2-06).
+    let origin = admin::request_origin(&url);
 
     // Read body bytes BEFORE routing so they are available for both NIP-98
     // payload hash verification and route handler consumption.
@@ -151,30 +200,18 @@ async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         _ => Vec::new(),
     };
 
-    let result = route(&req, env, path, &method, &body_bytes).await;
+    let result = route(&req, env, path, &method, &body_bytes, &origin).await;
 
     match result {
         Ok(resp) => Ok(with_cors(resp, env)),
         Err(e) => {
-            console_error!("Route error: {e:?}");
-            let msg = format!("{e:?}");
-            let status = if msg.contains("Serialization")
-                || msg.contains("JSON")
-                || msg.contains("json")
-                || msg.contains("missing field")
-                || msg.contains("parsing")
-                || msg.contains("Invalid")
-            {
-                400u16
-            } else {
-                500u16
-            };
-            let user_msg = if status == 400 {
-                "Invalid request body"
-            } else {
-                "Internal server error"
-            };
-            Ok(error_response(env, user_msg, status))
+            let route_err = RouteError::from(e);
+            console_error!("Route error: {:?}", route_err);
+            Ok(error_response(
+                env,
+                route_err.user_message(),
+                route_err.status(),
+            ))
         }
     }
 }
@@ -190,6 +227,7 @@ async fn route(
     path: &str,
     method: &Method,
     body_bytes: &[u8],
+    origin: &str,
 ) -> Result<Response> {
     // DID document serving (public, no auth required)
     if let Some(rest) = path.strip_prefix("/.well-known/did/nostr/") {
@@ -253,6 +291,7 @@ async fn route(
             method,
             body_bytes,
             auth_header_opt.as_deref(),
+            origin,
         )
         .await?
         {
@@ -270,7 +309,7 @@ async fn route(
             }
         };
 
-        let request_url = admin::canonical_url(env, path);
+        let request_url = admin::canonical_url(origin, path);
 
         // Pass body bytes to NIP-98 for payload hash verification on POST/PUT.
         // For GET/HEAD/DELETE the body is empty, so we pass None.
@@ -320,6 +359,7 @@ async fn route_sprint_api(
     method: &Method,
     body_bytes: &[u8],
     auth_header: Option<&str>,
+    origin: &str,
 ) -> Result<Option<Response>> {
     // Collect query pairs once for GET endpoints.
     let query: Vec<(String, String)> = req
@@ -334,28 +374,33 @@ async fn route_sprint_api(
     // -- Moderation (WI-2) ----------------------------------------------
     if matches!(path, "/api/mod/ban" | "/api/mod/mute" | "/api/mod/warn") && *method == Method::Post
     {
-        let resp = moderation::handle_action(path, body_bytes, auth_header, env).await?;
+        let resp = moderation::handle_action(path, body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/mod/report" && *method == Method::Post {
-        let resp = moderation::handle_report(body_bytes, auth_header, env).await?;
+        let resp = moderation::handle_report(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/mod/actions" && *method == Method::Get {
-        let resp = moderation::handle_list_actions(&query, auth_header, env).await?;
+        let resp = moderation::handle_list_actions(&query, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/mod/reports" && *method == Method::Get {
-        let resp = moderation::handle_list_reports(&query, auth_header, env).await?;
+        let resp = moderation::handle_list_reports(&query, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     // POST /api/mod/reports/:id/action
     if let Some(rest) = path.strip_prefix("/api/mod/reports/") {
         if let Some(report_id) = rest.strip_suffix("/action") {
             if *method == Method::Post && !report_id.is_empty() && !report_id.contains('/') {
-                let resp =
-                    moderation::handle_report_action(report_id, body_bytes, auth_header, env)
-                        .await?;
+                let resp = moderation::handle_report_action(
+                    report_id,
+                    body_bytes,
+                    auth_header,
+                    env,
+                    origin,
+                )
+                .await?;
                 return Ok(Some(resp));
             }
         }
@@ -363,45 +408,47 @@ async fn route_sprint_api(
 
     // -- Web-of-Trust (WI-3) --------------------------------------------
     if path == "/api/wot/status" && *method == Method::Get {
-        let resp = wot::handle_status(auth_header, env).await?;
+        let resp = wot::handle_status(auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/wot/set-referente" && *method == Method::Post {
-        let resp = wot::handle_set_referente(body_bytes, auth_header, env).await?;
+        let resp = wot::handle_set_referente(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/wot/refresh" && *method == Method::Post {
-        let resp = wot::handle_refresh(body_bytes, auth_header, env).await?;
+        let resp = wot::handle_refresh(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if matches!(path, "/api/wot/override/add" | "/api/wot/override/remove")
         && *method == Method::Post
     {
-        let resp = wot::handle_override(path, body_bytes, auth_header, env).await?;
+        let resp = wot::handle_override(path, body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 
     // -- Invites (WI-4) -------------------------------------------------
     if path == "/api/invites/create" && *method == Method::Post {
-        let resp = invites::handle_create(body_bytes, auth_header, env).await?;
+        let resp = invites::handle_create(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/invites/mine" && *method == Method::Get {
-        let resp = invites::handle_list_mine(auth_header, env).await?;
+        let resp = invites::handle_list_mine(auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     // POST /api/invites/:id/revoke (must be checked before the generic preview)
     if let Some(rest) = path.strip_prefix("/api/invites/") {
         if let Some(invite_id) = rest.strip_suffix("/revoke") {
             if *method == Method::Post && !invite_id.is_empty() && !invite_id.contains('/') {
-                let resp = invites::handle_revoke(invite_id, body_bytes, auth_header, env).await?;
+                let resp =
+                    invites::handle_revoke(invite_id, body_bytes, auth_header, env, origin).await?;
                 return Ok(Some(resp));
             }
         }
         // POST /api/invites/:code/redeem
         if let Some(code) = rest.strip_suffix("/redeem") {
             if *method == Method::Post && !code.is_empty() && !code.contains('/') {
-                let resp = invites::handle_redeem(code, body_bytes, auth_header, env).await?;
+                let resp =
+                    invites::handle_redeem(code, body_bytes, auth_header, env, origin).await?;
                 return Ok(Some(resp));
             }
         }
@@ -419,75 +466,77 @@ async fn route_sprint_api(
 
     // -- Welcome bot (WI-5) --------------------------------------------
     if path == "/api/welcome/config" && *method == Method::Get {
-        let resp = welcome::handle_get_config(auth_header, env).await?;
+        let resp = welcome::handle_get_config(auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/welcome/configure" && *method == Method::Post {
-        let resp = welcome::handle_configure(body_bytes, auth_header, env).await?;
+        let resp = welcome::handle_configure(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/welcome/set-bot-key" && *method == Method::Post {
-        let resp = welcome::handle_set_bot_key(body_bytes, auth_header, env).await?;
+        let resp = welcome::handle_set_bot_key(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/welcome/test" && *method == Method::Post {
-        let resp = welcome::handle_test(body_bytes, auth_header, env).await?;
+        let resp = welcome::handle_test(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 
     // -- Admin management (WI-8) ----------------------------------------
     if path == "/api/admins" && *method == Method::Get {
-        let resp = admins::handle_list(auth_header, env).await?;
+        let resp = admins::handle_list(auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/admins/add" && *method == Method::Post {
-        let resp = admins::handle_add(body_bytes, auth_header, env).await?;
+        let resp = admins::handle_add(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/admins/remove" && *method == Method::Post {
-        let resp = admins::handle_remove(body_bytes, auth_header, env).await?;
+        let resp = admins::handle_remove(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 
     // -- Governance (Agent Control Surface) --------------------------------
     if path == "/api/governance/agents" && *method == Method::Get {
-        let resp = governance_api::handle_list_agents(auth_header, env).await?;
+        let resp = governance_api::handle_list_agents(auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/governance/agents/register" && *method == Method::Post {
-        let resp = governance_api::handle_register_agent(body_bytes, auth_header, env).await?;
+        let resp =
+            governance_api::handle_register_agent(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/governance/agents/revoke" && *method == Method::Post {
-        let resp = governance_api::handle_revoke_agent(body_bytes, auth_header, env).await?;
+        let resp =
+            governance_api::handle_revoke_agent(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/governance/cases" && *method == Method::Get {
-        let resp = governance_api::handle_list_cases(&query, auth_header, env).await?;
+        let resp = governance_api::handle_list_cases(&query, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if let Some(case_id) = path.strip_prefix("/api/governance/cases/") {
         if *method == Method::Get && !case_id.is_empty() && !case_id.contains('/') {
-            let resp = governance_api::handle_get_case(case_id, auth_header, env).await?;
+            let resp = governance_api::handle_get_case(case_id, auth_header, env, origin).await?;
             return Ok(Some(resp));
         }
     }
     if path == "/api/governance/roles/grant" && *method == Method::Post {
-        let resp = governance_api::handle_grant_role(body_bytes, auth_header, env).await?;
+        let resp = governance_api::handle_grant_role(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/governance/roles/revoke" && *method == Method::Post {
-        let resp = governance_api::handle_revoke_role(body_bytes, auth_header, env).await?;
+        let resp = governance_api::handle_revoke_role(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/governance/roles" && *method == Method::Get {
-        let resp = governance_api::handle_list_roles(auth_header, env).await?;
+        let resp = governance_api::handle_list_roles(auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 
     // -- NIP-1984 standard report queue (admin view) --------------------
     if path == "/api/moderation/reports" && *method == Method::Get {
-        let resp = moderation::handle_nip1984_reports(auth_header, env).await?;
+        let resp = moderation::handle_nip1984_reports(auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 
@@ -503,11 +552,11 @@ async fn route_sprint_api(
         return Ok(Some(resp));
     }
     if path == "/api/username/claim" && *method == Method::Post {
-        let resp = username::handle_claim(body_bytes, auth_header, env).await?;
+        let resp = username::handle_claim(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
     if path == "/api/username/release" && *method == Method::Post {
-        let resp = username::handle_release(body_bytes, auth_header, env).await?;
+        let resp = username::handle_release(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 

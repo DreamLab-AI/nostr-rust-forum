@@ -32,13 +32,10 @@ struct PubkeyBody {
 }
 
 // ---------------------------------------------------------------------------
-// D1 row types
+// D1 row types — use shared types from nostr_bbs_core (P2-01)
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct PubkeyRow {
-    pubkey: String,
-}
+use nostr_bbs_core::admin_shared::PubkeyRow;
 
 // ---------------------------------------------------------------------------
 // KV-cached admin lookup (60-second TTL)
@@ -69,7 +66,7 @@ pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
     // RELAY_DB: whitelist.is_admin (source of truth)
     if let Ok(relay_db) = env.d1("RELAY_DB") {
         let whitelist = relay_db
-            .prepare("SELECT pubkey FROM whitelist WHERE is_admin = 1")
+            .prepare(nostr_bbs_core::WHITELIST_ADMIN_LIST_SQL)
             .all()
             .await;
         if let Ok(result) = whitelist {
@@ -86,7 +83,7 @@ pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
     // DB: members.is_admin (invite flow)
     if let Ok(db) = env.d1("DB") {
         let members = db
-            .prepare("SELECT pubkey FROM members WHERE is_admin = 1")
+            .prepare(nostr_bbs_core::MEMBERS_ADMIN_LIST_SQL)
             .all()
             .await;
         if let Ok(result) = members {
@@ -129,8 +126,8 @@ async fn bust_cache(env: &Env) {
 // GET /api/admins
 // ---------------------------------------------------------------------------
 
-pub async fn handle_list(auth_header: Option<&str>, env: &Env) -> Result<Response> {
-    let url = canonical_url(env, "/api/admins");
+pub async fn handle_list(auth_header: Option<&str>, env: &Env, origin: &str) -> Result<Response> {
+    let url = canonical_url(origin, "/api/admins");
     if let Err((body, status)) = require_admin(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -151,8 +148,9 @@ pub async fn handle_add(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/admins/add");
+    let url = canonical_url(origin, "/api/admins/add");
     if let Err((body, status)) =
         require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
     {
@@ -229,8 +227,9 @@ pub async fn handle_remove(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/admins/remove");
+    let url = canonical_url(origin, "/api/admins/remove");
     let caller = match require_admin(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),

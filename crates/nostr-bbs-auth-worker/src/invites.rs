@@ -158,8 +158,9 @@ pub async fn handle_create(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/invites/create");
+    let url = canonical_url(origin, "/api/invites/create");
     let pubkey = match require_authed(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -268,8 +269,12 @@ pub async fn handle_create(
 // GET /api/invites/mine
 // ---------------------------------------------------------------------------
 
-pub async fn handle_list_mine(auth_header: Option<&str>, env: &Env) -> Result<Response> {
-    let url = canonical_url(env, "/api/invites/mine");
+pub async fn handle_list_mine(
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/invites/mine");
     let pubkey = match require_authed(auth_header, &url, "GET", None, env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -400,12 +405,13 @@ pub async fn handle_redeem(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
     if !is_valid_code(code) {
         return error_json(env, "Invalid code", 400);
     }
 
-    let url = canonical_url(env, &format!("/api/invites/{code}/redeem"));
+    let url = canonical_url(origin, &format!("/api/invites/{code}/redeem"));
     let redeemer = match require_authed(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),
@@ -529,12 +535,13 @@ pub async fn handle_revoke(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
     if !is_valid_code(invite_id) {
         return error_json(env, "Invalid invite id", 400);
     }
 
-    let url = canonical_url(env, &format!("/api/invites/{invite_id}/revoke"));
+    let url = canonical_url(origin, &format!("/api/invites/{invite_id}/revoke"));
     let caller = match require_authed(auth_header, &url, "POST", Some(body_bytes), env).await {
         Ok(pk) => pk,
         Err((body, status)) => return json_response(env, &body, status),

@@ -123,8 +123,8 @@ async fn load_settings(env: &Env) -> Option<SettingsRow> {
 // GET /api/wot/status
 // ---------------------------------------------------------------------------
 
-pub async fn handle_status(auth_header: Option<&str>, env: &Env) -> Result<Response> {
-    let url = canonical_url(env, "/api/wot/status");
+pub async fn handle_status(auth_header: Option<&str>, env: &Env, origin: &str) -> Result<Response> {
+    let url = canonical_url(origin, "/api/wot/status");
     if let Err((body, status)) = require_admin(auth_header, &url, "GET", None, env).await {
         return json_response(env, &body, status);
     }
@@ -188,8 +188,9 @@ pub async fn handle_set_referente(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/wot/set-referente");
+    let url = canonical_url(origin, "/api/wot/set-referente");
     if let Err((body, status)) =
         require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
     {
@@ -247,8 +248,9 @@ pub async fn handle_refresh(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, "/api/wot/refresh");
+    let url = canonical_url(origin, "/api/wot/refresh");
     if let Err((body, status)) =
         require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
     {
@@ -355,8 +357,9 @@ pub async fn handle_override(
     body_bytes: &[u8],
     auth_header: Option<&str>,
     env: &Env,
+    origin: &str,
 ) -> Result<Response> {
-    let url = canonical_url(env, path);
+    let url = canonical_url(origin, path);
     if let Err((body, status)) =
         require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
     {

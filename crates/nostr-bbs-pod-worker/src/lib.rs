@@ -87,33 +87,20 @@ fn method_str(m: &Method) -> &'static str {
 }
 
 /// Build CORS headers from the `EXPECTED_ORIGIN` env var.
+///
+/// Uses the canonical [`nostr_bbs_core::POD_CORS_HEADERS`] constant for the
+/// extended method/header set required by the Solid/LDP protocol.
 fn cors_headers(env: &Env) -> Headers {
     let origin = env
         .var("EXPECTED_ORIGIN")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string());
+        .unwrap_or_else(|_| "*".to_string());
 
     let headers = Headers::new();
     headers.set("Access-Control-Allow-Origin", &origin).ok();
-    headers
-        .set(
-            "Access-Control-Allow-Methods",
-            "GET, PUT, POST, DELETE, PATCH, HEAD, OPTIONS",
-        )
-        .ok();
-    headers
-        .set(
-            "Access-Control-Allow-Headers",
-            "Content-Type, Authorization, Slug, If-Match, If-None-Match, Range",
-        )
-        .ok();
-    headers.set("Access-Control-Max-Age", "86400").ok();
-    headers
-        .set(
-            "Access-Control-Expose-Headers",
-            "ETag, Accept-Ranges, Content-Range, Link, Location, WAC-Allow",
-        )
-        .ok();
+    for (name, value) in nostr_bbs_core::POD_CORS_HEADERS {
+        headers.set(name, value).ok();
+    }
     headers
 }
 
@@ -174,7 +161,7 @@ fn add_cache_control(headers: &Headers, resource_path: &str) {
 /// must match whichever origin the client actually used.
 fn request_origin(url: &worker::Url) -> String {
     let scheme = url.scheme();
-    let host = url.host_str().unwrap_or("example.com");
+    let host = url.host_str().unwrap_or("localhost");
     match url.port() {
         Some(port) => format!("{scheme}://{host}:{port}"),
         None => format!("{scheme}://{host}"),
@@ -504,11 +491,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     };
 
     // Authenticate via NIP-98
+    let nip98_origin = request_origin(&url);
     let expected_origin = env
         .var("EXPECTED_ORIGIN")
         .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string());
-    let nip98_origin = request_origin(&url);
+        .unwrap_or_else(|_| nip98_origin.clone());
     let request_url = format!("{nip98_origin}{path}");
 
     let requester_pubkey: Option<String> = if let Some(ref header) = auth_header {
@@ -1402,11 +1389,11 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
 /// Queries `members.is_admin` then falls back to `whitelist.is_admin`,
 /// matching the auth-worker's `admin::is_admin` logic. Uses the `REPLAY_DB`
 /// binding which points at the same D1 database as the auth-worker's `DB`.
+///
+/// Uses shared SQL constants and row types from [`nostr_bbs_core::admin_shared`]
+/// to prevent structural drift between workers (P2-01).
 async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
-    #[derive(serde::Deserialize)]
-    struct IsAdminRow {
-        is_admin: i32,
-    }
+    use nostr_bbs_core::admin_shared::IsAdminRow;
 
     let db = match env.d1("REPLAY_DB") {
         Ok(db) => db,
@@ -1414,7 +1401,7 @@ async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
     };
 
     if let Ok(stmt) = db
-        .prepare("SELECT is_admin FROM members WHERE pubkey = ?1")
+        .prepare(nostr_bbs_core::MEMBERS_IS_ADMIN_SQL)
         .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
     {
         if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
@@ -1425,7 +1412,7 @@ async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
     }
 
     if let Ok(stmt) = db
-        .prepare("SELECT is_admin FROM whitelist WHERE pubkey = ?1")
+        .prepare(nostr_bbs_core::WHITELIST_IS_ADMIN_SQL)
         .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
     {
         if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
