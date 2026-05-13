@@ -148,7 +148,8 @@ pub async fn handle_check_whitelist(req: &Request, env: &Env) -> Result<Response
 /// Paginated whitelist with optional cohort filter. Joins with the events table
 /// to extract `display_name` from the most recent kind-0 profile event.
 pub async fn handle_whitelist_list(req: &Request, env: &Env) -> Result<Response> {
-    let request_url = req.url()?.to_string();
+    let url = req.url()?;
+    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
     let auth_header = req.headers().get("Authorization").ok().flatten();
     if let Err((body, status)) =
         auth::require_nip98_admin(auth_header.as_deref(), &request_url, "GET", None, env).await

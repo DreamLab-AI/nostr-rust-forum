@@ -139,6 +139,11 @@ async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
     let path = url.path();
     let method = req.method();
 
+    // Store the actual request origin for NIP-98 verification. This ensures
+    // tokens signed for .workers.dev URLs verify correctly even when
+    // EXPECTED_ORIGIN points at a custom domain.
+    admin::set_nip98_origin(&admin::request_origin(&url));
+
     // Read body bytes BEFORE routing so they are available for both NIP-98
     // payload hash verification and route handler consumption.
     let body_bytes: Vec<u8> = match method {
@@ -265,11 +270,7 @@ async fn route(
             }
         };
 
-        let expected_origin = env
-            .var("EXPECTED_ORIGIN")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "https://example.com".to_string());
-        let request_url = format!("{expected_origin}{path}");
+        let request_url = admin::canonical_url(env, path);
 
         // Pass body bytes to NIP-98 for payload hash verification on POST/PUT.
         // For GET/HEAD/DELETE the body is empty, so we pass None.

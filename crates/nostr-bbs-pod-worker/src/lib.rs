@@ -166,6 +166,21 @@ fn add_cache_control(headers: &Headers, resource_path: &str) {
     headers.set("Cache-Control", value).ok();
 }
 
+/// Extract the origin (`scheme://host[:port]`) from a parsed URL.
+///
+/// Used to construct NIP-98 verification URLs from the actual request origin
+/// rather than the `EXPECTED_ORIGIN` env var. Workers may be accessed via
+/// their `.workers.dev` subdomain or a custom domain — the NIP-98 `u` tag
+/// must match whichever origin the client actually used.
+fn request_origin(url: &worker::Url) -> String {
+    let scheme = url.scheme();
+    let host = url.host_str().unwrap_or("example.com");
+    match url.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
 /// Create a JSON error response with CORS headers.
 fn json_error(env: &Env, message: &str, status: u16) -> Result<Response> {
     let body = serde_json::json!({ "error": message });
@@ -415,11 +430,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None
             };
 
-            let expected_origin = env
-                .var("EXPECTED_ORIGIN")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|_| "https://example.com".to_string());
-            let request_url = format!("{expected_origin}{path}");
+            let pay_nip98_origin = request_origin(&url);
+            let request_url = format!("{pay_nip98_origin}{path}");
             let requester_pubkey: Option<String> = if let Some(ref header) = pay_auth_header {
                 let method_name = method_str(&method);
                 let body_ref = pay_body.as_deref();
@@ -431,6 +443,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None
             };
 
+            let pay_cors_origin = env
+                .var("EXPECTED_ORIGIN")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| pay_nip98_origin.clone());
             let pay_db = env
                 .d1("REPLAY_DB")
                 .map_err(|e| Error::RustError(format!("REPLAY_DB D1 binding missing: {e}")))?;
@@ -447,7 +463,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             {
                 let resp = result?;
                 resp.headers()
-                    .set("Access-Control-Allow-Origin", &expected_origin)
+                    .set("Access-Control-Allow-Origin", &pay_cors_origin)
                     .ok();
                 return Ok(resp);
             }
@@ -492,7 +508,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .var("EXPECTED_ORIGIN")
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "https://example.com".to_string());
-    let request_url = format!("{expected_origin}{path}");
+    let nip98_origin = request_origin(&url);
+    let request_url = format!("{nip98_origin}{path}");
 
     let requester_pubkey: Option<String> = if let Some(ref header) = auth_header {
         let method_name = method_str(&method);

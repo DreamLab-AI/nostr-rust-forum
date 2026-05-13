@@ -138,16 +138,48 @@ pub async fn require_authed(
     Ok(token.pubkey)
 }
 
-/// Build the absolute request URL that NIP-98 expects for verification. The
-/// workers-rs `Request::url()` already returns the full URL; this helper
-/// exists for parity with the relay-worker handler style that reconstructs
-/// from `EXPECTED_ORIGIN + path`.
+/// Per-request NIP-98 origin, set at the top of `handle_request` from the
+/// actual `req.url()`. Workers are single-threaded, so a `thread_local!`
+/// `RefCell` is safe and avoids threading an extra parameter through every
+/// handler signature.
+use std::cell::RefCell;
+thread_local! {
+    static NIP98_ORIGIN: RefCell<String> = RefCell::new(String::new());
+}
+
+/// Store the actual request origin for the duration of this request.
+/// Called once at the top of the request handler.
+pub fn set_nip98_origin(origin: &str) {
+    NIP98_ORIGIN.with(|o| *o.borrow_mut() = origin.to_string());
+}
+
+/// Build the absolute request URL that NIP-98 expects for verification.
+///
+/// Prefers the actual request origin (set by [`set_nip98_origin`]) so
+/// NIP-98 tokens signed for `.workers.dev` URLs verify correctly, even
+/// when `EXPECTED_ORIGIN` points at a custom domain. Falls back to
+/// `EXPECTED_ORIGIN` if no per-request origin has been set.
 pub fn canonical_url(env: &Env, path: &str) -> String {
-    let origin = env
-        .var("EXPECTED_ORIGIN")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string());
+    let origin = NIP98_ORIGIN.with(|o| {
+        let v = o.borrow();
+        if v.is_empty() { None } else { Some(v.clone()) }
+    });
+    let origin = origin.unwrap_or_else(|| {
+        env.var("EXPECTED_ORIGIN")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "https://example.com".to_string())
+    });
     format!("{origin}{path}")
+}
+
+/// Extract the origin (`scheme://host[:port]`) from a parsed URL.
+pub fn request_origin(url: &worker::Url) -> String {
+    let scheme = url.scheme();
+    let host = url.host_str().unwrap_or("example.com");
+    match url.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
