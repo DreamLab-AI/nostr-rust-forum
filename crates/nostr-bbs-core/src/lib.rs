@@ -26,6 +26,8 @@ pub mod nip98;
 pub mod signer;
 pub mod types;
 
+pub mod admin_shared;
+pub mod cors;
 pub mod d1_helpers;
 pub mod did;
 pub mod governance;
@@ -62,7 +64,10 @@ pub use nip98::{
 };
 pub use types::{EventId, Tag, Timestamp};
 
-pub use calendar::{create_calendar_event, create_rsvp, CalendarError, RsvpStatus};
+pub use calendar::{
+    create_calendar_event, create_calendar_event_signer, create_rsvp, create_rsvp_signer,
+    CalendarError, RsvpStatus,
+};
 
 pub use moderation_events::{
     build_ban, build_moderation_action, build_mute, build_report, build_unban, build_unmute,
@@ -89,6 +94,12 @@ pub use nip90::{
     KIND_JOB_RESULT_MIN,
 };
 pub use signer::{PrfSigner, Signer, SignerError};
+
+pub use admin_shared::{
+    IsAdminRow, PubkeyRow, MEMBERS_ADMIN_LIST_SQL, MEMBERS_IS_ADMIN_SQL, WHITELIST_ADMIN_LIST_SQL,
+    WHITELIST_IS_ADMIN_SQL,
+};
+pub use cors::{CorsHeader, POD_CORS_HEADERS, STANDARD_CORS_HEADERS};
 
 pub use governance::{
     extract_d_tag, extract_tag, is_governance_kind, ActionDef, ActionPriority, ActionRequest,

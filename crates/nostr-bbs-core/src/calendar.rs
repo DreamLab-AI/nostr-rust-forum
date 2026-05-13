@@ -8,6 +8,7 @@ use k256::schnorr::SigningKey;
 use thiserror::Error;
 
 use crate::event::{sign_event, NostrEvent, UnsignedEvent};
+use crate::signer::Signer;
 
 // -- Kind constants -----------------------------------------------------------
 
@@ -218,6 +219,107 @@ pub fn create_rsvp(
     };
 
     sign_event(unsigned, &signing_key).map_err(|e| CalendarError::SigningFailed(e.to_string()))
+}
+
+// -- Signer-based constructors ------------------------------------------------
+
+/// Create a time-based calendar event (kind 31923) using a [`Signer`].
+///
+/// Async variant of [`create_calendar_event`] that delegates signing to the
+/// provided signer trait object, enabling NIP-07 and other async backends.
+pub async fn create_calendar_event_signer(
+    signer: &dyn Signer,
+    title: &str,
+    start_timestamp: u64,
+    end_timestamp: Option<u64>,
+    location: Option<&str>,
+    description: Option<&str>,
+    max_attendees: Option<u32>,
+) -> Result<NostrEvent, CalendarError> {
+    if title.is_empty() {
+        return Err(CalendarError::EmptyTitle);
+    }
+    if start_timestamp == 0 {
+        return Err(CalendarError::InvalidStartTime);
+    }
+    if let Some(end) = end_timestamp {
+        if end < start_timestamp {
+            return Err(CalendarError::EndBeforeStart {
+                start: start_timestamp,
+                end,
+            });
+        }
+    }
+
+    let pubkey = signer.public_key().to_string();
+    let d_tag = random_d_tag();
+    let mut tags = vec![
+        vec!["d".to_string(), d_tag],
+        vec!["title".to_string(), title.to_string()],
+        vec!["start".to_string(), start_timestamp.to_string()],
+    ];
+
+    if let Some(end) = end_timestamp {
+        tags.push(vec!["end".to_string(), end.to_string()]);
+    }
+
+    if let Some(loc) = location {
+        tags.push(vec!["location".to_string(), loc.to_string()]);
+    }
+
+    if let Some(max) = max_attendees {
+        tags.push(vec!["max_attendees".to_string(), max.to_string()]);
+    }
+
+    tags.push(vec!["t".to_string(), "calendar-event".to_string()]);
+
+    let unsigned = UnsignedEvent {
+        pubkey,
+        created_at: now_secs(),
+        kind: KIND_CALENDAR_EVENT,
+        tags,
+        content: description.unwrap_or("").to_string(),
+    };
+
+    signer
+        .sign_event(unsigned)
+        .await
+        .map_err(|e| CalendarError::SigningFailed(e.to_string()))
+}
+
+/// Create a calendar RSVP (kind 31925) using a [`Signer`].
+///
+/// Async variant of [`create_rsvp`] that delegates signing to the provided
+/// signer trait object.
+pub async fn create_rsvp_signer(
+    signer: &dyn Signer,
+    event_id: &str,
+    status: RsvpStatus,
+) -> Result<NostrEvent, CalendarError> {
+    if event_id.len() != 64 || hex::decode(event_id).is_err() {
+        return Err(CalendarError::InvalidEventId(event_id.to_string()));
+    }
+
+    let pubkey = signer.public_key().to_string();
+
+    let tags = vec![
+        vec!["d".to_string(), event_id.to_string()],
+        vec!["e".to_string(), event_id.to_string()],
+        vec!["status".to_string(), status.as_str().to_string()],
+    ];
+
+    let unsigned = UnsignedEvent {
+        pubkey,
+        created_at: now_secs(),
+        kind: KIND_CALENDAR_RSVP,
+        tags,
+        content: String::new(),
+    };
+
+    signer
+        .sign_event(unsigned)
+        .await
+        .map_err(|e| CalendarError::SigningFailed(e.to_string()))
 }
 
 #[cfg(test)]

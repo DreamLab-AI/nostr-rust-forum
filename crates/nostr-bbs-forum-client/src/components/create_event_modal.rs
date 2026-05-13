@@ -103,10 +103,10 @@ pub fn CreateEventModal(
             Some(desc)
         };
 
-        // Sign and publish
+        // Sign and publish via Signer trait
         let auth = use_auth();
-        let privkey = match auth.get_privkey_bytes() {
-            Some(pk) => pk,
+        let signer = match auth.get_signer() {
+            Some(s) => s,
             None => {
                 error_msg.set(Some("Not authenticated".into()));
                 return;
@@ -115,29 +115,34 @@ pub fn CreateEventModal(
 
         submitting.set(true);
 
-        match nostr_bbs_core::create_calendar_event(
-            &privkey,
-            t.trim(),
-            start_ts,
-            end_ts,
-            loc_opt.as_deref(),
-            desc_opt.as_deref(),
-            max_opt,
-        ) {
-            Ok(event) => {
-                let relay = expect_context::<RelayConnection>();
-                relay.publish(&event);
-                let event_id = event.id.clone();
-                toasts.show("Event created", ToastVariant::Success);
-                on_created.run(event_id);
-                on_close.run(());
+        let title_trimmed = t.trim().to_string();
+        let toasts_spawn = toasts.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match nostr_bbs_core::create_calendar_event_signer(
+                signer.as_ref(),
+                &title_trimmed,
+                start_ts,
+                end_ts,
+                loc_opt.as_deref(),
+                desc_opt.as_deref(),
+                max_opt,
+            )
+            .await
+            {
+                Ok(event) => {
+                    let relay = expect_context::<RelayConnection>();
+                    relay.publish(&event);
+                    let event_id = event.id.clone();
+                    toasts_spawn.show("Event created", ToastVariant::Success);
+                    on_created.run(event_id);
+                    on_close.run(());
+                }
+                Err(e) => {
+                    error_msg.set(Some(format!("Failed to create event: {}", e)));
+                }
             }
-            Err(e) => {
-                error_msg.set(Some(format!("Failed to create event: {}", e)));
-            }
-        }
-
-        submitting.set(false);
+            submitting.set(false);
+        });
     };
 
     let on_backdrop = move |_| {

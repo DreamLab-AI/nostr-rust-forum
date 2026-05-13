@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use leptos::prelude::*;
 use nostr_bbs_core::gift_wrap::{gift_wrap, unwrap_gift};
+use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{nip44_decrypt, NostrEvent};
 use zeroize::Zeroize as _;
 
@@ -128,18 +129,34 @@ impl DMStore {
     /// Fetch existing DM conversations by subscribing to kind 4 (legacy) and
     /// kind 1059 (NIP-59 Gift Wrap) events where the user is either sender
     /// (author) or recipient (#p tag).
+    ///
+    /// Accepts a [`Signer`] for key material extraction. DMs require raw key
+    /// bytes for NIP-59 gift unwrap; the signer's [`raw_key_bytes()`] method
+    /// is used when available.
     pub fn fetch_conversations(
         &self,
         relay: &RelayConnection,
-        privkey_bytes: &[u8; 32],
+        signer: &dyn Signer,
         my_pubkey: &str,
     ) {
+        let sk = match signer.raw_key_bytes() {
+            Some(bytes) => bytes,
+            None => {
+                self.state.update(|s| {
+                    s.error = Some(
+                        "DMs require a local signing key. NIP-07 extensions cannot decrypt DMs."
+                            .into(),
+                    );
+                });
+                return;
+            }
+        };
+
         self.state.update(|s| {
             s.is_loading = true;
             s.error = None;
         });
 
-        let sk = *privkey_bytes;
         let my_pk = my_pubkey.to_string();
         let state = self.state;
 
@@ -178,13 +195,18 @@ impl DMStore {
 
     /// Subscribe to incoming DMs in real-time (new events only, since=now).
     /// Listens for both kind 4 (legacy) and kind 1059 (NIP-59 Gift Wrap).
+    ///
+    /// Requires a signer with [`raw_key_bytes()`] access for NIP-59 unwrap.
     pub fn subscribe_incoming(
         &self,
         relay: &RelayConnection,
-        privkey_bytes: &[u8; 32],
+        signer: &dyn Signer,
         my_pubkey: &str,
     ) {
-        let sk = *privkey_bytes;
+        let sk = match signer.raw_key_bytes() {
+            Some(bytes) => bytes,
+            None => return, // NIP-07 cannot decrypt DMs — silently skip subscription
+        };
         let my_pk = my_pubkey.to_string();
         let state = self.state;
         let now = (js_sys::Date::now() / 1000.0) as u64;
@@ -226,14 +248,19 @@ impl DMStore {
 
     /// Subscribe to historical + live messages for a specific conversation partner.
     /// Subscribes to both kind 4 (legacy) and kind 1059 (NIP-59 Gift Wrap).
+    ///
+    /// Requires a signer with [`raw_key_bytes()`] access for NIP-59 unwrap.
     pub fn load_conversation_messages(
         &self,
         relay: &RelayConnection,
-        privkey_bytes: &[u8; 32],
+        signer: &dyn Signer,
         my_pubkey: &str,
         partner_pubkey: &str,
     ) {
-        let sk = *privkey_bytes;
+        let sk = match signer.raw_key_bytes() {
+            Some(bytes) => bytes,
+            None => return, // NIP-07 cannot decrypt DMs
+        };
         let my_pk = my_pubkey.to_string();
         let partner_pk = partner_pubkey.to_string();
         let state = self.state;
@@ -287,8 +314,8 @@ impl DMStore {
     ///   2. Seal (kind 13, sender signs + NIP-44 encrypts the rumor)
     ///   3. Wrap (kind 1059, throwaway key signs + NIP-44 encrypts the seal)
     ///
-    /// The privkey bytes are passed directly to `gift_wrap()` which creates the
-    /// Seal signature internally. No separate `auth.sign_event()` call is needed.
+    /// Accepts a [`Signer`] for key material. NIP-59 gift wrap requires raw key
+    /// bytes; these are extracted via `signer.raw_key_bytes()`.
     ///
     /// Also publishes kind-10050 (preferred DM relay) on first send if not already done.
     pub fn send_message(
@@ -296,7 +323,7 @@ impl DMStore {
         relay: &RelayConnection,
         recipient_pk_hex: &str,
         content: &str,
-        privkey_bytes: &[u8; 32],
+        signer: &dyn Signer,
         my_pubkey: &str,
     ) -> Result<(), String> {
         if content.trim().is_empty() {
@@ -312,10 +339,14 @@ impl DMStore {
             return Err("Invalid recipient pubkey hex".into());
         }
 
-        // Publish kind-10050 (preferred DM relay) once per pubkey per session.
-        ensure_dm_relay_published(relay, privkey_bytes, my_pubkey);
+        let privkey_bytes = signer
+            .raw_key_bytes()
+            .ok_or("DMs require a local signing key. NIP-07 extensions cannot send DMs.")?;
 
-        let wrapped = gift_wrap(privkey_bytes, my_pubkey, recipient_pk_hex, content)
+        // Publish kind-10050 (preferred DM relay) once per pubkey per session.
+        ensure_dm_relay_published(relay, &privkey_bytes, my_pubkey);
+
+        let wrapped = gift_wrap(&privkey_bytes, my_pubkey, recipient_pk_hex, content)
             .map_err(|e| format!("Gift wrap failed: {e}"))?;
 
         let now = (js_sys::Date::now() / 1000.0) as u64;

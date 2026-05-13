@@ -54,14 +54,14 @@ pub fn DmChatPage() -> impl IntoView {
             return;
         }
 
-        let privkey = auth.get_privkey_bytes();
+        let signer = auth.get_signer();
         let pubkey = auth.pubkey().get_untracked();
 
-        if let (Some(sk), Some(pk)) = (privkey, pubkey) {
+        if let (Some(s), Some(pk)) = (signer, pubkey) {
             fetch_started.set(true);
             dm_store.select_conversation(&rpk);
-            dm_store.load_conversation_messages(&relay_for_sub, &sk, &pk, &rpk);
-            dm_store.subscribe_incoming(&relay_for_sub, &sk, &pk);
+            dm_store.load_conversation_messages(&relay_for_sub, s.as_ref(), &pk, &rpk);
+            dm_store.subscribe_incoming(&relay_for_sub, s.as_ref(), &pk);
         }
     });
 
@@ -100,16 +100,16 @@ pub fn DmChatPage() -> impl IntoView {
             return;
         }
 
-        let privkey = auth.get_privkey_bytes();
+        let signer = auth.get_signer();
         let my_pubkey = auth.pubkey().get_untracked();
 
-        match (privkey, my_pubkey) {
-            (Some(sk), Some(pk)) => {
+        match (signer, my_pubkey) {
+            (Some(s), Some(pk)) => {
                 sending.set(true);
                 send_error.set(None);
                 message_input.set(String::new());
 
-                match dm_store.send_message(&relay_for_send, &rpk, &content, &sk, &pk) {
+                match dm_store.send_message(&relay_for_send, &rpk, &content, s.as_ref(), &pk) {
                     Ok(()) => {
                         sending.set(false);
                     }

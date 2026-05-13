@@ -14,6 +14,99 @@ const POD_API: &str = match option_env!("VITE_POD_API_URL") {
     None => "https://pod.example.com",
 };
 
+/// Upload a blob to the user's public media folder on their Solid pod,
+/// using a [`Signer`] for NIP-98 authentication.
+///
+/// Returns the public URL of the uploaded file on success.
+pub async fn upload_to_pod_signer(
+    blob: &Blob,
+    filename: &str,
+    pubkey: &str,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+    pod_api_url: Option<&str>,
+) -> Result<String, String> {
+    let base_url = pod_api_url.unwrap_or(POD_API);
+    let url = format!("{}/pods/{}/media/public/{}", base_url, pubkey, filename);
+
+    // Read blob into bytes for NIP-98 payload hash
+    let array_buf_promise = blob.array_buffer();
+    let array_buf = JsFuture::from(array_buf_promise)
+        .await
+        .map_err(|e| format!("Blob read: {e:?}"))?;
+    let bytes: Vec<u8> = js_sys::Uint8Array::new(&array_buf).to_vec();
+
+    // Create NIP-98 auth token via signer
+    let token =
+        crate::auth::nip98::create_nip98_token_with_signer(signer, &url, "POST", Some(&bytes))
+            .await
+            .map_err(|e| format!("NIP-98 error: {e}"))?;
+    let auth_header = format!("Nostr {}", token);
+
+    // POST to pod API
+    let window = web_sys::window().ok_or("No window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+
+    let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
+    headers
+        .set("Authorization", &auth_header)
+        .map_err(|e| format!("{e:?}"))?;
+    headers
+        .set("Content-Type", "application/octet-stream")
+        .map_err(|e| format!("{e:?}"))?;
+    init.set_headers(&headers);
+    init.set_body(&js_sys::Uint8Array::from(bytes.as_slice()).into());
+
+    let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
+    let resp_val = JsFuture::from(window.fetch_with_request(&req))
+        .await
+        .map_err(|e| format!("Fetch: {e:?}"))?;
+    let resp: web_sys::Response = resp_val.unchecked_into();
+
+    if !resp.ok() {
+        let status = resp.status();
+        if let Ok(tp) = resp.text() {
+            if let Ok(t) = JsFuture::from(tp).await {
+                if let Some(s) = t.as_string() {
+                    return Err(format!("HTTP {}: {}", status, s));
+                }
+            }
+        }
+        return Err(format!("HTTP {}", status));
+    }
+
+    // Parse response for the final URL
+    let text_promise = resp.text().map_err(|e| format!("{e:?}"))?;
+    let text_val = JsFuture::from(text_promise)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let body = text_val.as_string().unwrap_or_default();
+
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Some(u) = parsed.get("url").and_then(|v| v.as_str()) {
+            return Ok(u.to_string());
+        }
+    }
+    if body.starts_with("http") {
+        return Ok(body);
+    }
+    Ok(url)
+}
+
+/// Upload both a compressed image and its thumbnail via [`Signer`], returning (image_url, thumb_url).
+pub async fn upload_image_with_thumbnail_signer(
+    image_blob: &Blob,
+    thumb_blob: &Blob,
+    filename: &str,
+    pubkey: &str,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+) -> Result<(String, String), String> {
+    let thumb_name = thumb_filename(filename);
+    let image_url = upload_to_pod_signer(image_blob, filename, pubkey, signer, None).await?;
+    let thumb_url = upload_to_pod_signer(thumb_blob, &thumb_name, pubkey, signer, None).await?;
+    Ok((image_url, thumb_url))
+}
+
 /// Upload a blob to the user's public media folder on their Solid pod.
 ///
 /// Returns the public URL of the uploaded file on success.

@@ -109,6 +109,18 @@ pub trait Signer {
         sender_pubkey_hex: &str,
         ciphertext: &str,
     ) -> Result<String, SignerError>;
+
+    /// Return raw secret key bytes, if the backend supports it.
+    ///
+    /// Most signers return `None` (e.g. NIP-07 extensions never expose the key).
+    /// [`PrfSigner`] (local keypair) returns `Some` because certain protocol
+    /// operations (NIP-59 gift wrap, NIP-44 symmetric decrypt) require raw key
+    /// material. Callers should prefer the higher-level trait methods (`sign_event`,
+    /// `nip44_decrypt`, etc.) and only fall back to raw bytes when structurally
+    /// required.
+    fn raw_key_bytes(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 // ── PrfSigner ─────────────────────────────────────────────────────────────────
@@ -199,6 +211,10 @@ impl Signer for PrfSigner {
             ciphertext,
         )
         .map_err(|e| SignerError::DecryptionFailed(e.to_string()))
+    }
+
+    fn raw_key_bytes(&self) -> Option<[u8; 32]> {
+        Some(*self.keypair.secret.as_bytes())
     }
 }
 

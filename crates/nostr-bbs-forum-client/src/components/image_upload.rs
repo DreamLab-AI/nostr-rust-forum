@@ -3,7 +3,6 @@
 
 use crate::auth::use_auth;
 use crate::utils::image_compress::{compress_image_default, generate_thumbnail};
-use crate::utils::pod_client::upload_image_with_thumbnail;
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -121,8 +120,8 @@ pub(crate) fn ImageUpload(
                 return;
             }
         };
-        let privkey = match auth.get_privkey_bytes() {
-            Some(k) => k,
+        let signer = match auth.get_signer() {
+            Some(s) => s,
             None => {
                 state.set(State::Err("No signing key".into()));
                 return;
@@ -149,8 +148,15 @@ pub(crate) fn ImageUpload(
                 }
             };
             state.set(State::Uploading);
-            // Upload both to pod
-            match upload_image_with_thumbnail(&compressed, &thumbnail, &fname, &pk, &privkey).await
+            // Upload both to pod via signer
+            match crate::utils::pod_client::upload_image_with_thumbnail_signer(
+                &compressed,
+                &thumbnail,
+                &fname,
+                &pk,
+                signer.as_ref(),
+            )
+            .await
             {
                 Ok((image_url, _thumb_url)) => {
                     state.set(State::Ok(image_url.clone()));

@@ -273,8 +273,18 @@ pub fn SettingsPage() -> impl IntoView {
     };
 
     // -- Nsec export handler --
+    // NOTE: get_privkey_bytes() is the intentional and legitimate path here --
+    // the user explicitly wants to see/export their raw private key. NIP-07
+    // users cannot export because the extension never exposes keys.
     let toasts_for_nsec = toasts.clone();
     let on_confirm_nsec = Callback::new(move |_: ()| {
+        if auth.get().is_nip07 {
+            toasts_for_nsec.show(
+                "Private key export is not available with NIP-07 browser extensions. Your key is managed by the extension.",
+                ToastVariant::Warning,
+            );
+            return;
+        }
         if let Some(privkey) = auth.get_privkey_bytes() {
             let hex_str = hex::encode(*privkey);
             // Copy to clipboard
@@ -717,10 +727,31 @@ pub fn SettingsPage() -> impl IntoView {
 
                     <div class="flex gap-3 pt-2">
                         <button
-                            on:click=move |_| confirm_nsec_open.set(true)
-                            class="text-sm text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded-lg px-4 py-2 transition-colors"
+                            on:click=move |_| {
+                                if auth.get().is_nip07 {
+                                    // Show toast immediately for NIP-07 — no confirmation dialog needed
+                                    let toasts = use_toasts();
+                                    toasts.show(
+                                        "Private key export is not available with NIP-07 browser extensions. Your key is managed by the extension.",
+                                        ToastVariant::Warning,
+                                    );
+                                } else {
+                                    confirm_nsec_open.set(true);
+                                }
+                            }
+                            class=move || {
+                                if auth.get().is_nip07 {
+                                    "text-sm text-gray-500 border border-gray-600 rounded-lg px-4 py-2 transition-colors cursor-not-allowed opacity-60"
+                                } else {
+                                    "text-sm text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded-lg px-4 py-2 transition-colors"
+                                }
+                            }
                         >
-                            "Export Private Key"
+                            {move || if auth.get().is_nip07 {
+                                "Export Private Key (unavailable)"
+                            } else {
+                                "Export Private Key"
+                            }}
                         </button>
                         <button
                             on:click=on_logout

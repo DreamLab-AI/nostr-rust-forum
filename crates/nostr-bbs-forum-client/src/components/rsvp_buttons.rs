@@ -36,39 +36,42 @@ pub fn RsvpButtons(
     let rsvp_action = move |eid: String, status: RsvpStatus| {
         let auth = use_auth();
         let toasts = use_toasts();
-        let privkey = match auth.get_privkey_bytes() {
-            Some(pk) => pk,
+        let signer = match auth.get_signer() {
+            Some(s) => s,
             None => {
                 toasts.show("Not authenticated", ToastVariant::Error);
                 return;
             }
         };
 
-        match nostr_bbs_core::create_rsvp(&privkey, &eid, status) {
-            Ok(event) => {
-                let relay = expect_context::<RelayConnection>();
-                let label = match status {
-                    RsvpStatus::Accept => "Accepted",
-                    RsvpStatus::Decline => "Declined",
-                    RsvpStatus::Tentative => "Tentative",
-                };
-                let toasts_ok = toasts.clone();
-                let label_owned = label.to_string();
-                let ack = Rc::new(move |accepted: bool, message: String| {
-                    if accepted {
-                        toasts_ok.show(format!("RSVP: {}", label_owned), ToastVariant::Success);
-                    } else {
-                        toasts_ok.show(format!("RSVP rejected: {}", message), ToastVariant::Error);
+        wasm_bindgen_futures::spawn_local(async move {
+            match nostr_bbs_core::create_rsvp_signer(signer.as_ref(), &eid, status).await {
+                Ok(event) => {
+                    let relay = expect_context::<RelayConnection>();
+                    let label = match status {
+                        RsvpStatus::Accept => "Accepted",
+                        RsvpStatus::Decline => "Declined",
+                        RsvpStatus::Tentative => "Tentative",
+                    };
+                    let toasts_ok = toasts.clone();
+                    let label_owned = label.to_string();
+                    let ack = Rc::new(move |accepted: bool, message: String| {
+                        if accepted {
+                            toasts_ok.show(format!("RSVP: {}", label_owned), ToastVariant::Success);
+                        } else {
+                            toasts_ok
+                                .show(format!("RSVP rejected: {}", message), ToastVariant::Error);
+                        }
+                    });
+                    if let Err(e) = relay.publish_with_ack(&event, Some(ack)) {
+                        toasts.show(format!("RSVP failed: {}", e), ToastVariant::Error);
                     }
-                });
-                if let Err(e) = relay.publish_with_ack(&event, Some(ack)) {
+                }
+                Err(e) => {
                     toasts.show(format!("RSVP failed: {}", e), ToastVariant::Error);
                 }
             }
-            Err(e) => {
-                toasts.show(format!("RSVP failed: {}", e), ToastVariant::Error);
-            }
-        }
+        });
     };
 
     let btn_class = move |status: RsvpStatus, base_bg: &str, base_text: &str, base_border: &str| {

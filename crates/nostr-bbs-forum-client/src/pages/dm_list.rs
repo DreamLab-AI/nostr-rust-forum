@@ -45,13 +45,13 @@ pub fn DmListPage() -> impl IntoView {
             return;
         }
 
-        let privkey = auth.get_privkey_bytes();
+        let signer = auth.get_signer();
         let pubkey = auth.pubkey().get_untracked();
 
-        if let (Some(sk), Some(pk)) = (privkey, pubkey) {
+        if let (Some(s), Some(pk)) = (signer, pubkey) {
             fetch_started.set(true);
-            dm_store.fetch_conversations(&relay_for_fetch, &sk, &pk);
-            dm_store.subscribe_incoming(&relay_for_fetch, &sk, &pk);
+            dm_store.fetch_conversations(&relay_for_fetch, s.as_ref(), &pk);
+            dm_store.subscribe_incoming(&relay_for_fetch, s.as_ref(), &pk);
         }
     });
 
