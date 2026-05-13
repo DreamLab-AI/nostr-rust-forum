@@ -13,7 +13,7 @@ use nostr_bbs_core::{NostrEvent, UnsignedEvent};
 use send_wrapper::SendWrapper;
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -99,6 +99,7 @@ struct RelayInner {
     reconnect_attempts: u32,
     pending_messages: Vec<String>,
     relay_url: String,
+    seen_events: HashSet<String>,
     auth_signer: Option<AuthSignCallback>,
     auth_signer_async: Option<AuthSignAsyncCallback>,
     _on_open: Option<Closure<dyn FnMut()>>,
@@ -140,6 +141,7 @@ impl RelayConnection {
             reconnect_attempts: 0,
             pending_messages: Vec::new(),
             relay_url,
+            seen_events: HashSet::new(),
             auth_signer: None,
             auth_signer_async: None,
             _on_open: None,
@@ -224,6 +226,7 @@ impl RelayConnection {
             state.set(ConnectionState::Connected);
             let mut inner = inner_rc.borrow_mut();
             inner.reconnect_attempts = 0;
+            inner.seen_events.clear();
             // Flush pending messages
             let pending: Vec<String> = inner.pending_messages.drain(..).collect();
             if let Some(ws) = &inner.ws {
@@ -482,6 +485,16 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                     return;
                 }
             };
+
+            {
+                let mut inner = inner_rc.borrow_mut();
+                if !inner.seen_events.insert(event.id.clone()) {
+                    return;
+                }
+                if inner.seen_events.len() > 10_000 {
+                    inner.seen_events.clear();
+                }
+            }
 
             let callback = {
                 let inner = inner_rc.borrow();

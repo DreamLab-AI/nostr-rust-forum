@@ -118,12 +118,14 @@ pub fn ForumsPage() -> impl IntoView {
         let chans = store.channels.get();
         let mut map = HashMap::<String, HashMap<String, u32>>::new();
         for ch in &chans {
-            if ch.section.is_empty() {
-                continue;
-            }
-            if let Some(zone_id) = section_to_zone(&ch.section) {
+            let section = if ch.section.is_empty() {
+                "home-lobby".to_string()
+            } else {
+                ch.section.clone()
+            };
+            if let Some(zone_id) = section_to_zone(&section) {
                 let cats = map.entry(zone_id.to_string()).or_default();
-                *cats.entry(ch.section.clone()).or_insert(0) += 1;
+                *cats.entry(section).or_insert(0) += 1;
             }
         }
         map

@@ -87,6 +87,9 @@ impl PanelRegistry {
 
                 if let Ok(req) = serde_json::from_str::<governance::ActionRequest>(&event.content) {
                     self.state.update(|s| {
+                        if s.actions.iter().any(|a| a.event_id == event.id) {
+                            return;
+                        }
                         s.actions.push(ActionEntry {
                             d_tag,
                             agent_pubkey: event.pubkey.clone(),

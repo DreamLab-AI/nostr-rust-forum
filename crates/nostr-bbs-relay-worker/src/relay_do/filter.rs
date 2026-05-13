@@ -150,7 +150,7 @@ impl NostrRelayDO {
                 }
                 let escaped = v.replace('%', "\\%").replace('_', "\\_").replace('"', "");
                 let pattern = format!("%\"{tag_name}\",\"{escaped}\"%");
-                tag_conditions.push(format!("tags LIKE ?{} ESCAPE '\\\\'", *param_idx));
+                tag_conditions.push(format!("tags LIKE ?{} ESCAPE '\\'", *param_idx));
                 params.push(JsValue::from_str(&pattern));
                 *param_idx += 1;
             }
@@ -167,7 +167,7 @@ impl NostrRelayDO {
             if !search.is_empty() {
                 let escaped = search.replace('%', "\\%").replace('_', "\\_");
                 let pattern = format!("%{escaped}%");
-                conditions.push(format!("content LIKE ?{} ESCAPE '\\\\'", *param_idx));
+                conditions.push(format!("content LIKE ?{} ESCAPE '\\'", *param_idx));
                 params.push(JsValue::from_str(&pattern));
                 *param_idx += 1;
             }

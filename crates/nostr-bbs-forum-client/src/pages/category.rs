@@ -163,7 +163,7 @@ pub fn CategoryPage() -> impl IntoView {
                 .iter()
                 .find(|t| t.len() >= 2 && t[0] == "section")
                 .map(|t| t[1].clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| "home-lobby".to_string());
 
             // Match: exact match, case-insensitive match, or zone parent match
             let matches = section_tag == slug
@@ -228,9 +228,9 @@ pub fn CategoryPage() -> impl IntoView {
             return;
         }
 
+        let channel_id_set: std::collections::HashSet<String> = channel_ids.into_iter().collect();
         let msg_filter = Filter {
             kinds: Some(vec![42]),
-            e_tags: Some(channel_ids),
             ..Default::default()
         };
 
@@ -245,6 +245,9 @@ pub fn CategoryPage() -> impl IntoView {
                 .map(|t| t[1].clone());
 
             if let Some(cid) = cid {
+                if !channel_id_set.contains(&cid) {
+                    return;
+                }
                 counts.update(|m| *m.entry(cid.clone()).or_insert(0) += 1);
                 active.update(|m| {
                     let ts = m.entry(cid).or_insert(0);
