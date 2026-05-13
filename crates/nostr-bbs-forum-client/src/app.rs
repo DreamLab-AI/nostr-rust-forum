@@ -22,8 +22,8 @@ use crate::components::toast::{provide_toasts, ToastContainer};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, CategoryPage, ChannelPage, ChatPage, DmChatPage, DmListPage, EventsPage, ForumsPage,
-    GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage, PendingPage, PodBrowserPage,
-    ProfilePage, SearchPage, SectionPage, SettingsPage, SetupPage, SignupPage,
+    GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage, PendingPage,
+    PodBrowserPage, ProfilePage, SearchPage, SectionPage, SettingsPage, SetupPage, SignupPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};

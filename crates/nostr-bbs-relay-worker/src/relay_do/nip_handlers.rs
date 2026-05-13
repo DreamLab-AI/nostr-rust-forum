@@ -838,9 +838,7 @@ impl NostrRelayDO {
             return false;
         }
 
-        allowed_dids
-            .split(',')
-            .any(|did| did.trim() == pubkey)
+        allowed_dids.split(',').any(|did| did.trim() == pubkey)
     }
 
     /// Check whether a given event kind is in the `MESH_FEDERATED_KINDS`

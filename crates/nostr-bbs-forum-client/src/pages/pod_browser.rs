@@ -36,11 +36,13 @@ enum FetchState {
 
 // ── Authenticated fetch ─────────────────────────────────────────────────────
 
-async fn pod_fetch(url: &str, signer: &dyn nostr_bbs_core::signer::Signer) -> Result<String, String> {
-    let token =
-        crate::auth::nip98::create_nip98_token_with_signer(signer, url, "GET", None)
-            .await
-            .map_err(|e| format!("NIP-98: {e}"))?;
+async fn pod_fetch(
+    url: &str,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+) -> Result<String, String> {
+    let token = crate::auth::nip98::create_nip98_token_with_signer(signer, url, "GET", None)
+        .await
+        .map_err(|e| format!("NIP-98: {e}"))?;
 
     let win = web_sys::window().ok_or("No window")?;
     let init = web_sys::RequestInit::new();
@@ -51,12 +53,14 @@ async fn pod_fetch(url: &str, signer: &dyn nostr_bbs_core::signer::Signer) -> Re
         .set("Authorization", &format!("Nostr {token}"))
         .map_err(|e| format!("{e:?}"))?;
     headers
-        .set("Accept", "application/ld+json, application/json, text/turtle, */*")
+        .set(
+            "Accept",
+            "application/ld+json, application/json, text/turtle, */*",
+        )
         .map_err(|e| format!("{e:?}"))?;
     init.set_headers(&headers);
 
-    let req =
-        web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| format!("{e:?}"))?;
+    let req = web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| format!("{e:?}"))?;
     let resp_val = JsFuture::from(win.fetch_with_request(&req))
         .await
         .map_err(|e| format!("Fetch: {e:?}"))?;
