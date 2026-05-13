@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-forum-client"
-version = "3.0.0-rc7"
+version = "3.0.0-rc8"
 edition = "2021"
 description = "Leptos CSR forum client for nostr-bbs deployments"
 license = "MIT OR Apache-2.0"

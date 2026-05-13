@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-setup-skill"
-version = "3.0.0-rc7"
+version = "3.0.0-rc8"
 edition = "2021"
 description = "Provider-abstracted operator-onboarding skill for nostr-bbs (ADR-079)"
 license = "MIT OR Apache-2.0"

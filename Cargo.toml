@@ -130,10 +130,10 @@ wasm-bindgen-test = "0.3"
 solid-pod-rs = { version = "0.4.0-alpha.10", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc7" }
-nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc7" }
-nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc7" }
-nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "3.0.0-rc7" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc8" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc8" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc8" }
+nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "3.0.0-rc8" }
 
 # ---------------------------------------------------------------------------
 # Release profile (Sprint v9 D1) — WASM-optimized for forum-client and workers.

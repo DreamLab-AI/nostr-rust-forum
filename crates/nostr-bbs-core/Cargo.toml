@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-core"
-version = "3.0.0-rc7"
+version = "3.0.0-rc8"
 edition = "2021"
 description = "Shared Nostr protocol primitives for the nostr-bbs forum (client + workers)"
 license = "MIT OR Apache-2.0"
