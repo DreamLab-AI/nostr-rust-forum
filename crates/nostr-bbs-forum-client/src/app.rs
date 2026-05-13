@@ -238,10 +238,11 @@ pub fn App() -> impl IntoView {
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
 
+    let auth_conn = auth;
     Effect::new(move |_| {
         if is_authed.get() {
             let r = expect_context::<RelayConnection>();
-            let a = use_auth();
+            let a = auth_conn;
             if a.state.get_untracked().is_nip07 {
                 let a2 = a;
                 let async_signer: crate::relay::AuthSignAsyncCallback =
@@ -269,6 +270,7 @@ pub fn App() -> impl IntoView {
     {
         let published_profile = RwSignal::new(false);
         let relay_state = relay.connection_state();
+        let auth_k0 = auth;
         Effect::new(move |_| {
             if relay_state.get() != ConnectionState::Connected {
                 return;
@@ -281,7 +283,7 @@ pub fn App() -> impl IntoView {
                 return;
             }
 
-            let auth = use_auth();
+            let auth = auth_k0;
             let r = expect_context::<RelayConnection>();
             let pubkey = match auth.pubkey().get_untracked() {
                 Some(pk) => pk,
@@ -332,6 +334,7 @@ pub fn App() -> impl IntoView {
     {
         let published_relay_list = RwSignal::new(false);
         let relay_state = relay.connection_state();
+        let auth_k10002 = auth;
         Effect::new(move |_| {
             if relay_state.get() != ConnectionState::Connected {
                 return;
@@ -344,7 +347,7 @@ pub fn App() -> impl IntoView {
                 return;
             }
 
-            let auth = use_auth();
+            let auth = auth_k10002;
             let r = expect_context::<RelayConnection>();
             let pubkey = match auth.pubkey().get_untracked() {
                 Some(pk) => pk,
