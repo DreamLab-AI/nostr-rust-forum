@@ -130,8 +130,8 @@ impl DMStore {
     /// kind 1059 (NIP-59 Gift Wrap) events where the user is either sender
     /// (author) or recipient (#p tag).
     ///
-    /// Accepts a [`Signer`] for key material extraction. DMs require raw key
-    /// bytes for NIP-59 gift unwrap; the signer's [`raw_key_bytes()`] method
+    /// Accepts a `Signer` for key material extraction. DMs require raw key
+    /// bytes for NIP-59 gift unwrap; the signer's `raw_key_bytes()` method
     /// is used when available.
     pub fn fetch_conversations(
         &self,
@@ -196,7 +196,7 @@ impl DMStore {
     /// Subscribe to incoming DMs in real-time (new events only, since=now).
     /// Listens for both kind 4 (legacy) and kind 1059 (NIP-59 Gift Wrap).
     ///
-    /// Requires a signer with [`raw_key_bytes()`] access for NIP-59 unwrap.
+    /// Requires a signer with `raw_key_bytes()` access for NIP-59 unwrap.
     pub fn subscribe_incoming(
         &self,
         relay: &RelayConnection,
@@ -249,7 +249,7 @@ impl DMStore {
     /// Subscribe to historical + live messages for a specific conversation partner.
     /// Subscribes to both kind 4 (legacy) and kind 1059 (NIP-59 Gift Wrap).
     ///
-    /// Requires a signer with [`raw_key_bytes()`] access for NIP-59 unwrap.
+    /// Requires a signer with `raw_key_bytes()` access for NIP-59 unwrap.
     pub fn load_conversation_messages(
         &self,
         relay: &RelayConnection,

@@ -7,12 +7,12 @@
 //!
 //! ## Usage
 //!
-//! Workers call [`cors_header_pairs`] to get the standard pairs, then apply
-//! them to their own `worker::Headers` instance.
+//! Workers iterate over [`STANDARD_CORS_HEADERS`] to get the standard pairs,
+//! then apply them to their own `worker::Headers` instance.
 //!
 //! Workers that need extended headers (e.g. the pod-worker exposes `ETag`,
-//! `WAC-Allow`, etc.) should call [`cors_header_pairs`] first and then append
-//! their additional headers.
+//! `WAC-Allow`, etc.) should use [`POD_CORS_HEADERS`] instead, which includes
+//! the additional methods and expose headers.
 
 /// A single CORS header name/value pair.
 pub type CorsHeader = (&'static str, &'static str);

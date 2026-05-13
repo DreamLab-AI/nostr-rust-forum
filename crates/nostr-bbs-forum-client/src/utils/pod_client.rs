@@ -15,7 +15,7 @@ const POD_API: &str = match option_env!("VITE_POD_API_URL") {
 };
 
 /// Upload a blob to the user's public media folder on their Solid pod,
-/// using a [`Signer`] for NIP-98 authentication.
+/// using a `Signer` for NIP-98 authentication.
 ///
 /// Returns the public URL of the uploaded file on success.
 pub async fn upload_to_pod_signer(
@@ -93,7 +93,7 @@ pub async fn upload_to_pod_signer(
     Ok(url)
 }
 
-/// Upload both a compressed image and its thumbnail via [`Signer`], returning (image_url, thumb_url).
+/// Upload both a compressed image and its thumbnail via `Signer`, returning (image_url, thumb_url).
 pub async fn upload_image_with_thumbnail_signer(
     image_blob: &Blob,
     thumb_blob: &Blob,
