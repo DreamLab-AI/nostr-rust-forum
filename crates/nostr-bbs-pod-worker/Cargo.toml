@@ -14,6 +14,16 @@ rust-version = "1.85"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# JSS Phase 1 forward-compat alias (ADR-086, consumer-surface-map.md).
+# Activates the upstream Phase 1 feature trio and unlocks the stub modules
+# in `src/{key_provisioning,export,nip05_endpoint}.rs`.
+solid-pod-rs-phase1 = [
+    "solid-pod-rs/provision-keys",
+    "solid-pod-rs/nip05-endpoint",
+    "solid-pod-rs/export-jsonld",
+]
+
 [dependencies]
 nostr-bbs-core = { workspace = true }
 nostr-bbs-rate-limit = { workspace = true }

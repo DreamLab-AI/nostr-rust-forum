@@ -31,6 +31,15 @@ mod remote_storage;
 mod storage;
 mod webid;
 
+// JSS Phase 1 staging (ADR-086): inert re-export shims for the
+// `provision-keys`, `export-jsonld`, and `nip05-endpoint` upstream features.
+// These modules compile to empty surfaces today; activation is gated on the
+// `solid-pod-rs-phase1` feature AND the workspace bumping `solid-pod-rs` to
+// `0.4.0-alpha.11`. See `docs/consumer-surface-map.md`.
+mod export;
+mod key_provisioning;
+mod nip05_endpoint;
+
 use acl::{
     coerce_required_mode_for_acl, evaluate_access, find_effective_acl, wac_allow_header, AccessMode,
 };
