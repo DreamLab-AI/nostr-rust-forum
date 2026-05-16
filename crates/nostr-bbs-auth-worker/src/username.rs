@@ -10,16 +10,23 @@
 //! so the pod-worker's `/.well-known/nostr.json` endpoint can serve NIP-05
 //! verification without a second round-trip to D1.
 //!
+//! JSS Phase 1 (ADR-086) adds an explicit NIP-05 *resolution* surface:
+//! `resolve()` consults D1 first, then optionally falls through to the
+//! operator-configured pod's `/.well-known/nostr.json` over HTTP when
+//! `NIP05_RESOLVER_MODE = "federated"`. This is distinct from `check()` and
+//! `claim()` — both of which stay D1-only to preserve the trust root.
+//!
 //! | Method | Path                        | Auth     | Purpose                            |
 //! |--------|-----------------------------|----------|------------------------------------|
 //! | GET    | /api/username/check?name=X  | open     | Is username available?             |
+//! | GET    | /api/username/resolve?name=X| open     | NIP-05 resolve (D1 → pod fallback) |
 //! | POST   | /api/username/claim         | NIP-98   | Atomic claim; one per pubkey       |
 //! | POST   | /api/username/release       | NIP-98   | Release caller's username          |
 
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::JsValue;
-use worker::{Env, Response, Result};
+use worker::{Env, Fetch, Method, Request, Response, Result};
 
 use crate::admin::{canonical_url, now_secs, require_authed};
 use crate::http::{error_json, json_response};
@@ -408,6 +415,140 @@ pub async fn handle_release(
 }
 
 // ---------------------------------------------------------------------------
+// JSS Phase 1 — Federated NIP-05 resolution (ADR-086)
+// ---------------------------------------------------------------------------
+
+/// Operator-selected NIP-05 resolution policy. Mirrors the
+/// `[nip05].resolver_mode` field defined in `nostr-bbs-config`. The
+/// auth-worker reads the chosen value from the `NIP05_RESOLVER_MODE` env
+/// var (operator's deploy script injects it from `forum.toml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolverMode {
+    /// D1+KV only; no pod fallback. Default — preserves legacy behaviour.
+    D1,
+    /// D1+KV first, then pod fallback on miss.
+    Federated,
+}
+
+impl ResolverMode {
+    /// Parse `NIP05_RESOLVER_MODE`. Unknown / empty values default to `D1`
+    /// — the kit refuses to silently enable federation.
+    pub fn from_env_str(s: Option<&str>) -> Self {
+        match s.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("federated") => ResolverMode::Federated,
+            _ => ResolverMode::D1,
+        }
+    }
+}
+
+/// Parse a NIP-05 response body (`{"names": {<name>: <pubkey-hex>}}`) and
+/// return the 64-char lowercase hex pubkey for `name`, if present.
+///
+/// Returns `None` when the JSON is malformed, the `names` field is missing
+/// or non-object, the requested name is absent, or the value is not a
+/// 64-char lowercase hex string. This is the trust-boundary parser for
+/// federated responses — be strict.
+pub fn parse_nip05_pubkey(body: &[u8], name: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let pk = v.get("names")?.get(name)?.as_str()?;
+    if pk.len() != 64 || !pk.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return None;
+    }
+    Some(pk.to_string())
+}
+
+/// Build the federation fetch URL for `name` against `pod_base_url`.
+///
+/// Strips any trailing slash on `pod_base_url` (validator should already
+/// reject it, but defence-in-depth). Returns `None` when name is empty.
+pub fn build_federated_url(pod_base_url: &str, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let base = pod_base_url.trim_end_matches('/');
+    Some(format!("{base}/.well-known/nostr.json?name={name}"))
+}
+
+/// Federation-aware NIP-05 resolve. Pure D1 first (trust root); on miss in
+/// `Federated` mode, fetches the operator's pod over HTTP and parses the
+/// response. ADR-086 §3.
+///
+/// Failure modes per ADR-086 §5: pod offline → `None`; malformed JSON →
+/// `None`; conflicting record never happens because D1 hit short-circuits
+/// before the fetch.
+pub async fn resolve(env: &Env, name: &str) -> std::result::Result<Option<String>, UsernameError> {
+    validate_username(name)?;
+
+    // Trust root: D1 first.
+    if let Some(pk) = check(env, name).await? {
+        return Ok(Some(pk));
+    }
+
+    // Mode + base URL gate.
+    let mode_str = env.var("NIP05_RESOLVER_MODE").ok().map(|v| v.to_string());
+    let mode = ResolverMode::from_env_str(mode_str.as_deref());
+    if mode != ResolverMode::Federated {
+        return Ok(None);
+    }
+    let pod_base = match env.var("POD_BASE_URL").ok().map(|v| v.to_string()) {
+        Some(v) if !v.is_empty() => v,
+        _ => return Ok(None), // No URL configured — silently degrade to D1-only.
+    };
+
+    let Some(url) = build_federated_url(&pod_base, name) else {
+        return Ok(None);
+    };
+
+    // Short-timeout HTTP fetch. The CF Workers runtime does not expose a
+    // direct timeout knob on `Fetch::Url`; the platform applies its own
+    // hard ceiling (sub-second to a few seconds depending on plan) which
+    // is acceptable for a verifier path.
+    let request = match Request::new(&url, Method::Get) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let mut resp = match Fetch::Request(request).send().await {
+        Ok(r) => r,
+        Err(_) => return Ok(None), // Pod offline / DNS / TLS — degrade silently.
+    };
+    if resp.status_code() != 200 {
+        return Ok(None);
+    }
+    let body = match resp.bytes().await {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    Ok(parse_nip05_pubkey(&body, name))
+}
+
+/// `GET /api/username/resolve?name=alice` — ADR-086 federated NIP-05 resolve.
+///
+/// Response shape mirrors `handle_check` for client symmetry but
+/// semantically returns NIP-05 resolution rather than availability:
+///   200 `{"name": "alice", "pubkey": "<hex>"}` on hit (D1 or pod)
+///   404 `{"error": "Not found"}` on miss
+///   400 on invalid username
+///   500 on backend failure
+pub async fn handle_resolve(query: &[(String, String)], env: &Env) -> Result<Response> {
+    let name = query
+        .iter()
+        .find(|(k, _)| k == "name")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if let Err(e) = validate_username(&name) {
+        return json_response(env, &json!({ "error": e.message() }), e.http_status());
+    }
+
+    match resolve(env, &name).await {
+        Ok(Some(pk)) => json_response(env, &json!({ "name": name, "pubkey": pk }), 200),
+        Ok(None) => json_response(env, &json!({ "error": "Not found" }), 404),
+        Err(e) => error_json(env, &e.message(), e.http_status()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests (pure validation — D1/KV paths are exercised in the integration suite)
 // ---------------------------------------------------------------------------
 
@@ -522,5 +663,134 @@ mod tests {
         assert_eq!(UsernameError::UsernameTaken.http_status(), 409);
         assert_eq!(UsernameError::PubkeyHasUsername.http_status(), 409);
         assert_eq!(UsernameError::Backend("x".into()).http_status(), 500);
+    }
+
+    // ── ADR-086: ResolverMode parsing ─────────────────────────────────
+
+    #[test]
+    fn resolver_mode_defaults_to_d1_on_missing_env() {
+        assert_eq!(ResolverMode::from_env_str(None), ResolverMode::D1);
+    }
+
+    #[test]
+    fn resolver_mode_defaults_to_d1_on_empty_env() {
+        assert_eq!(ResolverMode::from_env_str(Some("")), ResolverMode::D1);
+        assert_eq!(ResolverMode::from_env_str(Some("   ")), ResolverMode::D1);
+    }
+
+    #[test]
+    fn resolver_mode_parses_federated_case_insensitive() {
+        assert_eq!(
+            ResolverMode::from_env_str(Some("federated")),
+            ResolverMode::Federated
+        );
+        assert_eq!(
+            ResolverMode::from_env_str(Some("FEDERATED")),
+            ResolverMode::Federated
+        );
+        assert_eq!(
+            ResolverMode::from_env_str(Some(" Federated ")),
+            ResolverMode::Federated
+        );
+    }
+
+    #[test]
+    fn resolver_mode_unknown_value_falls_back_to_d1() {
+        // Refuse to silently enable federation on typo / future-mode names.
+        assert_eq!(
+            ResolverMode::from_env_str(Some("hybrid")),
+            ResolverMode::D1
+        );
+        assert_eq!(
+            ResolverMode::from_env_str(Some("d1")),
+            ResolverMode::D1
+        );
+    }
+
+    // ── ADR-086: build_federated_url ──────────────────────────────────
+
+    #[test]
+    fn build_federated_url_basic() {
+        assert_eq!(
+            build_federated_url("https://pods.example.com", "alice"),
+            Some("https://pods.example.com/.well-known/nostr.json?name=alice".into())
+        );
+    }
+
+    #[test]
+    fn build_federated_url_strips_trailing_slash() {
+        assert_eq!(
+            build_federated_url("https://pods.example.com/", "alice"),
+            Some("https://pods.example.com/.well-known/nostr.json?name=alice".into())
+        );
+    }
+
+    #[test]
+    fn build_federated_url_rejects_empty_name() {
+        assert_eq!(build_federated_url("https://pods.example.com", ""), None);
+    }
+
+    // ── ADR-086: parse_nip05_pubkey (trust-boundary parser) ────────────
+
+    #[test]
+    fn parse_nip05_pubkey_happy_path() {
+        let pk = "a".repeat(64);
+        let body = format!(r#"{{"names":{{"alice":"{pk}"}}}}"#);
+        assert_eq!(
+            parse_nip05_pubkey(body.as_bytes(), "alice"),
+            Some(pk)
+        );
+    }
+
+    #[test]
+    fn parse_nip05_pubkey_returns_none_for_unknown_name() {
+        let pk = "a".repeat(64);
+        let body = format!(r#"{{"names":{{"alice":"{pk}"}}}}"#);
+        assert_eq!(parse_nip05_pubkey(body.as_bytes(), "bob"), None);
+    }
+
+    #[test]
+    fn parse_nip05_pubkey_rejects_malformed_json() {
+        assert_eq!(parse_nip05_pubkey(b"not json", "alice"), None);
+        assert_eq!(parse_nip05_pubkey(b"", "alice"), None);
+    }
+
+    #[test]
+    fn parse_nip05_pubkey_rejects_missing_names_field() {
+        assert_eq!(parse_nip05_pubkey(br#"{"relays":{}}"#, "alice"), None);
+    }
+
+    #[test]
+    fn parse_nip05_pubkey_rejects_non_string_pubkey() {
+        assert_eq!(
+            parse_nip05_pubkey(br#"{"names":{"alice":42}}"#, "alice"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_nip05_pubkey_rejects_wrong_length() {
+        // 63 chars
+        let pk = "a".repeat(63);
+        let body = format!(r#"{{"names":{{"alice":"{pk}"}}}}"#);
+        assert_eq!(parse_nip05_pubkey(body.as_bytes(), "alice"), None);
+        // 65 chars
+        let pk = "a".repeat(65);
+        let body = format!(r#"{{"names":{{"alice":"{pk}"}}}}"#);
+        assert_eq!(parse_nip05_pubkey(body.as_bytes(), "alice"), None);
+    }
+
+    #[test]
+    fn parse_nip05_pubkey_rejects_non_hex() {
+        let body = r#"{"names":{"alice":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}}"#;
+        assert_eq!(parse_nip05_pubkey(body.as_bytes(), "alice"), None);
+    }
+
+    #[test]
+    fn parse_nip05_pubkey_rejects_uppercase_hex() {
+        // NIP-05 mandates lowercase hex. Strict parsing prevents canonicalisation surprises.
+        let pk = "A".repeat(64);
+        let body = format!(r#"{{"names":{{"alice":"{pk}"}}}}"#);
+        assert_eq!(parse_nip05_pubkey(body.as_bytes(), "alice"), None);
     }
 }

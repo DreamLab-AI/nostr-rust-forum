@@ -1,6 +1,6 @@
 # ADR-086 — NIP-05 Pod Federation
 
-- **Status:** Accepted
+- **Status:** Implemented
 - **Date:** 2026-05-16
 - **Owners:** nostr-rust-forum (NRF) consumer surface; cooperates with
   `dreamlab-overlay`'s `dreamlab.toml` schema work and the `solid-porter`
@@ -179,3 +179,29 @@ fixtures.
   fetches NIP-05 over HTTP regardless of which framework serves the
   endpoint on the other side. Auth-worker implementation lands in the
   follow-up impact-assessment task (see task #5).
+
+## 9. Implementation note (2026-05-16, task #5)
+
+- `nostr-bbs-config` schema absorbs `[nip05]` first-class:
+  - `Nip05 { resolver_mode: ResolverMode, pod_base_url: Option<String> }`
+  - `ResolverMode::{D1, Federated}` with `#[serde(rename_all = "lowercase")]`
+    and `D1` as the conservative default.
+  - Validators enforce HTTPS (or `http://localhost`), reject trailing
+    slash, and reject `Federated` without a `pod_base_url`.
+- `nostr-bbs-auth-worker::username` adds the federation path:
+  - `ResolverMode::from_env_str` parses `NIP05_RESOLVER_MODE` (defaults to
+    `D1` on missing/unknown values — no silent federation).
+  - `parse_nip05_pubkey` is the trust-boundary parser: strict 64-char
+    lowercase-hex check on the JSON response body.
+  - `build_federated_url` constructs `${pod_base}/.well-known/nostr.json?name=<X>`.
+  - `resolve(env, name) -> Option<String>` does D1 → optional pod-HTTP
+    fallback.
+  - `GET /api/username/resolve?name=<X>` exposes the resolver.
+  - Existing `check()`/`claim()` paths untouched — they keep the
+    D1-only invariant.
+- 10 new pure-logic tests covering: mode parsing (5), URL construction (3),
+  JSON parsing (7) including malformed JSON, missing `names`, non-string
+  pubkey, wrong length, non-hex, uppercase hex.
+- The pod-offline failure mode is degrade-silently (returns `None`); the
+  endpoint responds 404 to the caller. D1-wins-by-construction makes the
+  conflicting-record scenario unreachable.

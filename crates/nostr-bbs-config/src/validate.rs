@@ -90,6 +90,31 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
         ));
     }
 
+    // nip05.pod_base_url, when set, must be HTTPS (ADR-086).
+    if let Some(url) = cfg.nip05.pod_base_url.as_deref() {
+        if !url.starts_with("https://") && !url.starts_with("http://localhost") {
+            return Err(format!(
+                "nip05.pod_base_url must use https:// (got {url})"
+            ));
+        }
+        if url.ends_with('/') {
+            return Err(format!(
+                "nip05.pod_base_url must not have a trailing slash (got {url})"
+            ));
+        }
+    }
+    // Federated mode without pod_base_url is a configuration error — the
+    // fallback fetch has nowhere to go.
+    if matches!(
+        cfg.nip05.resolver_mode,
+        crate::schema::ResolverMode::Federated
+    ) && cfg.nip05.pod_base_url.is_none()
+    {
+        return Err(
+            "nip05.resolver_mode = \"federated\" requires nip05.pod_base_url to be set".into(),
+        );
+    }
+
     Ok(())
 }
 
@@ -135,6 +160,7 @@ mod tests {
             custody: Custody {
                 operator: "tier-2".into(),
             },
+            nip05: Nip05::default(),
         }
     }
 
@@ -191,5 +217,130 @@ mod tests {
         cfg.moderation.kinds_lo = 99999;
         cfg.moderation.kinds_hi = 1000;
         assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn nip05_default_d1_is_valid_without_pod_url() {
+        // Default `resolver_mode = "d1"` and `pod_base_url = None` must
+        // validate — existing deployments inherit this implicitly.
+        let cfg = baseline_cfg();
+        assert!(validate_config(&cfg).is_ok());
+        assert_eq!(cfg.nip05.resolver_mode, ResolverMode::D1);
+        assert!(cfg.nip05.pod_base_url.is_none());
+    }
+
+    #[test]
+    fn nip05_federated_without_pod_url_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.nip05.resolver_mode = ResolverMode::Federated;
+        cfg.nip05.pod_base_url = None;
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn nip05_federated_with_pod_url_validates() {
+        let mut cfg = baseline_cfg();
+        cfg.nip05.resolver_mode = ResolverMode::Federated;
+        cfg.nip05.pod_base_url = Some("https://pods.example.com".into());
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn nip05_pod_url_http_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.nip05.pod_base_url = Some("http://pods.example.com".into());
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn nip05_pod_url_trailing_slash_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.nip05.pod_base_url = Some("https://pods.example.com/".into());
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn nip05_pod_url_localhost_http_accepted() {
+        let mut cfg = baseline_cfg();
+        cfg.nip05.pod_base_url = Some("http://localhost:8080".into());
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn nip05_toml_round_trip() {
+        // Round-trip: TOML with [nip05] section parses back into the same
+        // ResolverMode + pod_base_url values.
+        let toml_src = r#"
+[deployment]
+name = "Test"
+hostname = "https://example.com"
+
+[webauthn]
+rp_id = "example.com"
+expected_origin = "https://example.com"
+
+[pod]
+base_url = "https://pods.example.com"
+storage_backend = "cf-r2"
+
+[relay]
+url = "wss://relay.example.com"
+ingress_policy = "allowlist"
+
+[admin]
+mode = "static"
+static_pubkeys = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+
+[mesh]
+mode = "standalone"
+
+[custody]
+operator = "tier-2"
+
+[nip05]
+resolver_mode = "federated"
+pod_base_url = "https://pods.dreamlab-ai.com"
+"#;
+        let cfg: ForumConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.nip05.resolver_mode, ResolverMode::Federated);
+        assert_eq!(
+            cfg.nip05.pod_base_url.as_deref(),
+            Some("https://pods.dreamlab-ai.com")
+        );
+        validate_config(&cfg).expect("federated config with valid pod_base_url must validate");
+    }
+
+    #[test]
+    fn nip05_missing_section_defaults_to_d1() {
+        let toml_src = r#"
+[deployment]
+name = "Test"
+hostname = "https://example.com"
+
+[webauthn]
+rp_id = "example.com"
+expected_origin = "https://example.com"
+
+[pod]
+base_url = "https://pods.example.com"
+storage_backend = "cf-r2"
+
+[relay]
+url = "wss://relay.example.com"
+ingress_policy = "allowlist"
+
+[admin]
+mode = "static"
+static_pubkeys = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+
+[mesh]
+mode = "standalone"
+
+[custody]
+operator = "tier-2"
+"#;
+        let cfg: ForumConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.nip05.resolver_mode, ResolverMode::D1);
+        assert!(cfg.nip05.pod_base_url.is_none());
     }
 }

@@ -551,6 +551,11 @@ async fn route_sprint_api(
         let resp = username::handle_check(&query, env).await?;
         return Ok(Some(resp));
     }
+    // JSS Phase 1 (ADR-086) — federated NIP-05 resolve.
+    if path == "/api/username/resolve" && *method == Method::Get {
+        let resp = username::handle_resolve(&query, env).await?;
+        return Ok(Some(resp));
+    }
     if path == "/api/username/claim" && *method == Method::Post {
         let resp = username::handle_claim(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));

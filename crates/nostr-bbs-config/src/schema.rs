@@ -41,6 +41,9 @@ pub struct ForumConfig {
     pub features: Features,
     /// Operator custody tier.
     pub custody: Custody,
+    /// NIP-05 resolution policy (JSS Phase 1; ADR-086).
+    #[serde(default)]
+    pub nip05: Nip05,
 }
 
 /// Deployment metadata.
@@ -206,4 +209,39 @@ pub struct Custody {
     /// Operator tier: `tier-1` (self-host) | `tier-2` (CF Workers Secrets) |
     /// `tier-3` (managed PaaS) | `tier-4` (turnkey hosted).
     pub operator: String,
+}
+
+/// NIP-05 resolution mode (JSS Phase 1; ADR-086).
+///
+/// `D1` (default) preserves the legacy central-registry behaviour:
+/// `username_reservations` rows in D1 (mirrored to KV) are the sole source
+/// of truth. `Federated` opts in to ADR-086 — on D1/KV miss, the auth-worker
+/// falls through to `${pod_base_url}/.well-known/nostr.json?name=<local>`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolverMode {
+    /// D1+KV only; no pod fallback. Forum is authoritative.
+    #[default]
+    D1,
+    /// D1+KV first; on miss, fall through to pod NIP-05 over HTTP.
+    Federated,
+}
+
+/// NIP-05 resolution policy (JSS Phase 1; ADR-086).
+///
+/// Additive section. Defaults are conservative: `resolver_mode = "d1"` and
+/// `pod_base_url = None` so existing deployments remain bit-for-bit
+/// identical. Operators flip `resolver_mode` to `"federated"` once their
+/// pod tier serves a real `/.well-known/nostr.json` and they've set
+/// `pod_base_url`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Nip05 {
+    /// Resolution mode. See [`ResolverMode`].
+    #[serde(default)]
+    pub resolver_mode: ResolverMode,
+    /// Pod root URL (e.g. `https://pods.example.com`) used to build the
+    /// fallback fetch when `resolver_mode = "federated"`. The federation
+    /// fetch is `${pod_base_url}/.well-known/nostr.json?name=<local>`.
+    #[serde(default)]
+    pub pod_base_url: Option<String>,
 }
