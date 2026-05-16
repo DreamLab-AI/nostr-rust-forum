@@ -7,6 +7,38 @@ Workers backend -- all in Rust. Operators consume this kit by creating a
 
 **Current release:** `v3.0.0-rc7` (see [CHANGELOG.md](CHANGELOG.md))
 
+## Phase 1 (May 2026)
+
+The JSS Phase 1 cross-repo sprint (closed 2026-05-16) landed federated
+identity, pod-resident key provisioning, and pod data export across
+the ecosystem. From this kit's perspective:
+
+- **Federated NIP-05 resolution** -- `nostr-bbs-auth-worker` resolves
+  `/.well-known/nostr.json?name=<local>` against the local D1
+  whitelist first and falls back to the user's pod over HTTP when
+  `[nip05].resolver_mode = "federated"` (the new default; legacy
+  operators can pin `"d1-only"`). The federated path is documented in
+  [ADR-086 §9](docs/adr/ADR-086-nip05-pod-federation.md).
+- **Schema-typed `[nip05]` config** -- `nostr-bbs-config` now exposes
+  a first-class `Nip05Config` block (resolver mode, pod base URL,
+  fallback timeouts, CORS policy). Operators wire it via
+  `forum-config/`; runtime values flow into `wrangler.toml` as
+  `NIP05_RESOLVER_MODE` and `POD_BASE_URL`.
+- **solid-pod-rs alpha.11** -- workspace dependency now tracks
+  `0.4.0-alpha.11` from crates.io (no `[patch.crates-io]` override).
+  The `solid-pod-rs-phase1` feature flag activates the three new
+  default-off features (`provision-keys`, `nip05-endpoint`,
+  `export-jsonld`) for downstream binaries.
+
+Two follow-up ADRs are open:
+[ADR-087](docs/adr/ADR-087-cf-workers-portable-cores.md) (draft) tracks
+the CF-Workers portability gap in solid-pod-rs that currently blocks
+shipping the pod-resident signup UX, data export UX, and NIP-05 badge
+inside the CF Workers runtime.
+[ADR-088](docs/adr/ADR-088-wac-turtle-serializer-quirk.md) (draft)
+tracks a small bare-path IRI quirk in the upstream WAC Turtle
+serializer.
+
 ## Architecture
 
 Twelve crates in a Cargo workspace:
