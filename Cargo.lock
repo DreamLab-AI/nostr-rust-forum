@@ -3387,7 +3387,8 @@ dependencies = [
 [[package]]
 name = "solid-pod-rs"
 version = "0.4.0-alpha.11"
-source = "git+https://github.com/DreamLab-AI/solid-pod-rs?tag=v0.4.0-alpha.11#d8a1c81a7f5c5ea2cc6ea5260852ef4396bb80d6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c244660430bbad47f926db3715b2c4090c94d21e05ff080045bab53a2280da86"
 dependencies = [
  "async-trait",
  "base64",

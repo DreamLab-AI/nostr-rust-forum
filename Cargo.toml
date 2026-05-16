@@ -148,10 +148,3 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-# TODO(phase1): remove [patch.crates-io] once solid-pod-rs 0.4.0-alpha.11 is
-# published to crates.io. Pins the workspace to the upstream tag so the
-# Phase 1 feature wiring (provision-keys / nip05-endpoint / export-jsonld)
-# is reachable before cargo publish runs.
-[patch.crates-io]
-solid-pod-rs = { git = "https://github.com/DreamLab-AI/solid-pod-rs", tag = "v0.4.0-alpha.11" }
-
