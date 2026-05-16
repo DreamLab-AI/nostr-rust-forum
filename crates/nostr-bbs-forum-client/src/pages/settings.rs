@@ -22,6 +22,15 @@ use crate::utils::shorten_pubkey;
 /// NIP-05 host that backs claimed usernames (mirrors onboarding_modal::NIP05_HOST).
 const NIP05_USERNAME_HOST: &str = "example.test";
 
+/// Pod API base URL — same source-of-truth as `pages::pod_browser` and
+/// `utils::pod_client`. Surfaces the `[pod].base_url` operator-config
+/// value via the `VITE_POD_API_URL` build-time env. Used here to render
+/// the per-user git clone URL (ADR-089).
+const POD_API: &str = match option_env!("VITE_POD_API_URL") {
+    Some(u) => u,
+    None => "https://pod.example.com",
+};
+
 /// Key used to persist muted pubkeys in localStorage.
 const MUTED_STORAGE_KEY: &str = "nostr_bbs_muted";
 
@@ -112,6 +121,22 @@ pub fn SettingsPage() -> impl IntoView {
     });
 
     let pubkey_full = Memo::new(move |_| auth.pubkey().get().unwrap_or_default());
+
+    // Per-user pod git clone URL (ADR-089). Renders when the user has a
+    // pubkey; the URL only resolves on deployments where the operator has
+    // enabled git-init at pod provisioning (non-CF tier). The CF Workers
+    // tier does not git-init pods — see ADR-089 for the divergence.
+    let pod_clone_url = Memo::new(move |_| {
+        auth.pubkey()
+            .get()
+            .map(|pk| format!("{}/pods/{}/", POD_API.trim_end_matches('/'), pk))
+    });
+    let pod_clone_command = Memo::new(move |_| {
+        pod_clone_url
+            .get()
+            .map(|url| format!("git clone {}", url))
+            .unwrap_or_default()
+    });
 
     // -- Fetch kind-0 metadata on mount to populate fields --
     {
@@ -307,6 +332,21 @@ pub fn SettingsPage() -> impl IntoView {
     let on_change_username = move |_| {
         let current = auth.nickname().get_untracked();
         open_onboarding_with_prefill(current);
+    };
+
+    // -- Pod git clone URL: copy-to-clipboard handler (ADR-089) --
+    let toasts_for_clone = toasts.clone();
+    let on_copy_clone_cmd = move |_| {
+        let cmd = pod_clone_command.get_untracked();
+        if cmd.is_empty() {
+            toasts_for_clone.show("No clone URL available", ToastVariant::Warning);
+            return;
+        }
+        if let Some(window) = web_sys::window() {
+            let nav = window.navigator().clipboard();
+            let _ = nav.write_text(&cmd);
+            toasts_for_clone.show("Clone command copied", ToastVariant::Success);
+        }
     };
 
     // -- Username release handler (called from confirm dialog) --
@@ -702,6 +742,40 @@ pub fn SettingsPage() -> impl IntoView {
                     </div>
                 </div>
 
+                // -- Section 4d: Pod git repository (ADR-089) --
+                <div class="glass-card p-6 space-y-4">
+                    <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                        {git_icon()}
+                        "Pod git repository"
+                    </h2>
+                    <div class="border-t border-gray-700/50"></div>
+
+                    <div class="space-y-3">
+                        <p class="text-sm text-gray-400">
+                            "Your pod can be cloned as a git repository on deployments where the operator has enabled git-init at provisioning."
+                        </p>
+                        <div>
+                            <span class="text-xs text-gray-500 uppercase tracking-wide">"Clone command"</span>
+                            <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1">
+                                <code class="text-xs text-amber-300 font-mono break-all">
+                                    {move || pod_clone_command.get()}
+                                </code>
+                            </div>
+                        </div>
+                        <div class="flex gap-3 pt-1">
+                            <button
+                                on:click=on_copy_clone_cmd
+                                class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors"
+                            >
+                                "Copy"
+                            </button>
+                        </div>
+                        <p class="text-xs text-gray-500">
+                            "Available on pods with git-init enabled (see your operator's deployment). Cloudflare Workers deployments cannot auto-init git — see ADR-089."
+                        </p>
+                    </div>
+                </div>
+
                 // -- Section 5: Account --
                 <div class="glass-card p-6 space-y-4">
                     <h2 class="text-lg font-semibold text-white flex items-center gap-2">
@@ -842,4 +916,7 @@ fn bell_icon() -> impl IntoView {
 }
 fn content_icon() -> impl IntoView {
     section_icon("M4 6h16M4 12h16M4 18h7")
+}
+fn git_icon() -> impl IntoView {
+    section_icon("M6 3v12a3 3 0 003 3h6a3 3 0 003-3M6 3a3 3 0 016 0M6 3a3 3 0 00-3 3v12a3 3 0 003 3M18 9a3 3 0 100-6 3 3 0 000 6z")
 }

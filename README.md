@@ -39,6 +39,23 @@ inside the CF Workers runtime.
 tracks a small bare-path IRI quirk in the upstream WAC Turtle
 serializer.
 
+### Phase 1 extension: git-pods (2026-05-16)
+
+Upstream `solid-pod-rs` v0.4.0-alpha.12 (JSS #471) ships **git-auto-init**
+at pod provisioning: pods become clone-able `git` repositories on
+deployments that can spawn a `git init` subprocess (server-Tokio
+runtimes, e.g. agentbox). The NRF kit surfaces the per-user clone
+command on the Settings page so users on those deployments can see and
+copy it. **The Cloudflare Workers tier cannot auto-init git** — no
+process-spawning capability, no Tokio runtime, no `wasm32` target for
+`tokio::process`. CF-Workers-provisioned pods remain LDP+R2 prefixes
+with no git history; the clone URL is rendered with a caveat advising
+that resolution depends on the operator's deployment.
+[ADR-089](docs/adr/ADR-089-git-pods-cf-workers-limitation.md) (draft)
+documents the option matrix and the shipping default (defer on CF
+Workers; `gix`-on-R2 and external git-init sidecar tracked as future
+options).
+
 ## Architecture
 
 Twelve crates in a Cargo workspace:

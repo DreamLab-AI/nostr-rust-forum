@@ -81,6 +81,20 @@ fn render_public_type_index_acl(owner_did: &str) -> Vec<u8> {
 }
 
 /// Provision a new pod with default containers, ACLs, and WebID profile.
+///
+/// **Divergence from upstream `solid_pod_rs::provision::provision_pod`
+/// (alpha.12):** this CF-Workers port intentionally does NOT perform
+/// `git init -b main` against the pod root. The alpha.12 `git` feature
+/// pulls in `tokio::process` for the `git init` subprocess fallback,
+/// which has no `wasm32-unknown-unknown` target. CF Workers also lacks
+/// process-spawning and a Tokio runtime, so the upstream code path is
+/// structurally unreachable here. See **ADR-089** (`docs/adr/ADR-089-git-pods-cf-workers-limitation.md`)
+/// for the option matrix and shipping decision. Pods provisioned by
+/// this worker are LDP+R2 prefixes with no git history; the parallel
+/// agentbox deployment of the same kit does git-init on its server
+/// Tokio runtime, so users on that tier get a clone-able pod. The
+/// forum-client surfaces a clone URL with an "available on git-init-
+/// enabled deployments" caveat to bridge the two tiers.
 pub async fn provision_pod(
     bucket: &Bucket,
     kv: &kv::KvStore,
