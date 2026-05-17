@@ -22,6 +22,7 @@ mod container;
 mod content_negotiation;
 mod contexts;
 mod did;
+mod git;
 mod notifications;
 mod patch;
 mod payments;
@@ -472,6 +473,19 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Some(parsed) => parsed,
         None => return json_error(&env, "Not found", 404),
     };
+
+    // --- Git HTTP protocol guard (ADR-089, JSS parity) -------------------
+    // Block direct .git/ access unconditionally (security).
+    if git::is_dot_git_path(resource_path) {
+        return git::git_dir_forbidden();
+    }
+    // Git smart-HTTP protocol: 501 on CF Workers (no subprocess support).
+    // On native/agentbox deployments, wire solid-pod-rs-git::GitHttpService
+    // here instead. The forum-client pod_browser already handles 501 +
+    // the X-Git-Unavailable header by displaying "not enabled on this deployment".
+    if git::is_git_request(resource_path) {
+        return git::git_not_implemented();
+    }
 
     // We need owned copies before we borrow `req` mutably for the body
     let owner_pubkey = owner_pubkey.to_string();

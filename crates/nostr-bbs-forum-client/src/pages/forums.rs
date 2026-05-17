@@ -95,7 +95,9 @@ fn section_to_zone(section: &str) -> Option<&'static str> {
     {
         Some("private")
     } else {
-        None
+        // Catch-all: any unrecognised section falls into Home so channels
+        // remain visible on the forums page instead of silently disappearing.
+        Some("home")
     }
 }
 
