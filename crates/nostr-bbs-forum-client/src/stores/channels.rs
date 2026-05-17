@@ -33,12 +33,18 @@ pub struct ChannelMeta {
 }
 
 /// Cached channel data persisted to localStorage.
+///
+/// ADR-091: `message_counts` is no longer persisted — it is derived from
+/// `channel_messages.len()` at runtime. Legacy caches that contain the field
+/// continue to deserialize (extra fields are ignored by `serde_json`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct CachedData {
+    #[serde(default)]
     channels: Vec<ChannelMeta>,
-    message_counts: HashMap<String, u32>,
+    #[serde(default)]
     last_active: HashMap<String, u64>,
     /// Timestamp of last successful relay sync.
+    #[serde(default)]
     synced_at: u64,
 }
 
@@ -46,17 +52,25 @@ struct CachedData {
 
 /// Global channel store provided via Leptos context.
 /// Subscribe once at app root — all pages read from these signals.
-#[derive(Clone)]
+///
+/// ADR-091: post counts are NEVER stored as an independent field.
+/// Use [`ChannelStore::count_for`] / [`ChannelStore::count_map`] /
+/// [`ChannelStore::total_messages`] — they derive from `channel_messages`
+/// which already dedups by event id. This eliminates the count-inflation
+/// class of bugs.
+#[derive(Clone, Copy)]
 pub struct ChannelStore {
     pub channels: RwSignal<Vec<ChannelMeta>>,
-    pub message_counts: RwSignal<HashMap<String, u32>>,
     pub last_active: RwSignal<HashMap<String, u64>>,
-    /// Raw kind-42 events stored per resolved channel ID.
+    /// Raw kind-42 events stored per resolved channel ID, deduped by id.
     pub channel_messages: RwSignal<HashMap<String, Vec<NostrEvent>>>,
     pub loading: RwSignal<bool>,
     pub eose_received: RwSignal<bool>,
     sub_id: RwSignal<Option<String>>,
     msg_sub_id: RwSignal<Option<String>>,
+    /// Set of channel ids/slugs for which `ensure_subscribed` has been called.
+    /// ADR-092: idempotent self-bootstrap.
+    ensured: RwSignal<HashSet<String>>,
 }
 
 impl ChannelStore {
@@ -67,7 +81,6 @@ impl ChannelStore {
 
         Self {
             channels: RwSignal::new(cached.channels),
-            message_counts: RwSignal::new(cached.message_counts),
             last_active: RwSignal::new(cached.last_active),
             channel_messages: RwSignal::new(HashMap::new()),
             // If we have cache, don't show loading — render immediately
@@ -75,7 +88,30 @@ impl ChannelStore {
             eose_received: RwSignal::new(false),
             sub_id: RwSignal::new(None),
             msg_sub_id: RwSignal::new(None),
+            ensured: RwSignal::new(HashSet::new()),
         }
+    }
+
+    // -- Derived count accessors (ADR-091) ------------------------------------
+
+    /// Post count for a single channel, derived from deduped event Vec.
+    /// Reactive: re-runs when `channel_messages` changes.
+    pub fn count_for(&self, cid: &str) -> u32 {
+        self.channel_messages
+            .with(|m| m.get(cid).map(|v| v.len() as u32).unwrap_or(0))
+    }
+
+    /// Full count map (cid → count). Useful as a single Signal for filters
+    /// that need to read multiple counts in one update tick.
+    pub fn count_map(&self) -> HashMap<String, u32> {
+        self.channel_messages
+            .with(|m| m.iter().map(|(k, v)| (k.clone(), v.len() as u32)).collect())
+    }
+
+    /// Sum of all channel post counts.
+    pub fn total_messages(&self) -> u32 {
+        self.channel_messages
+            .with(|m| m.values().map(|v| v.len() as u32).sum())
     }
 
     fn load_cache() -> CachedData {
@@ -88,7 +124,6 @@ impl ChannelStore {
     fn save_cache(&self) {
         let data = CachedData {
             channels: self.channels.get_untracked(),
-            message_counts: self.message_counts.get_untracked(),
             last_active: self.last_active.get_untracked(),
             synced_at: (js_sys::Date::now() / 1000.0) as u64,
         };
@@ -150,9 +185,11 @@ impl ChannelStore {
             // (they were deleted or the DB was wiped)
             let ids = relay_ids.borrow();
             if ids.is_empty() {
-                // Relay returned zero channels — clear everything
+                // Relay returned zero channels — clear everything.
+                // Counts are derived from channel_messages (ADR-091), so
+                // clearing that map zeroes all counts automatically.
                 channels_sig.set(Vec::new());
-                store_for_eose.message_counts.set(HashMap::new());
+                store_for_eose.channel_messages.set(HashMap::new());
                 store_for_eose.last_active.set(HashMap::new());
             } else {
                 channels_sig.update(|list| {
@@ -224,7 +261,6 @@ impl ChannelStore {
             }
         }
 
-        let msg_counts = self.message_counts;
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
         let store = self.clone();
@@ -251,23 +287,27 @@ impl ChannelStore {
                 .cloned();
 
             if let Some(cid) = resolved {
-                msg_counts.update(|m| {
-                    *m.entry(cid.clone()).or_insert(0) += 1;
-                });
-                last_active.update(|m| {
-                    let ts = m.entry(cid.clone()).or_insert(0);
-                    if event.created_at > *ts {
-                        *ts = event.created_at;
-                    }
-                });
-                // Store raw event for channel page consumption
+                // Store raw event for channel page consumption. Dedup by
+                // event id is the ONLY counter — ADR-091. Last-active only
+                // advances when a genuinely new event is appended.
+                let mut newly_added = false;
+                let event_ts = event.created_at;
                 channel_msgs.update(|m| {
-                    let events = m.entry(cid).or_insert_with(Vec::new);
+                    let events = m.entry(cid.clone()).or_insert_with(Vec::new);
                     if !events.iter().any(|e| e.id == event.id) {
                         events.push(event);
                         events.sort_by_key(|e| e.created_at);
+                        newly_added = true;
                     }
                 });
+                if newly_added {
+                    last_active.update(|m| {
+                        let ts = m.entry(cid).or_insert(0);
+                        if event_ts > *ts {
+                            *ts = event_ts;
+                        }
+                    });
+                }
             }
         });
 
@@ -286,6 +326,94 @@ impl ChannelStore {
             Some(on_msg_eose),
         );
         self.msg_sub_id.set(Some(id));
+    }
+
+    /// Resolve a slug, section name, or hex id to a concrete channel id.
+    /// Returns None if the channel list has no matching entry yet.
+    pub fn resolve_channel(&self, cid_or_slug: &str) -> Option<String> {
+        let needle_lower = cid_or_slug.to_lowercase();
+        self.channels.with(|list| {
+            list.iter()
+                .find(|c| {
+                    c.id == cid_or_slug
+                        || c.name.to_lowercase() == needle_lower
+                        || c.section.to_lowercase() == needle_lower
+                })
+                .map(|c| c.id.clone())
+        })
+    }
+
+    /// Idempotent per-channel narrow subscription (ADR-092).
+    ///
+    /// Called from `ChannelPage::on_mount` so direct deep-links boot their
+    /// own data instead of waiting for the global `start_msg_sync` chain.
+    /// Safe to call repeatedly: the `ensured` set guards against duplicate
+    /// REQs.
+    pub fn ensure_subscribed(&self, relay: &RelayConnection, cid_or_slug: &str) {
+        if cid_or_slug.is_empty() {
+            return;
+        }
+        let key = cid_or_slug.to_string();
+        if self.ensured.with_untracked(|s| s.contains(&key)) {
+            return;
+        }
+        self.ensured.update(|s| {
+            s.insert(key.clone());
+        });
+
+        // Resolve to a concrete id when possible — fall back to using the
+        // raw value (the relay accepts either: kind-42 events may carry
+        // slug-style e-tags from legacy data).
+        let needle = self.resolve_channel(cid_or_slug).unwrap_or(key);
+
+        let last_active = self.last_active;
+        let channel_msgs = self.channel_messages;
+
+        let on_event = Rc::new(move |event: NostrEvent| {
+            if event.kind != 42 {
+                return;
+            }
+            // Re-resolve here as well in case channel metadata arrived after
+            // this subscription was opened.
+            let tag_val = event
+                .tags
+                .iter()
+                .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
+                .or_else(|| event.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
+                .map(|t| t[1].clone());
+            let cid = match tag_val {
+                Some(v) => v,
+                None => return,
+            };
+            let mut newly_added = false;
+            let event_ts = event.created_at;
+            channel_msgs.update(|m| {
+                let events = m.entry(cid.clone()).or_insert_with(Vec::new);
+                if !events.iter().any(|e| e.id == event.id) {
+                    events.push(event);
+                    events.sort_by_key(|e| e.created_at);
+                    newly_added = true;
+                }
+            });
+            if newly_added {
+                last_active.update(|m| {
+                    let ts = m.entry(cid).or_insert(0);
+                    if event_ts > *ts {
+                        *ts = event_ts;
+                    }
+                });
+            }
+        });
+
+        let _ = relay.subscribe(
+            vec![Filter {
+                kinds: Some(vec![42]),
+                e_tags: Some(vec![needle]),
+                ..Default::default()
+            }],
+            on_event,
+            None,
+        );
     }
 
     /// Cleanup subscriptions.

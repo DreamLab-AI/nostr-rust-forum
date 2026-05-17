@@ -8,6 +8,7 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 use leptos_router::NavigateOptions;
 use nostr_bbs_core::UnsignedEvent;
 
+use crate::app::current_app_path;
 use crate::auth::use_auth;
 use crate::relay::RelayConnection;
 use crate::utils::shorten_pubkey;
@@ -47,14 +48,26 @@ pub fn SetupPage() -> impl IntoView {
     let is_submitting = RwSignal::new(false);
     let nick_valid = RwSignal::new(false);
 
-    // Read returnTo query parameter — default to /forums, reject loops
+    // Read returnTo query parameter — default to /forums.
+    //
+    // Normalise to a base-relative path (ADR-090): strip any `FORUM_BASE`
+    // prefix so `use_navigate(...)` doesn't re-prefix and double the base.
+    // Reject root, /login, /signup, /setup to avoid redirect loops.
     let query = use_query_map();
     let return_to = move || {
-        let r = query.read().get("returnTo").unwrap_or_default();
-        if r.is_empty() || !r.starts_with('/') || r == "/login" || r == "/signup" || r == "/setup" {
+        let raw = query.read().get("returnTo").unwrap_or_default();
+        if raw.is_empty() || !raw.starts_with('/') {
+            return "/forums".to_string();
+        }
+        let normalised = current_app_path(&raw);
+        if normalised == "/"
+            || normalised == "/login"
+            || normalised == "/signup"
+            || normalised == "/setup"
+        {
             "/forums".to_string()
         } else {
-            r
+            normalised
         }
     };
 

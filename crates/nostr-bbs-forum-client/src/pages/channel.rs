@@ -75,19 +75,51 @@ pub fn ChannelPage() -> impl IntoView {
     let relay_for_send = relay.clone();
     let relay_for_cleanup = relay;
 
-    // Try channel store for instant header (avoids waiting for kind-40 relay round-trip)
-    {
-        let cid = channel_id();
-        if let Some(store) = use_context::<ChannelStore>() {
-            let channels = store.channels.get_untracked();
-            if let Some(found) = channels.iter().find(|c| c.id == cid || c.name == cid) {
-                channel_info.set(Some(ChannelHeader {
-                    name: found.name.clone(),
-                    description: found.description.clone(),
-                    archived: false, // ChannelStore doesn't carry archived flag yet
-                }));
+    // Reactive header fallback (ADR-092): re-run whenever `store.channels`
+    // changes, so a deep-link that arrives BEFORE the channel list has
+    // loaded still transitions out of "Loading…" once metadata streams in.
+    //
+    // Also matches by `section` so slug-style URLs (e.g. /chat/home-lobby)
+    // resolve as well as hex-id URLs.
+    if let Some(store) = use_context::<ChannelStore>() {
+        let store_for_header = store.clone();
+        Effect::new(move |_| {
+            // Don't clobber a header already populated by the kind-40 query.
+            if channel_info.with_untracked(|c| c.is_some()) {
+                return;
             }
-        }
+            let cid = channel_id();
+            if cid.is_empty() {
+                return;
+            }
+            let needle_lower = cid.to_lowercase();
+            store_for_header.channels.with(|list| {
+                if let Some(found) = list.iter().find(|c| {
+                    c.id == cid
+                        || c.name.to_lowercase() == needle_lower
+                        || c.section.to_lowercase() == needle_lower
+                }) {
+                    channel_info.set(Some(ChannelHeader {
+                        name: found.name.clone(),
+                        description: found.description.clone(),
+                        archived: false,
+                    }));
+                }
+            });
+        });
+
+        // ADR-092: idempotent self-bootstrap. Opens a narrow kind-42 sub
+        // for this channel so direct deep-links render messages even if
+        // the global `start_msg_sync` hasn't fired yet for this cid.
+        let store_for_sub = store;
+        let relay_for_ensure = relay_for_sub.clone();
+        Effect::new(move |_| {
+            let cid = channel_id();
+            if cid.is_empty() {
+                return;
+            }
+            store_for_sub.ensure_subscribed(&relay_for_ensure, &cid);
+        });
     }
 
     // Subscribe to channel metadata (kind 40) when connected.
@@ -131,8 +163,8 @@ pub fn ChannelPage() -> impl IntoView {
     // The store resolves each event's channel identity and groups them by ID.
     // This Effect re-runs whenever channel_messages changes (new events arrive).
     Effect::new(move |_| {
-        let cid = channel_id();
-        if cid.is_empty() {
+        let raw_cid = channel_id();
+        if raw_cid.is_empty() {
             return;
         }
 
@@ -141,8 +173,12 @@ pub fn ChannelPage() -> impl IntoView {
             None => return,
         };
 
+        // Resolve slug/section/id to a concrete cid using the store's lookup.
+        // ADR-092: deep-links via slug must still locate their events.
+        let cid = store.resolve_channel(&raw_cid).unwrap_or(raw_cid.clone());
+
         let all_msgs = store.channel_messages.get();
-        let channel_events = match all_msgs.get(&cid) {
+        let channel_events = match all_msgs.get(&cid).or_else(|| all_msgs.get(&raw_cid)) {
             Some(events) => events.clone(),
             None => {
                 // No messages yet — check if EOSE has been received

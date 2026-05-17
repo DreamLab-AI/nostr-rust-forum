@@ -84,7 +84,10 @@ pub fn ChatPage() -> impl IntoView {
     let read_store = use_read_positions();
 
     // -- Dashboard derived signals from ChannelStore --
-    let total_messages = Signal::derive(move || store.message_counts.get().values().sum::<u32>());
+    // ADR-091: counts are derived from `channel_messages` (deduped) rather
+    // than an independent counter. Reading `channel_messages` here makes the
+    // Signal reactively re-run when a new kind-42 event lands.
+    let total_messages = Signal::derive(move || store.total_messages());
     let total_users = Signal::derive(move || {
         // Approximate: count unique authors from channel_messages
         let all = store.channel_messages.get();
@@ -182,7 +185,7 @@ pub fn ChatPage() -> impl IntoView {
     let filtered_channels = move || {
         let section = section_filter();
         let chans = store.channels.get();
-        let counts = store.message_counts.get();
+        let counts = store.count_map();
         let active = store.last_active.get();
         let home = za_home.get();
         let members = za_members.get();
@@ -219,7 +222,7 @@ pub fn ChatPage() -> impl IntoView {
     let muted_channels = move || {
         let section = section_filter();
         let chans = store.channels.get();
-        let counts = store.message_counts.get();
+        let counts = store.count_map();
         let active = store.last_active.get();
         let home = za_home.get();
         let members = za_members.get();

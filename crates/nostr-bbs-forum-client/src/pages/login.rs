@@ -10,7 +10,7 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 use leptos_router::NavigateOptions;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::app::base_href;
+use crate::app::{base_href, current_app_path};
 use crate::auth::nip07;
 use crate::auth::use_auth;
 use crate::stores::preferences::use_preferences;
@@ -29,14 +29,25 @@ pub fn LoginPage() -> impl IntoView {
     let show_more = RwSignal::new(false);
     let show_tech = Memo::new(move |_| use_preferences().get().show_technical_details);
 
-    // Read returnTo query parameter — default to /forums, reject non-path values and loops
+    // Read returnTo query parameter — default to /forums.
+    //
+    // Normalise to a base-relative path (ADR-090): an incoming value like
+    // `/community/forums` (legacy / external links) is stripped to `/forums`
+    // so that `use_navigate(...)` doesn't re-prefix and produce
+    // `/community/community/forums`.
+    //
+    // Reject non-path values, root, /login, /signup to avoid redirect loops.
     let query = use_query_map();
     let return_to = move || {
-        let r = query.read().get("returnTo").unwrap_or_default();
-        if r.is_empty() || !r.starts_with('/') || r == "/login" || r == "/signup" {
+        let raw = query.read().get("returnTo").unwrap_or_default();
+        if raw.is_empty() || !raw.starts_with('/') {
+            return "/forums".to_string();
+        }
+        let normalised = current_app_path(&raw);
+        if normalised == "/" || normalised == "/login" || normalised == "/signup" {
             "/forums".to_string()
         } else {
-            r
+            normalised
         }
     };
 

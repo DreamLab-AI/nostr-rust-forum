@@ -5,7 +5,7 @@ use leptos_router::components::A;
 use leptos_router::hooks::{use_navigate, use_query_map};
 use leptos_router::NavigateOptions;
 
-use crate::app::base_href;
+use crate::app::{base_href, current_app_path};
 use crate::auth::use_auth;
 use crate::components::nsec_backup::NsecBackup;
 
@@ -27,14 +27,22 @@ pub fn SignupPage() -> impl IntoView {
     let phase = RwSignal::new(Phase::Name);
     let privkey_hex = RwSignal::new(String::new());
 
-    // Read returnTo query parameter — default to /forums, reject non-path values and loops
+    // Read returnTo query parameter — default to /forums.
+    //
+    // Normalise to a base-relative path (ADR-090): strip any `FORUM_BASE`
+    // prefix so `use_navigate(...)` doesn't re-prefix and double the base.
+    // Reject root, /login, /signup to avoid redirect loops.
     let query = use_query_map();
     let return_to = move || {
-        let r = query.read().get("returnTo").unwrap_or_default();
-        if r.is_empty() || !r.starts_with('/') || r == "/login" || r == "/signup" {
+        let raw = query.read().get("returnTo").unwrap_or_default();
+        if raw.is_empty() || !raw.starts_with('/') {
+            return "/forums".to_string();
+        }
+        let normalised = current_app_path(&raw);
+        if normalised == "/" || normalised == "/login" || normalised == "/signup" {
             "/forums".to_string()
         } else {
-            r
+            normalised
         }
     };
 

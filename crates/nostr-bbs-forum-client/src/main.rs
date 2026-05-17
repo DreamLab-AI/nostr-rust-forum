@@ -39,6 +39,11 @@ fn main() {
 }
 
 /// Register the service worker for offline caching.
+///
+/// ADR-090: SW URL and scope are computed against `FORUM_BASE` so the
+/// registration works from every route, not only `/community/`. A relative
+/// `./sw.js` resolves against `document.baseURI` and 404s on every deep
+/// route (e.g. `/community/forums/home/sw.js`).
 fn register_service_worker() {
     let Some(window) = web_sys::window() else {
         return;
@@ -46,10 +51,22 @@ fn register_service_worker() {
     let navigator = window.navigator();
     let sw_container = navigator.service_worker();
 
-    let promise = sw_container.register("./sw.js");
+    // FORUM_BASE is compile-time; mirror app::FORUM_BASE.
+    let base: &str = match option_env!("FORUM_BASE") {
+        Some(b) => b,
+        None => "",
+    };
+    let sw_url = format!("{base}/sw.js");
+    let scope = format!("{base}/");
+
+    let options = web_sys::RegistrationOptions::new();
+    options.set_scope(&scope);
+    let promise = sw_container.register_with_options(&sw_url, &options);
     wasm_bindgen_futures::spawn_local(async move {
         match wasm_bindgen_futures::JsFuture::from(promise).await {
-            Ok(_) => web_sys::console::log_1(&"[PWA] Service worker registered".into()),
+            Ok(_) => web_sys::console::log_1(
+                &format!("[PWA] Service worker registered at {sw_url} (scope {scope})").into(),
+            ),
             Err(e) => web_sys::console::warn_1(
                 &format!("[PWA] Service worker registration failed: {:?}", e).into(),
             ),

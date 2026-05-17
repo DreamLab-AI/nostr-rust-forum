@@ -21,6 +21,7 @@ use crate::admin::user_table::{UpdateCohortsCb, UserTable};
 use crate::admin::{provide_admin, use_admin, AdminTab};
 use crate::auth::use_auth;
 use crate::components::admin_checklist::AdminChecklist;
+use crate::components::toast::{use_toasts, ToastVariant};
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::zone_access::use_zone_access;
 
@@ -43,9 +44,13 @@ pub fn AdminPage() -> impl IntoView {
         }
     });
 
-    // Redirect non-admin users
+    // Redirect non-admin users. Surface a toast BEFORE the navigate so the
+    // user understands why they were bounced — silent redirects make /admin
+    // appear broken to anyone without the role (Bug #4).
+    let toasts = use_toasts();
     Effect::new(move |_| {
         if is_ready.get() && is_authed.get() && !is_admin.get() {
+            toasts.show("Admin access required.", ToastVariant::Warning);
             navigate.with_value(|nav| nav("/chat", NavigateOptions::default()));
         }
     });

@@ -55,6 +55,28 @@ pub(crate) fn base_href(path: &str) -> String {
     }
 }
 
+/// Strip `FORUM_BASE` from a browser path, returning a base-relative app path.
+///
+/// `current_app_path("/community/forums")` → `"/forums"` when `FORUM_BASE="/community"`.
+/// Identity when `FORUM_BASE` is empty. Always returns a string starting with `/`.
+///
+/// Use this whenever you want to feed `location.pathname.get()` back into
+/// `use_navigate(...)` or store it in a `returnTo` query — the router will
+/// re-prefix the base on its own, so the value stored must NOT contain it.
+pub(crate) fn current_app_path(pathname: &str) -> String {
+    if FORUM_BASE.is_empty() {
+        return pathname.to_string();
+    }
+    let stripped = pathname.strip_prefix(FORUM_BASE).unwrap_or(pathname);
+    if stripped.is_empty() {
+        "/".to_string()
+    } else if stripped.starts_with('/') {
+        stripped.to_string()
+    } else {
+        format!("/{stripped}")
+    }
+}
+
 // -- SVG icon helpers ---------------------------------------------------------
 
 fn brand_icon() -> impl IntoView {
@@ -856,7 +878,7 @@ fn AuthGatedChat() -> impl IntoView {
 
     Effect::new(move |_| {
         if is_ready.get() && !is_authed.get() {
-            let current = location.pathname.get();
+            let current = current_app_path(&location.pathname.get());
             let target = login_redirect_target(&current);
             navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
         }
@@ -882,7 +904,7 @@ fn AuthGatedChannel() -> impl IntoView {
 
     Effect::new(move |_| {
         if is_ready.get() && !is_authed.get() {
-            let current = location.pathname.get();
+            let current = current_app_path(&location.pathname.get());
             let target = login_redirect_target(&current);
             navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
         }
@@ -908,7 +930,7 @@ fn AuthGatedDmList() -> impl IntoView {
 
     Effect::new(move |_| {
         if is_ready.get() && !is_authed.get() {
-            let current = location.pathname.get();
+            let current = current_app_path(&location.pathname.get());
             let target = login_redirect_target(&current);
             navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
         }
@@ -934,7 +956,7 @@ fn AuthGatedDmChat() -> impl IntoView {
 
     Effect::new(move |_| {
         if is_ready.get() && !is_authed.get() {
-            let current = location.pathname.get();
+            let current = current_app_path(&location.pathname.get());
             let target = login_redirect_target(&current);
             navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
         }
