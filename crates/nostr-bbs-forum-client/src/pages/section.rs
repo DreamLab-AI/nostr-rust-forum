@@ -326,7 +326,10 @@ pub fn SectionPage() -> impl IntoView {
                         ] />
 
                         <h1 class="text-2xl font-bold text-white">
-                            {move || section_info.get().map(|i| i.name).unwrap_or_else(|| "Loading...".to_string())}
+                            {move || section_info
+                                .get()
+                                .map(|i| i.name)
+                                .unwrap_or_else(|| humanize_section_slug(&section_slug()))}
                         </h1>
                         {move || section_info.get().and_then(|i| {
                             if i.description.is_empty() { None } else {
