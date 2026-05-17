@@ -127,18 +127,18 @@ wasm-bindgen-test = "0.3"
 # `core` consumers (CF Workers): use this dep.
 # Server-side consumers: enable `tokio-runtime` and the IO backends
 # they need.
-# 2026-05-17: pin to git HEAD past 0.4.0-alpha.12 to pick up the new
-# URL builders plus JSS v0.0.197 HTTP parity fixes (CORS, auth challenge
-# headers, Updates-Via, and POST /.pods server surface). These are consumed by
-# the forum-client and pod-worker so NRF stays aligned with solid-pod-rs until
-# the next alpha publishes.
-solid-pod-rs = { git = "https://github.com/DreamLab-AI/solid-pod-rs.git", rev = "8668792da63908698b93eb7ab30c8e157c188e5a", default-features = false, features = ["core"] }
+# Pinned to the 0.4.0-alpha.13 release commit. alpha.13 captures:
+# git-pods GitAutoInit + GitHttpService wiring (`git` feature in solid-pod-rs-server),
+# JSS v0.0.197 HTTP parity (CORS envelope, DPoP auth challenge, POST /.pods,
+# per-IP rate limiting), URL builders (webid_url, pod_git_clone_url), and the
+# ProvisionPlan::new() ergonomic constructor.
+solid-pod-rs = { git = "https://github.com/DreamLab-AI/solid-pod-rs.git", rev = "a146723", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc8" }
-nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc8" }
-nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc8" }
-nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "3.0.0-rc8" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc9" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "3.0.0-rc9" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "3.0.0-rc9" }
+nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "3.0.0-rc9" }
 
 # ---------------------------------------------------------------------------
 # Release profile (Sprint v9 D1) — WASM-optimized for forum-client and workers.
