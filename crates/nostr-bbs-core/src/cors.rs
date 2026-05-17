@@ -40,20 +40,23 @@ pub const STANDARD_CORS_HEADERS: &[CorsHeader] = &[
 /// Extended CORS header pairs for the pod-worker (LDP / Solid / payments).
 ///
 /// The pod-worker allows additional HTTP methods and exposes additional
-/// response headers required by the Solid protocol and WAC.
+/// response headers required by the Solid protocol and WAC. This intentionally
+/// mirrors the JSS-compatible global envelope used by solid-pod-rs-server so
+/// browser clients see one predictable surface across native and Worker pods.
 pub const POD_CORS_HEADERS: &[CorsHeader] = &[
     (
         "Access-Control-Allow-Methods",
-        "GET, PUT, POST, DELETE, PATCH, HEAD, OPTIONS",
+        "GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS",
     ),
     (
         "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, Slug, If-Match, If-None-Match, Range",
+        "Accept, Authorization, Content-Type, DPoP, If-Match, If-None-Match, Link, Range, Slug, Origin",
     ),
+    ("Access-Control-Allow-Credentials", "true"),
     ("Access-Control-Max-Age", "86400"),
     (
         "Access-Control-Expose-Headers",
-        "ETag, Accept-Ranges, Content-Range, Link, Location, WAC-Allow",
+        "Accept-Patch, Accept-Post, Accept-Ranges, Allow, Content-Length, Content-Range, Content-Type, ETag, Link, Location, Updates-Via, WAC-Allow, X-Cost, X-Balance, X-Pay-Currency",
     ),
 ];
 
@@ -83,6 +86,32 @@ mod tests {
         assert!(methods.contains("PUT"));
         assert!(methods.contains("DELETE"));
         assert!(methods.contains("PATCH"));
+        assert!(methods.contains("HEAD"));
+    }
+
+    #[test]
+    fn pod_cors_matches_solid_jss_browser_surface() {
+        let allow_headers = POD_CORS_HEADERS
+            .iter()
+            .find(|(n, _)| *n == "Access-Control-Allow-Headers")
+            .map(|(_, v)| *v)
+            .unwrap();
+        assert!(allow_headers.contains("DPoP"));
+        assert!(allow_headers.contains("Origin"));
+        assert!(allow_headers.contains("Link"));
+
+        let expose_headers = POD_CORS_HEADERS
+            .iter()
+            .find(|(n, _)| *n == "Access-Control-Expose-Headers")
+            .map(|(_, v)| *v)
+            .unwrap();
+        assert!(expose_headers.contains("Updates-Via"));
+        assert!(expose_headers.contains("Accept-Patch"));
+        assert!(expose_headers.contains("X-Pay-Currency"));
+
+        assert!(POD_CORS_HEADERS
+            .iter()
+            .any(|(n, v)| *n == "Access-Control-Allow-Credentials" && *v == "true"));
     }
 
     #[test]

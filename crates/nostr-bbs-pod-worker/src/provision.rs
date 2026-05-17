@@ -10,7 +10,15 @@
 use worker::*;
 
 /// Default container structure for a new pod.
-const DEFAULT_CONTAINERS: &[&str] = &["profile/", "public/", "private/", "inbox/", "settings/"];
+const DEFAULT_CONTAINERS: &[&str] = &[
+    "profile/",
+    "public/",
+    "private/",
+    "inbox/",
+    "settings/",
+    "media/",
+    "media/public/",
+];
 
 /// Storage path of the public type-index document.
 ///
@@ -197,6 +205,21 @@ pub async fn provision_pod(
     bucket
         .put(
             format!("{base}/public/.acl"),
+            serde_json::to_vec(&public_acl).unwrap_or_default(),
+        )
+        .http_metadata(HttpMetadata {
+            content_type: Some("application/ld+json".into()),
+            ..Default::default()
+        })
+        .execute()
+        .await?;
+
+    // Public media container: world-readable uploads, owner full control.
+    // The forum-client writes images to `/media/public/`; provisioning it
+    // explicitly keeps the user-facing media flow aligned with the browser UI.
+    bucket
+        .put(
+            format!("{base}/media/public/.acl"),
             serde_json::to_vec(&public_acl).unwrap_or_default(),
         )
         .http_metadata(HttpMetadata {
@@ -399,6 +422,8 @@ mod tests {
         assert!(names.contains(&"private/"));
         assert!(names.contains(&"inbox/"));
         assert!(names.contains(&"settings/"));
+        assert!(names.contains(&"media/"));
+        assert!(names.contains(&"media/public/"));
     }
 
     #[test]

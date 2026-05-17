@@ -80,6 +80,15 @@ fn is_provision_path(path: &str) -> bool {
     path == "/.provision"
 }
 
+/// Forum Worker pod names are Nostr x-only pubkeys.
+///
+/// Native solid-pod-rs can create named pods through `POST /.pods`; this
+/// Worker maps that surface onto the existing `/pods/{pubkey}/` storage model
+/// so the authenticated creator and ACL owner remain the same identity.
+fn is_valid_worker_pod_name(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Map a `worker::Method` enum to its string name.
 fn method_str(m: &Method) -> &'static str {
     match m {
@@ -135,6 +144,9 @@ fn add_ldp_headers(headers: &Headers, is_container: bool, resource_path: &str) {
 
     headers.set("Link", &link_parts.join(", ")).ok();
     headers.set("Accept-Ranges", "bytes").ok();
+    headers
+        .set("Updates-Via", &format!("{resource_path}.notifications"))
+        .ok();
 }
 
 /// Add WAC-Allow header to a response.
@@ -187,6 +199,14 @@ fn json_error(env: &Env, message: &str, status: u16) -> Result<Response> {
         .with_status(status)
         .with_headers(cors);
     resp.headers().set("Content-Type", "application/json").ok();
+    if status == 401 {
+        resp.headers()
+            .set(
+                "WWW-Authenticate",
+                "DPoP realm=\"Solid\", Bearer realm=\"Solid\"",
+            )
+            .ok();
+    }
     Ok(resp)
 }
 
@@ -412,6 +432,69 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return json_ok(&env, &body, 200);
     }
 
+    // JSS-compatible pod creation surface: POST /.pods {"name":"<pubkey>"}.
+    //
+    // Unlike the native server's anonymous development path, the Worker keeps
+    // creation authenticated and bound to the signing pubkey because its ACLs
+    // and DID identities are keyed by did:nostr:<pubkey>.
+    if path == "/.pods" {
+        if req.method() != Method::Post {
+            return json_error(&env, "Method not allowed; use POST", 405);
+        }
+
+        let body = req.bytes().await.unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::RustError(format!("Invalid JSON body: {e}")))?;
+        let name = parsed
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !is_valid_worker_pod_name(name) {
+            return json_error(&env, "Pod name must be a 64-character Nostr pubkey", 400);
+        }
+
+        let auth_header = req.headers().get("Authorization").ok().flatten();
+        let request_url = format!("{}{}", request_origin(&url), path);
+        let requester_pubkey = match auth_header.as_deref() {
+            Some(header) => {
+                auth::verify_nip98_replay(header, &request_url, "POST", Some(&body), &env)
+                    .await
+                    .ok()
+                    .map(|token| token.pubkey)
+            }
+            None => None,
+        };
+        if requester_pubkey.as_deref() != Some(name) {
+            return json_error(&env, "Authentication required for this pod name", 401);
+        }
+
+        let kv = env.kv("POD_META")?;
+        let bucket = env.bucket("PODS")?;
+        if provision::pod_exists(&bucket, name).await {
+            return json_error(&env, "Pod already provisioned", 409);
+        }
+
+        let pod_base = env
+            .var("EXPECTED_ORIGIN")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| request_origin(&url));
+        provision::provision_pod(&bucket, &kv, name, &pod_base, None).await?;
+
+        let pod_uri = format!("{}/pods/{name}/", pod_base.trim_end_matches('/'));
+        let web_id = format!("{pod_uri}profile/card#me");
+        let resp = json_ok(
+            &env,
+            &serde_json::json!({
+                "name": name,
+                "webId": web_id,
+                "podUri": pod_uri,
+            }),
+            201,
+        )?;
+        resp.headers().set("Location", &pod_uri).ok();
+        return Ok(resp);
+    }
+
     // -------------------------------------------------------------------
     // /pay/ routes (HTTP 402 payment system — Web Ledgers spec)
     // -------------------------------------------------------------------
@@ -607,7 +690,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "podUrl": pod_url,
                 "webId": webid_url,
                 "didNostr": format!("did:nostr:{owner_pubkey}"),
-                "containers": ["profile/", "public/", "private/", "inbox/", "settings/"]
+                "containers": ["profile/", "public/", "private/", "inbox/", "settings/", "media/", "media/public/"]
             }),
             201,
         );
@@ -1529,6 +1612,15 @@ mod tests {
         assert!(!is_provision_path("/provision"));
         assert!(!is_provision_path("/.provision/extra"));
         assert!(!is_provision_path("/public/.provision"));
+    }
+
+    #[test]
+    fn worker_pod_names_are_nostr_pubkeys() {
+        assert!(is_valid_worker_pod_name(&"a".repeat(64)));
+        assert!(is_valid_worker_pod_name(&"ABCDEF0123456789".repeat(4)));
+        assert!(!is_valid_worker_pod_name("alice"));
+        assert!(!is_valid_worker_pod_name(&"g".repeat(64)));
+        assert!(!is_valid_worker_pod_name(&"a".repeat(63)));
     }
 
     #[test]

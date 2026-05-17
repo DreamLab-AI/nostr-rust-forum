@@ -24,11 +24,12 @@ the ecosystem. From this kit's perspective:
   fallback timeouts, CORS policy). Operators wire it via
   `forum-config/`; runtime values flow into `wrangler.toml` as
   `NIP05_RESOLVER_MODE` and `POD_BASE_URL`.
-- **solid-pod-rs alpha.11** -- workspace dependency now tracks
-  `0.4.0-alpha.11` from crates.io (no `[patch.crates-io]` override).
-  The `solid-pod-rs-phase1` feature flag activates the three new
-  default-off features (`provision-keys`, `nip05-endpoint`,
-  `export-jsonld`) for downstream binaries.
+- **solid-pod-rs JSS v0.0.197 alignment** -- workspace dependency is pinned
+  to `solid-pod-rs` git commit `8668792` until the next alpha publishes. The
+  forum consumes the WASM-safe `core` surface and mirrors the new server
+  browser contract in the Worker tier: JSS-compatible CORS, Solid auth
+  challenge headers, exposed notification discovery, and an authenticated
+  `POST /.pods` creation alias mapped to `/pods/{nostr-pubkey}/`.
 
 Two follow-up ADRs are open:
 [ADR-087](docs/adr/ADR-087-cf-workers-portable-cores.md) (draft) tracks
@@ -55,6 +56,22 @@ that resolution depends on the operator's deployment.
 documents the option matrix and the shipping default (defer on CF
 Workers; `gix`-on-R2 and external git-init sidecar tracked as future
 options).
+
+### JSS v0.0.197 HTTP parity surface (2026-05-17)
+
+The pod-worker now follows the same browser-facing envelope as the native
+`solid-pod-rs-server` for high-value Solid flows:
+
+- `POD_CORS_HEADERS` exposes Solid, WAC, payment, and notification headers used
+  by pod browser, upload, and agent clients.
+- `401` Solid pod responses include `WWW-Authenticate: DPoP realm="Solid",
+  Bearer realm="Solid"`.
+- LDP responses include `Updates-Via` pointing at the Worker notification
+  subscription sidecar for the requested resource.
+- `POST /.pods` accepts `{"name":"<64-hex-nostr-pubkey>"}` with a matching
+  NIP-98 signature and returns the JSS-shaped `{ name, webId, podUri }` body.
+  The Worker intentionally keeps pod names tied to Nostr pubkeys because WAC
+  ownership is `did:nostr:<pubkey>`.
 
 ## Architecture
 

@@ -8,6 +8,20 @@ and this project tracks the spec home at [VisionClaw monorepo](https://github.co
 
 ## [Unreleased]
 
+### Added
+
+- **JSS v0.0.197 pod HTTP parity for the Worker tier**: Solid-compatible CORS
+  envelope, `WWW-Authenticate` on 401 responses, notification discovery via
+  `Updates-Via`, and authenticated `POST /.pods` returning `{ name, webId,
+  podUri }`.
+- **Provisioned media containers**: new pods now include `media/` and
+  `media/public/`, matching the forum-client image upload destination.
+
+### Fixed
+
+- **Pod browser TypeIndex link** now points at
+  `/settings/publicTypeIndex.jsonld`, matching the provisioned Solid document.
+
 ## [3.0.0-rc7] -- 2026-05-12
 
 Agent Control Surface Protocol: governance types, relay integration, REST API,

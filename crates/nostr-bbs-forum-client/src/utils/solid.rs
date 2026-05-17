@@ -36,11 +36,33 @@ impl PodClient {
         } else {
             "privateTypeIndex"
         };
-        format!("{}/settings/{}", self.pod_url.trim_end_matches('/'), idx)
+        format!(
+            "{}/settings/{}.jsonld",
+            self.pod_url.trim_end_matches('/'),
+            idx
+        )
     }
 
     /// Base media folder URL for uploaded files.
     pub fn media_url(&self) -> String {
         format!("{}/media/public/", self.pod_url.trim_end_matches('/'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PodClient;
+
+    #[test]
+    fn type_index_urls_match_provisioned_jsonld_paths() {
+        let client = PodClient::new("https://pods.example/pods/alice/".into(), "alice".into());
+        assert_eq!(
+            client.type_index_url(true),
+            "https://pods.example/pods/alice/settings/publicTypeIndex.jsonld"
+        );
+        assert_eq!(
+            client.type_index_url(false),
+            "https://pods.example/pods/alice/settings/privateTypeIndex.jsonld"
+        );
     }
 }

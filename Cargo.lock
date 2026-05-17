@@ -3388,7 +3388,7 @@ dependencies = [
 [[package]]
 name = "solid-pod-rs"
 version = "0.4.0-alpha.12"
-source = "git+https://github.com/DreamLab-AI/solid-pod-rs.git?rev=635b780faf1fc6f5563a35189c1f6e33d4c3f287#635b780faf1fc6f5563a35189c1f6e33d4c3f287"
+source = "git+https://github.com/DreamLab-AI/solid-pod-rs.git?rev=8668792da63908698b93eb7ab30c8e157c188e5a#8668792da63908698b93eb7ab30c8e157c188e5a"
 dependencies = [
  "async-trait",
  "base64",

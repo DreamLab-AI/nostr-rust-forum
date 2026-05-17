@@ -1,13 +1,13 @@
 # NRF → solid-pod-rs Consumer Surface Map
 
-**Generated:** 2026-05-16 (mega-sprint Phase 1 staging)
-**Pin:** `solid-pod-rs = "0.4.0-alpha.10"` (workspace, `default-features = false, features = ["core"]`)
-**Purpose:** Track every NRF call into `solid_pod_rs::*` so the Phase 1 alpha.11
-bump can be audited at a glance. Re-export shims are surfaces NRF re-publishes
-verbatim per the ADR-076/078 absorption; internal uses are call sites the kit
-consumes but does not re-export.
+**Generated:** 2026-05-17 (JSS v0.0.197 alignment pass)
+**Pin:** `solid-pod-rs` git commit `8668792` (workspace, `default-features = false, features = ["core"]`)
+**Purpose:** Track every NRF call into `solid_pod_rs::*` so upstream Solid/JSS
+parity bumps can be audited at a glance. Re-export shims are surfaces NRF
+re-publishes verbatim per the ADR-076/078 absorption; internal uses are call
+sites the kit consumes but does not re-export.
 
-## Current consumer surface (alpha.10)
+## Current consumer surface
 
 | NRF file (crate / path) | solid-pod-rs symbol | Role |
 | --- | --- | --- |
@@ -17,13 +17,28 @@ consumes but does not re-export.
 | `nostr-bbs-pod-worker/src/webid.rs:12` | `solid_pod_rs::webid::generate_webid_html` | Re-export shim (public API) |
 | `nostr-bbs-pod-worker/src/payments.rs:31` | `solid_pod_rs::payments::{balance_response, parse_txo_uri, pay_info, payment_required_body, pubkey_to_did, webledgers_discovery, ChainConfig, PayConfig, PaymentError, PaymentStore, TokenConfig, WebLedger}` | Re-export shim (public API) |
 | `nostr-bbs-core/src/did.rs:13` | `solid_pod_rs::did_nostr_types` (aliased `upstream`) | Internal wrapper (kit adds adapters on top) |
+| `nostr-bbs-forum-client/src/pages/{signup,pod_browser,settings}.rs` | `solid_pod_rs::webid::{webid_url, pod_git_clone_url}` | Internal URL builder use; avoids hand-rolled pod/WebID/git URL strings in user-facing WASM |
 | `nostr-bbs-pod-worker/src/provision.rs` (docs only) | mirrors `solid_pod_rs::provision::*` constants/paths | Documentation reference (no `use` line — kit re-implements equivalents) |
 
-## Staged Phase 1 consumer surface (alpha.11, currently inert)
+## Worker-local mirrors
+
+The Cloudflare Worker target cannot link the native actix/tokio server surfaces,
+so these routes intentionally mirror the upstream behavior with Worker-native
+storage and response types:
+
+| NRF surface | Upstream reference | Worker disposition |
+| --- | --- | --- |
+| `nostr-bbs-core::POD_CORS_HEADERS` | `solid-pod-rs-server` JSS-compatible CORS middleware | Mirrors method/header/expose envelope, including `DPoP`, `Updates-Via`, WAC, and payment headers |
+| `nostr-bbs-pod-worker::json_error(401)` | JSS-compatible Solid auth challenge | Emits `WWW-Authenticate: DPoP realm="Solid", Bearer realm="Solid"` |
+| `POST /.pods` | `solid-pod-rs-server` pod creation route | Authenticated alias that provisions `/pods/{pubkey}/` and returns `{ name, webId, podUri }` |
+| LDP response headers | `Updates-Via: .../.notifications` | Emits resource sidecar notification discovery (`{resource}.notifications`) for the Worker webhook implementation |
+
+## Staged Phase 1 consumer surface
 
 The following stub modules are wired in `nostr-bbs-pod-worker/src/lib.rs` behind
-the inert `solid-pod-rs-phase1` cargo feature. Bodies stay commented until the
-workspace bumps `solid-pod-rs` to `0.4.0-alpha.11`.
+the `solid-pod-rs-phase1` cargo feature. They remain Worker-portability markers
+because the native upstream implementations are not directly linkable in
+`wasm32-unknown-unknown`.
 
 | NRF stub file | Anticipated solid-pod-rs symbol | Role on activation |
 | --- | --- | --- |

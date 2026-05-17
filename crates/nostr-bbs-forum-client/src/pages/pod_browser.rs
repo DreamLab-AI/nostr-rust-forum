@@ -184,7 +184,7 @@ const QUICK_LINKS: &[QuickLink] = &[
     },
     QuickLink {
         label: "Public Index",
-        path: "/settings/publicTypeIndex",
+        path: "/settings/publicTypeIndex.jsonld",
         icon: "M4 6h16M4 10h16M4 14h16M4 18h16",
         description: "Public type registrations",
     },

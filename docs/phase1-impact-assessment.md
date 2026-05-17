@@ -8,6 +8,12 @@ The `dreamlab-ai-website` operator overlay is out of scope.
 874524f, task #6 closed). Phase 1 features `provision-keys`, `nip05-endpoint`,
 `export-jsonld` are now reachable from the workspace.
 
+**2026-05-17 update:** NRF is now pinned to `solid-pod-rs` commit `8668792`
+for the JSS v0.0.197 parity pass. The Worker tier mirrors the high-value HTTP
+surface that is portable to Cloudflare Workers: CORS envelope, Solid auth
+challenge headers, notification discovery headers, and an authenticated
+`POST /.pods` alias bound to the caller's Nostr pubkey.
+
 ## 1. Per-crate findings
 
 ### 1.1 `nostr-bbs-auth-worker`
@@ -30,14 +36,15 @@ to preserve the trust-root invariant.
 
 | Surface | Phase 1 primitive? | Redundant? | New capability? | Disposition |
 | --- | --- | --- | --- | --- |
-| `src/provision.rs` (CF-Workers-native pod provisioning) | Yes | No — upstream `provision-keys` lives in `solid-pod-rs-idp` (tokio-only, separate crate). Pod-worker's R2/KV/D1 path is non-portable in the other direction. | Could optionally write `nostr:pubkey` triple into the WebID profile/card so pod-resident NIP-05 can serve from it later. | **Nice-to-have** (decouples from federation work; can land next sprint without blocking the federation path) |
+| `src/provision.rs` (CF-Workers-native pod provisioning) | Yes | No — upstream `provision-keys` lives in `solid-pod-rs-idp` (tokio-only, separate crate). Pod-worker's R2/KV/D1 path is non-portable in the other direction. | Now provisions the media container used by the WASM uploader and backs both `/pods/{pubkey}/.provision` and authenticated `POST /.pods`. | **Implemented Worker mirror** |
 | `src/lib.rs` `/.well-known/nostr.json` route | Yes — KV-backed handler | No — alpha.11 upstream handler is actix-web in `solid-pod-rs-server`, not portable to `worker::Response`. ADR-086 §8 records this. | Pod-resident WebID-sourced NIP-05 would be a net new feature but requires the upstream port. | **Deferred** |
 | `src/webid.rs` `generate_webid_html` re-export | Yes | No | Could grow `nostr:pubkey` triple emission (small) | **Nice-to-have**, sequenced after pod-worker provision optionally writes the privkey/triple |
 | `src/payments.rs`, `src/acl.rs`, `src/did.rs` | Unaffected by Phase 1 | No | None | No-op |
 | `src/export.rs` (new shim, alpha.11) | Surface is live (`solid_pod_rs::export::*`) | No | Upstream `export-jsonld = ["tokio-runtime"]` — the underlying `export_pod_jsonld` async fn requires tokio + a `Storage` impl. CF Workers can't run it. | **Deferred** (upstream blocker for the worker target) |
 
-**Required action:** None for this pass. All Phase 1 pod-worker work needs an
-upstream CF-Workers-portable extraction first.
+**Required action:** The portable HTTP mirrors are implemented in this pass.
+Native-only export and key-provisioning internals still need an upstream
+CF-Workers-portable extraction before direct reuse.
 
 ### 1.3 `nostr-bbs-config`
 
@@ -95,6 +102,16 @@ In priority order:
 | Data export UX (export-jsonld) | 3 | Upstream `export_pod_jsonld` is tokio + `Storage` trait. CF Workers can't run it. Pod-worker has no `/api/exports/all` route to call. |
 | Profile NIP-05 badge | 4 | Genuinely nice-to-have; cuts client-side scope from this commit. File a follow-up. Implementation is ~50 lines of Leptos once the federation path is verified. |
 | Optional `nostr:pubkey` triple emission in `webid.rs` | n/a | Pairs better with pod-resident signup; isolated change otherwise has no consumer until then. |
+
+## 5. JSS v0.0.197 Worker parity notes
+
+- The Worker `POST /.pods` route deliberately requires a NIP-98 token and only
+  accepts a 64-hex Nostr pubkey as `name`. This keeps WAC ownership and pod
+  naming aligned with the existing `/pods/{pubkey}/` storage model.
+- `settings/publicTypeIndex.jsonld` is now the canonical browser quick-link
+  target, matching the provisioned TypeIndex document.
+- `media/` and `media/public/` are provisioned up front so image uploads have a
+  real user-visible container rather than an implicit prefix.
 
 ## 4. Open questions for follow-up ADRs
 
