@@ -227,6 +227,17 @@ fn ResourceViewer(content: String, path: String) -> impl IntoView {
 
 // ── Main page component ─────────────────────────────────────────────────────
 
+/// Result of probing the pod for a `.git/HEAD` file. The CF Workers tier
+/// returns 404 (no git-init); native/agentbox tiers serve the HEAD ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GitProbeState {
+    Idle,
+    Probing,
+    Available { branch: String },
+    Unavailable, // 404 / no HEAD
+    Error(String),
+}
+
 #[component]
 pub fn PodBrowserPage() -> impl IntoView {
     let auth = use_auth();
@@ -236,12 +247,70 @@ pub fn PodBrowserPage() -> impl IntoView {
     let fetch_state = RwSignal::new(FetchState::Idle);
     let resource_content = RwSignal::new(None::<(String, String)>);
     let viewing_resource = RwSignal::new(false);
+    let git_probe = RwSignal::new(GitProbeState::Idle);
+    let toasts = crate::components::toast::use_toasts();
 
     let pod_base_url = Memo::new(move |_| {
         pubkey
             .get()
             .map(|pk| format!("{}/pods/{}", POD_API.trim_end_matches('/'), pk))
     });
+
+    // Per-user pod git clone command (ADR-089). Mirrors `pages::settings`
+    // surface — both derive from the same `POD_API` env that flows from
+    // `[pod].base_url` in nostr-bbs-config. Resolves only when git-init at
+    // pod provisioning is enabled on the operator's deployment.
+    let pod_clone_command = Memo::new(move |_| {
+        pod_base_url
+            .get()
+            .map(|base| format!("git clone {}/", base.trim_end_matches('/')))
+            .unwrap_or_default()
+    });
+
+    // Copy the clone command to clipboard.
+    let toasts_for_copy = toasts.clone();
+    let on_copy_clone = move |_| {
+        let cmd = pod_clone_command.get_untracked();
+        if cmd.is_empty() {
+            toasts_for_copy.show("No clone URL available", crate::components::toast::ToastVariant::Warning);
+            return;
+        }
+        if let Some(window) = web_sys::window() {
+            let nav = window.navigator().clipboard();
+            let _ = nav.write_text(&cmd);
+        }
+        toasts_for_copy.show("Clone command copied", crate::components::toast::ToastVariant::Success);
+    };
+
+    // Probe `<pod_base>/HEAD` (NOT `.git/HEAD`; smart-HTTP-style serves the
+    // refs at the root in solid-pod-rs-git's design). 200 means git-init
+    // ran at provisioning; 404 means this operator's tier doesn't support
+    // it. Idempotent; safe to call repeatedly.
+    let on_probe_git = move |_| {
+        let Some(base) = pod_base_url.get() else { return; };
+        let Some(signer) = auth.get_signer() else { return; };
+        git_probe.set(GitProbeState::Probing);
+        let url = format!("{}/HEAD", base.trim_end_matches('/'));
+        wasm_bindgen_futures::spawn_local(async move {
+            match pod_fetch(&url, &*signer).await {
+                Ok(body) => {
+                    // Format: `ref: refs/heads/<branch>\n`
+                    let branch = body
+                        .trim()
+                        .strip_prefix("ref: refs/heads/")
+                        .unwrap_or(body.trim())
+                        .to_string();
+                    if branch.is_empty() {
+                        git_probe.set(GitProbeState::Unavailable);
+                    } else {
+                        git_probe.set(GitProbeState::Available { branch });
+                    }
+                }
+                Err(e) if e.contains("404") => git_probe.set(GitProbeState::Unavailable),
+                Err(e) => git_probe.set(GitProbeState::Error(e)),
+            }
+        });
+    };
 
     let navigate_to = move |path: String| {
         resource_content.set(None);
@@ -320,6 +389,81 @@ pub fn PodBrowserPage() -> impl IntoView {
                     {move || pod_base_url.get().unwrap_or_else(|| "Connecting...".into())}
                 </p>
             </div>
+
+            // Git pod card (ADR-089). Per-user pods become clone-able git
+            // repositories on deployments that ran `git init` at provisioning.
+            // The CF Workers tier can't subprocess, so the URL still renders
+            // but resolves only when the operator's backend supports it.
+            <section
+                data-section="git-pod"
+                aria-labelledby="git-pod-heading"
+                class="mb-6 bg-gradient-to-br from-amber-500/10 to-orange-500/5 border border-amber-400/20 rounded-lg p-4"
+            >
+                <div class="flex items-center gap-2 mb-2">
+                    <svg class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"/>
+                        <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
+                    </svg>
+                    <h2 id="git-pod-heading" class="text-base font-semibold text-white">"Your pod is a git repository"</h2>
+                </div>
+                <p class="text-sm text-gray-300 mb-3">
+                    "Clone, push, and pull your pod with standard git. Branch defaults to "
+                    <code class="text-xs bg-gray-800 px-1.5 py-0.5 rounded text-amber-300">"main"</code>
+                    " with "
+                    <code class="text-xs bg-gray-800 px-1.5 py-0.5 rounded text-amber-300">"receive.denyCurrentBranch=updateInstead"</code>
+                    " — clone, edit, push, and the working tree updates server-side."
+                </p>
+                <div class="bg-gray-900/80 border border-gray-700/50 rounded px-3 py-2 mb-3">
+                    <code data-testid="pod-clone-command" class="text-xs text-amber-300 font-mono break-all">
+                        {move || pod_clone_command.get()}
+                    </code>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button
+                        data-testid="pod-clone-copy"
+                        on:click=on_copy_clone
+                        class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-3 py-1.5 rounded-md transition-colors"
+                    >
+                        "Copy clone command"
+                    </button>
+                    <button
+                        data-testid="pod-git-probe"
+                        on:click=on_probe_git
+                        class="text-sm bg-gray-700 hover:bg-gray-600 text-gray-100 font-medium px-3 py-1.5 rounded-md transition-colors disabled:opacity-50"
+                        disabled=move || matches!(git_probe.get(), GitProbeState::Probing)
+                    >
+                        {move || match git_probe.get() {
+                            GitProbeState::Probing => "Checking…",
+                            GitProbeState::Available { .. } => "Re-check status",
+                            _ => "Check status",
+                        }}
+                    </button>
+                    <span data-testid="pod-git-status" class="text-xs">
+                        {move || match git_probe.get() {
+                            GitProbeState::Idle => view! { <span class="text-gray-500">""</span> }.into_any(),
+                            GitProbeState::Probing => view! { <span class="text-gray-400">"probing…"</span> }.into_any(),
+                            GitProbeState::Available { branch } => view! {
+                                <span class="text-green-400">
+                                    {format!("✓ git-init OK on branch {branch}")}
+                                </span>
+                            }.into_any(),
+                            GitProbeState::Unavailable => view! {
+                                <span class="text-amber-400" title="Operator has not enabled git-init at provisioning (e.g. CF Workers tier — see ADR-089)">
+                                    "✕ git-init not enabled on this deployment"
+                                </span>
+                            }.into_any(),
+                            GitProbeState::Error(e) => view! {
+                                <span class="text-red-400">{format!("error: {e}")}</span>
+                            }.into_any(),
+                        }}
+                    </span>
+                </div>
+                <p class="text-xs text-gray-500 mt-3">
+                    "Powered by "
+                    <code class="text-amber-300">"solid-pod-rs ≥ 0.4.0-alpha.12"</code>
+                    " · ADR-089 covers the CF Workers limitation."
+                </p>
+            </section>
 
             // Quick-access cards
             <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
