@@ -112,7 +112,7 @@ impl ToastStore {
         });
 
         // Auto-dismiss after delay.
-        let store = self.clone();
+        let store = *self;
         set_timeout_once(move || store.dismiss(id), AUTO_DISMISS_MS);
     }
 
@@ -125,7 +125,7 @@ impl ToastStore {
         if let Some(exiting) = found {
             exiting.set(true);
             // Remove after exit animation completes (200 ms).
-            let store = self.clone();
+            let store = *self;
             set_timeout_once(
                 move || {
                     store.toasts.update(|list| list.retain(|t| t.id != id));
@@ -169,7 +169,6 @@ pub(crate) fn ToastContainer() -> impl IntoView {
                     let icon_color = toast.variant.icon_color();
                     let exiting = toast.exiting;
                     let id = toast.id;
-                    let store = store.clone();
 
                     let item_class = move || {
                         let base = format!("toast-item flex items-start gap-3 {}", variant_cls);

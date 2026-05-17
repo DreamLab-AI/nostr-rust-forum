@@ -159,7 +159,7 @@ pub fn SectionRequests() -> impl IntoView {
             <Show when=move || !loading.get()>
                 {
                     let admin = admin.clone();
-                    let toasts = toasts.clone();
+                    let toasts = toasts;
                     let relay = relay.clone();
                     move || {
                     let reqs = requests.get();
@@ -194,20 +194,20 @@ pub fn SectionRequests() -> impl IntoView {
                                     let requests_sig = requests;
                                     let auth_a = auth;
                                     let admin_a = admin.clone();
-                                    let toasts_a = toasts.clone();
+                                    let toasts_a = toasts;
                                     let relay_a = relay.clone();
                                     let auth_d = auth;
-                                    let toasts_d = toasts.clone();
+                                    let toasts_d = toasts;
                                     let relay_d = relay.clone();
 
                                     view! {
                                         <RequestRow
                                             req=req
                                             on_approve=move || {
-                                                approve_request(req_for_approve.clone(), requests_sig, auth_a, admin_a.clone(), toasts_a.clone(), relay_a.clone());
+                                                approve_request(req_for_approve.clone(), requests_sig, auth_a, admin_a.clone(), toasts_a, relay_a.clone());
                                             }
                                             on_deny=move || {
-                                                deny_request(req_for_deny.clone(), requests_sig, auth_d, toasts_d.clone(), relay_d.clone());
+                                                deny_request(req_for_deny.clone(), requests_sig, auth_d, toasts_d, relay_d.clone());
                                             }
                                         />
                                     }

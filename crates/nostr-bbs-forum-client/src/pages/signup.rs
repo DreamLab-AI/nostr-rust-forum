@@ -47,7 +47,7 @@ fn clipboard_copy(text: &str, what: &str, toasts: crate::components::toast::Toas
         let nav = window.navigator().clipboard();
         let _ = nav.write_text(text);
     }
-    toasts.show(&format!("{what} copied"), ToastVariant::Success);
+    toasts.show(format!("{what} copied"), ToastVariant::Success);
 }
 /// NIP-05 host that backs claimed usernames (mirrors onboarding_modal::NIP05_HOST).
 const NIP05_USERNAME_HOST: &str = "example.test";
@@ -283,7 +283,7 @@ pub fn SignupPage() -> impl IntoView {
                             }
                             Err(e) => {
                                 toasts.show(
-                                    &format!("Username claim failed (continuing): {e}"),
+                                    format!("Username claim failed (continuing): {e}"),
                                     ToastVariant::Warning,
                                 );
                             }

@@ -53,7 +53,7 @@ pub fn RsvpButtons(
                         RsvpStatus::Decline => "Declined",
                         RsvpStatus::Tentative => "Tentative",
                     };
-                    let toasts_ok = toasts.clone();
+                    let toasts_ok = toasts;
                     let label_owned = label.to_string();
                     let ack = Rc::new(move |accepted: bool, message: String| {
                         if accepted {

@@ -201,7 +201,7 @@ pub fn SettingsPage() -> impl IntoView {
     }
 
     // -- Profile save handler --
-    let toasts_for_profile = toasts.clone();
+    let toasts_for_profile = toasts;
     let on_save_profile = move |_| {
         let name = nickname.get_untracked().trim().to_string();
         if name.is_empty() {
@@ -245,9 +245,9 @@ pub fn SettingsPage() -> impl IntoView {
             content,
         };
 
-        let toasts_ok = toasts_for_profile.clone();
-        let toasts_pub = toasts_for_profile.clone();
-        let toasts_err = toasts_for_profile.clone();
+        let toasts_ok = toasts_for_profile;
+        let toasts_pub = toasts_for_profile;
+        let toasts_err = toasts_for_profile;
         let relay = relay.clone();
         wasm_bindgen_futures::spawn_local(async move {
             match auth.sign_event_async(unsigned).await {
@@ -281,7 +281,7 @@ pub fn SettingsPage() -> impl IntoView {
     };
 
     // -- Unmute handler --
-    let toasts_for_unmute = toasts.clone();
+    let toasts_for_unmute = toasts;
     let on_unmute = move |pk: String| {
         muted.update(|list| list.retain(|p| p != &pk));
         save_muted_list(&muted.get_untracked());
@@ -289,7 +289,7 @@ pub fn SettingsPage() -> impl IntoView {
     };
 
     // -- Privacy save handler --
-    let toasts_for_privacy = toasts.clone();
+    let toasts_for_privacy = toasts;
     let on_save_privacy = move |_| {
         privacy_saving.set(true);
         save_privacy_settings(show_online.get_untracked(), allow_dms.get_untracked());
@@ -301,7 +301,7 @@ pub fn SettingsPage() -> impl IntoView {
     // NOTE: get_privkey_bytes() is the intentional and legitimate path here --
     // the user explicitly wants to see/export their raw private key. NIP-07
     // users cannot export because the extension never exposes keys.
-    let toasts_for_nsec = toasts.clone();
+    let toasts_for_nsec = toasts;
     let on_confirm_nsec = Callback::new(move |_: ()| {
         if auth.get().is_nip07 {
             toasts_for_nsec.show(
@@ -335,7 +335,7 @@ pub fn SettingsPage() -> impl IntoView {
     };
 
     // -- Pod git clone URL: copy-to-clipboard handler (ADR-089) --
-    let toasts_for_clone = toasts.clone();
+    let toasts_for_clone = toasts;
     let on_copy_clone_cmd = move |_| {
         let cmd = pod_clone_command.get_untracked();
         if cmd.is_empty() {
@@ -350,11 +350,11 @@ pub fn SettingsPage() -> impl IntoView {
     };
 
     // -- Username release handler (called from confirm dialog) --
-    let toasts_for_release = toasts.clone();
+    let toasts_for_release = toasts;
     let on_confirm_release = Callback::new(move |_: ()| {
         release_pending.set(true);
-        let toasts_ok = toasts_for_release.clone();
-        let toasts_err = toasts_for_release.clone();
+        let toasts_ok = toasts_for_release;
+        let toasts_err = toasts_for_release;
         spawn_local_release(release_pending, toasts_ok, toasts_err);
     });
 

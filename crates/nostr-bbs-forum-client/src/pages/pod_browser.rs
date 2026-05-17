@@ -272,7 +272,7 @@ pub fn PodBrowserPage() -> impl IntoView {
     });
 
     // Copy the clone command to clipboard.
-    let toasts_for_copy = toasts.clone();
+    let toasts_for_copy = toasts;
     let on_copy_clone = move |_| {
         let cmd = pod_clone_command.get_untracked();
         if cmd.is_empty() {

@@ -116,7 +116,7 @@ pub fn CreateEventModal(
         submitting.set(true);
 
         let title_trimmed = t.trim().to_string();
-        let toasts_spawn = toasts.clone();
+        let toasts_spawn = toasts;
         wasm_bindgen_futures::spawn_local(async move {
             match nostr_bbs_core::create_calendar_event_signer(
                 signer.as_ref(),

@@ -75,7 +75,7 @@ fn RelaySettingsInner() -> impl IntoView {
     };
 
     // Test connection handler
-    let toasts_for_test = toasts.clone();
+    let toasts_for_test = toasts;
     let on_test = move |_| {
         let url = relay_url.get_untracked().trim().to_string();
         if url.is_empty() {
@@ -130,7 +130,7 @@ fn RelaySettingsInner() -> impl IntoView {
 
     // Disconnect handler
     let relay_for_disconnect = relay.clone();
-    let toasts_for_disc = toasts.clone();
+    let toasts_for_disc = toasts;
     let on_disconnect = move |_| {
         relay_for_disconnect.disconnect();
         toasts_for_disc.show("Disconnected from relay", ToastVariant::Info);
@@ -138,14 +138,14 @@ fn RelaySettingsInner() -> impl IntoView {
 
     // Reconnect handler
     let relay_for_reconnect = relay.clone();
-    let toasts_for_reconn = toasts.clone();
+    let toasts_for_reconn = toasts;
     let on_reconnect = move |_| {
         relay_for_reconnect.connect();
         toasts_for_reconn.show("Reconnecting to relay...", ToastVariant::Info);
     };
 
     // Save URL handler
-    let toasts_for_save = toasts.clone();
+    let toasts_for_save = toasts;
     let on_save = move |_| {
         let url = relay_url.get_untracked().trim().to_string();
         if url.is_empty() {
