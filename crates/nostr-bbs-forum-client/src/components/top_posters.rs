@@ -64,8 +64,14 @@ pub fn TopPosters(
                                         }}
                                     </div>
 
-                                    // Avatar
-                                    <Avatar pubkey=pk size=AvatarSize::Sm />
+                                    // Avatar — decorative for SR users; the name
+                                    // is right next to it. Bug #27: without
+                                    // aria-hidden, the a11y tree read "🥇 64
+                                    // 6407ee…425a 7" — the avatar fallback
+                                    // letters "64" wedged into the handle.
+                                    <div aria-hidden="true">
+                                        <Avatar pubkey=pk size=AvatarSize::Sm />
+                                    </div>
 
                                     // Name + bar
                                     <div class="flex-1 min-w-0">
