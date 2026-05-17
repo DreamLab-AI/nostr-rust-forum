@@ -67,8 +67,15 @@ pub fn ChannelPage() -> impl IntoView {
     let typing_pubkeys = RwSignal::new(Vec::<String>::new());
     let messages_container = NodeRef::<leptos::html::Div>::new();
 
-    // Track subscription ID for cleanup
+    // Track subscription IDs for cleanup. `channel_sub_id` is the kind-40
+    // by-id query; `replay_sub_ids` collects narrow kind-42 subs opened by
+    // the on-discovery replay path so they get torn down on unmount —
+    // without this, leaked subs from previous channel pages keep firing
+    // into the global ChannelStore signals and trigger
+    // "Tried to access a reactive value that has already been disposed"
+    // panics under fast navigation.
     let channel_sub_id: RwSignal<Option<String>> = RwSignal::new(None);
+    let replay_sub_ids: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
 
     // Clone relay for each closure that needs it
     let relay_for_sub = relay.clone();
@@ -244,7 +251,7 @@ pub fn ChannelPage() -> impl IntoView {
                     if !section.is_empty() {
                         needles.push(section);
                     }
-                    let _ = relay_for_retry.subscribe(
+                    let sub_id = relay_for_retry.subscribe(
                         vec![Filter {
                             kinds: Some(vec![42]),
                             e_tags: Some(needles),
@@ -253,6 +260,7 @@ pub fn ChannelPage() -> impl IntoView {
                         on_replay,
                         None,
                     );
+                    replay_sub_ids.update(|ids| ids.push(sub_id));
                 }
             }
         });
@@ -364,9 +372,18 @@ pub fn ChannelPage() -> impl IntoView {
         }
     });
 
-    // Cleanup kind-40 subscription on unmount
+    // Cleanup on unmount: tear down the kind-40 by-id sub AND every
+    // narrow kind-42 replay sub opened during this page's lifetime. Leaked
+    // subs would otherwise keep firing into global ChannelStore signals
+    // from disposed reactive scopes, surfacing as
+    // "Tried to access a reactive value that has already been disposed"
+    // panics on subsequent navigations.
     on_cleanup(move || {
         if let Some(id) = channel_sub_id.get_untracked() {
+            relay_for_cleanup.unsubscribe(&id);
+        }
+        let ids = replay_sub_ids.get_untracked();
+        for id in ids {
             relay_for_cleanup.unsubscribe(&id);
         }
     });
