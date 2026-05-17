@@ -11,12 +11,11 @@
 //! downstream crates depend on `nostr-bbs-pod-worker::webid::*` rather
 //! than reaching into solid-pod-rs themselves.
 
+// Re-exported as an inheritance seam — downstream nostr-bbs crates import
+// URL builders from here rather than depending on solid-pod-rs directly.
+#[allow(unused_imports)]
 pub use solid_pod_rs::webid::{
-    generate_webid_html,
-    pod_git_clone_url,
-    pod_root_url,
-    webid_document_url,
-    webid_url,
+    generate_webid_html, pod_git_clone_url, pod_root_url, webid_document_url, webid_url,
 };
 
 #[cfg(test)]

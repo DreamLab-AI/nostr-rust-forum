@@ -93,9 +93,7 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
     // nip05.pod_base_url, when set, must be HTTPS (ADR-086).
     if let Some(url) = cfg.nip05.pod_base_url.as_deref() {
         if !url.starts_with("https://") && !url.starts_with("http://localhost") {
-            return Err(format!(
-                "nip05.pod_base_url must use https:// (got {url})"
-            ));
+            return Err(format!("nip05.pod_base_url must use https:// (got {url})"));
         }
         if url.ends_with('/') {
             return Err(format!(

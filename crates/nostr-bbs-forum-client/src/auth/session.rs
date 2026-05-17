@@ -277,15 +277,10 @@ impl AuthStore {
                                 nostr_bbs_core::keys::SecretKey::from_bytes(sk_bytes)
                             {
                                 let public = secret.public_key();
-                                let keypair = nostr_bbs_core::keys::Keypair {
-                                    secret,
-                                    public,
-                                };
-                                let signer: Rc<dyn Signer> = Rc::new(
-                                    nostr_bbs_core::signer::PrfSigner::new(keypair),
-                                );
-                                self.signer
-                                    .set_value(Some(SendWrapper::new(signer)));
+                                let keypair = nostr_bbs_core::keys::Keypair { secret, public };
+                                let signer: Rc<dyn Signer> =
+                                    Rc::new(nostr_bbs_core::signer::PrfSigner::new(keypair));
+                                self.signer.set_value(Some(SendWrapper::new(signer)));
                             }
                             self.privkey.set_value(Some(bytes));
                             self.state.set(AuthState {

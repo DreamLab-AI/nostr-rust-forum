@@ -451,7 +451,11 @@ impl ResolverMode {
 pub fn parse_nip05_pubkey(body: &[u8], name: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let pk = v.get("names")?.get(name)?.as_str()?;
-    if pk.len() != 64 || !pk.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+    if pk.len() != 64
+        || !pk
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
         return None;
     }
     Some(pk.to_string())
@@ -697,14 +701,8 @@ mod tests {
     #[test]
     fn resolver_mode_unknown_value_falls_back_to_d1() {
         // Refuse to silently enable federation on typo / future-mode names.
-        assert_eq!(
-            ResolverMode::from_env_str(Some("hybrid")),
-            ResolverMode::D1
-        );
-        assert_eq!(
-            ResolverMode::from_env_str(Some("d1")),
-            ResolverMode::D1
-        );
+        assert_eq!(ResolverMode::from_env_str(Some("hybrid")), ResolverMode::D1);
+        assert_eq!(ResolverMode::from_env_str(Some("d1")), ResolverMode::D1);
     }
 
     // ── ADR-086: build_federated_url ──────────────────────────────────
@@ -736,10 +734,7 @@ mod tests {
     fn parse_nip05_pubkey_happy_path() {
         let pk = "a".repeat(64);
         let body = format!(r#"{{"names":{{"alice":"{pk}"}}}}"#);
-        assert_eq!(
-            parse_nip05_pubkey(body.as_bytes(), "alice"),
-            Some(pk)
-        );
+        assert_eq!(parse_nip05_pubkey(body.as_bytes(), "alice"), Some(pk));
     }
 
     #[test]

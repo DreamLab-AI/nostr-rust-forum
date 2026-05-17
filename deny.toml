@@ -34,6 +34,7 @@ allow = [
     "CC0-1.0",
     "MPL-2.0",
     "OpenSSL",
+    "CDLA-Permissive-2.0",
 ]
 
 # Ring uses a custom licence that is functionally ISC.
@@ -56,9 +57,10 @@ license-files = [{ path = "LICENSE-UNICODE", hash = 0x3fb01745 }]
 # Warn for now; tighten to "deny" once duplicates are resolved.
 multiple-versions = "warn"
 # Wildcards in version requirements are sloppy.
-wildcards = "deny"
+# Using "warn" while solid-pod-rs is git-pinned (rev counts as wildcard).
+# Tighten back to "deny" once alpha.13 lands on crates.io.
+wildcards = "warn"
 # Allow specific duplicates that are hard to unify (transitive deps):
-# allow-wildcard-paths = true
 # skip = []
 
 # ---------------------------------------------------------------------------
@@ -69,4 +71,6 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# solid-pod-rs is pinned to a specific rev pending alpha.13 crates.io release.
+# Remove once alpha.13 publishes and the workspace dep is updated to a version.
+allow-git = ["https://github.com/DreamLab-AI/solid-pod-rs"]

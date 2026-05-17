@@ -262,7 +262,12 @@ pub fn PodBrowserPage() -> impl IntoView {
     let pod_clone_command = Memo::new(move |_| {
         pubkey
             .get()
-            .map(|pk| format!("git clone {}", solid_pod_rs::webid::pod_git_clone_url(POD_API, &pk)))
+            .map(|pk| {
+                format!(
+                    "git clone {}",
+                    solid_pod_rs::webid::pod_git_clone_url(POD_API, &pk)
+                )
+            })
             .unwrap_or_default()
     });
 
@@ -271,14 +276,20 @@ pub fn PodBrowserPage() -> impl IntoView {
     let on_copy_clone = move |_| {
         let cmd = pod_clone_command.get_untracked();
         if cmd.is_empty() {
-            toasts_for_copy.show("No clone URL available", crate::components::toast::ToastVariant::Warning);
+            toasts_for_copy.show(
+                "No clone URL available",
+                crate::components::toast::ToastVariant::Warning,
+            );
             return;
         }
         if let Some(window) = web_sys::window() {
             let nav = window.navigator().clipboard();
             let _ = nav.write_text(&cmd);
         }
-        toasts_for_copy.show("Clone command copied", crate::components::toast::ToastVariant::Success);
+        toasts_for_copy.show(
+            "Clone command copied",
+            crate::components::toast::ToastVariant::Success,
+        );
     };
 
     // Probe `<pod_base>/HEAD` (NOT `.git/HEAD`; smart-HTTP-style serves the
@@ -286,8 +297,12 @@ pub fn PodBrowserPage() -> impl IntoView {
     // ran at provisioning; 404 means this operator's tier doesn't support
     // it. Idempotent; safe to call repeatedly.
     let on_probe_git = move |_| {
-        let Some(base) = pod_base_url.get() else { return; };
-        let Some(signer) = auth.get_signer() else { return; };
+        let Some(base) = pod_base_url.get() else {
+            return;
+        };
+        let Some(signer) = auth.get_signer() else {
+            return;
+        };
         git_probe.set(GitProbeState::Probing);
         let url = format!("{}/HEAD", base.trim_end_matches('/'));
         wasm_bindgen_futures::spawn_local(async move {

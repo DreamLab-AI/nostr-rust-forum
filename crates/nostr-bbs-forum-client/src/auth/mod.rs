@@ -433,10 +433,7 @@ impl AuthStore {
         // silently no-op'd (pod page never fetched, relay AUTH sync warning
         // every connection).
         let public = sk.public_key();
-        let keypair = nostr_bbs_core::keys::Keypair {
-            secret: sk,
-            public,
-        };
+        let keypair = nostr_bbs_core::keys::Keypair { secret: sk, public };
         let signer: Rc<dyn Signer> = Rc::new(nostr_bbs_core::signer::PrfSigner::new(keypair));
         self.signer.set_value(Some(SendWrapper::new(signer)));
 
