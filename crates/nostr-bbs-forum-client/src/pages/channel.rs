@@ -88,8 +88,13 @@ pub fn ChannelPage() -> impl IntoView {
     //
     // Also matches by `section` so slug-style URLs (e.g. /chat/home-lobby)
     // resolve as well as hex-id URLs.
+    //
+    // Note: the previous `ensure_subscribed` Effect was removed in favour of
+    // the kind-40 by-id query below — that path already replays the channel's
+    // kind-42 history once metadata arrives, and the duplicate Effect was
+    // implicated in "Tried to access a reactive value that has already been
+    // disposed" panics on deep-link unmount.
     if let Some(store) = use_context::<ChannelStore>() {
-        let store_for_header = store.clone();
         Effect::new(move |_| {
             // Don't clobber a header already populated by the kind-40 query.
             if channel_info.with_untracked(|c| c.is_some()) {
@@ -100,7 +105,7 @@ pub fn ChannelPage() -> impl IntoView {
                 return;
             }
             let needle_lower = cid.to_lowercase();
-            store_for_header.channels.with(|list| {
+            store.channels.with(|list| {
                 if let Some(found) = list.iter().find(|c| {
                     c.id == cid
                         || c.name.to_lowercase() == needle_lower
@@ -113,19 +118,6 @@ pub fn ChannelPage() -> impl IntoView {
                     }));
                 }
             });
-        });
-
-        // ADR-092: idempotent self-bootstrap. Opens a narrow kind-42 sub
-        // for this channel so direct deep-links render messages even if
-        // the global `start_msg_sync` hasn't fired yet for this cid.
-        let store_for_sub = store;
-        let relay_for_ensure = relay_for_sub.clone();
-        Effect::new(move |_| {
-            let cid = channel_id();
-            if cid.is_empty() {
-                return;
-            }
-            store_for_sub.ensure_subscribed(&relay_for_ensure, &cid);
         });
     }
 

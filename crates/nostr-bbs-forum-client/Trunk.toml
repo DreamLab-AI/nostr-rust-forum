@@ -60,3 +60,17 @@ command_arguments = [
 # instead. See index.html for sw.js (registered via main.rs navigator.serviceWorker).
 # webgpu-particles.js gets bundled by wasm-bindgen via the snippets/ pipeline so
 # it doesn't need a top-level copy directive.
+
+# Bug #19: scrub stale wasm-bindgen snippet directories before each build.
+# Trunk does not garbage-collect `dist/snippets/<crate>-<hash>/` between runs,
+# so prior builds' hashed copies of `js/webgpu-particles.js` (and any other
+# JS imported via `#[wasm_bindgen(module = "/js/...")]`) accumulate. End
+# users were downloading the same file 3× under different content-addressed
+# directories.
+[[hooks]]
+stage = "pre_build"
+command = "bash"
+command_arguments = [
+    "-c",
+    "set -euo pipefail; rm -rf ../../dist/snippets || true"
+]
