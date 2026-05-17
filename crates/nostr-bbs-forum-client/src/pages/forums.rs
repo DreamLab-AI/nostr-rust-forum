@@ -66,13 +66,37 @@ const ZONES: &[Zone] = &[
 ];
 
 /// Resolve a section tag to its parent zone ID.
+///
+/// Tries exact match first (ZONES.sections list), then falls back to
+/// prefix-based matching to handle relay section tags like "dreamlab-lobby",
+/// "minimoonoir-welcome" that weren't in the original hardcoded list.
 fn section_to_zone(section: &str) -> Option<&'static str> {
+    // Exact match against configured zone section lists.
     for zone in ZONES {
         if zone.sections.contains(&section) {
             return Some(zone.id);
         }
     }
-    None
+    // Prefix-based fallback for relay-created channels whose section tags
+    // use the branding names ("dreamlab-*", "minimoonoir-*").
+    if section.starts_with("home-") || section == "home" || section == "lobby" {
+        Some("home")
+    } else if section.starts_with("members-")
+        || section.starts_with("ai-")
+        || section.starts_with("dreamlab-")
+        || section == "members"
+        || section == "dreamlab"
+    {
+        Some("members")
+    } else if section.starts_with("private-")
+        || section.starts_with("minimoonoir-")
+        || section == "private"
+        || section == "minimoonoir"
+    {
+        Some("private")
+    } else {
+        None
+    }
 }
 
 // -- Welcome card helpers -----------------------------------------------------
@@ -113,9 +137,12 @@ pub fn ForumsPage() -> impl IntoView {
     let za_private = zone_access.private;
     let za_loaded = zone_access.loaded;
 
-    // Derive zone_id -> { section_id -> channel_count } from the shared store
+    // Derive zone_id -> { section_id -> post_count } from the shared store.
+    // Reads both `channels` (for section routing) and `channel_messages`
+    // (for live post counts) so the Memo re-runs whenever either changes.
     let zone_categories = Memo::new(move |_| {
         let chans = store.channels.get();
+        let msgs = store.channel_messages.get();
         let mut map = HashMap::<String, HashMap<String, u32>>::new();
         for ch in &chans {
             let section = if ch.section.is_empty() {
@@ -125,7 +152,11 @@ pub fn ForumsPage() -> impl IntoView {
             };
             if let Some(zone_id) = section_to_zone(&section) {
                 let cats = map.entry(zone_id.to_string()).or_default();
-                *cats.entry(section).or_insert(0) += 1;
+                let post_count = msgs.get(&ch.id).map(|v| v.len() as u32).unwrap_or(0);
+                // Ensure the section entry exists even if post_count == 0 so
+                // the category card still renders (section is known to exist).
+                let entry = cats.entry(section).or_insert(0);
+                *entry += post_count;
             }
         }
         map
@@ -307,17 +338,17 @@ pub fn ForumsPage() -> impl IntoView {
                                 </div>
 
                                 {if has_cats {
-                                    let cards: Vec<_> = cats.iter().map(|(section_id, topic_count)| {
+                                    let cards: Vec<_> = cats.iter().map(|(section_id, post_count)| {
                                         let display_name = humanize_section_id(section_id);
                                         let sid = section_id.clone();
-                                        let count = *topic_count;
+                                        let count = *post_count;
                                         view! {
                                             <CategoryCard
                                                 name=display_name
                                                 description=section_description(section_id).to_string()
                                                 section_id=sid
                                                 icon=icon
-                                                section_count=count
+                                                post_count=count
                                                 accent_color=accent
                                                 zone_id=zone_id
                                             />

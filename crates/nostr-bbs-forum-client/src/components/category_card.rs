@@ -20,8 +20,8 @@ pub fn CategoryCard(
     section_id: String,
     /// Icon identifier: "globe", "users", "code", or "shield".
     icon: &'static str,
-    /// Number of sections in this category.
-    section_count: u32,
+    /// Total post count across all channels in this section.
+    post_count: u32,
     /// Accent color key: "amber", "blue", "purple", "emerald".
     accent_color: &'static str,
     /// Parent zone id for building the href.
@@ -65,10 +65,12 @@ pub fn CategoryCard(
         _ => "text-gray-500/10",
     };
 
-    let count_label = if section_count == 1 {
-        "1 topic".to_string()
+    let count_label = if post_count == 0 {
+        "No posts yet".to_string()
+    } else if post_count == 1 {
+        "1 post".to_string()
     } else {
-        format!("{} topics", section_count)
+        format!("{} posts", post_count)
     };
 
     let name_display = name.clone();
