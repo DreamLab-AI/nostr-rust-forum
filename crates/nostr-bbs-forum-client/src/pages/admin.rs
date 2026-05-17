@@ -205,6 +205,7 @@ fn AdminPanelInner() -> impl IntoView {
                 <TabButton tab=AdminTab::Settings active=active_tab label="Settings" />
                 <TabButton tab=AdminTab::Reports active=active_tab label="Reports" />
                 <TabButton tab=AdminTab::AuditLog active=active_tab label="Audit Log" />
+                <TabButton tab=AdminTab::NativePods active=active_tab label="Native Pods" />
             </div>
 
             // Tab content
@@ -218,6 +219,7 @@ fn AdminPanelInner() -> impl IntoView {
                     AdminTab::Settings => view! { <SettingsTab /> }.into_any(),
                     AdminTab::Reports => view! { <ReportsTab /> }.into_any(),
                     AdminTab::AuditLog => view! { <AuditLogTab /> }.into_any(),
+                    AdminTab::NativePods => view! { <NativePodsTab /> }.into_any(),
                 }
             }}
 
@@ -491,6 +493,82 @@ fn UsersTab() -> impl IntoView {
                 >
                     <UserTable users=users_signal on_update_cohorts=UpdateCohortsCb::new(on_update_cohorts.clone()) on_toggle_admin=AdminToggleCb::new(on_toggle_admin.clone()) />
                 </Show>
+            </div>
+        </div>
+    }
+}
+
+// -- Native Pods tab ----------------------------------------------------------
+
+#[component]
+fn NativePodsTab() -> impl IntoView {
+    let provision_pubkey = RwSignal::new(String::new());
+    let provision_status = RwSignal::new(Option::<String>::None);
+    let busy = RwSignal::new(false);
+    let auth = use_auth();
+
+    let on_provision = move |_| {
+        let pk = provision_pubkey.get_untracked();
+        if pk.len() != 64 {
+            provision_status.set(Some("Invalid pubkey (need 64 hex chars)".into()));
+            return;
+        }
+        if busy.get_untracked() {
+            return;
+        }
+        let Some(signer) = auth.get_signer() else {
+            provision_status.set(Some("No signer available — log in first".into()));
+            return;
+        };
+        busy.set(true);
+        provision_status.set(None);
+        let pk_owned = pk.clone();
+        spawn_local(async move {
+            let url = format!(
+                "{}/api/native-pod/provision",
+                crate::utils::relay_url::auth_api_base()
+            );
+            let body = serde_json::json!({ "pubkey": pk_owned }).to_string();
+            let result =
+                crate::auth::nip98::fetch_with_nip98_post_signer(&url, &body, &*signer).await;
+            match result {
+                Ok(_) => {
+                    provision_status.set(Some(format!("\u{2713} Pod provisioned for {pk_owned}")));
+                    provision_pubkey.set(String::new());
+                }
+                Err(e) => provision_status.set(Some(format!("Error: {e}"))),
+            }
+            busy.set(false);
+        });
+    };
+
+    view! {
+        <div class="space-y-6">
+            <div>
+                <h3 class="text-sm font-semibold text-gray-300 mb-3">"Provision Native Pod"</h3>
+                <p class="text-xs text-gray-500 mb-4">
+                    "Provisions a pod on the agentbox native server for a user pubkey. "
+                    "The user will see a second pod with full git support in their pod browser."
+                </p>
+                <div class="flex gap-2">
+                    <input
+                        type="text"
+                        placeholder="User pubkey (64 hex chars)"
+                        class="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-white font-mono placeholder-gray-600 focus:outline-none focus:border-green-500/50"
+                        on:input=move |ev| provision_pubkey.set(event_target_value(&ev))
+                        prop:value=provision_pubkey
+                    />
+                    <button
+                        on:click=on_provision
+                        disabled=move || busy.get() || provision_pubkey.get().len() != 64
+                        class="px-4 py-2 bg-green-600 hover:bg-green-500 disabled:opacity-40 text-white text-sm font-medium rounded transition-colors"
+                    >
+                        {move || if busy.get() { "Provisioning\u{2026}" } else { "Provision" }}
+                    </button>
+                </div>
+                {move || provision_status.get().map(|msg| view! {
+                    <p class="mt-2 text-xs text-gray-400">{msg}</p>
+                })}
             </div>
         </div>
     }

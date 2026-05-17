@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-pod-worker"
-version = "3.0.0-rc10"
+version = "3.0.0-rc11"
 edition = "2021"
 description = "Pod Worker: Solid pods + R2 storage + WAC ACL (nostr-bbs)"
 license = "MIT OR Apache-2.0"

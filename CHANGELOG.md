@@ -6,6 +6,19 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 and this project tracks the spec home at [VisionClaw monorepo](https://github.com/DreamLab-AI/VisionClaw)
 (`docs/specs/` + `docs/adr/`) for cross-substrate normative decisions.
 
+## [3.0.0-rc11] - 2026-05-17
+
+### Added
+
+- **Native pod support**: `[native_pod]` config section in nostr-bbs-config; when
+  `native_pod.enabled = true`, pod browser shows a second "Native pod" card probing
+  the native server URL. Available → GitPanel + AppManifestPanel. Probing/Unavailable
+  states handled gracefully.
+- **Admin: Native Pods tab**: provision a native pod for any user pubkey via the admin
+  control panel. Calls CF auth-worker `POST /api/native-pod/provision` → forwards to
+  native server `/_admin/provision/{pubkey}` with PSK header.
+- `NATIVE_POD_URL` build-time env wires the forum client to the native server URL.
+
 ## [3.0.0-rc10] - 2026-05-17
 
 ### Added

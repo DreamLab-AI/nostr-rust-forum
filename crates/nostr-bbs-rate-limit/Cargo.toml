@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-rate-limit"
-version = "3.0.0-rc10"
+version = "3.0.0-rc11"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

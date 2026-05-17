@@ -44,6 +44,9 @@ pub struct ForumConfig {
     /// NIP-05 resolution policy (JSS Phase 1; ADR-086).
     #[serde(default)]
     pub nip05: Nip05,
+    /// Native solid-pod-rs server (agentbox tier) configuration.
+    #[serde(default)]
+    pub native_pod: NativePod,
 }
 
 /// Deployment metadata.
@@ -244,4 +247,44 @@ pub struct Nip05 {
     /// fetch is `${pod_base_url}/.well-known/nostr.json?name=<local>`.
     #[serde(default)]
     pub pod_base_url: Option<String>,
+}
+
+/// Native solid-pod-rs server (agentbox tier) configuration.
+/// When enabled, users in `allowlist_cohorts` get a second pod on the
+/// native server with full git support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NativePod {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Public base URL of the native server (e.g. "https://pods-native.dreamlab-ai.com")
+    #[serde(default)]
+    pub base_url: String,
+    /// Cohorts eligible for a native pod.  Empty = all authenticated users.
+    #[serde(default)]
+    pub allowlist_cohorts: Vec<String>,
+    /// Whether git features are enabled on this native server.
+    #[serde(default = "bool_true")]
+    pub git_enabled: bool,
+    /// URL the CF auth-worker POSTs to in order to provision a pod on the native server.
+    /// Set to "{native_base_url}/_admin/provision/{pubkey}" pattern — auth-worker
+    /// fills in the pubkey. Leave blank if admin provisioning is not needed.
+    #[serde(default)]
+    pub admin_provision_url: String,
+}
+
+impl Default for NativePod {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            allowlist_cohorts: vec![],
+            git_enabled: true,
+            admin_provision_url: String::new(),
+        }
+    }
+}
+
+fn bool_true() -> bool {
+    true
 }

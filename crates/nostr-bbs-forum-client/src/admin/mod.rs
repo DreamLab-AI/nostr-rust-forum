@@ -41,6 +41,7 @@ pub enum AdminTab {
     Settings,
     Reports,
     AuditLog,
+    NativePods,
 }
 
 /// A whitelisted user returned from the relay API.

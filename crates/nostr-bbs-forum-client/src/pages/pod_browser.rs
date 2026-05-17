@@ -16,6 +16,11 @@ const POD_API: &str = match option_env!("VITE_POD_API_URL") {
     None => "https://pod.example.com",
 };
 
+const NATIVE_POD_URL: &str = match option_env!("NATIVE_POD_URL") {
+    Some(u) => u,
+    None => "",
+};
+
 // ── Data types ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -248,6 +253,7 @@ pub fn PodBrowserPage() -> impl IntoView {
     let resource_content = RwSignal::new(None::<(String, String)>);
     let viewing_resource = RwSignal::new(false);
     let git_probe = RwSignal::new(GitProbeState::Idle);
+    let native_probe = RwSignal::new(GitProbeState::Idle);
     let toasts = crate::components::toast::use_toasts();
 
     let pod_base_url = Memo::new(move |_| {
@@ -340,6 +346,52 @@ pub fn PodBrowserPage() -> impl IntoView {
         } else {
             false
         }
+    });
+
+    // Native pod base URL derived from pubkey + NATIVE_POD_URL constant.
+    let native_pod_base_url = Memo::new(move |_| {
+        if NATIVE_POD_URL.is_empty() {
+            return None;
+        }
+        pubkey
+            .get()
+            .map(|pk| format!("{}/{}", NATIVE_POD_URL.trim_end_matches('/'), pk))
+    });
+
+    // Auto-probe native pod once the URL and signer are ready.
+    Effect::new(move |ran: Option<bool>| {
+        if ran == Some(true) || NATIVE_POD_URL.is_empty() {
+            return true;
+        }
+        let Some(base) = native_pod_base_url.get() else {
+            return false;
+        };
+        let Some(signer) = auth.get_signer() else {
+            return false;
+        };
+        native_probe.set(GitProbeState::Probing);
+        let head_url = format!("{}/HEAD", base.trim_end_matches('/'));
+        wasm_bindgen_futures::spawn_local(async move {
+            match pod_fetch(&head_url, &*signer).await {
+                Ok(body) => {
+                    let branch = body
+                        .trim()
+                        .strip_prefix("ref: refs/heads/")
+                        .unwrap_or(body.trim())
+                        .to_string();
+                    if branch.is_empty() {
+                        native_probe.set(GitProbeState::Unavailable);
+                    } else {
+                        native_probe.set(GitProbeState::Available { branch });
+                    }
+                }
+                Err(e) if e.contains("404") || e.contains("501") => {
+                    native_probe.set(GitProbeState::Unavailable)
+                }
+                Err(e) => native_probe.set(GitProbeState::Error(e)),
+            }
+        });
+        true
     });
 
     let on_probe_git = move |_| run_git_probe();
@@ -527,6 +579,49 @@ pub fn PodBrowserPage() -> impl IntoView {
                         </button>
                     </div>
                 }.into_any(),
+            }}
+
+            // Native pod section — only rendered when NATIVE_POD_URL is configured.
+            {move || {
+                if NATIVE_POD_URL.is_empty() { return view! {<div></div>}.into_any(); }
+                match native_probe.get() {
+                    GitProbeState::Idle | GitProbeState::Probing => view! {
+                        <div class="mb-4 flex items-center gap-2 text-sm text-gray-500 py-2">
+                            <div class="animate-spin rounded-full h-4 w-4 border-b-2 border-green-400/50"></div>
+                            "Connecting to native pod\u{2026}"
+                        </div>
+                    }.into_any(),
+                    GitProbeState::Available { branch } => {
+                        let branch_for_header = branch.clone();
+                        let branch_sig = Signal::derive({ let b = branch.clone(); move || b.clone() });
+                        view! {
+                            <section class="mb-4 bg-gradient-to-br from-green-500/10 to-emerald-500/5 border border-green-400/20 rounded-lg p-4">
+                                <div class="flex items-center gap-2 mb-2">
+                                    <span class="text-green-400 text-lg">"\u{2387}"</span>
+                                    <h2 class="text-base font-semibold text-white">
+                                        {format!("Native pod \u{00b7} branch: {branch_for_header}")}
+                                    </h2>
+                                    <span class="ml-auto text-xs bg-green-500/20 text-green-300 px-2 py-0.5 rounded-full">"Git enabled"</span>
+                                </div>
+                                <p class="text-xs text-gray-400 mb-3">
+                                    "Full git version control \u{00b7} hosted on the agentbox native server"
+                                </p>
+                            </section>
+                            <crate::components::git_panel::GitPanel
+                                pod_base_url=native_pod_base_url
+                                branch=branch_sig
+                            />
+                            <crate::components::git_panel::AppManifestPanel
+                                pod_base_url=native_pod_base_url
+                            />
+                        }.into_any()
+                    },
+                    GitProbeState::Unavailable | GitProbeState::Error(_) => view! {
+                        <div class="mb-4 text-xs text-gray-700 bg-gray-800/20 border border-gray-700/20 rounded px-3 py-2">
+                            "Native pod not reachable \u{2014} check tunnel"
+                        </div>
+                    }.into_any(),
+                }
             }}
 
             // Quick-access cards

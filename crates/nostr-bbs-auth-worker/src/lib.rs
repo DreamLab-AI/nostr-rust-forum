@@ -546,6 +546,13 @@ async fn route_sprint_api(
         return Ok(Some(resp));
     }
 
+    // -- Native pod provisioning ----------------------------------------
+    if path == "/api/native-pod/provision" && *method == Method::Post {
+        let resp =
+            handle_native_pod_provision(body_bytes, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+
     // -- Sprint v10: username reservations ------------------------------
     if path == "/api/username/check" && *method == Method::Get {
         let resp = username::handle_check(&query, env).await?;
@@ -566,6 +573,136 @@ async fn route_sprint_api(
     }
 
     Ok(None)
+}
+
+/// POST /api/native-pod/provision
+///
+/// Admin NIP-98 required. Validates the supplied pubkey, then forwards a
+/// provisioning request to the native solid-pod-rs server using the PSK header.
+///
+/// Env bindings required:
+/// - `NATIVE_POD_URL`      — Base URL of the native server
+/// - `NATIVE_POD_ADMIN_KEY` — Pre-shared key sent as `X-Pod-Admin-Key`
+async fn handle_native_pod_provision(
+    body_bytes: &[u8],
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    // Require admin NIP-98 auth.
+    let auth_header = match auth_header {
+        Some(h) => h,
+        None => {
+            return json_response(
+                env,
+                &serde_json::json!({ "error": "Authorization required" }),
+                401,
+            );
+        }
+    };
+    let request_url = admin::canonical_url(origin, "/api/native-pod/provision");
+    let token = match crate::auth::verify_nip98_replay(
+        auth_header,
+        &request_url,
+        "POST",
+        Some(body_bytes),
+        env,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(_) => {
+            return json_response(
+                env,
+                &serde_json::json!({ "error": "Invalid NIP-98 token" }),
+                401,
+            );
+        }
+    };
+    if !admin::is_admin(&token.pubkey, env).await {
+        return json_response(
+            env,
+            &serde_json::json!({ "error": "Admin access required" }),
+            403,
+        );
+    }
+
+    // Parse request body: { "pubkey": "<hex>" }
+    let body: serde_json::Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return json_response(
+                env,
+                &serde_json::json!({ "error": "Invalid request body" }),
+                400,
+            );
+        }
+    };
+    let pubkey = match body.get("pubkey").and_then(|v| v.as_str()) {
+        Some(pk) => pk.to_string(),
+        None => {
+            return json_response(
+                env,
+                &serde_json::json!({ "error": "Missing pubkey field" }),
+                400,
+            );
+        }
+    };
+    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return json_response(
+            env,
+            &serde_json::json!({ "error": "pubkey must be 64 hex characters" }),
+            400,
+        );
+    }
+
+    // Read env bindings.
+    let native_pod_url = match env.var("NATIVE_POD_URL") {
+        Ok(v) => v.to_string(),
+        Err(_) => {
+            return json_response(
+                env,
+                &serde_json::json!({ "error": "native pod not configured" }),
+                503,
+            );
+        }
+    };
+    let native_pod_admin_key = match env.var("NATIVE_POD_ADMIN_KEY") {
+        Ok(v) => v.to_string(),
+        Err(_) => {
+            return json_response(
+                env,
+                &serde_json::json!({ "error": "native pod not configured" }),
+                503,
+            );
+        }
+    };
+
+    // Forward to native server: POST {NATIVE_POD_URL}/_admin/provision/{pubkey}
+    let provision_url = format!(
+        "{}/_admin/provision/{}",
+        native_pod_url.trim_end_matches('/'),
+        pubkey
+    );
+
+    let headers = Headers::new();
+    headers
+        .set("X-Pod-Admin-Key", &native_pod_admin_key)
+        .map_err(|e| Error::RustError(format!("Headers::set: {e:?}")))?;
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|e| Error::RustError(format!("Headers::set: {e:?}")))?;
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post).with_headers(headers);
+
+    let upstream_req = Request::new_with_init(&provision_url, &init)?;
+    let mut upstream_resp = Fetch::Request(upstream_req).send().await?;
+    let status = upstream_resp.status_code();
+    let body_text = upstream_resp.text().await.unwrap_or_default();
+
+    let resp = Response::ok(body_text)?.with_status(status);
+    Ok(resp)
 }
 
 /// Map a `worker::Method` enum to its string name.
