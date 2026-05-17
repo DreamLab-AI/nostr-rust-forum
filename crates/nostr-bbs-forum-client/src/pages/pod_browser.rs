@@ -256,14 +256,13 @@ pub fn PodBrowserPage() -> impl IntoView {
             .map(|pk| format!("{}/pods/{}", POD_API.trim_end_matches('/'), pk))
     });
 
-    // Per-user pod git clone command (ADR-089). Mirrors `pages::settings`
-    // surface — both derive from the same `POD_API` env that flows from
-    // `[pod].base_url` in nostr-bbs-config. Resolves only when git-init at
-    // pod provisioning is enabled on the operator's deployment.
+    // Per-user pod git clone command (ADR-089). URL builder lives in
+    // `solid_pod_rs::webid::pod_git_clone_url` so the forum-client and the
+    // pod-worker share one definition of the layout.
     let pod_clone_command = Memo::new(move |_| {
-        pod_base_url
+        pubkey
             .get()
-            .map(|base| format!("git clone {}/", base.trim_end_matches('/')))
+            .map(|pk| format!("git clone {}", solid_pod_rs::webid::pod_git_clone_url(POD_API, &pk)))
             .unwrap_or_default()
     });
 

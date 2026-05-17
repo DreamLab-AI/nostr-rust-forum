@@ -17,6 +17,11 @@ path = "src/main.rs"
 
 [dependencies]
 nostr-bbs-core = { workspace = true }
+# `solid-pod-rs` core feature — wasm32-safe pure-logic surface. Exposes
+# `did_nostr_types::{NostrPubkey, did_nostr_uri}` plus the `webid` and
+# `interop` modules. Used by signup wizard + pod-browser + settings to
+# avoid duplicating WebID / pod URL / NIP-05 formatting across the client.
+solid-pod-rs = { workspace = true }
 leptos = { workspace = true }
 leptos_router = { workspace = true }
 leptos_meta = { workspace = true }

@@ -347,6 +347,25 @@ impl AuthStore {
             .set_value(Some(keypair.secret.as_bytes().to_vec()));
         save_privkey_session(&privkey_hex);
 
+        // Mirror login_with_local_key's signer registration so downstream
+        // NIP-98 features (pod browser, search, relay AUTH) work the moment
+        // signup completes. Without this, the just-registered user can't
+        // sign anything until they re-login.
+        {
+            let mut sk_copy = [0u8; 32];
+            sk_copy.copy_from_slice(keypair.secret.as_bytes());
+            if let Ok(secret_for_signer) = nostr_bbs_core::keys::SecretKey::from_bytes(sk_copy) {
+                let public = secret_for_signer.public_key();
+                let signer_keypair = nostr_bbs_core::keys::Keypair {
+                    secret: secret_for_signer,
+                    public,
+                };
+                let signer: Rc<dyn Signer> =
+                    Rc::new(nostr_bbs_core::signer::PrfSigner::new(signer_keypair));
+                self.signer.set_value(Some(SendWrapper::new(signer)));
+            }
+        }
+
         let nickname = Some(display_name.to_string());
 
         let stored = StoredSession {

@@ -72,7 +72,12 @@ struct Toast {
 // ---------------------------------------------------------------------------
 
 /// Shared toast store that lives in Leptos context.
-#[derive(Clone)]
+///
+/// `Copy` because both fields are already `Copy` (`RwSignal<T>` is Copy in
+/// Leptos 0.7). The Copy derive lets callers capture `toasts` into
+/// multiple closures without manual `.clone()` chains — required for
+/// FnMut on:click handlers.
+#[derive(Clone, Copy)]
 pub struct ToastStore {
     toasts: RwSignal<Vec<Toast>>,
     next_id: RwSignal<u64>,

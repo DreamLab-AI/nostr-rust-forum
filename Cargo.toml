@@ -127,7 +127,12 @@ wasm-bindgen-test = "0.3"
 # `core` consumers (CF Workers): use this dep.
 # Server-side consumers: enable `tokio-runtime` and the IO backends
 # they need.
-solid-pod-rs = { version = "0.4.0-alpha.12", default-features = false, features = ["core"] }
+# 2026-05-17: pin to git HEAD past 0.4.0-alpha.12 to pick up the new
+# URL builders (pod_root_url / webid_url / pod_git_clone_url) shipped in
+# solid-pod-rs commit 635b780. These are consumed by the forum-client's
+# signup wizard + pod-browser to avoid duplicating WebID/pod URL format
+# strings. Bump to alpha.13 once that publishes.
+solid-pod-rs = { git = "https://github.com/DreamLab-AI/solid-pod-rs.git", rev = "635b780faf1fc6f5563a35189c1f6e33d4c3f287", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
 nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc8" }
