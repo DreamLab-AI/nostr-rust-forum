@@ -11,6 +11,7 @@ use wasm_bindgen_futures::spawn_local;
 use super::WhitelistUser;
 use crate::auth::nip98::fetch_with_nip98_post_signer;
 use crate::auth::use_auth;
+use crate::components::user_display::use_display_name_memo;
 
 /// Available zone flags for cohort editing.
 const AVAILABLE_COHORTS: &[(&str, &str)] = &[
@@ -391,7 +392,9 @@ fn UserRow(
 ) -> impl IntoView {
     let pk = user.pubkey.clone();
     let pk_display = truncate_pubkey(&pk);
-    let display_name = user.display_name.clone();
+    // Reactively resolve display name from the profile cache (triggers a
+    // batch fetch on miss; updates automatically when the response arrives).
+    let display_name = use_display_name_memo(pk.clone());
     let cohorts = user.cohorts.clone();
     let is_admin_user = user.is_admin;
 
@@ -464,12 +467,10 @@ fn UserRow(
 
     view! {
         <div class="grid grid-cols-12 gap-2 px-4 py-3 items-center text-sm hover:bg-gray-750 hover:border-l-2 hover:border-l-amber-500/50 border-l-2 border-l-transparent transition-all">
-            // User column -- display name + truncated pubkey
+            // User column -- reactive display name + truncated pubkey
             <div class="col-span-3">
                 <div class="flex flex-col gap-0.5">
-                    {display_name.as_ref().map(|name| view! {
-                        <span class="text-white font-medium text-sm">{name.clone()}</span>
-                    })}
+                    <span class="text-white font-medium text-sm">{display_name}</span>
                     <span
                         class="font-mono text-gray-500 bg-gray-900 rounded px-2 py-0.5 text-xs w-fit"
                         title=pk.clone()
