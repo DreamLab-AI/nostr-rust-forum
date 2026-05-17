@@ -96,6 +96,12 @@ fn set_skipped(pubkey: &str) {
     if let Some(s) = local_storage() {
         let until = js_sys::Date::now() + SKIP_DURATION_MS;
         let _ = s.set_item(&skipped_key(pubkey), &format!("{:.0}", until));
+        // ALSO set the legacy "onboarded" flag so the modal stops auto-popping
+        // for any pubkey on this device. Pre-2026-05-17 users complained that
+        // every fresh login re-opened the modal — clicking "I'll choose later"
+        // should mean "stop pestering me", not "ask again in 7 days".
+        // Users can still claim a username from Settings any time.
+        let _ = s.set_item(LEGACY_ONBOARDED_KEY, "1");
     }
 }
 

@@ -400,6 +400,19 @@ impl AuthStore {
         self.privkey.set_value(Some(key_bytes.to_vec()));
         save_privkey_session(privkey_hex);
 
+        // Register a Signer so anything that calls `auth.get_signer()` works
+        // (pod browser, search, anything that needs NIP-98). Without this, the
+        // signer field was None for local-key users and downstream features
+        // silently no-op'd (pod page never fetched, relay AUTH sync warning
+        // every connection).
+        let public = sk.public_key();
+        let keypair = nostr_bbs_core::keys::Keypair {
+            secret: sk,
+            public,
+        };
+        let signer: Rc<dyn Signer> = Rc::new(nostr_bbs_core::signer::PrfSigner::new(keypair));
+        self.signer.set_value(Some(SendWrapper::new(signer)));
+
         let (nickname, avatar, account_status, _nsec_backed_up) = self.read_existing_metadata();
 
         let stored = StoredSession {

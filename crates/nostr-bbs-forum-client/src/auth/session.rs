@@ -10,7 +10,12 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use zeroize::Zeroize;
 
+use std::rc::Rc;
+
+use send_wrapper::SendWrapper;
+
 use super::{AccountStatus, AuthPhase, AuthState, AuthStore, STORAGE_KEY};
+use nostr_bbs_core::signer::Signer;
 
 /// sessionStorage key for local-key privkey (survives same-tab nav, cleared on tab close).
 ///
@@ -262,6 +267,26 @@ impl AuthStore {
                     }
                     if let Ok(bytes) = decoded {
                         if bytes.len() == 32 {
+                            // Register a Signer for downstream features
+                            // (pod, search, NIP-98). Without this, the signer
+                            // was None after restore for local-key users and
+                            // every authed request silently no-op'd.
+                            let mut sk_bytes = [0u8; 32];
+                            sk_bytes.copy_from_slice(&bytes);
+                            if let Ok(secret) =
+                                nostr_bbs_core::keys::SecretKey::from_bytes(sk_bytes)
+                            {
+                                let public = secret.public_key();
+                                let keypair = nostr_bbs_core::keys::Keypair {
+                                    secret,
+                                    public,
+                                };
+                                let signer: Rc<dyn Signer> = Rc::new(
+                                    nostr_bbs_core::signer::PrfSigner::new(keypair),
+                                );
+                                self.signer
+                                    .set_value(Some(SendWrapper::new(signer)));
+                            }
                             self.privkey.set_value(Some(bytes));
                             self.state.set(AuthState {
                                 state: AuthPhase::Authenticated,
