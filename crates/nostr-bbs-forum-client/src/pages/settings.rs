@@ -523,7 +523,6 @@ pub fn SettingsPage() -> impl IntoView {
                                         // hex for unknown pubkeys.
                                         let pk_display = use_display_name(&pk);
                                         let pk_for_unmute = pk.clone();
-                                        let on_unmute = on_unmute;
                                         view! {
                                             <div class="flex items-center justify-between bg-gray-800 rounded-lg px-3 py-2">
                                                 <code class="text-xs text-gray-300 font-mono">{pk_display}</code>
