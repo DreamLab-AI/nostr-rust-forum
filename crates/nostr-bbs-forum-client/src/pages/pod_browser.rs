@@ -320,7 +320,12 @@ pub fn PodBrowserPage() -> impl IntoView {
                         git_probe.set(GitProbeState::Available { branch });
                     }
                 }
-                Err(e) if e.contains("404") => git_probe.set(GitProbeState::Unavailable),
+                // 404: LDP path not found (no git-init ran at provisioning).
+                // 501: pod-worker built without git support (CF Workers or
+                //      `--features git` not set in the server build).
+                Err(e) if e.contains("404") || e.contains("501") => {
+                    git_probe.set(GitProbeState::Unavailable)
+                }
                 Err(e) => git_probe.set(GitProbeState::Error(e)),
             }
         });
