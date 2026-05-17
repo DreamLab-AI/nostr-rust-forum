@@ -141,7 +141,7 @@ impl ChannelStore {
         let channels_sig = self.channels;
         let loading_sig = self.loading;
         let eose_sig = self.eose_received;
-        let store = self.clone();
+        let store = *self;
 
         // Track which channel IDs came from the relay (vs stale cache)
         let relay_ids = Rc::new(std::cell::RefCell::new(HashSet::<String>::new()));
@@ -179,7 +179,7 @@ impl ChannelStore {
             });
         });
 
-        let store_for_eose = store.clone();
+        let store_for_eose = store;
         let on_eose = Rc::new(move || {
             // Prune channels that were in the cache but NOT received from relay
             // (they were deleted or the DB was wiped)
@@ -256,7 +256,7 @@ impl ChannelStore {
         let channels_sig = self.channels;
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
-        let store = self.clone();
+        let store = *self;
 
         let on_msg = Rc::new(move |event: NostrEvent| {
             // Extract the root e-tag value (prefer explicit "root" marker)

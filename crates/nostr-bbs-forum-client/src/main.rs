@@ -52,10 +52,7 @@ fn register_service_worker() {
     let sw_container = navigator.service_worker();
 
     // FORUM_BASE is compile-time; mirror app::FORUM_BASE.
-    let base: &str = match option_env!("FORUM_BASE") {
-        Some(b) => b,
-        None => "",
-    };
+    let base: &str = option_env!("FORUM_BASE").unwrap_or_default();
     let sw_url = format!("{base}/sw.js");
     let scope = format!("{base}/");
 
