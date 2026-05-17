@@ -190,6 +190,20 @@ fn request_origin(url: &worker::Url) -> String {
     }
 }
 
+/// Public pod base URL used in WebID, Location, and podUri values.
+///
+/// This is intentionally separate from `EXPECTED_ORIGIN`, which is the browser
+/// CORS origin for the forum frontend. DreamLab deploys the frontend at
+/// `dreamlab-ai.com` and the pod worker at `pods.dreamlab-ai.com`, so using one
+/// variable for both produces broken WebID URLs.
+fn public_pod_base_url(env: &Env, fallback_origin: &str) -> String {
+    env.var("POD_BASE_URL")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| fallback_origin.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
 /// Create a JSON error response with CORS headers.
 fn json_error(env: &Env, message: &str, status: u16) -> Result<Response> {
     let body = serde_json::json!({ "error": message });
@@ -474,13 +488,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             return json_error(&env, "Pod already provisioned", 409);
         }
 
-        let pod_base = env
-            .var("EXPECTED_ORIGIN")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| request_origin(&url));
+        let pod_base = public_pod_base_url(&env, &request_origin(&url));
         provision::provision_pod(&bucket, &kv, name, &pod_base, None).await?;
 
-        let pod_uri = format!("{}/pods/{name}/", pod_base.trim_end_matches('/'));
+        let pod_uri = format!("{pod_base}/pods/{name}/");
         let web_id = format!("{pod_uri}profile/card#me");
         let resp = json_ok(
             &env,
@@ -671,7 +682,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     .map(String::from)
             });
 
-        let pod_base = expected_origin.clone();
+        let pod_base = public_pod_base_url(&env, &nip98_origin);
         provision::provision_pod(
             &bucket,
             &kv,
@@ -681,8 +692,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         )
         .await?;
 
-        let pod_url = format!("{expected_origin}/pods/{owner_pubkey}/");
-        let webid_url = format!("{expected_origin}/pods/{owner_pubkey}/profile/card#me");
+        let pod_url = format!("{pod_base}/pods/{owner_pubkey}/");
+        let webid_url = format!("{pod_url}profile/card#me");
         return json_ok(
             &env,
             &serde_json::json!({
@@ -1621,6 +1632,18 @@ mod tests {
         assert!(!is_valid_worker_pod_name("alice"));
         assert!(!is_valid_worker_pod_name(&"g".repeat(64)));
         assert!(!is_valid_worker_pod_name(&"a".repeat(63)));
+    }
+
+    #[test]
+    fn pod_uri_uses_trimmed_public_base() {
+        let base = "https://pods.example.com/".trim_end_matches('/');
+        let pubkey = "a".repeat(64);
+        let pod_uri = format!("{base}/pods/{pubkey}/");
+        assert_eq!(pod_uri, format!("https://pods.example.com/pods/{pubkey}/"));
+        assert_eq!(
+            format!("{pod_uri}profile/card#me"),
+            format!("https://pods.example.com/pods/{pubkey}/profile/card#me")
+        );
     }
 
     #[test]

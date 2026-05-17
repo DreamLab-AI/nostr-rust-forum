@@ -7,7 +7,16 @@ use serde_json::json;
 use worker::*;
 
 /// Pod base URL template. The pubkey is appended as a path segment.
-const POD_BASE_URL: &str = "https://pods.example.com";
+///
+/// Operators set this through `POD_BASE_URL`; it must point at the public pod
+/// worker origin, not necessarily the frontend/WebAuthn origin.
+fn pod_base_url(env: &Env) -> String {
+    env.var("POD_BASE_URL")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "https://pods.example.com".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
 
 /// Provision a new Solid pod for the given pubkey.
 ///
@@ -97,9 +106,10 @@ pub async fn provision_pod(pubkey: &str, env: &Env) -> Result<PodInfo> {
         .execute()
         .await?;
 
+    let pod_base_url = pod_base_url(env);
     Ok(PodInfo {
-        web_id: format!("{POD_BASE_URL}/{pubkey}/profile/card#me"),
-        pod_url: format!("{POD_BASE_URL}/{pubkey}/"),
+        web_id: format!("{pod_base_url}/pods/{pubkey}/profile/card#me"),
+        pod_url: format!("{pod_base_url}/pods/{pubkey}/"),
     })
 }
 
@@ -135,4 +145,21 @@ pub async fn handle_profile(pubkey: &str, env: &Env, cors: Headers) -> Result<Re
 pub struct PodInfo {
     pub web_id: String,
     pub pod_url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pod_base_urls_are_trimmed_before_appending_pubkey() {
+        let pod_base_url = "https://pods.example.com/".trim_end_matches('/');
+        let pubkey = "a".repeat(64);
+        assert_eq!(
+            format!("{pod_base_url}/pods/{pubkey}/profile/card#me"),
+            format!("https://pods.example.com/pods/{pubkey}/profile/card#me")
+        );
+        assert_eq!(
+            format!("{pod_base_url}/pods/{pubkey}/"),
+            format!("https://pods.example.com/pods/{pubkey}/")
+        );
+    }
 }
