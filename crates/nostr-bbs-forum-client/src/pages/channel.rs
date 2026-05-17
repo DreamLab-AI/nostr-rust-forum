@@ -148,10 +148,40 @@ pub fn ChannelPage() -> impl IntoView {
         };
 
         let channel_info_sig = channel_info;
+        let store_for_kind40 = use_context::<ChannelStore>();
         let on_channel_event = Rc::new(move |event: NostrEvent| {
             if event.kind == 40 {
                 let header = parse_channel_metadata(&event.content);
                 channel_info_sig.set(Some(header));
+
+                // ADR-092: also seed the channel into the global store so the
+                // shared kind-42 resolver can match historical events for
+                // this channel. Without this, a direct deep-link to a
+                // channel that the broad kind-40 query missed never has any
+                // events resolved to it and stays "0 messages".
+                if let Some(store) = store_for_kind40.as_ref() {
+                    let (name, description, picture) =
+                        crate::stores::channels::parse_channel_content(&event.content);
+                    let section = event
+                        .tags
+                        .iter()
+                        .find(|t| t.len() >= 2 && t[0] == "section")
+                        .map(|t| t[1].clone())
+                        .unwrap_or_default();
+                    let meta = crate::stores::channels::ChannelMeta {
+                        id: event.id.clone(),
+                        name,
+                        description,
+                        section,
+                        picture,
+                        created_at: event.created_at,
+                    };
+                    store.channels.update(|list| {
+                        if !list.iter().any(|c| c.id == meta.id) {
+                            list.push(meta);
+                        }
+                    });
+                }
             }
         });
 

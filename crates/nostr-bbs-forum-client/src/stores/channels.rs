@@ -236,6 +236,13 @@ impl ChannelStore {
     /// relay data tags messages with slugs or section names instead of the
     /// kind-40 event id. Client-side resolution matches each event's root
     /// `e` tag value against channel id, name, and section.
+    ///
+    /// ADR-092: the resolver re-reads `channels` *for every event* so that
+    /// channels which arrive later (e.g. via `ChannelPage`'s direct kind-40
+    /// fetch on a deep-link, or a delayed broadcast) can still claim their
+    /// historical kind-42 events. The previous implementation captured the
+    /// lookup maps at subscribe time and silently dropped any event whose
+    /// channel wasn't yet known.
     pub(crate) fn start_msg_sync(&self, relay: &RelayConnection) {
         if self.msg_sub_id.get_untracked().is_some() {
             return;
@@ -246,21 +253,7 @@ impl ChannelStore {
             return;
         }
 
-        // Build lookup maps for client-side channel resolution.
-        // Keys are lowercased for case-insensitive matching.
-        let mut by_id: HashMap<String, String> = HashMap::new();
-        let mut by_name: HashMap<String, String> = HashMap::new();
-        let mut by_section: HashMap<String, String> = HashMap::new();
-        for ch in &channels {
-            by_id.insert(ch.id.clone(), ch.id.clone());
-            if !ch.name.is_empty() {
-                by_name.insert(ch.name.to_lowercase(), ch.id.clone());
-            }
-            if !ch.section.is_empty() {
-                by_section.insert(ch.section.to_lowercase(), ch.id.clone());
-            }
-        }
-
+        let channels_sig = self.channels;
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
         let store = self.clone();
@@ -278,13 +271,21 @@ impl ChannelStore {
                 Some(v) => v,
                 None => return,
             };
+            let tag_lower = tag_val.to_lowercase();
 
-            // Resolve tag value to a known channel id
-            let resolved = by_id
-                .get(&tag_val)
-                .or_else(|| by_name.get(&tag_val.to_lowercase()))
-                .or_else(|| by_section.get(&tag_val.to_lowercase()))
-                .cloned();
+            // Resolve against the CURRENT channel list. `get_untracked` so
+            // we don't subscribe the outer effect to channels here — the
+            // store re-emits this closure for every event, the freshness
+            // comes from the inherent reactivity of the kind-42 stream.
+            let resolved = channels_sig.with_untracked(|list| {
+                list.iter()
+                    .find(|c| {
+                        c.id == tag_val
+                            || c.name.to_lowercase() == tag_lower
+                            || c.section.to_lowercase() == tag_lower
+                    })
+                    .map(|c| c.id.clone())
+            });
 
             if let Some(cid) = resolved {
                 // Store raw event for channel page consumption. Dedup by
