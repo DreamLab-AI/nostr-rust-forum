@@ -85,12 +85,26 @@ pub(crate) fn NotificationBell() -> impl IntoView {
     let legacy_store = use_notifications();
     let panel_open = RwSignal::new(false);
 
+    // Bug #18: route open-state through the shared PopoverCoord so opening
+    // this popover automatically closes any sibling popover (Bookmarks etc.)
+    // Two-way sync — see app.rs::Layout for the parallel bookmarks block.
+    let coord = crate::components::popover_coord::use_popover_coord();
+    const KEY: &str = "notifications";
+    Effect::new(move |_| {
+        panel_open.set(coord.is_active(KEY));
+    });
+    Effect::new(move |_| {
+        if !panel_open.get() {
+            coord.close(KEY);
+        }
+    });
+
     // Combined unread count from both stores
     let legacy_unread = legacy_store.unread_count();
     let v2_unread = v2_store.unread_count();
     let total_unread = Memo::new(move |_| legacy_unread.get() + v2_unread.get());
 
-    let toggle = move |_| panel_open.update(|v| *v = !*v);
+    let toggle = move |_| coord.toggle(KEY);
 
     view! {
         <div class="relative" data-notification-bell="">

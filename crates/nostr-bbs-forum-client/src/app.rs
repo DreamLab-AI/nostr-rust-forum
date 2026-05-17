@@ -251,6 +251,11 @@ pub fn App() -> impl IntoView {
     provide_announcer();
     crate::stores::badges::provide_badges();
     provide_panel_registry();
+    // Popover coordinator: only one header popover (Notifications,
+    // Bookmarks, …) can be open at a time. Bug #18 — clicking one used
+    // to leave the other open *and* intercept the channel cards behind
+    // them.
+    provide_context(crate::components::popover_coord::PopoverCoord::new());
 
     // Provide relay connection as context — connect/disconnect reactively with auth state
     let relay = RelayConnection::new();
@@ -562,6 +567,22 @@ fn Layout(children: Children) -> impl IntoView {
     let profile_target_pk = RwSignal::new(String::new());
     let profile_open = RwSignal::new(false);
 
+    // Bug #18: Bookmarks popover participates in the shared PopoverCoord so
+    // opening it closes Notifications (and vice versa). Two-way sync:
+    // - coord active → reflect into `bookmarks_open` so the modal renders
+    // - `bookmarks_open` cleared by the modal's own close button → tell the
+    //   coordinator so the next toggle behaves correctly.
+    let coord = crate::components::popover_coord::use_popover_coord();
+    const BOOKMARKS_KEY: &str = "bookmarks";
+    Effect::new(move |_| {
+        bookmarks_open.set(coord.is_active(BOOKMARKS_KEY));
+    });
+    Effect::new(move |_| {
+        if !bookmarks_open.get() {
+            coord.close(BOOKMARKS_KEY);
+        }
+    });
+
     // Watch for profile modal requests from any component
     Effect::new(move |_| {
         if let Some(target) = use_context::<ProfileModalTarget>() {
@@ -711,7 +732,7 @@ fn Layout(children: Children) -> impl IntoView {
                             <NotificationBell />
                             <button
                                 class="text-gray-400 hover:text-amber-400 transition-colors p-2 rounded-lg hover:bg-gray-800"
-                                on:click=move |_| bookmarks_open.set(true)
+                                on:click=move |_| coord.toggle(BOOKMARKS_KEY)
                                 title="Bookmarks"
                             >
                                 <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

@@ -17,6 +17,7 @@ pub mod badge;
 pub mod confirm_dialog;
 pub mod empty_state;
 pub mod modal;
+pub mod popover_coord;
 pub mod toast;
 
 // -- Rich Messages (Stream 2) ------------------------------------------------
