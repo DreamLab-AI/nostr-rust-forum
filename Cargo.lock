@@ -2062,6 +2062,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "sha2",
+ "solid-pod-rs",
  "thiserror 2.0.18",
  "uuid",
  "wasm-bindgen",
@@ -3387,8 +3388,7 @@ dependencies = [
 [[package]]
 name = "solid-pod-rs"
 version = "0.4.0-alpha.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e6071cfd2df1ed3db45a524bf7b13dec3dbcc6489720b89ce5ae6c4331aea1a"
+source = "git+https://github.com/DreamLab-AI/solid-pod-rs.git?rev=635b780faf1fc6f5563a35189c1f6e33d4c3f287#635b780faf1fc6f5563a35189c1f6e33d4c3f287"
 dependencies = [
  "async-trait",
  "base64",
