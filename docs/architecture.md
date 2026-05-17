@@ -44,6 +44,94 @@ sequenceDiagram
 | `nostr-bbs-search-worker` | R2, KV (SEARCH_CONFIG) | Vector indexing in RVF binary format, in-memory cosine k-NN search, NIP-50 search protocol, rate limiting |
 | `nostr-bbs-preview-worker` | KV (RATE_LIMIT) | URL metadata extraction, Open Graph and oEmbed parsing, SSRF protection (private IP rejection, redirect limits), response caching |
 
+## Pod Storage Tiers
+
+NRF operates two independent pod storage tiers. Users are assigned to one tier
+at provisioning time; the pod browser auto-discovers which tiers are available
+on mount.
+
+```
+Browser (WASM)
+    │
+    ├─── NIP-98 signed ──► CF Workers tier (pods.dreamlab-ai.com)
+    │                        nostr-bbs-pod-worker
+    │                        Storage: R2 + KV
+    │                        Git: No (returns 501 on /_git/*)
+    │                        Provisioned: automatically at registration
+    │
+    └─── NIP-98 signed ──► Native tier (pods-native.dreamlab-ai.com)
+                             solid-pod-rs-server --features git
+                             Storage: host filesystem
+                             Git: Yes (/_git/<pubkey>/ smart HTTP)
+                             /.well-known/apps: Yes (JSS #464)
+                             Provisioned: admin action via auth-worker PSK
+                             Transport: Cloudflare Tunnel (zero-config TLS)
+```
+
+### Trust bridge
+
+Both tiers verify requests using NIP-98 Schnorr signatures over the user's
+secp256k1 pubkey. The signature is self-contained — it covers the URL, HTTP
+method, and optional body hash — so each tier verifies independently from the
+same pubkey. No token exchange and no cross-tier session sharing is required.
+
+### WebID-based tier routing
+
+Each user's WebID document includes a `pod_base_url` field that encodes which
+tier they are on:
+
+| Tier | WebID URL | `pod_base_url` value |
+|------|-----------|---------------------|
+| CF Workers | `https://pods.dreamlab-ai.com/{pubkey}/profile/card#me` | `https://pods.dreamlab-ai.com` |
+| Native | `https://pods-native.dreamlab-ai.com/{pubkey}/profile/card#me` | `https://pods-native.dreamlab-ai.com` |
+
+Consumers that need to resolve a user's pod storage root (e.g. link-preview
+worker, external Solid clients) dereference the WebID and read `pod_base_url`
+rather than assuming a fixed hostname.
+
+### Pod browser auto-probe
+
+`pages/pod_browser.rs` mounts two independent `Effect::new` probes on
+component load:
+
+1. **CF probe** — always runs; calls `{CF_POD_URL}/{pubkey}/` and renders the
+   standard pod card (LDP container listing, quota, WAC ACL editor).
+2. **Native probe** — runs only when the `NATIVE_POD_URL` build-time env var
+   is set and the authenticated user's cohort is in `[native_pod].allowlist_cohorts`;
+   calls `{NATIVE_POD_URL}/{pubkey}/` and renders a second pod card with a git
+   badge, `git clone` URL, and `AppManifestPanel` (JSS #464 app index).
+
+Each probe fails independently; a network error or 404 on one does not suppress
+the other. On CF-only deployments where `NATIVE_POD_URL` is unset, the native
+probe is never scheduled.
+
+### Cloudflare Tunnel
+
+The native `solid-pod-rs-server` instance runs in the agentbox container and is
+exposed via a Cloudflare Tunnel at `pods-native.dreamlab-ai.com`. The tunnel
+terminates TLS at the Cloudflare edge and forwards plaintext to the container on
+an internal port — no public inbound port is opened on the host, and no TLS
+certificate management is required on the operator side.
+
+### Admin provisioning
+
+Native pods are provisioned on demand by an administrator. The provisioning
+path is:
+
+```
+Admin UI  →  POST /api/native-pod/provision  →  auth-worker
+                                                  │ X-Pod-Admin-Key (PSK)
+                                                  ↓
+                                         POST /_admin/provision/{pubkey}
+                                              (native server)
+                                                  │
+                                         mkdir + .acl + git init -b main
+```
+
+The pre-shared key (`X-Pod-Admin-Key`) is stored in `ADMIN_KV` and never
+returned to clients. See ADR-093 for the full decision record and PSK
+rotation procedure.
+
 ## Data Flow
 
 ```mermaid
