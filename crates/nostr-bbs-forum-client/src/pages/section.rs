@@ -27,6 +27,35 @@ struct SectionHeader {
     channel_id: String,
 }
 
+/// Map a zone slug to its display name. Mirrors the table in
+/// `pages/category.rs::display_name` — keep in sync.
+/// Bug #22: avoid showing URL slug "Private" when zone is "Minimoonoir".
+fn category_display_name(slug: &str) -> String {
+    match slug {
+        "home" => "Home".to_string(),
+        "members" => "Members".to_string(),
+        "private" => "Minimoonoir".to_string(),
+        other => capitalize(other),
+    }
+}
+
+/// Humanise a section slug for breadcrumb display. `home-lobby` → `Lobby`.
+/// Bug #24: avoid breadcrumb leaf reading `Home-lobby` (kebab-cased URL).
+fn humanize_section_slug(slug: &str) -> String {
+    let suffix = slug.split_once('-').map(|(_, s)| s).unwrap_or(slug);
+    suffix
+        .split('-')
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().to_string() + chars.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[component]
 pub fn SectionPage() -> impl IntoView {
     let relay = expect_context::<RelayConnection>();
@@ -284,9 +313,15 @@ pub fn SectionPage() -> impl IntoView {
                         <Breadcrumb items=vec![
                             BreadcrumbItem::link("Home", "/"),
                             BreadcrumbItem::link("Forums", "/forums"),
-                            BreadcrumbItem::link(capitalize(&category_slug()), format!("/forums/{}", category_slug())),
+                            BreadcrumbItem::link(
+                                category_display_name(&category_slug()),
+                                format!("/forums/{}", category_slug()),
+                            ),
                             BreadcrumbItem::current(
-                                section_info.get_untracked().map(|i| i.name).unwrap_or_else(|| capitalize(&section_slug()))
+                                section_info
+                                    .get_untracked()
+                                    .map(|i| i.name)
+                                    .unwrap_or_else(|| humanize_section_slug(&section_slug()))
                             ),
                         ] />
 

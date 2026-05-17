@@ -167,9 +167,20 @@ pub fn ProfilePage() -> impl IntoView {
     let display_name = Memo::new(move |_| {
         let pk = pubkey.get();
         let m = meta.get();
-        m.display_name
-            .or(m.name)
-            .unwrap_or_else(|| use_display_name(&pk))
+        let candidate = m.display_name.or(m.name);
+        if let Some(name) = candidate.filter(|s| !s.trim().is_empty()) {
+            return name;
+        }
+        // Fallback chain: profile-cache → short hex → npub short form.
+        // Empty h1 was an a11y defect; SR users landed on a nameless page.
+        let lookup = use_display_name(&pk);
+        if !lookup.trim().is_empty() {
+            return lookup;
+        }
+        if !pk.is_empty() {
+            return crate::utils::shorten_pubkey(&pk);
+        }
+        "Profile".to_string()
     });
 
     let on_dm = move |_| {

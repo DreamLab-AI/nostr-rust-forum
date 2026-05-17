@@ -382,7 +382,10 @@ pub fn CategoryPage() -> impl IntoView {
             <Breadcrumb items=vec![
                 BreadcrumbItem::link("Home", "/"),
                 BreadcrumbItem::link("Forums", "/forums"),
-                BreadcrumbItem::current(capitalize(&category_slug())),
+                // Use the same display-name mapping as the hero so the
+                // breadcrumb reads e.g. "Minimoonoir" not "Private"
+                // (Bug #22).
+                BreadcrumbItem::current(display_name()),
             ] />
 
             // New Topic button + inline form
