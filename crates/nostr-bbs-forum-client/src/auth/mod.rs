@@ -182,7 +182,7 @@ impl AuthStore {
     /// constructed inside the closure and dropped (+ zeroized) before
     /// returning. This prevents the 32-byte secret from being copied
     /// onto arbitrary WASM stack frames in calling code.
-    pub fn sign_event(&self, event: UnsignedEvent) -> Result<NostrEvent, String> {
+    pub fn sign_event(&self, mut event: UnsignedEvent) -> Result<NostrEvent, String> {
         self.privkey.with_value(|opt| {
             let v = opt.as_ref().ok_or("No signing key available")?;
             if v.len() != 32 {
@@ -193,6 +193,14 @@ impl AuthStore {
             let signing_key = k256::schnorr::SigningKey::from_bytes(&key_bytes)
                 .map_err(|e| format!("Invalid signing key: {e}"))?;
             key_bytes.zeroize();
+            // Auto-populate pubkey when caller left it blank. The relay's
+            // NIP-42 AUTH builder constructs the unsigned event without a
+            // pubkey because it has no access to the auth store — fill it
+            // in here from the verifying key so core's `sign_event` doesn't
+            // bounce on PubkeyMismatch.
+            if event.pubkey.is_empty() {
+                event.pubkey = hex::encode(signing_key.verifying_key().to_bytes());
+            }
             nostr_bbs_core::sign_event(event, &signing_key)
                 .map_err(|e| format!("Signing failed: {e}"))
         })
