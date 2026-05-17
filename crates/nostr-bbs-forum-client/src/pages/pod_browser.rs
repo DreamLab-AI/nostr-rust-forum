@@ -434,52 +434,67 @@ pub fn PodBrowserPage() -> impl IntoView {
                     </div>
                 }.into_any(),
 
-                GitProbeState::Available { branch } => view! {
-                    <section
-                        data-section="git-pod"
-                        aria-labelledby="git-pod-heading"
-                        class="mb-6 bg-gradient-to-br from-amber-500/10 to-orange-500/5 border border-amber-400/20 rounded-lg p-4"
-                    >
-                        <div class="flex items-center gap-2 mb-2">
-                            <svg class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <circle cx="12" cy="12" r="3"/>
-                                <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
-                            </svg>
-                            <h2 id="git-pod-heading" class="text-base font-semibold text-white">
-                                {format!("Your pod is a git repository · branch: {branch}")}
-                            </h2>
-                        </div>
-                        <p class="text-sm text-gray-300 mb-3">
-                            "Clone, push, and pull your pod with standard git. "
-                            <code class="text-xs bg-gray-800 px-1.5 py-0.5 rounded text-amber-300">"receive.denyCurrentBranch=updateInstead"</code>
-                            " — push and the working tree updates server-side."
-                        </p>
-                        <div class="bg-gray-900/80 border border-gray-700/50 rounded px-3 py-2 mb-3">
-                            <code data-testid="pod-clone-command" class="text-xs text-amber-300 font-mono break-all">
-                                {move || pod_clone_command.get()}
-                            </code>
-                        </div>
-                        <div class="flex flex-wrap items-center gap-2">
-                            <button
-                                data-testid="pod-clone-copy"
-                                on:click=on_copy_clone
-                                class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-3 py-1.5 rounded-md transition-colors"
+                GitProbeState::Available { branch } => {
+                    let branch_signal = Signal::derive({
+                        let branch = branch.clone();
+                        move || branch.clone()
+                    });
+                    view! {
+                        <div>
+                            <section
+                                data-section="git-pod"
+                                aria-labelledby="git-pod-heading"
+                                class="mb-4 bg-gradient-to-br from-amber-500/10 to-orange-500/5 border border-amber-400/20 rounded-lg p-4"
                             >
-                                "Copy clone command"
-                            </button>
-                            <button
-                                data-testid="pod-git-probe"
-                                on:click=on_probe_git
-                                class="text-sm bg-gray-700 hover:bg-gray-600 text-gray-100 font-medium px-3 py-1.5 rounded-md transition-colors"
-                            >
-                                "Re-check"
-                            </button>
+                                <div class="flex items-center gap-2 mb-2">
+                                    <svg class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <circle cx="12" cy="12" r="3"/>
+                                        <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
+                                    </svg>
+                                    <h2 id="git-pod-heading" class="text-base font-semibold text-white">
+                                        {format!("Your pod is a git repository · branch: {branch}")}
+                                    </h2>
+                                </div>
+                                <p class="text-sm text-gray-300 mb-3">
+                                    "Clone, push, and pull your pod with standard git. "
+                                    <code class="text-xs bg-gray-800 px-1.5 py-0.5 rounded text-amber-300">"receive.denyCurrentBranch=updateInstead"</code>
+                                    " — push and the working tree updates server-side."
+                                </p>
+                                <div class="bg-gray-900/80 border border-gray-700/50 rounded px-3 py-2 mb-3">
+                                    <code data-testid="pod-clone-command" class="text-xs text-amber-300 font-mono break-all">
+                                        {move || pod_clone_command.get()}
+                                    </code>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <button
+                                        data-testid="pod-clone-copy"
+                                        on:click=on_copy_clone
+                                        class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-3 py-1.5 rounded-md transition-colors"
+                                    >
+                                        "Copy clone command"
+                                    </button>
+                                    <button
+                                        data-testid="pod-git-probe"
+                                        on:click=on_probe_git
+                                        class="text-sm bg-gray-700 hover:bg-gray-600 text-gray-100 font-medium px-3 py-1.5 rounded-md transition-colors"
+                                    >
+                                        "Re-check"
+                                    </button>
+                                </div>
+                                <p class="text-xs text-gray-500 mt-3">
+                                    "Powered by solid-pod-rs · git feature enabled on this deployment."
+                                </p>
+                            </section>
+                            <crate::components::git_panel::GitPanel
+                                pod_base_url=pod_base_url
+                                branch=branch_signal
+                            />
+                            <crate::components::git_panel::AppManifestPanel
+                                pod_base_url=pod_base_url
+                            />
                         </div>
-                        <p class="text-xs text-gray-500 mt-3">
-                            "Powered by solid-pod-rs · git feature enabled on this deployment."
-                        </p>
-                    </section>
-                }.into_any(),
+                    }.into_any()
+                },
 
                 GitProbeState::Unavailable => view! {
                     <div

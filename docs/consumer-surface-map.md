@@ -1,7 +1,7 @@
 # NRF → solid-pod-rs Consumer Surface Map
 
-**Generated:** 2026-05-17 (JSS v0.0.197 alignment pass)
-**Pin:** `solid-pod-rs` git commit `8668792` (workspace, `default-features = false, features = ["core"]`)
+**Generated:** 2026-05-17 (3.0.0-rc10 / git control panel + JSS #464)
+**Pin:** `solid-pod-rs` git commit `4ac7670` (alpha.14, `default-features = false, features = ["core"]`)
 **Purpose:** Track every NRF call into `solid_pod_rs::*` so upstream Solid/JSS
 parity bumps can be audited at a glance. Re-export shims are surfaces NRF
 re-publishes verbatim per the ADR-076/078 absorption; internal uses are call
@@ -18,6 +18,7 @@ sites the kit consumes but does not re-export.
 | `nostr-bbs-pod-worker/src/payments.rs:31` | `solid_pod_rs::payments::{balance_response, parse_txo_uri, pay_info, payment_required_body, pubkey_to_did, webledgers_discovery, ChainConfig, PayConfig, PaymentError, PaymentStore, TokenConfig, WebLedger}` | Re-export shim (public API) |
 | `nostr-bbs-core/src/did.rs:13` | `solid_pod_rs::did_nostr_types` (aliased `upstream`) | Internal wrapper (kit adds adapters on top) |
 | `nostr-bbs-forum-client/src/pages/{signup,pod_browser,settings}.rs` | `solid_pod_rs::webid::{webid_url, pod_git_clone_url}` | Internal URL builder use; avoids hand-rolled pod/WebID/git URL strings in user-facing WASM |
+| `nostr-bbs-forum-client/src/components/git_panel.rs` | `/_git/{pk}/*` REST API (solid-pod-rs-server, feature `git`) + `/.well-known/apps` (JSS #464) | Forum git control panel calls server-side endpoints; no direct `solid_pod_rs::` import (REST boundary); only available on native server deployments (ADR-089) |
 | `nostr-bbs-pod-worker/src/provision.rs` (docs only) | mirrors `solid_pod_rs::provision::*` constants/paths | Documentation reference (no `use` line — kit re-implements equivalents) |
 
 ## Worker-local mirrors

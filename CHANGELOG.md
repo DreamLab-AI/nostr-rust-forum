@@ -6,9 +6,27 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 and this project tracks the spec home at [VisionClaw monorepo](https://github.com/DreamLab-AI/VisionClaw)
 (`docs/specs/` + `docs/adr/`) for cross-substrate normative decisions.
 
-## [Unreleased]
+## [3.0.0-rc10] - 2026-05-17
 
 ### Added
+
+- **Git control panel** (`components/git_panel.rs`): VS Code–style Source
+  Control panel for in-pod git repositories. Staged/unstaged/untracked file
+  sections with per-file stage, unstage, discard, and inline diff viewer
+  (green/red syntax colouring). Commit textarea + button. Lazy-loaded commit
+  history. Busy guard prevents concurrent mutations. Shows "Git API not
+  available" gracefully on CF Workers (HTTP 404/501).
+- **App manifest panel** (JSS #464): `AppManifestPanel` below the git card;
+  GET/PUT `{pod}/apps/manifest.json` with NIP-98 auth. Enables pods as
+  first-class app distribution repositories.
+- **Auto-probe on pod mount**: `pod_browser` fires a one-shot `Effect::new`
+  when `pod_base_url` and signer are ready. No manual "Check Git" button.
+  `Available` → git card + panels; `Unavailable` → compact note; `Probing` →
+  spinner. CF Workers settle immediately to `Unavailable`.
+- **solid-pod-rs pinned to alpha.14** (`rev = "4ac7670"`): nine `/_git/*`
+  REST endpoints, `/.well-known/apps` discovery, GAP-ANALYSIS E.1 SHIPPED.
+
+### Fixed
 
 - **JSS v0.0.197 pod HTTP parity for the Worker tier**: Solid-compatible CORS
   envelope, `WWW-Authenticate` on 401 responses, notification discovery via
@@ -16,9 +34,6 @@ and this project tracks the spec home at [VisionClaw monorepo](https://github.co
   podUri }`.
 - **Provisioned media containers**: new pods now include `media/` and
   `media/public/`, matching the forum-client image upload destination.
-
-### Fixed
-
 - **Pod browser TypeIndex link** now points at
   `/settings/publicTypeIndex.jsonld`, matching the provisioned Solid document.
 

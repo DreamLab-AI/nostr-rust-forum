@@ -98,3 +98,6 @@ pub mod admin_checklist;
 // -- Onboarding & Badges (Phase 2 P1) --------------------------------------
 pub mod badge_display;
 pub mod onboarding_modal;
+
+// -- Git Source Control + App Manifest (JSS Phase 1 / ADR-089) -------------
+pub mod git_panel;
