@@ -294,9 +294,9 @@ pub fn PodBrowserPage() -> impl IntoView {
 
     // Probe `<pod_base>/HEAD` (NOT `.git/HEAD`; smart-HTTP-style serves the
     // refs at the root in solid-pod-rs-git's design). 200 means git-init
-    // ran at provisioning; 404 means this operator's tier doesn't support
-    // it. Idempotent; safe to call repeatedly.
-    let on_probe_git = move |_| {
+    // ran at provisioning; 404 / 501 means this operator's tier doesn't
+    // support it. Idempotent; safe to call repeatedly.
+    let run_git_probe = move || {
         let Some(base) = pod_base_url.get() else {
             return;
         };
@@ -308,7 +308,6 @@ pub fn PodBrowserPage() -> impl IntoView {
         wasm_bindgen_futures::spawn_local(async move {
             match pod_fetch(&url, &*signer).await {
                 Ok(body) => {
-                    // Format: `ref: refs/heads/<branch>\n`
                     let branch = body
                         .trim()
                         .strip_prefix("ref: refs/heads/")
@@ -320,9 +319,8 @@ pub fn PodBrowserPage() -> impl IntoView {
                         git_probe.set(GitProbeState::Available { branch });
                     }
                 }
-                // 404: LDP path not found (no git-init ran at provisioning).
-                // 501: pod-worker built without git support (CF Workers or
-                //      `--features git` not set in the server build).
+                // 404: no git-init ran at provisioning (native tier, feature
+                //      flag off). 501: CF Workers tier (ADR-089 limitation).
                 Err(e) if e.contains("404") || e.contains("501") => {
                     git_probe.set(GitProbeState::Unavailable)
                 }
@@ -330,6 +328,21 @@ pub fn PodBrowserPage() -> impl IntoView {
             }
         });
     };
+
+    // Auto-probe once as soon as the pod URL is known.
+    Effect::new(move |ran: Option<bool>| {
+        if ran == Some(true) {
+            return true; // already fired
+        }
+        if pod_base_url.get().is_some() && auth.get_signer().is_some() {
+            run_git_probe();
+            true
+        } else {
+            false
+        }
+    });
+
+    let on_probe_git = move |_| run_git_probe();
 
     let navigate_to = move |path: String| {
         resource_content.set(None);
@@ -409,80 +422,97 @@ pub fn PodBrowserPage() -> impl IntoView {
                 </p>
             </div>
 
-            // Git pod card (ADR-089). Per-user pods become clone-able git
-            // repositories on deployments that ran `git init` at provisioning.
-            // The CF Workers tier can't subprocess, so the URL still renders
-            // but resolves only when the operator's backend supports it.
-            <section
-                data-section="git-pod"
-                aria-labelledby="git-pod-heading"
-                class="mb-6 bg-gradient-to-br from-amber-500/10 to-orange-500/5 border border-amber-400/20 rounded-lg p-4"
-            >
-                <div class="flex items-center gap-2 mb-2">
-                    <svg class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="3"/>
-                        <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
-                    </svg>
-                    <h2 id="git-pod-heading" class="text-base font-semibold text-white">"Your pod is a git repository"</h2>
-                </div>
-                <p class="text-sm text-gray-300 mb-3">
-                    "Clone, push, and pull your pod with standard git. Branch defaults to "
-                    <code class="text-xs bg-gray-800 px-1.5 py-0.5 rounded text-amber-300">"main"</code>
-                    " with "
-                    <code class="text-xs bg-gray-800 px-1.5 py-0.5 rounded text-amber-300">"receive.denyCurrentBranch=updateInstead"</code>
-                    " — clone, edit, push, and the working tree updates server-side."
-                </p>
-                <div class="bg-gray-900/80 border border-gray-700/50 rounded px-3 py-2 mb-3">
-                    <code data-testid="pod-clone-command" class="text-xs text-amber-300 font-mono break-all">
-                        {move || pod_clone_command.get()}
-                    </code>
-                </div>
-                <div class="flex flex-wrap items-center gap-2">
-                    <button
-                        data-testid="pod-clone-copy"
-                        on:click=on_copy_clone
-                        class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-3 py-1.5 rounded-md transition-colors"
+            // Git pod card (ADR-089). Shown only when the probe confirms git
+            // is available; CF Workers returns 501 → Unavailable → no card.
+            {move || match git_probe.get() {
+                GitProbeState::Idle => view! { <div></div> }.into_any(),
+
+                GitProbeState::Probing => view! {
+                    <div class="mb-6 flex items-center gap-2 text-sm text-gray-500 py-2">
+                        <div class="animate-spin rounded-full h-4 w-4 border-b-2 border-amber-400/50"></div>
+                        "Checking git status…"
+                    </div>
+                }.into_any(),
+
+                GitProbeState::Available { branch } => view! {
+                    <section
+                        data-section="git-pod"
+                        aria-labelledby="git-pod-heading"
+                        class="mb-6 bg-gradient-to-br from-amber-500/10 to-orange-500/5 border border-amber-400/20 rounded-lg p-4"
                     >
-                        "Copy clone command"
-                    </button>
-                    <button
-                        data-testid="pod-git-probe"
-                        on:click=on_probe_git
-                        class="text-sm bg-gray-700 hover:bg-gray-600 text-gray-100 font-medium px-3 py-1.5 rounded-md transition-colors disabled:opacity-50"
-                        disabled=move || matches!(git_probe.get(), GitProbeState::Probing)
+                        <div class="flex items-center gap-2 mb-2">
+                            <svg class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="3"/>
+                                <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
+                            </svg>
+                            <h2 id="git-pod-heading" class="text-base font-semibold text-white">
+                                {format!("Your pod is a git repository · branch: {branch}")}
+                            </h2>
+                        </div>
+                        <p class="text-sm text-gray-300 mb-3">
+                            "Clone, push, and pull your pod with standard git. "
+                            <code class="text-xs bg-gray-800 px-1.5 py-0.5 rounded text-amber-300">"receive.denyCurrentBranch=updateInstead"</code>
+                            " — push and the working tree updates server-side."
+                        </p>
+                        <div class="bg-gray-900/80 border border-gray-700/50 rounded px-3 py-2 mb-3">
+                            <code data-testid="pod-clone-command" class="text-xs text-amber-300 font-mono break-all">
+                                {move || pod_clone_command.get()}
+                            </code>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button
+                                data-testid="pod-clone-copy"
+                                on:click=on_copy_clone
+                                class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-3 py-1.5 rounded-md transition-colors"
+                            >
+                                "Copy clone command"
+                            </button>
+                            <button
+                                data-testid="pod-git-probe"
+                                on:click=on_probe_git
+                                class="text-sm bg-gray-700 hover:bg-gray-600 text-gray-100 font-medium px-3 py-1.5 rounded-md transition-colors"
+                            >
+                                "Re-check"
+                            </button>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-3">
+                            "Powered by solid-pod-rs · git feature enabled on this deployment."
+                        </p>
+                    </section>
+                }.into_any(),
+
+                GitProbeState::Unavailable => view! {
+                    <div
+                        data-section="git-pod-unavailable"
+                        class="mb-6 flex items-center justify-between gap-3 text-xs text-gray-600 bg-gray-800/30 border border-gray-700/30 rounded-lg px-4 py-2.5"
                     >
-                        {move || match git_probe.get() {
-                            GitProbeState::Probing => "Checking…",
-                            GitProbeState::Available { .. } => "Re-check status",
-                            _ => "Check status",
-                        }}
-                    </button>
-                    <span data-testid="pod-git-status" class="text-xs">
-                        {move || match git_probe.get() {
-                            GitProbeState::Idle => view! { <span class="text-gray-500">""</span> }.into_any(),
-                            GitProbeState::Probing => view! { <span class="text-gray-400">"probing…"</span> }.into_any(),
-                            GitProbeState::Available { branch } => view! {
-                                <span class="text-green-400">
-                                    {format!("✓ git-init OK on branch {branch}")}
-                                </span>
-                            }.into_any(),
-                            GitProbeState::Unavailable => view! {
-                                <span class="text-amber-400" title="Operator has not enabled git-init at provisioning (e.g. CF Workers tier — see ADR-089)">
-                                    "✕ git-init not enabled on this deployment"
-                                </span>
-                            }.into_any(),
-                            GitProbeState::Error(e) => view! {
-                                <span class="text-red-400">{format!("error: {e}")}</span>
-                            }.into_any(),
-                        }}
-                    </span>
-                </div>
-                <p class="text-xs text-gray-500 mt-3">
-                    "Powered by "
-                    <code class="text-amber-300">"solid-pod-rs ≥ 0.4.0-alpha.12"</code>
-                    " · ADR-089 covers the CF Workers limitation."
-                </p>
-            </section>
+                        <span>
+                            "Git HTTP not available on this deployment "
+                            <span class="text-gray-700">"(CF Workers tier — see ADR-089)"</span>
+                        </span>
+                        <button
+                            data-testid="pod-git-probe"
+                            on:click=on_probe_git
+                            class="text-gray-600 hover:text-gray-400 transition-colors underline underline-offset-2 flex-shrink-0"
+                        >
+                            "Re-check"
+                        </button>
+                    </div>
+                }.into_any(),
+
+                GitProbeState::Error(e) => view! {
+                    <div class="mb-6 flex items-center justify-between gap-3 text-xs text-red-500/70 bg-gray-800/30 border border-gray-700/30 rounded-lg px-4 py-2.5">
+                        <span>{format!("Git probe error: {e}")}</span>
+                        <button
+                            data-testid="pod-git-probe"
+                            on:click=on_probe_git
+                            class="text-gray-600 hover:text-gray-400 transition-colors underline underline-offset-2 flex-shrink-0"
+                        >
+                            "Retry"
+                        </button>
+                    </div>
+                }.into_any(),
+            }}
 
             // Quick-access cards
             <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
