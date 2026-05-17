@@ -149,16 +149,20 @@ pub fn ChannelPage() -> impl IntoView {
 
         let channel_info_sig = channel_info;
         let store_for_kind40 = use_context::<ChannelStore>();
+        let relay_for_retry = relay_for_sub.clone();
         let on_channel_event = Rc::new(move |event: NostrEvent| {
             if event.kind == 40 {
                 let header = parse_channel_metadata(&event.content);
                 channel_info_sig.set(Some(header));
 
-                // ADR-092: also seed the channel into the global store so the
-                // shared kind-42 resolver can match historical events for
-                // this channel. Without this, a direct deep-link to a
-                // channel that the broad kind-40 query missed never has any
-                // events resolved to it and stays "0 messages".
+                // ADR-092: seed the channel into the global store so the
+                // shared kind-42 resolver can match historical events. Also
+                // open a *retry* kind-42 sub keyed on all known identifiers
+                // (hex id + name + section) — the broad kind-42 sub fires
+                // before this kind-40-by-id query completes, so any events
+                // for this channel that arrived earlier were dropped by the
+                // resolver (channel wasn't in store.channels yet). The retry
+                // sub replays them.
                 if let Some(store) = store_for_kind40.as_ref() {
                     let (name, description, picture) =
                         crate::stores::channels::parse_channel_content(&event.content);
@@ -170,9 +174,9 @@ pub fn ChannelPage() -> impl IntoView {
                         .unwrap_or_default();
                     let meta = crate::stores::channels::ChannelMeta {
                         id: event.id.clone(),
-                        name,
+                        name: name.clone(),
                         description,
-                        section,
+                        section: section.clone(),
                         picture,
                         created_at: event.created_at,
                     };
@@ -181,6 +185,74 @@ pub fn ChannelPage() -> impl IntoView {
                             list.push(meta);
                         }
                     });
+
+                    // Replay historical kind-42 events for this channel via a
+                    // narrow filter on all identifier variants. The store's
+                    // on_msg resolver (channels-reactive) will route them.
+                    let last_active = store.last_active;
+                    let channel_msgs = store.channel_messages;
+                    let channels_sig = store.channels;
+                    let cid_for_replay = event.id.clone();
+                    let on_replay = Rc::new(move |ev: NostrEvent| {
+                        if ev.kind != 42 {
+                            return;
+                        }
+                        let tag_val = ev
+                            .tags
+                            .iter()
+                            .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
+                            .or_else(|| ev.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
+                            .map(|t| t[1].clone());
+                        let tag_val = match tag_val {
+                            Some(v) => v,
+                            None => return,
+                        };
+                        let tag_lower = tag_val.to_lowercase();
+                        let resolved = channels_sig.with_untracked(|list| {
+                            list.iter()
+                                .find(|c| {
+                                    c.id == tag_val
+                                        || c.name.to_lowercase() == tag_lower
+                                        || c.section.to_lowercase() == tag_lower
+                                })
+                                .map(|c| c.id.clone())
+                        });
+                        let cid_match = resolved.unwrap_or_else(|| cid_for_replay.clone());
+                        let mut newly_added = false;
+                        let event_ts = ev.created_at;
+                        channel_msgs.update(|m| {
+                            let events = m.entry(cid_match.clone()).or_insert_with(Vec::new);
+                            if !events.iter().any(|e| e.id == ev.id) {
+                                events.push(ev);
+                                events.sort_by_key(|e| e.created_at);
+                                newly_added = true;
+                            }
+                        });
+                        if newly_added {
+                            last_active.update(|m| {
+                                let ts = m.entry(cid_match).or_insert(0);
+                                if event_ts > *ts {
+                                    *ts = event_ts;
+                                }
+                            });
+                        }
+                    });
+                    let mut needles: Vec<String> = vec![event.id.clone()];
+                    if !name.is_empty() {
+                        needles.push(name);
+                    }
+                    if !section.is_empty() {
+                        needles.push(section);
+                    }
+                    let _ = relay_for_retry.subscribe(
+                        vec![Filter {
+                            kinds: Some(vec![42]),
+                            e_tags: Some(needles),
+                            ..Default::default()
+                        }],
+                        on_replay,
+                        None,
+                    );
                 }
             }
         });
