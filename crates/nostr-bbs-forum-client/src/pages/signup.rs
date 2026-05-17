@@ -297,9 +297,13 @@ pub fn SignupPage() -> impl IntoView {
         navigate.with_value(|nav| nav(&dest, NavigateOptions::default()));
     });
 
-    // Redirect if already authenticated AND not mid-signup.
+    // Redirect if already authenticated AND not in the middle of the new
+    // wizard. Crucially we hold the user inside Phases 2 and 3 (profile +
+    // backup) — they only flow to `/forums` via the explicit on_backup_done
+    // callback. Pre-existing returning users (no signup in flight, is_busy
+    // never set) still get the redirect.
     Effect::new(move |_| {
-        if is_authed.get() && phase.get() == Phase::Identity {
+        if is_authed.get() && phase.get() == Phase::Identity && !is_busy.get() {
             let dest = return_to();
             navigate.with_value(|nav| nav(&dest, NavigateOptions::default()));
         }
