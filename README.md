@@ -1,9 +1,11 @@
-# nostr-rust-forum -- Decentralized Forum Kit on Nostr
+# nostr-rust-forum — Decentralized Forum Kit on Nostr
 
 A full-stack, open-source forum kit built on the Nostr protocol. Passkey-first
 authentication, Solid pod storage, config-driven zone access, and Cloudflare
-Workers backend -- all in Rust. Operators consume this kit by creating a
+Workers backend — all in Rust. Operators consume this kit by creating a
 `forum-config/` package that overlays branding, zones, and deployment config.
+
+**Maintainer**: [John O'Hare](https://github.com/jjohare) · **Upstream IP**: [Melvin Carvalho](https://github.com/melvincarvalho) ([JSS](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer), [DID:Nostr](https://github.com/nicholasgasior/did-nostr)) · [MAINTAINERS.md](MAINTAINERS.md)
 
 **Current release:** `v3.0.0-rc7` (see [CHANGELOG.md](CHANGELOG.md))
 
