@@ -37,6 +37,8 @@ See [`src/schema.rs`](src/schema.rs) for the canonical schema. Major sections:
 | `[features]`   | optional UI features                                           |
 | `[custody]`    | operator tier (tier-1 .. tier-4 per ADR-079)                   |
 | `[governance]` | Agent Control Surface settings: agent registry mode, default rate limit, governance API path |
+| `[nip05]`      | NIP-05 resolver mode, pod base URL, fallback timeout, CORS (ADR-086) |
+| `[native_pod]` | Native solid-pod-rs (agentbox) tier: enabled, base URL, allowlist cohorts, git, admin provisioning URL (ADR-093) |
 
 ## Validation
 

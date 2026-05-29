@@ -1,7 +1,7 @@
 # NRF → solid-pod-rs Consumer Surface Map
 
-**Generated:** 2026-05-17 (3.0.0-rc10 / git control panel + JSS #464)
-**Pin:** `solid-pod-rs` git commit `4ac7670` (alpha.14, `default-features = false, features = ["core"]`)
+**Generated:** 2026-05-17 (3.0.0-rc11 / git control panel + JSS #464 + native pod tier)
+**Pin:** `solid-pod-rs` `0.4.0-alpha.15` from crates.io (`default-features = false, features = ["core"]`; superseded git revs `4ac7670` alpha.14 / `8668792`)
 **Purpose:** Track every NRF call into `solid_pod_rs::*` so upstream Solid/JSS
 parity bumps can be audited at a glance. Re-export shims are surfaces NRF
 re-publishes verbatim per the ADR-076/078 absorption; internal uses are call

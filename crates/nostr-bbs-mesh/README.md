@@ -34,6 +34,54 @@ themselves.
         │                                       │
 ```
 
+## Tailscale Transport
+
+### Alternative to public relays
+
+The mesh crate's peer relay connections can traverse a
+[Tailscale](https://tailscale.com) tailnet instead of the public internet.
+This keeps relay traffic private between DreamLab infrastructure nodes —
+no NIP-42 challenge is exposed to the open web, and latency drops to
+single-digit ms on the same tailnet.
+
+### Configuration
+
+In `dreamlab.toml` (or `forum.toml`), point `peer_relays` at Tailscale
+MagicDNS hostnames:
+
+```toml
+[mesh]
+mode = "federated"
+peer_relays = ["ws://agentbox.tailnet-name.ts.net:7777"]
+```
+
+Replace `tailnet-name` with your actual tailnet domain (visible in the
+Tailscale admin console under **DNS**).
+
+### Discovery
+
+Agentbox exposes its Nostr relay on `:7777` via its tailnet hostname.
+The mesh crate connects over a standard WebSocket — no Tailscale SDK or
+library dependency is required. Any node on the same tailnet can reach
+the relay without port-forwarding or TLS certificate provisioning
+(Tailscale's WireGuard tunnel handles encryption).
+
+### Cross-network federation
+
+The forum itself runs on Cloudflare Workers and cannot join a tailnet
+directly. The mesh relay bridge handles cross-network federation:
+
+```text
+CF Workers relay ↔ public wss:// ↔ agentbox relay
+                                        ↑
+                                  also reachable over
+                                  tailnet by other
+                                  agentbox instances
+```
+
+Agentbox relays are therefore dual-homed: reachable from CF Workers over
+the public internet *and* from sibling agentboxes over the tailnet.
+
 ## License
 
 MIT OR Apache-2.0.
