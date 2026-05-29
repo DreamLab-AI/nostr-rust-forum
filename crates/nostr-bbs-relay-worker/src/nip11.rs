@@ -3,6 +3,10 @@
 //! Returns a JSON document describing relay capabilities, limits, and retention
 //! policies per <https://github.com/nostr-protocol/nips/blob/master/11.md>.
 
+use nostr_bbs_core::governance::{
+    KIND_ACTION_REQUEST, KIND_ACTION_RESPONSE, KIND_PANEL_DEFINITION, KIND_PANEL_RETIRED,
+    KIND_PANEL_STATE, KIND_PANEL_UPDATE,
+};
 use serde_json::json;
 use worker::Env;
 
@@ -25,7 +29,11 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         "description": "Private whitelist-only Nostr relay (nostr-bbs).",
         "pubkey": admin_pubkey,
         "contact": contact,
-        "supported_nips": [1, 9, 11, 16, 17, 29, 33, 40, 42, 45, 50, 59, 65, 90, 98],
+        // NIP-56 (kind-1984 reports) is enforced relay-side: trust-gated
+        // submission, report projection, and auto-hide moderation all run in
+        // `nip_handlers`. It was previously implemented but unadvertised; add
+        // it so the info document accurately reflects relay capability.
+        "supported_nips": [1, 9, 11, 16, 17, 29, 33, 40, 42, 45, 50, 56, 59, 65, 90, 98],
         "software": "https://github.com/DreamLab-AI/nostr-rust-forum",
         "version": "3.0.0",
         "limitation": {
@@ -49,5 +57,28 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
             { "kinds": [[10000, 19999]], "time": serde_json::Value::Null },
             { "kinds": [[30000, 39999]], "time": serde_json::Value::Null },
         ],
+        // DreamLab namespaced extension: the Agent Control Surface Protocol.
+        // This relay gates governance kinds 31400-31405 behind the
+        // `agent_registry` table (only registered `did:nostr` agent pubkeys may
+        // publish PanelDefinition/ActionRequest/etc.; humans respond via 31403).
+        // A NIP-11-reading agent uses this block to discover that the relay
+        // speaks the mesh governance protocol and which kinds it enforces.
+        // Kind numbers are sourced from the canonical `governance` constants to
+        // prevent drift. Namespaced under `dreamlab` so it never collides with
+        // standard NIP-11 fields.
+        "dreamlab": {
+            "agent_control_surface": {
+                "enabled": true,
+                "registry_gated": true,
+                "panel_definition_kind": KIND_PANEL_DEFINITION,
+                "panel_state_kind": KIND_PANEL_STATE,
+                "action_request_kind": KIND_ACTION_REQUEST,
+                "action_response_kind": KIND_ACTION_RESPONSE,
+                "panel_update_kind": KIND_PANEL_UPDATE,
+                "panel_retired_kind": KIND_PANEL_RETIRED,
+                "agent_auth": "nip98",
+                "agent_identity": "did:nostr",
+            }
+        },
     })
 }
