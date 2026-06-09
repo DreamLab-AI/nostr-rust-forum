@@ -33,7 +33,14 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         // submission, report projection, and auto-hide moderation all run in
         // `nip_handlers`. It was previously implemented but unadvertised; add
         // it so the info document accurately reflects relay capability.
-        "supported_nips": [1, 9, 11, 16, 17, 29, 33, 40, 42, 45, 50, 56, 59, 65, 90, 98],
+        //
+        // NIP-17 (private direct messages) is NOT advertised. The relay
+        // accepts and recipient-gates kind-1059 gift wraps (NIP-59), but
+        // NIP-17 additionally requires inbox routing: kind-14 chat messages
+        // delivered to the recipient's declared DM relays (kind-10050). No
+        // such inbox routing exists here, so advertising NIP-17 would
+        // overstate capability — only the NIP-59 transport is implemented.
+        "supported_nips": [1, 9, 11, 16, 29, 33, 40, 42, 45, 50, 56, 59, 65, 90, 98],
         "software": "https://github.com/DreamLab-AI/nostr-rust-forum",
         "version": "3.0.0",
         "limitation": {
