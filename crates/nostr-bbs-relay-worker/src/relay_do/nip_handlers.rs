@@ -11,7 +11,7 @@
 
 use nostr_bbs_core::event::NostrEvent;
 use nostr_bbs_core::governance;
-use nostr_bbs_core::{KIND_BAN, KIND_MUTE, KIND_REPORT_NIP56};
+use nostr_bbs_core::{KIND_BAN, KIND_MUTE, KIND_REPORT_NIP56, KIND_UNBAN, KIND_UNMUTE};
 use wasm_bindgen::JsValue;
 use worker::*;
 
@@ -37,6 +37,16 @@ const MAX_SUBSCRIPTIONS: usize = 20;
 /// NIP-29: Admin-only group management/moderation kinds.
 fn is_nip29_admin_kind(kind: u64) -> bool {
     (9000..=9020).contains(&kind) || (39000..=39002).contains(&kind)
+}
+
+/// P1-6: whether an event must be rejected by the governance ActionResponse
+/// admin gate. Returns `true` when the event is kind-31403 (approve/reject of
+/// an agent action request) and the signer is NOT an admin.
+///
+/// Extracted as a pure predicate so the gate decision is unit-testable without
+/// a `worker::Env` / `WebSocket`.
+pub fn governance_response_blocked(kind: u64, is_admin: bool) -> bool {
+    kind == governance::KIND_ACTION_RESPONSE && !is_admin
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +227,9 @@ impl NostrRelayDO {
 
         // Agent Control Surface Protocol: governance kinds (31400-31405) are
         // only accepted from pubkeys registered in the agent_registry table.
-        // Human responses (kind 31403) are allowed from any whitelisted user.
+        // Human responses (kind 31403, approve/reject of agent action requests)
+        // are exempt from the agent-registry gate but, per P1-6, MUST come from
+        // an admin -- they are privileged decisions, not generic member actions.
         if governance::is_governance_kind(event.kind)
             && event.kind != governance::KIND_ACTION_RESPONSE
             && !self.is_registered_agent(&event.pubkey).await
@@ -227,6 +239,18 @@ impl NostrRelayDO {
                 &event.id,
                 false,
                 "blocked: pubkey not in agent registry",
+            );
+            return;
+        }
+
+        // P1-6: kind-31403 ActionResponse (approve/reject) is admin-only. Uses
+        // the same admin check as the moderation mirror. Reject non-admins.
+        if governance_response_blocked(event.kind, is_admin) {
+            Self::send_ok(
+                ws,
+                &event.id,
+                false,
+                "blocked: admin-only governance action response",
             );
             return;
         }
@@ -281,11 +305,12 @@ impl NostrRelayDO {
                 self.process_report(&event).await;
             }
 
-            // WI-2: mirror moderation-action Nostr events (kind 30910 ban,
-            // 30911 mute) into the local `moderation_actions` table so the
-            // ingress gate can reject content from muted/banned authors.
-            // Only respected when the signer is an admin on this relay.
-            if matches!(event.kind, KIND_BAN | KIND_MUTE) && is_admin {
+            // WI-2 + P0-4(a): mirror moderation-action Nostr events (kind 30910
+            // ban, 30911 mute, 30915 unban, 30916 unmute) into the local
+            // `moderation_actions` table so the ingress gate can reject content
+            // from muted/banned authors AND so a lifted ban/mute stops being
+            // enforced. Only respected when the signer is an admin on this relay.
+            if matches!(event.kind, KIND_BAN | KIND_MUTE | KIND_UNBAN | KIND_UNMUTE) && is_admin {
                 self.mirror_moderation_action(&event).await;
                 if let Some(target) = filter::tag_value(&event, "p") {
                     self.mod_cache.invalidate(&target);
@@ -925,14 +950,19 @@ impl NostrRelayDO {
         .await;
     }
 
-    /// WI-2: mirror a kind-30910 (ban) or kind-30911 (mute) event into the
-    /// local `moderation_actions` table. Idempotent via `event_id` dedup --
-    /// re-receiving the same event is a no-op. Missing target pubkey (no
-    /// `p` tag) silently drops the mirror.
+    /// WI-2 + P0-4(a): mirror a kind-30910 (ban), 30911 (mute), 30915 (unban),
+    /// or 30916 (unmute) event into the local `moderation_actions` table.
+    /// Idempotent via `event_id` dedup -- re-receiving the same event is a
+    /// no-op. Missing target pubkey (no `p` tag) silently drops the mirror.
+    /// Unban/unmute rows are written as their own action rows (preserving
+    /// signer + target + created_at) so `load_state` can apply latest-wins and
+    /// cancel a prior ban/mute.
     pub(crate) async fn mirror_moderation_action(&self, event: &NostrEvent) {
         let action = match event.kind {
-            30910 => "ban",
-            30911 => "mute",
+            KIND_BAN => "ban",
+            KIND_MUTE => "mute",
+            KIND_UNBAN => "unban",
+            KIND_UNMUTE => "unmute",
             _ => return,
         };
 
@@ -940,8 +970,8 @@ impl NostrRelayDO {
             return;
         };
 
-        // expires_at: mutes may carry a NIP-40 style `expiration` tag. Bans
-        // never expire; we persist NULL.
+        // expires_at: mutes may carry a NIP-40 style `expiration` tag. Bans,
+        // unbans and unmutes never expire; we persist NULL.
         let expires_at: Option<i64> = if action == "mute" {
             filter::tag_value(event, "expiration").and_then(|s| s.parse::<i64>().ok())
         } else {
@@ -959,7 +989,10 @@ impl NostrRelayDO {
         };
 
         let row_id = format!("mirror:{}", event.id);
-        let now = auth::js_now_secs();
+        // P0-4(a): persist the event's signed `created_at` (not receipt time) so
+        // `load_state` latest-wins ordering between ban/unban (and mute/unmute)
+        // follows the admin's intended sequence even under out-of-order delivery.
+        let created_at = event.created_at;
 
         let sql = "INSERT INTO moderation_actions \
              (id, action, target_pubkey, performed_by, reason, expires_at, event_id, created_at) \
@@ -975,7 +1008,7 @@ impl NostrRelayDO {
                 .map(|v| JsValue::from_f64(v as f64))
                 .unwrap_or(JsValue::NULL),
             JsValue::from_str(&event.id),
-            JsValue::from_f64(now as f64),
+            JsValue::from_f64(created_at as f64),
         ]) else {
             return;
         };

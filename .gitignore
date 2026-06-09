@@ -5,3 +5,5 @@ node_modules/
 .wrangler/
 .agentic-qe/
 *.db
+
+.env

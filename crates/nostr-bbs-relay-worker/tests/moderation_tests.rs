@@ -194,7 +194,8 @@ fn ban_dominates_any_mute() {
         .max_by_key(|s| match s {
             Block::None => 0,
             Block::MutedUntil(_) => 1,
-            Block::Banned => 2,
+            // P2: Unknown is the fail-CLOSED sentinel; rank alongside Banned.
+            Block::Banned | Block::Unknown => 2,
         })
         .unwrap();
     assert_eq!(strongest, Block::Banned);

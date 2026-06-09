@@ -50,6 +50,46 @@ use worker::*;
 /// Maximum request body size: 50 MB.
 const MAX_BODY_SIZE: u64 = 50 * 1024 * 1024;
 
+/// Defense-in-depth path-traversal guard for pod resource paths (P2).
+///
+/// The `r2_key` is built as `pods/{owner}{resource_path}`. ACL scoping plus
+/// WHATWG URL normalization already contain most traversal, but this helper
+/// adds an explicit decode-then-validate rejection so a crafted path can never
+/// escape the `pods/{owner}/` prefix. Rejects, before any R2 key is built:
+///   - literal `..` parent-directory segments;
+///   - percent-encoded dots (`%2e`/`%2E`) that decode to `.` (re-encoded
+///     traversal such as `%2e%2e%2f`);
+///   - percent-encoded slashes (`%2f`/`%2F`) that decode to `/` (smuggled path
+///     separators the prefix check would otherwise miss);
+///   - backslashes (`\`), which some clients/proxies treat as separators;
+///   - NUL bytes (`%00` or raw `\0`), a classic truncation vector.
+///
+/// Returns `true` when the path is safe to use in an `r2_key`.
+fn is_safe_resource_path(resource_path: &str) -> bool {
+    // Raw forbidden bytes.
+    if resource_path.contains('\\') || resource_path.contains('\0') {
+        return false;
+    }
+    if resource_path.contains("..") {
+        return false;
+    }
+
+    // Inspect percent-encodings WITHOUT a full decode (we cannot fully decode
+    // here without pulling in a decoder, and a single-pass lowercase scan is
+    // sufficient to catch the encoded dot/slash/NUL forms).
+    let lower = resource_path.to_ascii_lowercase();
+    if lower.contains("%2e") // encoded '.'
+        || lower.contains("%2f") // encoded '/'
+        || lower.contains("%5c") // encoded '\'
+        || lower.contains("%00")
+    // encoded NUL
+    {
+        return false;
+    }
+
+    true
+}
+
 /// Regex-equivalent pattern for pod routes: `/pods/{64 hex chars}{optional path}`.
 /// We parse manually instead of pulling in `regex` to keep the WASM binary small.
 fn parse_pod_route(path: &str) -> Option<(&str, &str)> {
@@ -67,6 +107,11 @@ fn parse_pod_route(path: &str) -> Option<(&str, &str)> {
         return None;
     }
     let resource_path = if remainder.is_empty() { "/" } else { remainder };
+    // Defense-in-depth: reject traversal/encoded-separator paths before any
+    // caller can build an `r2_key` from this value (P2).
+    if !is_safe_resource_path(resource_path) {
+        return None;
+    }
     Some((pubkey, resource_path))
 }
 
@@ -1052,6 +1097,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
 
             let child_path = container::resolve_slug(&resource_path, slug_header.as_deref());
+            // Defense-in-depth (P2): the child path is derived from the
+            // attacker-controlled `Slug` header, so re-validate before building
+            // the r2_key — `parse_pod_route`'s guard only covers the URL path.
+            if !is_safe_resource_path(&child_path) {
+                return json_error(&env, "Invalid resource path", 400);
+            }
             let child_r2_key = format!("pods/{owner_pubkey}{child_path}");
 
             bucket
@@ -1605,6 +1656,62 @@ mod tests {
         let (pk, rp) = parse_pod_route(&path).unwrap();
         assert_eq!(pk, pubkey);
         assert_eq!(rp, "/media/");
+    }
+
+    // ── P2: resource-path traversal guard ──────────────────────────────
+
+    #[test]
+    fn is_safe_resource_path_allows_normal_nested() {
+        assert!(is_safe_resource_path("/"));
+        assert!(is_safe_resource_path("/media/"));
+        assert!(is_safe_resource_path("/profile/card"));
+        assert!(is_safe_resource_path("/public/sub/dir/file.json"));
+        assert!(is_safe_resource_path("/notes/2026-06-07.md"));
+    }
+
+    #[test]
+    fn is_safe_resource_path_rejects_dotdot() {
+        assert!(!is_safe_resource_path("/../etc/passwd"));
+        assert!(!is_safe_resource_path("/media/../../secret"));
+        assert!(!is_safe_resource_path("/a/../b"));
+    }
+
+    #[test]
+    fn is_safe_resource_path_rejects_encoded_dot() {
+        // %2e / %2E decode to '.'  → re-encoded traversal.
+        assert!(!is_safe_resource_path("/%2e%2e%2f"));
+        assert!(!is_safe_resource_path("/media/%2E%2E/secret"));
+        assert!(!is_safe_resource_path("/%2efoo"));
+    }
+
+    #[test]
+    fn is_safe_resource_path_rejects_encoded_slash() {
+        // %2f / %2F decode to '/'  → smuggled separator.
+        assert!(!is_safe_resource_path("/media%2f..%2fsecret"));
+        assert!(!is_safe_resource_path("/a%2Fb"));
+    }
+
+    #[test]
+    fn is_safe_resource_path_rejects_backslash_and_nul() {
+        assert!(!is_safe_resource_path("/media\\..\\secret"));
+        assert!(!is_safe_resource_path("/a%5cb")); // encoded backslash
+        assert!(!is_safe_resource_path("/a\0b")); // raw NUL
+        assert!(!is_safe_resource_path("/a%00b")); // encoded NUL
+    }
+
+    #[test]
+    fn parse_pod_route_rejects_traversal() {
+        let pubkey = "f".repeat(64);
+        // URL-path traversal and encoded forms are rejected at route parse.
+        assert!(parse_pod_route(&format!("/pods/{pubkey}/../etc")).is_none());
+        assert!(parse_pod_route(&format!("/pods/{pubkey}/%2e%2e%2fsecret")).is_none());
+        assert!(parse_pod_route(&format!("/pods/{pubkey}/a%2fb")).is_none());
+        assert!(parse_pod_route(&format!("/pods/{pubkey}/a\\b")).is_none());
+        // A normal nested path still parses.
+        let normal_path = format!("/pods/{pubkey}/public/file");
+        let (pk, rp) = parse_pod_route(&normal_path).unwrap();
+        assert_eq!(pk, pubkey);
+        assert_eq!(rp, "/public/file");
     }
 
     #[test]

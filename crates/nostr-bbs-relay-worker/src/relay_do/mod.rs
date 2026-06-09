@@ -33,7 +33,8 @@ pub(crate) use mod_cache::ModCache;
 pub mod test_exports {
     pub use super::broadcast::{event_treatment, EventTreatment};
     pub use super::filter::{d_tag_value, event_matches_filters, tag_value, NostrFilter};
-    pub use super::mod_cache::{Block, ModCache};
+    pub use super::mod_cache::{resolve_block, ActionRow, Block, ModCache};
+    pub use super::nip_handlers::governance_response_blocked;
 }
 
 use std::cell::RefCell;

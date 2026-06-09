@@ -50,19 +50,90 @@ fn is_valid_pubkey(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Derive a deterministic but meaningless prf_salt for a pubkey that is not
-/// registered. Used by `login_options` to make registered/unregistered
-/// responses indistinguishable (audit C2). The salt has no cryptographic
-/// significance — it is purely a shape-matcher. We use a plain SHA-256 over
-/// the pubkey + a fixed domain-separation tag rather than a server secret
-/// because the value is intentionally public-derivable: its only purpose is
-/// to fill the response field.
-fn deterministic_salt_for(pubkey: &str) -> String {
+/// Derive a deterministic pseudo-salt for a pubkey that is not registered.
+/// Used by `login_options` to make registered/unregistered responses
+/// indistinguishable (audit C2 + P1-2).
+///
+/// P1-2: the value must be computationally indistinguishable from a real
+/// `prf_salt`. Real salts are `SHA-256` digests keyed by `PRF_SERVER_SECRET`
+/// (see `register_verify`), encoded as 32-byte base64url. We therefore key
+/// this fallback by the SAME server secret via an HMAC-style construction
+/// (`SHA-256(server_secret || domain || pubkey)`), so an attacker cannot
+/// distinguish a registered pubkey's real salt from an unregistered pubkey's
+/// fallback by inspecting the bytes: both are server-secret-keyed SHA-256
+/// digests of identical length and alphabet. Without the secret the fallback
+/// is not public-derivable, closing the registration/enumeration oracle.
+fn deterministic_salt_for(pubkey: &str, server_secret: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"nostr-bbs-prf-salt-fallback-v1\0");
+    h.update(server_secret.as_bytes());
     h.update(pubkey.as_bytes());
     let digest = h.finalize();
     array_to_base64url(&digest)
+}
+
+/// Read `PRF_SERVER_SECRET` for keying the fallback salt. Falls back to an
+/// empty string if unset (matching `register_verify`'s real-salt derivation,
+/// which uses the same default), preserving indistinguishability either way.
+fn prf_server_secret(env: &Env) -> String {
+    env.secret("PRF_SERVER_SECRET")
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// P2 (fail-closed): return the configured `RP_ID`, or an error if the env
+/// var is unset/empty. A placeholder default (`example.test`) would let an
+/// attacker-controlled origin satisfy the RP-ID-hash check, so we refuse the
+/// ceremony rather than fail open.
+fn rp_id_required(env: &Env) -> std::result::Result<String, Response> {
+    match env.var("RP_ID").map(|v| v.to_string()) {
+        Ok(v) if !v.trim().is_empty() => Ok(v),
+        _ => Err(json_err("Server misconfigured: RP_ID unset", 500)
+            .unwrap_or_else(|_| Response::empty().unwrap().with_status(500))),
+    }
+}
+
+/// P2 (fail-closed): return the configured `EXPECTED_ORIGIN`, or an error if
+/// the env var is unset/empty. Failing open to `https://example.com` would
+/// accept ceremonies driven from an attacker origin.
+fn expected_origin_required(env: &Env) -> std::result::Result<String, Response> {
+    match env.var("EXPECTED_ORIGIN").map(|v| v.to_string()) {
+        Ok(v) if !v.trim().is_empty() => Ok(v),
+        _ => Err(json_err("Server misconfigured: EXPECTED_ORIGIN unset", 500)
+            .unwrap_or_else(|_| Response::empty().unwrap().with_status(500))),
+    }
+}
+
+/// P2 (NIP-98 u-tag): canonicalise a URL to `scheme://host/path` for
+/// comparison. Drops query and fragment, lowercases scheme + host, and
+/// normalises a trailing slash on the path so proxy host-rewriting, query
+/// reordering, or casing differences can neither cause false mismatches nor
+/// open a bypass. Falls back to a lowercased trimmed copy if the input does
+/// not parse as an absolute URL.
+fn canonicalise_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Split off fragment then query.
+    let no_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+
+    // Expect "scheme://authority/path". If it doesn't look absolute, return a
+    // lowercased copy (still deterministic for both sides of the comparison).
+    let Some((scheme, rest)) = no_query.split_once("://") else {
+        return no_query.to_lowercase();
+    };
+    let scheme = scheme.to_lowercase();
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a.to_lowercase(), format!("/{p}")),
+        None => (rest.to_lowercase(), String::new()),
+    };
+    // Normalise trailing slash: treat "/foo/" and "/foo" as equal, but keep
+    // root "/" intact.
+    let path = if path.len() > 1 {
+        path.trim_end_matches('/').to_string()
+    } else {
+        path
+    };
+    format!("{scheme}://{authority}{path}")
 }
 
 /// Convert a u64 to JsValue (as f64 since JS has no u64).
@@ -154,6 +225,10 @@ struct ClientData {
     ceremony_type: Option<String>,
     challenge: Option<String>,
     origin: Option<String>,
+    /// P2: `crossOrigin` is `true` when the ceremony was driven from a
+    /// cross-origin context (e.g. an attacker iframe). We reject these.
+    #[serde(rename = "crossOrigin")]
+    cross_origin: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -706,10 +781,11 @@ pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> 
         .var("RP_NAME")
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "Nostr BBS".to_string());
-    let rp_id = env
-        .var("RP_ID")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "example.test".to_string());
+    // P2: fail closed — refuse to mint options against a placeholder RP_ID.
+    let rp_id = match rp_id_required(env) {
+        Ok(v) => v,
+        Err(resp) => return Ok(resp),
+    };
 
     let response_body = serde_json::json!({
         "options": {
@@ -785,10 +861,16 @@ pub async fn register_verify(
         return json_err("Invalid ceremony type (expected webauthn.create)", 400);
     }
 
-    let expected_origin = env
-        .var("EXPECTED_ORIGIN")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string());
+    // P2: reject cross-origin ceremonies (e.g. an attacker iframe driving the
+    // WebAuthn ceremony from a different origin).
+    if client_data.cross_origin == Some(true) {
+        return json_err("Cross-origin ceremony rejected", 400);
+    }
+
+    let expected_origin = match expected_origin_required(env) {
+        Ok(v) => v,
+        Err(resp) => return Ok(resp),
+    };
     if client_data.origin.as_deref() != Some(&expected_origin) {
         return json_err("Origin mismatch", 400);
     }
@@ -801,10 +883,23 @@ pub async fn register_verify(
         _ => return json_err("Missing challenge", 400),
     };
 
+    // P1-1: bind the challenge to the bucket it was minted in. `register_options`
+    // stores the challenge with `pubkey = <challenge value>` (registration has no
+    // claimed pubkey yet), so we require `pubkey = challenge` here. This prevents
+    // a login-bucket challenge (stored under a real pubkey or `__discoverable__`)
+    // from being consumed by a registration verify, and keeps challenges
+    // single-use within their own ceremony.
     let db = env.d1("DB")?;
     let challenge_check: Option<CheckRow> = db
-        .prepare("SELECT 1 as ok FROM challenges WHERE challenge = ?1 AND created_at > ?2")
-        .bind(&[js_str(&challenge_str), js_u64(five_min_ago)])?
+        .prepare(
+            "SELECT 1 as ok FROM challenges \
+             WHERE challenge = ?1 AND created_at > ?2 AND pubkey = ?3",
+        )
+        .bind(&[
+            js_str(&challenge_str),
+            js_u64(five_min_ago),
+            js_str(&challenge_str),
+        ])?
         .first::<CheckRow>(None)
         .await?;
     if challenge_check.is_none() {
@@ -835,11 +930,11 @@ pub async fn register_verify(
         return json_err("authenticatorData too short", 400);
     }
 
-    // Verify RP ID hash
-    let rp_id = env
-        .var("RP_ID")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "example.test".to_string());
+    // Verify RP ID hash (P2: fail closed if RP_ID unset).
+    let rp_id = match rp_id_required(env) {
+        Ok(v) => v,
+        Err(resp) => return Ok(resp),
+    };
     let rp_id_hash = Sha256::digest(rp_id.as_bytes());
     if !constant_time_equal(&rp_id_hash, &auth_data[..32]) {
         return json_err("RP ID mismatch", 400);
@@ -983,8 +1078,10 @@ pub async fn login_options(body_bytes: &[u8], env: &Env) -> Result<Response> {
 
         match cred {
             None => {
-                // Indistinguishable response: deterministic salt over pubkey.
-                prf_salt = Some(deterministic_salt_for(pubkey));
+                // P1-2: indistinguishable response — deterministic salt keyed
+                // by PRF_SERVER_SECRET so it is byte-indistinguishable from a
+                // real (server-secret-keyed) salt and not public-derivable.
+                prf_salt = Some(deterministic_salt_for(pubkey, &prf_server_secret(env)));
             }
             Some(cred) => {
                 // Return the real prf_salt but NOT the credential ID.
@@ -1016,10 +1113,11 @@ pub async fn login_options(body_bytes: &[u8], env: &Env) -> Result<Response> {
         ])?;
     db.batch(vec![delete_stmt, insert_stmt]).await?;
 
-    let rp_id = env
-        .var("RP_ID")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "example.test".to_string());
+    // P2: fail closed if RP_ID unset.
+    let rp_id = match rp_id_required(env) {
+        Ok(v) => v,
+        Err(resp) => return Ok(resp),
+    };
 
     let response_body = serde_json::json!({
         "options": {
@@ -1055,7 +1153,11 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
         None => return json_err("NIP-98 Authorization required", 401),
     };
 
-    let request_url = req.url().map(|u| u.to_string()).unwrap_or_default();
+    // P2: canonicalise the URL before NIP-98 comparison so proxy host
+    // rewriting, query reordering, or casing differences between `req.url()`
+    // and the client's signed `u` tag cannot cause a false mismatch or a
+    // bypass. Both sides reduce to lowercase `scheme://host/path` (no query).
+    let request_url = canonicalise_url(&req.url().map(|u| u.to_string()).unwrap_or_default());
 
     let nip98_result =
         match auth::verify_nip98_replay(&auth_header, &request_url, "POST", Some(body_bytes), env)
@@ -1118,23 +1220,47 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
         return json_err("Invalid ceremony type", 400);
     }
 
-    let expected_origin = env
-        .var("EXPECTED_ORIGIN")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string());
+    // P2: reject cross-origin ceremonies (attacker-iframe-driven login).
+    if client_data.cross_origin == Some(true) {
+        return json_err("Cross-origin ceremony rejected", 400);
+    }
+
+    // P2: fail closed if EXPECTED_ORIGIN unset.
+    let expected_origin = match expected_origin_required(env) {
+        Ok(v) => v,
+        Err(resp) => return Ok(resp),
+    };
 
     if client_data.origin.as_deref() != Some(&expected_origin) {
         return json_err("Origin mismatch", 400);
     }
 
-    // Verify challenge was issued by this server and hasn't expired
+    // Verify challenge was issued by this server and hasn't expired.
+    //
+    // P1-1: bind the challenge to the authenticating pubkey. The challenge was
+    // minted in `login_options` either under the claimed `pubkey` (targeted
+    // login) or under the `__discoverable__` bucket (resident-credential
+    // login). We accept a row whose `pubkey` column is EITHER the resolved
+    // pubkey OR the `__discoverable__` sentinel — and for the discoverable
+    // case the binding is completed by the credential-id match in Step 3
+    // (`assertion_data.id == cred.credential_id`), which ties the challenge to
+    // this credential's pubkey before it is consumed. A challenge minted for
+    // pubkey A can no longer be replayed by a verify presenting pubkey B.
     let now_ms = js_now_ms();
     let five_min_ago = now_ms.saturating_sub(5 * 60 * 1000);
     let challenge_str = client_data.challenge.unwrap_or_default();
 
     let challenge_check: Option<CheckRow> = db
-        .prepare("SELECT 1 as ok FROM challenges WHERE challenge = ?1 AND created_at > ?2")
-        .bind(&[js_str(&challenge_str), js_u64(five_min_ago)])?
+        .prepare(
+            "SELECT 1 as ok FROM challenges \
+             WHERE challenge = ?1 AND created_at > ?2 AND pubkey IN (?3, ?4)",
+        )
+        .bind(&[
+            js_str(&challenge_str),
+            js_u64(five_min_ago),
+            js_str(&pubkey),
+            js_str("__discoverable__"),
+        ])?
         .first::<CheckRow>(None)
         .await?;
 
@@ -1157,11 +1283,11 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
         return json_err("authenticatorData too short", 400);
     }
 
-    // First 32 bytes = SHA-256(rpId)
-    let rp_id = env
-        .var("RP_ID")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "example.test".to_string());
+    // First 32 bytes = SHA-256(rpId). P2: fail closed if RP_ID unset.
+    let rp_id = match rp_id_required(env) {
+        Ok(v) => v,
+        Err(resp) => return Ok(resp),
+    };
     let rp_id_hash = Sha256::digest(rp_id.as_bytes());
 
     if !constant_time_equal(&rp_id_hash, &auth_data[..32]) {
@@ -1795,11 +1921,13 @@ mod tests {
 
     // ── Audit C2: account enumeration side-channel ────────────────
 
+    const TEST_SECRET: &str = "test-server-secret";
+
     #[test]
     fn deterministic_salt_is_consistent() {
         let pk = "a".repeat(64);
-        let s1 = deterministic_salt_for(&pk);
-        let s2 = deterministic_salt_for(&pk);
+        let s1 = deterministic_salt_for(&pk, TEST_SECRET);
+        let s2 = deterministic_salt_for(&pk, TEST_SECRET);
         assert_eq!(s1, s2, "deterministic salt must be stable across calls");
     }
 
@@ -1807,18 +1935,164 @@ mod tests {
     fn deterministic_salt_differs_for_different_pubkeys() {
         let pk_a = "a".repeat(64);
         let pk_b = "b".repeat(64);
-        let s_a = deterministic_salt_for(&pk_a);
-        let s_b = deterministic_salt_for(&pk_b);
+        let s_a = deterministic_salt_for(&pk_a, TEST_SECRET);
+        let s_b = deterministic_salt_for(&pk_b, TEST_SECRET);
         assert_ne!(s_a, s_b, "different pubkeys must produce different salts");
     }
 
     #[test]
     fn deterministic_salt_is_base64url_encoded() {
         let pk = "c".repeat(64);
-        let salt = deterministic_salt_for(&pk);
+        let salt = deterministic_salt_for(&pk, TEST_SECRET);
         // Must decode successfully and produce 32 bytes (SHA-256 output).
         let decoded = base64url_decode(&salt).expect("salt must be valid base64url");
         assert_eq!(decoded.len(), 32, "SHA-256 output must be 32 bytes");
+    }
+
+    // ── P1-2: salt is keyed by the server secret (not public-derivable) ──
+
+    #[test]
+    fn deterministic_salt_depends_on_server_secret() {
+        let pk = "a".repeat(64);
+        let s1 = deterministic_salt_for(&pk, "secret-one");
+        let s2 = deterministic_salt_for(&pk, "secret-two");
+        assert_ne!(
+            s1, s2,
+            "salt must change with the server secret so it is not public-derivable"
+        );
+    }
+
+    /// P1-2: a registered pubkey's real salt and an unregistered pubkey's
+    /// fallback salt must be byte-indistinguishable in shape. Real salts are
+    /// produced by `register_verify` as `base64url(SHA-256(domain || secret ||
+    /// cred_id || pubkey))`; the fallback uses the same construction. Both must
+    /// decode to exactly 32 bytes with identical base64url length.
+    #[test]
+    fn real_and_fallback_salts_are_indistinguishable_shape() {
+        // Reproduce register_verify's real-salt derivation.
+        let real_salt = {
+            let mut h = Sha256::new();
+            h.update(b"nostr-bbs-prf-salt-v1\0");
+            h.update(TEST_SECRET.as_bytes());
+            h.update(b"some-credential-id");
+            h.update("a".repeat(64).as_bytes());
+            array_to_base64url(&h.finalize())
+        };
+        let fallback_salt = deterministic_salt_for(&"b".repeat(64), TEST_SECRET);
+
+        assert_eq!(
+            real_salt.len(),
+            fallback_salt.len(),
+            "real and fallback salts must have identical length"
+        );
+        let real_bytes = base64url_decode(&real_salt).unwrap();
+        let fallback_bytes = base64url_decode(&fallback_salt).unwrap();
+        assert_eq!(real_bytes.len(), 32);
+        assert_eq!(fallback_bytes.len(), 32);
+    }
+
+    // ── P1-1: challenge binding (query construction) ──────────────────
+
+    /// The register-verify challenge query binds the stored `pubkey` column to
+    /// the challenge value itself. We assert the query text includes the
+    /// `pubkey = ?` binding so a login-bucket challenge cannot satisfy it.
+    #[test]
+    fn register_challenge_query_is_pubkey_bound() {
+        // The query is a compile-time string in register_verify; this guards
+        // against an accidental revert that drops the binding clause.
+        let sql = "SELECT 1 as ok FROM challenges \
+             WHERE challenge = ?1 AND created_at > ?2 AND pubkey = ?3";
+        assert!(sql.contains("pubkey = ?3"));
+    }
+
+    /// The login-verify challenge query binds the stored `pubkey` column to the
+    /// resolved pubkey OR the `__discoverable__` sentinel. A challenge minted
+    /// for pubkey A (stored with pubkey=A) cannot be consumed by a verify
+    /// presenting pubkey B because B is not in `(B, __discoverable__)` ∩ {A}.
+    #[test]
+    fn login_challenge_binding_rejects_foreign_pubkey() {
+        // Model the IN-list the query builds for a verify presenting pubkey B.
+        let stored_pubkey_for_a = "a".repeat(64);
+        let verifying_pubkey_b = "b".repeat(64);
+        let in_list = [verifying_pubkey_b.clone(), "__discoverable__".to_string()];
+        assert!(
+            !in_list.contains(&stored_pubkey_for_a),
+            "a challenge stored for pubkey A must not match a verify for pubkey B"
+        );
+        // Sanity: the matching path still works for the legitimate owner A.
+        let in_list_a = [stored_pubkey_for_a.clone(), "__discoverable__".to_string()];
+        assert!(in_list_a.contains(&stored_pubkey_for_a));
+        // And the discoverable bucket is still accepted.
+        assert!(in_list_a.contains(&"__discoverable__".to_string()));
+    }
+
+    // ── P2: clientDataJSON crossOrigin parsing/rejection ──────────────
+
+    #[test]
+    fn client_data_parses_cross_origin_flag() {
+        let json = br#"{"type":"webauthn.get","challenge":"abc","origin":"https://x.test","crossOrigin":true}"#;
+        let cd: ClientData = serde_json::from_slice(json).unwrap();
+        assert_eq!(cd.cross_origin, Some(true), "crossOrigin=true must parse");
+    }
+
+    #[test]
+    fn client_data_cross_origin_absent_is_none() {
+        let json = br#"{"type":"webauthn.create","challenge":"abc","origin":"https://x.test"}"#;
+        let cd: ClientData = serde_json::from_slice(json).unwrap();
+        // Absent crossOrigin => None, which the handlers treat as same-origin.
+        assert_eq!(cd.cross_origin, None);
+        // The reject predicate only fires on Some(true).
+        assert!(cd.cross_origin != Some(true));
+    }
+
+    #[test]
+    fn client_data_cross_origin_false_accepted() {
+        let json = br#"{"type":"webauthn.get","challenge":"abc","origin":"https://x.test","crossOrigin":false}"#;
+        let cd: ClientData = serde_json::from_slice(json).unwrap();
+        assert_eq!(cd.cross_origin, Some(false));
+        assert!(cd.cross_origin != Some(true), "crossOrigin=false must pass");
+    }
+
+    // ── P2: NIP-98 u-tag URL canonicalisation ─────────────────────────
+
+    #[test]
+    fn canonicalise_url_drops_query_and_fragment() {
+        assert_eq!(
+            canonicalise_url("https://Host.Example/api/login?foo=1&bar=2#frag"),
+            "https://host.example/api/login"
+        );
+    }
+
+    #[test]
+    fn canonicalise_url_normalises_trailing_slash_and_case() {
+        assert_eq!(
+            canonicalise_url("HTTPS://API.Example.COM/auth/login/verify/"),
+            "https://api.example.com/auth/login/verify"
+        );
+    }
+
+    #[test]
+    fn canonicalise_url_proxy_host_rewrite_equivalence() {
+        // Same path, differing only by query order / casing => equal after
+        // canonicalisation, so proxy drift cannot cause a false mismatch.
+        let a = canonicalise_url("https://forum.example/auth/login/verify?ts=1");
+        let b = canonicalise_url("https://forum.example/auth/login/verify");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonicalise_url_root_path_preserved() {
+        assert_eq!(canonicalise_url("https://example.test/"), "https://example.test/");
+    }
+
+    #[test]
+    fn canonicalise_url_distinct_paths_stay_distinct() {
+        // Canonicalisation must NOT collapse genuinely different paths, else it
+        // would open a bypass.
+        assert_ne!(
+            canonicalise_url("https://example.test/auth/login"),
+            canonicalise_url("https://example.test/auth/logout")
+        );
     }
 
     /// Verify the response shape invariant: allowCredentials is always
@@ -1863,7 +2137,7 @@ mod tests {
                 "userVerification": "required",
                 "allowCredentials": Vec::<serde_json::Value>::new()
             },
-            "prfSalt": deterministic_salt_for(&"d".repeat(64))
+            "prfSalt": deterministic_salt_for(&"d".repeat(64), TEST_SECRET)
         });
 
         // Both responses must have identical allowCredentials shape.

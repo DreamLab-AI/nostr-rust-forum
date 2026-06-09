@@ -17,8 +17,10 @@
 //!
 //! All events use `d`-tag addressing (NIP-33 parameterized replaceable).
 
+use crate::event::NostrEvent;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use thiserror::Error;
 
 // ── Event kind constants ────────────────────────────────────────────────────
 
@@ -162,6 +164,74 @@ pub fn extract_tag<'a>(tags: &'a [Vec<String>], name: &str) -> Option<&'a str> {
         .find(|t| t.first().map(|s| s.as_str()) == Some(name))
         .and_then(|t| t.get(1))
         .map(|s| s.as_str())
+}
+
+// ── Governance event validation (P2: authz / append-only audit log) ──────────
+
+/// Reasons a governance control-surface event can fail validation.
+///
+/// Mirrors the structure/style of
+/// [`crate::moderation_events::ModerationEventError`] so callers can adopt the
+/// same handling pattern.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum GovernanceEventError {
+    /// The event kind is outside the governance range (31400-31405).
+    #[error("kind {0} is not a governance event kind")]
+    UnknownKind(u64),
+
+    /// The `d` tag required by parameterized-replaceable semantics is missing.
+    #[error("missing `d` tag")]
+    MissingDTag,
+
+    /// The `d` tag is present but empty.
+    #[error("`d` tag is empty")]
+    EmptyDTag,
+
+    /// A 31405 audit-log entry reused a `d` tag that was already recorded.
+    ///
+    /// Audit logs are append-only and tamper-evident: each entry MUST carry a
+    /// unique audit-entry id in its `d` tag. A repeated `d` is a replay /
+    /// overwrite attempt and is rejected rather than silently replacing the
+    /// existing entry.
+    #[error("duplicate audit-log `d` tag `{0}`: audit entries are append-only")]
+    DuplicateAuditEntry(String),
+}
+
+/// The 31405 GovernanceAuditLog kind. Audit-log entries are append-only: each
+/// uses a unique-per-entry `d` tag (audit-entry id) so a same-`d` replay is
+/// rejected as a duplicate instead of overwriting the prior entry.
+pub const KIND_GOVERNANCE_AUDIT_LOG: u64 = 31405;
+
+/// Validate that `event` is a well-formed governance control-surface event.
+///
+/// `seen_audit_ids` is the set of audit-entry `d` tags already recorded by the
+/// caller. For 31405 audit-log events this enforces append-only semantics: a
+/// `d` tag already present in the set is a replay/overwrite and is rejected.
+/// Callers should insert each accepted audit-entry `d` into the set after a
+/// successful validation. For non-audit kinds the set is ignored.
+pub fn validate_governance_event(
+    event: &NostrEvent,
+    seen_audit_ids: &HashSet<String>,
+) -> Result<(), GovernanceEventError> {
+    // (a) kind must be in the governance range.
+    if !is_governance_kind(event.kind) {
+        return Err(GovernanceEventError::UnknownKind(event.kind));
+    }
+
+    // All governance kinds are NIP-33 parameterized-replaceable: require a
+    // non-empty `d` tag.
+    let d = extract_d_tag(&event.tags).ok_or(GovernanceEventError::MissingDTag)?;
+    if d.is_empty() {
+        return Err(GovernanceEventError::EmptyDTag);
+    }
+
+    // (b) 31405 audit-log entries are append-only: the `d` tag must be a unique
+    // audit-entry id never seen before. A reused `d` is a duplicate.
+    if event.kind == KIND_GOVERNANCE_AUDIT_LOG && seen_audit_ids.contains(d) {
+        return Err(GovernanceEventError::DuplicateAuditEntry(d.to_string()));
+    }
+
+    Ok(())
 }
 
 // ── Agent Registry ──────────────────────────────────────────────────────────
@@ -573,6 +643,89 @@ mod tests {
         assert!(is_governance_kind(31405));
         assert!(!is_governance_kind(31399));
         assert!(!is_governance_kind(31406));
+    }
+
+    // ---- P2: governance event authz / append-only audit log ----
+
+    fn gov_event(kind: u64, d: &str) -> NostrEvent {
+        NostrEvent {
+            id: "00".repeat(32),
+            pubkey: "11".repeat(32),
+            created_at: 1_700_000_000,
+            kind,
+            tags: vec![vec!["d".to_string(), d.to_string()]],
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn governance_validator_rejects_out_of_range_kind() {
+        let ev = gov_event(31399, "x");
+        assert_eq!(
+            validate_governance_event(&ev, &HashSet::new()),
+            Err(GovernanceEventError::UnknownKind(31399)),
+        );
+        let ev2 = gov_event(31406, "x");
+        assert_eq!(
+            validate_governance_event(&ev2, &HashSet::new()),
+            Err(GovernanceEventError::UnknownKind(31406)),
+        );
+    }
+
+    #[test]
+    fn governance_validator_accepts_in_range_kind() {
+        let ev = gov_event(KIND_PANEL_DEFINITION, "panel-1");
+        assert!(validate_governance_event(&ev, &HashSet::new()).is_ok());
+    }
+
+    #[test]
+    fn governance_validator_requires_non_empty_d_tag() {
+        let mut ev = gov_event(KIND_PANEL_STATE, "x");
+        ev.tags.clear();
+        assert_eq!(
+            validate_governance_event(&ev, &HashSet::new()),
+            Err(GovernanceEventError::MissingDTag),
+        );
+        let ev_empty = gov_event(KIND_PANEL_STATE, "");
+        assert_eq!(
+            validate_governance_event(&ev_empty, &HashSet::new()),
+            Err(GovernanceEventError::EmptyDTag),
+        );
+    }
+
+    #[test]
+    fn audit_log_duplicate_d_tag_rejected() {
+        // First audit entry with a fresh id validates.
+        let ev = gov_event(KIND_GOVERNANCE_AUDIT_LOG, "audit-entry-1");
+        let mut seen: HashSet<String> = HashSet::new();
+        assert!(validate_governance_event(&ev, &seen).is_ok());
+
+        // Caller records the accepted entry id, making it append-only.
+        seen.insert("audit-entry-1".to_string());
+
+        // A replay/overwrite with the SAME `d` is rejected as a duplicate.
+        let replay = gov_event(KIND_GOVERNANCE_AUDIT_LOG, "audit-entry-1");
+        assert_eq!(
+            validate_governance_event(&replay, &seen),
+            Err(GovernanceEventError::DuplicateAuditEntry(
+                "audit-entry-1".to_string()
+            )),
+        );
+
+        // A distinct audit-entry id is still accepted (append-only, not frozen).
+        let next = gov_event(KIND_GOVERNANCE_AUDIT_LOG, "audit-entry-2");
+        assert!(validate_governance_event(&next, &seen).is_ok());
+    }
+
+    #[test]
+    fn non_audit_kind_ignores_seen_set() {
+        // Replaceable non-audit kinds may legitimately reuse a `d` tag; the
+        // duplicate check only applies to the 31405 audit log.
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert("panel-1".to_string());
+        let ev = gov_event(KIND_PANEL_DEFINITION, "panel-1");
+        assert!(validate_governance_event(&ev, &seen).is_ok());
     }
 
     #[test]

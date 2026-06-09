@@ -3,6 +3,26 @@
 //! Validates target URLs to block requests to private, loopback, link-local,
 //! cloud metadata, and other internal addresses, and provides a fetch
 //! wrapper that disables auto-redirects and re-validates SSRF on every hop.
+//!
+//! ## Cloudflare Workers runtime limitation (DNS-rebinding)
+//!
+//! The string/hostname denylist below validates only the *hostname text* of a
+//! URL. On a native client we would resolve the hostname to an IP and pin that
+//! IP for the actual connection (resolve-then-pin), closing the
+//! time-of-check/time-of-use gap. The Cloudflare Workers runtime exposes **no
+//! raw socket and no `getaddrinfo`**, so we cannot pin the resolved IP: the
+//! runtime resolves the hostname again at `fetch` time. An attacker domain
+//! (`rebind.attacker.com`) that passes the string denylist but resolves to
+//! `127.0.0.1` / `169.254.169.254` / an RFC1918 address will still connect
+//! internally. The denylist therefore reduces, but does not eliminate, SSRF.
+//!
+//! **The real mitigation in this runtime is the egress allowlist**
+//! ([`AllowList`], env var `PREVIEW_ALLOWED_HOSTS`). When set, only fetches to
+//! hosts matching the allowlist are permitted, so a rebinding attacker domain
+//! is rejected up front regardless of what it resolves to. When the allowlist
+//! is empty/unset we fall back to the hardened denylist, which is
+//! rebind-vulnerable by construction — operators handling untrusted preview
+//! targets should configure `PREVIEW_ALLOWED_HOSTS`.
 
 use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Response, Url};
 
@@ -47,6 +67,95 @@ impl std::fmt::Display for SsrfFetchError {
             SsrfFetchError::HttpStatus(s) => write!(f, "HTTP {s}"),
         }
     }
+}
+
+/// Egress allowlist of permitted preview hosts.
+///
+/// Populated from the `PREVIEW_ALLOWED_HOSTS` env var (comma/whitespace
+/// separated). An entry matches a host exactly, or — when the entry begins
+/// with a leading dot (`.example.com`) — matches that domain and any subdomain
+/// (`a.example.com`, `b.a.example.com`). Bare `example.com` matches the apex
+/// and its subdomains too (`www.example.com`).
+///
+/// When the allowlist is **non-empty** it is authoritative: only matching hosts
+/// are fetchable, which is the robust mitigation for DNS rebinding in the CF
+/// Workers runtime (see module docs). When **empty**, callers fall back to the
+/// hardened denylist in [`is_private_url`].
+#[derive(Debug, Clone, Default)]
+pub struct AllowList {
+    hosts: Vec<String>,
+}
+
+impl AllowList {
+    /// Parse an allowlist from a raw `PREVIEW_ALLOWED_HOSTS` string.
+    /// Splits on commas and ASCII whitespace; lowercases and trims each entry.
+    pub fn parse(raw: &str) -> Self {
+        let hosts = raw
+            .split([',', ' ', '\t', '\n', '\r'])
+            .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        AllowList { hosts }
+    }
+
+    /// `true` when no entries were configured (denylist fallback applies).
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+    }
+
+    /// `true` if `host` is permitted by this allowlist. A configured entry
+    /// matches the host exactly or as a parent domain suffix.
+    pub fn allows(&self, host: &str) -> bool {
+        let host = host.to_lowercase();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(&host);
+        self.hosts.iter().any(|entry| {
+            host == entry || host.ends_with(&format!(".{entry}"))
+        })
+    }
+}
+
+/// Process-global egress allowlist consulted by [`is_private_url`].
+///
+/// Kept global (rather than threaded through every call site) so the existing
+/// caller signatures — `is_private_url(&url)` at `lib.rs:216` and
+/// `ssrf_fetch_with_redirects(url, headers)` at `parse.rs`/`oembed.rs` — do not
+/// change; all callers benefit from the allowlist transparently.
+///
+/// Initialised lazily from `std::env::var("PREVIEW_ALLOWED_HOSTS")` (effective
+/// for native deployments and tests). The CF Workers WASM runtime injects vars
+/// via the JS `Env` object rather than the process environment, so the worker
+/// entry point should call [`set_allowlist`] with the parsed value; until then
+/// the lazy default yields an empty allowlist and the hardened denylist applies.
+static ALLOWLIST: std::sync::OnceLock<std::sync::RwLock<AllowList>> = std::sync::OnceLock::new();
+
+fn allowlist_cell() -> &'static std::sync::RwLock<AllowList> {
+    ALLOWLIST.get_or_init(|| {
+        let raw = std::env::var("PREVIEW_ALLOWED_HOSTS").unwrap_or_default();
+        std::sync::RwLock::new(AllowList::parse(&raw))
+    })
+}
+
+/// Install the egress allowlist for all subsequent SSRF checks.
+///
+/// The worker entry point reads `PREVIEW_ALLOWED_HOSTS` from its JS `Env` and
+/// calls this once per request (cheap: a single `RwLock` write of a small
+/// `Vec<String>`). Passing an empty/unset value restores hardened-denylist-only
+/// behaviour.
+pub fn set_allowlist(list: AllowList) {
+    if let Ok(mut guard) = allowlist_cell().write() {
+        *guard = list;
+    }
+}
+
+/// Snapshot the current global allowlist for use in a single validation pass.
+fn current_allowlist() -> AllowList {
+    allowlist_cell()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 /// Build a request with manual redirect handling so we can re-run the SSRF
@@ -115,9 +224,22 @@ pub async fn read_text_capped(mut response: Response) -> Result<String, SsrfFetc
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Returns `true` if the URL resolves to a private, loopback, link-local,
-/// metadata, or otherwise internal address that should not be fetched.
+/// Returns `true` if the URL should be blocked: it fails the egress allowlist
+/// (when one is configured), uses a non-http(s) scheme, carries userinfo, uses
+/// a non-standard port, or its hostname text matches a private, loopback,
+/// link-local, metadata, `.local`, or otherwise internal address.
+///
+/// **DNS rebinding caveat:** the hostname checks operate on the URL *string*,
+/// not the IP the CF runtime resolves at fetch time (see module docs). The
+/// allowlist is the authoritative mitigation; the denylist below is hardened
+/// best-effort and remains rebind-vulnerable when no allowlist is set.
 pub(crate) fn is_private_url(raw_url: &str) -> bool {
+    is_private_url_with(raw_url, &current_allowlist())
+}
+
+/// Allowlist-explicit core of [`is_private_url`]. Kept pure (no global reads)
+/// so it can be unit-tested deterministically without mutating process state.
+pub(crate) fn is_private_url_with(raw_url: &str, allowlist: &AllowList) -> bool {
     let parsed = match Url::parse(raw_url) {
         Ok(u) => u,
         Err(_) => return true, // unparseable -> block
@@ -129,10 +251,36 @@ pub(crate) fn is_private_url(raw_url: &str) -> bool {
         _ => return true,
     }
 
+    // Reject embedded credentials (`user:pass@host`) — a classic way to
+    // disguise the real authority and confuse downstream parsers.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return true;
+    }
+
+    // Restrict to the standard web ports. An explicit port other than 80/443
+    // is a strong signal of an attempt to reach an internal service.
+    if let Some(port) = parsed.port() {
+        if port != 80 && port != 443 {
+            return true;
+        }
+    }
+
     let hostname: String = match parsed.host_str() {
         Some(h) => h.to_lowercase(),
         None => return true,
     };
+
+    // Egress allowlist (authoritative when configured). A host outside the
+    // allowlist is blocked before any denylist heuristic runs; this is the
+    // robust DNS-rebinding mitigation available in the CF Workers runtime.
+    if !allowlist.is_empty() && !allowlist.allows(&hostname) {
+        return true;
+    }
+
+    // Reject mDNS / internal `.local` TLD (RFC 6762) — never publicly routable.
+    if hostname == "local" || hostname.ends_with(".local") {
+        return true;
+    }
 
     // Block non-standard IP obfuscation (integer/hex) that may bypass
     // the dotted-decimal regex on URL implementations that don't normalize them.
@@ -377,6 +525,86 @@ mod tests {
     fn redirect_target_to_link_local_ipv6_blocked() {
         let next = "http://[fe80::1]/";
         assert!(is_private_url(next));
+    }
+
+    // ── P1-7 hardening: userinfo / ports / .local ──────────────────────
+
+    #[test]
+    fn blocks_userinfo_in_authority() {
+        // `user:pass@host` disguises the real authority.
+        assert!(is_private_url("http://attacker@example.com/"));
+        assert!(is_private_url("https://user:pass@example.com/"));
+        // A bare public host without userinfo is still allowed.
+        assert!(!is_private_url("https://example.com/"));
+    }
+
+    #[test]
+    fn blocks_non_standard_ports() {
+        assert!(is_private_url("http://example.com:8080/"));
+        assert!(is_private_url("https://example.com:22/"));
+        // Standard ports remain allowed.
+        assert!(!is_private_url("http://example.com:80/"));
+        assert!(!is_private_url("https://example.com:443/"));
+    }
+
+    #[test]
+    fn blocks_mdns_local_tld() {
+        assert!(is_private_url("http://printer.local/"));
+        assert!(is_private_url("http://local/"));
+    }
+
+    // ── P1-7 egress allowlist ──────────────────────────────────────────
+    //
+    // Exercised through the pure `is_private_url_with(url, &allowlist)` core so
+    // tests never touch the process-global allowlist and cannot race the other
+    // public-host assertions that call `is_private_url`.
+
+    #[test]
+    fn allowlist_parse_matches_apex_and_subdomains() {
+        let list = AllowList::parse("example.com, .images.example.org");
+        assert!(!list.is_empty());
+        assert!(list.allows("example.com")); // apex
+        assert!(list.allows("www.example.com")); // subdomain of bare entry
+        assert!(list.allows("images.example.org")); // apex of dotted entry
+        assert!(list.allows("cdn.images.example.org")); // subdomain
+        assert!(!list.allows("evil.com"));
+        assert!(!list.allows("notexample.com")); // suffix must be a label boundary
+    }
+
+    #[test]
+    fn allowlist_empty_falls_back_to_denylist() {
+        // An empty allowlist must not block public hosts (denylist authoritative).
+        let empty = AllowList::parse("   ,  ");
+        assert!(empty.is_empty());
+        assert!(!is_private_url_with("https://example.com/", &empty));
+        assert!(!is_private_url_with("https://other.com/", &empty));
+        // ...but the denylist still applies under an empty allowlist.
+        assert!(is_private_url_with("http://127.0.0.1/", &empty));
+    }
+
+    #[test]
+    fn allowlist_enforced_when_set() {
+        let list = AllowList::parse("example.com");
+        // Allowlisted apex + subdomain pass.
+        assert!(!is_private_url_with("https://example.com/", &list));
+        assert!(!is_private_url_with("https://www.example.com/", &list));
+        // Anything outside the allowlist is blocked BEFORE any DNS resolution —
+        // the real DNS-rebinding mitigation in the CF Workers runtime.
+        assert!(
+            is_private_url_with("https://rebind.attacker.com/", &list),
+            "host outside allowlist must be blocked regardless of resolution"
+        );
+        assert!(is_private_url_with("https://other.com/", &list));
+    }
+
+    #[test]
+    fn allowlist_redirect_hop_to_private_host_rejected() {
+        // Even when the initial host is allowlisted, a redirect hop to a host
+        // outside the allowlist is rejected: the redirect loop re-runs the same
+        // validation on every `Location` target.
+        let list = AllowList::parse("example.com");
+        assert!(is_private_url_with("http://169.254.169.254/latest/", &list));
+        assert!(is_private_url_with("http://192.168.1.1/secret", &list));
     }
 
     #[test]

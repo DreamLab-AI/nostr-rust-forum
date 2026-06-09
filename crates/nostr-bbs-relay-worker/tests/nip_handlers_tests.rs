@@ -15,7 +15,8 @@
 
 use nostr_bbs_core::event::NostrEvent;
 use nostr_bbs_relay_worker::test_exports::{
-    d_tag_value, event_matches_filters, event_treatment, tag_value, EventTreatment, NostrFilter,
+    d_tag_value, event_matches_filters, event_treatment, governance_response_blocked, tag_value,
+    EventTreatment, NostrFilter,
 };
 
 // ---------------------------------------------------------------------------
@@ -651,4 +652,40 @@ fn governance_event_matches_kind_filter() {
         extra: std::collections::HashMap::new(),
     };
     assert!(event_matches_filters(&event, &[filter]));
+}
+
+// ---------------------------------------------------------------------------
+// P1-6: kind-31403 ActionResponse (approve/reject) is admin-only.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn non_admin_action_response_is_blocked() {
+    // A whitelisted but non-admin signer must NOT be able to approve/reject.
+    assert!(governance_response_blocked(
+        nostr_bbs_core::governance::KIND_ACTION_RESPONSE,
+        /* is_admin */ false
+    ));
+}
+
+#[test]
+fn admin_action_response_is_accepted() {
+    // An admin signer is permitted to approve/reject.
+    assert!(!governance_response_blocked(
+        nostr_bbs_core::governance::KIND_ACTION_RESPONSE,
+        /* is_admin */ true
+    ));
+}
+
+#[test]
+fn action_response_gate_only_targets_31403() {
+    // Other governance kinds are not affected by the admin-only response gate
+    // (they go through the agent-registry gate instead).
+    assert!(!governance_response_blocked(
+        nostr_bbs_core::governance::KIND_ACTION_REQUEST,
+        false
+    ));
+    assert!(!governance_response_blocked(
+        nostr_bbs_core::governance::KIND_PANEL_DEFINITION,
+        false
+    ));
 }

@@ -24,7 +24,7 @@
 use nostr_bbs_core::d1_helpers::{js_i64, js_opt_i64, js_opt_str, js_str};
 use nostr_bbs_core::{
     validate_moderation_event, NostrEvent, KIND_BAN, KIND_MUTE, KIND_REPORT, KIND_REPORT_NIP56,
-    KIND_WARNING, MOD_KINDS,
+    KIND_UNBAN, KIND_UNMUTE, KIND_WARNING, MOD_KINDS,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -157,7 +157,25 @@ async fn admin_set(env: &Env) -> HashSet<String> {
 // POST /api/mod/{ban|mute|warn}
 // ---------------------------------------------------------------------------
 
-/// Handle an admin moderation action (ban / mute / warn).
+/// Map a moderation action path to its `(action_name, expected_kind)` pair.
+///
+/// P0-4: `unban`/`unmute` are the HTTP-side counterparts to the relay's
+/// unban/unmute mirror. They flow through the identical admin/NIP-98 auth
+/// and validate-then-persist path as `ban`/`mute`; the signed KIND_UNBAN
+/// (30915) / KIND_UNMUTE (30916) events are built client-side via
+/// `build_unban` / `build_unmute`.
+fn action_for_path(path: &str) -> Option<(&'static str, u64)> {
+    match path {
+        "/api/mod/ban" => Some(("ban", KIND_BAN)),
+        "/api/mod/mute" => Some(("mute", KIND_MUTE)),
+        "/api/mod/warn" => Some(("warn", KIND_WARNING)),
+        "/api/mod/unban" => Some(("unban", KIND_UNBAN)),
+        "/api/mod/unmute" => Some(("unmute", KIND_UNMUTE)),
+        _ => None,
+    }
+}
+
+/// Handle an admin moderation action (ban / mute / warn / unban / unmute).
 ///
 /// `expected_kind` constrains the event kind so clients can't mix actions.
 pub async fn handle_action(
@@ -167,11 +185,9 @@ pub async fn handle_action(
     env: &Env,
     origin: &str,
 ) -> Result<Response> {
-    let (action_name, expected_kind) = match path {
-        "/api/mod/ban" => ("ban", KIND_BAN),
-        "/api/mod/mute" => ("mute", KIND_MUTE),
-        "/api/mod/warn" => ("warn", KIND_WARNING),
-        _ => return error_json(env, "Unknown moderation action path", 404),
+    let (action_name, expected_kind) = match action_for_path(path) {
+        Some(pair) => pair,
+        None => return error_json(env, "Unknown moderation action path", 404),
     };
 
     let url = canonical_url(origin, path);
@@ -686,7 +702,7 @@ mod tests {
     use super::*;
     use k256::schnorr::SigningKey;
     use nostr_bbs_core::event::{sign_event_deterministic, UnsignedEvent};
-    use nostr_bbs_core::{build_ban, build_mute, build_report};
+    use nostr_bbs_core::{build_ban, build_mute, build_report, build_unban, build_unmute};
 
     fn admin_sk() -> SigningKey {
         SigningKey::from_bytes(&[0x02u8; 32]).unwrap()
@@ -787,5 +803,58 @@ mod tests {
         let ev = signed(build_ban(&admin_pk(), &target_pk(), "", 1_700_000_000));
         assert_eq!(first_tag(&ev, "p"), Some(target_pk().as_str()));
         assert_eq!(first_tag(&ev, "zz"), None);
+    }
+
+    // ── P0-4: unban / unmute routing ──────────────────────────────────
+
+    #[test]
+    fn action_for_path_routes_all_actions() {
+        assert_eq!(action_for_path("/api/mod/ban"), Some(("ban", KIND_BAN)));
+        assert_eq!(action_for_path("/api/mod/mute"), Some(("mute", KIND_MUTE)));
+        assert_eq!(
+            action_for_path("/api/mod/warn"),
+            Some(("warn", KIND_WARNING))
+        );
+        // The two gap-filled routes must resolve to the unban/unmute kinds.
+        assert_eq!(
+            action_for_path("/api/mod/unban"),
+            Some(("unban", KIND_UNBAN))
+        );
+        assert_eq!(
+            action_for_path("/api/mod/unmute"),
+            Some(("unmute", KIND_UNMUTE))
+        );
+        assert_eq!(action_for_path("/api/mod/nope"), None);
+    }
+
+    #[test]
+    fn unban_event_routes_and_validates() {
+        // The route resolves to KIND_UNBAN ...
+        let (name, kind) = action_for_path("/api/mod/unban").unwrap();
+        assert_eq!(name, "unban");
+        assert_eq!(kind, KIND_UNBAN);
+
+        // ... and an admin-signed unban event passes the same kind-match +
+        // validate_moderation_event gate that handle_action applies.
+        let ev = signed(build_unban(&admin_pk(), &target_pk(), "appeal granted", 1_700_000_000));
+        assert_eq!(ev.kind, kind);
+        let mut admins = HashSet::new();
+        admins.insert(admin_pk());
+        validate_moderation_event(&ev, &admins).expect("unban event must validate for admin signer");
+        assert_eq!(first_tag(&ev, "p"), Some(target_pk().as_str()));
+    }
+
+    #[test]
+    fn unmute_event_routes_and_validates() {
+        let (name, kind) = action_for_path("/api/mod/unmute").unwrap();
+        assert_eq!(name, "unmute");
+        assert_eq!(kind, KIND_UNMUTE);
+
+        let ev = signed(build_unmute(&admin_pk(), &target_pk(), "cooldown over", 1_700_000_000));
+        assert_eq!(ev.kind, kind);
+        let mut admins = HashSet::new();
+        admins.insert(admin_pk());
+        validate_moderation_event(&ev, &admins).expect("unmute event must validate for admin signer");
+        assert_eq!(first_tag(&ev, "p"), Some(target_pk().as_str()));
     }
 }

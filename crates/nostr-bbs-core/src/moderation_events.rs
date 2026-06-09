@@ -26,8 +26,8 @@ use thiserror::Error;
 /// Permanent ban on a pubkey. `d` tag = banned pubkey (hex, 64 chars).
 pub const KIND_BAN: u64 = 30910;
 
-/// Temporary mute on a pubkey. `d` tag = muted pubkey. Add `expires` tag
-/// with a unix-seconds value to bound the mute; absence = indefinite.
+/// Temporary mute on a pubkey. `d` tag = muted pubkey. Add `expiration` tag
+/// (NIP-40 standard) with a unix-seconds value to bound the mute; absence = indefinite.
 pub const KIND_MUTE: u64 = 30911;
 
 /// Formal warning to a pubkey. `d` tag = `<pubkey>:<created_at_secs>`
@@ -114,8 +114,8 @@ pub enum ModerationEventError {
     #[error("report missing `e` (target event id) tag")]
     ReportMissingE,
 
-    /// A mute with `expires` must carry a parseable unix-seconds value.
-    #[error("invalid `expires` tag: {0}")]
+    /// A mute with `expiration` must carry a parseable unix-seconds value.
+    #[error("invalid `expiration` tag: {0}")]
     InvalidExpires(String),
 }
 
@@ -185,8 +185,18 @@ pub fn validate_moderation_event(
                     reason: "target portion of d-tag must be 64-char hex pubkey",
                 });
             }
+            // P1-5: bind the admin namespace to the signer. The d-tag's admin
+            // half must equal the event's pubkey, else admin A could overwrite
+            // admin B's replaceable ban/unban/mute/unmute slot. Compare
+            // case-normalised (lowercase) consistent with the hex64 shape.
+            if !admin_part.eq_ignore_ascii_case(&event.pubkey) {
+                return Err(ModerationEventError::InvalidDTag {
+                    kind: event.kind,
+                    reason: "d-tag admin namespace must match the signing pubkey",
+                });
+            }
             if event.kind == KIND_MUTE {
-                if let Some(exp) = first_tag_value(event, "expires") {
+                if let Some(exp) = first_tag_value(event, "expiration") {
                     exp.parse::<u64>()
                         .map_err(|e| ModerationEventError::InvalidExpires(e.to_string()))?;
                 }
@@ -245,12 +255,12 @@ pub fn validate_moderation_event(
     Ok(())
 }
 
-/// Read the `expires` tag as a unix-seconds value, if present.
+/// Read the `expiration` tag (NIP-40) as a unix-seconds value, if present.
 ///
 /// Returns `Ok(None)` when the tag is absent, `Ok(Some(ts))` when it parses,
 /// and `Err(...)` when the tag is present but malformed.
 pub fn mute_expires_at(event: &NostrEvent) -> Result<Option<u64>, ModerationEventError> {
-    match first_tag_value(event, "expires") {
+    match first_tag_value(event, "expiration") {
         None => Ok(None),
         Some(v) => v
             .parse::<u64>()
@@ -307,7 +317,7 @@ pub fn build_unban(
 }
 
 /// Build an unsigned Mute event. `expires_at` is unix-seconds; pass 0 for
-/// an indefinite mute (the `expires` tag is then omitted).
+/// an indefinite mute (the `expiration` tag is then omitted).
 ///
 /// The `d` tag is `{admin_pubkey}:{target_pubkey}` (same scheme as ban).
 pub fn build_mute(
@@ -323,7 +333,7 @@ pub fn build_mute(
         vec!["p".to_string(), target_pubkey.to_string()],
     ];
     if expires_at > 0 {
-        tags.push(vec!["expires".to_string(), expires_at.to_string()]);
+        tags.push(vec!["expiration".to_string(), expires_at.to_string()]);
     }
     UnsignedEvent {
         pubkey: admin_pubkey.to_string(),
@@ -606,7 +616,7 @@ mod tests {
     fn mute_with_garbage_expires_rejected() {
         let mut u = build_mute(&admin_pk_hex(), &target_pk(), 0, "r", 1_700_000_000);
         u.tags
-            .push(vec!["expires".to_string(), "tomorrow".to_string()]);
+            .push(vec!["expiration".to_string(), "tomorrow".to_string()]);
         let signed = sign(u);
         assert!(matches!(
             validate_moderation_event(&signed, &admin_set()),
@@ -657,6 +667,79 @@ mod tests {
         let u = build_ban(&admin_pk_hex(), &target_pk(), "x", 1);
         let expected = format!("{}:{}", admin_pk_hex(), target_pk());
         assert_eq!(d_tag_of(&u), Some(expected.as_str()));
+    }
+
+    // ---- P0-3: timed-mute expiry round-trips through the `expiration` tag ----
+
+    #[test]
+    fn timed_mute_expiry_round_trips_end_to_end() {
+        // Build a timed mute, then run it back through the validator/parse path.
+        // The parsed expiry must equal the input, proving the tag name
+        // (`expiration`, NIP-40) is consistent end-to-end within core.
+        let now = 1_700_000_000u64;
+        let expires_at = now + 3600;
+        let u = build_mute(&admin_pk_hex(), &target_pk(), expires_at, "cool down", now);
+        let signed = sign(u);
+
+        // Validator accepts the timed mute (parses the expiration tag).
+        assert!(validate_moderation_event(&signed, &admin_set()).is_ok());
+        // The expiry parses back to exactly what we put in.
+        assert_eq!(mute_expires_at(&signed).unwrap(), Some(expires_at));
+
+        // The raw tag carries the NIP-40 `expiration` name, never the old `expires`.
+        assert_eq!(first_tag_value(&signed, "expiration"), Some(expires_at.to_string().as_str()));
+        assert_eq!(first_tag_value(&signed, "expires"), None);
+    }
+
+    // ---- P1-5: d-tag admin namespace must be bound to the signing pubkey ----
+
+    #[test]
+    fn ban_with_foreign_admin_namespace_rejected() {
+        // A valid admin signs a ban whose d-tag names a DIFFERENT admin's
+        // namespace. The signer is in the admin set, but the d-tag admin half
+        // is not the signer's pubkey, so it must be rejected (slot hijack).
+        let other_admin = "ab".repeat(32);
+        let u = UnsignedEvent {
+            pubkey: admin_pk_hex(),
+            created_at: 1_700_000_000,
+            kind: KIND_BAN,
+            tags: vec![
+                vec!["d".to_string(), format!("{}:{}", other_admin, target_pk())],
+                vec!["p".to_string(), target_pk()],
+            ],
+            content: "hijack".to_string(),
+        };
+        let signed = sign(u);
+        let err = validate_moderation_event(&signed, &admin_set()).unwrap_err();
+        assert!(matches!(
+            err,
+            ModerationEventError::InvalidDTag { kind: KIND_BAN, .. }
+        ));
+    }
+
+    #[test]
+    fn unmute_with_foreign_admin_namespace_rejected() {
+        // Same binding check applies to the unmute (revocation) kind.
+        let other_admin = "cd".repeat(32);
+        let u = UnsignedEvent {
+            pubkey: admin_pk_hex(),
+            created_at: 1_700_000_000,
+            kind: KIND_UNMUTE,
+            tags: vec![
+                vec!["d".to_string(), format!("{}:{}", other_admin, target_pk())],
+                vec!["p".to_string(), target_pk()],
+            ],
+            content: "hijack".to_string(),
+        };
+        let signed = sign(u);
+        let err = validate_moderation_event(&signed, &admin_set()).unwrap_err();
+        assert!(matches!(
+            err,
+            ModerationEventError::InvalidDTag {
+                kind: KIND_UNMUTE,
+                ..
+            }
+        ));
     }
 
     #[test]

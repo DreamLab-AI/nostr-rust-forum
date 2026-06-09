@@ -159,6 +159,13 @@ mod tests {
                 operator: "tier-2".into(),
             },
             nip05: Nip05::default(),
+            native_pod: NativePod {
+                enabled: false,
+                base_url: "https://pods-native.example.com".into(),
+                allowlist_cohorts: Vec::new(),
+                git_enabled: true,
+                admin_provision_url: String::new(),
+            },
         }
     }
 

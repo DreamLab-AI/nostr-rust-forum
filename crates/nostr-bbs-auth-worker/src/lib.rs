@@ -372,7 +372,14 @@ async fn route_sprint_api(
         .unwrap_or_default();
 
     // -- Moderation (WI-2) ----------------------------------------------
-    if matches!(path, "/api/mod/ban" | "/api/mod/mute" | "/api/mod/warn") && *method == Method::Post
+    if matches!(
+        path,
+        "/api/mod/ban"
+            | "/api/mod/mute"
+            | "/api/mod/warn"
+            | "/api/mod/unban"
+            | "/api/mod/unmute"
+    ) && *method == Method::Post
     {
         let resp = moderation::handle_action(path, body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
