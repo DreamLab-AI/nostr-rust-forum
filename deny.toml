@@ -57,8 +57,8 @@ license-files = [{ path = "LICENSE-UNICODE", hash = 0x3fb01745 }]
 # Warn for now; tighten to "deny" once duplicates are resolved.
 multiple-versions = "warn"
 # Wildcards in version requirements are sloppy.
-# Using "warn" while solid-pod-rs is git-pinned (rev counts as wildcard).
-# Tighten back to "deny" once alpha.13 lands on crates.io.
+# Using "warn" while solid-pod-rs is git-pinned (tag counts as wildcard).
+# Tighten back to "deny" once 0.4.0-alpha.16 publishes to crates.io.
 wildcards = "warn"
 # Allow specific duplicates that are hard to unify (transitive deps):
 # skip = []
@@ -71,6 +71,6 @@ wildcards = "warn"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# solid-pod-rs is pinned to a specific rev pending alpha.13 crates.io release.
-# Remove once alpha.13 publishes and the workspace dep is updated to a version.
+# solid-pod-rs is pinned to git tag v0.4.0-alpha.16 pending its crates.io release.
+# Remove once 0.4.0-alpha.16 publishes and the workspace dep reverts to a version.
 allow-git = ["https://github.com/DreamLab-AI/solid-pod-rs"]

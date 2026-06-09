@@ -127,8 +127,15 @@ wasm-bindgen-test = "0.3"
 # `core` consumers (CF Workers): use this dep.
 # Server-side consumers: enable `tokio-runtime` and the IO backends
 # they need.
-# 0.4.0-alpha.15: CORS allowlist, /_admin/provision, native pod sidecar support.
-solid-pod-rs = { version = "0.4.0-alpha.15", default-features = false, features = ["core"] }
+# Pinned to the git tag v0.4.0-alpha.16 rather than the crates.io publish.
+# The registry `0.4.0-alpha.15` aliased two different code states: the published
+# crate and an advanced, untagged git HEAD (the highest real tag was alpha.11).
+# alpha.16 is the first tag since alpha.11 and pins the post-publish auth +
+# cost-accounting fixes (WAC/git read-auth, payments::debit) so this forum builds
+# the same solid-pod-rs code as agentbox. NOTE: the tag becomes resolvable only
+# once the operator pushes solid-pod-rs main + the tag; until then `cargo update
+# -p solid-pod-rs` against the remote will fail (a listed operator action).
+solid-pod-rs = { git = "https://github.com/DreamLab-AI/solid-pod-rs", tag = "v0.4.0-alpha.16", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as version 3.0+).
 nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "3.0.0-rc11" }
