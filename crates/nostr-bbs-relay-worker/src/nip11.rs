@@ -51,6 +51,16 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
             "max_filters": 10,
             "max_limit": 1000,
             "max_subid_length": 64,
+            // Gap 7 (truthful relay-info): the relay sends a NIP-42 AUTH
+            // challenge on connect and lists 42 in supported_nips, but writes
+            // are NOT gated on completing the AUTH handshake — the gate is on
+            // the *signed event's pubkey* being whitelisted (see
+            // nip_handlers::handle_event `is_whitelisted`). So `auth_required`
+            // is false in the strict NIP-42 sense (no AUTH round-trip is
+            // forced before EVENT), but writes are still trust-gated. The
+            // `restricted_writes` flag plus the `dreamlab.write_policy` block
+            // below describe the actual model so a standard client does not
+            // mistake this for an open relay.
             "auth_required": false,
             "payment_required": false,
             "restricted_writes": true,
@@ -74,6 +84,21 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         // prevent drift. Namespaced under `dreamlab` so it never collides with
         // standard NIP-11 fields.
         "dreamlab": {
+            // Gap 7: make the whitelist-gated write model explicit. Standard
+            // NIP-11 only has the boolean `restricted_writes`; this block says
+            // *how* writes are restricted so a client knows a rejection is not
+            // a NIP-42 AUTH failure but a trust/whitelist decision keyed on the
+            // signed event's pubkey. `auth_method: "whitelist"` (not "nip42")
+            // is the truthful description: the EVENT itself proves identity,
+            // and admission is decided against the relay's whitelist + trust
+            // levels, not against a completed AUTH session.
+            "write_policy": {
+                "model": "whitelist",
+                "auth_method": "whitelist",
+                "nip42_challenge_sent": true,
+                "nip42_required_for_write": false,
+                "rejection_message": "blocked: pubkey not whitelisted",
+            },
             "agent_control_surface": {
                 "enabled": true,
                 "registry_gated": true,
