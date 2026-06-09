@@ -7,7 +7,10 @@ command = "worker-build --release"
 
 [vars]
 RELAY_NAME = "Nostr BBS Relay"
-ADMIN_PUBKEYS = ""
+# NOTE: the relay sources admin status from D1 (whitelist.is_admin), not from
+# an env var — there is no ADMIN_PUBKEYS reader in src/. A dead ADMIN_PUBKEYS=""
+# var was removed here (Gap 2) to avoid implying the relay has a static admin
+# set that diverges from the auth/search workers.
 ALLOWED_ORIGIN = "https://example.com"
 ALLOWED_ORIGINS = "https://example.com"
 

@@ -3,20 +3,26 @@
 //! Ingest endpoint requires NIP-98 admin auth. Uses D1-backed atomic replay
 //! protection via `nostr_bbs_rate_limit::verify_nip98`.
 //!
-//! ## Admin check limitation (P2-02)
+//! ## Admin check (`ADMIN_PUBKEYS` static set)
 //!
 //! Unlike the auth-worker and pod-worker, this worker does **not** have a D1
 //! binding to the members/whitelist tables. Admin membership is determined by
-//! the `ADMIN_PUBKEYS` environment variable (comma-separated hex pubkeys).
+//! the `ADMIN_PUBKEYS` environment variable (comma-separated hex pubkeys) —
+//! the **static** half of the canonical `static ∪ D1` resolution order. The
+//! auth-worker reads this same env var (its bootstrap/fallback set) plus D1, so
+//! when the deploy pipeline injects `dreamlab.toml [admin] static_pubkeys` into
+//! `ADMIN_PUBKEYS` for both workers, the search-worker admin set is a subset of
+//! the auth-worker set and no longer diverges (Gap 2).
+//!
+//! Parsing goes through [`nostr_bbs_core::admin_pubkeys_from_env_str`] — the
+//! single canonical parser shared with the auth-worker — so the
+//! comma/whitespace/empty semantics cannot drift between the two WASM targets.
 //!
 //! This is a deliberate tradeoff: the search worker's only admin-gated
 //! endpoint is the ingest trigger, and adding a D1 binding would increase
-//! cold-start latency for a single rarely-used route.
-//!
-//! If the search worker grows additional admin endpoints, the admin check
-//! should be migrated to D1-backed queries using
-//! [`nostr_bbs_core::admin_shared`] shared constants, matching the canonical
-//! algorithm documented there.
+//! cold-start latency for a single rarely-used route. If the search worker
+//! grows endpoints that need the *dynamic* D1 admins, migrate it to the
+//! D1-backed queries in [`nostr_bbs_core::admin_shared`].
 
 use nostr_bbs_core::nip98::{Nip98Error, Nip98Token};
 use worker::Env;
@@ -42,20 +48,24 @@ pub async fn verify_nip98_replay(
     .await
 }
 
-/// Return the list of admin pubkeys from the `ADMIN_PUBKEYS` environment variable.
+/// Return the list of admin pubkeys from the `ADMIN_PUBKEYS` environment
+/// variable, parsed through the canonical shared parser so the semantics match
+/// the auth-worker exactly.
 pub fn admin_pubkeys(env: &Env) -> Vec<String> {
-    env.var("ADMIN_PUBKEYS")
+    let raw = env
+        .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)
         .map(|v| v.to_string())
-        .unwrap_or_default()
-        .split(',')
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-        .collect()
+        .unwrap_or_default();
+    nostr_bbs_core::admin_pubkeys_from_env_str(&raw)
 }
 
 /// Check whether a pubkey is listed in the `ADMIN_PUBKEYS` environment variable.
 pub fn is_admin(pubkey: &str, env: &Env) -> bool {
-    admin_pubkeys(env).iter().any(|k| k == pubkey)
+    let raw = env
+        .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    nostr_bbs_core::is_static_admin(pubkey, &raw)
 }
 
 /// Verify NIP-98 auth and assert the authenticated pubkey is an admin.
