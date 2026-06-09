@@ -37,15 +37,31 @@ pub async fn verify(
 
 /// Is `pubkey` an admin?
 ///
-/// The relay worker's D1 (`RELAY_DB` binding) is the single source of truth
-/// for whitelist membership and admin flags — the relay's `/api/whitelist/*`
-/// handlers write there. We check `RELAY_DB` first, then fall back to `DB`
-/// (dreamlab-auth) for sprint-native `members` rows created by the invite
-/// redemption flow.
+/// Resolution order is **static (`ADMIN_PUBKEYS`) ∪ D1**, per the canonical
+/// algorithm in [`nostr_bbs_core::admin_shared`]:
+///
+/// 1. The deploy-time static admin set in the `ADMIN_PUBKEYS` env var (mirrors
+///    `dreamlab.toml [admin] static_pubkeys`). This is the bootstrap/fallback
+///    authority so a fresh deployment whose D1 tables carry no `is_admin = 1`
+///    row still has working admins — closing Gap 1 (the static config was
+///    previously inert: declared in `dreamlab.toml` but read by no runtime
+///    gate). The env var is the same source the search-worker uses, so all
+///    three workers now agree on the static set (Gap 2).
+/// 2. The relay worker's D1 (`RELAY_DB` binding) — authority for dynamic
+///    `whitelist.is_admin`, written by the relay's `/api/whitelist/*` handlers.
+/// 3. The auth worker's D1 (`DB` binding) — sprint-native `members.is_admin`
+///    rows created by the invite-redemption flow.
 ///
 /// Returns `false` on DB error or missing rows — never leaks ambient
 /// authority across error branches.
 pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
+    // Static admin set (ADMIN_PUBKEYS): deploy-time bootstrap/fallback.
+    if let Ok(raw) = env.var(nostr_bbs_core::ADMIN_PUBKEYS_VAR).map(|v| v.to_string()) {
+        if nostr_bbs_core::is_static_admin(pubkey, &raw) {
+            return true;
+        }
+    }
+
     // RELAY_DB (dreamlab-relay): authority for whitelist.is_admin
     if let Ok(relay_db) = env.d1("RELAY_DB") {
         if let Ok(stmt) = relay_db

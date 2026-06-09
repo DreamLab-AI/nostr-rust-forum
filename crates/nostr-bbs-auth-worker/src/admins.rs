@@ -58,10 +58,21 @@ pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
         }
     }
 
-    // Cache miss — query D1. Check both RELAY_DB (relay's whitelist, the
-    // source of truth for admin flags) and DB (auth's members table, set
-    // by the invite-redemption flow).
+    // Cache miss — resolve static (ADMIN_PUBKEYS) ∪ D1, matching the
+    // canonical order in `admin::is_admin`. Check both RELAY_DB (relay's
+    // whitelist, the source of truth for dynamic admin flags) and DB (auth's
+    // members table, set by the invite-redemption flow).
     let mut pubkeys: Vec<String> = Vec::new();
+
+    // Static admin set (ADMIN_PUBKEYS): deploy-time bootstrap/fallback, so a
+    // fresh D1 still surfaces the operator's static admins here (Gap 1/2).
+    if let Ok(raw) = env.var(nostr_bbs_core::ADMIN_PUBKEYS_VAR).map(|v| v.to_string()) {
+        for k in nostr_bbs_core::admin_pubkeys_from_env_str(&raw) {
+            if !pubkeys.contains(&k) {
+                pubkeys.push(k);
+            }
+        }
+    }
 
     // RELAY_DB: whitelist.is_admin (source of truth)
     if let Ok(relay_db) = env.d1("RELAY_DB") {

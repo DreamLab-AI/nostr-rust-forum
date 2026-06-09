@@ -21,6 +21,19 @@
 //! On DB error or missing rows, the check returns `false` — never leaking
 //! ambient authority across error branches.
 //!
+//! ## Static admin bootstrap (`ADMIN_PUBKEYS`)
+//!
+//! In addition to the two D1 sources, a deploy-time **static** admin set may be
+//! injected via the `ADMIN_PUBKEYS` env var (comma-separated hex pubkeys). This
+//! mirrors `dreamlab.toml [admin] static_pubkeys` and is the bootstrap/fallback
+//! authority: a fresh deployment whose D1 `whitelist`/`members` tables carry no
+//! `is_admin = 1` row still has working admins so the operator can seed D1.
+//!
+//! The canonical resolution order is **`ADMIN_PUBKEYS` (static) ∪ D1**. Every
+//! worker parses the env var through [`admin_pubkeys_from_env_str`] so the
+//! comma/whitespace/empty-filter semantics never drift between crates (workers
+//! are separate WASM targets and cannot share a function at link time).
+//!
 //! ## Listing all admin pubkeys
 //!
 //! To list all admins (e.g. for the `/api/admins` endpoint or KV cache
@@ -69,6 +82,35 @@ pub const WHITELIST_ADMIN_LIST_SQL: &str = "SELECT pubkey FROM whitelist WHERE i
 pub const MEMBERS_ADMIN_LIST_SQL: &str = "SELECT pubkey FROM members WHERE is_admin = 1";
 
 // ---------------------------------------------------------------------------
+// Static admin set (`ADMIN_PUBKEYS` env var)
+// ---------------------------------------------------------------------------
+
+/// Env var carrying the deploy-time static admin set, comma-separated hex
+/// pubkeys. Mirrors `dreamlab.toml [admin] static_pubkeys` (injected at deploy
+/// time, following the `POD_BASE_URL` mirroring convention).
+pub const ADMIN_PUBKEYS_VAR: &str = "ADMIN_PUBKEYS";
+
+/// Parse a raw `ADMIN_PUBKEYS` value into the static admin pubkey set.
+///
+/// Splits on `,`, trims each entry, and drops empties — so an unset/empty var
+/// yields an empty `Vec` (no ambient admins), and trailing commas or stray
+/// whitespace are tolerated. This is the single canonical parser; every worker
+/// calls it so the comma/whitespace/empty semantics stay identical across the
+/// separately-compiled WASM targets.
+pub fn admin_pubkeys_from_env_str(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .collect()
+}
+
+/// Whether `pubkey` is present in the static `ADMIN_PUBKEYS` set parsed from
+/// `raw`. Constant-shape membership test over [`admin_pubkeys_from_env_str`].
+pub fn is_static_admin(pubkey: &str, raw: &str) -> bool {
+    admin_pubkeys_from_env_str(raw).iter().any(|k| k == pubkey)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -103,5 +145,27 @@ mod tests {
         assert!(MEMBERS_IS_ADMIN_SQL.contains("?1"));
         assert!(WHITELIST_ADMIN_LIST_SQL.contains("is_admin = 1"));
         assert!(MEMBERS_ADMIN_LIST_SQL.contains("is_admin = 1"));
+    }
+
+    #[test]
+    fn static_admin_parse_empty_is_no_admins() {
+        assert!(admin_pubkeys_from_env_str("").is_empty());
+        assert!(admin_pubkeys_from_env_str("   ").is_empty());
+        assert!(admin_pubkeys_from_env_str(",, ,").is_empty());
+    }
+
+    #[test]
+    fn static_admin_parse_trims_and_filters() {
+        let keys = admin_pubkeys_from_env_str(" aabb , ccdd ,,eeff ");
+        assert_eq!(keys, vec!["aabb", "ccdd", "eeff"]);
+    }
+
+    #[test]
+    fn static_admin_membership() {
+        let raw = "6407eed8,5d80b5fa";
+        assert!(is_static_admin("6407eed8", raw));
+        assert!(is_static_admin("5d80b5fa", raw));
+        assert!(!is_static_admin("deadbeef", raw));
+        assert!(!is_static_admin("6407eed8", ""));
     }
 }

@@ -96,8 +96,8 @@ pub use nip90::{
 pub use signer::{PrfSigner, Signer, SignerError};
 
 pub use admin_shared::{
-    IsAdminRow, PubkeyRow, MEMBERS_ADMIN_LIST_SQL, MEMBERS_IS_ADMIN_SQL, WHITELIST_ADMIN_LIST_SQL,
-    WHITELIST_IS_ADMIN_SQL,
+    admin_pubkeys_from_env_str, is_static_admin, IsAdminRow, PubkeyRow, ADMIN_PUBKEYS_VAR,
+    MEMBERS_ADMIN_LIST_SQL, MEMBERS_IS_ADMIN_SQL, WHITELIST_ADMIN_LIST_SQL, WHITELIST_IS_ADMIN_SQL,
 };
 pub use cors::{CorsHeader, POD_CORS_HEADERS, STANDARD_CORS_HEADERS};
 
