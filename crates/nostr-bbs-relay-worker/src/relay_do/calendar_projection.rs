@@ -364,7 +364,13 @@ mod tests {
             "business, unknown zone deny-by-default"
         );
         assert_eq!(
-            project_tier(&cohorts(&[COHORT_BUSINESS]), ZONE_PUBLIC, None, false, false),
+            project_tier(
+                &cohorts(&[COHORT_BUSINESS]),
+                ZONE_PUBLIC,
+                None,
+                false,
+                false
+            ),
             Projection::Full,
             "business, public zone full"
         );
@@ -515,7 +521,13 @@ mod tests {
     fn rsvp_served_only_when_target_tier_full() {
         // friends viewing a friends-zone target → Full → RSVP served.
         assert_eq!(
-            project_tier(&cohorts(&[COHORT_FRIENDS]), ZONE_FRIENDS, None, false, false),
+            project_tier(
+                &cohorts(&[COHORT_FRIENDS]),
+                ZONE_FRIENDS,
+                None,
+                false,
+                false
+            ),
             Projection::Full,
         );
         // friends viewing a family@fairfield target → FreeBusy → RSVP withheld.
@@ -531,7 +543,13 @@ mod tests {
         );
         // business viewing a family-zone target → Omit → RSVP withheld.
         assert_eq!(
-            project_tier(&cohorts(&[COHORT_BUSINESS]), ZONE_FAMILY, None, false, false),
+            project_tier(
+                &cohorts(&[COHORT_BUSINESS]),
+                ZONE_FAMILY,
+                None,
+                false,
+                false
+            ),
             Projection::Omit,
         );
     }
