@@ -1,7 +1,7 @@
 //! Root application component with router, layout, and auth gate.
 
 use leptos::prelude::*;
-use leptos_router::components::{FlatRoutes, Route, Router, A};
+use leptos_router::components::{FlatRoutes, Redirect, Route, Router, A};
 use leptos_router::hooks::{use_location, use_navigate};
 use leptos_router::path;
 use leptos_router::NavigateOptions;
@@ -554,7 +554,12 @@ pub fn App() -> impl IntoView {
                     // Auth-gated routes
                     <Route path=path!("/setup") view=AuthGatedSetup />
                     <Route path=path!("/pending") view=AuthGatedPending />
-                    <Route path=path!("/chat") view=AuthGatedChat />
+                    // Chat is consolidated into Forums (the canonical,
+                    // config-correct channel browser). The bare /chat route
+                    // redirects to /forums; the Chat nav link is removed.
+                    // chat.rs (ChatPage) remains reachable only by direct URL
+                    // for the channel-list dashboard.
+                    <Route path=path!("/chat") view=|| view! { <Redirect path="/forums" /> } />
                     <Route path=path!("/chat/:channel_id") view=AuthGatedChannel />
                     <Route path=path!("/dm") view=AuthGatedDmList />
                     <Route path=path!("/dm/:pubkey") view=AuthGatedDmChat />
@@ -730,10 +735,6 @@ fn Layout(children: Children) -> impl IntoView {
                                 {forums_icon()}
                                 "Forums"
                             </A>
-                            <A href=base_href("/chat") attr:class=nav_link_class("/chat")>
-                                {chat_icon()}
-                                "Chat"
-                            </A>
                             <A href=base_href("/dm") attr:class=nav_link_class("/dm")>
                                 {dm_icon()}
                                 "DMs"
@@ -808,10 +809,6 @@ fn Layout(children: Children) -> impl IntoView {
                             <A href=base_href("/forums") attr:class=mobile_link_class("/forums") on:click=close_mobile>
                                 {forums_icon()}
                                 "Forums"
-                            </A>
-                            <A href=base_href("/chat") attr:class=mobile_link_class("/chat") on:click=close_mobile>
-                                {chat_icon()}
-                                "Chat"
                             </A>
                             <A href=base_href("/dm") attr:class=mobile_link_class("/dm") on:click=close_mobile>
                                 {dm_icon()}

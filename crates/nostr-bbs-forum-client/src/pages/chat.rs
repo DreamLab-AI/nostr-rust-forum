@@ -15,54 +15,46 @@ use crate::stores::channels::use_channel_store;
 use crate::stores::mute::use_mute_store;
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
+use crate::stores::zones::{load_zones, Zone};
 
-/// Zone-based filter pill definitions.
-/// Each entry: (label, zone_id). Empty zone_id = "All".
-const SECTION_FILTERS: &[(&str, &str)] = &[
-    ("All", ""),
-    ("Home", "home"),
-    ("Members", "members"),
-    ("Minimoonoir", "private"),
-];
-
-/// Maps zone IDs to their child section IDs.
-const ZONE_SECTIONS: &[(&str, &[&str])] = &[
-    ("home", &["home-lobby"]),
-    (
-        "members",
-        &[
-            "members-training",
-            "members-projects",
-            "members-bookings",
-            "ai-general",
-            "ai-claude-flow",
-            "ai-visionflow",
-        ],
-    ),
-    (
-        "private",
-        &["private-welcome", "private-events", "private-booking"],
-    ),
-];
-
-/// Resolve a channel's section tag to its parent zone ID.
-fn section_to_zone_id(section: &str) -> Option<&'static str> {
-    for &(zone_id, sections) in ZONE_SECTIONS {
-        if sections.contains(&section) {
-            return Some(zone_id);
-        }
+/// Resolve a channel's `section` tag to the id of its owning config zone.
+///
+/// Mirrors `forums.rs::section_to_zone` / `section.rs`: exact id match, then a
+/// `<zone-id>-` prefix match. Returns `None` when no zone claims the section so
+/// the caller can decide the default-visibility policy.
+fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
+    let sec = section.to_lowercase();
+    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
+        return Some(z.id.clone());
+    }
+    if let Some(z) = zones
+        .iter()
+        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
+    {
+        return Some(z.id.clone());
     }
     None
 }
 
-/// Check whether the user can see a channel based on its section's zone access.
-fn can_see_channel(section: &str, home: bool, members: bool, private: bool) -> bool {
-    match section_to_zone_id(section) {
-        Some("home") => home,
-        Some("members") => members,
-        Some("private") => private,
-        Some(_) => false,
-        None => true, // Unknown section → show it
+/// Config-driven visibility for a channel: a channel is visible when its zone
+/// is public, or the user is a member of that zone (admin or matching cohort).
+/// Unknown sections (no owning zone) default to visible — the relay is the real
+/// boundary (ADR-022).
+///
+/// Takes the resolved `is_admin` flag and `cohorts` slice (read from the Copy
+/// signals on `ZoneAccess`) rather than a `&ZoneAccess`, so the calling closures
+/// stay `Copy` and can be reused across multiple reactive views.
+fn can_see_channel(section: &str, zones: &[Zone], is_admin: bool, cohorts: &[String]) -> bool {
+    match section_to_zone(section, zones) {
+        Some(zid) => match zones.iter().find(|z| z.id == zid) {
+            Some(zone) => {
+                zone.visibility == crate::stores::zones::ZoneVisibility::Public
+                    || is_admin
+                    || zone.is_member(cohorts)
+            }
+            None => true,
+        },
+        None => true,
     }
 }
 
@@ -72,10 +64,15 @@ pub fn ChatPage() -> impl IntoView {
     let store = use_channel_store();
     let conn_state = expect_context::<crate::relay::RelayConnection>().connection_state();
     let zone_access = use_zone_access();
-    // Extract Copy signals for use in multiple closures
-    let za_home = zone_access.home;
-    let za_members = zone_access.members;
-    let za_private = zone_access.private;
+    // Extract Copy signals so the filter/pill closures remain `Copy` and can be
+    // reused across multiple reactive views (mirrors forums.rs).
+    let za_admin = zone_access.is_admin;
+    let za_cohorts = zone_access.cohorts;
+
+    // Config-driven zone list, sourced once from `window.__ENV__.ZONE_CONFIG`
+    // (falls back to the legacy list). StoredValue is Copy. Mirrors forums.rs /
+    // section.rs.
+    let zones = StoredValue::new(load_zones());
 
     let query = use_query_map();
     let section_filter = move || query.read().get("section").unwrap_or_default();
@@ -189,20 +186,21 @@ pub fn ChatPage() -> impl IntoView {
         let chans = store.channels.get();
         let counts = store.count_map();
         let active = store.last_active.get();
-        let home = za_home.get();
-        let members = za_members.get();
-        let private = za_private.get();
+        let zs = zones.get_value();
+        let is_admin = za_admin.get();
+        let cohorts = za_cohorts.get();
 
         let mut result: Vec<ChannelInfo> = chans
             .iter()
             // Zone access gate: only show channels the user can see
-            .filter(|c| can_see_channel(&c.section, home, members, private))
+            .filter(|c| can_see_channel(&c.section, &zs, is_admin, &cohorts))
             .filter(|c| {
                 if section.is_empty() {
                     return true;
                 }
                 // Match against zone ID or direct section
-                c.section == section || section_to_zone_id(&c.section) == Some(section.as_str())
+                c.section == section
+                    || section_to_zone(&c.section, &zs).as_deref() == Some(section.as_str())
             })
             .filter(|c| !mute_store.is_channel_muted(&c.id))
             .map(|c| ChannelInfo {
@@ -226,18 +224,19 @@ pub fn ChatPage() -> impl IntoView {
         let chans = store.channels.get();
         let counts = store.count_map();
         let active = store.last_active.get();
-        let home = za_home.get();
-        let members = za_members.get();
-        let private = za_private.get();
+        let zs = zones.get_value();
+        let is_admin = za_admin.get();
+        let cohorts = za_cohorts.get();
 
         let mut result: Vec<ChannelInfo> = chans
             .iter()
-            .filter(|c| can_see_channel(&c.section, home, members, private))
+            .filter(|c| can_see_channel(&c.section, &zs, is_admin, &cohorts))
             .filter(|c| {
                 if section.is_empty() {
                     return true;
                 }
-                c.section == section || section_to_zone_id(&c.section) == Some(section.as_str())
+                c.section == section
+                    || section_to_zone(&c.section, &zs).as_deref() == Some(section.as_str())
             })
             .filter(|c| mute_store.is_channel_muted(&c.id))
             .map(|c| ChannelInfo {
@@ -260,12 +259,12 @@ pub fn ChatPage() -> impl IntoView {
         if section.is_empty() {
             "Channels".to_string()
         } else {
-            match section.as_str() {
-                "home" => "Home".to_string(),
-                "members" => "Members".to_string(),
-                "private" => "Minimoonoir".to_string(),
-                _ => "Channels".to_string(),
-            }
+            zones
+                .get_value()
+                .iter()
+                .find(|z| z.id == section)
+                .map(|z| z.label())
+                .unwrap_or_else(|| "Channels".to_string())
         }
     };
 
@@ -315,18 +314,28 @@ pub fn ChatPage() -> impl IntoView {
                 <MarkAllRead on_click=on_mark_all_read />
             </div>
 
-            // Section filter pills (only show zones the user can access)
+            // Section filter pills — config-driven zones (only show those the
+            // user can access). Mirrors forums.rs zone membership.
             <div class="flex gap-2 overflow-x-auto pb-2 mb-4 scrollbar-none" style="-webkit-overflow-scrolling: touch">
                 {move || {
                     let current = section_filter();
-                    SECTION_FILTERS.iter().filter(|&&(_, zone_id)| {
-                        zone_id.is_empty() || match zone_id {
-                            "home" => za_home.get(),
-                            "members" => za_members.get(),
-                            "private" => za_private.get(),
-                            _ => false,
+                    let zs = zones.get_value();
+                    let is_admin = za_admin.get();
+                    let cohorts = za_cohorts.get();
+
+                    // "All" pill first.
+                    let mut pills: Vec<(String, String)> = vec![("All".to_string(), String::new())];
+                    for z in &zs {
+                        let accessible = z.visibility
+                            == crate::stores::zones::ZoneVisibility::Public
+                            || is_admin
+                            || z.is_member(&cohorts);
+                        if accessible {
+                            pills.push((z.label(), z.id.clone()));
                         }
-                    }).map(|&(label, value)| {
+                    }
+
+                    pills.into_iter().map(|(label, value)| {
                         let is_active = if value.is_empty() {
                             current.is_empty()
                         } else {

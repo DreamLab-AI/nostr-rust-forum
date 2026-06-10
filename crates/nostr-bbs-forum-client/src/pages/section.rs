@@ -1,9 +1,17 @@
 //! Section page -- messages within a specific forum section.
 //! Route: /forums/:category/:section
+//!
+//! Messages are sourced exclusively from the shared `ChannelStore` — the same
+//! global kind-40 / kind-42 subscriptions that drive the Forums index tiles.
+//! This eliminates the previous local two-stage subscription, which raced the
+//! NIP-42 AUTH handshake: an unauthenticated reader is zone-filtered to public
+//! zones, so the friends/family/business kind-40 def never arrived, the local
+//! `section_info` stayed `None`, and the gated kind-42 sub never started.
+//! By reading from the store (which subscribes ONCE at app root and survives
+//! the AUTH replay), the page is independent of AUTH timing.
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
-use nostr_bbs_core::NostrEvent;
 use std::rc::Rc;
 
 use wasm_bindgen_futures::spawn_local;
@@ -17,17 +25,11 @@ use crate::components::reaction_bar::Reaction;
 use crate::components::swipeable_message::SwipeableMessage;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::typing_indicator::TypingIndicator;
-use crate::relay::{ConnectionState, Filter, RelayConnection};
+use crate::relay::RelayConnection;
+use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
-use crate::stores::zones::{load_zones, ZoneVisibility};
+use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
 use crate::utils::{capitalize, set_timeout_once};
-
-#[derive(Clone, Debug)]
-struct SectionHeader {
-    name: String,
-    description: String,
-    channel_id: String,
-}
 
 /// Map a zone slug to its display name. Config-driven: resolves against the
 /// live `ZONE_CONFIG` zone list, falling back to a capitalised slug for unknown
@@ -58,11 +60,102 @@ fn humanize_section_slug(slug: &str) -> String {
         .join(" ")
 }
 
+/// Resolve the channel `section` tag to the id of the owning config zone.
+///
+/// Mirrors `forums.rs::section_to_zone`: exact id match, then `<zone-id>-`
+/// prefix match, then the first zone as a catch-all so channels never silently
+/// disappear from routing.
+fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
+    let sec = section.to_lowercase();
+    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
+        return Some(z.id.clone());
+    }
+    if let Some(z) = zones
+        .iter()
+        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
+    {
+        return Some(z.id.clone());
+    }
+    zones.first().map(|z| z.id.clone())
+}
+
+/// Slugify a channel name the same way the route slug is generated.
+fn slugify(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Find the channel whose section/name maps to `(category_slug, section_slug)`,
+/// using the SAME config-zone logic the Forums index uses.
+///
+/// A channel matches when its `section` tag routes to the requested category
+/// zone (or the category is empty) AND its `section` tag equals the section
+/// slug, OR its name/name-slug equals the section slug, OR its id is prefixed
+/// by the slug (deep-link by id-prefix). This re-implements the resolution the
+/// old local kind-40 handler did, but against the already-populated store.
+fn resolve_channel(
+    channels: &[ChannelMeta],
+    category_slug: &str,
+    section_slug: &str,
+    zones: &[Zone],
+) -> Option<ChannelMeta> {
+    let cat = category_slug.to_lowercase();
+    let sec = section_slug.to_lowercase();
+    channels
+        .iter()
+        .find(|c| {
+            let routes_to_category = cat.is_empty()
+                || section_to_zone(&c.section, zones)
+                    .map(|z| z.to_lowercase() == cat)
+                    .unwrap_or(false);
+            let section_matches = c.section.to_lowercase() == sec
+                || slugify(&c.name) == section_slug
+                || c.name.to_lowercase() == sec
+                || c.id.starts_with(section_slug);
+            routes_to_category && section_matches
+        })
+        .cloned()
+}
+
+/// Convert a stored kind-42 [`NostrEvent`] into the page's [`MessageData`].
+fn event_to_message(event: &nostr_bbs_core::NostrEvent) -> MessageData {
+    let reply_to = event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "reply")
+        .or_else(|| event.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
+        .map(|t| t[1].clone());
+    let reply_pk = event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == "p")
+        .map(|t| t[1].clone());
+    MessageData {
+        id: event.id.clone(),
+        pubkey: event.pubkey.clone(),
+        content: event.content.clone(),
+        created_at: event.created_at,
+        reply_to_id: reply_to,
+        reply_to_pubkey: reply_pk,
+        reply_to_content: None,
+        reactions: RwSignal::new(Vec::<Reaction>::new()),
+        is_hidden: false,
+        channel_id: String::new(),
+        thread_replies: RwSignal::new(Vec::new()),
+    }
+}
+
 #[component]
 pub fn SectionPage() -> impl IntoView {
     let relay = expect_context::<RelayConnection>();
     let auth = use_auth();
-    let conn_state = relay.connection_state();
+    let store = use_channel_store();
     let zone_access = use_zone_access();
 
     let params = use_params_map();
@@ -84,19 +177,59 @@ pub fn SectionPage() -> impl IntoView {
         }
     });
 
-    let (messages, section_info) = (
-        RwSignal::new(Vec::<MessageData>::new()),
-        RwSignal::<Option<SectionHeader>>::new(None),
-    );
-    let (loading, error_msg) = (RwSignal::new(true), RwSignal::<Option<String>>::new(None));
+    // Resolve the channel for this route reactively from the shared store. The
+    // store's broad kind-40 sub survives the AUTH replay, so a friends/family/
+    // business channel resolves here regardless of when AUTH completed.
+    //
+    // `Signal::derive` (not `Memo`) because `ChannelMeta` is not `PartialEq`.
+    let resolved_channel = Signal::derive(move || {
+        let chans = store.channels.get();
+        let zones = load_zones();
+        resolve_channel(&chans, &category_slug(), &section_slug(), &zones)
+    });
+
+    // Top up the per-channel subscription once the channel id is known, so a
+    // channel the broad kind-42 sub hasn't yet covered still loads its history.
+    {
+        let relay = relay.clone();
+        Effect::new(move |_| {
+            if let Some(ch) = resolved_channel.get() {
+                store.ensure_subscribed(&relay, &ch.id);
+            }
+        });
+    }
+
+    // Messages rendered reactively from the shared channel_messages map. Dedup
+    // and created_at sort are already maintained by the store; we re-sort
+    // defensively after mapping so render order is deterministic.
+    //
+    // `Signal::derive` (not `Memo`) because `MessageData` holds `RwSignal`
+    // fields and is therefore not `PartialEq`.
+    let messages = Signal::derive(move || {
+        let cid = match resolved_channel.get() {
+            Some(ch) => ch.id,
+            None => return Vec::<MessageData>::new(),
+        };
+        store.channel_messages.with(|m| {
+            let mut msgs: Vec<MessageData> = m
+                .get(&cid)
+                .map(|events| events.iter().map(event_to_message).collect())
+                .unwrap_or_default();
+            msgs.sort_by_key(|x| x.created_at);
+            msgs
+        })
+    });
+
+    // Loading is true while the global store is still fetching AND we have not
+    // resolved a channel yet. Once the store finishes (eose/loading=false) or a
+    // channel resolves, the empty-state can render honestly.
+    let store_loading = store.loading;
+    let loading = Memo::new(move |_| store_loading.get() && resolved_channel.get().is_none());
+
+    let error_msg = RwSignal::<Option<String>>::new(None);
     let typing_pubkeys = RwSignal::new(Vec::<String>::new());
     let messages_container = NodeRef::<leptos::html::Div>::new();
-    let (ch_sub_id, msg_sub_id) = (
-        RwSignal::<Option<String>>::new(None),
-        RwSignal::<Option<String>>::new(None),
-    );
-    let relay_for_send = relay.clone();
-    let (relay_for_ch, relay_for_msgs, relay_for_cleanup) = (relay.clone(), relay.clone(), relay);
+    let relay_for_send = relay;
 
     // Resolve the toast store at component construction (calling use_toasts()
     // inside the async send closure would panic — the reactive owner is gone).
@@ -121,142 +254,7 @@ pub fn SectionPage() -> impl IntoView {
         seq
     });
 
-    Effect::new(move |_| {
-        let state = conn_state.get();
-        if state != ConnectionState::Connected {
-            return;
-        }
-        if ch_sub_id.get_untracked().is_some() {
-            return;
-        }
-
-        loading.set(true);
-        error_msg.set(None);
-
-        let filter = Filter {
-            kinds: Some(vec![40]),
-            ..Default::default()
-        };
-
-        let sec_slug = section_slug();
-        let cat_slug = category_slug();
-        let section_info_sig = section_info;
-        let on_event = Rc::new(move |event: NostrEvent| {
-            if event.kind != 40 {
-                return;
-            }
-
-            // Check if this channel matches the section slug
-            let (name, description) = parse_content(&event.content);
-            let name_slug = slugify(&name);
-            let section_tag = event
-                .tags
-                .iter()
-                .find(|t| t.len() >= 2 && t[0] == "section")
-                .map(|t| t[1].clone())
-                .unwrap_or_default();
-
-            let tag_matches = section_tag.contains(&cat_slug)
-                || section_tag
-                    .to_lowercase()
-                    .contains(&cat_slug.to_lowercase());
-            let name_matches = name_slug == sec_slug
-                || name.to_lowercase() == sec_slug.to_lowercase()
-                || event.id.starts_with(&sec_slug);
-
-            if (tag_matches || cat_slug.is_empty()) && name_matches {
-                section_info_sig.set(Some(SectionHeader {
-                    name,
-                    description,
-                    channel_id: event.id.clone(),
-                }));
-            }
-        });
-
-        let loading_sig = loading;
-        let section_info_for_eose = section_info;
-        let on_eose = Rc::new(move || {
-            if section_info_for_eose.get_untracked().is_none() {
-                loading_sig.set(false);
-            }
-        });
-
-        let id = relay_for_ch.subscribe(vec![filter], on_event, Some(on_eose));
-        ch_sub_id.set(Some(id));
-
-        set_timeout_once(
-            move || {
-                if loading_sig.get_untracked() {
-                    loading_sig.set(false);
-                }
-            },
-            8000,
-        );
-    });
-
-    Effect::new(move |_| {
-        let info = section_info.get();
-        let info = match info {
-            Some(i) => i,
-            None => return,
-        };
-        if msg_sub_id.get_untracked().is_some() {
-            return;
-        }
-
-        let msg_filter = Filter {
-            kinds: Some(vec![42]),
-            e_tags: Some(vec![info.channel_id.clone()]),
-            ..Default::default()
-        };
-
-        let messages_sig = messages;
-        let on_msg = Rc::new(move |event: NostrEvent| {
-            if event.kind != 42 {
-                return;
-            }
-            // Parse reply info from tags
-            let reply_to = event
-                .tags
-                .iter()
-                .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "reply")
-                .or_else(|| event.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
-                .map(|t| t[1].clone());
-            let reply_pk = event
-                .tags
-                .iter()
-                .find(|t| t.len() >= 2 && t[0] == "p")
-                .map(|t| t[1].clone());
-            let msg = MessageData {
-                id: event.id.clone(),
-                pubkey: event.pubkey.clone(),
-                content: event.content.clone(),
-                created_at: event.created_at,
-                reply_to_id: reply_to,
-                reply_to_pubkey: reply_pk,
-                reply_to_content: None,
-                reactions: RwSignal::new(Vec::<Reaction>::new()),
-                is_hidden: false,
-                channel_id: String::new(),
-                thread_replies: RwSignal::new(Vec::new()),
-            };
-            messages_sig.update(|list| {
-                if !list.iter().any(|m| m.id == msg.id) {
-                    list.push(msg);
-                    list.sort_by_key(|m| m.created_at);
-                }
-            });
-        });
-
-        let loading_sig = loading;
-        let on_eose = Rc::new(move || {
-            loading_sig.set(false);
-        });
-
-        let id = relay_for_msgs.subscribe(vec![msg_filter], on_msg, Some(on_eose));
-        msg_sub_id.set(Some(id));
-    });
-
+    // Auto-scroll to the latest message whenever the count changes.
     Effect::new(move |_| {
         let _count = messages.get().len();
         if let Some(container) = messages_container.get() {
@@ -270,21 +268,12 @@ pub fn SectionPage() -> impl IntoView {
         }
     });
 
-    on_cleanup(move || {
-        if let Some(id) = ch_sub_id.get_untracked() {
-            relay_for_cleanup.unsubscribe(&id);
-        }
-        if let Some(id) = msg_sub_id.get_untracked() {
-            relay_for_cleanup.unsubscribe(&id);
-        }
-    });
-
     let do_send_text = {
         let relay = relay_for_send;
         move |content: String| {
-            let cid = section_info
+            let cid = resolved_channel
                 .get_untracked()
-                .map(|i| i.channel_id)
+                .map(|ch| ch.id)
                 .unwrap_or_default();
             if cid.is_empty() {
                 return;
@@ -349,6 +338,16 @@ pub fn SectionPage() -> impl IntoView {
     let send_callback = Callback::new(do_send_text);
     let is_authed = auth.is_authenticated();
 
+    // Header name/description sourced from the resolved channel.
+    let header_name = move || {
+        resolved_channel
+            .get()
+            .map(|c| c.name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| humanize_section_slug(&section_slug()))
+    };
+    let header_desc = move || resolved_channel.get().map(|c| c.description);
+
     view! {
         <Show
             when=move || has_zone_access.get()
@@ -368,23 +367,15 @@ pub fn SectionPage() -> impl IntoView {
                                 category_display_name(&category_slug()),
                                 format!("/forums/{}", category_slug()),
                             ),
-                            BreadcrumbItem::current(
-                                section_info
-                                    .get_untracked()
-                                    .map(|i| i.name)
-                                    .unwrap_or_else(|| humanize_section_slug(&section_slug()))
-                            ),
+                            BreadcrumbItem::current(header_name()),
                         ] />
 
                         <h1 class="text-2xl font-bold text-white">
-                            {move || section_info
-                                .get()
-                                .map(|i| i.name)
-                                .unwrap_or_else(|| humanize_section_slug(&section_slug()))}
+                            {header_name}
                         </h1>
-                        {move || section_info.get().and_then(|i| {
-                            if i.description.is_empty() { None } else {
-                                Some(view! { <p class="text-sm text-gray-400 mt-1">{i.description}</p> })
+                        {move || header_desc().and_then(|d| {
+                            if d.is_empty() { None } else {
+                                Some(view! { <p class="text-sm text-gray-400 mt-1">{d}</p> })
                             }
                         })}
 
@@ -457,33 +448,4 @@ pub fn SectionPage() -> impl IntoView {
         </div>
         </Show>
     }
-}
-
-fn parse_content(content: &str) -> (String, String) {
-    serde_json::from_str::<serde_json::Value>(content)
-        .map(|v| {
-            let n = v
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unnamed")
-                .to_string();
-            let d = v
-                .get("about")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            (n, d)
-        })
-        .unwrap_or_else(|_| ("Unnamed".to_string(), String::new()))
-}
-
-fn slugify(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
 }
