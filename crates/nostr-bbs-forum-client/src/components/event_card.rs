@@ -36,6 +36,92 @@ fn extract_date_parts(ts: u64) -> (String, u32) {
     (month.to_string(), d.get_date())
 }
 
+/// Human-readable venue label for a free/busy venue slug.
+///
+/// `fairfield` -> "Fairfield", `dreamlab` -> "DreamLab"; any other slug is
+/// title-cased best-effort.
+fn venue_label(slug: &str) -> String {
+    match slug.to_ascii_lowercase().as_str() {
+        "fairfield" => "Fairfield".to_string(),
+        "dreamlab" => "DreamLab".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// A compact, opaque "busy" card for redacted free/busy calendar blocks.
+///
+/// Renders a muted/greyed block labelled "Busy" (or "Busy at <Venue>" when a
+/// venue is known), showing only the real start–end time range parsed from the
+/// `start`/`end` tags. No title, no description, no "details visible per tier"
+/// string, and no RSVP affordances — the slot is booked, the detail is hidden.
+#[component]
+pub(crate) fn BusyCard(
+    /// UNIX timestamp for the block start.
+    start_time: u64,
+    /// UNIX timestamp for the block end.
+    end_time: u64,
+    /// Venue slug (`fairfield` / `dreamlab`), empty when unknown.
+    venue: String,
+) -> impl IntoView {
+    let past = is_past(end_time);
+    let (month, day) = extract_date_parts(start_time);
+    let time_range = format!("{} - {}", format_time(start_time), format_time(end_time));
+
+    let label = if venue.trim().is_empty() {
+        "Busy".to_string()
+    } else {
+        format!("Busy at {}", venue_label(&venue))
+    };
+
+    let card_class = format!(
+        "event-card glass-card-interactive p-4 grayscale-[0.4] {}",
+        if past { "opacity-60" } else { "opacity-80" },
+    );
+
+    view! {
+        <div class=card_class aria-label="Busy — details hidden">
+            <div class="flex gap-4">
+                // Muted date badge
+                <div class="event-date-badge flex flex-col items-center justify-center grayscale opacity-80">
+                    <span class="text-gray-400 text-xs font-semibold uppercase tracking-wide">
+                        {month}
+                    </span>
+                    <span class="text-gray-300 text-2xl font-bold leading-tight">
+                        {day}
+                    </span>
+                </div>
+
+                // Busy detail (no title, no description, no RSVP)
+                <div class="flex-1 min-w-0 flex flex-col justify-center gap-1.5">
+                    <div class="flex items-center gap-2">
+                        <span class="inline-flex items-center justify-center w-5 h-5 rounded-md bg-gray-700/60 text-gray-400">
+                            <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="11" width="18" height="11" rx="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M7 11V7a5 5 0 0110 0v4" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </span>
+                        <h3 class="text-gray-300 font-semibold text-base">{label}</h3>
+                    </div>
+
+                    <span class="inline-flex items-center gap-1 text-xs text-gray-500">
+                        <svg class="w-3.5 h-3.5 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10" stroke-linecap="round" stroke-linejoin="round"/>
+                            <polyline points="12 6 12 12 16 14" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        {time_range}
+                    </span>
+                </div>
+            </div>
+        </div>
+    }
+}
+
 /// A single event card with date badge, details, host, and RSVP button.
 ///
 /// Uses the `event-card` class for base styling and `glass-card-interactive`

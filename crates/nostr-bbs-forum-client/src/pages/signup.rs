@@ -50,7 +50,12 @@ fn clipboard_copy(text: &str, what: &str, toasts: crate::components::toast::Toas
     toasts.show(format!("{what} copied"), ToastVariant::Success);
 }
 /// NIP-05 host that backs claimed usernames (mirrors onboarding_modal::NIP05_HOST).
-const NIP05_USERNAME_HOST: &str = "example.test";
+/// Baked from `NOSTR_BBS_NIP05_DOMAIN` at build time; placeholder only for
+/// un-configured local builds.
+const NIP05_USERNAME_HOST: &str = match option_env!("NOSTR_BBS_NIP05_DOMAIN") {
+    Some(d) => d,
+    None => "example.test",
+};
 
 /// Signup wizard phases.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

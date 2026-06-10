@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::create_event_modal::CreateEventModal;
-use crate::components::event_card::EventCard;
+use crate::components::event_card::{BusyCard, EventCard};
 use crate::components::mini_calendar::MiniCalendar;
 use crate::components::rsvp_buttons::RsvpButtons;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
@@ -28,17 +28,33 @@ struct CalendarEvent {
     host_pubkey: String,
     max_attendees: Option<u32>,
     featured: bool,
+    /// True when the relay served this as a redacted free/busy projection
+    /// (carries a `["busy","1"]` tag, empty sig, no title). Such events render
+    /// as an opaque busy block with no detail and no RSVP affordances.
+    is_busy: bool,
+    /// Venue slug (`fairfield` / `dreamlab`) when present on a busy block.
+    venue: String,
 }
 
 /// RSVP data for an event.
+///
+/// Counts are derived from `by_user` (one status per user) rather than tracked
+/// as blind increment counters, so a user switching status (Accept -> Decline)
+/// adjusts every count consistently.
 #[derive(Clone, Debug, Default)]
 struct RsvpData {
-    accepted: u32,
-    #[allow(dead_code)]
-    declined: u32,
-    #[allow(dead_code)]
-    tentative: u32,
+    /// Latest RSVP status per user pubkey. Authoritative source for all counts.
+    by_user: HashMap<String, RsvpStatus>,
     my_status: Option<RsvpStatus>,
+}
+
+impl RsvpData {
+    fn accepted(&self) -> u32 {
+        self.by_user
+            .values()
+            .filter(|s| matches!(s, RsvpStatus::Accept))
+            .count() as u32
+    }
 }
 
 /// Events listing page with tab filtering, event cards, and sidebar calendar.
@@ -145,11 +161,11 @@ pub fn EventsPage() -> impl IntoView {
 
             rsvps_sig.update(|map| {
                 let data = map.entry(event_ref).or_default();
-                match status {
-                    RsvpStatus::Accept => data.accepted += 1,
-                    RsvpStatus::Decline => data.declined += 1,
-                    RsvpStatus::Tentative => data.tentative += 1,
-                }
+                // A kind 31925 RSVP is a parameterized-replaceable event keyed on
+                // the user's pubkey, so the latest one wins: overwrite rather than
+                // increment. Counts are derived from `by_user`, so switching status
+                // (e.g. Accept -> Decline) adjusts the accepted count automatically.
+                data.by_user.insert(event.pubkey.clone(), status);
                 if is_me {
                     data.my_status = Some(status);
                 }
@@ -410,6 +426,21 @@ pub fn EventsPage() -> impl IntoView {
                                         }.into_any()
                                     } else {
                                         list.into_iter().map(|evt| {
+                                            // Redacted free/busy block: render an opaque busy card
+                                            // with no title, no detail, and no RSVP affordances
+                                            // (the relay rejects RSVPs on these server-side).
+                                            if evt.is_busy {
+                                                return view! {
+                                                    <div>
+                                                        <BusyCard
+                                                            start_time=evt.start_time
+                                                            end_time=evt.end_time
+                                                            venue=evt.venue
+                                                        />
+                                                    </div>
+                                                }.into_any();
+                                            }
+
                                             let eid = evt.id.clone();
                                             let eid_rsvp = evt.id.clone();
                                             let max = evt.max_attendees;
@@ -422,7 +453,7 @@ pub fn EventsPage() -> impl IntoView {
                                             let attendee_count = Signal::derive({
                                                 let eid2 = eid.clone();
                                                 move || {
-                                                    rsvps_sig.get().get(&eid2).map(|d| d.accepted).unwrap_or(0)
+                                                    rsvps_sig.get().get(&eid2).map(|d| d.accepted()).unwrap_or(0)
                                                 }
                                             });
 
@@ -446,7 +477,7 @@ pub fn EventsPage() -> impl IntoView {
                                                         />
                                                     </div>
                                                 </div>
-                                            }
+                                            }.into_any()
                                         }).collect_view().into_any()
                                     }
                                 }}
@@ -698,6 +729,34 @@ fn parse_calendar_event(event: &NostrEvent) -> CalendarEvent {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(start + 3600);
 
+    // Redacted free/busy projection: the relay served a copy with a synthetic
+    // `["busy","1"]` tag, an empty signature and no title. Any of these signals
+    // identifies a busy block; the explicit tag is authoritative.
+    let has_busy_tag = event
+        .tags
+        .iter()
+        .any(|t| t.len() >= 2 && t[0] == "busy" && t[1] == "1");
+    let is_busy = has_busy_tag || (event.sig.is_empty() && tag("title").is_none());
+
+    if is_busy {
+        // Carry only the time block and venue; nothing else is trustworthy or
+        // present on a redacted projection.
+        return CalendarEvent {
+            id: event.id.clone(),
+            d_tag: tag("d").unwrap_or_default(),
+            title: String::new(),
+            description: String::new(),
+            start_time: start,
+            end_time: end,
+            location: String::new(),
+            host_pubkey: event.pubkey.clone(),
+            max_attendees: None,
+            featured: false,
+            is_busy: true,
+            venue: tag("venue").unwrap_or_default(),
+        };
+    }
+
     // Try parsing content as JSON for name/description/location fallback
     let content_json: Option<serde_json::Value> = serde_json::from_str(&event.content).ok();
 
@@ -737,5 +796,7 @@ fn parse_calendar_event(event: &NostrEvent) -> CalendarEvent {
         host_pubkey: event.pubkey.clone(),
         max_attendees: tag("max_attendees").and_then(|s| s.parse().ok()),
         featured: false,
+        is_busy: false,
+        venue: tag("venue").unwrap_or_default(),
     }
 }

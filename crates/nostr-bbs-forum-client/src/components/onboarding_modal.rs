@@ -38,8 +38,13 @@ use crate::utils::relay_url::auth_api_base;
 const LEGACY_ONBOARDED_KEY: &str = "nostrbbs:onboarded";
 /// Suppress duration when user clicks "I'll choose later" (7 days, ms).
 const SKIP_DURATION_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
-/// NIP-05 host that backs successful claims.
-const NIP05_HOST: &str = "example.test";
+/// NIP-05 host that backs successful claims. Baked at build time from
+/// `NOSTR_BBS_NIP05_DOMAIN` (the deployment's RP domain); placeholder only for
+/// un-configured local builds.
+const NIP05_HOST: &str = match option_env!("NOSTR_BBS_NIP05_DOMAIN") {
+    Some(d) => d,
+    None => "example.test",
+};
 
 fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window().and_then(|w| w.local_storage().ok().flatten())
