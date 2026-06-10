@@ -43,6 +43,36 @@ fn is_nip29_admin_kind(kind: u64) -> bool {
     (9000..=9020).contains(&kind) || (39000..=39002).contains(&kind)
 }
 
+/// Phase C (write side): whether an RSVP (kind 31925) is permitted to be written,
+/// given the AUTHOR's resolved projection tier for the RSVP's TARGET event.
+///
+/// An RSVP attaches its author to a target event. If the author can only see that
+/// target as free/busy (`FreeBusy`) or not at all (`Omit`), accepting the RSVP is a
+/// privacy/integrity leak. Only a `Full` tier (which already covers admins/owners
+/// via `project_tier`'s short-circuit) is write-permitted.
+///
+/// Pure predicate over the already-resolved tier so the gate decision is
+/// unit-testable without a `worker::Env` / D1. The caller resolves the target
+/// zone/venue from D1 and computes the tier via
+/// [`calendar_projection::project_tier`].
+pub fn rsvp_write_permitted(tier: &calendar_projection::Projection) -> bool {
+    matches!(tier, calendar_projection::Projection::Full)
+}
+
+/// Phase C (write side): whether a zone-tagged calendar event (31922/31923) is
+/// permitted to be written. A zone-tagged event requires the author to hold write
+/// access to that zone; an untagged event is unscoped and always permitted here.
+///
+/// `has_write` is the already-resolved
+/// [`trust::has_zone_write_access`](crate::trust::has_zone_write_access) result.
+/// Pure predicate so the decision is unit-testable without a `worker::Env`.
+pub fn calendar_write_permitted(zone: Option<&str>, has_write: bool) -> bool {
+    match zone {
+        Some(_) => has_write,
+        None => true,
+    }
+}
+
 /// P1-6: whether an event must be rejected by the governance ActionResponse
 /// admin gate. Returns `true` when the event is kind-31403 (approve/reject of
 /// an agent action request) and the signer is NOT an admin.
@@ -272,6 +302,68 @@ impl NostrRelayDO {
             // so a public zone can be read-by-all yet write-restricted.
             if !is_admin && !trust::has_zone_write_access(&event.pubkey, &zone, &self.env).await {
                 Self::send_ok(ws, &event.id, false, "zone access denied");
+                return;
+            }
+        }
+
+        // Phase C (write side): NIP-52 calendar kinds carry their access binding
+        // natively, not via a channel-id lookup. The READ path projects them
+        // per-tier; the WRITE path must validate the author against the SAME
+        // data-tier rules so a lower-tier author cannot inject an RSVP into, or a
+        // calendar event onto, a zone they cannot fully see/write.
+        //
+        //   - 31925 RSVP: an RSVP attaches the author to a target event. If the
+        //     author can only see that target as free/busy (or not at all), the
+        //     RSVP is a privacy/integrity leak — it surfaces participation in an
+        //     event the author isn't a full participant of. We resolve the TARGET
+        //     from D1 (never an author-mirrored tag, which is spoofable) and
+        //     compute the AUTHOR's projection tier for it; accept only on Full.
+        //     Admins/owners are inherently Full. An unresolvable target denies for
+        //     non-admins (deny-by-default: blocks pre-publishing RSVPs to a target
+        //     that isn't visible yet).
+        //
+        //   - 31922/31923 calendar events: a zone-tagged event must come from an
+        //     author with write access to that zone (mirrors kind-42). Untagged
+        //     calendar events are unscoped and keep prior behaviour.
+        if event.kind == KIND_CALENDAR_RSVP && !is_admin {
+            let permitted = match self.resolve_rsvp_target(&event).await {
+                Some((zone, venue)) => {
+                    // `is_owner=false`: a non-admin author is never the relay owner.
+                    // `project_tier` short-circuits admins/owners to Full anyway;
+                    // here we ask the author's own tier for the TARGET's real zone.
+                    let (author_cohorts, author_cohort_admin) =
+                        trust::get_viewer_cohorts(&event.pubkey, &self.env).await;
+                    let tier = calendar_projection::project_tier(
+                        &author_cohorts,
+                        &zone,
+                        venue.as_deref(),
+                        false,
+                        author_cohort_admin,
+                    );
+                    rsvp_write_permitted(&tier)
+                }
+                // Target not resolvable: deny by default for non-admins. Prevents
+                // pre-publishing an RSVP to an event that is not yet visible.
+                None => false,
+            };
+            if !permitted {
+                Self::send_ok(ws, &event.id, false, "blocked: rsvp not permitted");
+                return;
+            }
+        } else if matches!(
+            event.kind,
+            nostr_bbs_core::KIND_CALENDAR_DATE_EVENT | nostr_bbs_core::KIND_CALENDAR_EVENT
+        ) && !is_admin
+        {
+            // Only zone-tagged calendar events are write-gated; untagged events
+            // are unscoped and retain prior behaviour.
+            let zone = nostr_bbs_core::read_zone_tag(&event);
+            let has_write = match zone {
+                Some(z) => trust::has_zone_write_access(&event.pubkey, z, &self.env).await,
+                None => false,
+            };
+            if !calendar_write_permitted(zone, has_write) {
+                Self::send_ok(ws, &event.id, false, "blocked: zone access denied");
                 return;
             }
         }
@@ -1197,5 +1289,145 @@ impl NostrRelayDO {
             return;
         };
         let _ = stmt.run().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase C (write side): data-tier write validation tests
+// ---------------------------------------------------------------------------
+//
+// The EVENT (write) gate for calendar kinds mirrors the READ projection. These
+// tests drive the same decision the handler executes: the AUTHOR's projection
+// tier for an RSVP's TARGET (resolved zone/venue from D1) feeds `project_tier`,
+// then `rsvp_write_permitted` accepts only `Full`; a zone-tagged calendar event
+// feeds `calendar_write_permitted` with the author's resolved write access. The
+// D1 lookups themselves are exercised by integration tests; here we pin the
+// pure decision boundary that those lookups feed into.
+#[cfg(test)]
+mod write_gate_tests {
+    use super::super::calendar_projection::{
+        project_tier, Projection, COHORT_BUSINESS, COHORT_FAMILY, COHORT_FRIENDS, ZONE_BUSINESS,
+        ZONE_FAMILY,
+    };
+    use super::*;
+
+    fn cohorts(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Helper: compute the author's RSVP write decision exactly as `handle_event`
+    /// does — resolved target (zone, venue) + author cohorts → tier → permitted.
+    fn rsvp_decision(
+        author_cohorts: &[String],
+        author_cohort_admin: bool,
+        target_zone: &str,
+        target_venue: Option<&str>,
+    ) -> bool {
+        let tier = project_tier(
+            author_cohorts,
+            target_zone,
+            target_venue,
+            false,
+            author_cohort_admin,
+        );
+        rsvp_write_permitted(&tier)
+    }
+
+    // ---- RSVP write gate (kind 31925) --------------------------------------
+
+    #[test]
+    fn friends_author_rsvp_to_business_venue_target_rejected() {
+        // EVIDENCE replay: a friends-cohort author RSVPs to a business-zone event
+        // she only sees as free/busy (business@dreamlab venue). Author tier =
+        // FreeBusy ⇒ write rejected.
+        assert!(
+            !rsvp_decision(
+                &cohorts(&[COHORT_FRIENDS]),
+                false,
+                ZONE_BUSINESS,
+                Some("dreamlab"),
+            ),
+            "friends author must not RSVP to a business target she only sees as free/busy"
+        );
+        // Off-site business target (no shared venue): friends tier = Omit ⇒ reject.
+        assert!(!rsvp_decision(
+            &cohorts(&[COHORT_FRIENDS]),
+            false,
+            ZONE_BUSINESS,
+            None
+        ));
+    }
+
+    #[test]
+    fn family_author_rsvp_to_business_target_accepted() {
+        // family tier is Full on every zone, including business ⇒ RSVP permitted.
+        assert!(rsvp_decision(
+            &cohorts(&[COHORT_FAMILY]),
+            false,
+            ZONE_BUSINESS,
+            Some("dreamlab"),
+        ));
+        assert!(rsvp_decision(
+            &cohorts(&[COHORT_FAMILY]),
+            false,
+            ZONE_BUSINESS,
+            None
+        ));
+    }
+
+    #[test]
+    fn owner_admin_author_rsvp_accepted() {
+        // Admin author (cohort_admin flag) → project_tier short-circuits to Full,
+        // regardless of target zone ⇒ permitted. (A non-cohort author flagged
+        // admin in the handler bypasses this gate entirely; this asserts the tier
+        // short-circuit for the cohort-admin path.)
+        assert!(rsvp_decision(&[], true, ZONE_FAMILY, None));
+        assert!(rsvp_decision(&[], true, ZONE_BUSINESS, Some("dreamlab")));
+    }
+
+    #[test]
+    fn business_author_rsvp_to_own_business_zone_accepted() {
+        // A business author RSVPing to a business-zone target sees it Full ⇒ ok.
+        assert!(rsvp_decision(
+            &cohorts(&[COHORT_BUSINESS]),
+            false,
+            ZONE_BUSINESS,
+            None
+        ));
+        // ...but a business author RSVPing to a FAMILY target sees Omit ⇒ reject.
+        assert!(!rsvp_decision(
+            &cohorts(&[COHORT_BUSINESS]),
+            false,
+            ZONE_FAMILY,
+            None
+        ));
+    }
+
+    #[test]
+    fn rsvp_write_permitted_only_on_full_tier() {
+        assert!(rsvp_write_permitted(&Projection::Full));
+        assert!(!rsvp_write_permitted(&Projection::FreeBusy));
+        assert!(!rsvp_write_permitted(&Projection::Omit));
+    }
+
+    // ---- Calendar event write gate (kind 31922/31923) ----------------------
+
+    #[test]
+    fn calendar_write_into_non_member_zone_rejected() {
+        // Zone-tagged event, author lacks write access ⇒ rejected.
+        assert!(!calendar_write_permitted(Some(ZONE_BUSINESS), false));
+    }
+
+    #[test]
+    fn calendar_write_into_member_zone_accepted() {
+        // Zone-tagged event, author holds write access ⇒ accepted.
+        assert!(calendar_write_permitted(Some(ZONE_BUSINESS), true));
+    }
+
+    #[test]
+    fn untagged_calendar_event_keeps_prior_behaviour() {
+        // No zone tag → unscoped → permitted regardless of zone-write resolution.
+        assert!(calendar_write_permitted(None, false));
+        assert!(calendar_write_permitted(None, true));
     }
 }
