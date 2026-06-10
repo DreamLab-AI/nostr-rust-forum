@@ -148,10 +148,18 @@ impl NostrRelayDO {
                 if v.is_empty() {
                     continue;
                 }
-                let escaped = v.replace('%', "\\%").replace('_', "\\_").replace('"', "");
-                let pattern = format!("%\"{tag_name}\",\"{escaped}\"%");
-                tag_conditions.push(format!("tags LIKE ?{} ESCAPE '\\'", *param_idx));
-                params.push(JsValue::from_str(&pattern));
+                // instr() substring match instead of LIKE: D1's SQLite rejects
+                // the LIKE+ESCAPE pattern for 64-char hex values with
+                // "LIKE or GLOB pattern too complex" (SQLITE_ERROR 7500), and
+                // query_events swallows the error — every tag-filtered REQ
+                // (#e/#p/#t…) silently returned zero rows. instr has no pattern
+                // engine and is case-sensitive, which is what nostr tag values
+                // want. Strip quotes so a value can't escape the JSON-quoted
+                // needle context.
+                let sanitized = v.replace('"', "");
+                let needle = format!("\"{tag_name}\",\"{sanitized}\"");
+                tag_conditions.push(format!("instr(tags, ?{}) > 0", *param_idx));
+                params.push(JsValue::from_str(&needle));
                 *param_idx += 1;
             }
 
