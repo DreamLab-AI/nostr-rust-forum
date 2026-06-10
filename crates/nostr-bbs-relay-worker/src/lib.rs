@@ -28,6 +28,7 @@ mod profiles;
 mod relay_do;
 mod trust;
 mod whitelist;
+mod zone_config;
 
 /// Re-export so the `worker` crate runtime can discover the Durable Object.
 pub use relay_do::NostrRelayDO;
@@ -271,6 +272,13 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
         return whitelist::handle_reset_db(req, env).await;
     }
 
+    // Channel -> zone mapping upsert (NIP-98 admin only). This is the sole
+    // write path into the `channel_zones` table; zones themselves are declared
+    // in config (ZONE_CONFIG), this binds a channel to one of them.
+    if path == "/api/admin/channel-zone" && method == Method::Post {
+        return handle_channel_zone_upsert(req, env).await;
+    }
+
     // --- Moderation endpoints (NIP-98 admin only) ---
 
     // List reports
@@ -362,6 +370,158 @@ async fn handle_profiles_backfill(mut req: Request, env: &Env) -> Result<Respons
             )
         }
     }
+}
+
+/// `POST /api/admin/channel-zone` — NIP-98 admin only.
+///
+/// Inserts or updates a row in `channel_zones`, binding a channel id to a zone
+/// slug. Zones themselves are config-driven (declared via `ZONE_CONFIG`); this
+/// endpoint is the only write path into the mapping table, mirroring the
+/// whitelist admin handlers. Request body:
+/// `{ "channel_id": "<hex>", "zone": "<slug>", "archived": false }`.
+async fn handle_channel_zone_upsert(mut req: Request, env: &Env) -> Result<Response> {
+    use nostr_bbs_core::d1_helpers::{js_f64, js_str};
+
+    let url = req.url()?;
+    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let auth_header = req.headers().get("Authorization").ok().flatten();
+    let body_bytes = req.bytes().await.unwrap_or_default();
+    let body_for_auth: Option<&[u8]> = if body_bytes.is_empty() {
+        None
+    } else {
+        Some(&body_bytes)
+    };
+
+    let admin_pubkey = match auth::require_nip98_admin(
+        auth_header.as_deref(),
+        &request_url,
+        "POST",
+        body_for_auth,
+        env,
+    )
+    .await
+    {
+        Ok(pk) => pk,
+        Err((body, status)) => return json_response(&req, env, &body, status),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct Body {
+        channel_id: Option<String>,
+        zone: Option<String>,
+        #[serde(default)]
+        archived: bool,
+    }
+
+    let body: Body = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_response(
+                &req,
+                env,
+                &serde_json::json!({ "error": "invalid JSON", "detail": e.to_string() }),
+                400,
+            )
+        }
+    };
+
+    let channel_id = match &body.channel_id {
+        Some(c) if !c.is_empty() && c.len() <= 128 && c.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            c.clone()
+        }
+        _ => {
+            return json_response(
+                &req,
+                env,
+                &serde_json::json!({ "error": "missing or invalid channel_id (hex required)" }),
+                400,
+            )
+        }
+    };
+
+    let zone = match &body.zone {
+        Some(z)
+            if !z.is_empty()
+                && z.len() <= 64
+                && z.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+        {
+            z.clone()
+        }
+        _ => {
+            return json_response(
+                &req,
+                env,
+                &serde_json::json!({ "error": "missing or invalid zone slug" }),
+                400,
+            )
+        }
+    };
+
+    let db = match env.d1("DB") {
+        Ok(db) => db,
+        Err(_) => {
+            return json_response(
+                &req,
+                env,
+                &serde_json::json!({ "error": "DB unavailable" }),
+                500,
+            )
+        }
+    };
+
+    let archived = if body.archived { 1.0 } else { 0.0 };
+    let upsert = db
+        .prepare(
+            "INSERT INTO channel_zones (channel_id, zone, archived) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (channel_id) DO UPDATE SET zone = excluded.zone, archived = excluded.archived",
+        )
+        .bind(&[js_str(&channel_id), js_str(&zone), js_f64(archived)]);
+
+    match upsert {
+        Ok(stmt) => match stmt.run().await {
+            Ok(_) => {}
+            Err(e) => {
+                console_error!("channel_zone upsert failed: {e}");
+                return json_response(
+                    &req,
+                    env,
+                    &serde_json::json!({ "error": "upsert failed" }),
+                    500,
+                );
+            }
+        },
+        Err(e) => {
+            console_error!("channel_zone bind failed: {e}");
+            return json_response(
+                &req,
+                env,
+                &serde_json::json!({ "error": "bind failed" }),
+                500,
+            );
+        }
+    }
+
+    // Audit trail, mirroring the whitelist admin handlers.
+    let _ = audit::log_admin_action(
+        env,
+        &admin_pubkey,
+        "channel_zone_set",
+        None,
+        Some(&channel_id),
+        None,
+        Some(&zone),
+        None,
+    )
+    .await;
+
+    json_response(
+        &req,
+        env,
+        &serde_json::json!({ "success": true, "channel_id": channel_id, "zone": zone }),
+        200,
+    )
 }
 
 /// Idempotent schema migrations.

@@ -18,6 +18,7 @@ use worker::*;
 use crate::auth;
 use crate::moderation;
 use crate::trust::{self, TrustLevel};
+use crate::zone_config::ZoneConfig;
 
 use super::broadcast::{event_treatment, EventTreatment};
 use super::filter::{self, NostrFilter};
@@ -264,7 +265,9 @@ impl NostrRelayDO {
             let zone = trust::get_channel_zone(&channel_id, &self.env)
                 .await
                 .unwrap_or_else(|| "home".to_string());
-            if !is_admin && !trust::has_zone_access(&event.pubkey, &zone, &self.env).await {
+            // Writes route through the write gate (write_cohorts ?? required_cohorts)
+            // so a public zone can be read-by-all yet write-restricted.
+            if !is_admin && !trust::has_zone_write_access(&event.pubkey, &zone, &self.env).await {
                 Self::send_ok(ws, &event.id, false, "zone access denied");
                 return;
             }
@@ -464,22 +467,70 @@ impl NostrRelayDO {
         // Query D1 for matching events
         let events = self.query_events(&filters).await;
 
-        // Zone-filter: exclude events from channels the user lacks zone access for.
-        // Only applies to kind-42 (channel messages) events.
+        // Load the config-driven zone definitions once for this REQ.
+        let zones = ZoneConfig::load(&self.env);
+        // Admin status of the requester (if any). Admins see every zone.
+        let is_admin = match &session_pubkey {
+            Some(pk) => self.admin_cache.is_admin(pk, &self.env).await,
+            None => false,
+        };
+
+        // Zone-filter every matching event. Two event classes are zone-scoped:
+        //   - kind-40 channel DEFINITIONS: the channel id is the event's own id.
+        //   - kind-42 channel MESSAGES (content): the channel id is the `e` tag.
+        // Decision matrix for a NON-member (non-admin), per zone visibility:
+        //   Public : defs + content served to everyone (incl. unauth).
+        //   Locked : defs served (tile renders) but content withheld.
+        //   Hidden : defs AND content omitted.
+        // Members (cohort match) and admins always receive both. An unauth
+        // reader (session_pubkey == None) is treated as a non-member with no
+        // cohorts, so it is limited to Public zones for content and to
+        // non-Hidden zones for definitions — closing the prior gap where zone
+        // filtering only ran when session_pubkey.is_some().
         for event in &events {
-            if event.kind == 42 {
-                if let Some(channel_id) = filter::tag_value(event, "e") {
-                    if let Some(ref pk) = session_pubkey {
-                        let zone = trust::get_channel_zone(&channel_id, &self.env)
-                            .await
-                            .unwrap_or_else(|| "home".to_string());
-                        let is_admin = self.admin_cache.is_admin(pk, &self.env).await;
-                        if !is_admin && !trust::has_zone_access(pk, &zone, &self.env).await {
-                            continue; // skip this event
+            // Resolve the channel id for zone-scoped kinds.
+            let channel_id: Option<String> = match event.kind {
+                40 => Some(event.id.clone()),
+                42 => filter::tag_value(event, "e"),
+                // Phase C seam: NIP-52 calendar kinds (31922/31923 events,
+                // 31924 calendar, 31925 RSVP) are zone-scoped too. When added,
+                // resolve their channel/zone tag here (e.g. the `a`/`e` tag that
+                // binds an event to its zone channel) and fall through to the
+                // same allow_content/allow_defs gate below. Until then they are
+                // treated as unscoped and served unfiltered.
+                _ => None,
+            };
+
+            if let Some(cid) = channel_id {
+                let zone = trust::get_channel_zone(&cid, &self.env)
+                    .await
+                    .unwrap_or_else(|| "home".to_string());
+
+                if !is_admin {
+                    // Member iff their cohorts grant read on this zone.
+                    let is_member = match &session_pubkey {
+                        Some(pk) => trust::has_zone_access(pk, &zone, &self.env).await,
+                        None => zones.is_public_read(&zone),
+                    };
+
+                    if !is_member {
+                        if event.kind == 40 {
+                            // Channel definition: served only if the zone is
+                            // not Hidden (Locked/Public tiles render).
+                            if !zones.defs_visible_to_nonmember(&zone) {
+                                continue;
+                            }
+                        } else {
+                            // Channel content (kind-42 + future calendar kinds):
+                            // withheld from non-members of Locked/Hidden zones;
+                            // only Public content reaches them (already covered
+                            // by is_member via is_public_read).
+                            continue;
                         }
                     }
                 }
             }
+
             Self::send_event(&ws, sub_id, event);
         }
         Self::send_eose(&ws, sub_id);

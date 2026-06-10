@@ -14,6 +14,7 @@ use wasm_bindgen::JsValue;
 use worker::Env;
 
 use crate::auth;
+use crate::zone_config::ZoneConfig;
 
 // ---------------------------------------------------------------------------
 // Trust level enum
@@ -572,11 +573,14 @@ pub async fn get_channel_zone(channel_id: &str, env: &Env) -> Option<String> {
     }
 }
 
-/// Check whether a pubkey has access to a given zone based on their cohorts.
-pub async fn has_zone_access(pubkey: &str, zone: &str, env: &Env) -> bool {
+/// Fetch a pubkey's cohort list and admin flag from the whitelist.
+///
+/// Returns `(cohorts, is_admin)`. A missing row or DB error yields
+/// `(vec![], false)` — i.e. a non-member with no admin privilege.
+async fn whitelist_cohorts(pubkey: &str, env: &Env) -> (Vec<String>, bool) {
     let db = match env.d1("DB") {
         Ok(db) => db,
-        Err(_) => return false,
+        Err(_) => return (Vec::new(), false),
     };
 
     #[derive(Deserialize)]
@@ -589,47 +593,47 @@ pub async fn has_zone_access(pubkey: &str, zone: &str, env: &Env) -> bool {
     match stmt.bind(&[JsValue::from_str(pubkey)]) {
         Ok(s) => match s.first::<Row>(None).await {
             Ok(Some(row)) => {
-                // Admins have access to all zones
-                if row.is_admin.unwrap_or(0) == 1 {
-                    return true;
-                }
-
                 let cohorts: Vec<String> = serde_json::from_str(&row.cohorts).unwrap_or_default();
-
-                match zone {
-                    "home" | "lobby" => cohorts.iter().any(|c| {
-                        matches!(
-                            c.as_str(),
-                            "home" | "lobby" | "approved" | "cross-access" | "members"
-                        )
-                    }),
-                    "members" => cohorts.iter().any(|c| {
-                        matches!(
-                            c.as_str(),
-                            "members"
-                                | "business"
-                                | "business-only"
-                                | "trainers"
-                                | "trainees"
-                                | "ai-agents"
-                                | "agent"
-                                | "cross-access"
-                        )
-                    }),
-                    "private" => cohorts.iter().any(|c| {
-                        matches!(
-                            c.as_str(),
-                            "private" | "private-only" | "private-business" | "cross-access"
-                        )
-                    }),
-                    // Unknown zone: deny by default
-                    _ => false,
-                }
+                (cohorts, row.is_admin.unwrap_or(0) == 1)
             }
-            _ => false,
+            _ => (Vec::new(), false),
         },
-        Err(_) => false,
+        Err(_) => (Vec::new(), false),
     }
+}
+
+/// Check whether a pubkey may READ a given zone.
+///
+/// Config-driven (no hardcoded zone names): the zone's `required_cohorts` come
+/// from `ZONE_CONFIG` ([`ZoneConfig`]). Admins always pass. A `public` zone with
+/// empty `required_cohorts` is readable by everyone; every other zone requires
+/// the reader to hold one of its `required_cohorts`. Unknown zones deny.
+pub async fn has_zone_access(pubkey: &str, zone: &str, env: &Env) -> bool {
+    let zones = ZoneConfig::load(env);
+    // Public zones are readable regardless of membership.
+    if zones.is_public_read(zone) {
+        return true;
+    }
+    let (cohorts, is_admin) = whitelist_cohorts(pubkey, env).await;
+    if is_admin {
+        return true;
+    }
+    zones.cohorts_can_read(zone, &cohorts)
+}
+
+/// Check whether a pubkey may WRITE to a given zone.
+///
+/// Uses the zone's effective write cohorts (`write_cohorts ?? required_cohorts`)
+/// so a zone can have read != write (e.g. `public`: unauth read, friends-only
+/// write). Admins always pass. Writes are never anonymous: an empty effective
+/// write-cohort set denies all non-admins. Unknown zones deny.
+pub async fn has_zone_write_access(pubkey: &str, zone: &str, env: &Env) -> bool {
+    let zones = ZoneConfig::load(env);
+    let (cohorts, is_admin) = whitelist_cohorts(pubkey, env).await;
+    if is_admin {
+        return true;
+    }
+    zones.cohorts_can_write(zone, &cohorts)
 }
 
 // ---------------------------------------------------------------------------

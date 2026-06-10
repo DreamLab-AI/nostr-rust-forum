@@ -113,16 +113,54 @@ pub struct Branding {
     pub welcome_copy: Option<String>,
 }
 
+/// Zone visibility for non-members (members and admins always see content).
+///
+/// - `Public`: listed and readable without auth or cohort membership.
+/// - `Locked` (default): listed to everyone as a tile (name + banner) but
+///   content is withheld from non-members; channel definitions are still
+///   returned so the tile renders.
+/// - `Hidden`: omitted entirely for non-members (definitions and content
+///   both withheld).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZoneVisibility {
+    /// Listed + readable without auth/cohort.
+    Public,
+    /// Listed as a content-gated tile (default).
+    #[default]
+    Locked,
+    /// Omitted entirely for non-members.
+    Hidden,
+}
+
 /// Zone definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
-    /// Slug identifier (`"home"`, `"members"`, `"private"`, ...).
+    /// Slug identifier (`"public"`, `"friends"`, `"family"`, `"business"`, ...).
     pub id: String,
     /// Display name.
     pub display_name: String,
-    /// Required cohorts to access this zone.
+    /// Cohorts required to READ this zone. Admins bypass this unconditionally.
+    /// An empty list combined with `visibility = "public"` means unauthenticated
+    /// read; an empty list with any other visibility means admin-only read.
     #[serde(default)]
     pub required_cohorts: Vec<String>,
+    /// Cohorts required to WRITE to this zone. When absent, falls back to
+    /// `required_cohorts` (read == write). The `public` zone uses this to allow
+    /// unauthenticated read while restricting writes to e.g. `["friends"]`.
+    #[serde(default)]
+    pub write_cohorts: Option<Vec<String>>,
+    /// Banner image rendered on the zone tile (including the locked tile shown
+    /// to non-members).
+    #[serde(default)]
+    pub banner_image_url: Option<String>,
+    /// Visibility policy for non-members. See [`ZoneVisibility`].
+    #[serde(default)]
+    pub visibility: ZoneVisibility,
+    /// Whether content in this zone is client-side encrypted (NIP-44). The relay
+    /// only records the flag; encryption/decryption is a client concern.
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 /// Trust system thresholds.
