@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::app::base_href;
 use crate::components::mention_text::MentionText;
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::use_display_name_memo;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::utils::{format_relative_time, pubkey_color, set_timeout_once};
 
@@ -205,9 +205,16 @@ pub fn NoteViewPage() -> impl IntoView {
                         </div>
                     }.into_any()
                 } else if let Some(n) = note.get() {
-                    let avatar_text = n.pubkey[..2].to_uppercase();
+                    // Avatar glyph: first two hex chars (identicon initial), not a label.
+                    let avatar_text = if n.pubkey.len() >= 2 {
+                        n.pubkey[..2].to_uppercase()
+                    } else {
+                        "??".to_string()
+                    };
                     let avatar_bg = pubkey_color(&n.pubkey);
-                    let pk_short = use_display_name(&n.pubkey);
+                    // Resolve author name reactively (display_name > name > NIP-05 >
+                    // shortened pubkey). Re-renders when kind-0 metadata arrives.
+                    let author_name = use_display_name_memo(n.pubkey.clone());
                     let time_str = format_relative_time(n.created_at);
                     let label = kind_label(n.kind);
                     let is_private = is_private_kind(n.kind);
@@ -225,7 +232,7 @@ pub fn NoteViewPage() -> impl IntoView {
                                     {avatar_text}
                                 </div>
                                 <div>
-                                    <div class="font-semibold text-white text-sm">{pk_short}</div>
+                                    <div class="font-semibold text-white text-sm">{move || author_name.get()}</div>
                                     <div class="text-xs text-gray-500">{time_str}</div>
                                 </div>
                                 <span class="ml-auto text-xs text-gray-500 border border-gray-700 rounded px-2 py-0.5">

@@ -127,15 +127,11 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
     };
     let title = panel.definition.title.clone();
     let description = panel.definition.description.clone();
-    let pubkey_short = if panel.agent_pubkey.len() >= 12 {
-        format!(
-            "{}...{}",
-            &panel.agent_pubkey[..6],
-            &panel.agent_pubkey[panel.agent_pubkey.len() - 6..]
-        )
-    } else {
-        panel.agent_pubkey.clone()
-    };
+    // Resolve the publishing agent's name reactively through the shared profile
+    // cache (display_name > name > NIP-05 > shortened pubkey). Fills in when the
+    // agent's kind-0 metadata arrives instead of showing a raw hex pubkey.
+    let agent_name =
+        crate::components::user_display::use_display_name_memo(panel.agent_pubkey.clone());
     let field_count = panel.definition.fields.len();
     let action_count = panel.definition.actions.len();
 
@@ -149,7 +145,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
             <div class="flex items-center gap-4 text-xs text-gray-500 mb-3">
                 <span>{format!("{field_count} fields")}</span>
                 <span>{format!("{action_count} actions")}</span>
-                <span class="font-mono">{pubkey_short}</span>
+                <span>{move || agent_name.get()}</span>
             </div>
             <div class="flex gap-2">
                 {panel.definition.actions.iter().map(|action| {
@@ -197,11 +193,10 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
     let priority = item.priority.clone();
     let d_tag = item.d_tag.clone();
     let event_id = item.event_id.clone();
-    let agent_short = if item.agent_pubkey.len() >= 12 {
-        format!("{}...", &item.agent_pubkey[..8])
-    } else {
-        item.agent_pubkey.clone()
-    };
+    // Resolve the requesting agent's name reactively (display_name > name >
+    // NIP-05 > shortened pubkey). Re-renders when kind-0 metadata arrives.
+    let agent_name =
+        crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
 
     let approve_loading = RwSignal::new(false);
     let reject_loading = RwSignal::new(false);
@@ -279,7 +274,7 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
             <div class="flex-1 min-w-0">
                 <span class="text-white font-medium block truncate">{title_tag}</span>
                 <span class="text-gray-500 text-xs block truncate">
-                    {reasoning}" · "{agent_short}
+                    {reasoning}" · "{move || agent_name.get()}
                 </span>
             </div>
             <Show

@@ -322,6 +322,12 @@ pub fn SignupPage() -> impl IntoView {
     });
 
     // Derived identity bundle (Phase 2 reveal).
+    // NOTE: this is the user being shown THEIR OWN freshly-minted pubkey during
+    // signup. There is no kind-0 profile to resolve against yet, and a name would
+    // be meaningless — the shortened hex *is* the correct, canonical thing to
+    // display. The full key is exposed via the copy affordance below (the reveal
+    // card renders a copy button next to this value), so we intentionally do NOT
+    // route this through use_display_name_memo.
     let pubkey_short = Memo::new(move |_| {
         pubkey
             .get()

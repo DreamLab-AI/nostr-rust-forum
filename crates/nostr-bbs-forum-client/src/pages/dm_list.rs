@@ -265,14 +265,35 @@ fn ConversationRow(convo: DMConversation) -> impl IntoView {
     let has_unread = convo.unread_count > 0;
     let unread_count = convo.unread_count;
     let time_display = format_relative_time(convo.last_timestamp);
-    let avatar_text = convo.pubkey[..2].to_uppercase();
+    // Avatar glyph: first two hex chars, uppercased. This is a deterministic
+    // identicon initial, not a displayed identity label.
+    let avatar_text = if convo.pubkey.len() >= 2 {
+        convo.pubkey[..2].to_uppercase()
+    } else {
+        "??".to_string()
+    };
     let avatar_bg = pubkey_color(&convo.pubkey);
-    let name = convo.name.clone();
-    // TODO(nicknames): keep raw shortened npub as the secondary identity
-    // fingerprint under the resolved nickname — intentional technical context.
+    // Keep the raw shortened npub as the secondary identity fingerprint
+    // beneath the resolved nickname — intentional technical context.
     let short_pk = crate::utils::shorten_pubkey(&convo.pubkey);
-    // Show pubkey separately only when name differs from shortened pubkey
-    let _name_is_pubkey = name == short_pk || name == convo.pubkey;
+    // Resolve the display name reactively through the shared profile cache
+    // (display_name > name > NIP-05 > shortened pubkey). Falls back to any
+    // pre-populated `convo.name`, then the shortened pubkey, while kind-0
+    // metadata is still in flight. Re-renders when the cache fills.
+    let resolved_name =
+        crate::components::user_display::use_display_name_memo(convo.pubkey.clone());
+    let convo_name = convo.name.clone();
+    let short_pk_for_name = short_pk.clone();
+    let name = move || {
+        let r = resolved_name.get();
+        // If resolution only yielded the shortened pubkey, prefer any explicit
+        // nickname carried on the conversation; otherwise show the resolved label.
+        if r == short_pk_for_name && !convo_name.is_empty() {
+            convo_name.clone()
+        } else {
+            r
+        }
+    };
     let last_message = convo.last_message.clone();
     let has_message = !last_message.is_empty();
 
