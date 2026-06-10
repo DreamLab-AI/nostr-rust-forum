@@ -591,10 +591,40 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                         }
                     };
 
+                    // Replay all active subscriptions after AUTH so the relay
+                    // re-evaluates them with the authenticated session: REQs
+                    // opened before the NIP-42 handshake completed were zone-
+                    // filtered as unauthenticated. Same-socket ordering means
+                    // the relay processes AUTH before these re-REQs.
+                    let replay_rc = inner_rc.clone();
+                    let replay_subs = move |ws: &Option<WebSocket>| {
+                        let inner = replay_rc.borrow();
+                        if let Some(ws) = ws {
+                            for (sub_id, sub) in inner.subscriptions.iter() {
+                                let mut req = vec![
+                                    serde_json::Value::String("REQ".into()),
+                                    serde_json::Value::String(sub_id.clone()),
+                                ];
+                                for filter in &sub.filters {
+                                    if let Ok(v) = serde_json::to_value(filter) {
+                                        req.push(v);
+                                    }
+                                }
+                                if let Ok(msg) = serde_json::to_string(&req) {
+                                    let _ = ws.send_with_str(&msg);
+                                }
+                            }
+                            web_sys::console::log_1(
+                                &"[Relay] replayed subscriptions post-AUTH".into(),
+                            );
+                        }
+                    };
+
                     if let Some(sign_fn) = sync_signer {
                         let unsigned = make_unsigned(relay_url, challenge);
                         if let Some(signed) = sign_fn(unsigned) {
                             send_auth(&signed, &ws);
+                            replay_subs(&ws);
                         } else {
                             web_sys::console::warn_1(&"[Relay] AUTH sync signing failed".into());
                         }
@@ -603,6 +633,7 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Some(signed) = async_sign(unsigned).await {
                                 send_auth(&signed, &ws);
+                                replay_subs(&ws);
                             } else {
                                 web_sys::console::warn_1(
                                     &"[Relay] AUTH async signing failed".into(),
