@@ -5,13 +5,14 @@
 //! - RVF binary format persistence to R2
 //! - id↔label mapping in KV
 //! - NIP-98 authenticated ingest
-//! - Hash-based fallback embedding generation
+//! - Semantic embeddings via Cloudflare Workers AI (bge-small-en-v1.5),
+//!   with a deterministic hash fallback when the AI binding is absent
 //!
 //! ## Architecture
 //!
 //! - `lib.rs`   -- HTTP router, CORS, entry point
 //! - `store.rs` -- In-memory vector store, RVF serialization
-//! - `embed.rs` -- Hash-based embedding generator
+//! - `embed.rs` -- Workers AI BGE-small embeddings + hash fallback
 //! - `auth.rs`  -- NIP-98 admin verification
 
 // Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
@@ -262,7 +263,10 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
                 400,
             );
         }
-        embed::generate_embedding(text)
+        // Embed the query with the same model used at ingest time so the
+        // query vector lives in the same space as the stored vectors.
+        let (mut embs, _model) = embed::embed_texts(env, std::slice::from_ref(text)).await;
+        embs.pop().unwrap_or_default()
     } else {
         return json_response(
             req,
@@ -358,7 +362,8 @@ async fn handle_embed(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    let embeddings: Vec<Vec<f32>> = texts.iter().map(|t| embed::generate_embedding(t)).collect();
+    let (embeddings, model) = embed::embed_texts(env, &texts).await;
+    let semantic = model == embed::MODEL_LABEL_SEMANTIC;
 
     json_response(
         req,
@@ -366,8 +371,13 @@ async fn handle_embed(req: &Request, env: &Env) -> Result<Response> {
         &serde_json::json!({
             "embeddings": embeddings,
             "dimensions": DIM,
-            "model": "hash-fallback-v1",
-            "note": "Hash-based fallback embedding. Replace with ONNX WASM model for semantic quality.",
+            "model": model,
+            "semantic": semantic,
+            "note": if semantic {
+                "Cloudflare Workers AI bge-small-en-v1.5 (384-dim, L2-normalized)."
+            } else {
+                "Hash-based fallback embedding (AI binding unavailable). Vectors are NOT semantic."
+            },
         }),
         200,
     )
@@ -446,6 +456,16 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
 async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
     let store = load_store(env).await?;
 
+    // Report the model actually in use, not a hardcoded string. When the
+    // Workers AI binding is configured we serve real BGE-small embeddings;
+    // otherwise the worker degrades to the deterministic hash fallback.
+    let ai_live = embed::ai_binding_available(env);
+    let model = if ai_live {
+        embed::MODEL_LABEL_SEMANTIC
+    } else {
+        embed::MODEL_LABEL_FALLBACK
+    };
+
     json_response(
         req,
         env,
@@ -454,7 +474,9 @@ async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
             "totalVectors": store.count(),
             "dimensions": DIM,
             "metric": "cosine",
-            "model": "all-MiniLM-L6-v2",
+            "model": model,
+            "semantic": ai_live,
+            "aiBinding": ai_live,
             "engine": "rvf-rust",
             "runtime": "workers-rs",
             "format": "rvf-v1",

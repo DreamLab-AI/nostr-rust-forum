@@ -5,6 +5,12 @@ compatibility_date = "2025-09-01"
 [build]
 command = "worker-build --release"
 
+# Cloudflare Workers AI binding. Powers semantic embeddings via
+# @cf/baai/bge-small-en-v1.5 (384-dim, matches the store DIM). When this
+# binding is absent the worker falls back to deterministic hash embeddings.
+[ai]
+binding = "AI"
+
 [[r2_buckets]]
 binding = "VECTORS"
 bucket_name = "nostr-bbs-vectors"
