@@ -567,18 +567,30 @@ pub fn PodBrowserPage() -> impl IntoView {
                     </div>
                 }.into_any(),
 
-                GitProbeState::Error(e) => view! {
-                    <div class="mb-6 flex items-center justify-between gap-3 text-xs text-red-500/70 bg-gray-800/30 border border-gray-700/30 rounded-lg px-4 py-2.5">
-                        <span>{format!("Git probe error: {e}")}</span>
-                        <button
-                            data-testid="pod-git-probe"
-                            on:click=on_probe_git
-                            class="text-gray-600 hover:text-gray-400 transition-colors underline underline-offset-2 flex-shrink-0"
-                        >
-                            "Retry"
-                        </button>
-                    </div>
-                }.into_any(),
+                GitProbeState::Error(e) => {
+                    web_sys::console::warn_1(
+                        &format!("[PodBrowser] Git probe failed: {e}").into(),
+                    );
+                    let detail = e.clone();
+                    view! {
+                        <div class="mb-6 flex flex-col gap-2 text-xs text-gray-500 bg-gray-800/30 border border-gray-700/30 rounded-lg px-4 py-2.5">
+                            <div class="flex items-center justify-between gap-3">
+                                <span>"Version history isn\u{2019}t available for your pod just yet."</span>
+                                <button
+                                    data-testid="pod-git-probe"
+                                    on:click=on_probe_git
+                                    class="text-gray-600 hover:text-gray-400 transition-colors underline underline-offset-2 flex-shrink-0"
+                                >
+                                    "Re-check"
+                                </button>
+                            </div>
+                            <details class="text-gray-700">
+                                <summary class="cursor-pointer select-none hover:text-gray-500">"Details"</summary>
+                                <span class="block mt-1 font-mono">{detail}</span>
+                            </details>
+                        </div>
+                    }.into_any()
+                },
             }}
 
             // Native pod section — only rendered when NATIVE_POD_URL is configured.
@@ -616,11 +628,18 @@ pub fn PodBrowserPage() -> impl IntoView {
                             />
                         }.into_any()
                     },
-                    GitProbeState::Unavailable | GitProbeState::Error(_) => view! {
-                        <div class="mb-4 text-xs text-gray-700 bg-gray-800/20 border border-gray-700/20 rounded px-3 py-2">
-                            "Native pod not reachable \u{2014} check tunnel"
-                        </div>
-                    }.into_any(),
+                    GitProbeState::Unavailable | GitProbeState::Error(_) => {
+                        if let GitProbeState::Error(e) = native_probe.get() {
+                            web_sys::console::warn_1(
+                                &format!("[PodBrowser] Native pod probe failed: {e}").into(),
+                            );
+                        }
+                        view! {
+                            <div class="mb-4 text-xs text-gray-600 bg-gray-800/20 border border-gray-700/20 rounded px-3 py-2">
+                                "Your pod storage is still being set up. Check back shortly."
+                            </div>
+                        }.into_any()
+                    },
                 }
             }}
 
@@ -716,12 +735,25 @@ pub fn PodBrowserPage() -> impl IntoView {
                         </div>
                     }.into_any(),
 
-                    FetchState::Error(e) => view! {
-                        <div class="bg-red-900/20 border border-red-500/30 rounded-lg p-4 text-center">
-                            <p class="text-red-400 text-sm">{format!("Failed to load: {e}")}</p>
-                            <p class="text-gray-500 text-xs mt-1">"The pod may not be provisioned yet, or the resource may not exist."</p>
-                        </div>
-                    }.into_any(),
+                    FetchState::Error(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[PodBrowser] Pod fetch failed: {e}").into(),
+                        );
+                        let detail = e.clone();
+                        view! {
+                            <div class="bg-gray-800/50 border border-gray-700/50 rounded-lg p-6 text-center">
+                                <svg class="w-12 h-12 mx-auto text-gray-600 mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                                <p class="text-gray-300 text-sm">"Your personal pod isn\u{2019}t set up yet."</p>
+                                <p class="text-gray-500 text-xs mt-1">"Pod storage is being provisioned \u{2014} this can take a moment after you first sign in."</p>
+                                <details class="text-gray-700 text-xs mt-3 inline-block text-left">
+                                    <summary class="cursor-pointer select-none hover:text-gray-500">"Details"</summary>
+                                    <span class="block mt-1 font-mono">{detail}</span>
+                                </details>
+                            </div>
+                        }.into_any()
+                    },
 
                     FetchState::Loaded(entries) if entries.is_empty() => view! {
                         <div class="bg-gray-800/50 rounded-lg p-8 text-center">

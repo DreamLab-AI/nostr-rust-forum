@@ -91,6 +91,7 @@ pub fn PinButton(
         <Show when=move || is_admin.get()>
             <button
                 class="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-gray-700/50 text-gray-600 hover:text-amber-400"
+                aria-label="Pin message"
                 title="Pin message"
                 on:click=on_pin
             >
@@ -239,6 +240,7 @@ pub fn PinnedMessages(
                                         <Show when=move || is_admin.get()>
                                             <button
                                                 class="opacity-0 group-hover/pin:opacity-100 transition-opacity p-1 rounded hover:bg-gray-700/50 text-gray-500 hover:text-red-400 flex-shrink-0"
+                                                aria-label="Unpin message"
                                                 title="Unpin message"
                                                 on:click=on_unpin
                                             >
