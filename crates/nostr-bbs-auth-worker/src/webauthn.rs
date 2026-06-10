@@ -2082,7 +2082,10 @@ mod tests {
 
     #[test]
     fn canonicalise_url_root_path_preserved() {
-        assert_eq!(canonicalise_url("https://example.test/"), "https://example.test/");
+        assert_eq!(
+            canonicalise_url("https://example.test/"),
+            "https://example.test/"
+        );
     }
 
     #[test]

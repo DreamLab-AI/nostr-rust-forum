@@ -387,11 +387,7 @@ async fn route_sprint_api(
     // -- Moderation (WI-2) ----------------------------------------------
     if matches!(
         path,
-        "/api/mod/ban"
-            | "/api/mod/mute"
-            | "/api/mod/warn"
-            | "/api/mod/unban"
-            | "/api/mod/unmute"
+        "/api/mod/ban" | "/api/mod/mute" | "/api/mod/warn" | "/api/mod/unban" | "/api/mod/unmute"
     ) && *method == Method::Post
     {
         let resp = moderation::handle_action(path, body_bytes, auth_header, env, origin).await?;
@@ -568,8 +564,7 @@ async fn route_sprint_api(
 
     // -- Native pod provisioning ----------------------------------------
     if path == "/api/native-pod/provision" && *method == Method::Post {
-        let resp =
-            handle_native_pod_provision(body_bytes, auth_header, env, origin).await?;
+        let resp = handle_native_pod_provision(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 

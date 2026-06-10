@@ -111,9 +111,9 @@ impl AllowList {
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(&host);
-        self.hosts.iter().any(|entry| {
-            host == entry || host.ends_with(&format!(".{entry}"))
-        })
+        self.hosts
+            .iter()
+            .any(|entry| host == entry || host.ends_with(&format!(".{entry}")))
     }
 }
 

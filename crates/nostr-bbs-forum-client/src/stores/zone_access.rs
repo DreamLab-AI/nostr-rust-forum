@@ -154,9 +154,7 @@ fn relay_api_base() -> String {
 /// the `cohorts` array for backwards compatibility with old relay versions.
 /// The raw `cohorts` array is always surfaced (when present) so config-driven
 /// zones can compute membership without the legacy 3-flag mapping.
-async fn fetch_user_access(
-    pubkey: &str,
-) -> Result<(bool, bool, bool, bool, Vec<String>), String> {
+async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool, Vec<String>), String> {
     let url = format!("{}/api/check-whitelist?pubkey={}", relay_api_base(), pubkey);
     let win = web_sys::window().ok_or("No window")?;
     let resp_val = JsFuture::from(win.fetch_with_str(&url))

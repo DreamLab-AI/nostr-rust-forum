@@ -510,8 +510,15 @@ impl NostrRelayDO {
             // because a viewer who MAY read the zone might still only be entitled
             // to a free/busy block or to nothing.
             if calendar_projection::is_projected_calendar_kind(event.kind) {
-                if let Some(out) =
-                    self.project_calendar_for_viewer(event, &session_pubkey, &viewer_cohorts, viewer_is_admin, &zones).await
+                if let Some(out) = self
+                    .project_calendar_for_viewer(
+                        event,
+                        &session_pubkey,
+                        &viewer_cohorts,
+                        viewer_is_admin,
+                        &zones,
+                    )
+                    .await
                 {
                     Self::send_event(&ws, sub_id, &out);
                 }
@@ -613,7 +620,12 @@ impl NostrRelayDO {
         }
 
         // Stage 2: per-tier projection over the calendar event itself.
-        calendar_projection::project_calendar_event(viewer_cohorts, event, is_owner, viewer_is_admin)
+        calendar_projection::project_calendar_event(
+            viewer_cohorts,
+            event,
+            is_owner,
+            viewer_is_admin,
+        )
     }
 
     /// Resolve the owning zone slug of a calendar RSVP by reading the referenced

@@ -100,8 +100,7 @@ async fn git_fetch_raw(
     }
     init.set_headers(&headers);
 
-    let req =
-        web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| format!("{e:?}"))?;
+    let req = web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| format!("{e:?}"))?;
     let resp_val = JsFuture::from(win.fetch_with_request(&req))
         .await
         .map_err(|e| format!("Fetch: {e:?}"))?;

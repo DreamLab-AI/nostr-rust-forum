@@ -56,7 +56,10 @@ pub async fn verify(
 /// authority across error branches.
 pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
     // Static admin set (ADMIN_PUBKEYS): deploy-time bootstrap/fallback.
-    if let Ok(raw) = env.var(nostr_bbs_core::ADMIN_PUBKEYS_VAR).map(|v| v.to_string()) {
+    if let Ok(raw) = env
+        .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)
+        .map(|v| v.to_string())
+    {
         if nostr_bbs_core::is_static_admin(pubkey, &raw) {
             return true;
         }

@@ -687,7 +687,10 @@ mod tests {
         assert_eq!(mute_expires_at(&signed).unwrap(), Some(expires_at));
 
         // The raw tag carries the NIP-40 `expiration` name, never the old `expires`.
-        assert_eq!(first_tag_value(&signed, "expiration"), Some(expires_at.to_string().as_str()));
+        assert_eq!(
+            first_tag_value(&signed, "expiration"),
+            Some(expires_at.to_string().as_str())
+        );
         assert_eq!(first_tag_value(&signed, "expires"), None);
     }
 

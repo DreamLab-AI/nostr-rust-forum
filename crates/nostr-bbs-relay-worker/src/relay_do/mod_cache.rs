@@ -157,9 +157,7 @@ pub fn resolve_block(rows: &[ActionRow], now: i64) -> Block {
     for r in rows {
         match r.action.as_str() {
             "ban" => last_ban = Some(last_ban.map_or(r.created_at, |c| c.max(r.created_at))),
-            "unban" => {
-                last_unban = Some(last_unban.map_or(r.created_at, |c| c.max(r.created_at)))
-            }
+            "unban" => last_unban = Some(last_unban.map_or(r.created_at, |c| c.max(r.created_at))),
             "mute" => {
                 last_mute = Some(last_mute.map_or(r.created_at, |c| c.max(r.created_at)));
                 match r.expires_at {

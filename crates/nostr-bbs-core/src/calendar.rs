@@ -78,15 +78,23 @@ pub fn read_venue_tag(event: &NostrEvent) -> Option<&str> {
 /// Idempotent: any existing `zone` tag is removed first so the event binds to
 /// exactly one zone. Returns the mutated event for chaining.
 pub fn set_zone_tag(mut event: NostrEvent, zone: &str) -> NostrEvent {
-    event.tags.retain(|t| t.first().map(String::as_str) != Some(ZONE_TAG));
-    event.tags.push(vec![ZONE_TAG.to_string(), zone.to_string()]);
+    event
+        .tags
+        .retain(|t| t.first().map(String::as_str) != Some(ZONE_TAG));
+    event
+        .tags
+        .push(vec![ZONE_TAG.to_string(), zone.to_string()]);
     event
 }
 
 /// Set (or replace) the venue tag on an event's tag list. See [`set_zone_tag`].
 pub fn set_venue_tag(mut event: NostrEvent, venue: &str) -> NostrEvent {
-    event.tags.retain(|t| t.first().map(String::as_str) != Some(VENUE_TAG));
-    event.tags.push(vec![VENUE_TAG.to_string(), venue.to_string()]);
+    event
+        .tags
+        .retain(|t| t.first().map(String::as_str) != Some(VENUE_TAG));
+    event
+        .tags
+        .push(vec![VENUE_TAG.to_string(), venue.to_string()]);
     event
 }
 
@@ -749,7 +757,10 @@ mod tests {
         // Time block kept.
         assert_eq!(read_zone_tag(&fb), Some("family"));
         assert_eq!(read_venue_tag(&fb), Some("fairfield"));
-        assert!(fb.tags.iter().any(|t| t[0] == "start" && t[1] == "1700000000"));
+        assert!(fb
+            .tags
+            .iter()
+            .any(|t| t[0] == "start" && t[1] == "1700000000"));
         assert!(fb.tags.iter().any(|t| t[0] == "end"));
         assert!(fb.tags.iter().any(|t| t[0] == "busy" && t[1] == "1"));
         // Detail STRIPPED.

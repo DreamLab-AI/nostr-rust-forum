@@ -4,8 +4,8 @@
 //! groups them by zone/category from the `section` tag, and renders
 //! each zone with its categories as visually rich hero cards.
 
-use leptos::prelude::*;
 use leptos::prelude::AnyView;
+use leptos::prelude::*;
 use std::collections::HashMap;
 
 use leptos_router::components::A;

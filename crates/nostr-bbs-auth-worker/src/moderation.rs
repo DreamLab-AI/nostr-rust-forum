@@ -836,11 +836,17 @@ mod tests {
 
         // ... and an admin-signed unban event passes the same kind-match +
         // validate_moderation_event gate that handle_action applies.
-        let ev = signed(build_unban(&admin_pk(), &target_pk(), "appeal granted", 1_700_000_000));
+        let ev = signed(build_unban(
+            &admin_pk(),
+            &target_pk(),
+            "appeal granted",
+            1_700_000_000,
+        ));
         assert_eq!(ev.kind, kind);
         let mut admins = HashSet::new();
         admins.insert(admin_pk());
-        validate_moderation_event(&ev, &admins).expect("unban event must validate for admin signer");
+        validate_moderation_event(&ev, &admins)
+            .expect("unban event must validate for admin signer");
         assert_eq!(first_tag(&ev, "p"), Some(target_pk().as_str()));
     }
 
@@ -850,11 +856,17 @@ mod tests {
         assert_eq!(name, "unmute");
         assert_eq!(kind, KIND_UNMUTE);
 
-        let ev = signed(build_unmute(&admin_pk(), &target_pk(), "cooldown over", 1_700_000_000));
+        let ev = signed(build_unmute(
+            &admin_pk(),
+            &target_pk(),
+            "cooldown over",
+            1_700_000_000,
+        ));
         assert_eq!(ev.kind, kind);
         let mut admins = HashSet::new();
         admins.insert(admin_pk());
-        validate_moderation_event(&ev, &admins).expect("unmute event must validate for admin signer");
+        validate_moderation_event(&ev, &admins)
+            .expect("unmute event must validate for admin signer");
         assert_eq!(first_tag(&ev, "p"), Some(target_pk().as_str()));
     }
 }

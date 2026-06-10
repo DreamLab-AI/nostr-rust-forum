@@ -247,13 +247,7 @@ mod tests {
     #[test]
     fn owner_always_full_even_other_tier() {
         // A business user viewing their OWN family-zone event still gets full.
-        let p = project_tier(
-            &cohorts(&[COHORT_BUSINESS]),
-            ZONE_FAMILY,
-            None,
-            true,
-            false,
-        );
+        let p = project_tier(&cohorts(&[COHORT_BUSINESS]), ZONE_FAMILY, None, true, false);
         assert_eq!(p, Projection::Full);
     }
 
@@ -372,9 +366,16 @@ mod tests {
     #[test]
     fn wrapper_untagged_event_served_as_is() {
         let key = [0x09u8; 32];
-        let ev =
-            nostr_bbs_core::create_calendar_event(&key, "Open", 1_700_000_000, None, None, None, None)
-                .unwrap();
+        let ev = nostr_bbs_core::create_calendar_event(
+            &key,
+            "Open",
+            1_700_000_000,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let out = project_calendar_event(&cohorts(&[COHORT_BUSINESS]), &ev, false, false).unwrap();
         // No zone tag → unscoped → unchanged (title preserved).
         assert!(out.tags.iter().any(|t| t[0] == "title"));

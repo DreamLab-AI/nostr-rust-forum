@@ -66,7 +66,10 @@ pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
 
     // Static admin set (ADMIN_PUBKEYS): deploy-time bootstrap/fallback, so a
     // fresh D1 still surfaces the operator's static admins here (Gap 1/2).
-    if let Ok(raw) = env.var(nostr_bbs_core::ADMIN_PUBKEYS_VAR).map(|v| v.to_string()) {
+    if let Ok(raw) = env
+        .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)
+        .map(|v| v.to_string())
+    {
         for k in nostr_bbs_core::admin_pubkeys_from_env_str(&raw) {
             if !pubkeys.contains(&k) {
                 pubkeys.push(k);
