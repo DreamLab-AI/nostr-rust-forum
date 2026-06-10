@@ -1,21 +1,26 @@
 //! Phase C: tiered calendar visibility projection (access-tier data projection).
 //!
-//! This module sits *on top of* the Phase A zone read-gate. The zone gate
-//! (`trust::has_zone_access`) answers "may this viewer see this zone at all?".
-//! The calendar projector answers the finer question: even among calendar events
-//! a viewer is allowed to know about, which ones must be reduced to a free/busy
-//! block, and which must be omitted entirely because the viewer is not even
-//! supposed to be *aware* they exist.
+//! This module is the COMPLETE access decision for calendar event kinds. There
+//! is no upstream zone read-gate for calendar kinds: a live probe proved that a
+//! gate-then-project ordering omitted any event in a zone the viewer was not a
+//! member of, so the FreeBusy / cross-zone-Full tiers never executed. The
+//! projector answers the whole question — for every (viewer, event) pair: serve
+//! full, reduce to a free/busy block, or omit entirely (viewer must remain
+//! unaware the event exists). It is deny-by-default for unknown zones.
 //!
 //! It implements the operator-approved matrix
 //! (`dreamlab-ai-website/docs/architecture/forum-org-redesign.md` §4):
 //!
-//! | Viewer ↓ / Event zone → | family   | business | friends | own  |
-//! |-------------------------|----------|----------|---------|------|
-//! | admin                   | full     | full     | full    | full |
-//! | family                  | full     | full     | full    | full |
-//! | friends                 | free/busy| free/busy| full    | full |
-//! | business                | OMIT     | full     | OMIT    | full |
+//! | Viewer ↓ / Event zone → | family   | business | friends | public | unknown |
+//! |-------------------------|----------|----------|---------|--------|---------|
+//! | admin / owner           | full     | full     | full    | full   | full    |
+//! | family                  | full     | full     | full    | full   | full    |
+//! | friends                 | f/b*     | f/b*     | full    | full   | OMIT    |
+//! | business                | OMIT     | full     | OMIT    | full   | OMIT    |
+//! | no cohort / anon        | OMIT     | OMIT     | OMIT    | full   | OMIT    |
+//!
+//! (*) friends see family/business as free/busy ONLY at a recognised shared
+//! venue (fairfield/dreamlab); off-site events are omitted.
 //!
 //! Free/busy keeps start/end + venue + a busy flag (see
 //! [`nostr_bbs_core::to_free_busy`]); for a `friends` viewer, a family/business
@@ -40,6 +45,8 @@ pub const COHORT_BUSINESS: &str = "business";
 pub const ZONE_FAMILY: &str = "family";
 pub const ZONE_BUSINESS: &str = "business";
 pub const ZONE_FRIENDS: &str = "friends";
+/// The public zone slug — readable by every tier at full detail.
+pub const ZONE_PUBLIC: &str = "public";
 
 /// The outcome of projecting one calendar event for one viewer tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,11 +108,12 @@ pub fn project_tier(
                     Projection::Omit
                 }
             }
-            // Any other (e.g. public) zone: free/busy is the safe floor for a
-            // non-owning friend; but public calendar events are not zone-private,
-            // so default to full for unknown/public zones the friend can already
-            // read via the zone gate.
-            _ => Projection::Full,
+            // Public is not zone-private: full detail.
+            ZONE_PUBLIC => Projection::Full,
+            // Any unrecognised zone: deny by default — the projector is now the
+            // complete access decision (no upstream read-gate), so an unknown
+            // zone must not be served.
+            _ => Projection::Omit,
         };
     }
 
@@ -115,15 +123,20 @@ pub fn project_tier(
             ZONE_BUSINESS => Projection::Full,
             // family / friends: business must remain unaware.
             ZONE_FAMILY | ZONE_FRIENDS => Projection::Omit,
-            _ => Projection::Full,
+            // Public is not zone-private: full detail.
+            ZONE_PUBLIC => Projection::Full,
+            // Unrecognised zone: deny by default.
+            _ => Projection::Omit,
         };
     }
 
-    // No relevant cohort: the Phase A zone read-gate already denied non-members
-    // of locked/hidden zones before reaching here, so anything that arrives is a
-    // zone the viewer may read (e.g. public). Serve full — the gate, not the
-    // projector, is the membership boundary.
-    Projection::Full
+    // No relevant cohort (includes anon/unauthenticated and whitelisted but
+    // uncohorted viewers). The projector is the complete access decision: public
+    // zone events are served full, EVERYTHING else is omitted. Deny by default.
+    match event_zone {
+        ZONE_PUBLIC => Projection::Full,
+        _ => Projection::Omit,
+    }
 }
 
 /// Apply the projection to an event, returning the event to serve, or `None`
@@ -310,6 +323,99 @@ mod tests {
         assert_eq!(p, Projection::Full);
     }
 
+    // ---- Deny-by-default / no-cohort / unknown-zone cells ------------------
+
+    #[test]
+    fn no_cohort_viewer_full_on_public_omitted_elsewhere() {
+        // Empty cohorts (anon / unauthenticated / whitelisted-but-uncohorted).
+        assert_eq!(
+            project_tier(&[], ZONE_PUBLIC, None, false, false),
+            Projection::Full,
+            "no cohort, public"
+        );
+        for zone in [ZONE_FAMILY, ZONE_BUSINESS, ZONE_FRIENDS, "mystery"] {
+            assert_eq!(
+                project_tier(&[], zone, Some("fairfield"), false, false),
+                Projection::Omit,
+                "no cohort, zone {zone} omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn friends_unknown_zone_omitted_public_full() {
+        assert_eq!(
+            project_tier(&cohorts(&[COHORT_FRIENDS]), "mystery", None, false, false),
+            Projection::Omit,
+            "friends, unknown zone deny-by-default"
+        );
+        assert_eq!(
+            project_tier(&cohorts(&[COHORT_FRIENDS]), ZONE_PUBLIC, None, false, false),
+            Projection::Full,
+            "friends, public zone full"
+        );
+    }
+
+    #[test]
+    fn business_unknown_zone_omitted_public_full() {
+        assert_eq!(
+            project_tier(&cohorts(&[COHORT_BUSINESS]), "mystery", None, false, false),
+            Projection::Omit,
+            "business, unknown zone deny-by-default"
+        );
+        assert_eq!(
+            project_tier(&cohorts(&[COHORT_BUSINESS]), ZONE_PUBLIC, None, false, false),
+            Projection::Full,
+            "business, public zone full"
+        );
+    }
+
+    #[test]
+    fn family_sees_business_full_explicit() {
+        // The probe persona: family-dave must see business@dreamlab full.
+        assert_eq!(
+            project_tier(
+                &cohorts(&[COHORT_FAMILY]),
+                ZONE_BUSINESS,
+                Some("dreamlab"),
+                false,
+                false,
+            ),
+            Projection::Full,
+        );
+        // ...and friends events full too.
+        assert_eq!(
+            project_tier(&cohorts(&[COHORT_FAMILY]), ZONE_FRIENDS, None, false, false),
+            Projection::Full,
+        );
+    }
+
+    #[test]
+    fn friends_sees_family_fairfield_free_busy_not_omit() {
+        // The probe persona: friends-carol must get free/busy (not absent) for
+        // family@fairfield and business@dreamlab.
+        assert_eq!(
+            project_tier(
+                &cohorts(&[COHORT_FRIENDS]),
+                ZONE_FAMILY,
+                Some("fairfield"),
+                false,
+                false,
+            ),
+            Projection::FreeBusy,
+        );
+        assert_eq!(
+            project_tier(
+                &cohorts(&[COHORT_FRIENDS]),
+                ZONE_BUSINESS,
+                Some("dreamlab"),
+                false,
+                false,
+            ),
+            Projection::FreeBusy,
+        );
+    }
+
     #[test]
     fn dual_cohort_family_friends_takes_family_tier() {
         // A relative who also visits (family,friends) gets the more permissive
@@ -364,6 +470,23 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_no_cohort_public_full_unknown_omit() {
+        // No-cohort viewer on a public zone event: full (title preserved).
+        let pub_ev = build_event(ZONE_PUBLIC, None);
+        let out = project_calendar_event(&[], &pub_ev, false, false).unwrap();
+        assert!(out.tags.iter().any(|t| t[0] == "title"));
+        // No-cohort viewer on an unknown zone: omitted entirely.
+        let unk_ev = build_event("mystery", Some("fairfield"));
+        assert!(project_calendar_event(&[], &unk_ev, false, false).is_none());
+    }
+
+    #[test]
+    fn wrapper_friends_unknown_zone_omitted() {
+        let ev = build_event("mystery", Some("dreamlab"));
+        assert!(project_calendar_event(&cohorts(&[COHORT_FRIENDS]), &ev, false, false).is_none());
+    }
+
+    #[test]
     fn wrapper_untagged_event_served_as_is() {
         let key = [0x09u8; 32];
         let ev = nostr_bbs_core::create_calendar_event(
@@ -379,6 +502,56 @@ mod tests {
         let out = project_calendar_event(&cohorts(&[COHORT_BUSINESS]), &ev, false, false).unwrap();
         // No zone tag → unscoped → unchanged (title preserved).
         assert!(out.tags.iter().any(|t| t[0] == "title"));
+    }
+
+    // ---- RSVP tier gating contract (the nip_handlers RSVP rule) ------------
+    //
+    // The RSVP handler serves an RSVP ONLY when the viewer's tier for the TARGET
+    // event is Full; FreeBusy/Omit ⇒ withhold (an RSVP leaks participants). These
+    // assert the tier inputs that drive that branch. The D1 target lookup itself
+    // is exercised by integration tests; here we pin the decision boundary.
+
+    #[test]
+    fn rsvp_served_only_when_target_tier_full() {
+        // friends viewing a friends-zone target → Full → RSVP served.
+        assert_eq!(
+            project_tier(&cohorts(&[COHORT_FRIENDS]), ZONE_FRIENDS, None, false, false),
+            Projection::Full,
+        );
+        // friends viewing a family@fairfield target → FreeBusy → RSVP withheld.
+        assert_eq!(
+            project_tier(
+                &cohorts(&[COHORT_FRIENDS]),
+                ZONE_FAMILY,
+                Some("fairfield"),
+                false,
+                false,
+            ),
+            Projection::FreeBusy,
+        );
+        // business viewing a family-zone target → Omit → RSVP withheld.
+        assert_eq!(
+            project_tier(&cohorts(&[COHORT_BUSINESS]), ZONE_FAMILY, None, false, false),
+            Projection::Omit,
+        );
+    }
+
+    #[test]
+    fn rsvp_spoofed_mirror_zone_does_not_grant_full() {
+        // SECURITY: even if an attacker mirrors zone=public on the RSVP, the
+        // handler resolves the TARGET's real zone (family) from D1 and feeds THAT
+        // here. A no-cohort/lower-tier viewer therefore gets Omit, not Full — the
+        // spoofed public tag never reaches this function.
+        assert_eq!(
+            project_tier(&[], ZONE_FAMILY, None, false, false),
+            Projection::Omit,
+        );
+        // Contrast: had the spoof won (public fed in), it would have been Full —
+        // which is exactly the leak the target-resolution prevents.
+        assert_eq!(
+            project_tier(&[], ZONE_PUBLIC, None, false, false),
+            Projection::Full,
+        );
     }
 
     #[test]

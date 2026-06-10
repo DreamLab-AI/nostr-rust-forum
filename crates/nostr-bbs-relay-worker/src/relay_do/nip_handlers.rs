@@ -25,7 +25,7 @@ use super::calendar_projection;
 use super::filter::{self, NostrFilter};
 use super::NostrRelayDO;
 
-use nostr_bbs_core::{read_zone_tag, KIND_CALENDAR_RSVP};
+use nostr_bbs_core::KIND_CALENDAR_RSVP;
 
 // ---------------------------------------------------------------------------
 // Security limits
@@ -503,12 +503,12 @@ impl NostrRelayDO {
         for event in &events {
             // Phase C: NIP-52 calendar kinds (31922 date, 31923 time, 31925 RSVP)
             // are zone-scoped via a native `["zone", "<slug>"]` binding tag on the
-            // event itself (not via a channel-id lookup). They get a two-stage
-            // treatment: (1) the SAME Phase-A zone read-gate — a non-member of a
-            // locked/hidden owning zone never receives the event at all; then
-            // (2) the per-tier PROJECTION (full / free-busy / omit) layered on top,
-            // because a viewer who MAY read the zone might still only be entitled
-            // to a free/busy block or to nothing.
+            // event itself (not via a channel-id lookup). The per-tier PROJECTION
+            // (full / free-busy / omit) is the COMPLETE access decision — there is
+            // no separate zone read-gate for calendar kinds. A live probe proved a
+            // gate-then-project ordering wrong (it omitted cross-zone events the
+            // projector should serve as free/busy or full), so the projector now
+            // decides everything, deny-by-default for unknown zones.
             if calendar_projection::is_projected_calendar_kind(event.kind) {
                 if let Some(out) = self
                     .project_calendar_for_viewer(
@@ -566,60 +566,63 @@ impl NostrRelayDO {
         Self::send_eose(&ws, sub_id);
     }
 
-    /// Phase C: gate + project a single NIP-52 calendar event for one viewer.
+    /// Phase C: project a single NIP-52 calendar event for one viewer.
     ///
-    /// Stage 1 (zone read-gate, reuses Phase A): resolve the event's owning zone
-    /// from its `["zone", ...]` binding tag. A non-admin viewer who cannot READ
-    /// that zone (per `has_zone_access`) receives nothing — identical to the
-    /// kind-42 content rule. Untagged calendar events are unscoped and skip the
-    /// gate (no zone-private detail).
+    /// The projector is the COMPLETE access decision — there is no upstream zone
+    /// read-gate for calendar kinds. A live probe proved a gate-then-project
+    /// ordering wrong: the gate omitted any event in a zone the viewer was not a
+    /// member of, so the FreeBusy / cross-zone-Full tiers never ran. The pure
+    /// projector applies the operator-approved matrix end to end
+    /// (full / free-busy-redacted / omit), deny-by-default for unknown zones.
     ///
-    /// Stage 2 (tier projection): among events the viewer MAY read, apply the
-    /// matrix — full / free-busy-redacted / omit — via the pure projector.
-    ///
-    /// For RSVPs (kind 31925) the owning zone is resolved from the referenced
-    /// calendar event so an RSVP cannot leak the existence of an event the
-    /// viewer is supposed to be unaware of; a surviving RSVP is served as-is.
+    /// For RSVPs (kind 31925) the target event's zone AND venue are resolved from
+    /// the STORED referenced event (never from an author-mirrored tag on the RSVP,
+    /// which is spoofable with the gate removed). The RSVP is served only when the
+    /// viewer's tier for the target is `Full` — an RSVP leaks participants, so a
+    /// free/busy tier omits it. If the target cannot be resolved, the RSVP is
+    /// served only to admin or the RSVP's owner (deny-by-default).
     async fn project_calendar_for_viewer(
         &self,
         event: &NostrEvent,
         session_pubkey: &Option<String>,
         viewer_cohorts: &[String],
         viewer_is_admin: bool,
-        zones: &ZoneConfig,
+        _zones: &ZoneConfig,
     ) -> Option<NostrEvent> {
         let is_owner = session_pubkey
             .as_deref()
             .map(|pk| pk == event.pubkey)
             .unwrap_or(false);
 
-        // Resolve the owning zone slug. For an RSVP, follow the reference.
-        let zone_slug: Option<String> = if event.kind == KIND_CALENDAR_RSVP {
-            self.resolve_rsvp_zone(event).await
-        } else {
-            read_zone_tag(event).map(|s| s.to_string())
-        };
-
-        // Stage 1: zone read-gate (only for zone-bound events; owners/admins pass).
-        if let Some(zone) = &zone_slug {
-            if !viewer_is_admin && !is_owner {
-                let may_read = match session_pubkey {
-                    Some(pk) => trust::has_zone_access(pk, zone, &self.env).await,
-                    None => zones.is_public_read(zone),
-                };
-                if !may_read {
-                    return None;
-                }
-            }
-        }
-
-        // RSVPs carry no private detail of their own; once past the read-gate
-        // (so they don't leak an omitted event's existence), serve unchanged.
+        // RSVPs: the TARGET event's tier decides. Resolve zone + venue from the
+        // stored referenced event (spoof-resistant). Serve only on a Full tier;
+        // a FreeBusy/Omit tier would leak the participant list.
         if event.kind == KIND_CALENDAR_RSVP {
-            return Some(event.clone());
+            let Some((zone, venue)) = self.resolve_rsvp_target(event).await else {
+                // Target unresolvable: deny by default, admin/owner only.
+                return if viewer_is_admin || is_owner {
+                    Some(event.clone())
+                } else {
+                    None
+                };
+            };
+            let tier = calendar_projection::project_tier(
+                viewer_cohorts,
+                &zone,
+                venue.as_deref(),
+                is_owner,
+                viewer_is_admin,
+            );
+            return match tier {
+                calendar_projection::Projection::Full => Some(event.clone()),
+                // FreeBusy or Omit ⇒ withhold the RSVP entirely (it would leak
+                // participation in an event the viewer only sees as a busy block,
+                // or not at all).
+                _ => None,
+            };
         }
 
-        // Stage 2: per-tier projection over the calendar event itself.
+        // Calendar events (31922/31923): the projector decides everything.
         calendar_projection::project_calendar_event(
             viewer_cohorts,
             event,
@@ -628,16 +631,16 @@ impl NostrRelayDO {
         )
     }
 
-    /// Resolve the owning zone slug of a calendar RSVP by reading the referenced
-    /// calendar event's `zone` tag. The RSVP references its target via an `a`
-    /// (parameterized) or `e` (event id) tag. Returns `None` when the target
-    /// cannot be resolved (treated as unscoped).
-    async fn resolve_rsvp_zone(&self, rsvp: &NostrEvent) -> Option<String> {
-        // An RSVP author MAY mirror the zone tag directly; honour it first.
-        if let Some(z) = read_zone_tag(rsvp) {
-            return Some(z.to_string());
-        }
-
+    /// Resolve the owning zone slug AND venue of a calendar RSVP's TARGET event by
+    /// reading the referenced event's stored `zone`/`venue` tags from D1. The RSVP
+    /// references its target via an `e` (event id) tag.
+    ///
+    /// SECURITY: the target's zone/venue are read from the STORED event, never
+    /// from any tag the RSVP author mirrored onto the RSVP itself — with the read
+    /// gate removed, an author-mirrored `zone=public` on an RSVP targeting a
+    /// family event would otherwise leak that event. Returns `None` when the
+    /// target cannot be resolved.
+    async fn resolve_rsvp_target(&self, rsvp: &NostrEvent) -> Option<(String, Option<String>)> {
         let db = self.env.d1("DB").ok()?;
 
         #[derive(serde::Deserialize)]
@@ -645,7 +648,7 @@ impl NostrRelayDO {
             tags: String,
         }
 
-        // Look up the referenced calendar event and read its zone tag.
+        // Look up the referenced calendar event and read its zone + venue tags.
         let target_id = filter::tag_value(rsvp, "e")?;
         let stmt = db.prepare("SELECT tags FROM events WHERE id = ?1 LIMIT 1");
         let row = stmt
@@ -655,9 +658,15 @@ impl NostrRelayDO {
             .await
             .ok()??;
         let tags: Vec<Vec<String>> = serde_json::from_str(&row.tags).ok()?;
-        tags.iter()
+        let zone = tags
+            .iter()
             .find(|t| t.len() >= 2 && t[0] == nostr_bbs_core::ZONE_TAG)
-            .map(|t| t[1].clone())
+            .map(|t| t[1].clone())?;
+        let venue = tags
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == nostr_bbs_core::VENUE_TAG)
+            .map(|t| t[1].clone());
+        Some((zone, venue))
     }
 
     pub(crate) async fn handle_close(&self, session_id: u64, sub_id: &str) {
