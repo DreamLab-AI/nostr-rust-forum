@@ -15,6 +15,7 @@ use crate::components::message_bubble::{MessageBubble, MessageData};
 use crate::components::message_input::MessageInput;
 use crate::components::reaction_bar::Reaction;
 use crate::components::swipeable_message::SwipeableMessage;
+use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::typing_indicator::TypingIndicator;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::zone_access::use_zone_access;
@@ -96,6 +97,29 @@ pub fn SectionPage() -> impl IntoView {
     );
     let relay_for_send = relay.clone();
     let (relay_for_ch, relay_for_msgs, relay_for_cleanup) = (relay.clone(), relay.clone(), relay);
+
+    // Resolve the toast store at component construction (calling use_toasts()
+    // inside the async send closure would panic — the reactive owner is gone).
+    let toasts = use_toasts();
+    // Restore channel: a rejected publish pushes the failed text back here so
+    // MessageInput can re-fill the textarea (content is never lost on failure).
+    let restore_failed = RwSignal::<Option<String>>::new(None);
+
+    // Surface relay NOTICEs (e.g. rate-limit / policy messages) as warn toasts.
+    // The relay layer already rate-limits duplicate notice text; `seq` makes
+    // each surfaced notice distinct so none are missed.
+    let notices = relay_for_send.notices();
+    Effect::new(move |prev: Option<u64>| {
+        let current = notices.get();
+        let seq = current.as_ref().map(|n| n.seq).unwrap_or(0);
+        if let Some(notice) = current {
+            // Skip the initial None→first read only when it is genuinely new.
+            if prev != Some(notice.seq) {
+                toasts.show(notice.message, ToastVariant::Warning);
+            }
+        }
+        seq
+    });
 
     Effect::new(move |_| {
         let state = conn_state.get();
@@ -272,6 +296,9 @@ pub fn SectionPage() -> impl IntoView {
                 return;
             }
 
+            // Keep the original text so a rejected publish can restore it.
+            let original = content.clone();
+
             let now = (js_sys::Date::now() / 1000.0) as u64;
             let unsigned = nostr_bbs_core::UnsignedEvent {
                 pubkey: pubkey.clone(),
@@ -290,10 +317,29 @@ pub fn SectionPage() -> impl IntoView {
             spawn_local(async move {
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {
-                        relay.publish(&signed);
+                        // Publish WITH ack so relay rejections (e.g. zone access
+                        // denied) surface to the user instead of vanishing.
+                        let original_for_ack = original.clone();
+                        let on_ok = Rc::new(move |accepted: bool, message: String| {
+                            if !accepted {
+                                let reason = if message.trim().is_empty() {
+                                    "Message rejected by relay".to_string()
+                                } else {
+                                    format!("Message rejected: {message}")
+                                };
+                                toasts.show(reason, ToastVariant::Error);
+                                // Re-fill the composer — do not lose the text.
+                                restore_failed.set(Some(original_for_ack.clone()));
+                            }
+                        });
+                        if let Err(e) = relay.publish_with_ack(&signed, Some(on_ok)) {
+                            toasts.show(format!("Send failed: {e}"), ToastVariant::Error);
+                            restore_failed.set(Some(original.clone()));
+                        }
                     }
                     Err(e) => {
-                        error_msg.set(Some(e));
+                        toasts.show(format!("Failed to sign message: {e}"), ToastVariant::Error);
+                        restore_failed.set(Some(original.clone()));
                     }
                 }
             });
@@ -404,7 +450,7 @@ pub fn SectionPage() -> impl IntoView {
                 <div class="bg-gray-800 border-t border-gray-700 p-3">
                     <div class="max-w-4xl mx-auto">
                         <TypingIndicator typing_pubkeys=typing_pubkeys />
-                        <MessageInput on_send=send_callback />
+                        <MessageInput on_send=send_callback restore_failed=restore_failed />
                     </div>
                 </div>
             </Show>

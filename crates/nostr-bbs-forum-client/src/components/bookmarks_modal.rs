@@ -120,9 +120,25 @@ pub fn provide_bookmarks() {
     provide_context(store);
 }
 
-/// Get the bookmark store from context. Panics if `provide_bookmarks` was not called.
+/// Get the bookmark store from context.
+///
+/// `BookmarkStore` is `Copy`, so callers may resolve it once at component
+/// construction and reuse it inside handlers. Historically several call sites
+/// called this *inside* a click handler / `spawn_local`, where the reactive
+/// owner can be detached — `expect_context` then panicked
+/// ("expected context of type BookmarkStore"), and that panic aborts the whole
+/// WASM runtime (dead app). This resolves defensively: if the context is
+/// missing at call time we lazily provide a fresh store (backed by the same
+/// localStorage key, so state is preserved) instead of panicking.
 pub fn use_bookmarks() -> BookmarkStore {
-    expect_context::<BookmarkStore>()
+    match use_context::<BookmarkStore>() {
+        Some(store) => store,
+        None => {
+            let store = BookmarkStore::new();
+            provide_context(store);
+            store
+        }
+    }
 }
 
 // -- Modal component ----------------------------------------------------------

@@ -96,20 +96,45 @@ pub fn CategoryPage() -> impl IntoView {
     let params = use_params_map();
     let category_slug = move || params.read().get("category").unwrap_or_default();
 
-    // Check if this is a known zone
+    // Check if this is a known zone. Config-driven: a zone is valid if it
+    // appears in the live ZONE_CONFIG (load_zones) OR in the legacy hardcoded
+    // section map. The legacy `ZONE_SECTIONS`-only check rejected every
+    // config-only zone (family, friends, business) as "Zone Not Found" even
+    // though the relay served their content — the root cause of "family chat
+    // shows 0 posts".
     let is_valid_zone = Memo::new(move |_| {
         let cat = category_slug();
-        ZONE_SECTIONS.iter().any(|&(id, _)| id == cat.as_str())
+        crate::stores::zones::load_zones()
+            .iter()
+            .any(|z| z.id == cat)
+            || ZONE_SECTIONS.iter().any(|&(id, _)| id == cat.as_str())
     });
 
-    // Zone access gate: category slug maps directly to zone ID
+    // Zone access gate: the category slug IS the zone ID. Config-driven —
+    // resolves against the live zone list (public zones are always readable,
+    // otherwise membership via admin OR matching cohort). Unknown zones default
+    // to accessible so relay-created zones never 403 the client UX; the relay
+    // remains the real boundary (ADR-022). Mirrors section.rs exactly.
     let has_zone_access = Memo::new(move |_| {
         let cat = category_slug();
-        match cat.as_str() {
-            "home" => zone_access.home.get(),
-            "members" => zone_access.members.get(),
-            "private" => zone_access.private.get(),
-            _ => false,
+        match crate::stores::zones::load_zones()
+            .into_iter()
+            .find(|z| z.id == cat)
+        {
+            Some(zone) => {
+                zone.visibility == crate::stores::zones::ZoneVisibility::Public
+                    || zone_access.is_member_of(&zone)
+            }
+            None => {
+                // Fall back to the legacy 3-flag map for the hardcoded zones so
+                // existing deployments without ZONE_CONFIG do not regress.
+                match cat.as_str() {
+                    "home" => zone_access.home.get(),
+                    "members" => zone_access.members.get(),
+                    "private" => zone_access.private.get(),
+                    _ => true,
+                }
+            }
         }
     });
 

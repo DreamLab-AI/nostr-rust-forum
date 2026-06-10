@@ -59,6 +59,15 @@ pub fn ThreadView(
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
 
+    // Resolve contexts at component construction. Calling expect_context() /
+    // use_auth() / use_toasts() inside the click handler or spawn_local panics
+    // ("expected context of type RelayConnection") because the reactive owner
+    // is gone by event time, killing the whole WASM runtime. AuthStore/Toast
+    // store are Copy; RelayConnection is parked in a StoredValue (Copy) and
+    // cloned from there inside the handler.
+    let relay_stored = StoredValue::new(expect_context::<RelayConnection>());
+    let toasts = use_toasts();
+
     // Submit a kind-1111 reply
     let on_send_reply = move |_: leptos::ev::MouseEvent| {
         let content = reply_text.get_untracked();
@@ -66,8 +75,7 @@ pub fn ThreadView(
             return;
         }
 
-        let relay = expect_context::<RelayConnection>();
-        let auth = use_auth();
+        let relay = relay_stored.get_value();
         let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
         if pubkey.is_empty() {
             return;
@@ -109,12 +117,10 @@ pub fn ThreadView(
                     relay.publish(&signed);
                     reply_text_sig.set(String::new());
                     show_composer_sig.set(false);
-                    let toasts = use_toasts();
                     toasts.show("Reply sent", ToastVariant::Success);
                 }
                 Err(e) => {
                     web_sys::console::error_1(&format!("[ThreadView] Sign failed: {}", e).into());
-                    let toasts = use_toasts();
                     toasts.show("Failed to send reply", ToastVariant::Error);
                 }
             }

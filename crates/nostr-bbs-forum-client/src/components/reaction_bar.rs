@@ -43,9 +43,17 @@ pub(crate) fn ReactionBar(
     // Store event_id in StoredValue so closures that capture it are Copy.
     let event_id_stored = StoredValue::new(event_id);
 
+    // Resolve contexts at component construction. Calling expect_context() /
+    // use_auth() inside a click handler or spawn_local panics ("expected
+    // context of type RelayConnection") because the reactive owner is gone by
+    // event time, and that panic kills the whole WASM runtime. AuthStore is
+    // Copy; RelayConnection is only Clone, so park it in a StoredValue (Copy)
+    // and clone from there inside the handlers — keeps the closures Copy.
+    let auth = use_auth();
+    let relay_stored = StoredValue::new(expect_context::<RelayConnection>());
+
     let toggle_reaction = move |emoji: String| {
-        let relay = expect_context::<RelayConnection>();
-        let auth = use_auth();
+        let relay = relay_stored.get_value();
         let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
         if pubkey.is_empty() {
             return;
@@ -99,8 +107,7 @@ pub(crate) fn ReactionBar(
 
     let add_from_picker = move |emoji: &'static str| {
         show_picker.set(false);
-        let relay = expect_context::<RelayConnection>();
-        let auth = use_auth();
+        let relay = relay_stored.get_value();
         let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
         if pubkey.is_empty() {
             return;

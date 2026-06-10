@@ -140,6 +140,25 @@ async fn search_profiles(query: &str) -> Result<Vec<MentionCandidate>, String> {
     Ok(parsed.into_vec())
 }
 
+/// Round `idx` down to the nearest UTF-8 char boundary that is `<= idx`.
+///
+/// `caret_pos` arrives from the DOM's `selectionStart`, which counts UTF-16
+/// code units, not bytes. When the textarea contains any multi-byte character
+/// (e.g. the em-dash `—`, three bytes) before the caret, the raw value can land
+/// *inside* a UTF-8 sequence. Slicing `&text[..caret_pos]` on a non-boundary
+/// panics, and the panic aborts the WASM runtime — the whole app goes dead.
+/// Flooring to a char boundary makes every downstream slice infallible.
+fn floor_char_boundary(text: &str, idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    let mut i = idx;
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Locate the `@<query>` token at or before `caret_pos` inside `text`.
 ///
 /// Returns `Some((token_start, query))` where:
@@ -148,7 +167,9 @@ async fn search_profiles(query: &str) -> Result<Vec<MentionCandidate>, String> {
 ///
 /// Returns `None` if no active mention token is found.
 fn detect_mention_token(text: &str, caret_pos: usize) -> Option<(usize, String)> {
-    let caret_pos = caret_pos.min(text.len());
+    // `caret_pos` may be a UTF-16 offset that falls inside a multi-byte char;
+    // floor it to a valid UTF-8 boundary before any byte slicing.
+    let caret_pos = floor_char_boundary(text, caret_pos);
     let prefix = &text[..caret_pos];
 
     // Find the most recent `@` that is preceded by start-of-string or whitespace.
@@ -201,6 +222,13 @@ pub(crate) fn MessageInput(
     /// Optional callback fired when an image file is attached for upload.
     #[prop(optional)]
     on_image_attach: Option<Callback<web_sys::File>>,
+    /// Optional restore channel for failed sends. The send path publishes with
+    /// an ack callback; when the relay rejects the message (OK=false, e.g.
+    /// "zone access denied"), the caller pushes the original text here. The
+    /// input re-fills the textarea so the user does not lose what they wrote.
+    /// Omitting this prop preserves the legacy fire-and-forget clear behaviour.
+    #[prop(optional)]
+    restore_failed: Option<RwSignal<Option<String>>>,
 ) -> impl IntoView {
     let content = RwSignal::new(String::new());
     let file_input_ref = NodeRef::<leptos::html::Input>::new();
@@ -267,6 +295,20 @@ pub(crate) fn MessageInput(
     let show_preview = RwSignal::new(false);
     let show_emoji = RwSignal::new(false);
     let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
+
+    // Restore-on-failure: when the send path reports a rejected publish, it
+    // pushes the failed text here. Re-fill the textarea (only if the user has
+    // not already typed a replacement) so nothing is silently lost.
+    if let Some(restore) = restore_failed {
+        Effect::new(move |_| {
+            if let Some(failed) = restore.get() {
+                if content.get_untracked().trim().is_empty() {
+                    content.set(failed);
+                }
+                restore.set(None);
+            }
+        });
+    }
 
     let char_count = move || content.get().len();
     let is_empty = move || content.get().trim().is_empty() && attachment.get().is_none();
@@ -386,7 +428,9 @@ pub(crate) fn MessageInput(
         };
         let start = mention_token_start.get_untracked();
         let mut text = content.get_untracked();
-        if start > text.len() {
+        // `start` indexes the `@`; bail if it is stale (content shrank) or no
+        // longer lands on a char boundary (defensive — it always should).
+        if start >= text.len() || !text.is_char_boundary(start) {
             return;
         }
         // Replace from `start` through the current end of the token.
@@ -884,6 +928,52 @@ mod tests {
         // Caret at index 7 = end of "ali".
         let r = detect_mention_token("hi @ali rest", 7);
         assert_eq!(r, Some((3, "ali".to_string())));
+    }
+
+    #[test]
+    fn floor_char_boundary_clamps_into_multibyte() {
+        // "ab—" is bytes: a(0) b(1) then em-dash occupies bytes 2..5.
+        let s = "ab\u{2014}";
+        assert_eq!(s.len(), 5);
+        // Boundaries are 0, 1, 2, 5.
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 2), 2);
+        // 3 and 4 land inside the em-dash → floored back to 2.
+        assert_eq!(floor_char_boundary(s, 3), 2);
+        assert_eq!(floor_char_boundary(s, 4), 2);
+        // Past the end clamps to len.
+        assert_eq!(floor_char_boundary(s, 5), 5);
+        assert_eq!(floor_char_boundary(s, 99), 5);
+    }
+
+    #[test]
+    fn detect_token_no_panic_with_multibyte_at_caret() {
+        // Regression: caret_pos from selectionStart was a UTF-16 offset that
+        // could fall inside a multi-byte char, panicking on `&text[..caret]`
+        // ("end byte index N is not a char boundary; inside '—'"). The em-dash
+        // here spans bytes 30..33; a caret of 31 must NOT panic.
+        let text = "look at this thread for the —fix";
+        let dash_byte = text.find('\u{2014}').unwrap();
+        assert_eq!(dash_byte, 28);
+        // Caret one byte into the em-dash — previously a hard panic.
+        let _ = detect_mention_token(text, dash_byte + 1);
+        // And exactly at the QA-reported shape: em-dash spanning 30..33.
+        let text2 = "0123456789012345678901234567890\u{2014}x"; // dash at byte 31
+        let dash2 = text2.find('\u{2014}').unwrap();
+        assert_eq!(dash2, 31);
+        let r = detect_mention_token(text2, 32);
+        // No `@` present, so the result is None — the point is it returns
+        // rather than panicking.
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn detect_token_multibyte_before_at() {
+        // A multi-byte char before the `@` must not corrupt the byte indices.
+        // "— @al" : em-dash(0..3) space(3) @(4) a(5) l(6).
+        let text = "\u{2014} @al";
+        let r = detect_mention_token(text, text.len());
+        assert_eq!(r, Some((4, "al".to_string())));
     }
 
     #[test]

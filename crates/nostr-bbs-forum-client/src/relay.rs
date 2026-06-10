@@ -102,6 +102,13 @@ struct RelayInner {
     seen_events: HashSet<String>,
     auth_signer: Option<AuthSignCallback>,
     auth_signer_async: Option<AuthSignAsyncCallback>,
+    /// Reactive sink for relay NOTICE messages (cloned from the outer
+    /// `RelayConnection::notice` signal so `handle_relay_message` can publish).
+    notice_sink: Option<RwSignal<Option<RelayNotice>>>,
+    /// Rate-limit state for NOTICE dedup: last surfaced text + epoch-ms time.
+    last_notice: Option<(String, f64)>,
+    /// Monotonic counter so each surfaced notice has a distinct `seq`.
+    notice_seq: u64,
     _on_open: Option<Closure<dyn FnMut()>>,
     _on_message: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
     _on_error: Option<Closure<dyn FnMut(web_sys::ErrorEvent)>>,
@@ -113,12 +120,28 @@ struct RelayInner {
 /// guaranteed in WASM.
 type SharedInner = SendWrapper<Rc<RefCell<RelayInner>>>;
 
+/// A relay NOTICE message surfaced to the UI. Carries a monotonically
+/// increasing `seq` so consumers can react to *every* notice (even a repeat of
+/// the same text) without missing one, while the relay layer still suppresses
+/// rapid duplicates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayNotice {
+    /// The human-readable notice text from the relay.
+    pub message: String,
+    /// Monotonic sequence — changes on every surfaced notice.
+    pub seq: u64,
+}
+
 /// Relay connection manager. Provided as Leptos context so any component
 /// can subscribe to events or publish.
 #[derive(Clone)]
 pub struct RelayConnection {
     inner: SharedInner,
     state: RwSignal<ConnectionState>,
+    /// Latest relay NOTICE surfaced for the UI (rate-limited against rapid
+    /// duplicates inside `handle_relay_message`). Components can read this to
+    /// raise a warn toast.
+    notice: RwSignal<Option<RelayNotice>>,
 }
 
 // SAFETY: In WASM, there is only one thread. SendWrapper enforces this
@@ -144,15 +167,27 @@ impl RelayConnection {
             seen_events: HashSet::new(),
             auth_signer: None,
             auth_signer_async: None,
+            notice_sink: None,
+            last_notice: None,
+            notice_seq: 0,
             _on_open: None,
             _on_message: None,
             _on_error: None,
             _on_close: None,
         }));
+        let notice = RwSignal::new(None);
+        inner.borrow_mut().notice_sink = Some(notice);
         Self {
             inner: SendWrapper::new(inner),
             state: RwSignal::new(ConnectionState::Disconnected),
+            notice,
         }
+    }
+
+    /// Reactive signal carrying the latest relay NOTICE (rate-limited). A
+    /// consumer can raise a warn toast when this changes.
+    pub fn notices(&self) -> RwSignal<Option<RelayNotice>> {
+        self.notice
     }
 
     /// Get the reactive connection state signal.
@@ -531,6 +566,31 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             if arr.len() >= 2 {
                 if let Some(notice) = arr[1].as_str() {
                     web_sys::console::warn_1(&format!("[Relay] NOTICE: {}", notice).into());
+
+                    // Surface to the UI as a warn toast, rate-limiting rapid
+                    // duplicates: the same notice text within 5s is dropped so a
+                    // chatty relay cannot spam the user.
+                    const NOTICE_DEDUP_WINDOW_MS: f64 = 5_000.0;
+                    let now = js_sys::Date::now();
+                    let mut inner = inner_rc.borrow_mut();
+                    let is_dup = inner
+                        .last_notice
+                        .as_ref()
+                        .map(|(prev, ts)| prev == notice && (now - *ts) < NOTICE_DEDUP_WINDOW_MS)
+                        .unwrap_or(false);
+                    if !is_dup {
+                        inner.last_notice = Some((notice.to_string(), now));
+                        inner.notice_seq = inner.notice_seq.wrapping_add(1);
+                        let seq = inner.notice_seq;
+                        let sink = inner.notice_sink;
+                        drop(inner);
+                        if let Some(sink) = sink {
+                            sink.set(Some(RelayNotice {
+                                message: notice.to_string(),
+                                seq,
+                            }));
+                        }
+                    }
                 }
             }
         }
