@@ -33,9 +33,18 @@ pub fn RsvpButtons(
 
     let is_full = move || max.map(|m| attendee_count.get() >= m).unwrap_or(false);
 
+    // Resolve contexts at component construction — calling use_auth()/
+    // expect_context() inside the click handler or spawn_local panics
+    // ("expected context of type AuthStore") because the reactive owner is
+    // gone by event time, and the panic kills the whole WASM runtime.
+    let auth = use_auth();
+    let toasts = use_toasts();
+    let relay = expect_context::<RelayConnection>();
+
     let rsvp_action = move |eid: String, status: RsvpStatus| {
-        let auth = use_auth();
-        let toasts = use_toasts();
+        let auth = auth.clone();
+        let toasts = toasts.clone();
+        let relay = relay.clone();
         let signer = match auth.get_signer() {
             Some(s) => s,
             None => {
@@ -47,7 +56,6 @@ pub fn RsvpButtons(
         wasm_bindgen_futures::spawn_local(async move {
             match nostr_bbs_core::create_rsvp_signer(signer.as_ref(), &eid, status).await {
                 Ok(event) => {
-                    let relay = expect_context::<RelayConnection>();
                     let label = match status {
                         RsvpStatus::Accept => "Accepted",
                         RsvpStatus::Decline => "Declined",
@@ -108,6 +116,7 @@ pub fn RsvpButtons(
                 }
                 on:click={
                     let eid = event_id_accept.clone();
+                    let rsvp_action = rsvp_action.clone();
                     move |_| rsvp_action(eid.clone(), RsvpStatus::Accept)
                 }
             >
@@ -124,6 +133,7 @@ pub fn RsvpButtons(
                 )
                 on:click={
                     let eid = event_id_tentative.clone();
+                    let rsvp_action = rsvp_action.clone();
                     move |_| rsvp_action(eid.clone(), RsvpStatus::Tentative)
                 }
             >
@@ -140,6 +150,7 @@ pub fn RsvpButtons(
                 )
                 on:click={
                     let eid = event_id_decline.clone();
+                    let rsvp_action = rsvp_action.clone();
                     move |_| rsvp_action(eid.clone(), RsvpStatus::Decline)
                 }
             >

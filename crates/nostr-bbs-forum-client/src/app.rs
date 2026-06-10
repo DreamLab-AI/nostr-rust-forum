@@ -610,18 +610,24 @@ fn Layout(children: Children) -> impl IntoView {
     };
 
     // Resolve the logged-in user's display name through the layered profile
-    // cache. Falls back to `auth.nickname()` (set during onboarding) and
-    // finally to a shortened hex key + "Anonymous".
+    // cache (tracked, so the chip updates the moment our kind-0 lands in the
+    // cache). The cache only wins when it yields a real label; otherwise we
+    // prefer `auth.nickname()` (the claimed username set during onboarding)
+    // over the shortened hex key, and "Anonymous" only when neither exists.
     let display_name = Memo::new(move |_| {
-        if let Some(pk) = pubkey.get() {
-            if !pk.is_empty() {
-                let resolved = crate::components::user_display::use_display_name(&pk);
-                if !resolved.is_empty() {
-                    return resolved;
-                }
+        let pk = pubkey.get().unwrap_or_default();
+        if !pk.is_empty() {
+            if let Some(resolved) = crate::components::user_display::try_display_name_tracked(&pk) {
+                return resolved;
             }
         }
-        nickname.get().unwrap_or_else(|| "Anonymous".to_string())
+        if let Some(nick) = nickname.get().filter(|n| !n.trim().is_empty()) {
+            return nick;
+        }
+        if !pk.is_empty() {
+            return crate::utils::shorten_pubkey(&pk);
+        }
+        "Anonymous".to_string()
     });
 
     let zone_access = crate::stores::zone_access::use_zone_access();

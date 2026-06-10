@@ -9,6 +9,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::auth::nip98::fetch_with_nip98_get_signer;
 use crate::auth::use_auth;
+use crate::components::user_display::use_display_name_memo;
 
 // -- Types --------------------------------------------------------------------
 
@@ -179,15 +180,29 @@ pub fn AuditLogTab() -> impl IntoView {
 #[component]
 fn AuditRow(entry: AuditEntry) -> impl IntoView {
     let timestamp = format_timestamp(entry.timestamp);
-    let actor = entry
-        .actor_name
-        .clone()
-        .unwrap_or_else(|| truncate_pk(&entry.actor_pubkey));
-    let target = entry
-        .target_name
-        .clone()
-        .or_else(|| entry.target_pubkey.as_ref().map(|pk| truncate_pk(pk)))
-        .unwrap_or_else(|| "-".to_string());
+    // API-provided names win; otherwise resolve via the shared profile cache
+    // (reactive — the row fills in nicknames when kind-0 metadata arrives,
+    // falling back to the shortened hex pubkey in the interim).
+    let actor_name = entry.actor_name.clone();
+    let actor_resolved = use_display_name_memo(entry.actor_pubkey.clone());
+    let actor = move || {
+        actor_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| actor_resolved.get())
+    };
+    let target_name = entry.target_name.clone();
+    let target_resolved = use_display_name_memo(entry.target_pubkey.clone().unwrap_or_default());
+    let target = move || {
+        target_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| {
+                let t = target_resolved.get();
+                (!t.is_empty()).then_some(t)
+            })
+            .unwrap_or_else(|| "-".to_string())
+    };
     let details_raw = entry.details.clone().unwrap_or_default();
     let details = details_raw.clone();
     let details_title = details_raw;
@@ -212,13 +227,6 @@ fn AuditRow(entry: AuditEntry) -> impl IntoView {
 }
 
 // -- Helpers ------------------------------------------------------------------
-
-fn truncate_pk(pk: &str) -> String {
-    if pk.len() <= 16 {
-        return pk.to_string();
-    }
-    format!("{}...{}", &pk[..8], &pk[pk.len() - 4..])
-}
 
 fn format_timestamp(ts: u64) -> String {
     if ts == 0 {

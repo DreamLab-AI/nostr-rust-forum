@@ -66,6 +66,44 @@ pub fn use_display_name(pubkey: &str) -> String {
     shorten_pubkey(pubkey)
 }
 
+/// Tracked (subscribing) layered lookup that returns `Some(label)` only when
+/// a cache layer resolves a human label, and `None` while resolution is still
+/// pending. Schedules the debounced batch fetch on a miss.
+///
+/// Call this INSIDE a reactive scope (a `Memo`, `Signal::derive`, or a
+/// `move ||` view closure): it subscribes to the `ProfileCache` entries
+/// signal and the legacy `NameCache`, so the enclosing closure re-runs when
+/// the kind-0 metadata arrives. Use it when the caller wants to supply its
+/// own fallback (e.g. the logged-in user's claimed nickname).
+pub fn try_display_name_tracked(pubkey: &str) -> Option<String> {
+    if pubkey.is_empty() {
+        return None;
+    }
+    if let Some(cache) = try_use_profile_cache() {
+        // Reactive read — subscribes to entries signal.
+        if let Some(entry) = cache.lookup_reactive(pubkey) {
+            if let Some(label) = entry.best_label() {
+                return Some(label);
+            }
+        }
+    }
+    if let Some(cache) = try_use_name_cache() {
+        if let Some(name) = cache.0.get().get(pubkey).cloned() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Tracked variant of `use_display_name` for call sites that already sit
+/// inside a reactive closure (a `Memo`, `Signal::derive`, or a `move ||`
+/// view closure). Subscribes to the caches, so the enclosing closure
+/// re-runs and the name fills in when the batch fetcher completes.
+/// Falls back to the shortened hex pubkey while resolution is pending.
+pub fn use_display_name_tracked(pubkey: &str) -> String {
+    try_display_name_tracked(pubkey).unwrap_or_else(|| shorten_pubkey(pubkey))
+}
+
 /// Reactive version of `use_display_name` for use inside `view!` macros.
 ///
 /// Returns a `Memo<String>` that re-evaluates whenever the underlying
@@ -76,20 +114,7 @@ pub fn use_display_name_memo(pubkey: String) -> Memo<String> {
         if pubkey.is_empty() {
             return String::new();
         }
-        if let Some(cache) = try_use_profile_cache() {
-            // Reactive read — subscribes to entries signal.
-            if let Some(entry) = cache.lookup_reactive(&pubkey) {
-                if let Some(label) = entry.best_label() {
-                    return label;
-                }
-            }
-        }
-        if let Some(cache) = try_use_name_cache() {
-            if let Some(name) = cache.0.get().get(&pubkey).cloned() {
-                return name;
-            }
-        }
-        shorten_pubkey(&pubkey)
+        use_display_name_tracked(&pubkey)
     })
 }
 

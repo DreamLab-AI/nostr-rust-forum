@@ -8,7 +8,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use super::use_admin;
 use crate::auth::use_auth;
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::{use_display_name, use_display_name_memo};
 
 /// A pending registration entry. In the current system, pending users are
 /// those who have registered passkeys but have not yet been added to the
@@ -80,6 +80,9 @@ fn RegistrationsInner() -> impl IntoView {
             is_loading.set(true);
             action_msg.set(None);
             let pending_sig = pending;
+            // Resolve the nickname synchronously (component context) before the
+            // async block — `use_context` is not reliable inside `spawn_local`.
+            let pk_short = use_display_name(&pubkey);
             spawn_local(async move {
                 let cohorts = vec!["cross-access".to_string()];
                 match admin_ctx
@@ -88,14 +91,7 @@ fn RegistrationsInner() -> impl IntoView {
                 {
                     Ok(_) => {
                         pending_sig.update(|list| list.retain(|u| u.pubkey != pubkey));
-                        action_msg.set(Some((
-                            format!(
-                                "Approved {}...{}",
-                                &pubkey[..6],
-                                &pubkey[pubkey.len().saturating_sub(4)..]
-                            ),
-                            true,
-                        )));
+                        action_msg.set(Some((format!("Approved {}", pk_short), true)));
                     }
                     Err(e) => {
                         action_msg.set(Some((e, false)));
@@ -281,7 +277,8 @@ fn RegistrationsInner() -> impl IntoView {
                                 <div class="divide-y divide-gray-700/50">
                                     {users.into_iter().map(|user| {
                                         let pk = user.pubkey.clone();
-                                        let pk_short = use_display_name(&pk);
+                                        // Reactive: fills in the nickname when kind-0 arrives.
+                                        let pk_short = use_display_name_memo(pk.clone());
                                         let nick = user.nickname.clone().unwrap_or_else(|| "-".to_string());
                                         let time_str = user.registered_at
                                             .map(crate::utils::format_relative_time)
@@ -302,7 +299,7 @@ fn RegistrationsInner() -> impl IntoView {
                                                 </div>
                                                 <div class="col-span-4">
                                                     <span class="font-mono text-gray-300 bg-gray-900 rounded px-2 py-0.5 text-xs" title=pk.clone()>
-                                                        {pk_short}
+                                                        {move || pk_short.get()}
                                                     </span>
                                                 </div>
                                                 <div class="col-span-3 text-gray-400 text-xs truncate">{nick}</div>

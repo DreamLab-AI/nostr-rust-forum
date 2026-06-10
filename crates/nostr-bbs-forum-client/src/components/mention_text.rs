@@ -9,7 +9,7 @@
 
 use leptos::prelude::*;
 
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::{use_display_name, use_display_name_memo};
 
 /// A parsed segment of message text.
 #[derive(Clone, Debug)]
@@ -63,26 +63,46 @@ pub(crate) fn MentionText(
                         }.into_any()
                     }
                     Segment::PubkeyMention(pubkey) => {
-                        let short = shorten_mention(&pubkey);
+                        // Resolve the mentioned user's nickname reactively;
+                        // falls back to the shortened hex while in flight.
+                        let display = use_display_name_memo(pubkey.clone());
                         view! {
                             <span
                                 class="text-amber-400 font-medium cursor-pointer hover:text-amber-300 hover:underline transition-colors"
                                 title=format!("Pubkey: {}", pubkey)
                             >
-                                {"@"}{short}
+                                {"@"}{move || display.get()}
                             </span>
                         }.into_any()
                     }
                     Segment::NpubMention(npub) => {
-                        let short = shorten_mention(&npub);
-                        view! {
-                            <span
-                                class="text-amber-400 font-medium cursor-pointer hover:text-amber-300 hover:underline transition-colors"
-                                title=format!("Npub: {}", npub)
-                            >
-                                {"@"}{short}
-                            </span>
-                        }.into_any()
+                        // Decode npub -> hex so the mention resolves through the
+                        // shared profile cache; bech32 shortening is the fallback
+                        // when decoding fails.
+                        match npub_to_hex(&npub) {
+                            Some(hex_pk) => {
+                                let display = use_display_name_memo(hex_pk);
+                                view! {
+                                    <span
+                                        class="text-amber-400 font-medium cursor-pointer hover:text-amber-300 hover:underline transition-colors"
+                                        title=format!("Npub: {}", npub)
+                                    >
+                                        {"@"}{move || display.get()}
+                                    </span>
+                                }.into_any()
+                            }
+                            None => {
+                                let short = shorten_mention(&npub);
+                                view! {
+                                    <span
+                                        class="text-amber-400 font-medium cursor-pointer hover:text-amber-300 hover:underline transition-colors"
+                                        title=format!("Npub: {}", npub)
+                                    >
+                                        {"@"}{short}
+                                    </span>
+                                }.into_any()
+                            }
+                        }
                     }
                     Segment::UsernameMention { username, pubkey } => {
                         // Tag-based lookup first; otherwise scan all p-tags so that
@@ -92,7 +112,8 @@ pub(crate) fn MentionText(
 
                         match resolved_pubkey {
                             Some(pk) => {
-                                let display = use_display_name(&pk);
+                                // Reactive: fills in when kind-0 arrives.
+                                let display = use_display_name_memo(pk.clone());
                                 let href = format!("/community/profile/{}", pk);
                                 view! {
                                     <a
@@ -100,7 +121,7 @@ pub(crate) fn MentionText(
                                         class="text-amber-400 font-medium hover:text-amber-300 hover:underline transition-colors"
                                         title=format!("@{}", username)
                                     >
-                                        {"@"}{display}
+                                        {"@"}{move || display.get()}
                                     </a>
                                 }.into_any()
                             }
@@ -272,6 +293,17 @@ fn find_next_at(input: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Decode an `npub1...` bech32 string to a 64-char hex pubkey so mentions can
+/// resolve through the shared profile cache. Returns `None` for anything that
+/// is not a valid 32-byte `npub`.
+fn npub_to_hex(npub: &str) -> Option<String> {
+    let (hrp, data) = bech32::decode(npub).ok()?;
+    if hrp.as_str() != "npub" || data.len() != 32 {
+        return None;
+    }
+    Some(hex::encode(data))
 }
 
 /// Shorten a pubkey or npub for display.

@@ -204,6 +204,9 @@ fn SuspendModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl I
         }
     };
 
+    // Resolved nickname (reactive) plus the truncated hex key as the exact
+    // technical identifier the admin is acting on.
+    let display_name = use_display_name_memo(pubkey.clone());
     let pk_display = truncate_pubkey(&pubkey);
 
     view! {
@@ -215,7 +218,11 @@ fn SuspendModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl I
                 on:click=|ev| ev.stop_propagation()
             >
                 <h3 class="text-lg font-semibold text-white mb-1">"Suspend User"</h3>
-                <p class="text-sm text-gray-400 mb-4 font-mono">{pk_display}</p>
+                <p class="text-sm text-gray-400 mb-4">
+                    {move || display_name.get()}
+                    " "
+                    <span class="font-mono text-xs text-gray-500">{pk_display}</span>
+                </p>
 
                 {move || error_msg.get().map(|msg| view! {
                     <div class="mb-3 bg-red-900/50 border border-red-700 rounded-lg px-3 py-2 text-red-200 text-sm">{msg}</div>
@@ -332,6 +339,9 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
         }
     };
 
+    // Resolved nickname (reactive) plus the truncated hex key as the exact
+    // technical identifier the admin is acting on.
+    let display_name = use_display_name_memo(pubkey.clone());
     let pk_display = truncate_pubkey(&pubkey);
 
     view! {
@@ -343,7 +353,11 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
                 on:click=|ev| ev.stop_propagation()
             >
                 <h3 class="text-lg font-semibold text-white mb-1">"Admin Notes"</h3>
-                <p class="text-sm text-gray-400 mb-4 font-mono">{pk_display}</p>
+                <p class="text-sm text-gray-400 mb-4">
+                    {move || display_name.get()}
+                    " "
+                    <span class="font-mono text-xs text-gray-500">{pk_display}</span>
+                </p>
 
                 <Show
                     when=move || !is_loading.get()

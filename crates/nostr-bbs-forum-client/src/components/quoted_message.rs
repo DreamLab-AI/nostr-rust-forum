@@ -3,7 +3,7 @@
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::use_display_name_memo;
 use crate::utils::pubkey_color;
 
 /// Display a quoted/replied-to message with a left amber border.
@@ -20,7 +20,8 @@ pub(crate) fn QuotedMessage(
     /// Content of the original message.
     reply_to_content: String,
 ) -> impl IntoView {
-    let short_pk = use_display_name(&reply_to_pubkey);
+    // Reactive: fills in the original author's nickname when kind-0 arrives.
+    let short_pk = use_display_name_memo(reply_to_pubkey.clone());
     let avatar_bg = pubkey_color(&reply_to_pubkey);
     let avatar_letter = reply_to_pubkey
         .chars()
@@ -88,7 +89,7 @@ pub(crate) fn QuotedMessage(
 
             <div class="flex-1 min-w-0">
                 <span class="text-xs font-medium text-amber-400/80 font-mono">
-                    {short_pk}
+                    {move || short_pk.get()}
                 </span>
                 <p class="text-xs text-gray-400 truncate leading-snug mt-0.5">
                     {truncated}

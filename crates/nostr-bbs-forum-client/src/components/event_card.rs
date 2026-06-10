@@ -7,7 +7,7 @@
 use leptos::prelude::*;
 
 use crate::components::avatar::{Avatar, AvatarSize};
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::use_display_name_memo;
 
 /// Month abbreviations for date badge display.
 const MONTHS: [&str; 12] = [
@@ -61,7 +61,8 @@ pub(crate) fn EventCard(
     let past = is_past(end_time);
     let (month, day) = extract_date_parts(start_time);
     let time_range = format!("{} - {}", format_time(start_time), format_time(end_time));
-    let host_display = use_display_name(&host_pubkey);
+    // Reactive: fills in the host's nickname when the kind-0 metadata lands.
+    let host_display = use_display_name_memo(host_pubkey.clone());
 
     let card_class = format!(
         "event-card glass-card-interactive p-4 {} {}",
@@ -115,7 +116,7 @@ pub(crate) fn EventCard(
                     <div class="flex items-center justify-between pt-1">
                         <div class="flex items-center gap-2">
                             <Avatar pubkey=host_pubkey size=AvatarSize::Sm />
-                            <span class="text-xs text-gray-500">{host_display}</span>
+                            <span class="text-xs text-gray-500">{move || host_display.get()}</span>
                         </div>
 
                         {(!past).then(|| view! {

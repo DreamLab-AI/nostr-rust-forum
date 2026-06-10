@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::auth::use_auth;
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::use_display_name_memo;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 
 /// A calendar event parsed from a kind 31923 Nostr event.
@@ -227,7 +227,8 @@ where
 
     let start_str = format_datetime(entry.start_time);
     let end_str = entry.end_time.map(format_datetime).unwrap_or_default();
-    let pk_short = use_display_name(&entry.host_pubkey);
+    // Reactive: resolves the host's nickname when kind-0 metadata arrives.
+    let pk_short = use_display_name_memo(entry.host_pubkey.clone());
     let _total_rsvp = entry.rsvp_accepted + entry.rsvp_tentative;
 
     let card_opacity = if is_past { "opacity-60" } else { "" };
@@ -261,7 +262,7 @@ where
                                 </span>
                             }
                         })}
-                        <span class="font-mono">{pk_short}</span>
+                        <span class="font-mono">{move || pk_short.get()}</span>
                     </div>
 
                     // RSVP stats

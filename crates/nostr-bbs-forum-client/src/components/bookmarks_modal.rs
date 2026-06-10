@@ -9,7 +9,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::app::base_href;
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::use_display_name_tracked;
 use crate::utils::format_relative_time;
 
 /// localStorage key for bookmarks.
@@ -211,7 +211,9 @@ pub(crate) fn BookmarksModal(
                                     let event_id_rm = bm.event_id.clone();
                                     let preview = bm.content_preview.clone();
                                     let avatar_text = bm.author_pubkey[..2].to_uppercase();
-                                    let author_short = use_display_name(&bm.author_pubkey);
+                                    // Tracked: the enclosing closure re-runs
+                                    // when kind-0 metadata fills the cache.
+                                    let author_short = use_display_name_tracked(&bm.author_pubkey);
                                     let author_color = crate::utils::pubkey_color(&bm.author_pubkey);
                                     let time_str = format_relative_time(bm.timestamp);
                                     let href = base_href(&format!("/chat/{}", bm.channel_id));

@@ -141,7 +141,9 @@ pub fn ChatPage() -> impl IntoView {
             .into_iter()
             .map(|(pk, count)| PosterData {
                 pubkey: pk.clone(),
-                name: crate::components::user_display::use_display_name(&pk),
+                // Tracked: this Signal::derive re-runs when the profile cache
+                // fills, so top posters show nicknames once kind-0 arrives.
+                name: crate::components::user_display::use_display_name_tracked(&pk),
                 message_count: count,
                 avatar_url: None,
             })

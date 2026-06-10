@@ -12,7 +12,7 @@ use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::mute::use_mute_store;
 use crate::utils::shorten_pubkey;
@@ -124,7 +124,10 @@ pub(crate) fn ProfileModal(
 
     let display_name = Memo::new(move |_| {
         let pk = pk_stored.get_value();
-        meta.get().name.unwrap_or_else(|| use_display_name(&pk))
+        // Tracked fallback: the Memo re-runs when the shared cache fills.
+        meta.get()
+            .name
+            .unwrap_or_else(|| use_display_name_tracked(&pk))
     });
 
     view! {

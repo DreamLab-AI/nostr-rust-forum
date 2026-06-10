@@ -14,7 +14,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::badge_display::BadgeGrid;
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::badges::{use_badges, EarnedBadge};
 use crate::utils::shorten_pubkey;
@@ -173,7 +173,8 @@ pub fn ProfilePage() -> impl IntoView {
         }
         // Fallback chain: profile-cache → short hex → npub short form.
         // Empty h1 was an a11y defect; SR users landed on a nameless page.
-        let lookup = use_display_name(&pk);
+        // Tracked: this Memo re-runs when the cache fills.
+        let lookup = use_display_name_tracked(&pk);
         if !lookup.trim().is_empty() {
             return lookup;
         }

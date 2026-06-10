@@ -14,7 +14,7 @@ use crate::auth::use_auth;
 use crate::components::confirm_dialog::{ConfirmDialog, ConfirmVariant};
 use crate::components::onboarding_modal::{open_onboarding_with_prefill, release_username};
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::preferences::{save_preferences, use_preferences, NotificationLevel, Theme};
 use crate::utils::shorten_pubkey;
@@ -518,10 +518,10 @@ pub fn SettingsPage() -> impl IntoView {
                             view! {
                                 <div class="space-y-2">
                                     {list.into_iter().map(|pk| {
-                                        // Use the display-name resolver so muted users show
-                                        // nicknames where available; falls back to shortened
-                                        // hex for unknown pubkeys.
-                                        let pk_display = use_display_name(&pk);
+                                        // Tracked resolver — the enclosing `move ||` closure
+                                        // re-runs when kind-0 metadata fills the cache, so
+                                        // muted users show nicknames as soon as available.
+                                        let pk_display = use_display_name_tracked(&pk);
                                         let pk_for_unmute = pk.clone();
                                         view! {
                                             <div class="flex items-center justify-between bg-gray-800 rounded-lg px-3 py-2">

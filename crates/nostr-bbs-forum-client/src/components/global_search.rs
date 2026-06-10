@@ -80,9 +80,11 @@ impl Hit {
                     content.clone()
                 }
             }
-            Self::User { nickname, pubkey } => nickname
-                .clone()
-                .unwrap_or_else(|| crate::components::user_display::use_display_name(pubkey)),
+            // Tracked: title()/subtitle() run inside the reactive results
+            // closure, so the list re-renders when kind-0 metadata arrives.
+            Self::User { nickname, pubkey } => nickname.clone().unwrap_or_else(|| {
+                crate::components::user_display::use_display_name_tracked(pubkey)
+            }),
         }
     }
     fn subtitle(&self) -> String {
@@ -90,16 +92,18 @@ impl Hit {
             Self::Channel { desc, .. } => desc.clone(),
             Self::Message { author, .. } => format!(
                 "by {}",
-                crate::components::user_display::use_display_name(author)
+                crate::components::user_display::use_display_name_tracked(author)
             ),
             Self::SemanticMessage { label, .. } if !label.is_empty() => {
                 format!(
                     "by {}",
-                    crate::components::user_display::use_display_name(label)
+                    crate::components::user_display::use_display_name_tracked(label)
                 )
             }
             Self::SemanticMessage { .. } => "semantic match".to_string(),
-            Self::User { pubkey, .. } => crate::components::user_display::use_display_name(pubkey),
+            Self::User { pubkey, .. } => {
+                crate::components::user_display::use_display_name_tracked(pubkey)
+            }
         }
     }
     fn icon(&self) -> (&'static str, &'static str) {

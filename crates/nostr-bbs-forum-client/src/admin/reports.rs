@@ -10,6 +10,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::auth::nip98::{fetch_with_nip98_get_signer, fetch_with_nip98_post_signer};
 use crate::auth::use_auth;
+use crate::components::user_display::use_display_name_memo;
 
 // -- Types --------------------------------------------------------------------
 
@@ -216,10 +217,17 @@ fn ReportCard(
     report: Report,
     resolve: impl Fn(String, String, ReportAction) + Clone + 'static,
 ) -> impl IntoView {
-    let reporter_display = report
-        .reporter_name
-        .clone()
-        .unwrap_or_else(|| truncate_pk(&report.reporter_pubkey));
+    // API-provided name wins; otherwise resolve via the shared profile cache
+    // (reactive — fills in the nickname when kind-0 metadata arrives, with a
+    // shortened-hex fallback in the interim).
+    let reporter_name = report.reporter_name.clone();
+    let reporter_resolved = use_display_name_memo(report.reporter_pubkey.clone());
+    let reporter_display = move || {
+        reporter_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| reporter_resolved.get())
+    };
     let timestamp = format_timestamp(report.created_at);
     let report_count = report.report_count;
     let content_preview = if report.content.len() > 200 {
@@ -296,13 +304,6 @@ fn ReportCard(
 }
 
 // -- Helpers ------------------------------------------------------------------
-
-fn truncate_pk(pk: &str) -> String {
-    if pk.len() <= 16 {
-        return pk.to_string();
-    }
-    format!("{}...{}", &pk[..8], &pk[pk.len() - 4..])
-}
 
 fn format_timestamp(ts: u64) -> String {
     if ts == 0 {
