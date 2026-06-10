@@ -59,9 +59,15 @@ fn skipped_key(pubkey: &str) -> String {
 
 /// Has the user already claimed (locally cached)?
 fn has_claimed_locally(pubkey: &str) -> bool {
+    claimed_username_cached(pubkey).is_some()
+}
+
+/// Read the locally-cached claimed username (the claim flow stores the
+/// username string as the flag value).
+pub fn claimed_username_cached(pubkey: &str) -> Option<String> {
     local_storage()
         .and_then(|s| s.get_item(&claimed_key(pubkey)).ok().flatten())
-        .is_some()
+        .filter(|v| !v.is_empty())
 }
 
 /// Mark the username as claimed locally so we never re-prompt this user.
@@ -211,13 +217,49 @@ pub struct OnboardingPrefill {
     pub force_open: RwSignal<bool>,
 }
 
+/// Reactive holder for the user's CLAIMED username.
+///
+/// This is deliberately separate from `AuthState::nickname` (the kind-0
+/// display name): saving a profile nickname must never present that
+/// nickname as a claimed username / NIP-05 handle (QA HIGH bug #5a).
+/// Populated from the localStorage claim cache, the kind-0 `nip05` field,
+/// and successful claims; cleared on release.
+#[derive(Clone, Copy, Debug)]
+pub struct ClaimedUsername(pub RwSignal<Option<String>>);
+
 /// Provide an `OnboardingPrefill` context so other pages (Settings) can
-/// open the modal pre-filled with an existing value.
+/// open the modal pre-filled with an existing value, plus the shared
+/// `ClaimedUsername` signal.
 pub fn provide_onboarding_prefill() {
     provide_context(OnboardingPrefill {
         initial: RwSignal::new(None),
         force_open: RwSignal::new(false),
     });
+    provide_context(ClaimedUsername(RwSignal::new(None)));
+}
+
+/// Read the shared claimed-username signal (None outside the app tree).
+pub fn use_claimed_username() -> Option<ClaimedUsername> {
+    use_context::<ClaimedUsername>()
+}
+
+/// Write-through to the localStorage claim cache (no context access, safe
+/// to call from relay callbacks).
+pub fn cache_claimed_username(pubkey: &str, username: &str) {
+    mark_claimed_locally(pubkey, username);
+}
+
+/// Format the NIP-05 identifier for a claimed username.
+pub fn nip05_for(username: &str) -> String {
+    format!("{}@{}", username, NIP05_HOST)
+}
+
+/// Extract `name` from a kind-0 `nip05` value when it belongs to our host.
+pub fn username_from_nip05(nip05: &str) -> Option<String> {
+    nip05
+        .strip_suffix(&format!("@{}", NIP05_HOST))
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
 }
 
 /// Open the onboarding modal in "change username" mode pre-filled with `current`.
@@ -226,6 +268,45 @@ pub fn open_onboarding_with_prefill(current: Option<String>) {
         prefill.initial.set(current);
         prefill.force_open.set(true);
     }
+}
+
+/// Probe the relay for the user's own kind-0 and return the username from
+/// its `nip05` field (our host only). Waits up to 2.5s; the REQ is queued
+/// by the relay client if the socket is still connecting.
+async fn probe_remote_claim(relay: &crate::relay::RelayConnection, pubkey: &str) -> Option<String> {
+    use std::rc::Rc;
+
+    let found: RwSignal<Option<String>> = RwSignal::new(None);
+    let cb = Rc::new(move |ev: nostr_bbs_core::NostrEvent| {
+        if ev.kind != 0 {
+            return;
+        }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&ev.content) {
+            if let Some(nip05) = obj.get("nip05").and_then(|v| v.as_str()) {
+                if let Some(name) = username_from_nip05(nip05) {
+                    found.set(Some(name));
+                }
+            }
+        }
+    });
+    let sid = relay.subscribe(
+        vec![crate::relay::Filter {
+            kinds: Some(vec![0]),
+            authors: Some(vec![pubkey.to_string()]),
+            limit: Some(1),
+            ..Default::default()
+        }],
+        cb,
+        None,
+    );
+    let delay = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 2_500);
+    });
+    let _ = JsFuture::from(delay).await;
+    relay.unsubscribe(&sid);
+    found.get_untracked()
 }
 
 #[component]
@@ -241,6 +322,9 @@ pub fn OnboardingModal() -> impl IntoView {
     // Generation counter to invalidate in-flight debounced checks when the
     // user keeps typing.
     let check_seq = RwSignal::new(0u32);
+
+    // Pubkey for which the remote claim probe has already run this session.
+    let probed_pubkey: RwSignal<Option<String>> = RwSignal::new(None);
 
     // Decide whether to open on auth-state change.
     Effect::new(move |_| {
@@ -263,14 +347,23 @@ pub fn OnboardingModal() -> impl IntoView {
             }
         }
 
-        // Auto-open when user has no nickname AND has not claimed AND not skipping.
         let pubkey = match state.pubkey.as_ref() {
             Some(pk) => pk.clone(),
             None => return,
         };
-        if state.nickname.is_some() {
-            return;
+
+        // Hydrate the shared ClaimedUsername signal from the local cache so
+        // Settings shows the claimed handle even before any network access.
+        let claimed_sig = use_claimed_username();
+        if let Some(claimed) = claimed_sig {
+            if claimed.0.get_untracked().is_none() {
+                if let Some(cached) = claimed_username_cached(&pubkey) {
+                    claimed.0.set(Some(cached));
+                }
+            }
         }
+
+        // Auto-open only when no username claim exists AND not skipping.
         if has_claimed_locally(&pubkey) {
             return;
         }
@@ -283,7 +376,40 @@ pub fn OnboardingModal() -> impl IntoView {
                 return;
             }
         }
-        is_open.set(true);
+
+        // The local cache is per-device: a user who claimed on another
+        // device (or in a fresh browser context) has no cache entry. Before
+        // prompting, probe the user's own kind-0 for a `nip05` minted by a
+        // previous claim — if one exists, record it and suppress the modal
+        // (QA HIGH bug #5b: carol2 was claimed but the modal re-appeared).
+        if probed_pubkey.get_untracked().as_deref() == Some(pubkey.as_str()) {
+            return;
+        }
+        probed_pubkey.set(Some(pubkey.clone()));
+
+        let Some(relay) = use_context::<crate::relay::RelayConnection>() else {
+            is_open.set(true);
+            return;
+        };
+        spawn_local(async move {
+            let remote = probe_remote_claim(&relay, &pubkey).await;
+            match remote {
+                Some(name) => {
+                    mark_claimed_locally(&pubkey, &name);
+                    if let Some(claimed) = claimed_sig {
+                        claimed.0.set(Some(name));
+                    }
+                    is_open.set(false);
+                }
+                None => {
+                    // Re-check the gates — the user may have claimed or
+                    // skipped while the probe was in flight.
+                    if !has_claimed_locally(&pubkey) && !is_skipping(&pubkey) {
+                        is_open.set(true);
+                    }
+                }
+            }
+        });
     });
 
     // Debounced live validation.
@@ -390,6 +516,7 @@ pub fn OnboardingModal() -> impl IntoView {
         let body = serde_json::json!({ "username": name }).to_string();
         let pubkey_for_meta = pubkey.clone();
         let name_for_meta = name.clone();
+        let claimed_sig = use_claimed_username();
 
         spawn_local(async move {
             let result = fetch_with_nip98_post_signer(&url, &body, signer.as_ref()).await;
@@ -408,17 +535,30 @@ pub fn OnboardingModal() -> impl IntoView {
                         return;
                     }
 
-                    // Persist + update auth state.
+                    // Persist + update the claimed-username state. The claim
+                    // sets the HANDLE, deliberately decoupled from the
+                    // kind-0 display name (QA HIGH bug #5a) — an existing
+                    // nickname/avatar is preserved; the nickname defaults to
+                    // the username only when none exists yet.
                     mark_claimed_locally(&pubkey_for_meta, &name_for_meta);
                     clear_skipped(&pubkey_for_meta);
-                    auth.set_profile(Some(name_for_meta.clone()), None);
+                    if let Some(claimed) = claimed_sig {
+                        claimed.0.set(Some(name_for_meta.clone()));
+                    }
+                    let current = auth.get();
+                    let display_name = current
+                        .nickname
+                        .clone()
+                        .filter(|n| !n.trim().is_empty())
+                        .unwrap_or_else(|| name_for_meta.clone());
+                    auth.set_profile(Some(display_name.clone()), current.avatar.clone());
 
                     // Publish a kind-0 update with name + nip05 fields so other clients
                     // see the new identity. Best-effort; failures are logged.
                     let nip05 = format!("{}@{}", name_for_meta, NIP05_HOST);
                     let meta = serde_json::json!({
                         "name": name_for_meta,
-                        "display_name": name_for_meta,
+                        "display_name": display_name,
                         "nip05": nip05,
                     })
                     .to_string();
@@ -668,11 +808,18 @@ pub async fn release_username() -> Result<(), String> {
 
     let url = format!("{}/api/username/release", auth_api_base());
     let body = "{}".to_string();
+    // Capture the claimed-username signal before the await so the context
+    // lookup happens while the reactive owner is still current.
+    let claimed_sig = use_claimed_username();
     let result = fetch_with_nip98_post_signer(&url, &body, signer.as_ref()).await;
     match result {
         Ok(_) => {
             clear_claimed_locally(&pubkey);
-            auth.set_profile(None, None);
+            // Clear the claimed handle only — the kind-0 display name
+            // (nickname/avatar) is a separate concern and stays intact.
+            if let Some(claimed) = claimed_sig {
+                claimed.0.set(None);
+            }
             Ok(())
         }
         Err(e) => {

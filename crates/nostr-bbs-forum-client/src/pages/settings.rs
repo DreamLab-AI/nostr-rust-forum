@@ -12,7 +12,10 @@ use nostr_bbs_core::UnsignedEvent;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::confirm_dialog::{ConfirmDialog, ConfirmVariant};
-use crate::components::onboarding_modal::{open_onboarding_with_prefill, release_username};
+use crate::components::onboarding_modal::{
+    cache_claimed_username, claimed_username_cached, open_onboarding_with_prefill,
+    release_username, use_claimed_username, username_from_nip05,
+};
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
@@ -102,16 +105,31 @@ pub fn SettingsPage() -> impl IntoView {
     let confirm_release_open = RwSignal::new(false);
     let release_pending = RwSignal::new(false);
 
-    // Display the currently-claimed username (if any). We show whatever
-    // value AuthState currently holds — successful claims update it via
-    // `auth.set_profile`, and the onboarding modal's `release_username()`
-    // helper resets it to None.
-    let claimed_username = Memo::new(move |_| auth.nickname().get());
+    // Display the currently-claimed username (if any).
+    //
+    // Deliberately NOT derived from `auth.nickname()` — the nickname is the
+    // kind-0 display name and conflating the two made a profile nickname
+    // save (e.g. "Carol QA") render as a claimed username with an invalid
+    // NIP-05 (QA HIGH bug #5a). The shared ClaimedUsername signal is fed by
+    // the claim flow, the localStorage claim cache, and the kind-0 `nip05`
+    // field fetched below (QA HIGH bug #5b: claimed usernames now load).
+    let claimed_sig = use_claimed_username();
+    let claimed_username = Memo::new(move |_| claimed_sig.and_then(|c| c.0.get()));
     let claimed_nip05 = Memo::new(move |_| {
-        auth.nickname()
+        claimed_username
             .get()
             .map(|n| format!("{}@{}", n, NIP05_USERNAME_HOST))
     });
+
+    // Hydrate from the local claim cache on mount (covers direct /settings
+    // navigation before the onboarding modal effect has run).
+    if let (Some(claimed), Some(pk)) = (claimed_sig, auth.pubkey().get_untracked()) {
+        if claimed.0.get_untracked().is_none() {
+            if let Some(cached) = claimed_username_cached(&pk) {
+                claimed.0.set(Some(cached));
+            }
+        }
+    }
 
     let pubkey_display = Memo::new(move |_| {
         auth.pubkey()
@@ -157,13 +175,22 @@ pub fn SettingsPage() -> impl IntoView {
                 None => return,
             };
 
+            let pk_for_event = pk.clone();
             let on_event: Rc<dyn Fn(nostr_bbs_core::NostrEvent)> =
                 Rc::new(move |event: nostr_bbs_core::NostrEvent| {
                     if event.kind != 0 {
                         return;
                     }
                     if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&event.content) {
-                        if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                        // The nickname is the DISPLAY name — prefer
+                        // `display_name`, falling back to `name` for events
+                        // published before the username/nickname split.
+                        let display = obj
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .or_else(|| obj.get("name").and_then(|v| v.as_str()));
+                        if let Some(name) = display {
                             nickname_sig.set(name.to_string());
                         }
                         if let Some(bio) = obj.get("about").and_then(|v| v.as_str()) {
@@ -174,6 +201,20 @@ pub fn SettingsPage() -> impl IntoView {
                         }
                         if let Some(bday) = obj.get("birthday").and_then(|v| v.as_str()) {
                             birthday_sig.set(bday.to_string());
+                        }
+                        // Recover an already-claimed username from the
+                        // kind-0 `nip05` field (QA HIGH bug #5b).
+                        if let Some(nip05) = obj.get("nip05").and_then(|v| v.as_str()) {
+                            if let Some(username) = username_from_nip05(nip05) {
+                                cache_claimed_username(&pk_for_event, &username);
+                                if let Some(claimed) = claimed_sig {
+                                    if claimed.0.get_untracked().as_deref()
+                                        != Some(username.as_str())
+                                    {
+                                        claimed.0.set(Some(username));
+                                    }
+                                }
+                            }
                         }
                     }
                 });
@@ -219,15 +260,36 @@ pub fn SettingsPage() -> impl IntoView {
 
         profile_saving.set(true);
 
+        // The nickname is published as `display_name` ONLY — it is never a
+        // username claim (QA HIGH bug #5a: saving "Carol QA" used to be
+        // presented as a claimed handle, violating the [a-z0-9_-]{3,30}
+        // rule and minting an invalid NIP-05). When a username IS claimed,
+        // it keeps owning the `name` + `nip05` fields; username changes go
+        // through the explicit, validated claim flow.
         let mut metadata = serde_json::Map::new();
-        metadata.insert("name".into(), serde_json::Value::String(name.clone()));
+        metadata.insert(
+            "display_name".into(),
+            serde_json::Value::String(name.clone()),
+        );
+        if let Some(username) = claimed_username.get_untracked() {
+            metadata.insert("name".into(), serde_json::Value::String(username.clone()));
+            metadata.insert(
+                "nip05".into(),
+                serde_json::Value::String(format!("{}@{}", username, NIP05_USERNAME_HOST)),
+            );
+        } else {
+            // No claimed username: keep `name` mirroring the display name
+            // for clients that only read `name`, but nothing here is ever
+            // treated as a claimed handle.
+            metadata.insert("name".into(), serde_json::Value::String(name.clone()));
+        }
         let bio = about.get_untracked().trim().to_string();
         if !bio.is_empty() {
             metadata.insert("about".into(), serde_json::Value::String(bio));
         }
         let pic = avatar_url.get_untracked().trim().to_string();
         if !pic.is_empty() {
-            metadata.insert("picture".into(), serde_json::Value::String(pic));
+            metadata.insert("picture".into(), serde_json::Value::String(pic.clone()));
         }
         let bday = birthday.get_untracked().trim().to_string();
         if !bday.is_empty() {
@@ -255,10 +317,16 @@ pub fn SettingsPage() -> impl IntoView {
                     let saving_sig = profile_saving;
                     let auth_for_ack = auth;
                     let name_for_ack = name.clone();
+                    let avatar_for_ack = if pic.is_empty() {
+                        None
+                    } else {
+                        Some(pic.clone())
+                    };
                     let ack = Rc::new(move |accepted: bool, message: String| {
                         saving_sig.set(false);
                         if accepted {
-                            auth_for_ack.set_profile(Some(name_for_ack.clone()), None);
+                            auth_for_ack
+                                .set_profile(Some(name_for_ack.clone()), avatar_for_ack.clone());
                             toasts_ok.show("Profile updated", ToastVariant::Success);
                         } else {
                             toasts_ok.show(
@@ -329,8 +397,10 @@ pub fn SettingsPage() -> impl IntoView {
     };
 
     // -- Username change handler (opens onboarding modal pre-filled) --
+    // Pre-fill with the CLAIMED username, never the nickname — the claim
+    // flow enforces the [a-z0-9_-]{3,30} format client-side.
     let on_change_username = move |_| {
-        let current = auth.nickname().get_untracked();
+        let current = claimed_username.get_untracked();
         open_onboarding_with_prefill(current);
     };
 

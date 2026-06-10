@@ -16,7 +16,7 @@ use nostr_bbs_core::{nip44_decrypt, NostrEvent};
 use zeroize::Zeroize as _;
 
 use crate::components::user_display::use_display_name;
-use crate::relay::{Filter, RelayConnection};
+use crate::relay::{EoseCallback, EventCallback, Filter, RelayConnection};
 
 /// A single decrypted direct message.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +57,9 @@ struct DMStateInner {
 pub struct DMStore {
     state: RwSignal<DMStateInner>,
     sub_ids: RwSignal<Vec<String>>,
+    /// Bumped by `cleanup()`; pending auth-retry timers from a previous
+    /// page abort when the epoch they captured no longer matches.
+    sub_epoch: RwSignal<u32>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -69,6 +72,7 @@ impl DMStore {
         Self {
             state: RwSignal::new(DMStateInner::default()),
             sub_ids: RwSignal::new(Vec::new()),
+            sub_epoch: RwSignal::new(0),
         }
     }
 
@@ -172,15 +176,22 @@ impl DMStore {
         };
 
         let my_pk_cb = my_pk.clone();
-        let on_event = Rc::new(move |event: NostrEvent| {
+        let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
             process_dm_event(&event, &sk, &my_pk_cb, state);
         });
-        let on_eose = Rc::new(move || {
+        let on_eose: EoseCallback = Rc::new(move || {
             state.update(|s| s.is_loading = false);
         });
 
-        let id = relay.subscribe(vec![sent_filter, recv_filter], on_event, Some(on_eose));
-        self.sub_ids.update(|ids| ids.push(id));
+        subscribe_dm_with_auth_retry(
+            *self,
+            relay.clone(),
+            vec![sent_filter, recv_filter],
+            on_event,
+            Some(on_eose),
+            "fetch_conversations",
+            0,
+        );
 
         // Timeout guard so the UI never gets stuck (auto-drops closure)
         crate::utils::set_timeout_once(
@@ -217,12 +228,19 @@ impl DMStore {
             since: Some(now),
             ..Default::default()
         };
-        let on_event = Rc::new(move |event: NostrEvent| {
+        let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
             process_dm_event(&event, &sk, &my_pk, state);
         });
 
-        let id = relay.subscribe(vec![filter], on_event, None);
-        self.sub_ids.update(|ids| ids.push(id));
+        subscribe_dm_with_auth_retry(
+            *self,
+            relay.clone(),
+            vec![filter],
+            on_event,
+            None,
+            "subscribe_incoming",
+            0,
+        );
     }
 
     /// Select a conversation and mark it as read.
@@ -296,15 +314,22 @@ impl DMStore {
         };
 
         let my_pk_cb = my_pk.clone();
-        let on_event = Rc::new(move |event: NostrEvent| {
+        let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
             process_dm_event(&event, &sk, &my_pk_cb, state);
         });
-        let on_eose = Rc::new(move || {
+        let on_eose: EoseCallback = Rc::new(move || {
             state.update(|s| s.is_loading = false);
         });
 
-        let id = relay.subscribe(vec![sent_filter, recv_filter], on_event, Some(on_eose));
-        self.sub_ids.update(|ids| ids.push(id));
+        subscribe_dm_with_auth_retry(
+            *self,
+            relay.clone(),
+            vec![sent_filter, recv_filter],
+            on_event,
+            Some(on_eose),
+            "load_conversation_messages",
+            0,
+        );
     }
 
     /// Encrypt and send a DM using NIP-59 Gift Wrap (kind 1059).
@@ -390,11 +415,111 @@ impl DMStore {
 
     /// Unsubscribe from all active DM subscriptions.
     pub fn cleanup(&self, relay: &RelayConnection) {
+        // Invalidate any pending auth-retry timers from this page.
+        self.sub_epoch.update(|e| *e = e.wrapping_add(1));
         for id in &self.sub_ids.get_untracked() {
             relay.unsubscribe(id);
         }
         self.sub_ids.set(Vec::new());
     }
+}
+
+// -- Authenticated subscription with retry -------------------------------------
+
+/// How long to wait for the relay's EOSE before treating the REQ as dropped.
+const DM_SUB_CONFIRM_MS: i32 = 3_000;
+/// Maximum REQ attempts before surfacing an error.
+const DM_SUB_MAX_ATTEMPTS: u32 = 4;
+
+/// Subscribe to DM filters, re-issuing the REQ if the relay never confirms it.
+///
+/// Root cause (QA HIGH bug #3): kind-1059 REQs are AUTH-gated server-side.
+/// The DM pages subscribe as soon as the WebSocket reports `Connected`, which
+/// races the NIP-42 AUTH handshake — the relay answers a pre-AUTH REQ with
+/// `NOTICE auth-required: must authenticate to receive kind-1059 DMs` and
+/// drops it *without* an EOSE, so the subscription is never established on
+/// the authenticated session (live kind-1059 broadcast also requires
+/// `authed_pubkey == recipient`). The relay sends EOSE on every accepted REQ,
+/// so a missing EOSE within `DM_SUB_CONFIRM_MS` reliably identifies a dropped
+/// subscription: close it and re-REQ on the (by now) authenticated session.
+/// This also self-heals reconnect/replay races where the post-AUTH replay in
+/// the relay client did not take effect.
+#[allow(clippy::too_many_arguments)]
+fn subscribe_dm_with_auth_retry(
+    store: DMStore,
+    relay: RelayConnection,
+    filters: Vec<Filter>,
+    on_event: EventCallback,
+    on_eose: Option<EoseCallback>,
+    label: &'static str,
+    attempt: u32,
+) {
+    let epoch = store.sub_epoch.get_untracked();
+    let confirmed = Rc::new(std::cell::Cell::new(false));
+
+    let confirmed_for_eose = confirmed.clone();
+    let caller_eose = on_eose.clone();
+    let eose_wrapper: EoseCallback = Rc::new(move || {
+        confirmed_for_eose.set(true);
+        if let Some(cb) = &caller_eose {
+            cb();
+        }
+    });
+
+    let sub_id = relay.subscribe(filters.clone(), on_event.clone(), Some(eose_wrapper));
+    store.sub_ids.update(|ids| ids.push(sub_id.clone()));
+
+    crate::utils::set_timeout_once(
+        move || {
+            if confirmed.get() {
+                return;
+            }
+            // The page that owned this subscription was cleaned up.
+            if store.sub_epoch.get_untracked() != epoch {
+                return;
+            }
+            store.sub_ids.update(|ids| ids.retain(|id| id != &sub_id));
+            relay.unsubscribe(&sub_id);
+
+            if attempt + 1 >= DM_SUB_MAX_ATTEMPTS {
+                web_sys::console::error_1(
+                    &format!(
+                        "[DM] {label}: subscription never confirmed after {DM_SUB_MAX_ATTEMPTS} \
+                         attempts — relay session is not authenticated"
+                    )
+                    .into(),
+                );
+                store.state.update(|s| {
+                    s.is_loading = false;
+                    s.error = Some(
+                        "Could not establish an authenticated connection for DMs. \
+                         Please reload the page to retry."
+                            .into(),
+                    );
+                });
+                return;
+            }
+
+            web_sys::console::warn_1(
+                &format!(
+                    "[DM] {label}: no EOSE within {DM_SUB_CONFIRM_MS}ms (likely raced NIP-42 \
+                     AUTH) — re-subscribing (attempt {})",
+                    attempt + 2
+                )
+                .into(),
+            );
+            subscribe_dm_with_auth_retry(
+                store,
+                relay,
+                filters,
+                on_event,
+                on_eose,
+                label,
+                attempt + 1,
+            );
+        },
+        DM_SUB_CONFIRM_MS,
+    );
 }
 
 // -- Event processing ---------------------------------------------------------

@@ -17,14 +17,22 @@ use send_wrapper::SendWrapper;
 use super::{AccountStatus, AuthPhase, AuthState, AuthStore, STORAGE_KEY};
 use nostr_bbs_core::signer::Signer;
 
-/// sessionStorage key for local-key privkey (survives same-tab nav, cleared on tab close).
+/// Storage key for the local-key privkey.
 ///
-/// **DEPRECATED PATH** (audit C2/B8): persisting a Schnorr private key in
-/// `sessionStorage` is acceptable only as a transitional bridge for the
-/// "local-key" import flow (NIP-19 `nsec` paste). Passkey users never hit
-/// this code path — their key is re-derived from the authenticator on
-/// every authenticate. New code MUST NOT route through `save_privkey_session`.
+/// Lives in **localStorage** by default so an explicit login survives page
+/// reloads (QA: "session lost on every reload"). When the user opts out of
+/// persistence via the remember-me flag (`nostr_bbs_remember` == "false"),
+/// the key is written to sessionStorage instead (cleared on tab close).
+///
+/// **TRANSITIONAL PATH** (audit C2/B8): persisting a Schnorr private key in
+/// web storage is acceptable only as a bridge for the "local-key" import
+/// flow (NIP-19 `nsec` paste). Passkey users never hit this code path —
+/// their key is re-derived from the authenticator on every authenticate.
 const SESSION_PRIVKEY_KEY: &str = "nostr_bbs_sk";
+
+/// localStorage flag controlling privkey persistence scope. Anything other
+/// than the literal string "false" means "remember me" (the default).
+const REMEMBER_ME_KEY: &str = "nostr_bbs_remember";
 
 // -- Persisted session data ---------------------------------------------------
 
@@ -89,45 +97,76 @@ impl PrivkeyMem {
     }
 }
 
-// -- sessionStorage privkey helpers -------------------------------------------
+// -- privkey storage helpers ----------------------------------------------------
 
-/// Store privkey hex in sessionStorage (survives SPA navigation + refresh,
-/// cleared on tab close).
-///
-/// **DEPRECATED.** See `SESSION_PRIVKEY_KEY` doc comment for the migration
-/// note. This function logs a console warning at runtime so accidental new
-/// callers are visible in dev tools. Passkey-derived keys MUST NOT be
-/// persisted via this path; they re-derive from PRF on every login.
-pub(super) fn save_privkey_session(hex: &str) {
-    web_sys::console::warn_1(
-        &"[auth/session] save_privkey_session is DEPRECATED — \
-         storing privkey in sessionStorage is a transitional path for \
-         imported nsec only. Passkey users must re-derive on login."
-            .into(),
-    );
-    if let Some(storage) = web_sys::window()
-        .and_then(|w| w.session_storage().ok())
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok())
         .flatten()
-    {
-        let _ = storage.set_item(SESSION_PRIVKEY_KEY, hex);
-    }
 }
 
-/// Read privkey hex from sessionStorage.
-pub(super) fn read_privkey_session() -> Option<String> {
+fn session_storage() -> Option<web_sys::Storage> {
     web_sys::window()
         .and_then(|w| w.session_storage().ok())
         .flatten()
+}
+
+/// "Remember me" is the default. Only an explicit `"false"` flag in
+/// localStorage downgrades privkey persistence to sessionStorage scope.
+fn remember_me() -> bool {
+    local_storage()
+        .and_then(|s| s.get_item(REMEMBER_ME_KEY).ok())
+        .flatten()
+        .map(|v| v != "false")
+        .unwrap_or(true)
+}
+
+/// Store privkey hex so an explicit login survives page reloads.
+///
+/// Writes to localStorage by default ("remember me" on), or sessionStorage
+/// when the user opted out. The other storage area is cleared so a stale
+/// copy can never linger. See `SESSION_PRIVKEY_KEY` for the audit note —
+/// passkey-derived keys MUST NOT be persisted via this path; they
+/// re-derive from PRF on every login.
+pub(super) fn save_privkey_session(hex: &str) {
+    if remember_me() {
+        if let Some(storage) = local_storage() {
+            let _ = storage.set_item(SESSION_PRIVKEY_KEY, hex);
+        }
+        if let Some(storage) = session_storage() {
+            let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
+        }
+    } else {
+        if let Some(storage) = session_storage() {
+            let _ = storage.set_item(SESSION_PRIVKEY_KEY, hex);
+        }
+        if let Some(storage) = local_storage() {
+            let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
+        }
+    }
+}
+
+/// Read privkey hex from storage. Checks localStorage first (the default
+/// persistence scope), then sessionStorage (remember-me=false sessions and
+/// sessions created before the localStorage migration).
+pub(super) fn read_privkey_session() -> Option<String> {
+    if let Some(hex) = local_storage()
+        .and_then(|s| s.get_item(SESSION_PRIVKEY_KEY).ok())
+        .flatten()
+    {
+        return Some(hex);
+    }
+    session_storage()
         .and_then(|s| s.get_item(SESSION_PRIVKEY_KEY).ok())
         .flatten()
 }
 
-/// Clear privkey from sessionStorage.
+/// Clear privkey from both storage areas. Called on explicit logout.
 pub(super) fn clear_privkey_session() {
-    if let Some(storage) = web_sys::window()
-        .and_then(|w| w.session_storage().ok())
-        .flatten()
-    {
+    if let Some(storage) = local_storage() {
+        let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
+    }
+    if let Some(storage) = session_storage() {
         let _ = storage.remove_item(SESSION_PRIVKEY_KEY);
     }
 }
@@ -251,7 +290,8 @@ impl AuthStore {
 
         if stored.is_local_key {
             if let Some(ref pubkey) = stored.public_key {
-                // Try to restore privkey from sessionStorage (survives refresh).
+                // Try to restore the persisted privkey (localStorage by
+                // default, sessionStorage for remember-me=false sessions).
                 // The hex string is zeroized in-place after decoding so it
                 // does not linger on the JS heap longer than necessary
                 // (audit B8 hardening).
@@ -305,7 +345,7 @@ impl AuthStore {
                     }
                 }
 
-                // sessionStorage empty — privkey lost, need re-login.
+                // No persisted privkey — need re-login.
                 self.state.set(AuthState {
                     state: AuthPhase::Unauthenticated,
                     pubkey: Some(pubkey.clone()),
@@ -349,17 +389,20 @@ pub(super) fn register_pagehide_listener(store: AuthStore) {
             if event.persisted() {
                 return;
             }
-            // Page actually unloading -- zero the key
+            // Page actually unloading -- zero the in-memory key
             store_clone.privkey.update_value(|opt| {
                 if let Some(ref mut v) = opt {
                     v.iter_mut().for_each(|b| *b = 0);
                 }
                 *opt = None;
             });
-            // Audit B8: also flush the deprecated sessionStorage key so a
-            // stale copy cannot survive the unload event for a brief
-            // window before the browser tears the storage area down.
-            clear_privkey_session();
+            // Do NOT clear the persisted privkey here. `pagehide` with
+            // persisted=false fires on every plain reload as well as on tab
+            // close — clearing storage here wiped the key before the new
+            // document could restore it, logging the user out on every
+            // reload (QA HIGH bug #1). Storage is cleared on explicit
+            // logout only; tab-close cleanup of the non-remember-me copy is
+            // handled by the browser (sessionStorage scope).
             // AuthState no longer carries private_key — privkey bytes
             // are already zeroed in the StoredValue above.
         },

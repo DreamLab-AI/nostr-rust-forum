@@ -11,6 +11,7 @@ use gloo::events::EventListener;
 use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -156,6 +157,9 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     let tab = RwSignal::new(Tab::All);
     let results: RwSignal<Vec<Hit>> = RwSignal::new(Vec::new());
     let loading = RwSignal::new(false);
+    // Search/hydration errors surfaced in the panel (QA HIGH bug #4 — they
+    // used to be swallowed silently while the list rendered nothing).
+    let search_error: RwSignal<Option<String>> = RwSignal::new(None);
     let sel = RwSignal::new(0usize);
     let input_ref = NodeRef::<leptos::html::Input>::new();
     let recents = RwSignal::new(load_recents());
@@ -163,6 +167,11 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     // Semantic search toggle
     let semantic_mode = RwSignal::new(false);
     let api_online = RwSignal::new(false);
+
+    // Capture the relay handle at setup time — `do_search` runs from a
+    // debounce setTimeout callback where the reactive owner (and therefore
+    // context lookup) is not guaranteed.
+    let relay_handle = StoredValue::new(expect_context::<RelayConnection>());
 
     // Check search API status on open
     Effect::new(move |_| {
@@ -204,6 +213,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
             query.set(String::new());
             results.set(Vec::new());
             sel.set(0);
+            search_error.set(None);
         }
     });
 
@@ -216,55 +226,122 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
         if q.trim().is_empty() {
             results.set(Vec::new());
             loading.set(false);
+            search_error.set(None);
             return;
         }
         loading.set(true);
         sel.set(0);
+        search_error.set(None);
+        let relay = relay_handle.with_value(|r| r.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let mut out = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
 
-            if is_semantic && (t == Tab::All || t == Tab::Messages) {
-                // Use RuVector semantic search
-                match search_client::search_similar(&q, 10, 0.3, None).await {
-                    Ok(hits) => {
-                        for h in hits {
-                            out.push(Hit::SemanticMessage {
-                                id: h.id,
-                                content: h.content.unwrap_or_default(),
-                                label: h.label.unwrap_or_default(),
-                                score: h.score,
-                            });
-                        }
+            if t == Tab::All || t == Tab::Messages {
+                // Collect raw API results as (event_id, score, content?, label?).
+                // The search API responds with `{results:[{id,score},...]}` —
+                // event bodies are NOT included, so hits must be hydrated
+                // id→event via the relay below (QA HIGH bug #4: blank rows).
+                let mut raw: Vec<(String, Option<f64>, Option<String>, Option<String>)> =
+                    Vec::new();
+                let mut fetch_err: Option<String> = None;
+
+                let non_empty = |s: String| {
+                    if s.trim().is_empty() {
+                        None
+                    } else {
+                        Some(s)
                     }
-                    Err(_) => {
-                        // Fallback: try legacy text search on error
-                        if let Ok(hits) = semantic_search(&q).await {
+                };
+
+                if is_semantic {
+                    // RuVector semantic search, with legacy text fallback.
+                    match search_client::search_similar(&q, 10, 0.3, None).await {
+                        Ok(hits) => {
                             for h in hits {
-                                out.push(Hit::Message {
-                                    content: h.content,
-                                    author: h.label.unwrap_or_default(),
-                                    channel_id: h.id,
-                                });
+                                let content = h.content.and_then(non_empty);
+                                raw.push((h.id, Some(h.score), content, h.label));
                             }
                         }
+                        Err(sem_err) => match semantic_search(&q).await {
+                            Ok(hits) => {
+                                for h in hits {
+                                    raw.push((h.id, None, non_empty(h.content), h.label));
+                                }
+                            }
+                            Err(txt_err) => {
+                                fetch_err = Some(format!("semantic: {sem_err}; text: {txt_err}"));
+                            }
+                        },
+                    }
+                } else {
+                    // Legacy text search via /search
+                    match semantic_search(&q).await {
+                        Ok(hits) => {
+                            for h in hits {
+                                raw.push((h.id, None, non_empty(h.content), h.label));
+                            }
+                        }
+                        Err(e) => fetch_err = Some(e),
                     }
                 }
-            } else if t == Tab::All || t == Tab::Messages {
-                // Legacy text search via /search
-                if let Ok(hits) = semantic_search(&q).await {
-                    for h in hits {
-                        out.push(Hit::Message {
-                            content: h.content,
-                            author: h.label.unwrap_or_default(),
-                            channel_id: h.id,
-                        });
+
+                if let Some(e) = fetch_err {
+                    errors.push(format!("Message search failed: {e}"));
+                }
+
+                // Hydrate hits whose content is missing from the API response.
+                let need: Vec<String> = raw
+                    .iter()
+                    .filter(|(_, _, content, _)| content.is_none())
+                    .map(|(id, _, _, _)| id.clone())
+                    .collect();
+                let hydrated = hydrate_search_ids(&relay, need).await;
+
+                let mut missing = 0usize;
+                for (id, score, content, label) in raw {
+                    let event = hydrated.get(&id);
+                    let content = match content {
+                        Some(c) => c,
+                        None => match event {
+                            Some(ev) if !ev.content.trim().is_empty() => ev.content.clone(),
+                            _ => {
+                                missing += 1;
+                                continue;
+                            }
+                        },
+                    };
+                    let author = label
+                        .filter(|l| !l.is_empty())
+                        .or_else(|| event.map(|ev| ev.pubkey.clone()))
+                        .unwrap_or_default();
+                    // Link to the containing channel (kind-42 `e` tag) when
+                    // known; fall back to the raw id.
+                    let channel = event.and_then(channel_id_of).unwrap_or_else(|| id.clone());
+                    match score {
+                        Some(s) => out.push(Hit::SemanticMessage {
+                            id: channel,
+                            content,
+                            label: author,
+                            score: s,
+                        }),
+                        None => out.push(Hit::Message {
+                            content,
+                            author,
+                            channel_id: channel,
+                        }),
                     }
+                }
+                if missing > 0 {
+                    errors.push(format!(
+                        "{missing} matching message(s) could not be loaded from the relay"
+                    ));
                 }
             }
 
             if t == Tab::All || t == Tab::Channels {
                 let ql = q.to_lowercase();
-                let relay = expect_context::<RelayConnection>();
+                let relay = relay.clone();
                 let found: RwSignal<Vec<Hit>> = RwSignal::new(Vec::new());
                 let qs = ql.clone();
                 let cb = Rc::new(move |ev: nostr_bbs_core::NostrEvent| {
@@ -313,6 +390,11 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 });
                 let _ = JsFuture::from(delay).await;
                 out.extend(found.get_untracked());
+            }
+            if !errors.is_empty() {
+                let msg = errors.join(" \u{2014} ");
+                web_sys::console::warn_1(&format!("[search] {msg}").into());
+                search_error.set(Some(msg));
             }
             results.set(out);
             loading.set(false);
@@ -427,6 +509,11 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                         }}).collect_view()}
                     </div>
                     <div class="max-h-80 overflow-y-auto px-2 pb-3">
+                        <Show when=move || search_error.get().is_some()>
+                            <div class="mx-1 mt-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-xs text-red-300" role="alert">
+                                {move || search_error.get().unwrap_or_default()}
+                            </div>
+                        </Show>
                         <Show when=move || loading.get()>
                             <div class="flex items-center justify-center py-8"><div class="animate-spin w-6 h-6 border-2 border-amber-400 border-t-transparent rounded-full"></div></div>
                         </Show>
@@ -495,6 +582,52 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
             </div>
         </Show>
     }
+}
+
+/// Extract the containing channel id from a kind-42 message event (`e` tag).
+fn channel_id_of(ev: &nostr_bbs_core::NostrEvent) -> Option<String> {
+    ev.tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == "e")
+        .map(|t| t[1].clone())
+}
+
+/// Hydrate search-result event ids into full events via a relay `ids` REQ.
+///
+/// The search API only returns `{id, score}` pairs; the event body, author,
+/// and channel must be fetched from the relay. Waits up to 1.2s for results
+/// then unsubscribes. Missing ids (deleted or zone-withheld events) are
+/// simply absent from the returned map — callers surface the count.
+async fn hydrate_search_ids(
+    relay: &RelayConnection,
+    ids: Vec<String>,
+) -> HashMap<String, nostr_bbs_core::NostrEvent> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    let found: RwSignal<HashMap<String, nostr_bbs_core::NostrEvent>> =
+        RwSignal::new(HashMap::new());
+    let cb = Rc::new(move |ev: nostr_bbs_core::NostrEvent| {
+        found.update(|m| {
+            m.insert(ev.id.clone(), ev);
+        });
+    });
+    let sid = relay.subscribe(
+        vec![Filter {
+            ids: Some(ids),
+            ..Default::default()
+        }],
+        cb,
+        None,
+    );
+    let delay = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1_200);
+    });
+    let _ = JsFuture::from(delay).await;
+    relay.unsubscribe(&sid);
+    found.get_untracked()
 }
 
 async fn semantic_search(query: &str) -> Result<Vec<SHit>, String> {

@@ -317,12 +317,33 @@ pub fn App() -> impl IntoView {
                 None => return,
             };
 
+            // kind-0 is replaceable: this auto-whitelist publish must not
+            // clobber an existing username claim's `name`/`nip05` fields
+            // (QA HIGH bug #5b — the claimed handle vanished on the next
+            // connect). The nickname is only ever the display name.
             let nickname = auth.nickname().get_untracked().unwrap_or_default();
-            let content = serde_json::json!({
-                "name": nickname,
-                "display_name": nickname,
-            })
-            .to_string();
+            let claimed = crate::components::onboarding_modal::claimed_username_cached(&pubkey);
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "display_name".into(),
+                serde_json::Value::String(nickname.clone()),
+            );
+            match &claimed {
+                Some(username) => {
+                    obj.insert("name".into(), serde_json::Value::String(username.clone()));
+                    obj.insert(
+                        "nip05".into(),
+                        serde_json::Value::String(crate::components::onboarding_modal::nip05_for(
+                            username,
+                        )),
+                    );
+                }
+                None => {
+                    obj.insert("name".into(), serde_json::Value::String(nickname.clone()));
+                }
+            }
+            let content =
+                serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default();
 
             let now = (js_sys::Date::now() / 1000.0) as u64;
             let unsigned = nostr_bbs_core::UnsignedEvent {
@@ -905,9 +926,10 @@ fn AuthGatedChat() -> impl IntoView {
 
     Effect::new(move |_| {
         if is_ready.get() && !is_authed.get() {
-            let current = current_app_path(&location.pathname.get());
-            let target = login_redirect_target(&current);
-            navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            let current = location.pathname.get();
+            if let Some(target) = login_redirect_target(&current) {
+                navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            }
         }
     });
 
@@ -931,9 +953,10 @@ fn AuthGatedChannel() -> impl IntoView {
 
     Effect::new(move |_| {
         if is_ready.get() && !is_authed.get() {
-            let current = current_app_path(&location.pathname.get());
-            let target = login_redirect_target(&current);
-            navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            let current = location.pathname.get();
+            if let Some(target) = login_redirect_target(&current) {
+                navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            }
         }
     });
 
@@ -957,9 +980,10 @@ fn AuthGatedDmList() -> impl IntoView {
 
     Effect::new(move |_| {
         if is_ready.get() && !is_authed.get() {
-            let current = current_app_path(&location.pathname.get());
-            let target = login_redirect_target(&current);
-            navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            let current = location.pathname.get();
+            if let Some(target) = login_redirect_target(&current) {
+                navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            }
         }
     });
 
@@ -983,9 +1007,10 @@ fn AuthGatedDmChat() -> impl IntoView {
 
     Effect::new(move |_| {
         if is_ready.get() && !is_authed.get() {
-            let current = current_app_path(&location.pathname.get());
-            let target = login_redirect_target(&current);
-            navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            let current = location.pathname.get();
+            if let Some(target) = login_redirect_target(&current) {
+                navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            }
         }
     });
 
@@ -1000,17 +1025,24 @@ fn AuthGatedDmChat() -> impl IntoView {
 
 // -- Auth-gated v3.0 pages ----------------------------------------------------
 
-/// Compute a `/login?returnTo=...` target from the current pathname, avoiding
-/// redirect loops when the user is already on `/login` or `/signup`.
-fn login_redirect_target(pathname: &str) -> String {
-    if pathname.is_empty()
-        || pathname == "/login"
-        || pathname == "/signup"
-        || !pathname.starts_with('/')
-    {
-        "/login".to_string()
+/// Compute a `/login?returnTo=...` target from the current pathname.
+///
+/// Returns `None` when the user is already on an auth page (`/login`,
+/// `/signup`) so callers skip the navigation entirely — re-navigating from
+/// there used to overwrite a good `returnTo` with a self-referential
+/// `returnTo=/community/login` (QA HIGH bug #2). The pathname is normalised
+/// through `current_app_path` so the `FORUM_BASE` prefix (e.g. `/community`)
+/// never leaks into the stored value and the `/login`/`/signup` guards
+/// actually match in production builds.
+fn login_redirect_target(pathname: &str) -> Option<String> {
+    let app_path = current_app_path(pathname);
+    if app_path.starts_with("/login") || app_path.starts_with("/signup") {
+        return None;
+    }
+    if app_path.is_empty() || app_path == "/" || !app_path.starts_with('/') {
+        Some("/login".to_string())
     } else {
-        format!("/login?returnTo={}", pathname)
+        Some(format!("/login?returnTo={}", app_path))
     }
 }
 
@@ -1028,8 +1060,9 @@ macro_rules! auth_gated {
             Effect::new(move |_| {
                 if is_ready.get() && !is_authed.get() {
                     let current = location.pathname.get();
-                    let target = login_redirect_target(&current);
-                    navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+                    if let Some(target) = login_redirect_target(&current) {
+                        navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+                    }
                 }
             });
 

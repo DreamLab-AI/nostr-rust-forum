@@ -36,7 +36,9 @@ pub fn LoginPage() -> impl IntoView {
     // so that `use_navigate(...)` doesn't re-prefix and produce
     // `/community/community/forums`.
     //
-    // Reject non-path values, root, /login, /signup to avoid redirect loops.
+    // Reject non-path values, root, and anything under /login or /signup
+    // (including query-string variants like `/login?returnTo=...`) to avoid
+    // self-referential redirect loops (QA HIGH bug #2).
     let query = use_query_map();
     let return_to = move || {
         let raw = query.read().get("returnTo").unwrap_or_default();
@@ -44,7 +46,10 @@ pub fn LoginPage() -> impl IntoView {
             return "/forums".to_string();
         }
         let normalised = current_app_path(&raw);
-        if normalised == "/" || normalised == "/login" || normalised == "/signup" {
+        if normalised == "/"
+            || normalised.starts_with("/login")
+            || normalised.starts_with("/signup")
+        {
             "/forums".to_string()
         } else {
             normalised
@@ -118,7 +123,7 @@ pub fn LoginPage() -> impl IntoView {
                                             class="w-full bg-gray-900 border border-gray-600 focus:border-amber-500 rounded-xl px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500 text-sm font-mono"
                                         />
                                         <p class="text-xs text-gray-500">
-                                            {move || if show_tech.get() { "Key stored in sessionStorage, zeroed on pagehide" } else { "Your key never leaves your browser" }}
+                                            {move || if show_tech.get() { "Key stored locally in your browser; cleared on logout" } else { "Your key never leaves your browser" }}
                                         </p>
                                     </div>
                                     <button
@@ -212,7 +217,7 @@ pub fn LoginPage() -> impl IntoView {
                                         "Sign In"
                                     </button>
                                     <p class="text-xs text-gray-500">
-                                        {move || if show_tech.get() { "Key stored in sessionStorage, zeroed on pagehide" } else { "Your key never leaves your browser" }}
+                                        {move || if show_tech.get() { "Key stored locally in your browser; cleared on logout" } else { "Your key never leaves your browser" }}
                                     </p>
                                 </div>
                             </Show>
