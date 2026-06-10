@@ -58,6 +58,10 @@ fn register_service_worker() {
 
     let options = web_sys::RegistrationOptions::new();
     options.set_scope(&scope);
+    // Always revalidate sw.js itself on page load (skip the HTTP cache) so a
+    // new deploy's worker installs on the FIRST visit, instead of whenever the
+    // browser's sw.js cache heuristic expires.
+    options.set_update_via_cache(web_sys::ServiceWorkerUpdateViaCache::None);
     let promise = sw_container.register_with_options(&sw_url, &options);
     wasm_bindgen_futures::spawn_local(async move {
         match wasm_bindgen_futures::JsFuture::from(promise).await {

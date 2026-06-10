@@ -21,6 +21,15 @@ self.addEventListener('activate', (event) => {
       Promise.all(
         keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))
       )
+    ).then(() =>
+      // Refresh the offline-fallback copy of index.html on every activation —
+      // the install-time precache otherwise pins a stale shell (and with it,
+      // stale content-hashed asset references) across deploys.
+      caches.open(CACHE_NAME).then((cache) =>
+        fetch('./index.html', { cache: 'no-cache' })
+          .then((r) => (r.ok ? cache.put('./index.html', r) : undefined))
+          .catch(() => undefined)
+      )
     )
   );
   self.clients.claim();
@@ -52,10 +61,19 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Network-first for HTML / SPA navigation
+  // Network-first for HTML / SPA navigation; keep the offline fallback fresh
+  // by updating the cached shell whenever the network copy succeeds.
   if (event.request.mode === 'navigate') {
     event.respondWith(
-      fetch(event.request).catch(() => caches.match('./index.html'))
+      fetch(event.request)
+        .then((response) => {
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put('./index.html', clone));
+          }
+          return response;
+        })
+        .catch(() => caches.match('./index.html'))
     );
     return;
   }
