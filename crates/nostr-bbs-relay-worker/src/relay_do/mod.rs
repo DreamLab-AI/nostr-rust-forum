@@ -19,6 +19,7 @@
 //! - `nip_handlers` -- NIP-01/09/42/45 protocol handlers, event storage, whitelist
 
 mod broadcast;
+mod calendar_projection;
 mod filter;
 mod mod_cache;
 mod nip_handlers;

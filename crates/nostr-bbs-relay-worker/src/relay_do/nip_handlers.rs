@@ -21,8 +21,11 @@ use crate::trust::{self, TrustLevel};
 use crate::zone_config::ZoneConfig;
 
 use super::broadcast::{event_treatment, EventTreatment};
+use super::calendar_projection;
 use super::filter::{self, NostrFilter};
 use super::NostrRelayDO;
+
+use nostr_bbs_core::{read_zone_tag, KIND_CALENDAR_RSVP};
 
 // ---------------------------------------------------------------------------
 // Security limits
@@ -475,6 +478,16 @@ impl NostrRelayDO {
             None => false,
         };
 
+        // Phase C: resolve the viewer's cohort tags once for calendar-tier
+        // projection. Unauthenticated viewers have no cohorts. The admin flag
+        // here mirrors `is_admin` above but is read from the whitelist row so the
+        // projector remains correct even if the two sources ever diverge.
+        let (viewer_cohorts, cohort_admin) = match &session_pubkey {
+            Some(pk) => trust::get_viewer_cohorts(pk, &self.env).await,
+            None => (Vec::new(), false),
+        };
+        let viewer_is_admin = is_admin || cohort_admin;
+
         // Zone-filter every matching event. Two event classes are zone-scoped:
         //   - kind-40 channel DEFINITIONS: the channel id is the event's own id.
         //   - kind-42 channel MESSAGES (content): the channel id is the `e` tag.
@@ -488,16 +501,27 @@ impl NostrRelayDO {
         // non-Hidden zones for definitions — closing the prior gap where zone
         // filtering only ran when session_pubkey.is_some().
         for event in &events {
-            // Resolve the channel id for zone-scoped kinds.
+            // Phase C: NIP-52 calendar kinds (31922 date, 31923 time, 31925 RSVP)
+            // are zone-scoped via a native `["zone", "<slug>"]` binding tag on the
+            // event itself (not via a channel-id lookup). They get a two-stage
+            // treatment: (1) the SAME Phase-A zone read-gate — a non-member of a
+            // locked/hidden owning zone never receives the event at all; then
+            // (2) the per-tier PROJECTION (full / free-busy / omit) layered on top,
+            // because a viewer who MAY read the zone might still only be entitled
+            // to a free/busy block or to nothing.
+            if calendar_projection::is_projected_calendar_kind(event.kind) {
+                if let Some(out) =
+                    self.project_calendar_for_viewer(event, &session_pubkey, &viewer_cohorts, viewer_is_admin, &zones).await
+                {
+                    Self::send_event(&ws, sub_id, &out);
+                }
+                continue;
+            }
+
+            // Resolve the channel id for zone-scoped channel kinds.
             let channel_id: Option<String> = match event.kind {
                 40 => Some(event.id.clone()),
                 42 => filter::tag_value(event, "e"),
-                // Phase C seam: NIP-52 calendar kinds (31922/31923 events,
-                // 31924 calendar, 31925 RSVP) are zone-scoped too. When added,
-                // resolve their channel/zone tag here (e.g. the `a`/`e` tag that
-                // binds an event to its zone channel) and fall through to the
-                // same allow_content/allow_defs gate below. Until then they are
-                // treated as unscoped and served unfiltered.
                 _ => None,
             };
 
@@ -521,10 +545,9 @@ impl NostrRelayDO {
                                 continue;
                             }
                         } else {
-                            // Channel content (kind-42 + future calendar kinds):
-                            // withheld from non-members of Locked/Hidden zones;
-                            // only Public content reaches them (already covered
-                            // by is_member via is_public_read).
+                            // Channel content (kind-42): withheld from non-members
+                            // of Locked/Hidden zones; only Public content reaches
+                            // them (already covered by is_member via is_public_read).
                             continue;
                         }
                     }
@@ -534,6 +557,95 @@ impl NostrRelayDO {
             Self::send_event(&ws, sub_id, event);
         }
         Self::send_eose(&ws, sub_id);
+    }
+
+    /// Phase C: gate + project a single NIP-52 calendar event for one viewer.
+    ///
+    /// Stage 1 (zone read-gate, reuses Phase A): resolve the event's owning zone
+    /// from its `["zone", ...]` binding tag. A non-admin viewer who cannot READ
+    /// that zone (per `has_zone_access`) receives nothing — identical to the
+    /// kind-42 content rule. Untagged calendar events are unscoped and skip the
+    /// gate (no zone-private detail).
+    ///
+    /// Stage 2 (tier projection): among events the viewer MAY read, apply the
+    /// matrix — full / free-busy-redacted / omit — via the pure projector.
+    ///
+    /// For RSVPs (kind 31925) the owning zone is resolved from the referenced
+    /// calendar event so an RSVP cannot leak the existence of an event the
+    /// viewer is supposed to be unaware of; a surviving RSVP is served as-is.
+    async fn project_calendar_for_viewer(
+        &self,
+        event: &NostrEvent,
+        session_pubkey: &Option<String>,
+        viewer_cohorts: &[String],
+        viewer_is_admin: bool,
+        zones: &ZoneConfig,
+    ) -> Option<NostrEvent> {
+        let is_owner = session_pubkey
+            .as_deref()
+            .map(|pk| pk == event.pubkey)
+            .unwrap_or(false);
+
+        // Resolve the owning zone slug. For an RSVP, follow the reference.
+        let zone_slug: Option<String> = if event.kind == KIND_CALENDAR_RSVP {
+            self.resolve_rsvp_zone(event).await
+        } else {
+            read_zone_tag(event).map(|s| s.to_string())
+        };
+
+        // Stage 1: zone read-gate (only for zone-bound events; owners/admins pass).
+        if let Some(zone) = &zone_slug {
+            if !viewer_is_admin && !is_owner {
+                let may_read = match session_pubkey {
+                    Some(pk) => trust::has_zone_access(pk, zone, &self.env).await,
+                    None => zones.is_public_read(zone),
+                };
+                if !may_read {
+                    return None;
+                }
+            }
+        }
+
+        // RSVPs carry no private detail of their own; once past the read-gate
+        // (so they don't leak an omitted event's existence), serve unchanged.
+        if event.kind == KIND_CALENDAR_RSVP {
+            return Some(event.clone());
+        }
+
+        // Stage 2: per-tier projection over the calendar event itself.
+        calendar_projection::project_calendar_event(viewer_cohorts, event, is_owner, viewer_is_admin)
+    }
+
+    /// Resolve the owning zone slug of a calendar RSVP by reading the referenced
+    /// calendar event's `zone` tag. The RSVP references its target via an `a`
+    /// (parameterized) or `e` (event id) tag. Returns `None` when the target
+    /// cannot be resolved (treated as unscoped).
+    async fn resolve_rsvp_zone(&self, rsvp: &NostrEvent) -> Option<String> {
+        // An RSVP author MAY mirror the zone tag directly; honour it first.
+        if let Some(z) = read_zone_tag(rsvp) {
+            return Some(z.to_string());
+        }
+
+        let db = self.env.d1("DB").ok()?;
+
+        #[derive(serde::Deserialize)]
+        struct TagsRow {
+            tags: String,
+        }
+
+        // Look up the referenced calendar event and read its zone tag.
+        let target_id = filter::tag_value(rsvp, "e")?;
+        let stmt = db.prepare("SELECT tags FROM events WHERE id = ?1 LIMIT 1");
+        let row = stmt
+            .bind(&[JsValue::from_str(&target_id)])
+            .ok()?
+            .first::<TagsRow>(None)
+            .await
+            .ok()??;
+        let tags: Vec<Vec<String>> = serde_json::from_str(&row.tags).ok()?;
+        tags.iter()
+            .find(|t| t.len() >= 2 && t[0] == nostr_bbs_core::ZONE_TAG)
+            .map(|t| t[1].clone())
     }
 
     pub(crate) async fn handle_close(&self, session_id: u64, sub_id: &str) {

@@ -602,6 +602,15 @@ async fn whitelist_cohorts(pubkey: &str, env: &Env) -> (Vec<String>, bool) {
     }
 }
 
+/// Resolve a pubkey's cohort tags and admin flag from the whitelist.
+///
+/// Public accessor over the internal whitelist lookup, used by the calendar
+/// tier projector (Phase C) which needs the viewer's cohorts to decide
+/// full / free-busy / omit. A missing row or DB error yields `(vec![], false)`.
+pub async fn get_viewer_cohorts(pubkey: &str, env: &Env) -> (Vec<String>, bool) {
+    whitelist_cohorts(pubkey, env).await
+}
+
 /// Check whether a pubkey may READ a given zone.
 ///
 /// Config-driven (no hardcoded zone names): the zone's `required_cohorts` come
