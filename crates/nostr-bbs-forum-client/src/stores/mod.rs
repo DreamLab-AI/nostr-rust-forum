@@ -15,3 +15,4 @@ pub mod preferences;
 pub mod profile_cache;
 pub mod read_position;
 pub mod zone_access;
+pub mod zones;

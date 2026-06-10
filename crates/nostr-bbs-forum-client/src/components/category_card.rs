@@ -25,7 +25,7 @@ pub fn CategoryCard(
     /// Accent color key: "amber", "blue", "purple", "emerald".
     accent_color: &'static str,
     /// Parent zone id for building the href.
-    zone_id: &'static str,
+    zone_id: String,
     /// Optional picture URL for background image.
     #[prop(optional, into)]
     picture: String,

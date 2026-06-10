@@ -32,6 +32,25 @@ pub struct ZoneAccess {
     /// Raw flags signal (set from relay response).
     #[allow(dead_code)]
     flags: RwSignal<(bool, bool, bool)>,
+    /// Raw cohort list for the authenticated user (from the relay's
+    /// check-whitelist response). Drives config-driven zone membership so the
+    /// tile renderer is no longer coupled to the legacy 3-flag model.
+    pub cohorts: RwSignal<Vec<String>>,
+}
+
+impl ZoneAccess {
+    /// Config-driven membership check for an arbitrary zone.
+    ///
+    /// A zone is "entered" (rendered as a normal, openable tile) when the user
+    /// is an admin, OR the zone requires no cohorts, OR the user holds one of
+    /// the zone's `required_cohorts`. This mirrors the relay's read gate; the
+    /// relay remains the security boundary (ADR-022).
+    pub fn is_member_of(&self, zone: &crate::stores::zones::Zone) -> bool {
+        if self.is_admin.get() {
+            return true;
+        }
+        zone.is_member(&self.cohorts.get())
+    }
 }
 
 impl ZoneAccess {
@@ -58,6 +77,7 @@ pub fn provide_zone_access() {
     let flags = RwSignal::new((false, false, false));
     let is_admin_sig = RwSignal::new(false);
     let loaded = RwSignal::new(false);
+    let cohorts_sig = RwSignal::new(Vec::<String>::new());
 
     let home = Memo::new(move |_| flags.get().0);
     let members = Memo::new(move |_| flags.get().1);
@@ -75,6 +95,7 @@ pub fn provide_zone_access() {
         is_admin: is_admin_sig,
         loaded,
         flags,
+        cohorts: cohorts_sig,
     };
     provide_context(access.clone());
 
@@ -87,19 +108,21 @@ pub fn provide_zone_access() {
                 let flags_sig = flags;
                 let admin_sig = is_admin_sig;
                 let loaded_sig = loaded;
+                let cohorts_set = cohorts_sig;
                 loaded_sig.set(false);
                 leptos::task::spawn_local(async move {
                     match fetch_user_access(&pk).await {
-                        Ok((h, d, m, admin)) => {
+                        Ok((h, d, m, admin, cohorts)) => {
                             web_sys::console::log_1(
                                 &format!(
-                                    "[zone_access] flags for {}: home={}, members={}, private={}, admin={}",
-                                    &pk[..8], h, d, m, admin
+                                    "[zone_access] flags for {}: home={}, members={}, private={}, admin={}, cohorts={:?}",
+                                    &pk[..8], h, d, m, admin, cohorts
                                 )
                                 .into(),
                             );
                             flags_sig.set((h, d, m));
                             admin_sig.set(admin);
+                            cohorts_set.set(cohorts);
                         }
                         Err(e) => {
                             web_sys::console::error_1(
@@ -113,6 +136,7 @@ pub fn provide_zone_access() {
         } else {
             flags.set((false, false, false));
             is_admin_sig.set(false);
+            cohorts_sig.set(Vec::new());
             loaded.set(false);
         }
     });
@@ -125,10 +149,14 @@ fn relay_api_base() -> String {
 
 /// Fetch the user's access flags from the relay's check-whitelist endpoint.
 ///
-/// Returns `(home, members, private, is_admin)`.
+/// Returns `(home, members, private, is_admin, cohorts)`.
 /// Parses the `access` object first (new format). Falls back to normalizing
 /// the `cohorts` array for backwards compatibility with old relay versions.
-async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool), String> {
+/// The raw `cohorts` array is always surfaced (when present) so config-driven
+/// zones can compute membership without the legacy 3-flag mapping.
+async fn fetch_user_access(
+    pubkey: &str,
+) -> Result<(bool, bool, bool, bool, Vec<String>), String> {
     let url = format!("{}/api/check-whitelist?pubkey={}", relay_api_base(), pubkey);
     let win = web_sys::window().ok_or("No window")?;
     let resp_val = JsFuture::from(win.fetch_with_str(&url))
@@ -152,6 +180,17 @@ async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool), Str
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Raw cohort list — surfaced for config-driven zone membership regardless
+    // of which access representation the relay returned.
+    let cohorts: Vec<String> = val["cohorts"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // New format: { access: { home, members, private } }
     if let Some(access) = val.get("access") {
         let home = access
@@ -166,22 +205,13 @@ async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool), Str
             .get("private")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        return Ok((home, members, private, is_admin));
+        return Ok((home, members, private, is_admin, cohorts));
     }
 
     // Fallback: normalize from cohorts array
     if is_admin {
-        return Ok((true, true, true, true));
+        return Ok((true, true, true, true, cohorts));
     }
-
-    let cohorts: Vec<String> = val["cohorts"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
 
     let home = cohorts
         .iter()
@@ -207,7 +237,7 @@ async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool), Str
         )
     });
 
-    Ok((home, members, private, false))
+    Ok((home, members, private, false, cohorts))
 }
 
 /// Retrieve the zone access store from context.

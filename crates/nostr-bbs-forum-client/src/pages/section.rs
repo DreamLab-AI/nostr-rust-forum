@@ -18,6 +18,7 @@ use crate::components::swipeable_message::SwipeableMessage;
 use crate::components::typing_indicator::TypingIndicator;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::zone_access::use_zone_access;
+use crate::stores::zones::{load_zones, ZoneVisibility};
 use crate::utils::{capitalize, set_timeout_once};
 
 #[derive(Clone, Debug)]
@@ -27,16 +28,16 @@ struct SectionHeader {
     channel_id: String,
 }
 
-/// Map a zone slug to its display name. Mirrors the table in
-/// `pages/category.rs::display_name` — keep in sync.
-/// Bug #22: avoid showing URL slug "Private" when zone is "Minimoonoir".
+/// Map a zone slug to its display name. Config-driven: resolves against the
+/// live `ZONE_CONFIG` zone list, falling back to a capitalised slug for unknown
+/// zones. Bug #22: avoid showing URL slug "Private" when the zone has a
+/// configured display name.
 fn category_display_name(slug: &str) -> String {
-    match slug {
-        "home" => "Home".to_string(),
-        "members" => "Members".to_string(),
-        "private" => "Minimoonoir".to_string(),
-        other => capitalize(other),
-    }
+    load_zones()
+        .into_iter()
+        .find(|z| z.id == slug)
+        .map(|z| z.label())
+        .unwrap_or_else(|| capitalize(slug))
 }
 
 /// Humanise a section slug for breadcrumb display. `home-lobby` → `Lobby`.
@@ -67,14 +68,18 @@ pub fn SectionPage() -> impl IntoView {
     let category_slug = move || params.read().get("category").unwrap_or_default();
     let section_slug = move || params.read().get("section").unwrap_or_default();
 
-    // Zone access gate: the category slug IS the zone ID
+    // Zone access gate: the category slug IS the zone ID. Config-driven —
+    // resolves against the live zone list. A public zone is always readable;
+    // otherwise membership (admin OR matching cohort) is required. Unknown
+    // zones default to accessible so relay-created channels never 403 the
+    // client UX (the relay remains the real boundary, ADR-022).
     let has_zone_access = Memo::new(move |_| {
         let cat = category_slug();
-        match cat.as_str() {
-            "home" => zone_access.home.get(),
-            "members" => zone_access.members.get(),
-            "private" => zone_access.private.get(),
-            _ => true, // unknown zones default to accessible
+        match load_zones().into_iter().find(|z| z.id == cat) {
+            Some(zone) => {
+                zone.visibility == ZoneVisibility::Public || zone_access.is_member_of(&zone)
+            }
+            None => true,
         }
     });
 
