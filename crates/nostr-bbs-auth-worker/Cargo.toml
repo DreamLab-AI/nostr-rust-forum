@@ -1,9 +1,9 @@
 [package]
 name = "nostr-bbs-auth-worker"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 edition = "2021"
 description = "Auth Worker: WebAuthn + NIP-98 + pod provisioning (nostr-bbs)"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
 homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
 documentation = "https://docs.rs/nostr-bbs-auth-worker"
