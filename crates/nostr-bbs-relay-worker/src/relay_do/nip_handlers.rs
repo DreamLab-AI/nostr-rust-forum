@@ -104,6 +104,33 @@ pub fn governance_response_blocked(kind: u64, is_admin: bool) -> bool {
     kind == governance::KIND_ACTION_RESPONSE && !is_admin
 }
 
+/// ADR-099: resolve the EFFECTIVE principal a session's access derives from.
+///
+/// When device keys are enabled and the authing `pubkey` is a registered,
+/// non-revoked device key, its session "acts as" the OWNER for READ scope and
+/// the OWNER is the principal the write-gate allowlist is checked against. The
+/// device's own signature is verified UNCHANGED upstream — this only rebinds
+/// *who is treated as the principal* for access, never the event's pubkey/sig.
+///
+/// `device_owner` is the already-resolved `device_owner(pubkey)` D1 lookup
+/// (`Some(owner)` for a non-revoked device row, `None` otherwise). `enabled` is
+/// `DEVICE_KEYS_ENABLED == "true"`.
+///
+/// Gate-off (`enabled == false`) ⇒ identity passthrough: returns `pubkey`
+/// verbatim, so a device key is just an unknown pubkey and every existing gate
+/// behaves exactly as before. Gate-on with no device row ⇒ also passthrough.
+///
+/// Pure over its inputs so the resolution is unit-testable without a
+/// `worker::Env` / D1.
+pub fn effective_principal(pubkey: &str, device_owner: Option<&str>, enabled: bool) -> String {
+    if enabled {
+        if let Some(owner) = device_owner {
+            return owner.to_string();
+        }
+    }
+    pubkey.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // NIP-01: EVENT handling
 // ---------------------------------------------------------------------------
@@ -165,9 +192,18 @@ impl NostrRelayDO {
                 );
                 return;
             }
-        } else if !self.is_whitelisted(&event.pubkey).await {
-            Self::send_ok(ws, &event.id, false, "blocked: pubkey not whitelisted");
-            return;
+        } else {
+            // ADR-099: a device-authored event is admitted under its OWNER's
+            // allowlist. `effective_pubkey` returns the owner for a registered
+            // non-revoked device key when DEVICE_KEYS_ENABLED, else the author
+            // pubkey verbatim (gate-off / non-device ⇒ unchanged behaviour). The
+            // event's signature was already verified strictly above against the
+            // device's own key; we only rebind WHO the allowlist is checked for.
+            let allowlist_pubkey = self.effective_pubkey(&event.pubkey).await;
+            if !self.is_whitelisted(&allowlist_pubkey).await {
+                Self::send_ok(ws, &event.id, false, "blocked: pubkey not whitelisted");
+                return;
+            }
         }
 
         // F11 (PRD-010): When mesh federation is active, events arriving from
@@ -604,10 +640,27 @@ impl NostrRelayDO {
         // Query D1 for matching events
         let events = self.query_events(&filters).await;
 
+        // ADR-099: the EFFECTIVE pubkey the session's READ scope derives from.
+        // When DEVICE_KEYS_ENABLED and the authed pubkey is a registered,
+        // non-revoked device key, cohorts / zone-read / admin status are computed
+        // for its OWNER (the device acts with the owner's read scope). Gate-off
+        // or a non-device pubkey ⇒ identity passthrough, so `access_pubkey ==
+        // session_pubkey` and every read decision below is unchanged.
+        //
+        // NOTE: the kind-1059 DM `#p` filter above is deliberately NOT rebound —
+        // it stays on the literal `session_pubkey`. A device key cannot decrypt
+        // the owner's NIP-17 gift-wraps (ADR-099 defers multi-device DMs to phase
+        // 2), so granting it the owner's DM scope would leak undecryptable (and
+        // policy-forbidden) traffic. Only cohort/zone READ scope is rebound here.
+        let access_pubkey: Option<String> = match &session_pubkey {
+            Some(pk) => Some(self.effective_pubkey(pk).await),
+            None => None,
+        };
+
         // Load the config-driven zone definitions once for this REQ.
         let zones = ZoneConfig::load(&self.env);
         // Admin status of the requester (if any). Admins see every zone.
-        let is_admin = match &session_pubkey {
+        let is_admin = match &access_pubkey {
             Some(pk) => self.admin_cache.is_admin(pk, &self.env).await,
             None => false,
         };
@@ -616,7 +669,7 @@ impl NostrRelayDO {
         // projection. Unauthenticated viewers have no cohorts. The admin flag
         // here mirrors `is_admin` above but is read from the whitelist row so the
         // projector remains correct even if the two sources ever diverge.
-        let (viewer_cohorts, cohort_admin) = match &session_pubkey {
+        let (viewer_cohorts, cohort_admin) = match &access_pubkey {
             Some(pk) => trust::get_viewer_cohorts(pk, &self.env).await,
             None => (Vec::new(), false),
         };
@@ -672,8 +725,11 @@ impl NostrRelayDO {
                     .unwrap_or_else(|| "home".to_string());
 
                 if !is_admin {
-                    // Member iff their cohorts grant read on this zone.
-                    let is_member = match &session_pubkey {
+                    // Member iff their cohorts grant read on this zone. ADR-099:
+                    // uses the effective (device→owner) pubkey so a device key
+                    // inherits the owner's zone read access; identity passthrough
+                    // when the feature is off or the pubkey is not a device.
+                    let is_member = match &access_pubkey {
                         Some(pk) => trust::has_zone_access(pk, &zone, &self.env).await,
                         None => zones.is_public_read(&zone),
                     };
@@ -993,6 +1049,58 @@ impl NostrRelayDO {
             },
             Err(_) => false,
         }
+    }
+
+    /// ADR-099: whether device-key honouring is enabled. Reads the
+    /// `DEVICE_KEYS_ENABLED` Worker var; only the exact string `"true"` enables
+    /// the feature. Absent/empty/any-other value ⇒ disabled (default off).
+    pub(crate) fn device_keys_enabled(&self) -> bool {
+        match self.env.var("DEVICE_KEYS_ENABLED") {
+            Ok(val) => val.to_string() == "true",
+            Err(_) => false,
+        }
+    }
+
+    /// ADR-099 (read-only here; the auth-worker owns writes): resolve the OWNER
+    /// account for a registered, non-revoked device key.
+    ///
+    /// Returns `Some(owner_pubkey)` for a `device_keys` row whose `revoked = 0`,
+    /// else `None`. Fail-safe: a missing `device_keys` table (not provisioned
+    /// yet) or any D1 error yields `None` — a device key then resolves to no
+    /// owner and is treated as an ordinary unknown pubkey.
+    pub(crate) async fn device_owner(&self, pubkey: &str) -> Option<String> {
+        let db = self.env.d1("DB").ok()?;
+
+        #[derive(serde::Deserialize)]
+        struct OwnerRow {
+            owner_pubkey: String,
+        }
+
+        let stmt = db.prepare(
+            "SELECT owner_pubkey FROM device_keys WHERE device_pubkey = ?1 AND revoked = 0 LIMIT 1",
+        );
+        // A missing table surfaces as a prepare/bind/exec error; `.ok()?` maps it
+        // to `None` (fail-safe), so the relay behaves as if no device exists.
+        let bound = stmt.bind(&[JsValue::from_str(pubkey)]).ok()?;
+        match bound.first::<OwnerRow>(None).await {
+            Ok(Some(row)) => Some(row.owner_pubkey),
+            _ => None,
+        }
+    }
+
+    /// ADR-099: resolve the EFFECTIVE principal for `pubkey`, applied to read
+    /// scope (cohorts/zone access) and the write-gate allowlist check.
+    ///
+    /// Gated by `DEVICE_KEYS_ENABLED`. When off, this is a pure identity
+    /// passthrough (no D1 read at all) — guaranteeing zero behaviour change. When
+    /// on, a registered non-revoked device key resolves to its OWNER; otherwise
+    /// the input pubkey is returned unchanged.
+    pub(crate) async fn effective_pubkey(&self, pubkey: &str) -> String {
+        if !self.device_keys_enabled() {
+            return pubkey.to_string();
+        }
+        let owner = self.device_owner(pubkey).await;
+        effective_principal(pubkey, owner.as_deref(), true)
     }
 
     pub(crate) async fn is_registered_agent(&self, pubkey: &str) -> bool {
@@ -1532,5 +1640,133 @@ mod write_gate_tests {
         // author `is_whitelisted` branch still applies (gift_wrap_recipient → None).
         let ev = mk_event(1, vec![p(&"22".repeat(32))]);
         assert_eq!(gift_wrap_recipient(&ev), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-099: revocable device-key access resolution tests
+// ---------------------------------------------------------------------------
+//
+// The async `device_owner` / `effective_pubkey` / `is_whitelisted` methods need
+// a `worker::Env` / D1 and cannot run in isolation. These tests pin the PURE
+// decision the handler feeds those lookups into:
+//   - `effective_principal` resolves the principal access derives from (the
+//     device→owner mapping, gated). This is the exact function the async
+//     `effective_pubkey` calls after resolving `device_owner(pubkey)` from D1.
+//   - `access_admitted` replays the write-gate boolean the handler computes:
+//     `is_whitelisted(effective_principal(author, owner, enabled))`.
+// The D1 `device_owner` query (missing-table → None) and the env gate read are
+// exercised by integration tests against a real D1; here we pin the resolution
+// and the access boundary those feed.
+#[cfg(test)]
+mod device_key_tests {
+    use super::*;
+
+    const DEVICE: &str = "de";
+    const OWNER: &str = "01";
+    const OTHER: &str = "99";
+
+    fn dev() -> String {
+        DEVICE.repeat(32)
+    }
+    fn owner() -> String {
+        OWNER.repeat(32)
+    }
+
+    // ---- pure resolution: effective_principal -----------------------------
+
+    #[test]
+    fn device_resolves_to_owner_when_enabled() {
+        // Registered, non-revoked device row (device_owner → Some(owner)) and the
+        // feature on ⇒ the session acts as the OWNER for access.
+        assert_eq!(
+            effective_principal(&dev(), Some(&owner()), true),
+            owner(),
+            "an enabled, registered device key must resolve to its owner"
+        );
+    }
+
+    #[test]
+    fn revoked_or_unknown_device_resolves_to_self() {
+        // `device_owner` returns `None` for a revoked row (the query filters
+        // `revoked = 0`) AND for an unknown pubkey AND for a missing table
+        // (fail-safe). All three reach here as `None` ⇒ identity passthrough.
+        assert_eq!(effective_principal(&dev(), None, true), dev());
+    }
+
+    #[test]
+    fn gate_off_is_identity_passthrough() {
+        // DEVICE_KEYS_ENABLED off ⇒ even a known device→owner mapping is ignored;
+        // the device key is just an unknown pubkey, current behaviour unchanged.
+        assert_eq!(effective_principal(&dev(), Some(&owner()), false), dev());
+        // And a non-device pubkey is of course unchanged too.
+        assert_eq!(effective_principal(&dev(), None, false), dev());
+    }
+
+    // ---- access decision: write-gate allowlist replay ---------------------
+    //
+    // The handler admits a (non-gift-wrap) event iff
+    // `is_whitelisted(effective_pubkey(author))`. We model `is_whitelisted` as a
+    // membership set and replay the exact composition.
+
+    /// Replay of the handler's write-gate: admit iff the EFFECTIVE principal is
+    /// whitelisted. `whitelisted` models the `is_whitelisted` D1 set.
+    fn access_admitted(
+        author: &str,
+        device_owner: Option<&str>,
+        enabled: bool,
+        whitelisted: &[String],
+    ) -> bool {
+        let principal = effective_principal(author, device_owner, enabled);
+        whitelisted.iter().any(|w| *w == principal)
+    }
+
+    #[test]
+    fn device_event_admitted_iff_owner_whitelisted() {
+        // Owner IS whitelisted, device is NOT ⇒ enabled device event admitted
+        // under the owner's allowlist.
+        let wl = vec![owner()];
+        assert!(
+            access_admitted(&dev(), Some(&owner()), true, &wl),
+            "device-authored event must be admitted when its owner is whitelisted"
+        );
+    }
+
+    #[test]
+    fn device_event_rejected_when_owner_not_whitelisted() {
+        // Owner NOT whitelisted ⇒ rejected even though it is a valid device row.
+        let wl = vec![OTHER.repeat(32)];
+        assert!(!access_admitted(&dev(), Some(&owner()), true, &wl));
+    }
+
+    #[test]
+    fn device_event_rejected_when_gate_off_even_if_owner_whitelisted() {
+        // Gate off ⇒ the device pubkey itself is checked. Owner whitelisted but
+        // device not ⇒ rejected. This is the "fully inert" guarantee: a device
+        // key is just an unknown pubkey.
+        let wl = vec![owner()];
+        assert!(!access_admitted(&dev(), Some(&owner()), false, &wl));
+    }
+
+    #[test]
+    fn revoked_device_rejected_even_when_enabled() {
+        // Revoked ⇒ `device_owner` is None ⇒ the device pubkey is checked, not
+        // the owner ⇒ rejected (owner whitelisted but device not).
+        let wl = vec![owner()];
+        assert!(!access_admitted(&dev(), None, true, &wl));
+    }
+
+    #[test]
+    fn non_device_author_unchanged() {
+        // An ordinary author (no device row) is checked against itself in both
+        // gate states — no behaviour change for the common path.
+        let author = "ab".repeat(32);
+        let wl = vec![author.clone()];
+        assert!(access_admitted(&author, None, true, &wl));
+        assert!(access_admitted(&author, None, false, &wl));
+        // ...and a non-whitelisted ordinary author is rejected, gate on or off.
+        let wl_empty: Vec<String> = vec![];
+        assert!(!access_admitted(&author, None, true, &wl_empty));
+        assert!(!access_admitted(&author, None, false, &wl_empty));
     }
 }
