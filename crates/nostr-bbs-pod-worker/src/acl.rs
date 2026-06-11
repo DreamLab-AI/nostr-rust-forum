@@ -218,15 +218,37 @@ fn parent_dir(path: &str) -> String {
 /// Find the effective ACL for a resource by walking up the container tree.
 ///
 /// Resolution order (most-specific first; first parseable hit wins):
-/// 1. KV fast-path: `acl:{owner_pubkey}` (the pod-level ACL)
-/// 2. R2 sidecar walk built by [`acl_probe_sequence`], which probes BOTH the
+/// 1. R2 sidecar walk built by [`acl_probe_sequence`], which probes BOTH the
 ///    resource's own flat sidecar `{path}.acl` AND every enclosing container
 ///    sidecar `{dir}/.acl` (the container case the legacy resolver skipped —
 ///    ADR-096), interleaved with the legacy flat `{dir}.acl` ancestor form.
+/// 2. KV miss-fallback ONLY: the pod-level `acl:{owner_pubkey}` key, consulted
+///    exclusively when the R2 walk found nothing at any level.
+///
+/// ## Why R2 is authoritative and KV is a fallback (delegation masking fix)
+///
+/// The KV `acl:{owner_pubkey}` key is a legacy whole-pod ACL keyed only by
+/// owner. It is NOT a cache of the resolved R2 result: nothing writes through
+/// to it on an `.acl` PUT, and the live provisioner
+/// ([`crate::provision::provision_pod`]) only ever writes R2 sidecars. Probing
+/// it FIRST (the previous behaviour) let a stale, owner-granular KV entry
+/// UNCONDITIONALLY short-circuit and shadow every more-specific R2 sidecar —
+/// including a per-container delegation grant written by
+/// [`build_delegation_acl`] to `<container>/.acl` (ADR-096). A pod whose owner
+/// happened to have a KV entry (e.g. legacy auth-worker provisioning) could
+/// therefore never have a delegation take effect.
+///
+/// R2 sidecars are the single source of truth. We resolve them first, by
+/// strict most-specific-wins precedence, so a delegation grant becomes
+/// effective on the very next resource access. KV is consulted only as a
+/// miss-fallback for pods that have no R2 sidecar at all, preserving any
+/// pre-existing KV-only deployments without ever masking R2.
 ///
 /// An ACL resolved from an ANCESTOR carries `inherited = true`, so the
 /// upstream evaluator honours only its `acl:default` rules (WAC §4.2). The
-/// resource's own sidecar carries `inherited = false`.
+/// resource's own sidecar carries `inherited = false`. The KV fallback ACL is
+/// a pod-level (root) document and is treated as non-inherited (its rules name
+/// the pod root via `acl:accessTo`/`acl:default`).
 ///
 /// All ACL documents are parsed via [`parse_acl_with_cap`] so any single
 /// graph larger than [`MAX_ACL_DOC_BYTES`] is rejected (treated as missing).
@@ -238,24 +260,16 @@ pub async fn find_effective_acl(
     owner_pubkey: &str,
     resource_path: &str,
 ) -> Option<AclDocument> {
-    // Fast path: pod-level ACL in KV
-    let kv_key = format!("acl:{owner_pubkey}");
-    if let Ok(Some(text)) = kv.get(&kv_key).text().await {
-        if let Some(doc) = parse_acl_text_with_cap(&text) {
-            return Some(doc);
-        }
-    }
-
-    // R2 sidecar walk: own sidecar, then each enclosing container sidecar.
+    // (1) R2 sidecar walk — AUTHORITATIVE. Own sidecar, then each enclosing
+    // container sidecar, most-specific first. The first parseable hit wins, so
+    // a per-container delegation grant at `<container>/.acl` is honoured before
+    // any broader (pod-level) ACL can apply.
     for (probe_path, inherited) in acl_probe_sequence(resource_path) {
         let acl_key = format!("pods/{owner_pubkey}{probe_path}");
         if let Ok(Some(obj)) = bucket.get(&acl_key).execute().await {
             if let Some(body) = obj.body() {
                 if let Ok(bytes) = body.bytes().await {
-                    if let Some(mut doc) = parse_acl_with_cap(&bytes) {
-                        // Mark inherited resolution so the evaluator applies
-                        // only `acl:default` rules for ancestor containers.
-                        doc.inherited = inherited;
+                    if let Some(doc) = resolve_r2_sidecar(&bytes, inherited) {
                         return Some(doc);
                     }
                 }
@@ -263,7 +277,61 @@ pub async fn find_effective_acl(
         }
     }
 
+    // (2) KV miss-fallback ONLY: a legacy pod-level ACL. Reached solely when
+    // the R2 walk resolved nothing, so it can never shadow a more-specific R2
+    // sidecar (and therefore can never mask a delegation grant).
+    let kv_key = format!("acl:{owner_pubkey}");
+    if let Ok(Some(text)) = kv.get(&kv_key).text().await {
+        if let Some(doc) = resolve_kv_fallback(&text) {
+            return Some(doc);
+        }
+    }
+
     None
+}
+
+/// Parse an R2 sidecar's bytes into an [`AclDocument`], stamping the
+/// `inherited` flag the [`acl_probe_sequence`] entry carried. Returns `None`
+/// if the bytes are missing, oversized, or unparseable (so the walk falls
+/// through to the next, broader probe).
+///
+/// Split out from [`find_effective_acl`] so the runtime-agnostic resolution
+/// ordering (R2-authoritative, KV-fallback) is unit-testable without the
+/// worker R2/KV runtime types — see [`resolve_effective_acl`].
+fn resolve_r2_sidecar(bytes: &[u8], inherited: bool) -> Option<AclDocument> {
+    let mut doc = parse_acl_with_cap(bytes)?;
+    // Mark inherited resolution so the evaluator applies only `acl:default`
+    // rules for ancestor containers.
+    doc.inherited = inherited;
+    Some(doc)
+}
+
+/// Parse the legacy KV pod-level ACL text into an [`AclDocument`]. The KV ACL
+/// names the pod root directly, so it is non-inherited (the default).
+fn resolve_kv_fallback(text: &str) -> Option<AclDocument> {
+    parse_acl_text_with_cap(text)
+}
+
+/// Pure, runtime-agnostic core of [`find_effective_acl`]: given an ordered
+/// most-specific-first list of R2 sidecar candidates `(bytes, inherited)` and
+/// an optional legacy KV pod-level ACL `text`, return the effective ACL using
+/// the EXACT precedence the live resolver uses — R2 is authoritative, KV is a
+/// miss-fallback consulted only when no R2 sidecar resolves.
+///
+/// This is the load-bearing ordering that fixes the pod-delegation masking
+/// bug (a stale KV `acl:{owner}` entry must never shadow a more-specific R2
+/// delegation sidecar). [`find_effective_acl`] is a thin async I/O loop that
+/// feeds R2/KV reads into exactly this decision.
+fn resolve_effective_acl<'a>(
+    r2_candidates: impl IntoIterator<Item = (&'a [u8], bool)>,
+    kv_text: Option<&str>,
+) -> Option<AclDocument> {
+    for (bytes, inherited) in r2_candidates {
+        if let Some(doc) = resolve_r2_sidecar(bytes, inherited) {
+            return Some(doc);
+        }
+    }
+    kv_text.and_then(resolve_kv_fallback)
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,5 +1152,169 @@ mod tests {
         ));
         // Exactly one authorisation (owner only) in the graph.
         assert_eq!(doc.graph.as_ref().map(Vec::len), Some(1));
+    }
+
+    // ── Pod-delegation masking (audit O3 / pod-cartography F-1) ─────────
+    //
+    // `find_effective_acl` needs the worker R2/KV runtime types and is not
+    // unit-testable natively. Its load-bearing logic is the resolution
+    // ORDERING — R2 sidecars are authoritative, the legacy KV `acl:{owner}`
+    // pod-level entry is a miss-fallback only. `resolve_effective_acl` is the
+    // pure core that `find_effective_acl` feeds R2/KV reads into; these tests
+    // drive it with the SAME `acl_probe_sequence` order the live resolver
+    // uses, modelling a provisioned pod (KV owner ACL set) plus a delegation
+    // grant written to the container `.acl`.
+
+    /// The exact legacy pod-level ACL the (now-dead) auth-worker
+    /// `pod::provision_pod` writes to KV `acl:{owner}`: owner-only Control on
+    /// the pod root, public read on profile/media. Crucially it contains NO
+    /// delegate authorisation — so if it shadows R2, the delegate is denied.
+    fn legacy_kv_owner_acl() -> String {
+        format!(
+            concat!(
+                r##"{{"@context":{{"acl":"http://www.w3.org/ns/auth/acl#","##,
+                r##""foaf":"http://xmlns.com/foaf/0.1/"}},"##,
+                r##""@graph":[{{"@id":"#owner","@type":"acl:Authorization","##,
+                r##""acl:agent":{{"@id":"{owner}"}},"##,
+                r##""acl:accessTo":{{"@id":"/"}},"acl:default":{{"@id":"/"}},"##,
+                r##""acl:mode":[{{"@id":"acl:Read"}},{{"@id":"acl:Write"}},"##,
+                r##"{{"@id":"acl:Control"}}]}}]}}"##,
+            ),
+            owner = OWNER,
+        )
+    }
+
+    /// Build the R2 candidate list for `resource_path` exactly as the live
+    /// resolver does — `acl_probe_sequence` order — pulling each sidecar's
+    /// bytes from a `(probe_key -> json)` store. `probe_key` is the
+    /// pod-relative `.acl` path (the second tuple field of the sequence is the
+    /// `inherited` flag).
+    fn r2_candidates_for<'a>(
+        resource_path: &str,
+        store: &'a std::collections::HashMap<String, Vec<u8>>,
+    ) -> Vec<(&'a [u8], bool)> {
+        acl_probe_sequence(resource_path)
+            .into_iter()
+            .filter_map(|(key, inherited)| {
+                store.get(&key).map(|bytes| (bytes.as_slice(), inherited))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn delegation_grant_is_not_masked_by_legacy_kv_owner_acl() {
+        // Scenario: a pod was provisioned via the path that sets the KV
+        // `acl:{owner}` entry (legacy auth-worker provisioning). The owner
+        // then delegates Write on `/private/agent/` to DELEGATE by PUTting
+        // the structured grant — the worker serialises it via
+        // `build_delegation_acl` and stores it at the CONTAINER sidecar
+        // `pods/{owner}/private/agent/.acl`.
+        let kv_owner_acl = legacy_kv_owner_acl();
+
+        let delegation = build_delegation_acl(
+            OWNER,
+            DELEGATE,
+            "/private/agent/",
+            &[AccessMode::Write],
+        );
+        let delegation_bytes =
+            serde_json::to_vec(&delegation).expect("delegation serialises");
+
+        let mut r2: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        // The PUT route stores the grant at the container sidecar; in
+        // pod-relative probe-key terms that is `/private/agent/.acl`.
+        r2.insert("/private/agent/.acl".to_string(), delegation_bytes);
+
+        // Resolve the effective ACL for a resource INSIDE the delegated
+        // container, through the real probe order + resolution precedence.
+        let resource = "/private/agent/SOUL.md";
+        let candidates = r2_candidates_for(resource, &r2);
+        let effective = resolve_effective_acl(candidates, Some(&kv_owner_acl))
+            .expect("an ACL must resolve (R2 sidecar present)");
+
+        // THE FIX: the R2 delegation sidecar wins; the KV owner-only ACL did
+        // NOT short-circuit and mask it. The delegate now has Write...
+        assert!(
+            evaluate_access(Some(&effective), Some(DELEGATE), resource, AccessMode::Write),
+            "delegate must resolve Write — KV owner ACL must not mask the R2 delegation grant"
+        );
+        // ...and Append (Write implies Append upstream)...
+        assert!(evaluate_access(
+            Some(&effective),
+            Some(DELEGATE),
+            resource,
+            AccessMode::Append
+        ));
+        // ...but never Control (delegation never confers Control).
+        assert!(!evaluate_access(
+            Some(&effective),
+            Some(DELEGATE),
+            resource,
+            AccessMode::Control
+        ));
+        // The owner's Control survives in the delegation doc.
+        assert!(evaluate_access(
+            Some(&effective),
+            Some(OWNER),
+            resource,
+            AccessMode::Control
+        ));
+    }
+
+    #[test]
+    fn masking_repro_kv_first_would_have_denied_delegate() {
+        // Guard against regressing to the old "KV first" ordering. Under the
+        // buggy order the legacy KV owner-only ACL (no delegate authorisation)
+        // would have been returned and the delegate denied Write. Assert that
+        // the KV doc, on its own, indeed lacks the grant — so the ONLY reason
+        // the previous test passes is the R2-first precedence.
+        let kv_owner_acl = legacy_kv_owner_acl();
+        let kv_doc = resolve_kv_fallback(&kv_owner_acl).expect("KV ACL parses");
+        assert!(
+            !evaluate_access(
+                Some(&kv_doc),
+                Some(DELEGATE),
+                "/private/agent/SOUL.md",
+                AccessMode::Write
+            ),
+            "legacy KV owner ACL grants the delegate nothing — proving it WOULD mask the grant if probed first"
+        );
+        // And it keeps owner Control, confirming it is a real owner ACL.
+        assert!(evaluate_access(
+            Some(&kv_doc),
+            Some(OWNER),
+            "/private/agent/SOUL.md",
+            AccessMode::Control
+        ));
+    }
+
+    #[test]
+    fn kv_fallback_still_serves_when_no_r2_sidecar() {
+        // Single-source-of-truth must not break pre-existing KV-only pods:
+        // with NO R2 sidecar at any level, the KV owner ACL is the fallback.
+        let kv_owner_acl = legacy_kv_owner_acl();
+        let empty_r2: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        let candidates = r2_candidates_for("/private/agent/SOUL.md", &empty_r2);
+        assert!(candidates.is_empty(), "no R2 sidecars in this scenario");
+
+        let effective = resolve_effective_acl(candidates, Some(&kv_owner_acl))
+            .expect("KV fallback resolves when R2 is empty");
+        // Owner retains Control via the fallback.
+        assert!(evaluate_access(
+            Some(&effective),
+            Some(OWNER),
+            "/private/agent/SOUL.md",
+            AccessMode::Control
+        ));
+    }
+
+    #[test]
+    fn no_r2_no_kv_denies_all() {
+        let empty_r2: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        let candidates = r2_candidates_for("/foo", &empty_r2);
+        assert!(resolve_effective_acl(candidates, None).is_none());
     }
 }
