@@ -135,6 +135,18 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
     let field_count = panel.definition.fields.len();
     let action_count = panel.definition.actions.len();
 
+    // Contexts resolved at construction (NOT inside the click handler — resolving
+    // expect_context at event time risks "expected context" panics once the
+    // reactive owner is gone). Panel action buttons publish a 31403 ActionResponse
+    // keyed on the panel's own d-tag + definition event id, so a human can act
+    // directly on a panel (the publishing agent subscribes to responses on its
+    // panel d-tag), mirroring the ActionRow flow below.
+    let auth = use_auth();
+    let is_authed = auth.is_authenticated();
+    let relay = expect_context::<RelayConnection>();
+    let panel_d_tag = panel.d_tag.clone();
+    let panel_event_id = panel.event_id.clone();
+
     view! {
         <div class="panel-card bg-gray-800 rounded-lg p-5 border border-gray-700/50 hover:border-amber-400/30 transition-colors">
             <div class="flex items-center justify-between mb-3">
@@ -149,14 +161,71 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
             </div>
             <div class="flex gap-2">
                 {panel.definition.actions.iter().map(|action| {
+                    let action_id = action.id.clone();
                     let label = action.label.clone();
                     let btn_class = match format!("{:?}", action.style).as_str() {
-                        "Destructive" => "px-3 py-1.5 text-xs rounded bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors",
-                        "Primary" => "px-3 py-1.5 text-xs rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 hover:bg-amber-500/20 transition-colors",
-                        _ => "px-3 py-1.5 text-xs rounded bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600 transition-colors",
+                        "Destructive" => "px-3 py-1.5 text-xs rounded bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors disabled:opacity-50",
+                        "Primary" => "px-3 py-1.5 text-xs rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 hover:bg-amber-500/20 transition-colors disabled:opacity-50",
+                        _ => "px-3 py-1.5 text-xs rounded bg-gray-700 text-gray-300 border border-gray-600 hover:bg-gray-600 transition-colors disabled:opacity-50",
+                    };
+                    let loading = RwSignal::new(false);
+                    let sent = RwSignal::new(false);
+                    let on_click = {
+                        let action_id = action_id.clone();
+                        let d_tag = panel_d_tag.clone();
+                        let event_id = panel_event_id.clone();
+                        let auth = auth.clone();
+                        let relay = relay.clone();
+                        move |_: web_sys::MouseEvent| {
+                            if loading.get_untracked() || sent.get_untracked() {
+                                return;
+                            }
+                            let pubkey = match auth.pubkey().get_untracked() {
+                                Some(pk) => pk,
+                                None => return,
+                            };
+                            loading.set(true);
+                            let content = serde_json::json!({
+                                "action": action_id,
+                                "reasoning": format!("Human selected '{action_id}' on this panel via the governance UI"),
+                            })
+                            .to_string();
+                            let now = (js_sys::Date::now() / 1000.0) as u64;
+                            let unsigned = nostr_bbs_core::UnsignedEvent {
+                                pubkey,
+                                created_at: now,
+                                kind: nostr_bbs_core::governance::KIND_ACTION_RESPONSE,
+                                tags: vec![
+                                    vec!["d".to_string(), d_tag.clone()],
+                                    vec!["e".to_string(), event_id.clone()],
+                                ],
+                                content,
+                            };
+                            match auth.sign_event(unsigned) {
+                                Ok(signed) => {
+                                    relay.publish(&signed);
+                                    sent.set(true);
+                                    loading.set(false);
+                                }
+                                Err(e) => {
+                                    web_sys::console::warn_1(
+                                        &format!("[governance] panel action sign failed: {e}").into(),
+                                    );
+                                    loading.set(false);
+                                }
+                            }
+                        }
                     };
                     view! {
-                        <button class=btn_class disabled=true>{label}</button>
+                        <button
+                            class=btn_class
+                            disabled=move || !is_authed.get() || loading.get() || sent.get()
+                            on:click=on_click
+                        >
+                            {move || if sent.get() { "✓ Sent".to_string() }
+                                else if loading.get() { "…".to_string() }
+                                else { label.clone() }}
+                        </button>
                     }
                 }).collect_view()}
             </div>
