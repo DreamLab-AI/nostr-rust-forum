@@ -687,6 +687,12 @@ impl NostrRelayDO {
         // cohorts, so it is limited to Public zones for content and to
         // non-Hidden zones for definitions — closing the prior gap where zone
         // filtering only ran when session_pubkey.is_some().
+        // Count events actually DELIVERED to the reader this REQ. NIP-01 read
+        // activity is "events received on a subscription", so we tally post-zone
+        // filtering (an event withheld by zone access was never read) and batch
+        // a single `posts_read` increment at EOSE — never per filter, never per
+        // skipped event, and only for an authenticated whitelisted member.
+        let mut delivered: i32 = 0;
         for event in &events {
             // Phase C: NIP-52 calendar kinds (31922 date, 31923 time, 31925 RSVP)
             // are zone-scoped via a native `["zone", "<slug>"]` binding tag on the
@@ -708,6 +714,7 @@ impl NostrRelayDO {
                     .await
                 {
                     Self::send_event(&ws, sub_id, &out);
+                    delivered += 1;
                 }
                 continue;
             }
@@ -752,8 +759,24 @@ impl NostrRelayDO {
             }
 
             Self::send_event(&ws, sub_id, event);
+            delivered += 1;
         }
         Self::send_eose(&ws, sub_id);
+
+        // O1: count this REQ's reads toward TL0→TL1 promotion. Gate on an
+        // authenticated session and at least one delivered event; the
+        // `increment_posts_read_by` UPDATE is whitelist-scoped, so a
+        // non-member authed pubkey is a harmless no-op. We charge the read to
+        // the literal session pubkey (the identity that subscribed), not the
+        // device→owner `access_pubkey` rebinding used for zone reads. After the
+        // batched increment, run the same `check_promotion` the EVENT path uses
+        // so a reader can cross the threshold without needing to also write.
+        if delivered > 0 {
+            if let Some(pk) = &session_pubkey {
+                trust::increment_posts_read_by(pk, delivered, &self.env).await;
+                let _ = trust::check_promotion(pk, &self.env).await;
+            }
+        }
     }
 
     /// Phase C: project a single NIP-52 calendar event for one viewer.

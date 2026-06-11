@@ -415,13 +415,28 @@ pub async fn increment_posts_created(pubkey: &str, env: &Env) {
     }
 }
 
-/// Increment the `posts_read` counter for a pubkey.
-#[allow(dead_code)]
+/// Increment the `posts_read` counter for a pubkey by one.
 pub async fn increment_posts_read(pubkey: &str, env: &Env) {
+    increment_posts_read_by(pubkey, 1, env).await;
+}
+
+/// Increment the `posts_read` counter for a pubkey by `count`.
+///
+/// Batched per REQ so a subscription that delivers N matching events to a
+/// whitelisted reader costs one D1 write, not N. A non-positive `count` is a
+/// no-op; the `WHERE pubkey` predicate scopes the write to the whitelist row,
+/// so a non-member pubkey leaves no rows touched.
+pub async fn increment_posts_read_by(pubkey: &str, count: i32, env: &Env) {
+    if count <= 0 {
+        return;
+    }
     if let Ok(db) = env.d1("DB") {
         if let Ok(bound) = db
-            .prepare("UPDATE whitelist SET posts_read = posts_read + 1 WHERE pubkey = ?1")
-            .bind(&[JsValue::from_str(pubkey)])
+            .prepare("UPDATE whitelist SET posts_read = posts_read + ?1 WHERE pubkey = ?2")
+            .bind(&[
+                JsValue::from_f64(count as f64),
+                JsValue::from_str(pubkey),
+            ])
         {
             let _ = bound.run().await;
         }
@@ -737,6 +752,62 @@ mod tests {
         assert_eq!(t.tl2_posts_read, 50);
         assert_eq!(t.tl2_posts_created, 10);
         assert_eq!(t.demotion_hysteresis_pct, 90);
+    }
+
+    #[test]
+    fn posts_read_gates_tl1_promotion() {
+        // O1: with days + a post satisfied, the read counter is the ONLY thing
+        // standing between TL0 and TL1. This is the model layer `check_promotion`
+        // delegates to, so it proves the wired `increment_posts_read` makes the
+        // TL0→TL1 transition reachable via relay reads.
+        let t = TrustThresholds::default();
+        let days = t.tl1_days_active;
+        let posts = t.tl1_posts_created;
+
+        // Simulate REQ-driven reads accumulating toward the threshold.
+        let mut posts_read = 0;
+        for _ in 0..(t.tl1_posts_read - 1) {
+            posts_read += 1;
+            assert_eq!(
+                compute_trust_level(days, posts_read, posts, 0, &t),
+                TrustLevel::Newcomer,
+                "below {} reads must stay TL0",
+                t.tl1_posts_read
+            );
+        }
+
+        // The read that crosses the threshold promotes TL0 → TL1.
+        posts_read += 1;
+        assert_eq!(posts_read, t.tl1_posts_read);
+        assert_eq!(
+            compute_trust_level(days, posts_read, posts, 0, &t),
+            TrustLevel::Member,
+            "crossing {} reads must promote to TL1",
+            t.tl1_posts_read
+        );
+    }
+
+    #[test]
+    fn posts_read_alone_insufficient_for_tl1() {
+        // Reads with no posts created or no days active must NOT promote, so the
+        // batched read increment cannot fabricate a TL1 on its own.
+        let t = TrustThresholds::default();
+        // Reads + days but zero posts created.
+        assert_eq!(
+            compute_trust_level(t.tl1_days_active, t.tl1_posts_read, 0, 0, &t),
+            TrustLevel::Newcomer
+        );
+        // Reads + post but too few days active.
+        assert_eq!(
+            compute_trust_level(
+                t.tl1_days_active - 1,
+                t.tl1_posts_read,
+                t.tl1_posts_created,
+                0,
+                &t
+            ),
+            TrustLevel::Newcomer
+        );
     }
 
     #[test]
