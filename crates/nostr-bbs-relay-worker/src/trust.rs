@@ -283,7 +283,12 @@ pub async fn check_promotion(pubkey: &str, env: &Env) -> Option<TrustLevel> {
 ///
 /// TL3 users are never auto-demoted. TL1 users can be demoted to TL0.
 /// TL2 users can be demoted to TL1 or TL0.
-#[allow(dead_code)]
+///
+/// ADR-102: wired into the periodic inactivity-decay sweep in
+/// [`crate::cron::sweep_inactive_demotions`]. This is inherently time-driven
+/// (the precondition is a ~6-month inactivity gate), so the cron sweep — not a
+/// request handler — is its only caller; firing it on a request would target
+/// ACTIVE users, the opposite of its precondition.
 pub async fn check_demotion(pubkey: &str, env: &Env) -> Option<TrustLevel> {
     let db = env.d1("DB").ok()?;
     let thresholds = TrustThresholds::load(env).await;
@@ -302,8 +307,16 @@ pub async fn check_demotion(pubkey: &str, env: &Env) -> Option<TrustLevel> {
 
     let current = TrustLevel::from_i32(row.trust_level);
 
-    // TL3 never auto-demoted; TL0 cannot be demoted further
+    // TL3 never auto-demoted; TL0 cannot be demoted further (TL0 floor).
     if current == TrustLevel::Trusted || current == TrustLevel::Newcomer {
+        return Some(current);
+    }
+
+    // ADR-102: admin/exempt rows are never auto-demoted, regardless of trust
+    // level or inactivity. An admin can sit at TL2 without losing standing
+    // while away. This guard lives in `check_demotion` itself so it holds for
+    // every call path (the cron sweep and any future request-driven caller).
+    if row.is_admin.unwrap_or(0) == 1 {
         return Some(current);
     }
 

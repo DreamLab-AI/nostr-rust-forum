@@ -725,7 +725,15 @@ fn accepts_nostr_json(req: &Request) -> bool {
 // Cron keep-warm
 // ---------------------------------------------------------------------------
 
-/// Cron handler: touch D1 to keep the connection pool warm and prevent cold starts.
+/// Cron handler: keep-warm plus the ADR-102 inactivity-decay trust sweep.
+///
+/// The `SELECT 1` touches D1 to keep the connection pool warm and prevent cold
+/// starts. The demotion sweep (ADR-102) then selects whitelist rows past the
+/// ~6-month inactivity gate and applies `trust::check_demotion` to each —
+/// wiring the previously-dead demotion path onto the only trigger whose
+/// semantics match its precondition (time-driven, not request-driven). The
+/// sweep is paged and bounded; a sweep error is logged but never propagated, so
+/// it cannot break the keep-warm tick.
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let db = match env.d1("DB") {
@@ -736,4 +744,18 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         .prepare("SELECT 1")
         .first::<serde_json::Value>(None)
         .await;
+
+    match cron::sweep_inactive_demotions(&env).await {
+        Ok(result) => {
+            if result.demoted > 0 || result.truncated {
+                console_log!(
+                    "trust demotion sweep: scanned={} demoted={} truncated={}",
+                    result.scanned,
+                    result.demoted,
+                    result.truncated
+                );
+            }
+        }
+        Err(e) => console_error!("trust demotion sweep failed: {e}"),
+    }
 }

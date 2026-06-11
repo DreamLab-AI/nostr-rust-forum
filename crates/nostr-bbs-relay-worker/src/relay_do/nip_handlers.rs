@@ -774,6 +774,14 @@ impl NostrRelayDO {
         if delivered > 0 {
             if let Some(pk) = &session_pubkey {
                 trust::increment_posts_read_by(pk, delivered, &self.env).await;
+                // ADR-102: a delivered read is activity. Stamp `last_active_at`
+                // so a read-only member's inactivity clock resets, mirroring
+                // the EVENT path's `update_last_active`. Without this, an active
+                // lurker who never writes would drift past the ~6-month
+                // inactivity gate and be demoted by the cron sweep despite
+                // reading daily. The UPDATE is whitelist-scoped, so a non-member
+                // authed pubkey is a harmless no-op.
+                trust::update_last_active(pk, &self.env).await;
                 let _ = trust::check_promotion(pk, &self.env).await;
             }
         }
