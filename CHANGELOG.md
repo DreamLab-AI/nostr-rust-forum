@@ -6,6 +6,43 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 and this project tracks the spec home at [VisionClaw monorepo](https://github.com/DreamLab-AI/VisionClaw)
 (`docs/specs/` + `docs/adr/`) for cross-substrate normative decisions.
 
+## [ADR backfill] - 2026-06-11
+
+### Added
+
+- **ADR index / register** (`docs/adr/README.md`): canonical register of ADR-086
+  onward, listing the three sprint-resident ADRs (090/091/092 under
+  `docs/sprint/2026-05-17-ux-audit/`), noting ADR-102 as incoming (trust demotion),
+  and recording the numbering-authority convention (sequential, unique, this dir
+  canonical; ADRs 001–085 are the upstream/historical kit record, not filed here).
+  Closes register gap **G6**.
+- **ADR-100 — Key lifecycle** (`docs/adr/`): three-tier key model (root /
+  purpose-subkey / device key); device keys absorb day-to-day exposure so root
+  rotation stays a rare, identity-fatal last resort; compromise-response playbook
+  by scope; ordering invariant **revoke → rotate → re-enrol**. Reconciles ADR-094's
+  no-compromise-isolation disclaimer with ADR-099's `device_keys.revoked`.
+- **ADR-101 — Multi-device NIP-17 DM delivery** (`docs/adr/`): the ADR-099 phase-2
+  deferral. Our client multi-wraps each DM to the recipient's master **and** each
+  registered non-revoked device key; graceful degradation when an outside client
+  reaches only the master; relay admission unchanged (per ADR-104). Implementation
+  deferred — `forum-client/src/dm/mod.rs` send-path expansion + auth-worker per-owner
+  device lookup; relay untouched.
+- **ADR-103 — Kit semver / publish / yank policy** (`docs/adr/`): defines
+  API-breaking (removing any `pub` item — the `!` commits dropping `nip26`/`nip90`),
+  `1.0.0-beta.N` line semantics (breaking bumps the beta counter, not major; betas
+  don't auto-match), next publish is **1.0.0-beta.3**, yank-for-defect-only policy,
+  and the SHA-pin downstream contract (dreamlab pins by SHA). Codifies the R2/R4
+  audit findings.
+- **ADR-104 — NIP-59 gift-wrap recipient admission + relay gating** (`docs/adr/`):
+  documents the implemented rule — the relay admits kind-1059 by **recipient `#p`
+  whitelist membership**, never the ephemeral author, without decrypting. Privacy
+  boundary (relay is a zero-knowledge router), device-key effective-pubkey
+  attribution, and why DM `#p` is deliberately **not** rebound to the owner
+  (`relay_do/nip_handlers.rs:649-657`). References `docs/diagrams/relay-event-admission.md`.
+
+> ADR-102 (trust demotion, anomaly O1) is reserved and owned by concurrent
+> `relay-worker/src/trust.rs` work; it lands with that change.
+
 ## [Upstream kit features] - 2026-06-11
 
 ### Added
