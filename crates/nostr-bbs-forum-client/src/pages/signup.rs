@@ -28,7 +28,9 @@ use solid_pod_rs::webid::{pod_git_clone_url, webid_url};
 use crate::app::{base_href, current_app_path};
 use crate::auth::use_auth;
 use crate::components::nsec_backup::NsecBackup;
+use crate::components::recovery_sheet::RecoverySheet;
 use crate::components::toast::{use_toasts, ToastVariant};
+use crate::utils::relay_url::relay_url;
 use crate::utils::shorten_pubkey;
 
 const POD_API: &str = match option_env!("VITE_POD_API_URL") {
@@ -230,6 +232,11 @@ pub fn SignupPage() -> impl IntoView {
     let privkey_hex = RwSignal::new(String::new());
     let claimed_username = RwSignal::new(Option::<String>::None);
     let is_busy = RwSignal::new(false);
+    // ADR-095 gate: the finish/exit control in the Backup phase stays disabled
+    // until the recovery sheet has been printed AND confirmed (`sheet_ready`),
+    // unless the user takes the explicit advanced override.
+    let sheet_ready = RwSignal::new(false);
+    let advanced_override = RwSignal::new(false);
 
     // returnTo: same base-relative normalisation as login.rs (ADR-090).
     let query = use_query_map();
@@ -391,10 +398,26 @@ pub fn SignupPage() -> impl IntoView {
         }
     };
 
-    let on_backup_done = Callback::new(move |()| {
+    // The real exit: confirm backup + navigate away. Performs no gating itself
+    // so it can be reused by both the gated finish button and the override.
+    let finish_signup = Callback::new(move |()| {
         auth.confirm_nsec_backup();
         let dest = return_to();
         navigate.with_value(|nav| nav(&dest, NavigateOptions::default()));
+    });
+
+    // Gated dismiss handed to NsecBackup. Clicking "I've saved my backup" only
+    // exits once the recovery sheet gate is satisfied (or the advanced override
+    // is taken); otherwise we steer the user to the sheet (insist-with-override).
+    let on_backup_done = Callback::new(move |()| {
+        if sheet_ready.get_untracked() || advanced_override.get_untracked() {
+            finish_signup.run(());
+        } else {
+            toasts.show(
+                "Print & confirm your recovery sheet first (or use the advanced override).",
+                ToastVariant::Warning,
+            );
+        }
     });
 
     // Redirect if already authenticated AND not in the middle of the new
@@ -687,9 +710,53 @@ pub fn SignupPage() -> impl IntoView {
                         </button>
                     </Show>
 
-                    // ── Phase 3: nsec backup (unchanged component) ────
+                    // ── Phase 3: nsec backup + recovery sheet (ADR-095) ──
                     <Show when=move || phase.get() == Phase::Backup>
-                        <NsecBackup nsec=privkey_hex.get_untracked() on_dismiss=on_backup_done />
+                        <div class="space-y-6">
+                            // Plain nsec card (unchanged component, same nsec source).
+                            <NsecBackup nsec=privkey_hex.get_untracked() on_dismiss=on_backup_done />
+
+                            // Printable recovery & device-onboarding sheet.
+                            // Client-side only: the nsec never leaves the browser.
+                            <RecoverySheet
+                                privkey_hex=privkey_hex.get_untracked()
+                                pubkey_hex=pubkey.get_untracked().unwrap_or_default()
+                                relay_url=relay_url()
+                                display_name=display_name.get_untracked()
+                                nip05=nip05_handle.get_untracked()
+                                on_ready=Callback::new(move |()| sheet_ready.set(true))
+                            />
+
+                            // Gated finish control + advanced override.
+                            <div class="rs-screen-controls space-y-3">
+                                <button
+                                    data-testid="signup-finish"
+                                    prop:disabled=move || {
+                                        !(sheet_ready.get() || advanced_override.get())
+                                    }
+                                    on:click=move |_: web_sys::MouseEvent| finish_signup.run(())
+                                    class="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-40 \
+                                           disabled:cursor-not-allowed text-gray-900 font-semibold \
+                                           py-3 px-4 rounded-xl transition-colors"
+                                >
+                                    "Finish — enter the forum"
+                                </button>
+                                <Show
+                                    when=move || !(sheet_ready.get() || advanced_override.get())
+                                >
+                                    <button
+                                        data-testid="signup-advanced-override"
+                                        on:click=move |_: web_sys::MouseEvent| {
+                                            advanced_override.set(true);
+                                        }
+                                        class="block w-full text-center text-xs text-gray-500 \
+                                               hover:text-gray-300 underline"
+                                    >
+                                        "I've stored my key elsewhere (advanced)"
+                                    </button>
+                                </Show>
+                            </div>
+                        </div>
                     </Show>
 
                 </div>

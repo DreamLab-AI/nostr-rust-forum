@@ -127,5 +127,8 @@ send_wrapper = "0.6"
 serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1"
 bech32 = "0.11"
+# Pure-Rust QR generator (no_std-friendly, wasm32-clean). Renders QR codes to
+# SVG strings entirely in-WASM so the nsec never crosses into JS (ADR-095).
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["js"] }
