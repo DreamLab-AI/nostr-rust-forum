@@ -8,6 +8,8 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use leptos_router::components::A;
 use nostr_bbs_core::UnsignedEvent;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
@@ -20,6 +22,7 @@ use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::preferences::{save_preferences, use_preferences, NotificationLevel, Theme};
+use crate::utils::pod_client::upload_to_pod_signer;
 use crate::utils::relay_url::auth_api_base;
 use crate::utils::shorten_pubkey;
 
@@ -34,6 +37,9 @@ const POD_API: &str = match option_env!("VITE_POD_API_URL") {
     Some(u) => u,
     None => "https://pod.example.com",
 };
+
+/// Client-side size cap for profile picture uploads (~2 MB).
+const MAX_AVATAR_BYTES: f64 = 2.0 * 1024.0 * 1024.0;
 
 /// Key used to persist muted pubkeys in localStorage.
 const MUTED_STORAGE_KEY: &str = "nostr_bbs_muted";
@@ -308,109 +314,122 @@ pub fn SettingsPage() -> impl IntoView {
 
     // -- Profile save handler --
     let toasts_for_profile = toasts;
+    let relay_for_save = relay.clone();
     let on_save_profile = move |_| {
         let name = nickname.get_untracked().trim().to_string();
         if name.is_empty() {
             toasts_for_profile.show("Nickname cannot be empty", ToastVariant::Warning);
             return;
         }
-
-        let pubkey_hex = match auth.pubkey().get_untracked() {
-            Some(pk) => pk,
-            None => {
-                toasts_for_profile.show("Not authenticated", ToastVariant::Error);
-                return;
-            }
-        };
-
-        profile_saving.set(true);
-
-        // The nickname is published as `display_name` ONLY — it is never a
-        // username claim (QA HIGH bug #5a: saving "Carol QA" used to be
-        // presented as a claimed handle, violating the [a-z0-9_-]{3,30}
-        // rule and minting an invalid NIP-05). When a username IS claimed,
-        // it keeps owning the `name` + `nip05` fields; username changes go
-        // through the explicit, validated claim flow.
-        let mut metadata = serde_json::Map::new();
-        metadata.insert(
-            "display_name".into(),
-            serde_json::Value::String(name.clone()),
+        publish_profile_metadata(
+            auth,
+            relay_for_save.clone(),
+            toasts_for_profile,
+            profile_saving,
+            name,
+            claimed_username.get_untracked(),
+            about.get_untracked().trim().to_string(),
+            avatar_url.get_untracked().trim().to_string(),
+            birthday.get_untracked().trim().to_string(),
+            "Profile updated",
         );
-        if let Some(username) = claimed_username.get_untracked() {
-            metadata.insert("name".into(), serde_json::Value::String(username.clone()));
-            metadata.insert(
-                "nip05".into(),
-                serde_json::Value::String(format!("{}@{}", username, NIP05_USERNAME_HOST)),
-            );
-        } else {
-            // No claimed username: keep `name` mirroring the display name
-            // for clients that only read `name`, but nothing here is ever
-            // treated as a claimed handle.
-            metadata.insert("name".into(), serde_json::Value::String(name.clone()));
-        }
-        let bio = about.get_untracked().trim().to_string();
-        if !bio.is_empty() {
-            metadata.insert("about".into(), serde_json::Value::String(bio));
-        }
-        let pic = avatar_url.get_untracked().trim().to_string();
-        if !pic.is_empty() {
-            metadata.insert("picture".into(), serde_json::Value::String(pic.clone()));
-        }
-        let bday = birthday.get_untracked().trim().to_string();
-        if !bday.is_empty() {
-            metadata.insert("birthday".into(), serde_json::Value::String(bday));
-        }
+    };
 
-        let content =
-            serde_json::to_string(&serde_json::Value::Object(metadata)).unwrap_or_default();
-
-        let unsigned = UnsignedEvent {
-            pubkey: pubkey_hex,
-            created_at: (js_sys::Date::now() / 1000.0) as u64,
-            kind: 0,
-            tags: vec![],
-            content,
+    // -- Profile picture upload handler --
+    //
+    // Stores the image in the user's pod public media folder (NIP-98 authed
+    // POST via `pod_client::upload_to_pod_signer`), then republishes kind-0
+    // with `picture` set to the public pod URL, preserving all other fields.
+    let pic_uploading = RwSignal::new(false);
+    let toasts_for_pic = toasts;
+    let relay_for_pic = relay.clone();
+    let on_pic_file = move |ev: leptos::ev::Event| {
+        let input: web_sys::HtmlInputElement = event_target(&ev);
+        let Some(file) = input.files().and_then(|fl| fl.get(0)) else {
+            return;
         };
-
-        let toasts_ok = toasts_for_profile;
-        let toasts_pub = toasts_for_profile;
-        let toasts_err = toasts_for_profile;
-        let relay = relay.clone();
+        // Reset so re-selecting the same file re-fires `change`.
+        input.set_value("");
+        if file.size() > MAX_AVATAR_BYTES {
+            toasts_for_pic.show(
+                "Image too large — maximum size is 2 MB",
+                ToastVariant::Warning,
+            );
+            return;
+        }
+        let Some(pk) = auth.pubkey().get_untracked() else {
+            toasts_for_pic.show("Not authenticated", ToastVariant::Error);
+            return;
+        };
+        let Some(signer) = auth.get_signer() else {
+            toasts_for_pic.show("Not authenticated", ToastVariant::Error);
+            return;
+        };
+        pic_uploading.set(true);
+        let relay = relay_for_pic.clone();
+        let name = nickname.get_untracked().trim().to_string();
+        let claimed = claimed_username.get_untracked();
+        let bio = about.get_untracked().trim().to_string();
+        let bday = birthday.get_untracked().trim().to_string();
         wasm_bindgen_futures::spawn_local(async move {
-            match auth.sign_event_async(unsigned).await {
-                Ok(signed) => {
-                    let saving_sig = profile_saving;
-                    let auth_for_ack = auth;
-                    let name_for_ack = name.clone();
-                    let avatar_for_ack = if pic.is_empty() {
-                        None
-                    } else {
-                        Some(pic.clone())
-                    };
-                    let ack = Rc::new(move |accepted: bool, message: String| {
-                        saving_sig.set(false);
-                        if accepted {
-                            auth_for_ack
-                                .set_profile(Some(name_for_ack.clone()), avatar_for_ack.clone());
-                            toasts_ok.show("Profile updated", ToastVariant::Success);
-                        } else {
-                            toasts_ok.show(
-                                format!("Profile rejected: {}", message),
-                                ToastVariant::Error,
-                            );
-                        }
-                    });
-                    if let Err(e) = relay.publish_with_ack(&signed, Some(ack)) {
-                        profile_saving.set(false);
-                        toasts_pub.show(format!("Publish failed: {}", e), ToastVariant::Error);
+            let filename = avatar_filename(&file.type_());
+            let mut result =
+                upload_to_pod_signer(&file, &filename, &pk, signer.as_ref(), None).await;
+            // Pods are provisioned eagerly at signup, but accounts predating
+            // that may not have one yet — on 404, provision once and retry.
+            if matches!(&result, Err(e) if e.starts_with("HTTP 404")) {
+                result = match provision_pod(auth).await {
+                    Ok(()) => {
+                        upload_to_pod_signer(&file, &filename, &pk, signer.as_ref(), None).await
                     }
+                    Err(e) => Err(format!("pod provisioning failed: {e}")),
+                };
+            }
+            match result {
+                Ok(url) => {
+                    pic_uploading.set(false);
+                    avatar_url.set(url.clone());
+                    publish_profile_metadata(
+                        auth,
+                        relay,
+                        toasts_for_pic,
+                        profile_saving,
+                        name,
+                        claimed,
+                        bio,
+                        url,
+                        bday,
+                        "Profile picture updated",
+                    );
                 }
                 Err(e) => {
-                    profile_saving.set(false);
-                    toasts_err.show(format!("Failed to sign: {}", e), ToastVariant::Error);
+                    pic_uploading.set(false);
+                    toasts_for_pic.show(format!("Upload failed: {}", e), ToastVariant::Error);
                 }
             }
         });
+    };
+
+    // -- Profile picture remove handler --
+    //
+    // Clears `picture` from kind-0 (replaceable, so the next publish without
+    // the field removes it). The pod file is deliberately left in place.
+    let toasts_for_pic_remove = toasts;
+    let relay_for_pic_remove = relay.clone();
+    let on_remove_picture = move |_: leptos::ev::MouseEvent| {
+        avatar_url.set(String::new());
+        publish_profile_metadata(
+            auth,
+            relay_for_pic_remove.clone(),
+            toasts_for_pic_remove,
+            profile_saving,
+            nickname.get_untracked().trim().to_string(),
+            claimed_username.get_untracked(),
+            about.get_untracked().trim().to_string(),
+            String::new(),
+            birthday.get_untracked().trim().to_string(),
+            "Profile picture removed",
+        );
     };
 
     // -- Unmute handler --
@@ -602,6 +621,43 @@ pub fn SettingsPage() -> impl IntoView {
                                 class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500 transition-colors resize-none"
                             />
                         </div>
+                        <div class="space-y-2">
+                            <label class="block text-sm font-medium text-gray-300">"Profile picture"</label>
+                            {move || {
+                                let pic = avatar_url.get().trim().to_string();
+                                let on_remove = on_remove_picture.clone();
+                                (!pic.is_empty()).then(|| view! {
+                                    <div class="flex items-center gap-3">
+                                        <img
+                                            src=pic
+                                            alt="Current profile picture"
+                                            loading="lazy"
+                                            class="w-16 h-16 rounded-full object-cover border border-gray-600"
+                                        />
+                                        <button
+                                            on:click=on_remove
+                                            class="text-xs text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded px-2 py-1 transition-colors"
+                                        >
+                                            "Remove"
+                                        </button>
+                                    </div>
+                                })
+                            }}
+                            <input
+                                type="file"
+                                accept="image/*"
+                                on:change=on_pic_file
+                                disabled=move || pic_uploading.get()
+                                class="block w-full text-sm text-gray-400 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-amber-500 file:text-gray-900 hover:file:bg-amber-400 file:cursor-pointer disabled:opacity-50"
+                            />
+                            <p class="text-xs text-gray-500">
+                                {move || if pic_uploading.get() {
+                                    "Uploading to your pod\u{2026}"
+                                } else {
+                                    "Stored in your pod\u{2019}s public media folder and published in your profile. Max 2 MB."
+                                }}
+                            </p>
+                        </div>
                         <div class="space-y-1">
                             <label class="block text-sm font-medium text-gray-300">"Avatar URL"</label>
                             <input
@@ -611,6 +667,7 @@ pub fn SettingsPage() -> impl IntoView {
                                 placeholder="https://example.com/avatar.jpg"
                                 class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500 transition-colors"
                             />
+                            <p class="text-xs text-gray-500">"Or paste an external image URL, then Save Profile."</p>
                         </div>
                         <div class="space-y-1">
                             <label class="block text-sm font-medium text-gray-300">"Birthday"</label>
@@ -1044,6 +1101,167 @@ fn spawn_local_release(
             }
         }
     });
+}
+
+/// Build and publish the kind-0 profile metadata event, preserving every
+/// field the Settings page manages (display name, claimed username + NIP-05,
+/// about, picture, birthday).
+///
+/// The nickname is published as `display_name` ONLY — it is never a
+/// username claim (QA HIGH bug #5a: saving "Carol QA" used to be
+/// presented as a claimed handle, violating the [a-z0-9_-]{3,30}
+/// rule and minting an invalid NIP-05). When a username IS claimed,
+/// it keeps owning the `name` + `nip05` fields; username changes go
+/// through the explicit, validated claim flow.
+///
+/// Shared by the Save Profile button, the picture upload flow, and the
+/// picture Remove flow so kind-0 (a replaceable event) is always rebuilt
+/// from the full field set and never clobbers sibling fields.
+#[allow(clippy::too_many_arguments)]
+fn publish_profile_metadata(
+    auth: crate::auth::AuthStore,
+    relay: RelayConnection,
+    toasts: crate::components::toast::ToastStore,
+    saving: RwSignal<bool>,
+    name: String,
+    claimed: Option<String>,
+    bio: String,
+    pic: String,
+    bday: String,
+    success_msg: &'static str,
+) {
+    let pubkey_hex = match auth.pubkey().get_untracked() {
+        Some(pk) => pk,
+        None => {
+            toasts.show("Not authenticated", ToastVariant::Error);
+            return;
+        }
+    };
+
+    saving.set(true);
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "display_name".into(),
+        serde_json::Value::String(name.clone()),
+    );
+    match &claimed {
+        Some(username) => {
+            metadata.insert("name".into(), serde_json::Value::String(username.clone()));
+            metadata.insert(
+                "nip05".into(),
+                serde_json::Value::String(format!("{}@{}", username, NIP05_USERNAME_HOST)),
+            );
+        }
+        None => {
+            // No claimed username: keep `name` mirroring the display name
+            // for clients that only read `name`, but nothing here is ever
+            // treated as a claimed handle.
+            metadata.insert("name".into(), serde_json::Value::String(name.clone()));
+        }
+    }
+    if !bio.is_empty() {
+        metadata.insert("about".into(), serde_json::Value::String(bio));
+    }
+    if !pic.is_empty() {
+        metadata.insert("picture".into(), serde_json::Value::String(pic.clone()));
+    }
+    if !bday.is_empty() {
+        metadata.insert("birthday".into(), serde_json::Value::String(bday));
+    }
+
+    let content = serde_json::to_string(&serde_json::Value::Object(metadata)).unwrap_or_default();
+
+    let unsigned = UnsignedEvent {
+        pubkey: pubkey_hex,
+        created_at: (js_sys::Date::now() / 1000.0) as u64,
+        kind: 0,
+        tags: vec![],
+        content,
+    };
+
+    wasm_bindgen_futures::spawn_local(async move {
+        match auth.sign_event_async(unsigned).await {
+            Ok(signed) => {
+                let name_for_ack = name.clone();
+                let avatar_for_ack = if pic.is_empty() {
+                    None
+                } else {
+                    Some(pic.clone())
+                };
+                let ack = Rc::new(move |accepted: bool, message: String| {
+                    saving.set(false);
+                    if accepted {
+                        auth.set_profile(Some(name_for_ack.clone()), avatar_for_ack.clone());
+                        toasts.show(success_msg, ToastVariant::Success);
+                    } else {
+                        toasts.show(
+                            format!("Profile rejected: {}", message),
+                            ToastVariant::Error,
+                        );
+                    }
+                });
+                if let Err(e) = relay.publish_with_ack(&signed, Some(ack)) {
+                    saving.set(false);
+                    toasts.show(format!("Publish failed: {}", e), ToastVariant::Error);
+                }
+            }
+            Err(e) => {
+                saving.set(false);
+                toasts.show(format!("Failed to sign: {}", e), ToastVariant::Error);
+            }
+        }
+    });
+}
+
+/// Derive a timestamped pod filename for an uploaded avatar from its MIME
+/// type, e.g. `avatar-1765432100.png`. The timestamp busts client caches
+/// when a user replaces their picture.
+fn avatar_filename(mime: &str) -> String {
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/avif" => "avif",
+        _ => "img",
+    };
+    format!("avatar-{}.{}", (js_sys::Date::now() / 1000.0) as u64, ext)
+}
+
+/// Provision the caller's Solid pod (`POST {POD_API}/.provision`, NIP-98
+/// authed — the pod owner is the authed pubkey).
+///
+/// Pods are provisioned eagerly at signup; this mirrors
+/// `pages::signup::provision_pod` for accounts that predate eager
+/// provisioning. Called once when an avatar upload 404s, after which the
+/// upload is retried. 201 = created, 409 = already exists; both are success.
+async fn provision_pod(auth: crate::auth::AuthStore) -> Result<(), String> {
+    let url = format!("{}/.provision", POD_API);
+    let signer = auth.get_signer().ok_or("no signer")?;
+    let token = crate::auth::nip98::create_nip98_token_with_signer(&*signer, &url, "POST", None)
+        .await
+        .map_err(|e| format!("nip98: {e}"))?;
+    let win = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
+    headers
+        .set("Authorization", &format!("Nostr {token}"))
+        .map_err(|e| format!("{e:?}"))?;
+    init.set_headers(&headers);
+    let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
+    let resp_val = JsFuture::from(win.fetch_with_request(&req))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let resp: web_sys::Response = resp_val
+        .dyn_into()
+        .map_err(|_| "bad response".to_string())?;
+    match resp.status() {
+        201 | 409 => Ok(()),
+        s => Err(format!("HTTP {s}")),
+    }
 }
 
 // -- SVG icon helpers ---------------------------------------------------------

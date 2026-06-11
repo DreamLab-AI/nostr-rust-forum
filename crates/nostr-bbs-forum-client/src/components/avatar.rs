@@ -1,10 +1,18 @@
-//! Generative identicon avatar component.
+//! Profile-picture avatar with generative identicon fallback.
 //!
-//! Derives a deterministic hue from the pubkey (same algo as `utils::pubkey_color`)
-//! and displays the first two hex characters as initials inside a colored circle.
+//! Resolves the pubkey's kind-0 `picture` from the reactive `ProfileCache`
+//! (tracked read — the avatar fills in as soon as metadata arrives). When a
+//! non-empty http(s) URL is cached, renders a round lazily-loaded `<img>`
+//! clipped by the identicon disc; the initials disc remains the fallback for
+//! missing pictures and for images that fail to load (`on:error`).
+//!
+//! The identicon derives a deterministic hue from the pubkey (same algo as
+//! `utils::pubkey_color`) and displays the first two hex characters as
+//! initials inside a colored circle.
 
 use leptos::prelude::*;
 
+use crate::stores::profile_cache::try_use_profile_cache;
 use crate::utils::pubkey_color;
 
 /// Avatar size presets.
@@ -42,13 +50,15 @@ impl AvatarSize {
     }
 }
 
-/// Generative identicon avatar rendered from a hex pubkey.
+/// Avatar rendered from a hex pubkey.
 ///
-/// Displays the first two characters as initials on a deterministic HSL
-/// background. Supports an optional online-indicator dot and four size presets.
+/// Shows the kind-0 profile picture when the `ProfileCache` resolves one,
+/// falling back to the first two pubkey characters as initials on a
+/// deterministic HSL background. Supports an optional online-indicator dot
+/// and four size presets.
 #[component]
 pub(crate) fn Avatar(
-    /// Hex pubkey used for color derivation and initials.
+    /// Hex pubkey used for picture lookup, color derivation, and initials.
     pubkey: String,
     /// Visual size. Defaults to `Md` (36 px).
     #[prop(optional)]
@@ -67,6 +77,23 @@ pub(crate) fn Avatar(
 
     let outer_class = format!("avatar-identicon text-white {} relative", text_cls,);
 
+    // Tracked picture resolution: re-evaluates when kind-0 metadata fills the
+    // cache. `failed_src` remembers the last URL that errored so we flip back
+    // to initials for it, while still retrying if the profile later points at
+    // a different URL.
+    let cache = try_use_profile_cache();
+    let failed_src = RwSignal::new(Option::<String>::None);
+    let pk_for_pic = pubkey.clone();
+    let picture = Memo::new(move |_| {
+        let url = cache
+            .as_ref()
+            .and_then(|c| c.picture_reactive(&pk_for_pic))?;
+        if failed_src.get().as_deref() == Some(url.as_str()) {
+            return None;
+        }
+        Some(url)
+    });
+
     // Online dot sizing scales with the avatar.
     let dot_px = if px >= 48 { 12 } else { 8 };
     let dot_style = format!(
@@ -77,6 +104,18 @@ pub(crate) fn Avatar(
     view! {
         <div class=outer_class style=style>
             {initials}
+            {move || picture.get().map(|url| {
+                let url_for_error = url.clone();
+                view! {
+                    <img
+                        src=url
+                        loading="lazy"
+                        alt=""
+                        class="absolute inset-0 w-full h-full object-cover rounded-full"
+                        on:error=move |_| failed_src.set(Some(url_for_error.clone()))
+                    />
+                }
+            })}
             {online.then(|| view! {
                 <span
                     class="absolute rounded-full bg-green-500 ring-2 ring-gray-900"

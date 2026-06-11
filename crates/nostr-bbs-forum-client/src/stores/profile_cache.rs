@@ -173,6 +173,19 @@ impl ProfileCache {
         None
     }
 
+    /// Tracked read of a profile's `picture` URL by pubkey.
+    ///
+    /// Subscribes to the entries signal (so the enclosing reactive scope
+    /// re-runs when kind-0 metadata arrives) and schedules the debounced
+    /// batch fetch on a miss. Only returns non-empty http(s) URLs — anything
+    /// else falls back to `None` so callers render the identicon disc.
+    pub fn picture_reactive(&self, pubkey: &str) -> Option<String> {
+        self.lookup_reactive(pubkey)
+            .and_then(|e| e.picture)
+            .map(|p| p.trim().to_string())
+            .filter(|p| p.starts_with("http://") || p.starts_with("https://"))
+    }
+
     /// Insert or update an entry from a kind-0 nostr event.
     pub fn upsert_from_kind0(&self, pubkey: &str, content_json: &str, created_at: u64) {
         if pubkey.is_empty() {
