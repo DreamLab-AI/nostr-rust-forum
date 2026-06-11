@@ -18,6 +18,7 @@ mod admins;
 mod auth;
 mod crypto;
 mod delegation;
+mod devices;
 mod did;
 mod governance_api;
 mod http;
@@ -552,6 +553,22 @@ async fn route_sprint_api(
     }
     if path == "/api/governance/roles" && *method == Method::Get {
         let resp = governance_api::handle_list_roles(auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+
+    // -- Revocable device keys (ADR-099) --------------------------------
+    // Gated behind DEVICE_KEYS_ENABLED == "true" inside each handler; off by
+    // default. The owner is always the NIP-98 author — never a body field.
+    if path == "/api/devices" && *method == Method::Get {
+        let resp = devices::handle_list(auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/devices/register" && *method == Method::Post {
+        let resp = devices::handle_register(body_bytes, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/devices/revoke" && *method == Method::Post {
+        let resp = devices::handle_revoke(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 
