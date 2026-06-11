@@ -1,7 +1,21 @@
-//! Recovery & device-onboarding sheet (ADR-095).
+//! Recovery & device-onboarding sheet (ADR-095, extended by ADR-098).
 //!
 //! Renders a print-optimised one-page sheet of QR codes that simultaneously
-//! (a) backs up the account and (b) onboards a mobile Nostr client (0xchat).
+//! (a) backs up the account, (b) onboards this user's phone into the forum PWA
+//! via the `/connect` magic-link QR (ADR-098 — scan with the phone camera, the
+//! forum opens and signs you in), and (c) optionally onboards a third-party
+//! mobile Nostr client (0xchat / Amber) for power users.
+//!
+//! ## /connect magic-link QR (primary mobile path — ADR-098)
+//!
+//! The 📱 block encodes `{origin}{FORUM_BASE}/connect#k=<nsec1…>`, computed
+//! from the LIVE browser origin so the printed/scanned link points at the same
+//! deployment the user signed up on. The nsec rides in the URL *fragment*
+//! (after `#`) — fragments are never transmitted to the server. `/connect`
+//! strips the fragment from history before importing the key. This QR IS the
+//! account (bearer credential), hence the red warning. It is the recommended
+//! mobile path because it lands the user in the full forum surface, not a
+//! third-party client.
 //!
 //! ## Hard invariant
 //!
@@ -38,6 +52,8 @@
 use leptos::prelude::*;
 use qrcode::render::svg;
 use qrcode::{EcLevel, QrCode};
+
+use crate::app::base_href;
 
 /// Render `data` as a self-contained SVG QR-code string (pure-Rust, in-WASM).
 ///
@@ -85,7 +101,18 @@ pub(crate) fn RecoverySheet(
     // Created date (UTC, YYYY-MM-DD) for the sheet header. Best-effort.
     let created = created_date_utc();
 
+    // --- /connect magic-link URL (ADR-098) -----------------------------------
+    // Computed from the LIVE origin so the printed link targets the exact
+    // deployment the user signed up on. The nsec rides in the URL *fragment*
+    // (after `#`) — never a query string — so it is never transmitted to the
+    // server. `base_href("/connect")` applies the FORUM_BASE prefix (e.g.
+    // `/community/connect`) when the forum is mounted in a sub-directory.
+    let connect_url = web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .map(|origin| format!("{origin}{}#k={nsec}", base_href("/connect")));
+
     // --- QR SVGs (generated once at mount) -----------------------------------
+    let connect_qr = connect_url.as_deref().map(qr_svg).unwrap_or_default();
     let nsec_qr = qr_svg(&nsec);
     let relay_qr = qr_svg(&relay_url);
     let npub_qr = qr_svg(&npub);
@@ -146,7 +173,8 @@ pub(crate) fn RecoverySheet(
                 <h2 class="text-xl font-bold text-gray-900">"Recovery & Device Sheet"</h2>
                 <p class="text-xs text-gray-600">
                     "Print this page (or Save as PDF) and store it safely. "
-                    "It backs up your account and onboards the 0xchat mobile app."
+                    "It backs up your account and lets you sign in on your phone "
+                    "(scan the 📱 QR with your camera)."
                 </p>
                 <p class="text-xs text-gray-500 mt-1">
                     {format!("Account: {display_name}")}
@@ -155,17 +183,63 @@ pub(crate) fn RecoverySheet(
                 </p>
             </div>
 
+            // ── 📱 Open on this phone (PRIMARY mobile path — ADR-098) ──
+            // A phone-camera scan of this QR opens the forum PWA and signs the
+            // user in. This is the recommended mobile path: it lands them in
+            // the full forum surface, not a third-party client.
+            <Show when={
+                let has = connect_url.is_some();
+                move || has
+            }>
+                <div class="border-2 border-red-600 rounded-xl p-4 bg-red-50">
+                    <div class="flex items-center gap-2 mb-2">
+                        <span class="text-lg">"📱"</span>
+                        <span class="text-sm font-bold text-red-700 uppercase tracking-wide">
+                            "Open on this phone — bearer credential"
+                        </span>
+                    </div>
+                    <p class="text-xs text-gray-800 mb-2 font-medium">
+                        "Scan with your phone camera → opens the forum and signs you in."
+                    </p>
+                    <p class="text-xs text-red-700 mb-3 font-bold">
+                        "⚠ This link/QR IS your account. Anyone who scans or copies it can sign in "
+                        "as you. Keep this sheet private."
+                    </p>
+                    <div class="flex flex-col sm:flex-row items-center gap-4">
+                        <div class="rs-qr flex-shrink-0" inner_html=connect_qr.clone()></div>
+                        <div class="min-w-0 w-full">
+                            <p class="text-[10px] uppercase tracking-wide text-red-600 mb-1">
+                                "forum sign-in link"
+                            </p>
+                            <code class="block text-[10px] text-gray-900 font-mono">
+                                {connect_url.clone().unwrap_or_default()}
+                            </code>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
             // ── 🔑 SECRET (nsec) — bearer credential ──────────────────
+            // This is the raw private key for power users importing into a
+            // third-party signer. It is NOT 0xchat's "Login with QR".
             <div class="border-2 border-red-600 rounded-xl p-4 bg-red-50">
                 <div class="flex items-center gap-2 mb-2">
                     <span class="text-lg">"🔑"</span>
                     <span class="text-sm font-bold text-red-700 uppercase tracking-wide">
-                        "Secret key — bearer credential"
+                        "Secret key (nsec) — bearer credential"
                     </span>
                 </div>
-                <p class="text-xs text-red-700 mb-3 font-medium">
-                    "ANYONE who scans or reads this controls your account. Keep this sheet "
-                    "private. This is the 0xchat login QR."
+                <p class="text-xs text-red-700 mb-2 font-medium">
+                    "ANYONE who scans or reads this controls your account. Keep this sheet private."
+                </p>
+                <p class="text-xs text-gray-800 mb-3">
+                    "Paste into 0xchat via "
+                    <span class="font-semibold">"\u{201c}Login with private key\u{201d}"</span>
+                    ", or scan into a signer app (Amber). "
+                    <span class="font-semibold text-red-700">
+                        "Do NOT use 0xchat\u{2019}s \u{201c}Login with QR code\u{201d}"
+                    </span>
+                    " — that is a remote-signer QR, not this key."
                 </p>
                 <div class="flex flex-col sm:flex-row items-center gap-4">
                     <div class="rs-qr flex-shrink-0" inner_html=nsec_qr></div>
@@ -227,19 +301,25 @@ pub(crate) fn RecoverySheet(
                 </div>
                 <div class="grid sm:grid-cols-2 gap-4">
                     <div>
+                        <p class="font-semibold text-gray-900 mb-1">"On mobile (recommended)"</p>
+                        <ol class="list-decimal list-inside space-y-1 text-xs text-gray-700">
+                            <li>"Scan the 📱 QR with your phone camera."</li>
+                            <li>"The forum opens and signs you in automatically."</li>
+                            <li>
+                                "Power users: 0xchat → "
+                                <span class="font-semibold">"Login with private key"</span>
+                                " → paste the nsec; or import the nsec into Amber and use "
+                                <span class="font-semibold">"Login with Amber"</span>
+                                "."
+                            </li>
+                        </ol>
+                    </div>
+                    <div>
                         <p class="font-semibold text-gray-900 mb-1">"On the web"</p>
                         <ol class="list-decimal list-inside space-y-1 text-xs text-gray-700">
                             <li>"Open the forum sign-in page."</li>
                             <li>"Paste your nsec (or scan the 🔑 QR)."</li>
                             <li>"You're back in — same account."</li>
-                        </ol>
-                    </div>
-                    <div>
-                        <p class="font-semibold text-gray-900 mb-1">"On mobile (0xchat)"</p>
-                        <ol class="list-decimal list-inside space-y-1 text-xs text-gray-700">
-                            <li>"Install 0xchat (Android)."</li>
-                            <li>"Login → scan the 🔑 nsec QR above."</li>
-                            <li>"Add the 📡 relay (scan its QR / paste the URL)."</li>
                         </ol>
                     </div>
                 </div>

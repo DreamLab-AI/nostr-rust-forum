@@ -4,6 +4,7 @@
 mod admin;
 mod channel;
 mod chat;
+mod connect;
 mod dm_chat;
 mod dm_list;
 mod home;
@@ -30,6 +31,7 @@ pub use admin::AdminPage;
 pub use category::CategoryPage;
 pub use channel::ChannelPage;
 pub use chat::ChatPage;
+pub use connect::ConnectPage;
 pub use dm_chat::DmChatPage;
 pub use dm_list::DmListPage;
 pub use events::EventsPage;

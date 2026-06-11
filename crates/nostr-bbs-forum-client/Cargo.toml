@@ -112,6 +112,8 @@ web-sys = { workspace = true, features = [
     "SubtleCrypto",
     "CryptoKey",
     "Url",
+    # /connect magic-link: strip the nsec-bearing fragment from history on mount (ADR-098)
+    "History",
 ] }
 gloo = { workspace = true }
 comrak = { workspace = true }

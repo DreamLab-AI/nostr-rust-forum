@@ -21,9 +21,10 @@ use crate::components::session_timeout::SessionTimeout;
 use crate::components::toast::{provide_toasts, ToastContainer};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
-    AdminPage, CategoryPage, ChannelPage, ChatPage, DmChatPage, DmListPage, EventsPage, ForumsPage,
-    GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage, PendingPage,
-    PodBrowserPage, ProfilePage, SearchPage, SectionPage, SettingsPage, SetupPage, SignupPage,
+    AdminPage, CategoryPage, ChannelPage, ChatPage, ConnectPage, DmChatPage, DmListPage,
+    EventsPage, ForumsPage, GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage,
+    PendingPage, PodBrowserPage, ProfilePage, SearchPage, SectionPage, SettingsPage, SetupPage,
+    SignupPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
@@ -549,6 +550,10 @@ pub fn App() -> impl IntoView {
                     // Public routes (no auth required)
                     <Route path=path!("/") view=HomePage />
                     <Route path=path!("/login") view=LoginPage />
+                    // /connect: magic-link sign-in (ADR-098). MUST NOT be
+                    // auth-gated — it is the route that authenticates the device
+                    // from the nsec in the URL fragment.
+                    <Route path=path!("/connect") view=ConnectPage />
                     <Route path=path!("/signup") view=SignupPage />
                     <Route path=path!("/view/:note_id") view=NoteViewPage />
                     // Auth-gated routes
