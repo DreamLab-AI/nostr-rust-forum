@@ -5,14 +5,30 @@
 use worker::{Env, Headers, Response, Result};
 
 /// Build CORS headers from the `EXPECTED_ORIGIN` env var.
+///
+/// Fail-closed (Gap 5): when `EXPECTED_ORIGIN` is unset or empty we emit **no**
+/// `Access-Control-Allow-Origin` header rather than falling back to a
+/// `https://example.com` placeholder. A placeholder default silently CORS-grants
+/// an unrelated origin on a misconfigured deploy; omitting the header makes the
+/// browser refuse the cross-origin response instead. This mirrors the
+/// `expected_origin_required()` fail-closed pattern already used in the
+/// WebAuthn ceremony path (`webauthn.rs`).
+///
+/// This is the single canonical CORS builder for the auth-worker; `lib.rs`
+/// re-exports it so both response paths share identical fail-closed behaviour.
 pub fn cors_headers(env: &Env) -> Headers {
-    let origin = env
-        .var("EXPECTED_ORIGIN")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://example.com".to_string());
-
     let headers = Headers::new();
-    headers.set("Access-Control-Allow-Origin", &origin).ok();
+
+    match env.var("EXPECTED_ORIGIN").map(|v| v.to_string()) {
+        Ok(origin) if !origin.trim().is_empty() => {
+            headers.set("Access-Control-Allow-Origin", &origin).ok();
+        }
+        // Misconfigured deploy: no allowed origin. Omit ACAO entirely so the
+        // browser's same-origin policy blocks the response — never grant a
+        // placeholder origin.
+        _ => {}
+    }
+
     headers
         .set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         .ok();

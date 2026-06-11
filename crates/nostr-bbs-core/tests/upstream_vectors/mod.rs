@@ -1,4 +1,4 @@
-// crates/nostr-core/tests/upstream_vectors/mod.rs
+// crates/nostr-bbs-core/tests/upstream_vectors/mod.rs
 //! L1 reference-vector tests for the forum-side `nostr-core` kit.
 //!
 //! Per ADR-082 D5, the forum substrate consumes fixtures synced from the

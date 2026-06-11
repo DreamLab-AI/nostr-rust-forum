@@ -27,7 +27,9 @@ fn pod_base_url(env: &Env) -> String {
 ///
 /// Returns the WebID and pod URL on success.
 pub async fn provision_pod(pubkey: &str, env: &Env) -> Result<PodInfo> {
-    let did = format!("did:nostr:{pubkey}");
+    let did = nostr_bbs_core::did::NostrPubkey::from_hex(pubkey)
+        .map(|pk| nostr_bbs_core::did_nostr_uri(&pk))
+        .unwrap_or_else(|_| format!("did:nostr:{pubkey}"));
 
     let default_acl = json!({
         "@context": {

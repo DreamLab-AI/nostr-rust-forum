@@ -1018,7 +1018,9 @@ pub async fn register_verify(
     let response_body = serde_json::json!({
         "verified": true,
         "pubkey": pubkey,
-        "didNostr": format!("did:nostr:{pubkey}"),
+        "didNostr": nostr_bbs_core::did::NostrPubkey::from_hex(&pubkey)
+            .map(|pk| nostr_bbs_core::did_nostr_uri(&pk))
+            .unwrap_or_else(|_| format!("did:nostr:{pubkey}")),
         "credentialId": credential_id_b64,
     });
 
@@ -1376,7 +1378,9 @@ pub async fn login_verify(req: &Request, body_bytes: &[u8], env: &Env) -> Result
     let response_body = serde_json::json!({
         "verified": true,
         "pubkey": pubkey,
-        "didNostr": format!("did:nostr:{pubkey}")
+        "didNostr": nostr_bbs_core::did::NostrPubkey::from_hex(&pubkey)
+            .map(|pk| nostr_bbs_core::did_nostr_uri(&pk))
+            .unwrap_or_else(|_| format!("did:nostr:{pubkey}"))
     });
 
     Response::from_json(&response_body)

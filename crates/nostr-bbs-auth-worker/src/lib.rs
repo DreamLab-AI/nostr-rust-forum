@@ -17,7 +17,6 @@ mod admin;
 mod admins;
 mod auth;
 mod crypto;
-mod delegation;
 mod devices;
 mod did;
 mod governance_api;
@@ -33,40 +32,10 @@ mod wot;
 
 use worker::*;
 
-/// Build CORS headers from the `EXPECTED_ORIGIN` env var.
-///
-/// Fail-closed (Gap 5): when `EXPECTED_ORIGIN` is unset or empty we emit **no**
-/// `Access-Control-Allow-Origin` header rather than falling back to a
-/// `https://example.com` placeholder. A placeholder default silently CORS-grants
-/// an unrelated origin on a misconfigured deploy; omitting the header makes the
-/// browser refuse the cross-origin response instead. This mirrors the
-/// `expected_origin_required()` fail-closed pattern already used in the
-/// WebAuthn ceremony path (`webauthn.rs`).
-fn cors_headers(env: &Env) -> Headers {
-    let headers = Headers::new();
-
-    match env.var("EXPECTED_ORIGIN").map(|v| v.to_string()) {
-        Ok(origin) if !origin.trim().is_empty() => {
-            headers.set("Access-Control-Allow-Origin", &origin).ok();
-        }
-        // Misconfigured deploy: no allowed origin. Omit ACAO entirely so the
-        // browser's same-origin policy blocks the response — never grant a
-        // placeholder origin.
-        _ => {}
-    }
-
-    headers
-        .set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        .ok();
-    headers
-        .set(
-            "Access-Control-Allow-Headers",
-            "Content-Type, Authorization",
-        )
-        .ok();
-    headers.set("Access-Control-Max-Age", "86400").ok();
-    headers
-}
+// Canonical fail-closed CORS builder lives in `http.rs`; re-exported here so
+// both response paths share identical behaviour (no placeholder origin when
+// `EXPECTED_ORIGIN` is unset).
+use crate::http::cors_headers;
 
 /// Create a JSON error response that NEVER masks failures with an empty 200.
 ///
@@ -575,12 +544,6 @@ async fn route_sprint_api(
     // -- NIP-1984 standard report queue (admin view) --------------------
     if path == "/api/moderation/reports" && *method == Method::Get {
         let resp = moderation::handle_nip1984_reports(auth_header, env, origin).await?;
-        return Ok(Some(resp));
-    }
-
-    // -- NIP-26 Delegation verification (stub for W6) -------------------
-    if path == "/api/delegation/verify" && *method == Method::Post {
-        let resp = delegation::handle_verify(body_bytes, auth_header, env).await?;
         return Ok(Some(resp));
     }
 

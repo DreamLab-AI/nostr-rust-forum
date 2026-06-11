@@ -7,7 +7,7 @@
 //!
 //! - target: `wasm32-unknown-unknown`
 //! - toolchain: Rust 1.84.0+ (per Sprint v9 STREAM-C)
-//! - features: `nip04`, `nip19`, `nip26`, `nip44`, `nip59`, `nip90`, `nip98`
+//! - features: `nip04`, `nip19`, `nip44`, `nip59`, `nip98`
 //!   (all default-features = false; `std` only)
 //!
 //! This crate is **not** linked into the forum binary. It exists so that

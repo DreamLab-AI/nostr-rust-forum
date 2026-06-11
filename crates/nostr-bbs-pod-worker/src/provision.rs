@@ -112,6 +112,13 @@ pub async fn provision_pod(
 ) -> Result<()> {
     let base = format!("pods/{owner_pubkey}");
 
+    // Canonical owner DID, minted through the shared helper so the URI scheme
+    // stays consistent with the rest of the ecosystem. Falls back to the literal
+    // form only if `owner_pubkey` is not valid hex (callers validate upstream).
+    let owner_did = crate::did::NostrPubkey::from_hex(owner_pubkey)
+        .map(|pk| nostr_bbs_core::did_nostr_uri(&pk))
+        .unwrap_or_else(|_| format!("did:nostr:{owner_pubkey}"));
+
     // Create root container marker
     let root_meta = serde_json::json!({
         "@context": {"ldp": "http://www.w3.org/ns/ldp#"},
@@ -167,7 +174,7 @@ pub async fn provision_pod(
         "@context": {"acl": "http://www.w3.org/ns/auth/acl#"},
         "@graph": [{
             "@id": "#owner",
-            "acl:agent": {"@id": format!("did:nostr:{owner_pubkey}")},
+            "acl:agent": {"@id": owner_did.clone()},
             "acl:accessTo": {"@id": "./"},
             "acl:default": {"@id": "./"},
             "acl:mode": [{"@id": "acl:Read"}, {"@id": "acl:Write"}, {"@id": "acl:Control"}]
@@ -196,7 +203,7 @@ pub async fn provision_pod(
             "acl:mode": {"@id": "acl:Read"}
         }, {
             "@id": "#owner",
-            "acl:agent": {"@id": format!("did:nostr:{owner_pubkey}")},
+            "acl:agent": {"@id": owner_did.clone()},
             "acl:accessTo": {"@id": "./"},
             "acl:default": {"@id": "./"},
             "acl:mode": [{"@id": "acl:Read"}, {"@id": "acl:Write"}, {"@id": "acl:Control"}]
@@ -234,7 +241,7 @@ pub async fn provision_pod(
         "@context": {"acl": "http://www.w3.org/ns/auth/acl#"},
         "@graph": [{
             "@id": "#owner",
-            "acl:agent": {"@id": format!("did:nostr:{owner_pubkey}")},
+            "acl:agent": {"@id": owner_did.clone()},
             "acl:accessTo": {"@id": "./"},
             "acl:default": {"@id": "./"},
             "acl:mode": [{"@id": "acl:Read"}, {"@id": "acl:Write"}, {"@id": "acl:Control"}]
@@ -263,7 +270,7 @@ pub async fn provision_pod(
             "acl:mode": {"@id": "acl:Append"}
         }, {
             "@id": "#owner",
-            "acl:agent": {"@id": format!("did:nostr:{owner_pubkey}")},
+            "acl:agent": {"@id": owner_did.clone()},
             "acl:accessTo": {"@id": "./"},
             "acl:default": {"@id": "./"},
             "acl:mode": [{"@id": "acl:Read"}, {"@id": "acl:Write"}, {"@id": "acl:Control"}]
@@ -292,7 +299,7 @@ pub async fn provision_pod(
             "acl:mode": {"@id": "acl:Read"}
         }, {
             "@id": "#owner",
-            "acl:agent": {"@id": format!("did:nostr:{owner_pubkey}")},
+            "acl:agent": {"@id": owner_did.clone()},
             "acl:accessTo": {"@id": "./"},
             "acl:default": {"@id": "./"},
             "acl:mode": [{"@id": "acl:Read"}, {"@id": "acl:Write"}, {"@id": "acl:Control"}]
@@ -315,7 +322,7 @@ pub async fn provision_pod(
         "@context": {"acl": "http://www.w3.org/ns/auth/acl#"},
         "@graph": [{
             "@id": "#owner",
-            "acl:agent": {"@id": format!("did:nostr:{owner_pubkey}")},
+            "acl:agent": {"@id": owner_did.clone()},
             "acl:accessTo": {"@id": "./"},
             "acl:default": {"@id": "./"},
             "acl:mode": [{"@id": "acl:Read"}, {"@id": "acl:Write"}, {"@id": "acl:Control"}]
@@ -343,7 +350,6 @@ pub async fn provision_pod(
     // Mirrors solid-pod-rs v0.4.0-alpha.2 provision::provision_pod logic.
     // -----------------------------------------------------------------------
     let pod_url = format!("{pod_base}/pods/{owner_pubkey}/");
-    let owner_did = format!("did:nostr:{owner_pubkey}");
 
     let public_ti_url = format!("{pod_url}{PUBLIC_TYPE_INDEX_PATH}");
     let public_ti_body = render_type_index_body(&public_ti_url, "solid:ListedDocument");

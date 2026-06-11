@@ -19,9 +19,7 @@ pub mod keys;
 pub mod moderation_events;
 pub mod nip04;
 pub mod nip19;
-pub mod nip26;
 pub mod nip44;
-pub mod nip90;
 pub mod nip98;
 pub mod signer;
 pub mod types;
@@ -89,13 +87,6 @@ pub use nip19::{
     decode_naddr, decode_nevent, decode_note, decode_nprofile, decode_npub, decode_nsec,
     encode_naddr, encode_nevent, encode_note, encode_nprofile, encode_npub, encode_nsec, NAddr,
     NEvent, NProfile, Nip19Error,
-};
-pub use nip26::{validate_delegation_tag, Conditions, DelegationTag, DelegationToken, Nip26Error};
-pub use nip90::{
-    is_job_request, is_job_result, parse_job_inputs, DvmCapabilityAd, DvmJobFeedback,
-    DvmJobRequest, DvmJobResult, JobInput, JobStatus, Nip90Error, KIND_HANDLER_INFO,
-    KIND_JOB_FEEDBACK, KIND_JOB_REQUEST_MAX, KIND_JOB_REQUEST_MIN, KIND_JOB_RESULT_MAX,
-    KIND_JOB_RESULT_MIN,
 };
 pub use signer::{PrfSigner, Signer, SignerError};
 

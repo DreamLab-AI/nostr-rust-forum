@@ -74,6 +74,23 @@ struct NormalizedProvision {
     rate_limit_per_min: u32,
 }
 
+/// Shared pubkey/name validation for both the register and provision paths.
+///
+/// - `pubkey` must be exactly 64 ASCII hex chars (BIP-340 x-only).
+/// - `name` must be non-empty after trimming.
+///
+/// Returns `Ok(())` so callers keep ownership of the body and decide their own
+/// normalisation (register stores the pubkey as supplied; provision lowercases).
+fn validate_agent_fields(pubkey: &str, name: &str) -> std::result::Result<(), &'static str> {
+    if pubkey.len() != 64 || !pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid pubkey: must be 64 hex chars");
+    }
+    if name.trim().is_empty() {
+        return Err("name is required");
+    }
+    Ok(())
+}
+
 /// Pure validation/normalisation for [`ProvisionAgentBody`].
 ///
 /// Rules:
@@ -84,12 +101,7 @@ struct NormalizedProvision {
 fn normalize_provision(
     body: ProvisionAgentBody,
 ) -> std::result::Result<NormalizedProvision, &'static str> {
-    if body.pubkey.len() != 64 || !body.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("invalid pubkey: must be 64 hex chars");
-    }
-    if body.name.trim().is_empty() {
-        return Err("name is required");
-    }
+    validate_agent_fields(&body.pubkey, &body.name)?;
     if body.cohorts.is_empty() {
         return Err("cohorts is required and must be non-empty");
     }
@@ -196,11 +208,8 @@ pub async fn handle_register_agent(
         Err(e) => return error_json(env, &format!("bad body: {e}"), 400),
     };
 
-    if body.pubkey.len() != 64 || !body.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
-        return error_json(env, "invalid pubkey: must be 64 hex chars", 400);
-    }
-    if body.name.trim().is_empty() {
-        return error_json(env, "name is required", 400);
+    if let Err(msg) = validate_agent_fields(&body.pubkey, &body.name) {
+        return error_json(env, msg, 400);
     }
 
     let db = relay_db(env)?;

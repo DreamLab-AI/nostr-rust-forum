@@ -687,9 +687,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .d1("REPLAY_DB")
         .map_err(|e| Error::RustError(format!("REPLAY_DB D1 binding missing: {e}")))?;
 
-    let agent_uri = requester_pubkey
-        .as_ref()
-        .map(|pk| format!("did:nostr:{pk}"));
+    let agent_uri = requester_pubkey.as_ref().map(|pk| {
+        did::NostrPubkey::from_hex(pk)
+            .map(|p| nostr_bbs_core::did_nostr_uri(&p))
+            .unwrap_or_else(|_| format!("did:nostr:{pk}"))
+    });
 
     // -----------------------------------------------------------------------
     // Provisioning endpoint: POST /pods/{pubkey}/.provision
@@ -745,7 +747,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "status": "provisioned",
                 "podUrl": pod_url,
                 "webId": webid_url,
-                "didNostr": format!("did:nostr:{owner_pubkey}"),
+                "didNostr": did::NostrPubkey::from_hex(&owner_pubkey)
+                    .map(|pk| nostr_bbs_core::did_nostr_uri(&pk))
+                    .unwrap_or_else(|_| format!("did:nostr:{owner_pubkey}")),
                 "containers": ["profile/", "public/", "private/", "inbox/", "settings/", "media/", "media/public/"]
             }),
             201,
@@ -1426,7 +1430,9 @@ async fn handle_acl_request(
                             }
                         }
                     }
-                    let owner_did = format!("did:nostr:{owner_pubkey}");
+                    let owner_did = did::NostrPubkey::from_hex(owner_pubkey)
+                        .map(|pk| nostr_bbs_core::did_nostr_uri(&pk))
+                        .unwrap_or_else(|_| format!("did:nostr:{owner_pubkey}"));
                     // The container the ACL governs is the parent of the
                     // `.acl` sidecar, normalised to a container path.
                     let container = if parent_path.ends_with('/') {

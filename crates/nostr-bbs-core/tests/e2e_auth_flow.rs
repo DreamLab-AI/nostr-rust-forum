@@ -10,7 +10,6 @@
 //! 5. **NIP-19 encoding**: entity encoding round-trips for client <-> relay interop
 //! 6. **Moderation events**: build -> sign -> validate pipeline (auth-worker + relay-worker)
 //! 7. **Calendar events (NIP-52)**: create -> verify pipeline
-//! 8. **Delegation (NIP-26)**: create -> validate pipeline for delegated auth
 //!
 //! Workers cannot run in native cargo test (wasm32 runtime required), but these
 //! tests exercise the identical protocol logic that workers invoke at request time.
@@ -57,9 +56,6 @@ use nostr_bbs_core::{
     nip04_shared_secret,
 
     nip19::{NAddr, NEvent, NProfile},
-
-    // Delegation (NIP-26)
-    nip26::{Conditions, DelegationTag, DelegationToken, Nip26Error},
     nip44_decrypt,
 
     // NIP-44 encryption
@@ -70,7 +66,6 @@ use nostr_bbs_core::{
     sign_event,
     sign_event_deterministic,
     unwrap_gift,
-    validate_delegation_tag,
     validate_moderation_event,
     verify_event,
     verify_event_strict,
@@ -1008,116 +1003,6 @@ fn e2e_calendar_rsvp_invalid_event_id_rejected() {
 }
 
 // ============================================================================
-// 9. Delegation (NIP-26): create -> validate round-trip
-// ============================================================================
-
-#[test]
-fn e2e_delegation_token_roundtrip() {
-    let delegator_sk = sk_scalar(1);
-    let delegatee_pk = pk_hex_for_scalar(2);
-    let conditions = Conditions::from_str("kind=1").unwrap();
-
-    let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    token.verify().unwrap();
-}
-
-#[test]
-fn e2e_delegation_token_with_time_bounds() {
-    let delegator_sk = sk_scalar(3);
-    let delegatee_pk = pk_hex_for_scalar(4);
-    let conditions = Conditions::from_str("kind=1&created_at>1000&created_at<9999999999").unwrap();
-
-    let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    token.verify().unwrap();
-}
-
-#[test]
-fn e2e_delegation_tag_roundtrip() {
-    let delegator_sk = sk_scalar(1);
-    let delegatee_pk = pk_hex_for_scalar(2);
-    let conditions = Conditions::from_str("kind=1").unwrap();
-
-    let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    let tag = DelegationTag::from_token(&token);
-
-    assert_eq!(tag.0[0], "delegation");
-    assert_eq!(tag.0[1].len(), 64);
-    assert_eq!(tag.0[3].len(), 128);
-
-    // Round-trip: parse tag back into a token and verify
-    let recovered = DelegationToken::from_tag(&tag).unwrap();
-    recovered.verify().unwrap();
-}
-
-#[test]
-fn e2e_delegation_validate_accepts_matching_event() {
-    let delegator_sk = sk_scalar(1);
-    let delegatee_pk = pk_hex_for_scalar(2);
-    let conditions = Conditions::from_str("kind=1&created_at>0&created_at<9999999999").unwrap();
-
-    let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    let tag = DelegationTag::from_token(&token);
-
-    let result = validate_delegation_tag(&tag, &delegatee_pk, 1, 1_000_000_000);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn e2e_delegation_validate_rejects_wrong_kind() {
-    let delegator_sk = sk_scalar(1);
-    let delegatee_pk = pk_hex_for_scalar(2);
-    let conditions = Conditions::from_str("kind=1").unwrap();
-
-    let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    let tag = DelegationTag::from_token(&token);
-
-    let result = validate_delegation_tag(&tag, &delegatee_pk, 4, 0);
-    assert!(result.is_err());
-}
-
-#[test]
-fn e2e_delegation_validate_rejects_wrong_author() {
-    let delegator_sk = sk_scalar(1);
-    let delegatee_pk = pk_hex_for_scalar(2);
-    let wrong_author = pk_hex_for_scalar(3);
-    let conditions = Conditions::from_str("kind=1").unwrap();
-
-    let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    let tag = DelegationTag::from_token(&token);
-
-    let result = validate_delegation_tag(&tag, &wrong_author, 1, 0);
-    assert!(result.is_err());
-}
-
-#[test]
-fn e2e_delegation_validate_rejects_expired_time() {
-    let delegator_sk = sk_scalar(1);
-    let delegatee_pk = pk_hex_for_scalar(2);
-    let conditions = Conditions::from_str("created_at>100&created_at<200").unwrap();
-
-    let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    let tag = DelegationTag::from_token(&token);
-
-    let result = validate_delegation_tag(&tag, &delegatee_pk, 1, 300);
-    assert!(result.is_err());
-}
-
-#[test]
-fn e2e_delegation_tampered_sig_fails() {
-    let delegator_sk = sk_scalar(1);
-    let delegatee_pk = pk_hex_for_scalar(2);
-    let conditions = Conditions::from_str("kind=1").unwrap();
-
-    let mut token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    let mut sig_bytes = hex::decode(&token.sig).unwrap();
-    sig_bytes[0] ^= 0xFF;
-    token.sig = hex::encode(&sig_bytes);
-
-    let result = token.verify();
-    assert!(matches!(result, Err(Nip26Error::InvalidSignature)));
-}
-
-// ============================================================================
 // 10. Cross-worker E2E: Full auth -> relay -> pod pipeline simulation
 // ============================================================================
 
@@ -1261,35 +1146,6 @@ fn e2e_dm_relay_routing_flow() {
     // Step 4: Recipient verifies sender identity from the sealed layer
     assert_eq!(unwrapped.sender_pubkey, sender_pk);
     assert!(verify_event(&unwrapped.seal));
-}
-
-/// Simulates the delegated event flow for NIP-26:
-/// 1. Delegator creates a delegation token for the delegatee
-/// 2. Delegatee creates an event with the delegation tag
-/// 3. Relay validates the delegation tag against the event
-#[test]
-fn e2e_delegated_event_relay_flow() {
-    let delegator_sk = sk_scalar(1);
-    let delegatee_pk = pk_hex_for_scalar(2);
-    let conditions =
-        Conditions::from_str("kind=1&created_at>1000000000&created_at<2000000000").unwrap();
-
-    // Step 1: Delegator creates a delegation token
-    let token = DelegationToken::create(&delegator_sk, &delegatee_pk, &conditions).unwrap();
-    let tag = DelegationTag::from_token(&token);
-
-    // Step 2: The delegatee would include this tag in their event
-    // Step 3: Relay validates the delegation
-    let result = validate_delegation_tag(&tag, &delegatee_pk, 1, 1_500_000_000);
-    assert!(result.is_ok());
-
-    // Relay rejects if the delegatee tries to publish a kind not in the delegation
-    let result = validate_delegation_tag(&tag, &delegatee_pk, 4, 1_500_000_000);
-    assert!(result.is_err());
-
-    // Relay rejects if the event timestamp is outside the delegation window
-    let result = validate_delegation_tag(&tag, &delegatee_pk, 1, 500_000_000);
-    assert!(result.is_err());
 }
 
 /// Simulates a search-worker authentication flow:
