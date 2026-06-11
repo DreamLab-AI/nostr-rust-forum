@@ -55,4 +55,4 @@ See [`src/schema.rs`](src/schema.rs) for the canonical schema. Major sections:
 
 ## License
 
-MIT OR Apache-2.0.
+AGPL-3.0-only.

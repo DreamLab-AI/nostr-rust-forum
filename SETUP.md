@@ -114,13 +114,21 @@ wrangler r2 bucket create nostr-bbs-vectors
 
 Update each worker's `wrangler.toml` with the resource IDs from step 1:
 
-- `crates/nostr-bbs-auth-worker/wrangler.toml` -- D1 ID, KV IDs (SESSIONS, POD_META), R2 bucket, RP_ID, RP_NAME, EXPECTED_ORIGIN
+- `crates/nostr-bbs-auth-worker/wrangler.toml` -- D1 ID, KV IDs (SESSIONS, POD_META), R2 bucket, RP_ID, RP_NAME, EXPECTED_ORIGIN, POD_BASE_URL, NATIVE_POD_URL, NATIVE_POD_ADMIN_KEY (secret), WELCOME_MASTER_KEY (secret), DEVICE_KEYS_ENABLED
 - `crates/nostr-bbs-pod-worker/wrangler.toml` -- KV ID (POD_META), EXPECTED_ORIGIN
 - `crates/nostr-bbs-preview-worker/wrangler.toml` -- KV ID (RATE_LIMIT), ALLOWED_ORIGIN
-- `crates/nostr-bbs-relay-worker/wrangler.toml` -- D1 ID, RELAY_NAME, ALLOWED_ORIGIN(S)
+- `crates/nostr-bbs-relay-worker/wrangler.toml` -- D1 ID, RELAY_NAME, ALLOWED_ORIGIN(S), ZONE_CONFIG, DEVICE_KEYS_ENABLED, MESH_MODE, MESH_PEER_RELAYS, MESH_FEDERATED_KINDS, MESH_ALLOWED_REMOTE_DIDS
 - `crates/nostr-bbs-search-worker/wrangler.toml` -- R2 bucket, KV ID (SEARCH_CONFIG), ALLOWED_ORIGIN(S)
 
 Set your domain in all `RP_ID`, `EXPECTED_ORIGIN`, `ALLOWED_ORIGIN`, and `ALLOWED_ORIGINS` vars.
+
+Set the two secrets (`NATIVE_POD_ADMIN_KEY`, `WELCOME_MASTER_KEY`) with
+`wrangler secret put` -- never commit them to `wrangler.toml`.
+
+**`DEVICE_KEYS_ENABLED` (ADR-099)** defaults to `false`. Only the exact string
+`"true"` enables revocable device keys, and it must be set in all three places
+together -- the auth-worker, the relay-worker, and the client's
+`window.__ENV__` -- or the feature stays dormant.
 
 ## 3. Deploy Workers
 

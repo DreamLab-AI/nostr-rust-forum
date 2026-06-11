@@ -133,7 +133,7 @@ wasm-bindgen-test = "0.3"
 # interim git+tag pin is retired per the deny.toml plan.
 solid-pod-rs = { version = "0.4.0-alpha.17", default-features = false, features = ["core"] }
 
-# Internal crates (workspace path deps; published to crates.io as version 3.0+).
+# Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.2).
 nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.2" }
 nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.2" }
 nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.2" }

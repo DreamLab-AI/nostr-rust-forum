@@ -1,7 +1,7 @@
 ---
 id: ADR-099
 title: Revocable device keys — tear-off mobile onboarding without the master key
-status: Proposed
+status: Accepted (implemented, gated behind DEVICE_KEYS_ENABLED, default off; phase-2 multi-device DMs deferred)
 date: 2026-06-11
 related: [ADR-094, ADR-095, ADR-097, ADR-098]
 ---
@@ -10,8 +10,9 @@ related: [ADR-094, ADR-095, ADR-097, ADR-098]
 
 ## Status
 
-Proposed (2026-06-11). Built behind a gate (`DEVICE_KEYS_ENABLED`, default off) —
-queued for later activation. Multi-device DM delivery is explicitly phase 2.
+Accepted (implemented, gated behind `DEVICE_KEYS_ENABLED`, default off; phase-2
+multi-device DMs deferred). Built behind the gate and shipped dormant — activation
+is per-deployment. Multi-device DM delivery is explicitly phase 2.
 
 ## Context
 

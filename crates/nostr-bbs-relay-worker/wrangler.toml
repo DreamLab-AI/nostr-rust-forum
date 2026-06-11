@@ -13,6 +13,12 @@ RELAY_NAME = "Nostr BBS Relay"
 # set that diverges from the auth/search workers.
 ALLOWED_ORIGIN = "https://example.com"
 ALLOWED_ORIGINS = "https://example.com"
+# Zone access config (JSON array of zone definitions consumed at ingress).
+# Empty array = no extra zone gating; operators overlay via forum-config/.
+ZONE_CONFIG = "[]"
+# Revocable device keys (ADR-099). Exact string "true" enables; default off.
+# Must match the auth-worker and the client window.__ENV__ to take effect.
+DEVICE_KEYS_ENABLED = "false"
 
 # Mesh federation (PRD-010 Phase 3 / ADR-073)
 MESH_MODE               = "standalone"

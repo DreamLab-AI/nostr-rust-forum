@@ -42,7 +42,7 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         // overstate capability — only the NIP-59 transport is implemented.
         "supported_nips": [1, 9, 11, 16, 29, 33, 40, 42, 45, 50, 56, 59, 65, 90, 98],
         "software": "https://github.com/DreamLab-AI/nostr-rust-forum",
-        "version": "3.0.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "limitation": {
             "max_message_length": 65536,
             "max_content_length": 65536,

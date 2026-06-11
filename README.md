@@ -8,7 +8,7 @@ backend — all in Rust. Operators consume this kit by creating a
 
 **Maintainer**: [John O'Hare](https://github.com/jjohare) · **Upstream IP**: [Melvin Carvalho](https://github.com/melvincarvalho) ([JSS](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer), [DID:Nostr](https://github.com/nicholasgasior/did-nostr)) · [MAINTAINERS.md](MAINTAINERS.md)
 
-**Current release:** `v3.0.0-rc11` (see [CHANGELOG.md](CHANGELOG.md)) — `main`
+**Current release:** `v1.0.0-beta.2` (see [CHANGELOG.md](CHANGELOG.md)) — `main`
 additionally carries the June 2026 zones/calendar/search sprint described
 below (`3503eeb..6f9c2d0`).
 
@@ -316,7 +316,7 @@ the ecosystem. From this kit's perspective:
   `forum-config/`; runtime values flow into `wrangler.toml` as
   `NIP05_RESOLVER_MODE` and `POD_BASE_URL`.
 - **solid-pod-rs JSS v0.0.197 alignment** -- workspace dependency is pinned
-  to `solid-pod-rs` `0.4.0-alpha.15` (published on crates.io; earlier rc builds
+  to `solid-pod-rs` `0.4.0-alpha.17` (published on crates.io; earlier rc builds
   used git revisions `8668792` / `4ac7670`). The
   forum consumes the WASM-safe `core` surface and mirrors the new server
   browser contract in the Worker tier: JSS-compatible CORS, Solid auth
@@ -432,7 +432,7 @@ for the full ADR and protocol specification.
 ## NIP Coverage
 
 The relay advertises its supported NIPs in the NIP-11 information document
-(`crates/nostr-bbs-relay-worker/src/nip11.rs`): `1, 9, 11, 16, 17, 29, 33, 40,
+(`crates/nostr-bbs-relay-worker/src/nip11.rs`): `1, 9, 11, 16, 29, 33, 40,
 42, 45, 50, 56, 59, 65, 90, 98`.
 
 | NIP | Description | Crate |
@@ -442,7 +442,7 @@ The relay advertises its supported NIPs in the NIP-11 information document
 | 09 | Event deletion | nostr-bbs-core, nostr-bbs-relay-worker |
 | 11 | Relay information document | nostr-bbs-relay-worker |
 | 16 | Event treatment (replaceable/ephemeral) | nostr-bbs-relay-worker |
-| 17 | Private direct messages | nostr-bbs-core, nostr-bbs-relay-worker |
+| 17 | NIP-59 gift-wrap transport only (NIP-17 inbox routing not implemented) | nostr-bbs-core, nostr-bbs-relay-worker |
 | 29 | Relay-based groups | nostr-bbs-core, nostr-bbs-relay-worker |
 | 33 | Parameterized replaceable events | nostr-bbs-core, nostr-bbs-relay-worker |
 | 40 | Expiration timestamp | nostr-bbs-core, nostr-bbs-relay-worker |
@@ -587,4 +587,5 @@ nostr-rust-forum is the **forum kit and governance UI** of the [VisionFlow](http
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.
+Licensed under [AGPL-3.0-only](LICENSE), inherited from upstream JSS
+([JavaScriptSolidServer](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer)).

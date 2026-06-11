@@ -11,6 +11,14 @@ database_name = "nostr-bbs-auth"
 database_id = "e3981999-e8f0-4c07-9e4b-2e50859b8524"
 migrations_dir = "migrations"
 
+# required by governance_api.rs/devices.rs/admin.rs — point at the relay's D1;
+# deployments override (see downstream forum-config/deploy). The placeholder
+# database_id below MUST be replaced with the relay worker's actual D1 id.
+[[d1_databases]]
+binding = "RELAY_DB"
+database_name = "dreamlab-relay"
+database_id = "00000000-0000-0000-0000-000000000000"
+
 [[kv_namespaces]]
 binding = "SESSIONS"
 id = "901345296c2848788066686aa67d5909"
@@ -38,3 +46,14 @@ bucket_name = "nostr-bbs-pods"
 RP_ID = "example.com"
 RP_NAME = "Nostr BBS"
 EXPECTED_ORIGIN = "https://example.com"
+# Solid pod base (NIP-05 federation / pod creation alias).
+POD_BASE_URL = "https://example.com"
+# Native pod tier endpoint (this kit's own pod service).
+NATIVE_POD_URL = "https://example.com"
+# Revocable device keys (ADR-099). Exact string "true" enables; default off.
+# Must be set the same on the relay-worker and the client window.__ENV__.
+DEVICE_KEYS_ENABLED = "false"
+
+# Secrets — set via `wrangler secret put`, never inline here:
+#   NATIVE_POD_ADMIN_KEY   admin key for the native pod tier
+#   WELCOME_MASTER_KEY     master key used to mint /connect welcome links

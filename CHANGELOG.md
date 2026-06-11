@@ -16,7 +16,8 @@ and this project tracks the spec home at [VisionClaw monorepo](https://github.co
   recoverable, purpose-scoped child keys; byte-for-byte parity with agentbox's
   JS mirror derivation, pinned by a known-answer vector (root `0x01`×32 + tag
   `agentbox-mirror-v1` → `2d07f2ce…695d`). Domain separation, not compromise
-  isolation — use NIP-26 for revocable delegation.
+  isolation — revocable delegation is provided by device keys (ADR-099);
+  NIP-26 was evaluated and rejected.
 - **ADR-095 — Recovery & device-onboarding sheet** (`nostr-bbs-forum-client`):
   a `RecoverySheet` Leptos component renders a 100% client-side printable
   one-page sheet at signup (nsec/npub/relay QRs + metadata + restore steps +

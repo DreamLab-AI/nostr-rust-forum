@@ -84,4 +84,4 @@ the public internet *and* from sibling agentboxes over the tailnet.
 
 ## License
 
-MIT OR Apache-2.0.
+AGPL-3.0-only.

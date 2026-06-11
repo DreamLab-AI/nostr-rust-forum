@@ -78,5 +78,5 @@ If you discover a security vulnerability, do NOT open a public issue. See
 
 ## License
 
-By contributing, you agree that your contributions will be dual-licensed under
-MIT and Apache 2.0, consistent with the project license.
+By contributing, you agree that your contributions will be licensed under
+AGPL-3.0-only, consistent with the project license.

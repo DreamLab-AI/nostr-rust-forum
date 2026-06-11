@@ -181,6 +181,7 @@ graph TD
 | `nostr-bbs-config` | Operator configuration schema. Zone definitions, deployment topology, branding overlay points. Consumed by `forum-config/` packages. |
 | `nostr-bbs-mesh` | Private relay mesh federation. NIP-42 AUTH gate, peer discovery, cross-system message routing via IS-Envelope. |
 | `nostr-bbs-setup-skill` | Provider-abstracted AI configurator. Guides operators through initial deployment setup with LLM backend independence. |
+| `nostr-bbs-rate-limit` | Shared application-layer rate limiting via Cloudflare KV, consumed by all workers. |
 
 ## NIP Coverage by Worker
 
@@ -199,6 +200,10 @@ graph TD
 | 45  |      | X     |     |        |         |      |        |
 | 50  |      |       |     | X      |         |      |        |
 | 52  |      |       |     |        |         | X    |        |
+| 56  |      | X     |     |        |         |      |        |
+| 59  |      | X     |     |        |         | X    |        |
+| 65  |      | X     |     |        |         |      |        |
+| 90  |      | X     |     |        |         |      |        |
 | 98  | X    | X     | X   | X      |         | X    |        |
 | app:31400-31405 | X | X |  |     |         | X    | X      |
 
@@ -207,6 +212,13 @@ parameterized replaceable events. The auth-worker exposes REST endpoints for the
 governance tables; the relay-worker validates agent events at ingress and projects
 action requests to D1; the core crate defines the domain model; the client renders
 panels and signs action responses.
+
+**Note (NIP-56/65/90):** Reporting (kind-1984, relay-enforced moderation), relay
+list metadata, and data vending machines are validated at ingress by the
+relay-worker. **NIP-59 gift wrap (kind-1059)** carries the only direct-message
+transport: the relay-worker enforces a recipient-whitelist admission gate on
+kind-1059 events (see `relay-worker/src/relay_do/nip_handlers.rs`). There is no
+NIP-17 kind-14 inbox routing — only the NIP-59 gift-wrap envelope.
 
 ## Authentication Flow
 
@@ -444,3 +456,24 @@ restore steps, and an optional relay "sweep" block. Save-as-PDF via
 additive to `NsecBackup` and gated by an insist-with-override exit control. The
 target mobile client is 0xchat (NIP-17 DMs, NIP-28 channels, NIP-42 AUTH);
 ncryptsec/NIP-49 is deferred until core exposes a NIP-49 surface.
+
+### Magic-link onboarding, gated device keys, NIP-59 admission (ADR-098/099)
+
+**ADR-098 — `/connect` magic-link onboarding** (`forum-client/src/pages/connect.rs`):
+an operator-issued single-use link lands a new member on the `/connect` route,
+which performs client-side key generation and first-publish without exposing the
+admin seed sequence to the invitee. The nsec is minted in-WASM and never leaves
+the browser.
+
+**ADR-099 — gated revocable device keys** (`auth-worker/src/devices.rs`): a
+member may tear off per-device subkeys (ADR-094 derivation) so a lost device can
+be revoked without rotating the root identity. The feature is gated behind
+`DEVICE_KEYS_ENABLED` (exact string `"true"`, default off) and must be set on the
+auth-worker, the relay-worker, and the client's `window.__ENV__` together;
+phase-2 multi-device DMs are deferred.
+
+**NIP-59 recipient-admission rule** (`relay-worker/src/relay_do/nip_handlers.rs`):
+the relay admits a kind-1059 gift wrap only when its `#p` recipient tag resolves
+to a whitelisted member, so DM transport cannot be used as an unsolicited-mail
+vector. This is the gift-wrap envelope only — there is no NIP-17 kind-14 inbox
+routing.
