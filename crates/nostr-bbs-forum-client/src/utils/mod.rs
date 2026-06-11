@@ -1,5 +1,6 @@
 //! Shared utility functions used across forum-client components.
 
+pub mod devices;
 pub mod image_compress;
 pub mod pod_client;
 pub mod relay_url;

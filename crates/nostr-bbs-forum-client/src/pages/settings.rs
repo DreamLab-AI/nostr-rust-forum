@@ -110,6 +110,84 @@ pub fn SettingsPage() -> impl IntoView {
     let allow_dms = RwSignal::new(init_dms);
     let privacy_saving = RwSignal::new(false);
 
+    // Devices (ADR-099, gated on window.__ENV__.DEVICE_KEYS_ENABLED).
+    // When the flag is off the whole section is hidden and never fetches.
+    let device_keys_on = crate::utils::devices::device_keys_enabled();
+    let devices_list: RwSignal<Vec<crate::utils::devices::DeviceKey>> = RwSignal::new(Vec::new());
+    let devices_loading = RwSignal::new(false);
+    let devices_error: RwSignal<Option<String>> = RwSignal::new(None);
+    // "Add a device" QR + link, rendered after a successful registration.
+    let new_device_qr = RwSignal::new(String::new());
+    let new_device_connect = RwSignal::new(String::new());
+    let new_device_busy = RwSignal::new(false);
+
+    // Load the device list once, only when the feature is enabled and authed.
+    if device_keys_on {
+        Effect::new(move |_| {
+            if auth.pubkey().get().is_none() {
+                return;
+            }
+            if devices_loading.get_untracked() || !devices_list.get_untracked().is_empty() {
+                return;
+            }
+            devices_loading.set(true);
+            wasm_bindgen_futures::spawn_local(async move {
+                match crate::utils::devices::list_devices(auth).await {
+                    Ok(list) => devices_list.set(list),
+                    Err(e) => devices_error.set(Some(e.to_string())),
+                }
+                devices_loading.set(false);
+            });
+        });
+    }
+
+    // Derive + register a new device key, then surface its /connect QR.
+    let on_add_device = move |_| {
+        if new_device_busy.get_untracked() {
+            return;
+        }
+        new_device_busy.set(true);
+        devices_error.set(None);
+        wasm_bindgen_futures::spawn_local(async move {
+            let label = format!("Device added {}", crate::utils::devices::today_utc());
+            match crate::utils::devices::register_device(auth, &label).await {
+                Ok(reg) => {
+                    let url = crate::utils::devices::device_connect_url(&reg.device_nsec)
+                        .unwrap_or_default();
+                    new_device_qr.set(crate::utils::devices::qr_svg(&url));
+                    new_device_connect.set(url);
+                    // Refresh the list to include the newly-registered device.
+                    match crate::utils::devices::list_devices(auth).await {
+                        Ok(list) => devices_list.set(list),
+                        Err(e) => devices_error.set(Some(e.to_string())),
+                    }
+                }
+                Err(e) => devices_error.set(Some(e.to_string())),
+            }
+            new_device_busy.set(false);
+        });
+    };
+
+    // Revoke a device key and drop it from the list optimistically.
+    let on_revoke_device = move |pubkey: String| {
+        let pk = pubkey.clone();
+        devices_error.set(None);
+        wasm_bindgen_futures::spawn_local(async move {
+            match crate::utils::devices::revoke_device(auth, &pk).await {
+                Ok(()) => {
+                    devices_list.update(|l| {
+                        for d in l.iter_mut() {
+                            if d.device_pubkey == pk {
+                                d.revoked = 1;
+                            }
+                        }
+                    });
+                }
+                Err(e) => devices_error.set(Some(e.to_string())),
+            }
+        });
+    };
+
     // Confirm dialog for nsec export
     let confirm_nsec_open = RwSignal::new(false);
 
@@ -995,6 +1073,124 @@ pub fn SettingsPage() -> impl IntoView {
                     </div>
                 </div>
 
+                // -- Section 4e: Devices (ADR-099, gated) --
+                // Hidden entirely unless DEVICE_KEYS_ENABLED is set, so the
+                // feature is inert by default with zero behaviour change.
+                <Show when=move || device_keys_on>
+                    <div class="glass-card p-6 space-y-4">
+                        <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                            {device_icon()}
+                            "Devices"
+                        </h2>
+                        <div class="border-t border-gray-700/50"></div>
+
+                        <p class="text-sm text-gray-400">
+                            "Phones and other devices that can sign in as you with a "
+                            <span class="text-gray-300">"revocable device key"</span>
+                            ". Revoking a device kills its access immediately without touching your main account."
+                        </p>
+
+                        <Show when=move || devices_error.get().is_some()>
+                            <p class="text-sm text-red-400" data-testid="devices-error">
+                                {move || devices_error.get().unwrap_or_default()}
+                            </p>
+                        </Show>
+
+                        // Device list.
+                        <div class="space-y-2">
+                            <Show
+                                when=move || !devices_list.get().is_empty()
+                                fallback=move || view! {
+                                    <p class="text-sm text-gray-500" data-testid="devices-empty">
+                                        {move || if devices_loading.get() {
+                                            "Loading devices…"
+                                        } else {
+                                            "No devices yet. Add one below to sign in on your phone."
+                                        }}
+                                    </p>
+                                }
+                            >
+                                <For
+                                    each=move || devices_list.get()
+                                    key=|d| d.device_pubkey.clone()
+                                    children=move |d| {
+                                        let pk = d.device_pubkey.clone();
+                                        let active = d.is_active();
+                                        let label = d.label.clone().unwrap_or_else(|| "Unnamed device".to_string());
+                                        let short = shorten_pubkey(&d.device_pubkey);
+                                        let added = if d.created_at > 0 {
+                                            crate::utils::format_relative_time(d.created_at)
+                                        } else {
+                                            String::new()
+                                        };
+                                        let revoke_pk = pk.clone();
+                                        view! {
+                                            <div class="flex items-center justify-between bg-gray-800 rounded-lg px-3 py-2">
+                                                <div class="min-w-0">
+                                                    <p class="text-sm text-white truncate">
+                                                        {label}
+                                                        {(!active).then(|| view! {
+                                                            <span class="ml-2 text-xs text-red-400">"(revoked)"</span>
+                                                        })}
+                                                    </p>
+                                                    <p class="text-xs text-gray-500 font-mono truncate">
+                                                        {short}
+                                                        {(!added.is_empty()).then(|| format!(" · {added}"))}
+                                                    </p>
+                                                </div>
+                                                <Show when=move || active>
+                                                    <button
+                                                        on:click={
+                                                            let on_revoke_device = on_revoke_device;
+                                                            let revoke_pk = revoke_pk.clone();
+                                                            move |_| on_revoke_device(revoke_pk.clone())
+                                                        }
+                                                        class="text-sm text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded-lg px-3 py-1 transition-colors flex-shrink-0"
+                                                        data-testid="device-revoke"
+                                                    >
+                                                        "Revoke"
+                                                    </button>
+                                                </Show>
+                                            </div>
+                                        }
+                                    }
+                                />
+                            </Show>
+                        </div>
+
+                        // Add-a-device action.
+                        <div class="border-t border-gray-700/50 pt-3 space-y-3">
+                            <button
+                                on:click=on_add_device
+                                prop:disabled=move || new_device_busy.get()
+                                class="text-sm bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors"
+                                data-testid="device-add"
+                            >
+                                {move || if new_device_busy.get() { "Adding…" } else { "Add a device" }}
+                            </button>
+
+                            // /connect QR for the freshly-added device (scan/print).
+                            <Show when=move || !new_device_connect.get().is_empty()>
+                                <div class="bg-gray-800 rounded-lg p-3 space-y-2">
+                                    <p class="text-xs text-amber-300">
+                                        "Scan this with your phone to sign in. It grants forum access as you — revoke it above if the phone is lost."
+                                    </p>
+                                    <div class="flex flex-col sm:flex-row items-center gap-3">
+                                        <div
+                                            class="bg-white p-2 rounded flex-shrink-0 [&_svg]:w-40 [&_svg]:h-40"
+                                            inner_html=move || new_device_qr.get()
+                                            data-testid="device-qr"
+                                        ></div>
+                                        <code class="text-[10px] text-gray-300 font-mono break-all min-w-0">
+                                            {move || new_device_connect.get()}
+                                        </code>
+                                    </div>
+                                </div>
+                            </Show>
+                        </div>
+                    </div>
+                </Show>
+
                 // -- Section 5: Account --
                 <div class="glass-card p-6 space-y-4">
                     <h2 class="text-lg font-semibold text-white flex items-center gap-2">
@@ -1284,6 +1480,10 @@ fn mute_icon() -> impl IntoView {
 }
 fn privacy_icon() -> impl IntoView {
     section_icon("M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z")
+}
+fn device_icon() -> impl IntoView {
+    // Smartphone outline.
+    section_icon("M7 2h10a2 2 0 012 2v16a2 2 0 01-2 2H7a2 2 0 01-2-2V4a2 2 0 012-2zM11 18h2")
 }
 fn palette_icon() -> impl IntoView {
     section_icon("M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 011.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z")
