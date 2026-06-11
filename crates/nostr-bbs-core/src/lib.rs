@@ -42,7 +42,9 @@ pub use event::{
     NostrEvent, PubkeyMismatch, UnsignedEvent,
 };
 pub use gift_wrap::{gift_wrap, unwrap_gift, GiftWrapError, UnwrappedGift};
-pub use keys::{derive_from_prf, generate_keypair, Keypair, PublicKey, SecretKey, Signature};
+pub use keys::{
+    derive_from_prf, derive_subkey, generate_keypair, Keypair, PublicKey, SecretKey, Signature,
+};
 pub use nip44::{decrypt as nip44_decrypt, encrypt as nip44_encrypt};
 pub use nip98::{
     authorization_header as nip98_authorization_header,

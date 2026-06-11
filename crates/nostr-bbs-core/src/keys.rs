@@ -1,9 +1,12 @@
 //! Nostr keypair management, HKDF key derivation from WebAuthn PRF, and BIP-340 Schnorr signing.
 
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use k256::schnorr::{SigningKey, VerifyingKey};
 use sha2::Sha256;
 use zeroize::Zeroize;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// HKDF info string — must match the JavaScript implementation in passkey.ts
 const HKDF_INFO: &[u8] = b"nostr-secp256k1-v1";
@@ -198,6 +201,54 @@ pub fn derive_from_prf(prf_output: &[u8; 32]) -> Result<Keypair, KeyError> {
     Ok(Keypair { secret, public })
 }
 
+/// Derive a deterministic, purpose-scoped child secret key from a root secret key.
+///
+/// The scheme is **HMAC-SHA-256(key = root's 32 secret bytes, msg = utf8(tag))**.
+/// The 32-byte output is then validated/reduced into a secp256k1 scalar exactly
+/// as the [`SecretKey::from_bytes`] path does. This is intentionally a
+/// *different construction* from [`derive_from_prf`] (which uses HKDF-Expand) —
+/// see [ADR-094] — because it must match the existing agentbox JavaScript
+/// derivation byte-for-byte:
+///
+/// ```js
+/// child_sk = crypto.createHmac('sha256', rootSk32Bytes).update(tag, 'utf8').digest();
+/// ```
+///
+/// A key derived this way is the SAME across Rust and JS for a given
+/// `(root, tag)` pair, enabling forum device keys and agentbox agent/mirror
+/// keys to converge on one purpose-scoped key (e.g. tag `"agentbox-mirror-v1"`).
+///
+/// Rotation is by tag: change the tag suffix (`-v1` → `-v2`) to rotate.
+///
+/// # Security
+///
+/// A derived subkey is **recoverable from the root** by anyone holding the root.
+/// Do NOT use it where independence from the root is required (e.g. delegating
+/// authority you must be able to deny later). It provides *domain separation*,
+/// not *compromise isolation*.
+///
+/// # Errors
+///
+/// Returns [`KeyError::InvalidSecretKey`] if the HMAC output is not a valid
+/// secp256k1 scalar (zero or >= curve order) — astronomically unlikely.
+///
+/// [ADR-094]: ../../../docs/adr/ADR-094-deterministic-subkey-derivation.md
+pub fn derive_subkey(root: &SecretKey, tag: &str) -> Result<SecretKey, KeyError> {
+    // HMAC-SHA-256 keyed with the root's 32 secret bytes; message is the UTF-8 tag.
+    let mut mac = HmacSha256::new_from_slice(root.as_bytes())
+        .expect("HMAC-SHA-256 accepts keys of any length");
+    mac.update(tag.as_bytes());
+    let result = mac.finalize().into_bytes();
+
+    let mut child = [0u8; 32];
+    child.copy_from_slice(&result);
+
+    // Validate/reduce into a valid secp256k1 scalar via the canonical path.
+    let secret = SecretKey::from_bytes(child)?;
+    child.zeroize();
+    Ok(secret)
+}
+
 /// Generate a random keypair (primarily for testing).
 pub fn generate_keypair() -> Result<Keypair, KeyError> {
     let mut bytes = [0u8; 32];
@@ -367,5 +418,63 @@ mod tests {
         let sk = signing_key_from_bytes(&secret).unwrap();
         let pk = hex::encode(sk.verifying_key().to_bytes());
         assert_eq!(pk.len(), 64);
+    }
+
+    // ── derive_subkey (ADR-094) ───────────────────────────────────────────────
+
+    #[test]
+    fn derive_subkey_deterministic() {
+        let root = SecretKey::from_bytes([0x42u8; 32]).unwrap();
+        let a = derive_subkey(&root, "agentbox-mirror-v1").unwrap();
+        let b = derive_subkey(&root, "agentbox-mirror-v1").unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        assert_eq!(a.public_key(), b.public_key());
+    }
+
+    #[test]
+    fn derive_subkey_domain_separation() {
+        let root = SecretKey::from_bytes([0x42u8; 32]).unwrap();
+        let mirror = derive_subkey(&root, "agentbox-mirror-v1").unwrap();
+        let agent = derive_subkey(&root, "agentbox-agent-v1").unwrap();
+        let rotated = derive_subkey(&root, "agentbox-mirror-v2").unwrap();
+        assert_ne!(mirror.as_bytes(), agent.as_bytes());
+        assert_ne!(mirror.as_bytes(), rotated.as_bytes());
+        assert_ne!(agent.as_bytes(), rotated.as_bytes());
+    }
+
+    /// Known-answer vector locking in JS parity.
+    ///
+    /// Cross-checked against Node.js:
+    /// ```sh
+    /// node -e 'const c=require("crypto");
+    ///   const root=Buffer.alloc(32,0x01);
+    ///   console.log(c.createHmac("sha256",root).update("agentbox-mirror-v1","utf8").digest("hex"));'
+    /// // => 2d07f2ce93d0361687fdd81d2690082b5d6c35b93e3ece2d44bcf115ef8f695d
+    /// ```
+    #[test]
+    fn derive_subkey_known_answer_vector_js_parity() {
+        let root = SecretKey::from_bytes([0x01u8; 32]).unwrap();
+        let child = derive_subkey(&root, "agentbox-mirror-v1").unwrap();
+        assert_eq!(
+            hex::encode(child.as_bytes()),
+            "2d07f2ce93d0361687fdd81d2690082b5d6c35b93e3ece2d44bcf115ef8f695d"
+        );
+    }
+
+    #[test]
+    fn derive_subkey_empty_tag_is_valid_and_distinct() {
+        let root = SecretKey::from_bytes([0x07u8; 32]).unwrap();
+        let empty = derive_subkey(&root, "").unwrap();
+        let named = derive_subkey(&root, "agentbox-mirror-v1").unwrap();
+        assert_ne!(empty.as_bytes(), named.as_bytes());
+    }
+
+    #[test]
+    fn derive_subkey_different_roots_differ() {
+        let root_a = SecretKey::from_bytes([0x01u8; 32]).unwrap();
+        let root_b = SecretKey::from_bytes([0x02u8; 32]).unwrap();
+        let a = derive_subkey(&root_a, "agentbox-mirror-v1").unwrap();
+        let b = derive_subkey(&root_b, "agentbox-mirror-v1").unwrap();
+        assert_ne!(a.as_bytes(), b.as_bytes());
     }
 }

@@ -7,6 +7,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::event::{compute_event_id as compute_id_inner, UnsignedEvent};
 use crate::keys;
+use crate::nip19;
 use crate::nip44;
 use crate::nip98;
 
@@ -64,6 +65,41 @@ pub fn derive_keypair_from_prf(prf_output: &[u8]) -> Result<JsValue, JsValue> {
     let sk_array = js_sys::Uint8Array::from(kp.secret.as_bytes().as_slice());
     js_sys::Reflect::set(&obj, &"secretKey".into(), &sk_array)?;
     js_sys::Reflect::set(&obj, &"publicKey".into(), &kp.public.to_hex().into())?;
+    Ok(obj.into())
+}
+
+/// Derive a deterministic, purpose-scoped child key from a root secret key.
+///
+/// Scheme (ADR-094): `child_sk = HMAC-SHA-256(root_sk_bytes, utf8(tag))`,
+/// reduced into a secp256k1 scalar. Matches the agentbox JavaScript derivation
+/// byte-for-byte, so a key derived here equals the key derived in JS / native
+/// Rust for the same `(root, tag)`.
+///
+/// `root_hex` is a 64-char lowercase hex secret key. Returns a JS object
+/// `{ publicKey: string, secretKeyHex: string, nsec: string }`.
+#[wasm_bindgen]
+pub fn derive_subkey_js(root_hex: &str, tag: &str) -> Result<JsValue, JsValue> {
+    let root_bytes =
+        hex::decode(root_hex).map_err(|_| JsValue::from_str("root_hex must be valid hex"))?;
+    let root_arr: [u8; 32] = root_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| JsValue::from_str("root_hex must be 32 bytes"))?;
+    let root =
+        keys::SecretKey::from_bytes(root_arr).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let child = keys::derive_subkey(&root, tag).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let child_hex = hex::encode(child.as_bytes());
+    let nsec = nip19::encode_nsec(&child_hex).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &obj,
+        &"publicKey".into(),
+        &child.public_key().to_hex().into(),
+    )?;
+    js_sys::Reflect::set(&obj, &"secretKeyHex".into(), &child_hex.into())?;
+    js_sys::Reflect::set(&obj, &"nsec".into(), &nsec.into())?;
     Ok(obj.into())
 }
 
