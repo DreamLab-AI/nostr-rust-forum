@@ -38,6 +38,10 @@ const MAX_TAG_VALUE_SIZE: usize = 1024;
 const MAX_TIMESTAMP_DRIFT: u64 = 60 * 60 * 24 * 7;
 const MAX_SUBSCRIPTIONS: usize = 20;
 
+/// NIP-59: gift-wrap event kind. Signed by a fresh ephemeral key per message;
+/// recipient-gated via the first `["p", <hex>]` tag rather than the author.
+const GIFT_WRAP_KIND: u64 = 1059;
+
 /// NIP-29: Admin-only group management/moderation kinds.
 fn is_nip29_admin_kind(kind: u64) -> bool {
     (9000..=9020).contains(&kind) || (39000..=39002).contains(&kind)
@@ -70,6 +74,23 @@ pub fn calendar_write_permitted(zone: Option<&str>, has_write: bool) -> bool {
     match zone {
         Some(_) => has_write,
         None => true,
+    }
+}
+
+/// NIP-59: extract the gift-wrap (kind-1059) RECIPIENT pubkey from the first
+/// `["p", <hex>]` tag. Returns `None` when the event is not a gift wrap, or when
+/// no non-empty `p` tag is present. The recipient — not the ephemeral author —
+/// is the principal the membership gate is applied to.
+///
+/// Pure over the event so the routing decision is unit-testable without an
+/// `is_whitelisted` D1 lookup / `worker::Env`.
+pub fn gift_wrap_recipient(event: &NostrEvent) -> Option<String> {
+    if event.kind != GIFT_WRAP_KIND {
+        return None;
+    }
+    match filter::tag_value(event, "p") {
+        Some(pk) if !pk.is_empty() => Some(pk),
+        _ => None,
     }
 }
 
@@ -123,7 +144,28 @@ impl NostrRelayDO {
             return;
         }
 
-        if !self.is_whitelisted(&event.pubkey).await {
+        // NIP-59 gift wraps (kind-1059) are signed by a fresh ephemeral key per
+        // message, so the author is intentionally NOT a member and the standard
+        // author-membership check would always reject them. Instead, gate on the
+        // RECIPIENT carried in the first `["p", <hex>]` tag: accept only if that
+        // recipient is a whitelisted member. This bounds gift-wrap acceptance to
+        // messages addressed to existing members (no spam to non-members) while
+        // permitting the ephemeral author.
+        if event.kind == GIFT_WRAP_KIND {
+            let recipient_ok = match gift_wrap_recipient(&event) {
+                Some(pk) => self.is_whitelisted(&pk).await,
+                None => false,
+            };
+            if !recipient_ok {
+                Self::send_ok(
+                    ws,
+                    &event.id,
+                    false,
+                    "blocked: gift-wrap recipient not whitelisted",
+                );
+                return;
+            }
+        } else if !self.is_whitelisted(&event.pubkey).await {
             Self::send_ok(ws, &event.id, false, "blocked: pubkey not whitelisted");
             return;
         }
@@ -1429,5 +1471,66 @@ mod write_gate_tests {
         // No zone tag → unscoped → permitted regardless of zone-write resolution.
         assert!(calendar_write_permitted(None, false));
         assert!(calendar_write_permitted(None, true));
+    }
+
+    // ---- NIP-59 gift-wrap (kind 1059) recipient routing --------------------
+    //
+    // The handler's recipient gate is `is_whitelisted(recipient)`, which needs a
+    // `worker::Env` / D1 and so cannot run in isolation. These tests pin the PURE
+    // decision the handler feeds into that lookup: `gift_wrap_recipient` resolves
+    // the principal the membership check is applied to. `Some(pk)` ⇒ the gate runs
+    // against `pk` (admitted iff whitelisted); `None` ⇒ fail-closed reject; for a
+    // normal kind ⇒ `None`, so the author `is_whitelisted` branch runs as before.
+
+    fn mk_event(kind: u64, tags: Vec<Vec<String>>) -> NostrEvent {
+        NostrEvent {
+            id: "00".repeat(32),
+            pubkey: "ab".repeat(32),
+            created_at: 0,
+            kind,
+            tags,
+            content: String::new(),
+            sig: "cd".repeat(64),
+        }
+    }
+
+    fn p(hex: &str) -> Vec<String> {
+        vec!["p".to_string(), hex.to_string()]
+    }
+
+    #[test]
+    fn gift_wrap_with_p_tag_routes_membership_to_recipient() {
+        // kind-1059 carrying a #p recipient ⇒ gate that recipient (not the
+        // ephemeral author). The handler then admits iff that recipient is
+        // whitelisted; here we pin the recipient resolution + the boolean gate.
+        let recipient = "11".repeat(32);
+        let ev = mk_event(GIFT_WRAP_KIND, vec![p(&recipient)]);
+        assert_eq!(
+            gift_wrap_recipient(&ev).as_deref(),
+            Some(recipient.as_str())
+        );
+        // Whitelisted recipient ⇒ admitted; non-whitelisted ⇒ rejected.
+        let admitted =
+            |whitelisted: bool| matches!(gift_wrap_recipient(&ev), Some(_)) && whitelisted;
+        assert!(admitted(true));
+        assert!(!admitted(false));
+    }
+
+    #[test]
+    fn gift_wrap_without_or_empty_p_tag_rejected() {
+        // No #p tag ⇒ no resolvable recipient ⇒ fail-closed reject.
+        let ev_missing = mk_event(GIFT_WRAP_KIND, vec![vec!["e".to_string(), "ff".repeat(32)]]);
+        assert_eq!(gift_wrap_recipient(&ev_missing), None);
+        // Empty #p value ⇒ treated as absent ⇒ reject.
+        let ev_empty = mk_event(GIFT_WRAP_KIND, vec![p("")]);
+        assert_eq!(gift_wrap_recipient(&ev_empty), None);
+    }
+
+    #[test]
+    fn normal_kind_does_not_route_to_recipient_gate() {
+        // A normal kind (e.g. kind-1) with a #p tag is NOT recipient-gated; the
+        // author `is_whitelisted` branch still applies (gift_wrap_recipient → None).
+        let ev = mk_event(1, vec![p(&"22".repeat(32))]);
+        assert_eq!(gift_wrap_recipient(&ev), None);
     }
 }
