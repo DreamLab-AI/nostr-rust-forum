@@ -1,13 +1,31 @@
-//! Category browsing page -- shows sections within a specific zone/category.
+//! Category browsing page -- shows the SECTIONS within a zone and lets a user
+//! open a new TOPIC inside one of them.
 //!
 //! Route: /forums/:category
-//! Subscribes to kind 40 channels whose `section` tag matches the category,
-//! and renders them as section cards with message counts and last activity.
+//!
+//! ## BBS composition (the contract this page restores)
+//!
+//! - A *zone* (config: public/Landing, friends, family, business) groups
+//!   *sections*.
+//! - A *section* is a kind-40 channel carrying a `["section", <slug>]` tag that
+//!   routes to this zone (exact id match, or `<zone>-` prefix).
+//! - A *topic* is a kind-42 root message (a thread) inside a section channel;
+//!   replies e-tag the root.
+//!
+//! This page therefore lists the zone's *sections* (read from the shared
+//! [`ChannelStore`] — NO per-page relay subscription) with per-section topic
+//! counts, and offers a "New Topic" form whose **Section** dropdown is populated
+//! from those same resolved sections. Creating a topic publishes a kind-42 root
+//! e-tagging the selected section channel — it does NOT create a new channel.
+//!
+//! Previously this page (a) ran its own redundant kind-40/kind-42 subscriptions
+//! that duplicated the store, and (b) populated the Section dropdown from a dead
+//! hardcoded `ZONE_SECTIONS` const that had no entry for config-driven zones
+//! (friends/family/business) — so the dropdown rendered empty while the section
+//! tile rendered fine, and "New Topic" minted a *channel* instead of a thread.
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
-use nostr_bbs_core::NostrEvent;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::app::base_href;
@@ -15,337 +33,136 @@ use crate::auth::use_auth;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::empty_state::EmptyState;
 use crate::components::section_card::SectionCard;
+use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::zone_hero::ZoneHero;
-use crate::relay::{ConnectionState, Filter, RelayConnection};
+use crate::relay::{ConnectionState, RelayConnection};
+use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
-use crate::utils::{capitalize, set_timeout_once};
+use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
+use crate::utils::capitalize;
 
-/// Maps zone IDs to their child section IDs.
-const ZONE_SECTIONS: &[(&str, &[&str])] = &[
-    ("home", &["home-lobby"]),
-    (
-        "members",
-        &[
-            "members-training",
-            "members-projects",
-            "members-bookings",
-            "ai-general",
-            "ai-claude-flow",
-            "ai-visionflow",
-        ],
-    ),
-    (
-        "private",
-        &["private-welcome", "private-events", "private-booking"],
-    ),
-];
-
-/// Resolve a channel's section tag to its parent zone ID.
-fn section_to_zone_id(section: &str) -> Option<&'static str> {
-    for &(zone_id, sections) in ZONE_SECTIONS {
-        if sections.contains(&section) {
-            return Some(zone_id);
-        }
+/// Resolve a channel's `section` tag to the id of the owning config zone.
+///
+/// Mirrors `forums.rs::section_to_zone` / `section.rs::section_to_zone`: exact
+/// id match, then `<zone-id>-` prefix match, then the first zone as a catch-all
+/// so channels never silently disappear from routing.
+fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
+    let sec = section.to_lowercase();
+    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
+        return Some(z.id.clone());
     }
-    None
-}
-
-/// Get the section IDs belonging to a zone.
-fn zone_section_ids(zone_id: &str) -> &'static [&'static str] {
-    ZONE_SECTIONS
+    if let Some(z) = zones
         .iter()
-        .find(|&&(id, _)| id == zone_id)
-        .map(|&(_, secs)| secs)
-        .unwrap_or(&[])
+        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
+    {
+        return Some(z.id.clone());
+    }
+    zones.first().map(|z| z.id.clone())
 }
 
-/// Convert a section ID like "members-training" to "Training".
-fn humanize_section_id(id: &str) -> String {
-    let suffix = id.find('-').map(|i| &id[i + 1..]).unwrap_or(id);
-    suffix
-        .split('-')
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                None => String::new(),
-                Some(f) => f.to_uppercase().to_string() + c.as_str(),
-            }
+/// The sections (kind-40 channels) belonging to `category_slug`, resolved from
+/// the shared store using the SAME zone-routing logic the Forums index uses.
+fn sections_for_zone(
+    channels: &[ChannelMeta],
+    category_slug: &str,
+    zones: &[Zone],
+) -> Vec<ChannelMeta> {
+    let cat = category_slug.to_lowercase();
+    let mut out: Vec<ChannelMeta> = channels
+        .iter()
+        .filter(|ch| {
+            let section = if ch.section.is_empty() {
+                zones.first().map(|z| z.id.clone()).unwrap_or_default()
+            } else {
+                ch.section.clone()
+            };
+            section_to_zone(&section, zones)
+                .map(|z| z.to_lowercase() == cat)
+                .unwrap_or(false)
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .cloned()
+        .collect();
+    // Stable, deterministic order: by name.
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
 }
 
-/// Parsed section data from kind 40 events.
-#[derive(Clone, Debug)]
-struct SectionMeta {
-    channel_id: String,
-    name: String,
-    description: String,
-    _created_at: u64,
-}
-
-/// Category page showing sections within a specific category.
+/// Category page showing the sections within a zone.
 #[component]
 pub fn CategoryPage() -> impl IntoView {
-    let relay = expect_context::<RelayConnection>();
-    let conn_state = relay.connection_state();
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
     let zone_access = use_zone_access();
+    let store = use_channel_store();
+    let toasts = use_toasts();
 
     let params = use_params_map();
     let category_slug = move || params.read().get("category").unwrap_or_default();
 
-    // Check if this is a known zone. Config-driven: a zone is valid if it
-    // appears in the live ZONE_CONFIG (load_zones) OR in the legacy hardcoded
-    // section map. The legacy `ZONE_SECTIONS`-only check rejected every
-    // config-only zone (family, friends, business) as "Zone Not Found" even
-    // though the relay served their content — the root cause of "family chat
-    // shows 0 posts".
+    // Valid zone if it appears in the live ZONE_CONFIG.
     let is_valid_zone = Memo::new(move |_| {
         let cat = category_slug();
-        crate::stores::zones::load_zones()
-            .iter()
-            .any(|z| z.id == cat)
-            || ZONE_SECTIONS.iter().any(|&(id, _)| id == cat.as_str())
+        load_zones().iter().any(|z| z.id == cat)
     });
 
-    // Zone access gate: the category slug IS the zone ID. Config-driven —
-    // resolves against the live zone list (public zones are always readable,
-    // otherwise membership via admin OR matching cohort). Unknown zones default
-    // to accessible so relay-created zones never 403 the client UX; the relay
-    // remains the real boundary (ADR-022). Mirrors section.rs exactly.
+    // Zone access gate: the category slug IS the zone ID (ADR-022 — relay is the
+    // real boundary; unknown zones default accessible).
     let has_zone_access = Memo::new(move |_| {
         let cat = category_slug();
-        match crate::stores::zones::load_zones()
-            .into_iter()
-            .find(|z| z.id == cat)
-        {
+        match load_zones().into_iter().find(|z| z.id == cat) {
             Some(zone) => {
-                zone.visibility == crate::stores::zones::ZoneVisibility::Public
-                    || zone_access.is_member_of(&zone)
+                zone.visibility == ZoneVisibility::Public || zone_access.is_member_of(&zone)
             }
-            None => {
-                // Fall back to the legacy 3-flag map for the hardcoded zones so
-                // existing deployments without ZONE_CONFIG do not regress.
-                match cat.as_str() {
-                    "home" => zone_access.home.get(),
-                    "members" => zone_access.members.get(),
-                    "private" => zone_access.private.get(),
-                    _ => true,
-                }
-            }
+            None => true,
         }
     });
 
-    let sections = RwSignal::new(Vec::<SectionMeta>::new());
-    let message_counts = RwSignal::new(HashMap::<String, u32>::new());
-    let last_active_map = RwSignal::new(HashMap::<String, u64>::new());
-    let loading = RwSignal::new(true);
-    let eose_received = RwSignal::new(false);
+    // Sections (channels) for this zone, derived reactively from the shared
+    // store. `Signal::derive` (not `Memo`) — `ChannelMeta` is not `PartialEq`.
+    let zone_sections = Signal::derive(move || {
+        let chans = store.channels.get();
+        let zones = load_zones();
+        sections_for_zone(&chans, &category_slug(), &zones)
+    });
+
+    // Loading is true while the store is still fetching AND no section resolved.
+    let store_loading = store.loading;
+    let loading = Memo::new(move |_| store_loading.get() && zone_sections.with(|s| s.is_empty()));
 
     // -- New topic creation state --
     let show_new_topic = RwSignal::new(false);
     let topic_name = RwSignal::new(String::new());
-    let topic_desc = RwSignal::new(String::new());
     let creating = RwSignal::new(false);
     let create_error = RwSignal::new(Option::<String>::None);
+    // Selected SECTION = the channel id of the section the topic lands in.
     let selected_section = RwSignal::new(String::new());
 
-    let channel_sub_id: RwSignal<Option<String>> = RwSignal::new(None);
-    let msg_sub_id: RwSignal<Option<String>> = RwSignal::new(None);
-
-    let relay_for_ch = relay.clone();
-    let relay_for_msgs = relay.clone();
-    let relay_for_cleanup = relay;
-
-    // Subscribe to kind 40 events, filter by section tag matching this category
+    // Keep `selected_section` valid: preselect the only/first section so the
+    // form is immediately submittable instead of stuck on "Please select".
     Effect::new(move |_| {
-        let state = conn_state.get();
-        if state != ConnectionState::Connected {
-            return;
-        }
-        if channel_sub_id.get_untracked().is_some() {
-            return;
-        }
-
-        loading.set(true);
-
-        let filter = Filter {
-            kinds: Some(vec![40]),
-            ..Default::default()
-        };
-
-        let slug = category_slug();
-        let sections_sig = sections;
-        let on_event = Rc::new(move |event: NostrEvent| {
-            if event.kind != 40 {
-                return;
-            }
-
-            let section_tag = event
-                .tags
-                .iter()
-                .find(|t| t.len() >= 2 && t[0] == "section")
-                .map(|t| t[1].clone())
-                .unwrap_or_else(|| "home-lobby".to_string());
-
-            // Match: exact match, case-insensitive match, or zone parent match
-            let matches = section_tag == slug
-                || section_tag.eq_ignore_ascii_case(&slug)
-                || section_to_zone_id(&section_tag) == Some(slug.as_str());
-
-            if !matches && !slug.is_empty() {
-                return;
-            }
-
-            let (name, description) = parse_channel_content(&event.content);
-
-            let meta = SectionMeta {
-                channel_id: event.id.clone(),
-                name,
-                description,
-                _created_at: event.created_at,
-            };
-
-            sections_sig.update(|list| {
-                if !list.iter().any(|s| s.channel_id == meta.channel_id) {
-                    list.push(meta);
-                }
-            });
-        });
-
-        let loading_sig = loading;
-        let eose_sig = eose_received;
-        let on_eose = Rc::new(move || {
-            loading_sig.set(false);
-            eose_sig.set(true);
-        });
-
-        let id = relay_for_ch.subscribe(vec![filter], on_event, Some(on_eose));
-        channel_sub_id.set(Some(id));
-
-        set_timeout_once(
-            move || {
-                if loading_sig.get_untracked() {
-                    loading_sig.set(false);
-                }
-            },
-            8000,
-        );
-    });
-
-    // Subscribe to kind 42 messages for counts and last-active timestamps
-    Effect::new(move |_| {
-        if !eose_received.get() {
-            return;
-        }
-        if msg_sub_id.get_untracked().is_some() {
-            return;
-        }
-
-        let channel_ids: Vec<String> = sections
-            .get_untracked()
-            .iter()
-            .map(|s| s.channel_id.clone())
-            .collect();
-        if channel_ids.is_empty() {
-            return;
-        }
-
-        let channel_id_set: std::collections::HashSet<String> = channel_ids.into_iter().collect();
-        let msg_filter = Filter {
-            kinds: Some(vec![42]),
-            ..Default::default()
-        };
-
-        let counts = message_counts;
-        let active = last_active_map;
-        let on_msg = Rc::new(move |event: NostrEvent| {
-            let cid = event
-                .tags
-                .iter()
-                .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
-                .or_else(|| event.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
-                .map(|t| t[1].clone());
-
-            if let Some(cid) = cid {
-                if !channel_id_set.contains(&cid) {
-                    return;
-                }
-                counts.update(|m| *m.entry(cid.clone()).or_insert(0) += 1);
-                active.update(|m| {
-                    let ts = m.entry(cid).or_insert(0);
-                    if event.created_at > *ts {
-                        *ts = event.created_at;
-                    }
-                });
-            }
-        });
-
-        let id = relay_for_msgs.subscribe(vec![msg_filter], on_msg, None);
-        msg_sub_id.set(Some(id));
-    });
-
-    on_cleanup(move || {
-        if let Some(id) = channel_sub_id.get_untracked() {
-            relay_for_cleanup.unsubscribe(&id);
-        }
-        if let Some(id) = msg_sub_id.get_untracked() {
-            relay_for_cleanup.unsubscribe(&id);
+        let secs = zone_sections.get();
+        let cur = selected_section.get_untracked();
+        let still_valid = !cur.is_empty() && secs.iter().any(|s| s.id == cur);
+        if !still_valid {
+            selected_section.set(secs.first().map(|s| s.id.clone()).unwrap_or_default());
         }
     });
 
     let display_name = move || {
         let slug = category_slug();
-        match slug.as_str() {
-            "home" => "Home".to_string(),
-            "private" => "Minimoonoir".to_string(),
-            "members" => "Members".to_string(),
-            other => {
-                // For section IDs like "home-lobby", humanize to "Lobby"
-                if other.contains('-') {
-                    let suffix = other.split_once('-').map(|(_, s)| s).unwrap_or(other);
-                    suffix
-                        .split('-')
-                        .map(|w| {
-                            let mut c = w.chars();
-                            match c.next() {
-                                None => String::new(),
-                                Some(f) => f.to_uppercase().to_string() + c.as_str(),
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                } else {
-                    capitalize(other)
-                }
-            }
-        }
+        load_zones()
+            .into_iter()
+            .find(|z| z.id == slug)
+            .map(|z| z.label())
+            .unwrap_or_else(|| capitalize(&slug))
     };
 
-    // Map category slug to zone_id for ZoneHero
-    let zone_id_for_hero = move || -> String {
-        let slug = category_slug();
-        match slug.as_str() {
-            "home" | "members" | "private" => slug,
-            _ => {
-                // Resolve section ID to parent zone
-                section_to_zone_id(&slug).unwrap_or("home").to_string()
-            }
-        }
-    };
-
-    // Icon path data per zone
+    // Zone gradient/icon are keyed off the slug; ZoneHero falls back gracefully
+    // for config zones it doesn't special-case.
+    let zone_id_for_hero = move || category_slug();
     let zone_icon = move || -> &'static str {
-        let slug = category_slug();
-        if slug.starts_with("private") {
-            // Moon
-            "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"
-        } else {
-            // Sparkle for Home and Members
-            "M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8L12 2z"
-        }
+        // Sparkle is the neutral default for config zones.
+        "M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8L12 2z"
     };
 
     view! {
@@ -398,7 +215,7 @@ pub fn CategoryPage() -> impl IntoView {
             {move || view! {
                 <ZoneHero
                     title=display_name()
-                    description="Browse sections and start a discussion".to_string()
+                    description="Browse sections and start a topic".to_string()
                     zone_id=zone_id_for_hero()
                     icon=zone_icon()
                 />
@@ -407,13 +224,12 @@ pub fn CategoryPage() -> impl IntoView {
             <Breadcrumb items=vec![
                 BreadcrumbItem::link("Home", "/"),
                 BreadcrumbItem::link("Forums", "/forums"),
-                // Use the same display-name mapping as the hero so the
-                // breadcrumb reads e.g. "Minimoonoir" not "Private"
-                // (Bug #22).
                 BreadcrumbItem::current(display_name()),
             ] />
 
-            // New Topic button + inline form
+            // New Topic button + inline form. Discoverable on the page (not just
+            // via direct URL): the trigger is always rendered for authed users
+            // once the store has finished loading.
             <Show when=move || is_authed.get() && !loading.get()>
                 <div class="mb-4">
                     <Show
@@ -421,39 +237,36 @@ pub fn CategoryPage() -> impl IntoView {
                         fallback=move || {
                             let relay_create = expect_context::<RelayConnection>();
                             let auth_create = use_auth();
-                            let sections_sig = sections;
-                            let zone_secs = zone_section_ids(&category_slug());
+                            let toasts = toasts;
                             view! {
                                 <div class="bg-gray-800 border border-gray-700 rounded-lg p-5 space-y-3">
                                     <h3 class="text-lg font-semibold text-white">"New Topic"</h3>
                                     <input
                                         type="text"
-                                        maxlength="64"
-                                        placeholder="Topic name"
+                                        maxlength="80"
+                                        placeholder="Topic title"
                                         prop:value=move || topic_name.get()
                                         on:input=move |ev| topic_name.set(event_target_value(&ev))
                                         class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500"
                                     />
-                                    <textarea
-                                        placeholder="Description (optional)"
-                                        rows="2"
-                                        prop:value=move || topic_desc.get()
-                                        on:input=move |ev| topic_desc.set(event_target_value(&ev))
-                                        class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 resize-none"
-                                    />
-                                    // Section picker
+                                    // Section picker — populated from the zone's
+                                    // actual resolved sections (channels). The
+                                    // <option> value is the channel id the topic
+                                    // root e-tags.
                                     <div>
                                         <label class="block text-sm text-gray-400 mb-1">"Section"</label>
                                         <select
                                             on:change=move |ev| selected_section.set(event_target_value(&ev))
+                                            prop:value=move || selected_section.get()
                                             class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500"
                                         >
-                                            {zone_secs.iter().map(|&s| {
-                                                let display = humanize_section_id(s);
-                                                view! {
-                                                    <option value=s>{display}</option>
-                                                }
-                                            }).collect_view()}
+                                            {move || {
+                                                zone_sections.get().into_iter().map(|s| {
+                                                    let id = s.id.clone();
+                                                    let label = if s.name.is_empty() { s.id.clone() } else { s.name.clone() };
+                                                    view! { <option value=id>{label}</option> }
+                                                }).collect_view()
+                                            }}
                                         </select>
                                     </div>
                                     {move || create_error.get().map(|e| view! {
@@ -464,31 +277,33 @@ pub fn CategoryPage() -> impl IntoView {
                                             type="button"
                                             disabled=move || creating.get() || topic_name.get().trim().len() < 3
                                             on:click=move |_| {
-                                                let name = topic_name.get_untracked();
-                                                let desc = topic_desc.get_untracked();
-                                                let section = selected_section.get_untracked();
-                                                if section.is_empty() {
+                                                let title = topic_name.get_untracked();
+                                                let section_cid = selected_section.get_untracked();
+                                                if section_cid.is_empty() {
                                                     create_error.set(Some("Please select a section".into()));
                                                     return;
                                                 }
-                                                if name.trim().len() < 3 {
-                                                    create_error.set(Some("Name must be at least 3 characters".into()));
+                                                if title.trim().len() < 3 {
+                                                    create_error.set(Some("Title must be at least 3 characters".into()));
                                                     return;
                                                 }
                                                 creating.set(true);
                                                 create_error.set(None);
 
-                                                match create_topic_event(&auth_create, &relay_create, &name, &desc, &section, create_error) {
-                                                    Ok(meta) => {
-                                                        // Add to local list immediately
-                                                        sections_sig.update(|list| {
-                                                            if !list.iter().any(|s| s.channel_id == meta.channel_id) {
-                                                                list.push(meta);
-                                                            }
-                                                        });
+                                                match publish_topic_root(
+                                                    &auth_create,
+                                                    &relay_create,
+                                                    &section_cid,
+                                                    &title,
+                                                    toasts,
+                                                ) {
+                                                    Ok(()) => {
                                                         topic_name.set(String::new());
-                                                        topic_desc.set(String::new());
                                                         show_new_topic.set(false);
+                                                        toasts.show(
+                                                            "Topic created".to_string(),
+                                                            ToastVariant::Success,
+                                                        );
                                                     }
                                                     Err(e) => create_error.set(Some(e)),
                                                 }
@@ -513,24 +328,41 @@ pub fn CategoryPage() -> impl IntoView {
                             }
                         }
                     >
-                        <button
-                            type="button"
-                            on:click=move |_| {
-                                let secs = zone_section_ids(&category_slug());
-                                if let Some(&first) = secs.first() {
-                                    selected_section.set(first.to_string());
-                                }
-                                show_new_topic.set(true);
+                        // Trigger is disabled (with a hint) when the zone has no
+                        // sections yet — a topic needs a section to live in.
+                        {move || {
+                            let has_sections = !zone_sections.with(|s| s.is_empty());
+                            if has_sections {
+                                view! {
+                                    <button
+                                        type="button"
+                                        on:click=move |_| {
+                                            // Preselect first section so the form opens ready.
+                                            if selected_section.get_untracked().is_empty() {
+                                                if let Some(first) = zone_sections.get_untracked().first() {
+                                                    selected_section.set(first.id.clone());
+                                                }
+                                            }
+                                            show_new_topic.set(true);
+                                        }
+                                        class="flex items-center gap-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 px-4 py-2 rounded-lg transition-colors text-sm font-medium"
+                                    >
+                                        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="10"/>
+                                            <line x1="12" y1="8" x2="12" y2="16"/>
+                                            <line x1="8" y1="12" x2="16" y2="12"/>
+                                        </svg>
+                                        "New Topic"
+                                    </button>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <p class="text-gray-500 text-sm">
+                                        "No sections exist in this zone yet."
+                                    </p>
+                                }.into_any()
                             }
-                            class="flex items-center gap-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 px-4 py-2 rounded-lg transition-colors text-sm font-medium"
-                        >
-                            <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <circle cx="12" cy="12" r="10"/>
-                                <line x1="12" y1="8" x2="12" y2="16"/>
-                                <line x1="8" y1="12" x2="16" y2="12"/>
-                            </svg>
-                            "New Topic"
-                        </button>
+                        }}
                     </Show>
                 </div>
             </Show>
@@ -544,13 +376,13 @@ pub fn CategoryPage() -> impl IntoView {
                 </div>
             </Show>
 
-            // Content
+            // Content — the zone's sections as cards, each linking into its
+            // topic list, with a per-section topic count derived from the store.
             <Show when=move || !loading.get()>
                 {move || {
-                    let secs = sections.get();
-                    let counts = message_counts.get();
-                    let active = last_active_map.get();
+                    let secs = zone_sections.get();
                     let cat = category_slug();
+                    let last_active = store.last_active.get();
 
                     if secs.is_empty() {
                         let empty_icon: Box<dyn FnOnce() -> leptos::prelude::AnyView + Send> = Box::new(|| view! {
@@ -558,29 +390,24 @@ pub fn CategoryPage() -> impl IntoView {
                                 <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
                         }.into_any());
-                        let (title, desc) = if is_authed.get() {
-                            ("No topics yet".to_string(), "Be the first — click \"New Topic\" above to start a conversation.".to_string())
-                        } else {
-                            ("No topics yet".to_string(), "Sign in to start a conversation.".to_string())
-                        };
                         view! {
                             <EmptyState
                                 icon=empty_icon
-                                title=title
-                                description=desc
+                                title="No sections yet".to_string()
+                                description="This zone has no sections. An admin can seed one for the community.".to_string()
                                 action_label="Back to Forums".to_string()
                                 action_href=base_href("/forums")
                             />
                         }.into_any()
                     } else {
                         let cards: Vec<_> = secs.iter().map(|s| {
-                            let mc = counts.get(&s.channel_id).copied().unwrap_or(0);
-                            let la = active.get(&s.channel_id).copied().unwrap_or(0);
+                            let mc = store.count_for(&s.id);
+                            let la = last_active.get(&s.id).copied().unwrap_or(0);
                             view! {
                                 <SectionCard
                                     name=s.name.clone()
                                     description=s.description.clone()
-                                    channel_id=s.channel_id.clone()
+                                    channel_id=s.id.clone()
                                     message_count=mc
                                     last_activity=la
                                     category=cat.clone()
@@ -618,26 +445,20 @@ fn SectionSkeleton() -> impl IntoView {
     }
 }
 
-/// Create a kind-40 channel event, sign it, and publish to the relay with ack.
-/// Returns the `SectionMeta` for optimistic local insertion.
-/// On relay rejection, the error signal is set asynchronously.
-fn create_topic_event(
+/// Publish a new TOPIC: a kind-42 root message e-tagging the selected section
+/// channel. The topic title becomes the message content (the thread starter).
+/// This is the same shape `SectionPage` produces for a root post, so the new
+/// topic appears in the section's message list immediately on relay echo.
+fn publish_topic_root(
     auth: &crate::auth::AuthStore,
     relay: &RelayConnection,
-    name: &str,
-    description: &str,
-    section: &str,
-    error_signal: RwSignal<Option<String>>,
-) -> Result<SectionMeta, String> {
+    section_channel_id: &str,
+    title: &str,
+    toasts: crate::components::toast::ToastStore,
+) -> Result<(), String> {
     if relay.connection_state().get_untracked() != ConnectionState::Connected {
         return Err("Relay not connected".to_string());
     }
-
-    let content = serde_json::json!({
-        "name": name.trim(),
-        "about": description.trim(),
-        "picture": ""
-    });
 
     let pubkey = auth
         .pubkey()
@@ -645,59 +466,40 @@ fn create_topic_event(
         .ok_or_else(|| "Not authenticated".to_string())?;
 
     let now = (js_sys::Date::now() / 1000.0) as u64;
-    let tags = vec![
-        vec!["section".into(), section.into()],
-        vec!["zone".into(), "1".into()],
-    ];
+    // NIP-10 root marker pointing at the section channel (kind-40) id.
+    let tags = vec![vec![
+        "e".to_string(),
+        section_channel_id.to_string(),
+        String::new(),
+        "root".to_string(),
+    ]];
 
     let unsigned = nostr_bbs_core::UnsignedEvent {
         pubkey,
         created_at: now,
-        kind: 40,
+        kind: 42,
         tags,
-        content: serde_json::to_string(&content).unwrap(),
+        content: title.trim().to_string(),
     };
 
     let signed = auth.sign_event(unsigned)?;
-    let channel_id = signed.id.clone();
 
-    // Publish with ack — show error asynchronously if relay rejects
-    let on_ok = std::rc::Rc::new(move |accepted: bool, msg: String| {
+    // Publish with ack so relay rejections (e.g. not-yet-whitelisted) surface.
+    let on_ok = Rc::new(move |accepted: bool, msg: String| {
         if !accepted {
             let display = if msg.contains("whitelist") {
                 "Your account isn't active yet — try refreshing the page.".to_string()
+            } else if msg.trim().is_empty() {
+                "Topic rejected by relay".to_string()
             } else {
-                format!("Relay rejected: {msg}")
+                format!("Topic rejected: {msg}")
             };
-            error_signal.set(Some(display));
+            toasts.show(display, ToastVariant::Error);
         }
     });
-    let _ = relay.publish_with_ack(&signed, Some(on_ok));
+    relay
+        .publish_with_ack(&signed, Some(on_ok))
+        .map_err(|e| format!("Send failed: {e}"))?;
 
-    Ok(SectionMeta {
-        channel_id,
-        name: name.trim().to_string(),
-        description: description.trim().to_string(),
-        _created_at: now,
-    })
-}
-
-/// Parse kind 40 event content JSON into (name, description).
-fn parse_channel_content(content: &str) -> (String, String) {
-    match serde_json::from_str::<serde_json::Value>(content) {
-        Ok(val) => {
-            let name = val
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unnamed Section")
-                .to_string();
-            let desc = val
-                .get("about")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            (name, desc)
-        }
-        Err(_) => ("Unnamed Section".to_string(), String::new()),
-    }
+    Ok(())
 }
