@@ -11,6 +11,7 @@ use crate::auth::use_auth;
 use crate::components::badge::{Badge, BadgeVariant};
 use crate::components::channel_stats::ChannelStats;
 use crate::components::export_modal::ExportModal;
+use crate::components::mention_text::normalise_mention_pubkey;
 use crate::components::message_bubble::{MessageBubble, MessageData};
 use crate::components::message_input::MessageInput;
 use crate::components::pinned_messages::{PinnedMessage, PinnedMessages};
@@ -381,7 +382,7 @@ pub fn ChannelPage() -> impl IntoView {
     });
 
     // Send message handler
-    let do_send_text = move |content: String| {
+    let do_send_text = move |(content, mention_pubkeys): (String, Vec<String>)| {
         let cid = channel_id();
         if cid.is_empty() {
             return;
@@ -395,16 +396,26 @@ pub fn ChannelPage() -> impl IntoView {
 
         let now = (js_sys::Date::now() / 1000.0) as u64;
         let content_for_index = content.clone();
+        // Root e-tag first, then one ["p", pubkey] per @-mention selected in
+        // the composer so mentioned users are addressable per NIP-10.
+        let mut tags = vec![vec![
+            "e".to_string(),
+            cid.clone(),
+            String::new(),
+            "root".to_string(),
+        ]];
+        for pk in mention_pubkeys {
+            if let Some(hex) = normalise_mention_pubkey(&pk) {
+                if !tags.iter().any(|t| t[0] == "p" && t[1] == hex) {
+                    tags.push(vec!["p".to_string(), hex]);
+                }
+            }
+        }
         let unsigned = nostr_bbs_core::UnsignedEvent {
             pubkey: pubkey.clone(),
             created_at: now,
             kind: 42,
-            tags: vec![vec![
-                "e".to_string(),
-                cid.clone(),
-                String::new(),
-                "root".to_string(),
-            ]],
+            tags,
             content,
         };
 
@@ -435,6 +446,9 @@ pub fn ChannelPage() -> impl IntoView {
     };
 
     let send_callback = Callback::new(do_send_text);
+    // MessageInput fires `on_send` alongside `on_send_with_mentions`; all
+    // publish work lives in the mentions path, so the plain path is a no-op.
+    let noop_send = Callback::new(|_: String| {});
     let is_authed = auth.is_authenticated();
 
     // Channel archived state (derived from metadata)
@@ -641,7 +655,11 @@ pub fn ChannelPage() -> impl IntoView {
                 <div class="bg-gray-800 border-t border-gray-700 p-3">
                     <div class="max-w-4xl mx-auto">
                         <TypingIndicator typing_pubkeys=typing_pubkeys />
-                        <MessageInput on_send=send_callback channel_id=channel_id() />
+                        <MessageInput
+                            on_send=noop_send
+                            on_send_with_mentions=send_callback
+                            channel_id=channel_id()
+                        />
                     </div>
                 </div>
             </Show>

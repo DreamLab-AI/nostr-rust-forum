@@ -306,6 +306,21 @@ fn npub_to_hex(npub: &str) -> Option<String> {
     Some(hex::encode(data))
 }
 
+/// Normalise a mention pubkey to 64-char lowercase hex for `["p", pubkey]`
+/// tag emission. Accepts a 64-hex pubkey (any case) or a bech32 `npub1...`.
+/// Returns `None` for anything else so malformed autocomplete data can never
+/// produce an invalid p-tag.
+pub(crate) fn normalise_mention_pubkey(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(s.to_ascii_lowercase());
+    }
+    if s.starts_with("npub1") {
+        return npub_to_hex(s);
+    }
+    None
+}
+
 /// Shorten a pubkey or npub for display.
 fn shorten_mention(s: &str) -> String {
     if s.len() <= 12 {
