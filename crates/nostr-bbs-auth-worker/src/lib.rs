@@ -522,6 +522,11 @@ async fn route_sprint_api(
             governance_api::handle_register_agent(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
+    if path == "/api/governance/agents/provision" && *method == Method::Post {
+        let resp =
+            governance_api::handle_provision_agent(body_bytes, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
     if path == "/api/governance/agents/revoke" && *method == Method::Post {
         let resp =
             governance_api::handle_revoke_agent(body_bytes, auth_header, env, origin).await?;
