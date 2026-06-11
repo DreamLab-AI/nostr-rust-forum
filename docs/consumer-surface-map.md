@@ -11,7 +11,7 @@ sites the kit consumes but does not re-export.
 
 | NRF file (crate / path) | solid-pod-rs symbol | Role |
 | --- | --- | --- |
-| `nostr-bbs-pod-worker/src/acl.rs:22` | `solid_pod_rs::wac::{method_to_mode, wac_allow_header, AccessMode, AclDocument}` | Re-export shim (public API) |
+| `nostr-bbs-pod-worker/src/acl.rs:22` | `solid_pod_rs::wac::{method_to_mode, wac_allow_header, AccessMode, AclDocument}` | Re-export shim (public API). The kit-local `find_effective_acl` resolver (ADR-096) now probes the per-container sidecar `<dir>/.acl` at every walk-up level and sets `AclDocument::inherited` per level; `build_delegation_acl` emits a canonical owner-Control + agent-minus-Control merged doc that round-trips through this parser. |
 | `nostr-bbs-pod-worker/src/acl.rs:45` | `solid_pod_rs::wac::evaluate_access` | Internal use (delegated call) |
 | `nostr-bbs-pod-worker/src/acl.rs:181` (test) | `solid_pod_rs::wac::{mode_name, AclAuthorization, IdOrIds, IdRef}` | Internal use (unit tests only) |
 | `nostr-bbs-pod-worker/src/webid.rs:12` | `solid_pod_rs::webid::generate_webid_html` | Re-export shim (public API) |

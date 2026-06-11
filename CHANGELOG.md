@@ -6,6 +6,36 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 and this project tracks the spec home at [VisionClaw monorepo](https://github.com/DreamLab-AI/VisionClaw)
 (`docs/specs/` + `docs/adr/`) for cross-substrate normative decisions.
 
+## [Upstream kit features] - 2026-06-11
+
+### Added
+
+- **ADR-094 — Deterministic purpose-scoped subkey derivation** (`nostr-bbs-core`):
+  `derive_subkey(root, tag)` = HMAC-SHA-256(root_sk, tag) → validated secp256k1
+  `SecretKey`. One canonical primitive (native + wasm bridge) for rotatable,
+  recoverable, purpose-scoped child keys; byte-for-byte parity with agentbox's
+  JS mirror derivation, pinned by a known-answer vector (root `0x01`×32 + tag
+  `agentbox-mirror-v1` → `2d07f2ce…695d`). Domain separation, not compromise
+  isolation — use NIP-26 for revocable delegation.
+- **ADR-095 — Recovery & device-onboarding sheet** (`nostr-bbs-forum-client`):
+  a `RecoverySheet` Leptos component renders a 100% client-side printable
+  one-page sheet at signup (nsec/npub/relay QRs + metadata + restore steps +
+  optional relay "sweep" block), Save-as-PDF via `window.print()`. Additive to
+  `NsecBackup`; insist-with-override exit gate; target mobile client is 0xchat
+  (NIP-17/28/42). The nsec never leaves WASM; ncryptsec/NIP-49 deferred.
+- **ADR-096 — ACL container resolution + per-container delegation**
+  (`nostr-bbs-pod-worker`): `find_effective_acl` now probes the per-container
+  sidecar `<dir>/.acl` at every walk-up level (with correct `inherited` flags),
+  fixing the previously-unreachable container ACL. Adds `build_delegation_acl`
+  and an opt-in `PUT {"@delegation":{agent,modes}}` to `<container>/.acl`;
+  `acl:Control` is never delegated and owner Control is always preserved.
+  Retires the flat-sidecar workaround (migration is non-breaking).
+- **ADR-097 — Consolidated agent identity provisioning** (`nostr-bbs-auth-worker`):
+  `POST /api/governance/agents/provision` (NIP-98 admin) performs the whitelist
+  upsert + `agent_registry` upsert atomically in one D1 `batch()`, replacing the
+  four-call seed dance. Idempotent on `pubkey`; `/register` and
+  `/api/whitelist/add` unchanged. The agent's kind-0/NIP-65 stay client-side.
+
 ## [3.0.0-rc11] - 2026-05-17
 
 ### Added

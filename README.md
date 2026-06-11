@@ -214,8 +214,12 @@ nostr-bbs-upstream-canary      (standalone, publish = false)
 - **Tiered NIP-52 calendar** -- Per-cohort full / free-busy / omit projection with venue awareness and anti-spoof RSVP gating
 - **Agent Control Surface Protocol** -- Agents publish interactive control panels (kinds 31400-31405) to the relay; the forum renders them as decision surfaces with approve/reject/configure actions, creating a universal human-in-the-loop governance plane
 - **Passkey-first auth** -- WebAuthn PRF extension derives Nostr keys deterministically; private keys never stored
+- **Recovery & device-onboarding sheet** -- Signup issues a 100% client-side printable one-page sheet (nsec/npub/relay QRs + restore steps + optional relay sweep), Save-as-PDF; 0xchat mobile on-ramp; insist-with-override gate (ADR-095)
+- **Deterministic subkey derivation** -- `derive_subkey(root, tag)` = HMAC-SHA-256(root, tag) → validated secp256k1 key; one tested primitive (native + wasm) for rotatable, recoverable purpose-scoped keys, with JS-parity to agentbox (ADR-094)
 - **First-user-is-admin** -- No hardcoded admin keys; first registrant gets admin privileges
+- **Consolidated agent provisioning** -- `POST /api/governance/agents/provision` (NIP-98 admin) provisions whitelist + agent registry atomically in one D1 batch, replacing the four-call seed dance (ADR-097)
 - **Solid pods** -- Per-user W3C-compliant storage with WAC ACL, LDP containers, and JSON Patch
+- **Per-container pod delegation** -- Container `<dir>/.acl` resolution fix plus an opt-in `PUT {"@delegation":{agent,modes}}` grant that never confers Control and never locks the owner out (ADR-096)
 - **Semantic search** -- Workers AI BGE-small embeddings with cosine k-NN over an RVF store
 - **Display-name resolution** -- One reactive resolution path for every identity render site; `@hex` and `nostr:npub1` mentions resolve
 - **Offline-first** -- Service worker + IndexedDB caching with 30-day eviction
@@ -408,11 +412,12 @@ sequenceDiagram
 - `broker_decisions` -- append-only decision audit trail with provenance chain
 - `broker_roles` -- role assignments (contributor, auditor, broker, admin)
 
-**REST API** (7 endpoints on auth-worker, all NIP-98 gated):
+**REST API** (8 endpoints on auth-worker, all NIP-98 gated):
 
 | Method | Path                            | Gate  | Purpose                  |
 |--------|---------------------------------|-------|--------------------------|
 | GET    | /api/governance/agents          | any   | List registered agents   |
+| POST   | /api/governance/agents/provision| admin | Atomic whitelist + registry provisioning (ADR-097) |
 | POST   | /api/governance/agents/register | admin | Register an agent pubkey |
 | POST   | /api/governance/agents/revoke   | admin | Deactivate an agent      |
 | GET    | /api/governance/cases           | any   | List broker cases        |

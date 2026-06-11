@@ -360,11 +360,12 @@ The governance dashboard at `/governance` uses these components:
 
 ### Governance REST API (auth-worker)
 
-Seven NIP-98-gated endpoints for programmatic access to governance data:
+Eight NIP-98-gated endpoints for programmatic access to governance data:
 
 | Method | Path | Gate | Purpose |
 |--------|------|------|---------|
 | GET | `/api/governance/agents` | any authenticated | List registered agents |
+| POST | `/api/governance/agents/provision` | admin | Atomic `whitelist` + `agent_registry` provisioning in one D1 `batch()` (ADR-097) |
 | POST | `/api/governance/agents/register` | admin | Register an agent pubkey |
 | POST | `/api/governance/agents/revoke` | admin | Deactivate an agent |
 | GET | `/api/governance/cases` | any authenticated | List broker cases (optional `?state=` filter) |
@@ -374,3 +375,72 @@ Seven NIP-98-gated endpoints for programmatic access to governance data:
 
 All endpoints validate the `Authorization: Nostr <base64>` header via
 `nostr_bbs_core::nip98` with D1-backed replay protection.
+
+## Upstream Kit Surfaces (2026-06-11)
+
+Four cross-stack surfaces landed in the June 2026 upstream-kit wave. Each is
+consumed downstream by agentbox and/or the dreamlab operator overlay.
+
+### Atomic agent provisioning (ADR-097)
+
+`POST /api/governance/agents/provision` (auth-worker, NIP-98 admin) replaces the
+prior four-call seed sequence (key gen → `/api/whitelist/add` → `/register` →
+client publishes kind-0/NIP-65) with a single admin operation that performs the
+two **admin-side** writes atomically:
+
+```
+POST /api/governance/agents/provision        (NIP-98 admin)
+{ "pubkey": "<64-hex>", "name": "scribe-bot",
+  "cohorts": ["ai-agents","members"], "rate_limit_per_min": 60 }
+→ 200 { "pubkey": "<64-hex>", "cohorts": [...], "registered": true }
+```
+
+Because `whitelist` and `agent_registry` co-reside in the `nostr-bbs-relay` D1
+(reached via the auth-worker's `RELAY_DB` binding), the two upserts issue as one
+`db.batch(...)` — all-or-nothing, idempotent on `pubkey`. Key material (often an
+ADR-094 subkey) and the agent's own signed kind-0/NIP-65 stay client-side.
+
+### Per-container ACL delegation (ADR-096)
+
+The pod-worker resolver `find_effective_acl` now probes the per-container sidecar
+`<dir>/.acl` at every walk-up level (own resource sidecar `inherited=false`,
+every ancestor `inherited=true`), fixing the previously-unreachable container ACL
+and closing a latent `accessTo`-leak. Delegation is a first-class PUT:
+
+```
+PUT /pods/<owner>/<container>/.acl        (NIP-98; acl:Control on parent required)
+Content-Type: application/json
+{ "@delegation": { "agent": "did:nostr:<hex>",
+                   "modes": ["acl:Read", "acl:Write"] } }
+```
+
+`build_delegation_acl` emits the canonical merged doc: the `#owner` grant always
+re-asserts `Read+Write+Control` (the owner can never be locked out, even for an
+empty `modes`), and the `#delegate` grant is the requested modes **minus
+`acl:Control`** (delegation never confers Control). Non-`@delegation` bodies fall
+through to the existing raw-JSON-LD PUT path. The flat-sidecar workaround is
+retired; both forms remain reachable so migration is non-breaking.
+
+### Deterministic subkey derivation (ADR-094)
+
+`nostr-bbs-core` exposes `derive_subkey(root: &SecretKey, tag: &str) ->
+Result<SecretKey, KeyError>` = HMAC-SHA-256(`root.secret_bytes_32`, utf8(`tag`))
+mapped through the validating secp256k1 scalar constructor, with a wasm bridge
+(`derive_subkey_js`). It is byte-for-byte identical to agentbox's JS mirror
+derivation, pinned by a known-answer vector (root `0x01`×32 + tag
+`agentbox-mirror-v1` → `2d07f2ce93d0361687fdd81d2690082b5d6c35b93e3ece2d44bcf115ef8f695d`).
+Rotation is by tag suffix. It provides domain separation, **not** compromise
+isolation (subkeys are recoverable from the root) — for revocable delegation use
+NIP-26. This is distinct from `derive_from_prf` (HKDF, WebAuthn-PRF path), which
+is kept separate.
+
+### Recovery & device-onboarding sheet (ADR-095)
+
+The forum-client `RecoverySheet` Leptos component renders a 100% client-side,
+print-optimised one-page sheet at signup: nsec/npub/relay QR codes (generated
+in-WASM via a pure-Rust QR crate, bech32 via the existing NIP-19 path), metadata,
+restore steps, and an optional relay "sweep" block. Save-as-PDF via
+`window.print()`. The nsec never leaves WASM or touches the network. It is
+additive to `NsecBackup` and gated by an insist-with-override exit control. The
+target mobile client is 0xchat (NIP-17 DMs, NIP-28 channels, NIP-42 AUTH);
+ncryptsec/NIP-49 is deferred until core exposes a NIP-49 surface.
