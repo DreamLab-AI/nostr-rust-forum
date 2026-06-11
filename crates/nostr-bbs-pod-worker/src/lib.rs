@@ -1372,7 +1372,72 @@ async fn handle_acl_request(
                 );
             }
 
-            let data = body_bytes.unwrap_or_default();
+            let mut data = body_bytes.unwrap_or_default();
+
+            // ── Delegation shortcut (ADR-096) ──────────────────────────
+            //
+            // An `acl:Control` holder (verified above) may grant another
+            // `did:nostr` agent Read/Write on this container WITHOUT
+            // hand-authoring JSON-LD by PUTting a structured grant:
+            //
+            //   { "@delegation": { "agent": "did:nostr:<hex>",
+            //                      "modes": ["acl:Read", "acl:Write"] } }
+            //
+            // to the container sidecar `<container>/.acl`. The worker
+            // serialises the canonical ACL via `build_delegation_acl`,
+            // which ALWAYS re-emits the owner's full `acl:Control` so the
+            // owner can never be locked out, and never confers Control on
+            // the grantee. `acl:Append` is accepted as a synonym for the
+            // append mode. Any other body falls through to raw JSON-LD.
+            if let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if let Some(grant) = envelope.get("@delegation") {
+                    let agent_did = grant.get("agent").and_then(|v| v.as_str());
+                    let Some(agent_did) = agent_did else {
+                        return json_error(
+                            env,
+                            "Invalid delegation: @delegation.agent (did:nostr) required",
+                            422,
+                        );
+                    };
+                    if !agent_did.starts_with("did:nostr:") {
+                        return json_error(
+                            env,
+                            "Invalid delegation: agent must be a did:nostr identifier",
+                            422,
+                        );
+                    }
+                    let mut modes: Vec<AccessMode> = Vec::new();
+                    if let Some(arr) = grant.get("modes").and_then(|v| v.as_array()) {
+                        for m in arr {
+                            match m.as_str() {
+                                Some("acl:Read") => modes.push(AccessMode::Read),
+                                Some("acl:Write") => modes.push(AccessMode::Write),
+                                Some("acl:Append") => modes.push(AccessMode::Append),
+                                // acl:Control is intentionally ignored here:
+                                // build_delegation_acl never delegates Control.
+                                Some("acl:Control") => {}
+                                _ => {
+                                    return json_error(
+                                        env,
+                                        "Invalid delegation: modes must be acl:Read/Write/Append",
+                                        422,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let owner_did = format!("did:nostr:{owner_pubkey}");
+                    // The container the ACL governs is the parent of the
+                    // `.acl` sidecar, normalised to a container path.
+                    let container = if parent_path.ends_with('/') {
+                        parent_path.to_string()
+                    } else {
+                        format!("{parent_path}/")
+                    };
+                    let doc = acl::build_delegation_acl(&owner_did, agent_did, &container, &modes);
+                    data = serde_json::to_vec(&doc).map_err(|e| Error::RustError(e.to_string()))?;
+                }
+            }
 
             // Validate that the body is a valid ACL document (parseable JSON-LD)
             if serde_json::from_slice::<acl::AclDocument>(&data).is_err() {

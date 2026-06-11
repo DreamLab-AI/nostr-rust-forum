@@ -113,11 +113,120 @@ fn parse_acl_text_with_cap(text: &str) -> Option<AclDocument> {
     serde_json::from_str::<AclDocument>(text).ok()
 }
 
+/// Compute the ordered list of R2 sidecar keys to probe for a resource,
+/// most-specific first, paired with the WAC `inherited` flag that the
+/// resulting [`AclDocument`] must carry.
+///
+/// The previous resolver had a container-resolution gap (ADR-096): it only
+/// ever probed `{path}.acl` and then derived parents from the path with the
+/// trailing slash stripped, so for `/private/agent/SOUL.md` it walked
+/// `…/SOUL.md.acl → /private/agent.acl → /private.acl → /.acl` and NEVER
+/// probed the per-container sidecar `/private/agent/.acl`. A normal Solid
+/// container ACL at `<dir>/.acl` was therefore unreachable, forcing
+/// deployments to write a flat `<dir>.acl` instead.
+///
+/// This builder restores correct WAC semantics by probing, at every level of
+/// the upward walk, BOTH forms:
+///
+/// 1. the resource's own flat sidecar `{path}.acl` (resolution-specific to
+///    that exact resource; `inherited = false`), and
+/// 2. the container sidecar `{dir}/.acl` for each enclosing directory
+///    (`inherited = true`, because for an ancestor container only
+///    `acl:default` rules may apply — WAC §4.2, enforced by the upstream
+///    evaluator's `AclDocument::inherited` gate).
+///
+/// For the resource's OWN sidecar `inherited` is `false` so its
+/// `acl:accessTo` rules apply directly. The flat per-resource sidecar of an
+/// ANCESTOR (e.g. `/private/agent.acl` resolved for `/private/agent/SOUL.md`)
+/// is treated as inherited, matching the pre-existing walk-up contract.
+///
+/// Precedence is strictly most-specific-wins: the first key that resolves to
+/// a parseable document is returned, so a resource-specific `{path}.acl`
+/// beats the container `{dir}/.acl`, which beats `{parent}/.acl`, …, which
+/// beats `/.acl`. The legacy flat-sidecar form for each ancestor remains in
+/// the sequence (interleaved by specificity) so existing flat deployments
+/// keep resolving — both forms stay reachable.
+///
+/// `(key_path, inherited)` tuples are returned; callers prefix with
+/// `pods/{owner_pubkey}` and parse with the size cap.
+fn acl_probe_sequence(resource_path: &str) -> Vec<(String, bool)> {
+    let mut probes: Vec<(String, bool)> = Vec::new();
+
+    // Normalise: callers pass absolute pod-relative paths beginning with `/`.
+    let resource = if resource_path.is_empty() {
+        "/"
+    } else {
+        resource_path
+    };
+
+    // (1) The resource's OWN sidecar (`inherited = false`).
+    //
+    // For a non-container resource `/a/b/c` this is the flat `/a/b/c.acl`,
+    // whose `acl:accessTo` applies directly to `/a/b/c`.
+    //
+    // For a container target `/a/b/` this own-sidecar IS the container
+    // sidecar `/a/b/.acl`; it is non-inherited relative to the container
+    // itself so `acl:accessTo: /a/b/` and its direct-child rules apply.
+    //
+    // Both cases are `{resource}.acl`, so a single push covers them.
+    probes.push((format!("{resource}.acl"), false));
+
+    // (2) Walk up the enclosing containers. For each ancestor directory we
+    // probe the container sidecar `<dir>/.acl` (inherited) AND keep the
+    // legacy flat `<dir>.acl` form (also inherited) for backward compat.
+    //
+    // Most-specific first: immediate parent container before grandparent.
+    let mut dir = parent_dir(resource);
+    loop {
+        // Container sidecar `<dir>/.acl`. `dir` always ends in `/` here
+        // (it is a container path, including the root "/").
+        probes.push((format!("{dir}.acl"), true));
+
+        if dir == "/" {
+            break;
+        }
+
+        // Legacy flat sidecar for this ancestor: `<dir without trailing />.acl`
+        // e.g. dir = "/private/agent/" -> "/private/agent.acl".
+        let flat = dir.trim_end_matches('/');
+        if !flat.is_empty() {
+            probes.push((format!("{flat}.acl"), true));
+        }
+
+        dir = parent_dir(flat);
+    }
+
+    probes
+}
+
+/// Return the enclosing container path for a pod-relative resource path,
+/// always normalised to end with a trailing `/` (so `/a/b/c` -> `/a/b/`,
+/// `/a/b/` -> `/a/`, `/a` -> `/`, `/` -> `/`).
+fn parent_dir(path: &str) -> String {
+    if path == "/" || path.is_empty() {
+        return "/".to_string();
+    }
+    // Strip a single trailing slash (container input) before finding the
+    // last separator so `/a/b/` resolves to its parent `/a/`.
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(pos) => format!("{}/", &trimmed[..pos]),
+    }
+}
+
 /// Find the effective ACL for a resource by walking up the container tree.
 ///
-/// Resolution order:
+/// Resolution order (most-specific first; first parseable hit wins):
 /// 1. KV fast-path: `acl:{owner_pubkey}` (the pod-level ACL)
-/// 2. R2 sidecar walk: `{resource_path}.acl` -> `{parent}/.acl` -> ... -> `/.acl`
+/// 2. R2 sidecar walk built by [`acl_probe_sequence`], which probes BOTH the
+///    resource's own flat sidecar `{path}.acl` AND every enclosing container
+///    sidecar `{dir}/.acl` (the container case the legacy resolver skipped —
+///    ADR-096), interleaved with the legacy flat `{dir}.acl` ancestor form.
+///
+/// An ACL resolved from an ANCESTOR carries `inherited = true`, so the
+/// upstream evaluator honours only its `acl:default` rules (WAC §4.2). The
+/// resource's own sidecar carries `inherited = false`.
 ///
 /// All ACL documents are parsed via [`parse_acl_with_cap`] so any single
 /// graph larger than [`MAX_ACL_DOC_BYTES`] is rejected (treated as missing).
@@ -137,34 +246,146 @@ pub async fn find_effective_acl(
         }
     }
 
-    // Walk up the container tree looking for `.acl` sidecar files in R2
-    let mut path = resource_path.to_string();
-    loop {
-        let acl_key = format!("pods/{owner_pubkey}{path}.acl");
+    // R2 sidecar walk: own sidecar, then each enclosing container sidecar.
+    for (probe_path, inherited) in acl_probe_sequence(resource_path) {
+        let acl_key = format!("pods/{owner_pubkey}{probe_path}");
         if let Ok(Some(obj)) = bucket.get(&acl_key).execute().await {
             if let Some(body) = obj.body() {
                 if let Ok(bytes) = body.bytes().await {
-                    if let Some(doc) = parse_acl_with_cap(&bytes) {
+                    if let Some(mut doc) = parse_acl_with_cap(&bytes) {
+                        // Mark inherited resolution so the evaluator applies
+                        // only `acl:default` rules for ancestor containers.
+                        doc.inherited = inherited;
                         return Some(doc);
                     }
                 }
             }
         }
-
-        // Move up one directory level
-        if path == "/" || path.is_empty() {
-            break;
-        }
-        // Strip trailing slash before finding parent
-        let trimmed = path.trim_end_matches('/');
-        path = match trimmed.rfind('/') {
-            Some(0) => "/".to_string(),
-            Some(pos) => trimmed[..pos].to_string(),
-            None => "/".to_string(),
-        };
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// Kit-specific: delegation ACL builder (ADR-096)
+// ---------------------------------------------------------------------------
+
+/// Build the canonical merged ACL JSON-LD document granting `agent_did`
+/// the requested `modes` on `container_path`, while PRESERVING the owner's
+/// full `acl:Control` over the same container.
+///
+/// This is the pure core of the per-container delegation operation
+/// (ADR-096): an `acl:Control` holder can grant another `did:nostr` agent
+/// Read/Write on one of their containers without hand-authoring JSON-LD.
+/// The worker's authed `PUT /<container>/.acl` route serialises a structured
+/// grant `{container, agent_did, modes}` through this function and stores the
+/// result at the container sidecar `pods/<owner>/<container>/.acl`.
+///
+/// Invariants:
+/// - The emitted `@graph` ALWAYS contains an owner authorisation granting
+///   `acl:Read acl:Write acl:Control` on `container_path` via BOTH
+///   `acl:accessTo` (the container itself) and `acl:default` (its
+///   descendants). This is what stops an owner from locking themselves out:
+///   no delegation can overwrite or omit the owner's Control.
+/// - The delegate authorisation grants exactly the requested `modes` (deduped,
+///   `acl:Control` stripped — a delegation never confers Control; that would
+///   let the delegate re-delegate or seize the container) on `container_path`
+///   via `acl:accessTo` + `acl:default`.
+/// - `owner_did` and `agent_did` are written verbatim as `did:nostr:<hex>`
+///   `@id` values; callers validate the DID shape upstream.
+///
+/// Returns the [`AclDocument`] AST; callers serialise via `serde_json` to the
+/// canonical wire shape and round-trip cleanly through this crate's parser.
+pub fn build_delegation_acl(
+    owner_did: &str,
+    agent_did: &str,
+    container_path: &str,
+    modes: &[AccessMode],
+) -> AclDocument {
+    use solid_pod_rs::wac::{AclAuthorization, IdOrIds, IdRef};
+
+    // Normalise the container path to a leading-slash form. We keep the
+    // trailing slash if present so `acl:accessTo` names the container itself.
+    let path = if container_path.is_empty() {
+        "/".to_string()
+    } else {
+        container_path.to_string()
+    };
+
+    let id_ref = |s: &str| IdRef { id: s.to_string() };
+    let single = |s: &str| Some(IdOrIds::Single(id_ref(s)));
+
+    // Helper: build `acl:mode` value from a mode slice, deduped, in canonical
+    // order (Read, Write, Append, Control). Returns `None` for an empty set.
+    fn modes_value(modes: &[AccessMode]) -> Option<IdOrIds> {
+        use solid_pod_rs::wac::{IdOrIds, IdRef};
+        let order = [
+            (AccessMode::Read, "acl:Read"),
+            (AccessMode::Write, "acl:Write"),
+            (AccessMode::Append, "acl:Append"),
+            (AccessMode::Control, "acl:Control"),
+        ];
+        let mut refs: Vec<IdRef> = Vec::new();
+        for (m, iri) in order {
+            if modes.contains(&m) {
+                refs.push(IdRef {
+                    id: iri.to_string(),
+                });
+            }
+        }
+        match refs.len() {
+            0 => None,
+            1 => Some(IdOrIds::Single(refs.into_iter().next().unwrap())),
+            _ => Some(IdOrIds::Multiple(refs)),
+        }
+    }
+
+    // Owner authorisation: ALWAYS full control on the container + descendants.
+    let owner_auth = AclAuthorization {
+        id: Some("#owner".to_string()),
+        r#type: Some("acl:Authorization".to_string()),
+        agent: single(owner_did),
+        agent_class: None,
+        agent_group: None,
+        origin: None,
+        access_to: single(&path),
+        default: single(&path),
+        mode: modes_value(&[AccessMode::Read, AccessMode::Write, AccessMode::Control]),
+        condition: None,
+    };
+
+    // Delegate authorisation: requested modes MINUS Control (never delegate
+    // Control — that would let the grantee re-delegate or seize the container).
+    let delegate_modes: Vec<AccessMode> = modes
+        .iter()
+        .copied()
+        .filter(|m| *m != AccessMode::Control)
+        .collect();
+
+    let mut graph = vec![owner_auth];
+
+    if let Some(mode_val) = modes_value(&delegate_modes) {
+        graph.push(AclAuthorization {
+            id: Some("#delegate".to_string()),
+            r#type: Some("acl:Authorization".to_string()),
+            agent: single(agent_did),
+            agent_class: None,
+            agent_group: None,
+            origin: None,
+            access_to: single(&path),
+            default: single(&path),
+            mode: Some(mode_val),
+            condition: None,
+        });
+    }
+
+    AclDocument {
+        context: Some(serde_json::json!({
+            "acl": "http://www.w3.org/ns/auth/acl#"
+        })),
+        graph: Some(graph),
+        inherited: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +405,7 @@ mod tests {
         AclDocument {
             context: None,
             graph: Some(graph),
+            ..Default::default()
         }
     }
 
@@ -239,6 +461,7 @@ mod tests {
         let doc = AclDocument {
             context: None,
             graph: None,
+            ..Default::default()
         };
         assert!(!evaluate_access(Some(&doc), None, "/foo", AccessMode::Read));
     }
@@ -594,5 +817,272 @@ mod tests {
             doc.is_none(),
             "documents larger than MAX_ACL_DOC_BYTES must be rejected"
         );
+    }
+
+    // ── ACL container resolution gap (ADR-096) ─────────────────────────
+    //
+    // `find_effective_acl` itself needs R2 + KV (worker runtime types) and
+    // is therefore not unit-testable on the native target. These tests
+    // exercise the PURE probe-sequence builder that is the load-bearing
+    // change — `find_effective_acl` is a thin loop over its output that
+    // returns the first parseable hit, so probe order == resolution order.
+
+    /// Convenience: collect just the probe key paths in order.
+    fn probe_keys(resource: &str) -> Vec<String> {
+        acl_probe_sequence(resource)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    #[test]
+    fn container_sidecar_is_probed_for_direct_child() {
+        // BUG REPRO (now fixed): `/private/agent/SOUL.md` must probe the
+        // per-container sidecar `/private/agent/.acl`, which the legacy
+        // resolver NEVER reached.
+        let keys = probe_keys("/private/agent/SOUL.md");
+        assert!(
+            keys.contains(&"/private/agent/.acl".to_string()),
+            "container sidecar /private/agent/.acl must be probed; got {keys:?}"
+        );
+        // Root container sidecar is the final fallback.
+        assert!(keys.contains(&"/.acl".to_string()));
+    }
+
+    #[test]
+    fn container_sidecar_is_probed_for_deeper_descendant() {
+        // The previously-broken case: a deeper resource `/dir/sub/file`
+        // must still reach BOTH `/dir/sub/.acl` and `/dir/.acl`.
+        let keys = probe_keys("/dir/sub/file");
+        assert!(
+            keys.contains(&"/dir/sub/.acl".to_string()),
+            "immediate container /dir/sub/.acl must be probed; got {keys:?}"
+        );
+        assert!(
+            keys.contains(&"/dir/.acl".to_string()),
+            "ancestor container /dir/.acl must be probed; got {keys:?}"
+        );
+        assert!(keys.contains(&"/.acl".to_string()));
+    }
+
+    #[test]
+    fn own_flat_sidecar_still_reachable() {
+        // The flat-sidecar form must remain reachable (do not break the
+        // deployment workaround during migration).
+        let keys = probe_keys("/dir/file");
+        // Own flat sidecar, most specific.
+        assert_eq!(keys.first().map(String::as_str), Some("/dir/file.acl"));
+        // Ancestor legacy flat form preserved.
+        assert!(
+            keys.contains(&"/dir.acl".to_string()),
+            "legacy flat ancestor /dir.acl must remain reachable; got {keys:?}"
+        );
+    }
+
+    #[test]
+    fn most_specific_precedence_ordering() {
+        // (b) Precedence: `/dir/file.acl` (own) precedes `/dir/.acl`
+        // (container) precedes `/.acl` (root). First parseable hit wins,
+        // so position in this vec == resolution precedence.
+        let keys = probe_keys("/dir/file");
+        let pos = |needle: &str| keys.iter().position(|k| k == needle);
+        let own = pos("/dir/file.acl").expect("own sidecar present");
+        let container = pos("/dir/.acl").expect("container sidecar present");
+        let root = pos("/.acl").expect("root sidecar present");
+        assert!(
+            own < container,
+            "own /dir/file.acl must precede container /dir/.acl ({own} !< {container}); {keys:?}"
+        );
+        assert!(
+            container < root,
+            "container /dir/.acl must precede root /.acl ({container} !< {root}); {keys:?}"
+        );
+    }
+
+    #[test]
+    fn own_sidecar_is_not_inherited_ancestors_are() {
+        // The resource's own sidecar applies `acl:accessTo` directly
+        // (inherited = false); every ancestor sidecar applies only
+        // `acl:default` (inherited = true) per WAC §4.2.
+        let seq = acl_probe_sequence("/private/agent/SOUL.md");
+        let (own_key, own_inherited) = &seq[0];
+        assert_eq!(own_key, "/private/agent/SOUL.md.acl");
+        assert!(!own_inherited, "own sidecar must NOT be inherited");
+        for (key, inherited) in &seq[1..] {
+            assert!(
+                *inherited,
+                "ancestor sidecar {key} must be marked inherited"
+            );
+        }
+    }
+
+    #[test]
+    fn root_resource_probes_root_sidecar() {
+        let keys = probe_keys("/");
+        // Own sidecar of the root container IS `/.acl`.
+        assert_eq!(keys.first().map(String::as_str), Some("/.acl"));
+    }
+
+    #[test]
+    fn container_target_probes_its_own_and_parent_sidecars() {
+        // A container target `/private/agent/` probes its own `/private/agent/.acl`
+        // (non-inherited) then ancestors.
+        let seq = acl_probe_sequence("/private/agent/");
+        assert_eq!(seq[0], ("/private/agent/.acl".to_string(), false));
+        let keys: Vec<String> = seq.into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"/private/.acl".to_string()));
+        assert!(keys.contains(&"/.acl".to_string()));
+    }
+
+    // ── Delegation builder (ADR-096) ───────────────────────────────────
+
+    const OWNER: &str =
+        "did:nostr:0000000000000000000000000000000000000000000000000000000000000001";
+    const DELEGATE: &str =
+        "did:nostr:0000000000000000000000000000000000000000000000000000000000000002";
+
+    #[test]
+    fn build_delegation_grants_owner_control_and_agent_read() {
+        // (c) builder emits owner-Control + agent-Read and round-trips
+        // through the AclDocument parser.
+        let doc = build_delegation_acl(OWNER, DELEGATE, "/private/agent/", &[AccessMode::Read]);
+
+        // Owner retains full Control on the container + descendants.
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(OWNER),
+            "/private/agent/",
+            AccessMode::Control
+        ));
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(OWNER),
+            "/private/agent/",
+            AccessMode::Write
+        ));
+        // Delegate has Read on the container...
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/private/agent/",
+            AccessMode::Read
+        ));
+        // ...and on descendants (acl:default), but NOT Write or Control.
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/private/agent/SOUL.md",
+            AccessMode::Read
+        ));
+        assert!(!evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/private/agent/",
+            AccessMode::Write
+        ));
+        assert!(!evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/private/agent/",
+            AccessMode::Control
+        ));
+
+        // Round-trip: serialise to canonical wire JSON-LD and reparse.
+        let wire = serde_json::to_string(&doc).expect("serialises");
+        let reparsed = parse_acl_text_with_cap(&wire).expect("round-trips through parser");
+        assert!(evaluate_access(
+            Some(&reparsed),
+            Some(OWNER),
+            "/private/agent/",
+            AccessMode::Control
+        ));
+        assert!(evaluate_access(
+            Some(&reparsed),
+            Some(DELEGATE),
+            "/private/agent/",
+            AccessMode::Read
+        ));
+    }
+
+    #[test]
+    fn build_delegation_grants_write_includes_append() {
+        let doc = build_delegation_acl(OWNER, DELEGATE, "/shared/", &[AccessMode::Write]);
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/shared/",
+            AccessMode::Write
+        ));
+        // Upstream maps Write -> {Write, Append}, so Append follows.
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/shared/",
+            AccessMode::Append
+        ));
+        assert!(!evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/shared/",
+            AccessMode::Control
+        ));
+    }
+
+    #[test]
+    fn build_delegation_never_grants_control_to_delegate() {
+        // (d) Even if a caller asks for Control, the delegate must NOT get
+        // it — only the owner holds Control. This is the lock-out guard.
+        let doc = build_delegation_acl(
+            OWNER,
+            DELEGATE,
+            "/private/",
+            &[AccessMode::Read, AccessMode::Write, AccessMode::Control],
+        );
+        // Delegate gets Read + Write but Control is stripped.
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/private/",
+            AccessMode::Read
+        ));
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/private/",
+            AccessMode::Write
+        ));
+        assert!(
+            !evaluate_access(Some(&doc), Some(DELEGATE), "/private/", AccessMode::Control),
+            "a delegation must never confer acl:Control on the grantee"
+        );
+        // Owner Control is intact.
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(OWNER),
+            "/private/",
+            AccessMode::Control
+        ));
+    }
+
+    #[test]
+    fn build_delegation_owner_control_survives_empty_modes() {
+        // A no-op delegation (empty modes) still emits the owner's Control
+        // grant — the owner can never be locked out by an empty grant.
+        let doc = build_delegation_acl(OWNER, DELEGATE, "/x/", &[]);
+        assert!(evaluate_access(
+            Some(&doc),
+            Some(OWNER),
+            "/x/",
+            AccessMode::Control
+        ));
+        // No delegate authorisation emitted, so the delegate has nothing.
+        assert!(!evaluate_access(
+            Some(&doc),
+            Some(DELEGATE),
+            "/x/",
+            AccessMode::Read
+        ));
+        // Exactly one authorisation (owner only) in the graph.
+        assert_eq!(doc.graph.as_ref().map(Vec::len), Some(1));
     }
 }
