@@ -587,6 +587,22 @@ async fn route_sprint_api(
         return Ok(Some(resp));
     }
 
+    // -- Real-name redesign: admin-only provisioning name ----------------
+    // Self-scoped read/write of the caller's own real name (NIP-98 authed).
+    if path == "/api/profile/real-name" && *method == Method::Get {
+        let resp = username::handle_get_own_real_name(auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/profile/real-name" && *method == Method::Post {
+        let resp = username::handle_set_own_real_name(body_bytes, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+    // Admin-gated read of all reservations (handle + real name) for provisioning.
+    if path == "/api/admin/registrations" && *method == Method::Get {
+        let resp = username::handle_admin_registrations(auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+
     Ok(None)
 }
 

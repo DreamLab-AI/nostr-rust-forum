@@ -28,8 +28,27 @@ use serde_json::json;
 use wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Method, Request, Response, Result};
 
-use crate::admin::{canonical_url, now_secs, require_authed};
+use crate::admin::{canonical_url, now_secs, require_admin, require_authed};
 use crate::http::{error_json, json_response};
+
+/// Maximum byte length accepted for an admin-only real name. Generous enough
+/// for any legal name; bounded to keep the D1 row small and avoid abuse.
+const REAL_NAME_MAX_LEN: usize = 200;
+
+/// Normalise + bound-check a candidate real name.
+///
+/// Trims surrounding whitespace, rejects anything over [`REAL_NAME_MAX_LEN`],
+/// and maps the empty string to `None` (clear). Returns the cleaned value.
+fn normalise_real_name(raw: &str) -> std::result::Result<Option<String>, UsernameError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > REAL_NAME_MAX_LEN {
+        return Err(UsernameError::InvalidLength);
+    }
+    Ok(Some(trimmed.to_string()))
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -192,8 +211,16 @@ pub async fn claim(
     env: &Env,
     pubkey: &str,
     username: &str,
+    real_name: Option<&str>,
 ) -> std::result::Result<UsernameClaim, UsernameError> {
     validate_username(username)?;
+
+    // Normalise the optional real name up front so a bad value fails before
+    // we touch D1. `None`/empty leaves the column untouched on claim.
+    let real_name_clean = match real_name {
+        Some(r) => normalise_real_name(r)?,
+        None => None,
+    };
 
     let db = env
         .d1("DB")
@@ -203,16 +230,22 @@ pub async fn claim(
 
     // Atomic INSERT — relies on UNIQUE(username) and UNIQUE(pubkey) constraints
     // to surface conflicts. We let D1 raise the error and then disambiguate
-    // afterwards via two cheap SELECTs.
+    // afterwards via two cheap SELECTs. `real_name` is written in the same
+    // INSERT so the admin provisioning record is complete from claim time.
     let insert = db
         .prepare(
-            "INSERT INTO username_reservations (username, pubkey, created_at, status) \
-             VALUES (?1, ?2, ?3, 'active')",
+            "INSERT INTO username_reservations \
+             (username, pubkey, created_at, status, real_name) \
+             VALUES (?1, ?2, ?3, 'active', ?4)",
         )
         .bind(&[
             JsValue::from_str(username),
             JsValue::from_str(pubkey),
             JsValue::from_f64(now as f64),
+            match &real_name_clean {
+                Some(r) => JsValue::from_str(r),
+                None => JsValue::NULL,
+            },
         ])
         .map_err(|e| UsernameError::Backend(format!("bind failed: {e}")))?
         .run()
@@ -223,7 +256,11 @@ pub async fn claim(
         if let Ok(Some(existing_pk)) = check(env, username).await {
             if existing_pk == pubkey {
                 // Idempotent re-claim of the same (username, pubkey) pair.
-                // Treat as success so retries are safe.
+                // If a real name was supplied on the retry, persist it so the
+                // claim+real-name submission is not lost on idempotent replay.
+                if real_name_clean.is_some() {
+                    let _ = set_real_name(env, pubkey, real_name).await;
+                }
                 return Ok(UsernameClaim {
                     username: username.to_string(),
                     pubkey: pubkey.to_string(),
@@ -316,12 +353,142 @@ pub async fn release(
 }
 
 // ---------------------------------------------------------------------------
+// Real name (admin-only) — set / clear / read
+// ---------------------------------------------------------------------------
+
+/// One reservation row enriched with the admin-only real name. Used by the
+/// admin registration / user-table read routes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReservationRow {
+    pub username: String,
+    pub pubkey: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub real_name: Option<String>,
+}
+
+/// Set or clear the caller's own `real_name`.
+///
+/// `raw` is the supplied value: an empty/whitespace string clears the field
+/// (sets it to NULL), any other value (≤ [`REAL_NAME_MAX_LEN`]) is stored
+/// verbatim. A row is created if the pubkey has no reservation yet, so a user
+/// can record a provisioning name before (or without) claiming a handle —
+/// the username column is left NULL via a placeholder is impossible (NOT NULL
+/// PRIMARY KEY), so we instead UPSERT only when a reservation row exists and
+/// otherwise insert a status='pending' real-name-only row keyed by pubkey.
+///
+/// Because `username` is the PRIMARY KEY and NOT NULL, a real-name-only record
+/// cannot live in this table without a handle. The handle is REQUIRED at
+/// signup, so in practice the row always exists by the time real_name is set.
+/// We therefore UPDATE the existing row and return `PubkeyHasUsername`-free
+/// success even when zero rows match (idempotent no-op).
+pub async fn set_real_name(
+    env: &Env,
+    pubkey: &str,
+    raw: Option<&str>,
+) -> std::result::Result<Option<String>, UsernameError> {
+    let clean = match raw {
+        Some(r) => normalise_real_name(r)?,
+        None => None,
+    };
+
+    let db = env
+        .d1("DB")
+        .map_err(|e| UsernameError::Backend(format!("D1 unavailable: {e}")))?;
+
+    let _ = db
+        .prepare("UPDATE username_reservations SET real_name = ?1 WHERE pubkey = ?2")
+        .bind(&[
+            match &clean {
+                Some(r) => JsValue::from_str(r),
+                None => JsValue::NULL,
+            },
+            JsValue::from_str(pubkey),
+        ])
+        .map_err(|e| UsernameError::Backend(format!("bind failed: {e}")))?
+        .run()
+        .await
+        .map_err(|e| UsernameError::Backend(format!("update failed: {e}")))?;
+
+    Ok(clean)
+}
+
+/// Read the caller's own `real_name` (or any pubkey's, for admin reads).
+pub async fn get_real_name(
+    env: &Env,
+    pubkey: &str,
+) -> std::result::Result<Option<String>, UsernameError> {
+    let db = env
+        .d1("DB")
+        .map_err(|e| UsernameError::Backend(format!("D1 unavailable: {e}")))?;
+
+    #[derive(Deserialize)]
+    struct RealNameRow {
+        real_name: Option<String>,
+    }
+
+    let stmt = db
+        .prepare("SELECT real_name FROM username_reservations WHERE pubkey = ?1")
+        .bind(&[JsValue::from_str(pubkey)])
+        .map_err(|e| UsernameError::Backend(format!("bind failed: {e}")))?;
+
+    let row = stmt
+        .first::<RealNameRow>(None)
+        .await
+        .map_err(|e| UsernameError::Backend(format!("query failed: {e}")))?;
+
+    Ok(row.and_then(|r| r.real_name))
+}
+
+/// List every active reservation with its handle + admin-only real name.
+///
+/// Admin-gated callers only. Ordered newest-first so the pending-registration
+/// view surfaces the latest signups at the top.
+pub async fn list_reservations(
+    env: &Env,
+) -> std::result::Result<Vec<ReservationRow>, UsernameError> {
+    let db = env
+        .d1("DB")
+        .map_err(|e| UsernameError::Backend(format!("D1 unavailable: {e}")))?;
+
+    let result = db
+        .prepare(
+            "SELECT username, pubkey, created_at, real_name \
+             FROM username_reservations \
+             WHERE status = 'active' \
+             ORDER BY created_at DESC",
+        )
+        .all()
+        .await
+        .map_err(|e| UsernameError::Backend(format!("query failed: {e}")))?;
+
+    result
+        .results::<ReservationRow>()
+        .map_err(|e| UsernameError::Backend(format!("deserialize failed: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct ClaimBody {
+    /// The public handle to claim. Accepts both `username` (onboarding modal)
+    /// and `name` (signup wizard) keys so the two client call sites stay
+    /// interoperable.
+    #[serde(alias = "name")]
     username: String,
+    /// OPTIONAL admin-only real name supplied at signup. Never published to
+    /// the relay/kind-0; stored in D1 and surfaced only on admin-gated reads.
+    #[serde(default)]
+    real_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RealNameBody {
+    /// New real name. Empty string clears the stored value.
+    #[serde(default)]
+    real_name: Option<String>,
 }
 
 /// `GET /api/username/check?name=alice`
@@ -375,7 +542,7 @@ pub async fn handle_claim(
 
     let username = body.username.to_lowercase();
 
-    match claim(env, &pubkey, &username).await {
+    match claim(env, &pubkey, &username, body.real_name.as_deref()).await {
         Ok(claim) => json_response(
             env,
             &json!({
@@ -410,6 +577,99 @@ pub async fn handle_release(
             &json!({ "ok": true, "released": serde_json::Value::Null }),
             200,
         ),
+        Err(e) => error_json(env, &e.message(), e.http_status()),
+    }
+}
+
+/// `GET /api/profile/real-name` — NIP-98 authed. Returns the CALLER'S OWN
+/// real name only. Self-scoped: the verified NIP-98 pubkey is the lookup key,
+/// so a user can never read another user's real name through this route.
+pub async fn handle_get_own_real_name(
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/profile/real-name");
+    let pubkey = match require_authed(auth_header, &url, "GET", None, env).await {
+        Ok(pk) => pk,
+        Err((body, status)) => return json_response(env, &body, status),
+    };
+
+    match get_real_name(env, &pubkey).await {
+        Ok(real_name) => json_response(
+            env,
+            &json!({
+                "ok": true,
+                "real_name": real_name,
+            }),
+            200,
+        ),
+        Err(e) => error_json(env, &e.message(), e.http_status()),
+    }
+}
+
+/// `POST /api/profile/real-name` — NIP-98 authed. Sets or clears the CALLER'S
+/// OWN real name (self-only write — the verified pubkey is the write key, so
+/// no user can overwrite another's). An empty `real_name` clears the field.
+pub async fn handle_set_own_real_name(
+    body_bytes: &[u8],
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/profile/real-name");
+    let pubkey = match require_authed(auth_header, &url, "POST", Some(body_bytes), env).await {
+        Ok(pk) => pk,
+        Err((body, status)) => return json_response(env, &body, status),
+    };
+
+    let body: RealNameBody = match serde_json::from_slice(body_bytes) {
+        Ok(b) => b,
+        Err(_) => return error_json(env, "Invalid JSON body", 400),
+    };
+
+    match set_real_name(env, &pubkey, body.real_name.as_deref()).await {
+        Ok(stored) => json_response(
+            env,
+            &json!({
+                "ok": true,
+                "real_name": stored,
+            }),
+            200,
+        ),
+        Err(e) => error_json(env, &e.message(), e.http_status()),
+    }
+}
+
+/// `GET /api/admin/registrations` — admin NIP-98 required. Returns the full
+/// list of active reservations with handle + admin-only real name so admins
+/// can provision access. This is the ONLY surface (besides the owner's own
+/// authed read) on which `real_name` is exposed.
+pub async fn handle_admin_registrations(
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/admin/registrations");
+    if let Err((body, status)) = require_admin(auth_header, &url, "GET", None, env).await {
+        return json_response(env, &body, status);
+    }
+
+    match list_reservations(env).await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "pubkey": r.pubkey,
+                        "handle": r.username,
+                        "real_name": r.real_name,
+                        "created_at": r.created_at,
+                    })
+                })
+                .collect();
+            json_response(env, &json!({ "ok": true, "registrations": items }), 200)
+        }
         Err(e) => error_json(env, &e.message(), e.http_status()),
     }
 }
@@ -559,6 +819,64 @@ pub async fn handle_resolve(query: &[(String, String)], env: &Env) -> Result<Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── real_name redesign ────────────────────────────────────────────
+
+    #[test]
+    fn normalise_real_name_trims_and_keeps() {
+        assert_eq!(
+            normalise_real_name("  Ada Lovelace  "),
+            Ok(Some("Ada Lovelace".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalise_real_name_empty_is_none() {
+        assert_eq!(normalise_real_name(""), Ok(None));
+        assert_eq!(normalise_real_name("   "), Ok(None));
+    }
+
+    #[test]
+    fn normalise_real_name_rejects_overlong() {
+        let too_long = "a".repeat(REAL_NAME_MAX_LEN + 1);
+        assert_eq!(
+            normalise_real_name(&too_long),
+            Err(UsernameError::InvalidLength)
+        );
+        // Exactly at the limit is accepted.
+        let at_limit = "a".repeat(REAL_NAME_MAX_LEN);
+        assert_eq!(normalise_real_name(&at_limit), Ok(Some(at_limit)));
+    }
+
+    #[test]
+    fn claim_body_accepts_username_key() {
+        let b: ClaimBody = serde_json::from_str(r#"{"username":"alice"}"#).unwrap();
+        assert_eq!(b.username, "alice");
+        assert_eq!(b.real_name, None);
+    }
+
+    #[test]
+    fn claim_body_accepts_name_alias() {
+        // Signup wizard historically sent {"name": ...}; the alias keeps it working.
+        let b: ClaimBody = serde_json::from_str(r#"{"name":"bob"}"#).unwrap();
+        assert_eq!(b.username, "bob");
+    }
+
+    #[test]
+    fn claim_body_carries_optional_real_name() {
+        let b: ClaimBody =
+            serde_json::from_str(r#"{"username":"carol","real_name":"Carol Real"}"#).unwrap();
+        assert_eq!(b.username, "carol");
+        assert_eq!(b.real_name.as_deref(), Some("Carol Real"));
+    }
+
+    #[test]
+    fn real_name_body_defaults_to_none() {
+        let b: RealNameBody = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(b.real_name, None);
+        let b2: RealNameBody = serde_json::from_str(r#"{"real_name":""}"#).unwrap();
+        assert_eq!(b2.real_name.as_deref(), Some(""));
+    }
 
     #[test]
     fn reserved_list_is_sorted() {

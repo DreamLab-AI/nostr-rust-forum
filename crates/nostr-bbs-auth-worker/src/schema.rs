@@ -205,6 +205,20 @@ pub async fn ensure_schema(env: &Env) {
         let _ = db.prepare(stmt).run().await;
     }
 
+    // --- Real-name redesign: admin-only legal/provisioning name ----------
+    //
+    // `real_name` is the OPTIONAL real name a user supplies so admins can
+    // provision access. It is NEVER published to the relay or kind-0 (which
+    // are public) and is only ever returned on admin-gated read routes plus
+    // the owner's own authed read. Co-located with the username reservation
+    // (one row per pubkey) so the admin registration view is a single-table
+    // read joined on the handle. `ALTER TABLE ADD COLUMN` is idempotent here:
+    // the error when the column already exists is swallowed by design.
+    let _ = db
+        .prepare("ALTER TABLE username_reservations ADD COLUMN real_name TEXT")
+        .run()
+        .await;
+
     // Agent Control Surface Protocol tables (agent_registry, broker_cases,
     // broker_decisions, broker_roles) live in the relay worker's D1
     // (dreamlab-relay, bound as RELAY_DB). They are NOT created here.

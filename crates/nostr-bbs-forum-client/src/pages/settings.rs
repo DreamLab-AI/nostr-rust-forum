@@ -20,6 +20,7 @@ use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::preferences::{save_preferences, use_preferences, NotificationLevel, Theme};
+use crate::utils::relay_url::auth_api_base;
 use crate::utils::shorten_pubkey;
 
 /// NIP-05 host that backs claimed usernames (mirrors onboarding_modal::NIP05_HOST).
@@ -88,6 +89,11 @@ pub fn SettingsPage() -> impl IntoView {
     let avatar_url = RwSignal::new(String::new());
     let birthday = RwSignal::new(String::new()); // "MM-DD" format
     let profile_saving = RwSignal::new(false);
+
+    // Real name (admin-only): loaded from + saved to the auth-worker D1 via
+    // NIP-98 authed routes. NEVER published to kind-0 / the relay.
+    let real_name = RwSignal::new(String::new());
+    let real_name_saving = RwSignal::new(false);
 
     // Muted users
     let muted = RwSignal::new(load_muted_list());
@@ -240,6 +246,65 @@ pub fn SettingsPage() -> impl IntoView {
             );
         });
     }
+
+    // -- Load the admin-only real name (authed GET) on mount --
+    {
+        let real_name_sig = real_name;
+        Effect::new(move |_| {
+            // Re-run when authentication establishes a signer.
+            if auth.pubkey().get().is_none() {
+                return;
+            }
+            let Some(signer) = auth.get_signer() else {
+                return;
+            };
+            wasm_bindgen_futures::spawn_local(async move {
+                let url = format!("{}/api/profile/real-name", auth_api_base());
+                if let Ok(body) =
+                    crate::auth::nip98::fetch_with_nip98_get_signer(&url, signer.as_ref()).await
+                {
+                    if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(rn) = resp.get("real_name").and_then(|v| v.as_str()) {
+                            real_name_sig.set(rn.to_string());
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    // -- Real name save handler (authed POST; empty value clears) --
+    let toasts_for_real_name = toasts;
+    let on_save_real_name = move |_| {
+        let Some(signer) = auth.get_signer() else {
+            toasts_for_real_name.show("Not authenticated", ToastVariant::Error);
+            return;
+        };
+        real_name_saving.set(true);
+        let value = real_name.get_untracked().trim().to_string();
+        let body = serde_json::json!({ "real_name": value }).to_string();
+        let toasts_ok = toasts_for_real_name;
+        let toasts_err = toasts_for_real_name;
+        wasm_bindgen_futures::spawn_local(async move {
+            let url = format!("{}/api/profile/real-name", auth_api_base());
+            match crate::auth::nip98::fetch_with_nip98_post_signer(&url, &body, signer.as_ref())
+                .await
+            {
+                Ok(_) => {
+                    real_name_saving.set(false);
+                    if value.is_empty() {
+                        toasts_ok.show("Real name cleared", ToastVariant::Success);
+                    } else {
+                        toasts_ok.show("Real name saved", ToastVariant::Success);
+                    }
+                }
+                Err(e) => {
+                    real_name_saving.set(false);
+                    toasts_err.show(format!("Save failed: {}", e), ToastVariant::Error);
+                }
+            }
+        });
+    };
 
     // -- Profile save handler --
     let toasts_for_profile = toasts;
@@ -568,6 +633,34 @@ pub fn SettingsPage() -> impl IntoView {
                     >
                         {move || if profile_saving.get() { "Saving..." } else { "Save Profile" }}
                     </button>
+
+                    // Real name (admin-only) — separate backend, separate save.
+                    <div class="border-t border-gray-700/50 pt-4 mt-2 space-y-3">
+                        <div class="space-y-1">
+                            <label class="block text-sm font-medium text-gray-300">
+                                "Real name "
+                                <span class="text-xs text-gray-500">"(optional)"</span>
+                            </label>
+                            <input
+                                type="text"
+                                prop:value=move || real_name.get()
+                                on:input=move |ev| real_name.set(event_target_value(&ev))
+                                maxlength="200"
+                                placeholder="e.g. Ada Lovelace"
+                                class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500 transition-colors"
+                            />
+                            <p class="text-xs text-gray-500">
+                                "Visible only to administrators and used to provision your access. It is never published, never shown publicly, and never written to the relay. Your handle is what everyone sees. Clear the field and save to remove it."
+                            </p>
+                        </div>
+                        <button
+                            on:click=on_save_real_name
+                            disabled=move || real_name_saving.get()
+                            class="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:cursor-not-allowed text-gray-100 font-semibold px-4 py-2 rounded-lg transition-colors text-sm flex items-center gap-1.5"
+                        >
+                            {move || if real_name_saving.get() { "Saving..." } else { "Save Real Name" }}
+                        </button>
+                    </div>
                 </div>
 
                 // -- Section 2: Muted Users --

@@ -56,6 +56,11 @@ pub struct WhitelistUser {
     pub added_at: Option<u64>,
     #[serde(default, alias = "isAdmin")]
     pub is_admin: bool,
+    /// Admin-only real name, enriched after the whitelist load from the
+    /// auth-worker `GET /api/admin/registrations` route. Never sourced from
+    /// the relay (the relay never sees real names) and never public.
+    #[serde(default, skip)]
+    pub real_name: Option<String>,
 }
 
 /// A channel parsed from a kind-40 event on the relay.
@@ -324,7 +329,11 @@ impl AdminStore {
                         "Whitelist is empty. No users have been approved yet.".to_string(),
                     ));
                 }
-                self.state.users.set(parsed.users);
+                let mut users = parsed.users;
+                // Enrich with admin-only real names from the auth-worker. The
+                // relay never sees real names, so they are joined here by pubkey.
+                Self::enrich_real_names(&mut users, signer).await;
+                self.state.users.set(users);
                 self.state.stats.update(|s| {
                     s.total_users = self.state.users.get_untracked().len() as u32;
                 });
@@ -336,6 +345,38 @@ impl AdminStore {
                 self.state.error.set(Some(msg.clone()));
                 self.state.is_loading.set(false);
                 Err(msg)
+            }
+        }
+    }
+
+    /// Fetch the admin-only registrations map (pubkey → real_name) from the
+    /// auth-worker and splice the real names onto the whitelist users by
+    /// pubkey. Best-effort: a failure leaves `real_name = None` and the table
+    /// still renders. NEVER surfaces real names on any non-admin path.
+    async fn enrich_real_names(users: &mut [WhitelistUser], signer: &dyn Signer) {
+        let url = format!(
+            "{}/api/admin/registrations",
+            crate::utils::relay_url::auth_api_base()
+        );
+        let Ok(body) = fetch_with_nip98_get_signer(&url, signer).await else {
+            return;
+        };
+        let Ok(resp) = serde_json::from_str::<serde_json::Value>(&body) else {
+            return;
+        };
+        let Some(items) = resp.get("registrations").and_then(|v| v.as_array()) else {
+            return;
+        };
+        for user in users.iter_mut() {
+            if let Some(item) = items
+                .iter()
+                .find(|it| it.get("pubkey").and_then(|v| v.as_str()) == Some(user.pubkey.as_str()))
+            {
+                user.real_name = item
+                    .get("real_name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
             }
         }
     }

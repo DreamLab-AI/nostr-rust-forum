@@ -9,15 +9,19 @@ use wasm_bindgen_futures::spawn_local;
 use super::use_admin;
 use crate::auth::use_auth;
 use crate::components::user_display::{use_display_name, use_display_name_memo};
+use crate::utils::relay_url::auth_api_base;
 
-/// A pending registration entry. In the current system, pending users are
-/// those who have registered passkeys but have not yet been added to the
-/// whitelist. This is a simplified representation for the UI.
+/// A pending registration entry. Sourced from the auth-worker
+/// `GET /api/admin/registrations` route: every active username reservation,
+/// carrying the public handle plus the admin-only real name. The admin
+/// reviews both before provisioning access (adding to the whitelist).
 #[derive(Clone, Debug)]
 struct PendingUser {
     pubkey: String,
-    nickname: Option<String>,
-    registered_at: Option<u64>,
+    /// Public handle (claimed username) — what everyone sees.
+    handle: Option<String>,
+    /// Admin-only real name supplied at signup. Never public.
+    real_name: Option<String>,
     selected: RwSignal<bool>,
 }
 
@@ -49,11 +53,68 @@ fn RegistrationsInner() -> impl IntoView {
     let _admin = use_admin(); // verified via context
     let auth = use_auth();
 
-    // Pending users state. In practice this would come from an auth API
-    // endpoint; here we use admin state and filter for "pending" status.
+    // Pending users state, loaded from the auth-worker admin registrations
+    // route (handle + admin-only real name). The admin reviews both before
+    // approving (whitelisting) a registrant.
     let pending = RwSignal::new(Vec::<PendingUser>::new());
     let is_loading = RwSignal::new(false);
     let action_msg: RwSignal<Option<(String, bool)>> = RwSignal::new(None);
+
+    // -- Load reservations from the admin-gated endpoint on mount --
+    {
+        let pending_sig = pending;
+        let loading_sig = is_loading;
+        Effect::new(move |_| {
+            let Some(signer) = auth.get_signer() else {
+                return;
+            };
+            loading_sig.set(true);
+            spawn_local(async move {
+                let url = format!("{}/api/admin/registrations", auth_api_base());
+                match crate::auth::nip98::fetch_with_nip98_get_signer(&url, signer.as_ref()).await {
+                    Ok(body) => {
+                        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(items) =
+                                resp.get("registrations").and_then(|v| v.as_array())
+                            {
+                                let users: Vec<PendingUser> = items
+                                    .iter()
+                                    .filter_map(|item| {
+                                        let pubkey = item
+                                            .get("pubkey")
+                                            .and_then(|v| v.as_str())?
+                                            .to_string();
+                                        let handle = item
+                                            .get("handle")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                        let real_name = item
+                                            .get("real_name")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .map(|s| s.to_string());
+                                        Some(PendingUser {
+                                            pubkey,
+                                            handle,
+                                            real_name,
+                                            selected: RwSignal::new(false),
+                                        })
+                                    })
+                                    .collect();
+                                pending_sig.set(users);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[registrations] load failed: {}", e).into(),
+                        );
+                    }
+                }
+                loading_sig.set(false);
+            });
+        });
+    }
 
     // Derive pending count
     let pending_count = Memo::new(move |_| pending.get().len());
@@ -267,9 +328,9 @@ fn RegistrationsInner() -> impl IntoView {
                                 // Table header
                                 <div class="grid grid-cols-12 gap-2 px-4 py-3 bg-gray-800/80 border-b border-gray-700 text-xs font-semibold text-gray-400 uppercase tracking-wider">
                                     <div class="col-span-1"></div>
-                                    <div class="col-span-4">"Pubkey"</div>
-                                    <div class="col-span-3">"Nickname"</div>
-                                    <div class="col-span-2">"Registered"</div>
+                                    <div class="col-span-3">"Handle"</div>
+                                    <div class="col-span-3">"Real Name"</div>
+                                    <div class="col-span-3">"Pubkey"</div>
                                     <div class="col-span-2 text-right">"Actions"</div>
                                 </div>
 
@@ -277,12 +338,14 @@ fn RegistrationsInner() -> impl IntoView {
                                 <div class="divide-y divide-gray-700/50">
                                     {users.into_iter().map(|user| {
                                         let pk = user.pubkey.clone();
-                                        // Reactive: fills in the nickname when kind-0 arrives.
+                                        // Reactive: resolves the kind-0 display name for the pubkey badge.
                                         let pk_short = use_display_name_memo(pk.clone());
-                                        let nick = user.nickname.clone().unwrap_or_else(|| "-".to_string());
-                                        let time_str = user.registered_at
-                                            .map(crate::utils::format_relative_time)
-                                            .unwrap_or_else(|| "-".to_string());
+                                        let handle = user.handle.clone()
+                                            .map(|h| format!("@{h}"))
+                                            .unwrap_or_else(|| "—".to_string());
+                                        // Admin-only real name: only ever rendered on this admin surface.
+                                        let real = user.real_name.clone().unwrap_or_else(|| "—".to_string());
+                                        let real_is_set = user.real_name.is_some();
                                         let selected = user.selected;
                                         let pk_approve = pk.clone();
                                         let pk_reject = pk.clone();
@@ -297,13 +360,20 @@ fn RegistrationsInner() -> impl IntoView {
                                                         class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
                                                     />
                                                 </div>
-                                                <div class="col-span-4">
-                                                    <span class="font-mono text-gray-300 bg-gray-900 rounded px-2 py-0.5 text-xs" title=pk.clone()>
+                                                <div class="col-span-3 text-amber-300 font-mono text-xs truncate" title=handle.clone()>
+                                                    {handle.clone()}
+                                                </div>
+                                                <div
+                                                    class=if real_is_set { "col-span-3 text-gray-200 text-xs truncate" } else { "col-span-3 text-gray-600 text-xs truncate italic" }
+                                                    title=real.clone()
+                                                >
+                                                    {real.clone()}
+                                                </div>
+                                                <div class="col-span-3">
+                                                    <span class="font-mono text-gray-400 bg-gray-900 rounded px-2 py-0.5 text-xs" title=pk.clone()>
                                                         {move || pk_short.get()}
                                                     </span>
                                                 </div>
-                                                <div class="col-span-3 text-gray-400 text-xs truncate">{nick}</div>
-                                                <div class="col-span-2 text-gray-500 text-xs">{time_str}</div>
                                                 <div class="col-span-2 flex justify-end gap-1">
                                                     <button
                                                         on:click=move |_| approve_user.run(pk_approve.clone())

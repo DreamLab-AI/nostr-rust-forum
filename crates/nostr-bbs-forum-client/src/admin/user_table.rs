@@ -411,6 +411,9 @@ fn UserRow(
     let display_name = use_display_name_memo(pk.clone());
     let cohorts = user.cohorts.clone();
     let is_admin_user = user.is_admin;
+    // Admin-only real name (enriched from the auth-worker). Rendered on this
+    // admin surface only so admins can provision the right person.
+    let real_name = user.real_name.clone();
 
     let pk_for_edit = pk.clone();
     let cohorts_for_edit = cohorts.clone();
@@ -481,10 +484,15 @@ fn UserRow(
 
     view! {
         <div class="grid grid-cols-12 gap-2 px-4 py-3 items-center text-sm hover:bg-gray-750 hover:border-l-2 hover:border-l-amber-500/50 border-l-2 border-l-transparent transition-all">
-            // User column -- reactive display name + truncated pubkey
+            // User column -- reactive display name + admin-only real name + truncated pubkey
             <div class="col-span-3">
                 <div class="flex flex-col gap-0.5">
                     <span class="text-white font-medium text-sm">{display_name}</span>
+                    {real_name.map(|rn| view! {
+                        <span class="text-xs text-gray-400" title="Real name (admin-only)">
+                            {rn}
+                        </span>
+                    })}
                     <span
                         class="font-mono text-gray-500 bg-gray-900 rounded px-2 py-0.5 text-xs w-fit"
                         title=pk.clone()
