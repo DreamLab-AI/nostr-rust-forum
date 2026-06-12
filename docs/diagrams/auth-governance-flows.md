@@ -11,11 +11,11 @@ Every `/api/*` route (and the `POST /api/native-pod/provision` out-of-band handl
 passes through this path before any business logic executes.
 
 Sources:
-- `lib.rs:160-231` — outer `fetch` + `handle_request`
-- `lib.rs:233-363` — `route()`
+- `lib.rs:130-202` — outer `fetch` + `handle_request`
+- `lib.rs:207-332` — `route()` (+ `route_sprint_api()` at `lib.rs:338`)
 - `admin.rs:28-36` — `verify()` (thin wrapper)
 - `auth.rs:15-31` — `verify_nip98_replay()` (thin wrapper selecting `REPLAY_DB = "DB"`)
-- `crates/nostr-bbs-rate-limit/src/replay.rs:77-103` — `verify_nip98()` (actual D1 path)
+- `crates/nostr-bbs-rate-limit/src/replay.rs:72-103` — `verify_nip98()` (actual D1 path)
 - `crates/nostr-bbs-core/src/nip98.rs:400-496` — `verify_token_full()` (all structural checks)
 - `crates/nostr-bbs-core/src/nip98.rs:547-577` — `verify_nip98_with_replay()` (replay layer)
 
@@ -28,12 +28,12 @@ sequenceDiagram
     participant D1R as D1: nostr-bbs-auth (nip98_replay table)
 
     C->>W: HTTP request + Authorization: Nostr <base64>
-    W->>W: ensure_schema() + ensure_replay_schema() [lib.rs:180-181]
-    W->>W: IP rate-limit check (SESSIONS KV, 20 req/60s) [lib.rs:191-198]
-    W->>W: read body_bytes for POST/PUT/PATCH [lib.rs:212-215]
+    W->>W: ensure_schema() + ensure_replay_schema() [lib.rs:149-150]
+    W->>W: IP rate-limit check (SESSIONS KV, 20 req/60s) [lib.rs:160-166]
+    W->>W: read body_bytes for POST/PUT/PATCH [lib.rs:181-185]
 
     alt path starts with /api/
-        W->>W: route_sprint_api() first — self-verifying sprint modules [lib.rs:301-313]
+        W->>W: route_sprint_api() first — self-verifying sprint modules [lib.rs:270-280]
         Note over W: Sprint modules (moderation, wot, invites, etc.)<br/>call require_admin / require_authed directly
         W->>RL: verify_nip98(auth_header, url, method, body, env, "DB") [auth.rs:22]
         RL->>RL: get JS wall-clock now [replay.rs:85]
@@ -49,7 +49,7 @@ sequenceDiagram
         end
         CORE-->>RL: Ok(Nip98Token {event_id, pubkey, url, method, ...})
         RL-->>W: Ok(Nip98Token)
-        W->>W: extract pubkey from token [lib.rs:345]
+        W->>W: extract pubkey from token [lib.rs:318]
         W-->>C: route to handler with authed pubkey
     end
 ```
@@ -60,7 +60,7 @@ sequenceDiagram
 from the client body. Two gate levels consume it:
 
 - `require_authed()` (`admin.rs:136-158`): any valid NIP-98 token; returns `pubkey`.
-- `require_admin()` (`admin.rs:99-131`): additionally calls `is_admin(pubkey, env)`,
+- `require_admin()` (`admin.rs:103-131`): additionally calls `is_admin(pubkey, env)`,
   which checks three sources in order: `ADMIN_PUBKEYS` env var → `RELAY_DB whitelist.is_admin` → `DB members.is_admin`.
 
 ---
@@ -70,7 +70,9 @@ from the client body. Two gate levels consume it:
 ### 2a. Whitelist Add / Remove
 
 These operate on `RELAY_DB` (the relay's `nostr-bbs-relay` D1, bound as `RELAY_DB` in
-the auth-worker — **but this binding is absent from `wrangler.toml`**; see Finding 1).
+the auth-worker). The binding is now declared in `wrangler.toml` with a placeholder
+`database_id` that deployments must override with the relay worker's actual D1 id
+(Finding 1, resolved — anomaly register R6).
 
 Sources: `admins.rs:160-297`, `admin.rs:57-97`
 
@@ -96,7 +98,7 @@ sequenceDiagram
     W-->>A: 200 {"ok":true, "pubkey":"...", "action":"admin_added"}
 
     A->>W: POST /api/admins/remove  Authorization: Nostr ...
-    W->>W: require_admin() — prevents self-removal [admins.rs:262]
+    W->>W: require_admin() — prevents self-removal [admins.rs:247]
     W->>D1R: UPDATE whitelist SET is_admin=0 WHERE pubkey=? [admins.rs:274-279]
     D1R-->>W: ok
     W->>D1A: UPDATE members SET is_admin=0 WHERE pubkey=? [admins.rs:282-291]
@@ -110,32 +112,32 @@ sequenceDiagram
 Atomic D1 batch writing both `whitelist` and `agent_registry` in one implicit D1
 transaction. Both tables live in `nostr-bbs-relay` (accessed via `RELAY_DB`).
 
-Sources: `governance_api.rs:259-332`
+Sources: `governance_api.rs:268-341`
 
 ```mermaid
 sequenceDiagram
     participant A as Admin Client
     participant W as auth-worker
-    participant V as normalize_provision() [governance_api.rs:84]
+    participant V as normalize_provision() [governance_api.rs:101]
     participant D1R as D1: nostr-bbs-relay (RELAY_DB)<br/>tables: whitelist, agent_registry
 
     A->>W: POST /api/governance/agents/provision<br/>Body: {pubkey, name, description, cohorts, rate_limit_per_min?}
-    W->>W: require_admin() [governance_api.rs:266]
+    W->>W: require_admin() [governance_api.rs:275]
     Note over W: NIP-98 verify → admin gate
 
-    W->>W: serde_json::from_slice body [governance_api.rs:271]
-    W->>V: normalize_provision(body) [governance_api.rs:276]
-    Note over V: Rules [governance_api.rs:84-103]:<br/>• pubkey exactly 64 hex chars, lowercased<br/>• name non-empty after trim<br/>• cohorts non-empty Vec
+    W->>W: serde_json::from_slice body [governance_api.rs:280]
+    W->>V: normalize_provision(body) [governance_api.rs:285]
+    Note over V: Rules [governance_api.rs:101-115]:<br/>• pubkey exactly 64 hex chars, lowercased<br/>• name non-empty after trim<br/>• cohorts non-empty Vec
 
     V-->>W: Ok(NormalizedProvision) or Err(msg) → 400
 
-    W->>W: serde_json::to_string(cohorts) [governance_api.rs:281]
+    W->>W: serde_json::to_string(cohorts) [governance_api.rs:290]
 
-    W->>D1R: PREPARE whitelist upsert<br/>INSERT INTO whitelist (pubkey, cohorts, added_at, added_by)<br/>ON CONFLICT (pubkey) DO UPDATE SET cohorts=excluded.cohorts, added_by=excluded.added_by [governance_api.rs:291-302]
+    W->>D1R: PREPARE whitelist upsert<br/>INSERT INTO whitelist (pubkey, cohorts, added_at, added_by)<br/>ON CONFLICT (pubkey) DO UPDATE SET cohorts=excluded.cohorts, added_by=excluded.added_by [governance_api.rs:302]
 
-    W->>D1R: PREPARE agent_registry upsert<br/>INSERT OR REPLACE INTO agent_registry<br/>(pubkey, name, description, registered_by, registered_at, rate_limit_per_min, active=1) [governance_api.rs:305-318]
+    W->>D1R: PREPARE agent_registry upsert<br/>INSERT OR REPLACE INTO agent_registry<br/>(pubkey, name, description, registered_by, registered_at, rate_limit_per_min, active=1) [governance_api.rs:316]
 
-    W->>D1R: db.batch([whitelist_stmt, registry_stmt]) [governance_api.rs:321]
+    W->>D1R: db.batch([whitelist_stmt, registry_stmt]) [governance_api.rs:330]
     Note over D1R: D1 batch = implicit transaction<br/>All-or-nothing; no partial state
 
     D1R-->>W: Ok or Err
@@ -151,15 +153,15 @@ sequenceDiagram
     participant D1R as D1: nostr-bbs-relay (RELAY_DB — agent_registry)
 
     A->>W: POST /api/governance/agents/register<br/>Body: {pubkey, name, description?, rate_limit_per_min?}
-    W->>W: require_admin() [governance_api.rs:189]
-    W->>W: validate pubkey (64 hex), name non-empty [governance_api.rs:199-203]
-    W->>D1R: INSERT OR REPLACE INTO agent_registry<br/>(pubkey, name, description, registered_by, registered_at, rate_limit_per_min, active=1) [governance_api.rs:209-223]
+    W->>W: require_admin() [governance_api.rs:201]
+    W->>W: validate pubkey (64 hex), name non-empty [governance_api.rs:206-214]
+    W->>D1R: INSERT OR REPLACE INTO agent_registry<br/>(pubkey, name, description, registered_by, registered_at, rate_limit_per_min, active=1) [governance_api.rs:219]
     D1R-->>W: ok
     W-->>A: 201 {"ok":true, "pubkey":"...", "name":"..."}
 
     A->>W: POST /api/governance/agents/revoke  Body: {pubkey}
-    W->>W: require_admin() [governance_api.rs:341]
-    W->>D1R: UPDATE agent_registry SET active=0 WHERE pubkey=? [governance_api.rs:353]
+    W->>W: require_admin() [governance_api.rs:351]
+    W->>D1R: UPDATE agent_registry SET active=0 WHERE pubkey=? [governance_api.rs:362]
     D1R-->>W: ok
     W-->>A: 200 {"ok":true, "pubkey":"...", "active":false}
 ```
@@ -173,30 +175,31 @@ sequenceDiagram
     participant D1R as D1: nostr-bbs-relay (RELAY_DB — broker_roles)
 
     A->>W: POST /api/governance/roles/grant  Body: {pubkey, role}
-    W->>W: require_admin() [governance_api.rs:428]
-    W->>W: validate pubkey 64 hex [governance_api.rs:438]
-    W->>D1R: INSERT OR REPLACE INTO broker_roles (pubkey, role, granted_by, granted_at) [governance_api.rs:445-457]
+    W->>W: require_admin() [governance_api.rs:437]
+    W->>W: validate pubkey 64 hex [governance_api.rs:447]
+    W->>D1R: INSERT OR REPLACE INTO broker_roles (pubkey, role, granted_by, granted_at) [governance_api.rs:455]
     D1R-->>W: ok
     W-->>A: 201 {"ok":true, "pubkey":"...", "role":"..."}
 
     A->>W: POST /api/governance/roles/revoke  Body: {pubkey, role}
-    W->>W: require_admin() [governance_api.rs:492]
-    W->>D1R: DELETE FROM broker_roles WHERE pubkey=? AND role=? [governance_api.rs:504-509]
+    W->>W: require_admin() [governance_api.rs:502]
+    W->>D1R: DELETE FROM broker_roles WHERE pubkey=? AND role=? [governance_api.rs:513]
     D1R-->>W: ok
     W-->>A: 200 {"ok":true, ..., "revoked":true}
 
     A->>W: GET /api/governance/roles
-    W->>W: require_authed() [governance_api.rs:470]
-    W->>D1R: SELECT * FROM broker_roles ORDER BY pubkey, role [governance_api.rs:477]
+    W->>W: require_authed() [governance_api.rs:480]
+    W->>D1R: SELECT * FROM broker_roles ORDER BY pubkey, role [governance_api.rs:486]
     D1R-->>W: rows
     W-->>A: 200 {"roles":[...]}
 ```
 
 ### 2e. Broker Cases — List / Get (read-only from auth-worker)
 
-Broker cases are **written by the relay worker's Durable Object** (kinds 31400/31402
-projected at `nip_handlers.rs:1144`) and **read by the auth-worker** via the same
-`RELAY_DB` binding.
+Broker cases are **written by the relay worker's Durable Object** (kind-31402
+ActionRequests projected by `project_action_request`, `nip_handlers.rs:1158-1194`;
+kind-31400 PanelDefinitions are stored as events but NOT projected to `broker_cases`)
+and **read by the auth-worker** via the same `RELAY_DB` binding.
 
 ```mermaid
 sequenceDiagram
@@ -206,25 +209,25 @@ sequenceDiagram
     participant AC as Auth Client (HTTP)
     participant W as auth-worker
 
-    RC->>RDO: EVENT kind=31400 (ActionRequest) — agent pubkey
-    RDO->>RDO: is_registered_agent(pubkey) → SELECT active FROM agent_registry [nip_handlers.rs:1117]
+    RC->>RDO: EVENT kind=31402 (ActionRequest) — agent pubkey
+    RDO->>RDO: is_registered_agent(pubkey) → SELECT active FROM agent_registry [nip_handlers.rs:1148]
     D1R-->>RDO: active=1
-    RDO->>D1R: INSERT OR REPLACE INTO broker_cases (...) [nip_handlers.rs:1144]
+    RDO->>D1R: INSERT OR REPLACE INTO broker_cases (...) [nip_handlers.rs:1175]
 
     RC->>RDO: EVENT kind=31403 (ActionResponse) — admin pubkey
     RDO->>RDO: governance_response_blocked check (is_admin required)
-    RDO->>D1R: INSERT OR IGNORE INTO broker_decisions (...) [nip_handlers.rs:1187]
-    RDO->>D1R: UPDATE broker_cases SET state=resolved/rejected [nip_handlers.rs:1207]
+    RDO->>D1R: INSERT OR IGNORE INTO broker_decisions (...) [nip_handlers.rs:1218]
+    RDO->>D1R: UPDATE broker_cases SET state=resolved/rejected [nip_handlers.rs:1239]
 
     AC->>W: GET /api/governance/cases[?state=open]
-    W->>W: require_authed() [governance_api.rs:372]
-    W->>D1R: SELECT * FROM broker_cases [WHERE state=?] ORDER BY updated_at DESC LIMIT 100 [governance_api.rs:383-394]
+    W->>W: require_authed() [governance_api.rs:381]
+    W->>D1R: SELECT * FROM broker_cases [WHERE state=?] ORDER BY updated_at DESC LIMIT 100 [governance_api.rs:392-397]
     D1R-->>W: rows
     W-->>AC: 200 {"cases":[...]}
 
     AC->>W: GET /api/governance/cases/:id
-    W->>W: require_authed() [governance_api.rs:404]
-    W->>D1R: SELECT * FROM broker_cases WHERE id=? [governance_api.rs:409]
+    W->>W: require_authed() [governance_api.rs:413]
+    W->>D1R: SELECT * FROM broker_cases WHERE id=? [governance_api.rs:419]
     D1R-->>W: row or None
     W-->>AC: 200 {"case":{...}} or 404
 ```
@@ -246,7 +249,7 @@ sequenceDiagram
     participant G as device_keys_enabled() [devices.rs:51]
     participant T as ensure_device_table() [devices.rs:63]
     participant D1R as D1: nostr-bbs-relay (RELAY_DB — device_keys)
-    participant RDOA as nostr-bbs-relay DO [nip_handlers.rs:1064]
+    participant RDOA as nostr-bbs-relay DO [nip_handlers.rs:1102]
 
     Note over W,D1R: All three endpoints check gate first
 
@@ -283,10 +286,10 @@ sequenceDiagram
     D1R-->>W: meta.changes
     W-->>U: 200 {device_pubkey, owner_pubkey, revoked:1} or 404
 
-    Note over RDOA,D1R: Relay DO reads device_keys at NIP-42 AUTH
-    RDOA->>RDOA: effective_pubkey(incoming_pubkey) [nip_handlers.rs:1098]
+    Note over RDOA,D1R: Relay DO reads device_keys on EVENT/REQ handling
+    RDOA->>RDOA: effective_pubkey(incoming_pubkey) [nip_handlers.rs:1129]
     alt DEVICE_KEYS_ENABLED=true
-        RDOA->>D1R: SELECT owner_pubkey FROM device_keys<br/>WHERE device_pubkey=? AND revoked=0 LIMIT 1 [nip_handlers.rs:1080]
+        RDOA->>D1R: SELECT owner_pubkey FROM device_keys<br/>WHERE device_pubkey=? AND revoked=0 LIMIT 1 [nip_handlers.rs:1110]
         D1R-->>RDOA: owner_pubkey or None
         RDOA->>RDOA: treat owner_pubkey as the effective principal for whitelist/zone checks
     end
@@ -301,43 +304,37 @@ classification.
 
 ---
 
-**Finding 1 — HIGH | isolated**
-`crates/nostr-bbs-auth-worker/wrangler.toml` (entire file, no `RELAY_DB` stanza)
+**Finding 1 — RESOLVED (anomaly register R6)**
+`crates/nostr-bbs-auth-worker/wrangler.toml`
 
-`governance_api.rs` and `devices.rs` both call `env.d1("RELAY_DB")` at runtime, and
-`admin.rs:69` also reads `RELAY_DB` for `whitelist.is_admin`. None of these bindings
-appear in `wrangler.toml`. At deploy time every call to `env.d1("RELAY_DB")` will
-return `Err`, which propagates as a `worker::Error` and eventually returns a 500. The
-entire governance surface (`/api/governance/*`), device-key surface (`/api/devices/*`),
-and admin-flag checks are silently broken in the deployed worker until the binding is
-added. The relay worker correctly declares `RELAY_DB` pointing at `nostr-bbs-auth`
-(for replay protection), but the auth worker's separate `RELAY_DB` — which must point
-at `nostr-bbs-relay` (`97c77d23-...`) — has no `[[d1_databases]]` entry.
+~~`governance_api.rs` and `devices.rs` both call `env.d1("RELAY_DB")` at runtime but
+no `RELAY_DB` binding appeared in `wrangler.toml`.~~ The kit template now declares a
+`[[d1_databases]]` stanza for `RELAY_DB` (`database_name = "dreamlab-relay"`) with an
+explicit placeholder `database_id` of all-zeros and a comment instructing deployments
+to point it at the relay worker's actual D1. Downstream deploys override it; a deploy
+that forgets still fails per-request with 500s on `/api/governance/*` and
+`/api/devices/*`, but the template drift is fixed.
 
 ---
 
-**Finding 2 — HIGH | duplicate**
-`crates/nostr-bbs-auth-worker/src/lib.rs:45-69` vs `crates/nostr-bbs-auth-worker/src/http.rs:8-27`
+**Finding 2 — RESOLVED (anomaly register R8)**
+`crates/nostr-bbs-auth-worker/src/http.rs:19-44`
 
-Two `cors_headers()` implementations exist in the same crate. The `lib.rs` version
-is fail-closed: when `EXPECTED_ORIGIN` is unset it emits **no** `Access-Control-Allow-Origin`
-header (the safe behaviour documented at `lib.rs:38-44`). The `http.rs` version
-fallback-fills `"https://example.com"` (`http.rs:12`). Every sprint module (moderation,
-wot, invites, welcome, admins, governance, devices) imports from `http.rs` via
-`crate::http::json_response`, meaning their CORS responses silently grant `example.com`
-on misconfigured deploys — contradicting the hardening note in `lib.rs`. The `lib.rs`
-version is only used by the legacy `/api/profile` branch and CORS-preflight path.
+~~Two `cors_headers()` implementations existed; the `http.rs` version fallback-filled
+`"https://example.com"`.~~ Consolidated: `http.rs::cors_headers()` is now the single
+canonical builder and is fail-closed — when `EXPECTED_ORIGIN` is unset or empty it
+emits **no** `Access-Control-Allow-Origin` header. `lib.rs` imports it
+(`use crate::http::cors_headers`, `lib.rs:38`); there is no duplicate definition.
 
 ---
 
-**Finding 3 — MEDIUM | isolated**
-`crates/nostr-bbs-auth-worker/src/delegation.rs:26-38`, routed at `lib.rs:582-585`
+**Finding 3 — RESOLVED (anomaly register R4)**
+~~`crates/nostr-bbs-auth-worker/src/delegation.rs`~~ (file removed)
 
-`POST /api/delegation/verify` is registered in the router and responds `501 Not Implemented`.
-No client in the repo calls this endpoint (confirmed by grep across all crates). The
-route carries no auth requirement: `_auth_header` is ignored. This is stub scaffolding
-from a deferred work item (NIP-26 delegation, commented "W6") that has no consumer,
-exercises no logic, and cannot be tested end-to-end.
+~~`POST /api/delegation/verify` 501 stub with no consumer.~~ The NIP-26 delegation
+implementation, its test suite, and the auth-worker 501 stub were deleted (~860
+lines) as superseded by ADR-099 device keys. No `delegation` route or module remains
+in the auth-worker.
 
 ---
 
@@ -390,17 +387,17 @@ within a single D1 write (which is synchronous from D1's perspective).
 
 ---
 
-**Finding 8 — LOW | isolated**
-`crates/nostr-bbs-auth-worker/src/lib.rs:588-592` — `POST /api/native-pod/provision`
+**Finding 8 — LOW | isolated (partially resolved)**
+`crates/nostr-bbs-auth-worker/src/lib.rs:551` — `POST /api/native-pod/provision`
 
-This endpoint (`handle_native_pod_provision`, `lib.rs:639-758`) requires `NATIVE_POD_URL`
-and `NATIVE_POD_ADMIN_KEY` env vars (`lib.rs:712-732`). Neither is declared in
-`wrangler.toml`. The endpoint returns `503 {"error":"native pod not configured"}` when
-either is missing — a proper fail-closed response — but the endpoint is effectively
-always disabled on the current deploy configuration. The forum client's
-`pod_browser.rs:19` reads `NATIVE_POD_URL` as a build-time `option_env!` constant,
-not as a runtime auth-worker call, so there is no client-side HTTP consumer for this
-auth-worker route.
+This endpoint (`handle_native_pod_provision`, `lib.rs:602-`) requires `NATIVE_POD_URL`
+and `NATIVE_POD_ADMIN_KEY` env vars (`lib.rs:676-695`). `NATIVE_POD_URL` is now
+declared in `wrangler.toml` `[vars]` (placeholder value); `NATIVE_POD_ADMIN_KEY` is
+documented there as a `wrangler secret put` secret, never inline. The endpoint returns
+`503 {"error":"native pod not configured"}` when either is missing — a proper
+fail-closed response. The forum client's `pod_browser.rs` reads `NATIVE_POD_URL` as a
+build-time `option_env!` constant, not as a runtime auth-worker call; the admin UI is
+the intended consumer of this route.
 
 ---
 
@@ -415,16 +412,15 @@ databases and neither can safely create the other's tables.
 
 ---
 
-**Finding 10 — INFO | isolated**
-`crates/nostr-bbs-relay-worker/src/trust.rs:287` — `check_demotion()` is `#[allow(dead_code)]`
+**Finding 10 — RESOLVED (commit 42b1ded, ADR-102)**
+`crates/nostr-bbs-relay-worker/src/trust.rs:292` — `check_demotion()`
 
-`check_demotion()` is implemented but never called. `check_promotion()` is called from
-`nip_handlers.rs` after qualifying events, but the symmetric demotion pass has no
-scheduled invocation (the cron at `crates/nostr-bbs-relay-worker/wrangler.toml` runs
-`scheduled()` every 5 minutes but does not invoke `check_demotion`). Demotion logic
-exists only in tests; no user can be automatically demoted in the current deployment.
-This is not in scope for the auth-worker audit but is directly adjacent to the
-governance trust model.
+~~`check_demotion()` is implemented but never called.~~ The 5-minute cron
+(`wrangler.toml` `crons`, `scheduled()` at `lib.rs:737`) now runs the paged
+`cron::sweep_inactive_demotions` after keep-warm (`lib.rs:748`), applying
+`check_demotion` (one demotion step, admins/TL3 exempt) to whitelist rows past the
+~6-month inactivity gate. `last_active_at` is also stamped on the relay's EOSE read
+path so active lurkers are not demoted.
 
 ---
 

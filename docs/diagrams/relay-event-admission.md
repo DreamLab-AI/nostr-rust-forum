@@ -15,18 +15,18 @@ CSPRNG draw XOR-mixed with the session id (`session.rs:292-298`). The session
 survives Durable Object hibernation via tagged WebSockets; `recover_session`
 restores subscriptions and auth state from DO transactional storage
 (`session.rs:67-174`). NIP-42 AUTH response handling lives in
-`nip_handlers.rs:879-933`.
+`nip_handlers.rs:912-975`.
 
 The device-key attribution path (ADR-099) is resolved in
-`nip_handlers.rs:1057-1104` via `device_keys_enabled()` reading the
+`nip_handlers.rs:1088-1135` via `device_keys_enabled()` reading the
 `DEVICE_KEYS_ENABLED` Worker var and `device_owner()` querying
 `device_keys WHERE device_pubkey = ?1 AND revoked = 0`. The effective
 principal for cohort/zone READ scope is then computed by `effective_pubkey()`
-(`nip_handlers.rs:1098-1104`), which calls the pure `effective_principal()`
+(`nip_handlers.rs:1129-1135`), which calls the pure `effective_principal()`
 (`nip_handlers.rs:125-132`). Crucially, the kind-1059 DM `#p` filter in
 `handle_req` is deliberately NOT rebound to the owner — it stays on the literal
 `session_pubkey` to prevent a device key receiving owner DMs it cannot decrypt
-(`nip_handlers.rs:649-657`).
+(`nip_handlers.rs:642-658`).
 
 ```mermaid
 sequenceDiagram
@@ -48,24 +48,24 @@ sequenceDiagram
     Note over C,DO: Session established; authed_pubkey remains None
 
     C->>DO: ["AUTH", {kind:22242, pubkey, sig, tags:[["challenge","..."],["relay","..."]]}]
-    DO->>DO: handle_auth(session_id, ws, event) (nip_handlers.rs:881)
-    DO->>DO: check event.kind == 22242 (nip_handlers.rs:883-886)
-    DO->>DO: verify_event_strict (Schnorr sig) (nip_handlers.rs:889-896)
-    DO->>Sess: compare challenge tag vs session.challenge (nip_handlers.rs:900-913)
-    DO->>DO: timestamp within 600s (nip_handlers.rs:915-919)
+    DO->>DO: handle_auth(session_id, ws, event) (nip_handlers.rs:912)
+    DO->>DO: check event.kind == 22242 (nip_handlers.rs:914-917)
+    DO->>DO: verify_event_strict (Schnorr sig) (nip_handlers.rs:920-927)
+    DO->>Sess: compare challenge tag vs session.challenge (nip_handlers.rs:930-944)
+    DO->>DO: timestamp within 600s (nip_handlers.rs:946-950)
     alt any check fails
         DO-->>C: ["OK", id, false, "invalid: ..."]
     end
-    DO->>Sess: session.authed_pubkey = Some(event.pubkey) (nip_handlers.rs:922-927)
+    DO->>Sess: session.authed_pubkey = Some(event.pubkey) (nip_handlers.rs:953-958)
     DO->>Store: put("ws_auth:{session_id}", pubkey) (session.rs:216-225)
     DO-->>C: ["OK", id, true, ""]
 
     Note over DO,D1: ADR-099 device-key scope resolution (runs on REQ, not on AUTH)
-    DO->>DO: device_keys_enabled() reads DEVICE_KEYS_ENABLED var (nip_handlers.rs:1057-1062)
+    DO->>DO: device_keys_enabled() reads DEVICE_KEYS_ENABLED var (nip_handlers.rs:1088-1093)
     alt DEVICE_KEYS_ENABLED == "true"
-        DO->>D1: SELECT owner_pubkey FROM device_keys WHERE device_pubkey=? AND revoked=0 (nip_handlers.rs:1079-1088)
+        DO->>D1: SELECT owner_pubkey FROM device_keys WHERE device_pubkey=? AND revoked=0 (nip_handlers.rs:1102-1120)
         alt device row found (non-revoked)
-            DO->>DO: effective_pubkey = owner_pubkey (nip_handlers.rs:1125-1132)
+            DO->>DO: effective_pubkey = owner_pubkey (nip_handlers.rs:1129-1135)
         else no row / revoked / feature off
             DO->>DO: effective_pubkey = session_pubkey (identity passthrough)
         end
@@ -120,15 +120,15 @@ flowchart TD
     GIFT_WL{is_whitelisted\nrecipient\nstorage.rs:310-326}
     GIFT_FAIL([OK false: recipient not whitelisted])
 
-    DEV[effective_pubkey:\ndevice_keys_enabled + device_owner D1\nnip_handlers.rs:1098-1104]
+    DEV[effective_pubkey:\ndevice_keys_enabled + device_owner D1\nnip_handlers.rs:1129-1135]
     WL{is_whitelisted\nallowlist_pubkey\nstorage.rs:310-326}
     WL_FAIL([OK false: pubkey not whitelisted])
 
-    MESH{is_mesh_peer?\nMESH_MODE != standalone\nAND pubkey in MESH_ALLOWED_REMOTE_DIDS\nnip_handlers.rs:1273-1293}
-    MESH_KIND{is_federated_kind_allowed?\nMESH_FEDERATED_KINDS comma list\nnip_handlers.rs:1301-1315}
+    MESH{is_mesh_peer?\nMESH_MODE != standalone\nAND pubkey in MESH_ALLOWED_REMOTE_DIDS\nnip_handlers.rs:1304-1324}
+    MESH_KIND{is_federated_kind_allowed?\nMESH_FEDERATED_KINDS comma list\nnip_handlers.rs:1332-1346}
     MESH_FAIL([OK false: kind not in federated_kinds])
 
-    SUSP{check_suspension:\nsuspended_until > now\nOR silenced flag\ntrust.rs:521-549}
+    SUSP{check_suspension:\nsuspended_until > now\nOR silenced flag\ntrust.rs:549-577}
     SUSP_FAIL([OK false: suspended or silenced])
     SILENCE_FAIL([OK false: silenced])
 
@@ -145,22 +145,22 @@ flowchart TD
     NIP29_ADMIN{is_admin?\nnip_handlers.rs:334}
     NIP29_FAIL([OK false: missing group tag or admin-only])
 
-    GOV{is_governance_kind\nAND != KIND_ACTION_RESPONSE\nnip_handlers.rs:345-357}
-    GOV_REG{is_registered_agent D1\nnip_handlers.rs:1106-1125}
+    GOV{is_governance_kind\nAND != KIND_ACTION_RESPONSE\nnip_handlers.rs:345-356}
+    GOV_REG{is_registered_agent D1\nnip_handlers.rs:1137-1156}
     GOV_FAIL([OK false: not in agent registry])
     GOV_RESP{governance_response_blocked:\nkind==31403 AND not admin\nnip_handlers.rs:103-105}
     GOV_RESP_FAIL([OK false: admin-only governance response])
 
     ZONE42{kind == 42?\nnip_handlers.rs:371}
-    ZONE42_GET[get_channel_zone D1\ntrust.rs:558-574]
-    ZONE42_WA{has_zone_write_access:\nwrite_cohorts ?? required_cohorts\ntrust.rs:639-646}
+    ZONE42_GET[get_channel_zone D1\ntrust.rs:586-602]
+    ZONE42_WA{has_zone_write_access:\nwrite_cohorts ?? required_cohorts\ntrust.rs:667-674}
     ZONE42_FAIL([OK false: zone access denied])
 
     CAL_RSVP{kind == 31925 AND\nnot admin?\nnip_handlers.rs:406}
-    CAL_RSVP_T[resolve_rsvp_target D1:\nSELECT tags FROM events\nWHERE id = e_tag\nnip_handlers.rs:833-860]
+    CAL_RSVP_T[resolve_rsvp_target D1:\nSELECT tags FROM events\nWHERE id = e_tag\nnip_handlers.rs:864-891]
     CAL_TIER[project_tier + rsvp_write_permitted:\nonly Full admitted\ncalendar_projection]
     CAL_RSVP_FAIL([OK false: rsvp not permitted])
-    CAL_EV{kind 31922/31923 AND\nnot admin?\nnip_handlers.rs:431}
+    CAL_EV{kind 31922/31923 AND\nnot admin?\nnip_handlers.rs:431-447}
     CAL_EV_Z[read_zone_tag from event\nhas_zone_write_access D1]
     CAL_EV_FAIL([OK false: zone access denied])
 
@@ -171,7 +171,7 @@ flowchart TD
     SAVE_FAIL([OK false: failed to save])
 
     BROADCAST[broadcast_event\nbroadcast.rs:41-67]
-    ACTIVITY[increment_posts_created\nupdate_last_active\ncheck_promotion\ntrust.rs:407-472]
+    ACTIVITY[increment_posts_created\nupdate_last_active\ncheck_promotion\ntrust.rs:420, 461, 202]
     NIP09{kind == 5?\nprocess_deletion}
     NIP56{kind == 1984?\nprocess_report}
     MOD_MIRROR{kind in 30910/11/15/16\nAND is_admin?\nnip_handlers.rs:489}
@@ -295,7 +295,7 @@ flowchart LR
 
 ## 4. REQ Filter Handling and DM #p Scoping
 
-`handle_req` in `nip_handlers.rs:553-757` executes three filtering stages:
+`handle_req` in `nip_handlers.rs:553-788` executes these filtering stages:
 
 1. **Subscription cap**: max 20 subscriptions per session (`nip_handlers.rs:568-576`).
 2. **NIP-59 kind-1059 AUTH gate** (`nip_handlers.rs:599-638`): if any filter requests
@@ -305,11 +305,18 @@ flowchart LR
    any client-supplied `#p` to prevent cross-recipient leakage.
 3. **ADR-099 effective pubkey** (`nip_handlers.rs:655-658`): `access_pubkey` is the
    device→owner-resolved principal for zone/cohort checks. The kind-1059 `#p` is
-   NOT rebound (note comment at `nip_handlers.rs:649-657`).
-4. **Zone filtering of results** (`nip_handlers.rs:690-755`): for each event returned
+   NOT rebound (note comment at `nip_handlers.rs:650-654`).
+4. **Zone filtering of results** (`nip_handlers.rs:696-763`): for each event returned
    from D1, channel kinds (40/42) and calendar kinds (31922/31923/31925) are filtered
    per the viewer's cohort/zone membership. Non-calendar events from zones the viewer
    cannot access are silently dropped.
+5. **Read-activity tracking at EOSE** (`nip_handlers.rs:774-787`, O1 fix /
+   ADR-102): delivered events are tallied post-zone-filtering and, for an
+   authenticated session with at least one delivered event, a single batched
+   `increment_posts_read_by(pk, delivered)` plus `update_last_active` and
+   `check_promotion` run after EOSE — charged to the literal session pubkey,
+   not the device→owner rebinding. This makes TL0→TL1 promotion reachable for
+   readers and resets the ADR-102 inactivity-demotion clock for lurkers.
 
 The SQL query builder (`filter.rs:53-183`) uses `instr()` for tag matching to avoid
 SQLite LIKE complexity errors on 64-char hex values (`filter.rs:152-164`).
@@ -348,7 +355,7 @@ sequenceDiagram
 
     DO->>ZC: ZoneConfig::load(env) reads ZONE_CONFIG var (zone_config.rs:83-96)
     DO->>DO: is_admin = admin_cache.is_admin(access_pubkey)
-    DO->>DO: get_viewer_cohorts(access_pubkey) for calendar tier (trust.rs:610-612)
+    DO->>DO: get_viewer_cohorts(access_pubkey) for calendar tier (trust.rs:638-660)
 
     DO->>D1: query_events(filters) — per-filter SQL with instr() tag matching (storage.rs:241-302)
     D1-->>DO: Vec<NostrEvent>
@@ -356,15 +363,15 @@ sequenceDiagram
     Note over DO: Zone + calendar filtering of results
     loop for each event in results
         alt calendar kind 31922/31923/31925
-            DO->>D1: resolve_rsvp_target if kind 31925 (nip_handlers.rs:791-860)
-            DO->>DO: project_calendar_for_viewer:\ncalendar_projection::project_tier (nip_handlers.rs:774-822)
+            DO->>D1: resolve_rsvp_target if kind 31925 (nip_handlers.rs:864-891)
+            DO->>DO: project_calendar_for_viewer:\ncalendar_projection::project_tier (nip_handlers.rs:805-853)
             alt Projection::Full or viewer is owner/admin
                 DO-->>C: ["EVENT", sub_id, event]
             else Projection::FreeBusy or Omit
                 Note over DO: event silently dropped
             end
         else channel kind 40 or 42
-            DO->>D1: get_channel_zone(channel_id) (trust.rs:558-574)
+            DO->>D1: get_channel_zone(channel_id) (trust.rs:586-602)
             DO->>DO: is_member = has_zone_access(access_pubkey, zone)\nor is_public_read (zone_config.rs:110-114)
             alt admin or is_member
                 DO-->>C: ["EVENT", sub_id, event]
@@ -380,6 +387,13 @@ sequenceDiagram
         end
     end
     DO-->>C: ["EOSE", sub_id]
+
+    Note over DO,D1: O1 / ADR-102: read-activity tracking (nip_handlers.rs:774-787)
+    alt delivered > 0 and session authenticated
+        DO->>D1: increment_posts_read_by(session_pubkey, delivered) (trust.rs:442)
+        DO->>D1: update_last_active(session_pubkey) (trust.rs:461)
+        DO->>D1: check_promotion(session_pubkey) (trust.rs:202)
+    end
 ```
 
 ---
@@ -432,10 +446,14 @@ sequenceDiagram
 ## 6. Trust Level Resolution and Admin Check Chain
 
 The relay uses two parallel admin sources that are queried in sequence:
-`members` table first, then `whitelist` (`auth.rs:143-162`). An `#allow(dead_code)`
-annotation on `check_demotion` in `trust.rs:287` signals that the demotion path
-is implemented but never called from the event pipeline — only `check_promotion`
-is wired up (`nip_handlers.rs:472`).
+`members` table first, then `whitelist` (`auth.rs:143-162`). `check_promotion`
+is wired into the event pipeline (`nip_handlers.rs:472`) and, since the O1 fix,
+also into the REQ/EOSE read path (`nip_handlers.rs:786`). `check_demotion`
+(`trust.rs:292`) is deliberately NOT called from the event pipeline — it is
+time-driven and invoked by the 5-minute cron via the paged
+`cron::sweep_inactive_demotions` inactivity sweep (ADR-102, `lib.rs:748`,
+`cron.rs`), which applies one demotion step per qualifying row and exempts
+admins/TL3.
 
 ```mermaid
 flowchart TD
@@ -462,14 +480,14 @@ flowchart TD
     ADMIN_TRUE --> CACHE_STORE
     ADMIN_FALSE --> CACHE_STORE
 
-    TL([get_trust_level\ntrust.rs:491-510])
+    TL([get_trust_level\ntrust.rs:519-538])
     TL_Q[SELECT trust_level FROM whitelist\nWHERE pubkey = ?]
     TL_R([TrustLevel 0-3\ndefault: Newcomer if not found])
     TL --> TL_Q --> TL_R
 
-    PROMO([check_promotion\nnip_handlers.rs:472\ntrust.rs:202-272])
-    DEMOTE([check_demotion\ntrust.rs:287-400\nNEVER CALLED from event pipeline])
-    PROMO -. not called .-> DEMOTE
+    PROMO([check_promotion\nnip_handlers.rs:472 + EOSE read path :786\ntrust.rs:202])
+    DEMOTE([check_demotion\ntrust.rs:292\ncalled from cron sweep_inactive_demotions\ncron.rs via lib.rs:748 — ADR-102])
+    PROMO -. independent paths: write/read vs cron .-> DEMOTE
 ```
 
 ---
@@ -560,26 +578,26 @@ sequenceDiagram
 
 1. **{severity: medium, file: auth.rs:143-162, description: Dual admin-table lookup (members then whitelist). The `members` table is checked first, then `whitelist`. The relay event path uses `whitelist.is_admin` throughout the DO; `members` is a legacy table that predates the whitelist cohort model. If a pubkey appears in `members` as admin but not in `whitelist`, the relay's `is_whitelisted()` check at `storage.rs:310-326` will reject their events even though `is_admin` returns true. This means an admin from `members` could pass the admin gate but fail the whitelist gate, creating an inconsistent access state., suspected-legacy}**
 
-2. **{severity: low, file: trust.rs:287-400 (#allow(dead_code) at line 287), description: `check_demotion` is fully implemented with hysteresis logic but is never called from the event pipeline. Only `check_promotion` is wired up (nip_handlers.rs:472). Demotion requires an external cron trigger or manual admin action; none exists in the codebase. The function is reachable from tests only., suspected-legacy}**
+2. **RESOLVED (commit 42b1ded, ADR-102)** — ~~`check_demotion` is fully implemented with hysteresis logic but is never called~~. `check_demotion` (`trust.rs:292`) is now invoked by the 5-minute cron via the paged `cron::sweep_inactive_demotions` inactivity sweep (`lib.rs:748`), with an added admin/TL3 exemption guard. `last_active_at` is also stamped on the EOSE read path so active lurkers do not drift into demotion.
 
-3. **{severity: low, file: trust.rs:419-429 (#allow(dead_code) at line 419), description: `increment_posts_read` is defined but dead — no call site exists in the relay worker. The `posts_read` counter in `whitelist` is never incremented, so TL1 promotion (`posts_read >= 10`) can only be satisfied by the initial value (0) or an admin direct-write to D1. All TL1 promotion paths using this counter are effectively broken unless the column is pre-seeded., isolated}**
+3. **RESOLVED (commit 1e49c3e)** — ~~`increment_posts_read` is defined but dead~~. Reads are now tallied post-zone-filtering in `handle_req` and batched into a single `increment_posts_read_by(pk, delivered)` at EOSE (`nip_handlers.rs:774-787`), followed by `check_promotion`, so TL0→TL1 promotion (`posts_read >= 10`) is reachable for readers.
 
 4. **{severity: low, file: nip_handlers.rs:245-255, description: `admin_cache.is_admin()` is called twice for the same pubkey per event: once at line 246 (inside the `matches!(event.kind, 1 | 42)` guard) and again at line 255 (unconditional). For a kind-1 or kind-42 event from a non-admin, two cache lookups occur at the same timestamp; for an admin or other kind, only the second call fires. The cache makes this a near-zero-cost hit, but it is a structural duplicate — both resolve to the same value for the same pubkey in the same request., duplicate}**
 
 5. **{severity: medium, file: relay_do/mod_cache.rs:113-133 vs relay_do/storage.rs:310-326, description: Two separate D1 schemas enforced implicitly. `is_whitelisted` queries `whitelist` table; `ModCache` queries `moderation_actions` table. Both are fail-safe (false / Block::Unknown respectively) on D1 error, but `Block::Unknown` is fail-CLOSED (treated as blocked) while `is_whitelisted` D1 error is fail-OPEN (returns false, which rejects events). The asymmetry is intentional per code comments but creates a nuanced security posture: a D1 fault silently drops all events rather than admitting unvalidated ones., ok}**
 
-6. **{severity: medium, file: nip_handlers.rs:1057-1062, description: `DEVICE_KEYS_ENABLED` is read on every call to `effective_pubkey()` (and therefore on every EVENT and every REQ). There is no caching of this env-var read; `self.env.var()` is a JS interop call. For high-frequency relays this is a minor but measurable overhead per message., ok}**
+6. **{severity: medium, file: nip_handlers.rs:1088-1093, description: `DEVICE_KEYS_ENABLED` is read on every call to `effective_pubkey()` (and therefore on every EVENT and every REQ). There is no caching of this env-var read; `self.env.var()` is a JS interop call. When the gate is off the D1 device lookup is skipped entirely (pure passthrough), so the residual overhead is the env-var read only., ok}**
 
 7. **{severity: high, file: nip_handlers.rs:325-338 (NIP-29 admin kinds gate), description: The NIP-29 handler comment at line 328-330 states "NIP-29 TODO: This enforces the h-tag/admin gate, but full group metadata should be relay-key-generated rather than accepted from arbitrary clients." Group metadata events (kinds 39000-39002) are accepted from admin clients but the spec requires relay-generated signatures. A TODO-gated admission path for admin-controlled group metadata that bypasses relay key signing is an incomplete implementation — a rogue admin could inject arbitrary group metadata., doc-drift}**
 
 8. **{severity: low, file: nip_handlers.rs:341-368 (governance kinds gate), description: The agent governance gate (kinds 31400-31405) checks `is_registered_agent` for all governance kinds EXCEPT `KIND_ACTION_RESPONSE` (31403). The comment at line 343 says 31403 is "exempt" because it comes from humans (admins), not agents. However, the subsequent `governance_response_blocked` check at line 360 then enforces admin-only for 31403. The two gates together are correct, but the structural split (one gate exempts, the next gate re-restricts) is non-obvious and could be collapsed into a single check., ok}**
 
-9. **{severity: medium, file: nostr-bbs-mesh/src/lib.rs:1-120, description: The `MeshTransport` trait, `PeerSession` struct, and `broadcast_kind30033` method are defined as a scaffold with no concrete implementation wired into `nostr-bbs-relay-worker`. The relay worker uses `is_mesh_peer()` and `is_federated_kind_allowed()` (nip_handlers.rs:1264-1315) as env-var guards, but these are self-contained inline checks that do not call into `nostr-bbs-mesh`. The mesh crate is a dead library dependency for the relay worker — it is not imported in `relay_do/mod.rs` or any relay source file. Sprint v12+ is cited for the full implementation., suspected-legacy}**
+9. **{severity: medium, file: nostr-bbs-mesh/src/lib.rs:1-120, description: The `MeshTransport` trait, `PeerSession` struct, and `broadcast_kind30033` method are defined as a scaffold with no concrete implementation wired into `nostr-bbs-relay-worker`. The relay worker uses `is_mesh_peer()` and `is_federated_kind_allowed()` (nip_handlers.rs:1304-1346) as env-var guards, but these are self-contained inline checks that do not call into `nostr-bbs-mesh`. The mesh crate is a dead library dependency for the relay worker — it is not imported in `relay_do/mod.rs` or any relay source file. Sprint v12+ is cited for the full implementation., suspected-legacy}**
 
 10. **{severity: low, file: relay_do/storage.rs:144-148 (kind-0 profile hook), description: The `upsert_profile` side-effect fires for every successfully stored kind-0 event but failures are silently swallowed (`Err(_) => return`). If the `profiles` table does not exist (e.g. a fresh deployment missing schema migrations), kind-0 events still succeed and the relay logs nothing. This makes the profiles projection silently broken on misconfigured deployments., ok}**
 
 11. **{severity: low, file: relay_do/filter.rs:628-637 (test comment at line 629), description: The test `empty_ids_array_matches_all` has a comment that says "an empty array means 'no constraint' -- the field is set but effectively a no-op" but then the assertion proves it DOES reject (returns false), contradicting the comment. The code is correct (NIP-01: empty ids = impossible match), but the comment is wrong (it says it should match but the assert says it shouldn't). Documentation drift within the test., doc-drift}**
 
-12. **{severity: medium, file: relay_do/nip_handlers.rs:270-297 (kind-41 TL gate), description: For kind-41 (channel metadata/pin), TL2 authors are allowed to modify their OWN channel, while TL3 is required to modify others'. The `is_channel_creator` check (`nip_handlers.rs:1032-1051`) queries `events WHERE id = ? AND kind = 40` to find the original channel. If the kind-40 event was deleted via kind-5 (NIP-09), the creator lookup returns false and a TL2 author loses access to their own channel even though they created it. No tombstone or separate creator index exists., isolated}**
+12. **{severity: medium, file: relay_do/nip_handlers.rs:271-297 (kind-41 TL gate), description: For kind-41 (channel metadata/pin), TL2 authors are allowed to modify their OWN channel, while TL3 is required to modify others'. The `is_channel_creator` check (`nip_handlers.rs:1064-1086`) queries `events WHERE id = ? AND kind = 40` to find the original channel. If the kind-40 event was deleted via kind-5 (NIP-09), the creator lookup returns false and a TL2 author loses access to their own channel even though they created it. No tombstone or separate creator index exists., isolated}**
 
-13. **{severity: low, file: relay_do/nip_handlers.rs:1176-1184 (ActionResponse projection), description: `project_action_response` parses `event.content` as `ActionResponse` twice in sequence (lines 1176 and 1180) for the same string, extracting `action` on the first parse and `reasoning` on the second. Both calls allocate and drop a `governance::ActionResponse`. A single parse into a local variable would suffice., ok}**
+13. **{severity: low, file: relay_do/nip_handlers.rs:1207-1213 (ActionResponse projection), description: `project_action_response` parses `event.content` as `ActionResponse` twice in sequence (lines 1207 and 1211) for the same string, extracting `action` on the first parse and `reasoning` on the second. Both calls allocate and drop a `governance::ActionResponse`. A single parse into a local variable would suffice., ok}**

@@ -22,9 +22,10 @@ mindmap
       RELAY_DB binding missing in kit template — FIXED
       ZONE_CONFIG absent from wrangler vars — FIXED
     Behavioural (open)
-      TL1 promotion unreachable
+      TL1 promotion unreachable — FIXED 1e49c3e
+      demotion unwired — FIXED 42b1ded
       members-vs-whitelist admin split
-      KV ACL fast-path masks R2 delegation
+      KV ACL fast-path masks R2 delegation — FIXED 682a948
       NIP-07 DM silent no-op
     Duplication (open)
       provision_pod x2 client
@@ -45,14 +46,16 @@ mindmap
 | R7 | ~15 ad-hoc `format!("did:nostr:{...}")` sites bypassing exported `did_nostr_uri` (itself orphaned) | Routed through the helper |
 | R8 | auth-worker dual `cors_headers()` — `http.rs` fallback-granted `https://example.com` on misconfigured deploys | Consolidated fail-closed |
 | R9 | architecture.md missing NIP-56/59/65/90 rows, rate-limit crate, ADR-098/099 coverage; ADR-099 status stale | Added/updated |
+| R10 | O1: `posts_read` never incremented → TL0→TL1 promotion unreachable for readers; `check_demotion` unwired | Reads tallied post-zone-filter, batched `increment_posts_read_by` + `check_promotion` at EOSE (commit 1e49c3e); demotion wired via 5-min cron `sweep_inactive_demotions` with admin/TL3 exemption and EOSE `last_active_at` stamping (commit 42b1ded, ADR-102) |
+| R11 | O3: KV `acl:{pubkey}` fast-path unconditionally shadowed R2 sidecars → delegation grants unreachable | R2 sidecars now authoritative; KV consulted only as miss-fallback; pure `resolve_effective_acl` + 4 regression tests (commit 682a948) |
 
 ## Open — behavioural (need decisions/tests, not auto-fixed)
 
 | ID | Sev | Where | Finding |
 |----|-----|-------|---------|
-| O1 | HIGH | `relay-worker/src/trust.rs:419` | `increment_posts_read` is dead code → `posts_read` never leaves 0 → **TL1 promotion unreachable** via relay activity. `check_demotion` (trust.rs:287) also unwired. Decide: wire on REQ/EOSE, or drop the read-count dimension. |
+| O1 | ~~HIGH~~ **RESOLVED** | `relay-worker` (see R10) | ~~`increment_posts_read` dead → TL1 promotion unreachable; `check_demotion` unwired~~ — fixed in commits 1e49c3e (EOSE read tallying) and 42b1ded (cron demotion sweep, ADR-102). |
 | O2 | HIGH | `relay-worker/src/relay_do/nip_handlers.rs:325-338` | NIP-29 group metadata (39000-39002) admitted from admin clients instead of relay-key-signed (acknowledged TODO). Spec drift. |
-| O3 | MED | `pod-worker/src/acl.rs:241-247` + `auth-worker/src/pod.rs:29` | KV fast-path `acl:{pubkey}` unconditionally shadows R2 sidecars for auth-worker-provisioned pods → **delegation grants silently unreachable** on those pods. Auth-worker `provision_pod` is also a dead under-provisioning path. Needs repro test + resolution order decision. |
+| O3 | ~~MED~~ **RESOLVED** | `pod-worker/src/acl.rs:257` (see R11) | ~~KV fast-path shadows R2 sidecars → delegation grants unreachable~~ — fixed in commit 682a948 (R2 authoritative, KV miss-fallback only, regression tests). Residual: auth-worker `provision_pod` is still a dead under-provisioning path flagged for deletion. |
 | O4 | MED | `relay-worker/src/auth.rs:143-162` | Admin in `members` but not `whitelist` passes `is_admin()` yet fails admission as unknown pubkey — inconsistent dual-table authority. |
 | O5 | MED | `relay-worker nip_handlers.rs:270-297` | Kind-40 deletion (NIP-09) destroys `is_channel_creator` lookup → TL2 author locked out of own channel. |
 | O6 | HIGH | `forum-client/src/dm/mod.rs:217-220` | NIP-07 (extension) users get a silent no-op DM subscription — no UI warning. |
@@ -64,4 +67,4 @@ mindmap
 
 ## Verdict
 
-Workers' SQL parameterisation, request-path unwraps, NIP-98 consolidation (one authoritative core impl), device-key gating coverage, and licence headers in source all verified **clean**. The repo's debt is now concentrated in O1-O8: behavioural gaps best attacked with failing repro tests (diagram-driven diagnosis phase 3) rather than doc edits.
+Workers' SQL parameterisation, request-path unwraps, NIP-98 consolidation (one authoritative core impl), device-key gating coverage, and licence headers in source all verified **clean**. O1 and O3 were closed by the 2026-06-11 fix wave (R10/R11). The remaining debt is concentrated in O2, O4-O8: behavioural gaps best attacked with failing repro tests (diagram-driven diagnosis phase 3) rather than doc edits.

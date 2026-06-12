@@ -6,11 +6,19 @@ Generated from source code. All file:line references are to the live codebase.
 
 ## 1. Pod Resource GET/PUT with WAC Authorisation
 
-The `find_effective_acl` resolver in `crates/nostr-bbs-pod-worker/src/acl.rs:235`
+The `find_effective_acl` resolver in `crates/nostr-bbs-pod-worker/src/acl.rs:257`
 drives every request. It is called from two places in `lib.rs`:
 
-- Line 782 — standard resource flow (GET, PUT, POST, PATCH, DELETE)
-- Line 1287 — ACL resource flow (`handle_acl_request`), for the *parent* resource
+- Line 786 — standard resource flow (GET, PUT, POST, PATCH, DELETE)
+- Line 1291 — ACL resource flow (`handle_acl_request`), for the *parent* resource
+
+> **Resolution-order change (commit 682a948):** the R2 sidecar walk is now
+> AUTHORITATIVE and runs first; the KV `acl:{owner_pubkey}` key is a legacy
+> pod-level document consulted ONLY when no R2 sidecar resolves at any level.
+> The previous KV-first fast path let a stale owner-granular KV entry shadow
+> every R2 sidecar — including ADR-096 delegation grants (former Finding 1,
+> now resolved). The pure ordering lives in `resolve_effective_acl`
+> (`acl.rs:325`) for unit testing.
 
 ### 1a. GET /pods/{pubkey}/{resource} — Full ACL Walk
 
@@ -29,39 +37,41 @@ sequenceDiagram
 
     W->>W: required_mode = coerce_required_mode_for_acl(resource_path, "GET")<br/>→ Read (non-acl path)<br/>acl.rs:70-80
 
-    Note over W: find_effective_acl(bucket, kv, owner_pubkey, resource_path)<br/>acl.rs:235
+    Note over W: find_effective_acl(bucket, kv, owner_pubkey, resource_path)<br/>acl.rs:257 — R2 sidecars AUTHORITATIVE, KV miss-fallback only (commit 682a948)
 
-    W->>KV: GET acl:{owner_pubkey}
-    alt KV hit and parseable (<=64 KiB)
-        KV-->>W: AclDocument (inherited=false)
-        Note over W: FAST PATH — pod-level ACL<br/>acl.rs:242-247
-    else KV miss or oversized
-        Note over W: Build probe sequence via acl_probe_sequence(resource_path)<br/>acl.rs:152
+    Note over W: Build probe sequence via acl_probe_sequence(resource_path)<br/>acl.rs:152
 
-        Note over W: Probe 1 (non-inherited): {resource}.acl<br/>e.g. /private/agent/SOUL.md.acl<br/>acl.rs:172
+    Note over W: Probe 1 (non-inherited): {resource}.acl<br/>e.g. /private/agent/SOUL.md.acl<br/>acl.rs:172
 
-        W->>R2: GET pods/{pubkey}/{resource}.acl
-        alt R2 hit and <=64 KiB
-            R2-->>W: bytes → AclDocument (inherited=false)
-        else miss or oversized
-            Note over W: Probe 2 (inherited): {dir}/.acl for immediate container<br/>e.g. /private/agent/.acl (ADR-096 fix)<br/>acl.rs:183
+    W->>R2: GET pods/{pubkey}/{resource}.acl
+    alt R2 hit and <=64 KiB
+        R2-->>W: bytes → AclDocument (inherited=false)
+    else miss or oversized
+        Note over W: Probe 2 (inherited): {dir}/.acl for immediate container<br/>e.g. /private/agent/.acl (ADR-096 fix)<br/>acl.rs:183
 
-            W->>R2: GET pods/{pubkey}{dir}/.acl
+        W->>R2: GET pods/{pubkey}{dir}/.acl
+        alt R2 hit
+            R2-->>W: bytes → AclDocument (inherited=true)
+        else miss
+            Note over W: Probe 3 (inherited): legacy flat {dir-without-slash}.acl<br/>e.g. /private/agent.acl<br/>acl.rs:190-195
+
+            W->>R2: GET pods/{pubkey}/private/agent.acl
             alt R2 hit
                 R2-->>W: bytes → AclDocument (inherited=true)
             else miss
-                Note over W: Probe 3 (inherited): legacy flat {dir-without-slash}.acl<br/>e.g. /private/agent.acl<br/>acl.rs:190-195
+                Note over W: Continue walk: parent dir = /private/<br/>Probe: /private/.acl then /private.acl then /.acl<br/>acl.rs:196
 
-                W->>R2: GET pods/{pubkey}/private/agent.acl
-                alt R2 hit
-                    R2-->>W: bytes → AclDocument (inherited=true)
-                else miss
-                    Note over W: Continue walk: parent dir = /private/<br/>Probe: /private/.acl then /private.acl then /.acl<br/>acl.rs:196
+                W->>R2: GET pods/{pubkey}/private/.acl
+                W->>R2: GET pods/{pubkey}/private.acl
+                W->>R2: GET pods/{pubkey}/.acl
+                R2-->>W: first hit wins; doc.inherited = true
 
-                    W->>R2: GET pods/{pubkey}/private/.acl
-                    W->>R2: GET pods/{pubkey}/private.acl
-                    W->>R2: GET pods/{pubkey}/.acl
-                    R2-->>W: first hit wins; doc.inherited = true
+                alt no R2 sidecar at ANY level
+                    Note over W: KV MISS-FALLBACK only — legacy pod-level ACL<br/>acl.rs:280-289
+                    W->>KV: GET acl:{owner_pubkey}
+                    alt KV hit and parseable (<=64 KiB)
+                        KV-->>W: AclDocument (pod-level, non-inherited)
+                    end
                 end
             end
         end
@@ -124,41 +134,41 @@ sequenceDiagram
 ## 2. Delegation Grant: PUT `{"@delegation":{...}}` to Container Sidecar
 
 This is the "structured grant" shortcut documented in ADR-096.
-The ACL-write handler in `lib.rs:1377-1439` detects the `@delegation` envelope
-before the generic JSON-LD path and calls `build_delegation_acl` in `acl.rs:299`.
+The ACL-write handler in `lib.rs:1387-1449` detects the `@delegation` envelope
+before the generic JSON-LD path and calls `build_delegation_acl` in `acl.rs:367`.
 
 ```mermaid
 sequenceDiagram
     participant C as Client (acl:Control holder)
-    participant W as handle_acl_request (lib.rs:1262)
-    participant ACL as acl::build_delegation_acl (acl.rs:299)
+    participant W as handle_acl_request (lib.rs:1266)
+    participant ACL as acl::build_delegation_acl (acl.rs:367)
     participant R2 as CF R2
 
     C->>W: PUT /pods/{pubkey}/{container}/.acl<br/>body: {"@delegation":{"agent":"did:nostr:...","modes":["acl:Read","acl:Write"]}}
-    Note over W: is_acl_path() → true → handle_acl_request() lib.rs:758
+    Note over W: is_acl_path() → true → handle_acl_request() lib.rs:762
 
-    W->>W: parent_path = acl_path.strip_suffix(".acl")<br/>e.g. "/private/agent/" lib.rs:1278-1283
+    W->>W: parent_path = acl_path.strip_suffix(".acl")<br/>e.g. "/private/agent/" lib.rs:1282
 
     W->>W: find_effective_acl(bucket, kv, owner_pubkey, parent_path)<br/>→ parent_acl (same probe sequence as §1a)
 
     W->>W: evaluate_access(parent_acl, agent_uri, parent_path, Control)
     alt No acl:Control
-        W-->>C: 401/403 "acl:Control required to modify ACL" lib.rs:1358-1365
+        W-->>C: 401/403 "acl:Control required to modify ACL" lib.rs:1365
     else Has Control
-        W->>W: JSON parse body → detect "@delegation" key lib.rs:1392-1393
-        W->>W: validate agent starts with "did:nostr:" lib.rs:1402-1408
-        W->>W: parse modes array; "acl:Control" silently ignored lib.rs:1410-1428
+        W->>W: JSON parse body → detect "@delegation" key lib.rs:1397
+        W->>W: validate agent starts with "did:nostr:" lib.rs:1399-1412
+        W->>W: parse modes array; "acl:Control" silently ignored lib.rs:1414-1438
 
         W->>ACL: build_delegation_acl(owner_did, agent_did, container, modes)
-        Note over ACL: 1. ALWAYS emit #owner auth:<br/>   agent=owner_did, accessTo+default=container<br/>   modes=[Read,Write,Control] acl.rs:344-355
-        Note over ACL: 2. Strip acl:Control from delegate modes acl.rs:359-363
-        Note over ACL: 3. If delegate_modes non-empty, emit #delegate auth:<br/>   agent=agent_did, accessTo+default=container<br/>   modes=requested_minus_Control acl.rs:365-378
+        Note over ACL: 1. ALWAYS emit #owner auth:<br/>   agent=owner_did, accessTo+default=container<br/>   modes=[Read,Write,Control] acl.rs:405-423
+        Note over ACL: 2. Strip acl:Control from delegate modes acl.rs:425-431
+        Note over ACL: 3. If delegate_modes non-empty, emit #delegate auth:<br/>   agent=agent_did, accessTo+default=container<br/>   modes=requested_minus_Control acl.rs:435-450
         Note over ACL: Result: AclDocument {inherited:false, @graph:[#owner,#delegate]}
         ACL-->>W: AclDocument
 
-        W->>W: serde_json::to_vec(doc) — canonical wire JSON-LD lib.rs:1438
-        W->>W: Validate round-trips as AclDocument lib.rs:1443
-        W->>R2: PUT pods/{owner}/{container}/.acl (content-type: application/ld+json) lib.rs:1451-1458
+        W->>W: serde_json::to_vec(doc) — canonical wire JSON-LD
+        W->>W: Validate round-trips as AclDocument
+        W->>R2: PUT pods/{owner}/{container}/.acl (content-type: application/ld+json)
         W-->>C: 201 {"status":"ok"}
     end
 ```
@@ -166,7 +176,7 @@ sequenceDiagram
 **Owner lock-out invariant**: `build_delegation_acl` always re-emits the owner's
 `[Read, Write, Control]` grant regardless of what the caller requested. The delegate
 never receives `acl:Control` even if `"acl:Control"` is included in the modes array
-— it is silently dropped at `acl.rs:362`.
+— it is silently dropped at `acl.rs:427-431`.
 
 ---
 
@@ -276,7 +286,7 @@ sequenceDiagram
 
     rect rgb(255, 245, 220)
         Note over C,AW: Path C: Auth-worker pod.rs (auth-worker only, no R2 container tree)
-        Note over AW: auth-worker::pod::provision_pod writes ONLY:<br/>1. KV: acl:{pubkey} (pod-level ACL JSON)<br/>2. R2: pods/{pubkey}/profile/card (JSON-LD profile)<br/>3. KV: meta:{pubkey} (timestamp + usage)<br/>pod.rs:29-113<br/>NOTE: never called from webauthn.rs — it is called from<br/>lib.rs:349 only for GET /api/profile
+        Note over AW: auth-worker::pod::provision_pod writes ONLY:<br/>1. KV: acl:{pubkey} (pod-level ACL JSON)<br/>2. R2: pods/{pubkey}/profile/card (JSON-LD profile)<br/>3. KV: meta:{pubkey} (timestamp + usage)<br/>pod.rs:29-113<br/>NOTE: never called from webauthn.rs — only pod::handle_profile is<br/>called (lib.rs:318, GET /api/profile); provision_pod is dead code
     end
 
     Note over PW,R2: pod-worker provision_pod() creates full tree:
@@ -301,26 +311,22 @@ sequenceDiagram
 
 ## Findings
 
-### Finding 1 — MEDIUM | Dual ACL Representation with Incomplete Fast-Path Scope
+### Finding 1 — RESOLVED (commit 682a948) | KV Fast-Path Masked R2 Sidecars
 
-**File**: `crates/nostr-bbs-pod-worker/src/acl.rs:241-247` and `acl.rs:250-264`
-**Classification**: Design gap / inconsistency
+**File**: `crates/nostr-bbs-pod-worker/src/acl.rs:257-298`
+**Classification**: Fixed design gap
 
-The KV fast-path at `find_effective_acl:242` reads `acl:{owner_pubkey}` as a
-**pod-level** document (the entire pod's ACL). This document is written by the
-auth-worker's `pod::provision_pod` at `pod.rs:88` via KV key `acl:{pubkey}`.
-It is *not* written by the pod-worker's own `provision_pod`, which writes ACLs
-per-container into R2 only (no KV ACL entry). If the auth-worker path is used
-to bootstrap a pod and the KV ACL is present, it takes unconditional precedence
-over *all* R2 sidecars — including per-container ACLs that should override it.
-The KV fast-path has no way to express resource-specificity or inherited/non-inherited
-semantics; its `AclDocument` is returned with no `inherited` flag set (relies on
-`Default`, which is `false`). A pod provisioned via the auth-worker path will
-never reach its R2 per-resource sidecars for any resource.
-
-**Impact**: A pod provisioned via auth-worker (`pod.rs`) gets a KV ACL that
-occludes all R2 sidecar ACLs. Delegation grants written into R2 (via
-`build_delegation_acl`) are unreachable for those pods.
+~~The KV fast-path read `acl:{owner_pubkey}` FIRST and returned unconditionally
+on a hit, shadowing every R2 sidecar — so delegation grants written into R2
+(via `build_delegation_acl`) were unreachable for pods carrying that KV key.~~
+Fixed at the single resolver every access decision funnels through:
+`find_effective_acl` now runs the most-specific-first R2 probe sequence first
+and authoritatively; the legacy pod-level KV key is consulted only when no R2
+sidecar resolves at any level, so it can never mask a more-specific R2
+delegation sidecar. The ordering is extracted into the pure
+`resolve_effective_acl` helper (`acl.rs:325`) with regression tests (masking
+repro + KV-fallback + deny-all preserved). The auth-worker `pod::provision_pod`
+— the only writer of the masking KV key — remains dead code (see Finding 4).
 
 ---
 
@@ -364,7 +370,7 @@ or remove them from the module doc description.
 
 `pod::provision_pod` in the auth-worker is never called for actual provisioning.
 It is defined at `pod.rs:29` and the only call to `pod::` in `lib.rs` is at
-line 349 (`pod::handle_profile`). Provisioning is performed by the pod-worker's
+line 318 (`pod::handle_profile`). Provisioning is performed by the pod-worker's
 own `provision::provision_pod` (`pod-worker/src/provision.rs:106`), reachable via
 `POST /.pods` or `POST /pods/{pubkey}/.provision`.
 
@@ -375,9 +381,10 @@ The two implementations have diverging behaviour:
   ACLs, TypeIndex documents, WebID HTML, sub-containers) and no KV ACL entry.
 
 If `auth-worker::pod::provision_pod` were ever wired into a signup flow, it would
-produce an under-provisioned pod with a KV ACL that suppresses all R2 container
-ACLs (see Finding 1). The function should either be deleted or clearly marked as
-a test-only or legacy stub.
+produce an under-provisioned pod with a legacy KV ACL. Since commit 682a948 the
+resolver treats that KV key as a miss-fallback only (it can no longer suppress R2
+sidecars — former Finding 1), but the function remains an under-provisioning dead
+path flagged for deletion.
 
 ---
 

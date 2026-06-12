@@ -231,13 +231,16 @@ NIP-17 kind-14 inbox routing — only the NIP-59 gift-wrap envelope.
 
 ## Zone Enforcement
 
-The relay worker enforces the 3-zone access model:
+The relay worker enforces the config-driven zone access model (deny-by-default):
 
-1. On WebSocket connect, the relay checks the user's whitelist entry in D1
-2. The `cohorts` JSON array determines which zones the user can access
-3. REQ filters are intersected with the user's permitted zones
+1. Zone definitions are read from the `ZONE_CONFIG` env var — a JSON array of
+   `nostr_bbs_config::schema::Zone` (`relay_do/zone_config.rs`)
+2. The user's `whitelist.cohorts` JSON array determines which zones they can read
+   (`required_cohorts`) and write (`write_cohorts ?? required_cohorts`); admins bypass
+3. REQ results are zone-filtered per event: kind-40 definitions are withheld for
+   `hidden` zones, kind-42 content is withheld from non-members of `locked`/`hidden` zones
 4. EVENT submissions are rejected if the user lacks write access to the target zone
-5. Zone definitions are operator-configurable via `BbsConfig` (from `nostr-bbs-config`)
+5. Unauthenticated readers are limited to `public` zones
 
 ## Agent Control Surface Protocol
 
@@ -270,7 +273,8 @@ sequenceDiagram
     Human->>Client: clicks Approve
     Client->>Client: sign kind 31403 ActionResponse
     Client->>Relay: EVENT kind 31403
-    Relay->>D1: store event
+    Relay->>Relay: admin-only gate (governance_response_blocked)
+    Relay->>D1: store event + project to broker_decisions,<br/>update broker_cases state
     Relay-->>Agent: subscription push on kind 31403
 ```
 
@@ -355,8 +359,9 @@ stateDiagram-v2
 |-------|------------|------|
 | Agent (registered) | Publish PanelDefinition, PanelState, ActionRequest, PanelUpdate, PanelRetired | `agent_registry` D1 table (admin-approved) |
 | Agent (unregistered) | None | Rejected at relay ingress |
-| Human (broker role) | Respond to ActionRequests, bulk actions, claim cases | `broker_roles` D1 table |
-| Human (member) | View panels, respond if `p`-tagged | Standard forum membership |
+| Human (admin) | Publish kind-31403 ActionResponses | `governance_response_blocked` admin-only gate at relay ingress |
+| Human (broker role) | Read cases/roles via the governance REST API | `broker_roles` D1 table (REST surface only — not consulted at relay ingress) |
+| Human (member) | View panels | Standard forum membership |
 | Admin | Register/deregister agents, grant broker roles | `whitelist.is_admin` |
 
 ### Forum Client Components
@@ -368,11 +373,11 @@ The governance dashboard at `/governance` uses these components:
 | `GovernancePage` | `pages/governance.rs` | Top-level dashboard: stats, pending actions, panel grid |
 | `PanelCard` | `pages/governance.rs` | Renders a panel definition: title, schema badge, fields, action buttons |
 | `ActionRow` | `pages/governance.rs` | Renders an action request: priority badge, reasoning, approve/reject buttons |
-| `PanelRegistry` | `stores/panel_registry.rs` | Reactive store: ingests kind 31400/31402/31405 events, maintains panel + action state |
+| `PanelRegistry` | `stores/panel_registry.rs` | Reactive store: ingests panel kinds 31400/31401/31402/31404/31405, maintains panel + action state |
 
 ### Governance REST API (auth-worker)
 
-Eight NIP-98-gated endpoints for programmatic access to governance data:
+Nine NIP-98-gated endpoints for programmatic access to governance data:
 
 | Method | Path | Gate | Purpose |
 |--------|------|------|---------|
@@ -383,6 +388,7 @@ Eight NIP-98-gated endpoints for programmatic access to governance data:
 | GET | `/api/governance/cases` | any authenticated | List broker cases (optional `?state=` filter) |
 | GET | `/api/governance/cases/:id` | any authenticated | Get a single broker case with details |
 | POST | `/api/governance/roles/grant` | admin | Grant a broker role to a pubkey |
+| POST | `/api/governance/roles/revoke` | admin | Revoke a broker role from a pubkey |
 | GET | `/api/governance/roles` | any authenticated | List all broker role assignments |
 
 All endpoints validate the `Authorization: Nostr <base64>` header via

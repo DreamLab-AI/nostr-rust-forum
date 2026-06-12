@@ -372,6 +372,9 @@ agent system. Agents publish structured nostr events into the forum relay; the
 forum renders them as interactive decision surfaces. Humans respond through the
 same relay with cryptographically signed events.
 
+As of June 2026 the protocol has a live producer: VisionClaw's elevation panel
+(VisionClaw ADR-110) publishes governance events into this plane.
+
 ```mermaid
 sequenceDiagram
     participant Agent
@@ -385,7 +388,7 @@ sequenceDiagram
     Relay-->>Client: push to PanelRegistry
     Client-->>Human: render decision UI
     Human->>Client: approve / reject / configure
-    Client->>Relay: kind 31403 ActionResponse (NIP-98 signed)
+    Client->>Relay: kind 31403 ActionResponse (Schnorr-signed; relay admits admins only)
     Relay-->>Agent: subscription on kind 31403
 ```
 
@@ -403,7 +406,9 @@ sequenceDiagram
 **Trust model:**
 - Agent pubkeys must be registered in the `agent_registry` D1 table (admin-gated)
 - Governance events from unregistered agents are rejected at relay ingress
-- Human responses require standard NIP-98 auth; broker-role users can act on any case
+- Human responses (kind 31403) are signed nostr events; the relay admits them
+  only from admins (`governance_response_blocked`). Broker roles exist in D1
+  and back the REST surface, but are not consulted at relay ingress
 - Decisions are cryptographically signed nostr events -- immutable audit trail
 
 **D1 governance schema** (4 tables, deployed via `0002_governance.sql` migration):
@@ -412,7 +417,7 @@ sequenceDiagram
 - `broker_decisions` -- append-only decision audit trail with provenance chain
 - `broker_roles` -- role assignments (contributor, auditor, broker, admin)
 
-**REST API** (8 endpoints on auth-worker, all NIP-98 gated):
+**REST API** (9 endpoints on auth-worker, all NIP-98 gated):
 
 | Method | Path                            | Gate  | Purpose                  |
 |--------|---------------------------------|-------|--------------------------|
@@ -423,6 +428,7 @@ sequenceDiagram
 | GET    | /api/governance/cases           | any   | List broker cases        |
 | GET    | /api/governance/cases/:id       | any   | Get a single broker case |
 | POST   | /api/governance/roles/grant     | admin | Grant a broker role      |
+| POST   | /api/governance/roles/revoke    | admin | Revoke a broker role     |
 | GET    | /api/governance/roles           | any   | List role assignments    |
 
 See [docs/architecture.md](docs/architecture.md) for data flow diagrams and
