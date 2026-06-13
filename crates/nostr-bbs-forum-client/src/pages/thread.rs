@@ -553,7 +553,10 @@ pub fn ThreadPage() -> impl IntoView {
             for hex in
                 crate::components::mention_autocomplete::resolve_content_mentions(&new_content)
             {
-                if !tags.iter().any(|t| t.len() >= 2 && t[0] == "p" && t[1] == hex) {
+                if !tags
+                    .iter()
+                    .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == hex)
+                {
                     tags.push(vec!["p".to_string(), hex]);
                 }
             }
@@ -727,8 +730,7 @@ fn is_media_url(url: &str) -> bool {
 #[component]
 fn PostBody(content: String) -> impl IntoView {
     let urls = extract_urls(&content);
-    let (media_urls, link_urls): (Vec<_>, Vec<_>) =
-        urls.into_iter().partition(|u| is_media_url(u));
+    let (media_urls, link_urls): (Vec<_>, Vec<_>) = urls.into_iter().partition(|u| is_media_url(u));
     let first_link = link_urls.into_iter().next();
     let text = content.clone();
     view! {
@@ -950,7 +952,13 @@ fn first_line(content: &str) -> String {
 mod tests {
     use super::*;
 
-    fn ev(id: &str, pubkey: &str, created_at: u64, content: &str, tags: Vec<Vec<&str>>) -> NostrEvent {
+    fn ev(
+        id: &str,
+        pubkey: &str,
+        created_at: u64,
+        content: &str,
+        tags: Vec<Vec<&str>>,
+    ) -> NostrEvent {
         NostrEvent {
             id: id.to_string(),
             pubkey: pubkey.to_string(),
@@ -979,7 +987,13 @@ mod tests {
     fn edit_target_ignores_root_and_reply_markers() {
         let root = ev("r", "alice", 100, "hi", vec![vec!["e", "chan", "", "root"]]);
         assert_eq!(edit_target(&root), None);
-        let reply = ev("p", "alice", 100, "hi", vec![vec!["e", "root", "", "reply"]]);
+        let reply = ev(
+            "p",
+            "alice",
+            100,
+            "hi",
+            vec![vec!["e", "root", "", "reply"]],
+        );
         assert_eq!(edit_target(&reply), None);
     }
 
@@ -1043,7 +1057,13 @@ mod tests {
         let orig = ev("orig", "alice", 100, "v1", vec![]);
         let e1 = ev("e1", "alice", 200, "v2", vec![edit_tag("orig")]);
         let e2 = ev("e2", "alice", 300, "v3", vec![edit_tag("e1")]);
-        let other = ev("x", "alice", 150, "reply", vec![vec!["e", "orig", "", "reply"]]);
+        let other = ev(
+            "x",
+            "alice",
+            150,
+            "reply",
+            vec![vec!["e", "orig", "", "reply"]],
+        );
         let events = vec![orig.clone(), e1, e2, other];
         let ids = edit_chain_ids(&orig, &events);
         assert!(ids.contains(&"orig".to_string()));
