@@ -95,19 +95,23 @@ impl MentionCandidate {
 
     /// True when any human-facing label of this candidate contains `q`
     /// (case-insensitive). The empty query matches everything.
-    fn matches(&self, q_lower: &str) -> bool {
-        if q_lower.is_empty() {
+    fn matches(&self, q: &str) -> bool {
+        if q.is_empty() {
             return true;
         }
+        // Lowercase the query here so the helper is genuinely case-insensitive
+        // regardless of caller (the search path also pre-lowercases — a no-op).
+        let ql = q.to_lowercase();
+        let needle = ql.as_str();
         let hay = |s: &Option<String>| {
             s.as_ref()
-                .map(|v| v.to_lowercase().contains(q_lower))
+                .map(|v| v.to_lowercase().contains(needle))
                 .unwrap_or(false)
         };
         hay(&self.display_name)
             || hay(&self.name)
             || hay(&self.nip05)
-            || self.pubkey.to_lowercase().starts_with(q_lower)
+            || self.pubkey.to_lowercase().starts_with(needle)
     }
 
     fn from_entry(entry: &ProfileEntry) -> Self {
