@@ -3,6 +3,8 @@
 //! Collects title, description, dates, location, and max attendees, then signs
 //! and publishes via the relay connection.
 
+use std::rc::Rc;
+
 use leptos::prelude::*;
 
 use crate::auth::use_auth;
@@ -29,6 +31,13 @@ pub fn CreateEventModal(
     let submitting = RwSignal::new(false);
 
     let toasts = use_toasts();
+    // Resolve the auth store and relay connection from context HERE, inside the
+    // component body where the reactive owner is alive. Resolving them inside
+    // the submit handler's `spawn_local` (no owner) makes `expect_context`
+    // panic, which `wasm_bindgen_futures` swallows silently — the exact "button
+    // does nothing, no error" symptom of #20. Both handles are cheap to clone.
+    let auth = use_auth();
+    let relay = expect_context::<RelayConnection>();
 
     let on_submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
@@ -103,12 +112,15 @@ pub fn CreateEventModal(
             Some(desc)
         };
 
-        // Sign and publish via Signer trait
-        let auth = use_auth();
+        // Sign and publish via Signer trait. `get_signer()` covers local-key,
+        // passkey and (lazily) NIP-07 extension sessions.
         let signer = match auth.get_signer() {
             Some(s) => s,
             None => {
-                error_msg.set(Some("Not authenticated".into()));
+                let msg = "Could not sign — your session has no signing key. \
+                           Try refreshing the page or signing in again.";
+                error_msg.set(Some(msg.into()));
+                toasts.show(msg, ToastVariant::Error);
                 return;
             }
         };
@@ -117,6 +129,10 @@ pub fn CreateEventModal(
 
         let title_trimmed = t.trim().to_string();
         let toasts_spawn = toasts;
+        // `relay` is captured from the component body, NOT resolved inside this
+        // future — `expect_context` here would panic with no reactive owner and
+        // abort the future silently (#20).
+        let relay = relay.clone();
         wasm_bindgen_futures::spawn_local(async move {
             match nostr_bbs_core::create_calendar_event_signer(
                 signer.as_ref(),
@@ -130,15 +146,43 @@ pub fn CreateEventModal(
             .await
             {
                 Ok(event) => {
-                    let relay = expect_context::<RelayConnection>();
-                    relay.publish(&event);
                     let event_id = event.id.clone();
-                    toasts_spawn.show("Event created", ToastVariant::Success);
-                    on_created.run(event_id);
-                    on_close.run(());
+                    // Publish with ack so a relay-side rejection (e.g. account
+                    // not yet whitelisted/active) surfaces as a toast instead of
+                    // silently appearing to succeed.
+                    let toasts_ok = toasts_spawn;
+                    let on_ok = Rc::new(move |accepted: bool, msg: String| {
+                        if accepted {
+                            toasts_ok.show("Event created", ToastVariant::Success);
+                        } else {
+                            let display = if msg.contains("whitelist") {
+                                "Your account isn't active yet — try refreshing the page."
+                                    .to_string()
+                            } else if msg.trim().is_empty() {
+                                "Event rejected by relay".to_string()
+                            } else {
+                                format!("Event rejected: {msg}")
+                            };
+                            toasts_ok.show(display, ToastVariant::Error);
+                        }
+                    });
+
+                    match relay.publish_with_ack(&event, Some(on_ok)) {
+                        Ok(()) => {
+                            on_created.run(event_id);
+                            on_close.run(());
+                        }
+                        Err(e) => {
+                            let msg = format!("Failed to send event: {e}");
+                            error_msg.set(Some(msg.clone()));
+                            toasts_spawn.show(msg, ToastVariant::Error);
+                        }
+                    }
                 }
                 Err(e) => {
-                    error_msg.set(Some(format!("Failed to create event: {}", e)));
+                    let msg = format!("Failed to create event: {e}");
+                    error_msg.set(Some(msg.clone()));
+                    toasts_spawn.show(msg, ToastVariant::Error);
                 }
             }
             submitting.set(false);
