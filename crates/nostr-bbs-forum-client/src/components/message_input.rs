@@ -5,12 +5,16 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::auth::use_auth;
 use crate::components::draft_indicator::{clear_draft, load_draft, save_draft, DraftIndicator};
 use crate::components::mention_autocomplete::{
     local_candidates, merge_candidates, search_profiles, MentionAutocomplete, MentionCandidate,
     NETWORK_SEARCH_MIN_LEN,
 };
-use crate::utils::image_compress::{is_accepted_image, MAX_FILE_SIZE};
+use crate::utils::image_compress::{
+    compress_image_default, generate_thumbnail, is_accepted_image, MAX_FILE_SIZE,
+};
+use crate::utils::pod_client::upload_image_with_thumbnail_signer;
 
 /// Pending image attachment for preview before sending.
 #[derive(Clone, Debug)]
@@ -164,6 +168,28 @@ pub(crate) fn MessageInput(
     /// Optional callback fired when an image file is attached for upload.
     #[prop(optional)]
     on_image_attach: Option<Callback<web_sys::File>>,
+    /// When `true`, the composer handles photo upload end-to-end: an attached
+    /// image is compressed and uploaded to the user's pod (NIP-98) on send, and
+    /// the resulting public URL is appended to the message content so it renders
+    /// inline via `MediaEmbed`. This enables the paperclip affordance without the
+    /// caller wiring `on_image_attach`. The two are independent: a caller may use
+    /// either or both.
+    #[prop(optional)]
+    enable_image_upload: bool,
+    /// Optional initial textarea content. Used by the edit flow to pre-fill the
+    /// composer with the post being edited. Existing call sites omit it and the
+    /// composer opens empty (then restores any saved draft).
+    #[prop(optional, into)]
+    initial_content: Option<String>,
+    /// When `true`, the send button renders as a "Save edit" action and the
+    /// composer styling signals edit mode. Purely cosmetic — the publish path is
+    /// the caller's responsibility via `on_send` / `on_send_with_mentions`.
+    #[prop(optional)]
+    is_editing: bool,
+    /// Optional callback fired when the user cancels an in-progress edit
+    /// (only rendered when `is_editing` is set).
+    #[prop(optional)]
+    on_cancel_edit: Option<Callback<()>>,
     /// Optional restore channel for failed sends. The send path publishes with
     /// an ack callback; when the relay rejects the message (OK=false, e.g.
     /// "zone access denied"), the caller pushes the original text here. The
@@ -172,10 +198,21 @@ pub(crate) fn MessageInput(
     #[prop(optional)]
     restore_failed: Option<RwSignal<Option<String>>>,
 ) -> impl IntoView {
-    let content = RwSignal::new(String::new());
+    let content = RwSignal::new(initial_content.clone().unwrap_or_default());
     let file_input_ref = NodeRef::<leptos::html::Input>::new();
     let attachment = RwSignal::new(Option::<ImageAttachment>::None);
-    let has_image_support = on_image_attach.is_some();
+    // The paperclip shows when EITHER the caller wants the raw file
+    // (`on_image_attach`) OR the composer should upload it itself
+    // (`enable_image_upload`).
+    let has_image_support = on_image_attach.is_some() || enable_image_upload;
+    // Tracks the self-contained pod upload triggered on send. `None` when idle,
+    // `Some(true)` while uploading, `Some(false)` is unused (errors surface via
+    // `upload_error`). Disables the send button while a photo is in flight.
+    let uploading = RwSignal::new(false);
+    let upload_error: RwSignal<Option<String>> = RwSignal::new(None);
+    // Auth store captured in the component's reactive scope (Copy) so the send
+    // callback can read pubkey/signer without re-entering context.
+    let auth = use_auth();
 
     // Mention autocomplete state.
     let mention_open = RwSignal::new(false);
@@ -267,6 +304,22 @@ pub(crate) fn MessageInput(
                 .ok();
         }
     };
+
+    // When opened with pre-filled content (edit flow), size the textarea to fit
+    // once it is mounted. Runs once: the guard returns early after the resize.
+    if initial_content.is_some() {
+        Effect::new(move |ran: Option<bool>| {
+            if ran == Some(true) {
+                return true;
+            }
+            if textarea_ref.get().is_some() {
+                resize_textarea();
+                true
+            } else {
+                false
+            }
+        });
+    }
 
     // -- Mention autocomplete: token detection + debounced fetch ----------
     //
@@ -429,15 +482,11 @@ pub(crate) fn MessageInput(
     };
 
     let cid_for_clear = StoredValue::new(cid_for_draft.clone());
-    let do_send = Callback::new(move |()| {
-        // Fire image attachment callback if present.
-        if let Some(att) = attachment.get_untracked() {
-            if let Some(cb) = on_image_attach {
-                cb.run(att.file);
-            }
-            attachment.set(None);
-        }
-        let text = content.get_untracked();
+
+    // Emit `text` through the send callbacks (filtering mentions to those still
+    // present) and reset the composer. Shared by the synchronous send path and
+    // the async upload-then-send path so both behave identically post-send.
+    let finalize_send = Callback::new(move |text: String| {
         let text = text.trim().to_string();
         if !text.is_empty() && text.len() <= MAX_CHARS {
             // Determine which selected mentions actually appear in the final text
@@ -467,6 +516,93 @@ pub(crate) fn MessageInput(
             let el: web_sys::HtmlElement = el.into();
             el.style().set_property("height", "auto").ok();
         }
+    });
+
+    let do_send = Callback::new(move |()| {
+        let att = attachment.get_untracked();
+
+        // Legacy raw-file path: hand the caller the File for its own upload.
+        if let Some(ref a) = att {
+            if let Some(cb) = on_image_attach {
+                cb.run(a.file.clone());
+            }
+        }
+
+        let text = content.get_untracked();
+
+        // Self-contained upload path: compress + upload the attachment to the
+        // user's pod, append the public URL to the content, then send. The URL
+        // is detected as media by `MediaEmbed`, so the photo renders inline.
+        if enable_image_upload {
+            if let Some(a) = att {
+                let file = a.file.clone();
+                let pk = match auth.pubkey().get_untracked() {
+                    Some(p) if !p.is_empty() => p,
+                    _ => {
+                        upload_error.set(Some("Sign in to attach a photo".into()));
+                        return;
+                    }
+                };
+                let signer = match auth.get_signer() {
+                    Some(s) => s,
+                    None => {
+                        upload_error.set(Some("No signing key available".into()));
+                        return;
+                    }
+                };
+                upload_error.set(None);
+                uploading.set(true);
+                let base_text = text.clone();
+                spawn_local(async move {
+                    let compressed = match compress_image_default(&file).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            uploading.set(false);
+                            upload_error.set(Some(format!("Compression failed: {e}")));
+                            return;
+                        }
+                    };
+                    let thumbnail = match generate_thumbnail(&file).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            uploading.set(false);
+                            upload_error.set(Some(format!("Thumbnail failed: {e}")));
+                            return;
+                        }
+                    };
+                    match upload_image_with_thumbnail_signer(
+                        &compressed,
+                        &thumbnail,
+                        &file.name(),
+                        &pk,
+                        signer.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok((image_url, _thumb_url)) => {
+                            uploading.set(false);
+                            attachment.set(None);
+                            let combined = if base_text.trim().is_empty() {
+                                image_url
+                            } else {
+                                format!("{}\n{}", base_text.trim_end(), image_url)
+                            };
+                            finalize_send.run(combined);
+                        }
+                        Err(e) => {
+                            uploading.set(false);
+                            upload_error.set(Some(format!("Upload failed: {e}")));
+                        }
+                    }
+                });
+                return;
+            }
+        }
+
+        // No upload pending — clear any legacy attachment preview and send the
+        // text immediately.
+        attachment.set(None);
+        finalize_send.run(text);
     });
 
     let on_keydown = Callback::new(move |ev: leptos::ev::KeyboardEvent| {
@@ -586,6 +722,34 @@ pub(crate) fn MessageInput(
 
     view! {
         <div class="glass-card p-3 rounded-2xl relative">
+            // Edit-mode banner with a cancel affordance.
+            {is_editing.then(|| view! {
+                <div class="mb-2 flex items-center justify-between gap-2 px-1">
+                    <span class="text-xs text-amber-400 flex items-center gap-1.5">
+                        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        "Editing post"
+                    </span>
+                    {on_cancel_edit.map(|cb| view! {
+                        <button
+                            class="text-xs text-gray-400 hover:text-white underline"
+                            on:click=move |_| cb.run(())
+                        >
+                            "Cancel"
+                        </button>
+                    })}
+                </div>
+            })}
+
+            // Upload error (self-contained photo upload path).
+            {move || upload_error.get().map(|e| view! {
+                <div class="mb-2 px-3 py-2 bg-red-500/10 border border-red-500/30 rounded-lg text-xs text-red-400">
+                    {e}
+                </div>
+            })}
+
             // Hidden file input for image attachment
             {if has_image_support {
                 Some(view! {
@@ -762,12 +926,41 @@ pub(crate) fn MessageInput(
                     <button
                         class="w-8 h-8 flex items-center justify-center rounded-full bg-amber-500 hover:bg-amber-400 disabled:bg-gray-700 disabled:text-gray-500 text-gray-900 transition-all glow-hover flex-shrink-0"
                         on:click=move |_| do_send.run(())
-                        disabled=move || is_empty() || is_over_limit()
-                        aria-label="Send message"
+                        disabled=move || is_empty() || is_over_limit() || uploading.get()
+                        aria-label=move || {
+                            if uploading.get() {
+                                "Uploading photo"
+                            } else if is_editing {
+                                "Save edit"
+                            } else {
+                                "Send message"
+                            }
+                        }
+                        title=move || if is_editing { "Save edit" } else { "Send" }
                     >
-                        <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd" d="M10 17a.75.75 0 01-.75-.75V5.612L5.29 9.77a.75.75 0 01-1.08-1.04l5.25-5.5a.75.75 0 011.08 0l5.25 5.5a.75.75 0 11-1.08 1.04l-3.96-4.158V16.25A.75.75 0 0110 17z" clip-rule="evenodd"/>
-                        </svg>
+                        {move || {
+                            if uploading.get() {
+                                // Spinner while the photo uploads to the pod.
+                                view! {
+                                    <svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                        <path d="M12 2v4m0 12v4m-7.07-3.93l2.83-2.83m8.48-8.48l2.83-2.83M2 12h4m12 0h4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83" stroke-linecap="round"/>
+                                    </svg>
+                                }.into_any()
+                            } else if is_editing {
+                                // Checkmark for "save edit".
+                                view! {
+                                    <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                                        <polyline points="20 6 9 17 4 12" stroke-linecap="round" stroke-linejoin="round"/>
+                                    </svg>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <svg class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+                                        <path fill-rule="evenodd" d="M10 17a.75.75 0 01-.75-.75V5.612L5.29 9.77a.75.75 0 01-1.08-1.04l5.25-5.5a.75.75 0 011.08 0l5.25 5.5a.75.75 0 11-1.08 1.04l-3.96-4.158V16.25A.75.75 0 0110 17z" clip-rule="evenodd"/>
+                                    </svg>
+                                }.into_any()
+                            }
+                        }}
                     </button>
                 </div>
             </div>
