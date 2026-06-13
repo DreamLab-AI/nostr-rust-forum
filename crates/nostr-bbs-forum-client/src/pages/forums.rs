@@ -16,8 +16,20 @@ use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::category_card::CategoryCard;
 use crate::components::empty_state::EmptyState;
 use crate::stores::channels::use_channel_store;
+use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
+
+/// Per-section post tallies projected into each category card.
+///
+/// `total` is the existing "N posts" lifetime count; `unread` is the number of
+/// messages newer than the user's last-read position across every channel in
+/// the section (issue #24 — bright "N new" chip on the forum index).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionCounts {
+    pub total: u32,
+    pub unread: u32,
+}
 
 // -- Zone -> section routing --------------------------------------------------
 
@@ -81,6 +93,7 @@ fn dismiss_welcome() {
 #[component]
 pub fn ForumsPage() -> impl IntoView {
     let store = use_channel_store();
+    let read_store = use_read_positions();
     let loading = store.loading;
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
@@ -97,14 +110,17 @@ pub fn ForumsPage() -> impl IntoView {
     // render closures can clone it cheaply without re-parsing.
     let zones = StoredValue::new(load_zones());
 
-    // Derive zone_id -> { section_id -> post_count } from the shared store.
-    // Reads both `channels` (for section routing) and `channel_messages`
-    // (for live post counts) so the Memo re-runs whenever either changes.
+    // Derive zone_id -> { section_id -> SectionCounts } from the shared store.
+    // Reads `channels` (section routing), `channel_messages` (live post counts +
+    // per-message timestamps) and the read-position timestamps so the Memo
+    // re-runs whenever any of them change — including when a channel is marked
+    // read, which clears the bright "N new" chip immediately.
     let zone_categories = Memo::new(move |_| {
         let chans = store.channels.get();
         let msgs = store.channel_messages.get();
+        let read_ts = read_store.read_timestamps();
         let zs = zones.get_value();
-        let mut map = HashMap::<String, HashMap<String, u32>>::new();
+        let mut map = HashMap::<String, HashMap<String, SectionCounts>>::new();
         for ch in &chans {
             let section = if ch.section.is_empty() {
                 zs.first().map(|z| z.id.clone()).unwrap_or_default()
@@ -113,11 +129,21 @@ pub fn ForumsPage() -> impl IntoView {
             };
             if let Some(zone_id) = section_to_zone(&section, &zs) {
                 let cats = map.entry(zone_id).or_default();
-                let post_count = msgs.get(&ch.id).map(|v| v.len() as u32).unwrap_or(0);
+                let channel_msgs = msgs.get(&ch.id);
+                let post_count = channel_msgs.map(|v| v.len() as u32).unwrap_or(0);
+                // Unread = messages newer than this channel's last-read position.
+                // A channel with no read position counts every message as unread
+                // (it has never been opened). Read timestamps are the kind-42
+                // `created_at` recorded by mark_read in the channel view.
+                let last_read = read_ts.get(&ch.id).copied().unwrap_or(0);
+                let unread_count = channel_msgs
+                    .map(|v| v.iter().filter(|e| e.created_at > last_read).count() as u32)
+                    .unwrap_or(0);
                 // Ensure the section entry exists even if post_count == 0 so
                 // the category card still renders (section is known to exist).
-                let entry = cats.entry(section).or_insert(0);
-                *entry += post_count;
+                let entry = cats.entry(section).or_default();
+                entry.total += post_count;
+                entry.unread += unread_count;
             }
         }
         map
@@ -292,7 +318,7 @@ pub fn ForumsPage() -> impl IntoView {
 /// The tile is headed by the zone's `banner_image_url` (responsive, lazy,
 /// `alt = display_name`) and lists the zone's category cards below. When the
 /// zone has no topics yet it shows an "enter" link instead.
-fn zone_tile(zone: &Zone, cats: HashMap<String, u32>) -> AnyView {
+fn zone_tile(zone: &Zone, cats: HashMap<String, SectionCounts>) -> AnyView {
     let zone_id = zone.id.clone();
     let label = zone.label();
     let label_alt = label.clone();
@@ -308,11 +334,11 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, u32>) -> AnyView {
     let zone_href = base_href(&format!("/forums/{}", zone_id));
 
     let cards_view = if has_cats {
-        let mut entries: Vec<(String, u32)> = cats.into_iter().collect();
+        let mut entries: Vec<(String, SectionCounts)> = cats.into_iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         let cards: Vec<_> = entries
             .into_iter()
-            .map(|(section_id, post_count)| {
+            .map(|(section_id, counts)| {
                 let display_name = humanize_section_id(&section_id);
                 view! {
                     <CategoryCard
@@ -320,7 +346,8 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, u32>) -> AnyView {
                         description=section_description(&section_id).to_string()
                         section_id=section_id
                         icon="sparkle"
-                        post_count=post_count
+                        post_count=counts.total
+                        unread_count=counts.unread
                         accent_color=accent
                         zone_id=zone_id.clone()
                     />

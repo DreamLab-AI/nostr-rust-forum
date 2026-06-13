@@ -95,6 +95,22 @@ impl ReadPositionStore {
             .unwrap_or_default()
     }
 
+    /// Reactively read the whole `channel_id -> last-read timestamp` map.
+    ///
+    /// Used by the forum index to compute per-section unread counts: a message
+    /// is unread when its `created_at` is newer than the last-read timestamp for
+    /// its channel (or the channel has no read position at all). Subscribing to
+    /// this signal makes the unread badges update the moment a channel is marked
+    /// read (e.g. on returning from a channel view).
+    pub fn read_timestamps(&self) -> HashMap<String, u64> {
+        self.inner.with(|rp| {
+            rp.positions
+                .iter()
+                .map(|(cid, pos)| (cid.clone(), pos.timestamp))
+                .collect()
+        })
+    }
+
     /// Return a reactive signal of the unread count for a specific channel.
     pub fn unread_count_signal(&self, channel_id: String) -> Memo<u32> {
         let inner = self.inner;
