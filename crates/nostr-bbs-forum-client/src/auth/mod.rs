@@ -164,9 +164,32 @@ impl AuthStore {
     }
 
     /// Get the active Signer, if one has been set.
+    ///
+    /// Lazy NIP-07 fallback: a browser extension (Podkey) injects `window.nostr`
+    /// AFTER the WASM boot, so when an extension session is authenticated on load
+    /// the `Nip07Signer` is often not installed into `self.signer` (restore ran
+    /// before injection; the relay-side auth path only sets the async relay
+    /// signer, not this store). Posting still works because it routes through
+    /// `sign_event_async()` / `window.nostr` directly — but every authed NIP-98
+    /// fetch (admin user list + registrations, pod, search) calls `get_signer()`
+    /// and was silently no-op'ing for extension users. So when no signer is
+    /// stored but the session is NIP-07 and `window.nostr` is now present,
+    /// construct a `Nip07Signer` on demand (it signs lazily via the extension).
     pub fn get_signer(&self) -> Option<Rc<dyn Signer>> {
-        self.signer
+        if let Some(s) = self
+            .signer
             .with_value(|s| s.as_ref().map(|sw| (**sw).clone()))
+        {
+            return Some(s);
+        }
+        let st = self.state.get_untracked();
+        if st.is_nip07 && nip07::has_nip07_extension() {
+            if let Some(pk) = st.pubkey {
+                let signer: Rc<dyn Signer> = Rc::new(nip07::Nip07Signer::from_pubkey(pk));
+                return Some(signer);
+            }
+        }
+        None
     }
 
     /// Build a PodClient from the current pod_url and pubkey, if both are available.
