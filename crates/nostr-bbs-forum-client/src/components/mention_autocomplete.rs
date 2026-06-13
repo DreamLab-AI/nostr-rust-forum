@@ -218,6 +218,105 @@ pub(crate) fn local_candidates(query: &str, limit: usize) -> Vec<MentionCandidat
     dedup_by_pubkey(from_cache.into_iter().chain(from_seed), limit)
 }
 
+// -- Publish-time content mention resolution ----------------------------------
+
+/// Characters that make up a `@handle` token in free text.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
+/// Extract every `@handle` token from free-text `content`.
+///
+/// Scans ALL `@` occurrences (not only whitespace-anchored ones) so a mention
+/// glued to the preceding word — e.g. `please@junkiejarvis`, which is how the
+/// composer can leave it — is still picked up. False positives (e.g. an email
+/// domain) are harmless: resolution only succeeds for an exact candidate handle
+/// or a curated known-user prefix, neither of which a domain matches.
+fn extract_mention_tokens(content: &str) -> Vec<String> {
+    let chars: Vec<char> = content.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '@' {
+            let mut j = i + 1;
+            while j < chars.len() && is_token_char(chars[j]) {
+                j += 1;
+            }
+            if j > i + 1 {
+                let tok: String = chars[i + 1..j].iter().collect();
+                let tok = tok.trim_matches('.').to_string();
+                if !tok.is_empty() {
+                    out.push(tok);
+                }
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Resolve free-text `@handle` mentions in `content` to hex pubkeys, so a
+/// mention that was TYPED (not picked from the dropdown) still produces a
+/// `["p", pubkey]` tag. Without this, the relay's `#p`-filtered agent
+/// subscriptions (e.g. `@junkiejarvis`) never receive a content-only mention,
+/// so the agent never replies.
+///
+/// Per token (case-insensitive):
+///   1. exact handle match against the known-users seed + read-only ProfileCache;
+///   2. else the longest KNOWN_USERS handle that PREFIXES the token (covers a
+///      missing separator like `@junkiejarvishello`). Restricted to the curated
+///      seed so a short ProfileCache handle cannot greedily swallow words.
+///
+/// Best-effort outside a reactive scope: the ProfileCache read is skipped when
+/// unavailable, but the always-present seed still resolves the ecosystem bots.
+pub fn resolve_content_mentions(content: &str) -> Vec<String> {
+    let tokens = extract_mention_tokens(content);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    // Candidate pool: ProfileCache (if reachable) + the known-users seed.
+    // `get_untracked` so this is safe to call outside a reactive scope (e.g.
+    // from inside a `spawn_local` publish path).
+    let mut pool: Vec<MentionCandidate> = Vec::new();
+    if let Some(cache) = try_use_profile_cache() {
+        for entry in cache.entries.get_untracked().values() {
+            pool.push(MentionCandidate::from_entry(entry));
+        }
+    }
+    pool.extend(seed_candidates());
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for token in tokens {
+        let tl = token.to_lowercase();
+        let exact = pool.iter().find(|c| {
+            [&c.display_name, &c.name, &c.nip05].iter().any(|f| {
+                f.as_ref()
+                    .map(|v| v.trim().to_lowercase() == tl)
+                    .unwrap_or(false)
+            })
+        });
+        let resolved = if let Some(c) = exact {
+            Some(c.pubkey.clone())
+        } else {
+            KNOWN_USERS
+                .iter()
+                .filter(|(h, _)| tl.starts_with(&h.to_lowercase()))
+                .max_by_key(|(h, _)| h.len())
+                .map(|(_, pk)| (*pk).to_string())
+        };
+        if let Some(pk) = resolved {
+            if seen.insert(pk.clone()) {
+                out.push(pk);
+            }
+        }
+    }
+    out
+}
+
 /// De-duplicate candidates by pubkey, preserving first-seen order and
 /// preferring whichever record carries a real `display_name`/`picture`.
 fn dedup_by_pubkey<I>(iter: I, limit: usize) -> Vec<MentionCandidate>

@@ -473,12 +473,23 @@ async fn publish_topic_root(
 
     let now = (js_sys::Date::now() / 1000.0) as u64;
     // NIP-10 root marker pointing at the section channel (kind-40) id.
-    let tags = vec![vec![
+    let mut tags = vec![vec![
         "e".to_string(),
         section_channel_id.to_string(),
         String::new(),
         "root".to_string(),
     ]];
+    // @handles typed into the topic title/body get ["p", pubkey] tags so
+    // mentioned users / agents (e.g. @junkiejarvis) are addressable and
+    // reachable via the relay's #p-filtered subscriptions.
+    for hex in crate::components::mention_autocomplete::resolve_content_mentions(title) {
+        if !tags
+            .iter()
+            .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == hex)
+        {
+            tags.push(vec!["p".to_string(), hex]);
+        }
+    }
 
     let unsigned = nostr_bbs_core::UnsignedEvent {
         pubkey,

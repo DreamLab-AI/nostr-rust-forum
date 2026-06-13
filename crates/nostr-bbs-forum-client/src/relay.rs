@@ -225,10 +225,19 @@ impl RelayConnection {
 
     /// Connect to a specific relay URL.
     fn connect_to(&self, url: &str) {
-        // Close existing connection
+        // Close existing connection. Detach the JS event handlers BEFORE the
+        // closures are dropped below — otherwise the closing socket fires
+        // onclose/onmessage on a later tick and invokes a freed Closure
+        // ("closure invoked recursively or after being dropped", thrown from
+        // WebSocket.real), and that stale onclose also re-triggers
+        // schedule_reconnect() (state is not Disconnected here) → reconnect storm.
         self.with_inner(|rc| {
             let mut inner = rc.borrow_mut();
             if let Some(ws) = inner.ws.take() {
+                ws.set_onopen(None);
+                ws.set_onmessage(None);
+                ws.set_onerror(None);
+                ws.set_onclose(None);
                 let _ = ws.close();
             }
             inner._on_open = None;
@@ -333,6 +342,12 @@ impl RelayConnection {
         self.with_inner(|rc| {
             let mut inner = rc.borrow_mut();
             if let Some(ws) = inner.ws.take() {
+                // Detach handlers before dropping the closures so the closing
+                // socket cannot invoke a freed Closure on a later tick.
+                ws.set_onopen(None);
+                ws.set_onmessage(None);
+                ws.set_onerror(None);
+                ws.set_onclose(None);
                 let _ = ws.close();
             }
             inner._on_open = None;
