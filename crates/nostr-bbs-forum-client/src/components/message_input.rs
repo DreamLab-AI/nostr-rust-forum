@@ -2,13 +2,15 @@
 //! draft auto-save (debounced 2s to localStorage), and `@`-mention autocomplete.
 
 use leptos::prelude::*;
-use serde::Deserialize;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::spawn_local;
 
 use crate::components::draft_indicator::{clear_draft, load_draft, save_draft, DraftIndicator};
+use crate::components::mention_autocomplete::{
+    local_candidates, merge_candidates, search_profiles, MentionAutocomplete, MentionCandidate,
+    NETWORK_SEARCH_MIN_LEN,
+};
 use crate::utils::image_compress::{is_accepted_image, MAX_FILE_SIZE};
-use crate::utils::relay_url::relay_api_base;
 
 /// Pending image attachment for preview before sending.
 #[derive(Clone, Debug)]
@@ -50,95 +52,16 @@ const EMOJIS: &[&str] = &[
 ];
 
 // -- Mention autocomplete ----------------------------------------------------
+//
+// Candidate sourcing, ranking, and the dropdown view live in
+// `components/mention_autocomplete.rs`. This module owns only the
+// textarea-side concerns: detecting the active `@<query>` token at the caret,
+// driving the candidate signal (local sources first, network merge after),
+// keyboard navigation, and splicing the chosen handle back into the textarea
+// while stashing the pubkey for `["p", pubkey]` tag emission.
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct MentionCandidate {
-    pubkey: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    nip05: Option<String>,
-    #[serde(default)]
-    picture: Option<String>,
-}
-
-/// Wrapper deserialiser tolerant of both `[..]` and `{"results":[..]}` shapes.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SearchResponse {
-    Array(Vec<MentionCandidate>),
-    Wrapped { results: Vec<MentionCandidate> },
-}
-
-impl SearchResponse {
-    fn into_vec(self) -> Vec<MentionCandidate> {
-        match self {
-            Self::Array(v) => v,
-            Self::Wrapped { results } => results,
-        }
-    }
-}
-
-impl MentionCandidate {
-    fn handle(&self) -> String {
-        self.display_name
-            .clone()
-            .or_else(|| self.name.clone())
-            .or_else(|| self.nip05.clone())
-            .unwrap_or_else(|| self.pubkey.chars().take(8).collect())
-    }
-}
-
-/// Minimal URL-encode helper for query-string values.
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-async fn search_profiles(query: &str) -> Result<Vec<MentionCandidate>, String> {
-    if query.is_empty() {
-        return Ok(Vec::new());
-    }
-    let url = format!(
-        "{}/api/profiles/search?q={}&limit=10",
-        relay_api_base(),
-        url_encode(query)
-    );
-    let win = web_sys::window().ok_or_else(|| "no window".to_string())?;
-    let init = web_sys::RequestInit::new();
-    init.set_method("GET");
-    let req = web_sys::Request::new_with_str_and_init(&url, &init)
-        .map_err(|e| format!("request build failed: {:?}", e))?;
-    let resp_val = JsFuture::from(win.fetch_with_request(&req))
-        .await
-        .map_err(|e| format!("fetch failed: {:?}", e))?;
-    let resp: web_sys::Response = resp_val
-        .dyn_into()
-        .map_err(|_| "bad response type".to_string())?;
-    if !resp.ok() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    let txt_promise = resp.text().map_err(|e| format!("text() failed: {:?}", e))?;
-    let txt_val = JsFuture::from(txt_promise)
-        .await
-        .map_err(|e| format!("await text failed: {:?}", e))?;
-    let txt = txt_val
-        .as_string()
-        .ok_or_else(|| "non-string body".to_string())?;
-    let parsed: SearchResponse =
-        serde_json::from_str(&txt).map_err(|e| format!("parse failed: {}", e))?;
-    Ok(parsed.into_vec())
-}
+/// Max candidates shown in the dropdown.
+const MENTION_LIMIT: usize = 10;
 
 /// Round `idx` down to the nearest UTF-8 char boundary that is `<= idx`.
 ///
@@ -159,38 +82,57 @@ fn floor_char_boundary(text: &str, idx: usize) -> usize {
     i
 }
 
+/// Characters allowed inside a `@<query>` mention token.
+///
+/// Covers usernames (`a-z 0-9 _ -`), capitalised display-name typing
+/// (`A-Z`), and NIP-05 handles (`. @`) so a user can begin typing any of the
+/// labels the candidates expose. Whitespace always closes the token.
+fn is_mention_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@')
+}
+
 /// Locate the `@<query>` token at or before `caret_pos` inside `text`.
 ///
 /// Returns `Some((token_start, query))` where:
-/// - `token_start` is the byte index of the `@`
-/// - `query` is the text between `@` and `caret_pos` (must be ≥2 chars to trigger fetch)
+/// - `token_start` is the byte index of the leading `@`
+/// - `query` is the text between that `@` and `caret_pos`
 ///
-/// Returns `None` if no active mention token is found.
+/// The query may be empty (the moment after `@` is typed) so the dropdown can
+/// open immediately and offer the local roster. Returns `None` when there is
+/// no active mention token (no `@`, `@` glued to a word, or whitespace in the
+/// query).
 fn detect_mention_token(text: &str, caret_pos: usize) -> Option<(usize, String)> {
     // `caret_pos` may be a UTF-16 offset that falls inside a multi-byte char;
     // floor it to a valid UTF-8 boundary before any byte slicing.
     let caret_pos = floor_char_boundary(text, caret_pos);
     let prefix = &text[..caret_pos];
 
-    // Find the most recent `@` that is preceded by start-of-string or whitespace.
-    let at_pos = prefix.rfind('@')?;
-    if at_pos > 0 {
-        let preceding = &prefix[..at_pos];
-        let last_char = preceding.chars().last()?;
-        if !last_char.is_whitespace() {
-            return None;
+    // Find the most recent `@` that begins a token (start-of-string or
+    // whitespace before it). Scanning from the end lets a NIP-05-style query
+    // ("alice@host") keep working: we anchor on the leading `@`.
+    let mut at_pos = None;
+    for (idx, _) in prefix.char_indices().rev() {
+        if prefix.as_bytes()[idx] == b'@' {
+            let starts_token = idx == 0
+                || prefix[..idx]
+                    .chars()
+                    .last()
+                    .map(|c| c.is_whitespace())
+                    .unwrap_or(true);
+            if starts_token {
+                at_pos = Some(idx);
+                break;
+            }
         }
     }
+    let at_pos = at_pos?;
     let query = &prefix[at_pos + 1..];
-    // Only username-shaped queries; bail on whitespace or 64-hex (which is a
-    // raw pubkey reference handled elsewhere).
+    // Whitespace closes the token; any non-mention char (e.g. punctuation that
+    // is not part of a handle) also closes it.
     if query.contains(char::is_whitespace) {
         return None;
     }
-    if !query
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-    {
+    if !query.chars().all(is_mention_char) {
         return None;
     }
     Some((at_pos, query.to_string()))
@@ -327,8 +269,19 @@ pub(crate) fn MessageInput(
     };
 
     // -- Mention autocomplete: token detection + debounced fetch ----------
-    let trigger_mention_search = move |query: String| {
-        // Cancel previous pending fetch.
+    //
+    // Two-stage resolution so `@mention` works even when the relay search
+    // endpoint is empty or undeployed:
+    //   1. Seed the dropdown synchronously from the LOCAL sources (read-only
+    //      ProfileCache + known-users seed). This is what makes typing `@junk`
+    //      surface `junkiejarvis` (pubkey 2de44d…) with no network at all.
+    //   2. Debounce-fetch the relay search endpoint and merge richer results
+    //      in, preferring network records but never dropping a local match.
+    //
+    // `local` is computed by the caller inside a reactive scope (so it
+    // subscribes to the ProfileCache) and threaded through here.
+    let trigger_mention_search = move |query: String, local: Vec<MentionCandidate>| {
+        // Cancel any previous pending network fetch.
         if let Some(h) = mention_debounce.get_untracked() {
             if let Some(w) = web_sys::window() {
                 w.clear_timeout_with_handle(h);
@@ -336,9 +289,12 @@ pub(crate) fn MessageInput(
             mention_debounce.set(None);
         }
 
-        if query.len() < 2 {
-            // Show open with empty candidates so users see "Keep typing"
-            mention_candidates.set(Vec::new());
+        // Stage 1: show local candidates immediately.
+        mention_candidates.set(local.clone());
+        mention_active_idx.set(0);
+
+        // Below the network-search threshold we rely on local sources only.
+        if query.len() < NETWORK_SEARCH_MIN_LEN {
             return;
         }
 
@@ -347,27 +303,19 @@ pub(crate) fn MessageInput(
 
         let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
             let q = mention_query.get_untracked();
-            if q.len() < 2 {
+            if q.len() < NETWORK_SEARCH_MIN_LEN {
                 return;
             }
             let q_for_fetch = q.clone();
+            let local_for_merge = local.clone();
             spawn_local(async move {
-                match search_profiles(&q_for_fetch).await {
-                    Ok(candidates) => {
-                        if mention_seq.get_untracked() == seq_now {
-                            mention_candidates.set(candidates);
-                            mention_active_idx.set(0);
-                        }
-                    }
-                    Err(e) => {
-                        // Endpoint not yet deployed — fail silently with empty list.
-                        web_sys::console::warn_1(
-                            &format!("[mention] profile search failed: {}", e).into(),
-                        );
-                        if mention_seq.get_untracked() == seq_now {
-                            mention_candidates.set(Vec::new());
-                        }
-                    }
+                // `search_profiles` degrades to an empty list on any failure,
+                // so the local candidates remain in place if the relay is down.
+                let network = search_profiles(&q_for_fetch, MENTION_LIMIT).await;
+                if mention_seq.get_untracked() == seq_now {
+                    let merged = merge_candidates(network, local_for_merge.clone(), MENTION_LIMIT);
+                    mention_candidates.set(merged);
+                    mention_active_idx.set(0);
                 }
             });
         }) as Box<dyn FnMut()>);
@@ -395,7 +343,10 @@ pub(crate) fn MessageInput(
                 mention_token_start.set(start);
                 mention_query.set(query.clone());
                 mention_open.set(true);
-                trigger_mention_search(query);
+                // Compute local candidates here (reactive scope -> subscribes
+                // to ProfileCache) and thread them into the search trigger.
+                let local = local_candidates(&query, MENTION_LIMIT);
+                trigger_mention_search(query, local);
             }
             None => {
                 mention_open.set(false);
@@ -419,13 +370,9 @@ pub(crate) fn MessageInput(
     });
 
     // Selecting a candidate from the dropdown — replace the @<query> token
-    // with @<candidate.handle> in the textarea and stash the pubkey for tag
-    // emission.
-    let select_candidate = Callback::new(move |idx: usize| {
-        let candidates = mention_candidates.get_untracked();
-        let Some(c) = candidates.get(idx).cloned() else {
-            return;
-        };
+    // with @<candidate.handle> in the textarea and stash the pubkey so the
+    // send path can emit a ["p", pubkey] tag on the kind-42 event.
+    let select_candidate = Callback::new(move |c: MentionCandidate| {
         let start = mention_token_start.get_untracked();
         let mut text = content.get_untracked();
         // `start` indexes the `@`; bail if it is stale (content shrank) or no
@@ -433,21 +380,32 @@ pub(crate) fn MessageInput(
         if start >= text.len() || !text.is_char_boundary(start) {
             return;
         }
-        // Replace from `start` through the current end of the token.
+        // Replace from `start` through the current end of the token. The token
+        // ends at the first char that cannot belong to a mention.
         let after_at = &text[start + 1..];
         let token_len = after_at
             .chars()
-            .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-')
-            .count();
+            .take_while(|c| is_mention_char(*c))
+            .map(char::len_utf8)
+            .sum::<usize>();
         let token_end = start + 1 + token_len;
+        // Splice the handle. Strip whitespace from the handle so the inserted
+        // token stays a single mention (display names may contain spaces).
         let handle = c.handle();
-        let replacement = format!("@{} ", handle);
+        let safe_handle: String = handle.chars().filter(|c| !c.is_whitespace()).collect();
+        let safe_handle = if safe_handle.is_empty() {
+            c.pubkey.chars().take(8).collect::<String>()
+        } else {
+            safe_handle
+        };
+        let replacement = format!("@{} ", safe_handle);
         text.replace_range(start..token_end, &replacement);
         content.set(text);
-        // Track the pubkey so on_send_with_mentions can emit ["p", pubkey].
+        // Track the (handle, pubkey) pair. `do_send` filters this list against
+        // the final text so a backspaced-away mention drops its p-tag.
         selected_mentions.update(|v| {
             if !v.iter().any(|(_, pk)| pk == &c.pubkey) {
-                v.push((handle.clone(), c.pubkey.clone()));
+                v.push((safe_handle.clone(), c.pubkey.clone()));
             }
         });
         // Place caret after the replacement.
@@ -461,6 +419,14 @@ pub(crate) fn MessageInput(
         mention_candidates.set(Vec::new());
         mention_query.set(String::new());
     });
+
+    // Keyboard path: resolve the highlighted row to its candidate, then select.
+    let select_active = move || {
+        let idx = mention_active_idx.get_untracked();
+        if let Some(c) = mention_candidates.get_untracked().get(idx).cloned() {
+            select_candidate.run(c);
+        }
+    };
 
     let cid_for_clear = StoredValue::new(cid_for_draft.clone());
     let do_send = Callback::new(move |()| {
@@ -521,7 +487,7 @@ pub(crate) fn MessageInput(
                     }
                     "Enter" | "Tab" => {
                         ev.prevent_default();
-                        select_candidate.run(mention_active_idx.get_untracked());
+                        select_active();
                         return;
                     }
                     "Escape" => {
@@ -695,77 +661,15 @@ pub(crate) fn MessageInput(
                         aria-multiline="true"
                     />
 
-                    // Mention autocomplete dropdown
-                    <Show when=move || mention_open.get()>
-                        <div class="absolute bottom-full left-0 mb-1 w-72 max-w-full glass-card rounded-xl shadow-lg z-50 overflow-hidden">
-                            {move || {
-                                let candidates = mention_candidates.get();
-                                if candidates.is_empty() {
-                                    let q = mention_query.get();
-                                    if q.len() < 2 {
-                                        view! {
-                                            <div class="px-3 py-2 text-xs text-gray-500">
-                                                "Keep typing to search\u{2026}"
-                                            </div>
-                                        }.into_any()
-                                    } else {
-                                        view! {
-                                            <div class="px-3 py-2 text-xs text-gray-500">
-                                                "No matches"
-                                            </div>
-                                        }.into_any()
-                                    }
-                                } else {
-                                    let active = mention_active_idx.get();
-                                    view! {
-                                        <ul role="listbox" class="max-h-60 overflow-y-auto">
-                                            {candidates.into_iter().enumerate().map(|(i, c)| {
-                                                let handle = c.handle();
-                                                let nip05 = c.nip05.clone().unwrap_or_default();
-                                                let is_active = i == active;
-                                                let class = if is_active {
-                                                    "flex items-center gap-2 px-3 py-2 cursor-pointer bg-amber-500/15 text-amber-100"
-                                                } else {
-                                                    "flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-800/60 text-gray-200"
-                                                };
-                                                let pic = c.picture.clone();
-                                                view! {
-                                                    <li
-                                                        role="option"
-                                                        aria-selected=is_active
-                                                        class=class
-                                                        on:mousedown=move |ev| {
-                                                            // mousedown so the textarea's blur doesn't kill the click.
-                                                            ev.prevent_default();
-                                                            select_candidate.run(i);
-                                                        }
-                                                    >
-                                                        {pic.map(|src| view! {
-                                                            <img
-                                                                src=src
-                                                                alt=""
-                                                                class="w-6 h-6 rounded-full bg-gray-700 object-cover flex-shrink-0"
-                                                            />
-                                                        })}
-                                                        <div class="flex-1 min-w-0">
-                                                            <div class="text-xs font-medium truncate">
-                                                                {handle.clone()}
-                                                            </div>
-                                                            {(!nip05.is_empty()).then(|| view! {
-                                                                <div class="text-[10px] text-gray-400 truncate">
-                                                                    "@" {nip05}
-                                                                </div>
-                                                            })}
-                                                        </div>
-                                                    </li>
-                                                }
-                                            }).collect_view()}
-                                        </ul>
-                                    }.into_any()
-                                }
-                            }}
-                        </div>
-                    </Show>
+                    // Mention autocomplete dropdown (view + ranking live in
+                    // components/mention_autocomplete.rs).
+                    <MentionAutocomplete
+                        open=mention_open
+                        query=mention_query
+                        candidates=mention_candidates
+                        active_idx=mention_active_idx
+                        on_select=select_candidate
+                    />
                 </div>
             </Show>
 
@@ -977,66 +881,33 @@ mod tests {
     }
 
     #[test]
-    fn url_encode_basic() {
-        assert_eq!(url_encode("alice"), "alice");
-        assert_eq!(url_encode("a b"), "a%20b");
-        assert_eq!(url_encode("a&b"), "a%26b");
+    fn detect_token_opens_on_bare_at() {
+        // The instant after typing `@`, the empty-query token opens so the
+        // dropdown can show the local roster.
+        let r = detect_mention_token("hi @", 4);
+        assert_eq!(r, Some((3, String::new())));
     }
 
     #[test]
-    fn search_response_array_shape() {
-        let json = r#"[{"pubkey":"abc","name":"alice"}]"#;
-        let parsed: SearchResponse = serde_json::from_str(json).unwrap();
-        let v = parsed.into_vec();
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].name.as_deref(), Some("alice"));
+    fn detect_token_allows_uppercase_and_nip05_chars() {
+        // Capitalised display-name typing.
+        let r = detect_mention_token("@Alice", 6);
+        assert_eq!(r, Some((0, "Alice".to_string())));
+        // NIP-05-style handle: anchors on the leading `@`, keeps the inner `@`.
+        let r2 = detect_mention_token("@alice@host.tld", 15);
+        assert_eq!(r2, Some((0, "alice@host.tld".to_string())));
     }
 
     #[test]
-    fn search_response_wrapped_shape() {
-        let json = r#"{"results":[{"pubkey":"abc","display_name":"Alice"}]}"#;
-        let parsed: SearchResponse = serde_json::from_str(json).unwrap();
-        let v = parsed.into_vec();
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].display_name.as_deref(), Some("Alice"));
-    }
-
-    #[test]
-    fn candidate_handle_precedence() {
-        let c = MentionCandidate {
-            pubkey: "abcdef0123456789".into(),
-            name: Some("alice".into()),
-            display_name: Some("Alice In Wonderland".into()),
-            nip05: Some("alice@example.com".into()),
-            picture: None,
-        };
-        assert_eq!(c.handle(), "Alice In Wonderland");
-
-        let c2 = MentionCandidate {
-            pubkey: "abcdef0123456789".into(),
-            name: Some("alice".into()),
-            display_name: None,
-            nip05: Some("alice@example.com".into()),
-            picture: None,
-        };
-        assert_eq!(c2.handle(), "alice");
-
-        let c3 = MentionCandidate {
-            pubkey: "abcdef0123456789".into(),
-            name: None,
-            display_name: None,
-            nip05: Some("alice@example.com".into()),
-            picture: None,
-        };
-        assert_eq!(c3.handle(), "alice@example.com");
-
-        let c4 = MentionCandidate {
-            pubkey: "abcdef0123456789".into(),
-            name: None,
-            display_name: None,
-            nip05: None,
-            picture: None,
-        };
-        assert_eq!(c4.handle(), "abcdef01");
+    fn is_mention_char_classes() {
+        assert!(is_mention_char('a'));
+        assert!(is_mention_char('Z'));
+        assert!(is_mention_char('9'));
+        assert!(is_mention_char('_'));
+        assert!(is_mention_char('-'));
+        assert!(is_mention_char('.'));
+        assert!(is_mention_char('@'));
+        assert!(!is_mention_char(' '));
+        assert!(!is_mention_char('!'));
     }
 }

@@ -446,10 +446,7 @@ pub async fn increment_posts_read_by(pubkey: &str, count: i32, env: &Env) {
     if let Ok(db) = env.d1("DB") {
         if let Ok(bound) = db
             .prepare("UPDATE whitelist SET posts_read = posts_read + ?1 WHERE pubkey = ?2")
-            .bind(&[
-                JsValue::from_f64(count as f64),
-                JsValue::from_str(pubkey),
-            ])
+            .bind(&[JsValue::from_f64(count as f64), JsValue::from_str(pubkey)])
         {
             let _ = bound.run().await;
         }

@@ -8,6 +8,7 @@ use leptos_router::components::A;
 
 use crate::app::base_href;
 use crate::utils::format_relative_time;
+use crate::utils::slug_hash::section_slug;
 
 /// Card representing a section within a category.
 #[component]
@@ -25,8 +26,13 @@ pub fn SectionCard(
     /// Parent category slug for building the href.
     category: String,
 ) -> impl IntoView {
-    let section_slug = slugify(&name);
-    let href = base_href(&format!("/forums/{}/{}", category, section_slug));
+    // #9: the URL carries a privacy hash of the channel id, never the section
+    // name. The real name is resolved for display by the section page.
+    let href = base_href(&format!(
+        "/forums/{}/{}",
+        category,
+        section_slug(&channel_id)
+    ));
 
     let has_messages = last_activity > 0;
     let activity_display = format_relative_time(last_activity);
@@ -97,16 +103,4 @@ pub fn SectionCard(
             </div>
         </A>
     }
-}
-
-/// Convert a section name to a URL slug.
-fn slugify(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|seg| !seg.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
 }

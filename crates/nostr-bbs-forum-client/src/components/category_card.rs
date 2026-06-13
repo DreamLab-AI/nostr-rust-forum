@@ -8,6 +8,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::app::base_href;
+use crate::utils::slug_hash::section_slug;
 
 /// Visually rich card representing a forum category.
 #[component]
@@ -16,7 +17,8 @@ pub fn CategoryCard(
     name: String,
     /// Short description text.
     description: String,
-    /// Raw section ID used for URL routing (e.g. "home-lobby").
+    /// Raw section tag for this category group (e.g. "home-lobby"). Hashed into
+    /// the URL slug (#9) so the section tag/name never appears in the address.
     section_id: String,
     /// Icon identifier: "globe", "users", "code", or "shield".
     icon: &'static str,
@@ -30,7 +32,14 @@ pub fn CategoryCard(
     #[prop(optional, into)]
     picture: String,
 ) -> impl IntoView {
-    let href = base_href(&format!("/forums/{}/{}", zone_id, section_id));
+    // #9: the section tag is hashed into the URL — its plaintext (which can
+    // reveal the section name) never appears in the address bar. The section
+    // page resolves the hash back to the real channel for display.
+    let href = base_href(&format!(
+        "/forums/{}/{}",
+        zone_id,
+        section_slug(&section_id)
+    ));
 
     let gradient_class = match accent_color {
         "amber" => "from-amber-600/20 via-orange-500/10 to-transparent",

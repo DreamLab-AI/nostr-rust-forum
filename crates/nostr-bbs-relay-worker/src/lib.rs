@@ -27,6 +27,7 @@ mod nip11;
 mod profiles;
 mod relay_do;
 mod trust;
+mod user_admin;
 mod whitelist;
 mod zone_config;
 
@@ -316,6 +317,43 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
     // re-running is always safe.
     if path == "/api/admin/profiles/backfill" && method == Method::Post {
         return handle_profiles_backfill(req, env).await;
+    }
+
+    // --- Task #7: admin user management (NIP-98 admin only) ---
+
+    // Remove a user from the whitelist, optionally purging their events.
+    if path == "/api/admin/user/delete" && method == Method::Post {
+        return user_admin::handle_delete_user(req, env).await;
+    }
+
+    // Suspend / unsuspend (writes whitelist.suspended_until).
+    if path == "/api/admin/suspend" && method == Method::Post {
+        return user_admin::handle_suspend(req, env).await;
+    }
+
+    // Silence / unsilence (writes whitelist.silenced).
+    if path == "/api/admin/silence" && method == Method::Post {
+        return user_admin::handle_silence(req, env).await;
+    }
+
+    // Admin notes write (POST) — read is the parameterised GET below.
+    if path == "/api/admin/notes" && method == Method::Post {
+        return user_admin::handle_notes_set(req, env).await;
+    }
+
+    // GET /api/admin/notes/:pubkey — the pubkey is the trailing path segment.
+    if let Some(rest) = path.strip_prefix("/api/admin/notes/") {
+        if method == Method::Get && !rest.is_empty() && !rest.contains('/') {
+            return user_admin::handle_notes_get(&req, env, rest).await;
+        }
+    }
+
+    // Pubkey aliases — list (GET) and link old->new (POST).
+    if path == "/api/admin/aliases" && method == Method::Get {
+        return user_admin::handle_aliases_list(&req, env).await;
+    }
+    if path == "/api/admin/alias" && method == Method::Post {
+        return user_admin::handle_alias_set(req, env).await;
     }
 
     json_response(&req, env, &serde_json::json!({ "error": "Not found" }), 404)
@@ -674,6 +712,19 @@ async fn ensure_schema(env: &Env) {
             granted_at INTEGER NOT NULL, \
             PRIMARY KEY (pubkey, role)\
         )",
+        // Task #7: pubkey alias map (old_pubkey -> new_pubkey). Nostr events are
+        // bound to the signing key and can never be re-signed, so identity
+        // inheritance is modelled as an alias: a newly-joining `new_pubkey` is
+        // linked to a prior `old_pubkey` so the DISPLAY layer attributes the new
+        // key's posts under the prior handle and cohorts can be inherited.
+        // `new_pubkey` is the PK (a joining key maps to at most one prior id).
+        "CREATE TABLE IF NOT EXISTS pubkey_aliases (\
+            new_pubkey TEXT PRIMARY KEY NOT NULL, \
+            old_pubkey TEXT NOT NULL, \
+            created_by TEXT NOT NULL, \
+            created_at INTEGER NOT NULL, \
+            reason TEXT\
+        )",
     ];
     for stmt in create_stmts {
         let _ = db.prepare(stmt).run().await;
@@ -705,6 +756,9 @@ async fn ensure_schema(env: &Env) {
         "CREATE INDEX IF NOT EXISTS idx_broker_cases_assigned ON broker_cases(assigned_to)",
         "CREATE INDEX IF NOT EXISTS idx_broker_decisions_case ON broker_decisions(case_id)",
         "CREATE INDEX IF NOT EXISTS idx_broker_roles_pubkey ON broker_roles(pubkey)",
+        // Task #7: reverse lookup old_pubkey -> new_pubkey for display/cohort
+        // resolution (the forward new_pubkey lookup uses the PK).
+        "CREATE INDEX IF NOT EXISTS idx_pubkey_aliases_old ON pubkey_aliases(old_pubkey)",
     ];
     for stmt in index_stmts {
         let _ = db.prepare(stmt).run().await;

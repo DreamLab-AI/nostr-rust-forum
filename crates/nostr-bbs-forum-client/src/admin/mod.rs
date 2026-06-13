@@ -61,6 +61,13 @@ pub struct WhitelistUser {
     /// the relay (the relay never sees real names) and never public.
     #[serde(default, skip)]
     pub real_name: Option<String>,
+    /// Claimed public handle (username), enriched from the auth-worker
+    /// `GET /api/admin/registrations` route. Unlike `real_name` this is a
+    /// PUBLIC handle and is used as a display-name source for users whose
+    /// kind-0 profile carries no name (Task #7 — the root cause of hex-only
+    /// names was that the auth `handle` was being discarded here).
+    #[serde(default, skip)]
+    pub handle: Option<String>,
 }
 
 /// A channel parsed from a kind-40 event on the relay.
@@ -377,6 +384,16 @@ impl AdminStore {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
+                // Task #7: also capture the PUBLIC claimed handle. This is the
+                // fallback display name for users whose kind-0 profile has no
+                // name field (the bulk of the live "hex pubkey" rows): the
+                // relay's profiles projection has nothing for them, but the
+                // auth-worker holds the handle they claimed at onboarding.
+                user.handle = item
+                    .get("handle")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
             }
         }
     }
@@ -475,6 +492,111 @@ impl AdminStore {
                     &pubkey[..8],
                     &pubkey[pubkey.len().saturating_sub(4)..],
                     action
+                )));
+                self.state.is_loading.set(false);
+                let _ = self.fetch_whitelist_signer(signer).await;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.state.error.set(Some(msg.clone()));
+                self.state.is_loading.set(false);
+                Err(msg)
+            }
+        }
+    }
+
+    /// Delete a user (Task #7). Removes the relay whitelist row via the
+    /// relay-worker `POST /api/admin/user/delete` (optionally purging their
+    /// posted messages when `delete_events`), then best-effort removes the
+    /// auth-side member record (handle + real_name) via the auth-worker
+    /// `POST /api/admins/delete-member`. The relay call is authoritative for
+    /// access revocation; the auth call clears residual identity data.
+    pub async fn delete_user_signer(
+        &self,
+        pubkey: &str,
+        delete_events: bool,
+        signer: &dyn Signer,
+    ) -> Result<(), String> {
+        self.state.is_loading.set(true);
+        self.state.error.set(None);
+        self.state.success.set(None);
+
+        let body = serde_json::json!({ "pubkey": pubkey, "delete_events": delete_events });
+        let body_json =
+            serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
+
+        // 1. Relay: revoke whitelist access (+ optional event purge). Authoritative.
+        let relay_url = format!("{}/api/admin/user/delete", Self::api_base());
+        if let Err(e) = fetch_with_nip98_post_signer(&relay_url, &body_json, signer).await {
+            let msg = e.to_string();
+            self.state.error.set(Some(msg.clone()));
+            self.state.is_loading.set(false);
+            return Err(msg);
+        }
+
+        // 2. Auth: drop the member's handle/real_name. Best-effort — a failure
+        //    here must not leave the user half-deleted on the relay side, so we
+        //    only log it and still report success for the access revocation.
+        let auth_url = format!(
+            "{}/api/admins/delete-member",
+            crate::utils::relay_url::auth_api_base()
+        );
+        let auth_body = serde_json::json!({ "pubkey": pubkey });
+        let auth_body_json = serde_json::to_string(&auth_body).unwrap_or_default();
+        if let Err(e) = fetch_with_nip98_post_signer(&auth_url, &auth_body_json, signer).await {
+            web_sys::console::warn_1(
+                &format!("[admin] auth-side member delete failed (relay delete succeeded): {e}")
+                    .into(),
+            );
+        }
+
+        self.state.success.set(Some(format!(
+            "Deleted {}...{}{}",
+            &pubkey[..8],
+            &pubkey[pubkey.len().saturating_sub(4)..],
+            if delete_events {
+                " (and their messages)"
+            } else {
+                ""
+            }
+        )));
+        self.state.is_loading.set(false);
+        let _ = self.fetch_whitelist_signer(signer).await;
+        Ok(())
+    }
+
+    /// Link a newly-joining `new_pubkey` to a prior `old_pubkey` (Task #7
+    /// alias inheritance). The relay copies the old pubkey's cohorts onto the
+    /// new whitelist row (when `inherit_cohorts`) and records the alias so
+    /// authorship displays under the prior handle. Events are never re-signed.
+    pub async fn set_alias_signer(
+        &self,
+        old_pubkey: &str,
+        new_pubkey: &str,
+        inherit_cohorts: bool,
+        reason: Option<&str>,
+        signer: &dyn Signer,
+    ) -> Result<(), String> {
+        self.state.is_loading.set(true);
+        self.state.error.set(None);
+        self.state.success.set(None);
+
+        let body = serde_json::json!({
+            "old_pubkey": old_pubkey,
+            "new_pubkey": new_pubkey,
+            "inherit_cohorts": inherit_cohorts,
+            "reason": reason,
+        });
+        let body_json =
+            serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
+        let url = format!("{}/api/admin/alias", Self::api_base());
+        match fetch_with_nip98_post_signer(&url, &body_json, signer).await {
+            Ok(_) => {
+                self.state.success.set(Some(format!(
+                    "Linked {}... to prior identity {}...",
+                    &new_pubkey[..8.min(new_pubkey.len())],
+                    &old_pubkey[..8.min(old_pubkey.len())],
                 )));
                 self.state.is_loading.set(false);
                 let _ = self.fetch_whitelist_signer(signer).await;

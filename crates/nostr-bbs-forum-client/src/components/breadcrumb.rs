@@ -4,6 +4,16 @@
 //! the `.breadcrumb-nav` and `.breadcrumb-separator` CSS classes from `style.css`.
 //! The last item is rendered as plain text (current page), while preceding items
 //! are links. The first item optionally displays a home icon when its href is "/".
+//!
+//! ## Label vs href separation (#9)
+//!
+//! Each [`BreadcrumbItem`] carries an explicit human-readable `label` and an
+//! independent `href`. This separation is what lets the forum show REAL section
+//! and topic names in the trail while the `href` carries privacy-hashed slugs
+//! (see [`crate::utils::slug_hash`]): callers resolve the real name from the
+//! shared `ChannelStore` and pass it as `label`, while building the `href` from
+//! the hash. The component never derives a label from an href, so opaque
+//! hashed segments never leak into the visible trail.
 
 use leptos::prelude::*;
 use leptos_router::components::A;

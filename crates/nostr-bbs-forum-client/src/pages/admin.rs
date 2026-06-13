@@ -16,7 +16,7 @@ use crate::admin::overview::{ConnectionStatusBar, OverviewTab};
 use crate::admin::reports::ReportsTab;
 use crate::admin::section_requests::SectionRequests;
 use crate::admin::settings::SettingsTab;
-use crate::admin::user_table::AdminToggleCb;
+use crate::admin::user_table::{AdminToggleCb, DeleteCb};
 use crate::admin::user_table::{UpdateCohortsCb, UserTable};
 use crate::admin::{provide_admin, use_admin, AdminTab};
 use crate::auth::use_auth;
@@ -342,9 +342,27 @@ fn UsersTab() -> impl IntoView {
     let users = admin.state.users;
     let is_loading = admin.state.is_loading;
 
+    // Config-driven cohorts (Task #7): the selectable cohort set comes from the
+    // live ZONE_CONFIG, not a hardcoded list. `cohort_options()` returns
+    // (cohort_id, zone_label) pairs; the default selection is the first cohort.
+    let cohort_options: Vec<(String, String)> = cohort_options();
+    let default_cohort = cohort_options
+        .first()
+        .map(|(id, _)| id.clone())
+        .unwrap_or_default();
+
     let new_pubkey = RwSignal::new(String::new());
-    let new_cohorts = RwSignal::new(vec!["general".to_string()]);
+    let new_cohorts = RwSignal::new(if default_cohort.is_empty() {
+        Vec::new()
+    } else {
+        vec![default_cohort.clone()]
+    });
     let add_error = RwSignal::new(Option::<String>::None);
+
+    // Alias inheritance (Task #7): link the newly-joining pubkey to a prior
+    // identity so it inherits cohorts and displays under the prior handle.
+    let link_prior = RwSignal::new(false);
+    let prior_pubkey = RwSignal::new(String::new());
 
     let on_pubkey_input = move |ev: leptos::ev::Event| {
         new_pubkey.set(event_target_value(&ev));
@@ -352,6 +370,7 @@ fn UsersTab() -> impl IntoView {
     };
 
     let admin_for_add = admin.clone();
+    let default_cohort_for_reset = default_cohort.clone();
     let on_add_user = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let pk = new_pubkey.get_untracked();
@@ -366,17 +385,54 @@ fn UsersTab() -> impl IntoView {
             add_error.set(Some("Select at least one cohort".into()));
             return;
         }
+
+        // When linking to a prior identity, validate the prior pubkey now.
+        let prior = if link_prior.get_untracked() {
+            let p = prior_pubkey.get_untracked();
+            let p = p.trim().to_string();
+            if p.len() != 64 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+                add_error.set(Some("Prior pubkey must be 64 hex characters".into()));
+                return;
+            }
+            if p == pk_trimmed {
+                add_error.set(Some("Prior pubkey must differ from the new pubkey".into()));
+                return;
+            }
+            Some(p)
+        } else {
+            None
+        };
+
         if let Some(signer) = auth.get_signer() {
             let admin_clone = admin_for_add.clone();
             let pk_owned = pk_trimmed.to_string();
+            let reset_cohort = default_cohort_for_reset.clone();
             spawn_local(async move {
                 if (admin_clone
                     .add_to_whitelist_signer(&pk_owned, &cohorts, &*signer)
                     .await)
                     .is_ok()
                 {
+                    // Optional alias link — inherits cohorts + display attribution.
+                    if let Some(old_pk) = prior {
+                        let _ = admin_clone
+                            .set_alias_signer(
+                                &old_pk,
+                                &pk_owned,
+                                true,
+                                Some("linked at onboarding"),
+                                &*signer,
+                            )
+                            .await;
+                    }
                     new_pubkey.set(String::new());
-                    new_cohorts.set(vec!["general".to_string()]);
+                    new_cohorts.set(if reset_cohort.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![reset_cohort.clone()]
+                    });
+                    link_prior.set(false);
+                    prior_pubkey.set(String::new());
                 }
             });
         } else {
@@ -403,6 +459,18 @@ fn UsersTab() -> impl IntoView {
             spawn_local(async move {
                 let _ = admin_clone
                     .set_admin_signer(&pubkey, new_admin_status, &*signer)
+                    .await;
+            });
+        }
+    };
+
+    let admin_for_delete = admin.clone();
+    let on_delete_user = move |pubkey: String, also_delete_events: bool| {
+        if let Some(signer) = auth.get_signer() {
+            let admin_clone = admin_for_delete.clone();
+            spawn_local(async move {
+                let _ = admin_clone
+                    .delete_user_signer(&pubkey, also_delete_events, &*signer)
                     .await;
             });
         }
@@ -446,11 +514,10 @@ fn UsersTab() -> impl IntoView {
                     <div class="space-y-1">
                         <label class="block text-sm font-medium text-gray-300">"Cohorts"</label>
                         <div class="flex flex-wrap gap-3">
-                            {["general", "music", "events", "tech", "moderator", "vip"].iter().map(|cohort| {
-                                let cs = cohort.to_string();
-                                let cc = cs.clone();
-                                let ct = cs.clone();
-                                let label = capitalize_str(cohort);
+                            {cohort_options.clone().into_iter().map(|(cohort_id, zone_label)| {
+                                let cc = cohort_id.clone();
+                                let ct = cohort_id.clone();
+                                let label = capitalize_str(&cohort_id);
                                 let is_checked = move || new_cohorts.get().contains(&cc);
                                 let on_toggle = move |_| {
                                     new_cohorts.update(|list| {
@@ -458,7 +525,7 @@ fn UsersTab() -> impl IntoView {
                                     });
                                 };
                                 view! {
-                                    <label class="flex items-center gap-1.5 cursor-pointer">
+                                    <label class="flex items-center gap-1.5 cursor-pointer" title=zone_label>
                                         <input type="checkbox" prop:checked=is_checked on:change=on_toggle
                                             class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500" />
                                         <span class="text-sm text-gray-300">{label}</span>
@@ -467,6 +534,35 @@ fn UsersTab() -> impl IntoView {
                             }).collect_view()}
                         </div>
                     </div>
+
+                    // Alias inheritance (Task #7): link this newly-joining pubkey to a
+                    // prior identity. Nostr events can't be re-signed, so this records
+                    // an alias — the new key inherits the prior key's cohorts and posts
+                    // display under the prior handle.
+                    <div class="space-y-2 border-t border-gray-700 pt-4">
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="checkbox"
+                                prop:checked=move || link_prior.get()
+                                on:change=move |ev| link_prior.set(checkbox_checked(&ev))
+                                class="mt-0.5 rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500" />
+                            <span class="text-sm text-gray-300">
+                                "Link to a prior identity (inherit cohorts + display attribution)"
+                                <span class="block text-xs text-gray-500">
+                                    "For a returning member who generated a new key. Their old posts stay signed by the old key but render under the prior handle."
+                                </span>
+                            </span>
+                        </label>
+                        <Show when=move || link_prior.get()>
+                            <input
+                                type="text"
+                                prop:value=move || prior_pubkey.get()
+                                on:input=move |ev| prior_pubkey.set(event_target_value(&ev))
+                                placeholder="Prior public key (64-char hex)"
+                                class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white font-mono text-sm placeholder-gray-500 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-colors"
+                            />
+                        </Show>
+                    </div>
+
                     <button type="submit" disabled=move || is_loading.get()
                         class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5">
                         {move || if is_loading.get() { "Adding..." } else { "Add User" }}
@@ -491,7 +587,12 @@ fn UsersTab() -> impl IntoView {
                         </div>
                     }
                 >
-                    <UserTable users=users_signal on_update_cohorts=UpdateCohortsCb::new(on_update_cohorts.clone()) on_toggle_admin=AdminToggleCb::new(on_toggle_admin.clone()) />
+                    <UserTable
+                        users=users_signal
+                        on_update_cohorts=UpdateCohortsCb::new(on_update_cohorts.clone())
+                        on_toggle_admin=AdminToggleCb::new(on_toggle_admin.clone())
+                        on_delete_user=DeleteCb::new(on_delete_user.clone())
+                    />
                 </Show>
             </div>
         </div>
@@ -644,6 +745,42 @@ fn DangerZone() -> impl IntoView {
 
 fn capitalize_str(s: &str) -> String {
     crate::utils::capitalize(s)
+}
+
+/// Config-driven cohort options for the add-user form (Task #7). Derived from
+/// the live `ZONE_CONFIG` (`stores::zones`): the de-duplicated union of every
+/// zone's `required_cohorts` and `write_cohorts`, paired with the zone's label.
+/// Replaces the prior hardcoded `general/music/events/tech/moderator/vip` set
+/// that never matched the real `friends/family/business/agent` cohorts.
+fn cohort_options() -> Vec<(String, String)> {
+    use std::collections::BTreeSet;
+    let zones = crate::stores::zones::load_zones();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for zone in &zones {
+        let mut cohorts: Vec<String> = zone.required_cohorts.clone();
+        if let Some(write) = &zone.write_cohorts {
+            cohorts.extend(write.iter().cloned());
+        }
+        for c in cohorts {
+            if c.is_empty() {
+                continue;
+            }
+            if seen.insert(c.clone()) {
+                out.push((c.clone(), zone.label()));
+            }
+        }
+    }
+    out
+}
+
+/// Read a checkbox's `checked` state from a DOM `change` event.
+fn checkbox_checked(ev: &leptos::ev::Event) -> bool {
+    use wasm_bindgen::JsCast;
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .map(|el| el.checked())
+        .unwrap_or(false)
 }
 
 /// Set a 5-second timer that calls the given closure.

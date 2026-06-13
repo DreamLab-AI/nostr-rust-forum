@@ -7,10 +7,15 @@
 //!   2. Live kind-0 EVENT messages from the relay subscription
 //!   3. On-demand HTTP batch fetch when the UI requests an unknown pubkey
 //!
-//! The fetcher is intentionally tolerant of a missing endpoint: if the
-//! relay-worker has not yet shipped `/api/profiles/batch` (STREAM-N1), every
-//! batch request gracefully degrades to `Ok(Vec::new())` so the UI continues
-//! to fall back to `shorten_pubkey` without errors.
+//! The relay-worker serves `/api/profiles/batch` (POST) and
+//! `/api/profiles/search` (GET) from the `profiles` projection of kind-0
+//! metadata. The fetcher remains tolerant of a non-200 response: any error or
+//! non-OK status degrades to `Ok(Vec::new())` so the UI falls back to
+//! `shorten_pubkey` without erroring. Note that the projection is only as
+//! populated as the stored kind-0 events: a deployment whose historic kind-0
+//! events predate the projection must run the one-shot
+//! `POST /api/admin/profiles/backfill` (relay worker) to seed it; the live
+//! kind-0 ingest hook keeps it current for new publishes thereafter.
 
 use std::collections::{HashMap, HashSet};
 

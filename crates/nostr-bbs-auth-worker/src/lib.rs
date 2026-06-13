@@ -481,6 +481,12 @@ async fn route_sprint_api(
         let resp = admins::handle_remove(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
+    // Task #7: hard-delete a member's auth-side records (members row + handle +
+    // real_name). The relay half lives at POST /api/admin/user/delete.
+    if path == "/api/admins/delete-member" && *method == Method::Post {
+        let resp = admins::handle_delete_member(body_bytes, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
 
     // -- Governance (Agent Control Surface) --------------------------------
     if path == "/api/governance/agents" && *method == Method::Get {

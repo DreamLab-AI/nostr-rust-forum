@@ -628,15 +628,34 @@ pub fn PodBrowserPage() -> impl IntoView {
                             />
                         }.into_any()
                     },
-                    GitProbeState::Unavailable | GitProbeState::Error(_) => {
-                        if let GitProbeState::Error(e) = native_probe.get() {
-                            web_sys::console::warn_1(
-                                &format!("[PodBrowser] Native pod probe failed: {e}").into(),
-                            );
-                        }
+                    // Reachable native server with no git pod for this user yet
+                    // (404/501). The git-backed mesh tier simply isn't available
+                    // on this deployment — say so plainly rather than implying an
+                    // in-progress setup that will never complete.
+                    GitProbeState::Unavailable => view! {
+                        <div class="mb-4 text-xs text-gray-500 bg-gray-800/20 border border-gray-700/20 rounded px-3 py-2">
+                            "A git-backed pod (mesh tier) isn\u{2019}t available on this deployment yet. "
+                            "Your files live on the standard pod above."
+                        </div>
+                    }.into_any(),
+                    // Transport/DNS failure reaching the configured native host
+                    // (e.g. the mesh pod server isn\u{2019}t wired up). Surface the
+                    // real error instead of a misleading \u{201c}being set up\u{201d} message.
+                    GitProbeState::Error(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[PodBrowser] Native pod probe failed: {e}").into(),
+                        );
+                        let detail = e.clone();
                         view! {
-                            <div class="mb-4 text-xs text-gray-600 bg-gray-800/20 border border-gray-700/20 rounded px-3 py-2">
-                                "Your pod storage is still being set up. Check back shortly."
+                            <div class="mb-4 flex flex-col gap-1 text-xs text-gray-500 bg-gray-800/20 border border-gray-700/20 rounded px-3 py-2">
+                                <span>
+                                    "The git-backed mesh pod server isn\u{2019}t reachable right now. "
+                                    "Your files live on the standard pod above."
+                                </span>
+                                <details class="text-gray-600">
+                                    <summary class="cursor-pointer select-none hover:text-gray-400">"Details"</summary>
+                                    <span class="block mt-1 font-mono">{detail}</span>
+                                </details>
                             </div>
                         }.into_any()
                     },

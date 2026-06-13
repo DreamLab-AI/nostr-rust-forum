@@ -302,6 +302,10 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, u32>) -> AnyView {
     let banner = zone.banner_image_url.clone().unwrap_or_default();
     let has_banner = !banner.is_empty();
     let has_cats = !cats.is_empty();
+    // The zone's channel-list page (CategoryPage). The banner links here so a
+    // single click on a zone always lands on its list of channels, never deep
+    // inside one channel's linear chat.
+    let zone_href = base_href(&format!("/forums/{}", zone_id));
 
     let cards_view = if has_cats {
         let mut entries: Vec<(String, u32)> = cats.into_iter().collect();
@@ -330,9 +334,8 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, u32>) -> AnyView {
         }
         .into_any()
     } else {
-        let zone_href = base_href(&format!("/forums/{}", zone_id));
         view! {
-            <A href=zone_href attr:class="block glass-card-interactive p-4 text-center no-underline text-inherit">
+            <A href=zone_href.clone() attr:class="block glass-card-interactive p-4 text-center no-underline text-inherit">
                 <p class="text-gray-400 text-sm mb-2">"No topics yet"</p>
                 <span class="text-amber-400 font-medium text-sm hover:text-amber-300 transition-colors">
                     "Enter & start a conversation →"
@@ -344,28 +347,35 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, u32>) -> AnyView {
 
     view! {
         <section class="mb-10">
-            // Banner-headed zone card.
-            <div class=format!(
-                "relative mb-4 rounded-2xl overflow-hidden bg-gradient-to-br {} border {} backdrop-blur-sm",
-                gradient, border
-            )>
-                {has_banner.then(|| view! {
-                    <img
-                        src=banner.clone()
-                        alt=label_alt
-                        class="w-full h-40 sm:h-48 object-cover"
-                        loading="lazy"
-                    />
-                    <div class="absolute inset-0 bg-gradient-to-t from-gray-900/90 via-gray-900/40 to-transparent pointer-events-none"></div>
-                })}
-                <div class=move || if has_banner {
-                    "absolute bottom-0 left-0 right-0 z-10 p-5"
-                } else {
-                    "relative z-10 p-6"
-                }>
-                    <h2 class="text-xl sm:text-2xl font-bold text-white">{label}</h2>
+            // Banner-headed zone card. The whole banner links to the zone's
+            // channel list (CategoryPage at /forums/{zone}); the section cards
+            // below are deep-link shortcuts straight into a single channel.
+            <A href=zone_href attr:class="block mb-4 no-underline text-inherit group">
+                <div class=format!(
+                    "relative rounded-2xl overflow-hidden bg-gradient-to-br {} border {} backdrop-blur-sm transition group-hover:ring-1 group-hover:ring-white/20",
+                    gradient, border
+                )>
+                    {has_banner.then(|| view! {
+                        <img
+                            src=banner.clone()
+                            alt=label_alt
+                            class="w-full h-40 sm:h-48 object-cover"
+                            loading="lazy"
+                        />
+                        <div class="absolute inset-0 bg-gradient-to-t from-gray-900/90 via-gray-900/40 to-transparent pointer-events-none"></div>
+                    })}
+                    <div class=move || if has_banner {
+                        "absolute bottom-0 left-0 right-0 z-10 p-5"
+                    } else {
+                        "relative z-10 p-6"
+                    }>
+                        <h2 class="text-xl sm:text-2xl font-bold text-white">{label}</h2>
+                        <span class="text-sm text-gray-300 group-hover:text-white transition-colors">
+                            "View channels →"
+                        </span>
+                    </div>
                 </div>
-            </div>
+            </A>
 
             {cards_view}
         </section>
