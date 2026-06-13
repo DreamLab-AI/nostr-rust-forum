@@ -14,7 +14,7 @@ use crate::components::global_search::GlobalSearch;
 use crate::components::message_bubble::{provide_profile_modal_target, ProfileModalTarget};
 use crate::components::mobile_bottom_nav::{provide_unread_dm_count, MobileBottomNav};
 use crate::components::notification_bell::{provide_notifications, NotificationBell};
-use crate::components::onboarding_modal::{provide_onboarding_prefill, OnboardingModal};
+use crate::components::onboarding_modal::provide_onboarding_prefill;
 use crate::components::profile_modal::ProfileModal;
 use crate::components::screen_reader::{provide_announcer, ScreenReaderAnnouncer};
 use crate::components::session_timeout::SessionTimeout;
@@ -903,8 +903,11 @@ fn Layout(children: Children) -> impl IntoView {
             <SessionTimeout />
             <MobileBottomNav />
             <BookmarksModal is_open=bookmarks_open />
-            // Username onboarding modal — self-gates on auth + localStorage flags
-            <OnboardingModal />
+            // Post-signup "Complete your profile" overlay removed (issue #15):
+            // the signup wizard already captures display + real name, so the
+            // auto-popup was redundant. Display/real name remain editable in
+            // Settings, and the prefill context is still provided so the
+            // Settings username action stays a harmless no-op.
 
             {move || {
                 let pk = profile_target_pk.get();
