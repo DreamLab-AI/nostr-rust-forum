@@ -277,6 +277,28 @@ pub fn PodBrowserPage() -> impl IntoView {
             .unwrap_or_default()
     });
 
+    // Copy the raw pod storage endpoint to the clipboard (issue #28). The URL
+    // is an authenticated Solid endpoint — pasting it into a browser 404s —
+    // so we surface it as a labelled copy affordance rather than a bare link.
+    let toasts_for_url_copy = toasts;
+    let on_copy_pod_url = move |_| {
+        let Some(url) = pod_base_url.get_untracked() else {
+            toasts_for_url_copy.show(
+                "Pod URL not available yet",
+                crate::components::toast::ToastVariant::Warning,
+            );
+            return;
+        };
+        if let Some(window) = web_sys::window() {
+            let nav = window.navigator().clipboard();
+            let _ = nav.write_text(&url);
+        }
+        toasts_for_url_copy.show(
+            "Pod URL copied",
+            crate::components::toast::ToastVariant::Success,
+        );
+    };
+
     // Copy the clone command to clipboard.
     let toasts_for_copy = toasts;
     let on_copy_clone = move |_| {
@@ -469,9 +491,39 @@ pub fn PodBrowserPage() -> impl IntoView {
             // Header
             <div class="mb-6">
                 <h1 class="text-2xl font-bold text-white mb-1">"Pod Browser"</h1>
-                <p class="text-gray-400 text-sm">
-                    {move || pod_base_url.get().unwrap_or_else(|| "Connecting...".into())}
-                </p>
+
+                // Pod storage endpoint (issue #28). This is an authenticated
+                // Solid endpoint accessed by the app on your behalf — opening
+                // it directly in a browser won't work. Present it as a clearly
+                // labelled, copy-to-clipboard field, not a bare clickable link.
+                <div class="mt-2 bg-gray-800/60 border border-gray-700/50 rounded-lg p-3">
+                    <div class="flex items-center justify-between gap-2 mb-1">
+                        <span class="text-xs text-gray-500 uppercase tracking-wide">
+                            "Your pod storage endpoint"
+                        </span>
+                        <button
+                            data-testid="pod-url-copy"
+                            on:click=on_copy_pod_url
+                            class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 font-medium px-2.5 py-1 rounded-md transition-colors flex items-center gap-1.5 flex-shrink-0"
+                            aria-label="Copy pod URL"
+                        >
+                            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                            </svg>
+                            "Copy"
+                        </button>
+                    </div>
+                    <code
+                        data-testid="pod-url"
+                        class="block text-xs text-gray-300 font-mono break-all select-all"
+                    >
+                        {move || pod_base_url.get().unwrap_or_else(|| "Connecting\u{2026}".into())}
+                    </code>
+                    <p class="text-xs text-gray-500 mt-2 leading-relaxed">
+                        "This is your private Solid pod storage endpoint — accessed by the app on your behalf. It requires authentication, so opening it directly in a browser won\u{2019}t work (you\u{2019}ll see an error). Use the folders below to browse your data."
+                    </p>
+                </div>
             </div>
 
             // Solid explainer — collapsible (what this Pod is and why it matters).
