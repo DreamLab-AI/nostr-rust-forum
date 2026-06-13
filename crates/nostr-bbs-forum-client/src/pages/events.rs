@@ -77,6 +77,16 @@ pub fn EventsPage() -> impl IntoView {
     let zone_access = crate::stores::zone_access::use_zone_access();
     let is_admin_or_mod = Memo::new(move |_| zone_access.is_admin.get());
 
+    // Show a friendly "no access" hint where the Create Event button would be,
+    // instead of silently rendering nothing, once an authenticated user's zone
+    // access has loaded and they are confirmed to be a non-admin. Creating
+    // calendar events is admin/mod-gated by design; the relay is the security
+    // boundary (ADR-022), so this is UX only.
+    let is_authed = auth.is_authenticated();
+    let zone_loaded = zone_access.loaded;
+    let show_no_access_hint =
+        Memo::new(move |_| is_authed.get() && zone_loaded.get() && !is_admin_or_mod.get());
+
     let now_ts = (js_sys::Date::now() / 1000.0) as u64;
 
     // Subscribe to kind 31923 and kind 31925 when relay connects
@@ -359,6 +369,22 @@ pub fn EventsPage() -> impl IntoView {
                                     </svg>
                                     "Create Event"
                                 </button>
+                            </Show>
+
+                            // Non-admins get a clear reason rather than an absent
+                            // button (silent dead-end). Event creation is gated to
+                            // admins/mods; surface that instead of nothing.
+                            <Show when=move || show_no_access_hint.get()>
+                                <span
+                                    class="inline-flex items-center gap-1.5 text-xs text-gray-500"
+                                    title="Creating events is limited to admins and moderators. Ask an admin if you'd like an event added."
+                                >
+                                    <svg class="w-3.5 h-3.5 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                        <path d="M7 11V7a5 5 0 0 1 10 0v4" stroke-linecap="round" stroke-linejoin="round"/>
+                                    </svg>
+                                    "Only admins can create events — ask an admin to add one."
+                                </span>
                             </Show>
                         </div>
 
