@@ -15,8 +15,8 @@ use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::confirm_dialog::{ConfirmDialog, ConfirmVariant};
 use crate::components::onboarding_modal::{
-    cache_claimed_username, claimed_username_cached, open_onboarding_with_prefill,
-    release_username, use_claimed_username, username_from_nip05,
+    cache_claimed_username, claimed_username_cached, release_username, use_claimed_username,
+    username_from_nip05,
 };
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_tracked;
@@ -77,9 +77,6 @@ fn build_hash() -> String {
 /// Key used to persist muted pubkeys in localStorage.
 const MUTED_STORAGE_KEY: &str = "nostr_bbs_muted";
 
-/// Key used to persist privacy toggles in localStorage.
-const PRIVACY_STORAGE_KEY: &str = "nostr_bbs_privacy";
-
 fn get_local_storage() -> Option<web_sys::Storage> {
     web_sys::window()
         .and_then(|w| w.local_storage().ok())
@@ -101,26 +98,21 @@ fn save_muted_list(list: &[String]) {
     }
 }
 
-fn load_privacy_settings() -> (bool, bool) {
-    get_local_storage()
-        .and_then(|s| s.get_item(PRIVACY_STORAGE_KEY).ok())
-        .flatten()
-        .and_then(|json| serde_json::from_str::<(bool, bool)>(&json).ok())
-        .unwrap_or((true, true))
-}
-
-fn save_privacy_settings(show_online: bool, allow_dms: bool) {
-    if let Some(storage) = get_local_storage() {
-        let json = serde_json::to_string(&(show_online, allow_dms)).unwrap_or_default();
-        let _ = storage.set_item(PRIVACY_STORAGE_KEY, &json);
-    }
-}
-
 #[component]
 pub fn SettingsPage() -> impl IntoView {
     let auth = use_auth();
     let toasts = use_toasts();
     let relay = expect_context::<RelayConnection>();
+
+    // Preferences store. Bound ONCE here, inside the component's reactive
+    // owner — `RwSignal` is `Copy`, so this handle is moved into the
+    // appearance/content/notification event handlers below. Calling
+    // `use_preferences()` (an `expect_context`) from inside a DOM event
+    // handler panics: event handlers run with no reactive owner on the
+    // stack, so the context lookup fails ("expected context … to be
+    // present"). That panic was the root cause of the Appearance controls
+    // doing nothing on the live build (#32).
+    let prefs = use_preferences();
 
     // Profile fields
     let nickname = RwSignal::new(auth.nickname().get_untracked().unwrap_or_default());
@@ -136,12 +128,6 @@ pub fn SettingsPage() -> impl IntoView {
 
     // Muted users
     let muted = RwSignal::new(load_muted_list());
-
-    // Privacy toggles
-    let (init_online, init_dms) = load_privacy_settings();
-    let show_online = RwSignal::new(init_online);
-    let allow_dms = RwSignal::new(init_dms);
-    let privacy_saving = RwSignal::new(false);
 
     // Devices (ADR-099, gated on window.__ENV__.DEVICE_KEYS_ENABLED).
     // When the flag is off the whole section is hidden and never fetches.
@@ -551,15 +537,6 @@ pub fn SettingsPage() -> impl IntoView {
         toasts_for_unmute.show("User unmuted", ToastVariant::Success);
     };
 
-    // -- Privacy save handler --
-    let toasts_for_privacy = toasts;
-    let on_save_privacy = move |_| {
-        privacy_saving.set(true);
-        save_privacy_settings(show_online.get_untracked(), allow_dms.get_untracked());
-        privacy_saving.set(false);
-        toasts_for_privacy.show("Privacy settings saved", ToastVariant::Success);
-    };
-
     // -- Nsec export handler --
     // NOTE: get_privkey_bytes() is the intentional and legitimate path here --
     // the user explicitly wants to see/export their raw private key. NIP-07
@@ -589,14 +566,6 @@ pub fn SettingsPage() -> impl IntoView {
     // -- Logout handler --
     let on_logout = move |_| {
         auth.logout();
-    };
-
-    // -- Username change handler (opens onboarding modal pre-filled) --
-    // Pre-fill with the CLAIMED username, never the nickname — the claim
-    // flow enforces the [a-z0-9_-]{3,30} format client-side.
-    let on_change_username = move |_| {
-        let current = claimed_username.get_untracked();
-        open_onboarding_with_prefill(current);
     };
 
     // -- Pod git clone URL: copy-to-clipboard handler (ADR-089) --
@@ -648,6 +617,10 @@ pub fn SettingsPage() -> impl IntoView {
                     {move || {
                         match claimed_username.get() {
                             Some(name) if !name.is_empty() => {
+                                // A legacy handle minted on a previous build still
+                                // resolves. We no longer mint new ones (onboarding
+                                // captures a display name only), so the only action
+                                // here is to release the handle.
                                 let nip05 = claimed_nip05.get().unwrap_or_default();
                                 view! {
                                     <div class="space-y-3">
@@ -665,12 +638,6 @@ pub fn SettingsPage() -> impl IntoView {
                                         </div>
                                         <div class="flex gap-3 pt-1">
                                             <button
-                                                on:click=on_change_username
-                                                class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors"
-                                            >
-                                                "Change"
-                                            </button>
-                                            <button
                                                 on:click=move |_| confirm_release_open.set(true)
                                                 disabled=move || release_pending.get()
                                                 class="text-sm text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded-lg px-4 py-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -686,17 +653,9 @@ pub fn SettingsPage() -> impl IntoView {
                                 }.into_any()
                             }
                             _ => view! {
-                                <div class="space-y-3">
-                                    <p class="text-sm text-gray-400">
-                                        "You haven\u{2019}t claimed a username yet. Choose a unique handle so others can mention and find you."
-                                    </p>
-                                    <button
-                                        on:click=on_change_username
-                                        class="text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors"
-                                    >
-                                        "Claim username"
-                                    </button>
-                                </div>
+                                <p class="text-sm text-gray-400">
+                                    "Your display name is what everyone sees next to your posts and mentions. Set it under Profile below."
+                                </p>
                             }.into_any(),
                         }
                     }}
@@ -872,44 +831,6 @@ pub fn SettingsPage() -> impl IntoView {
                     }}
                 </div>
 
-                // -- Section 3: Privacy --
-                <div class="glass-card p-6 space-y-4">
-                    <h2 class="text-lg font-semibold text-white flex items-center gap-2">
-                        {privacy_icon()}
-                        "Privacy"
-                    </h2>
-                    <div class="border-t border-gray-700/50"></div>
-
-                    <div class="space-y-3">
-                        <label class="flex items-center justify-between cursor-pointer">
-                            <span class="text-sm text-gray-300">"Show online status"</span>
-                            <input
-                                type="checkbox"
-                                prop:checked=move || show_online.get()
-                                on:change=move |_| show_online.update(|v| *v = !*v)
-                                class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
-                            />
-                        </label>
-                        <label class="flex items-center justify-between cursor-pointer">
-                            <span class="text-sm text-gray-300">"Allow DMs from non-contacts"</span>
-                            <input
-                                type="checkbox"
-                                prop:checked=move || allow_dms.get()
-                                on:change=move |_| allow_dms.update(|v| *v = !*v)
-                                class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
-                            />
-                        </label>
-                    </div>
-
-                    <button
-                        on:click=on_save_privacy
-                        disabled=move || privacy_saving.get()
-                        class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors text-sm flex items-center gap-1.5"
-                    >
-                        {move || if privacy_saving.get() { "Saving..." } else { "Save Privacy" }}
-                    </button>
-                </div>
-
                 // -- Section 4: Appearance --
                 <div class="glass-card p-6 space-y-4">
                     <h2 class="text-lg font-semibold text-white flex items-center gap-2">
@@ -930,7 +851,6 @@ pub fn SettingsPage() -> impl IntoView {
                                 view! {
                                     <button
                                         class=move || {
-                                            let prefs = use_preferences();
                                             if prefs.get().theme == theme_for_class {
                                                 "px-4 py-2 rounded-full text-sm font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30 transition-colors"
                                             } else {
@@ -940,14 +860,12 @@ pub fn SettingsPage() -> impl IntoView {
                                         on:click={
                                             let t = theme_for_click.clone();
                                             move |_| {
-                                                let prefs = use_preferences();
                                                 prefs.update(|p| p.theme = t.clone());
                                                 save_preferences(&prefs.get_untracked());
                                             }
                                         }
                                         role="radio"
                                         aria-checked=move || {
-                                            let prefs = use_preferences();
                                             (prefs.get().theme == theme_for_aria).to_string()
                                         }
                                     >
@@ -970,7 +888,6 @@ pub fn SettingsPage() -> impl IntoView {
                                 view! {
                                     <button
                                         class=move || {
-                                            let prefs = use_preferences();
                                             if prefs.get().font_size == fs_for_class {
                                                 "px-4 py-2 rounded-full text-sm font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30 transition-colors"
                                             } else {
@@ -980,14 +897,12 @@ pub fn SettingsPage() -> impl IntoView {
                                         on:click={
                                             let fs = fs_for_click.clone();
                                             move |_| {
-                                                let prefs = use_preferences();
                                                 prefs.update(|p| p.font_size = fs.clone());
                                                 save_preferences(&prefs.get_untracked());
                                             }
                                         }
                                         role="radio"
                                         aria-checked=move || {
-                                            let prefs = use_preferences();
                                             (prefs.get().font_size == fs_for_aria).to_string()
                                         }
                                     >
@@ -1011,7 +926,6 @@ pub fn SettingsPage() -> impl IntoView {
                                 view! {
                                     <button
                                         class=move || {
-                                            let prefs = use_preferences();
                                             if prefs.get().density == d_for_class {
                                                 "px-4 py-2 rounded-full text-sm font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30 transition-colors"
                                             } else {
@@ -1021,14 +935,12 @@ pub fn SettingsPage() -> impl IntoView {
                                         on:click={
                                             let d = d_for_click.clone();
                                             move |_| {
-                                                let prefs = use_preferences();
                                                 prefs.update(|p| p.density = d.clone());
                                                 save_preferences(&prefs.get_untracked());
                                             }
                                         }
                                         role="radio"
                                         aria-checked=move || {
-                                            let prefs = use_preferences();
                                             (prefs.get().density == d_for_aria).to_string()
                                         }
                                     >
@@ -1048,9 +960,8 @@ pub fn SettingsPage() -> impl IntoView {
                         </div>
                         <input
                             type="checkbox"
-                            prop:checked=move || use_preferences().get().show_technical_details
+                            prop:checked=move || prefs.get().show_technical_details
                             on:change=move |_| {
-                                let prefs = use_preferences();
                                 prefs.update(|p| p.show_technical_details = !p.show_technical_details);
                                 save_preferences(&prefs.get_untracked());
                             }
@@ -1066,9 +977,8 @@ pub fn SettingsPage() -> impl IntoView {
                         </div>
                         <input
                             type="checkbox"
-                            prop:checked=move || use_preferences().get().reduced_motion
+                            prop:checked=move || prefs.get().reduced_motion
                             on:change=move |_| {
-                                let prefs = use_preferences();
                                 prefs.update(|p| p.reduced_motion = !p.reduced_motion);
                                 save_preferences(&prefs.get_untracked());
                             }
@@ -1096,7 +1006,6 @@ pub fn SettingsPage() -> impl IntoView {
                                     "None" => NotificationLevel::None,
                                     _ => NotificationLevel::All,
                                 };
-                                let prefs = use_preferences();
                                 prefs.update(|p| p.notification_level = level);
                                 save_preferences(&prefs.get_untracked());
                             }
@@ -1109,7 +1018,7 @@ pub fn SettingsPage() -> impl IntoView {
                                 view! {
                                     <option
                                         value=val.clone()
-                                        selected=move || use_preferences().get().notification_level == level_cmp
+                                        selected=move || prefs.get().notification_level == level_cmp
                                     >
                                         {label}
                                     </option>
@@ -1132,23 +1041,9 @@ pub fn SettingsPage() -> impl IntoView {
                             <span class="text-sm text-gray-300">"Show link previews"</span>
                             <input
                                 type="checkbox"
-                                prop:checked=move || use_preferences().get().show_link_previews
+                                prop:checked=move || prefs.get().show_link_previews
                                 on:change=move |_| {
-                                    let prefs = use_preferences();
                                     prefs.update(|p| p.show_link_previews = !p.show_link_previews);
-                                    save_preferences(&prefs.get_untracked());
-                                }
-                                class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
-                            />
-                        </label>
-                        <label class="flex items-center justify-between cursor-pointer">
-                            <span class="text-sm text-gray-300">"Compact messages"</span>
-                            <input
-                                type="checkbox"
-                                prop:checked=move || use_preferences().get().compact_messages
-                                on:change=move |_| {
-                                    let prefs = use_preferences();
-                                    prefs.update(|p| p.compact_messages = !p.compact_messages);
                                     save_preferences(&prefs.get_untracked());
                                 }
                                 class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
@@ -1619,9 +1514,6 @@ fn handle_icon() -> impl IntoView {
 }
 fn mute_icon() -> impl IntoView {
     section_icon("M1 1l22 22M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2c0 .38-.03.75-.08 1.12M12 19v4M8 23h8")
-}
-fn privacy_icon() -> impl IntoView {
-    section_icon("M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z")
 }
 fn device_icon() -> impl IntoView {
     // Smartphone outline.

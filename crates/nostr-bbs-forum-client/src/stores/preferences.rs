@@ -1,8 +1,8 @@
 //! User preferences store backed by localStorage.
 //!
-//! Persists theme, notification level, link preview, compact mode, reduced
-//! motion, font size, and density preferences across sessions. Provided via
-//! Leptos context.
+//! Persists theme, notification level, link preview, reduced motion, font
+//! size, and density preferences across sessions. Provided via Leptos
+//! context.
 //!
 //! Appearance preferences (theme, font size, density, reduced motion) are
 //! *applied* to the document via [`apply_preferences`], which toggles the
@@ -25,7 +25,6 @@ pub struct Preferences {
     pub theme: Theme,
     pub notification_level: NotificationLevel,
     pub show_link_previews: bool,
-    pub compact_messages: bool,
     pub reduced_motion: bool,
     /// When true, show Nostr protocol names (NIP-07, nsec, pubkey hex, relay URLs).
     /// When false (default), use friendly labels.
@@ -175,7 +174,6 @@ impl Default for Preferences {
             theme: Theme::Dark,
             notification_level: NotificationLevel::All,
             show_link_previews: true,
-            compact_messages: false,
             reduced_motion: false,
             show_technical_details: false,
             font_size: FontSize::Medium,
@@ -224,6 +222,31 @@ pub fn save_preferences(prefs: &Preferences) {
         }
     }
     apply_preferences(prefs);
+}
+
+/// Read the persisted `reduced_motion` preference directly from localStorage,
+/// without going through the Leptos context.
+///
+/// The fx renderers ([`crate::components::fx`], [`ParticleCanvas`]) need this
+/// at points where the preferences *context* may not be provided yet (e.g.
+/// `provide_render_tier()` runs before `provide_preferences()` at app start),
+/// so they read storage directly rather than `use_preferences()`. Defaults to
+/// `false` when unset or unparseable.
+///
+/// [`ParticleCanvas`]: crate::components::particle_canvas::ParticleCanvas
+pub fn reduced_motion_pref() -> bool {
+    load_preferences().reduced_motion
+}
+
+/// Read the persisted `notification_level` directly from localStorage, without
+/// going through the Leptos context.
+///
+/// The notification store gates which events surface as notifications on this
+/// value, and does so from relay-driven effects/callbacks where reading
+/// storage directly is simpler and free of context-ordering concerns. Defaults
+/// to [`NotificationLevel::All`] when unset.
+pub fn notification_level_pref() -> NotificationLevel {
+    load_preferences().notification_level
 }
 
 /// Read the OS `prefers-color-scheme: dark` media query. Defaults to dark when
