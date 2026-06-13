@@ -253,6 +253,12 @@ pub fn SectionPage() -> impl IntoView {
     let create_error = RwSignal::new(Option::<String>::None);
     let is_authed = auth.is_authenticated();
 
+    // `relay` (RelayConnection) is non-Copy; the new-topic composer's on:click
+    // sits inside two <Show> children closures, which must be `Fn`. Capturing
+    // `relay` directly would move it out of the children env (FnOnce, E0525), so
+    // hold it in a Copy StoredValue the children can copy into the handler.
+    let composer_relay = StoredValue::new(relay.clone());
+
     let category_for_topics = Signal::derive(category_slug);
 
     view! {
@@ -338,7 +344,7 @@ pub fn SectionPage() -> impl IntoView {
                                 }
                                 creating.set(true);
                                 create_error.set(None);
-                                match publish_topic_root(&auth, &relay, &cid, &body, toasts) {
+                                match composer_relay.with_value(|r| publish_topic_root(&auth, r, &cid, &body, toasts)) {
                                     Ok(()) => {
                                         new_topic_text.set(String::new());
                                         show_new_topic.set(false);
