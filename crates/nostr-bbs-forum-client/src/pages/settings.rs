@@ -21,7 +21,9 @@ use crate::components::onboarding_modal::{
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
-use crate::stores::preferences::{save_preferences, use_preferences, NotificationLevel, Theme};
+use crate::stores::preferences::{
+    save_preferences, use_preferences, Density, FontSize, NotificationLevel, Theme,
+};
 use crate::utils::pod_client::upload_to_pod_signer;
 use crate::utils::relay_url::auth_api_base;
 use crate::utils::shorten_pubkey;
@@ -40,6 +42,37 @@ const POD_API: &str = match option_env!("VITE_POD_API_URL") {
 
 /// Client-side size cap for profile picture uploads (~2 MB).
 const MAX_AVATAR_BYTES: f64 = 2.0 * 1024.0 * 1024.0;
+
+/// Read a key from the `window.__ENV__` runtime-config object injected by the
+/// deploy (mirrors the private reader in `utils::relay_url`). Returns `None`
+/// for a missing/undefined/empty value.
+fn window_env(key: &str) -> Option<String> {
+    let window = web_sys::window()?;
+    let env = js_sys::Reflect::get(&window, &"__ENV__".into()).ok()?;
+    if env.is_undefined() || env.is_null() {
+        return None;
+    }
+    let val = js_sys::Reflect::get(&env, &key.into()).ok()?;
+    let s = val.as_string()?;
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Deploy version string, from `window.__ENV__.BUILD_VERSION`. The website
+/// deploy injects this; falls back to `"dev"` for local/un-injected builds
+/// (issue #27).
+fn build_version() -> String {
+    window_env("BUILD_VERSION").unwrap_or_else(|| "dev".to_string())
+}
+
+/// Short git hash of the deployed build, from `window.__ENV__.BUILD_HASH`.
+/// Falls back to `"local"` when absent (issue #27).
+fn build_hash() -> String {
+    window_env("BUILD_HASH").unwrap_or_else(|| "local".to_string())
+}
 
 /// Key used to persist muted pubkeys in localStorage.
 const MUTED_STORAGE_KEY: &str = "nostr_bbs_muted";
@@ -925,6 +958,88 @@ pub fn SettingsPage() -> impl IntoView {
                         </div>
                     </div>
 
+                    // Font size selector
+                    <div class="space-y-2">
+                        <span class="text-sm font-medium text-gray-300">"Text size"</span>
+                        <div class="flex gap-2" role="radiogroup" aria-label="Text size selection">
+                            {FontSize::all_variants().iter().cloned().map(|fs| {
+                                let label = fs.label();
+                                let fs_for_class = fs.clone();
+                                let fs_for_aria = fs.clone();
+                                let fs_for_click = fs.clone();
+                                view! {
+                                    <button
+                                        class=move || {
+                                            let prefs = use_preferences();
+                                            if prefs.get().font_size == fs_for_class {
+                                                "px-4 py-2 rounded-full text-sm font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30 transition-colors"
+                                            } else {
+                                                "px-4 py-2 rounded-full text-sm font-medium text-gray-400 hover:text-white bg-gray-800/50 border border-gray-700 hover:border-gray-600 transition-colors"
+                                            }
+                                        }
+                                        on:click={
+                                            let fs = fs_for_click.clone();
+                                            move |_| {
+                                                let prefs = use_preferences();
+                                                prefs.update(|p| p.font_size = fs.clone());
+                                                save_preferences(&prefs.get_untracked());
+                                            }
+                                        }
+                                        role="radio"
+                                        aria-checked=move || {
+                                            let prefs = use_preferences();
+                                            (prefs.get().font_size == fs_for_aria).to_string()
+                                        }
+                                    >
+                                        {label}
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                        <p class="text-xs text-gray-500">"Scales text across the whole forum."</p>
+                    </div>
+
+                    // Density selector
+                    <div class="space-y-2">
+                        <span class="text-sm font-medium text-gray-300">"Density"</span>
+                        <div class="flex gap-2" role="radiogroup" aria-label="Density selection">
+                            {Density::all_variants().iter().cloned().map(|d| {
+                                let label = d.label();
+                                let d_for_class = d.clone();
+                                let d_for_aria = d.clone();
+                                let d_for_click = d.clone();
+                                view! {
+                                    <button
+                                        class=move || {
+                                            let prefs = use_preferences();
+                                            if prefs.get().density == d_for_class {
+                                                "px-4 py-2 rounded-full text-sm font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30 transition-colors"
+                                            } else {
+                                                "px-4 py-2 rounded-full text-sm font-medium text-gray-400 hover:text-white bg-gray-800/50 border border-gray-700 hover:border-gray-600 transition-colors"
+                                            }
+                                        }
+                                        on:click={
+                                            let d = d_for_click.clone();
+                                            move |_| {
+                                                let prefs = use_preferences();
+                                                prefs.update(|p| p.density = d.clone());
+                                                save_preferences(&prefs.get_untracked());
+                                            }
+                                        }
+                                        role="radio"
+                                        aria-checked=move || {
+                                            let prefs = use_preferences();
+                                            (prefs.get().density == d_for_aria).to_string()
+                                        }
+                                    >
+                                        {label}
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                        <p class="text-xs text-gray-500">"Tightens spacing in lists and cards."</p>
+                    </div>
+
                     // Show technical details toggle
                     <label class="flex items-center justify-between cursor-pointer">
                         <div>
@@ -945,7 +1060,10 @@ pub fn SettingsPage() -> impl IntoView {
 
                     // Reduced motion toggle
                     <label class="flex items-center justify-between cursor-pointer">
-                        <span class="text-sm text-gray-300">"Reduced motion"</span>
+                        <div>
+                            <span class="text-sm text-gray-300">"Reduced motion"</span>
+                            <p class="text-xs text-gray-500 mt-0.5">"Minimise animations and transitions, regardless of your system setting"</p>
+                        </div>
                         <input
                             type="checkbox"
                             prop:checked=move || use_preferences().get().reduced_motion
@@ -1250,6 +1368,30 @@ pub fn SettingsPage() -> impl IntoView {
                         </button>
                     </div>
                 </div>
+
+                // -- Section 6: About / Version (issue #27) --
+                // BUILD_VERSION / BUILD_HASH come from window.__ENV__ injected
+                // by the website deploy; fall back to dev/local so the row is
+                // always meaningful, even in local Trunk serve builds.
+                <div class="glass-card p-6 space-y-4" data-testid="settings-about">
+                    <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                        {info_icon()}
+                        "About"
+                    </h2>
+                    <div class="border-t border-gray-700/50"></div>
+
+                    <div>
+                        <span class="text-xs text-gray-500 uppercase tracking-wide">"Build"</span>
+                        <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1">
+                            <code class="text-xs text-amber-300 font-mono break-all" data-testid="build-version">
+                                {move || format!("Build {} ({})", build_version(), build_hash())}
+                            </code>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-1">
+                            "Use this to confirm whether a deployed build includes a given fix."
+                        </p>
+                    </div>
+                </div>
             </div>
 
             // Confirm dialog for nsec export
@@ -1499,4 +1641,8 @@ fn content_icon() -> impl IntoView {
 }
 fn git_icon() -> impl IntoView {
     section_icon("M6 3v12a3 3 0 003 3h6a3 3 0 003-3M6 3a3 3 0 016 0M6 3a3 3 0 00-3 3v12a3 3 0 003 3M18 9a3 3 0 100-6 3 3 0 000 6z")
+}
+fn info_icon() -> impl IntoView {
+    // Circle-i info glyph.
+    section_icon("M12 22a10 10 0 100-20 10 10 0 000 20zM12 16v-4M12 8h.01")
 }
