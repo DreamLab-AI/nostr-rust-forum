@@ -42,9 +42,11 @@ pub(crate) fn NsecBackup(
                 let content = format!(
                     "Forum - Recovery Key Backup\n\
                      ==================================\n\n\
-                     Key: {}\n\n\
-                     IMPORTANT: Anyone with this key can access your account.\n\
-                     Store this file securely and delete it from your downloads.\n",
+                     Recovery key: {}\n\n\
+                     This key is how you sign back into your account (there is no\n\
+                     password to reset). Anyone who has it can access your account,\n\
+                     so keep it private. Save this file somewhere safe and remove it\n\
+                     from your Downloads folder.\n",
                     nsec
                 );
 
@@ -95,8 +97,10 @@ pub(crate) fn NsecBackup(
                     </svg>
                 </div>
                 <div>
-                    <h3 id="nsec-backup-title" class="text-lg font-bold text-white">"Save Your Recovery Key"</h3>
-                    <p id="nsec-backup-desc" class="text-xs text-gray-400">"You need this to sign back in."</p>
+                    <h3 id="nsec-backup-title" class="text-lg font-bold text-white">"Save your recovery key"</h3>
+                    <p id="nsec-backup-desc" class="text-xs text-gray-400">
+                        "There\u{2019}s no password to reset — this key is how you get back into your account. Keep it private."
+                    </p>
                 </div>
             </div>
 
@@ -113,7 +117,7 @@ pub(crate) fn NsecBackup(
                 <button
                     on:click=on_copy
                     class="flex items-center gap-2 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg transition-colors text-sm"
-                    aria-label="Copy private key to clipboard"
+                    aria-label="Copy recovery key to clipboard"
                 >
                     <Show
                         when=move || copied.get()
@@ -135,7 +139,7 @@ pub(crate) fn NsecBackup(
                 <button
                     on:click=on_download
                     class="flex items-center gap-2 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg transition-colors text-sm"
-                    aria-label="Download private key as text file"
+                    aria-label="Download recovery key as text file"
                 >
                     <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" stroke-linecap="round" stroke-linejoin="round"/>

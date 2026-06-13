@@ -6,12 +6,22 @@
 //!    claimed here — the federated `@host` handle is an advanced opt-in that
 //!    users can claim later from Settings, so onboarding stays to the two
 //!    fields a newcomer actually needs.
-//! 2. **Profile**: the freshly-minted identity bundle — npub short, Solid
-//!    WebID URL, git-pod clone command (per ADR-089) — surfaced for the
-//!    backup sheet. The keypair is generated on-device and the pod is
-//!    provisioned eagerly (`POST {POD_API}/.provision`).
-//! 3. **Backup**: present nsec for offline backup + a printable recovery
-//!    sheet. Required before exit (ADR-095).
+//! 2. **Profile**: a short, reassuring confirmation that the account exists and
+//!    lives on the user's device. The raw technical identifiers (public key,
+//!    Solid WebID, git-pod clone command — per ADR-089) are kept behind an
+//!    "Advanced details" disclosure so they stay AVAILABLE without dominating
+//!    the page; the real safety net is the key backup in the next step. The
+//!    keypair is still generated on-device and the pod is still provisioned
+//!    eagerly (`POST {POD_API}/.provision`) — only the copy/layout changed.
+//! 3. **Backup**: a single printable recovery sheet that folds in the recovery
+//!    key, sign-in QR and plain-English notes — one download keeps access.
+//!    Required before exit (ADR-095).
+//!
+//! UX note (operator guidance): users don't care about Nostr, relays, pods,
+//! keypairs or NIP-XX — but "private" is good. The primary reading path leads
+//! with plain-English benefits; protocol terms are de-emphasised behind
+//! disclosures or wrapped in `InfoTerm` explainers. No functionality is
+//! removed — only the cognitive load.
 //!
 //! Uses the JSS-derived primitives shipped in solid-pod-rs 0.5: provision-keys
 //! (pod is provisioned on first authed request), JSON-LD WebID export
@@ -28,7 +38,7 @@ use solid_pod_rs::webid::{pod_git_clone_url, webid_url};
 
 use crate::app::{base_href, current_app_path};
 use crate::auth::use_auth;
-use crate::components::nsec_backup::NsecBackup;
+use crate::components::info_term::InfoTerm;
 use crate::components::recovery_sheet::RecoverySheet;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::utils::relay_url::relay_url;
@@ -207,6 +217,9 @@ pub fn SignupPage() -> impl IntoView {
     // unless the user takes the explicit advanced override.
     let sheet_ready = RwSignal::new(false);
     let advanced_override = RwSignal::new(false);
+    // Phase 2: the raw technical identifiers (public key / WebID / git clone)
+    // are collapsed by default — they are informational, not the safety net.
+    let show_advanced = RwSignal::new(false);
 
     // returnTo: same base-relative normalisation as login.rs (ADR-090).
     let query = use_query_map();
@@ -292,25 +305,11 @@ pub fn SignupPage() -> impl IntoView {
         navigate.with_value(|nav| nav(&dest, NavigateOptions::default()));
     });
 
-    // Gated dismiss handed to NsecBackup. Clicking "I've saved my backup" only
-    // exits once the recovery sheet gate is satisfied (or the advanced override
-    // is taken); otherwise we steer the user to the sheet (insist-with-override).
-    let on_backup_done = Callback::new(move |()| {
-        if sheet_ready.get_untracked() || advanced_override.get_untracked() {
-            finish_signup.run(());
-        } else {
-            toasts.show(
-                "Print & confirm your recovery sheet first (or use the advanced override).",
-                ToastVariant::Warning,
-            );
-        }
-    });
-
     // Redirect if already authenticated AND not in the middle of the new
     // wizard. Crucially we hold the user inside Phases 2 and 3 (profile +
-    // backup) — they only flow to `/forums` via the explicit on_backup_done
-    // callback. Pre-existing returning users (no signup in flight, is_busy
-    // never set) still get the redirect.
+    // backup) — they only flow to `/forums` via the explicit finish control.
+    // Pre-existing returning users (no signup in flight, is_busy never set)
+    // still get the redirect.
     Effect::new(move |_| {
         if is_authed.get() && phase.get() == Phase::Identity && !is_busy.get() {
             let dest = return_to();
@@ -355,7 +354,7 @@ pub fn SignupPage() -> impl IntoView {
 
                     // Step indicator
                     <div class="flex items-center justify-center gap-2 text-xs" data-testid="signup-stepper">
-                        {[("Identity", Phase::Identity), ("Profile", Phase::Profile), ("Backup", Phase::Backup)]
+                        {[("Your name", Phase::Identity), ("Your account", Phase::Profile), ("Save access", Phase::Backup)]
                             .iter().enumerate().map(|(i, &(label, p))| {
                                 view! {
                                     <span class=move || {
@@ -375,9 +374,9 @@ pub fn SignupPage() -> impl IntoView {
                     // ── Phase 1: Identity ─────────────────────────────
                     <Show when=move || phase.get() == Phase::Identity>
                         <div class="text-center">
-                            <h1 class="text-3xl font-bold text-white" data-testid="signup-h1">"Create Account"</h1>
+                            <h1 class="text-3xl font-bold text-white" data-testid="signup-h1">"Create your account"</h1>
                             <p class="mt-2 text-gray-400 text-sm">
-                                "We generate a Nostr keypair on-device and provision your pod at first sign-in. Your private key never leaves the browser."
+                                "Your account is created right here on your device — nothing to install, no email or password needed. You stay in control, and your private details never leave this browser."
                             </p>
                         </div>
 
@@ -433,95 +432,52 @@ pub fn SignupPage() -> impl IntoView {
                                 disabled=move || is_busy.get()
                                 class="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-50 disabled:cursor-not-allowed text-gray-900 font-semibold py-3 px-4 rounded-xl transition-colors flex items-center justify-center gap-2"
                             >
-                                {move || if is_busy.get() { "Creating…" } else { "Create Account" }}
+                                {move || if is_busy.get() { "Creating…" } else { "Create my account" }}
                             </button>
                             <p class="text-xs text-gray-500 text-center">
-                                "You can claim a federated @-handle later from Settings."
+                                "You can choose a shareable @-handle later in Settings."
                             </p>
                         </div>
                     </Show>
 
-                    // ── Phase 2: Profile reveal ───────────────────────
+                    // ── Phase 2: account confirmation ─────────────────
+                    // Reassuring, plain-English confirmation. The raw technical
+                    // identifiers are kept AVAILABLE behind an "Advanced details"
+                    // disclosure — they are informational; the real safety net is
+                    // the recovery sheet in the next step.
                     <Show when=move || phase.get() == Phase::Profile>
                         <div class="text-center">
-                            <h1 class="text-3xl font-bold text-white">"Your identity"</h1>
-                            <p class="mt-2 text-gray-400 text-sm">"Keep these handy — back up your private key in the next step."</p>
+                            <div class="mx-auto w-12 h-12 rounded-full bg-green-500/15 flex items-center justify-center mb-1">
+                                <svg class="w-6 h-6 text-green-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="20 6 9 17 4 12" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                            </div>
+                            <h1 class="text-3xl font-bold text-white">"You\u{2019}re all set"</h1>
+                            <p class="mt-2 text-gray-400 text-sm">
+                                {move || {
+                                    let name = display_name.get_untracked();
+                                    if name.trim().is_empty() {
+                                        "Your account is ready and lives on this device. Next, let\u{2019}s save a backup so you never lose access.".to_string()
+                                    } else {
+                                        format!("Your account is ready, {}. It lives on this device — next, let\u{2019}s save a backup so you never lose access.", name.trim())
+                                    }
+                                }}
+                            </p>
                         </div>
 
-                        <div class="space-y-3" data-testid="signup-identity-bundle">
-                            // npub short
-                            <div class="bg-gray-900/80 border border-gray-700/50 rounded-lg p-3">
-                                <div class="flex items-center justify-between gap-2">
-                                    <div class="flex-1 min-w-0">
-                                        <p class="text-xs uppercase tracking-wide text-gray-500">"Public key"</p>
-                                        <p class="text-sm text-amber-300 font-mono truncate" data-testid="signup-pubkey">
-                                            {move || pubkey_short.get()}
-                                        </p>
-                                    </div>
-                                    <button
-                                        on:click=move |_| {
-                                            let pk = pubkey.get_untracked().unwrap_or_default();
-                                            clipboard_copy(&pk, "Pubkey", toasts);
-                                        }
-                                        class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
-                                    >
-                                        "Copy"
-                                    </button>
-                                </div>
-                            </div>
-
-                            // WebID
-                            <div class="bg-gray-900/80 border border-gray-700/50 rounded-lg p-3">
-                                <div class="flex items-center justify-between gap-2">
-                                    <div class="flex-1 min-w-0">
-                                        <p class="text-xs uppercase tracking-wide text-gray-500">"Solid WebID"</p>
-                                        <p class="text-xs text-amber-300 font-mono truncate" data-testid="signup-webid">
-                                            {move || webid.get()}
-                                        </p>
-                                    </div>
-                                    <button
-                                        on:click=move |_| {
-                                            let url = webid.get_untracked();
-                                            if let Some(window) = web_sys::window() {
-                                                let nav = window.navigator().clipboard();
-                                                let _ = nav.write_text(&url);
-                                                toasts.show("WebID copied", ToastVariant::Success);
-                                            }
-                                        }
-                                        class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
-                                    >
-                                        "Copy"
-                                    </button>
-                                </div>
-                            </div>
-
-                            // Git clone
-                            <div class="bg-gray-900/80 border border-gray-700/50 rounded-lg p-3">
-                                <div class="flex items-center justify-between gap-2">
-                                    <div class="flex-1 min-w-0">
-                                        <p class="text-xs uppercase tracking-wide text-gray-500">"Git clone"</p>
-                                        <p class="text-xs text-amber-300 font-mono truncate" data-testid="signup-git-clone">
-                                            {move || git_clone.get()}
-                                        </p>
-                                    </div>
-                                    <button
-                                        on:click=move |_| {
-                                            let cmd = git_clone.get_untracked();
-                                            if let Some(window) = web_sys::window() {
-                                                let nav = window.navigator().clipboard();
-                                                let _ = nav.write_text(&cmd);
-                                                toasts.show("Clone command copied", ToastVariant::Success);
-                                            }
-                                        }
-                                        class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
-                                    >
-                                        "Copy"
-                                    </button>
-                                </div>
-                                <p class="text-xs text-gray-500 mt-2">
-                                    "Available on deployments with git-init enabled (ADR-089)."
-                                </p>
-                            </div>
+                        <div class="bg-gray-900/50 border border-gray-700/40 rounded-xl p-4 text-sm text-gray-300 space-y-2" data-testid="signup-account-summary">
+                            <p class="flex items-start gap-2">
+                                <span class="text-green-400 mt-0.5">"\u{2713}"</span>
+                                <span>"Created privately on your device — no email or password to remember."</span>
+                            </p>
+                            <p class="flex items-start gap-2">
+                                <span class="text-green-400 mt-0.5">"\u{2713}"</span>
+                                <span>"Your own private space for posts and files is ready to use."</span>
+                            </p>
+                            <p class="flex items-start gap-2">
+                                <span class="text-amber-400 mt-0.5">"!"</span>
+                                <span>"There\u{2019}s no \u{201c}forgot password\u{201d} — the next step saves your way back in. Don\u{2019}t skip it."</span>
+                            </p>
                         </div>
 
                         <button
@@ -529,18 +485,133 @@ pub fn SignupPage() -> impl IntoView {
                             on:click=move |_: web_sys::MouseEvent| phase.set(Phase::Backup)
                             class="w-full bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold py-3 px-4 rounded-xl transition-colors"
                         >
-                            "Continue → Back up key"
+                            "Continue \u{2192} save my access"
                         </button>
+
+                        // Advanced: the raw technical identifiers, collapsed by
+                        // default. Functionality (Copy) is unchanged — only the
+                        // emphasis. Toggled via a plain disclosure button.
+                        <div class="border-t border-gray-700/40 pt-3">
+                            <button
+                                data-testid="signup-advanced-toggle"
+                                on:click=move |_: web_sys::MouseEvent| show_advanced.update(|v| *v = !*v)
+                                class="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 transition-colors"
+                                aria-expanded=move || if show_advanced.get() { "true" } else { "false" }
+                            >
+                                <span class=move || if show_advanced.get() { "rotate-90 transition-transform" } else { "transition-transform" }>"\u{25B8}"</span>
+                                "Advanced details (technical identifiers)"
+                            </button>
+
+                            <Show when=move || show_advanced.get()>
+                                <div class="space-y-3 mt-3" data-testid="signup-identity-bundle">
+                                    <p class="text-xs text-gray-500">
+                                        "These are the technical identifiers behind your account. You don\u{2019}t need them to use the forum — they\u{2019}re here if you want to connect another app."
+                                    </p>
+
+                                    // Public key
+                                    <div class="bg-gray-900/80 border border-gray-700/50 rounded-lg p-3">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <div class="flex-1 min-w-0">
+                                                <p class="text-xs uppercase tracking-wide text-gray-500">"Your public ID"</p>
+                                                <p class="text-sm text-amber-300 font-mono truncate" data-testid="signup-pubkey">
+                                                    {move || pubkey_short.get()}
+                                                </p>
+                                            </div>
+                                            <button
+                                                on:click=move |_| {
+                                                    let pk = pubkey.get_untracked().unwrap_or_default();
+                                                    clipboard_copy(&pk, "Public ID", toasts);
+                                                }
+                                                class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
+                                            >
+                                                "Copy"
+                                            </button>
+                                        </div>
+                                        <p class="text-xs text-gray-500 mt-2">
+                                            "Safe to share — it\u{2019}s how others find your posts. It can\u{2019}t be used to sign in as you."
+                                        </p>
+                                    </div>
+
+                                    // WebID
+                                    <div class="bg-gray-900/80 border border-gray-700/50 rounded-lg p-3">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <div class="flex-1 min-w-0">
+                                                <p class="text-xs uppercase tracking-wide text-gray-500">
+                                                    "Your space address "
+                                                    <InfoTerm
+                                                        term="(WebID)"
+                                                        explainer="A web link to your personal space — your portable online profile and storage."
+                                                    />
+                                                </p>
+                                                <p class="text-xs text-amber-300 font-mono truncate" data-testid="signup-webid">
+                                                    {move || webid.get()}
+                                                </p>
+                                            </div>
+                                            <button
+                                                on:click=move |_| {
+                                                    let url = webid.get_untracked();
+                                                    if let Some(window) = web_sys::window() {
+                                                        let nav = window.navigator().clipboard();
+                                                        let _ = nav.write_text(&url);
+                                                        toasts.show("Space address copied", ToastVariant::Success);
+                                                    }
+                                                }
+                                                class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
+                                            >
+                                                "Copy"
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    // Git clone
+                                    <div class="bg-gray-900/80 border border-gray-700/50 rounded-lg p-3">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <div class="flex-1 min-w-0">
+                                                <p class="text-xs uppercase tracking-wide text-gray-500">"Copy your space to your computer"</p>
+                                                <p class="text-xs text-amber-300 font-mono truncate" data-testid="signup-git-clone">
+                                                    {move || git_clone.get()}
+                                                </p>
+                                            </div>
+                                            <button
+                                                on:click=move |_| {
+                                                    let cmd = git_clone.get_untracked();
+                                                    if let Some(window) = web_sys::window() {
+                                                        let nav = window.navigator().clipboard();
+                                                        let _ = nav.write_text(&cmd);
+                                                        toasts.show("Command copied", ToastVariant::Success);
+                                                    }
+                                                }
+                                                class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
+                                            >
+                                                "Copy"
+                                            </button>
+                                        </div>
+                                        <p class="text-xs text-gray-500 mt-2">
+                                            "For developers — keep an offline copy of your space. Available where this feature is enabled."
+                                        </p>
+                                    </div>
+                                </div>
+                            </Show>
+                        </div>
                     </Show>
 
-                    // ── Phase 3: nsec backup + recovery sheet (ADR-095) ──
+                    // ── Phase 3: save access (one recovery sheet, ADR-095) ──
+                    // One download is the whole story: the printable sheet folds
+                    // in the recovery key, the phone sign-in QR and plain-English
+                    // notes. We no longer also render a separate key card — that
+                    // was the "preview of everything" that overwhelmed people.
+                    // Client-side only: the recovery key never leaves the browser.
                     <Show when=move || phase.get() == Phase::Backup>
                         <div class="space-y-6">
-                            // Plain nsec card (unchanged component, same nsec source).
-                            <NsecBackup nsec=privkey_hex.get_untracked() on_dismiss=on_backup_done />
+                            <div class="text-center">
+                                <h1 class="text-3xl font-bold text-white">"Save your way back in"</h1>
+                                <p class="mt-2 text-gray-400 text-sm">
+                                    "There\u{2019}s no password to reset, so this one sheet is how you get back into your account — on a new phone, a new computer, or if this browser is cleared. Save it as a PDF and keep it somewhere safe."
+                                </p>
+                            </div>
 
-                            // Printable recovery & device-onboarding sheet.
-                            // Client-side only: the nsec never leaves the browser.
+                            // Printable recovery & device-onboarding sheet — the
+                            // single download. Keep your private details on it.
                             <RecoverySheet
                                 privkey_hex=privkey_hex.get_untracked()
                                 pubkey_hex=pubkey.get_untracked().unwrap_or_default()
@@ -562,7 +633,7 @@ pub fn SignupPage() -> impl IntoView {
                                            disabled:cursor-not-allowed text-gray-900 font-semibold \
                                            py-3 px-4 rounded-xl transition-colors"
                                 >
-                                    "Finish — enter the forum"
+                                    "Done — take me to the forum"
                                 </button>
                                 <Show
                                     when=move || !(sheet_ready.get() || advanced_override.get())
@@ -575,7 +646,7 @@ pub fn SignupPage() -> impl IntoView {
                                         class="block w-full text-center text-xs text-gray-500 \
                                                hover:text-gray-300 underline"
                                     >
-                                        "I've stored my key elsewhere (advanced)"
+                                        "I\u{2019}ve already saved it elsewhere (skip)"
                                     </button>
                                 </Show>
                             </div>

@@ -54,6 +54,7 @@ use qrcode::render::svg;
 use qrcode::{EcLevel, QrCode};
 
 use crate::app::base_href;
+use crate::components::info_term::InfoTerm;
 use crate::utils::devices::{device_connect_url, device_keys_enabled, register_device_with_master};
 
 /// Render `data` as a self-contained SVG QR-code string (pure-Rust, in-WASM).
@@ -212,11 +213,12 @@ pub(crate) fn RecoverySheet(
             >
                 // ── Header ────────────────────────────────────────────────
                 <div class="border-b border-gray-300 pb-3">
-                    <h2 class="text-xl font-bold text-gray-900">"Recovery & Device Sheet"</h2>
+                    <h2 class="text-xl font-bold text-gray-900">"Your account & sign-in sheet"</h2>
                     <p class="text-xs text-gray-600">
-                        "Print this page (or Save as PDF) and store it safely. "
-                        "It backs up your account and lets you sign in on your phone "
-                        "(scan the 📱 QR with your camera)."
+                        "Save this page as a PDF (or print it) and keep it somewhere safe — "
+                        "it\u{2019}s how you get back into your account if you lose this browser. "
+                        "To sign in on your phone, just scan the 📱 code with your camera. "
+                        "Everything on this sheet is private to you; don\u{2019}t share it."
                     </p>
                     <p class="text-xs text-gray-500 mt-1">
                         {format!("Account: {display_name}")}
@@ -237,21 +239,20 @@ pub(crate) fn RecoverySheet(
                         <div class="flex items-center gap-2 mb-2">
                             <span class="text-lg">"📱"</span>
                             <span class="text-sm font-bold text-red-700 uppercase tracking-wide">
-                                "Open on this phone — bearer credential"
+                                "Sign in on your phone"
                             </span>
                         </div>
                         <p class="text-xs text-gray-800 mb-2 font-medium">
-                            "Scan with your phone camera → opens the forum and signs you in."
+                            "Scan this code with your phone\u{2019}s camera — the forum opens and signs you in. That\u{2019}s it."
                         </p>
                         <p class="text-xs text-red-700 mb-3 font-bold">
-                            "⚠ This link/QR IS your account. Anyone who scans or copies it can sign in "
-                            "as you. Keep this sheet private."
+                            "\u{26a0} Treat this code like a key to your account. Anyone who scans or photographs it can sign in as you, so keep this sheet private."
                         </p>
                         <div class="flex flex-col sm:flex-row items-center gap-4">
                             <div class="rs-qr flex-shrink-0" inner_html=connect_qr.clone()></div>
                             <div class="min-w-0 w-full">
                                 <p class="text-[10px] uppercase tracking-wide text-red-600 mb-1">
-                                    "forum sign-in link"
+                                    "your sign-in link"
                                 </p>
                                 <code class="block text-[10px] text-gray-900 font-mono">
                                     {connect_url.clone().unwrap_or_default()}
@@ -268,53 +269,82 @@ pub(crate) fn RecoverySheet(
                     <div class="flex items-center gap-2 mb-2">
                         <span class="text-lg">"🔑"</span>
                         <span class="text-sm font-bold text-red-700 uppercase tracking-wide">
-                            "Secret key (nsec) — bearer credential"
+                            "Your recovery key"
                         </span>
                     </div>
-                    <p class="text-xs text-red-700 mb-2 font-medium">
-                        "ANYONE who scans or reads this controls your account. Keep this sheet private."
+                    <p class="text-xs text-gray-800 mb-2">
+                        "This is the master key to your account — keep it on this sheet as your backup. "
+                        "Anyone who reads it can sign in as you, so don\u{2019}t share it or type it anywhere except a trusted sign-in screen."
                     </p>
-                    <p class="text-xs text-gray-800 mb-3">
-                        "Paste into 0xchat via "
-                        <span class="font-semibold">"\u{201c}Login with private key\u{201d}"</span>
-                        ", or scan into a signer app (Amber). "
-                        <span class="font-semibold text-red-700">
-                            "Do NOT use 0xchat\u{2019}s \u{201c}Login with QR code\u{201d}"
-                        </span>
-                        " — that is a remote-signer QR, not this key."
-                    </p>
+                    <details class="mb-3 rs-no-print">
+                        <summary class="text-xs text-gray-600 cursor-pointer hover:text-gray-900">
+                            "Using another app? (advanced)"
+                        </summary>
+                        <p class="text-xs text-gray-700 mt-2">
+                            "In a compatible app (e.g. 0xchat) choose "
+                            <span class="font-semibold">"\u{201c}Login with private key\u{201d}"</span>
+                            " and paste the key below, or import it into a signer app such as Amber. "
+                            <span class="font-semibold text-red-700">
+                                "Don\u{2019}t use \u{201c}Login with QR code\u{201d}"
+                            </span>
+                            " in those apps — that\u{2019}s a different feature, not this key."
+                        </p>
+                    </details>
                     <div class="flex flex-col sm:flex-row items-center gap-4">
                         <div class="rs-qr flex-shrink-0" inner_html=nsec_qr></div>
                         <div class="min-w-0 w-full">
                             <p class="text-[10px] uppercase tracking-wide text-red-600 mb-1">
-                                "nsec (bech32)"
+                                "recovery key "
+                                <InfoTerm
+                                    term="(nsec)"
+                                    explainer="Your account's secret key — the technical name is \"nsec\". It's the master password for your account; never share it."
+                                />
                             </p>
                             <code class="block text-xs text-gray-900 font-mono">{nsec}</code>
                         </div>
                     </div>
                 </div>
 
-                // ── 📡 Relay ──────────────────────────────────────────────
+                // ── 📡 Server address (relay) ─────────────────────────────
                 <div class="border border-gray-300 rounded-xl p-4">
                     <div class="flex items-center gap-2 mb-2">
                         <span class="text-lg">"📡"</span>
-                        <span class="text-sm font-bold text-gray-800 uppercase tracking-wide">"Relay"</span>
+                        <span class="text-sm font-bold text-gray-800 uppercase tracking-wide">
+                            "Server address"
+                        </span>
                     </div>
+                    <p class="text-xs text-gray-600 mb-2">
+                        "You don\u{2019}t need this for the website — it\u{2019}s only if you connect a separate "
+                        <InfoTerm
+                            term="messaging app"
+                            explainer="An optional third-party app that can show this forum's messages. Most people never need this."
+                        />
+                        ". Paste the address below to point it at this community."
+                    </p>
                     <div class="flex flex-col sm:flex-row items-center gap-4">
                         <div class="rs-qr flex-shrink-0" inner_html=relay_qr></div>
                         <div class="min-w-0 w-full">
-                            <p class="text-[10px] uppercase tracking-wide text-gray-500 mb-1">"Add this relay in your client"</p>
+                            <p class="text-[10px] uppercase tracking-wide text-gray-500 mb-1">
+                                "address "
+                                <InfoTerm
+                                    term="(relay)"
+                                    explainer="The server that stores and shares this community's messages. The technical name is \"relay\"."
+                                />
+                            </p>
                             <code class="block text-xs text-gray-900 font-mono">{relay_url}</code>
                         </div>
                     </div>
                 </div>
 
-                // ── 🪪 Public identity (npub) ─────────────────────────────
+                // ── 🪪 Public profile (npub) ──────────────────────────────
                 <div class="border border-gray-300 rounded-xl p-4">
                     <div class="flex items-center gap-2 mb-2">
                         <span class="text-lg">"🪪"</span>
-                        <span class="text-sm font-bold text-gray-800 uppercase tracking-wide">"Public identity"</span>
+                        <span class="text-sm font-bold text-gray-800 uppercase tracking-wide">"Your public profile"</span>
                     </div>
+                    <p class="text-xs text-gray-600 mb-2">
+                        "This part is safe to share — it\u{2019}s how people find and follow you. It can\u{2019}t be used to sign in as you."
+                    </p>
                     <div class="flex flex-col sm:flex-row items-center gap-4">
                         <div class="rs-qr flex-shrink-0" inner_html=npub_qr></div>
                         <div class="min-w-0 w-full space-y-1">
@@ -323,13 +353,19 @@ pub(crate) fn RecoverySheet(
                             </p>
                             {nip05.clone().map(|h| view! {
                                 <p class="text-xs text-gray-700">
-                                    <span class="font-semibold">"NIP-05: "</span>{h}
+                                    <span class="font-semibold">"Handle: "</span>{h}
                                 </p>
                             })}
                             <p class="text-xs text-gray-700">
                                 <span class="font-semibold">"Created: "</span>{created.clone()}
                             </p>
-                            <p class="text-[10px] uppercase tracking-wide text-gray-500 mt-1">"npub (bech32)"</p>
+                            <p class="text-[10px] uppercase tracking-wide text-gray-500 mt-1">
+                                "public ID "
+                                <InfoTerm
+                                    term="(npub)"
+                                    explainer="Your public username code — the technical name is \"npub\". Safe to share so others can find you."
+                                />
+                            </p>
                             <code class="block text-xs text-gray-900 font-mono">{npub}</code>
                         </div>
                     </div>
@@ -346,18 +382,16 @@ pub(crate) fn RecoverySheet(
                         <div class="flex items-center gap-2 mb-2">
                             <span class="text-lg">"\u{2702}"</span>
                             <span class="text-sm font-bold text-gray-800 uppercase tracking-wide">
-                                "Tear-off — add a phone"
+                                "Tear-off — add another phone"
                             </span>
                         </div>
                         <p class="text-xs text-gray-700 mb-2">
-                            "Generate a "
-                            <span class="font-semibold">"revocable device key"</span>
-                            " for a phone. Scan its QR to sign in on that device. "
-                            "Revoke it anytime in Settings → Devices — your main "
-                            "account and recovery keys above are untouched."
+                            "Want to sign in on an extra phone without sharing your main recovery key? "
+                            "Create a separate sign-in code for it below, then scan that code on the phone. "
+                            "You can switch it off anytime in Settings \u{2192} Devices — your main account and the keys above stay untouched."
                         </p>
                         <p class="text-xs text-amber-700 mb-3 font-medium">
-                            "\u{26a0} The QR below grants forum access AS YOU until revoked. "
+                            "\u{26a0} This code lets that phone sign in as you until you switch it off. "
                             "Cut along the dashed line and keep it private."
                         </p>
 
@@ -370,11 +404,11 @@ pub(crate) fn RecoverySheet(
                                 data-testid="recovery-device-generate"
                             >
                                 {move || if device_busy.get() {
-                                    "Generating…"
+                                    "Creating…"
                                 } else if device_connect.get().is_empty() {
-                                    "Generate device key"
+                                    "Create a sign-in code for another phone"
                                 } else {
-                                    "Generate another device key"
+                                    "Create another sign-in code"
                                 }}
                             </button>
                             <Show when=move || device_err.get().is_some()>
@@ -394,10 +428,10 @@ pub(crate) fn RecoverySheet(
                                 ></div>
                                 <div class="min-w-0 w-full">
                                     <p class="text-[10px] uppercase tracking-wide text-gray-500 mb-1">
-                                        "device sign-in link"
+                                        "sign-in code for the other phone"
                                     </p>
                                     <p class="text-xs text-gray-800 mb-1">
-                                        "Scan with your phone; revoke anytime in Settings → Devices."
+                                        "Scan it with that phone. Switch it off anytime in Settings \u{2192} Devices."
                                     </p>
                                     <code class="block text-[10px] text-gray-900 font-mono">
                                         {move || device_connect.get()}
@@ -416,33 +450,37 @@ pub(crate) fn RecoverySheet(
                     </div>
                     <div class="grid sm:grid-cols-2 gap-4">
                         <div>
-                            <p class="font-semibold text-gray-900 mb-1">"On mobile (recommended)"</p>
+                            <p class="font-semibold text-gray-900 mb-1">"On your phone (easiest)"</p>
                             <ol class="list-decimal list-inside space-y-1 text-xs text-gray-700">
-                                <li>"Scan the 📱 QR with your phone camera."</li>
+                                <li>"Point your phone\u{2019}s camera at the 📱 code."</li>
                                 <li>"The forum opens and signs you in automatically."</li>
                                 <li>
-                                    "Power users: 0xchat → "
+                                    "Using another app? In a compatible app, choose "
                                     <span class="font-semibold">"Login with private key"</span>
-                                    " → paste the nsec; or import the nsec into Amber and use "
-                                    <span class="font-semibold">"Login with Amber"</span>
-                                    "."
+                                    " and paste your recovery key (or scan the 🔑 code)."
                                 </li>
                             </ol>
                         </div>
                         <div>
-                            <p class="font-semibold text-gray-900 mb-1">"On the web"</p>
+                            <p class="font-semibold text-gray-900 mb-1">"On a computer"</p>
                             <ol class="list-decimal list-inside space-y-1 text-xs text-gray-700">
-                                <li>"Open the forum sign-in page."</li>
-                                <li>"Paste your nsec (or scan the 🔑 QR)."</li>
-                                <li>"You're back in — same account."</li>
+                                <li>"Open the forum\u{2019}s sign-in page."</li>
+                                <li>"Paste your recovery key (or scan the 🔑 code)."</li>
+                                <li>"You\u{2019}re back in — same account."</li>
                             </ol>
                         </div>
                     </div>
                 </div>
 
-                // ── ⚙️ Optional sweep (privacy) — screen-only control ─────
-                <div class="rs-screen-controls border border-gray-300 rounded-xl p-4">
-                    <label class="flex items-start gap-2 cursor-pointer text-sm text-gray-800">
+                // ── Advanced privacy option — hidden from the basic flow ──
+                // The single-relay "sweep" is a power-user privacy step; it
+                // confused newcomers, so it now lives behind an Advanced
+                // disclosure (screen-only) and is described in plain language.
+                <details class="rs-screen-controls border border-gray-300 rounded-xl p-4">
+                    <summary class="text-sm text-gray-700 cursor-pointer hover:text-gray-900">
+                        "Advanced privacy options"
+                    </summary>
+                    <label class="flex items-start gap-2 cursor-pointer text-sm text-gray-800 mt-3">
                         <input
                             type="checkbox"
                             class="mt-1"
@@ -450,27 +488,31 @@ pub(crate) fn RecoverySheet(
                             data-testid="recovery-sweep-toggle"
                         />
                         <span>
-                            <span class="font-semibold">"Lock my phone to this relay only "</span>
-                            <span class="text-xs text-gray-500">"(optional privacy step)"</span>
+                            <span class="font-semibold">"Keep my messaging app on this community only "</span>
+                            <span class="text-xs text-gray-500">"(optional)"</span>
+                            <span class="block text-xs text-gray-500 mt-0.5">
+                                "If you connect a separate messaging app, this adds steps to stop it sharing your activity with other public servers. Not needed to use the website."
+                            </span>
                         </span>
                     </label>
-                </div>
+                </details>
 
-                // The sweep block prints only when ticked.
+                // The detailed steps print only when ticked.
                 <Show when=move || sweep.get()>
                     <div class="border border-amber-500 rounded-xl p-4 bg-amber-50 text-sm text-gray-800">
                         <div class="flex items-center gap-2 mb-2">
                             <span class="text-lg">"⚙️"</span>
-                            <span class="font-bold uppercase tracking-wide text-amber-700">"Single-relay lockdown"</span>
+                            <span class="font-bold uppercase tracking-wide text-amber-700">
+                                "Keep to one community"
+                            </span>
                         </div>
                         <ol class="list-decimal list-inside space-y-1 text-xs text-gray-700">
-                            <li>"In 0xchat open Settings → Relays."</li>
-                            <li>"Remove every default relay that is NOT the 📡 relay above."</li>
-                            <li>"Keep only the one relay so your traffic stays on this deployment."</li>
+                            <li>"In your messaging app, open its Servers (or Relays) settings."</li>
+                            <li>"Remove every address except the 📡 Server address shown above."</li>
+                            <li>"Keep only that one, so your activity stays within this community."</li>
                         </ol>
                         <p class="text-xs text-amber-700 mt-2">
-                            "Privacy note: this stops your phone broadcasting to public relays. "
-                            "It is optional — not required for the account to work."
+                            "This is optional and only affects a separate messaging app — it stops that app sharing your activity with other public servers. Your account works fine without it."
                         </p>
                     </div>
                 </Show>
@@ -482,19 +524,22 @@ pub(crate) fn RecoverySheet(
                         class="w-full bg-gray-900 hover:bg-gray-700 text-white font-semibold py-3 px-4 rounded-xl transition-colors text-sm"
                         data-testid="recovery-print"
                     >
-                        "Download / Print sheet"
+                        "Save as PDF (or print)"
                     </button>
+                    <p class="text-xs text-gray-500">
+                        "In the dialog that opens, choose \u{201c}Save as PDF\u{201d} and keep the file somewhere safe — that one file keeps your access."
+                    </p>
                     <label class="flex items-center gap-2 cursor-pointer text-sm text-gray-800">
                         <input
                             type="checkbox"
                             on:change=on_toggle_confirm
                             data-testid="recovery-confirm"
                         />
-                        <span>"I've saved my recovery sheet"</span>
+                        <span>"I\u{2019}ve saved this somewhere safe"</span>
                     </label>
                     <Show when=move || printed.get() && confirmed.get()>
                         <p class="text-xs text-green-700 font-medium" data-testid="recovery-ready">
-                            "✓ Sheet saved — you can finish signup."
+                            "\u{2713} Saved — you\u{2019}re ready to finish."
                         </p>
                     </Show>
                 </div>
