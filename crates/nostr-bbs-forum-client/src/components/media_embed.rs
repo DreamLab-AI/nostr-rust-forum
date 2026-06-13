@@ -3,6 +3,7 @@
 use leptos::prelude::*;
 
 use crate::dm::encrypted_media::{decrypt_dm_image, EncryptedImage};
+use crate::stores::preferences::use_preferences;
 
 /// Detected media type from a URL.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,14 +79,24 @@ pub(crate) fn MediaEmbed(
 ) -> impl IntoView {
     let media_type = detect_media(&url);
 
-    match media_type {
-        MediaType::Image => {
-            let img_url = url.clone();
-            let full_url = url.clone();
-            let loaded = RwSignal::new(false);
-            let errored = RwSignal::new(false);
+    // Honour the "Show link previews" preference (#wire-settings): when off,
+    // inline media derived from a posted link is gated out of the render (and
+    // so never loaded), matching link-preview suppression. `prefs` is a `Copy`
+    // `RwSignal`, read inside the reactive block so toggling re-renders.
+    let prefs = use_preferences();
 
-            view! {
+    move || {
+        if !prefs.get().show_link_previews {
+            return ().into_any();
+        }
+        match media_type.clone() {
+            MediaType::Image => {
+                let img_url = url.clone();
+                let full_url = url.clone();
+                let loaded = RwSignal::new(false);
+                let errored = RwSignal::new(false);
+
+                view! {
                 <div class="mt-2 max-w-lg">
                     // Skeleton shown while loading
                     <Show when=move || !loaded.get() && !errored.get()>
@@ -129,14 +140,15 @@ pub(crate) fn MediaEmbed(
                 </div>
             }
             .into_any()
-        }
-        MediaType::Video => {
-            // Native HTML5 player for directly-hosted video (e.g. an uploaded
-            // .mp4 on the user's pod). Lazy metadata preload keeps the feed light.
-            view! {
+            }
+            MediaType::Video => {
+                // Native HTML5 player for directly-hosted video (e.g. an uploaded
+                // .mp4 on the user's pod). Lazy metadata preload keeps the feed light.
+                let video_url = url.clone();
+                view! {
                 <div class="mt-2 max-w-lg">
                     <video
-                        src=url
+                        src=video_url
                         class="max-h-[400px] w-auto rounded-lg border border-gray-700/50 bg-black"
                         controls=true
                         preload="metadata"
@@ -147,11 +159,11 @@ pub(crate) fn MediaEmbed(
                 </div>
             }
             .into_any()
-        }
-        MediaType::YouTube(video_id) => {
-            let embed_url = format!("https://www.youtube-nocookie.com/embed/{}", video_id);
+            }
+            MediaType::YouTube(video_id) => {
+                let embed_url = format!("https://www.youtube-nocookie.com/embed/{}", video_id);
 
-            view! {
+                view! {
                 <div class="mt-2 max-w-lg">
                     <div class="relative w-full overflow-hidden rounded-lg border border-gray-700/50" style="padding-top: 56.25%">
                         <iframe
@@ -165,10 +177,11 @@ pub(crate) fn MediaEmbed(
                 </div>
             }
             .into_any()
-        }
-        MediaType::Unknown => {
-            // Not a recognized media URL -- render nothing
-            view! { <span></span> }.into_any()
+            }
+            MediaType::Unknown => {
+                // Not a recognized media URL -- render nothing
+                view! { <span></span> }.into_any()
+            }
         }
     }
 }

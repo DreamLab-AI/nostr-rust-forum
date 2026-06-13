@@ -140,6 +140,17 @@ impl NotificationStoreV2 {
         timestamp: u64,
         dedup_id: Option<String>,
     ) {
+        // Honour the user's notification level (#wire-settings). The level
+        // gates which categories ever reach the store:
+        //   None         -> nothing,
+        //   MentionsOnly -> only @-mentions and direct-to-user events (DMs,
+        //                   join approvals, RSVPs, system) — never generic
+        //                   channel chatter,
+        //   All          -> everything.
+        if !notification_kind_allowed(&kind) {
+            return;
+        }
+
         let id = match dedup_id {
             Some(id) => {
                 if self
@@ -302,9 +313,27 @@ impl NotificationStoreV2 {
 
                     let author = author_display(&event.pubkey);
                     let preview = post_preview(&event.content);
+                    // Classify @-mentions of the current user as `Mention` so
+                    // they survive the MentionsOnly notification level; plain
+                    // channel posts stay `Message` and are gated out under it.
+                    let mentions_me = me
+                        .as_deref()
+                        .map(|pk| event_mentions(event, pk))
+                        .unwrap_or(false);
+                    let (kind, title) = if mentions_me {
+                        (
+                            NotificationKind::Mention,
+                            format!("You were mentioned in {}", channel_name),
+                        )
+                    } else {
+                        (
+                            NotificationKind::Message,
+                            format!("New reply in {}", channel_name),
+                        )
+                    };
                     store.add_at(
-                        NotificationKind::Message,
-                        &format!("New reply in {}", channel_name),
+                        kind,
+                        &title,
                         &format!("{}: {}", author, preview),
                         Some(&format!("/chat/{}", cid)),
                         event.created_at,
@@ -344,6 +373,33 @@ pub fn use_notification_store() -> NotificationStoreV2 {
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
+}
+
+/// Whether a notification of `kind` is allowed under the persisted
+/// `notification_level` preference (#wire-settings).
+///
+/// - `None`: nothing is allowed.
+/// - `MentionsOnly`: only `Mention` plus inherently direct-to-user categories
+///   (`DM`, `JoinRequest`, `JoinApproved`, `EventRSVP`, `System`) — generic
+///   channel `Message` traffic (new topics / new posts) is suppressed.
+/// - `All`: everything is allowed.
+fn notification_kind_allowed(kind: &NotificationKind) -> bool {
+    use crate::stores::preferences::NotificationLevel;
+    match crate::stores::preferences::notification_level_pref() {
+        NotificationLevel::All => true,
+        NotificationLevel::None => false,
+        NotificationLevel::MentionsOnly => !matches!(kind, NotificationKind::Message),
+    }
+}
+
+/// Whether `event` @-mentions `pubkey` — i.e. carries a `p` tag whose value is
+/// that pubkey (NIP-10 mention convention; also how typed @-mentions in posts
+/// are tagged). Case-insensitive hex compare.
+fn event_mentions(event: &nostr_bbs_core::NostrEvent, pubkey: &str) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|tag| tag.len() >= 2 && tag[0] == "p" && tag[1].eq_ignore_ascii_case(pubkey))
 }
 
 /// Resolve a pubkey to a human display name, falling back to a shortened hex.

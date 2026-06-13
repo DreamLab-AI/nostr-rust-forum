@@ -4,6 +4,8 @@ use leptos::prelude::*;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
+use crate::stores::preferences::use_preferences;
+
 /// Compile-time fallback for the link-preview API base URL. Overridden at
 /// runtime by `window.__ENV__.VITE_LINK_PREVIEW_API_URL` (see [`preview_api`]),
 /// which is the canonical injection path the deploy workflow uses for every
@@ -67,6 +69,12 @@ pub(crate) fn LinkPreview(
     /// The URL to fetch a preview for.
     url: String,
 ) -> impl IntoView {
+    // Honour the "Show link previews" preference (#wire-settings). `prefs` is
+    // a `Copy` `RwSignal`, so both the observer effect and the render block
+    // below read it independently: when off, the card renders nothing AND the
+    // observer never attaches, so the preview is never *fetched* either.
+    let prefs = use_preferences();
+
     let state = RwSignal::new(PreviewState::Idle);
     let container_ref = NodeRef::<leptos::html::Div>::new();
     let url_for_display = url.clone();
@@ -75,6 +83,11 @@ pub(crate) fn LinkPreview(
 
     // Set up IntersectionObserver to trigger fetch on visibility
     Effect::new(move |_| {
+        // Don't attach the observer (and so never fetch) while link previews
+        // are disabled. Re-runs and attaches if the pref is flipped on.
+        if !prefs.get().show_link_previews {
+            return;
+        }
         let el = match container_ref.get() {
             Some(el) => el,
             None => return,
@@ -126,6 +139,12 @@ pub(crate) fn LinkPreview(
     view! {
         <div node_ref=container_ref class="mt-2 max-w-lg">
             {move || {
+                // Preference gate (#wire-settings): render nothing when link
+                // previews are disabled. The observer effect also bails on the
+                // same pref, so disabling also means never fetching.
+                if !prefs.get().show_link_previews {
+                    return ().into_any();
+                }
                 match state.get() {
                     PreviewState::Idle | PreviewState::Loading => {
                         // Skeleton

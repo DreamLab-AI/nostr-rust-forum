@@ -306,7 +306,10 @@ pub fn ParticleCanvas() -> impl IntoView {
             110
         };
 
-        let reduced_motion = web_sys::window()
+        // Reduced motion: the user's `reduced_motion` preference ORed with the
+        // OS `prefers-reduced-motion: reduce` media query (#wire-settings).
+        // Either one draws a single static frame instead of the rAF loop.
+        let os_reduced_motion = web_sys::window()
             .and_then(|w| {
                 w.match_media("(prefers-reduced-motion: reduce)")
                     .ok()
@@ -314,6 +317,7 @@ pub fn ParticleCanvas() -> impl IntoView {
             })
             .map(|m: web_sys::MediaQueryList| m.matches())
             .unwrap_or(false);
+        let reduced_motion = os_reduced_motion || crate::stores::preferences::reduced_motion_pref();
 
         let field = Rc::new(RefCell::new(ParticleField::new(w, h, count)));
 

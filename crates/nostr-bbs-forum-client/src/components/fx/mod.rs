@@ -32,8 +32,15 @@ pub fn detect_render_tier() -> RenderTier {
     RenderTier::Canvas2D
 }
 
-/// Check `prefers-reduced-motion: reduce` media query.
+/// Whether motion should be reduced: the user's `reduced_motion` preference
+/// ORed with the OS `prefers-reduced-motion: reduce` media query. Either one
+/// being set drops the render tier to CSS-only.
 fn prefers_reduced_motion() -> bool {
+    crate::stores::preferences::reduced_motion_pref() || os_prefers_reduced_motion()
+}
+
+/// Check the OS `prefers-reduced-motion: reduce` media query.
+fn os_prefers_reduced_motion() -> bool {
     web_sys::window()
         .and_then(|w| {
             w.match_media("(prefers-reduced-motion: reduce)")
