@@ -13,6 +13,7 @@ use leptos::prelude::*;
 use crate::auth::use_auth;
 use crate::relay::RelayConnection;
 use crate::stores::panel_registry::{use_panel_registry, ActionEntry, PanelEntry};
+use wasm_bindgen_futures::spawn_local;
 
 // ── Governance page component ────────────────────────────────────────────────
 
@@ -201,19 +202,23 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                                 ],
                                 content,
                             };
-                            match auth.sign_event(unsigned) {
-                                Ok(signed) => {
-                                    relay.publish(&signed);
-                                    sent.set(true);
-                                    loading.set(false);
+                            // Async sign so NIP-07 / extension users can respond.
+                            let relay = relay.clone();
+                            spawn_local(async move {
+                                match auth.sign_event_async(unsigned).await {
+                                    Ok(signed) => {
+                                        relay.publish(&signed);
+                                        sent.set(true);
+                                        loading.set(false);
+                                    }
+                                    Err(e) => {
+                                        web_sys::console::warn_1(
+                                            &format!("[governance] panel action sign failed: {e}").into(),
+                                        );
+                                        loading.set(false);
+                                    }
                                 }
-                                Err(e) => {
-                                    web_sys::console::warn_1(
-                                        &format!("[governance] panel action sign failed: {e}").into(),
-                                    );
-                                    loading.set(false);
-                                }
-                            }
+                            });
                         }
                     };
                     view! {
@@ -307,20 +312,23 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                 content,
             };
 
-            match auth.sign_event(unsigned) {
-                Ok(signed) => {
-                    let r = expect_context::<RelayConnection>();
-                    r.publish(&signed);
-                    response_sent.set(true);
-                    loading_sig.set(false);
+            // Async sign so NIP-07 / extension users can respond.
+            let r = expect_context::<RelayConnection>();
+            spawn_local(async move {
+                match auth.sign_event_async(unsigned).await {
+                    Ok(signed) => {
+                        r.publish(&signed);
+                        response_sent.set(true);
+                        loading_sig.set(false);
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[governance] Failed to sign action response: {e}").into(),
+                        );
+                        loading_sig.set(false);
+                    }
                 }
-                Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("[governance] Failed to sign action response: {e}").into(),
-                    );
-                    loading_sig.set(false);
-                }
-            }
+            });
         }
     };
 
