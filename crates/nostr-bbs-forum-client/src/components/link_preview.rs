@@ -4,13 +4,36 @@ use leptos::prelude::*;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
-/// Default link-preview API endpoint.
-const PREVIEW_API: &str = match option_env!("VITE_LINK_PREVIEW_API_URL") {
+/// Compile-time fallback for the link-preview API base URL. Overridden at
+/// runtime by `window.__ENV__.VITE_LINK_PREVIEW_API_URL` (see [`preview_api`]),
+/// which is the canonical injection path the deploy workflow uses for every
+/// other worker endpoint (relay, pod, search).
+const PREVIEW_API_FALLBACK: &str = match option_env!("VITE_LINK_PREVIEW_API_URL") {
     Some(u) => u,
-    None => "https://members-link-preview.solitary-paper-764d.workers.dev",
+    None => "https://dreamlab-link-preview.solitary-paper-764d.workers.dev",
 };
 
-/// JSON shape returned by the link-preview worker.
+/// Resolve the link-preview API base URL at runtime.
+///
+/// Prefers `window.__ENV__.VITE_LINK_PREVIEW_API_URL` (injected by the deploy
+/// workflow alongside `VITE_RELAY_URL` etc.) so the endpoint can change per
+/// environment without a rebuild. Falls back to the build-time constant.
+/// A trailing slash is trimmed so the `/preview` path joins cleanly.
+fn preview_api() -> String {
+    let base = web_sys::window()
+        .and_then(|w| js_sys::Reflect::get(&w, &"__ENV__".into()).ok())
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .and_then(|env| js_sys::Reflect::get(&env, &"VITE_LINK_PREVIEW_API_URL".into()).ok())
+        .and_then(|v| v.as_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| PREVIEW_API_FALLBACK.to_string());
+    base.trim_end_matches('/').to_string()
+}
+
+/// JSON shape returned by the link-preview worker's `GET /preview` endpoint.
+///
+/// The worker emits `siteName` (camelCase) per the OpenGraph response contract,
+/// so the `site_name` field is aliased to accept either spelling.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 struct OgData {
     #[serde(default)]
@@ -19,7 +42,7 @@ struct OgData {
     description: Option<String>,
     #[serde(default)]
     image: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "siteName")]
     site_name: Option<String>,
     #[serde(default)]
     url: Option<String>,
@@ -185,9 +208,13 @@ pub(crate) fn LinkPreview(
     }
 }
 
-/// Fetch OG metadata from the link-preview worker.
+/// Fetch OG metadata from the link-preview worker's `GET /preview` endpoint.
 async fn fetch_og_data(url: &str) -> Result<OgData, String> {
-    let fetch_url = format!("{}?url={}", PREVIEW_API, js_sys::encode_uri_component(url));
+    let fetch_url = format!(
+        "{}/preview?url={}",
+        preview_api(),
+        js_sys::encode_uri_component(url)
+    );
 
     let opts = web_sys::RequestInit::new();
     opts.set_method("GET");

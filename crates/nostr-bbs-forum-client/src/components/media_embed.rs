@@ -8,6 +8,9 @@ use crate::dm::encrypted_media::{decrypt_dm_image, EncryptedImage};
 #[derive(Clone, Debug, PartialEq)]
 enum MediaType {
     Image,
+    /// A directly-hosted video file (mp4/webm/ogg/mov) -- rendered with a
+    /// native `<video controls>` player.
+    Video,
     YouTube(String), // video ID
     Unknown,
 }
@@ -15,14 +18,22 @@ enum MediaType {
 /// Detect what kind of media a URL points to.
 fn detect_media(url: &str) -> MediaType {
     let lower = url.to_lowercase();
+    // Strip any query string once for extension checks.
+    let path = lower.split('?').next().unwrap_or(&lower);
 
     // Image extensions
     let image_exts = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"];
     for ext in &image_exts {
-        // Check extension before any query string
-        let path = lower.split('?').next().unwrap_or(&lower);
         if path.ends_with(ext) {
             return MediaType::Image;
+        }
+    }
+
+    // Direct video file extensions (HTML5 <video>-playable containers).
+    let video_exts = [".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v"];
+    for ext in &video_exts {
+        if path.ends_with(ext) {
+            return MediaType::Video;
         }
     }
 
@@ -115,6 +126,24 @@ pub(crate) fn MediaEmbed(
                             on:error=move |_| errored.set(true)
                         />
                     </a>
+                </div>
+            }
+            .into_any()
+        }
+        MediaType::Video => {
+            // Native HTML5 player for directly-hosted video (e.g. an uploaded
+            // .mp4 on the user's pod). Lazy metadata preload keeps the feed light.
+            view! {
+                <div class="mt-2 max-w-lg">
+                    <video
+                        src=url
+                        class="max-h-[400px] w-auto rounded-lg border border-gray-700/50 bg-black"
+                        controls=true
+                        preload="metadata"
+                        playsinline=true
+                    >
+                        "Your browser does not support embedded video."
+                    </video>
                 </div>
             }
             .into_any()
