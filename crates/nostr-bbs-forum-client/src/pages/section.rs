@@ -37,6 +37,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 use std::rc::Rc;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
@@ -341,15 +342,21 @@ pub fn SectionPage() -> impl IntoView {
                                 }
                                 creating.set(true);
                                 create_error.set(None);
-                                match composer_relay.with_value(|r| publish_topic_root(&auth, r, &cid, &body, toasts)) {
-                                    Ok(()) => {
-                                        new_topic_text.set(String::new());
-                                        show_new_topic.set(false);
-                                        toasts.show("Topic created".to_string(), ToastVariant::Success);
+                                // Sign via the async path so NIP-07 / extension
+                                // (Podkey) users can post — the sync signer only
+                                // works for an in-browser local key.
+                                let relay = composer_relay.get_value();
+                                spawn_local(async move {
+                                    match publish_topic_root(&auth, &relay, &cid, &body, toasts).await {
+                                        Ok(()) => {
+                                            new_topic_text.set(String::new());
+                                            show_new_topic.set(false);
+                                            toasts.show("Topic created".to_string(), ToastVariant::Success);
+                                        }
+                                        Err(e) => create_error.set(Some(e)),
                                     }
-                                    Err(e) => create_error.set(Some(e)),
-                                }
-                                creating.set(false);
+                                    creating.set(false);
+                                });
                             }
                             class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors text-sm"
                         >
@@ -406,7 +413,7 @@ pub fn SectionPage() -> impl IntoView {
 /// The body's first line becomes the topic title in the list. Mirrors
 /// `category.rs::publish_topic_root` so both entry points produce the same
 /// shape and the topic appears in this list on relay echo.
-fn publish_topic_root(
+async fn publish_topic_root(
     auth: &crate::auth::AuthStore,
     relay: &RelayConnection,
     section_channel_id: &str,
@@ -435,7 +442,7 @@ fn publish_topic_root(
         tags,
         content: body.trim().to_string(),
     };
-    let signed = auth.sign_event(unsigned)?;
+    let signed = auth.sign_event_async(unsigned).await?;
 
     let on_ok = Rc::new(move |accepted: bool, msg: String| {
         if !accepted {

@@ -40,6 +40,7 @@ use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
 use crate::utils::capitalize;
+use wasm_bindgen_futures::spawn_local;
 
 /// Resolve a channel's `section` tag to the id of the owning config zone.
 ///
@@ -289,25 +290,30 @@ pub fn CategoryPage() -> impl IntoView {
                                                 }
                                                 creating.set(true);
                                                 create_error.set(None);
-
-                                                match publish_topic_root(
-                                                    &auth_create,
-                                                    &relay_create,
-                                                    &section_cid,
-                                                    &title,
-                                                    toasts,
-                                                ) {
-                                                    Ok(()) => {
-                                                        topic_name.set(String::new());
-                                                        show_new_topic.set(false);
-                                                        toasts.show(
-                                                            "Topic created".to_string(),
-                                                            ToastVariant::Success,
-                                                        );
+                                                // Async sign so NIP-07 / extension (Podkey)
+                                                // users can post — the sync signer needs a
+                                                // local in-browser key.
+                                                let relay = relay_create.clone();
+                                                spawn_local(async move {
+                                                    match publish_topic_root(
+                                                        &auth_create,
+                                                        &relay,
+                                                        &section_cid,
+                                                        &title,
+                                                        toasts,
+                                                    ).await {
+                                                        Ok(()) => {
+                                                            topic_name.set(String::new());
+                                                            show_new_topic.set(false);
+                                                            toasts.show(
+                                                                "Topic created".to_string(),
+                                                                ToastVariant::Success,
+                                                            );
+                                                        }
+                                                        Err(e) => create_error.set(Some(e)),
                                                     }
-                                                    Err(e) => create_error.set(Some(e)),
-                                                }
-                                                creating.set(false);
+                                                    creating.set(false);
+                                                });
                                             }
                                             class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors text-sm"
                                         >
@@ -449,7 +455,7 @@ fn SectionSkeleton() -> impl IntoView {
 /// channel. The topic title becomes the message content (the thread starter).
 /// This is the same shape `SectionPage` produces for a root post, so the new
 /// topic appears in the section's message list immediately on relay echo.
-fn publish_topic_root(
+async fn publish_topic_root(
     auth: &crate::auth::AuthStore,
     relay: &RelayConnection,
     section_channel_id: &str,
@@ -482,7 +488,7 @@ fn publish_topic_root(
         content: title.trim().to_string(),
     };
 
-    let signed = auth.sign_event(unsigned)?;
+    let signed = auth.sign_event_async(unsigned).await?;
 
     // Publish with ack so relay rejections (e.g. not-yet-whitelisted) surface.
     let on_ok = Rc::new(move |accepted: bool, msg: String| {
