@@ -40,6 +40,7 @@ use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
 use crate::utils::capitalize;
+use crate::utils::zone_theme::zone_accent_style;
 use wasm_bindgen_futures::spawn_local;
 
 /// Resolve a channel's `section` tag to the id of the owning config zone.
@@ -211,16 +212,31 @@ pub fn CategoryPage() -> impl IntoView {
                 </div>
             }
         >
-        <div class="max-w-5xl mx-auto p-4 sm:p-6">
+        // The page-root carries the zone accent as `--zone-accent`. Descendant
+        // links/buttons here use it; it also cascades to anything navigated to
+        // within the same subtree. The chat/thread pages mount under their own
+        // routes (not as children here) so they cannot inherit it via cascade —
+        // see the PR follow-up note for carrying the accent into thread.rs.
+        <div
+            class="max-w-5xl mx-auto p-4 sm:p-6"
+            style=move || zone_accent_style(&category_slug())
+        >
             // Zone hero banner
-            {move || view! {
-                <ZoneHero
-                    title=display_name()
-                    description="Browse sections and start a topic".to_string()
-                    zone_id=zone_id_for_hero()
-                    icon=zone_icon()
-                    banner_url=load_zones().into_iter().find(|z| z.id == category_slug()).and_then(|z| z.banner_image_url).unwrap_or_default()
-                />
+            {move || {
+                let slug = category_slug();
+                let zone = load_zones().into_iter().find(|z| z.id == slug);
+                let banner = zone.as_ref().and_then(|z| z.banner_image_url.clone()).unwrap_or_default();
+                let label = zone.map(|z| z.label());
+                view! {
+                    <ZoneHero
+                        title=display_name()
+                        description="Browse sections and start a topic".to_string()
+                        zone_id=zone_id_for_hero()
+                        icon=zone_icon()
+                        banner_url=banner
+                        zone_label=label.unwrap_or_default()
+                    />
+                }
             }}
 
             <Breadcrumb items=vec![

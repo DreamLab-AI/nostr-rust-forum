@@ -8,6 +8,7 @@ pub mod sanitize;
 pub mod search_client;
 pub mod slug_hash;
 pub mod solid;
+pub mod zone_theme;
 
 use leptos::prelude::*;
 use std::cell::Cell;

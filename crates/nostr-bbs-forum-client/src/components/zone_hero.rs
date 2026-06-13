@@ -5,15 +5,23 @@
 
 use leptos::prelude::*;
 
+use crate::utils::zone_theme::{zone_accent_style, zone_theme};
+
 /// Visual hero header for different forum zones.
 ///
-/// Renders a gradient glass banner with the zone's accent colour,
-/// an optional lock icon for restricted zones, and the title/description.
+/// Renders a gradient glass banner with the zone's accent colour (centralised in
+/// [`crate::utils::zone_theme`]), an optional lock icon for restricted zones, and
+/// the title/description. The container also exposes the zone accent as a
+/// `--zone-accent` CSS custom property so descendant / sibling pages (chat,
+/// thread) can pick up the zone identity without this component reaching into
+/// them.
 #[component]
 pub fn ZoneHero(
     title: String,
     description: String,
-    /// Zone identifier: "home", "members", or "private".
+    /// Real zone identifier from the operator config: `"public"`,
+    /// `"minimoonoir"`, `"family"`, `"business"` (legacy `home`/`members`/
+    /// `private` aliases still themed). Drives the palette via `zone_theme`.
     zone_id: String,
     /// SVG path data for the zone icon.
     icon: &'static str,
@@ -22,33 +30,33 @@ pub fn ZoneHero(
     /// overlay for legibility; falls back to the gradient when absent.
     #[prop(optional)]
     banner_url: Option<String>,
+    /// Optional explicit zone display label (the operator `display_name`, e.g.
+    /// "DreamLab" for the business zone). Falls back to a humanised id when
+    /// absent so the chip never shows a raw slug.
+    #[prop(optional)]
+    zone_label: Option<String>,
 ) -> impl IntoView {
-    let gradient = match zone_id.as_str() {
-        "home" => "from-amber-500/20 via-orange-500/10 to-yellow-500/10",
-        "members" => "from-pink-500/20 via-rose-500/10 to-fuchsia-500/10",
-        "private" => "from-purple-500/20 via-indigo-500/10 to-violet-500/10",
-        _ => "from-gray-500/20 via-gray-500/10 to-gray-500/5",
-    };
+    let theme = zone_theme(&zone_id);
+    let gradient = theme.gradient;
+    let border_color = theme.border;
+    let accent_style = zone_accent_style(&zone_id);
 
-    let zone_label = match zone_id.as_str() {
-        "home" => "Home",
-        "members" => "Members",
-        "private" => "Minimoonoir",
-        _ => "Forum",
-    };
+    // The pill label: explicit operator display name, else humanise the id.
+    let zone_label = zone_label
+        .filter(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| crate::utils::capitalize(&zone_id));
 
-    let border_color = match zone_id.as_str() {
-        "home" => "border-amber-500/20",
-        "members" => "border-pink-500/20",
-        "private" => "border-purple-500/20",
-        _ => "border-gray-500/20",
-    };
+    // `public` (Landing) is the only open zone; everything else shows the lock.
+    let is_open_zone = matches!(zone_id.as_str(), "public" | "home" | "landing");
 
     view! {
-        <div class=format!(
-            "relative mb-6 py-10 px-6 rounded-2xl overflow-hidden bg-gradient-to-br {} border {} backdrop-blur-sm",
-            gradient, border_color
-        )>
+        <div
+            class=format!(
+                "relative mb-6 py-10 px-6 rounded-2xl overflow-hidden bg-gradient-to-br {} border {} backdrop-blur-sm",
+                gradient, border_color
+            )
+            style=accent_style
+        >
             // Zone banner image (behind content). A dark gradient overlay keeps
             // the title/description legible over the artwork.
             {banner_url.filter(|u| !u.is_empty()).map(|url| view! {
@@ -78,8 +86,8 @@ pub fn ZoneHero(
                         <h1 class="text-2xl sm:text-3xl font-bold text-white truncate">
                             {title}
                         </h1>
-                        // Lock icon for non-home zones
-                        {(zone_id.as_str() != "home").then(|| view! {
+                        // Lock icon for restricted (non-public) zones.
+                        {(!is_open_zone).then(|| view! {
                             <svg class="w-4 h-4 text-white/50 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <rect x="3" y="11" width="18" height="11" rx="2" ry="2" stroke-linecap="round" stroke-linejoin="round"/>
                                 <path d="M7 11V7a5 5 0 0110 0v4" stroke-linecap="round" stroke-linejoin="round"/>
@@ -89,7 +97,12 @@ pub fn ZoneHero(
                     <p class="text-gray-300 text-sm sm:text-base line-clamp-2">
                         {description}
                     </p>
-                    <span class="inline-block mt-2 text-xs font-medium text-white/50 bg-white/10 rounded-full px-2.5 py-0.5">
+                    // Zone label chip tinted with the zone accent (via the
+                    // `--zone-accent` custom property set on the root container).
+                    <span
+                        class="inline-block mt-2 text-xs font-medium text-white/70 bg-white/10 rounded-full px-2.5 py-0.5"
+                        style="border:1px solid color-mix(in srgb, var(--zone-accent) 50%, transparent)"
+                    >
                         {zone_label}
                     </span>
                 </div>
