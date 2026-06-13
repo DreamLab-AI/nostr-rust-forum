@@ -703,7 +703,7 @@ pub fn OnboardingModal() -> impl IntoView {
 
                         // Keys / identity data link (existing recovery surface)
                         <div class="bg-gray-800/40 rounded-lg px-3 py-2.5 text-xs text-gray-400 border border-gray-700/40">
-                            "Per the design, you can download your keys and identity data from "
+                            "Need your backup again? You can download your recovery sheet anytime from "
                             <A
                                 href=base_href("/settings")
                                 on:click=on_keys_link

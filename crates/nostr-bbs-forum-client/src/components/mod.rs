@@ -16,6 +16,9 @@ pub mod avatar;
 pub mod badge;
 pub mod confirm_dialog;
 pub mod empty_state;
+// Inline plain-English explainer for hard terms (relay / WebID / encrypted …)
+// used across the de-jargoned onboarding surfaces.
+pub mod info_term;
 pub mod modal;
 pub mod popover_coord;
 pub mod toast;
