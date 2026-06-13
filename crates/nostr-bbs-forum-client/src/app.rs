@@ -17,7 +17,6 @@ use crate::components::notification_bell::{provide_notifications, NotificationBe
 use crate::components::onboarding_modal::provide_onboarding_prefill;
 use crate::components::profile_modal::ProfileModal;
 use crate::components::screen_reader::{provide_announcer, ScreenReaderAnnouncer};
-use crate::components::session_timeout::SessionTimeout;
 use crate::components::toast::{provide_toasts, use_toasts, ToastContainer, ToastVariant};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
@@ -885,7 +884,6 @@ fn Layout(children: Children) -> impl IntoView {
             // Global overlays and layout components
             <ToastContainer />
             <GlobalSearch />
-            <SessionTimeout />
             <MobileBottomNav />
             <BookmarksModal is_open=bookmarks_open />
             // Post-signup "Complete your profile" overlay removed (issue #15):

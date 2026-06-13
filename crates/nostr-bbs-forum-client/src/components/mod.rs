@@ -40,7 +40,6 @@ pub mod user_display;
 pub mod breadcrumb;
 pub mod mobile_bottom_nav;
 pub mod notification_bell;
-pub mod session_timeout;
 
 // -- Forum/BBS Hierarchy (Stream 5) ------------------------------------------
 pub mod category_card;
