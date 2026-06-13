@@ -90,8 +90,7 @@ fn resolve_section_channel(
         let routes = section_routes_to_zone(&c.section, category_slug, zones);
         routes
             && (matches_section_slug(&c.id, section_slug_param)
-                || (!c.section.is_empty()
-                    && matches_section_slug(&c.section, section_slug_param)))
+                || (!c.section.is_empty() && matches_section_slug(&c.section, section_slug_param)))
     }) {
         return Some(found.clone());
     }

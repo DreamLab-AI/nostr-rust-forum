@@ -138,7 +138,7 @@ mod tests {
         assert!(!is_section_slug("sgggggggggggg")); // non-hex
         assert!(!is_topic_slug("welcome"));
         assert!(!is_topic_slug("s1234567890ab")); // wrong prefix/len
-        // A topic slug is not a section slug and vice-versa.
+                                                  // A topic slug is not a section slug and vice-versa.
         assert!(!is_section_slug(&topic_slug(ROOT)));
         assert!(!is_topic_slug(&section_slug(CID)));
     }

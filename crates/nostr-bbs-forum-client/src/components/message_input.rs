@@ -313,8 +313,7 @@ pub(crate) fn MessageInput(
                 // so the local candidates remain in place if the relay is down.
                 let network = search_profiles(&q_for_fetch, MENTION_LIMIT).await;
                 if mention_seq.get_untracked() == seq_now {
-                    let merged =
-                        merge_candidates(network, local_for_merge.clone(), MENTION_LIMIT);
+                    let merged = merge_candidates(network, local_for_merge.clone(), MENTION_LIMIT);
                     mention_candidates.set(merged);
                     mention_active_idx.set(0);
                 }

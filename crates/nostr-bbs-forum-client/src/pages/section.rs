@@ -166,8 +166,7 @@ fn resolve_section(
                 .unwrap_or(false);
         routes_to_category
             && (matches_section_slug(&c.id, section_slug_param)
-                || (!c.section.is_empty()
-                    && matches_section_slug(&c.section, section_slug_param)))
+                || (!c.section.is_empty() && matches_section_slug(&c.section, section_slug_param)))
     }) {
         return Some(found.clone());
     }
@@ -225,12 +224,10 @@ pub fn SectionPage() -> impl IntoView {
             Some(ch) => ch.id,
             None => return Vec::<TopicSummary>::new(),
         };
-        store
-            .channel_messages
-            .with(|m| match m.get(&cid) {
-                Some(events) => classify_topics(&cid, events),
-                None => Vec::new(),
-            })
+        store.channel_messages.with(|m| match m.get(&cid) {
+            Some(events) => classify_topics(&cid, events),
+            None => Vec::new(),
+        })
     });
 
     // Loading while the store is fetching AND no channel resolved yet.

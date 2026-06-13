@@ -320,7 +320,11 @@ pub(crate) async fn search_profiles(query: &str, limit: usize) -> Vec<MentionCan
         Ok(v) => v,
         Err(e) => {
             web_sys::console::warn_1(
-                &format!("[mention] profile search degraded ({}); using local sources", e).into(),
+                &format!(
+                    "[mention] profile search degraded ({}); using local sources",
+                    e
+                )
+                .into(),
             );
             Vec::new()
         }
@@ -477,10 +481,7 @@ mod tests {
     fn handle_precedence() {
         assert_eq!(cand("ff", Some("Disp"), Some("nm")).handle(), "Disp");
         assert_eq!(cand("ff", None, Some("nm")).handle(), "nm");
-        assert_eq!(
-            cand("abcdef0123456789", None, None).handle(),
-            "abcdef01"
-        );
+        assert_eq!(cand("abcdef0123456789", None, None).handle(), "abcdef01");
         // Blank display_name falls through to name.
         assert_eq!(cand("ff", Some("   "), Some("nm")).handle(), "nm");
     }

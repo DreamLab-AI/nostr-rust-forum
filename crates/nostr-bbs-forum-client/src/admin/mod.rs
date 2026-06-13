@@ -555,7 +555,11 @@ impl AdminStore {
             "Deleted {}...{}{}",
             &pubkey[..8],
             &pubkey[pubkey.len().saturating_sub(4)..],
-            if delete_events { " (and their messages)" } else { "" }
+            if delete_events {
+                " (and their messages)"
+            } else {
+                ""
+            }
         )));
         self.state.is_loading.set(false);
         let _ = self.fetch_whitelist_signer(signer).await;

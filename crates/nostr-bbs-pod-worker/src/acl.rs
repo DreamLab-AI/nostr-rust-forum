@@ -1211,17 +1211,11 @@ mod tests {
         // `pods/{owner}/private/agent/.acl`.
         let kv_owner_acl = legacy_kv_owner_acl();
 
-        let delegation = build_delegation_acl(
-            OWNER,
-            DELEGATE,
-            "/private/agent/",
-            &[AccessMode::Write],
-        );
-        let delegation_bytes =
-            serde_json::to_vec(&delegation).expect("delegation serialises");
+        let delegation =
+            build_delegation_acl(OWNER, DELEGATE, "/private/agent/", &[AccessMode::Write]);
+        let delegation_bytes = serde_json::to_vec(&delegation).expect("delegation serialises");
 
-        let mut r2: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
+        let mut r2: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         // The PUT route stores the grant at the container sidecar; in
         // pod-relative probe-key terms that is `/private/agent/.acl`.
         r2.insert("/private/agent/.acl".to_string(), delegation_bytes);
@@ -1236,7 +1230,12 @@ mod tests {
         // THE FIX: the R2 delegation sidecar wins; the KV owner-only ACL did
         // NOT short-circuit and mask it. The delegate now has Write...
         assert!(
-            evaluate_access(Some(&effective), Some(DELEGATE), resource, AccessMode::Write),
+            evaluate_access(
+                Some(&effective),
+                Some(DELEGATE),
+                resource,
+                AccessMode::Write
+            ),
             "delegate must resolve Write — KV owner ACL must not mask the R2 delegation grant"
         );
         // ...and Append (Write implies Append upstream)...
@@ -1294,8 +1293,7 @@ mod tests {
         // Single-source-of-truth must not break pre-existing KV-only pods:
         // with NO R2 sidecar at any level, the KV owner ACL is the fallback.
         let kv_owner_acl = legacy_kv_owner_acl();
-        let empty_r2: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
+        let empty_r2: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         let candidates = r2_candidates_for("/private/agent/SOUL.md", &empty_r2);
         assert!(candidates.is_empty(), "no R2 sidecars in this scenario");
 
@@ -1312,8 +1310,7 @@ mod tests {
 
     #[test]
     fn no_r2_no_kv_denies_all() {
-        let empty_r2: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
+        let empty_r2: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         let candidates = r2_candidates_for("/foo", &empty_r2);
         assert!(resolve_effective_acl(candidates, None).is_none());
     }

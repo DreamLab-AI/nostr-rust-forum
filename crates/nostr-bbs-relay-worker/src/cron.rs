@@ -701,7 +701,11 @@ mod tests {
             now,
             &t,
         );
-        assert_eq!(after, TrustLevel::Newcomer, "inactive TL2 with no TL1 qual → TL0");
+        assert_eq!(
+            after,
+            TrustLevel::Newcomer,
+            "inactive TL2 with no TL1 qual → TL0"
+        );
     }
 
     #[test]
@@ -730,17 +734,7 @@ mod tests {
         let fresh = recent(now);
         // Even with collapsed metrics, a recently-active TL2 is untouched:
         // the inactivity gate is the precondition.
-        let after = decide_demotion(
-            TrustLevel::Regular,
-            0,
-            0,
-            0,
-            5,
-            fresh,
-            false,
-            now,
-            &t,
-        );
+        let after = decide_demotion(TrustLevel::Regular, 0, 0, 0, 5, fresh, false, now, &t);
         assert_eq!(after, TrustLevel::Regular, "active row never demoted");
     }
 
@@ -749,17 +743,7 @@ mod tests {
         let t = TrustThresholds::default();
         let (now, stale) = now_and_stale();
         // A TL0 row, inactive and metric-empty, cannot go below Newcomer.
-        let after = decide_demotion(
-            TrustLevel::Newcomer,
-            0,
-            0,
-            0,
-            0,
-            stale,
-            false,
-            now,
-            &t,
-        );
+        let after = decide_demotion(TrustLevel::Newcomer, 0, 0, 0, 0, stale, false, now, &t);
         assert_eq!(after, TrustLevel::Newcomer, "TL0 is the floor");
     }
 
@@ -786,18 +770,12 @@ mod tests {
     fn sweep_never_demotes_tl3() {
         let t = TrustThresholds::default();
         let (now, stale) = now_and_stale();
-        let after = decide_demotion(
+        let after = decide_demotion(TrustLevel::Trusted, 0, 0, 0, 0, stale, false, now, &t);
+        assert_eq!(
+            after,
             TrustLevel::Trusted,
-            0,
-            0,
-            0,
-            0,
-            stale,
-            false,
-            now,
-            &t,
+            "TL3 admin-granted never auto-demoted"
         );
-        assert_eq!(after, TrustLevel::Trusted, "TL3 admin-granted never auto-demoted");
     }
 
     #[test]

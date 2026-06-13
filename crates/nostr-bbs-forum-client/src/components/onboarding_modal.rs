@@ -1,46 +1,75 @@
-//! Onboarding modal — claim-username flow shown after first login.
+//! Onboarding modal — post-first-login profile capture.
 //!
-//! Displayed when the authenticated user has no claimed username yet and
-//! has not skipped the prompt within the last 7 days. The component
-//! self-gates via localStorage flags keyed on the first 8 chars of the
-//! pubkey:
+//! ## Current flow (operator simplification, 2026-06)
 //!
-//! - `nostr_bbs_username_claimed_{pubkey8}` — claim succeeded; never re-prompt
-//! - `nostr_bbs_username_skipped_until_{pubkey8}` — UNIX-ms timestamp; suppress until
+//! The modal no longer asks the user to *claim a username* / mint a
+//! `username@host` NIP-05 handle — the operator found that flow confusing.
+//! It now captures two plain fields after first login:
 //!
-//! The legacy `members:onboarded` localStorage key is still honoured so
-//! pre-existing users who already completed v1 onboarding are not nagged.
+//! - **Display name** (public) — published to the user's kind-0 profile as
+//!   both `name` and `display_name`.
+//! - **Real name** (private, admin-only) — POSTed NIP-98-authed to
+//!   `POST /api/profile/real-name` (handler `handle_set_own_real_name`). Never
+//!   published to a relay; only admins can read it.
 //!
-//! Validation is two-stage:
-//! 1. Local regex `^[a-z0-9][a-z0-9_-]{2,29}$`
-//! 2. Debounced (300 ms) `GET /api/username/check?name=` against auth-worker.
+//! A short line points the user at **Settings** to download their keys +
+//! identity data (the existing recovery / `/connect` device-onboarding surface
+//! that produces the printable identity sheet — see
+//! `components/recovery_sheet.rs`). This modal does NOT reimplement that PDF;
+//! it only links to it.
 //!
-//! On submit the client sends a NIP-98 authed `POST /api/username/claim`
-//! with body `{"username": "..."}`. On success we publish a kind-0 update
-//! containing the chosen `name` and `nip05` fields and update auth state.
+//! ## Dormant (still compiled & exported) — DO NOT remove
 //!
-//! All network errors are surfaced as a graceful "service temporarily
-//! unavailable" string so the page never crashes when the worker has not
-//! yet been deployed (Sprint v10 STREAM-N1 dependency).
+//! The username-claim / NIP-05 helpers below
+//! (`claimed_username_cached`, `cache_claimed_username`, `nip05_for`,
+//! `username_from_nip05`, `release_username`, the `ClaimedUsername` context,
+//! `use_claimed_username`, `NIP05_HOST`) are retained because other modules
+//! (`app.rs` kind-0 auto-whitelist, `pages/settings.rs`) still import and call
+//! them. They are NOT exercised by the modal UI any more, but the kind-0
+//! `nip05` probe-suppression still consumes them so a user who claimed a
+//! handle on a previous build is not re-prompted.
+//!
+//! ## Auto-open gating (preserved)
+//!
+//! The component self-gates via localStorage flags keyed on the first 8 chars
+//! of the pubkey:
+//!
+//! - `nostr_bbs_username_claimed_{pubkey8}` — a legacy/remote handle exists;
+//!   never re-prompt (still honoured for back-compat)
+//! - `nostr_bbs_username_skipped_until_{pubkey8}` — UNIX-ms timestamp; suppress
+//!   until it elapses
+//! - `nostrbbs:onboarded` — legacy v1 flag; once set the modal never
+//!   auto-pops. A successful profile submit (or "I'll do this later") sets it.
+//!
+//! All network errors are surfaced as a graceful inline error string so the
+//! page never crashes when the worker has not yet been deployed.
 
 use leptos::prelude::*;
+use leptos_router::components::A;
 use serde::Deserialize;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
+use crate::app::base_href;
 use crate::auth::nip98::fetch_with_nip98_post_signer;
 use crate::auth::use_auth;
 use crate::utils::relay_url::auth_api_base;
 
 // -- localStorage helpers -----------------------------------------------------
 
-/// Legacy v1 onboarding flag.
+/// Legacy v1 onboarding flag — also used as the "onboarding complete" marker
+/// so the modal stops auto-popping once the user has submitted (or deferred).
 const LEGACY_ONBOARDED_KEY: &str = "nostrbbs:onboarded";
-/// Suppress duration when user clicks "I'll choose later" (7 days, ms).
+/// Suppress duration when user clicks "I'll do this later" (7 days, ms).
 const SKIP_DURATION_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
-/// NIP-05 host that backs successful claims. Baked at build time from
-/// `NOSTR_BBS_NIP05_DOMAIN` (the deployment's RP domain); placeholder only for
-/// un-configured local builds.
+/// Maximum real-name length (mirrors the auth-worker `REAL_NAME_MAX_LEN` rule;
+/// the server is authoritative — this is only a friendly client-side cap).
+const REAL_NAME_MAX_LEN: usize = 100;
+/// Maximum display-name length (kind-0 `name`/`display_name`).
+const DISPLAY_NAME_MAX_LEN: usize = 50;
+/// NIP-05 host that backs legacy claimed usernames. Baked at build time from
+/// `NOSTR_BBS_NIP05_DOMAIN`; placeholder only for un-configured local builds.
+/// Retained for the dormant `nip05_for` / `username_from_nip05` helpers and the
+/// kind-0 probe — never surfaced in the modal UI any more.
 const NIP05_HOST: &str = match option_env!("NOSTR_BBS_NIP05_DOMAIN") {
     Some(d) => d,
     None => "example.test",
@@ -62,13 +91,16 @@ fn skipped_key(pubkey: &str) -> String {
     format!("nostr_bbs_username_skipped_until_{}", pubkey8(pubkey))
 }
 
-/// Has the user already claimed (locally cached)?
+/// Has the user already claimed a legacy handle (locally cached)?
 fn has_claimed_locally(pubkey: &str) -> bool {
     claimed_username_cached(pubkey).is_some()
 }
 
-/// Read the locally-cached claimed username (the claim flow stores the
+/// Read the locally-cached claimed username (the legacy claim flow stored the
 /// username string as the flag value).
+///
+/// Dormant in the modal UI but still consumed by `app.rs` (kind-0
+/// auto-whitelist) and `pages/settings.rs`.
 pub fn claimed_username_cached(pubkey: &str) -> Option<String> {
     local_storage()
         .and_then(|s| s.get_item(&claimed_key(pubkey)).ok().flatten())
@@ -76,16 +108,25 @@ pub fn claimed_username_cached(pubkey: &str) -> Option<String> {
 }
 
 /// Mark the username as claimed locally so we never re-prompt this user.
+/// Retained for the dormant `cache_claimed_username` write-through.
 fn mark_claimed_locally(pubkey: &str, username: &str) {
     if let Some(s) = local_storage() {
         let _ = s.set_item(&claimed_key(pubkey), username);
     }
 }
 
-/// Clear the local claim cache (used on release).
+/// Clear the local claim cache (used on `release_username`).
 fn clear_claimed_locally(pubkey: &str) {
     if let Some(s) = local_storage() {
         let _ = s.remove_item(&claimed_key(pubkey));
+    }
+}
+
+/// Set the device-wide "onboarding complete" marker so the modal never
+/// auto-pops again for any pubkey on this device.
+fn mark_onboarded() {
+    if let Some(s) = local_storage() {
+        let _ = s.set_item(LEGACY_ONBOARDED_KEY, "1");
     }
 }
 
@@ -108,10 +149,9 @@ fn set_skipped(pubkey: &str) {
         let until = js_sys::Date::now() + SKIP_DURATION_MS;
         let _ = s.set_item(&skipped_key(pubkey), &format!("{:.0}", until));
         // ALSO set the legacy "onboarded" flag so the modal stops auto-popping
-        // for any pubkey on this device. Pre-2026-05-17 users complained that
-        // every fresh login re-opened the modal — clicking "I'll choose later"
-        // should mean "stop pestering me", not "ask again in 7 days".
-        // Users can still claim a username from Settings any time.
+        // for any pubkey on this device. Clicking "I'll do this later" should
+        // mean "stop pestering me", not "ask again in 7 days". Users can still
+        // edit their profile from Settings any time.
         let _ = s.set_item(LEGACY_ONBOARDED_KEY, "1");
     }
 }
@@ -122,11 +162,15 @@ fn clear_skipped(pubkey: &str) {
     }
 }
 
-// -- Username validation ------------------------------------------------------
+// -- Dormant username/NIP-05 helpers (still compiled & exported) --------------
 
 /// Client-side regex check matching the auth-worker rule
 /// `^[a-z0-9][a-z0-9_-]{2,29}$`. Length 3..=30, lowercase alnum + `_` + `-`,
 /// no leading hyphen/underscore.
+///
+/// Dormant: kept for back-compat and unit-test coverage of the legacy rule;
+/// the modal no longer prompts for a username.
+#[allow(dead_code)]
 fn is_valid_format(name: &str) -> bool {
     let len = name.chars().count();
     if !(3..=30).contains(&len) {
@@ -140,66 +184,9 @@ fn is_valid_format(name: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CheckState {
-    Idle,
-    Pending,
-    Available,
-    Taken,
-    InvalidFormat,
-    Unavailable, // service temporarily unavailable
-}
-
-#[derive(Deserialize, Debug)]
-struct CheckResponse {
-    available: bool,
-    #[allow(dead_code)]
-    #[serde(default)]
-    claimed_by: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct ClaimResponse {
-    #[allow(dead_code)]
-    #[serde(default)]
-    success: Option<bool>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-async fn check_username_available(name: &str) -> Result<bool, String> {
-    let url = format!(
-        "{}/api/username/check?name={}",
-        auth_api_base(),
-        urlencoding_encode(name)
-    );
-    let win = web_sys::window().ok_or_else(|| "no window".to_string())?;
-    let init = web_sys::RequestInit::new();
-    init.set_method("GET");
-    let req = web_sys::Request::new_with_str_and_init(&url, &init)
-        .map_err(|e| format!("request build failed: {:?}", e))?;
-    let resp_val = JsFuture::from(win.fetch_with_request(&req))
-        .await
-        .map_err(|e| format!("fetch failed: {:?}", e))?;
-    let resp: web_sys::Response = resp_val
-        .dyn_into()
-        .map_err(|_| "bad response type".to_string())?;
-    if !resp.ok() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    let txt_promise = resp.text().map_err(|e| format!("text() failed: {:?}", e))?;
-    let txt_val = JsFuture::from(txt_promise)
-        .await
-        .map_err(|e| format!("await text failed: {:?}", e))?;
-    let txt = txt_val
-        .as_string()
-        .ok_or_else(|| "non-string body".to_string())?;
-    let parsed: CheckResponse =
-        serde_json::from_str(&txt).map_err(|e| format!("parse failed: {}", e))?;
-    Ok(parsed.available)
-}
-
 /// Minimal URI-encoder for query-string values (RFC 3986 unreserved set).
+/// Dormant; retained for unit-test coverage and any future query use.
+#[allow(dead_code)]
 fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -213,28 +200,42 @@ fn urlencoding_encode(s: &str) -> String {
     out
 }
 
-// -- Component ----------------------------------------------------------------
+// -- Real-name submit response ------------------------------------------------
 
-/// Optional pre-fill — used by the Settings "Change username" flow.
+/// Response of `POST /api/profile/real-name`
+/// (`{"ok": true, "real_name": ...}` on success, `{"error": "..."}` on failure).
+#[derive(Deserialize, Debug)]
+struct RealNameResponse {
+    #[allow(dead_code)]
+    #[serde(default)]
+    ok: Option<bool>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+// -- Component context types --------------------------------------------------
+
+/// Optional pre-fill — used by the Settings "Edit profile" flow.
+///
+/// `initial` carries the current display name to seed the field when the modal
+/// is force-opened from Settings.
 #[derive(Clone, Copy, Debug)]
 pub struct OnboardingPrefill {
     pub initial: RwSignal<Option<String>>,
     pub force_open: RwSignal<bool>,
 }
 
-/// Reactive holder for the user's CLAIMED username.
+/// Reactive holder for the user's legacy CLAIMED username / NIP-05 handle.
 ///
-/// This is deliberately separate from `AuthState::nickname` (the kind-0
-/// display name): saving a profile nickname must never present that
-/// nickname as a claimed username / NIP-05 handle (QA HIGH bug #5a).
-/// Populated from the localStorage claim cache, the kind-0 `nip05` field,
-/// and successful claims; cleared on release.
+/// Dormant in the modal but still provided and read by `pages/settings.rs`.
+/// Deliberately separate from `AuthState::nickname` (the kind-0 display name):
+/// a profile nickname must never be presented as a claimed handle.
 #[derive(Clone, Copy, Debug)]
 pub struct ClaimedUsername(pub RwSignal<Option<String>>);
 
 /// Provide an `OnboardingPrefill` context so other pages (Settings) can
-/// open the modal pre-filled with an existing value, plus the shared
-/// `ClaimedUsername` signal.
+/// open the modal pre-filled, plus the shared (dormant) `ClaimedUsername`
+/// signal.
 pub fn provide_onboarding_prefill() {
     provide_context(OnboardingPrefill {
         initial: RwSignal::new(None),
@@ -244,22 +245,25 @@ pub fn provide_onboarding_prefill() {
 }
 
 /// Read the shared claimed-username signal (None outside the app tree).
+/// Dormant in the modal; consumed by Settings.
 pub fn use_claimed_username() -> Option<ClaimedUsername> {
     use_context::<ClaimedUsername>()
 }
 
 /// Write-through to the localStorage claim cache (no context access, safe
-/// to call from relay callbacks).
+/// to call from relay callbacks). Dormant in the modal; called by `app.rs`.
 pub fn cache_claimed_username(pubkey: &str, username: &str) {
     mark_claimed_locally(pubkey, username);
 }
 
 /// Format the NIP-05 identifier for a claimed username.
+/// Dormant in the modal; consumed by `app.rs` kind-0 auto-whitelist.
 pub fn nip05_for(username: &str) -> String {
     format!("{}@{}", username, NIP05_HOST)
 }
 
 /// Extract `name` from a kind-0 `nip05` value when it belongs to our host.
+/// Dormant in the modal UI; still used by the kind-0 probe below and Settings.
 pub fn username_from_nip05(nip05: &str) -> Option<String> {
     nip05
         .strip_suffix(&format!("@{}", NIP05_HOST))
@@ -267,7 +271,8 @@ pub fn username_from_nip05(nip05: &str) -> Option<String> {
         .map(|n| n.to_string())
 }
 
-/// Open the onboarding modal in "change username" mode pre-filled with `current`.
+/// Open the onboarding modal pre-filled with `current` (the existing display
+/// name). Invoked by the Settings "Edit profile" entry.
 pub fn open_onboarding_with_prefill(current: Option<String>) {
     if let Some(prefill) = use_context::<OnboardingPrefill>() {
         prefill.initial.set(current);
@@ -278,6 +283,11 @@ pub fn open_onboarding_with_prefill(current: Option<String>) {
 /// Probe the relay for the user's own kind-0 and return the username from
 /// its `nip05` field (our host only). Waits up to 2.5s; the REQ is queued
 /// by the relay client if the socket is still connecting.
+///
+/// Retained so a user who claimed a handle on a *previous* build (and so has a
+/// kind-0 `nip05` but no local cache entry on this device) is recognised and
+/// not re-prompted — the auto-open gate suppresses the modal when a remote
+/// handle exists.
 async fn probe_remote_claim(relay: &crate::relay::RelayConnection, pubkey: &str) -> Option<String> {
     use std::rc::Rc;
 
@@ -314,19 +324,18 @@ async fn probe_remote_claim(relay: &crate::relay::RelayConnection, pubkey: &str)
     found.get_untracked()
 }
 
+// -- Component ----------------------------------------------------------------
+
 #[component]
 pub fn OnboardingModal() -> impl IntoView {
     let auth = use_auth();
     let prefill = use_context::<OnboardingPrefill>();
 
     let is_open = RwSignal::new(false);
-    let username = RwSignal::new(String::new());
-    let check_state = RwSignal::new(CheckState::Idle);
+    let display_name = RwSignal::new(String::new());
+    let real_name = RwSignal::new(String::new());
     let submit_error = RwSignal::new(Option::<String>::None);
     let is_submitting = RwSignal::new(false);
-    // Generation counter to invalidate in-flight debounced checks when the
-    // user keeps typing.
-    let check_seq = RwSignal::new(0u32);
 
     // Pubkey for which the remote claim probe has already run this session.
     let probed_pubkey: RwSignal<Option<String>> = RwSignal::new(None);
@@ -339,14 +348,18 @@ pub fn OnboardingModal() -> impl IntoView {
             return;
         }
 
-        // Force-opened from Settings ("Change username")
+        // Force-opened from Settings ("Edit profile"): seed the display-name
+        // field from the prefill (or the current kind-0 nickname).
         if let Some(p) = prefill {
             if p.force_open.get() {
-                if let Some(initial) = p.initial.get_untracked() {
-                    username.set(initial);
-                } else {
-                    username.set(String::new());
-                }
+                let seed = p
+                    .initial
+                    .get_untracked()
+                    .or_else(|| state.nickname.clone())
+                    .unwrap_or_default();
+                display_name.set(seed);
+                real_name.set(String::new());
+                submit_error.set(None);
                 is_open.set(true);
                 return;
             }
@@ -357,8 +370,9 @@ pub fn OnboardingModal() -> impl IntoView {
             None => return,
         };
 
-        // Hydrate the shared ClaimedUsername signal from the local cache so
-        // Settings shows the claimed handle even before any network access.
+        // Hydrate the shared (dormant) ClaimedUsername signal from the local
+        // cache so Settings shows the legacy handle even before any network
+        // access.
         let claimed_sig = use_claimed_username();
         if let Some(claimed) = claimed_sig {
             if claimed.0.get_untracked().is_none() {
@@ -368,29 +382,38 @@ pub fn OnboardingModal() -> impl IntoView {
             }
         }
 
-        // Auto-open only when no username claim exists AND not skipping.
+        // Auto-open only when no legacy claim exists AND not skipping.
         if has_claimed_locally(&pubkey) {
             return;
         }
         if is_skipping(&pubkey) {
             return;
         }
-        // Honour legacy v1 flag — pre-existing onboarded users are not pestered.
+        // Honour the "onboarded" marker — a user who has already completed
+        // (or deferred) onboarding is not pestered.
         if let Some(s) = local_storage() {
             if s.get_item(LEGACY_ONBOARDED_KEY).ok().flatten().is_some() {
                 return;
             }
         }
 
-        // The local cache is per-device: a user who claimed on another
-        // device (or in a fresh browser context) has no cache entry. Before
+        // The local cache is per-device: a user who claimed on another device
+        // (or in a fresh browser context) has no cache entry. Before
         // prompting, probe the user's own kind-0 for a `nip05` minted by a
-        // previous claim — if one exists, record it and suppress the modal
-        // (QA HIGH bug #5b: carol2 was claimed but the modal re-appeared).
+        // previous-build claim — if one exists, record it and suppress the
+        // modal (a previously-claimed user must not be re-prompted).
         if probed_pubkey.get_untracked().as_deref() == Some(pubkey.as_str()) {
             return;
         }
         probed_pubkey.set(Some(pubkey.clone()));
+
+        // Seed the display-name field from any existing kind-0 nickname so a
+        // returning user sees their current name rather than a blank field.
+        if display_name.get_untracked().is_empty() {
+            if let Some(nick) = state.nickname.clone() {
+                display_name.set(nick);
+            }
+        }
 
         let Some(relay) = use_context::<crate::relay::RelayConnection>() else {
             is_open.set(true);
@@ -400,6 +423,7 @@ pub fn OnboardingModal() -> impl IntoView {
             let remote = probe_remote_claim(&relay, &pubkey).await;
             match remote {
                 Some(name) => {
+                    // A legacy handle exists remotely — record it and suppress.
                     mark_claimed_locally(&pubkey, &name);
                     if let Some(claimed) = claimed_sig {
                         claimed.0.set(Some(name));
@@ -407,7 +431,7 @@ pub fn OnboardingModal() -> impl IntoView {
                     is_open.set(false);
                 }
                 None => {
-                    // Re-check the gates — the user may have claimed or
+                    // Re-check the gates — the user may have onboarded or
                     // skipped while the probe was in flight.
                     if !has_claimed_locally(&pubkey) && !is_skipping(&pubkey) {
                         is_open.set(true);
@@ -417,86 +441,32 @@ pub fn OnboardingModal() -> impl IntoView {
         });
     });
 
-    // Debounced live validation.
-    let debounce_handle: RwSignal<Option<i32>> = RwSignal::new(None);
-    Effect::new(move |_| {
-        let value = username.get();
-        // Cancel any pending check.
-        if let Some(h) = debounce_handle.get_untracked() {
-            if let Some(w) = web_sys::window() {
-                w.clear_timeout_with_handle(h);
-            }
-            debounce_handle.set(None);
-        }
-
-        if value.trim().is_empty() {
-            check_state.set(CheckState::Idle);
-            return;
-        }
-        if !is_valid_format(value.trim()) {
-            check_state.set(CheckState::InvalidFormat);
-            return;
-        }
-
-        check_state.set(CheckState::Pending);
-        let seq_now = check_seq.get_untracked().wrapping_add(1);
-        check_seq.set(seq_now);
-
-        let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-            // Schedule the actual fetch.
-            let value = username.get_untracked().trim().to_string();
-            if value.is_empty() {
-                check_state.set(CheckState::Idle);
-                return;
-            }
-            if !is_valid_format(&value) {
-                check_state.set(CheckState::InvalidFormat);
-                return;
-            }
-            spawn_local(async move {
-                match check_username_available(&value).await {
-                    Ok(true) => {
-                        if check_seq.get_untracked() == seq_now {
-                            check_state.set(CheckState::Available);
-                        }
-                    }
-                    Ok(false) => {
-                        if check_seq.get_untracked() == seq_now {
-                            check_state.set(CheckState::Taken);
-                        }
-                    }
-                    Err(e) => {
-                        web_sys::console::warn_1(
-                            &format!("[onboarding] username check failed: {}", e).into(),
-                        );
-                        if check_seq.get_untracked() == seq_now {
-                            check_state.set(CheckState::Unavailable);
-                        }
-                    }
-                }
-            });
-        }) as Box<dyn FnMut()>);
-
-        if let Some(w) = web_sys::window() {
-            if let Ok(h) = w.set_timeout_with_callback_and_timeout_and_arguments_0(
-                cb.as_ref().unchecked_ref(),
-                300,
-            ) {
-                debounce_handle.set(Some(h));
-            }
-        }
-        cb.forget();
-    });
-
-    // Submit handler.
+    // Submit handler: publish kind-0 (display name) + POST real name (private).
     let on_submit = move |_: web_sys::MouseEvent| {
-        let name = username.get_untracked().trim().to_string();
-        if !is_valid_format(&name) {
-            submit_error.set(Some(
-                "Please enter a valid username (3-30 chars, a-z, 0-9, _, -, no leading -/_)".into(),
-            ));
+        let display = display_name.get_untracked().trim().to_string();
+        let real = real_name.get_untracked().trim().to_string();
+
+        if display.is_empty() {
+            submit_error.set(Some("Please enter a display name.".into()));
             return;
         }
+        if display.chars().count() > DISPLAY_NAME_MAX_LEN {
+            submit_error.set(Some(format!(
+                "Display name is too long (max {DISPLAY_NAME_MAX_LEN} characters)."
+            )));
+            return;
+        }
+        if real.is_empty() {
+            submit_error.set(Some("Please enter your real name.".into()));
+            return;
+        }
+        if real.chars().count() > REAL_NAME_MAX_LEN {
+            submit_error.set(Some(format!(
+                "Real name is too long (max {REAL_NAME_MAX_LEN} characters)."
+            )));
+            return;
+        }
+
         let pubkey = match auth.pubkey().get_untracked() {
             Some(pk) => pk,
             None => {
@@ -504,8 +474,8 @@ pub fn OnboardingModal() -> impl IntoView {
                 return;
             }
         };
-        // Sprint v11: route signing through the Signer trait so NIP-07 and
-        // future hardware-bunker backends work alongside PRF/local keys.
+        // Route signing through the Signer trait so NIP-07 and future
+        // hardware-bunker backends work alongside PRF/local keys.
         let signer = match auth.get_signer() {
             Some(s) => s,
             None => {
@@ -517,21 +487,21 @@ pub fn OnboardingModal() -> impl IntoView {
         is_submitting.set(true);
         submit_error.set(None);
 
-        let url = format!("{}/api/username/claim", auth_api_base());
-        let body = serde_json::json!({ "username": name }).to_string();
+        let url = format!("{}/api/profile/real-name", auth_api_base());
+        let body = serde_json::json!({ "real_name": real }).to_string();
         let pubkey_for_meta = pubkey.clone();
-        let name_for_meta = name.clone();
-        let claimed_sig = use_claimed_username();
+        let display_for_meta = display.clone();
 
         spawn_local(async move {
-            let result = fetch_with_nip98_post_signer(&url, &body, signer.as_ref()).await;
+            // 1. POST the private real name (NIP-98 authed, admin-only visibility).
+            let real_name_result = fetch_with_nip98_post_signer(&url, &body, signer.as_ref()).await;
 
-            match result {
+            match real_name_result {
                 Ok(text) => {
-                    // Optimistically treat any 2xx body as success; surface error string only if present.
-                    let parsed: ClaimResponse =
-                        serde_json::from_str(&text).unwrap_or(ClaimResponse {
-                            success: Some(true),
+                    // Treat any 2xx body as success; surface an error string only if present.
+                    let parsed: RealNameResponse =
+                        serde_json::from_str(&text).unwrap_or(RealNameResponse {
+                            ok: Some(true),
                             error: None,
                         });
                     if let Some(err) = parsed.error.filter(|e| !e.is_empty()) {
@@ -539,80 +509,72 @@ pub fn OnboardingModal() -> impl IntoView {
                         is_submitting.set(false);
                         return;
                     }
-
-                    // Persist + update the claimed-username state. The claim
-                    // sets the HANDLE, deliberately decoupled from the
-                    // kind-0 display name (QA HIGH bug #5a) — an existing
-                    // nickname/avatar is preserved; the nickname defaults to
-                    // the username only when none exists yet.
-                    mark_claimed_locally(&pubkey_for_meta, &name_for_meta);
-                    clear_skipped(&pubkey_for_meta);
-                    if let Some(claimed) = claimed_sig {
-                        claimed.0.set(Some(name_for_meta.clone()));
-                    }
-                    let current = auth.get();
-                    let display_name = current
-                        .nickname
-                        .clone()
-                        .filter(|n| !n.trim().is_empty())
-                        .unwrap_or_else(|| name_for_meta.clone());
-                    auth.set_profile(Some(display_name.clone()), current.avatar.clone());
-
-                    // Publish a kind-0 update with name + nip05 fields so other clients
-                    // see the new identity. Best-effort; failures are logged.
-                    let nip05 = format!("{}@{}", name_for_meta, NIP05_HOST);
-                    let meta = serde_json::json!({
-                        "name": name_for_meta,
-                        "display_name": display_name,
-                        "nip05": nip05,
-                    })
-                    .to_string();
-                    let now = (js_sys::Date::now() / 1000.0) as u64;
-                    let unsigned = nostr_bbs_core::UnsignedEvent {
-                        pubkey: pubkey_for_meta.clone(),
-                        created_at: now,
-                        kind: 0,
-                        tags: vec![],
-                        content: meta,
-                    };
-                    // Use async signing so the kind-0 publish works for both
-                    // PRF/local-key and NIP-07 sessions.
-                    if let Ok(signed) = auth.sign_event_async(unsigned).await {
-                        if let Some(relay) = use_context::<crate::relay::RelayConnection>() {
-                            relay.publish(&signed);
-                        }
-                    }
-
-                    is_submitting.set(false);
-                    is_open.set(false);
-                    if let Some(p) = prefill {
-                        p.force_open.set(false);
-                    }
                 }
                 Err(e) => {
                     let msg = e.to_string();
                     web_sys::console::warn_1(
-                        &format!("[onboarding] username claim failed: {}", msg).into(),
+                        &format!("[onboarding] real-name submit failed: {}", msg).into(),
                     );
-                    // Distinguish "service unavailable" from "already taken" / validation.
-                    let user_msg = if msg.contains("HTTP 409") {
-                        "That username has just been taken. Please pick another.".to_string()
-                    } else if msg.contains("HTTP 400") {
-                        "Invalid username format.".to_string()
+                    let user_msg = if msg.contains("HTTP 400") {
+                        "That name could not be saved (invalid). Please try again.".to_string()
                     } else if msg.contains("HTTP") {
                         format!("Server rejected the request ({})", msg)
                     } else {
-                        "Username service is temporarily unavailable. Please try again later."
+                        "Profile service is temporarily unavailable. Please try again later."
                             .to_string()
                     };
                     submit_error.set(Some(user_msg));
                     is_submitting.set(false);
+                    return;
                 }
+            }
+
+            // 2. Publish the public display name to the kind-0 profile.
+            //    The kind-0 is replaceable; we set both `name` and
+            //    `display_name` so other clients render the chosen name. We do
+            //    NOT emit a `nip05` field — usernames/handles are no longer
+            //    minted here. Avatar is preserved.
+            let current = auth.get();
+            auth.set_profile(Some(display_for_meta.clone()), current.avatar.clone());
+
+            let meta = serde_json::json!({
+                "name": display_for_meta,
+                "display_name": display_for_meta,
+            })
+            .to_string();
+            let now = (js_sys::Date::now() / 1000.0) as u64;
+            let unsigned = nostr_bbs_core::UnsignedEvent {
+                pubkey: pubkey_for_meta.clone(),
+                created_at: now,
+                kind: 0,
+                tags: vec![],
+                content: meta,
+            };
+            // Async signing so the kind-0 publish works for PRF/local-key and
+            // NIP-07 sessions alike. Best-effort; failures are logged.
+            if let Ok(signed) = auth.sign_event_async(unsigned).await {
+                if let Some(relay) = use_context::<crate::relay::RelayConnection>() {
+                    relay.publish(&signed);
+                }
+            } else {
+                web_sys::console::warn_1(
+                    &"[onboarding] kind-0 display-name publish failed to sign".into(),
+                );
+            }
+
+            // 3. Mark onboarding complete so the modal never re-prompts.
+            clear_skipped(&pubkey_for_meta);
+            mark_onboarded();
+
+            is_submitting.set(false);
+            is_open.set(false);
+            if let Some(p) = prefill {
+                p.force_open.set(false);
             }
         });
     };
 
-    // Skip / close handlers.
+    // "I'll do this later" — suppress (and set the onboarded marker).
     let on_skip = move |_: web_sys::MouseEvent| {
         if let Some(pk) = auth.pubkey().get_untracked() {
             set_skipped(&pk);
@@ -623,8 +585,8 @@ pub fn OnboardingModal() -> impl IntoView {
         }
     };
 
-    // Allow close from Settings ("Change username" cancel) — but never auto-close
-    // if this is a forced first-login prompt without a nickname.
+    // Close (X). From Settings ("Edit profile" cancel) just close; from the
+    // auto-prompt path, treat the X as "skip".
     let on_close = move |_: web_sys::MouseEvent| {
         if let Some(p) = prefill {
             if p.force_open.get_untracked() {
@@ -633,64 +595,26 @@ pub fn OnboardingModal() -> impl IntoView {
                 return;
             }
         }
-        // For the auto-prompt path, treat the X as "skip for 7 days".
         if let Some(pk) = auth.pubkey().get_untracked() {
             set_skipped(&pk);
         }
         is_open.set(false);
     };
 
-    // Status indicator below the input.
-    let status_view = move || {
-        match check_state.get() {
-        CheckState::Idle => view! {
-            <p class="text-xs text-gray-500">"3-30 chars: a-z, 0-9, _ or -"</p>
+    // The "download your keys + identity data" link closes the modal first so
+    // the route navigation (to Settings, which hosts the recovery / identity
+    // surface) is not obscured by the overlay.
+    let on_keys_link = move |_: web_sys::MouseEvent| {
+        is_open.set(false);
+        if let Some(p) = prefill {
+            p.force_open.set(false);
         }
-        .into_any(),
-        CheckState::Pending => view! {
-            <p class="text-xs text-gray-400">"Checking availability\u{2026}"</p>
-        }
-        .into_any(),
-        CheckState::Available => view! {
-            <p class="text-xs text-emerald-400">"\u{2713} available"</p>
-        }
-        .into_any(),
-        CheckState::Taken => view! {
-            <p class="text-xs text-red-400">"\u{2717} already taken"</p>
-        }
-        .into_any(),
-        CheckState::InvalidFormat => view! {
-            <p class="text-xs text-red-400">
-                "\u{2717} invalid format \u{2014} 3-30 chars: a-z, 0-9, _ or -, must start with letter or digit"
-            </p>
-        }
-        .into_any(),
-        CheckState::Unavailable => view! {
-            <p class="text-xs text-amber-400">
-                "Username service is temporarily unavailable. You may submit anyway \u{2014} the server will validate."
-            </p>
-        }
-        .into_any(),
-    }
     };
 
     let can_submit = move || {
         !is_submitting.get()
-            && matches!(
-                check_state.get(),
-                CheckState::Available | CheckState::Unavailable
-            )
-            && is_valid_format(username.get().trim())
-    };
-
-    let nip05_preview = move || {
-        let name = username.get();
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            String::new()
-        } else {
-            format!("{}@{}", trimmed, NIP05_HOST)
-        }
+            && !display_name.get().trim().is_empty()
+            && !real_name.get().trim().is_empty()
     };
 
     view! {
@@ -725,43 +649,69 @@ pub fn OnboardingModal() -> impl IntoView {
                             {handle_icon()}
                         </div>
                         <h2 class="text-2xl font-bold bg-gradient-to-r from-amber-400 via-orange-400 to-rose-400 bg-clip-text text-transparent">
-                            "Pick your username"
+                            "Complete your profile"
                         </h2>
                         <p class="text-gray-400 text-sm mt-2">
-                            "Choose a unique handle so others can mention and find you. You can change it later in settings."
+                            "Tell us how to show your name. You can change this later in settings."
                         </p>
                     </div>
 
-                    <div class="space-y-3">
+                    <div class="space-y-4">
+                        // Display name (public)
                         <div class="space-y-1">
-                            <label for="onboard-username" class="block text-sm font-medium text-gray-300">
-                                "Username"
+                            <label for="onboard-display-name" class="block text-sm font-medium text-gray-300">
+                                "Display name "
+                                <span class="text-gray-500 font-normal">"(public)"</span>
                             </label>
-                            <div class="flex items-center bg-gray-800 border border-gray-600 focus-within:border-amber-500 focus-within:ring-1 focus-within:ring-amber-500 rounded-xl overflow-hidden">
-                                <span class="pl-3 text-gray-500 select-none">"@"</span>
-                                <input
-                                    id="onboard-username"
-                                    type="text"
-                                    placeholder="alice"
-                                    autocomplete="off"
-                                    spellcheck="false"
-                                    on:input=move |ev| {
-                                        let v = event_target_value(&ev).to_lowercase();
-                                        username.set(v);
-                                    }
-                                    prop:value=move || username.get()
-                                    maxlength="30"
-                                    class="flex-1 bg-transparent text-white placeholder-gray-500 px-2 py-3 text-sm focus:outline-none"
-                                />
-                            </div>
-                            {status_view}
+                            <input
+                                id="onboard-display-name"
+                                type="text"
+                                placeholder="e.g. Alice Cooper"
+                                autocomplete="name"
+                                spellcheck="false"
+                                on:input=move |ev| display_name.set(event_target_value(&ev))
+                                prop:value=move || display_name.get()
+                                maxlength="50"
+                                class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3 py-3 text-sm text-white placeholder-gray-500 focus:outline-none"
+                            />
+                            <p class="text-xs text-gray-500">
+                                "Shown next to your posts and mentions."
+                            </p>
                         </div>
 
-                        <div class="bg-gray-800/40 rounded-lg px-3 py-2 text-xs text-gray-400 border border-gray-700/40">
-                            "NIP-05 handle: "
-                            <code class="text-amber-300 font-mono">
-                                {move || nip05_preview()}
-                            </code>
+                        // Real name (private)
+                        <div class="space-y-1">
+                            <label for="onboard-real-name" class="block text-sm font-medium text-gray-300">
+                                "Real name "
+                                <span class="text-gray-500 font-normal">"(private)"</span>
+                            </label>
+                            <input
+                                id="onboard-real-name"
+                                type="text"
+                                placeholder="Your full name"
+                                autocomplete="off"
+                                spellcheck="false"
+                                on:input=move |ev| real_name.set(event_target_value(&ev))
+                                prop:value=move || real_name.get()
+                                maxlength="100"
+                                class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3 py-3 text-sm text-white placeholder-gray-500 focus:outline-none"
+                            />
+                            <p class="text-xs text-gray-500">
+                                "Visible to administrators only \u{2014} never published publicly."
+                            </p>
+                        </div>
+
+                        // Keys / identity data link (existing recovery surface)
+                        <div class="bg-gray-800/40 rounded-lg px-3 py-2.5 text-xs text-gray-400 border border-gray-700/40">
+                            "Per the design, you can download your keys and identity data from "
+                            <A
+                                href=base_href("/settings")
+                                on:click=on_keys_link
+                                attr:class="text-amber-300 hover:text-amber-200 underline underline-offset-2"
+                            >
+                                "Settings"
+                            </A>
+                            "."
                         </div>
 
                         {move || submit_error.get().map(|err| view! {
@@ -777,14 +727,14 @@ pub fn OnboardingModal() -> impl IntoView {
                             disabled=move || is_submitting.get()
                             class="flex-1 border border-gray-600 hover:border-gray-500 text-gray-300 py-3 rounded-xl transition-colors text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
                         >
-                            "I\u{2019}ll choose later"
+                            "I\u{2019}ll do this later"
                         </button>
                         <button
                             on:click=on_submit
                             disabled=move || !can_submit()
                             class="flex-1 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 disabled:from-gray-600 disabled:to-gray-700 disabled:cursor-not-allowed text-gray-900 font-semibold py-3 rounded-xl transition-all duration-200 shadow-lg shadow-amber-500/25 text-sm"
                         >
-                            {move || if is_submitting.get() { "Claiming\u{2026}" } else { "Claim username" }}
+                            {move || if is_submitting.get() { "Saving\u{2026}" } else { "Save profile" }}
                         </button>
                     </div>
                 </div>
@@ -795,18 +745,18 @@ pub fn OnboardingModal() -> impl IntoView {
 
 /// Public helper used by the Settings "Release username" button.
 ///
-/// Sends a NIP-98 authed `POST /api/username/release` with no body. On
-/// success the local claim flag is cleared and the auth-state nickname is
-/// reset to `None`. Errors are surfaced via the `Result`.
+/// Dormant relative to the onboarding modal but still called by
+/// `pages/settings.rs`. Sends a NIP-98 authed `POST /api/username/release`
+/// with no body. On success the local claim flag is cleared and the shared
+/// `ClaimedUsername` signal is reset. Errors are surfaced via the `Result`.
 pub async fn release_username() -> Result<(), String> {
     let auth = use_auth();
     let pubkey = auth
         .pubkey()
         .get_untracked()
         .ok_or_else(|| "Not authenticated".to_string())?;
-    // Sprint v11: route through the Signer trait so NIP-07 / hardware-bunker
-    // backends can release usernames. PRF-derived keys still work transparently
-    // because PrfSigner is the active signer for those sessions.
+    // Route through the Signer trait so NIP-07 / hardware-bunker backends can
+    // release. PRF-derived keys still work transparently.
     let signer = auth
         .get_signer()
         .ok_or_else(|| "No signer available — please sign in again.".to_string())?;
@@ -929,5 +879,18 @@ mod tests {
             skipped_key("0123456789abcdef"),
             "nostr_bbs_username_skipped_until_01234567"
         );
+    }
+
+    #[test]
+    fn nip05_for_uses_host() {
+        // Dormant helper still produces a host-qualified handle.
+        assert_eq!(nip05_for("alice"), format!("alice@{}", NIP05_HOST));
+    }
+
+    #[test]
+    fn username_from_nip05_roundtrip() {
+        let n = nip05_for("bob");
+        assert_eq!(username_from_nip05(&n), Some("bob".to_string()));
+        assert_eq!(username_from_nip05("carol@other.example"), None);
     }
 }

@@ -179,7 +179,8 @@ pub async fn handle_delete_user(mut req: Request, env: &Env) -> Result<Response>
     // Safety: never delete the last admin. If the target is an admin and is the
     // only one left, refuse.
     let target_is_admin = {
-        let stmt = db.prepare("SELECT COUNT(*) as count FROM whitelist WHERE pubkey = ?1 AND is_admin = 1");
+        let stmt = db
+            .prepare("SELECT COUNT(*) as count FROM whitelist WHERE pubkey = ?1 AND is_admin = 1");
         let bound = stmt.bind(&[js_str(&target)])?;
         matches!(bound.first::<CountRow>(None).await, Ok(Some(r)) if r.count > 0.0)
     };
@@ -546,11 +547,23 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
 
     let old_pk = match body.old_pubkey {
         Some(ref pk) if valid_pubkey(pk) => pk.clone(),
-        _ => return json_response(env, &json!({ "error": "Invalid or missing old_pubkey" }), 400),
+        _ => {
+            return json_response(
+                env,
+                &json!({ "error": "Invalid or missing old_pubkey" }),
+                400,
+            )
+        }
     };
     let new_pk = match body.new_pubkey {
         Some(ref pk) if valid_pubkey(pk) => pk.clone(),
-        _ => return json_response(env, &json!({ "error": "Invalid or missing new_pubkey" }), 400),
+        _ => {
+            return json_response(
+                env,
+                &json!({ "error": "Invalid or missing new_pubkey" }),
+                400,
+            )
+        }
     };
     if old_pk == new_pk {
         return json_response(

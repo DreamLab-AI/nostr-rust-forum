@@ -310,7 +310,14 @@ fn topic_title(content: &str) -> String {
 mod tests {
     use super::*;
 
-    fn ev(id: &str, pk: &str, content: &str, ts: u64, kind: u64, tags: Vec<Vec<&str>>) -> NostrEvent {
+    fn ev(
+        id: &str,
+        pk: &str,
+        content: &str,
+        ts: u64,
+        kind: u64,
+        tags: Vec<Vec<&str>>,
+    ) -> NostrEvent {
         NostrEvent {
             id: id.to_string(),
             pubkey: pk.to_string(),
@@ -334,8 +341,22 @@ mod tests {
 
         let events = vec![
             // Two topic roots anchored to the channel.
-            ev(t1, "alice", "First topic", 100, 42, vec![vec!["e", cid, "", "root"]]),
-            ev(t2, "bob", "Second topic", 110, 42, vec![vec!["e", cid, "", "root"]]),
+            ev(
+                t1,
+                "alice",
+                "First topic",
+                100,
+                42,
+                vec![vec!["e", cid, "", "root"]],
+            ),
+            ev(
+                t2,
+                "bob",
+                "Second topic",
+                110,
+                42,
+                vec![vec!["e", cid, "", "root"]],
+            ),
             // A reply to t1 in the EXACT shape ThreadPage emits: channel-anchored
             // root tag PLUS a "reply"-marked tag at the topic root. Must NOT be
             // mistaken for a topic root.
@@ -352,13 +373,24 @@ mod tests {
                 ],
             ),
             // A NIP-22 reply to t2.
-            ev("c1", "dave", "comment", 150, 1111, vec![vec!["E", t2, "", "root"], vec!["e", t2]]),
+            ev(
+                "c1",
+                "dave",
+                "comment",
+                150,
+                1111,
+                vec![vec!["E", t2, "", "root"], vec!["e", t2]],
+            ),
             // A legacy reply whose only e-tag is the parent root id (no marker).
             ev("c2", "erin", "legacy reply", 120, 42, vec![vec!["e", t1]]),
         ];
 
         let topics = classify_topics(cid, &events);
-        assert_eq!(topics.len(), 2, "exactly two topic roots (replies excluded)");
+        assert_eq!(
+            topics.len(),
+            2,
+            "exactly two topic roots (replies excluded)"
+        );
 
         // Sorted by last activity desc: t1 (last 200) before t2 (last 150).
         assert_eq!(topics[0].id, t1);
