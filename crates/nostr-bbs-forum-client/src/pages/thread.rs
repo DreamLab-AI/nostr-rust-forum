@@ -309,6 +309,17 @@ pub fn ThreadPage() -> impl IntoView {
                     }
                 }
             }
+            // Also resolve @handles typed directly into the reply (not picked
+            // from the dropdown) so e.g. @junkiejarvis still gets a ["p", pubkey]
+            // tag and the relay routes it to the agent's #p-filtered subscription.
+            for hex in crate::components::mention_autocomplete::resolve_content_mentions(&content) {
+                if !tags
+                    .iter()
+                    .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == hex)
+                {
+                    tags.push(vec!["p".to_string(), hex]);
+                }
+            }
             let unsigned = nostr_bbs_core::UnsignedEvent {
                 pubkey,
                 created_at: now,
