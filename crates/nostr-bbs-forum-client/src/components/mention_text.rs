@@ -57,9 +57,21 @@ pub(crate) fn MentionText(
             {segments.into_iter().map(|seg| {
                 match seg {
                     Segment::Text(text) => {
+                        // sanitize_markdown_inline trims leading/trailing
+                        // whitespace, which would glue a mention chip to the
+                        // adjacent text (e.g. "@bobhello" / "please@bob"). Re-emit
+                        // a single boundary space wherever the raw segment had one
+                        // so spacing around @mentions survives rendering.
+                        let lead = text.starts_with(|c: char| c.is_whitespace());
+                        let trail = text.ends_with(|c: char| c.is_whitespace());
                         let html = render_markdown_inline(&text);
+                        let has_body = !html.trim().is_empty();
                         view! {
-                            <span inner_html=html />
+                            <span>
+                                {lead.then_some(" ")}
+                                <span inner_html=html />
+                                {(trail && has_body).then_some(" ")}
+                            </span>
                         }.into_any()
                     }
                     Segment::PubkeyMention(pubkey) => {

@@ -62,14 +62,65 @@ enum Phase {
     Backup,
 }
 
-/// Store the caller's OPTIONAL real name (`POST {AUTH_API}/api/profile/real-name`,
-/// NIP-98 authed). The worker writes it to D1 keyed on the authed pubkey — it is
-/// admin-only and is NEVER published to kind-0 / the relay. Best-effort: a
-/// failure here is non-fatal (the user can set it later from Settings).
-async fn set_real_name(real_name: &str, auth: crate::auth::AuthStore) -> Result<(), String> {
-    let url = format!("{}/api/profile/real-name", AUTH_API);
+/// Slugify a display name into a candidate NIP-05 handle, with a short pubkey
+/// suffix so it is unique WITHOUT an availability round-trip and always valid
+/// (`^[a-z0-9][a-z0-9_-]{2,29}$`). The user never types this — it is derived so
+/// every new account still gets a federated handle AND, crucially, an admin
+/// registration record: the auth-worker keys the admin registrations / auth
+/// queue and the admin-only real name off the `username_reservations` row that
+/// the claim creates. (A real-name-only POST cannot create that row — the table
+/// requires a username PK — which is why a username-less signup left new joiners
+/// invisible to the admin queue and silently dropped their real name.)
+fn derive_username(display: &str, pubkey: &str) -> String {
+    let mut slug: String = display
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    // First char must be [a-z0-9]; trim any leading separators.
+    while slug
+        .chars()
+        .next()
+        .map(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit()))
+        .unwrap_or(false)
+    {
+        slug.remove(0);
+    }
+    if slug.is_empty() {
+        slug = "user".to_string();
+    }
+    slug.truncate(22);
+    let suffix: String = pubkey.chars().take(6).collect();
+    let suffix = if suffix.len() == 6 {
+        suffix
+    } else {
+        "000000".to_string()
+    };
+    format!("{slug}-{suffix}")
+}
+
+/// Claim the (auto-derived) NIP-05 handle for the caller, attaching the OPTIONAL
+/// admin-only real name. `POST {AUTH_API}/api/username/claim` (NIP-98). The claim
+/// creates the `username_reservations` row the admin registrations / auth queue
+/// reads AND stores the admin-only real name (which is NEVER published to kind-0
+/// / the relay). Best-effort: a failure is non-fatal (logged, signup continues).
+async fn claim_username(
+    name: &str,
+    real_name: Option<&str>,
+    auth: crate::auth::AuthStore,
+) -> Result<(), String> {
+    let url = format!("{}/api/username/claim", AUTH_API);
     let signer = auth.get_signer().ok_or("no signer")?;
-    let body = serde_json::json!({ "real_name": real_name.trim() }).to_string();
+    let body = match real_name {
+        Some(r) if !r.trim().is_empty() => {
+            serde_json::json!({ "username": name, "real_name": r.trim() }).to_string()
+        }
+        _ => serde_json::json!({ "username": name }).to_string(),
+    };
     let token = crate::auth::nip98::create_nip98_token_with_signer(
         &*signer,
         &url,
@@ -99,7 +150,7 @@ async fn set_real_name(real_name: &str, auth: crate::auth::AuthStore) -> Result<
         .dyn_into()
         .map_err(|_| "bad response".to_string())?;
     if !resp.ok() {
-        return Err(format!("HTTP {}", resp.status()));
+        return Err(format!("claim failed: HTTP {}", resp.status()));
     }
     Ok(())
 }
@@ -197,13 +248,20 @@ pub fn SignupPage() -> impl IntoView {
             Ok(hex) => {
                 privkey_hex.set(hex);
                 let auth_for_pod = auth;
+                let display_for_handle = display.clone();
                 spawn_local(async move {
-                    // Store the optional real name (admin-only D1, never published).
-                    if let Some(r) = real_opt {
-                        if let Err(e) = set_real_name(&r, auth).await {
-                            toasts.show(
-                                format!("Could not save real name (continuing): {e}"),
-                                ToastVariant::Warning,
+                    // Auto-derive a federated handle from the display name (no
+                    // prompt) and claim it. The claim creates the auth-worker
+                    // registration row that the admin auth queue reads AND stores
+                    // the optional admin-only real name. Without a claim there is
+                    // no registration row, so new joiners were invisible to the
+                    // admin and their real name was silently dropped.
+                    let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
+                    if !pubkey.is_empty() {
+                        let handle = derive_username(&display_for_handle, &pubkey);
+                        if let Err(e) = claim_username(&handle, real_opt.as_deref(), auth).await {
+                            web_sys::console::warn_1(
+                                &format!("[signup] handle claim deferred: {e}").into(),
                             );
                         }
                     }
