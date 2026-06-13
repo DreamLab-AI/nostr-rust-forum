@@ -64,7 +64,7 @@ pub fn ExportModal(
         trigger_download(
             &content,
             mime,
-            &format!("members-{}.{}", channel_id_dl, ext),
+            &format!("messages-{}.{}", channel_id_dl, ext),
         );
         is_open.set(false);
         on_close.run(());

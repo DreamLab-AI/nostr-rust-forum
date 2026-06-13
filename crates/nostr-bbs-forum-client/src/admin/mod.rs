@@ -8,8 +8,6 @@ pub mod audit_log;
 pub mod calendar;
 pub mod channel_form;
 pub mod overview;
-pub mod registrations;
-pub mod relay_settings;
 pub mod reports;
 pub mod section_requests;
 pub mod settings;
@@ -20,12 +18,8 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
-use crate::auth::nip98::{
-    fetch_with_nip98_get, fetch_with_nip98_get_signer, fetch_with_nip98_post,
-    fetch_with_nip98_post_signer,
-};
+use crate::auth::nip98::{fetch_with_nip98_get_signer, fetch_with_nip98_post_signer};
 use crate::relay::{ConnectionState, Filter, RelayConnection};
-use crate::stores::zone_access::use_zone_access;
 use nostr_bbs_core::signer::Signer;
 
 // -- Types --------------------------------------------------------------------
@@ -129,12 +123,6 @@ impl AdminStore {
         }
     }
 
-    /// Check whether the current user is admin using the zone_access context.
-    #[allow(dead_code)]
-    pub fn is_current_user_admin() -> bool {
-        use_zone_access().is_admin.get_untracked()
-    }
-
     /// Resolve the API base URL for whitelist/admin operations.
     ///
     /// Whitelist endpoints (`/api/whitelist/*`, `/api/check-whitelist`) live on the
@@ -142,182 +130,6 @@ impl AdminStore {
     /// `relay_url::relay_api_base()`.
     fn api_base() -> String {
         crate::utils::relay_url::relay_api_base()
-    }
-
-    // -- Whitelist API --------------------------------------------------------
-
-    /// Fetch the full whitelist from the relay-worker admin API.
-    pub async fn fetch_whitelist(&self, privkey: &[u8; 32]) -> Result<(), String> {
-        self.state.is_loading.set(true);
-        self.state.error.set(None);
-
-        let url = format!("{}/api/whitelist/list", Self::api_base());
-        match fetch_with_nip98_get(&url, privkey).await {
-            Ok(body) => {
-                let parsed: WhitelistResponse = serde_json::from_str(&body)
-                    .map_err(|e| format!("Failed to parse whitelist: {e}"))?;
-                if parsed.users.is_empty() {
-                    self.state.error.set(Some(
-                        "Whitelist is empty. No users have been approved yet.".to_string(),
-                    ));
-                }
-                self.state.users.set(parsed.users);
-                self.state.stats.update(|s| {
-                    s.total_users = self.state.users.get_untracked().len() as u32;
-                });
-                self.state.is_loading.set(false);
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                let user_msg =
-                    if msg.contains("401") || msg.contains("403") || msg.contains("Unauthorized") {
-                        format!(
-                            "Auth failure: your admin key was rejected by the API. {}",
-                            msg
-                        )
-                    } else if msg.contains("404") {
-                        format!(
-                            "Whitelist endpoint not found. Check API URL configuration. {}",
-                            msg
-                        )
-                    } else if msg.contains("NetworkError") || msg.contains("Failed to fetch") {
-                        format!(
-                            "Network error: cannot reach the auth API. Check your connection. {}",
-                            msg
-                        )
-                    } else {
-                        format!("Failed to fetch whitelist: {}", msg)
-                    };
-                self.state.error.set(Some(user_msg.clone()));
-                self.state.is_loading.set(false);
-                Err(user_msg)
-            }
-        }
-    }
-
-    /// Add a pubkey to the whitelist with the given cohorts.
-    pub async fn add_to_whitelist(
-        &self,
-        pubkey: &str,
-        cohorts: &[String],
-        privkey: &[u8; 32],
-    ) -> Result<(), String> {
-        self.state.is_loading.set(true);
-        self.state.error.set(None);
-        self.state.success.set(None);
-
-        let body = serde_json::json!({
-            "pubkey": pubkey,
-            "cohorts": cohorts,
-        });
-        let body_json =
-            serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
-        let url = format!("{}/api/whitelist/add", Self::api_base());
-        match fetch_with_nip98_post(&url, &body_json, privkey).await {
-            Ok(_) => {
-                self.state.success.set(Some(format!(
-                    "Added {}...{} to whitelist",
-                    &pubkey[..8],
-                    &pubkey[pubkey.len().saturating_sub(4)..]
-                )));
-                self.state.is_loading.set(false);
-                // Refresh the whitelist
-                let _ = self.fetch_whitelist(privkey).await;
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                self.state.error.set(Some(msg.clone()));
-                self.state.is_loading.set(false);
-                Err(msg)
-            }
-        }
-    }
-
-    /// Update cohorts for an existing whitelisted pubkey.
-    pub async fn update_cohorts(
-        &self,
-        pubkey: &str,
-        cohorts: &[String],
-        privkey: &[u8; 32],
-    ) -> Result<(), String> {
-        self.state.is_loading.set(true);
-        self.state.error.set(None);
-        self.state.success.set(None);
-
-        let body = serde_json::json!({
-            "pubkey": pubkey,
-            "cohorts": cohorts,
-        });
-        let body_json =
-            serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
-        let url = format!("{}/api/whitelist/update-cohorts", Self::api_base());
-        match fetch_with_nip98_post(&url, &body_json, privkey).await {
-            Ok(_) => {
-                self.state.success.set(Some(format!(
-                    "Updated cohorts for {}...{}",
-                    &pubkey[..8],
-                    &pubkey[pubkey.len().saturating_sub(4)..]
-                )));
-                self.state.is_loading.set(false);
-                // Refresh the whitelist
-                let _ = self.fetch_whitelist(privkey).await;
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                self.state.error.set(Some(msg.clone()));
-                self.state.is_loading.set(false);
-                Err(msg)
-            }
-        }
-    }
-
-    // -- Admin management -----------------------------------------------------
-
-    /// Set or revoke admin status for a pubkey via the relay API.
-    pub async fn set_admin(
-        &self,
-        pubkey: &str,
-        is_admin: bool,
-        privkey: &[u8; 32],
-    ) -> Result<(), String> {
-        self.state.is_loading.set(true);
-        self.state.error.set(None);
-        self.state.success.set(None);
-
-        let body = serde_json::json!({
-            "pubkey": pubkey,
-            "is_admin": is_admin,
-        });
-        let body_json =
-            serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
-        let url = format!("{}/api/whitelist/set-admin", Self::api_base());
-        match fetch_with_nip98_post(&url, &body_json, privkey).await {
-            Ok(_) => {
-                let action = if is_admin {
-                    "promoted to admin"
-                } else {
-                    "demoted from admin"
-                };
-                self.state.success.set(Some(format!(
-                    "{}...{} {}",
-                    &pubkey[..8],
-                    &pubkey[pubkey.len().saturating_sub(4)..],
-                    action
-                )));
-                self.state.is_loading.set(false);
-                let _ = self.fetch_whitelist(privkey).await;
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                self.state.error.set(Some(msg.clone()));
-                self.state.is_loading.set(false);
-                Err(msg)
-            }
-        }
     }
 
     // -- Signer-based variants (NIP-07 / extension wallets) ------------------
@@ -639,108 +451,6 @@ impl AdminStore {
 
     // -- Channel management ---------------------------------------------------
 
-    /// Create a kind-40 channel creation event and publish it to the relay.
-    #[allow(dead_code)]
-    pub fn create_channel(
-        &self,
-        name: &str,
-        description: &str,
-        section: &str,
-        privkey: &[u8; 32],
-    ) -> Result<(), String> {
-        self.create_channel_with_zone(name, description, section, "", 0, None, privkey)
-    }
-
-    /// Create a kind-40 channel with explicit zone and optional cohort tags.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_channel_with_zone(
-        &self,
-        name: &str,
-        description: &str,
-        section: &str,
-        picture: &str,
-        zone: u8,
-        cohort: Option<&str>,
-        privkey: &[u8; 32],
-    ) -> Result<(), String> {
-        let relay = expect_context::<RelayConnection>();
-        let conn = relay.connection_state();
-        if conn.get_untracked() != ConnectionState::Connected {
-            return Err("Relay not connected".to_string());
-        }
-
-        let sk = k256::schnorr::SigningKey::from_bytes(privkey)
-            .map_err(|e| format!("Invalid signing key: {e}"))?;
-        let pubkey_hex = hex::encode(sk.verifying_key().to_bytes());
-
-        let content = serde_json::json!({
-            "name": name,
-            "about": description,
-            "picture": picture
-        });
-
-        let now = (js_sys::Date::now() / 1000.0) as u64;
-
-        let mut tags = vec![
-            vec!["section".into(), section.into()],
-            vec!["zone".into(), zone.to_string()],
-        ];
-        if let Some(c) = cohort {
-            tags.push(vec!["cohort".into(), c.into()]);
-        }
-
-        let content_json = serde_json::to_string(&content)
-            .map_err(|e| format!("JSON serialization failed: {e}"))?;
-        let unsigned = nostr_bbs_core::UnsignedEvent {
-            pubkey: pubkey_hex,
-            created_at: now,
-            kind: 40,
-            tags,
-            content: content_json,
-        };
-
-        let signed = nostr_bbs_core::sign_event(unsigned, &sk)
-            .map_err(|e| format!("Signing failed: {e}"))?;
-
-        // Publish with ack — only update local state on relay acceptance
-        let success_sig = self.state.success;
-        let error_sig = self.state.error;
-        let channels_sig = self.state.channels;
-        let stats_sig = self.state.stats;
-        let channel_name = name.to_string();
-        let channel_desc = description.to_string();
-        let channel_section = section.to_string();
-        let event_id = signed.id.clone();
-        let event_created_at = signed.created_at;
-        let event_pubkey = signed.pubkey.clone();
-
-        let ack = Rc::new(move |accepted: bool, message: String| {
-            if accepted {
-                success_sig.set(Some(format!("Channel '{}' created", channel_name)));
-                channels_sig.update(|list| {
-                    if !list.iter().any(|c| c.id == event_id) {
-                        list.push(AdminChannel {
-                            id: event_id.clone(),
-                            name: channel_name.clone(),
-                            description: channel_desc.clone(),
-                            section: channel_section.clone(),
-                            created_at: event_created_at,
-                            creator: event_pubkey.clone(),
-                        });
-                    }
-                });
-                stats_sig.update(|s| {
-                    s.total_channels = channels_sig.get_untracked().len() as u32;
-                });
-            } else {
-                error_sig.set(Some(format!("Relay rejected: {}", message)));
-            }
-        });
-        let _ = relay.publish_with_ack(&signed, Some(ack));
-
-        Ok(())
-    }
-
     /// Create a kind-40 channel using the Signer trait (async, NIP-07 compatible).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_channel_with_zone_signer(
@@ -911,33 +621,6 @@ impl AdminStore {
             on_msg_event,
             None,
         );
-    }
-
-    /// Reset the database (delete all events and whitelist entries).
-    pub async fn reset_db(&self, privkey: &[u8; 32]) -> Result<(), String> {
-        self.state.is_loading.set(true);
-        self.state.error.set(None);
-        self.state.success.set(None);
-
-        let url = format!("{}/api/admin/reset-db", Self::api_base());
-        match fetch_with_nip98_post(&url, "{}", privkey).await {
-            Ok(_) => {
-                self.state.users.set(Vec::new());
-                self.state.channels.set(Vec::new());
-                self.state.stats.set(AdminStats::default());
-                self.state.success.set(Some(
-                    "Database reset. First user to register will become admin.".to_string(),
-                ));
-                self.state.is_loading.set(false);
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                self.state.error.set(Some(msg.clone()));
-                self.state.is_loading.set(false);
-                Err(msg)
-            }
-        }
     }
 
     /// Clear the current error.

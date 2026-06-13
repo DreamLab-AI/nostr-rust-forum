@@ -31,7 +31,6 @@ pub mod mention_text;
 pub mod message_input;
 pub mod quoted_message;
 pub mod reaction_bar;
-pub mod typing_indicator;
 
 // -- Auth Flow + Profile (Stream 3) ------------------------------------------
 pub mod profile_modal;
@@ -64,20 +63,10 @@ pub mod virtual_list;
 // -- Social Features (Stream 9) ----------------------------------------------
 pub mod draft_indicator;
 pub mod export_modal;
-pub mod join_request;
 pub mod pinned_messages;
 
 // -- Zone Access (Stream 10) -------------------------------------------------
 pub mod access_denied;
-pub mod section_request;
-
-// -- Board Stats (Stream 13) ------------------------------------------------
-pub mod activity_graph;
-pub mod board_stats;
-pub mod moderator_team;
-pub mod todays_activity;
-pub mod top_posters;
-pub mod welcome_modal;
 
 // -- PWA / Offline (Stream 12) -----------------------------------------------
 pub mod offline_banner;
@@ -88,11 +77,9 @@ pub mod nsec_backup;
 // that backs up the account and onboards 0xchat — client-side only.
 pub mod recovery_sheet;
 pub mod screen_reader;
-pub mod swipeable_message;
 
 // -- Integration (Stream 14) ------------------------------------------------
 pub mod channel_stats;
-pub mod mark_all_read;
 pub mod zone_hero;
 
 // -- Moderation (Phase 3 / P2) ----------------------------------------------

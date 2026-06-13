@@ -12,7 +12,7 @@ use crate::components::bookmarks_modal::BookmarksModal;
 use crate::components::fx::provide_render_tier;
 use crate::components::global_search::GlobalSearch;
 use crate::components::message_bubble::{provide_profile_modal_target, ProfileModalTarget};
-use crate::components::mobile_bottom_nav::{provide_unread_dm_count, MobileBottomNav};
+use crate::components::mobile_bottom_nav::MobileBottomNav;
 use crate::components::notification_bell::{provide_notifications, NotificationBell};
 use crate::components::onboarding_modal::provide_onboarding_prefill;
 use crate::components::profile_modal::ProfileModal;
@@ -21,10 +21,9 @@ use crate::components::session_timeout::SessionTimeout;
 use crate::components::toast::{provide_toasts, use_toasts, ToastContainer, ToastVariant};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
-    AdminPage, CategoryPage, ChannelPage, ChatPage, ConnectPage, DmChatPage, DmListPage,
-    EventsPage, ForumsPage, GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage,
-    PendingPage, PodBrowserPage, ProfilePage, SearchPage, SectionPage, SettingsPage, SetupPage,
-    SignupPage, ThreadPage,
+    AdminPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage, EventsPage,
+    ForumsPage, GovernancePage, HomePage, LoginPage, NoteViewPage, PodBrowserPage, ProfilePage,
+    SectionPage, SettingsPage, SetupPage, SignupPage, ThreadPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
@@ -86,15 +85,6 @@ fn brand_icon() -> impl IntoView {
             <path d="M12 2L21.5 7.5V16.5L12 22L2.5 16.5V7.5L12 2Z"
                 fill="currentColor" fill-opacity="0.2" stroke="currentColor" stroke-width="1.5"/>
             <circle cx="12" cy="12" r="3" fill="currentColor"/>
-        </svg>
-    }
-}
-
-fn chat_icon() -> impl IntoView {
-    view! {
-        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"
-                stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
     }
 }
@@ -250,7 +240,6 @@ pub fn App() -> impl IntoView {
     provide_notifications();
     crate::stores::notifications::provide_notification_store();
     provide_bookmarks();
-    provide_unread_dm_count();
     provide_name_cache();
     provide_profile_cache();
     provide_profile_modal_target();
@@ -567,12 +556,10 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/view/:note_id") view=NoteViewPage />
                     // Auth-gated routes
                     <Route path=path!("/setup") view=AuthGatedSetup />
-                    <Route path=path!("/pending") view=AuthGatedPending />
                     // Chat is consolidated into Forums (the canonical,
                     // config-correct channel browser). The bare /chat route
-                    // redirects to /forums; the Chat nav link is removed.
-                    // chat.rs (ChatPage) remains reachable only by direct URL
-                    // for the channel-list dashboard.
+                    // redirects to /forums for legacy bookmarks; the Chat nav
+                    // link and the channel-list dashboard have been removed.
                     <Route path=path!("/chat") view=|| view! { <Redirect path="/forums" /> } />
                     <Route path=path!("/chat/:channel_id") view=AuthGatedChannel />
                     <Route path=path!("/dm") view=AuthGatedDmList />
@@ -583,7 +570,6 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/forums/:category/:section/:topic") view=AuthGatedThread />
                     <Route path=path!("/events") view=AuthGatedEvents />
                     <Route path=path!("/profile/:pubkey") view=AuthGatedProfile />
-                    <Route path=path!("/search") view=AuthGatedSearch />
                     <Route path=path!("/settings") view=AuthGatedSettings />
                     <Route path=path!("/admin") view=AdminPage />
                     // The Agent Control Surface is an operations/admin tool, not
@@ -591,7 +577,6 @@ pub fn App() -> impl IntoView {
                     // the nav (hidden below) and on the route (admin guard).
                     <Route path=path!("/governance") view=AdminGatedGovernance />
                     <Route path=path!("/pod") view=AuthGatedPod />
-                    <Route path=path!("/marketplace") view=MarketplacePage />
                 </FlatRoutes>
             </Layout>
         </Router>
@@ -960,33 +945,6 @@ fn LogoutButton() -> impl IntoView {
 
 // -- Auth-gated chat pages ----------------------------------------------------
 
-/// Channel list with auth gate -- SPA-navigates to login if not authenticated.
-#[component]
-fn AuthGatedChat() -> impl IntoView {
-    let auth = use_auth();
-    let is_authed = auth.is_authenticated();
-    let is_ready = auth.is_ready();
-    let navigate = StoredValue::new(use_navigate());
-    let location = use_location();
-
-    Effect::new(move |_| {
-        if is_ready.get() && !is_authed.get() {
-            let current = location.pathname.get();
-            if let Some(target) = login_redirect_target(&current) {
-                navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
-            }
-        }
-    });
-
-    view! {
-        <Show when=move || is_ready.get() fallback=|| { loading_spinner() }>
-            <Show when=move || is_authed.get() fallback=|| { redirect_spinner() }>
-                <ChatPage />
-            </Show>
-        </Show>
-    }
-}
-
 /// Single channel view with auth gate.
 #[component]
 fn AuthGatedChannel() -> impl IntoView {
@@ -1123,14 +1081,12 @@ macro_rules! auth_gated {
 }
 
 auth_gated!(AuthGatedSetup, SetupPage);
-auth_gated!(AuthGatedPending, PendingPage);
 auth_gated!(AuthGatedForums, ForumsPage);
 auth_gated!(AuthGatedCategory, CategoryPage);
 auth_gated!(AuthGatedSection, SectionPage);
 auth_gated!(AuthGatedThread, ThreadPage);
 auth_gated!(AuthGatedEvents, EventsPage);
 auth_gated!(AuthGatedProfile, ProfilePage);
-auth_gated!(AuthGatedSearch, SearchPage);
 auth_gated!(AuthGatedSettings, SettingsPage);
 auth_gated!(AuthGatedPod, PodBrowserPage);
 

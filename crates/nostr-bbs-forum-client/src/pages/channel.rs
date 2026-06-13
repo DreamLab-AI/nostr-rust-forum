@@ -32,9 +32,7 @@ use crate::components::mention_text::normalise_mention_pubkey;
 use crate::components::message_bubble::{MessageBubble, MessageData};
 use crate::components::message_input::MessageInput;
 use crate::components::pinned_messages::{PinnedMessage, PinnedMessages};
-use crate::components::swipeable_message::SwipeableMessage;
 use crate::components::thread_view::ThreadReply;
-use crate::components::typing_indicator::TypingIndicator;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 #[allow(unused_imports)]
 use crate::stores::channels::ChannelStore;
@@ -136,7 +134,6 @@ pub fn ChannelPage() -> impl IntoView {
         }
         unique.len() as u32
     });
-    let typing_pubkeys = RwSignal::new(Vec::<String>::new());
     let messages_container = NodeRef::<leptos::html::Div>::new();
 
     // Track subscription IDs for cleanup. `channel_sub_id` is the kind-40
@@ -734,9 +731,7 @@ pub fn ChannelPage() -> impl IntoView {
                                                             <div class="flex-1 h-px bg-amber-500/30"></div>
                                                         </div>
                                                     })}
-                                                    <SwipeableMessage>
-                                                        <MessageBubble message=msg/>
-                                                    </SwipeableMessage>
+                                                    <MessageBubble message=msg/>
                                                 </>
                                             }
                                         }).collect_view()}
@@ -752,7 +747,6 @@ pub fn ChannelPage() -> impl IntoView {
             <Show when=move || is_authed.get() && !is_archived.get()>
                 <div class="bg-gray-800 border-t border-gray-700 p-3">
                     <div class="max-w-4xl mx-auto">
-                        <TypingIndicator typing_pubkeys=typing_pubkeys />
                         <MessageInput
                             on_send=noop_send
                             on_send_with_mentions=send_callback
