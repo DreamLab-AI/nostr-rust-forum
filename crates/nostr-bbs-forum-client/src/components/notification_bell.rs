@@ -82,6 +82,10 @@ pub fn use_notifications() -> NotificationStore {
 #[component]
 pub(crate) fn NotificationBell() -> impl IntoView {
     let v2_store = use_notification_store();
+    // #31: attach the live relay→notification effects. The bell mounts inside
+    // the Layout, after every app-root context (channel store, read positions,
+    // auth) is provided, so this is the safe point to start syncing. Idempotent.
+    v2_store.init_sync();
     let legacy_store = use_notifications();
     let panel_open = RwSignal::new(false);
 
