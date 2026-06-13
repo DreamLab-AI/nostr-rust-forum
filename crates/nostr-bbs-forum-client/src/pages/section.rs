@@ -45,12 +45,14 @@ use crate::components::access_denied::AccessDenied;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::topic_list::{classify_topics, TopicList, TopicSummary};
+use crate::components::zone_hero::ZoneHero;
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
 use crate::utils::capitalize;
 use crate::utils::slug_hash::matches_section_slug;
+use crate::utils::zone_theme::zone_accent_style;
 
 /// Map a zone slug to its display name. Config-driven: resolves against the
 /// live `ZONE_CONFIG` zone list, falling back to a capitalised slug for unknown
@@ -264,7 +266,32 @@ pub fn SectionPage() -> impl IntoView {
             when=move || has_zone_access.get()
             fallback=move || view! { <AccessDenied zone_id=category_slug() /> }
         >
-        <div class="max-w-4xl mx-auto p-4 sm:p-6">
+        // Root carries the zone accent as `--zone-accent` for descendants.
+        <div
+            class="max-w-4xl mx-auto p-4 sm:p-6"
+            style=move || zone_accent_style(&category_slug())
+        >
+            // Zone-identity banner for visual consistency with the category page
+            // (#30/#21): the section page now shows the owning zone's configured
+            // banner image and palette, not just a bare heading.
+            {move || {
+                let slug = category_slug();
+                let zone = load_zones().into_iter().find(|z| z.id == slug);
+                let banner = zone.as_ref().and_then(|z| z.banner_image_url.clone()).unwrap_or_default();
+                let label = zone.as_ref().map(|z| z.label()).unwrap_or_default();
+                view! {
+                    <ZoneHero
+                        title=category_display_name(&slug)
+                        description="Topics in this section".to_string()
+                        zone_id=slug.clone()
+                        // Sparkle: neutral default icon, matching the category page.
+                        icon="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8L12 2z"
+                        banner_url=banner
+                        zone_label=label
+                    />
+                }
+            }}
+
             <Breadcrumb items=vec![
                 BreadcrumbItem::link("Home", "/"),
                 BreadcrumbItem::link("Forums", "/forums"),
