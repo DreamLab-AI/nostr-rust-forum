@@ -24,6 +24,12 @@ pub fn CategoryCard(
     icon: &'static str,
     /// Total post count across all channels in this section.
     post_count: u32,
+    /// Number of posts newer than the user's last-read position across the
+    /// section's channels (issue #24). When > 0 a bright "N new" chip is shown
+    /// alongside the muted total chip; when 0 the chip is omitted. Defaults to 0
+    /// so callers that don't track read state keep their existing rendering.
+    #[prop(default = 0)]
+    unread_count: u32,
     /// Accent color key: "amber", "blue", "purple", "emerald".
     accent_color: &'static str,
     /// Parent zone id for building the href.
@@ -82,6 +88,17 @@ pub fn CategoryCard(
         format!("{} posts", post_count)
     };
 
+    // Bright "N new" chip (issue #24). Solid amber so unread activity stands out
+    // against the muted total-count chip when scanning the index; hidden when
+    // there is nothing new. `aria-label` spells it out for screen readers.
+    let has_unread = unread_count > 0;
+    let unread_label = format!("{} new", unread_count);
+    let unread_aria = format!(
+        "{} unread post{}",
+        unread_count,
+        if unread_count == 1 { "" } else { "s" }
+    );
+
     let name_display = name.clone();
     let desc_display = description.clone();
     let has_picture = !picture.is_empty();
@@ -125,9 +142,20 @@ pub fn CategoryCard(
                 </div>
 
                 <div class="flex items-center justify-between mt-4">
-                    <span class=format!("text-xs font-medium border rounded-full px-2.5 py-0.5 {}", badge_class)>
-                        {count_label}
-                    </span>
+                    <div class="flex items-center gap-2">
+                        <span class=format!("text-xs font-medium border rounded-full px-2.5 py-0.5 {}", badge_class)>
+                            {count_label}
+                        </span>
+                        {has_unread.then(|| view! {
+                            <span
+                                class="inline-flex items-center gap-1 text-xs font-semibold rounded-full px-2.5 py-0.5 bg-amber-400 text-gray-900 shadow-sm shadow-amber-500/30 animate-pulse"
+                                aria-label=unread_aria
+                            >
+                                <span class="w-1.5 h-1.5 rounded-full bg-gray-900/70" aria-hidden="true"></span>
+                                {unread_label}
+                            </span>
+                        })}
+                    </div>
                     <span class="text-xs text-gray-500">
                         {zone_id.replace('-', " ")}
                     </span>
