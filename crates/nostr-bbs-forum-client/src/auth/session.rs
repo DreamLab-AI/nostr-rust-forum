@@ -263,6 +263,16 @@ impl AuthStore {
         if stored.is_nip07 {
             if let Some(ref pubkey) = stored.public_key {
                 let has_ext = super::nip07::has_nip07_extension();
+                // Re-install the Nip07Signer so `get_signer()` works after a page
+                // reload. Without this the signer was None for restored extension
+                // (Podkey/NIP-07) sessions, so every authed NIP-98 request — the
+                // admin user list, pod, search — silently no-op'd (the admin panel
+                // showed "no users"). Mirrors the is_local_key branch below.
+                if has_ext {
+                    let s: Rc<dyn Signer> =
+                        Rc::new(super::nip07::Nip07Signer::from_pubkey(pubkey.clone()));
+                    self.signer.set_value(Some(SendWrapper::new(s)));
+                }
                 self.state.set(AuthState {
                     state: if has_ext {
                         AuthPhase::Authenticated
