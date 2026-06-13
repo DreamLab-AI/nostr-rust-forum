@@ -46,7 +46,6 @@ pub struct AuthState {
     pub public_key: Option<String>,
     pub nickname: Option<String>,
     pub avatar: Option<String>,
-    pub is_pending: bool,
     pub error: Option<String>,
     pub account_status: AccountStatus,
     pub nsec_backed_up: bool,
@@ -80,7 +79,6 @@ impl Default for AuthState {
             public_key: None,
             nickname: None,
             avatar: None,
-            is_pending: false,
             error: None,
             account_status: AccountStatus::Incomplete,
             nsec_backed_up: false,
@@ -260,11 +258,6 @@ impl AuthStore {
     }
 
     #[allow(dead_code)]
-    pub fn set_pending(&self, pending: bool) {
-        self.state.update(|s| s.is_pending = pending);
-    }
-
-    #[allow(dead_code)]
     pub fn set_profile(&self, nickname: Option<String>, avatar: Option<String>) {
         self.state.update(|s| {
             s.nickname = nickname.clone();
@@ -303,7 +296,6 @@ impl AuthStore {
     /// Register a new passkey and derive Nostr keypair from PRF.
     pub async fn register_with_passkey(&self, display_name: &str) -> Result<(), String> {
         self.state.update(|s| {
-            s.is_pending = true;
             s.error = None;
             s.state = AuthPhase::Authenticating;
         });
@@ -322,7 +314,6 @@ impl AuthStore {
                 );
                 web_sys::console::error_1(&format!("[register_with_passkey] Debug: {e:?}").into());
                 self.state.update(|s| {
-                    s.is_pending = false;
                     s.error = Some(msg.clone());
                     s.state = AuthPhase::Unauthenticated;
                 });
@@ -334,7 +325,6 @@ impl AuthStore {
     /// Authenticate with an existing passkey, re-deriving the Nostr privkey.
     pub async fn login_with_passkey(&self, pubkey: Option<&str>) -> Result<(), String> {
         self.state.update(|s| {
-            s.is_pending = true;
             s.error = None;
             s.state = AuthPhase::Authenticating;
         });
@@ -347,7 +337,6 @@ impl AuthStore {
             Err(e) => {
                 let msg = e.to_string();
                 self.state.update(|s| {
-                    s.is_pending = false;
                     s.error = Some(msg.clone());
                     s.state = AuthPhase::Unauthenticated;
                 });
@@ -412,7 +401,6 @@ impl AuthStore {
             public_key: Some(pubkey),
             nickname,
             avatar: None,
-            is_pending: false,
             error: None,
             account_status: AccountStatus::Incomplete,
             nsec_backed_up: false,
@@ -483,7 +471,6 @@ impl AuthStore {
             public_key: Some(pubkey),
             nickname,
             avatar,
-            is_pending: false,
             error: None,
             account_status,
             nsec_backed_up: true,
@@ -504,7 +491,6 @@ impl AuthStore {
     /// is stored — all signing is delegated to the extension via `signEvent()`.
     pub async fn login_with_nip07(&self) -> Result<(), String> {
         self.state.update(|s| {
-            s.is_pending = true;
             s.error = None;
             s.state = AuthPhase::Authenticating;
         });
@@ -542,7 +528,6 @@ impl AuthStore {
                     public_key: Some(pubkey),
                     nickname,
                     avatar,
-                    is_pending: false,
                     error: None,
                     account_status,
                     nsec_backed_up,
@@ -556,7 +541,6 @@ impl AuthStore {
             }
             Err(e) => {
                 self.state.update(|s| {
-                    s.is_pending = false;
                     s.error = Some(e.clone());
                     s.state = AuthPhase::Unauthenticated;
                 });
@@ -647,7 +631,6 @@ impl AuthStore {
             public_key: Some(result.pubkey.clone()),
             nickname,
             avatar,
-            is_pending: false,
             error: None,
             account_status: AccountStatus::Incomplete,
             nsec_backed_up: false,
@@ -696,7 +679,6 @@ impl AuthStore {
             public_key: Some(result.pubkey.clone()),
             nickname,
             avatar,
-            is_pending: false,
             error: None,
             account_status,
             nsec_backed_up,

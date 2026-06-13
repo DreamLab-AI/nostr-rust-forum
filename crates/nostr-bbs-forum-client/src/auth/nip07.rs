@@ -132,21 +132,6 @@ pub struct Nip07Signer {
 }
 
 impl Nip07Signer {
-    /// Attempt to connect to `window.nostr` and retrieve the pubkey.
-    ///
-    /// Returns an error if the extension is not available or the user rejects
-    /// the pubkey request.
-    pub async fn try_connect() -> Result<Self, String> {
-        if !has_nip07_extension() {
-            return Err(
-                "window.nostr not available — install a NIP-07 extension such as Alby or nos2x"
-                    .to_string(),
-            );
-        }
-        let pubkey_hex = nip07_get_pubkey().await?;
-        Ok(Self { pubkey_hex })
-    }
-
     /// Create a Nip07Signer directly from a known pubkey (e.g. for session restore).
     pub fn from_pubkey(pubkey_hex: String) -> Self {
         Self { pubkey_hex }

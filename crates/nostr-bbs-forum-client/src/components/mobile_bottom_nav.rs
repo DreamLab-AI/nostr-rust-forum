@@ -1,8 +1,8 @@
 //! Fixed bottom navigation bar for mobile screens.
 //!
-//! Displays 5 nav items (Home, Chat, DMs, Forums, Profile) with SVG icons,
-//! active route highlighting, and an unread-DM badge. Visibility is controlled
-//! by the `.mobile-bottom-nav` CSS class (hidden above 639px).
+//! Displays 4 nav items (Home, DMs, Forums, Profile) with SVG icons and
+//! active route highlighting. Visibility is controlled by the
+//! `.mobile-bottom-nav` CSS class (hidden above 639px).
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -10,26 +10,6 @@ use leptos_router::hooks::use_location;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
-
-/// Unread DM count signal, provided at the layout level and consumed here.
-#[derive(Clone, Copy)]
-pub struct UnreadDmCount(pub RwSignal<u32>);
-
-/// Provide the unread DM count context. Call once near the app root.
-pub fn provide_unread_dm_count() -> UnreadDmCount {
-    let count = UnreadDmCount(RwSignal::new(0));
-    provide_context(count);
-    count
-}
-
-/// Read the unread DM count from context.
-pub fn use_unread_dm_count() -> UnreadDmCount {
-    use_context::<UnreadDmCount>().unwrap_or_else(|| {
-        let fallback = UnreadDmCount(RwSignal::new(0));
-        provide_context(fallback);
-        fallback
-    })
-}
 
 /// Fixed bottom navigation bar visible only on mobile (< 640px).
 ///
@@ -40,7 +20,6 @@ pub(crate) fn MobileBottomNav() -> impl IntoView {
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
     let location = use_location();
-    let unread = use_unread_dm_count();
 
     let pathname = move || {
         let p = location.pathname.get();
@@ -92,38 +71,14 @@ pub(crate) fn MobileBottomNav() -> impl IntoView {
                     <span>"Home"</span>
                 </A>
 
-                // Chat
-                <A href=base_href("/chat") attr:class=item_class("/chat")>
+                // DMs
+                <A href=base_href("/dm") attr:class=item_class("/dm")>
                     <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
-                        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"
+                        <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"
+                            stroke-linecap="round" stroke-linejoin="round"/>
+                        <polyline points="22,6 12,13 2,6"
                             stroke-linecap="round" stroke-linejoin="round"/>
                     </svg>
-                    <span>"Chat"</span>
-                </A>
-
-                // DMs (with unread badge)
-                <A href=base_href("/dm") attr:class=item_class("/dm")>
-                    <div class="relative">
-                        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
-                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"
-                                stroke-linecap="round" stroke-linejoin="round"/>
-                            <polyline points="22,6 12,13 2,6"
-                                stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                        {move || {
-                            let count = unread.0.get();
-                            (count > 0).then(|| {
-                                let label = if count > 99 {
-                                    "99+".to_string()
-                                } else {
-                                    count.to_string()
-                                };
-                                view! {
-                                    <span class="notification-badge neon-pulse">{label}</span>
-                                }
-                            })
-                        }}
-                    </div>
                     <span>"DMs"</span>
                 </A>
 

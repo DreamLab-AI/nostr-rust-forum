@@ -164,10 +164,10 @@ pub fn HomePage() -> impl IntoView {
                     // Logged in, normal mode
                     <Show when=move || is_authed.get() && needs_setup.get() == Some(false)>
                         <A
-                            href=base_href("/chat")
+                            href=base_href("/forums")
                             attr:class="bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-8 py-3 rounded-xl text-lg transition-all duration-300 hover:shadow-lg hover:shadow-amber-500/20"
                         >
-                            "Enter Chat"
+                            "Enter Forum"
                         </A>
                     </Show>
                 </div>

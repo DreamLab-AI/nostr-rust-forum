@@ -183,7 +183,7 @@ pub fn SetupPage() -> impl IntoView {
                     // Header
                     <div class="text-center space-y-2">
                         <h1 class="text-3xl font-bold candy-gradient">
-                            ""Welcome""
+                            "Welcome"
                         </h1>
                         <p class="text-gray-400 text-sm">
                             "Set up your profile to join the community"

@@ -15,7 +15,6 @@ use wasm_bindgen::JsCast;
 use crate::auth::use_auth;
 use crate::components::image_upload::ImageUpload;
 use crate::components::info_term::InfoTerm;
-use crate::components::swipeable_message::SwipeableMessage;
 use crate::components::user_display::use_display_name_memo;
 use crate::dm::{provide_dm_store, use_dm_store, DMMessage};
 use crate::relay::{ConnectionState, RelayConnection};
@@ -383,9 +382,7 @@ fn MessageListWithDateSeparators(msgs: Vec<DMMessage>, my_pk: String) -> impl In
         let is_mine = msg.sender_pubkey == my_pk;
         fragments.push(
             view! {
-                <SwipeableMessage>
-                    <DmBubble message=msg is_mine=is_mine/>
-                </SwipeableMessage>
+                <DmBubble message=msg is_mine=is_mine/>
             }
             .into_any(),
         );
