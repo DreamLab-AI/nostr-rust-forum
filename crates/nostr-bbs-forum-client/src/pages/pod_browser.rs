@@ -474,6 +474,42 @@ pub fn PodBrowserPage() -> impl IntoView {
                 </p>
             </div>
 
+            // Solid explainer — what this Pod is and why it matters.
+            <div class="mb-8 bg-gray-800/40 border border-gray-700/50 rounded-xl p-5">
+                <div class="flex items-start gap-3">
+                    <svg
+                        class="w-6 h-6 text-amber-400 flex-shrink-0 mt-0.5"
+                        viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+                        aria-hidden="true"
+                    >
+                        <circle cx="12" cy="12" r="9.5" />
+                        <path stroke-linecap="round" d="M2.5 12h19M12 2.5c2.6 2.7 3.9 6 3.9 9.5s-1.3 6.8-3.9 9.5c-2.6-2.7-3.9-6-3.9-9.5s1.3-6.8 3.9-9.5z" />
+                    </svg>
+                    <div class="space-y-2">
+                        <h2 class="text-base font-semibold text-white">"Your data, your Pod — built on Solid"</h2>
+                        <p class="text-gray-300 text-sm leading-relaxed">
+                            "This is your personal "<span class="text-amber-300">"Solid Pod"</span>" — an instance of the open web standard created by Sir Tim Berners-Lee, inventor of the World Wide Web. Solid (\"Social Linked Data\") decouples your data from the apps that use it: rather than each service hoarding your information, you keep it in a datastore you own and control."
+                        </p>
+                        <p class="text-gray-300 text-sm leading-relaxed">
+                            "Everything here — your profile, messages, media, and your portable identity (your "<span class="text-amber-300">"WebID"</span>") — lives in storage that answers to you, not to someone else's servers. Apps ask permission to read or write, and you can revoke it at any time."
+                        </p>
+                        <p class="text-gray-400 text-sm leading-relaxed">
+                            "Why it matters: it flips the usual model — data portability instead of lock-in, consent instead of surveillance, an open standard instead of a walled garden. Your identity and your data travel with you across any Solid-compatible app, and this forum is just one of them."
+                        </p>
+                        <a
+                            href="https://solidproject.org"
+                            target="_blank" rel="noopener noreferrer"
+                            class="inline-flex items-center gap-1 text-amber-400 hover:text-amber-300 text-sm font-medium"
+                        >
+                            "Learn more about Solid"
+                            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" />
+                            </svg>
+                        </a>
+                    </div>
+                </div>
+            </div>
+
             // Git pod card (ADR-089). Shown only when the probe confirms git
             // is available; CF Workers returns 501 → Unavailable → no card.
             {move || match git_probe.get() {
