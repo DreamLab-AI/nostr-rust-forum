@@ -3,7 +3,13 @@
 //! Route: `/dm`
 //! Auth-gated. On mount, fetches conversations from the relay, displays them
 //! sorted by most recent, and provides a "New Message" input for starting
-//! conversations by pubkey.
+//! conversations.
+//!
+//! Starting a DM no longer requires pasting a raw 64-char hex key (issue #25).
+//! The "New Message" box is a name search: it reuses the same mention engine as
+//! the post composer (`components::mention_autocomplete`) to turn a typed
+//! display name / `@handle` into the recipient's key. Pasting a raw hex key (or
+//! an `npub`) still works as a power-user fallback.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -11,9 +17,32 @@ use wasm_bindgen::JsCast;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::components::info_term::InfoTerm;
+use crate::components::mention_autocomplete::{
+    local_candidates, merge_candidates, search_profiles, MentionAutocomplete, MentionCandidate,
+    NETWORK_SEARCH_MIN_LEN,
+};
 use crate::dm::{provide_dm_store, use_dm_store, DMConversation};
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::utils::{format_relative_time, pubkey_color};
+
+/// Max candidates surfaced in the new-DM name search dropdown.
+const DM_SEARCH_LIMIT: usize = 8;
+
+/// Resolve a raw typed key to a canonical 64-char lowercase hex pubkey, or
+/// `None` if it is not a recognisable key. Accepts bare hex and bech32 `npub`.
+fn resolve_raw_key(input: &str) -> Option<String> {
+    let s = input.trim();
+    // bech32 npub -> hex
+    if s.starts_with("npub1") {
+        return nostr_bbs_core::decode_npub(s).ok();
+    }
+    let lower = s.to_lowercase();
+    if lower.len() == 64 && hex::decode(&lower).is_ok() {
+        return Some(lower);
+    }
+    None
+}
 
 /// DM conversation list page component.
 #[component]
@@ -26,10 +55,20 @@ pub fn DmListPage() -> impl IntoView {
     provide_dm_store();
     let dm_store = use_dm_store();
 
-    // New conversation input
+    // New conversation input. The field is a name search (issue #25): you type
+    // a display name / @handle and pick a person; a pasted raw hex key or npub
+    // still resolves directly as a power-user fallback.
     let new_pubkey_input = RwSignal::new(String::new());
     let show_new_dm = RwSignal::new(false);
     let new_dm_error: RwSignal<Option<String>> = RwSignal::new(None);
+
+    // Name-search dropdown state, driven by the shared mention engine.
+    let search_open = RwSignal::new(false);
+    let search_query = RwSignal::new(String::new());
+    let search_candidates: RwSignal<Vec<MentionCandidate>> = RwSignal::new(Vec::new());
+    let search_active_idx = RwSignal::new(0usize);
+    // Monotonic sequence to discard stale async search responses.
+    let search_seq = RwSignal::new(0u64);
 
     // Track whether we've already started fetching
     let fetch_started = RwSignal::new(false);
@@ -61,55 +100,134 @@ pub fn DmListPage() -> impl IntoView {
         dm_store.cleanup(&relay_for_cleanup);
     });
 
-    // Navigate to a new DM conversation
-    let on_start_conversation = move |_| {
-        let pk = new_pubkey_input.get_untracked();
+    // Open the chat with a resolved hex pubkey, after the self-DM guard.
+    let open_chat_with = move |pk: String| -> bool {
         let pk = pk.trim().to_lowercase();
-
-        if pk.is_empty() {
-            new_dm_error.set(Some("Enter a pubkey to start a conversation".to_string()));
-            return;
-        }
-
-        // Validate hex pubkey (64 chars, valid hex)
         if pk.len() != 64 || hex::decode(&pk).is_err() {
-            new_dm_error.set(Some(
-                "Invalid pubkey. Must be 64 hex characters.".to_string(),
-            ));
-            return;
+            new_dm_error.set(Some("Couldn't resolve that to a person.".to_string()));
+            return false;
         }
-
-        // Don't DM yourself
         let my_pk = auth.pubkey().get_untracked().unwrap_or_default();
         if pk == my_pk {
-            new_dm_error.set(Some("You cannot send a DM to yourself.".to_string()));
-            return;
+            new_dm_error.set(Some("You cannot send a message to yourself.".to_string()));
+            return false;
         }
-
         new_dm_error.set(None);
         new_pubkey_input.set(String::new());
+        search_open.set(false);
+        search_candidates.set(Vec::new());
         show_new_dm.set(false);
-
-        // Navigate to the DM chat page
         if let Some(window) = web_sys::window() {
             let _ = window
                 .location()
                 .set_href(&base_href(&format!("/dm/{}", pk)));
         }
+        true
+    };
+
+    // Picking a person from the dropdown opens the chat with their key.
+    let select_candidate = Callback::new(move |c: MentionCandidate| {
+        open_chat_with(c.pubkey);
+    });
+
+    // "Start" / Enter: resolve whatever is typed. Priority:
+    //   1. the highlighted dropdown candidate (a name was searched);
+    //   2. a raw hex key or `npub` pasted as a fallback;
+    //   3. otherwise prompt the user to pick a name.
+    let on_start_conversation = move |_| {
+        let raw = new_pubkey_input.get_untracked();
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
+            new_dm_error.set(Some("Type a name to find someone to message.".to_string()));
+            return;
+        }
+        // 1. highlighted candidate, if the dropdown has matches.
+        let cands = search_candidates.get_untracked();
+        if !cands.is_empty() {
+            let idx = search_active_idx.get_untracked().min(cands.len() - 1);
+            open_chat_with(cands[idx].pubkey.clone());
+            return;
+        }
+        // 2. raw hex / npub fallback.
+        if let Some(hex_pk) = resolve_raw_key(&raw) {
+            open_chat_with(hex_pk);
+            return;
+        }
+        new_dm_error.set(Some(
+            "No match. Pick a name from the list, or paste their key.".to_string(),
+        ));
+    };
+
+    // Recompute the dropdown as the user types. Mirrors the composer: show
+    // local (ProfileCache + seed) candidates instantly, then merge in a
+    // debounced relay search for queries above the network threshold.
+    let run_search = move |query: String| {
+        search_query.set(query.clone());
+        search_active_idx.set(0);
+
+        // A raw key/npub paste isn't a name search — hide the dropdown so the
+        // fallback path takes over on Start/Enter.
+        if resolve_raw_key(&query).is_some() {
+            search_open.set(false);
+            search_candidates.set(Vec::new());
+            return;
+        }
+
+        if query.is_empty() {
+            search_open.set(false);
+            search_candidates.set(Vec::new());
+            return;
+        }
+
+        search_open.set(true);
+        let local = local_candidates(&query, DM_SEARCH_LIMIT);
+        search_candidates.set(local.clone());
+
+        if query.len() < NETWORK_SEARCH_MIN_LEN {
+            return;
+        }
+        let seq_now = search_seq.get_untracked().wrapping_add(1);
+        search_seq.set(seq_now);
+        wasm_bindgen_futures::spawn_local(async move {
+            let network = search_profiles(&query, DM_SEARCH_LIMIT).await;
+            if search_seq.get_untracked() == seq_now {
+                let merged = merge_candidates(network, local, DM_SEARCH_LIMIT);
+                search_candidates.set(merged);
+                search_active_idx.set(0);
+            }
+        });
     };
 
     let on_new_pubkey_input = move |ev: leptos::ev::Event| {
         let target = ev.target().unwrap();
         let input: web_sys::HtmlInputElement = target.unchecked_into();
-        new_pubkey_input.set(input.value());
+        let val = input.value();
+        new_pubkey_input.set(val.clone());
+        new_dm_error.set(None);
+        run_search(val.trim().to_string());
     };
 
     let on_new_pubkey_keydown = {
         let on_start = on_start_conversation;
         move |ev: leptos::ev::KeyboardEvent| {
-            if ev.key() == "Enter" {
-                ev.prevent_default();
-                on_start(());
+            let cand_len = search_candidates.get_untracked().len();
+            match ev.key().as_str() {
+                "ArrowDown" if cand_len > 0 => {
+                    ev.prevent_default();
+                    search_active_idx.update(|i| *i = (*i + 1).min(cand_len - 1));
+                }
+                "ArrowUp" if cand_len > 0 => {
+                    ev.prevent_default();
+                    search_active_idx.update(|i| *i = i.saturating_sub(1));
+                }
+                "Escape" => {
+                    search_open.set(false);
+                }
+                "Enter" => {
+                    ev.prevent_default();
+                    on_start(());
+                }
+                _ => {}
             }
         }
     };
@@ -127,10 +245,15 @@ pub fn DmListPage() -> impl IntoView {
                         {shield_icon()}
                         "Direct Messages"
                     </h1>
-                    <p class="text-gray-400 text-sm">"Private encrypted conversations"</p>
+                    <p class="text-gray-400 text-sm">"Private, encrypted conversations"</p>
                     <div class="text-xs text-green-400/60 flex items-center gap-1 mt-1">
                         {lock_icon_small()}
-                        "NIP-44 Encrypted"
+                        "Encrypted ("
+                        <InfoTerm
+                            term="NIP-44"
+                            explainer="The encryption standard that scrambles your messages so only you and the recipient can read them — not even the server."
+                        />
+                        ")"
                     </div>
                 </div>
                 <button
@@ -148,20 +271,51 @@ pub fn DmListPage() -> impl IntoView {
                 </button>
             </div>
 
-            // New DM input
+            // New DM input — search by name, with raw-key paste as a fallback.
             <Show when=move || show_new_dm.get()>
                 <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-4">
-                    <label class="block text-sm text-gray-300 mb-1">"Send to"</label>
-                    <p class="text-xs text-gray-500 mb-2">"Enter their pubkey (64 hex characters)"</p>
+                    <label class="block text-sm text-gray-300 mb-1">"Message someone"</label>
+                    <p class="text-xs text-gray-500 mb-2">
+                        "Start typing a name to find them."
+                    </p>
                     <div class="flex gap-2">
-                        <input
-                            type="text"
-                            class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-400 focus:outline-none focus:border-amber-500 transition-colors text-sm font-mono"
-                            placeholder="e.g. a1b2c3d4..."
-                            prop:value=move || new_pubkey_input.get()
-                            on:input=on_new_pubkey_input
-                            on:keydown=on_new_pubkey_keydown
-                        />
+                        // Wrapper is the positioning context for the dropdown
+                        // (MentionAutocomplete renders an absolute panel).
+                        <div class="relative flex-1">
+                            <input
+                                type="text"
+                                class="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-400 focus:outline-none focus:border-amber-500 transition-colors text-sm"
+                                placeholder="Search by name, or paste a key…"
+                                autocomplete="off"
+                                aria-label="Find someone to message by name"
+                                prop:value=move || new_pubkey_input.get()
+                                on:input=on_new_pubkey_input
+                                on:keydown=on_new_pubkey_keydown
+                                on:focus=move |_| {
+                                    if !search_candidates.get_untracked().is_empty() {
+                                        search_open.set(true);
+                                    }
+                                }
+                            />
+                            // MentionAutocomplete anchors its panel with
+                            // `bottom-full` (opens upward) — correct in the
+                            // composer at the foot of the screen, wrong here at
+                            // the top of the page. Flip it to open downward with
+                            // a scoped override of the child panel, without
+                            // modifying the shared component.
+                            <style>
+                                ".dm-search-anchor > div { top: 100%; bottom: auto; margin-top: 0.25rem; margin-bottom: 0; }"
+                            </style>
+                            <div class="dm-search-anchor">
+                                <MentionAutocomplete
+                                    open=search_open
+                                    query=search_query
+                                    candidates=search_candidates
+                                    active_idx=search_active_idx
+                                    on_select=select_candidate
+                                />
+                            </div>
+                        </div>
                         <button
                             class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:text-gray-400 text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors text-sm"
                             on:click=move |_| on_start_conversation(())
@@ -175,6 +329,14 @@ pub fn DmListPage() -> impl IntoView {
                             <p class="text-red-400 text-sm mt-2">{msg}</p>
                         })
                     }}
+                    <p class="text-[11px] text-gray-500 mt-2 leading-snug">
+                        "Know their key already? Paste their "
+                        <InfoTerm
+                            term="npub"
+                            explainer="A person's public username code (starts with \"npub\"). Safe to share — it's how others find you."
+                        />
+                        " or 64-character key instead."
+                    </p>
                 </div>
             </Show>
 

@@ -14,6 +14,7 @@ use wasm_bindgen::JsCast;
 
 use crate::auth::use_auth;
 use crate::components::image_upload::ImageUpload;
+use crate::components::info_term::InfoTerm;
 use crate::components::swipeable_message::SwipeableMessage;
 use crate::components::user_display::use_display_name_memo;
 use crate::dm::{provide_dm_store, use_dm_store, DMMessage};
@@ -218,7 +219,10 @@ pub fn DmChatPage() -> impl IntoView {
                                 <span class="text-xs text-gray-600">"|"</span>
                                 <span class="text-xs text-green-400/50 flex items-center gap-1">
                                     {lock_icon_tiny()}
-                                    "End-to-end encrypted"
+                                    <InfoTerm
+                                        term="End-to-end encrypted"
+                                        explainer="Messages are scrambled on your device and only unscrambled on theirs — the server (and anyone watching it) only ever sees gibberish."
+                                    />
                                 </span>
                             </div>
                         </div>
@@ -266,7 +270,12 @@ pub fn DmChatPage() -> impl IntoView {
                                         <p class="text-center text-gray-400">"No messages yet. Send the first one!"</p>
                                         <p class="text-xs text-green-400/40 mt-2 flex items-center gap-1">
                                             {lock_icon_tiny()}
-                                            "Messages are encrypted with NIP-44"
+                                            "Messages are encrypted ("
+                                            <InfoTerm
+                                                term="NIP-44"
+                                                explainer="The encryption standard that scrambles your messages so only you and the recipient can read them — not even the server."
+                                            />
+                                            ")"
                                         </p>
                                     </div>
                                 }.into_any()
