@@ -1,20 +1,21 @@
 //! Signup wizard — 3 phases:
 //!
-//! 1. **Identity**: display name + REQUIRED NIP-05 username/handle (validates
-//!    availability against the auth-worker as the user types) + an OPTIONAL,
-//!    admin-only real name (stored server-side in D1, never published).
-//! 2. **Profile**: generate keypair, register as local-key user, publish
-//!    kind-0 metadata, optionally claim the username via auth-worker
-//!    (`POST /api/username/claim` with NIP-98 auth). Surface the resulting
-//!    identity bundle — npub short, NIP-05 handle, WebID URL, git-pod
-//!    clone command (per ADR-089).
-//! 3. **Backup**: present nsec for offline backup. Required before exit.
+//! 1. **Identity**: display name (the public screen name, required) + an
+//!    OPTIONAL, admin-only real name (stored server-side in D1 via
+//!    `POST /api/profile/real-name`, never published). No NIP-05 handle is
+//!    claimed here — the federated `@host` handle is an advanced opt-in that
+//!    users can claim later from Settings, so onboarding stays to the two
+//!    fields a newcomer actually needs.
+//! 2. **Profile**: the freshly-minted identity bundle — npub short, Solid
+//!    WebID URL, git-pod clone command (per ADR-089) — surfaced for the
+//!    backup sheet. The keypair is generated on-device and the pod is
+//!    provisioned eagerly (`POST {POD_API}/.provision`).
+//! 3. **Backup**: present nsec for offline backup + a printable recovery
+//!    sheet. Required before exit (ADR-095).
 //!
-//! Uses the JSS-derived primitives shipped in solid-pod-rs 0.4.0-alpha.12:
-//! provision-keys (pod is provisioned on first authed request), federated
-//! NIP-05 endpoint (`<auth_api>/.well-known/nostr.json`), JSON-LD WebID
-//! export (`<pod_url>/profile/card`), and git-auto-init (`git clone
-//! <pod_url>`).
+//! Uses the JSS-derived primitives shipped in solid-pod-rs 0.5: provision-keys
+//! (pod is provisioned on first authed request), JSON-LD WebID export
+//! (`<pod_url>/profile/card`), and git-auto-init (`git clone <pod_url>`).
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -52,13 +53,6 @@ fn clipboard_copy(text: &str, what: &str, toasts: crate::components::toast::Toas
     }
     toasts.show(format!("{what} copied"), ToastVariant::Success);
 }
-/// NIP-05 host that backs claimed usernames (mirrors onboarding_modal::NIP05_HOST).
-/// Baked from `NOSTR_BBS_NIP05_DOMAIN` at build time; placeholder only for
-/// un-configured local builds.
-const NIP05_USERNAME_HOST: &str = match option_env!("NOSTR_BBS_NIP05_DOMAIN") {
-    Some(d) => d,
-    None => "example.test",
-};
 
 /// Signup wizard phases.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,86 +62,14 @@ enum Phase {
     Backup,
 }
 
-/// Real-time username availability state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum NameState {
-    Idle,
-    InvalidFormat,
-    Checking,
-    Available,
-    Taken,
-    NetworkError,
-}
-
-fn is_valid_format(name: &str) -> bool {
-    let len = name.chars().count();
-    if !(3..=30).contains(&len) {
-        return false;
-    }
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-async fn check_username(name: &str) -> Result<bool, String> {
-    let url = format!("{}/api/username/check?name={}", AUTH_API, urlencode(name));
-    let win = web_sys::window().ok_or("no window")?;
-    let init = web_sys::RequestInit::new();
-    init.set_method("GET");
-    let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
-    let resp_val = JsFuture::from(win.fetch_with_request(&req))
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let resp: web_sys::Response = resp_val
-        .dyn_into()
-        .map_err(|_| "bad response".to_string())?;
-    if !resp.ok() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    let txt_promise = resp.text().map_err(|e| format!("{e:?}"))?;
-    let txt = JsFuture::from(txt_promise)
-        .await
-        .map_err(|e| format!("{e:?}"))?
-        .as_string()
-        .ok_or("non-string body")?;
-    let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| format!("{e}"))?;
-    Ok(v.get("available")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false))
-}
-
-async fn claim_username(
-    name: &str,
-    real_name: Option<&str>,
-    auth: crate::auth::AuthStore,
-) -> Result<(), String> {
-    let url = format!("{}/api/username/claim", AUTH_API);
+/// Store the caller's OPTIONAL real name (`POST {AUTH_API}/api/profile/real-name`,
+/// NIP-98 authed). The worker writes it to D1 keyed on the authed pubkey — it is
+/// admin-only and is NEVER published to kind-0 / the relay. Best-effort: a
+/// failure here is non-fatal (the user can set it later from Settings).
+async fn set_real_name(real_name: &str, auth: crate::auth::AuthStore) -> Result<(), String> {
+    let url = format!("{}/api/profile/real-name", AUTH_API);
     let signer = auth.get_signer().ok_or("no signer")?;
-    // The handle is published; the OPTIONAL real_name is admin-only and the
-    // worker stores it in D1 — it is NEVER written to kind-0 / the relay.
-    let body = match real_name {
-        Some(r) if !r.trim().is_empty() => {
-            serde_json::json!({ "username": name, "real_name": r.trim() }).to_string()
-        }
-        _ => serde_json::json!({ "username": name }).to_string(),
-    };
-    // Hash the body for the NIP-98 payload tag.
+    let body = serde_json::json!({ "real_name": real_name.trim() }).to_string();
     let token = crate::auth::nip98::create_nip98_token_with_signer(
         &*signer,
         &url,
@@ -177,7 +99,7 @@ async fn claim_username(
         .dyn_into()
         .map_err(|_| "bad response".to_string())?;
     if !resp.ok() {
-        return Err(format!("claim failed: HTTP {}", resp.status()));
+        return Err(format!("HTTP {}", resp.status()));
     }
     Ok(())
 }
@@ -225,12 +147,9 @@ pub fn SignupPage() -> impl IntoView {
     let toasts = use_toasts();
 
     let display_name = RwSignal::new(String::new());
-    let username = RwSignal::new(String::new());
     let real_name = RwSignal::new(String::new());
-    let username_state = RwSignal::new(NameState::Idle);
     let phase = RwSignal::new(Phase::Identity);
     let privkey_hex = RwSignal::new(String::new());
-    let claimed_username = RwSignal::new(Option::<String>::None);
     let is_busy = RwSignal::new(false);
     // ADR-095 gate: the finish/exit control in the Backup phase stays disabled
     // until the recovery sheet has been printed AND confirmed (`sheet_ready`),
@@ -253,66 +172,8 @@ pub fn SignupPage() -> impl IntoView {
         }
     };
 
-    // Debounced username availability check.
-    let check_seq = RwSignal::new(0u32);
-    let debounce_handle = RwSignal::new(Option::<i32>::None);
-    Effect::new(move |_| {
-        let value = username.get();
-        if let Some(h) = debounce_handle.get_untracked() {
-            if let Some(w) = web_sys::window() {
-                w.clear_timeout_with_handle(h);
-            }
-            debounce_handle.set(None);
-        }
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            username_state.set(NameState::Idle);
-            return;
-        }
-        if !is_valid_format(&trimmed) {
-            username_state.set(NameState::InvalidFormat);
-            return;
-        }
-        username_state.set(NameState::Checking);
-        let seq_now = check_seq.get_untracked().wrapping_add(1);
-        check_seq.set(seq_now);
-        let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-            let v = username.get_untracked().trim().to_string();
-            if v.is_empty() || !is_valid_format(&v) {
-                return;
-            }
-            spawn_local(async move {
-                match check_username(&v).await {
-                    Ok(true) => {
-                        if check_seq.get_untracked() == seq_now {
-                            username_state.set(NameState::Available);
-                        }
-                    }
-                    Ok(false) => {
-                        if check_seq.get_untracked() == seq_now {
-                            username_state.set(NameState::Taken);
-                        }
-                    }
-                    Err(_) => {
-                        if check_seq.get_untracked() == seq_now {
-                            username_state.set(NameState::NetworkError);
-                        }
-                    }
-                }
-            });
-        }) as Box<dyn FnMut()>);
-        if let Some(w) = web_sys::window() {
-            if let Ok(h) = w.set_timeout_with_callback_and_timeout_and_arguments_0(
-                cb.as_ref().unchecked_ref(),
-                350,
-            ) {
-                debounce_handle.set(Some(h));
-            }
-        }
-        cb.forget();
-    });
-
-    // Phase 1 → 2: create identity (generate key, publish kind-0, claim username).
+    // Phase 1 → 2: create identity (generate key, publish kind-0, store the
+    // optional admin-only real name, provision the pod).
     let do_create = move || {
         let display = display_name.get_untracked().trim().to_string();
         if display.is_empty() || display.len() < 2 {
@@ -323,40 +184,11 @@ pub fn SignupPage() -> impl IntoView {
             auth.set_error("Display name must be 50 characters or fewer");
             return;
         }
-        // The handle is now REQUIRED — it is the public screen name claimed via
-        // the username flow and rendered everywhere. Block progression until a
-        // valid, available handle has been entered.
-        let want = username.get_untracked().trim().to_string();
-        if want.is_empty() {
-            auth.set_error("A username (handle) is required — this is your public screen name.");
-            return;
-        }
-        match username_state.get_untracked() {
-            NameState::Available => {}
-            NameState::Checking => {
-                auth.set_error("Still checking username availability — please wait a moment.");
-                return;
-            }
-            NameState::Taken => {
-                auth.set_error("That username is already taken — please choose another.");
-                return;
-            }
-            NameState::NetworkError => {
-                auth.set_error(
-                    "Could not verify the username (network). Please retry before continuing.",
-                );
-                return;
-            }
-            _ => {
-                auth.set_error("Please choose a valid, available username before continuing.");
-                return;
-            }
-        }
         auth.clear_error();
         is_busy.set(true);
 
         // The OPTIONAL real name is admin-only — it goes to the auth-worker D1
-        // alongside the claim and is NEVER published to kind-0 / the relay.
+        // and is NEVER published to kind-0 / the relay.
         let real = real_name.get_untracked().trim().to_string();
         let real_opt = if real.is_empty() { None } else { Some(real) };
 
@@ -364,17 +196,13 @@ pub fn SignupPage() -> impl IntoView {
         match auth.register_with_generated_key(&display) {
             Ok(hex) => {
                 privkey_hex.set(hex);
-                // Claim the (required) handle, attaching the optional real name.
-                let auth_for_pod = auth.clone();
+                let auth_for_pod = auth;
                 spawn_local(async move {
-                    match claim_username(&want, real_opt.as_deref(), auth).await {
-                        Ok(()) => {
-                            claimed_username.set(Some(want));
-                            toasts.show("Username claimed", ToastVariant::Success);
-                        }
-                        Err(e) => {
+                    // Store the optional real name (admin-only D1, never published).
+                    if let Some(r) = real_opt {
+                        if let Err(e) = set_real_name(&r, auth).await {
                             toasts.show(
-                                format!("Username claim failed (continuing): {e}"),
+                                format!("Could not save real name (continuing): {e}"),
                                 ToastVariant::Warning,
                             );
                         }
@@ -461,11 +289,6 @@ pub fn SignupPage() -> impl IntoView {
             .map(|pk| format!("git clone {}", pod_git_clone_url(POD_API, &pk)))
             .unwrap_or_default()
     });
-    let nip05_handle = Memo::new(move |_| {
-        claimed_username
-            .get()
-            .map(|u| format!("{u}@{NIP05_USERNAME_HOST}"))
-    });
 
     view! {
         <div class="min-h-[80vh] flex items-center justify-center px-4 py-8">
@@ -511,6 +334,9 @@ pub fn SignupPage() -> impl IntoView {
                                 <label for="display-name" class="block text-sm font-medium text-gray-300">
                                     "Display Name"
                                 </label>
+                                <p class="text-xs text-gray-500 -mt-1">
+                                    "Your public screen name — this is what everyone sees, and it can be anonymous."
+                                </p>
                                 <input
                                     id="display-name"
                                     data-testid="signup-display-name"
@@ -521,42 +347,6 @@ pub fn SignupPage() -> impl IntoView {
                                     maxlength="50"
                                     class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-xl px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
                                 />
-                            </div>
-
-                            <div class="space-y-2">
-                                <label for="username" class="block text-sm font-medium text-gray-300">
-                                    "Username "
-                                    <span class="text-xs text-amber-400">"(required)"</span>
-                                </label>
-                                <p class="text-xs text-gray-500 -mt-1">
-                                    "This is your public handle — your screen name and federated NIP-05. It is what everyone sees, and it can be anonymous."
-                                </p>
-                                <div class="flex items-stretch">
-                                    <span class="bg-gray-900 border border-gray-600 border-r-0 rounded-l-xl px-3 py-3 text-gray-500 text-sm flex items-center">"@"</span>
-                                    <input
-                                        id="username"
-                                        data-testid="signup-username"
-                                        type="text"
-                                        placeholder="e.g. ada"
-                                        on:input=move |ev| username.set(event_target_value(&ev).to_lowercase())
-                                        prop:value=move || username.get()
-                                        maxlength="30"
-                                        class="flex-1 bg-gray-800 border border-gray-600 focus:border-amber-500 px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
-                                    />
-                                    <span class="bg-gray-900 border border-gray-600 border-l-0 rounded-r-xl px-3 py-3 text-gray-500 text-sm flex items-center">
-                                        {format!("@{}", NIP05_USERNAME_HOST)}
-                                    </span>
-                                </div>
-                                <p class="text-xs h-4" data-testid="signup-username-state">
-                                    {move || match username_state.get() {
-                                        NameState::Idle => view! { <span class="text-gray-500">"3–30 chars: a-z, 0-9, _ or -"</span> }.into_any(),
-                                        NameState::InvalidFormat => view! { <span class="text-red-400">"Invalid format — lowercase letters/digits/_/- only, start with letter or digit"</span> }.into_any(),
-                                        NameState::Checking => view! { <span class="text-gray-400">"Checking availability…"</span> }.into_any(),
-                                        NameState::Available => view! { <span class="text-green-400">"✓ Available"</span> }.into_any(),
-                                        NameState::Taken => view! { <span class="text-amber-400">"✕ Already taken"</span> }.into_any(),
-                                        NameState::NetworkError => view! { <span class="text-amber-400">"Could not check (network) — you can claim later from Settings"</span> }.into_any(),
-                                    }}
-                                </p>
                             </div>
 
                             <div class="space-y-2">
@@ -575,24 +365,20 @@ pub fn SignupPage() -> impl IntoView {
                                     class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-xl px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
                                 />
                                 <p class="text-xs text-gray-500">
-                                    "Optional. Visible only to administrators and used to provision your access — it is never published, never shown publicly, and never written to the relay. Your handle above is what everyone sees."
+                                    "Optional. Visible only to administrators and used to provision your access — it is never published, never shown publicly, and never written to the relay. Your display name above is what everyone sees."
                                 </p>
                             </div>
 
                             <button
                                 data-testid="signup-submit"
                                 on:click=move |_: web_sys::MouseEvent| do_create()
-                                disabled=move || {
-                                    is_busy.get()
-                                        || username_state.get() == NameState::Checking
-                                        || username_state.get() != NameState::Available
-                                }
+                                disabled=move || is_busy.get()
                                 class="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-50 disabled:cursor-not-allowed text-gray-900 font-semibold py-3 px-4 rounded-xl transition-colors flex items-center justify-center gap-2"
                             >
                                 {move || if is_busy.get() { "Creating…" } else { "Create Account" }}
                             </button>
                             <p class="text-xs text-gray-500 text-center">
-                                "Powered by solid-pod-rs ≥ 0.4.0-alpha.12 (provision-keys + NIP-05 + git-init)."
+                                "You can claim a federated @-handle later from Settings."
                             </p>
                         </div>
                     </Show>
@@ -625,27 +411,6 @@ pub fn SignupPage() -> impl IntoView {
                                     </button>
                                 </div>
                             </div>
-
-                            // NIP-05 (only if claimed)
-                            {move || nip05_handle.get().map(|h| view! {
-                                <div class="bg-gray-900/80 border border-green-500/30 rounded-lg p-3">
-                                    <div class="flex items-center justify-between gap-2">
-                                        <div class="flex-1 min-w-0">
-                                            <p class="text-xs uppercase tracking-wide text-green-500">"NIP-05 handle"</p>
-                                            <p class="text-sm text-green-300 font-mono truncate" data-testid="signup-nip05">{h.clone()}</p>
-                                        </div>
-                                        <button
-                                            on:click={
-                                                let h = h.clone();
-                                                move |_| clipboard_copy(&h, "NIP-05", toasts)
-                                            }
-                                            class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
-                                        >
-                                            "Copy"
-                                        </button>
-                                    </div>
-                                </div>
-                            })}
 
                             // WebID
                             <div class="bg-gray-900/80 border border-gray-700/50 rounded-lg p-3">
@@ -723,7 +488,7 @@ pub fn SignupPage() -> impl IntoView {
                                 pubkey_hex=pubkey.get_untracked().unwrap_or_default()
                                 relay_url=relay_url()
                                 display_name=display_name.get_untracked()
-                                nip05=nip05_handle.get_untracked()
+                                nip05=None
                                 on_ready=Callback::new(move |()| sheet_ready.set(true))
                             />
 
