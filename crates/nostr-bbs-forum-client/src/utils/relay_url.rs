@@ -58,6 +58,18 @@ pub fn auth_api_base() -> String {
         .to_string()
 }
 
+/// Display name for the forum, used in landing copy and titles.
+///
+/// Resolved at runtime from `window.__ENV__.FORUM_NAME` so an operator can
+/// brand the deployment without forking the kit (matches the existing
+/// `RELAY_API_URL`/`ZONE_CONFIG` injection pattern). Falls back to a
+/// brand-neutral default, keeping the upstream kit unbranded.
+pub fn forum_name() -> String {
+    window_env("FORUM_NAME")
+        .or_else(|| option_env!("FORUM_NAME").map(String::from))
+        .unwrap_or_else(|| "Community Forum".to_string())
+}
+
 /// Read a key from the `window.__ENV__` object (runtime config injected by index.html).
 fn window_env(key: &str) -> Option<String> {
     let window = web_sys::window()?;

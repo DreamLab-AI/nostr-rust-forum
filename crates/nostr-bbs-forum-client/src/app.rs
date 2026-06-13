@@ -18,7 +18,7 @@ use crate::components::onboarding_modal::{provide_onboarding_prefill, Onboarding
 use crate::components::profile_modal::ProfileModal;
 use crate::components::screen_reader::{provide_announcer, ScreenReaderAnnouncer};
 use crate::components::session_timeout::SessionTimeout;
-use crate::components::toast::{provide_toasts, ToastContainer};
+use crate::components::toast::{provide_toasts, use_toasts, ToastContainer, ToastVariant};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, CategoryPage, ChannelPage, ChatPage, ConnectPage, DmChatPage, DmListPage,
@@ -33,7 +33,7 @@ use crate::stores::panel_registry::provide_panel_registry;
 use crate::stores::preferences::provide_preferences;
 use crate::stores::profile_cache::{provide_profile_cache, try_use_profile_cache};
 use crate::stores::read_position::provide_read_positions;
-use crate::stores::zone_access::provide_zone_access;
+use crate::stores::zone_access::{provide_zone_access, use_zone_access};
 
 // -- Base path for sub-directory deployment -----------------------------------
 
@@ -586,7 +586,10 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/search") view=AuthGatedSearch />
                     <Route path=path!("/settings") view=AuthGatedSettings />
                     <Route path=path!("/admin") view=AdminPage />
-                    <Route path=path!("/governance") view=AuthGatedGovernance />
+                    // The Agent Control Surface is an operations/admin tool, not
+                    // an ordinary member feature. It is gated to admins both in
+                    // the nav (hidden below) and on the route (admin guard).
+                    <Route path=path!("/governance") view=AdminGatedGovernance />
                     <Route path=path!("/pod") view=AuthGatedPod />
                     <Route path=path!("/marketplace") view=MarketplacePage />
                 </FlatRoutes>
@@ -764,10 +767,13 @@ fn Layout(children: Children) -> impl IntoView {
                                 {events_icon()}
                                 "Events"
                             </A>
-                            <A href=base_href("/governance") attr:class=nav_link_class("/governance")>
-                                {governance_icon()}
-                                "Agents"
-                            </A>
+                            // Agent Control Surface — admin/ops only (issue #22).
+                            {move || is_admin.get().then(|| view! {
+                                <A href=base_href("/governance") attr:class=nav_link_class("/governance")>
+                                    {governance_icon()}
+                                    "Agents"
+                                </A>
+                            })}
                             <A href=base_href("/pod") attr:class=nav_link_class("/pod")>
                                 {pod_icon()}
                                 "Pod"
@@ -847,10 +853,13 @@ fn Layout(children: Children) -> impl IntoView {
                                 {events_icon()}
                                 "Events"
                             </A>
-                            <A href=base_href("/governance") attr:class=mobile_link_class("/governance") on:click=close_mobile>
-                                {governance_icon()}
-                                "Agents"
-                            </A>
+                            // Agent Control Surface — admin/ops only (issue #22).
+                            {move || is_admin.get().then(|| view! {
+                                <A href=base_href("/governance") attr:class=mobile_link_class("/governance") on:click=close_mobile>
+                                    {governance_icon()}
+                                    "Agents"
+                                </A>
+                            })}
                             <A href=base_href("/pod") attr:class=mobile_link_class("/pod") on:click=close_mobile>
                                 {pod_icon()}
                                 "Pod"
@@ -1120,5 +1129,63 @@ auth_gated!(AuthGatedEvents, EventsPage);
 auth_gated!(AuthGatedProfile, ProfilePage);
 auth_gated!(AuthGatedSearch, SearchPage);
 auth_gated!(AuthGatedSettings, SettingsPage);
-auth_gated!(AuthGatedGovernance, GovernancePage);
 auth_gated!(AuthGatedPod, PodBrowserPage);
+
+/// Admin-gated Agent Control Surface (`/governance`, issue #22).
+///
+/// The governance page exposes agent/ops controls that are not meant for
+/// ordinary members. This gate mirrors `AdminPage`: it requires both auth and
+/// the admin flag from the relay whitelist (`ZoneAccess::is_admin`). Non-admins
+/// are bounced with an explanatory toast rather than a silent redirect.
+///
+/// The admin flag is fetched asynchronously after login (`ZoneAccess::loaded`),
+/// so the redirect waits for that fetch to complete — otherwise a genuine admin
+/// would be bounced during the brief window before their flag arrives.
+#[component]
+fn AdminGatedGovernance() -> impl IntoView {
+    let auth = use_auth();
+    let is_authed = auth.is_authenticated();
+    let is_ready = auth.is_ready();
+    let zone_access = use_zone_access();
+    let is_admin = Memo::new(move |_| zone_access.is_admin.get());
+    let access_loaded = zone_access.loaded;
+    let navigate = StoredValue::new(use_navigate());
+    let location = use_location();
+    let toasts = use_toasts();
+
+    // Not signed in → send to login, preserving returnTo.
+    Effect::new(move |_| {
+        if is_ready.get() && !is_authed.get() {
+            let current = location.pathname.get();
+            if let Some(target) = login_redirect_target(&current) {
+                navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            }
+        }
+    });
+
+    // Signed in but not an admin → bounce to /forums with a toast, but only
+    // once the whitelist access fetch has resolved (avoids racing the admin
+    // flag on a fresh login).
+    Effect::new(move |_| {
+        if is_ready.get() && is_authed.get() && access_loaded.get() && !is_admin.get() {
+            toasts.show(
+                "The Agents control surface is for administrators.",
+                ToastVariant::Warning,
+            );
+            navigate.with_value(|nav| nav("/forums", NavigateOptions::default()));
+        }
+    });
+
+    view! {
+        <Show when=move || is_ready.get() fallback=|| { loading_spinner() }>
+            <Show
+                when=move || is_authed.get() && (!access_loaded.get() || is_admin.get())
+                fallback=|| { redirect_spinner() }
+            >
+                <Show when=move || is_admin.get() fallback=|| { loading_spinner() }>
+                    <GovernancePage />
+                </Show>
+            </Show>
+        </Show>
+    }
+}
