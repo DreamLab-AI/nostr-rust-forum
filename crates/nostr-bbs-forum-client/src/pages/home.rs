@@ -95,20 +95,21 @@ pub fn HomePage() -> impl IntoView {
                     <div class="absolute -z-10 w-96 h-96 rounded-full bg-amber-500/10 blur-3xl animate-ambient-breathe"></div>
 
                     <p class="text-amber-400/60 uppercase tracking-widest text-xs font-medium mb-4">
-                        "a members ai ltd partnership"
+                        "Welcome"
                     </p>
 
                     <h1 class="text-5xl sm:text-6xl font-bold bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent drop-shadow-lg">
-                        "MiniMooNoir Forums"
+                        {crate::utils::relay_url::forum_name()}
                     </h1>
                 </div>
 
                 <div class="space-y-2">
                     <p class="text-xl text-gray-300 leading-relaxed">
-                        "Private, secure, multi cohort BBS done the right way"
+                        "A friendly, private place to talk with your community."
                     </p>
                     <p class="text-lg text-gray-400 leading-relaxed">
-                        "Secure, end to end encrypted with private file stores and distributed identity."
+                        "Join the conversation, share files, and keep your own space — "
+                        "with your own groups for the people who matter."
                     </p>
                 </div>
 
@@ -171,31 +172,68 @@ pub fn HomePage() -> impl IntoView {
                     </Show>
                 </div>
 
+                // Plain-benefit cards — lead with what people get, not the tech.
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-6 pt-12 text-left">
                     <FeatureCard
-                        icon="\u{1F511}"
-                        title="Nostr Identity"
-                        description="Instant keypair generation. Sign in with your private key, extension, or passkey."
+                        icon="\u{1F4AC}"
+                        title="Easy to join"
+                        description="Create an account in seconds and start chatting. No email or phone number needed."
                     />
                     <FeatureCard
-                        icon="\u{1F6E1}"
-                        title="End-to-End Encrypted"
-                        description="Direct messages use NIP-44 encryption. Only you and the recipient can read them."
+                        icon="\u{1F512}"
+                        title="Private by default"
+                        description="Your conversations stay between you and the people you choose. We can't read them."
                     />
                     <FeatureCard
-                        icon="\u{1F5DD}"
-                        title="Self-Sovereign"
-                        description="Your identity allows you to generate AI agents."
+                        icon="\u{1F465}"
+                        title="Your own groups"
+                        description="Keep separate spaces for friends, family, and work — each with its own members."
                     />
                 </div>
 
-                // Tech badges
-                <div class="flex flex-wrap items-center justify-center gap-3 pt-6">
-                    <TechBadge label="Nostr Protocol" />
-                    <TechBadge label="NIP-44 Encryption" />
-                    <TechBadge label="WebAuthn Passkeys" />
-                    <TechBadge label="Rust + WASM" />
-                </div>
+                // "Good to know" — technical reassurance, available but tucked away.
+                <details class="group mt-8 text-left max-w-xl mx-auto glass-card overflow-hidden">
+                    <summary class="cursor-pointer select-none list-none px-5 py-4 flex items-center justify-between text-gray-300 hover:text-white transition-colors">
+                        <span class="flex items-center gap-2 text-sm font-medium">
+                            <span aria-hidden="true">"\u{2728}"</span>
+                            "Good to know — how we keep things private"
+                        </span>
+                        <span
+                            class="text-gray-500 transition-transform duration-300 group-open:rotate-180"
+                            aria-hidden="true"
+                        >
+                            {chevron_down_icon()}
+                        </span>
+                    </summary>
+                    <div class="px-5 pb-5 pt-1 space-y-3 text-sm text-gray-400 leading-relaxed border-t border-gray-800/60">
+                        <p>
+                            "You don't need to know any of this to use the forum — but if you're curious, "
+                            "here's what's working quietly behind the scenes:"
+                        </p>
+                        <ul class="space-y-2 list-disc list-inside marker:text-amber-400/60">
+                            <li>
+                                <span class="text-gray-300">"End-to-end encrypted messages. "</span>
+                                "Direct messages use NIP-44 encryption, so only you and the person you're "
+                                "talking to can read them."
+                            </li>
+                            <li>
+                                <span class="text-gray-300">"An identity that's yours. "</span>
+                                "Sign in is built on the open Nostr protocol with a key you control — "
+                                "use a passkey, a browser extension, or your own private key."
+                            </li>
+                            <li>
+                                <span class="text-gray-300">"No central account to lose. "</span>
+                                "Your identity isn't tied to one company's database, so it travels with you."
+                            </li>
+                        </ul>
+                        <div class="flex flex-wrap items-center gap-2 pt-1">
+                            <TechBadge label="Nostr Protocol" />
+                            <TechBadge label="NIP-44 Encryption" />
+                            <TechBadge label="WebAuthn Passkeys" />
+                            <TechBadge label="Rust + WASM" />
+                        </div>
+                    </div>
+                </details>
             </div>
         </div>
     }
@@ -429,6 +467,14 @@ fn TechBadge(label: &'static str) -> impl IntoView {
 }
 
 // -- SVG icons ----------------------------------------------------------------
+
+fn chevron_down_icon() -> impl IntoView {
+    view! {
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="6 9 12 15 18 9" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+    }
+}
 
 fn shield_icon() -> impl IntoView {
     view! {
