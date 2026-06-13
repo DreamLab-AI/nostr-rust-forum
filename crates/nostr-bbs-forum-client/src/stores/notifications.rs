@@ -218,10 +218,7 @@ impl NotificationStoreV2 {
             let baseline = store.baseline.get_untracked();
             let channels = channels_sig.get();
             for c in channels.iter() {
-                if store
-                    .seen_channels
-                    .with_untracked(|s| s.contains(&c.id))
-                {
+                if store.seen_channels.with_untracked(|s| s.contains(&c.id)) {
                     continue;
                 }
                 store.seen_channels.update(|s| {
@@ -260,9 +257,11 @@ impl NotificationStoreV2 {
             let me = my_pubkey.get();
             let msgs = messages_sig.get();
             // Channel id -> display name for the notification body.
-            let names: std::collections::HashMap<String, String> =
-                channels_for_msgs.with_untracked(|list| {
-                    list.iter().map(|c| (c.id.clone(), c.name.clone())).collect()
+            let names: std::collections::HashMap<String, String> = channels_for_msgs
+                .with_untracked(|list| {
+                    list.iter()
+                        .map(|c| (c.id.clone(), c.name.clone()))
+                        .collect()
                 });
             for (cid, events) in msgs.iter() {
                 // Last-read position for this channel: posts at or before it are
