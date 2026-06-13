@@ -272,7 +272,11 @@ pub fn apply_preferences(prefs: &Preferences) {
     let _ = root.set_attribute("data-density", prefs.density.token());
     let _ = root.set_attribute(
         "data-reduced-motion",
-        if prefs.reduced_motion { "true" } else { "false" },
+        if prefs.reduced_motion {
+            "true"
+        } else {
+            "false"
+        },
     );
     // Drive the browser's own form-control / scrollbar rendering.
     let _ = root.set_attribute("style", &format!("color-scheme: {theme_token};"));
