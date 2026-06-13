@@ -11,20 +11,48 @@ use wasm_bindgen_futures::spawn_local;
 use super::WhitelistUser;
 use crate::auth::nip98::fetch_with_nip98_post_signer;
 use crate::auth::use_auth;
-use crate::components::user_display::use_display_name_memo;
+use crate::components::user_display::{try_display_name_tracked, use_display_name_memo};
+use crate::utils::shorten_pubkey;
 
-/// Available zone flags for cohort editing.
-const AVAILABLE_COHORTS: &[(&str, &str)] = &[
-    ("home", "Home"),
-    ("members", "Members"),
-    ("private", "Minimoonoir"),
-];
+/// Cohort options for the inline editor, derived from the live `ZONE_CONFIG`
+/// (`window.__ENV__.ZONE_CONFIG`) rather than a hardcoded list (Task #7,
+/// coordinator finding #3 — the prior `home/members/private` set never matched
+/// the real `friends/family/business/agent` zone cohorts).
+///
+/// Returns `(cohort_id, label)` pairs: the union of every zone's
+/// `required_cohorts` plus `write_cohorts`, de-duplicated, preserving the order
+/// zones are declared so the editor is stable. Each cohort is labelled by the
+/// zone it gates (falling back to a humanised cohort id).
+fn available_cohorts() -> Vec<(String, String)> {
+    use std::collections::BTreeSet;
+    let zones = crate::stores::zones::load_zones();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for zone in &zones {
+        let mut cohorts: Vec<String> = zone.required_cohorts.clone();
+        if let Some(write) = &zone.write_cohorts {
+            cohorts.extend(write.iter().cloned());
+        }
+        for c in cohorts {
+            if c.is_empty() {
+                continue;
+            }
+            if seen.insert(c.clone()) {
+                out.push((c.clone(), zone.label()));
+            }
+        }
+    }
+    out
+}
 
 /// Callback type for cohort updates: (pubkey, new_cohorts).
 type UpdateCallback = Rc<dyn Fn(String, Vec<String>)>;
 
 /// Callback type for admin toggle: (pubkey, is_admin).
 type AdminToggleCallback = Rc<dyn Fn(String, bool)>;
+
+/// Callback type for user deletion: (pubkey, also_delete_events).
+type DeleteCallback = Rc<dyn Fn(String, bool)>;
 
 /// Whitelist user table. Shows username, cohorts, and an edit button for each user.
 /// Calls `on_update_cohorts` when cohorts are changed for a user.
@@ -34,11 +62,13 @@ pub fn UserTable(
     users: Signal<Vec<WhitelistUser>>,
     #[prop(into)] on_update_cohorts: UpdateCohortsCb,
     #[prop(into)] on_toggle_admin: AdminToggleCb,
+    #[prop(into)] on_delete_user: DeleteCb,
 ) -> impl IntoView {
     let editing_pubkey = RwSignal::new(Option::<String>::None);
     let editing_cohorts = RwSignal::new(Vec::<String>::new());
     let callback = on_update_cohorts.0;
     let admin_callback = on_toggle_admin.0;
+    let delete_callback = on_delete_user.0;
 
     view! {
         <div class="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
@@ -63,9 +93,11 @@ pub fn UserTable(
                     } else {
                         let cb = callback.clone();
                         let acb = admin_callback.clone();
+                        let dcb = delete_callback.clone();
                         user_list.into_iter().map(move |user| {
                             let cb_for_row = cb.clone();
                             let acb_for_row = acb.clone();
+                            let dcb_for_row = dcb.clone();
                             view! {
                                 <UserRow
                                     user=user
@@ -73,6 +105,7 @@ pub fn UserTable(
                                     editing_cohorts=editing_cohorts
                                     on_save=UpdateCohortsCb(cb_for_row)
                                     on_toggle_admin=AdminToggleCb(acb_for_row)
+                                    on_delete_user=DeleteCb(dcb_for_row)
                                 />
                             }
                         }).collect_view().into_any()
@@ -122,6 +155,28 @@ unsafe impl Send for AdminToggleCb {}
 unsafe impl Sync for AdminToggleCb {}
 
 impl<F: Fn(String, bool) + 'static> From<F> for AdminToggleCb {
+    fn from(f: F) -> Self {
+        Self::new(f)
+    }
+}
+
+/// A wrapper to make the delete callback Send+Sync for Leptos context.
+/// Carries `(pubkey, also_delete_events)`.
+#[derive(Clone)]
+pub struct DeleteCb(SendWrapper<DeleteCallback>);
+
+impl DeleteCb {
+    pub fn new(f: impl Fn(String, bool) + 'static) -> Self {
+        Self(SendWrapper::new(Rc::new(f)))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for DeleteCb {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for DeleteCb {}
+
+impl<F: Fn(String, bool) + 'static> From<F> for DeleteCb {
     fn from(f: F) -> Self {
         Self::new(f)
     }
@@ -394,6 +449,84 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
     }
 }
 
+// -- Delete-user modal --------------------------------------------------------
+
+/// Confirmation modal for deleting a user, with an opt-in checkbox to also
+/// purge the user's posted messages. Invokes `on_confirm(also_delete_events)`.
+#[component]
+fn DeleteUserModal(
+    pubkey: String,
+    display_label: String,
+    on_close: impl Fn() + 'static + Clone,
+    on_confirm: impl Fn(bool) + 'static + Clone,
+) -> impl IntoView {
+    let also_delete_events = RwSignal::new(false);
+    let pk_display = truncate_pubkey(&pubkey);
+
+    let confirm = {
+        let on_confirm = on_confirm.clone();
+        let on_close = on_close.clone();
+        move |_| {
+            on_confirm.clone()(also_delete_events.get_untracked());
+            on_close.clone()();
+        }
+    };
+
+    view! {
+        <div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50" on:click={
+            let close = on_close.clone();
+            move |_| close()
+        }>
+            <div class="bg-gray-800 border border-gray-700 rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl"
+                on:click=|ev| ev.stop_propagation()
+            >
+                <h3 class="text-lg font-semibold text-white mb-1">"Delete User"</h3>
+                <p class="text-sm text-gray-400 mb-4">
+                    {display_label}
+                    " "
+                    <span class="font-mono text-xs text-gray-500">{pk_display}</span>
+                </p>
+
+                <div class="bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2 text-red-200 text-sm mb-4">
+                    "This removes the user from the whitelist, revoking all relay access. "
+                    "Their auth-side handle and provisioning name are also removed. This cannot be undone."
+                </div>
+
+                <label class="flex items-start gap-2 cursor-pointer text-sm mb-5">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || also_delete_events.get()
+                        on:change=move |ev| also_delete_events.set(event_target_checked(&ev))
+                        class="mt-0.5 rounded border-gray-600 bg-gray-900 text-red-500 focus:ring-red-500"
+                    />
+                    <span class="text-gray-300">
+                        "Also delete this user's posted messages"
+                        <span class="block text-xs text-gray-500">
+                            "Purges every event this pubkey authored from the relay. Other users' messages are unaffected."
+                        </span>
+                    </span>
+                </label>
+
+                <div class="flex justify-end gap-3">
+                    <button type="button" on:click={
+                        let close = on_close.clone();
+                        move |_| close()
+                    } class="text-sm text-gray-400 hover:text-gray-200 px-4 py-2 transition-colors">
+                        "Cancel"
+                    </button>
+                    <button
+                        type="button"
+                        on:click=confirm
+                        class="bg-red-600 hover:bg-red-500 text-white font-medium px-4 py-2 rounded-lg transition-colors text-sm"
+                    >
+                        "Delete User"
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
 /// A single row in the user table with inline edit capability,
 /// suspend/silence buttons, and admin notes.
 #[component]
@@ -403,17 +536,52 @@ fn UserRow(
     editing_cohorts: RwSignal<Vec<String>>,
     on_save: UpdateCohortsCb,
     on_toggle_admin: AdminToggleCb,
+    on_delete_user: DeleteCb,
 ) -> impl IntoView {
     let pk = user.pubkey.clone();
     let pk_display = truncate_pubkey(&pk);
-    // Reactively resolve display name from the profile cache (triggers a
-    // batch fetch on miss; updates automatically when the response arrives).
-    let display_name = use_display_name_memo(pk.clone());
     let cohorts = user.cohorts.clone();
     let is_admin_user = user.is_admin;
     // Admin-only real name (enriched from the auth-worker). Rendered on this
     // admin surface only so admins can provision the right person.
     let real_name = user.real_name.clone();
+    // Public claimed handle (auth-worker). Task #7: the fallback display name
+    // for users whose kind-0 profile has no name (most live "hex" rows). The
+    // profile cache (kind-0) is still tried first; the handle covers the gap so
+    // the admin table no longer falls back to a raw 64-hex pubkey.
+    let handle_fallback = user.handle.clone();
+    // The relay's /api/whitelist/list already joins the latest kind-0 and
+    // returns its display_name/name as `displayName`. We use it as a source
+    // before the auth handle (it is zero-extra-fetch and already loaded).
+    let relay_display_name = user.display_name.clone();
+    // Reactively resolve display name, in precedence order:
+    //   kind-0 profile cache -> relay-joined kind-0 name -> auth handle ->
+    //   shortened hex. The cache read subscribes so the name fills in live when
+    //   kind-0 metadata arrives. The auth handle is the key Task #7 fix: most
+    //   live "hex" rows have a blank kind-0 name but a claimed handle.
+    let display_name = {
+        let pk = pk.clone();
+        let handle = handle_fallback.clone();
+        let relay_name = relay_display_name.clone();
+        Memo::new(move |_| {
+            if let Some(name) = try_display_name_tracked(&pk) {
+                return name;
+            }
+            if let Some(n) = relay_name.as_ref() {
+                let t = n.trim();
+                if !t.is_empty() {
+                    return t.to_string();
+                }
+            }
+            if let Some(h) = handle.as_ref() {
+                let t = h.trim();
+                if !t.is_empty() {
+                    return format!("@{t}");
+                }
+            }
+            shorten_pubkey(&pk)
+        })
+    };
 
     let pk_for_edit = pk.clone();
     let cohorts_for_edit = cohorts.clone();
@@ -424,6 +592,7 @@ fn UserRow(
     let pk_for_suspend = pk.clone();
     let pk_for_notes = pk.clone();
     let pk_for_silence = pk.clone();
+    let pk_for_delete = pk.clone();
 
     let is_editing = move || editing_pubkey.get().as_deref() == Some(&*pk_for_check);
     let is_editing2 = move || editing_pubkey.get().as_deref() == Some(&*pk_for_check2);
@@ -431,7 +600,15 @@ fn UserRow(
     // Modal states
     let show_suspend_modal = RwSignal::new(false);
     let show_notes_modal = RwSignal::new(false);
+    let show_delete_modal = RwSignal::new(false);
     let is_silenced = RwSignal::new(false);
+
+    // Delete callback (pubkey, also_delete_events).
+    let delete_cb = on_delete_user.0;
+    let pk_delete = pk_for_delete.clone();
+    let on_delete_confirm = move |also_delete_events: bool| {
+        delete_cb(pk_delete.clone(), also_delete_events);
+    };
 
     let on_edit_click = move |_| {
         editing_pubkey.set(Some(pk_for_edit.clone()));
@@ -593,6 +770,13 @@ fn UserRow(
                         >
                             {notes_icon()}
                         </button>
+                        <button
+                            on:click=move |_| show_delete_modal.set(true)
+                            title="Delete user"
+                            class="text-xs text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded px-2 py-1 transition-colors flex items-center gap-1"
+                        >
+                            {trash_icon()}
+                        </button>
                     }
                 >
                     <button
@@ -632,18 +816,34 @@ fn UserRow(
                 />
             }
         })}
+        {move || show_delete_modal.get().then(|| {
+            let pk = pk_for_delete.clone();
+            let label = display_name.get();
+            let confirm = on_delete_confirm.clone();
+            view! {
+                <DeleteUserModal
+                    pubkey=pk
+                    display_label=label
+                    on_close=move || show_delete_modal.set(false)
+                    on_confirm=confirm
+                />
+            }
+        })}
     }
 }
 
-/// Inline cohort editor with checkboxes for each available zone flag.
+/// Inline cohort editor with a checkbox per cohort. The cohort set is derived
+/// from the live `ZONE_CONFIG` via [`available_cohorts`] (Task #7) so it always
+/// matches the operator's real zones rather than a hardcoded list.
 #[component]
 fn CohortEditor(editing_cohorts: RwSignal<Vec<String>>) -> impl IntoView {
+    let cohorts = available_cohorts();
     view! {
         <div class="flex flex-wrap gap-2">
-            {AVAILABLE_COHORTS.iter().map(|&(cohort_id, label)| {
-                let cohort_str = cohort_id.to_string();
-                let cohort_for_check = cohort_str.clone();
-                let cohort_for_toggle = cohort_str.clone();
+            {cohorts.into_iter().map(|(cohort_id, zone_label)| {
+                let cohort_for_check = cohort_id.clone();
+                let cohort_for_toggle = cohort_id.clone();
+                let label = capitalize(&cohort_id);
 
                 let is_checked = move || {
                     editing_cohorts.get().contains(&cohort_for_check)
@@ -660,7 +860,7 @@ fn CohortEditor(editing_cohorts: RwSignal<Vec<String>>) -> impl IntoView {
                 };
 
                 view! {
-                    <label class="flex items-center gap-1 cursor-pointer text-xs">
+                    <label class="flex items-center gap-1 cursor-pointer text-xs" title=zone_label>
                         <input
                             type="checkbox"
                             prop:checked=is_checked
@@ -675,6 +875,15 @@ fn CohortEditor(editing_cohorts: RwSignal<Vec<String>>) -> impl IntoView {
     }
 }
 
+/// Capitalise a cohort id for display (`"friends"` -> `"Friends"`).
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
 /// Truncate a hex pubkey to show first 8 and last 4 characters.
 fn truncate_pubkey(pk: &str) -> String {
     if pk.len() <= 16 {
@@ -683,9 +892,27 @@ fn truncate_pubkey(pk: &str) -> String {
     format!("{}...{}", &pk[..8], &pk[pk.len() - 4..])
 }
 
-/// Return a Tailwind CSS class string for a cohort badge based on the cohort name.
+/// Read a checkbox's `checked` state from a DOM `change` event.
+fn event_target_checked(ev: &leptos::ev::Event) -> bool {
+    use wasm_bindgen::JsCast;
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .map(|el| el.checked())
+        .unwrap_or(false)
+}
+
+/// Return a Tailwind CSS class string for a cohort badge based on the cohort
+/// name. Covers the real DreamLab zone cohorts (friends/family/business/agent)
+/// plus the legacy fallback names; any unrecognised cohort renders with the
+/// neutral grey badge so config-driven cohorts always have a sensible style.
 fn cohort_badge_class(cohort: &str) -> &'static str {
     match cohort {
+        // Real DreamLab zone cohorts.
+        "friends" => "inline-block text-xs rounded px-1.5 py-0.5 bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:shadow-[0_0_6px_rgba(245,158,11,0.3)] transition-shadow",
+        "family" => "inline-block text-xs rounded px-1.5 py-0.5 bg-pink-500/20 text-pink-300 border border-pink-500/30 hover:shadow-[0_0_6px_rgba(236,72,153,0.3)] transition-shadow",
+        "business" => "inline-block text-xs rounded px-1.5 py-0.5 bg-blue-500/20 text-blue-300 border border-blue-500/30 hover:shadow-[0_0_6px_rgba(59,130,246,0.3)] transition-shadow",
+        "agent" => "inline-block text-xs rounded px-1.5 py-0.5 bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:shadow-[0_0_6px_rgba(16,185,129,0.3)] transition-shadow",
+        // Legacy fallback cohorts (pre-zone-redesign deployments).
         "home" => "inline-block text-xs rounded px-1.5 py-0.5 bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:shadow-[0_0_6px_rgba(245,158,11,0.3)] transition-shadow",
         "members" => "inline-block text-xs rounded px-1.5 py-0.5 bg-pink-500/20 text-pink-300 border border-pink-500/30 hover:shadow-[0_0_6px_rgba(236,72,153,0.3)] transition-shadow",
         "private" => "inline-block text-xs rounded px-1.5 py-0.5 bg-purple-500/20 text-purple-300 border border-purple-500/30 hover:shadow-[0_0_6px_rgba(168,85,247,0.3)] transition-shadow",
@@ -727,6 +954,17 @@ fn notes_icon() -> impl IntoView {
             <polyline points="14 2 14 8 20 8"/>
             <line x1="16" y1="13" x2="8" y2="13"/>
             <line x1="16" y1="17" x2="8" y2="17"/>
+        </svg>
+    }
+}
+
+fn trash_icon() -> impl IntoView {
+    view! {
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+            <line x1="10" y1="11" x2="10" y2="17"/>
+            <line x1="14" y1="11" x2="14" y2="17"/>
         </svg>
     }
 }

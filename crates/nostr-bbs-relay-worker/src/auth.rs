@@ -140,7 +140,30 @@ struct IsAdminRow {
 /// P0-02 fix: previously only `whitelist` was checked, which meant a user
 /// added as admin via the `members` table would be rejected by the relay
 /// for admin-gated NIP-29 events.
+///
+/// Task #7 fix (admin-resolution): resolution order is now
+/// **`ADMIN_PUBKEYS` (static) ∪ D1**, matching the auth-worker
+/// (`crate::admin::is_admin`). The static set is the deploy-time
+/// bootstrap/fallback authority — it projects `dreamlab.toml [admin]
+/// static_pubkeys` so a fresh deployment whose relay `whitelist`/`members`
+/// tables carry no `is_admin = 1` row still has working admins. Without this,
+/// the relay's admin-gated endpoints (`/api/whitelist/list`, etc.) 401/403 for
+/// the operator and the admin panel renders empty, with no way to bootstrap an
+/// admin (adding one requires being one). The var is read through the canonical
+/// `nostr_bbs_core` helpers so the comma/whitespace/npub-or-hex semantics never
+/// drift from the auth- and search-workers.
 async fn query_is_admin(pubkey: &str, env: &Env) -> bool {
+    // Static admin set (ADMIN_PUBKEYS): deploy-time bootstrap/fallback. Checked
+    // before D1 so a no-seed deployment still authenticates the operator.
+    if let Ok(raw) = env
+        .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)
+        .map(|v| v.to_string())
+    {
+        if nostr_bbs_core::is_static_admin(pubkey, &raw) {
+            return true;
+        }
+    }
+
     if let Ok(db) = env.d1("DB") {
         let stmt = db.prepare("SELECT is_admin FROM members WHERE pubkey = ?1");
         if let Ok(bound) = stmt.bind(&[JsValue::from_str(pubkey)]) {

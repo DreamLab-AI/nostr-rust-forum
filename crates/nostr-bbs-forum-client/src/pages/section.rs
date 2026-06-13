@@ -1,42 +1,63 @@
-//! Section page -- messages within a specific forum section.
+//! Section page -- the LIST OF TOPICS within a forum section (#8).
 //! Route: /forums/:category/:section
 //!
-//! Messages are sourced exclusively from the shared `ChannelStore` — the same
-//! global kind-40 / kind-42 subscriptions that drive the Forums index tiles.
-//! This eliminates the previous local two-stage subscription, which raced the
+//! ## BBS composition (the contract this page restores)
+//!
+//! A *section* is a kind-40 channel. A *topic* is a kind-42 ROOT message inside
+//! it (a thread starter, anchored to the channel id). This page renders the
+//! section as a LIST OF TOPICS — each row showing the topic title, author,
+//! reply count and last-activity — NOT a flat linear chat. Clicking a topic row
+//! opens the [`crate::pages::thread::ThreadPage`] at
+//! `/forums/:category/:section/:topic`.
+//!
+//! The previous implementation rendered every kind-42 in the channel as a flat
+//! chat log, collapsing the topic/reply hierarchy. The flat single-channel chat
+//! still exists at `/chat/:channel_id` ([`crate::pages::channel::ChannelPage`])
+//! for direct deep-links, but the section view is now a true BBS topic list.
+//!
+//! ## Data sourcing
+//!
+//! Topics are derived from the shared [`ChannelStore`] — the same global
+//! kind-40 / kind-42 subscriptions that drive the Forums index tiles. This
+//! eliminates the previous local two-stage subscription, which raced the
 //! NIP-42 AUTH handshake: an unauthenticated reader is zone-filtered to public
 //! zones, so the friends/family/business kind-40 def never arrived, the local
 //! `section_info` stayed `None`, and the gated kind-42 sub never started.
 //! By reading from the store (which subscribes ONCE at app root and survives
 //! the AUTH replay), the page is independent of AUTH timing.
+//!
+//! ## URL privacy (#9)
+//!
+//! The `:section` slug in the URL is a HASH of the channel id (see
+//! [`crate::utils::slug_hash`]); the real section name is resolved from the
+//! store for the heading/breadcrumb. Legacy plaintext section slugs still
+//! resolve via the fallback resolver.
 
 use leptos::prelude::*;
+use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 use std::rc::Rc;
 
-use wasm_bindgen_futures::spawn_local;
-
+use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::access_denied::AccessDenied;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
-use crate::components::mention_text::normalise_mention_pubkey;
-use crate::components::message_bubble::{MessageBubble, MessageData};
-use crate::components::message_input::MessageInput;
-use crate::components::reaction_bar::Reaction;
-use crate::components::swipeable_message::SwipeableMessage;
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::typing_indicator::TypingIndicator;
-use crate::relay::RelayConnection;
+use crate::components::topic_list::{classify_topics, TopicList, TopicSummary};
+use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
-use crate::utils::{capitalize, set_timeout_once};
+use crate::utils::capitalize;
+use crate::utils::slug_hash::matches_section_slug;
 
 /// Map a zone slug to its display name. Config-driven: resolves against the
 /// live `ZONE_CONFIG` zone list, falling back to a capitalised slug for unknown
 /// zones. Bug #22: avoid showing URL slug "Private" when the zone has a
 /// configured display name.
-fn category_display_name(slug: &str) -> String {
+///
+/// `pub(crate)` so the thread page can render the same breadcrumb zone label.
+pub(crate) fn category_display_name(slug: &str) -> String {
     load_zones()
         .into_iter()
         .find(|z| z.id == slug)
@@ -44,8 +65,9 @@ fn category_display_name(slug: &str) -> String {
         .unwrap_or_else(|| capitalize(slug))
 }
 
-/// Humanise a section slug for breadcrumb display. `home-lobby` → `Lobby`.
-/// Bug #24: avoid breadcrumb leaf reading `Home-lobby` (kebab-cased URL).
+/// Humanise a section slug for breadcrumb display when no channel resolves.
+/// `home-lobby` → `Lobby`. Only used as a last-resort label (hashed slugs are
+/// opaque, so this is effectively a fallback for legacy plaintext URLs).
 fn humanize_section_slug(slug: &str) -> String {
     let suffix = slug.split_once('-').map(|(_, s)| s).unwrap_or(slug);
     suffix
@@ -80,7 +102,7 @@ fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
     zones.first().map(|z| z.id.clone())
 }
 
-/// Slugify a channel name the same way the route slug is generated.
+/// Slugify a channel name the same way legacy route slugs were generated.
 fn slugify(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -95,12 +117,14 @@ fn slugify(s: &str) -> String {
 /// Find the channel whose section/name maps to `(category_slug, section_slug)`,
 /// using the SAME config-zone logic the Forums index uses.
 ///
-/// A channel matches when its `section` tag routes to the requested category
-/// zone (or the category is empty) AND its `section` tag equals the section
-/// slug, OR its name/name-slug equals the section slug, OR its id is prefixed
-/// by the slug (deep-link by id-prefix). This re-implements the resolution the
-/// old local kind-40 handler did, but against the already-populated store.
-fn resolve_channel(
+/// LEGACY/PLAINTEXT resolver: a channel matches when its `section` tag routes
+/// to the requested category zone (or the category is empty) AND its `section`
+/// tag equals the section slug, OR its name/name-slug equals the section slug,
+/// OR its id is prefixed by the slug (deep-link by id-prefix).
+///
+/// `pub(crate)` so the thread page can share the fallback path. The hashed-slug
+/// match (#9) is tried first by callers; this is the back-compat fallback.
+pub(crate) fn resolve_channel(
     channels: &[ChannelMeta],
     category_slug: &str,
     section_slug: &str,
@@ -124,32 +148,31 @@ fn resolve_channel(
         .cloned()
 }
 
-/// Convert a stored kind-42 [`NostrEvent`] into the page's [`MessageData`].
-fn event_to_message(event: &nostr_bbs_core::NostrEvent) -> MessageData {
-    let reply_to = event
-        .tags
-        .iter()
-        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "reply")
-        .or_else(|| event.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
-        .map(|t| t[1].clone());
-    let reply_pk = event
-        .tags
-        .iter()
-        .find(|t| t.len() >= 2 && t[0] == "p")
-        .map(|t| t[1].clone());
-    MessageData {
-        id: event.id.clone(),
-        pubkey: event.pubkey.clone(),
-        content: event.content.clone(),
-        created_at: event.created_at,
-        reply_to_id: reply_to,
-        reply_to_pubkey: reply_pk,
-        reply_to_content: None,
-        reactions: RwSignal::new(Vec::<Reaction>::new()),
-        is_hidden: false,
-        channel_id: String::new(),
-        thread_replies: RwSignal::new(Vec::new()),
+/// Resolve a section channel for `(category, section_slug)` from the store,
+/// trying the hashed slug (#9) first and falling back to the plaintext resolver.
+fn resolve_section(
+    channels: &[ChannelMeta],
+    category_slug: &str,
+    section_slug_param: &str,
+    zones: &[Zone],
+) -> Option<ChannelMeta> {
+    let cat = category_slug.to_lowercase();
+    // Hashed form (#9): match the channel-id hash (SectionCard links) OR the
+    // section-tag hash (CategoryCard links group channels by section tag).
+    if let Some(found) = channels.iter().find(|c| {
+        let routes_to_category = cat.is_empty()
+            || section_to_zone(&c.section, zones)
+                .map(|z| z.to_lowercase() == cat)
+                .unwrap_or(false);
+        routes_to_category
+            && (matches_section_slug(&c.id, section_slug_param)
+                || (!c.section.is_empty()
+                    && matches_section_slug(&c.section, section_slug_param)))
+    }) {
+        return Some(found.clone());
     }
+    // Legacy plaintext fallback (old seeded / bookmarked links).
+    resolve_channel(channels, category_slug, section_slug_param, zones)
 }
 
 #[component]
@@ -158,16 +181,14 @@ pub fn SectionPage() -> impl IntoView {
     let auth = use_auth();
     let store = use_channel_store();
     let zone_access = use_zone_access();
+    let toasts = use_toasts();
 
     let params = use_params_map();
     let category_slug = move || params.read().get("category").unwrap_or_default();
     let section_slug = move || params.read().get("section").unwrap_or_default();
 
-    // Zone access gate: the category slug IS the zone ID. Config-driven —
-    // resolves against the live zone list. A public zone is always readable;
-    // otherwise membership (admin OR matching cohort) is required. Unknown
-    // zones default to accessible so relay-created channels never 403 the
-    // client UX (the relay remains the real boundary, ADR-022).
+    // Zone access gate: the category slug IS the zone ID (ADR-022 — the relay
+    // remains the real boundary; unknown zones default accessible).
     let has_zone_access = Memo::new(move |_| {
         let cat = category_slug();
         match load_zones().into_iter().find(|z| z.id == cat) {
@@ -178,19 +199,15 @@ pub fn SectionPage() -> impl IntoView {
         }
     });
 
-    // Resolve the channel for this route reactively from the shared store. The
-    // store's broad kind-40 sub survives the AUTH replay, so a friends/family/
-    // business channel resolves here regardless of when AUTH completed.
-    //
-    // `Signal::derive` (not `Memo`) because `ChannelMeta` is not `PartialEq`.
+    // Resolve the channel reactively from the shared store. `Signal::derive`
+    // (not `Memo`) because `ChannelMeta` is not `PartialEq`.
     let resolved_channel = Signal::derive(move || {
         let chans = store.channels.get();
         let zones = load_zones();
-        resolve_channel(&chans, &category_slug(), &section_slug(), &zones)
+        resolve_section(&chans, &category_slug(), &section_slug(), &zones)
     });
 
-    // Top up the per-channel subscription once the channel id is known, so a
-    // channel the broad kind-42 sub hasn't yet covered still loads its history.
+    // Top up the per-channel subscription once the channel id is known.
     {
         let relay = relay.clone();
         Effect::new(move |_| {
@@ -200,159 +217,26 @@ pub fn SectionPage() -> impl IntoView {
         });
     }
 
-    // Messages rendered reactively from the shared channel_messages map. Dedup
-    // and created_at sort are already maintained by the store; we re-sort
-    // defensively after mapping so render order is deterministic.
-    //
-    // `Signal::derive` (not `Memo`) because `MessageData` holds `RwSignal`
-    // fields and is therefore not `PartialEq`.
-    let messages = Signal::derive(move || {
+    // Topics: the kind-42 ROOTS in this channel, with reply counts + last
+    // activity, derived from the shared store. `Signal::derive` because
+    // `TopicSummary` is not `PartialEq`.
+    let topics = Signal::derive(move || {
         let cid = match resolved_channel.get() {
             Some(ch) => ch.id,
-            None => return Vec::<MessageData>::new(),
+            None => return Vec::<TopicSummary>::new(),
         };
-        store.channel_messages.with(|m| {
-            let mut msgs: Vec<MessageData> = m
-                .get(&cid)
-                .map(|events| events.iter().map(event_to_message).collect())
-                .unwrap_or_default();
-            msgs.sort_by_key(|x| x.created_at);
-            msgs
-        })
+        store
+            .channel_messages
+            .with(|m| match m.get(&cid) {
+                Some(events) => classify_topics(&cid, events),
+                None => Vec::new(),
+            })
     });
 
-    // Loading is true while the global store is still fetching AND we have not
-    // resolved a channel yet. Once the store finishes (eose/loading=false) or a
-    // channel resolves, the empty-state can render honestly.
+    // Loading while the store is fetching AND no channel resolved yet.
     let store_loading = store.loading;
     let loading = Memo::new(move |_| store_loading.get() && resolved_channel.get().is_none());
 
-    let error_msg = RwSignal::<Option<String>>::new(None);
-    let typing_pubkeys = RwSignal::new(Vec::<String>::new());
-    let messages_container = NodeRef::<leptos::html::Div>::new();
-    let relay_for_send = relay;
-
-    // Resolve the toast store at component construction (calling use_toasts()
-    // inside the async send closure would panic — the reactive owner is gone).
-    let toasts = use_toasts();
-    // Restore channel: a rejected publish pushes the failed text back here so
-    // MessageInput can re-fill the textarea (content is never lost on failure).
-    let restore_failed = RwSignal::<Option<String>>::new(None);
-
-    // Surface relay NOTICEs (e.g. rate-limit / policy messages) as warn toasts.
-    // The relay layer already rate-limits duplicate notice text; `seq` makes
-    // each surfaced notice distinct so none are missed.
-    let notices = relay_for_send.notices();
-    Effect::new(move |prev: Option<u64>| {
-        let current = notices.get();
-        let seq = current.as_ref().map(|n| n.seq).unwrap_or(0);
-        if let Some(notice) = current {
-            // Skip the initial None→first read only when it is genuinely new.
-            if prev != Some(notice.seq) {
-                toasts.show(notice.message, ToastVariant::Warning);
-            }
-        }
-        seq
-    });
-
-    // Auto-scroll to the latest message whenever the count changes.
-    Effect::new(move |_| {
-        let _count = messages.get().len();
-        if let Some(container) = messages_container.get() {
-            let el: web_sys::HtmlElement = container.into();
-            set_timeout_once(
-                move || {
-                    el.set_scroll_top(el.scroll_height());
-                },
-                50,
-            );
-        }
-    });
-
-    let do_send_text = {
-        let relay = relay_for_send;
-        move |(content, mention_pubkeys): (String, Vec<String>)| {
-            let cid = resolved_channel
-                .get_untracked()
-                .map(|ch| ch.id)
-                .unwrap_or_default();
-            if cid.is_empty() {
-                return;
-            }
-
-            let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
-            if pubkey.is_empty() {
-                error_msg.set(Some("Not authenticated".to_string()));
-                return;
-            }
-
-            // Keep the original text so a rejected publish can restore it.
-            let original = content.clone();
-
-            let now = (js_sys::Date::now() / 1000.0) as u64;
-            // Root e-tag first, then one ["p", pubkey] per @-mention selected
-            // in the composer so mentioned users are addressable per NIP-10.
-            let mut tags = vec![vec![
-                "e".to_string(),
-                cid,
-                String::new(),
-                "root".to_string(),
-            ]];
-            for pk in mention_pubkeys {
-                if let Some(hex) = normalise_mention_pubkey(&pk) {
-                    if !tags.iter().any(|t| t[0] == "p" && t[1] == hex) {
-                        tags.push(vec!["p".to_string(), hex]);
-                    }
-                }
-            }
-            let unsigned = nostr_bbs_core::UnsignedEvent {
-                pubkey: pubkey.clone(),
-                created_at: now,
-                kind: 42,
-                tags,
-                content,
-            };
-
-            let relay = relay.clone();
-            spawn_local(async move {
-                match auth.sign_event_async(unsigned).await {
-                    Ok(signed) => {
-                        // Publish WITH ack so relay rejections (e.g. zone access
-                        // denied) surface to the user instead of vanishing.
-                        let original_for_ack = original.clone();
-                        let on_ok = Rc::new(move |accepted: bool, message: String| {
-                            if !accepted {
-                                let reason = if message.trim().is_empty() {
-                                    "Message rejected by relay".to_string()
-                                } else {
-                                    format!("Message rejected: {message}")
-                                };
-                                toasts.show(reason, ToastVariant::Error);
-                                // Re-fill the composer — do not lose the text.
-                                restore_failed.set(Some(original_for_ack.clone()));
-                            }
-                        });
-                        if let Err(e) = relay.publish_with_ack(&signed, Some(on_ok)) {
-                            toasts.show(format!("Send failed: {e}"), ToastVariant::Error);
-                            restore_failed.set(Some(original.clone()));
-                        }
-                    }
-                    Err(e) => {
-                        toasts.show(format!("Failed to sign message: {e}"), ToastVariant::Error);
-                        restore_failed.set(Some(original.clone()));
-                    }
-                }
-            });
-        }
-    };
-
-    let send_callback = Callback::new(do_send_text);
-    // MessageInput fires `on_send` alongside `on_send_with_mentions`; all
-    // publish work lives in the mentions path, so the plain path is a no-op.
-    let noop_send = Callback::new(|_: String| {});
-    let is_authed = auth.is_authenticated();
-
-    // Header name/description sourced from the resolved channel.
     let header_name = move || {
         resolved_channel
             .get()
@@ -362,108 +246,214 @@ pub fn SectionPage() -> impl IntoView {
     };
     let header_desc = move || resolved_channel.get().map(|c| c.description);
 
+    // -- New-topic composer state --
+    let show_new_topic = RwSignal::new(false);
+    let new_topic_text = RwSignal::new(String::new());
+    let creating = RwSignal::new(false);
+    let create_error = RwSignal::new(Option::<String>::None);
+    let is_authed = auth.is_authenticated();
+
+    let category_for_topics = Signal::derive(category_slug);
+
     view! {
         <Show
             when=move || has_zone_access.get()
-            fallback=move || view! {
-                <AccessDenied zone_id=category_slug() />
-            }
+            fallback=move || view! { <AccessDenied zone_id=category_slug() /> }
         >
-        <div class="flex flex-col h-[calc(100vh-64px)]">
-            <div class="bg-gray-800 border-b border-gray-700 relative">
-                <div class="absolute inset-0 bg-gradient-to-r from-amber-500/5 via-transparent to-purple-500/5"></div>
-                <div class="relative p-4">
-                    <div class="max-w-4xl mx-auto">
-                        <Breadcrumb items=vec![
-                            BreadcrumbItem::link("Home", "/"),
-                            BreadcrumbItem::link("Forums", "/forums"),
-                            BreadcrumbItem::link(
-                                category_display_name(&category_slug()),
-                                format!("/forums/{}", category_slug()),
-                            ),
-                            BreadcrumbItem::current(header_name()),
-                        ] />
+        <div class="max-w-4xl mx-auto p-4 sm:p-6">
+            <Breadcrumb items=vec![
+                BreadcrumbItem::link("Home", "/"),
+                BreadcrumbItem::link("Forums", "/forums"),
+                BreadcrumbItem::link(
+                    category_display_name(&category_slug()),
+                    format!("/forums/{}", category_slug()),
+                ),
+                BreadcrumbItem::current(header_name()),
+            ] />
 
-                        <h1 class="text-2xl font-bold text-white">
-                            {header_name}
-                        </h1>
-                        {move || header_desc().and_then(|d| {
-                            if d.is_empty() { None } else {
-                                Some(view! { <p class="text-sm text-gray-400 mt-1">{d}</p> })
-                            }
-                        })}
-
-                        <div class="flex items-center gap-2 mt-2">
-                            <span class="text-xs text-gray-500 border border-gray-600 rounded px-1.5 py-0.5">
-                                {move || format!("{} messages", messages.get().len())}
-                            </span>
-                        </div>
-                    </div>
-                </div>
-                <div class="absolute bottom-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-amber-500/20 to-transparent"></div>
-            </div>
-
-            {move || error_msg.get().map(|msg| view! {
-                <div class="max-w-4xl mx-auto p-2">
-                    <div class="bg-yellow-900/50 border border-yellow-700 rounded-lg px-4 py-2 flex items-center justify-between">
-                        <span class="text-yellow-200 text-sm">{msg}</span>
-                        <button class="text-yellow-400 hover:text-yellow-200 text-xs ml-4" on:click=move |_| error_msg.set(None)>"dismiss"</button>
-                    </div>
-                </div>
-            })}
-
-            <div class="flex-1 overflow-y-auto bg-gray-900 relative virtual-scroll" node_ref=messages_container>
-                <div class="sticky top-0 left-0 right-0 h-6 bg-gradient-to-b from-gray-900 to-transparent z-10 pointer-events-none"></div>
-                <div class="max-w-4xl mx-auto px-4 pb-4">
-                    {move || {
-                        if loading.get() {
-                            view! {
-                                <div class="flex flex-col items-center justify-center py-20 gap-3">
-                                    <div class="animate-spin w-6 h-6 border-2 border-amber-400 border-t-transparent rounded-full"></div>
-                                    <span class="text-gray-400 text-sm">"Loading messages..."</span>
-                                </div>
-                            }.into_any()
-                        } else {
-                            let msgs = messages.get();
-                            if msgs.is_empty() {
-                                view! {
-                                    <div class="flex flex-col items-center justify-center py-20 text-center">
-                                        <div class="w-14 h-14 rounded-full bg-gray-800 flex items-center justify-center mb-4 animate-gentle-float">
-                                            <span class="text-2xl text-gray-500">"#"</span>
-                                        </div>
-                                        <h3 class="text-white font-semibold mb-1">"No messages yet"</h3>
-                                        <p class="text-gray-500 text-sm">"Be the first to start this conversation."</p>
-                                    </div>
-                                }.into_any()
-                            } else {
-                                view! {
-                                    <div class="space-y-1">
-                                        {msgs.into_iter().map(|msg| view! {
-                                            <SwipeableMessage>
-                                                <MessageBubble message=msg/>
-                                            </SwipeableMessage>
-                                        }).collect_view()}
-                                    </div>
-                                }.into_any()
-                            }
+            <div class="flex items-start justify-between gap-3 mt-2 mb-4">
+                <div class="min-w-0">
+                    <h1 class="text-2xl font-bold text-white">{header_name}</h1>
+                    {move || header_desc().and_then(|d| {
+                        if d.is_empty() { None } else {
+                            Some(view! { <p class="text-sm text-gray-400 mt-1">{d}</p> })
                         }
-                    }}
+                    })}
+                    <span class="inline-block mt-2 text-xs text-gray-500 border border-gray-600 rounded px-1.5 py-0.5">
+                        {move || {
+                            let n = topics.get().len();
+                            if n == 1 { "1 topic".to_string() } else { format!("{n} topics") }
+                        }}
+                    </span>
                 </div>
+
+                <Show when=move || is_authed.get() && !loading.get()>
+                    <button
+                        type="button"
+                        on:click=move |_| {
+                            show_new_topic.update(|v| *v = !*v);
+                            create_error.set(None);
+                        }
+                        class="flex-shrink-0 flex items-center gap-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 px-4 py-2 rounded-lg transition-colors text-sm font-medium"
+                    >
+                        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="12" y1="8" x2="12" y2="16"/>
+                            <line x1="8" y1="12" x2="16" y2="12"/>
+                        </svg>
+                        "New Topic"
+                    </button>
+                </Show>
             </div>
 
-            <Show when=move || is_authed.get()>
-                <div class="bg-gray-800 border-t border-gray-700 p-3">
-                    <div class="max-w-4xl mx-auto">
-                        <TypingIndicator typing_pubkeys=typing_pubkeys />
-                        <MessageInput
-                            on_send=noop_send
-                            on_send_with_mentions=send_callback
-                            restore_failed=restore_failed
-                        />
+            // Inline new-topic composer. Publishes a kind-42 ROOT e-tagging the
+            // resolved channel — the same shape category.rs uses, so the new
+            // topic appears in this list immediately on relay echo.
+            <Show when=move || show_new_topic.get()>
+                <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-5 space-y-3">
+                    <textarea
+                        class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 resize-none"
+                        rows="3"
+                        placeholder="Start a new topic — the first line becomes the title"
+                        prop:value=move || new_topic_text.get()
+                        on:input=move |ev| new_topic_text.set(event_target_value(&ev))
+                    />
+                    {move || create_error.get().map(|e| view! {
+                        <p class="text-red-400 text-sm">{e}</p>
+                    })}
+                    <div class="flex gap-2">
+                        <button
+                            type="button"
+                            disabled=move || creating.get() || new_topic_text.get().trim().len() < 3
+                            on:click=move |_| {
+                                let body = new_topic_text.get_untracked();
+                                let cid = resolved_channel.get_untracked().map(|c| c.id).unwrap_or_default();
+                                if cid.is_empty() {
+                                    create_error.set(Some("Section not resolved yet".into()));
+                                    return;
+                                }
+                                if body.trim().len() < 3 {
+                                    create_error.set(Some("Topic must be at least 3 characters".into()));
+                                    return;
+                                }
+                                creating.set(true);
+                                create_error.set(None);
+                                match publish_topic_root(&auth, &relay, &cid, &body, toasts) {
+                                    Ok(()) => {
+                                        new_topic_text.set(String::new());
+                                        show_new_topic.set(false);
+                                        toasts.show("Topic created".to_string(), ToastVariant::Success);
+                                    }
+                                    Err(e) => create_error.set(Some(e)),
+                                }
+                                creating.set(false);
+                            }
+                            class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors text-sm"
+                        >
+                            {move || if creating.get() { "Creating..." } else { "Create Topic" }}
+                        </button>
+                        <button
+                            type="button"
+                            on:click=move |_| { show_new_topic.set(false); create_error.set(None); }
+                            class="text-gray-400 hover:text-white px-3 py-2 text-sm transition-colors"
+                        >
+                            "Cancel"
+                        </button>
                     </div>
                 </div>
             </Show>
+
+            {move || {
+                if loading.get() {
+                    view! {
+                        <div class="flex flex-col items-center justify-center py-20 gap-3">
+                            <div class="animate-spin w-6 h-6 border-2 border-amber-400 border-t-transparent rounded-full"></div>
+                            <span class="text-gray-400 text-sm">"Loading topics..."</span>
+                        </div>
+                    }.into_any()
+                } else if let Some(ch) = resolved_channel.get() {
+                    view! {
+                        <TopicList
+                            channel_id=ch.id
+                            category=category_for_topics.get()
+                            topics=topics
+                        />
+                    }.into_any()
+                } else {
+                    // Store finished but no channel resolved for this slug.
+                    view! {
+                        <div class="glass-card p-8 text-center">
+                            <h2 class="text-xl font-bold text-white mb-2">"Section Not Found"</h2>
+                            <p class="text-gray-400 text-sm mb-4">
+                                "This section could not be found in this zone."
+                            </p>
+                            <A href=base_href(&format!("/forums/{}", category_slug())) attr:class="text-amber-400 hover:text-amber-300 text-sm underline">
+                                "Back to zone"
+                            </A>
+                        </div>
+                    }.into_any()
+                }
+            }}
         </div>
         </Show>
     }
 }
+
+/// Publish a new TOPIC: a kind-42 root message e-tagging the section channel.
+/// The body's first line becomes the topic title in the list. Mirrors
+/// `category.rs::publish_topic_root` so both entry points produce the same
+/// shape and the topic appears in this list on relay echo.
+fn publish_topic_root(
+    auth: &crate::auth::AuthStore,
+    relay: &RelayConnection,
+    section_channel_id: &str,
+    body: &str,
+    toasts: crate::components::toast::ToastStore,
+) -> Result<(), String> {
+    if relay.connection_state().get_untracked() != ConnectionState::Connected {
+        return Err("Relay not connected".to_string());
+    }
+    let pubkey = auth
+        .pubkey()
+        .get_untracked()
+        .ok_or_else(|| "Not authenticated".to_string())?;
+
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    let tags = vec![vec![
+        "e".to_string(),
+        section_channel_id.to_string(),
+        String::new(),
+        "root".to_string(),
+    ]];
+    let unsigned = nostr_bbs_core::UnsignedEvent {
+        pubkey,
+        created_at: now,
+        kind: 42,
+        tags,
+        content: body.trim().to_string(),
+    };
+    let signed = auth.sign_event(unsigned)?;
+
+    let on_ok = Rc::new(move |accepted: bool, msg: String| {
+        if !accepted {
+            let display = if msg.contains("whitelist") {
+                "Your account isn't active yet — try refreshing the page.".to_string()
+            } else if msg.trim().is_empty() {
+                "Topic rejected by relay".to_string()
+            } else {
+                format!("Topic rejected: {msg}")
+            };
+            toasts.show(display, ToastVariant::Error);
+        }
+    });
+    relay
+        .publish_with_ack(&signed, Some(on_ok))
+        .map_err(|e| format!("Send failed: {e}"))?;
+    Ok(())
+}
+
+// The previous flat-chat helpers (`event_to_message`, message rendering, typing
+// indicators, auto-scroll, notice toasts) were removed: the section view is now
+// a topic list, not a chat log. Per-message rendering, reactions, and the live
+// chat composer live on `/chat/:channel_id` (ChannelPage) and the per-topic
+// ThreadPage.

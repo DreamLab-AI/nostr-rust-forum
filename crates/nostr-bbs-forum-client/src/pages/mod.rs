@@ -25,6 +25,7 @@ mod search;
 mod section;
 mod settings;
 mod setup;
+mod thread;
 
 // -- Re-exports ---------------------------------------------------------------
 pub use admin::AdminPage;
@@ -49,3 +50,4 @@ pub use section::SectionPage;
 pub use settings::SettingsPage;
 pub use setup::SetupPage;
 pub use signup::SignupPage;
+pub use thread::ThreadPage;

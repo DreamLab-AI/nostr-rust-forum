@@ -1,4 +1,21 @@
-//! Single channel view page -- displays messages (kind 42) and compose box.
+//! Single channel view page -- the FLAT, linear chat of one channel (kind-42).
+//! Route: /chat/:channel_id
+//!
+//! ## Relationship to the BBS section view (#8 reconciliation)
+//!
+//! A *section* (kind-40 channel) is presented two ways:
+//! - `/forums/:category/:section` ([`crate::pages::section::SectionPage`]) — the
+//!   BBS TOPIC LIST: kind-42 roots with reply counts, the canonical browse view.
+//! - `/chat/:channel_id` (this page) — the flat, real-time chat log of every
+//!   message in the channel, retained as a deep-link target for search results,
+//!   bookmarks, note-view links, and the channel-list dashboard (`chat.rs`).
+//!
+//! These no longer DUPLICATE each other: the old `SectionPage` was itself a flat
+//! chat (a second copy of this view). It is now a topic list, so the only flat
+//! chat surface is here. To keep the two connected (not orphaned), this page
+//! offers a "View as topics" link that jumps to the channel's BBS section view
+//! (with the privacy-hashed section slug, #9). The link is omitted when the
+//! channel's owning zone cannot be resolved from the store.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -22,7 +39,26 @@ use crate::relay::{ConnectionState, Filter, RelayConnection};
 #[allow(unused_imports)]
 use crate::stores::channels::ChannelStore;
 use crate::stores::read_position::use_read_positions;
+use crate::stores::zones::{load_zones, Zone};
+use crate::utils::slug_hash::section_slug;
 use crate::utils::{arrow_left_svg, set_timeout_once};
+
+/// Resolve a channel's `section` tag to the owning config-zone id (mirrors
+/// `forums.rs::section_to_zone`): exact id match, then `<zone>-` prefix, then
+/// the first zone as a catch-all so channels never lose their zone.
+fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
+    let sec = section.to_lowercase();
+    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
+        return Some(z.id.clone());
+    }
+    if let Some(z) = zones
+        .iter()
+        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
+    {
+        return Some(z.id.clone());
+    }
+    zones.first().map(|z| z.id.clone())
+}
 
 /// Parsed channel metadata from the kind 40 event.
 #[derive(Clone, Debug)]
@@ -42,6 +78,41 @@ pub fn ChannelPage() -> impl IntoView {
 
     let params = use_params_map();
     let channel_id = move || params.read().get("channel_id").unwrap_or_default();
+
+    // BBS topic-list href for this channel: resolve the channel (and thus its
+    // owning zone) from the shared store, then build the privacy-hashed section
+    // URL (#9). `None` when the channel/zone is not yet known — the link is then
+    // hidden rather than pointing somewhere broken.
+    let section_topics_href = {
+        let store = use_context::<ChannelStore>();
+        Signal::derive(move || {
+            let raw = channel_id();
+            if raw.is_empty() {
+                return None;
+            }
+            let store = store?;
+            let zones = load_zones();
+            let needle_lower = raw.to_lowercase();
+            store.channels.with(|list| {
+                list.iter()
+                    .find(|c| {
+                        c.id == raw
+                            || c.name.to_lowercase() == needle_lower
+                            || c.section.to_lowercase() == needle_lower
+                    })
+                    .and_then(|c| {
+                        let section = if c.section.is_empty() {
+                            zones.first().map(|z| z.id.clone()).unwrap_or_default()
+                        } else {
+                            c.section.clone()
+                        };
+                        section_to_zone(&section, &zones).map(|zone| {
+                            base_href(&format!("/forums/{}/{}", zone, section_slug(&c.id)))
+                        })
+                    })
+            })
+        })
+    };
 
     // Read-position store for mark-as-read
     let read_store = use_read_positions();
@@ -490,6 +561,22 @@ pub fn ChannelPage() -> impl IntoView {
                                         .unwrap_or_else(|| "Loading...".to_string())
                                 }}
                             </h1>
+                            // "View as topics": jump to the BBS topic-list view
+                            // of this same channel (#8 reconciliation). Hidden
+                            // until the owning zone resolves from the store.
+                            {move || section_topics_href.get().map(|href| view! {
+                                <A href=href attr:class="ml-auto flex items-center gap-1.5 text-xs text-amber-400 hover:text-amber-300 border border-amber-500/20 hover:border-amber-500/40 rounded-lg px-2.5 py-1 transition-colors">
+                                    <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <line x1="8" y1="6" x2="21" y2="6" stroke-linecap="round"/>
+                                        <line x1="8" y1="12" x2="21" y2="12" stroke-linecap="round"/>
+                                        <line x1="8" y1="18" x2="21" y2="18" stroke-linecap="round"/>
+                                        <circle cx="3.5" cy="6" r="1" fill="currentColor"/>
+                                        <circle cx="3.5" cy="12" r="1" fill="currentColor"/>
+                                        <circle cx="3.5" cy="18" r="1" fill="currentColor"/>
+                                    </svg>
+                                    "View as topics"
+                                </A>
+                            })}
                         </div>
                         {move || {
                             channel_info.get().and_then(|c| {

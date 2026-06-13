@@ -23,6 +23,7 @@ pub mod toast;
 // -- Rich Messages (Stream 2) ------------------------------------------------
 pub mod link_preview;
 pub mod media_embed;
+pub mod mention_autocomplete;
 pub mod mention_text;
 pub mod message_input;
 pub mod quoted_message;
@@ -42,6 +43,7 @@ pub mod session_timeout;
 // -- Forum/BBS Hierarchy (Stream 5) ------------------------------------------
 pub mod category_card;
 pub mod section_card;
+pub mod topic_list;
 
 // -- Calendar/Events (Stream 6) ----------------------------------------------
 pub mod create_event_modal;

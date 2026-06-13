@@ -24,7 +24,7 @@ use crate::pages::{
     AdminPage, CategoryPage, ChannelPage, ChatPage, ConnectPage, DmChatPage, DmListPage,
     EventsPage, ForumsPage, GovernancePage, HomePage, LoginPage, MarketplacePage, NoteViewPage,
     PendingPage, PodBrowserPage, ProfilePage, SearchPage, SectionPage, SettingsPage, SetupPage,
-    SignupPage,
+    SignupPage, ThreadPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
@@ -164,6 +164,15 @@ fn admin_icon() -> impl IntoView {
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"
                 stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+    }
+}
+
+fn search_icon() -> impl IntoView {
+    view! {
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"/>
+            <path d="M21 21l-4.35-4.35"/>
         </svg>
     }
 }
@@ -571,6 +580,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/forums") view=AuthGatedForums />
                     <Route path=path!("/forums/:category") view=AuthGatedCategory />
                     <Route path=path!("/forums/:category/:section") view=AuthGatedSection />
+                    <Route path=path!("/forums/:category/:section/:topic") view=AuthGatedThread />
                     <Route path=path!("/events") view=AuthGatedEvents />
                     <Route path=path!("/profile/:pubkey") view=AuthGatedProfile />
                     <Route path=path!("/search") view=AuthGatedSearch />
@@ -701,6 +711,12 @@ fn Layout(children: Children) -> impl IntoView {
         mobile_open.set(false);
     };
 
+    // Shared open-state for the GlobalSearch overlay so the visible nav search
+    // button and the Cmd/Ctrl+K shortcut drive the same panel (the overlay reads
+    // this via context; see components::global_search::SearchOpen).
+    let search_open = RwSignal::new(false);
+    provide_context(crate::components::global_search::SearchOpen(search_open));
+
     view! {
         <div class="min-h-screen bg-gray-900 text-white flex flex-col">
             // Skip navigation link
@@ -762,6 +778,14 @@ fn Layout(children: Children) -> impl IntoView {
                                     <span class="text-sm">"Admin"</span>
                                 </A>
                             })}
+                            <button
+                                class="text-gray-400 hover:text-amber-400 transition-colors p-2 rounded-lg hover:bg-gray-800"
+                                on:click=move |_| search_open.set(true)
+                                title="Search (Ctrl/Cmd+K)"
+                                aria-label="Search"
+                            >
+                                {search_icon()}
+                            </button>
                             <NotificationBell />
                             <button
                                 class="text-gray-400 hover:text-amber-400 transition-colors p-2 rounded-lg hover:bg-gray-800"
@@ -831,6 +855,13 @@ fn Layout(children: Children) -> impl IntoView {
                                 {pod_icon()}
                                 "Pod"
                             </A>
+                            <button
+                                class="w-full flex items-center gap-2 text-gray-300 hover:text-white px-4 py-3 rounded-lg hover:bg-gray-800 transition-colors text-left"
+                                on:click=move |_| { search_open.set(true); mobile_open.set(false); }
+                            >
+                                {search_icon()}
+                                "Search"
+                            </button>
                             <A href=base_href("/settings") attr:class=mobile_link_class("/settings") on:click=close_mobile>
                                 {settings_icon()}
                                 "Settings"
@@ -1084,6 +1115,7 @@ auth_gated!(AuthGatedPending, PendingPage);
 auth_gated!(AuthGatedForums, ForumsPage);
 auth_gated!(AuthGatedCategory, CategoryPage);
 auth_gated!(AuthGatedSection, SectionPage);
+auth_gated!(AuthGatedThread, ThreadPage);
 auth_gated!(AuthGatedEvents, EventsPage);
 auth_gated!(AuthGatedProfile, ProfilePage);
 auth_gated!(AuthGatedSearch, SearchPage);

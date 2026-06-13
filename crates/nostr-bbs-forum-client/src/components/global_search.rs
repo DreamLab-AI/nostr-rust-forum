@@ -12,6 +12,12 @@ use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Shared open-state for the global search overlay. The app shell provides this
+/// via context so a visible nav button can open the very same panel that the
+/// Cmd/Ctrl+K shortcut toggles.
+#[derive(Clone, Copy)]
+pub struct SearchOpen(pub RwSignal<bool>);
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -152,7 +158,12 @@ struct SResp {
 
 #[component]
 pub(crate) fn GlobalSearch() -> impl IntoView {
-    let is_open = RwSignal::new(false);
+    // Open-state is shared via context when the app shell provides it, so the
+    // nav search button and Cmd/Ctrl+K drive one overlay. Falls back to a local
+    // signal when rendered without a provider (keyboard-only).
+    let is_open = use_context::<SearchOpen>()
+        .map(|s| s.0)
+        .unwrap_or_else(|| RwSignal::new(false));
     let query = RwSignal::new(String::new());
     let tab = RwSignal::new(Tab::All);
     let results: RwSignal<Vec<Hit>> = RwSignal::new(Vec::new());

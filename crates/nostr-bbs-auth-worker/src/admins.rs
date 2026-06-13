@@ -296,6 +296,70 @@ pub async fn handle_remove(
     )
 }
 
+/// `POST /api/admins/delete-member` — NIP-98 admin only (Task #7).
+///
+/// Hard-deletes a user's **auth-side** records: the `members` row (invite/admin
+/// state) and the `username_reservations` row (claimed handle + admin-only
+/// `real_name`). This is the auth half of "delete user"; the relay half
+/// (`POST /api/admin/user/delete` on the relay worker) removes the whitelist row
+/// and optionally purges events. The client calls both so a deleted user leaves
+/// no handle/real-name residue and cannot resolve to a stale display name.
+///
+/// Body: `{ "pubkey": "<hex>" }`. Self-deletion is refused to avoid lockout.
+pub async fn handle_delete_member(
+    body_bytes: &[u8],
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/admins/delete-member");
+    let caller = match require_admin(auth_header, &url, "POST", Some(body_bytes), env).await {
+        Ok(pk) => pk,
+        Err((body, status)) => return json_response(env, &body, status),
+    };
+
+    let body: PubkeyBody = match serde_json::from_slice(body_bytes) {
+        Ok(b) => b,
+        Err(e) => return error_json(env, &format!("Invalid JSON body: {e}"), 400),
+    };
+
+    if body.pubkey.len() != 64 || !body.pubkey.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return error_json(env, "pubkey must be a 64-char hex string", 400);
+    }
+
+    // Prevent self-deletion to avoid lockout.
+    if body.pubkey == caller {
+        return error_json(env, "Cannot delete your own account", 403);
+    }
+
+    // DB (dreamlab-auth): drop the members row and the username reservation
+    // (which carries the claimed handle and the admin-only real_name).
+    let db = match env.d1("DB") {
+        Ok(db) => db,
+        Err(_) => return error_json(env, "DB unavailable", 500),
+    };
+
+    let _ = db
+        .prepare("DELETE FROM members WHERE pubkey = ?1")
+        .bind(&[JsValue::from_str(&body.pubkey)])?
+        .run()
+        .await;
+    let _ = db
+        .prepare("DELETE FROM username_reservations WHERE pubkey = ?1")
+        .bind(&[JsValue::from_str(&body.pubkey)])?
+        .run()
+        .await;
+
+    // Bust the admin-list cache in case the deleted member held admin.
+    bust_cache(env).await;
+
+    json_response(
+        env,
+        &json!({ "ok": true, "pubkey": body.pubkey, "action": "member_deleted" }),
+        200,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

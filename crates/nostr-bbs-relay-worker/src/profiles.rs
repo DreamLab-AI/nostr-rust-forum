@@ -12,7 +12,7 @@
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::JsValue;
-use worker::{Env, Request, Response, Result};
+use worker::{D1Database, Env, Request, Response, Result};
 
 use crate::cors::json_response as cors_json_response;
 
@@ -136,9 +136,101 @@ pub async fn handle_batch(_req: &Request, body_bytes: &[u8], env: &Env) -> Resul
     };
 
     let rows: Vec<ProfileRow> = result.results().unwrap_or_default();
-    let profiles: Vec<serde_json::Value> = rows.into_iter().map(|r| r.into_json()).collect();
+    let mut profiles: Vec<serde_json::Value> = rows.into_iter().map(|r| r.into_json()).collect();
+
+    // Task #7 — alias inheritance for DISPLAY. Any requested pubkey that has no
+    // profile of its own but is aliased to a prior `old_pubkey` inherits the old
+    // pubkey's profile so authorship renders under the prior handle. Events are
+    // never re-signed; this is purely how the name resolves at read time.
+    let resolved: std::collections::HashSet<String> = profiles
+        .iter()
+        .filter_map(|p| p.get("pubkey").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    let unresolved: Vec<String> = clean
+        .iter()
+        .filter(|pk| !resolved.contains(*pk))
+        .cloned()
+        .collect();
+    if !unresolved.is_empty() {
+        let inherited = resolve_aliased_profiles(&db, &unresolved).await;
+        profiles.extend(inherited);
+    }
 
     cors_json_response(env, &json!({ "profiles": profiles }), 200)
+}
+
+/// For each `new_pubkey` with a `pubkey_aliases` row, fetch the aliased
+/// `old_pubkey`'s profile and return it keyed under the requested `new_pubkey`.
+///
+/// Best-effort: a missing alias or missing old profile simply yields no row for
+/// that pubkey (the client then falls back to the shortened hex). The returned
+/// JSON keeps the requested `new_pubkey` as `pubkey` so the client cache stores
+/// the inherited name against the key the caller asked about.
+async fn resolve_aliased_profiles(
+    db: &D1Database,
+    new_pubkeys: &[String],
+) -> Vec<serde_json::Value> {
+    if new_pubkeys.is_empty() {
+        return Vec::new();
+    }
+
+    // Map each requested new_pubkey -> aliased old_pubkey.
+    #[derive(Deserialize)]
+    struct AliasPair {
+        new_pubkey: String,
+        old_pubkey: String,
+    }
+
+    let placeholders: Vec<String> = (1..=new_pubkeys.len()).map(|i| format!("?{i}")).collect();
+    let alias_sql = format!(
+        "SELECT new_pubkey, old_pubkey FROM pubkey_aliases WHERE new_pubkey IN ({})",
+        placeholders.join(", ")
+    );
+    let binds: Vec<JsValue> = new_pubkeys.iter().map(|p| JsValue::from_str(p)).collect();
+    let stmt = match db.prepare(&alias_sql).bind(&binds) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let pairs: Vec<AliasPair> = match stmt.all().await {
+        Ok(r) => r.results().unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+
+    // Fetch the old pubkeys' profiles in one query, then re-key under the new.
+    let old_keys: Vec<String> = pairs.iter().map(|p| p.old_pubkey.clone()).collect();
+    let old_placeholders: Vec<String> = (1..=old_keys.len()).map(|i| format!("?{i}")).collect();
+    let prof_sql = format!(
+        "SELECT pubkey, name, display_name, picture, nip05 FROM profiles WHERE pubkey IN ({})",
+        old_placeholders.join(", ")
+    );
+    let old_binds: Vec<JsValue> = old_keys.iter().map(|p| JsValue::from_str(p)).collect();
+    let prof_stmt = match db.prepare(&prof_sql).bind(&old_binds) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let old_rows: Vec<ProfileRow> = match prof_stmt.all().await {
+        Ok(r) => r.results().unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    let old_by_pk: std::collections::HashMap<String, &ProfileRow> =
+        old_rows.iter().map(|r| (r.pubkey.clone(), r)).collect();
+
+    let mut out = Vec::new();
+    for pair in &pairs {
+        if let Some(old) = old_by_pk.get(&pair.old_pubkey) {
+            out.push(json!({
+                "pubkey": pair.new_pubkey,
+                "name": old.name,
+                "display_name": old.display_name,
+                "picture": old.picture,
+                "nip05": old.nip05,
+            }));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

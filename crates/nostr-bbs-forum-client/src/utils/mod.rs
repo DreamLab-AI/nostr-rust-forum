@@ -6,6 +6,7 @@ pub mod pod_client;
 pub mod relay_url;
 pub mod sanitize;
 pub mod search_client;
+pub mod slug_hash;
 pub mod solid;
 
 use leptos::prelude::*;
