@@ -283,6 +283,32 @@ pub async fn claim(
         }
     }
 
+    // Auto-whitelist the joiner into the Landing group (members cohort) at claim
+    // time so they are immediately visible in the admin whitelist interface and
+    // can post in the public/Landing zone — per the operator model (admins
+    // elevate further from there). Claiming is a reliable, deliberate join
+    // signal, unlike the relay's kind-0 auto_whitelist which depends on the
+    // client actually publishing a kind-0 after onboarding. Cross-D1 write to
+    // the relay's whitelist via the RELAY_DB binding; ON CONFLICT(pubkey) DO
+    // NOTHING preserves any cohorts an admin already set and never demotes an
+    // existing member/admin. Best-effort — failure is non-fatal.
+    if let Ok(relay_db) = env.d1("RELAY_DB") {
+        if let Ok(bound) = relay_db
+            .prepare(
+                "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by, is_admin) \
+                 VALUES (?1, ?2, ?3, ?4, 0) ON CONFLICT (pubkey) DO NOTHING",
+            )
+            .bind(&[
+                JsValue::from_str(pubkey),
+                JsValue::from_str(r#"["members"]"#),
+                JsValue::from_f64(now as f64),
+                JsValue::from_str("auto-registration"),
+            ])
+        {
+            let _ = bound.run().await;
+        }
+    }
+
     Ok(UsernameClaim {
         username: username.to_string(),
         pubkey: pubkey.to_string(),
