@@ -17,6 +17,11 @@ pub fn ZoneHero(
     zone_id: String,
     /// SVG path data for the zone icon.
     icon: &'static str,
+    /// Optional zone banner image URL (each zone's configured `banner_image_url`,
+    /// e.g. the Minimoonoir hero). Rendered behind the hero content with a dark
+    /// overlay for legibility; falls back to the gradient when absent.
+    #[prop(optional)]
+    banner_url: Option<String>,
 ) -> impl IntoView {
     let gradient = match zone_id.as_str() {
         "home" => "from-amber-500/20 via-orange-500/10 to-yellow-500/10",
@@ -44,6 +49,18 @@ pub fn ZoneHero(
             "relative mb-6 py-10 px-6 rounded-2xl overflow-hidden bg-gradient-to-br {} border {} backdrop-blur-sm",
             gradient, border_color
         )>
+            // Zone banner image (behind content). A dark gradient overlay keeps
+            // the title/description legible over the artwork.
+            {banner_url.filter(|u| !u.is_empty()).map(|url| view! {
+                <img
+                    src=url alt="" loading="lazy" decoding="async" aria-hidden="true"
+                    class="absolute inset-0 w-full h-full object-cover opacity-40"
+                />
+                <div
+                    class="absolute inset-0 bg-gradient-to-t from-gray-900/85 via-gray-900/45 to-gray-900/20"
+                    aria-hidden="true"
+                ></div>
+            })}
             // Ambient decorative orbs
             <div class="absolute -top-10 -right-10 w-40 h-40 rounded-full bg-white/5 blur-3xl" aria-hidden="true"></div>
             <div class="absolute -bottom-8 -left-8 w-32 h-32 rounded-full bg-white/3 blur-2xl" aria-hidden="true"></div>

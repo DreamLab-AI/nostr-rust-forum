@@ -219,6 +219,7 @@ pub fn CategoryPage() -> impl IntoView {
                     description="Browse sections and start a topic".to_string()
                     zone_id=zone_id_for_hero()
                     icon=zone_icon()
+                    banner_url=load_zones().into_iter().find(|z| z.id == category_slug()).and_then(|z| z.banner_image_url).unwrap_or_default()
                 />
             }}
 
