@@ -18,7 +18,7 @@ use crate::components::empty_state::EmptyState;
 use crate::stores::channels::use_channel_store;
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
-use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
+use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 
 /// Per-section post tallies projected into each category card.
 ///
@@ -32,30 +32,7 @@ pub struct SectionCounts {
 }
 
 // -- Zone -> section routing --------------------------------------------------
-
-/// Resolve a channel's `section` tag to the id of the owning config zone.
-///
-/// Channels carry a free-form `section` tag (e.g. `"family-events"`). With
-/// config-driven zones the relationship is by prefix/exact match against the
-/// live zone ids: a section belongs to the zone whose id it equals or is
-/// prefixed by (`"<zone>-..."`). Falls back to the first zone so channels never
-/// silently disappear from the index.
-fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
-    let sec = section.to_lowercase();
-    // Exact id match.
-    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
-        return Some(z.id.clone());
-    }
-    // Prefix match: "<zone-id>-suffix".
-    if let Some(z) = zones
-        .iter()
-        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
-    {
-        return Some(z.id.clone());
-    }
-    // Catch-all: first zone so unrouted channels remain visible.
-    zones.first().map(|z| z.id.clone())
-}
+// `section_to_zone` is the canonical resolver in `stores::zones` (imported above).
 
 /// Deterministic accent colour per zone, derived from the zone id so themed
 /// gradients/badges stay stable across renders without hardcoding zone names.

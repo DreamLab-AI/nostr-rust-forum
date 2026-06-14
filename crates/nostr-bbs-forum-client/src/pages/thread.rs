@@ -43,9 +43,10 @@ use crate::relay::RelayConnection;
 use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
-use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
+use crate::stores::zones::{load_zones, section_routes_to_zone, Zone, ZoneVisibility};
 use crate::utils::format_relative_time;
 use crate::utils::slug_hash::{matches_section_slug, matches_topic_slug, section_slug};
+use crate::utils::zone_theme::zone_accent_style;
 
 use super::section::{category_display_name, resolve_channel};
 
@@ -198,31 +199,6 @@ fn resolve_section_channel(
     }
     // Legacy plaintext fallback (shared with SectionPage).
     resolve_channel(channels, category_slug, section_slug_param, zones)
-}
-
-/// Whether a channel's `section` tag routes to the given zone id.
-fn section_routes_to_zone(section: &str, category_slug: &str, zones: &[Zone]) -> bool {
-    let cat = category_slug.to_lowercase();
-    if cat.is_empty() {
-        return true;
-    }
-    let sec = section.to_lowercase();
-    // Exact zone id match.
-    if zones.iter().any(|z| z.id.to_lowercase() == sec) {
-        return sec == cat;
-    }
-    // Prefix match "<zone>-...".
-    if let Some(z) = zones
-        .iter()
-        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
-    {
-        return z.id.to_lowercase() == cat;
-    }
-    // Catch-all: first zone owns unrouted channels.
-    zones
-        .first()
-        .map(|z| z.id.to_lowercase() == cat)
-        .unwrap_or(false)
 }
 
 /// Thread page: topic root + threaded replies + reply composer.
@@ -640,7 +616,11 @@ pub fn ThreadPage() -> impl IntoView {
             when=move || has_zone_access.get()
             fallback=move || view! { <AccessDenied zone_id=category_slug() /> }
         >
-        <div class="max-w-4xl mx-auto p-4 sm:p-6">
+        // Carry the zone accent through to this page (#29): `:category` IS the
+        // zone id, so expose its signature colour as `--zone-accent` on the root
+        // (mirrors category.rs). The accent elements below read it via
+        // `var(--zone-accent)`.
+        <div class="max-w-4xl mx-auto p-4 sm:p-6" style=move || zone_accent_style(&category_slug())>
             <Breadcrumb items=vec![
                 BreadcrumbItem::link("Home", "/"),
                 BreadcrumbItem::link("Forums", "/forums"),
@@ -656,7 +636,7 @@ pub fn ThreadPage() -> impl IntoView {
                 if loading.get() {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">
-                            <div class="animate-spin w-6 h-6 border-2 border-amber-400 border-t-transparent rounded-full"></div>
+                            <div class="animate-spin w-6 h-6 border-2 border-[color:var(--zone-accent)] border-t-transparent rounded-full"></div>
                             <span class="text-gray-400 text-sm">"Loading topic..."</span>
                         </div>
                     }.into_any()
@@ -668,7 +648,7 @@ pub fn ThreadPage() -> impl IntoView {
                             <p class="text-gray-400 text-sm mb-4">
                                 "This topic could not be found in this section."
                             </p>
-                            <A href=base_href(&back) attr:class="text-amber-400 hover:text-amber-300 text-sm underline">
+                            <A href=base_href(&back) attr:class="text-[color:var(--zone-accent)] hover:opacity-80 text-sm underline">
                                 "Back to section"
                             </A>
                         </div>
@@ -846,12 +826,18 @@ fn RootPost(
     let noop = Callback::new(|_: String| {});
 
     view! {
-        <article class="bg-gray-800/70 border border-amber-500/20 rounded-xl p-5 mt-4">
+        // Topic-root card: its frame is the most prominent accent on the thread
+        // page, so it wears the zone colour (#29) via the inherited
+        // `--zone-accent` custom property set on the page root.
+        <article
+            class="bg-gray-800/70 border rounded-xl p-5 mt-4"
+            style="border-color:color-mix(in srgb, var(--zone-accent) 25%, transparent)"
+        >
             <div class="flex items-start gap-3">
                 <Avatar pubkey=pk size=AvatarSize::Lg />
                 <div class="flex-1 min-w-0">
                     <div class="flex items-baseline gap-2 flex-wrap">
-                        <span class="font-semibold text-amber-400">{move || author.get()}</span>
+                        <span class="font-semibold text-[color:var(--zone-accent)]">{move || author.get()}</span>
                         <span class="text-xs text-gray-500">{time}</span>
                         {edited.then(|| view! {
                             <span class="text-xs text-gray-600 italic">"(edited)"</span>

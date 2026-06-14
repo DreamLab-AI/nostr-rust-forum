@@ -37,26 +37,10 @@ use crate::relay::{ConnectionState, Filter, RelayConnection};
 #[allow(unused_imports)]
 use crate::stores::channels::ChannelStore;
 use crate::stores::read_position::use_read_positions;
-use crate::stores::zones::{load_zones, Zone};
+use crate::stores::zones::{load_zones, section_to_zone};
 use crate::utils::slug_hash::section_slug;
+use crate::utils::zone_theme::zone_accent_style;
 use crate::utils::{arrow_left_svg, set_timeout_once};
-
-/// Resolve a channel's `section` tag to the owning config-zone id (mirrors
-/// `forums.rs::section_to_zone`): exact id match, then `<zone>-` prefix, then
-/// the first zone as a catch-all so channels never lose their zone.
-fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
-    let sec = section.to_lowercase();
-    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
-        return Some(z.id.clone());
-    }
-    if let Some(z) = zones
-        .iter()
-        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
-    {
-        return Some(z.id.clone());
-    }
-    zones.first().map(|z| z.id.clone())
-}
 
 /// Parsed channel metadata from the kind 40 event.
 #[derive(Clone, Debug)]
@@ -109,6 +93,46 @@ pub fn ChannelPage() -> impl IntoView {
                         })
                     })
             })
+        })
+    };
+
+    // Zone accent carry-through (issue #29): /chat/:channel_id has no :category
+    // route param, so resolve the channel's owning zone from its `section` tag
+    // via the canonical resolver and expose its signature colour as the
+    // `--zone-accent` CSS custom property on the page root. The prominent accent
+    // elements below read it through `var(--zone-accent)`, so the chat page wears
+    // the same colour as its zone hero / category page. Defaults to the neutral
+    // accent until the channel resolves from the store.
+    let zone_accent = {
+        let store = use_context::<ChannelStore>();
+        Signal::derive(move || {
+            let raw = channel_id();
+            let zones = load_zones();
+            let resolved_zone = store.and_then(|store| {
+                let needle_lower = raw.to_lowercase();
+                store.channels.with(|list| {
+                    list.iter()
+                        .find(|c| {
+                            c.id == raw
+                                || c.name.to_lowercase() == needle_lower
+                                || c.section.to_lowercase() == needle_lower
+                        })
+                        .and_then(|c| {
+                            let section = if c.section.is_empty() {
+                                raw.clone()
+                            } else {
+                                c.section.clone()
+                            };
+                            section_to_zone(&section, &zones)
+                        })
+                })
+            });
+            // Fall back to resolving the raw param as a section, then to the
+            // first zone, so the root always carries a coherent accent.
+            let zone = resolved_zone
+                .or_else(|| section_to_zone(&raw, &zones))
+                .unwrap_or_default();
+            zone_accent_style(&zone)
         })
     };
 
@@ -549,7 +573,7 @@ pub fn ChannelPage() -> impl IntoView {
     };
 
     view! {
-        <div class="flex flex-col h-[calc(100vh-64px)]">
+        <div class="flex flex-col h-[calc(100vh-64px)]" style=move || zone_accent.get()>
             // Channel header
             <div class="bg-gray-800 border-b border-gray-700 relative">
                 <div class="p-4">
@@ -558,8 +582,11 @@ pub fn ChannelPage() -> impl IntoView {
                             <A href=base_href("/chat") attr:class="text-gray-400 hover:text-white transition-colors p-1 rounded hover:bg-gray-700">
                                 {arrow_left_svg()}
                             </A>
-                            // Channel avatar
-                            <div class="w-8 h-8 rounded-full bg-amber-500/20 text-amber-400 flex items-center justify-center text-sm font-bold flex-shrink-0">
+                            // Channel avatar — tinted with the zone accent (#29)
+                            <div
+                                class="w-8 h-8 rounded-full text-[color:var(--zone-accent)] flex items-center justify-center text-sm font-bold flex-shrink-0"
+                                style="background:color-mix(in srgb, var(--zone-accent) 20%, transparent)"
+                            >
                                 {avatar_letter}
                             </div>
                             <h1 class="text-2xl font-bold text-white">
@@ -573,7 +600,11 @@ pub fn ChannelPage() -> impl IntoView {
                             // of this same channel (#8 reconciliation). Hidden
                             // until the owning zone resolves from the store.
                             {move || section_topics_href.get().map(|href| view! {
-                                <A href=href attr:class="ml-auto flex items-center gap-1.5 text-xs text-amber-400 hover:text-amber-300 border border-amber-500/20 hover:border-amber-500/40 rounded-lg px-2.5 py-1 transition-colors">
+                                <A
+                                    href=href
+                                    attr:class="ml-auto flex items-center gap-1.5 text-xs text-[color:var(--zone-accent)] hover:opacity-80 border rounded-lg px-2.5 py-1 transition-colors"
+                                    attr:style="border-color:color-mix(in srgb, var(--zone-accent) 30%, transparent)"
+                                >
                                     <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                         <line x1="8" y1="6" x2="21" y2="6" stroke-linecap="round"/>
                                         <line x1="8" y1="12" x2="21" y2="12" stroke-linecap="round"/>
@@ -689,7 +720,7 @@ pub fn ChannelPage() -> impl IntoView {
                         if loading.get() {
                             view! {
                                 <div class="flex flex-col items-center justify-center py-20 gap-3">
-                                    <svg class="w-6 h-6 text-amber-500 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <svg class="w-6 h-6 text-[color:var(--zone-accent)] animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                                         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                                         <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                                     </svg>
@@ -726,9 +757,9 @@ pub fn ChannelPage() -> impl IntoView {
                                                 <>
                                                     {show_divider.then(|| view! {
                                                         <div class="flex items-center gap-3 py-2">
-                                                            <div class="flex-1 h-px bg-amber-500/30"></div>
-                                                            <span class="text-xs font-medium text-amber-400">"New messages"</span>
-                                                            <div class="flex-1 h-px bg-amber-500/30"></div>
+                                                            <div class="flex-1 h-px" style="background:color-mix(in srgb, var(--zone-accent) 35%, transparent)"></div>
+                                                            <span class="text-xs font-medium text-[color:var(--zone-accent)]">"New messages"</span>
+                                                            <div class="flex-1 h-px" style="background:color-mix(in srgb, var(--zone-accent) 35%, transparent)"></div>
                                                         </div>
                                                     })}
                                                     <MessageBubble message=msg/>
