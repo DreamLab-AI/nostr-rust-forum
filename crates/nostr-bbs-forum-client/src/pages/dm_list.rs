@@ -89,8 +89,8 @@ pub fn DmListPage() -> impl IntoView {
 
         if let (Some(s), Some(pk)) = (signer, pubkey) {
             fetch_started.set(true);
-            dm_store.fetch_conversations(&relay_for_fetch, s.as_ref(), &pk);
-            dm_store.subscribe_incoming(&relay_for_fetch, s.as_ref(), &pk);
+            dm_store.fetch_conversations(&relay_for_fetch, s.clone(), &pk);
+            dm_store.subscribe_incoming(&relay_for_fetch, s, &pk);
         }
     });
 
