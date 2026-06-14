@@ -378,13 +378,20 @@ fn url_encode(s: &str) -> String {
 /// (never an error to the UI) when the endpoint is missing or the table is
 /// empty — the local sources keep the dropdown useful regardless.
 pub(crate) async fn search_profiles(query: &str, limit: usize) -> Vec<MentionCandidate> {
+    let query = query.trim();
     if query.is_empty() {
         return Vec::new();
     }
+    // Lowercase the query the client sends so handle search is case-insensitive
+    // even against a relay-worker whose query path doesn't fold case itself
+    // (the current worker does, via `LOWER(...)`, but the client must not rely
+    // on a particular server version). The results are still re-filtered
+    // case-insensitively by `MentionCandidate::matches` downstream.
+    let q_lower = query.to_lowercase();
     let url = format!(
         "{}/api/profiles/search?q={}&limit={}",
         relay_api_base(),
-        url_encode(query),
+        url_encode(&q_lower),
         limit
     );
     let result: Result<Vec<MentionCandidate>, String> = async {
@@ -652,5 +659,35 @@ mod tests {
         assert_eq!(url_encode("alice"), "alice");
         assert_eq!(url_encode("a b"), "a%20b");
         assert_eq!(url_encode("a&b"), "a%26b");
+    }
+
+    #[test]
+    fn extract_mention_tokens_basic() {
+        assert_eq!(extract_mention_tokens("hi @Alice there"), vec!["Alice"]);
+        assert_eq!(
+            extract_mention_tokens("@JunkieJarvis hello"),
+            vec!["JunkieJarvis"]
+        );
+        assert!(extract_mention_tokens("no mentions here").is_empty());
+    }
+
+    #[test]
+    fn resolve_content_mentions_is_case_insensitive_against_seed() {
+        // The known-users seed handle is lowercase "junkiejarvis"; a mention
+        // typed in any case must still resolve to the same hex pubkey, so the
+        // `["p", pubkey]` tag fires regardless of how the author cased it.
+        let expected = "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9";
+        for content in [
+            "ping @junkiejarvis",
+            "ping @JunkieJarvis",
+            "ping @JUNKIEJARVIS",
+        ] {
+            let resolved = resolve_content_mentions(content);
+            assert_eq!(
+                resolved,
+                vec![expected.to_string()],
+                "mention resolution must be case-insensitive for: {content}"
+            );
+        }
     }
 }

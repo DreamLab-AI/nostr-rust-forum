@@ -78,6 +78,18 @@ fn is_valid_pubkey(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Build the SQL `LIKE` pattern for a (caller-lowercased) handle search query.
+///
+/// Returns a case-insensitive **substring** pattern (`%<needle>%`) after
+/// stripping the literal `%`/`_` wildcards so the typeahead can't be coerced
+/// into a full wildcard scan. Pairing this with `LOWER(<column>) LIKE ?1`
+/// makes handle search case-insensitive in both directions and matches the
+/// client's `MentionCandidate::matches` (`.contains`) semantics.
+fn search_like_pattern(q_lower: &str) -> String {
+    let needle = q_lower.replace(['%', '_'], "");
+    format!("%{needle}%")
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/profiles/batch
 // ---------------------------------------------------------------------------
@@ -274,15 +286,26 @@ pub async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         Err(_) => return cors_json_response(env, &json!({ "error": "Database unavailable" }), 500),
     };
 
-    // Case-insensitive prefix match on either column. We rely on
-    // SQLite's default LIKE being case-insensitive for ASCII; the prefix
-    // is already lowercased above for parity with stored values when the
-    // column happens to carry mixed case.
-    let pattern = format!("{}%", q.replace(['%', '_'], ""));
+    // Case-insensitive SUBSTRING match across every human-facing handle
+    // column (`name`, `display_name`, `nip05`). Both sides are folded to
+    // lower-case — `q` is lowercased above and each column is wrapped in
+    // `LOWER(...)` — so a query like "reddread" surfaces a stored
+    // "RedDreadTest1" regardless of how the metadata was cased on publish.
+    //
+    // Substring (not prefix) parity with the client's `MentionCandidate::matches`
+    // (`.contains`): typing a fragment from the middle of a handle — e.g.
+    // "dread" or "test" — still finds the user, so the typeahead behaves the
+    // same whether a candidate comes from the relay or the local cache.
+    //
+    // The literal `%`/`_` LIKE wildcards are stripped from the query so a user
+    // can't turn the typeahead into a full wildcard scan.
+    let pattern = search_like_pattern(&q);
 
     let stmt = db.prepare(
         "SELECT pubkey, name, display_name, picture, nip05 FROM profiles \
-         WHERE LOWER(name) LIKE ?1 OR LOWER(display_name) LIKE ?1 \
+         WHERE LOWER(name) LIKE ?1 \
+            OR LOWER(display_name) LIKE ?1 \
+            OR LOWER(nip05) LIKE ?1 \
          ORDER BY last_kind0_at DESC LIMIT ?2",
     );
 
@@ -339,5 +362,52 @@ mod tests {
     fn is_valid_pubkey_rejects_non_hex() {
         let mixed = format!("g{}", "0".repeat(63));
         assert!(!is_valid_pubkey(&mixed));
+    }
+
+    // Mirror SQLite's `LOWER(<column>) LIKE <pattern>` for an ASCII column so
+    // the tests prove the matching contract without a live D1.
+    fn sql_like_match(column_value: &str, pattern: &str) -> bool {
+        let hay = column_value.to_lowercase();
+        // The handler only ever builds `%<needle>%` patterns, so a plain
+        // substring check is an exact stand-in for SQLite LIKE here.
+        let needle = pattern.trim_matches('%');
+        hay.contains(needle)
+    }
+
+    #[test]
+    fn search_pattern_wraps_substring() {
+        assert_eq!(search_like_pattern("reddread"), "%reddread%");
+    }
+
+    #[test]
+    fn search_pattern_strips_like_wildcards() {
+        // A user can't smuggle SQL LIKE wildcards into the typeahead.
+        assert_eq!(search_like_pattern("a%b_c"), "%abc%");
+        assert_eq!(search_like_pattern("%%__"), "%%");
+    }
+
+    #[test]
+    fn search_matches_case_insensitively() {
+        // Operator's case: typing "reddread" must surface "RedDreadTest1".
+        let pattern = search_like_pattern(&"RedDread".to_lowercase());
+        assert!(sql_like_match("RedDreadTest1", &pattern));
+        // And the reverse casing on the query.
+        let pattern = search_like_pattern(&"REDDREAD".to_lowercase());
+        assert!(sql_like_match("reddreadtest1", &pattern));
+    }
+
+    #[test]
+    fn search_matches_mid_handle_substring() {
+        // Substring (not prefix): a fragment from the middle still matches.
+        let pattern = search_like_pattern(&"dread".to_lowercase());
+        assert!(sql_like_match("RedDreadTest1", &pattern));
+        let pattern = search_like_pattern(&"test".to_lowercase());
+        assert!(sql_like_match("RedDreadTest1", &pattern));
+    }
+
+    #[test]
+    fn search_does_not_match_unrelated() {
+        let pattern = search_like_pattern(&"alice".to_lowercase());
+        assert!(!sql_like_match("RedDreadTest1", &pattern));
     }
 }
