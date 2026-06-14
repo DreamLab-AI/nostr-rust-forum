@@ -2,6 +2,15 @@
 //!
 //! Shows the bech32-encoded private key in a glass card with copy/download
 //! actions and a confirmation dismissal that persists via localStorage.
+//!
+//! NOT built on the shared [`Modal`](crate::components::modal::Modal) primitive
+//! by design: this is an *inline* step in the signup / home setup flow (rendered
+//! inside the page's `SetupPhase::Backup` panel), not a floating overlay. It has
+//! no backdrop and no fixed positioning — wrapping it in `Modal` (which adds a
+//! centered floating card, backdrop, and body-scroll-lock) would turn a wizard
+//! step into a dialog and break the flow. It already carries the correct
+//! `role="alertdialog"` + `aria-labelledby`/`aria-describedby` semantics for an
+//! inline assertive prompt.
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;

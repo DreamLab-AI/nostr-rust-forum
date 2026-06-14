@@ -2,6 +2,16 @@
 //!
 //! Shows a list of all notifications from the NotificationStoreV2, grouped by
 //! read status, with "Mark all read" action and click-to-navigate behavior.
+//!
+//! NOT built on the shared [`Modal`](crate::components::modal::Modal) primitive
+//! by design: this is a right-docked *drawer* (`fixed right-0 top-16 bottom-0`,
+//! full-height, slide-in-from-right), not a centered dialog. Its header carries
+//! "Mark all read" / "Clear" actions rather than a title + close-X, and its
+//! backdrop is a transparent click-catcher (no blur). `Modal` renders a centered
+//! floating card with a mandatory title bar and scale-in animation, so wrapping
+//! this drawer in it would change its layout and behaviour. Backdrop-click close
+//! is implemented here; a drawer variant on `Modal` would be a non-minimal fork
+//! of the shared primitive.
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;

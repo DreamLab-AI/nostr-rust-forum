@@ -11,6 +11,7 @@ use wasm_bindgen_futures::spawn_local;
 use super::WhitelistUser;
 use crate::auth::nip98::fetch_with_nip98_post_signer;
 use crate::auth::use_auth;
+use crate::components::modal::Modal;
 use crate::components::user_display::{try_display_name_tracked, use_display_name_memo};
 use crate::utils::shorten_pubkey;
 
@@ -219,7 +220,10 @@ impl SuspendDuration {
 // -- Suspend modal ------------------------------------------------------------
 
 #[component]
-fn SuspendModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl IntoView {
+fn SuspendModal(
+    pubkey: String,
+    on_close: impl Fn() + 'static + Clone + Send + Sync,
+) -> impl IntoView {
     let auth = use_auth();
     let duration = RwSignal::new(SuspendDuration::OneDay);
     let reason = RwSignal::new(String::new());
@@ -264,15 +268,17 @@ fn SuspendModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl I
     let display_name = use_display_name_memo(pubkey.clone());
     let pk_display = truncate_pubkey(&pubkey);
 
+    // Local visibility for the shared Modal shell; every close path forwards to
+    // the caller's `on_close`.
+    let is_open = RwSignal::new(true);
+    let on_modal_close = {
+        let close = on_close.clone();
+        Callback::new(move |()| close())
+    };
+
     view! {
-        <div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50" on:click={
-            let close = on_close.clone();
-            move |_| close()
-        }>
-            <div class="bg-gray-800 border border-gray-700 rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl"
-                on:click=|ev| ev.stop_propagation()
-            >
-                <h3 class="text-lg font-semibold text-white mb-1">"Suspend User"</h3>
+        <Modal is_open=is_open title="Suspend User".to_string() on_close=on_modal_close>
+            <div>
                 <p class="text-sm text-gray-400 mb-4">
                     {move || display_name.get()}
                     " "
@@ -331,14 +337,17 @@ fn SuspendModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl I
                     </div>
                 </form>
             </div>
-        </div>
+        </Modal>
     }
 }
 
 // -- Notes modal --------------------------------------------------------------
 
 #[component]
-fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl IntoView {
+fn NotesModal(
+    pubkey: String,
+    on_close: impl Fn() + 'static + Clone + Send + Sync,
+) -> impl IntoView {
     let auth = use_auth();
     let notes = RwSignal::new(String::new());
     let is_loading = RwSignal::new(true);
@@ -399,15 +408,17 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
     let display_name = use_display_name_memo(pubkey.clone());
     let pk_display = truncate_pubkey(&pubkey);
 
+    // Local visibility for the shared Modal shell; every close path forwards to
+    // the caller's `on_close`.
+    let is_open = RwSignal::new(true);
+    let on_modal_close = {
+        let close = on_close.clone();
+        Callback::new(move |()| close())
+    };
+
     view! {
-        <div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50" on:click={
-            let close = on_close.clone();
-            move |_| close()
-        }>
-            <div class="bg-gray-800 border border-gray-700 rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl"
-                on:click=|ev| ev.stop_propagation()
-            >
-                <h3 class="text-lg font-semibold text-white mb-1">"Admin Notes"</h3>
+        <Modal is_open=is_open title="Admin Notes".to_string() on_close=on_modal_close>
+            <div>
                 <p class="text-sm text-gray-400 mb-4">
                     {move || display_name.get()}
                     " "
@@ -445,7 +456,7 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
                     </button>
                 </div>
             </div>
-        </div>
+        </Modal>
     }
 }
 
@@ -457,8 +468,8 @@ fn NotesModal(pubkey: String, on_close: impl Fn() + 'static + Clone) -> impl Int
 fn DeleteUserModal(
     pubkey: String,
     display_label: String,
-    on_close: impl Fn() + 'static + Clone,
-    on_confirm: impl Fn(bool) + 'static + Clone,
+    on_close: impl Fn() + 'static + Clone + Send + Sync,
+    on_confirm: impl Fn(bool) + 'static + Clone + Send + Sync,
 ) -> impl IntoView {
     let also_delete_events = RwSignal::new(false);
     let pk_display = truncate_pubkey(&pubkey);
@@ -472,15 +483,17 @@ fn DeleteUserModal(
         }
     };
 
+    // Local visibility for the shared Modal shell; backdrop / Esc / header X all
+    // forward to the caller's `on_close` (equivalent to Cancel — non-destructive).
+    let is_open = RwSignal::new(true);
+    let on_modal_close = {
+        let close = on_close.clone();
+        Callback::new(move |()| close())
+    };
+
     view! {
-        <div class="fixed inset-0 bg-black/60 flex items-center justify-center z-50" on:click={
-            let close = on_close.clone();
-            move |_| close()
-        }>
-            <div class="bg-gray-800 border border-gray-700 rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl"
-                on:click=|ev| ev.stop_propagation()
-            >
-                <h3 class="text-lg font-semibold text-white mb-1">"Delete User"</h3>
+        <Modal is_open=is_open title="Delete User".to_string() on_close=on_modal_close>
+            <div>
                 <p class="text-sm text-gray-400 mb-4">
                     {display_label}
                     " "
@@ -523,7 +536,7 @@ fn DeleteUserModal(
                     </button>
                 </div>
             </div>
-        </div>
+        </Modal>
     }
 }
 

@@ -2,7 +2,9 @@
 //!
 //! Displays a user's profile details in a glass-panel modal overlay. Fetches
 //! kind 0 metadata from the relay on open. Provides DM, copy pubkey, and
-//! mute actions.
+//! mute actions. The overlay shell is the shared
+//! [`Modal`](crate::components::modal::Modal) primitive (backdrop-close, Esc,
+//! body-scroll-lock, `role="dialog"`, `aria-modal`).
 
 use std::rc::Rc;
 
@@ -12,6 +14,7 @@ use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
+use crate::components::modal::Modal;
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::mute::use_mute_store;
@@ -131,19 +134,8 @@ pub(crate) fn ProfileModal(
     });
 
     view! {
-        <Show when=move || is_open.get()>
-            <div class="modal-backdrop" on:click=move |_| is_open.set(false)>
-                <div class="modal-panel p-6 space-y-5" on:click=move |ev: web_sys::MouseEvent| ev.stop_propagation()>
-                    // Close button
-                    <div class="flex justify-end">
-                        <button
-                            on:click=move |_| is_open.set(false)
-                            class="text-gray-500 hover:text-gray-300 transition-colors p-1"
-                        >
-                            {close_icon_svg()}
-                        </button>
-                    </div>
-
+        <Modal is_open=is_open title=String::new()>
+            <div class="space-y-5">
                     // Avatar with gradient ring
                     <div class="flex flex-col items-center gap-3">
                         <div class="profile-avatar-ring">
@@ -246,22 +238,12 @@ pub(crate) fn ProfileModal(
                             </button>
                         </div>
                     </div>
-                </div>
             </div>
-        </Show>
+        </Modal>
     }
 }
 
 // -- SVG icons ----------------------------------------------------------------
-
-fn close_icon_svg() -> impl IntoView {
-    view! {
-        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18" stroke-linecap="round"/>
-            <line x1="6" y1="6" x2="18" y2="18" stroke-linecap="round"/>
-        </svg>
-    }
-}
 
 fn dm_icon_svg() -> impl IntoView {
     view! {

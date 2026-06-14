@@ -3,6 +3,16 @@
 //! Searches channels, messages, and users via relay and semantic search API.
 //! Supports a "Semantic" toggle for RuVector-powered vector search.
 //! Uses `.search-overlay` / `.search-panel` CSS classes from `style.css`.
+//!
+//! NOT built on the shared [`Modal`](crate::components::modal::Modal) primitive
+//! by design: this is a Cmd/Ctrl+K *command palette*, not a dialog. It is
+//! top-anchored (`padding-top: 15vh`, not centered), has a search input — not a
+//! title+close-X header — as its head, and owns focus-scoped keyboard
+//! navigation (ArrowUp/Down/Enter/Escape on the panel). Folding it into the
+//! centered, title-bar `Modal` would lose the palette UX and double-bind
+//! Escape (Modal's document-global Esc would race the palette's own handler).
+//! It already implements backdrop-close, Escape-to-close, and auto-focus
+//! itself.
 
 use crate::app::base_href;
 use crate::relay::{Filter, RelayConnection};
