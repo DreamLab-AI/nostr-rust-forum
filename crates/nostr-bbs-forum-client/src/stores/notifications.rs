@@ -355,16 +355,61 @@ impl NotificationStoreV2 {
 // -- Context providers --------------------------------------------------------
 
 /// Provide the notification store context. Call once near the app root.
+///
+/// The created store is also registered as the fallback singleton so that any
+/// later context miss (see [`use_notification_store`]) resolves to *this* exact
+/// instance rather than a divergent one — keeping the bell badge and the
+/// notification center in lock-step on a single `items` signal.
 pub fn provide_notification_store() {
     let store = NotificationStoreV2::new();
+    FALLBACK_STORE.with(|cell| {
+        *cell.borrow_mut() = Some(store);
+    });
     provide_context(store);
 }
 
 /// Read the notification store from context.
+///
+/// Resolves the single store installed by [`provide_notification_store`] at the
+/// app root. If `use_context` misses (it can, when called inside a transiently
+/// re-created reactive owner such as the body of a toggling `<Show>` — the
+/// notification center is rendered inside one), this falls back to a **single
+/// process-wide instance**, not a fresh one per call.
+///
+/// Root cause (BUG: bell badge shows a count while the expanded center is
+/// empty): the old fallback minted a *new* `NotificationStoreV2` — with its own
+/// empty `items` signal — on every context miss. The bell resolved the real
+/// (root) store, `init_sync` populated it and the badge counted its unread
+/// items, but a consumer that fell through to a freshly-minted empty store
+/// rendered nothing. Same invariant ("badge and list read one signal") but two
+/// physical stores. Sharing one singleton on the fallback path guarantees every
+/// consumer observes the same `items`, so the badge and list can never diverge.
 pub fn use_notification_store() -> NotificationStoreV2 {
-    use_context::<NotificationStoreV2>().unwrap_or_else(|| {
+    if let Some(store) = use_context::<NotificationStoreV2>() {
+        return store;
+    }
+    let store = fallback_singleton();
+    // Re-provide into the current reactive subtree so descendants resolve it via
+    // context directly (and we don't hit this path repeatedly).
+    provide_context(store);
+    store
+}
+
+thread_local! {
+    /// Single shared store used only when context resolution misses, so all
+    /// consumers still observe one set of reactive signals (see
+    /// `use_notification_store`). On WASM the app is single-threaded.
+    static FALLBACK_STORE: std::cell::RefCell<Option<NotificationStoreV2>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn fallback_singleton() -> NotificationStoreV2 {
+    FALLBACK_STORE.with(|cell| {
+        if let Some(store) = *cell.borrow() {
+            return store;
+        }
         let store = NotificationStoreV2::new();
-        provide_context(store);
+        *cell.borrow_mut() = Some(store);
         store
     })
 }
@@ -429,16 +474,27 @@ fn post_preview(content: &str) -> String {
     }
 }
 
-/// Load notifications from localStorage, evicting entries older than 7 days.
+/// Load notifications from localStorage, evicting entries older than 7 days and
+/// dropping any that fail to deserialize against the current schema.
+///
+/// Defensive against schema drift (BUG: count-but-not-render): a notification
+/// written by an older build (e.g. a `NotificationKind` variant that no longer
+/// exists, or a renamed field) must NOT poison the whole list. Strict
+/// `LocalStorage::get::<PersistedNotifications>()` fails the *entire* blob on one
+/// bad entry, so we parse leniently — element by element — and keep only the
+/// entries that map cleanly onto the current `Notification` schema. The migrated
+/// (cleaned) list is written straight back so the drift heals on first load.
 fn load_from_storage() -> Vec<Notification> {
-    let data: PersistedNotifications = LocalStorage::get(STORAGE_KEY).unwrap_or_default();
     let now = now_secs();
-    let items: Vec<Notification> = data
-        .items
-        .into_iter()
-        .filter(|n| now.saturating_sub(n.timestamp) < MAX_AGE_SECS)
-        .collect();
-    // Persist the evicted list back
+
+    // Parse leniently: read the raw JSON value, then deserialize each item on its
+    // own so a single legacy/corrupt entry is dropped rather than blanking all.
+    let items: Vec<Notification> = match LocalStorage::get::<serde_json::Value>(STORAGE_KEY) {
+        Ok(value) => parse_persisted_items(&value, now),
+        Err(_) => Vec::new(),
+    };
+
+    // Persist the cleaned/evicted/migrated list back.
     let _ = LocalStorage::set(
         STORAGE_KEY,
         PersistedNotifications {
@@ -446,4 +502,89 @@ fn load_from_storage() -> Vec<Notification> {
         },
     );
     items
+}
+
+/// Lenient, per-item parse of the persisted `{ "items": [...] }` blob.
+///
+/// Each element is deserialized independently: entries that don't match the
+/// current [`Notification`] schema (legacy variant, missing/renamed field) are
+/// dropped rather than failing the whole list, and anything older than 7 days is
+/// evicted. Extracted from [`load_from_storage`] so it is unit-testable without
+/// a DOM.
+fn parse_persisted_items(value: &serde_json::Value, now: u64) -> Vec<Notification> {
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| serde_json::from_value::<Notification>(item.clone()).ok())
+                .filter(|n| now.saturating_sub(n.timestamp) < MAX_AGE_SECS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn lenient_parse_drops_corrupt_entry_keeps_valid() {
+        let now = 1_000_000_000;
+        // One valid entry + one with an unknown NotificationKind variant.
+        let value = json!({
+            "items": [
+                { "id": "a", "kind": "Mention", "title": "ok", "body": "b",
+                  "timestamp": now, "read": false, "link": null },
+                { "id": "b", "kind": "LegacyKindThatNoLongerExists", "title": "x",
+                  "body": "y", "timestamp": now, "read": true, "link": null },
+            ]
+        });
+        let items = parse_persisted_items(&value, now);
+        // The corrupt entry is dropped; the valid one survives — so a single
+        // legacy notification can never blank the whole list (the count-but-not
+        // -render failure mode).
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "a");
+        assert_eq!(items[0].kind, NotificationKind::Mention);
+    }
+
+    #[test]
+    fn lenient_parse_evicts_old_entries() {
+        let now = MAX_AGE_SECS + 100;
+        let value = json!({
+            "items": [
+                { "id": "fresh", "kind": "DM", "title": "t", "body": "b",
+                  "timestamp": now, "read": false, "link": null },
+                { "id": "stale", "kind": "DM", "title": "t", "body": "b",
+                  "timestamp": 0, "read": false, "link": null },
+            ]
+        });
+        let items = parse_persisted_items(&value, now);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "fresh");
+    }
+
+    #[test]
+    fn lenient_parse_handles_missing_items_key() {
+        assert!(parse_persisted_items(&json!({}), 0).is_empty());
+        assert!(parse_persisted_items(&json!({ "items": "not-an-array" }), 0).is_empty());
+        assert!(parse_persisted_items(&json!(null), 0).is_empty());
+    }
+
+    #[test]
+    fn lenient_parse_missing_optional_link_is_dropped_when_required() {
+        // `link` is `Option<String>` — absent should still deserialize fine.
+        let now = 10;
+        let value = json!({
+            "items": [
+                { "id": "x", "kind": "System", "title": "t", "body": "b",
+                  "timestamp": now, "read": false },
+            ]
+        });
+        let items = parse_persisted_items(&value, now);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].link, None);
+    }
 }

@@ -50,6 +50,7 @@ pub fn DmListPage() -> impl IntoView {
     let auth = use_auth();
     let relay = expect_context::<RelayConnection>();
     let conn_state = relay.connection_state();
+    let relay_authed = relay.authenticated();
 
     // Provide DM store for this subtree
     provide_dm_store();
@@ -73,11 +74,22 @@ pub fn DmListPage() -> impl IntoView {
     // Track whether we've already started fetching
     let fetch_started = RwSignal::new(false);
 
-    // Fetch conversations when connected
+    // Fetch conversations only once the relay session is NIP-42 AUTHenticated.
+    //
+    // kind-1059 gift-wrap REQs are AUTH-gated server-side. Firing them on bare
+    // `Connected` raced the AUTH handshake — fine for fast local-key signing,
+    // but a NIP-07 extension signs the AUTH challenge through `window.nostr`
+    // (often with a user prompt), so the REQ landed pre-AUTH, was answered with
+    // `auth-required: must authenticate to receive kind-1059 DMs`, and dropped
+    // without an EOSE. The recipient then saw no DMs. Gating on `authenticated`
+    // (flipped true after the AUTH response is sent + subscriptions replayed)
+    // makes delivery deterministic for both signer backends; the time-based
+    // re-subscribe in the DM store remains as a belt-and-braces self-heal.
     let relay_for_fetch = relay.clone();
     Effect::new(move |_| {
-        let state = conn_state.get();
-        if state != ConnectionState::Connected {
+        let connected = conn_state.get() == ConnectionState::Connected;
+        let authed = relay_authed.get();
+        if !connected || !authed {
             return;
         }
         if fetch_started.get_untracked() {

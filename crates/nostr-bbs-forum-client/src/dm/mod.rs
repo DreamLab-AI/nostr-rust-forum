@@ -608,9 +608,26 @@ async fn process_gift_wrap_event(
     let unwrapped = match unwrap_gift_with_signer(event, signer).await {
         Ok(u) => u,
         Err(e) => {
+            let msg = e.to_string();
             web_sys::console::warn_1(
-                &format!("[DM] Gift unwrap failed for {}: {}", &event.id, e).into(),
+                &format!("[DM] Gift unwrap failed for {}: {}", &event.id, msg).into(),
             );
+            // A NIP-07 extension that implements only NIP-04 (no `window.nostr
+            // .nip44`) cannot decrypt gift wraps at all — every unwrap fails the
+            // same way and the list would otherwise stay silently empty. Surface
+            // a clear, actionable message instead of leaving the user guessing.
+            if msg.contains("nip44 not supported") || msg.contains("window.nostr.nip44") {
+                state.update(|s| {
+                    if s.error.is_none() {
+                        s.error = Some(
+                            "Your Nostr extension doesn't support NIP-44 encryption, which is \
+                             required to read these messages. Update your extension (or use a \
+                             local key) to view DMs."
+                                .into(),
+                        );
+                    }
+                });
+            }
             return;
         }
     };

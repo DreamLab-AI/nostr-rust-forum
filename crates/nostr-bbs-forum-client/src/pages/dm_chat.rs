@@ -26,6 +26,7 @@ pub fn DmChatPage() -> impl IntoView {
     let auth = use_auth();
     let relay = expect_context::<RelayConnection>();
     let conn_state = relay.connection_state();
+    let relay_authed = relay.authenticated();
 
     // Provide DM store for this subtree
     provide_dm_store();
@@ -42,12 +43,16 @@ pub fn DmChatPage() -> impl IntoView {
     let fetch_started = RwSignal::new(false);
     let show_image_upload = RwSignal::new(false);
 
-    // Subscribe to conversation messages when connected
+    // Subscribe to conversation messages only once the relay session is NIP-42
+    // AUTHenticated. kind-1059 gift-wrap REQs are AUTH-gated server-side; firing
+    // on bare `Connected` raced the handshake and silently dropped the REQ for
+    // slow NIP-07 extensions (see dm_list.rs for the full root-cause note).
     let relay_for_sub = relay.clone();
     Effect::new(move |_| {
-        let state = conn_state.get();
+        let connected = conn_state.get() == ConnectionState::Connected;
+        let authed = relay_authed.get();
         let rpk = recipient_pubkey();
-        if state != ConnectionState::Connected || rpk.is_empty() {
+        if !connected || !authed || rpk.is_empty() {
             return;
         }
         if fetch_started.get_untracked() {
