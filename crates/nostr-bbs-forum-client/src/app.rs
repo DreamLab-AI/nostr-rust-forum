@@ -771,8 +771,7 @@ fn Layout(children: Children) -> impl IntoView {
                             <button
                                 class="text-gray-400 hover:text-amber-400 transition-colors p-2 rounded-lg hover:bg-gray-800"
                                 on:click=move |_| search_open.set(true)
-                                title="Search (Ctrl/Cmd+K)"
-                                aria-label="Search"
+                                aria-label="Search (Ctrl/Cmd+K)"
                             >
                                 {search_icon()}
                             </button>

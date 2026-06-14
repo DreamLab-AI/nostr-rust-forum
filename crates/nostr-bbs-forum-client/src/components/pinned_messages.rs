@@ -92,7 +92,6 @@ pub fn PinButton(
             <button
                 class="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-gray-700/50 text-gray-600 hover:text-amber-400"
                 aria-label="Pin message"
-                title="Pin message"
                 on:click=on_pin
             >
                 <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -241,7 +240,6 @@ pub fn PinnedMessages(
                                             <button
                                                 class="opacity-0 group-hover/pin:opacity-100 transition-opacity p-1 rounded hover:bg-gray-700/50 text-gray-500 hover:text-red-400 flex-shrink-0"
                                                 aria-label="Unpin message"
-                                                title="Unpin message"
                                                 on:click=on_unpin
                                             >
                                                 <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

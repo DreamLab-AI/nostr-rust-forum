@@ -126,7 +126,6 @@ pub fn ReportButton(
             <button
                 class="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-gray-700/50 text-gray-600 hover:text-red-400"
                 aria-label="Report message"
-                title="Report message"
                 on:click=move |_| {
                     selected_reason.set(String::new());
                     other_text.set(String::new());
