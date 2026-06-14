@@ -901,7 +901,6 @@ pub(crate) fn MessageInput(
                             <button
                                 class="p-1.5 rounded-lg text-gray-500 hover:text-gray-300 hover:bg-gray-700/50 transition-colors"
                                 on:click=open_file_picker
-                                title="Attach image"
                                 aria-label="Attach image"
                             >
                                 <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -936,7 +935,6 @@ pub(crate) fn MessageInput(
                                 "Send message"
                             }
                         }
-                        title=move || if is_editing { "Save edit" } else { "Send" }
                     >
                         {move || {
                             if uploading.get() {

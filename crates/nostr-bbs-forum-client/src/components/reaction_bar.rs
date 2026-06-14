@@ -214,7 +214,6 @@ pub(crate) fn ReactionBar(
                     class="inline-flex items-center justify-center w-6 h-6 rounded-full text-gray-500 hover:text-amber-400 hover:bg-gray-700/50 transition-colors text-sm"
                     on:click=move |_| show_picker.update(|v| *v = !*v)
                     aria-label="Add reaction"
-                    title="Add reaction"
                 >
                     "+"
                 </button>
