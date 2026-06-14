@@ -105,6 +105,10 @@ struct RelayInner {
     /// Reactive sink for relay NOTICE messages (cloned from the outer
     /// `RelayConnection::notice` signal so `handle_relay_message` can publish).
     notice_sink: Option<RwSignal<Option<RelayNotice>>>,
+    /// Reactive sink for the NIP-42 authenticated flag (cloned from the outer
+    /// `RelayConnection::authenticated` signal so the AUTH handler can flip it
+    /// once the auth response has been signed + sent and subscriptions replayed).
+    authed_sink: Option<RwSignal<bool>>,
     /// Rate-limit state for NOTICE dedup: last surfaced text + epoch-ms time.
     last_notice: Option<(String, f64)>,
     /// Monotonic counter so each surfaced notice has a distinct `seq`.
@@ -142,6 +146,14 @@ pub struct RelayConnection {
     /// duplicates inside `handle_relay_message`). Components can read this to
     /// raise a warn toast.
     notice: RwSignal<Option<RelayNotice>>,
+    /// Whether the current socket has completed NIP-42 AUTH. Flips `true` once
+    /// the AUTH response is signed + sent (and subscriptions replayed), and back
+    /// to `false` whenever the socket (re)connects or disconnects. AUTH-gated
+    /// REQs (kind-1059 DMs, gated zones) must wait for this to avoid racing the
+    /// handshake — critical for slow NIP-07 extensions where signing the AUTH
+    /// challenge round-trips through `window.nostr` (and may prompt the user),
+    /// which can easily exceed a fixed re-subscribe timer.
+    authenticated: RwSignal<bool>,
 }
 
 // SAFETY: In WASM, there is only one thread. SendWrapper enforces this
@@ -168,6 +180,7 @@ impl RelayConnection {
             auth_signer: None,
             auth_signer_async: None,
             notice_sink: None,
+            authed_sink: None,
             last_notice: None,
             notice_seq: 0,
             _on_open: None,
@@ -176,12 +189,27 @@ impl RelayConnection {
             _on_close: None,
         }));
         let notice = RwSignal::new(None);
-        inner.borrow_mut().notice_sink = Some(notice);
+        let authenticated = RwSignal::new(false);
+        {
+            let mut b = inner.borrow_mut();
+            b.notice_sink = Some(notice);
+            b.authed_sink = Some(authenticated);
+        }
         Self {
             inner: SendWrapper::new(inner),
             state: RwSignal::new(ConnectionState::Disconnected),
             notice,
+            authenticated,
         }
+    }
+
+    /// Reactive signal: `true` once the current socket has completed NIP-42 AUTH.
+    ///
+    /// AUTH-gated subscriptions (kind-1059 DMs, gated zones) should wait for this
+    /// rather than firing on `ConnectionState::Connected`, which races the AUTH
+    /// handshake. Resets to `false` on every (re)connect and on disconnect.
+    pub fn authenticated(&self) -> RwSignal<bool> {
+        self.authenticated
     }
 
     /// Reactive signal carrying the latest relay NOTICE (rate-limited). A
@@ -268,30 +296,40 @@ impl RelayConnection {
         let on_open = Closure::wrap(Box::new(move || {
             web_sys::console::log_1(&"[Relay] WebSocket connected".into());
             state.set(ConnectionState::Connected);
-            let mut inner = inner_rc.borrow_mut();
-            inner.reconnect_attempts = 0;
-            inner.seen_events.clear();
-            // Flush pending messages
-            let pending: Vec<String> = inner.pending_messages.drain(..).collect();
-            if let Some(ws) = &inner.ws {
-                for msg in pending {
-                    let _ = ws.send_with_str(&msg);
-                }
-                // Replay subscriptions on reconnect
-                for (sub_id, sub) in inner.subscriptions.iter() {
-                    let mut req = vec![
-                        serde_json::Value::String("REQ".into()),
-                        serde_json::Value::String(sub_id.clone()),
-                    ];
-                    for filter in &sub.filters {
-                        if let Ok(v) = serde_json::to_value(filter) {
-                            req.push(v);
-                        }
-                    }
-                    if let Ok(msg) = serde_json::to_string(&req) {
+            let authed_sink = {
+                let mut inner = inner_rc.borrow_mut();
+                inner.reconnect_attempts = 0;
+                inner.seen_events.clear();
+                // Flush pending messages
+                let pending: Vec<String> = inner.pending_messages.drain(..).collect();
+                if let Some(ws) = &inner.ws {
+                    for msg in pending {
                         let _ = ws.send_with_str(&msg);
                     }
+                    // Replay subscriptions on reconnect
+                    for (sub_id, sub) in inner.subscriptions.iter() {
+                        let mut req = vec![
+                            serde_json::Value::String("REQ".into()),
+                            serde_json::Value::String(sub_id.clone()),
+                        ];
+                        for filter in &sub.filters {
+                            if let Ok(v) = serde_json::to_value(filter) {
+                                req.push(v);
+                            }
+                        }
+                        if let Ok(msg) = serde_json::to_string(&req) {
+                            let _ = ws.send_with_str(&msg);
+                        }
+                    }
                 }
+                inner.authed_sink
+            };
+            // A fresh socket is not yet NIP-42 authenticated — gated REQs must
+            // wait for the AUTH handshake to flip this back to true. Set after
+            // the borrow ends so a reactive effect reading `authenticated`
+            // cannot re-enter this RefCell.
+            if let Some(sig) = authed_sink {
+                sig.set(false);
             }
         }) as Box<dyn FnMut()>);
         ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
@@ -339,6 +377,7 @@ impl RelayConnection {
     /// Disconnect from the relay and stop reconnecting.
     pub fn disconnect(&self) {
         self.state.set(ConnectionState::Disconnected);
+        self.authenticated.set(false);
         self.with_inner(|rc| {
             let mut inner = rc.borrow_mut();
             if let Some(ws) = inner.ws.take() {
@@ -673,25 +712,42 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                     // the relay processes AUTH before these re-REQs.
                     let replay_rc = inner_rc.clone();
                     let replay_subs = move |ws: &Option<WebSocket>| {
-                        let inner = replay_rc.borrow();
-                        if let Some(ws) = ws {
-                            for (sub_id, sub) in inner.subscriptions.iter() {
-                                let mut req = vec![
-                                    serde_json::Value::String("REQ".into()),
-                                    serde_json::Value::String(sub_id.clone()),
-                                ];
-                                for filter in &sub.filters {
-                                    if let Ok(v) = serde_json::to_value(filter) {
-                                        req.push(v);
+                        // Extract the authed signal, then drop the borrow BEFORE
+                        // flipping it: `sig.set(true)` synchronously runs the
+                        // DM Effect, which calls `relay.subscribe()` ->
+                        // `inner.borrow_mut()`. Holding this borrow across the
+                        // set would re-enter the same RefCell and panic
+                        // ("already borrowed").
+                        let authed_sink = {
+                            let inner = replay_rc.borrow();
+                            if let Some(ws) = ws {
+                                for (sub_id, sub) in inner.subscriptions.iter() {
+                                    let mut req = vec![
+                                        serde_json::Value::String("REQ".into()),
+                                        serde_json::Value::String(sub_id.clone()),
+                                    ];
+                                    for filter in &sub.filters {
+                                        if let Ok(v) = serde_json::to_value(filter) {
+                                            req.push(v);
+                                        }
+                                    }
+                                    if let Ok(msg) = serde_json::to_string(&req) {
+                                        let _ = ws.send_with_str(&msg);
                                     }
                                 }
-                                if let Ok(msg) = serde_json::to_string(&req) {
-                                    let _ = ws.send_with_str(&msg);
-                                }
+                                web_sys::console::log_1(
+                                    &"[Relay] replayed subscriptions post-AUTH".into(),
+                                );
                             }
-                            web_sys::console::log_1(
-                                &"[Relay] replayed subscriptions post-AUTH".into(),
-                            );
+                            inner.authed_sink
+                        };
+                        // Mark the session authenticated so AUTH-gated consumers
+                        // (DM store) can now safely (re-)issue their kind-1059
+                        // REQs. Doing this *after* the AUTH response is sent and
+                        // subscriptions are replayed is what lets slow NIP-07
+                        // extensions deliver DMs without racing a fixed timer.
+                        if let Some(sig) = authed_sink {
+                            sig.set(true);
                         }
                     };
 
