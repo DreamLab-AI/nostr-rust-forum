@@ -86,7 +86,6 @@ pub(crate) fn NotificationBell() -> impl IntoView {
     // the Layout, after every app-root context (channel store, read positions,
     // auth) is provided, so this is the safe point to start syncing. Idempotent.
     v2_store.init_sync();
-    let legacy_store = use_notifications();
     let panel_open = RwSignal::new(false);
 
     // Bug #18: route open-state through the shared PopoverCoord so opening
@@ -103,10 +102,13 @@ pub(crate) fn NotificationBell() -> impl IntoView {
         }
     });
 
-    // Combined unread count from both stores
-    let legacy_unread = legacy_store.unread_count();
-    let v2_unread = v2_store.unread_count();
-    let total_unread = Memo::new(move |_| legacy_unread.get() + v2_unread.get());
+    // Badge count: read ONLY from the V2 store — the exact same `items` signal
+    // the NotificationCenter renders. Previously the badge summed a second,
+    // legacy `NotificationStore` that nothing populates and that the center
+    // never renders; any divergence there produced the "bell shows a count but
+    // the expanded list is empty" bug. Counting one source guarantees the badge
+    // and the list never disagree.
+    let total_unread = v2_store.unread_count();
 
     let toggle = move |_| coord.toggle(KEY);
 

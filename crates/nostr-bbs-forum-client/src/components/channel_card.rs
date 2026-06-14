@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::app::base_href;
+use crate::stores::channels::use_channel_store;
 use crate::stores::read_position::use_read_positions;
 use crate::utils::format_relative_time;
 
@@ -44,9 +45,27 @@ pub fn ChannelCard(channel: ChannelInfo) -> impl IntoView {
     let has_description = !description.is_empty();
     let section_badge_class = get_section_badge_class(&section);
 
-    // Unread badge from read-position store
+    // Unread badge — TIMESTAMP model (same as the forum index, forums.rs):
+    // a post is unread when its `created_at` is newer than this channel's
+    // last-read timestamp. We read live kind-42 messages from the shared
+    // ChannelStore and the per-channel last-read timestamp; the Memo re-runs
+    // whenever either changes, so the "N new" chip appears as posts arrive and
+    // clears the instant the channel is marked read. (The old counter model —
+    // unread_count_signal/increment_unread — was never wired, so it always
+    // reported 0 and channel cards never flagged unread; H1 / board #24.)
+    let channel_store = use_channel_store();
     let read_store = use_read_positions();
-    let unread = read_store.unread_count_signal(channel.id.clone());
+    let messages_sig = channel_store.channel_messages;
+    let last_read = read_store.last_read_timestamp(channel.id.clone());
+    let unread_cid = channel.id.clone();
+    let unread = Memo::new(move |_| {
+        let last_read = last_read.get();
+        messages_sig.with(|m| {
+            m.get(&unread_cid)
+                .map(|events| events.iter().filter(|e| e.created_at > last_read).count() as u32)
+                .unwrap_or(0)
+        })
+    });
 
     view! {
         <A href=href attr:class="block bg-gray-800 hover:bg-gray-750 border border-gray-700 hover:border-amber-500/30 rounded-lg transition-all duration-200 no-underline text-inherit hover:-translate-y-0.5 hover:shadow-lg hover:shadow-amber-500/5">
@@ -80,14 +99,18 @@ pub fn ChannelCard(channel: ChannelInfo) -> impl IntoView {
                                 })}
                             </div>
 
-                            // Stats + unread badge
+                            // Stats + unread "N new" chip
                             <div class="flex flex-col items-end gap-1 flex-shrink-0">
                                 {move || {
                                     let count = unread.get();
-                                    (count > 0).then(|| view! {
-                                        <span class="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 text-xs font-bold text-gray-900 bg-amber-400 rounded-full">
-                                            {if count > 99 { "99+".to_string() } else { count.to_string() }}
-                                        </span>
+                                    (count > 0).then(|| {
+                                        let n = if count > 99 { "99+".to_string() } else { count.to_string() };
+                                        view! {
+                                            <span class="inline-flex items-center gap-1 h-5 px-2 text-xs font-bold text-gray-900 bg-amber-400 rounded-full shadow-sm shadow-amber-400/40 animate-pulse">
+                                                <span class="w-1.5 h-1.5 rounded-full bg-gray-900"></span>
+                                                {format!("{} new", n)}
+                                            </span>
+                                        }
                                     })
                                 }}
                                 <span class="text-xs text-amber-400 bg-amber-500/10 rounded px-2 py-0.5 font-medium">

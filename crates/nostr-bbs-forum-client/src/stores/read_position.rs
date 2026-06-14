@@ -1,8 +1,13 @@
 //! Read-position tracking per channel, persisted to localStorage.
 //!
 //! Provides `provide_read_positions()` / `use_read_positions()` context pair.
-//! Components call `mark_read()` when the user has viewed the latest messages
-//! and `get_unread_count()` to display badge counts.
+//! Components call `mark_read()` when the user has viewed the latest messages.
+//! The canonical unread model is TIMESTAMP-based: a channel message is unread
+//! when its `created_at` is newer than the channel's last-read `timestamp`
+//! (see [`ReadPositionStore::read_timestamps`] /
+//! [`ReadPositionStore::last_read_timestamp`]). Consumers (forum index, channel
+//! cards) compute the count themselves against the live message set so the
+//! badge always reflects what is actually on the relay.
 
 use gloo::storage::Storage as _;
 use leptos::prelude::*;
@@ -11,11 +16,14 @@ use std::collections::HashMap;
 const STORAGE_KEY: &str = "nostrbbs:read_positions";
 
 /// Persisted per-channel read position.
+///
+/// Legacy caches may carry an extra `unread_count` field from the old
+/// (never-wired) counter model; `serde_json` ignores unknown fields on
+/// deserialize, so older data still loads cleanly.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReadPosition {
     pub last_event_id: String,
     pub timestamp: u64,
-    pub unread_count: u32,
 }
 
 /// Map of channel_id -> ReadPosition, serialized as JSON in localStorage.
@@ -46,43 +54,10 @@ impl ReadPositionStore {
                 ReadPosition {
                     last_event_id: event_id.to_string(),
                     timestamp,
-                    unread_count: 0,
                 },
             );
         });
         self.persist();
-    }
-
-    /// Increment the unread counter for a channel (call when a new message arrives
-    /// while the user is NOT viewing that channel).
-    #[allow(dead_code)]
-    pub fn increment_unread(&self, channel_id: &str) {
-        self.inner.update(|rp| {
-            if let Some(pos) = rp.positions.get_mut(channel_id) {
-                pos.unread_count += 1;
-            } else {
-                rp.positions.insert(
-                    channel_id.to_string(),
-                    ReadPosition {
-                        last_event_id: String::new(),
-                        timestamp: 0,
-                        unread_count: 1,
-                    },
-                );
-            }
-        });
-        self.persist();
-    }
-
-    /// Return the current unread count for a channel.
-    #[allow(dead_code)]
-    pub fn get_unread_count(&self, channel_id: &str) -> u32 {
-        self.inner
-            .get()
-            .positions
-            .get(channel_id)
-            .map(|p| p.unread_count)
-            .unwrap_or(0)
     }
 
     /// Return the last-read event ID for a channel (empty string if never read).
@@ -111,15 +86,21 @@ impl ReadPositionStore {
         })
     }
 
-    /// Return a reactive signal of the unread count for a specific channel.
-    pub fn unread_count_signal(&self, channel_id: String) -> Memo<u32> {
+    /// Reactive last-read timestamp for a single channel (0 if never opened).
+    ///
+    /// This is the canonical TIMESTAMP read model (the same one
+    /// [`read_timestamps`](Self::read_timestamps) and the forum index use):
+    /// unread = messages whose `created_at` is strictly newer than this value.
+    /// Subscribing to this signal makes a card's "N new" chip clear the instant
+    /// the channel is marked read.
+    pub fn last_read_timestamp(&self, channel_id: String) -> Memo<u64> {
         let inner = self.inner;
         Memo::new(move |_| {
             inner
                 .get()
                 .positions
                 .get(&channel_id)
-                .map(|p| p.unread_count)
+                .map(|p| p.timestamp)
                 .unwrap_or(0)
         })
     }

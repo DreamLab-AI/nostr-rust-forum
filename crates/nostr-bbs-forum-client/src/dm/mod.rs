@@ -191,11 +191,23 @@ impl DMStore {
         );
     }
 
-    /// Subscribe to incoming DMs in real-time (new events only, since=now).
+    /// Subscribe to incoming DMs in real-time.
     /// Listens for both kind 4 (legacy) and kind 1059 (NIP-59 Gift Wrap).
     ///
     /// Decryption is performed via the async [`Signer`] trait, so both local-key
     /// and NIP-07 sessions receive and decrypt live DMs.
+    ///
+    /// Root cause (DM-not-received bug): NIP-59 gift-wraps (kind-1059)
+    /// deliberately RANDOMISE their outer `created_at` into the PAST (up to ~2
+    /// days per the spec, to obscure timing metadata). A DM sent *right now* is
+    /// therefore stamped earlier than `now`, so a realtime subscription with
+    /// `since = now` SKIPS it and the recipient never sees the message without a
+    /// full reload. The fix widens the `since` window for the gift-wrap (and
+    /// kind-14) subscription to cover the randomisation window, and relies on
+    /// the existing event-id dedup (`seen_ids`) so re-streamed history is not
+    /// re-rendered. The legacy kind-4 path keeps a real `created_at`, but is
+    /// folded into the same widened filter for simplicity — dedup makes the
+    /// wider window harmless.
     pub fn subscribe_incoming(
         &self,
         relay: &RelayConnection,
@@ -205,11 +217,17 @@ impl DMStore {
         let my_pk = my_pubkey.to_string();
         let state = self.state;
         let now = (js_sys::Date::now() / 1000.0) as u64;
+        // Cover the NIP-59 gift-wrap timestamp-randomisation window (~2 days).
+        // A live gift-wrap addressed to us can be stamped up to this far in the
+        // past, so anchoring `since` here is what makes realtime delivery work.
+        // De-duplication by event id (`seen_ids`) prevents re-processing of any
+        // history this widened window also re-streams.
+        let since = now.saturating_sub(GIFT_WRAP_LOOKBACK_SECS);
 
         let filter = Filter {
             kinds: Some(vec![4, 1059]),
             p_tags: Some(vec![my_pk.clone()]),
-            since: Some(now),
+            since: Some(since),
             ..Default::default()
         };
         let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
@@ -443,6 +461,12 @@ impl DMStore {
 const DM_SUB_CONFIRM_MS: i32 = 3_000;
 /// Maximum REQ attempts before surfacing an error.
 const DM_SUB_MAX_ATTEMPTS: u32 = 4;
+
+/// How far back to anchor the realtime incoming-DM subscription's `since`
+/// filter. NIP-59 gift-wraps randomise their outer `created_at` up to ~2 days
+/// into the past, so the live subscription must look back at least that far or
+/// it silently drops freshly-sent DMs. Two days plus a small margin.
+const GIFT_WRAP_LOOKBACK_SECS: u64 = 2 * 24 * 60 * 60 + 3600;
 
 /// Subscribe to DM filters, re-issuing the REQ if the relay never confirms it.
 ///
