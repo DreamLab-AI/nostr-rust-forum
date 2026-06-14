@@ -1,14 +1,16 @@
 //! Bookmarks modal and bookmark store for persisting saved messages.
 //!
 //! Uses localStorage for persistence, with a reactive `RwSignal<Vec<Bookmark>>`
-//! provided via Leptos context. The modal uses `.modal-backdrop` / `.modal-panel`
-//! CSS classes from `style.css`.
+//! provided via Leptos context. The overlay shell is the shared
+//! [`Modal`](crate::components::modal::Modal) primitive (backdrop-close, Esc,
+//! body-scroll-lock, `role="dialog"`, `aria-modal`).
 
 use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::app::base_href;
+use crate::components::modal::Modal;
 use crate::components::user_display::use_display_name_tracked;
 use crate::utils::format_relative_time;
 
@@ -156,58 +158,22 @@ pub(crate) fn BookmarksModal(
     let store = use_bookmarks();
     let bookmarks = store.list();
 
-    // Escape key + body scroll lock via Effect
-    let is_open_esc = is_open;
-    Effect::new(move |prev: Option<Option<gloo::events::EventListener>>| {
-        if is_open_esc.get() {
-            toggle_body_scroll(true);
-            let listener =
-                gloo::events::EventListener::new(&gloo::utils::document(), "keydown", move |e| {
-                    use wasm_bindgen::JsCast;
-                    let key_evt = e.unchecked_ref::<web_sys::KeyboardEvent>();
-                    if key_evt.key() == "Escape" {
-                        is_open_esc.set(false);
-                    }
-                });
-            Some(listener)
-        } else {
-            toggle_body_scroll(false);
-            drop(prev);
-            None
-        }
-    });
-
-    let on_backdrop = move |_| {
-        is_open.set(false);
-    };
+    // Bookmark glyph rendered before the title in the shared Modal header.
+    let title_icon = view! {
+        <svg class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M5 2h14a1 1 0 011 1v19.143a.5.5 0 01-.766.424L12 18.03l-7.234 4.536A.5.5 0 014 22.143V3a1 1 0 011-1z"/>
+        </svg>
+    }
+    .into_any();
 
     view! {
-        <Show when=move || is_open.get()>
-            <div class="modal-backdrop" on:click=on_backdrop>
-                <div
-                    class="modal-panel p-6"
-                    style="width: min(90vw, 560px); max-width: 560px;"
-                    on:click=|e| e.stop_propagation()
-                >
-                    // Header
-                    <div class="flex items-center justify-between mb-4">
-                        <div class="flex items-center gap-2">
-                            <svg class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="currentColor">
-                                <path d="M5 2h14a1 1 0 011 1v19.143a.5.5 0 01-.766.424L12 18.03l-7.234 4.536A.5.5 0 014 22.143V3a1 1 0 011-1z"/>
-                            </svg>
-                            <h2 class="text-lg font-bold text-white">"Bookmarks"</h2>
-                        </div>
-                        <button
-                            class="text-gray-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-gray-800"
-                            on:click=move |_| is_open.set(false)
-                        >
-                            <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <line x1="18" y1="6" x2="6" y2="18" stroke-linecap="round"/>
-                                <line x1="6" y1="6" x2="18" y2="18" stroke-linecap="round"/>
-                            </svg>
-                        </button>
-                    </div>
-
+        <Modal
+            is_open=is_open
+            title="Bookmarks".to_string()
+            title_icon=title_icon
+            max_width="560px".to_string()
+        >
+            <div>
                     // Bookmark list
                     <div class="max-h-96 overflow-y-auto space-y-2">
                         <Show
@@ -288,9 +254,8 @@ pub(crate) fn BookmarksModal(
                             {move || format!("{} bookmark{}", bookmarks.get().len(), if bookmarks.get().len() == 1 { "" } else { "s" })}
                         </div>
                     </Show>
-                </div>
             </div>
-        </Show>
+        </Modal>
     }
 }
 
@@ -301,11 +266,4 @@ fn load_bookmarks() -> Vec<Bookmark> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
-}
-
-fn toggle_body_scroll(lock: bool) {
-    if let Some(body) = gloo::utils::document().body() {
-        let style = body.style();
-        let _ = style.set_property("overflow", if lock { "hidden" } else { "" });
-    }
 }

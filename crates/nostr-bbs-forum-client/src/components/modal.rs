@@ -18,6 +18,10 @@ pub(crate) fn Modal(
     is_open: RwSignal<bool>,
     /// Header title text.
     title: String,
+    /// Optional icon rendered before the title in the header (e.g. a bookmark
+    /// glyph). Lets callers decorate the title without forking the shell.
+    #[prop(optional)]
+    title_icon: Option<AnyView>,
     /// Optional CSS `max-width` override (e.g. `"640px"`).
     #[prop(optional)]
     max_width: Option<String>,
@@ -87,7 +91,10 @@ pub(crate) fn Modal(
             >
                 // Header
                 <div class="flex items-center justify-between mb-4">
-                    <h2 id=title_id class="text-lg font-bold text-white">{title.clone()}</h2>
+                    <div class="flex items-center gap-2">
+                        {title_icon}
+                        <h2 id=title_id class="text-lg font-bold text-white">{title.clone()}</h2>
+                    </div>
                     <button
                         class="text-gray-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-gray-800"
                         aria-label="Close dialog"

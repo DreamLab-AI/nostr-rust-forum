@@ -8,6 +8,7 @@ use std::rc::Rc;
 use leptos::prelude::*;
 
 use crate::auth::use_auth;
+use crate::components::modal::Modal;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::relay::RelayConnection;
 
@@ -19,6 +20,11 @@ pub fn CreateEventModal(
     /// Called with the new event ID on successful creation.
     on_created: Callback<String>,
 ) -> impl IntoView {
+    // Local visibility signal for the shared Modal shell. The parent mounts this
+    // component conditionally and listens on `on_close`, so we forward every
+    // close path (backdrop, Esc, X) to `on_close` via Modal's `on_close`.
+    let is_open = RwSignal::new(true);
+
     let title = RwSignal::new(String::new());
     let description = RwSignal::new(String::new());
     let start_date = RwSignal::new(String::new());
@@ -189,37 +195,19 @@ pub fn CreateEventModal(
         });
     };
 
-    let on_backdrop = move |_| {
+    // Forward every Modal-driven close (backdrop, Esc, header X) to the parent.
+    let on_modal_close = Callback::new(move |()| {
         on_close.run(());
-    };
-
-    let stop_propagation = move |ev: web_sys::MouseEvent| {
-        ev.stop_propagation();
-    };
+    });
 
     view! {
-        <div
-            class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-            on:click=on_backdrop
+        <Modal
+            is_open=is_open
+            title="Create Event".to_string()
+            max_width="512px".to_string()
+            on_close=on_modal_close
         >
-            <div
-                class="glass-card w-full max-w-lg mx-4 p-6 rounded-2xl border border-gray-700/50 shadow-2xl animate-slide-in-down max-h-[90vh] overflow-y-auto"
-                on:click=stop_propagation
-            >
-                // Header
-                <div class="flex items-center justify-between mb-5">
-                    <h2 class="text-xl font-bold text-white">"Create Event"</h2>
-                    <button
-                        class="p-1.5 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition-colors"
-                        on:click=move |_| on_close.run(())
-                    >
-                        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <line x1="18" y1="6" x2="6" y2="18" stroke-linecap="round"/>
-                            <line x1="6" y1="6" x2="18" y2="18" stroke-linecap="round"/>
-                        </svg>
-                    </button>
-                </div>
-
+            <div>
                 // Error
                 {move || error_msg.get().map(|msg| view! {
                     <div class="mb-4 bg-red-900/40 border border-red-700/50 rounded-lg px-3 py-2 text-sm text-red-300">
@@ -331,7 +319,7 @@ pub fn CreateEventModal(
                     </button>
                 </form>
             </div>
-        </div>
+        </Modal>
     }
 }
 
