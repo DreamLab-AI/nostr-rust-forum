@@ -13,6 +13,7 @@ use crate::admin::audit_log::AuditLogTab;
 use crate::admin::calendar::AdminCalendar;
 use crate::admin::channel_form::{ChannelForm, ChannelFormData};
 use crate::admin::overview::{ConnectionStatusBar, OverviewTab};
+use crate::admin::registrations::RegistrationsPanel;
 use crate::admin::reports::ReportsTab;
 use crate::admin::section_requests::SectionRequests;
 use crate::admin::settings::SettingsTab;
@@ -105,8 +106,32 @@ fn AdminPanelInner() -> impl IntoView {
         if let Some(signer) = auth_for_init.get_signer() {
             let admin_clone = admin_for_init.clone();
             spawn_local(async move {
+                // Whitelist first, then registrations: the pending count is
+                // registrations − whitelist, so we want the whitelist loaded
+                // before recomputing. Both end with `recompute_pending`, so the
+                // Overview "Pending" stat is populated on first load (fixing the
+                // frozen-0 count) regardless of which finishes last.
                 let _ = admin_clone.fetch_whitelist_signer(&*signer).await;
+                let _ = admin_clone.fetch_registrations_signer(&*signer).await;
             });
+        }
+    });
+
+    // Refresh registrations whenever the admin returns to a tab that surfaces
+    // the pending count (Overview stat, Pending list). Keeps the count and the
+    // review list fresh without a manual refresh after approvals elsewhere.
+    let admin_for_focus = admin.clone();
+    let auth_for_focus = auth;
+    let active_tab_for_focus = admin.state.active_tab;
+    Effect::new(move |_| {
+        let tab = active_tab_for_focus.get();
+        if matches!(tab, AdminTab::Overview | AdminTab::Pending) {
+            if let Some(signer) = auth_for_focus.get_signer() {
+                let admin_clone = admin_for_focus.clone();
+                spawn_local(async move {
+                    let _ = admin_clone.fetch_registrations_signer(&*signer).await;
+                });
+            }
         }
     });
 
@@ -200,6 +225,7 @@ fn AdminPanelInner() -> impl IntoView {
                 <TabButton tab=AdminTab::Overview active=active_tab label="Overview" />
                 <TabButton tab=AdminTab::Channels active=active_tab label="Channels" />
                 <TabButton tab=AdminTab::Users active=active_tab label="Users" />
+                <PendingTabButton active=active_tab pending=admin.state.stats />
                 <TabButton tab=AdminTab::Sections active=active_tab label="Sections" />
                 <TabButton tab=AdminTab::Calendar active=active_tab label="Calendar" />
                 <TabButton tab=AdminTab::Settings active=active_tab label="Settings" />
@@ -214,6 +240,7 @@ fn AdminPanelInner() -> impl IntoView {
                     AdminTab::Overview => view! { <OverviewTab /> }.into_any(),
                     AdminTab::Channels => view! { <ChannelsTab /> }.into_any(),
                     AdminTab::Users => view! { <UsersTab /> }.into_any(),
+                    AdminTab::Pending => view! { <RegistrationsPanel /> }.into_any(),
                     AdminTab::Sections => view! { <SectionRequests /> }.into_any(),
                     AdminTab::Calendar => view! { <AdminCalendar /> }.into_any(),
                     AdminTab::Settings => view! { <SettingsTab /> }.into_any(),
@@ -246,6 +273,37 @@ fn TabButton(tab: AdminTab, active: RwSignal<AdminTab>, label: &'static str) -> 
     view! {
         <button on:click=move |_| active.set(tab) class=class>
             {label}
+        </button>
+    }
+}
+
+/// Tab button for the Pending registrations tab, carrying a live count badge
+/// sourced from the same `pending_approvals` stat shown on the Overview card —
+/// so the icon and the number always agree and refresh together.
+#[component]
+fn PendingTabButton(
+    active: RwSignal<AdminTab>,
+    pending: RwSignal<crate::admin::AdminStats>,
+) -> impl IntoView {
+    let tab = AdminTab::Pending;
+    let is_active = move || active.get() == tab;
+    let class = move || {
+        if is_active() {
+            "py-2 px-1 text-sm font-medium transition-colors text-amber-400 border-b-2 border-amber-400 -mb-px flex items-center gap-1.5"
+        } else {
+            "py-2 px-1 text-sm font-medium transition-colors text-gray-400 hover:text-gray-200 border-b-2 border-transparent -mb-px flex items-center gap-1.5"
+        }
+    };
+    let count = move || pending.get().pending_approvals;
+
+    view! {
+        <button on:click=move |_| active.set(tab) class=class>
+            "Pending"
+            <Show when=move || { count() > 0 }>
+                <span class="bg-red-500/20 text-red-400 text-xs font-bold px-1.5 py-0.5 rounded-full border border-red-500/30 leading-none">
+                    {move || count().to_string()}
+                </span>
+            </Show>
         </button>
     }
 }
