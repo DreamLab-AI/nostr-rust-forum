@@ -38,29 +38,10 @@ use crate::components::zone_hero::ZoneHero;
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
-use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
+use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::utils::capitalize;
 use crate::utils::zone_theme::zone_accent_style;
 use wasm_bindgen_futures::spawn_local;
-
-/// Resolve a channel's `section` tag to the id of the owning config zone.
-///
-/// Mirrors `forums.rs::section_to_zone` / `section.rs::section_to_zone`: exact
-/// id match, then `<zone-id>-` prefix match, then the first zone as a catch-all
-/// so channels never silently disappear from routing.
-fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
-    let sec = section.to_lowercase();
-    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
-        return Some(z.id.clone());
-    }
-    if let Some(z) = zones
-        .iter()
-        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
-    {
-        return Some(z.id.clone());
-    }
-    zones.first().map(|z| z.id.clone())
-}
 
 /// The sections (kind-40 channels) belonging to `category_slug`, resolved from
 /// the shared store using the SAME zone-routing logic the Forums index uses.

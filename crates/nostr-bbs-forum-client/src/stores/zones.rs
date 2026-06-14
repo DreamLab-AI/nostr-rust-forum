@@ -159,6 +159,49 @@ fn read_zone_config_json() -> Option<String> {
         .and_then(|s| s.as_string())
 }
 
+/// Resolve a channel's `section` tag to the id of the owning config zone.
+///
+/// Channels carry a free-form `section` tag (e.g. `"family-events"`). With
+/// config-driven zones the relationship is by prefix/exact match against the
+/// live zone ids: a section belongs to the zone whose id it equals or is
+/// prefixed by (`"<zone>-..."`). Falls back to the first zone so channels never
+/// silently disappear from the index.
+///
+/// This is the single canonical resolver — previously copied verbatim into
+/// `forums.rs`, `section.rs`, `category.rs` and `channel.rs` (audit M1), and
+/// the inverse predicate [`section_routes_to_zone`] is derived from it.
+pub fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
+    let sec = section.to_lowercase();
+    // Exact id match.
+    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
+        return Some(z.id.clone());
+    }
+    // Prefix match: "<zone-id>-suffix".
+    if let Some(z) = zones
+        .iter()
+        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
+    {
+        return Some(z.id.clone());
+    }
+    // Catch-all: first zone so unrouted channels remain visible.
+    zones.first().map(|z| z.id.clone())
+}
+
+/// Whether a channel's `section` tag routes to the given zone id.
+///
+/// Derived from [`section_to_zone`]: a section routes to `category_slug` when
+/// the canonical resolver maps it to that zone (case-insensitively). An empty
+/// `category_slug` matches everything (the un-scoped/legacy lookup contract).
+pub fn section_routes_to_zone(section: &str, category_slug: &str, zones: &[Zone]) -> bool {
+    let cat = category_slug.to_lowercase();
+    if cat.is_empty() {
+        return true;
+    }
+    section_to_zone(section, zones)
+        .map(|z| z.to_lowercase() == cat)
+        .unwrap_or(false)
+}
+
 /// Humanise a zone slug: `"public"` → `"Public"`, `"ai-agents"` → `"Ai Agents"`.
 fn humanize(id: &str) -> String {
     id.split(['-', '_'])
@@ -206,4 +249,88 @@ fn fallback_zones() -> Vec<Zone> {
             encrypted: false,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zone(id: &str) -> Zone {
+        Zone {
+            id: id.to_string(),
+            display_name: String::new(),
+            required_cohorts: vec![],
+            write_cohorts: None,
+            banner_image_url: None,
+            visibility: ZoneVisibility::Public,
+            encrypted: false,
+        }
+    }
+
+    fn sample_zones() -> Vec<Zone> {
+        vec![
+            zone("public"),
+            zone("minimoonoir"),
+            zone("family"),
+            zone("business"),
+        ]
+    }
+
+    #[test]
+    fn section_to_zone_exact_match() {
+        let zones = sample_zones();
+        assert_eq!(
+            section_to_zone("family", &zones),
+            Some("family".to_string())
+        );
+    }
+
+    #[test]
+    fn section_to_zone_prefix_match() {
+        let zones = sample_zones();
+        assert_eq!(
+            section_to_zone("family-events", &zones),
+            Some("family".to_string())
+        );
+        assert_eq!(
+            section_to_zone("BUSINESS-Deals", &zones),
+            Some("business".to_string())
+        );
+    }
+
+    #[test]
+    fn section_to_zone_falls_back_to_first() {
+        let zones = sample_zones();
+        assert_eq!(
+            section_to_zone("totally-unknown", &zones),
+            Some("public".to_string())
+        );
+        assert_eq!(section_to_zone("anything", &[]), None);
+    }
+
+    #[test]
+    fn routes_to_zone_is_derived_from_resolver() {
+        let zones = sample_zones();
+        // For any (section, category) the predicate must agree with the
+        // resolver (case-insensitively) — the derivation invariant.
+        for section in ["family", "family-events", "business-deals", "stray"] {
+            for cat in ["public", "minimoonoir", "family", "business"] {
+                let expected = section_to_zone(section, &zones)
+                    .map(|z| z.eq_ignore_ascii_case(cat))
+                    .unwrap_or(false);
+                assert_eq!(
+                    section_routes_to_zone(section, cat, &zones),
+                    expected,
+                    "section={section} cat={cat}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routes_to_zone_empty_category_matches_everything() {
+        let zones = sample_zones();
+        assert!(section_routes_to_zone("family-events", "", &zones));
+        assert!(section_routes_to_zone("anything", "", &zones));
+    }
 }

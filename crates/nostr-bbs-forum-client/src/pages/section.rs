@@ -50,7 +50,7 @@ use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
-use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
+use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::utils::capitalize;
 use crate::utils::slug_hash::matches_section_slug;
 use crate::utils::zone_theme::zone_accent_style;
@@ -85,25 +85,6 @@ fn humanize_section_slug(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Resolve the channel `section` tag to the id of the owning config zone.
-///
-/// Mirrors `forums.rs::section_to_zone`: exact id match, then `<zone-id>-`
-/// prefix match, then the first zone as a catch-all so channels never silently
-/// disappear from routing.
-fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
-    let sec = section.to_lowercase();
-    if let Some(z) = zones.iter().find(|z| z.id.to_lowercase() == sec) {
-        return Some(z.id.clone());
-    }
-    if let Some(z) = zones
-        .iter()
-        .find(|z| sec.starts_with(&format!("{}-", z.id.to_lowercase())))
-    {
-        return Some(z.id.clone());
-    }
-    zones.first().map(|z| z.id.clone())
 }
 
 /// Slugify a channel name the same way legacy route slugs were generated.
