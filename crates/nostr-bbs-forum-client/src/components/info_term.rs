@@ -16,6 +16,11 @@
 //!   also set a native `title=` on that element, since the browser would paint
 //!   its own tooltip on top of the styled bubble, producing two overlapping
 //!   tooltips on hover;
+//! * the bubble carries a "Learn more →" link to the full glossary entry for
+//!   the term (issue #19), so a curious user can read a longer plain-English
+//!   explanation. The bubble itself stays `pointer-events-none` (so it never
+//!   eats clicks meant for the page behind it) and only the link re-enables
+//!   `pointer-events`, so it is clickable while hovered/focused;
 //! * accessibility is carried instead by `aria-label` (the term + explainer)
 //!   plus `aria-describedby` pointing at the bubble, so screen readers still
 //!   announce the explanation without a competing native tooltip;
@@ -23,8 +28,12 @@
 //!
 //! It is brand-neutral by construction: it only renders the `term` and
 //! `explainer` strings the caller passes, so deploy-time branding is untouched.
+//! The glossary link respects `FORUM_BASE` via [`crate::app::base_href`].
 
 use leptos::prelude::*;
+use leptos_router::components::A;
+
+use crate::app::base_href;
 
 /// Inline explainer for a single hard term.
 ///
@@ -33,6 +42,10 @@ use leptos::prelude::*;
 /// * `explainer` — a one-line, plain-English description shown on
 ///   hover/focus/long-press (e.g. `"The server that stores and relays the
 ///   forum's messages."`).
+/// * `slug` — optional glossary anchor for the "Learn more →" link. When set
+///   (e.g. `"relay"`) the link targets `/glossary#relay`; when omitted it links
+///   to the top of the glossary. Slugs are defined in
+///   [`crate::pages::glossary`].
 #[component]
 pub(crate) fn InfoTerm(
     /// The visible term (rendered with a dotted underline).
@@ -41,12 +54,23 @@ pub(crate) fn InfoTerm(
     /// One-line plain-English explanation surfaced on hover / focus / long-press.
     #[prop(into)]
     explainer: String,
+    /// Optional glossary anchor slug (e.g. `"nip44"`). Defaults to the glossary
+    /// top when not provided.
+    #[prop(into, optional)]
+    slug: Option<String>,
 ) -> impl IntoView {
     let aria = format!("{term}: {explainer}");
     // Stable per-instance id so `aria-describedby` can point screen readers at
     // the styled bubble (which carries the explainer) without us also setting a
     // native `title=` — that would paint a second, overlapping tooltip on hover.
     let bubble_id = format!("info-term-{}", next_info_term_id());
+    // Deep-link to the matching glossary entry when a slug is given; otherwise
+    // link to the glossary top. `base_href` keeps the FORUM_BASE prefix correct
+    // in sub-directory deployments (e.g. `/community/glossary#relay`).
+    let learn_more_href = match slug.as_deref() {
+        Some(s) if !s.is_empty() => base_href(&format!("/glossary#{s}")),
+        _ => base_href("/glossary"),
+    };
     view! {
         <span
             class="relative inline-block group"
@@ -69,6 +93,15 @@ pub(crate) fn InfoTerm(
                 role="tooltip"
             >
                 {explainer}
+                // The bubble is `pointer-events-none` so it never intercepts
+                // clicks meant for the page behind it; the link re-enables
+                // pointer events on itself so it stays clickable on hover/focus.
+                <A
+                    href=learn_more_href
+                    attr:class="pointer-events-auto mt-1.5 block text-amber-400 hover:text-amber-300 underline font-medium"
+                >
+                    "Learn more →"
+                </A>
             </span>
         </span>
     }

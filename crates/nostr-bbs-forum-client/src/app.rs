@@ -21,8 +21,8 @@ use crate::components::toast::{provide_toasts, use_toasts, ToastContainer, Toast
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage, EventsPage,
-    ForumsPage, GovernancePage, HomePage, LoginPage, NoteViewPage, PodBrowserPage, ProfilePage,
-    SectionPage, SettingsPage, SetupPage, SignupPage, ThreadPage,
+    ForumsPage, GlossaryPage, GovernancePage, HomePage, LoginPage, NoteViewPage, PodBrowserPage,
+    ProfilePage, SectionPage, SettingsPage, SetupPage, SignupPage, ThreadPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
@@ -552,6 +552,10 @@ pub fn App() -> impl IntoView {
                     // from the nsec in the URL fragment.
                     <Route path=path!("/connect") view=ConnectPage />
                     <Route path=path!("/signup") view=SignupPage />
+                    // Glossary: public info page explaining the technical terms
+                    // surfaced in the UI (issue #19). InfoTerm bubbles deep-link
+                    // here via /glossary#<slug>.
+                    <Route path=path!("/glossary") view=GlossaryPage />
                     <Route path=path!("/view/:note_id") view=NoteViewPage />
                     // Auth-gated routes
                     <Route path=path!("/setup") view=AuthGatedSetup />
@@ -910,6 +914,12 @@ fn Layout(children: Children) -> impl IntoView {
                             <span>"End-to-end encrypted"</span>
                             <span class="text-gray-700">"|"</span>
                             <span>"Built with Rust + WASM"</span>
+                            <span class="text-gray-700">"|"</span>
+                            // Glossary: plain-English explanations of the
+                            // technical terms surfaced in the UI (issue #19).
+                            <A href=base_href("/glossary") attr:class="hover:text-amber-400 transition-colors underline">
+                                "Glossary"
+                            </A>
                         </div>
                         <div class="text-xs text-gray-600">"2026"</div>
                     </div>
