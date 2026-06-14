@@ -48,6 +48,7 @@ use crate::components::topic_list::{classify_topics, TopicList, TopicSummary};
 use crate::components::zone_hero::ZoneHero;
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{use_channel_store, ChannelMeta};
+use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
 use crate::utils::capitalize;
@@ -182,6 +183,7 @@ pub fn SectionPage() -> impl IntoView {
     let relay = expect_context::<RelayConnection>();
     let auth = use_auth();
     let store = use_channel_store();
+    let read_store = use_read_positions();
     let zone_access = use_zone_access();
     let toasts = use_toasts();
 
@@ -232,6 +234,50 @@ pub fn SectionPage() -> impl IntoView {
             None => Vec::new(),
         })
     });
+
+    // Mark this channel read when its topic list is viewed (BBS reading flow).
+    //
+    // The forum index ("N new" chip) computes unread as messages newer than the
+    // channel's last-read position, but the BBS flow (zones → sections → topics)
+    // never recorded one — only the flat /chat view (channel.rs) did — so every
+    // post counted as "new" forever. Mirroring channel.rs:431, we record the
+    // LATEST kind-42 message's id + created_at the moment a user opens this
+    // section's topic list. The index Memo subscribes to `read_timestamps()`, so
+    // it re-runs and clears the chip on return.
+    //
+    // Gated on the latest message id so the Effect is a no-op once that channel
+    // is already marked at its newest message — it only re-fires when a genuinely
+    // newer message arrives, never on every render.
+    {
+        let last_marked = RwSignal::new(String::new());
+        Effect::new(move |_| {
+            let cid = match resolved_channel.get() {
+                Some(ch) => ch.id,
+                None => return,
+            };
+            // Latest kind-42 message in the channel (max created_at, tie-broken by
+            // id for determinism — matches the index's `created_at >` semantics).
+            let latest = store.channel_messages.with(|m| {
+                m.get(&cid).and_then(|events| {
+                    events
+                        .iter()
+                        .filter(|e| e.kind == 42)
+                        .max_by(|a, b| {
+                            a.created_at
+                                .cmp(&b.created_at)
+                                .then_with(|| a.id.cmp(&b.id))
+                        })
+                        .map(|e| (e.id.clone(), e.created_at))
+                })
+            });
+            if let Some((last_id, last_ts)) = latest {
+                if last_marked.get_untracked() != last_id {
+                    read_store.mark_read(&cid, &last_id, last_ts);
+                    last_marked.set(last_id);
+                }
+            }
+        });
+    }
 
     // Loading while the store is fetching AND no channel resolved yet.
     let store_loading = store.loading;

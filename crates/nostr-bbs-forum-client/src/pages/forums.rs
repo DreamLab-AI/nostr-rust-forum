@@ -206,8 +206,33 @@ pub fn ForumsPage() -> impl IntoView {
                         </p>
                         <p class="text-gray-400 text-xs">
                             "Start by exploring the "
-                            <span class="text-amber-400 font-medium">"Home"</span>
-                            " zone below."
+                            {move || {
+                                // Name the ACTUAL first public zone (or, failing
+                                // that, the first configured zone) rather than a
+                                // hardcoded "Home" — zones are operator-config
+                                // driven via load_zones()/ZONE_CONFIG. Link the
+                                // name straight to that zone's channel list.
+                                let zs = zones.get_value();
+                                let zone = zs
+                                    .iter()
+                                    .find(|z| z.visibility == ZoneVisibility::Public)
+                                    .or_else(|| zs.first())
+                                    .map(|z| (base_href(&format!("/forums/{}", z.id)), z.label()));
+                                match zone {
+                                    Some((href, label)) => view! {
+                                        <A
+                                            href=href
+                                            attr:class="text-amber-400 font-medium hover:text-amber-300 transition-colors no-underline"
+                                        >
+                                            {label}
+                                        </A>
+                                        " zone below."
+                                    }
+                                    .into_any(),
+                                    // No zones configured — fall back gracefully.
+                                    None => view! { "zones below." }.into_any(),
+                                }
+                            }}
                         </p>
                     </div>
                 </div>

@@ -41,6 +41,7 @@ use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
 use crate::stores::channels::{use_channel_store, ChannelMeta};
+use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, Zone, ZoneVisibility};
 use crate::utils::format_relative_time;
@@ -230,6 +231,7 @@ pub fn ThreadPage() -> impl IntoView {
     let relay = expect_context::<RelayConnection>();
     let auth = use_auth();
     let store = use_channel_store();
+    let read_store = use_read_positions();
     let zone_access = use_zone_access();
     let toasts = use_toasts();
 
@@ -277,6 +279,43 @@ pub fn ThreadPage() -> impl IntoView {
             .channel_messages
             .with(|m| m.get(&cid).cloned().unwrap_or_default())
     });
+
+    // Mark the channel read when a topic in it is opened (BBS reading flow).
+    //
+    // Deep-linking straight into a thread (without passing through the section
+    // topic list) must also clear the index "N new" chip, so this mirrors the
+    // section page: record the LATEST kind-42 message's id + created_at via
+    // ReadPositionStore::mark_read. The index Memo subscribes to
+    // `read_timestamps()` and re-runs to clear the chip on return.
+    //
+    // Gated on the latest message id so it only re-fires when a newer message
+    // actually arrives — never on every render.
+    {
+        let last_marked = RwSignal::new(String::new());
+        Effect::new(move |_| {
+            let cid = match resolved_channel.get() {
+                Some(ch) => ch.id,
+                None => return,
+            };
+            let latest = channel_events.with(|events| {
+                events
+                    .iter()
+                    .filter(|e| e.kind == 42)
+                    .max_by(|a, b| {
+                        a.created_at
+                            .cmp(&b.created_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    })
+                    .map(|e| (e.id.clone(), e.created_at))
+            });
+            if let Some((last_id, last_ts)) = latest {
+                if last_marked.get_untracked() != last_id {
+                    read_store.mark_read(&cid, &last_id, last_ts);
+                    last_marked.set(last_id);
+                }
+            }
+        });
+    }
 
     // The topic root event whose id maps to the :topic slug.
     let topic_root = Signal::derive(move || {
