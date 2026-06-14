@@ -19,6 +19,131 @@ const PREFS_KEY: &str = "nostrbbs:preferences";
 /// appearance preferences (light theme overrides, font scale, density).
 const PREFS_STYLE_ID: &str = "nostrbbs-prefs-style";
 
+/// Complete light-theme palette, scoped under `[data-theme="light"]` and
+/// injected into the managed `<style>` when a Light theme is active.
+///
+/// The kit is dark-first: `style.css`/`design-tokens.css` set a dark body, dark
+/// `--dl-card-*` surface vars, and components hardcode dark Tailwind utilities.
+/// Toggling Light only flips `body`, leaving most surfaces dark-on-light and
+/// near-unreadable. Rather than rewriting hundreds of component call-sites, we
+/// override the *actual* classes those components use, at the theme layer:
+///
+/// - Surfaces (`.glass-card`, `.glass`, `.section-list-card`,
+///   `.category-hero-card`, `.event-card`, `.link-preview-card`, modals,
+///   toasts, and the `bg-gray-50…900`/`bg-white|black/N` utilities) →
+///   light surface + subtle dark-tinted border.
+/// - Muted/secondary text (`text-gray-300…600`, `text-white/N`) →
+///   readable dark-grey (#374151/#4b5563 ≈ 7–9:1 on #f9fafb).
+/// - `text-white` → near-black so emphasised copy stays the *strongest* text.
+/// - Chips/badges (amber "N posts", emerald "new", gray stat chips) →
+///   light chip fills with darker accent text.
+/// - Inputs/textareas/selects → light field + dark text + visible border +
+///   readable placeholder.
+/// - Borders/dividers (`border-gray-*`, `border-white/N`, `divide-*`) and the
+///   breadcrumb keep adequate contrast.
+///
+/// `color-scheme: light` (set on `<html>` in `apply_preferences`) already drives
+/// native scrollbars/form chrome; this covers the styled layer on top.
+const LIGHT_THEME_CSS: &str = concat!(
+    // -- Canvas + base text ------------------------------------------------
+    "body{background-color:#f9fafb !important;color:#111827 !important;}",
+    // The animated dark mesh hero washes out on a light page — give it a light
+    // gradient bed so candy-gradient/text sits on a legible field.
+    "[data-theme=\"light\"] .mesh-bg{background:",
+    "radial-gradient(ellipse at 20% 50%,rgba(245,158,11,0.10) 0%,transparent 55%),",
+    "radial-gradient(ellipse at 80% 20%,rgba(96,165,250,0.10) 0%,transparent 55%),",
+    "radial-gradient(ellipse at 60% 80%,rgba(168,85,247,0.08) 0%,transparent 55%),",
+    "#eef1f6 !important;}",
+    // -- Glass / card / panel surfaces -------------------------------------
+    "[data-theme=\"light\"] .glass-card,",
+    "[data-theme=\"light\"] .glass-card-interactive,",
+    "[data-theme=\"light\"] .glass,",
+    "[data-theme=\"light\"] .section-list-card,",
+    "[data-theme=\"light\"] .category-hero-card,",
+    "[data-theme=\"light\"] .event-card,",
+    "[data-theme=\"light\"] .link-preview-card{",
+    "background:rgba(255,255,255,0.92) !important;",
+    "border-color:rgba(17,24,39,0.12) !important;color:#1f2937 !important;",
+    "box-shadow:0 1px 3px rgba(17,24,39,0.06),0 1px 2px rgba(17,24,39,0.04) !important;}",
+    // Interactive surface hover: keep the amber-tinted lift, just on light.
+    "[data-theme=\"light\"] .section-list-card:hover,",
+    "[data-theme=\"light\"] .event-card:hover,",
+    "[data-theme=\"light\"] .glass-card-interactive:hover{",
+    "background:rgba(255,255,255,0.98) !important;",
+    "border-color:rgba(245,158,11,0.45) !important;",
+    "box-shadow:0 4px 14px rgba(17,24,39,0.10) !important;}",
+    // Modal/search/toast surfaces: opaque white so overlaid content reads.
+    "[data-theme=\"light\"] .modal-panel,",
+    "[data-theme=\"light\"] .search-panel,",
+    "[data-theme=\"light\"] .toast-item{",
+    "background:rgba(255,255,255,0.98) !important;color:#1f2937 !important;",
+    "border-color:rgba(17,24,39,0.12) !important;",
+    "box-shadow:0 10px 40px rgba(17,24,39,0.18) !important;}",
+    // -- Dark surface utilities → light fills ------------------------------
+    "[data-theme=\"light\"] .bg-gray-900,",
+    "[data-theme=\"light\"] .bg-gray-850{background-color:#eef1f6 !important;}",
+    "[data-theme=\"light\"] .bg-gray-800,",
+    "[data-theme=\"light\"] .bg-gray-750{background-color:#f1f3f7 !important;}",
+    "[data-theme=\"light\"] .bg-gray-700{background-color:#e5e7eb !important;}",
+    "[data-theme=\"light\"] .bg-gray-600{background-color:#d1d5db !important;}",
+    "[data-theme=\"light\"] .bg-gray-500{background-color:#cbd0d8 !important;}",
+    // Translucent gray utilities used for chips/inputs (e.g. bg-gray-800/60).
+    "[data-theme=\"light\"] [class*=\"bg-gray-900/\"],",
+    "[data-theme=\"light\"] [class*=\"bg-gray-800/\"],",
+    "[data-theme=\"light\"] [class*=\"bg-gray-750/\"],",
+    "[data-theme=\"light\"] [class*=\"bg-gray-700/\"]{",
+    "background-color:rgba(243,244,246,0.85) !important;}",
+    // white/black alpha surfaces (subtle dark hover/overlay tints).
+    "[data-theme=\"light\"] [class*=\"bg-white/\"]{background-color:rgba(17,24,39,0.05) !important;}",
+    "[data-theme=\"light\"] [class*=\"bg-black/\"]{background-color:rgba(17,24,39,0.35) !important;}",
+    // -- Text: emphasis + muted/secondary ----------------------------------
+    // `text-white`/`text-gray-100/200` are the *strongest* copy → near-black.
+    "[data-theme=\"light\"] .text-white,",
+    "[data-theme=\"light\"] .text-gray-100,",
+    "[data-theme=\"light\"] .text-gray-200{color:#111827 !important;}",
+    "[data-theme=\"light\"] [class*=\"text-white/\"]{color:#1f2937 !important;}",
+    // gray-300/400 (body + muted) → readable mid-dark grey (≈7:1 on #f9fafb).
+    "[data-theme=\"light\"] .text-gray-300{color:#1f2937 !important;}",
+    "[data-theme=\"light\"] .text-gray-400{color:#374151 !important;}",
+    // gray-500/600 (subtle meta/stat text) → still ≥4.5:1 on light surfaces.
+    "[data-theme=\"light\"] .text-gray-500{color:#4b5563 !important;}",
+    "[data-theme=\"light\"] .text-gray-600{color:#52606d !important;}",
+    // -- Borders / dividers -------------------------------------------------
+    "[data-theme=\"light\"] .border-gray-900,",
+    "[data-theme=\"light\"] .border-gray-800,",
+    "[data-theme=\"light\"] .border-gray-700,",
+    "[data-theme=\"light\"] .border-gray-600,",
+    "[data-theme=\"light\"] .border-gray-500{border-color:rgba(17,24,39,0.14) !important;}",
+    "[data-theme=\"light\"] [class*=\"border-gray-700/\"],",
+    "[data-theme=\"light\"] [class*=\"border-gray-800/\"],",
+    "[data-theme=\"light\"] [class*=\"border-white/\"]{border-color:rgba(17,24,39,0.12) !important;}",
+    "[data-theme=\"light\"] [class*=\"divide-gray-\"]>*+*{border-color:rgba(17,24,39,0.10) !important;}",
+    // -- Chips / badges -----------------------------------------------------
+    // Amber chips ("N posts", links) — darken text so the fill still reads.
+    "[data-theme=\"light\"] .text-amber-400{color:#b45309 !important;}",
+    "[data-theme=\"light\"] .text-amber-300{color:#92400e !important;}",
+    "[data-theme=\"light\"] [class*=\"bg-amber-500/\"],",
+    "[data-theme=\"light\"] [class*=\"bg-amber-400/\"]{background-color:rgba(245,158,11,0.18) !important;}",
+    // Emerald "new" badge.
+    "[data-theme=\"light\"] .text-emerald-400{color:#047857 !important;}",
+    "[data-theme=\"light\"] [class*=\"bg-emerald-500/\"]{background-color:rgba(16,185,129,0.16) !important;}",
+    "[data-theme=\"light\"] [class*=\"border-emerald-500/\"]{border-color:rgba(16,185,129,0.35) !important;}",
+    // -- Inputs / textareas / selects --------------------------------------
+    "[data-theme=\"light\"] input,",
+    "[data-theme=\"light\"] textarea,",
+    "[data-theme=\"light\"] select{",
+    "background-color:#ffffff !important;color:#111827 !important;",
+    "border-color:rgba(17,24,39,0.20) !important;}",
+    "[data-theme=\"light\"] input::placeholder,",
+    "[data-theme=\"light\"] textarea::placeholder,",
+    "[data-theme=\"light\"] [class*=\"placeholder-gray-\"]::placeholder{color:#6b7280 !important;}",
+    // -- Breadcrumb ---------------------------------------------------------
+    "[data-theme=\"light\"] .breadcrumb-nav,",
+    "[data-theme=\"light\"] .breadcrumb-nav a{color:#4b5563 !important;}",
+    "[data-theme=\"light\"] .breadcrumb-nav a:hover{color:#b45309 !important;}",
+    "[data-theme=\"light\"] .breadcrumb-separator{color:#9ca3af !important;}",
+);
+
 /// User-configurable preferences.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Preferences {
@@ -319,20 +444,18 @@ fn inject_prefs_style(document: &web_sys::Document, prefs: &Preferences, dark: b
         prefs.font_size.root_px()
     ));
 
-    // Light theme: the kit hardcodes a dark body in style.css, so a Light
-    // choice has to override the body surface + base text colour. Components
-    // keep their own accent/border colours; this flips the canvas so Light is
-    // a genuine, legible surface rather than dark text on dark.
+    // Light theme: the kit is dark-first — `style.css` hardcodes a dark body
+    // and components lean on dark Tailwind utilities (`bg-gray-900`,
+    // `text-gray-300/400`, `border-gray-700`, `border-white/10`, …) and on the
+    // dark `--dl-card-*` surface vars, with no light counterpart. Rewriting
+    // every component is not viable, so we complete the palette here at the
+    // theme layer: a single scoped block under `[data-theme="light"]` that
+    // re-points the real surfaces, borders, muted text, chips/badges, and
+    // inputs to an accessible light palette (dark text ≥ ~4.5:1 on light
+    // surfaces). This `<style>` is the one place that already scopes Light
+    // rules, so it stays the chokepoint.
     if !dark {
-        css.push_str(
-            "body{background-color:#f9fafb !important;color:#111827 !important;}\
-             [data-theme=\"light\"] .glass-card,\
-             [data-theme=\"light\"] .glass{background:rgba(255,255,255,0.75) !important;\
-             border-color:rgba(17,24,39,0.10) !important;}\
-             [data-theme=\"light\"] .text-white{color:#111827 !important;}\
-             [data-theme=\"light\"] .bg-gray-900{background-color:#f3f4f6 !important;}\
-             [data-theme=\"light\"] .bg-gray-800{background-color:#e5e7eb !important;}",
-        );
+        css.push_str(LIGHT_THEME_CSS);
     }
 
     // Compact density: tighten the standard card/section padding so lists fit
