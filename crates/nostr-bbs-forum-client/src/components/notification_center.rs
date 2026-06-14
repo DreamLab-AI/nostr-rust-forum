@@ -51,7 +51,16 @@ pub fn NotificationCenter(
             ></div>
 
             // Panel
-            <div class="fixed right-0 top-16 bottom-0 w-96 max-w-[90vw] z-50 glass-card border-l border-gray-700/50 shadow-2xl flex flex-col animate-slide-in-down">
+            //
+            // Height is set explicitly via `h-[calc(100dvh-4rem)]` (viewport minus
+            // the `top-16` offset) rather than the older `bottom-0` pairing. The
+            // sticky app header carries `backdrop-blur-md` (a `backdrop-filter`),
+            // which per the CSS spec makes that header the *containing block* for
+            // `position:fixed` descendants — so `top-16 bottom-0` resolved against
+            // the 65px header instead of the viewport and collapsed the drawer to
+            // ~2px tall, leaving its rows in the DOM but unpainted. An explicit
+            // height is immune to which ancestor is the containing block.
+            <div class="fixed right-0 top-16 w-96 max-w-[90vw] h-[calc(100dvh-4rem)] z-50 glass-card border-l border-gray-700/50 shadow-2xl flex flex-col animate-slide-in-down">
                 // Header
                 <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700/50 flex-shrink-0">
                     <span class="text-sm font-semibold text-white">"Notifications"</span>
@@ -71,8 +80,11 @@ pub fn NotificationCenter(
                     </div>
                 </div>
 
-                // Notification list
-                <div class="flex-1 overflow-y-auto">
+                // Notification list. `min-h-0` lets this flex child shrink below
+                // its content's intrinsic height so `overflow-y-auto` actually
+                // scrolls a long list inside the fixed-height column (the flexbox
+                // `min-height:auto` trap) instead of overflowing the drawer.
+                <div class="flex-1 min-h-0 overflow-y-auto">
                     {move || {
                         let items = store.items.get();
                         if items.is_empty() {
