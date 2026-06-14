@@ -30,7 +30,7 @@ const KIND_RUMOR: u64 = 14;
 const KIND_SEAL: u64 = 13;
 
 /// Nostr kind for Gift Wrap (encrypted seal, signed by throwaway key).
-const KIND_GIFT_WRAP: u64 = 1059;
+pub const KIND_GIFT_WRAP: u64 = 1059;
 
 // ── Error type ───────────────────────────────────────────────────────────────
 
@@ -357,10 +357,137 @@ pub fn unwrap_gift(
     })
 }
 
+// ── Signer-based gift wrap (works for local-key AND NIP-07) ────────────────────
+
+use crate::signer::{Signer, SignerError};
+
+/// Errors from the [`Signer`]-driven gift-wrap path.
+///
+/// Distinct from [`GiftWrapError`] because these operations are async and may
+/// fail in the signing backend (e.g. a NIP-07 extension rejecting a prompt).
+#[derive(Debug, Error)]
+pub enum SignerGiftWrapError {
+    /// The signing/encryption backend failed (local crypto or NIP-07 bridge).
+    #[error("signer error: {0}")]
+    Signer(#[from] SignerError),
+
+    /// JSON (de)serialization of a layer failed.
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    /// A decrypted layer had an unexpected event kind.
+    #[error("invalid event kind: expected {expected}, got {actual}")]
+    InvalidKind {
+        /// The expected kind.
+        expected: u64,
+        /// The kind actually found.
+        actual: u64,
+    },
+
+    /// Throwaway-key generation or signing failed (gift-wrap outer layer).
+    #[error("key error: {0}")]
+    KeyError(String),
+}
+
+/// Seal a rumor using a [`Signer`] for the sender's identity operations.
+///
+/// The NIP-44 encryption of the rumor and the kind-13 signature both go through
+/// the signer, so this works for an in-memory local key (`PrfSigner`) **and** a
+/// NIP-07 extension (`Nip07Signer`) — neither requires raw secret-key bytes.
+async fn seal_rumor_with_signer(
+    rumor: &UnsignedEvent,
+    signer: &dyn Signer,
+    recipient_pubkey: &str,
+) -> Result<NostrEvent, SignerGiftWrapError> {
+    let rumor_json = serde_json::to_string(rumor)
+        .map_err(|e| SignerGiftWrapError::Serialization(e.to_string()))?;
+
+    // NIP-44 encrypt the rumor to the recipient via the signer (sender → recipient).
+    let encrypted = signer.nip44_encrypt(recipient_pubkey, &rumor_json).await?;
+
+    let unsigned_seal = UnsignedEvent {
+        pubkey: signer.public_key().to_string(),
+        created_at: randomized_timestamp(),
+        kind: KIND_SEAL,
+        tags: vec![],
+        content: encrypted,
+    };
+
+    // The seal must be signed by the sender's real key — the signer does this
+    // whether the key is local (PrfSigner) or held by the extension (NIP-07).
+    Ok(signer.sign_event(unsigned_seal).await?)
+}
+
+/// Create a fully gift-wrapped DM using a [`Signer`]: rumor → seal → wrap.
+///
+/// This is the signer-driven analogue of [`gift_wrap`]. The sender's seal
+/// (NIP-44 encrypt + kind-13 signature) is produced through the signer, so the
+/// caller does not need raw secret-key bytes. The outer wrap uses a throwaway
+/// keypair (pure local crypto, no identity), exactly like [`wrap_seal`].
+pub async fn gift_wrap_with_signer(
+    signer: &dyn Signer,
+    recipient_pubkey: &str,
+    content: &str,
+) -> Result<NostrEvent, SignerGiftWrapError> {
+    let sender_pubkey = signer.public_key();
+    let rumor = create_rumor(sender_pubkey, recipient_pubkey, content);
+    let seal = seal_rumor_with_signer(&rumor, signer, recipient_pubkey).await?;
+    wrap_seal(&seal, recipient_pubkey).map_err(|e| SignerGiftWrapError::KeyError(e.to_string()))
+}
+
+/// Unwrap a gift-wrapped (kind 1059) event using a [`Signer`] for decryption.
+///
+/// Both NIP-44 layers (gift→seal and seal→rumor) are decrypted through the
+/// signer, so a local-key session decrypts in-memory and a NIP-07 session
+/// decrypts via `window.nostr.nip44.decrypt`. No raw secret-key bytes are
+/// required: the in-memory (or extension-held) signing key has full authority.
+pub async fn unwrap_gift_with_signer(
+    gift: &NostrEvent,
+    signer: &dyn Signer,
+) -> Result<UnwrappedGift, SignerGiftWrapError> {
+    if gift.kind != KIND_GIFT_WRAP {
+        return Err(SignerGiftWrapError::InvalidKind {
+            expected: KIND_GIFT_WRAP,
+            actual: gift.kind,
+        });
+    }
+
+    // Layer 1: gift wrap → seal. The gift's pubkey is the throwaway key the
+    // sender used to encrypt to us; we decrypt with our key against it.
+    let seal_json = signer.nip44_decrypt(&gift.pubkey, &gift.content).await?;
+    let seal: NostrEvent = serde_json::from_str(&seal_json)
+        .map_err(|e| SignerGiftWrapError::Serialization(format!("seal JSON parse: {e}")))?;
+
+    if seal.kind != KIND_SEAL {
+        return Err(SignerGiftWrapError::InvalidKind {
+            expected: KIND_SEAL,
+            actual: seal.kind,
+        });
+    }
+
+    // Layer 2: seal → rumor. The seal's pubkey is the sender's real key.
+    let rumor_json = signer.nip44_decrypt(&seal.pubkey, &seal.content).await?;
+    let rumor: UnsignedEvent = serde_json::from_str(&rumor_json)
+        .map_err(|e| SignerGiftWrapError::Serialization(format!("rumor JSON parse: {e}")))?;
+
+    if rumor.kind != KIND_RUMOR {
+        return Err(SignerGiftWrapError::InvalidKind {
+            expected: KIND_RUMOR,
+            actual: rumor.kind,
+        });
+    }
+
+    Ok(UnwrappedGift {
+        sender_pubkey: seal.pubkey.clone(),
+        rumor,
+        seal,
+    })
+}
+
 // ── Kind-4 (NIP-04) direct message handling ───────────────────────────────────
 
 /// Nostr kind for legacy encrypted DM (NIP-04).
-const KIND_ENCRYPTED_DM: u64 = 4;
+pub const KIND_ENCRYPTED_DM: u64 = 4;
 
 /// Decrypt a kind-4 (NIP-04) encrypted direct message.
 ///
@@ -648,5 +775,101 @@ mod tests {
 
         // The seal should be verifiable (signed by sender's key)
         assert!(crate::event::verify_event(&unwrapped.seal));
+    }
+
+    // ── Signer-driven path ──────────────────────────────────────────────────
+
+    use crate::signer::PrfSigner;
+
+    /// Minimal synchronous executor for the I/O-free `PrfSigner` futures.
+    /// `PrfSigner` resolves on the first poll (pure CPU), so a single poll of a
+    /// no-op waker suffices for tests on native.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTAB)
+        }
+        static VTAB: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTAB)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = Box::pin(fut);
+        loop {
+            if let Poll::Ready(v) = pinned.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn prf_signer() -> (PrfSigner, String) {
+        let kp = gen_kp().unwrap();
+        let pk = kp.public.to_hex();
+        (PrfSigner::new(kp), pk)
+    }
+
+    #[test]
+    fn signer_gift_wrap_roundtrip() {
+        let (sender, sender_pk) = prf_signer();
+        let (recipient, recipient_pk) = prf_signer();
+
+        let content = "Signer-driven DM 🎁";
+        let wrapped = block_on(gift_wrap_with_signer(&sender, &recipient_pk, content)).unwrap();
+        assert_eq!(wrapped.kind, KIND_GIFT_WRAP);
+        // Outer pubkey is a throwaway, never the sender.
+        assert_ne!(wrapped.pubkey, sender_pk);
+
+        let unwrapped = block_on(unwrap_gift_with_signer(&wrapped, &recipient)).unwrap();
+        assert_eq!(unwrapped.sender_pubkey, sender_pk);
+        assert_eq!(unwrapped.rumor.content, content);
+    }
+
+    #[test]
+    fn signer_unwrap_is_compatible_with_raw_wrap() {
+        // A message wrapped via the raw (legacy) path must unwrap via the signer path.
+        let (sender_sk, sender_pk) = test_keypair();
+        let recipient = gen_kp().unwrap();
+        let recipient_pk = recipient.public.to_hex();
+        let recipient_signer = PrfSigner::new(recipient);
+
+        let wrapped = gift_wrap(&sender_sk, &sender_pk, &recipient_pk, "cross-compat").unwrap();
+        let unwrapped = block_on(unwrap_gift_with_signer(&wrapped, &recipient_signer)).unwrap();
+        assert_eq!(unwrapped.sender_pubkey, sender_pk);
+        assert_eq!(unwrapped.rumor.content, "cross-compat");
+    }
+
+    #[test]
+    fn raw_unwrap_is_compatible_with_signer_wrap() {
+        // A message wrapped via the signer path must unwrap via the raw path.
+        let (sender, sender_pk) = prf_signer();
+        let recipient = gen_kp().unwrap();
+        let recipient_sk = *recipient.secret.as_bytes();
+        let recipient_pk = recipient.public.to_hex();
+
+        let wrapped = block_on(gift_wrap_with_signer(&sender, &recipient_pk, "reverse")).unwrap();
+        let unwrapped = unwrap_gift(&wrapped, &recipient_sk).unwrap();
+        assert_eq!(unwrapped.sender_pubkey, sender_pk);
+        assert_eq!(unwrapped.rumor.content, "reverse");
+    }
+
+    #[test]
+    fn signer_unwrap_rejects_wrong_kind() {
+        let (recipient, _) = prf_signer();
+        let fake = NostrEvent {
+            id: "00".repeat(32),
+            pubkey: "aa".repeat(32),
+            created_at: 1_700_000_000,
+            kind: 1,
+            tags: vec![],
+            content: String::new(),
+            sig: "00".repeat(64),
+        };
+        let result = block_on(unwrap_gift_with_signer(&fake, &recipient));
+        assert!(matches!(
+            result,
+            Err(SignerGiftWrapError::InvalidKind {
+                expected: KIND_GIFT_WRAP,
+                actual: 1
+            })
+        ));
     }
 }

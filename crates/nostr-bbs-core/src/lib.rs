@@ -39,7 +39,10 @@ pub use event::{
     signing_key_to_upstream, verify_event, verify_event_strict, verify_events_batch, EventError,
     NostrEvent, PubkeyMismatch, UnsignedEvent,
 };
-pub use gift_wrap::{gift_wrap, unwrap_gift, GiftWrapError, UnwrappedGift};
+pub use gift_wrap::{
+    gift_wrap, gift_wrap_with_signer, unwrap_gift, unwrap_gift_with_signer, GiftWrapError,
+    SignerGiftWrapError, UnwrappedGift,
+};
 pub use keys::{
     derive_from_prf, derive_subkey, generate_keypair, Keypair, PublicKey, SecretKey, Signature,
 };

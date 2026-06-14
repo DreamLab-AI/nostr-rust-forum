@@ -60,8 +60,8 @@ pub fn DmChatPage() -> impl IntoView {
         if let (Some(s), Some(pk)) = (signer, pubkey) {
             fetch_started.set(true);
             dm_store.select_conversation(&rpk);
-            dm_store.load_conversation_messages(&relay_for_sub, s.as_ref(), &pk, &rpk);
-            dm_store.subscribe_incoming(&relay_for_sub, s.as_ref(), &pk);
+            dm_store.load_conversation_messages(&relay_for_sub, s.clone(), &pk, &rpk);
+            dm_store.subscribe_incoming(&relay_for_sub, s, &pk);
         }
     });
 
@@ -109,7 +109,7 @@ pub fn DmChatPage() -> impl IntoView {
                 send_error.set(None);
                 message_input.set(String::new());
 
-                match dm_store.send_message(&relay_for_send, &rpk, &content, s.as_ref(), &pk) {
+                match dm_store.send_message(&relay_for_send, &rpk, &content, s, &pk) {
                     Ok(()) => {
                         sending.set(false);
                     }
