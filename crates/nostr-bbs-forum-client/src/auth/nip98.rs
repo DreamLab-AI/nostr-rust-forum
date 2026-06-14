@@ -186,10 +186,9 @@ pub enum Nip98ClientError {
 /// Mirrors `nostr_bbs_core::nip98::create_token_at` but routes the signing
 /// step through the Signer trait so non-PRF backends (NIP-07, hardware) can
 /// participate.
+// Monotonic per-document counter so two NIP-98 tokens minted in the same second
+// never share an event id. WASM is single-threaded, so a `Cell` is sufficient.
 thread_local! {
-    /// Monotonic per-document counter so two NIP-98 tokens minted in the same
-    /// second never share an event id. WASM is single-threaded, so a `Cell` is
-    /// sufficient.
     static NIP98_NONCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
