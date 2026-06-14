@@ -11,6 +11,115 @@ use wasm_bindgen_futures::JsFuture;
 
 use crate::auth::use_auth;
 
+// ── Media classification ──────────────────────────────────────────────────────
+
+/// How a pod resource should be rendered. Media kinds need an authenticated
+/// byte fetch + object URL (an `<img>`/`<video>`/`<audio>` element can't carry
+/// the NIP-98 `Authorization` header, so a bare `src` to the pod URL 404s);
+/// everything else falls back to the text/JSON-LD viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Video,
+    Audio,
+    Other,
+}
+
+impl MediaKind {
+    /// Classify by file extension (primary signal — the container listing only
+    /// gives us names/paths, no content-type until we fetch).
+    fn from_path(path: &str) -> Self {
+        let ext = path
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "avif" | "bmp" | "ico") => {
+                MediaKind::Image
+            }
+            Some("mp4" | "webm" | "ogg" | "ogv" | "mov" | "m4v") => MediaKind::Video,
+            Some("mp3" | "wav" | "oga" | "m4a" | "aac" | "flac" | "opus") => MediaKind::Audio,
+            _ => MediaKind::Other,
+        }
+    }
+
+    /// Refine/confirm using the response `Content-Type` (authoritative when the
+    /// pod sets it; e.g. an extensionless file or a misnamed one). Only ever
+    /// upgrades an `Other` classification or corrects the media family — it
+    /// never demotes a known media extension to `Other` on a missing header.
+    fn from_content_type(ct: &str) -> Self {
+        let ct = ct.split(';').next().unwrap_or(ct).trim();
+        // `image/svg+xml`, `image/png`, etc. all render as images.
+        if ct.starts_with("image/") {
+            MediaKind::Image
+        } else if ct.starts_with("video/") {
+            MediaKind::Video
+        } else if ct.starts_with("audio/") {
+            MediaKind::Audio
+        } else {
+            MediaKind::Other
+        }
+    }
+}
+
+/// Best-effort MIME type for the `Blob` we hand to the browser. Prefer the
+/// server-provided content-type; fall back to a type derived from the
+/// extension so `<img>`/`<video>` decode correctly even when the pod omits it.
+fn mime_for(path: &str, content_type: Option<&str>) -> String {
+    if let Some(ct) = content_type {
+        let base = ct.split(';').next().unwrap_or(ct).trim();
+        if !base.is_empty() && base != "application/octet-stream" {
+            return base.to_string();
+        }
+    }
+    let ext = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("avif") => "image/avif",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("ogv") => "video/ogg",
+        Some("mov") => "video/quicktime",
+        Some("ogg") => "video/ogg",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("oga" | "opus") => "audio/ogg",
+        Some("m4a" | "aac") => "audio/mp4",
+        Some("flac") => "audio/flac",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Wrap raw bytes in a typed `Blob` and return a browser object URL that can be
+/// used directly as an `<img>`/`<video>`/`<audio>` `src`. The caller owns the
+/// URL and must revoke it (see `revoke_object_url`) once the element is gone.
+fn bytes_to_object_url(bytes: &[u8], mime: &str) -> Result<String, String> {
+    let arr = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::new();
+    parts.push(&arr.buffer());
+
+    let opts = web_sys::BlobPropertyBag::new();
+    opts.set_type(mime);
+
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts)
+        .map_err(|e| format!("Blob: {e:?}"))?;
+    web_sys::Url::create_object_url_with_blob(&blob).map_err(|e| format!("Object URL: {e:?}"))
+}
+
 const POD_API: &str = match option_env!("VITE_POD_API_URL") {
     Some(u) => u,
     None => "https://pod.example.com",
@@ -37,6 +146,32 @@ enum FetchState {
     Loading,
     Loaded(Vec<PodEntry>),
     Error(String),
+}
+
+/// What the resource viewer is currently showing. Text resources carry their
+/// decoded body; media resources carry a blob object URL (revoked on cleanup)
+/// and the kind so the viewer picks the right element.
+#[derive(Clone, Debug)]
+enum ResourceView {
+    Text {
+        content: String,
+        path: String,
+    },
+    Media {
+        object_url: String,
+        kind: MediaKind,
+        mime: String,
+        path: String,
+    },
+}
+
+impl ResourceView {
+    fn path(&self) -> &str {
+        match self {
+            ResourceView::Text { path, .. } => path,
+            ResourceView::Media { path, .. } => path,
+        }
+    }
 }
 
 // ── Authenticated fetch ─────────────────────────────────────────────────────
@@ -82,6 +217,52 @@ async fn pod_fetch(
         .await
         .map_err(|e| format!("{e:?}"))?;
     text_val.as_string().ok_or_else(|| "Empty response".into())
+}
+
+/// Same NIP-98 authenticated GET as [`pod_fetch`], but returns the raw bytes
+/// plus the server `Content-Type`. Used for media resources (image/video/audio)
+/// which must be decoded by the browser rather than rendered as text — an
+/// `<img>`/`<video>` `src` can't send the auth header, so we fetch the bytes
+/// here and hand them to a `Blob`/object-URL instead.
+async fn pod_fetch_bytes(
+    url: &str,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    let token = crate::auth::nip98::create_nip98_token_with_signer(signer, url, "GET", None)
+        .await
+        .map_err(|e| format!("NIP-98: {e}"))?;
+
+    let win = web_sys::window().ok_or("No window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("GET");
+
+    let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
+    headers
+        .set("Authorization", &format!("Nostr {token}"))
+        .map_err(|e| format!("{e:?}"))?;
+    headers.set("Accept", "*/*").map_err(|e| format!("{e:?}"))?;
+    init.set_headers(&headers);
+
+    let req = web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| format!("{e:?}"))?;
+    let resp_val = JsFuture::from(win.fetch_with_request(&req))
+        .await
+        .map_err(|e| format!("Fetch: {e:?}"))?;
+    let resp: web_sys::Response = resp_val
+        .dyn_into()
+        .map_err(|_| "Not a Response".to_string())?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    let content_type = resp.headers().get("content-type").ok().flatten();
+
+    let buf_promise = resp.array_buffer().map_err(|e| format!("{e:?}"))?;
+    let buf_val = JsFuture::from(buf_promise)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let bytes = js_sys::Uint8Array::new(&buf_val).to_vec();
+    Ok((bytes, content_type))
 }
 
 async fn pod_provision(
@@ -230,6 +411,76 @@ fn ResourceViewer(content: String, path: String) -> impl IntoView {
     }
 }
 
+/// Renders an authenticated media resource from a blob object URL. The bytes
+/// were fetched with NIP-98 auth and wrapped in an object URL by the caller, so
+/// the element can render without sending any header. The URL is revoked by the
+/// page's navigation/cleanup logic when the viewer is dismissed.
+#[component]
+fn MediaViewer(object_url: String, kind: MediaKind, mime: String, path: String) -> impl IntoView {
+    let label = match kind {
+        MediaKind::Image => "Image",
+        MediaKind::Video => "Video",
+        MediaKind::Audio => "Audio",
+        MediaKind::Other => "File",
+    };
+
+    let body = match kind {
+        MediaKind::Image => view! {
+            <div class="flex items-center justify-center p-4 bg-gray-950">
+                <img
+                    src=object_url.clone()
+                    alt=path.clone()
+                    class="max-w-full max-h-[32rem] object-contain rounded"
+                />
+            </div>
+        }
+        .into_any(),
+        MediaKind::Video => {
+            let src = object_url.clone();
+            let ty = mime.clone();
+            view! {
+                <div class="flex items-center justify-center p-4 bg-gray-950">
+                    <video
+                        controls=true
+                        class="max-w-full max-h-[32rem] rounded"
+                    >
+                        <source src=src type=ty />
+                        "Your browser can\u{2019}t play this video."
+                    </video>
+                </div>
+            }
+            .into_any()
+        }
+        MediaKind::Audio => {
+            let src = object_url.clone();
+            let ty = mime.clone();
+            view! {
+                <div class="p-4 bg-gray-950">
+                    <audio controls=true class="w-full">
+                        <source src=src type=ty />
+                        "Your browser can\u{2019}t play this audio."
+                    </audio>
+                </div>
+            }
+            .into_any()
+        }
+        MediaKind::Other => view! {
+            <div class="p-4 text-sm text-gray-400">"Unsupported media type."</div>
+        }
+        .into_any(),
+    };
+
+    view! {
+        <div class="bg-gray-900 rounded-lg border border-gray-700/50 overflow-hidden">
+            <div class="flex items-center justify-between px-4 py-2 bg-gray-800 border-b border-gray-700/50">
+                <span class="text-sm text-gray-400 font-mono truncate">{path}</span>
+                <span class="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300">{label}</span>
+            </div>
+            {body}
+        </div>
+    }
+}
+
 // ── Main page component ─────────────────────────────────────────────────────
 
 /// Result of probing the pod for a `.git/HEAD` file. The CF Workers tier
@@ -250,7 +501,7 @@ pub fn PodBrowserPage() -> impl IntoView {
 
     let current_path = RwSignal::new("/".to_string());
     let fetch_state = RwSignal::new(FetchState::Idle);
-    let resource_content = RwSignal::new(None::<(String, String)>);
+    let resource_content = RwSignal::new(None::<ResourceView>);
     let viewing_resource = RwSignal::new(false);
     let git_probe = RwSignal::new(GitProbeState::Idle);
     let native_probe = RwSignal::new(GitProbeState::Idle);
@@ -418,11 +669,24 @@ pub fn PodBrowserPage() -> impl IntoView {
 
     let on_probe_git = move |_| run_git_probe();
 
+    // Revoke any live blob object URL the viewer is holding, then clear it.
+    // Must run before replacing/clearing the resource so we don't leak the URL
+    // (and the underlying decoded bytes the browser keeps alive for it).
+    let revoke_current_object_url = move || {
+        if let Some(ResourceView::Media { object_url, .. }) = resource_content.get_untracked() {
+            let _ = web_sys::Url::revoke_object_url(&object_url);
+        }
+    };
+
     let navigate_to = move |path: String| {
+        revoke_current_object_url();
         resource_content.set(None);
         viewing_resource.set(false);
         current_path.set(path);
     };
+
+    // Final safety net: revoke the outstanding object URL when the page unmounts.
+    on_cleanup(move || revoke_current_object_url());
 
     // Fetch container listing whenever current_path changes
     Effect::new(move |_| {
@@ -434,7 +698,49 @@ pub fn PodBrowserPage() -> impl IntoView {
             let url = format!("{}{}", base, path);
             let is_container = path.ends_with('/') || path == "/";
 
+            // Media files are fetched as bytes and rendered via a blob object
+            // URL (an <img>/<video>/<audio> src can't carry the NIP-98 header).
+            // Classify by extension first; the content-type from the byte fetch
+            // refines it. Non-media resources keep the text/JSON-LD viewer.
+            let path_kind = MediaKind::from_path(&path);
+
             wasm_bindgen_futures::spawn_local(async move {
+                if !is_container && path_kind != MediaKind::Other {
+                    match pod_fetch_bytes(&url, &*signer).await {
+                        Ok((bytes, content_type)) => {
+                            // Prefer the server content-type when it disagrees
+                            // with the extension (e.g. .ogg served as audio).
+                            let kind = match content_type.as_deref() {
+                                Some(ct) => {
+                                    let ct_kind = MediaKind::from_content_type(ct);
+                                    if ct_kind == MediaKind::Other {
+                                        path_kind
+                                    } else {
+                                        ct_kind
+                                    }
+                                }
+                                None => path_kind,
+                            };
+                            let mime = mime_for(&path, content_type.as_deref());
+                            match bytes_to_object_url(&bytes, &mime) {
+                                Ok(object_url) => {
+                                    resource_content.set(Some(ResourceView::Media {
+                                        object_url,
+                                        kind,
+                                        mime,
+                                        path,
+                                    }));
+                                    viewing_resource.set(true);
+                                    fetch_state.set(FetchState::Idle);
+                                }
+                                Err(e) => fetch_state.set(FetchState::Error(e)),
+                            }
+                        }
+                        Err(e) => fetch_state.set(FetchState::Error(e)),
+                    }
+                    return;
+                }
+
                 let result = match pod_fetch(&url, &*signer).await {
                     Ok(body) => Ok(body),
                     Err(ref e) if path == "/" && (e.contains("403") || e.contains("404")) => {
@@ -454,7 +760,10 @@ pub fn PodBrowserPage() -> impl IntoView {
                             let entries = parse_container_listing(&body);
                             fetch_state.set(FetchState::Loaded(entries));
                         } else {
-                            resource_content.set(Some((body, path)));
+                            resource_content.set(Some(ResourceView::Text {
+                                content: body,
+                                path,
+                            }));
                             viewing_resource.set(true);
                             fetch_state.set(FetchState::Idle);
                         }
@@ -815,12 +1124,21 @@ pub fn PodBrowserPage() -> impl IntoView {
 
             // Resource viewer (when viewing a non-container resource)
             {move || {
-                resource_content.get().map(|(content, path)| {
+                resource_content.get().map(|view_res| {
                     let nav = navigate_to;
+                    let path = view_res.path().to_string();
                     let parent = {
                         let mut p = path.rsplit_once('/').map(|(a, _)| format!("{a}/")).unwrap_or_else(|| "/".into());
                         if p.is_empty() { p = "/".into(); }
                         p
+                    };
+                    let inner = match view_res {
+                        ResourceView::Text { content, path } => {
+                            view! { <ResourceViewer content=content path=path /> }.into_any()
+                        }
+                        ResourceView::Media { object_url, kind, mime, path } => {
+                            view! { <MediaViewer object_url=object_url kind=kind mime=mime path=path /> }.into_any()
+                        }
                     };
                     view! {
                         <div class="mb-4">
@@ -833,7 +1151,7 @@ pub fn PodBrowserPage() -> impl IntoView {
                                 </svg>
                                 "Back to folder"
                             </button>
-                            <ResourceViewer content=content path=path />
+                            {inner}
                         </div>
                     }
                 })
@@ -931,5 +1249,83 @@ pub fn PodBrowserPage() -> impl IntoView {
                 }}
             </Show>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mime_for, MediaKind};
+
+    #[test]
+    fn classifies_images_by_extension() {
+        for p in [
+            "/media/public/photo.png",
+            "cat.JPG",
+            "a/b/c.jpeg",
+            "x.gif",
+            "y.webp",
+            "logo.svg",
+            "shot.avif",
+        ] {
+            assert_eq!(MediaKind::from_path(p), MediaKind::Image, "{p}");
+        }
+    }
+
+    #[test]
+    fn classifies_video_and_audio_by_extension() {
+        assert_eq!(MediaKind::from_path("clip.mp4"), MediaKind::Video);
+        assert_eq!(MediaKind::from_path("clip.WEBM"), MediaKind::Video);
+        assert_eq!(MediaKind::from_path("a.mov"), MediaKind::Video);
+        assert_eq!(MediaKind::from_path("song.mp3"), MediaKind::Audio);
+        assert_eq!(MediaKind::from_path("v.wav"), MediaKind::Audio);
+        assert_eq!(MediaKind::from_path("v.flac"), MediaKind::Audio);
+    }
+
+    #[test]
+    fn non_media_extensions_stay_text() {
+        for p in [
+            "/profile/card",
+            "settings/publicTypeIndex.jsonld",
+            "notes.txt",
+            "data.ttl",
+            "noext",
+        ] {
+            assert_eq!(MediaKind::from_path(p), MediaKind::Other, "{p}");
+        }
+    }
+
+    #[test]
+    fn content_type_classification() {
+        assert_eq!(MediaKind::from_content_type("image/png"), MediaKind::Image);
+        assert_eq!(
+            MediaKind::from_content_type("image/svg+xml; charset=utf-8"),
+            MediaKind::Image
+        );
+        assert_eq!(MediaKind::from_content_type("video/mp4"), MediaKind::Video);
+        assert_eq!(MediaKind::from_content_type("audio/mpeg"), MediaKind::Audio);
+        assert_eq!(
+            MediaKind::from_content_type("text/turtle"),
+            MediaKind::Other
+        );
+    }
+
+    #[test]
+    fn mime_prefers_server_then_extension() {
+        // Server content-type wins when meaningful.
+        assert_eq!(mime_for("x.bin", Some("image/webp")), "image/webp");
+        // Strips parameters.
+        assert_eq!(
+            mime_for("x.png", Some("image/png; charset=binary")),
+            "image/png"
+        );
+        // octet-stream is ignored in favour of the extension-derived type.
+        assert_eq!(
+            mime_for("photo.jpg", Some("application/octet-stream")),
+            "image/jpeg"
+        );
+        // No header → derive from extension.
+        assert_eq!(mime_for("a/b/clip.webm", None), "video/webm");
+        // Unknown extension and no header → octet-stream.
+        assert_eq!(mime_for("mystery", None), "application/octet-stream");
     }
 }
