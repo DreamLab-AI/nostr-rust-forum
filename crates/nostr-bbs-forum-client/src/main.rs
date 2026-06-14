@@ -62,17 +62,82 @@ fn register_service_worker() {
     // new deploy's worker installs on the FIRST visit, instead of whenever the
     // browser's sw.js cache heuristic expires.
     options.set_update_via_cache(web_sys::ServiceWorkerUpdateViaCache::None);
+
+    // Auto-reload exactly once when a freshly-installed worker takes control,
+    // so an already-open tab swaps onto the new build instead of running the old
+    // WASM bundle until the user happens to reload. Guarded by a flag on
+    // `window` to avoid the classic controllerchange reload loop (a reload
+    // re-fires controllerchange under some browsers).
+    install_controllerchange_reload(&sw_container);
+
     let promise = sw_container.register_with_options(&sw_url, &options);
     wasm_bindgen_futures::spawn_local(async move {
         match wasm_bindgen_futures::JsFuture::from(promise).await {
-            Ok(_) => web_sys::console::log_1(
-                &format!("[PWA] Service worker registered at {sw_url} (scope {scope})").into(),
-            ),
+            Ok(reg) => {
+                web_sys::console::log_1(
+                    &format!("[PWA] Service worker registered at {sw_url} (scope {scope})").into(),
+                );
+                // Force an immediate update check on load so a new deploy's
+                // worker is discovered now, not on the browser's own schedule.
+                trigger_registration_update(&reg);
+            }
             Err(e) => web_sys::console::warn_1(
                 &format!("[PWA] Service worker registration failed: {:?}", e).into(),
             ),
         }
     });
+}
+
+/// Call `registration.update()` to force an immediate check for a new worker.
+///
+/// Uses `js_sys::Reflect` to invoke the method so we don't need the typed
+/// `ServiceWorkerRegistration` web-sys binding (the resolved `register()` value
+/// is a `JsValue` that quacks like a registration). Failure is non-fatal.
+fn trigger_registration_update(reg: &wasm_bindgen::JsValue) {
+    use wasm_bindgen::JsCast;
+
+    let Ok(update_fn) = js_sys::Reflect::get(reg, &"update".into()) else {
+        return;
+    };
+    if let Ok(func) = update_fn.dyn_into::<js_sys::Function>() {
+        // `update()` returns a promise; we don't need to await it.
+        let _ = func.call0(reg);
+    }
+}
+
+/// Reload the page once when a new service worker takes control, so an open tab
+/// picks up the just-deployed build. A `window.__sw_reloaded__` sentinel
+/// prevents the reload loop that `controllerchange` can otherwise trigger.
+fn install_controllerchange_reload(sw_container: &web_sys::ServiceWorkerContainer) {
+    use wasm_bindgen::JsCast;
+
+    let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        // Reload at most once: bail if a previous controllerchange already did.
+        let key = wasm_bindgen::JsValue::from_str("__sw_reloaded__");
+        if js_sys::Reflect::get(&window, &key)
+            .map(|v| v.is_truthy())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let _ = js_sys::Reflect::set(&window, &key, &wasm_bindgen::JsValue::TRUE);
+        web_sys::console::log_1(&"[PWA] New build active — reloading once".into());
+        if let Ok(loc) = js_sys::Reflect::get(&window, &"location".into()) {
+            if let Ok(reload) = js_sys::Reflect::get(&loc, &"reload".into()) {
+                if let Ok(func) = reload.dyn_into::<js_sys::Function>() {
+                    let _ = func.call0(&loc);
+                }
+            }
+        }
+    });
+
+    let _ = sw_container
+        .add_event_listener_with_callback("controllerchange", closure.as_ref().unchecked_ref());
+    // Leak the closure: it must outlive this fn for the lifetime of the page.
+    closure.forget();
 }
 
 /// Run startup tasks: evict stale IndexedDB data, check storage quota.
