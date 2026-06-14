@@ -31,7 +31,15 @@ use crate::stores::read_position::use_read_positions;
 use crate::utils::shorten_pubkey;
 
 const STORAGE_KEY: &str = "nostrbbs:notifications";
+/// Persisted producer sync state (baseline high-water mark + already-notified
+/// event ids). Separate key so it survives the 7-day eviction of the visible
+/// notification list — otherwise a backlog post would re-notify once its
+/// notification aged out (see [`SyncState`]).
+const SYNC_STATE_KEY: &str = "nostrbbs:notif_sync";
 const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Cap on persisted dedup ids so the set can't grow without bound. Far above the
+/// 100-notification visible cap; old ids are evicted FIFO-style on overflow.
+const MAX_SEEN_IDS: usize = 2_000;
 
 // -- Types --------------------------------------------------------------------
 
@@ -65,6 +73,31 @@ struct PersistedNotifications {
     items: Vec<Notification>,
 }
 
+/// Persisted producer state so notifications survive reloads correctly.
+///
+/// Two fields, both load-bearing for the "burst reader" workflow (log in, glance,
+/// leave; come back later to genuine unread activity):
+///
+/// - `baseline`: the FIRST-EVER-sync wall-clock floor, captured once and then
+///   persisted forever (until the user clears storage). It exists only to stop
+///   the very first sync from dumping the entire channel history as
+///   notifications. Crucially it is NOT reset to `now()` on later logins — so a
+///   post that arrived while the user was away (`created_at > baseline`) still
+///   qualifies. Resetting it every `init_sync` (the old behaviour) is exactly
+///   why a burst reader saw nothing: everything that happened between sessions
+///   fell at-or-before the freshly-captured baseline and was filed as backlog.
+/// - `notified_ids`: event ids already turned into a notification. Persisted so
+///   a still-on-relay backlog post is not re-notified after its visible
+///   notification is evicted by the 7-day rule, and so a reload does not
+///   re-announce everything. Bounded by [`MAX_SEEN_IDS`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SyncState {
+    #[serde(default)]
+    baseline: u64,
+    #[serde(default)]
+    notified_ids: Vec<String>,
+}
+
 // -- Reactive store -----------------------------------------------------------
 
 /// Reactive notification store, provided via context.
@@ -74,24 +107,32 @@ pub struct NotificationStoreV2 {
     /// Set once `init_sync` has attached its effects, so the bell can call it
     /// idempotently from its (post-context) mount.
     synced: RwSignal<bool>,
-    /// Sync baseline (UNIX secs). Content created at or before this is treated
-    /// as backlog and never notified — only genuinely new arrivals fire.
+    /// First-ever-sync floor (UNIX secs), loaded from / persisted to storage so
+    /// it is stable across logins. Only the very first sync uses it to avoid
+    /// dumping all history; thereafter the read-position is the real "already
+    /// seen" signal. See [`SyncState`].
     baseline: RwSignal<u64>,
-    /// Channel ids already turned into a "new topic" notification.
+    /// Channel ids already turned into a "new topic" notification (in-memory;
+    /// channel creations are rare and the persisted `notified_ids` covers reload
+    /// dedup for posts, which is where flooding matters).
     seen_channels: RwSignal<HashSet<String>>,
-    /// Message event ids already turned into a "new post" notification.
+    /// Message event ids already turned into a "new post" notification. Seeded
+    /// from the persisted [`SyncState::notified_ids`] on construction so dedup
+    /// survives reloads and 7-day item eviction.
     seen_messages: RwSignal<HashSet<String>>,
 }
 
 impl NotificationStoreV2 {
     fn new() -> Self {
         let loaded = load_from_storage();
+        let sync_state = load_sync_state();
+        let seen: HashSet<String> = sync_state.notified_ids.into_iter().collect();
         Self {
             items: RwSignal::new(loaded),
             synced: RwSignal::new(false),
-            baseline: RwSignal::new(0),
+            baseline: RwSignal::new(sync_state.baseline),
             seen_channels: RwSignal::new(HashSet::new()),
-            seen_messages: RwSignal::new(HashSet::new()),
+            seen_messages: RwSignal::new(seen),
         }
     }
 
@@ -214,8 +255,20 @@ impl NotificationStoreV2 {
             return;
         }
         self.synced.set(true);
-        // Everything already on screen at attach time is backlog.
-        self.baseline.set(now_secs());
+
+        // First-ever sync floor: if no baseline has ever been persisted, capture
+        // `now()` so this initial sync does not dump the entire channel backlog
+        // as notifications. On every SUBSEQUENT login the persisted value is
+        // reused (NOT reset) so activity that arrived between sessions still
+        // qualifies as new. This is the fix for the silent producer: a burst
+        // reader (log in → glance → leave → return) now gets notified for what
+        // happened while they were away, instead of having it all re-filed as
+        // backlog under a freshly-stamped `now()`.
+        if self.baseline.get_untracked() == 0 {
+            let now = now_secs();
+            self.baseline.set(now);
+            self.persist_sync_state();
+        }
 
         let store = *self;
         let channels_store = use_channel_store();
@@ -274,11 +327,17 @@ impl NotificationStoreV2 {
                         .map(|c| (c.id.clone(), c.name.clone()))
                         .collect()
                 });
+            // Read the read-position map ONCE per run (tracked: marking a channel
+            // read re-runs this effect so the badge clears), then index per
+            // channel below.
+            let read_map = read_positions.read_timestamps();
+            // Whether this run recorded any newly-seen event id; if so we persist
+            // the dedup set + baseline once at the end (not per event).
+            let mut seen_changed = false;
             for (cid, events) in msgs.iter() {
                 // Last-read position for this channel: posts at or before it are
                 // already read and must not re-notify.
-                let last_read_ts = read_positions.read_timestamps();
-                let read_ts = last_read_ts.get(cid).copied().unwrap_or(0);
+                let read_ts = read_map.get(cid).copied().unwrap_or(0);
                 let channel_name = names
                     .get(cid)
                     .filter(|n| !n.is_empty())
@@ -293,22 +352,32 @@ impl NotificationStoreV2 {
                         continue;
                     }
                     store.seen_messages.update(|s| {
+                        // Bound the persisted dedup set; on overflow drop an
+                        // arbitrary oldest-ish entry. Re-notifying a long-evicted
+                        // post is far less bad than an unbounded set.
+                        if s.len() >= MAX_SEEN_IDS {
+                            if let Some(victim) = s.iter().next().cloned() {
+                                s.remove(&victim);
+                            }
+                        }
                         s.insert(event.id.clone());
                     });
+                    seen_changed = true;
 
-                    // Backlog: anything from before we started watching.
-                    if event.created_at <= baseline {
+                    // Suppression model (the fix) — see `post_is_notifiable`.
+                    // Notify only on genuinely unread activity from someone else:
+                    // unread in-channel (`> read_ts`), past the persisted
+                    // first-sync floor (`> baseline`), and not the user's own.
+                    // De-dup against already-notified ids is the persisted
+                    // `seen_messages` check above.
+                    if !post_is_notifiable(
+                        &event.pubkey,
+                        event.created_at,
+                        me.as_deref(),
+                        read_ts,
+                        baseline,
+                    ) {
                         continue;
-                    }
-                    // Already read in this channel.
-                    if event.created_at <= read_ts {
-                        continue;
-                    }
-                    // Don't notify on the user's own posts.
-                    if let Some(ref pk) = me {
-                        if &event.pubkey == pk {
-                            continue;
-                        }
                     }
 
                     let author = author_display(&event.pubkey);
@@ -341,6 +410,12 @@ impl NotificationStoreV2 {
                     );
                 }
             }
+            // Persist the dedup set (and baseline) once per run if it grew, so
+            // already-notified posts are not re-announced after a reload or once
+            // their visible notification is evicted by the 7-day rule.
+            if seen_changed {
+                store.persist_sync_state();
+            }
         });
     }
 
@@ -349,6 +424,18 @@ impl NotificationStoreV2 {
             items: self.items.get_untracked(),
         };
         let _ = LocalStorage::set(STORAGE_KEY, data);
+    }
+
+    /// Persist the producer sync state (baseline + already-notified ids) to its
+    /// own localStorage key. Cheap; called at most once per effect run.
+    fn persist_sync_state(&self) {
+        let state = SyncState {
+            baseline: self.baseline.get_untracked(),
+            notified_ids: self
+                .seen_messages
+                .with_untracked(|s| s.iter().cloned().collect()),
+        };
+        let _ = LocalStorage::set(SYNC_STATE_KEY, state);
     }
 }
 
@@ -418,6 +505,42 @@ fn fallback_singleton() -> NotificationStoreV2 {
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
+}
+
+/// Load the persisted producer sync state, tolerating absence and schema drift
+/// (returns the default — baseline 0, empty set — on any parse failure, so a
+/// corrupt blob just means "first sync" rather than a crash).
+fn load_sync_state() -> SyncState {
+    LocalStorage::get::<SyncState>(SYNC_STATE_KEY).unwrap_or_default()
+}
+
+/// Pure suppression predicate for a kind-42 post (extracted so it is unit
+/// testable without a DOM). Returns `true` when the post represents genuine,
+/// unseen activity that should raise a notification.
+///
+/// A post is notifiable iff ALL hold:
+/// - it is not the user's own (`author != me`),
+/// - it is unread in its channel (`created_at > read_ts`) — the canonical
+///   timestamp read-model,
+/// - it is newer than the first-ever-sync floor (`created_at > baseline`), which
+///   only suppresses pre-first-visit history because `baseline` is persisted and
+///   never reset between sessions.
+///
+/// De-dup against already-notified ids is handled by the caller's persisted
+/// `seen_messages` set, not here.
+fn post_is_notifiable(
+    author: &str,
+    created_at: u64,
+    me: Option<&str>,
+    read_ts: u64,
+    baseline: u64,
+) -> bool {
+    if let Some(pk) = me {
+        if author == pk {
+            return false;
+        }
+    }
+    created_at > read_ts && created_at > baseline
 }
 
 /// Whether a notification of `kind` is allowed under the persisted
@@ -586,5 +709,99 @@ mod tests {
         let items = parse_persisted_items(&value, now);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].link, None);
+    }
+
+    // -- Producer suppression (the silent-producer fix) -----------------------
+
+    const ME: &str = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c";
+    const OTHER: &str = "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9";
+
+    #[test]
+    fn own_posts_never_notify() {
+        // Even when unread and well past the baseline, the user's own post is
+        // suppressed.
+        assert!(!post_is_notifiable(ME, 5_000, Some(ME), 0, 1_000));
+    }
+
+    #[test]
+    fn fresh_live_foreign_post_notifies() {
+        // Someone else, unread (read_ts=0), after the baseline → notify. This is
+        // the "post arrives while I'm looking" case that always worked.
+        assert!(post_is_notifiable(OTHER, 5_000, Some(ME), 0, 1_000));
+    }
+
+    #[test]
+    fn unread_backlog_after_baseline_notifies_for_burst_reader() {
+        // THE REGRESSION THIS FIXES: the operator logged in at t=1_000 (their
+        // FIRST visit → baseline=1_000), left, and a foreign post landed at
+        // t=2_000 while they were away. They have never opened the channel
+        // (read_ts=0). On return it must notify — previously `baseline` was
+        // reset to "now" on every login (e.g. 3_000), filing the 2_000 post as
+        // backlog and silently dropping it.
+        let baseline_from_first_visit = 1_000;
+        assert!(post_is_notifiable(
+            OTHER,
+            2_000,
+            Some(ME),
+            0,
+            baseline_from_first_visit
+        ));
+    }
+
+    #[test]
+    fn already_read_post_never_notifies() {
+        // Read up to t=5_000; a post at 4_000 is below the read position → no
+        // notification even though it post-dates the baseline.
+        assert!(!post_is_notifiable(OTHER, 4_000, Some(ME), 5_000, 1_000));
+        // Exactly at the read position is still "read".
+        assert!(!post_is_notifiable(OTHER, 5_000, Some(ME), 5_000, 1_000));
+        // One second newer than the read position → unread → notify.
+        assert!(post_is_notifiable(OTHER, 5_001, Some(ME), 5_000, 1_000));
+    }
+
+    #[test]
+    fn first_sync_history_is_suppressed_by_baseline_floor() {
+        // On the very first visit (baseline just stamped at 10_000), the entire
+        // pre-existing channel history (created_at < baseline) must NOT flood the
+        // bell, even though it is all technically unread (read_ts=0).
+        assert!(!post_is_notifiable(OTHER, 9_999, Some(ME), 0, 10_000));
+        assert!(!post_is_notifiable(OTHER, 1, Some(ME), 0, 10_000));
+        // Anything strictly after the floor is genuine new activity.
+        assert!(post_is_notifiable(OTHER, 10_001, Some(ME), 0, 10_000));
+    }
+
+    #[test]
+    fn unknown_self_pubkey_still_applies_read_and_baseline() {
+        // Before auth resolves `me` is None; own-post filtering can't run, but the
+        // unread + baseline gates still hold so we don't dump backlog.
+        assert!(!post_is_notifiable(OTHER, 500, None, 0, 1_000));
+        assert!(post_is_notifiable(OTHER, 2_000, None, 0, 1_000));
+    }
+
+    // -- Persisted sync state -------------------------------------------------
+
+    #[test]
+    fn sync_state_round_trips() {
+        let state = SyncState {
+            baseline: 1_700_000_000,
+            notified_ids: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: SyncState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.baseline, state.baseline);
+        assert_eq!(back.notified_ids, state.notified_ids);
+    }
+
+    #[test]
+    fn sync_state_tolerates_missing_fields() {
+        // A legacy/empty blob must deserialize to the "first sync" default rather
+        // than failing (mirrors load_sync_state's unwrap_or_default contract).
+        let back: SyncState = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.baseline, 0);
+        assert!(back.notified_ids.is_empty());
+        // Partial blob: only baseline present.
+        let back: SyncState = serde_json::from_str(r#"{"baseline":42}"#).unwrap();
+        assert_eq!(back.baseline, 42);
+        assert!(back.notified_ids.is_empty());
     }
 }
