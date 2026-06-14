@@ -252,6 +252,7 @@ pub fn DmListPage() -> impl IntoView {
                         <InfoTerm
                             term="NIP-44"
                             explainer="The encryption standard that scrambles your messages so only you and the recipient can read them — not even the server."
+                            slug="nip44"
                         />
                         ")"
                     </div>
@@ -334,6 +335,7 @@ pub fn DmListPage() -> impl IntoView {
                         <InfoTerm
                             term="npub"
                             explainer="A person's public username code (starts with \"npub\"). Safe to share — it's how others find you."
+                            slug="npub"
                         />
                         " or 64-character key instead."
                     </p>

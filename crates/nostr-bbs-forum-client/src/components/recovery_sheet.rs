@@ -298,6 +298,7 @@ pub(crate) fn RecoverySheet(
                                 <InfoTerm
                                     term="(nsec)"
                                     explainer="Your account's secret key — the technical name is \"nsec\". It's the master password for your account; never share it."
+                                    slug="nsec"
                                 />
                             </p>
                             <code class="block text-xs text-gray-900 font-mono">{nsec}</code>
@@ -318,6 +319,7 @@ pub(crate) fn RecoverySheet(
                         <InfoTerm
                             term="messaging app"
                             explainer="An optional third-party app that can show this forum's messages. Most people never need this."
+                            slug="giftwrap"
                         />
                         ". Paste the address below to point it at this community."
                     </p>
@@ -329,6 +331,7 @@ pub(crate) fn RecoverySheet(
                                 <InfoTerm
                                     term="(relay)"
                                     explainer="The server that stores and shares this community's messages. The technical name is \"relay\"."
+                                    slug="relay"
                                 />
                             </p>
                             <code class="block text-xs text-gray-900 font-mono">{relay_url}</code>
@@ -364,6 +367,7 @@ pub(crate) fn RecoverySheet(
                                 <InfoTerm
                                     term="(npub)"
                                     explainer="Your public username code — the technical name is \"npub\". Safe to share so others can find you."
+                                    slug="npub"
                                 />
                             </p>
                             <code class="block text-xs text-gray-900 font-mono">{npub}</code>

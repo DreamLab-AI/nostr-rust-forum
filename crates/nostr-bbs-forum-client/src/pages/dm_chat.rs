@@ -221,6 +221,7 @@ pub fn DmChatPage() -> impl IntoView {
                                     <InfoTerm
                                         term="End-to-end encrypted"
                                         explainer="Messages are scrambled on your device and only unscrambled on theirs — the server (and anyone watching it) only ever sees gibberish."
+                                        slug="encryption"
                                     />
                                 </span>
                             </div>
@@ -273,6 +274,7 @@ pub fn DmChatPage() -> impl IntoView {
                                             <InfoTerm
                                                 term="NIP-44"
                                                 explainer="The encryption standard that scrambles your messages so only you and the recipient can read them — not even the server."
+                                                slug="nip44"
                                             />
                                             ")"
                                         </p>

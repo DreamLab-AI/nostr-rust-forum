@@ -541,6 +541,7 @@ pub fn SignupPage() -> impl IntoView {
                                                     <InfoTerm
                                                         term="(WebID)"
                                                         explainer="A web link to your personal space — your portable online profile and storage."
+                                                        slug="pod"
                                                     />
                                                 </p>
                                                 <p class="text-xs text-amber-300 font-mono truncate" data-testid="signup-webid">
