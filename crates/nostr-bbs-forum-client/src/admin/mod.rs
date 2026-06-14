@@ -8,6 +8,7 @@ pub mod audit_log;
 pub mod calendar;
 pub mod channel_form;
 pub mod overview;
+pub mod registrations;
 pub mod reports;
 pub mod section_requests;
 pub mod settings;
@@ -30,6 +31,7 @@ pub enum AdminTab {
     Overview,
     Channels,
     Users,
+    Pending,
     Sections,
     Calendar,
     Settings,
@@ -64,6 +66,25 @@ pub struct WhitelistUser {
     pub handle: Option<String>,
 }
 
+/// A username reservation returned from the auth-worker
+/// `GET /api/admin/registrations` route. Every active reservation is listed
+/// here — both already-whitelisted users and those still awaiting approval.
+/// "Pending" is derived by subtracting the relay whitelist (see
+/// [`AdminStore::pending_registrations`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Registration {
+    pub pubkey: String,
+    /// Public claimed handle (username). May be absent for legacy rows.
+    #[serde(default)]
+    pub handle: Option<String>,
+    /// Admin-only real name supplied at signup. Never surfaced publicly.
+    #[serde(default)]
+    pub real_name: Option<String>,
+    /// Unix seconds the reservation was created. Used to sort newest-first.
+    #[serde(default)]
+    pub created_at: u64,
+}
+
 /// A channel parsed from a kind-40 event on the relay.
 #[derive(Clone, Debug)]
 pub struct AdminChannel {
@@ -90,6 +111,9 @@ pub struct AdminStats {
 #[derive(Clone)]
 pub struct AdminState {
     pub users: RwSignal<Vec<WhitelistUser>>,
+    /// Every username reservation from the auth-worker. The pending set (rows
+    /// not yet on the relay whitelist) is derived reactively, never stored.
+    pub registrations: RwSignal<Vec<Registration>>,
     pub channels: RwSignal<Vec<AdminChannel>>,
     pub stats: RwSignal<AdminStats>,
     pub is_loading: RwSignal<bool>,
@@ -113,6 +137,7 @@ impl AdminStore {
         Self {
             state: AdminState {
                 users: RwSignal::new(Vec::new()),
+                registrations: RwSignal::new(Vec::new()),
                 channels: RwSignal::new(Vec::new()),
                 stats: RwSignal::new(AdminStats::default()),
                 is_loading: RwSignal::new(false),
@@ -156,6 +181,11 @@ impl AdminStore {
                 self.state.stats.update(|s| {
                     s.total_users = self.state.users.get_untracked().len() as u32;
                 });
+                // The pending count is whitelist-relative, so recompute it
+                // whenever the whitelist changes (a just-approved user must drop
+                // out of "pending"). Safe even before registrations are loaded:
+                // it simply yields 0 until the first registrations fetch.
+                self.recompute_pending();
                 self.state.is_loading.set(false);
                 Ok(())
             }
@@ -208,6 +238,101 @@ impl AdminStore {
                     .map(|s| s.to_string());
             }
         }
+    }
+
+    /// Fetch the full set of username reservations from the auth-worker
+    /// `GET /api/admin/registrations` and store them, then recompute the
+    /// whitelist-relative pending-approvals count. This is the **only** source
+    /// of the Overview "Pending" stat — without it the count stays frozen at
+    /// its `Default` (0), which is the stale-icon bug operators reported.
+    ///
+    /// Best-effort: a 404 / network failure clears the registrations list and
+    /// the pending count drops to 0 rather than freezing on a stale value, so
+    /// the UI never lies about an endpoint that has gone away.
+    pub async fn fetch_registrations_signer(&self, signer: &dyn Signer) -> Result<(), String> {
+        let url = format!(
+            "{}/api/admin/registrations",
+            crate::utils::relay_url::auth_api_base()
+        );
+        match fetch_with_nip98_get_signer(&url, signer).await {
+            Ok(body) => {
+                let resp: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|e| format!("Failed to parse registrations: {e}"))?;
+                let items = resp
+                    .get("registrations")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let regs: Vec<Registration> = items
+                    .iter()
+                    .filter_map(|item| {
+                        let pubkey = item.get("pubkey").and_then(|v| v.as_str())?.to_string();
+                        let handle = item
+                            .get("handle")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                        // The auth-worker serialises an unset real name as the
+                        // JSON string "null" in some legacy rows — treat that
+                        // (and the empty string) as absent.
+                        let real_name = item
+                            .get("real_name")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty() && *s != "null")
+                            .map(|s| s.to_string());
+                        let created_at =
+                            item.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+                        Some(Registration {
+                            pubkey,
+                            handle,
+                            real_name,
+                            created_at,
+                        })
+                    })
+                    .collect();
+                self.state.registrations.set(regs);
+                self.recompute_pending();
+                Ok(())
+            }
+            Err(e) => {
+                // Endpoint gone or unreachable: don't show a frozen number.
+                self.state.registrations.set(Vec::new());
+                self.recompute_pending();
+                web_sys::console::warn_1(
+                    &format!("[admin] fetch registrations failed: {e}").into(),
+                );
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// The pending set: reservations that are **not** on the relay whitelist.
+    /// Derived from the two stored lists so it always reflects the live state
+    /// after an approval. Sorted newest-first by reservation time.
+    pub fn pending_registrations(&self) -> Vec<Registration> {
+        let whitelisted: std::collections::HashSet<String> = self
+            .state
+            .users
+            .get_untracked()
+            .into_iter()
+            .map(|u| u.pubkey)
+            .collect();
+        let mut pending: Vec<Registration> = self
+            .state
+            .registrations
+            .get_untracked()
+            .into_iter()
+            .filter(|r| !whitelisted.contains(&r.pubkey))
+            .collect();
+        pending.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        pending
+    }
+
+    /// Recompute the Overview "Pending" stat from the current registrations and
+    /// whitelist. Called after either list changes.
+    pub fn recompute_pending(&self) {
+        let count = self.pending_registrations().len() as u32;
+        self.state.stats.update(|s| s.pending_approvals = count);
     }
 
     pub async fn add_to_whitelist_signer(
