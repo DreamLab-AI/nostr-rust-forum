@@ -186,6 +186,13 @@ pub enum Nip98ClientError {
 /// Mirrors `nostr_bbs_core::nip98::create_token_at` but routes the signing
 /// step through the Signer trait so non-PRF backends (NIP-07, hardware) can
 /// participate.
+thread_local! {
+    /// Monotonic per-document counter so two NIP-98 tokens minted in the same
+    /// second never share an event id. WASM is single-threaded, so a `Cell` is
+    /// sufficient.
+    static NIP98_NONCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub async fn create_nip98_token_with_signer(
     signer: &dyn Signer,
     url: &str,
@@ -198,6 +205,22 @@ pub async fn create_nip98_token_with_signer(
         vec!["u".to_string(), url.to_string()],
         vec!["method".to_string(), method.to_string()],
     ];
+    // Uniqueness nonce. Two authed reads fired in the same second (e.g. the admin
+    // Overview card and the Pending tab both GET /api/admin/registrations on load)
+    // otherwise produce byte-identical NIP-98 events — same created_at seconds,
+    // same tags, empty content → identical event id → the worker's NIP-98 replay
+    // guard 401s the duplicate, blanking the data until a manual refresh. A
+    // per-call nonce makes each token's id unique; extra tags are ignored by
+    // NIP-98 validators (they only read `u`, `method`, and `payload`).
+    let nonce = NIP98_NONCE.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    });
+    tags.push(vec![
+        "nonce".to_string(),
+        format!("{}-{}", Date::now() as u64, nonce),
+    ]);
     if let Some(body_bytes) = body {
         let hash = Sha256::digest(body_bytes);
         tags.push(vec!["payload".to_string(), hex::encode(hash)]);
