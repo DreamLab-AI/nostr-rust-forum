@@ -91,45 +91,6 @@ pub async fn search_similar(
     Ok(data.results)
 }
 
-/// Index a new message for semantic search (NIP-98 authenticated).
-pub async fn ingest_message(
-    event_id: &str,
-    content: &str,
-    channel: Option<&str>,
-    secret_key: &[u8; 32],
-) -> Result<bool, String> {
-    let embedding = embed_query(content).await?;
-
-    let url = format!("{}/ingest", SEARCH_API);
-    let body = serde_json::json!({
-        "entries": [{
-            "id": event_id,
-            "embedding": embedding,
-            "channel": channel,
-            "timestamp": (js_sys::Date::now() / 1000.0) as u64,
-        }]
-    });
-    let body_str = body.to_string();
-
-    // Create NIP-98 auth token
-    let token =
-        crate::auth::nip98::create_nip98_token(secret_key, &url, "POST", Some(body_str.as_bytes()))
-            .map_err(|e| format!("NIP-98 error: {}", e))?;
-
-    let response = fetch_json_post(&url, &body_str, Some(&token)).await?;
-
-    #[derive(serde::Deserialize)]
-    struct IngestResponse {
-        #[serde(default)]
-        accepted: u32,
-    }
-
-    let data: IngestResponse =
-        serde_json::from_str(&response).map_err(|e| format!("Parse error: {}", e))?;
-
-    Ok(data.accepted > 0)
-}
-
 /// Index a new message for semantic search (Signer-based NIP-98 auth).
 pub async fn ingest_message_signer(
     event_id: &str,
