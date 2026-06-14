@@ -5,8 +5,8 @@
 //!
 //! ## Two paths
 //!
-//! - The original `fetch_with_nip98_{post,get}` take a 32-byte secret key and
-//!   only support the PRF/local-key signing path.
+//! - The original `fetch_with_nip98_post` takes a 32-byte secret key and
+//!   only supports the PRF/local-key signing path.
 //! - The Sprint v11 `fetch_with_nip98_{post,get}_signer` take any
 //!   [`nostr_bbs_core::signer::Signer`] (PRF, NIP-07, future hardware bunkers)
 //!   and route signing through the trait. They build the unsigned NIP-98
@@ -103,52 +103,6 @@ pub async fn fetch_with_nip98_post(
         .ok_or_else(|| Nip98ClientError::Fetch("Response body not a string".into()))
 }
 
-/// Fetch any URL with GET and NIP-98 authorization.
-pub async fn fetch_with_nip98_get(
-    url: &str,
-    secret_key: &[u8; 32],
-) -> Result<String, Nip98ClientError> {
-    let token = create_nip98_token(secret_key, url, "GET", None)?;
-    let auth_header = format!("Nostr {token}");
-
-    let win = window().ok_or(Nip98ClientError::NoBrowser)?;
-
-    let init = web_sys::RequestInit::new();
-    init.set_method("GET");
-
-    let headers = web_sys::Headers::new().map_err(|e| Nip98ClientError::Fetch(format!("{e:?}")))?;
-    headers
-        .set("Authorization", &auth_header)
-        .map_err(|e| Nip98ClientError::Fetch(format!("{e:?}")))?;
-    init.set_headers(&headers);
-
-    let request = web_sys::Request::new_with_str_and_init(url, &init)
-        .map_err(|e| Nip98ClientError::Fetch(format!("{e:?}")))?;
-
-    let resp_val = JsFuture::from(win.fetch_with_request(&request))
-        .await
-        .map_err(|e| Nip98ClientError::Fetch(format!("{e:?}")))?;
-
-    let resp: web_sys::Response = resp_val
-        .dyn_into()
-        .map_err(|_| Nip98ClientError::Fetch("Not a Response".into()))?;
-
-    if !resp.ok() {
-        let status = resp.status();
-        return Err(Nip98ClientError::ServerError(format!("HTTP {status}")));
-    }
-
-    let text_promise = resp
-        .text()
-        .map_err(|e| Nip98ClientError::Fetch(format!("{e:?}")))?;
-    let text = JsFuture::from(text_promise)
-        .await
-        .map_err(|e| Nip98ClientError::Fetch(format!("{e:?}")))?;
-
-    text.as_string()
-        .ok_or_else(|| Nip98ClientError::Fetch("Response body not a string".into()))
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum Nip98ClientError {
     #[error("No browser environment")]
@@ -180,18 +134,18 @@ pub enum Nip98ClientError {
 // fns are also async and must be awaited from a `spawn_local`-style task.
 // ---------------------------------------------------------------------------
 
-/// Build an unsigned NIP-98 event, sign it through the supplied [`Signer`],
-/// and return the base64-encoded `Authorization: Nostr <token>` payload.
-///
-/// Mirrors `nostr_bbs_core::nip98::create_token_at` but routes the signing
-/// step through the Signer trait so non-PRF backends (NIP-07, hardware) can
-/// participate.
 // Monotonic per-document counter so two NIP-98 tokens minted in the same second
 // never share an event id. WASM is single-threaded, so a `Cell` is sufficient.
 thread_local! {
     static NIP98_NONCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Build an unsigned NIP-98 event, sign it through the supplied [`Signer`],
+/// and return the base64-encoded `Authorization: Nostr <token>` payload.
+///
+/// Mirrors `nostr_bbs_core::nip98::create_token_at` but routes the signing
+/// step through the Signer trait so non-PRF backends (NIP-07, hardware) can
+/// participate.
 pub async fn create_nip98_token_with_signer(
     signer: &dyn Signer,
     url: &str,
@@ -307,9 +261,7 @@ pub async fn fetch_with_nip98_post_signer(
 
 /// GET `url` with NIP-98 auth via the supplied Signer.
 ///
-/// Drop-in replacement for [`fetch_with_nip98_get`] that works for any
-/// [`Signer`] backend.
-#[allow(dead_code)]
+/// Works for any [`Signer`] backend (PRF, NIP-07, hardware bunkers).
 pub async fn fetch_with_nip98_get_signer(
     url: &str,
     signer: &dyn Signer,

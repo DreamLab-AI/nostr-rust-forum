@@ -1,8 +1,7 @@
-//! Inline media embeds for images, YouTube videos, and encrypted DM images.
+//! Inline media embeds for images, direct video files, and YouTube videos.
 
 use leptos::prelude::*;
 
-use crate::dm::encrypted_media::{decrypt_dm_image, EncryptedImage};
 use crate::stores::preferences::use_preferences;
 
 /// Detected media type from a URL.
@@ -183,101 +182,5 @@ pub(crate) fn MediaEmbed(
                 view! { <span></span> }.into_any()
             }
         }
-    }
-}
-
-/// Render an encrypted DM image with decryption, lock icon overlay, and loading skeleton.
-///
-/// Decrypts the image on mount using the recipient's private key, then renders
-/// it as a blob URL. Shows a lock icon to indicate the content is encrypted.
-#[allow(dead_code)]
-#[component]
-pub(crate) fn EncryptedMediaEmbed(
-    /// JSON-serialized EncryptedImage from a DM event tag.
-    encrypted_json: String,
-    /// Hex pubkey of the message sender (needed for NIP-44 decryption).
-    sender_pubkey: String,
-    /// Recipient's 32-byte private key for decryption.
-    recipient_privkey: [u8; 32],
-) -> impl IntoView {
-    let decrypted_url = RwSignal::new(Option::<String>::None);
-    let error = RwSignal::new(Option::<String>::None);
-    let loading = RwSignal::new(true);
-
-    // Decrypt on mount
-    wasm_bindgen_futures::spawn_local(async move {
-        let encrypted = match EncryptedImage::from_tag_value(&encrypted_json) {
-            Ok(e) => e,
-            Err(e) => {
-                error.set(Some(format!("Parse error: {e}")));
-                loading.set(false);
-                return;
-            }
-        };
-
-        match decrypt_dm_image(&encrypted, &sender_pubkey, &recipient_privkey).await {
-            Ok(blob) => match web_sys::Url::create_object_url_with_blob(&blob) {
-                Ok(url) => {
-                    decrypted_url.set(Some(url));
-                }
-                Err(e) => {
-                    error.set(Some(format!("URL creation: {e:?}")));
-                }
-            },
-            Err(e) => {
-                error.set(Some(format!("Decryption failed: {e}")));
-            }
-        }
-        loading.set(false);
-    });
-
-    view! {
-        <div class="mt-2 max-w-lg relative">
-            // Loading skeleton
-            <Show when=move || loading.get()>
-                <div class="skeleton h-48 w-full rounded-lg flex items-center justify-center">
-                    <div class="flex items-center gap-2 text-gray-500 text-xs">
-                        <svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M12 2v4m0 12v4m-7.07-3.93l2.83-2.83m8.48-8.48l2.83-2.83M2 12h4m12 0h4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83"/>
-                        </svg>
-                        <span>"Decrypting..."</span>
-                    </div>
-                </div>
-            </Show>
-
-            // Error state
-            {move || {
-                error.get().map(|e| view! {
-                    <div class="flex items-center gap-2 text-gray-500 text-xs p-2 bg-gray-800/50 rounded-lg border border-gray-700/50">
-                        <svg class="w-4 h-4 flex-shrink-0 text-red-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <rect x="3" y="5" width="18" height="14" rx="2"/>
-                            <path d="M7 5V3a5 5 0 0110 0v2"/>
-                        </svg>
-                        <span>{e}</span>
-                    </div>
-                })
-            }}
-
-            // Decrypted image with lock overlay
-            {move || {
-                decrypted_url.get().map(|url| view! {
-                    <div class="relative group">
-                        <img
-                            src=url
-                            alt="Encrypted image"
-                            class="max-h-[400px] w-auto rounded-lg border border-gray-700/50"
-                            loading="lazy"
-                        />
-                        // Lock icon overlay
-                        <div class="absolute top-2 right-2 bg-gray-900/70 backdrop-blur-sm rounded-full p-1.5 flex items-center gap-1">
-                            <svg class="w-3 h-3 text-amber-400" viewBox="0 0 24 24" fill="currentColor">
-                                <path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM9 8V6c0-1.66 1.34-3 3-3s3 1.34 3 3v2H9z"/>
-                            </svg>
-                            <span class="text-[10px] text-amber-400/80 font-medium pr-0.5">"E2E"</span>
-                        </div>
-                    </div>
-                })
-            }}
-        </div>
     }
 }

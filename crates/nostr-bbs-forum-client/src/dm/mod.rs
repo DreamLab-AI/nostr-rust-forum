@@ -4,8 +4,6 @@
 //! backward-compatible NIP-44 kind-4 decryption for incoming events. Subscribes
 //! to both kind 4 and kind 1059 events for real-time DM delivery via the relay.
 
-pub mod encrypted_media;
-
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
