@@ -6,7 +6,8 @@ If you discover a security vulnerability in nostr-rust-forum, please report it
 responsibly. Do NOT open a public GitHub issue.
 
 - **Preferred:** Open a [GitHub Security Advisory](https://github.com/DreamLab-AI/nostr-rust-forum/security/advisories/new)
-- **Alternate:** Email security@dreamlab-ai.com
+- **Operators:** if you deploy this kit, publish your own security contact for
+  your community and triage reports for your deployment.
 
 We will acknowledge receipt within 48 hours and aim to provide a fix or
 mitigation within 7 days for critical issues.

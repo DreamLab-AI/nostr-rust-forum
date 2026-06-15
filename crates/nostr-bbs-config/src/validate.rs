@@ -113,7 +113,119 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
         );
     }
 
+    // provision.private_dir must be an absolute container path.
+    if !cfg.provision.private_dir.starts_with('/') {
+        return Err(format!(
+            "provision.private_dir must be an absolute path starting with '/' (got {})",
+            cfg.provision.private_dir
+        ));
+    }
+    if cfg.provision.privkey_filename.is_empty() {
+        return Err("provision.privkey_filename must not be empty".into());
+    }
+
+    // export.rate_limit_per_min, when export is enabled, must be > 0.
+    if cfg.export.enabled && cfg.export.rate_limit_per_min == 0 {
+        return Err("export.rate_limit_per_min must be > 0 when export.enabled = true".into());
+    }
+
+    // git.default_branch must not be empty.
+    if cfg.git.default_branch.is_empty() {
+        return Err("git.default_branch must not be empty".into());
+    }
+    // git.clone_url_base, when set, must be HTTPS (or a localhost dev URL).
+    if !cfg.git.clone_url_base.is_empty()
+        && !cfg.git.clone_url_base.starts_with("https://")
+        && !cfg.git.clone_url_base.starts_with("http://localhost")
+    {
+        return Err(format!(
+            "git.clone_url_base must use https:// (got {})",
+            cfg.git.clone_url_base
+        ));
+    }
+
+    // governance.kinds_lo <= kinds_hi.
+    if cfg.governance.kinds_lo > cfg.governance.kinds_hi {
+        return Err(format!(
+            "governance.kinds_lo ({}) must be <= kinds_hi ({})",
+            cfg.governance.kinds_lo, cfg.governance.kinds_hi
+        ));
+    }
+    // governance.relay_url, when set, must be wss:// (or localhost dev URL).
+    if !cfg.governance.relay_url.is_empty()
+        && !cfg.governance.relay_url.starts_with("wss://")
+        && !cfg.governance.relay_url.starts_with("ws://localhost")
+    {
+        return Err(format!(
+            "governance.relay_url must use wss:// (got {})",
+            cfg.governance.relay_url
+        ));
+    }
+    // governance agent pubkeys must be 64-char hex.
+    for pk in &cfg.governance.agent_pubkeys {
+        if pk.len() != 64 || !pk.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "governance.agent_pubkeys entry not 64-char hex: {pk}"
+            ));
+        }
+    }
+    // Enabling governance with no authorised agents is a foot-gun.
+    if cfg.governance.enabled && cfg.governance.agent_pubkeys.is_empty() {
+        return Err(
+            "governance.enabled = true requires at least one entry in governance.agent_pubkeys"
+                .into(),
+        );
+    }
+
+    // payments: when enabled, the token sub-table (if present) must be coherent.
+    if let Some(token) = cfg.payments.token.as_ref() {
+        if cfg.payments.enabled && token.ticker.is_empty() {
+            return Err("payments.token.ticker must not be empty when payments.enabled = true".into());
+        }
+        if token.supply != 0 && token.rate != 0 && token.rate > token.supply {
+            return Err(format!(
+                "payments.token.rate ({}) must not exceed supply ({})",
+                token.rate, token.supply
+            ));
+        }
+    }
+
+    // calendar venues must be non-empty, unique strings.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for venue in &cfg.calendar.shared_venues {
+            if venue.trim().is_empty() {
+                return Err("calendar.shared_venues entries must not be empty".into());
+            }
+            if !seen.insert(venue.as_str()) {
+                return Err(format!(
+                    "calendar.shared_venues contains a duplicate venue: {venue}"
+                ));
+            }
+        }
+    }
+
+    // zone accent_hex, when set, must be a CSS hex colour (#rgb / #rrggbb).
+    for zone in &cfg.zones {
+        if let Some(accent) = zone.accent_hex.as_deref() {
+            if !is_valid_hex_colour(accent) {
+                return Err(format!(
+                    "zone '{}' accent_hex must be a CSS hex colour like #3b82f6 (got {})",
+                    zone.id, accent
+                ));
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// True for `#rgb`, `#rrggbb`, or `#rrggbbaa` CSS hex colour strings.
+fn is_valid_hex_colour(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix('#') else {
+        return false;
+    };
+    matches!(hex.len(), 3 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -166,6 +278,12 @@ mod tests {
                 git_enabled: true,
                 admin_provision_url: String::new(),
             },
+            provision: Provision::default(),
+            export: Export::default(),
+            git: Git::default(),
+            governance: Governance::default(),
+            payments: Payments::default(),
+            calendar: Calendar::default(),
         }
     }
 
@@ -304,13 +422,13 @@ operator = "tier-2"
 
 [nip05]
 resolver_mode = "federated"
-pod_base_url = "https://pods.dreamlab-ai.com"
+pod_base_url = "https://pods.example.com"
 "#;
         let cfg: ForumConfig = toml::from_str(toml_src).expect("parse");
         assert_eq!(cfg.nip05.resolver_mode, ResolverMode::Federated);
         assert_eq!(
             cfg.nip05.pod_base_url.as_deref(),
-            Some("https://pods.dreamlab-ai.com")
+            Some("https://pods.example.com")
         );
         validate_config(&cfg).expect("federated config with valid pod_base_url must validate");
     }
@@ -347,5 +465,250 @@ operator = "tier-2"
         let cfg: ForumConfig = toml::from_str(toml_src).expect("parse");
         assert_eq!(cfg.nip05.resolver_mode, ResolverMode::D1);
         assert!(cfg.nip05.pod_base_url.is_none());
+    }
+
+    #[test]
+    fn new_sections_default_to_valid() {
+        // Provision, export, git, governance, payments, calendar all default
+        // to a valid (conservative) state on a baseline config.
+        let cfg = baseline_cfg();
+        assert!(validate_config(&cfg).is_ok());
+        assert!(!cfg.provision.enabled);
+        assert_eq!(cfg.provision.private_dir, "/private/");
+        assert!(!cfg.export.enabled);
+        assert_eq!(cfg.export.rate_limit_per_min, 6);
+        assert!(!cfg.git.enabled);
+        assert_eq!(cfg.git.default_branch, "main");
+        assert!(!cfg.governance.enabled);
+        assert_eq!(cfg.governance.kinds_lo, 31400);
+        assert_eq!(cfg.governance.kinds_hi, 31405);
+        assert!(!cfg.payments.enabled);
+        assert_eq!(cfg.calendar.shared_venues, vec!["primary", "secondary"]);
+    }
+
+    #[test]
+    fn provision_relative_private_dir_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.provision.private_dir = "private/".into();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn export_enabled_zero_rate_limit_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.export.enabled = true;
+        cfg.export.rate_limit_per_min = 0;
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn git_empty_branch_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.git.default_branch = String::new();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn git_http_clone_url_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.git.clone_url_base = "http://pods.example.com".into();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn git_https_clone_url_accepted() {
+        let mut cfg = baseline_cfg();
+        cfg.git.clone_url_base = "https://pods.example.com".into();
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn governance_bad_kind_range_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.governance.kinds_lo = 31405;
+        cfg.governance.kinds_hi = 31400;
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn governance_enabled_without_agents_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.governance.enabled = true;
+        cfg.governance.agent_pubkeys.clear();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn governance_enabled_with_agent_accepted() {
+        let mut cfg = baseline_cfg();
+        cfg.governance.enabled = true;
+        cfg.governance.agent_pubkeys = vec!["a".repeat(64)];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn governance_non_hex_agent_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.governance.agent_pubkeys = vec!["not-hex".into()];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn governance_http_relay_url_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.governance.relay_url = "https://relay.example.com".into();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn payments_enabled_empty_ticker_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.payments.enabled = true;
+        cfg.payments.token = Some(PaymentToken {
+            ticker: String::new(),
+            rate: 10,
+            supply: 1000,
+            issuer: String::new(),
+        });
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn payments_token_rate_exceeds_supply_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.payments.enabled = true;
+        cfg.payments.token = Some(PaymentToken {
+            ticker: "COIN".into(),
+            rate: 5000,
+            supply: 1000,
+            issuer: String::new(),
+        });
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn calendar_empty_venue_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.calendar.shared_venues = vec!["primary".into(), "  ".into()];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn calendar_duplicate_venue_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.calendar.shared_venues = vec!["primary".into(), "primary".into()];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn zone_valid_accent_hex_accepted() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![Zone {
+            id: "public".into(),
+            display_name: "Public".into(),
+            required_cohorts: Vec::new(),
+            write_cohorts: None,
+            banner_image_url: None,
+            accent_hex: Some("#3b82f6".into()),
+            visibility: ZoneVisibility::Public,
+            encrypted: false,
+        }];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn zone_bad_accent_hex_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![Zone {
+            id: "public".into(),
+            display_name: "Public".into(),
+            required_cohorts: Vec::new(),
+            write_cohorts: None,
+            banner_image_url: None,
+            accent_hex: Some("blue".into()),
+            visibility: ZoneVisibility::Public,
+            encrypted: false,
+        }];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn new_sections_toml_round_trip() {
+        // A TOML with every new section parses and validates.
+        // (r##"…"##: the inner `accent_hex = "#…"` contains `"#`, which would
+        // otherwise close an r#"…"# raw string early.)
+        let toml_src = r##"
+[deployment]
+name = "Community Forum"
+hostname = "https://forum.example.com"
+
+[webauthn]
+rp_id = "forum.example.com"
+expected_origin = "https://forum.example.com"
+
+[pod]
+base_url = "https://pods.example.com"
+storage_backend = "fs"
+
+[relay]
+url = "wss://relay.example.com"
+ingress_policy = "allowlist"
+
+[admin]
+mode = "static"
+static_pubkeys = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+
+[[zones]]
+id = "public"
+display_name = "Public"
+visibility = "public"
+accent_hex = "#3b82f6"
+
+[mesh]
+mode = "standalone"
+
+[custody]
+operator = "tier-1"
+
+[provision]
+enabled = true
+keys_at_signup = false
+
+[export]
+enabled = false
+rate_limit_per_min = 6
+
+[git]
+enabled = false
+default_branch = "main"
+clone_url_base = "https://pods.example.com"
+
+[governance]
+enabled = true
+agent_pubkeys = ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+
+[payments]
+enabled = true
+cost_sats = 1
+
+[payments.token]
+ticker = "COIN"
+rate = 10
+supply = 1000000
+
+[calendar]
+shared_venues = ["primary", "secondary"]
+"##;
+        let cfg: ForumConfig = toml::from_str(toml_src).expect("parse");
+        validate_config(&cfg).expect("validate");
+        assert!(cfg.provision.enabled);
+        assert!(!cfg.provision.keys_at_signup);
+        assert_eq!(cfg.git.default_branch, "main");
+        assert!(cfg.governance.enabled);
+        assert_eq!(cfg.governance.agent_pubkeys.len(), 1);
+        assert!(cfg.payments.enabled);
+        assert_eq!(cfg.payments.token.as_ref().unwrap().ticker, "COIN");
+        assert_eq!(cfg.calendar.shared_venues, vec!["primary", "secondary"]);
+        assert_eq!(cfg.zones[0].accent_hex.as_deref(), Some("#3b82f6"));
     }
 }

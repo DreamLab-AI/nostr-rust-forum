@@ -3,7 +3,7 @@
 **Date:** 2026-05-16
 **Scope:** Kit crates only (`nostr-bbs-{auth-worker, pod-worker, relay-worker,
 preview-worker, search-worker, forum-client, core, config, mesh, rate-limit}`).
-The `dreamlab-ai-website` operator overlay is out of scope.
+The operator overlay (the deployment-specific branding/config repo) is out of scope.
 **Trigger:** `solid-pod-rs` bumped 0.4.0-alpha.10 → 0.4.0-alpha.11 (commit
 874524f, task #6 closed). Phase 1 features `provision-keys`, `nip05-endpoint`,
 `export-jsonld` are now reachable from the workspace.

@@ -47,6 +47,24 @@ pub struct ForumConfig {
     /// Native solid-pod-rs server (agentbox tier) configuration.
     #[serde(default)]
     pub native_pod: NativePod,
+    /// Pod creation / provisioning policy (JSS Phase 1).
+    #[serde(default)]
+    pub provision: Provision,
+    /// Pod data export surface (`/api/exports/*`; JSS Phase 1).
+    #[serde(default)]
+    pub export: Export,
+    /// Git-versioned pods (JSS #471; solid-pod-rs alpha.12).
+    #[serde(default)]
+    pub git: Git,
+    /// Agent governance control-surface configuration (kinds 31400-31405).
+    #[serde(default)]
+    pub governance: Governance,
+    /// Payments / micro-ledger configuration (HTTP 402 + community token).
+    #[serde(default)]
+    pub payments: Payments,
+    /// Shared calendar / venue configuration (NIP-52 events).
+    #[serde(default)]
+    pub calendar: Calendar,
 }
 
 /// Deployment metadata.
@@ -154,6 +172,11 @@ pub struct Zone {
     /// to non-members).
     #[serde(default)]
     pub banner_image_url: Option<String>,
+    /// Accent colour for this zone tile, as a CSS hex string (e.g. `"#3b82f6"`).
+    /// Lets operators theme custom zones from config without editing the client.
+    /// When absent, the client falls back to the global [`Branding`] theme.
+    #[serde(default)]
+    pub accent_hex: Option<String>,
     /// Visibility policy for non-members. See [`ZoneVisibility`].
     #[serde(default)]
     pub visibility: ZoneVisibility,
@@ -242,6 +265,10 @@ pub struct Features {
     /// Direct messages UI.
     #[serde(default)]
     pub dms: bool,
+    /// Agent governance UI (control surfaces, kinds 31400-31405). When `false`
+    /// the governance route is hidden even if [`Governance::enabled`] is set.
+    #[serde(default)]
+    pub governance: bool,
 }
 
 /// Operator custody tier (per ADR-079 §4).
@@ -295,7 +322,7 @@ pub struct Nip05 {
 pub struct NativePod {
     #[serde(default)]
     pub enabled: bool,
-    /// Public base URL of the native server (e.g. "https://pods-native.dreamlab-ai.com")
+    /// Public base URL of the native server (e.g. "https://pods-native.example.com")
     #[serde(default)]
     pub base_url: String,
     /// Cohorts eligible for a native pod.  Empty = all authenticated users.
@@ -325,4 +352,248 @@ impl Default for NativePod {
 
 fn bool_true() -> bool {
     true
+}
+
+/// `[provision]` — pod creation / provisioning policy (JSS Phase 1).
+///
+/// When [`enabled`](Self::enabled) is `true`, authenticated `POST /.pods` and
+/// `/pods/{pubkey}/.provision` requests create the user's Solid pod (WebID
+/// profile, TypeIndex documents, media containers). Whether a generated
+/// keypair is written into the pod at signup is governed by
+/// [`keys_at_signup`](Self::keys_at_signup); deployments that generate keys
+/// on-device should leave it `false` so the backend never stores private keys.
+///
+/// All defaults are conservative: provisioning is OFF unless an operator opts
+/// in by adding the block (or setting `enabled = true`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Provision {
+    /// Master switch for authenticated pod creation. `false` = no pod is
+    /// created at signup (legacy behaviour).
+    #[serde(default)]
+    pub enabled: bool,
+    /// When `enabled`, write the generated keypair into the pod at signup.
+    /// Leave `false` when keys are generated on-device and the backend must
+    /// never store private keys.
+    #[serde(default = "bool_true")]
+    pub keys_at_signup: bool,
+    /// WAC-locked container path on the pod (e.g. `/private/`).
+    #[serde(default = "default_private_dir")]
+    pub private_dir: String,
+    /// NIP-19 bech32 keypair filename written under [`private_dir`](Self::private_dir).
+    #[serde(default = "default_privkey_filename")]
+    pub privkey_filename: String,
+}
+
+impl Default for Provision {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keys_at_signup: true,
+            private_dir: default_private_dir(),
+            privkey_filename: default_privkey_filename(),
+        }
+    }
+}
+
+fn default_private_dir() -> String {
+    "/private/".into()
+}
+
+fn default_privkey_filename() -> String {
+    "privkey.jsonld".into()
+}
+
+/// `[export]` — pod data export surface (`/api/exports/*`; JSS Phase 1).
+///
+/// The export surface bundles a member's pod data (and, with owner consent,
+/// `/private/*`) into a downloadable archive. It is bandwidth-heavy, so it is
+/// rate-limited per-IP and OFF by default. Enable only on a backend that
+/// actually serves the export route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Export {
+    /// Master switch for the export surface.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default for whether `/private/*` is included when the caller supplies no
+    /// explicit query parameter. Owner WAC is always required for private
+    /// inclusion regardless of this default.
+    #[serde(default)]
+    pub include_private_default: bool,
+    /// Per-IP rate limit (requests per minute) for the export surface.
+    #[serde(default = "default_export_rate_limit")]
+    pub rate_limit_per_min: u32,
+}
+
+impl Default for Export {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_private_default: false,
+            rate_limit_per_min: default_export_rate_limit(),
+        }
+    }
+}
+
+fn default_export_rate_limit() -> u32 {
+    6
+}
+
+/// `[git]` — git-versioned pods (JSS #471; solid-pod-rs alpha.12).
+///
+/// When [`enabled`](Self::enabled), the pod backend `git init`s each pod at
+/// creation with the configured [`default_branch`](Self::default_branch) and
+/// `receive.denyCurrentBranch=updateInstead`, giving members a per-pod audit
+/// trail and easy backup. Backends that cannot spawn subprocesses (e.g.
+/// serverless Workers) must leave this disabled; native backends flip it on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Git {
+    /// Master switch. Leave `false` on backends that cannot spawn subprocesses.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Informational — automatically `git init` each new pod when
+    /// [`enabled`](Self::enabled) is `true`.
+    #[serde(default = "bool_true")]
+    pub auto_init: bool,
+    /// Default branch name for newly-initialised pod repositories.
+    #[serde(default = "default_git_default_branch")]
+    pub default_branch: String,
+    /// Base URL surfaced to the forum-client for `git clone` instructions.
+    /// Empty string disables the UI hint.
+    #[serde(default)]
+    pub clone_url_base: String,
+}
+
+impl Default for Git {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_init: true,
+            default_branch: default_git_default_branch(),
+            clone_url_base: String::new(),
+        }
+    }
+}
+
+fn default_git_default_branch() -> String {
+    "main".into()
+}
+
+/// `[governance]` — agent governance control surfaces (kinds 31400-31405).
+///
+/// Pre-registered agent pubkeys are authorised to publish governance control
+/// panels (kind 31400) and action requests (kind 31402). The forum exposes a
+/// governance route when [`enabled`](Self::enabled) is `true`. Disabled by
+/// default; operators populate [`agent_pubkeys`](Self::agent_pubkeys) at
+/// deploy time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Governance {
+    /// Master switch for the governance control surface.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Client route under which the governance UI is mounted (e.g. `/governance`).
+    #[serde(default = "default_governance_route")]
+    pub route: String,
+    /// Inclusive lower-bound of governance event kinds.
+    #[serde(default = "default_governance_kinds_lo")]
+    pub kinds_lo: u64,
+    /// Inclusive upper-bound of governance event kinds.
+    #[serde(default = "default_governance_kinds_hi")]
+    pub kinds_hi: u64,
+    /// Relay URL for governance events. Empty = reuse the main [`Relay`].
+    #[serde(default)]
+    pub relay_url: String,
+    /// Agent pubkeys (hex) allowed to publish control-surface events.
+    #[serde(default)]
+    pub agent_pubkeys: Vec<String>,
+}
+
+impl Default for Governance {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            route: default_governance_route(),
+            kinds_lo: default_governance_kinds_lo(),
+            kinds_hi: default_governance_kinds_hi(),
+            relay_url: String::new(),
+            agent_pubkeys: Vec::new(),
+        }
+    }
+}
+
+fn default_governance_route() -> String {
+    "/governance".into()
+}
+
+fn default_governance_kinds_lo() -> u64 {
+    31400
+}
+
+fn default_governance_kinds_hi() -> u64 {
+    31405
+}
+
+/// `[payments]` — HTTP 402 micro-ledger + optional community token.
+///
+/// Lets a deployment gate paid actions behind a per-action sats cost and,
+/// optionally, mint a community token at a fixed rate against sats. Disabled
+/// by default; the `[payments.token]` sub-table is purely descriptive metadata
+/// surfaced to the client.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Payments {
+    /// Master switch for paid actions.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default cost (in sats) of a paid action.
+    #[serde(default)]
+    pub cost_sats: u64,
+    /// Optional community token metadata.
+    #[serde(default)]
+    pub token: Option<PaymentToken>,
+}
+
+/// `[payments.token]` — descriptive community-token metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PaymentToken {
+    /// Ticker symbol (e.g. `"COIN"`).
+    #[serde(default)]
+    pub ticker: String,
+    /// Token units minted per sat.
+    #[serde(default)]
+    pub rate: u64,
+    /// Total supply cap.
+    #[serde(default)]
+    pub supply: u64,
+    /// Issuer pubkey/identifier. Empty until the operator sets it at deploy time.
+    #[serde(default)]
+    pub issuer: String,
+}
+
+/// `[calendar]` — shared calendar / venue configuration (NIP-52 events).
+///
+/// A deployment can expose one or more shared **venues** — named buckets that
+/// scheduled NIP-52 events (kinds 31922/31923) are filed under. The venue model
+/// keeps cross-zone scheduling tidy: a calendar bot writes an event tagged with
+/// a venue from [`shared_venues`](Self::shared_venues), and the client groups
+/// the agenda by venue. Operators name venues however they like (rooms,
+/// channels, physical spaces); the default is two generic slots so the calendar
+/// renders out-of-the-box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Calendar {
+    /// Named venues that scheduled events are filed under. Order is preserved
+    /// and surfaced as the agenda's column/tab order. Defaults to
+    /// `["primary", "secondary"]`.
+    #[serde(default = "default_shared_venues")]
+    pub shared_venues: Vec<String>,
+}
+
+impl Default for Calendar {
+    fn default() -> Self {
+        Self {
+            shared_venues: default_shared_venues(),
+        }
+    }
+}
+
+fn default_shared_venues() -> Vec<String> {
+    vec!["primary".into(), "secondary".into()]
 }

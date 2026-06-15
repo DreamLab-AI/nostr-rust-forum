@@ -3,8 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project tracks the spec home at [VisionClaw monorepo](https://github.com/DreamLab-AI/VisionClaw)
-(`docs/specs/` + `docs/adr/`) for cross-substrate normative decisions.
+and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [ADR backfill] - 2026-06-11
 
@@ -31,7 +30,7 @@ and this project tracks the spec home at [VisionClaw monorepo](https://github.co
   API-breaking (removing any `pub` item — the `!` commits dropping `nip26`/`nip90`),
   `1.0.0-beta.N` line semantics (breaking bumps the beta counter, not major; betas
   don't auto-match), next publish is **1.0.0-beta.3**, yank-for-defect-only policy,
-  and the SHA-pin downstream contract (dreamlab pins by SHA). Codifies the R2/R4
+  and the SHA-pin downstream contract (downstream overlays pin by SHA). Codifies the R2/R4
   audit findings.
 - **ADR-104 — NIP-59 gift-wrap recipient admission + relay gating** (`docs/adr/`):
   documents the implemented rule — the relay admits kind-1059 by **recipient `#p`
@@ -188,7 +187,7 @@ control plane for any agent system.
 
 ## [Security Audit Sprint] - 2026-05-11
 
-DreamLab ecosystem-wide security audit. 12 fixes applied to nostr-rust-forum
+An ecosystem-wide security audit. 12 fixes applied to nostr-rust-forum
 covering P0 critical, P1 high, P2 medium, and P3 housekeeping findings.
 
 ### Security
@@ -269,7 +268,7 @@ Payments, security hardening, and upstream alignment.
 
 Phase 2 kit-extraction import. Brings critical security fixes, the F26 upstream
 canary crate, L1 reference-vector test scaffolds, and Phase-1 substrate scripts
-across from the legacy `dreamlab-ai-website/community-forum-rs` fork (where
+across from the legacy operator fork (where
 they were authored during the mega-sprint Phase 0 + Phase 1 windows).
 
 ### Fixed (Critical)
@@ -317,7 +316,7 @@ they were authored during the mega-sprint Phase 0 + Phase 1 windows).
     drift detection. Supports `--verify` mode for CI gates and
     `VISIONCLAW_FIXTURES_PATH` for offline / local-monorepo dev.
   - `scripts/anti-drift-lint.sh` -- ADR-077 P3 anti-drift lint. Rejects
-    DreamLab-only Schnorr verification suite identifiers
+    Operator-specific Schnorr verification suite identifiers
     (`NostrSchnorrKey2024`, `SchnorrSecp256k1VerificationKey2022`/`2025`/`2026`)
     in favour of the canonical `SchnorrSecp256k1VerificationKey2019`. Rejects
     hand-rolled DID-Document emitters outside `crates/pod-worker/src/did.rs`
@@ -336,7 +335,7 @@ they were authored during the mega-sprint Phase 0 + Phase 1 windows).
   incrementally in Phase 3+.
 - Crate renaming to a `nostr-bbs-*` prefix and the new `nostr-bbs-config`,
   `nostr-bbs-mesh`, `nostr-bbs-setup-skill` crates remain deferred.
-- The `admin-cli` crate is DreamLab-specific and stays in the legacy fork.
+- The `admin-cli` crate is operator-specific and stays in the legacy fork.
 
 ### Provenance
 

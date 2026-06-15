@@ -7,17 +7,19 @@
 //! **border** colour. Centralising the mapping here means the zone hero, the
 //! category page and the section page all derive the same look from one source.
 //!
-//! ## Real zone ids (operator config, `forum-config/dreamlab.toml`)
+//! ## Generic zone ids (operator config, `forum.toml` overlay)
 //!
 //! | id            | display     | colour family                |
 //! |---------------|-------------|------------------------------|
-//! | `public`      | Landing     | amber / dawn (warm, open)    |
-//! | `minimoonoir` | Minimoonoir | rose / fuchsia (the social)  |
+//! | `public`      | Public      | amber / dawn (warm, open)    |
+//! | `friends`     | Friends     | rose / fuchsia (the social)  |
 //! | `family`      | Family      | emerald / teal (warm, safe)  |
-//! | `business`    | DreamLab    | **purple** (the brand, #29)  |
+//! | `business`    | Business    | purple (the brand accent)    |
 //!
-//! Unknown / legacy ids (`home`, `members`, `private`, seeded test zones) fall
-//! back to a neutral slate palette so navigation never renders un-themed.
+//! Display labels above are defaults; the operator overrides them via the
+//! `forum.toml` overlay. Unknown / legacy ids (`home`, `members`, `private`,
+//! seeded test zones) fall back to a neutral slate palette so navigation never
+//! renders un-themed.
 //!
 //! The accent is a literal hex so it can flow into a CSS custom property
 //! (`style="--zone-accent: #..."`) on page-root containers we own — chat/thread
@@ -40,8 +42,8 @@ pub struct ZoneTheme {
     pub accent_hex: &'static str,
 }
 
-/// Resolve the palette for a zone id. Matches the real operator zone ids and
-/// keeps legacy aliases working; everything else gets the neutral slate theme.
+/// Resolve the palette for a zone id. Matches the generic zone ids and keeps
+/// legacy aliases working; everything else gets the neutral slate theme.
 pub fn zone_theme(zone_id: &str) -> ZoneTheme {
     match zone_id {
         // public / Landing — warm amber dawn, mirrors the lake-district-dawn banner.
@@ -51,8 +53,8 @@ pub fn zone_theme(zone_id: &str) -> ZoneTheme {
             accent_text: "text-amber-400",
             accent_hex: "#f59e0b",
         },
-        // minimoonoir — the social zone: rose → fuchsia.
-        "minimoonoir" | "friends" => ZoneTheme {
+        // friends — the social zone: rose → fuchsia.
+        "friends" => ZoneTheme {
             gradient: "from-rose-500/20 via-pink-500/10 to-fuchsia-500/10",
             border: "border-rose-500/25",
             accent_text: "text-rose-400",
@@ -65,8 +67,8 @@ pub fn zone_theme(zone_id: &str) -> ZoneTheme {
             accent_text: "text-emerald-400",
             accent_hex: "#34d399",
         },
-        // business / DreamLab — PURPLE (issue #29: the DreamLab zone is purple).
-        "business" | "dreamlab" => ZoneTheme {
+        // business — purple, the brand accent zone.
+        "business" => ZoneTheme {
             gradient: "from-purple-500/25 via-violet-500/12 to-indigo-500/10",
             border: "border-purple-500/30",
             accent_text: "text-purple-400",
@@ -115,12 +117,12 @@ mod tests {
     }
 
     #[test]
-    fn each_real_zone_has_a_distinct_accent() {
+    fn each_generic_zone_has_a_distinct_accent() {
         let public = zone_theme("public").accent_hex;
-        let mini = zone_theme("minimoonoir").accent_hex;
+        let friends = zone_theme("friends").accent_hex;
         let family = zone_theme("family").accent_hex;
         let business = zone_theme("business").accent_hex;
-        let all = [public, mini, family, business];
+        let all = [public, friends, family, business];
         for (i, a) in all.iter().enumerate() {
             for b in all.iter().skip(i + 1) {
                 assert_ne!(a, b, "zone accents must be distinct");

@@ -12,7 +12,7 @@ Decisions are recorded in issues, PRs, and ADRs.
 
 ## Upstream
 
-This kit is built on [solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs), a Rust port of
+This kit is built on [solid-pod-rs](https://github.com/melvincarvalho/solid-pod-rs), a Rust port of
 Melvin Carvalho's [JavaScriptSolidServer (JSS)](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer).
 JSS is the AGPL-3.0 reference implementation of the Solid Protocol and the canonical source for
 the feature set, protocol extensions, and Web Ledger micropayment system that this forum kit consumes.

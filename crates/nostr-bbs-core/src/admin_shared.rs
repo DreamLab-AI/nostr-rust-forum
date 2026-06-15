@@ -25,7 +25,7 @@
 //!
 //! In addition to the two D1 sources, a deploy-time **static** admin set may be
 //! injected via the `ADMIN_PUBKEYS` env var (comma-separated hex pubkeys). This
-//! mirrors `dreamlab.toml [admin] static_pubkeys` and is the bootstrap/fallback
+//! mirrors `forum.toml [admin] static_pubkeys` and is the bootstrap/fallback
 //! authority: a fresh deployment whose D1 `whitelist`/`members` tables carry no
 //! `is_admin = 1` row still has working admins so the operator can seed D1.
 //!
@@ -86,7 +86,7 @@ pub const MEMBERS_ADMIN_LIST_SQL: &str = "SELECT pubkey FROM members WHERE is_ad
 // ---------------------------------------------------------------------------
 
 /// Env var carrying the deploy-time static admin set, comma-separated hex
-/// pubkeys. Mirrors `dreamlab.toml [admin] static_pubkeys` (injected at deploy
+/// pubkeys. Mirrors `forum.toml [admin] static_pubkeys` (injected at deploy
 /// time, following the `POD_BASE_URL` mirroring convention).
 pub const ADMIN_PUBKEYS_VAR: &str = "ADMIN_PUBKEYS";
 

@@ -71,7 +71,7 @@ pub use calendar::{
     create_calendar_event, create_calendar_event_signer, create_date_calendar_event, create_rsvp,
     create_rsvp_signer, is_known_venue, read_venue_tag, read_zone_tag, set_venue_tag, set_zone_tag,
     to_free_busy, CalendarError, RsvpStatus, KIND_CALENDAR_DATE_EVENT, KIND_CALENDAR_EVENT,
-    KIND_CALENDAR_RSVP, VENUE_DREAMLAB, VENUE_FAIRFIELD, VENUE_TAG, ZONE_TAG,
+    KIND_CALENDAR_RSVP, VENUE_PRIMARY, VENUE_SECONDARY, VENUE_TAG, ZONE_TAG,
 };
 
 pub use moderation_events::{

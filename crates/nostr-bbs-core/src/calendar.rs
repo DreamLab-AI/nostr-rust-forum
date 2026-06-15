@@ -15,7 +15,7 @@
 //!   channel slug (matching a `ZoneConfig` `Zone.id`, e.g. `family`, `business`,
 //!   `friends`). This is what the relay reads to decide which cohort owns the
 //!   event and therefore which projection tier applies.
-//! - **venue tag** `["venue", "fairfield"|"dreamlab"]` — marks an event as held
+//! - **venue tag** `["venue", "primary"|"secondary"]` — marks an event as held
 //!   at a shared physical venue. The free/busy projection keeps this tag; off-site
 //!   events (no recognised venue) are omitted from lower tiers entirely.
 //!
@@ -44,15 +44,20 @@ pub const ZONE_TAG: &str = "zone";
 /// Tag name marking the physical venue of a calendar event.
 pub const VENUE_TAG: &str = "venue";
 
-/// Recognised shared-venue slugs. An event held at one of these venues is
-/// surfaced as free/busy to lower tiers; an off-site event is omitted instead.
-pub const VENUE_FAIRFIELD: &str = "fairfield";
-/// DreamLab venue slug. See [`VENUE_FAIRFIELD`].
-pub const VENUE_DREAMLAB: &str = "dreamlab";
+/// Example built-in shared-venue slug. An event held at one of the recognised
+/// shared venues is surfaced as free/busy to lower tiers; an off-site event is
+/// omitted instead.
+///
+/// These two consts are EXAMPLE built-in shared venues shipped with the kit.
+/// Operators define their real shared venues in `forum.toml` under
+/// `[calendar].shared_venues`.
+pub const VENUE_PRIMARY: &str = "primary";
+/// Example built-in shared-venue slug. See [`VENUE_PRIMARY`].
+pub const VENUE_SECONDARY: &str = "secondary";
 
 /// Whether a venue slug is a recognised shared physical venue.
 pub fn is_known_venue(venue: &str) -> bool {
-    venue == VENUE_FAIRFIELD || venue == VENUE_DREAMLAB
+    venue == VENUE_PRIMARY || venue == VENUE_SECONDARY
 }
 
 /// Read the zone-binding tag (`["zone", "<slug>"]`) from an event, if present.
@@ -706,9 +711,9 @@ mod tests {
         assert_eq!(read_venue_tag(&event), None);
 
         let event = set_zone_tag(event, "family");
-        let event = set_venue_tag(event, VENUE_FAIRFIELD);
+        let event = set_venue_tag(event, VENUE_PRIMARY);
         assert_eq!(read_zone_tag(&event), Some("family"));
-        assert_eq!(read_venue_tag(&event), Some("fairfield"));
+        assert_eq!(read_venue_tag(&event), Some("primary"));
         assert!(is_known_venue(read_venue_tag(&event).unwrap()));
     }
 
@@ -725,8 +730,8 @@ mod tests {
 
     #[test]
     fn unknown_venue_not_recognised() {
-        assert!(is_known_venue("fairfield"));
-        assert!(is_known_venue("dreamlab"));
+        assert!(is_known_venue("primary"));
+        assert!(is_known_venue("secondary"));
         assert!(!is_known_venue("offsite"));
         assert!(!is_known_venue(""));
     }
@@ -746,7 +751,7 @@ mod tests {
         )
         .unwrap();
         let event = set_zone_tag(event, "family");
-        let event = set_venue_tag(event, VENUE_FAIRFIELD);
+        let event = set_venue_tag(event, VENUE_PRIMARY);
 
         let fb = to_free_busy(&event);
 
@@ -756,7 +761,7 @@ mod tests {
         assert_eq!(fb.id, event.id);
         // Time block kept.
         assert_eq!(read_zone_tag(&fb), Some("family"));
-        assert_eq!(read_venue_tag(&fb), Some("fairfield"));
+        assert_eq!(read_venue_tag(&fb), Some("primary"));
         assert!(fb
             .tags
             .iter()

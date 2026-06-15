@@ -1,7 +1,7 @@
 # PRD — Forum UX Triage 2026-05-17
 
 ## Context
-Live audit of `dreamlab-ai.com/community` on 2026-05-17 catalogued **27 UX/UI defects** across 6 cross-cutting patterns. Catalogue: `bugs.md`. Code attribution: `codebase-findings.md`.
+Live audit of a deployed forum (`example.com/community`) on 2026-05-17 catalogued **27 UX/UI defects** across 6 cross-cutting patterns. Catalogue: `bugs.md`. Code attribution: `codebase-findings.md`.
 
 ## Goals
 1. **Zero P0 user-visible defects** on the next deploy.

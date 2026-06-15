@@ -53,13 +53,13 @@ on mount.
 ```
 Browser (WASM)
     │
-    ├─── NIP-98 signed ──► CF Workers tier (pods.dreamlab-ai.com)
+    ├─── NIP-98 signed ──► CF Workers tier (pods.example.com)
     │                        nostr-bbs-pod-worker
     │                        Storage: R2 + KV
     │                        Git: No (returns 501 on /_git/*)
     │                        Provisioned: automatically at registration
     │
-    └─── NIP-98 signed ──► Native tier (pods-native.dreamlab-ai.com)
+    └─── NIP-98 signed ──► Native tier (pods-native.example.com)
                              solid-pod-rs-server --features git
                              Storage: host filesystem
                              Git: Yes (/_git/<pubkey>/ smart HTTP)
@@ -82,8 +82,8 @@ tier they are on:
 
 | Tier | WebID URL | `pod_base_url` value |
 |------|-----------|---------------------|
-| CF Workers | `https://pods.dreamlab-ai.com/{pubkey}/profile/card#me` | `https://pods.dreamlab-ai.com` |
-| Native | `https://pods-native.dreamlab-ai.com/{pubkey}/profile/card#me` | `https://pods-native.dreamlab-ai.com` |
+| CF Workers | `https://pods.example.com/{pubkey}/profile/card#me` | `https://pods.example.com` |
+| Native | `https://pods-native.example.com/{pubkey}/profile/card#me` | `https://pods-native.example.com` |
 
 Consumers that need to resolve a user's pod storage root (e.g. link-preview
 worker, external Solid clients) dereference the WebID and read `pod_base_url`
@@ -107,8 +107,8 @@ probe is never scheduled.
 
 ### Cloudflare Tunnel
 
-The native `solid-pod-rs-server` instance runs in the agentbox container and is
-exposed via a Cloudflare Tunnel at `pods-native.dreamlab-ai.com`. The tunnel
+The native `solid-pod-rs-server` instance runs on a host you control and is
+exposed via a Cloudflare Tunnel at `pods-native.example.com`. The tunnel
 terminates TLS at the Cloudflare edge and forwards plaintext to the container on
 an internal port — no public inbound port is opened on the host, and no TLS
 certificate management is required on the operator side.
@@ -397,7 +397,7 @@ All endpoints validate the `Authorization: Nostr <base64>` header via
 ## Upstream Kit Surfaces (2026-06-11)
 
 Four cross-stack surfaces landed in the June 2026 upstream-kit wave. Each is
-consumed downstream by agentbox and/or the dreamlab operator overlay.
+consumed downstream by the operator overlay and any embedding agent platform.
 
 ### Atomic agent provisioning (ADR-097)
 

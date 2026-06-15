@@ -915,12 +915,12 @@ fn event_target_checked(ev: &leptos::ev::Event) -> bool {
 }
 
 /// Return a Tailwind CSS class string for a cohort badge based on the cohort
-/// name. Covers the real DreamLab zone cohorts (friends/family/business/agent)
-/// plus the legacy fallback names; any unrecognised cohort renders with the
-/// neutral grey badge so config-driven cohorts always have a sensible style.
+/// name. Covers the generic zone cohorts (friends/family/business/agent) plus
+/// the legacy fallback names; any unrecognised cohort renders with the neutral
+/// grey badge so config-driven cohorts always have a sensible style.
 fn cohort_badge_class(cohort: &str) -> &'static str {
     match cohort {
-        // Real DreamLab zone cohorts.
+        // Generic zone cohorts.
         "friends" => "inline-block text-xs rounded px-1.5 py-0.5 bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:shadow-[0_0_6px_rgba(245,158,11,0.3)] transition-shadow",
         "family" => "inline-block text-xs rounded px-1.5 py-0.5 bg-pink-500/20 text-pink-300 border border-pink-500/30 hover:shadow-[0_0_6px_rgba(236,72,153,0.3)] transition-shadow",
         "business" => "inline-block text-xs rounded px-1.5 py-0.5 bg-blue-500/20 text-blue-300 border border-blue-500/30 hover:shadow-[0_0_6px_rgba(59,130,246,0.3)] transition-shadow",

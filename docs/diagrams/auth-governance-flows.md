@@ -309,7 +309,7 @@ classification.
 
 ~~`governance_api.rs` and `devices.rs` both call `env.d1("RELAY_DB")` at runtime but
 no `RELAY_DB` binding appeared in `wrangler.toml`.~~ The kit template now declares a
-`[[d1_databases]]` stanza for `RELAY_DB` (`database_name = "dreamlab-relay"`) with an
+`[[d1_databases]]` stanza for `RELAY_DB` (`database_name = "nostr-bbs-relay"`) with an
 explicit placeholder `database_id` of all-zeros and a comment instructing deployments
 to point it at the relay worker's actual D1. Downstream deploys override it; a deploy
 that forgets still fails per-request with 500s on `/api/governance/*` and

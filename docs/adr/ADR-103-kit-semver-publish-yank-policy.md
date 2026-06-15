@@ -25,8 +25,8 @@ The audit sweep (anomaly register R2, R4) surfaced two release-discipline gaps:
   what "API-breaking" means for a beta line, what the next version should be, or how
   downstream consumers are protected.
 
-The kit publishes to crates.io and is consumed downstream (notably by dreamlab),
-so it needs an explicit, written contract.
+The kit publishes to crates.io and is consumed downstream (notably by SHA-pinned
+operator overlays), so it needs an explicit, written contract.
 
 ## 2. Decision
 
@@ -86,13 +86,13 @@ API-breaking under §2.1; it stays on the `1.0.0-beta` line under §2.2.
 
 ### 2.5 Downstream-consumer contract
 
-- **dreamlab pins by SHA**, not by a crates.io version range. The git/SHA pin is
-  the authoritative downstream coupling: a breaking kit change cannot reach
-  dreamlab until dreamlab deliberately bumps the pinned SHA and adapts. This is the
-  primary protection — the beta-line semver (§2.2) is a second line of defence for
-  crates.io-range consumers.
+- **Operator overlays pin by SHA**, not by a crates.io version range. The git/SHA
+  pin is the authoritative downstream coupling: a breaking kit change cannot reach
+  an overlay until that overlay deliberately bumps the pinned SHA and adapts. This
+  is the primary protection — the beta-line semver (§2.2) is a second line of
+  defence for crates.io-range consumers.
 - A breaking change therefore has a two-step propagation: publish `beta.N+1` →
-  dreamlab (and any other SHA-pinned consumer) bumps and adapts on its own
+  each SHA-pinned consumer bumps and adapts on its own
   schedule. The kit does **not** assume consumers track `HEAD`.
 - Version sources of truth: `Cargo.toml` `version` is canonical; anything that
   *reports* a version (NIP-11, README badges, SECURITY) MUST derive from it

@@ -115,5 +115,5 @@ to defer the affected NRF features under their existing rationale.
 - ADR-086 §8 (Implementation note: the deferral that surfaced this gap).
 - `docs/phase1-impact-assessment.md` §3.
 - `docs/consumer-surface-map.md` (staged Phase 1 consumer surface section).
-- Upstream: https://github.com/DreamLab-AI/solid-pod-rs commit
+- Upstream: https://github.com/melvincarvalho/solid-pod-rs commit
   `d8a1c81` (v0.4.0-alpha.11).

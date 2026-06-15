@@ -19,19 +19,19 @@ use crate::utils::zone_theme::{zone_accent_style, zone_theme};
 pub fn ZoneHero(
     title: String,
     description: String,
-    /// Real zone identifier from the operator config: `"public"`,
-    /// `"minimoonoir"`, `"family"`, `"business"` (legacy `home`/`members`/
-    /// `private` aliases still themed). Drives the palette via `zone_theme`.
+    /// Zone identifier from the operator config: `"public"`, `"friends"`,
+    /// `"family"`, `"business"` (legacy `home`/`members`/`private` aliases
+    /// still themed). Drives the palette via `zone_theme`.
     zone_id: String,
     /// SVG path data for the zone icon.
     icon: &'static str,
     /// Optional zone banner image URL (each zone's configured `banner_image_url`,
-    /// e.g. the Minimoonoir hero). Rendered behind the hero content with a dark
+    /// e.g. the public hero). Rendered behind the hero content with a dark
     /// overlay for legibility; falls back to the gradient when absent.
     #[prop(optional)]
     banner_url: Option<String>,
     /// Optional explicit zone display label (the operator `display_name`, e.g.
-    /// "DreamLab" for the business zone). Falls back to a humanised id when
+    /// "Business" for the business zone). Falls back to a humanised id when
     /// absent so the chip never shows a raw slug.
     #[prop(optional)]
     zone_label: Option<String>,

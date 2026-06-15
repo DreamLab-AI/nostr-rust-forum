@@ -3,12 +3,12 @@
 - **Status:** Implemented
 - **Date:** 2026-05-16
 - **Owners:** nostr-rust-forum (NRF) consumer surface; cooperates with
-  `dreamlab-overlay`'s `dreamlab.toml` schema work and the `solid-porter`
+  the operator overlay's `forum.toml` schema work and the `solid-porter`
   Phase 1 ports in `solid-pod-rs`.
 - **Related:** ADR-076 (D5 module absorption), ADR-078 (Shape A absorption
   follow-up), ADR-085 (forum.toml as single configuration source),
-  `dreamlab-overlay` operator surface ADR (TBD — being authored by that team
-  in parallel; field name `[nip05].resolver_mode`).
+  the operator overlay surface ADR (owned by the deploying operator;
+  field name `[nip05].resolver_mode`).
 
 ## 1. Context
 
@@ -95,18 +95,18 @@ All code paths below are deferred until alpha.11.
    }
    ```
 
-   `derive_pod_base_url` must consult `forum.toml`/`dreamlab.toml` for the
+   `derive_pod_base_url` must consult `forum.toml` for the
    federation-allowlist (per ADR-085 single-source config). Names without a
    resolvable pod URL fall through to `None`.
 
 5. **Test fixtures.** Add NIP-05 federation cases to
-   `tests/fixtures/` (ADR-082 shared-fixture protocol) so VisionClaw,
-   agentbox, and the dreamlab-ai-website downstream consumer can replay the
+   `tests/fixtures/` (ADR-082 shared-fixture protocol) so downstream
+   consumers (the operator overlay and any embedding platform) can replay the
    same lookup matrix.
 
 ## 4. Cooperation with operator overlay
 
-The `dreamlab-overlay` team owns the `dreamlab.toml` operator surface. The
+The operator overlay owns the `forum.toml` operator surface. The
 field that gates this federation pattern is:
 
 ```toml
@@ -114,17 +114,16 @@ field that gates this federation pattern is:
 # "d1"        → legacy behaviour: D1+KV only, no pod fallback.
 # "federated" → D1+KV first, then pod fallback on miss.
 resolver_mode = "d1"                       # safe default; "federated" requires alpha.11
-pod_base_url  = "https://pods.dreamlab-ai.com"
+pod_base_url  = "https://pods.example.com"
 ```
 
-Confirmed verbatim with `dreamlab-overlay` (2026-05-16): both field names
-and the `"d1" | "federated"` value set are locked. Defaults to `"d1"` so
-existing deployments remain bit-for-bit identical. Operators who want pod
-federation opt in by flipping `resolver_mode` to `"federated"`; the
+Both field names and the `"d1" | "federated"` value set are stable. Defaults
+to `"d1"` so existing deployments remain bit-for-bit identical. Operators who
+want pod federation opt in by flipping `resolver_mode` to `"federated"`; the
 `pod_base_url` is the host root the fallback HTTP fetch builds against,
 i.e. `${pod_base_url}/.well-known/nostr.json?name=<local>`.
 
-Parsing lives in `dreamlab-overlay`'s `src/phase1.rs::Nip05Config` (extracts
+Parsing lives in the operator overlay's `src/phase1.rs::Nip05Config` (extracts
 via `toml::Value`, additive — no `nostr-bbs-config` schema bump required).
 NRF consumers reach the parsed values through the overlay's existing
 config surface; no NRF-side parser work is needed.

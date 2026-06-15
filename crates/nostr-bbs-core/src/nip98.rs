@@ -1,11 +1,11 @@
 //! NIP-98: HTTP Auth via Nostr events (kind 27235).
 //!
-//! **Canonical Rust implementation for the DreamLab ecosystem.**
+//! **Canonical Rust implementation for the nostr-bbs forum kit.**
 //!
 //! This module is the single source of truth for NIP-98 verification across
-//! nostr-rust-forum, solid-pod-rs, VisionClaw, and any future Rust consumers.
-//! All verification paths converge here; downstream crates should depend on
-//! `nostr_bbs_core::nip98` rather than rolling their own.
+//! the forum kit and any downstream Rust consumers. All verification paths
+//! converge here; downstream crates should depend on `nostr_bbs_core::nip98`
+//! rather than rolling their own.
 //!
 //! Wire format: `Authorization: Nostr base64(json(signed_event))`
 //!
@@ -261,8 +261,8 @@ pub fn create_token_at(
 /// Verifies the `Authorization: Nostr <base64(event)>` header against the
 /// expected URL and HTTP method. Uses the system clock for timestamp checking.
 ///
-/// This is the recommended function for all new code across the DreamLab
-/// ecosystem. It performs every check specified by NIP-98:
+/// This is the recommended function for all new code across the forum kit.
+/// It performs every check specified by NIP-98:
 ///
 /// - Kind == 27235
 /// - URL tag matches `expected_url`

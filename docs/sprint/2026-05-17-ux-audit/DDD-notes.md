@@ -47,7 +47,7 @@
 | **BrowserPath** | Full URL pathname as the browser sees it (includes `FORUM_BASE`). Obtained from `Location.pathname`. |
 | **cid** | A channel's NIP-28 event id (hex). Source of truth for the channel directory. |
 | **slug** | A human-readable channel handle (e.g. `home-lobby`). May appear in URLs. Must resolve to a cid via store lookups before use. |
-| **section** | A NIP-29-style grouping tag attached to a channel (e.g. `minimoonoir-events`). Lookup-equivalent to slug for the resolver. |
+| **section** | A NIP-29-style grouping tag attached to a channel (e.g. `community-events`). Lookup-equivalent to slug for the resolver. |
 | **post count** | `channel_messages[cid].len()`. Never a separate counter. |
 
 ## Anti-patterns (codified)

@@ -32,7 +32,7 @@ struct CalendarEvent {
     /// (carries a `["busy","1"]` tag, empty sig, no title). Such events render
     /// as an opaque busy block with no detail and no RSVP affordances.
     is_busy: bool,
-    /// Venue slug (`fairfield` / `dreamlab`) when present on a busy block.
+    /// Venue slug (e.g. `fairfield`) when present on a busy block.
     venue: String,
 }
 

@@ -6,30 +6,33 @@ use wasm_bindgen::prelude::*;
 
 use crate::stores::preferences::use_preferences;
 
-/// Compile-time fallback for the link-preview API base URL. Overridden at
-/// runtime by `window.__ENV__.VITE_LINK_PREVIEW_API_URL` (see [`preview_api`]),
-/// which is the canonical injection path the deploy workflow uses for every
-/// other worker endpoint (relay, pod, search).
-const PREVIEW_API_FALLBACK: &str = match option_env!("VITE_LINK_PREVIEW_API_URL") {
-    Some(u) => u,
-    None => "https://dreamlab-link-preview.solitary-paper-764d.workers.dev",
-};
+/// Compile-time fallback for the link-preview API base URL.
+///
+/// The kit ships with **no** baked-in endpoint: operators point the client at
+/// their own link-preview worker via `window.__ENV__.VITE_LINK_PREVIEW_API_URL`
+/// at runtime (the canonical injection path the deploy uses for every other
+/// worker endpoint: relay, pod, search), or via the `VITE_LINK_PREVIEW_API_URL`
+/// env var at build time. When neither is set the feature is simply inert —
+/// no preview is fetched and the bare link renders unchanged.
+const PREVIEW_API_FALLBACK: Option<&str> = option_env!("VITE_LINK_PREVIEW_API_URL");
 
 /// Resolve the link-preview API base URL at runtime.
 ///
 /// Prefers `window.__ENV__.VITE_LINK_PREVIEW_API_URL` (injected by the deploy
 /// workflow alongside `VITE_RELAY_URL` etc.) so the endpoint can change per
 /// environment without a rebuild. Falls back to the build-time constant.
-/// A trailing slash is trimmed so the `/preview` path joins cleanly.
-fn preview_api() -> String {
+/// Returns `None` when no endpoint is configured, in which case the preview
+/// feature stays inert. A trailing slash is trimmed so the `/preview` path
+/// joins cleanly.
+fn preview_api() -> Option<String> {
     let base = web_sys::window()
         .and_then(|w| js_sys::Reflect::get(&w, &"__ENV__".into()).ok())
         .filter(|v| !v.is_undefined() && !v.is_null())
         .and_then(|env| js_sys::Reflect::get(&env, &"VITE_LINK_PREVIEW_API_URL".into()).ok())
         .and_then(|v| v.as_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| PREVIEW_API_FALLBACK.to_string());
-    base.trim_end_matches('/').to_string()
+        .or_else(|| PREVIEW_API_FALLBACK.map(str::to_string))?;
+    Some(base.trim_end_matches('/').to_string())
 }
 
 /// JSON shape returned by the link-preview worker's `GET /preview` endpoint.
@@ -229,9 +232,12 @@ pub(crate) fn LinkPreview(
 
 /// Fetch OG metadata from the link-preview worker's `GET /preview` endpoint.
 async fn fetch_og_data(url: &str) -> Result<OgData, String> {
+    // No endpoint configured ⇒ feature inert: report a soft failure so the card
+    // falls back to the bare link rather than panicking on a missing base URL.
+    let api = preview_api().ok_or("link-preview API not configured")?;
     let fetch_url = format!(
         "{}/preview?url={}",
-        preview_api(),
+        api,
         js_sys::encode_uri_component(url)
     );
 

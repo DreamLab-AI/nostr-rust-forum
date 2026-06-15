@@ -38,7 +38,7 @@ use worker::{Env, Response, Result};
 use crate::admin::{canonical_url, now_secs, require_authed};
 use crate::http::{error_json, json_response};
 
-/// `device_keys` lives in the relay worker's D1 (`dreamlab-relay`), bound as
+/// `device_keys` lives in the relay worker's D1 (`nostr-bbs-relay`), bound as
 /// `RELAY_DB` here so the relay DO can read the registry at NIP-42 AUTH without
 /// a cross-worker round-trip. Same binding `governance_api.rs` uses.
 fn relay_db(env: &Env) -> Result<worker::D1Database> {

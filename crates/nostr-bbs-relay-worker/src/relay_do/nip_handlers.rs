@@ -1519,14 +1519,14 @@ mod write_gate_tests {
     #[test]
     fn friends_author_rsvp_to_business_venue_target_rejected() {
         // EVIDENCE replay: a friends-cohort author RSVPs to a business-zone event
-        // she only sees as free/busy (business@dreamlab venue). Author tier =
+        // she only sees as free/busy (business@primary venue). Author tier =
         // FreeBusy ⇒ write rejected.
         assert!(
             !rsvp_decision(
                 &cohorts(&[COHORT_FRIENDS]),
                 false,
                 ZONE_BUSINESS,
-                Some("dreamlab"),
+                Some("primary"),
             ),
             "friends author must not RSVP to a business target she only sees as free/busy"
         );
@@ -1546,7 +1546,7 @@ mod write_gate_tests {
             &cohorts(&[COHORT_FAMILY]),
             false,
             ZONE_BUSINESS,
-            Some("dreamlab"),
+            Some("primary"),
         ));
         assert!(rsvp_decision(
             &cohorts(&[COHORT_FAMILY]),
@@ -1563,7 +1563,7 @@ mod write_gate_tests {
         // admin in the handler bypasses this gate entirely; this asserts the tier
         // short-circuit for the cohort-admin path.)
         assert!(rsvp_decision(&[], true, ZONE_FAMILY, None));
-        assert!(rsvp_decision(&[], true, ZONE_BUSINESS, Some("dreamlab")));
+        assert!(rsvp_decision(&[], true, ZONE_BUSINESS, Some("primary")));
     }
 
     #[test]

@@ -24,19 +24,19 @@
 //! [
 //!   {
 //!     "id": "public",
-//!     "display_name": "MiniMooNoir",
+//!     "display_name": "Public",
 //!     "required_cohorts": [],
 //!     "write_cohorts": ["friends"],
-//!     "banner_image_url": "/images/heroes/minimoonoir-hero.webp",
+//!     "banner_image_url": "/images/heroes/public-hero.webp",
 //!     "visibility": "public",
 //!     "encrypted": false
 //!   },
 //!   { "id": "friends",  "display_name": "Friends",  "required_cohorts": ["friends"],
-//!     "banner_image_url": "/images/heroes/minimoonoir-hero.webp", "visibility": "locked" },
+//!     "banner_image_url": "/images/heroes/friends-hero.webp",     "visibility": "locked" },
 //!   { "id": "family",   "display_name": "Family",   "required_cohorts": ["family"],
 //!     "banner_image_url": "/images/heroes/family-hero.webp",      "visibility": "locked", "encrypted": true },
 //!   { "id": "business", "display_name": "Business", "required_cohorts": ["business"],
-//!     "banner_image_url": "/images/heroes/dreamlab-hero.webp",    "visibility": "locked" }
+//!     "banner_image_url": "/images/heroes/business-hero.webp",    "visibility": "locked" }
 //! ]
 //! ```
 //!
@@ -241,7 +241,7 @@ fn fallback_zones() -> Vec<Zone> {
         },
         Zone {
             id: "private".to_string(),
-            display_name: "Minimoonoir".to_string(),
+            display_name: "Private".to_string(),
             required_cohorts: vec!["private".to_string()],
             write_cohorts: None,
             banner_image_url: Some("/images/heroes/corporate-immersive.webp".to_string()),
@@ -270,7 +270,7 @@ mod tests {
     fn sample_zones() -> Vec<Zone> {
         vec![
             zone("public"),
-            zone("minimoonoir"),
+            zone("friends"),
             zone("family"),
             zone("business"),
         ]
@@ -314,7 +314,7 @@ mod tests {
         // For any (section, category) the predicate must agree with the
         // resolver (case-insensitively) — the derivation invariant.
         for section in ["family", "family-events", "business-deals", "stray"] {
-            for cat in ["public", "minimoonoir", "family", "business"] {
+            for cat in ["public", "friends", "family", "business"] {
                 let expected = section_to_zone(section, &zones)
                     .map(|z| z.eq_ignore_ascii_case(cat))
                     .unwrap_or(false);

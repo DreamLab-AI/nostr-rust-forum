@@ -23,7 +23,7 @@ use crate::admin::{canonical_url, now_secs, require_admin, require_authed};
 use crate::http::{error_json, json_response};
 
 /// Governance tables (agent_registry, broker_cases, broker_decisions,
-/// broker_roles) live in the relay worker's D1 (`dreamlab-relay`), bound
+/// broker_roles) live in the relay worker's D1 (`nostr-bbs-relay`), bound
 /// as `RELAY_DB` in this worker. The relay DO reads these tables when
 /// gating governance event kinds (31400-31405).
 fn relay_db(env: &Env) -> Result<worker::D1Database> {

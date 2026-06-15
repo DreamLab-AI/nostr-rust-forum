@@ -246,8 +246,8 @@ fn request_origin(url: &worker::Url) -> String {
 /// Public pod base URL used in WebID, Location, and podUri values.
 ///
 /// This is intentionally separate from `EXPECTED_ORIGIN`, which is the browser
-/// CORS origin for the forum frontend. DreamLab deploys the frontend at
-/// `dreamlab-ai.com` and the pod worker at `pods.dreamlab-ai.com`, so using one
+/// CORS origin for the forum frontend. A typical deployment serves the frontend
+/// at `example.com` and the pod worker at `pods.example.com`, so using one
 /// variable for both produces broken WebID URLs.
 fn public_pod_base_url(env: &Env, fallback_origin: &str) -> String {
     env.var("POD_BASE_URL")

@@ -40,19 +40,19 @@ themselves.
 
 The mesh crate's peer relay connections can traverse a
 [Tailscale](https://tailscale.com) tailnet instead of the public internet.
-This keeps relay traffic private between DreamLab infrastructure nodes —
+This keeps relay traffic private between your own infrastructure nodes —
 no NIP-42 challenge is exposed to the open web, and latency drops to
 single-digit ms on the same tailnet.
 
 ### Configuration
 
-In `dreamlab.toml` (or `forum.toml`), point `peer_relays` at Tailscale
+In `forum.toml`, point `peer_relays` at Tailscale
 MagicDNS hostnames:
 
 ```toml
 [mesh]
 mode = "federated"
-peer_relays = ["ws://agentbox.tailnet-name.ts.net:7777"]
+peer_relays = ["ws://node.tailnet-name.ts.net:7777"]
 ```
 
 Replace `tailnet-name` with your actual tailnet domain (visible in the

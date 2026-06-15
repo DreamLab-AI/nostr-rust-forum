@@ -10,7 +10,7 @@
 //! the `ADMIN_PUBKEYS` environment variable (comma-separated hex pubkeys) —
 //! the **static** half of the canonical `static ∪ D1` resolution order. The
 //! auth-worker reads this same env var (its bootstrap/fallback set) plus D1, so
-//! when the deploy pipeline injects `dreamlab.toml [admin] static_pubkeys` into
+//! when the deploy pipeline injects `forum.toml [admin] static_pubkeys` into
 //! `ADMIN_PUBKEYS` for both workers, the search-worker admin set is a subset of
 //! the auth-worker set and no longer diverges (Gap 2).
 //!

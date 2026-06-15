@@ -144,7 +144,7 @@ struct IsAdminRow {
 /// Task #7 fix (admin-resolution): resolution order is now
 /// **`ADMIN_PUBKEYS` (static) ∪ D1**, matching the auth-worker
 /// (`crate::admin::is_admin`). The static set is the deploy-time
-/// bootstrap/fallback authority — it projects `dreamlab.toml [admin]
+/// bootstrap/fallback authority — it projects `forum.toml [admin]
 /// static_pubkeys` so a fresh deployment whose relay `whitelist`/`members`
 /// tables carry no `is_admin = 1` row still has working admins. Without this,
 /// the relay's admin-gated endpoints (`/api/whitelist/list`, etc.) 401/403 for

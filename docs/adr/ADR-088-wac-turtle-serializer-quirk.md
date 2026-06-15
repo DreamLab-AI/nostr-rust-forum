@@ -110,5 +110,5 @@ prevent the knowledge from evaporating into commit-message archaeology.
 - Solid-porter's task #4 implementation notes (2026-05-16, alpha.11
   publish): "the `provision-keys`-written ACL file is JSON-LD (not
   Turtle) because of a latent bug in `wac::serializer::emit_pairs`."
-- Upstream: https://github.com/DreamLab-AI/solid-pod-rs commit
+- Upstream: https://github.com/melvincarvalho/solid-pod-rs commit
   `d8a1c81` (v0.4.0-alpha.11).

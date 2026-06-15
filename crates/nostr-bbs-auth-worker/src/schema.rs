@@ -221,7 +221,7 @@ pub async fn ensure_schema(env: &Env) {
 
     // Agent Control Surface Protocol tables (agent_registry, broker_cases,
     // broker_decisions, broker_roles) live in the relay worker's D1
-    // (dreamlab-relay, bound as RELAY_DB). They are NOT created here.
+    // (nostr-bbs-relay, bound as RELAY_DB). They are NOT created here.
     // The relay-worker's ensure_tables_exist() manages their schema.
     // The governance_api.rs handlers read/write via the RELAY_DB binding.
 }

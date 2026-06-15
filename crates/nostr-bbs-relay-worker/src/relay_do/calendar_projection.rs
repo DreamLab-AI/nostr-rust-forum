@@ -9,7 +9,7 @@
 //! unaware the event exists). It is deny-by-default for unknown zones.
 //!
 //! It implements the operator-approved matrix
-//! (`dreamlab-ai-website/docs/architecture/forum-org-redesign.md` §4):
+//! (`docs/architecture/forum-org-redesign.md` §4):
 //!
 //! | Viewer ↓ / Event zone → | family   | business | friends | public | unknown |
 //! |-------------------------|----------|----------|---------|--------|---------|
@@ -20,11 +20,11 @@
 //! | no cohort / anon        | OMIT     | OMIT     | OMIT    | full   | OMIT    |
 //!
 //! (*) friends see family/business as free/busy ONLY at a recognised shared
-//! venue (fairfield/dreamlab); off-site events are omitted.
+//! venue (primary/secondary); off-site events are omitted.
 //!
 //! Free/busy keeps start/end + venue + a busy flag (see
 //! [`nostr_bbs_core::to_free_busy`]); for a `friends` viewer, a family/business
-//! event that is NOT at a recognised venue (fairfield/dreamlab) is OMITTED
+//! event that is NOT at a recognised venue (primary/secondary) is OMITTED
 //! rather than shown as free/busy — friends only see venue blocking, never
 //! private off-site time.
 //!
@@ -192,7 +192,7 @@ mod tests {
         let p = project_tier(
             &cohorts(&[COHORT_FRIENDS]),
             ZONE_FAMILY,
-            Some("fairfield"),
+            Some("primary"),
             false,
             false,
         );
@@ -220,7 +220,7 @@ mod tests {
         let p = project_tier(
             &cohorts(&[COHORT_BUSINESS]),
             ZONE_FAMILY,
-            Some("dreamlab"),
+            Some("secondary"),
             false,
             false,
         );
@@ -292,7 +292,7 @@ mod tests {
         let p = project_tier(
             &cohorts(&[COHORT_FRIENDS]),
             ZONE_BUSINESS,
-            Some("dreamlab"),
+            Some("secondary"),
             false,
             false,
         );
@@ -304,7 +304,7 @@ mod tests {
         let p = project_tier(
             &cohorts(&[COHORT_BUSINESS]),
             ZONE_FRIENDS,
-            Some("fairfield"),
+            Some("primary"),
             false,
             false,
         );
@@ -335,7 +335,7 @@ mod tests {
         );
         for zone in [ZONE_FAMILY, ZONE_BUSINESS, ZONE_FRIENDS, "mystery"] {
             assert_eq!(
-                project_tier(&[], zone, Some("fairfield"), false, false),
+                project_tier(&[], zone, Some("primary"), false, false),
                 Projection::Omit,
                 "no cohort, zone {zone} omitted"
             );
@@ -378,12 +378,12 @@ mod tests {
 
     #[test]
     fn family_sees_business_full_explicit() {
-        // The probe persona: family-dave must see business@dreamlab full.
+        // The probe persona: family-dave must see business@secondary full.
         assert_eq!(
             project_tier(
                 &cohorts(&[COHORT_FAMILY]),
                 ZONE_BUSINESS,
-                Some("dreamlab"),
+                Some("secondary"),
                 false,
                 false,
             ),
@@ -397,14 +397,14 @@ mod tests {
     }
 
     #[test]
-    fn friends_sees_family_fairfield_free_busy_not_omit() {
+    fn friends_sees_family_primary_venue_free_busy_not_omit() {
         // The probe persona: friends-carol must get free/busy (not absent) for
-        // family@fairfield and business@dreamlab.
+        // family@primary and business@secondary.
         assert_eq!(
             project_tier(
                 &cohorts(&[COHORT_FRIENDS]),
                 ZONE_FAMILY,
-                Some("fairfield"),
+                Some("primary"),
                 false,
                 false,
             ),
@@ -414,7 +414,7 @@ mod tests {
             project_tier(
                 &cohorts(&[COHORT_FRIENDS]),
                 ZONE_BUSINESS,
-                Some("dreamlab"),
+                Some("secondary"),
                 false,
                 false,
             ),
@@ -459,18 +459,18 @@ mod tests {
 
     #[test]
     fn wrapper_friends_family_venue_returns_redacted() {
-        let ev = build_event(ZONE_FAMILY, Some("fairfield"));
+        let ev = build_event(ZONE_FAMILY, Some("primary"));
         let out = project_calendar_event(&cohorts(&[COHORT_FRIENDS]), &ev, false, false).unwrap();
         // Redacted: no title, no content.
         assert!(out.content.is_empty());
         assert!(!out.tags.iter().any(|t| t[0] == "title"));
         assert!(out.tags.iter().any(|t| t[0] == "busy"));
-        assert_eq!(read_venue_tag(&out), Some("fairfield"));
+        assert_eq!(read_venue_tag(&out), Some("primary"));
     }
 
     #[test]
     fn wrapper_business_family_returns_none() {
-        let ev = build_event(ZONE_FAMILY, Some("dreamlab"));
+        let ev = build_event(ZONE_FAMILY, Some("secondary"));
         let out = project_calendar_event(&cohorts(&[COHORT_BUSINESS]), &ev, false, false);
         assert!(out.is_none());
     }
@@ -482,13 +482,13 @@ mod tests {
         let out = project_calendar_event(&[], &pub_ev, false, false).unwrap();
         assert!(out.tags.iter().any(|t| t[0] == "title"));
         // No-cohort viewer on an unknown zone: omitted entirely.
-        let unk_ev = build_event("mystery", Some("fairfield"));
+        let unk_ev = build_event("mystery", Some("primary"));
         assert!(project_calendar_event(&[], &unk_ev, false, false).is_none());
     }
 
     #[test]
     fn wrapper_friends_unknown_zone_omitted() {
-        let ev = build_event("mystery", Some("dreamlab"));
+        let ev = build_event("mystery", Some("secondary"));
         assert!(project_calendar_event(&cohorts(&[COHORT_FRIENDS]), &ev, false, false).is_none());
     }
 
@@ -530,12 +530,12 @@ mod tests {
             ),
             Projection::Full,
         );
-        // friends viewing a family@fairfield target → FreeBusy → RSVP withheld.
+        // friends viewing a family@primary target → FreeBusy → RSVP withheld.
         assert_eq!(
             project_tier(
                 &cohorts(&[COHORT_FRIENDS]),
                 ZONE_FAMILY,
-                Some("fairfield"),
+                Some("primary"),
                 false,
                 false,
             ),

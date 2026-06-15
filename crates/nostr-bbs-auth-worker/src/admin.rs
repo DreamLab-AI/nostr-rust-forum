@@ -41,10 +41,10 @@ pub async fn verify(
 /// algorithm in [`nostr_bbs_core::admin_shared`]:
 ///
 /// 1. The deploy-time static admin set in the `ADMIN_PUBKEYS` env var (mirrors
-///    `dreamlab.toml [admin] static_pubkeys`). This is the bootstrap/fallback
+///    `forum.toml [admin] static_pubkeys`). This is the bootstrap/fallback
 ///    authority so a fresh deployment whose D1 tables carry no `is_admin = 1`
 ///    row still has working admins — closing Gap 1 (the static config was
-///    previously inert: declared in `dreamlab.toml` but read by no runtime
+///    previously inert: declared in `forum.toml` but read by no runtime
 ///    gate). The env var is the same source the search-worker uses, so all
 ///    three workers now agree on the static set (Gap 2).
 /// 2. The relay worker's D1 (`RELAY_DB` binding) — authority for dynamic
@@ -65,7 +65,7 @@ pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
         }
     }
 
-    // RELAY_DB (dreamlab-relay): authority for whitelist.is_admin
+    // RELAY_DB (nostr-bbs-relay): authority for whitelist.is_admin
     if let Ok(relay_db) = env.d1("RELAY_DB") {
         if let Ok(stmt) = relay_db
             .prepare(nostr_bbs_core::WHITELIST_IS_ADMIN_SQL)
@@ -79,7 +79,7 @@ pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
         }
     }
 
-    // DB (dreamlab-auth): members table from invite redemption flow
+    // DB (nostr-bbs-auth): members table from invite redemption flow
     if let Ok(db) = env.d1("DB") {
         if let Ok(stmt) = db
             .prepare(nostr_bbs_core::MEMBERS_IS_ADMIN_SQL)

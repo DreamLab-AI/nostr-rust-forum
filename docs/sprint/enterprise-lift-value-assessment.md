@@ -2,11 +2,11 @@
 
 **Status:** DRAFT — awaiting sign-off
 **Date:** 2026-05-12
-**Author:** DreamLab AI Mega-Sprint (automated)
-**KHIVE Ref:** E1–E3 ecosystem integration tasks, SSO/DID alignment
-**Scope:** (1) Evaluate lifting VisionClaw enterprise decision broker into the forum. (2) Generalize: extend nostr-rust-forum upstream as a generic agent control surface protocol with MCP/API, instantiated against DreamLab's VisionClaw/agentbox use case. (3) SSO alignment via did:nostr as the identity unifier across all repos.
+**Author:** Operator mega-sprint (automated)
+**Ref:** E1–E3 ecosystem integration tasks, SSO/DID alignment
+**Scope:** (1) Evaluate lifting an enterprise decision broker (here, VisionClaw) into the forum. (2) Generalize: extend nostr-rust-forum upstream as a generic agent control surface protocol with MCP/API, instantiated against an operator's specific agent-platform use case. (3) SSO alignment via did:nostr as the identity unifier across all repos.
 
-**Key principle:** nostr-rust-forum upstream ships the generic protocol. DreamLab configures against our specific use case. The upstream knows "agents that publish panels via nostr events" — not VisionClaw.
+**Key principle:** nostr-rust-forum upstream ships the generic protocol. The operator configures against their specific use case. The upstream knows "agents that publish panels via nostr events" — not any one operator's agent.
 
 ---
 
@@ -14,14 +14,14 @@
 
 ### 1.1 Current State
 
-The DreamLab ecosystem has **two separate governance UIs**:
+A representative operator ecosystem has **two separate governance UIs**:
 
 | Surface | Stack | Auth | Persistence | Users See |
 |---------|-------|------|-------------|-----------|
 | VisionClaw enterprise drawer + `/enterprise` page | React + Actix actors + Neo4j | `X-Enterprise-Role` header (demo RBAC) | Neo4j graph DB | Broker inbox, decisions, workflows, KPIs, policy, connectors |
 | NRF forum | Leptos WASM + CF Workers | NIP-98 Schnorr (production) | D1 + KV | Forum channels, moderation, invites, pods |
 
-Users managing the DreamLab ecosystem must context-switch between two apps with two auth systems. The VisionClaw enterprise auth (`X-Enterprise-Role` header) is explicitly a Phase 1 placeholder — ADR-040 acknowledges OIDC JWT extraction is needed for Phase 2.
+Users managing such an ecosystem must context-switch between two apps with two auth systems. The VisionClaw enterprise auth (`X-Enterprise-Role` header) is explicitly a Phase 1 placeholder — ADR-040 acknowledges OIDC JWT extraction is needed for Phase 2.
 
 ### 1.2 Opportunity
 
@@ -157,7 +157,7 @@ Proposed (Forum):
     ["p", "<case_creator_pubkey>"],
     ["broker", "<deciding_broker_pubkey>"],
     ["action", "approve"],
-    ["h", "dreamlab-forum-broker"]
+    ["h", "forum-broker"]
   ]
 }
 ```
@@ -437,7 +437,7 @@ The broker lift does NOT supersede existing signup workflows. It adds a governan
 
 ### 7.3 Recommendation
 
-**Proceed with Broker Workbench lift.** The domain model is portable, the nostr mediation path is natural (kind 30300 events already exist), and the auth upgrade from demo headers to production NIP-98 is a strict improvement. The forum becomes the single governance surface for the DreamLab ecosystem.
+**Proceed with Broker Workbench lift.** The domain model is portable, the nostr mediation path is natural (kind 30300 events already exist), and the auth upgrade from demo headers to production NIP-98 is a strict improvement. The forum becomes the single governance surface for the operator's ecosystem.
 
 **Do not lift Contributor Studio or other VisionClaw-specific features.** They lose their primary value (spatial graph context) outside VisionClaw, and the coupling to ontology/AI systems would require reimplementing significant VisionClaw infrastructure in CF Workers.
 
@@ -519,7 +519,7 @@ New event kind range: **31400–31499** (parameterized replaceable, `d`-tag addr
     ["agent", "<agent_pubkey>", "VisionClaw"],
     ["priority", "high"],
     ["expires", "1747180800"],
-    ["context", "https://visionclaw.dreamlab.ai/graph?node=12345"]
+    ["context", "https://visionclaw.example.com/graph?node=12345"]
   ]
 }
 ```
@@ -642,7 +642,7 @@ The panel registry architecture subsumes the "Broker Workbench lift" from Sectio
 | **4** | MCP server adapter | NRF (new: governance-mcp) | 2 | `forum-governance` MCP server. Tools: `register_panel`, `submit_action_request`, `get_action_responses`, `list_panels`. Thin adapter: MCP calls → signed nostr events. |
 | **5** | VisionClaw agent integration | VisionClaw | 1 | `ServerNostrActor` publishes kind 31400 PanelDefinition + kind 31402 ActionRequests. Subscribes to kind 31403 responses. Replace `X-Enterprise-Role` with NIP-98. Register pubkey in forum `agent_registry`. |
 | **6** | JSS/Melvin SSO alignment | solid-pod-rs, NRF | 1 | Mutual DID resolution (forum ↔ JSS). Add JSS service endpoint to Tier-3 DID docs. Test cross-service NIP-98 acceptance. Draft PodKey elimination path. |
-| **7** | dreamlab-ai-website pin + agentbox | website, agentbox | 1 | Pin website to NRF version with governance route. Agentbox: register as agent, wire job approvals to forum ActionRequests. |
+| **7** | Operator website pin + agentbox | website, agentbox | 1 | Pin the operator website to an NRF version with governance route. Agentbox: register as agent, wire job approvals to forum ActionRequests. |
 
 **Total: 14 days (2 sprints)**
 
@@ -685,7 +685,7 @@ The agent control surface is only as strong as the identity layer underneath it.
 | **nostr-rust-forum** (upstream) | NIP-98 token creation/verification, DID document serving (Tier-1/3), WebAuthn→nostr key derivation, `agent_registry` table for agent pubkeys | Add `agent_registry` D1 table. Extend DID Tier-3 documents with `AgentControlPanel` service endpoint. Publish NIP-98 signing endpoint for cross-service token issuance. |
 | **VisionClaw** | `ServerNostrActor` (agent identity), `did:nostr:{hex}` in broker decisions, OIDC planned (ADR-040 Phase 2) | Replace `X-Enterprise-Role` header auth with NIP-98 tokens signed by agent's server identity. Publish agent pubkey in DID document. Register as agent in forum's `agent_registry`. |
 | **agentbox** | NIP-98 Schnorr verification (existing), DID:nostr 3-tier custody (existing), Solid pod on :8484 | Wire agent job approval to forum ActionRequest events instead of zero-auth WebSocket. Register agent pubkey in forum's `agent_registry`. |
-| **dreamlab-ai-website** | Forum client embedding, passkey/NIP-07 auth | Pin to NRF rc that includes agent control surface. SSO flow: user authenticates once via passkey → NIP-98 tokens valid across forum + JSS + agent panels. |
+| **Operator website** | Forum client embedding, passkey/NIP-07 auth | Pin to NRF rc that includes agent control surface. SSO flow: user authenticates once via passkey → NIP-98 tokens valid across forum + JSS + agent panels. |
 
 **The SSO alignment sequence (dependency-ordered):**
 
@@ -700,10 +700,10 @@ Step 4: JSS alignment — Melvin sync, mutual DID resolution, PodKey elimination
    ↓ (SSO across forum ↔ JSS)
 Step 5: agentbox — register as agent, wire job approvals to forum
    ↓ (second agent, validates generality)
-Step 6: dreamlab-ai-website — pin to new NRF, enable agent panels in UI
+Step 6: Operator website — pin to new NRF, enable agent panels in UI
 ```
 
-### 8.11 Generalized Upstream vs. DreamLab Instance
+### 8.11 Generalized Upstream vs. Operator Instance
 
 **What goes into nostr-rust-forum (upstream, generic):**
 
@@ -717,7 +717,7 @@ Step 6: dreamlab-ai-website — pin to new NRF, enable agent panels in UI
 - DID document Tier-3 `AgentControlPanel` service type
 - Trust-level gating: agent events require registered pubkey, human responses require membership + optional role
 
-**What stays in DreamLab configuration (instance-specific):**
+**What stays in operator configuration (instance-specific):**
 
 - Which agents are registered (VisionClaw pubkey, agentbox pubkey)
 - Which humans have broker role (governance decision-makers)

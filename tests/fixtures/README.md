@@ -1,6 +1,6 @@
 # Cross-Substrate Test Fixtures
 
-Per ADR-082. Master fixtures consumed by all four mesh substrates (VisionClaw, nostr-rust-forum, agentbox, solid-pod-rs) and the dreamlab-ai-website downstream consumer.
+Per ADR-082. Master fixtures consumed by all four mesh substrates (VisionClaw, nostr-rust-forum, agentbox, solid-pod-rs) and the operator-overlay downstream consumer.
 
 ## Files
 
@@ -25,9 +25,9 @@ The following fixtures MUST be populated before PRD-010 P0 implementation lands:
 | nip59-gift-wrap.json | nostr-protocol/nips | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
 | nip98-tokens.json | nostr-protocol/nips | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
 | multibase.json | multiformats/multibase | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
-| did-doc-conformance.json | DreamLab-internal (ADR-074 D2) | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
-| is-envelope-v1.json | DreamLab-internal (ADR-075 D1+D3) | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
-| mesh-federation.json | DreamLab-internal (ADR-073 D2/D6/D9 + ADR-074 D9) | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
+| did-doc-conformance.json | kit-internal (ADR-074 D2) | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
+| is-envelope-v1.json | kit-internal (ADR-075 D1+D3) | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
+| mesh-federation.json | kit-internal (ADR-073 D2/D6/D9 + ADR-074 D9) | DONE (Phase 1, 2026-05-07) | sprint Phase 1 |
 
 ## Agent Control Surface Protocol
 

@@ -58,7 +58,7 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
             // nip_handlers::handle_event `is_whitelisted`). So `auth_required`
             // is false in the strict NIP-42 sense (no AUTH round-trip is
             // forced before EVENT), but writes are still trust-gated. The
-            // `restricted_writes` flag plus the `dreamlab.write_policy` block
+            // `restricted_writes` flag plus the `nostr_bbs.write_policy` block
             // below describe the actual model so a standard client does not
             // mistake this for an open relay.
             "auth_required": false,
@@ -74,16 +74,16 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
             { "kinds": [[10000, 19999]], "time": serde_json::Value::Null },
             { "kinds": [[30000, 39999]], "time": serde_json::Value::Null },
         ],
-        // DreamLab namespaced extension: the Agent Control Surface Protocol.
+        // nostr-bbs kit namespaced extension: the Agent Control Surface Protocol.
         // This relay gates governance kinds 31400-31405 behind the
         // `agent_registry` table (only registered `did:nostr` agent pubkeys may
         // publish PanelDefinition/ActionRequest/etc.; humans respond via 31403).
         // A NIP-11-reading agent uses this block to discover that the relay
         // speaks the mesh governance protocol and which kinds it enforces.
         // Kind numbers are sourced from the canonical `governance` constants to
-        // prevent drift. Namespaced under `dreamlab` so it never collides with
+        // prevent drift. Namespaced under `nostr_bbs` so it never collides with
         // standard NIP-11 fields.
-        "dreamlab": {
+        "nostr_bbs": {
             // Gap 7: make the whitelist-gated write model explicit. Standard
             // NIP-11 only has the boolean `restricted_writes`; this block says
             // *how* writes are restricted so a client knows a rejection is not

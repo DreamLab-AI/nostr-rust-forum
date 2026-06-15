@@ -66,10 +66,9 @@ scripts/sync-fixtures.sh --verify
 
 ## Normative Specifications
 
-Cross-substrate normative decisions (ADRs, PRDs, DDD bounded-context maps)
-live in the [VisionClaw monorepo](https://github.com/DreamLab-AI/VisionClaw)
-under `docs/`. If kit code diverges from a VisionClaw normative document,
-that is a bug in this repository.
+Architecture decisions for the kit live in [`docs/adr/`](docs/adr/) in this
+repository. If kit code diverges from an accepted ADR, that is a bug in this
+repository.
 
 ## Security
 

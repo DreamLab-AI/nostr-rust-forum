@@ -46,15 +46,15 @@ Adopt a **hybrid two-tier architecture**:
 | Tier | Deployment | Storage | Git | Auth |
 |------|-----------|---------|-----|------|
 | CF Workers | Cloudflare edge | R2 + KV | No (501) | NIP-98 (Schnorr) |
-| Native (agentbox) | Docker container | Host filesystem | Yes | NIP-98 (Schnorr) |
+| Native (self-hosted) | Docker container | Host filesystem | Yes | NIP-98 (Schnorr) |
 
 ### 2.1 Cloudflare Tunnel transport
 
-The agentbox `solid-pod-rs-server` instance is exposed via a Cloudflare Tunnel
-at `pods-native.dreamlab-ai.com`. The tunnel provides:
+The self-hosted `solid-pod-rs-server` instance is exposed via a Cloudflare Tunnel
+at `pods-native.example.com`. The tunnel provides:
 
 - Encrypted transport (TLS terminated at Cloudflare edge) with no open inbound
-  ports on the agentbox host.
+  ports on the native pod host.
 - A stable public hostname independent of the container's IP address.
 - Zero infrastructure change to the CF Workers deployment.
 
@@ -106,15 +106,15 @@ credential and is rotatable without affecting user sessions.
 ### 2.4 Cohort-based access control
 
 The native tier is not universally available. The `[native_pod]` config section
-in `dreamlab.toml` lists which cohorts are entitled to native pods:
+in `forum.toml` lists which cohorts are entitled to native pods:
 
 ```toml
 [native_pod]
 enabled = true
-base_url = "https://pods-native.dreamlab-ai.com"
+base_url = "https://pods-native.example.com"
 allowlist_cohorts = ["developer", "early-access"]
 git_enabled = true
-admin_provision_url = "https://pods-native.dreamlab-ai.com/_admin/provision"
+admin_provision_url = "https://pods-native.example.com/_admin/provision"
 ```
 
 The pod browser reads the user's cohort from the forum auth state and conditionally
@@ -174,8 +174,8 @@ pods as app repositories alongside the git panel.
 
 - The pod browser probes both tiers independently on mount; the probe latency
   is additive but hidden by concurrent `Effect::new` scheduling.
-- WebID documents at `https://pods.dreamlab-ai.com/{pubkey}/profile/card#me`
-  (CF tier) and `https://pods-native.dreamlab-ai.com/{pubkey}/profile/card#me`
+- WebID documents at `https://pods.example.com/{pubkey}/profile/card#me`
+  (CF tier) and `https://pods-native.example.com/{pubkey}/profile/card#me`
   (native tier) are structurally identical; the `pod_base_url` field in the
   WebID determines which tier a given user is on.
 - The PSK rotation procedure is documented in `SETUP.md` but requires a worker
@@ -235,7 +235,7 @@ tier set this var in their Trunk build config or CI environment.
 ### CORS allowlist
 
 The native server's CORS configuration must include the forum-client origin
-(`https://dreamlab-ai.com`) and any local dev origins. This is set in the
+(`https://example.com`) and any local dev origins. This is set in the
 `solid-pod-rs-server` startup config, not in the CF Worker.
 
 ### PSK admin key lifecycle
@@ -277,10 +277,10 @@ native tier is disabled for that operator deployment.
   `admin.rs` gains `NativePodsTab` listing provisioned native pods with a
   "Provision" action.
 - **`nostr-bbs-config`**: `NativePod` struct; optional field on `BbsConfig`.
-- **`forum-config/dreamlab.toml`**: `[native_pod]` section added for the
-  DreamLab operator overlay.
-- **Agentbox**: `solid-pod-rs-server --features git` running on port 3001,
-  Cloudflare Tunnel configured for `pods-native.dreamlab-ai.com`.
+- **`forum-config/forum.toml`**: `[native_pod]` section added for the
+  operator overlay.
+- **Native pod host**: `solid-pod-rs-server --features git` running on port 3001,
+  Cloudflare Tunnel configured for `pods-native.example.com`.
 
 ---
 

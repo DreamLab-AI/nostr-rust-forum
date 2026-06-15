@@ -182,7 +182,7 @@ pub async fn handle_add(
 
     let now = now_secs() as i64;
 
-    // RELAY_DB (dreamlab-relay): the relay's whitelist is the source of
+    // RELAY_DB (nostr-bbs-relay): the relay's whitelist is the source of
     // truth for admin flags. Write there so the relay DO and this worker's
     // is_admin() both see the change immediately.
     let relay_db = match env.d1("RELAY_DB") {
@@ -207,7 +207,7 @@ pub async fn handle_add(
         return error_json(env, &format!("RELAY_DB error: {e}"), 500);
     }
 
-    // DB (dreamlab-auth): also ensure a members row exists for the
+    // DB (nostr-bbs-auth): also ensure a members row exists for the
     // invite-flow admin set.
     if let Ok(db) = env.d1("DB") {
         let _ = db
@@ -332,7 +332,7 @@ pub async fn handle_delete_member(
         return error_json(env, "Cannot delete your own account", 403);
     }
 
-    // DB (dreamlab-auth): drop the members row and the username reservation
+    // DB (nostr-bbs-auth): drop the members row and the username reservation
     // (which carries the claimed handle and the admin-only real_name).
     let db = match env.d1("DB") {
         Ok(db) => db,

@@ -117,9 +117,9 @@ work.
   git-init-enabled deployments. Pod base URL flows from
   `[pod].base_url` via the existing `VITE_POD_API_URL` env override
   (mirrors `pages/pod_browser.rs`).
-- **`dreamlab-ai-website`**: operator overlay keeps `[git].enabled =
-  false` for the Cloudflare deployment recipe; agentbox recipe sets it
-  to `true`.
+- **Operator overlay**: keeps `[git].enabled =
+  false` for the Cloudflare deployment recipe; a native (server-Tokio)
+  recipe sets it to `true`.
 - **README**: Phase 1 (May 2026) section gains a "Phase 1 extension:
   git-pods (2026-05-16)" paragraph cross-referencing this ADR.
 

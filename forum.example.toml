@@ -1,0 +1,278 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  nostr-bbs — VANILLA community forum configuration template
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  Copy this file to `forum.toml` and edit it for YOUR community:
+#
+#      cp forum.example.toml forum.toml
+#      $EDITOR forum.toml
+#
+#  This is the single source of truth for every deployment-specific setting.
+#  The worker crates load it at startup (`nostr_bbs_config::load_from_path`) and
+#  the forum-client reads its shape at build time. To rebrand, change hostnames,
+#  re-cut your cohort/zone taxonomy, or federate, edit THIS file — never the kit
+#  source.
+#
+#  Every value below is a SAFE, GENERIC placeholder. Replace `example.com`,
+#  the placeholder pubkeys, and the cohort names with your own before going
+#  live. Sections marked OPTIONAL may be deleted entirely — each one falls back
+#  to a conservative default if omitted.
+#
+#  Pubkeys are 64-character lowercase hex (Nostr x-only public keys). The
+#  zeroed placeholders below WILL FAIL validation by design — swap in real keys.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+# ─── Deployment ──────────────────────────────────────────────────────────────
+# Human-readable name and canonical hostname. The hostname MUST be https://
+# (http://localhost is allowed for local development).
+[deployment]
+name     = "Community Forum"
+hostname = "https://forum.example.com"
+
+
+# ─── WebAuthn ────────────────────────────────────────────────────────────────
+# Relying-party identity for passkey login. `rp_id` is a BARE domain (eTLD+1 of
+# your deployment — no scheme, no path). `expected_origin` is the full origin.
+[webauthn]
+rp_id           = "forum.example.com"
+expected_origin = "https://forum.example.com"
+
+
+# ─── Solid Pod backend ───────────────────────────────────────────────────────
+# Where member pods live. `storage_backend` is one of: "fs" (local filesystem),
+# "s3", or "cf-r2" (Cloudflare R2). `r2_bucket` only applies to "cf-r2".
+[pod]
+base_url        = "https://pods.example.com"
+storage_backend = "fs"
+# r2_bucket     = "community-pods"   # uncomment for storage_backend = "cf-r2"
+
+
+# ─── Nostr Relay ─────────────────────────────────────────────────────────────
+# The relay your community connects to. URL MUST be wss:// (ws://localhost is
+# allowed for local dev). `ingress_policy`: "allowlist" (whitelist required —
+# recommended for private communities) or "open" (anyone may publish).
+[relay]
+url            = "wss://relay.example.com"
+ingress_policy = "allowlist"
+
+
+# ─── Admin pubkeys ───────────────────────────────────────────────────────────
+# Who can moderate, manage zones, and bypass cohort gates. `mode`:
+#   "static" — admin pubkeys are listed below (simplest; recommended to start).
+#   "d1"     — admins resolved from a runtime D1 table (advanced).
+# Replace the placeholder with at least one REAL 64-char hex pubkey.
+[admin]
+mode = "static"
+static_pubkeys = [
+  # community-owner — primary admin. Replace with your real pubkey.
+  "0000000000000000000000000000000000000000000000000000000000000000",
+]
+
+
+# ─── Branding ────────────────────────────────────────────────────────────────
+# OPTIONAL. UI theme, logo, and onboarding copy.
+[branding]
+theme        = "neutral"                              # e.g. "neutral", "blue", "amber"
+logo_url     = "https://forum.example.com/assets/logo.svg"
+welcome_copy = "Welcome to our community forum — a space to share, plan, and connect."
+
+
+# ─── Zones ───────────────────────────────────────────────────────────────────
+# OPTIONAL but recommended. Zones are the top-level areas of your forum. Each
+# zone gates READ access by cohort and (optionally) WRITE access separately.
+#
+#   visibility:        "public" (read without auth) | "locked" (tile shown,
+#                      content gated) | "hidden" (invisible to non-members).
+#   required_cohorts:  cohorts needed to READ. Empty + public = open read.
+#   write_cohorts:     cohorts needed to WRITE (defaults to required_cohorts).
+#   accent_hex:        per-zone tile colour (#rgb / #rrggbb), themes the client.
+#   banner_image_url:  hero image for the zone tile.
+#   encrypted:         client-side NIP-44 encryption for zone content.
+#
+# Pick your own cohort taxonomy — "members"/"friends"/"family"/"business" below
+# is just one example. Cohorts are arbitrary string labels you assign to users.
+
+[[zones]]
+id               = "public"
+display_name     = "Public Square"
+required_cohorts = []                                  # open read
+write_cohorts    = ["members"]                         # only members post
+visibility       = "public"
+accent_hex       = "#3b82f6"                           # blue
+banner_image_url = "/images/heroes/public-hero.webp"
+encrypted        = false
+
+[[zones]]
+id               = "friends"
+display_name     = "Friends"
+required_cohorts = ["friends"]
+visibility       = "locked"
+accent_hex       = "#10b981"                           # green
+banner_image_url = "/images/heroes/friends-hero.webp"
+encrypted        = false
+
+[[zones]]
+id               = "family"
+display_name     = "Family"
+required_cohorts = ["family"]
+visibility       = "locked"
+accent_hex       = "#f59e0b"                           # amber
+banner_image_url = "/images/heroes/family-hero.webp"
+encrypted        = true                                # private — encrypt content
+
+[[zones]]
+id               = "business"
+display_name     = "Business"
+required_cohorts = ["business"]
+visibility       = "locked"
+accent_hex       = "#8b5cf6"                           # violet
+banner_image_url = "/images/heroes/business-hero.webp"
+encrypted        = false
+
+
+# ─── Trust thresholds ────────────────────────────────────────────────────────
+# OPTIONAL. Reputation gates for moderated channels.
+[trust]
+join_threshold = 0     # trust needed to JOIN a moderated channel (0 = anyone)
+post_threshold = 1     # trust needed to POST in a moderated channel
+
+
+# ─── Invite system ───────────────────────────────────────────────────────────
+# OPTIONAL. When enabled, a welcome bot DMs newly-onboarded members.
+[invites]
+enabled            = false
+# welcome_bot_pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
+
+
+# ─── Moderation ──────────────────────────────────────────────────────────────
+# OPTIONAL. Inclusive event-kind range used for moderation events.
+[moderation]
+kinds_lo = 30910
+kinds_hi = 30916
+
+
+# ─── Federation mesh ─────────────────────────────────────────────────────────
+# OPTIONAL. Cross-relay federation. `mode`:
+#   "standalone" — no federation (default; recommended to start).
+#   "federated"  — relay exposed externally; accepts/peers with other relays.
+[mesh]
+mode        = "standalone"
+peer_relays = []                                       # e.g. ["wss://peer.example.org"]
+
+
+# ─── Rate limits (per-route) ─────────────────────────────────────────────────
+# OPTIONAL. Per-IP requests per minute. Tune to your traffic.
+[ratelimit]
+profiles_batch_per_min   = 60     # /api/profiles/batch
+nostr_well_known_per_min = 60     # /.well-known/nostr.json
+
+
+# ─── Feature flags ───────────────────────────────────────────────────────────
+# OPTIONAL. Toggle optional UI surfaces on/off.
+[features]
+marketplace = false
+calendar    = true
+dms         = true
+governance  = false
+
+
+# ─── NIP-05 resolution ───────────────────────────────────────────────────────
+# OPTIONAL. How `name@your-domain` identifiers resolve. `resolver_mode`:
+#   "d1"        — central registry only (default; forum is authoritative).
+#   "federated" — registry first, then fall through to the pod's
+#                 /.well-known/nostr.json (requires pod_base_url, https://, no
+#                 trailing slash).
+[nip05]
+resolver_mode = "d1"
+# pod_base_url = "https://pods.example.com"   # required if resolver_mode = "federated"
+
+
+# ─── Native pod server ───────────────────────────────────────────────────────
+# OPTIONAL. A second, self-hosted pod backend with full git support, shown
+# alongside the primary pod for users in `allowlist_cohorts` (empty = everyone).
+[native_pod]
+enabled             = false
+base_url            = "https://pods-native.example.com"
+allowlist_cohorts   = ["family", "friends", "business"]
+git_enabled         = true
+admin_provision_url = "https://pods-native.example.com/_admin/provision"
+
+
+# ─── Pod creation / provisioning ─────────────────────────────────────────────
+# OPTIONAL. Authenticated pod creation at signup. Leave `keys_at_signup = false`
+# if your client generates keys on-device and the backend must never store
+# private keys.
+[provision]
+enabled         = false
+keys_at_signup  = false
+private_dir     = "/private/"            # WAC-locked container path (absolute)
+privkey_filename = "privkey.jsonld"
+
+
+# ─── Pod data export ─────────────────────────────────────────────────────────
+# OPTIONAL. The /api/exports/* surface. Bandwidth-heavy → rate-limited and off
+# by default. Owner consent (WAC) is always required to include /private/*.
+[export]
+enabled                 = false
+include_private_default = false
+rate_limit_per_min      = 6
+
+
+# ─── Git-versioned pods ──────────────────────────────────────────────────────
+# OPTIONAL. `git init` each pod at creation for a per-pod audit trail. Requires
+# a backend that can spawn subprocesses (native, not serverless). `clone_url_base`
+# (when set) must be https://.
+[git]
+enabled        = false
+auto_init      = true
+default_branch = "main"
+clone_url_base = "https://pods.example.com"
+
+
+# ─── Agent governance ────────────────────────────────────────────────────────
+# OPTIONAL. Control surfaces published by pre-registered agent pubkeys (event
+# kinds 31400-31405). When `enabled = true` you MUST list at least one 64-char
+# hex agent pubkey. `relay_url` empty = reuse the main [relay].
+[governance]
+enabled   = false
+route     = "/governance"
+kinds_lo  = 31400
+kinds_hi  = 31405
+relay_url = ""                                         # empty = use main relay
+agent_pubkeys = [
+  # control-agent — replace with a real agent pubkey before enabling.
+  # "0000000000000000000000000000000000000000000000000000000000000000",
+]
+
+
+# ─── Payments ────────────────────────────────────────────────────────────────
+# OPTIONAL. HTTP 402 micro-ledger gating for paid actions, plus an optional
+# descriptive community-token. Disabled by default.
+[payments]
+enabled   = false
+cost_sats = 1
+
+[payments.token]
+ticker = "COIN"
+rate   = 10                                            # token units minted per sat
+supply = 1000000                                       # total supply cap
+issuer = ""                                            # set your issuer pubkey at deploy time
+
+
+# ─── Shared calendar / venues ────────────────────────────────────────────────
+# OPTIONAL. Named venues that scheduled NIP-52 events are filed under. The
+# agenda groups events by venue, in the order listed here. Name them however
+# fits your community (rooms, channels, physical spaces, ...).
+[calendar]
+shared_venues = ["primary", "secondary"]
+
+
+# ─── Operator custody tier ───────────────────────────────────────────────────
+# Where deployment secrets live (per ADR-079 §4):
+#   "tier-1" — self-host (secrets on your own box)
+#   "tier-2" — serverless secrets (e.g. CF Workers Secrets)
+#   "tier-3" — managed PaaS
+#   "tier-4" — turnkey hosted
+[custody]
+operator = "tier-1"

@@ -2,7 +2,7 @@
 
 Per ADR-082 D3. Tracks which substrate consumes which fixture.
 
-| Fixture | nostr-rust-forum (kit) | agentbox | VisionClaw | solid-pod-rs | dreamlab-ai-website (consumer) |
+| Fixture | nostr-rust-forum (kit) | agentbox | VisionClaw | solid-pod-rs | operator-overlay (consumer) |
 |---------|:----------------------:|:--------:|:----------:|:-------------:|:-------------------------------:|
 | nip01-events.json | ✓ | ✓ | ✓ | ✓ | inherits via kit |
 | nip04-dm.json | ✓ | ✓ | ✓ | n/a | inherits via kit |
@@ -25,7 +25,7 @@ Per ADR-082 D3. Tracks which substrate consumes which fixture.
 Per ADR-082 D5:
 - Each substrate runs `scripts/sync-fixtures.sh` to copy from VisionClaw monorepo's `docs/specs/fixtures/`.
 - CI verifies SHA-256 match via `CHECKSUM.txt`.
-- `dreamlab-ai-website` consumes via Cargo dep on kit; inherits kit's fixture set.
+- `operator-overlay` consumes via Cargo dep on kit; inherits kit's fixture set.
 
 ## Update propagation
 

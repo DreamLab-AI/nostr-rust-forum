@@ -38,19 +38,14 @@ fn extract_date_parts(ts: u64) -> (String, u32) {
 
 /// Human-readable venue label for a free/busy venue slug.
 ///
-/// `fairfield` -> "Fairfield", `dreamlab` -> "DreamLab"; any other slug is
-/// title-cased best-effort.
+/// Title-cases the slug generically: `fairfield` -> "Fairfield". Operators
+/// supply venue display names via config; the kit never hardcodes brand labels.
 fn venue_label(slug: &str) -> String {
-    match slug.to_ascii_lowercase().as_str() {
-        "fairfield" => "Fairfield".to_string(),
-        "dreamlab" => "DreamLab".to_string(),
-        other => {
-            let mut chars = other.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        }
+    let lower = slug.to_ascii_lowercase();
+    let mut chars = lower.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -66,7 +61,7 @@ pub(crate) fn BusyCard(
     start_time: u64,
     /// UNIX timestamp for the block end.
     end_time: u64,
-    /// Venue slug (`fairfield` / `dreamlab`), empty when unknown.
+    /// Venue slug (e.g. `fairfield`), empty when unknown.
     venue: String,
 ) -> impl IntoView {
     let past = is_past(end_time);

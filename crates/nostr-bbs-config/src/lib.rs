@@ -28,8 +28,8 @@
 //! `#[serde(default)]`). Schema removals or type changes are breaking and bump
 //! the major version of this crate.
 //!
-//! [PRD-012 §5 X1]: https://github.com/DreamLab-AI/nostr-rust-forum/blob/main/docs/PRD-012.md
-//! [ADR-085]: https://github.com/DreamLab-AI/nostr-rust-forum/blob/main/docs/adr/ADR-085.md
+//! [PRD-012 §5 X1]: ../../docs/PRD-012.md
+//! [ADR-085]: ../../docs/adr/ADR-085.md
 
 #![warn(missing_docs)]
 

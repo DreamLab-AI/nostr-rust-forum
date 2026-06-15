@@ -16,7 +16,7 @@ migrations_dir = "migrations"
 # database_id below MUST be replaced with the relay worker's actual D1 id.
 [[d1_databases]]
 binding = "RELAY_DB"
-database_name = "dreamlab-relay"
+database_name = "nostr-bbs-relay"
 database_id = "00000000-0000-0000-0000-000000000000"
 
 [[kv_namespaces]]
