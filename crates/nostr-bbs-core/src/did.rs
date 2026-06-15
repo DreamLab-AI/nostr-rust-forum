@@ -77,40 +77,14 @@ pub fn is_valid_hex_pubkey(s: &str) -> bool {
 
 /// Render a Tier-1 (minimal) DID document.
 ///
-/// Delegates to `solid_pod_rs::did_nostr_types::render_did_document_tier1`
-/// and adds `authentication` + `assertionMethod` arrays (the forum
-/// convention includes these even at Tier-1 for clients that check
-/// authentication purpose before accepting signatures).
-///
-/// The `authentication`/`assertionMethod` references are derived from the
-/// upstream `verificationMethod[0].id` fragment rather than a hard-coded
-/// fragment string, so the forum tracks the canonical `did:nostr` Multikey
-/// form (`#key1`) emitted by upstream without re-pinning a fragment of its
-/// own (ADR-125 convergence; the `did:nostr:<hex>` string is unchanged, I1).
+/// Full delegation to `solid_pod_rs::did_nostr_types::render_did_document_tier1`
+/// — the canonical create-agent / ADR-125 Multikey form. As of solid-pod-rs
+/// 0.5.0-alpha.2 the upstream document already carries canonical relative
+/// `authentication`/`assertionMethod` (`["#key1"]`), `service: []`, and no
+/// `alsoKnownAs`, so the forum emits it verbatim — no fragment re-pinning and
+/// no absolute-ref rewrite (the `did:nostr:<hex>` string is unchanged, I1).
 pub fn render_did_document_tier1(pk: &NostrPubkey) -> Value {
-    let mut doc = upstream::render_did_document_tier1(&pk.to_upstream());
-    let vm_ref = vm_reference(&doc, pk);
-    doc["authentication"] = json!([&vm_ref]);
-    doc["assertionMethod"] = json!([&vm_ref]);
-    doc
-}
-
-/// Resolve the canonical verification-method reference for the document.
-///
-/// Reads the fragment from the upstream `verificationMethod[0].id` (the
-/// single source of truth for the VM identifier) and re-anchors it to the
-/// document `id`, yielding `<did>#<fragment>`. Falls back to the canonical
-/// `#key1` fragment if upstream omits a fragment. This keeps the forum's
-/// `authentication`/`assertionMethod` arrays in lockstep with whatever
-/// fragment upstream emits, so the Multikey convergence requires no forum
-/// edit when the upstream crate is bumped.
-fn vm_reference(doc: &Value, pk: &NostrPubkey) -> String {
-    let did = did_nostr_uri(pk);
-    let fragment = doc["verificationMethod"][0]["id"]
-        .as_str()
-        .and_then(|id| id.rsplit_once('#').map(|(_, frag)| frag.to_string()))
-        .unwrap_or_else(|| "key1".to_string());
-    format!("{did}#{fragment}")
+    upstream::render_did_document_tier1(&pk.to_upstream())
 }
 
 /// Render a Tier-3 DID document enriched with WebID and service entries.
@@ -245,7 +219,9 @@ mod tests {
         let doc = render_did_document_tier1(&pk);
         assert_eq!(doc["id"], format!("did:nostr:{PK_HEX}"));
         assert_eq!(doc["@context"][0], "https://w3id.org/did");
-        assert_eq!(doc["alsoKnownAs"].as_array().unwrap().len(), 0);
+        // ADR-125: canonical Multikey doc has no `alsoKnownAs` (the WebID link
+        // lives in `service`, populated only at Tier-3).
+        assert!(doc["alsoKnownAs"].is_null());
         let vm = &doc["verificationMethod"][0];
         // ADR-125: canonical Multikey form. publicKeyHex is dropped (D2 superseded).
         assert_eq!(vm["type"], "Multikey");
@@ -263,10 +239,12 @@ mod tests {
     fn tier1_includes_authentication_and_assertion() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
-        // The auth/assertion reference tracks the upstream VM fragment.
-        let expected_ref = doc["verificationMethod"][0]["id"].as_str().unwrap();
-        assert_eq!(doc["authentication"][0], expected_ref);
-        assert_eq!(doc["assertionMethod"][0], expected_ref);
+        // ADR-125: canonical authentication/assertionMethod use the relative
+        // fragment `#key1`; the VM id is the absolute `<did>#key1`.
+        assert_eq!(doc["authentication"][0], "#key1");
+        assert_eq!(doc["assertionMethod"][0], "#key1");
+        let vm_id = doc["verificationMethod"][0]["id"].as_str().unwrap();
+        assert!(vm_id.ends_with("#key1"));
     }
 
     #[test]
@@ -300,10 +278,12 @@ mod tests {
     }
 
     #[test]
-    fn tier1_has_no_service_section() {
+    fn tier1_has_empty_service_section() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
-        assert!(doc.get("service").is_none());
+        // ADR-125 / create-agent: the canonical doc carries `service: []` at
+        // Tier-1 (entries are added only at Tier-3).
+        assert!(doc["service"].as_array().unwrap().is_empty());
     }
 
     // ── Tier-3 document ───────────────────────────────────────────────
@@ -399,16 +379,15 @@ mod tests {
     }
 
     #[test]
-    fn tier1_superset_of_upstream() {
+    fn tier1_matches_upstream_canonical() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let local = render_did_document_tier1(&pk);
         let up = upstream::render_did_document_tier1(&pk.to_upstream());
-        assert_eq!(local["id"], up["id"]);
-        assert_eq!(local["@context"], up["@context"]);
-        assert_eq!(local["verificationMethod"], up["verificationMethod"]);
-        assert_eq!(local["alsoKnownAs"], up["alsoKnownAs"]);
-        // Forum adds authentication + assertionMethod at Tier-1
-        assert!(local.get("authentication").is_some());
-        assert!(up.get("authentication").is_none());
+        // Full delegation (alpha.2): the forum emits the upstream canonical
+        // Multikey document verbatim — relative authentication/assertionMethod
+        // and `service: []` included.
+        assert_eq!(local, up);
+        assert_eq!(local["authentication"][0], "#key1");
+        assert!(local["service"].as_array().unwrap().is_empty());
     }
 }

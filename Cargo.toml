@@ -131,7 +131,7 @@ wasm-bindgen-test = "0.3"
 # (commit 9b4076a), so registry and git are the same code — the alpha.15
 # aliasing (published crate != advanced untagged HEAD) is resolved and the
 # interim git+tag pin is retired per the deny.toml plan.
-solid-pod-rs = { version = "0.5.0-alpha.0", default-features = false, features = ["core"] }
+solid-pod-rs = { version = "0.5.0-alpha.2", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.2).
 nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.2" }

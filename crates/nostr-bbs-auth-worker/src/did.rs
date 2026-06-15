@@ -80,7 +80,12 @@ mod tests {
         assert_eq!(mb.len(), 71);
         assert_eq!(mb, mb.to_ascii_lowercase());
         assert_eq!(&mb[7..], VALID_PUBKEY);
-        assert_eq!(doc["alsoKnownAs"].as_array().unwrap().len(), 0);
+        // ADR-125: the canonical Multikey doc carries no `alsoKnownAs`; the
+        // DID->WebID link lives in `service` (SolidWebID), not here.
+        assert!(
+            doc["alsoKnownAs"].is_null(),
+            "canonical Multikey doc must not emit alsoKnownAs"
+        );
     }
 
     #[test]

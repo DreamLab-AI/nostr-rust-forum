@@ -50,6 +50,7 @@ STALE_SUITES=$(
     | grep -v 'node_modules' \
     | grep -v '/scripts/anti-drift-lint.sh' \
     | grep -v 'assert_ne!' \
+    | grep -v 'contains_key' \
     | grep -v '/tests/' \
     | grep -v '/fixtures/' \
     | grep -v '\.jsonld' \
