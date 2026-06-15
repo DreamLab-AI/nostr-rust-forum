@@ -81,13 +81,36 @@ pub fn is_valid_hex_pubkey(s: &str) -> bool {
 /// and adds `authentication` + `assertionMethod` arrays (the forum
 /// convention includes these even at Tier-1 for clients that check
 /// authentication purpose before accepting signatures).
+///
+/// The `authentication`/`assertionMethod` references are derived from the
+/// upstream `verificationMethod[0].id` fragment rather than a hard-coded
+/// fragment string, so the forum tracks the canonical `did:nostr` Multikey
+/// form (`#key1`) emitted by upstream without re-pinning a fragment of its
+/// own (ADR-125 convergence; the `did:nostr:<hex>` string is unchanged, I1).
 pub fn render_did_document_tier1(pk: &NostrPubkey) -> Value {
     let mut doc = upstream::render_did_document_tier1(&pk.to_upstream());
-    let did = did_nostr_uri(pk);
-    let vm_ref = format!("{did}#nostr-schnorr");
+    let vm_ref = vm_reference(&doc, pk);
     doc["authentication"] = json!([&vm_ref]);
     doc["assertionMethod"] = json!([&vm_ref]);
     doc
+}
+
+/// Resolve the canonical verification-method reference for the document.
+///
+/// Reads the fragment from the upstream `verificationMethod[0].id` (the
+/// single source of truth for the VM identifier) and re-anchors it to the
+/// document `id`, yielding `<did>#<fragment>`. Falls back to the canonical
+/// `#key1` fragment if upstream omits a fragment. This keeps the forum's
+/// `authentication`/`assertionMethod` arrays in lockstep with whatever
+/// fragment upstream emits, so the Multikey convergence requires no forum
+/// edit when the upstream crate is bumped.
+fn vm_reference(doc: &Value, pk: &NostrPubkey) -> String {
+    let did = did_nostr_uri(pk);
+    let fragment = doc["verificationMethod"][0]["id"]
+        .as_str()
+        .and_then(|id| id.rsplit_once('#').map(|(_, frag)| frag.to_string()))
+        .unwrap_or_else(|| "key1".to_string());
+    format!("{did}#{fragment}")
 }
 
 /// Render a Tier-3 DID document enriched with WebID and service entries.
@@ -221,19 +244,27 @@ mod tests {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
         assert_eq!(doc["id"], format!("did:nostr:{PK_HEX}"));
-        assert_eq!(doc["@context"][0], "https://www.w3.org/ns/did/v1");
+        assert_eq!(doc["@context"][0], "https://w3id.org/did");
         assert_eq!(doc["alsoKnownAs"].as_array().unwrap().len(), 0);
         let vm = &doc["verificationMethod"][0];
-        assert_eq!(vm["type"], "SchnorrSecp256k1VerificationKey2019");
-        assert_eq!(vm["publicKeyHex"], PK_HEX);
-        assert!(vm["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
+        // ADR-125: canonical Multikey form. publicKeyHex is dropped (D2 superseded).
+        assert_eq!(vm["type"], "Multikey");
+        assert!(vm.get("publicKeyHex").is_none());
+        let mb = vm["publicKeyMultibase"].as_str().unwrap();
+        // C1/C2/C3: f(base16-lower) + e701(secp256k1-pub) + 02(even-y) + 64-hex x-only.
+        assert!(mb.starts_with("fe70102"));
+        assert_eq!(mb.len(), 71);
+        assert_eq!(mb, mb.to_ascii_lowercase());
+        // I2 round-trip: multibase body equals the DID body equals the x-only hex.
+        assert_eq!(&mb[7..], PK_HEX);
     }
 
     #[test]
     fn tier1_includes_authentication_and_assertion() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
-        let expected_ref = format!("did:nostr:{PK_HEX}#nostr-schnorr");
+        // The auth/assertion reference tracks the upstream VM fragment.
+        let expected_ref = doc["verificationMethod"][0]["id"].as_str().unwrap();
         assert_eq!(doc["authentication"][0], expected_ref);
         assert_eq!(doc["assertionMethod"][0], expected_ref);
     }
@@ -243,17 +274,20 @@ mod tests {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
         let ctx = doc["@context"].as_array().unwrap();
+        // ADR-125 §2: canonical did:nostr Multikey contexts.
         assert_eq!(ctx.len(), 2);
-        assert_eq!(ctx[0], "https://www.w3.org/ns/did/v1");
-        assert_eq!(ctx[1], "https://w3id.org/security/suites/secp256k1-2019/v1");
+        assert_eq!(ctx[0], "https://w3id.org/did");
+        assert_eq!(ctx[1], "https://w3id.org/nostr/context");
     }
 
     #[test]
-    fn tier1_verification_method_type_is_2019() {
+    fn tier1_verification_method_type_is_multikey() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
         let vm_type = doc["verificationMethod"][0]["type"].as_str().unwrap();
-        assert_eq!(vm_type, "SchnorrSecp256k1VerificationKey2019");
+        // ADR-125: Multikey is canonical; the 2019/2022/2024 suites are superseded.
+        assert_eq!(vm_type, "Multikey");
+        assert_ne!(vm_type, "SchnorrSecp256k1VerificationKey2019");
         assert_ne!(vm_type, "SchnorrSecp256k1VerificationKey2022");
         assert_ne!(vm_type, "NostrSchnorrKey2024");
     }
@@ -340,13 +374,18 @@ mod tests {
     // ── Multibase ─────────────────────────────────────────────────────
 
     #[test]
-    fn multibase_is_deterministic_and_starts_z() {
+    fn multibase_is_deterministic_and_canonical_multikey() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let a = format_multibase_schnorr(&pk.0);
         let b = format_multibase_schnorr(&pk.0);
         assert_eq!(a, b);
-        assert!(a.starts_with('z'));
-        assert!(a.len() > 10);
+        // ADR-125 C1/C2/C3: fe70102 prefix, 71 chars, lowercase, body == x-only hex.
+        assert!(a.starts_with("fe70102"));
+        assert_eq!(a.len(), 71);
+        assert_eq!(a, a.to_ascii_lowercase());
+        assert_eq!(&a[7..], PK_HEX);
+        // Missing-parity (fe701 + 64 hex, 67 chars) is the ship-bug form — must NOT match.
+        assert_ne!(a.len(), 67);
     }
 
     // ── Upstream parity ───────────────────────────────────────────────

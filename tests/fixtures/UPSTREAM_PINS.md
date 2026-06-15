@@ -104,11 +104,12 @@ Per ADR-082 D2. Each fixture file in this directory derives vectors from an upst
 - Vectors: 27 (18 basic encodings + 4 leading-zero + 2 case-insensitive + 3 negative)
 
 ### did-doc-conformance (DreamLab-internal)
-- Source: `/home/devuser/workspace/project/docs/adr/ADR-074-cross-system-did-nostr-canonicalisation.md` D2 (DID Document canonical shape)
+- Source: `/home/devuser/workspace/project/docs/adr/ADR-125-did-nostr-multikey-convergence.md` §2 (canonical did:nostr Multikey DID Document shape; supersedes ADR-074 D2/D3/D4/D13). Ground truth: melvincarvalho/create-agent index.js + did-nostr CG (nostrcg.github.io/did-nostr).
 - Pinned commit: in-tree (this monorepo)
-- Last refresh: 2026-05-07
-- Refresh policy: on ADR-074 amendment
-- Vectors: 7 (2 positive Tier-3/Tier-1 + 5 negative for each major D-rule violation: stale-suite-2022, stale-suite-2025, missing-context, uppercase-id, mismatched-controller)
+- Last refresh: 2026-06-15
+- Refresh policy: on ADR-125 amendment
+- Invariants under test: I1 (did:nostr:<hex> string unchanged), I2 (publicKeyMultibase == "fe70102" + same 64-char lowercase x-only hex, 71 chars, parity 02), I4 (ADR-074 D1 x-only hex = canonical identity stays).
+- Vectors: 9 (2 positive — canonical create-agent minimal + tier3 agentbox-extension; 7 negative — missing-parity-byte, uppercase-hex-under-f, legacy-z-base58, retains-publickeyhex, stale-suite-2019, stale-suite-2025, mismatched-controller)
 
 ### is-envelope-v1 (DreamLab-internal)
 - Source: `/home/devuser/workspace/project/docs/adr/ADR-075-is-envelope-message-contract.md` D1+D3 (envelope schema, per-kind body shapes)
@@ -149,5 +150,6 @@ Per ADR-082 D2. Each fixture file in this directory derives vectors from an upst
 | 2026-05-07 | nip98-tokens.json | initial vendor (nostr-protocol/nips@05d3f19) | mega-sprint Phase 1 | NIP-98 HTTP Auth; 6 vectors |
 | 2026-05-07 | multibase.json | initial vendor (multiformats/multibase@d7406cd) | mega-sprint Phase 1 | Self-describing base encoding; 27 vectors |
 | 2026-05-07 | did-doc-conformance.json | initial DreamLab-internal (ADR-074 D2) | mega-sprint Phase 1 | DID Document conformance; 7 vectors |
+| 2026-06-15 | did-doc-conformance.json | ADR-125 did:nostr Multikey convergence (supersedes ADR-074 D2) | convergence sprint | Re-encoded to canonical fe70102 Multikey form; +C1/C2 negative vectors; 9 vectors |
 | 2026-05-07 | is-envelope-v1.json | initial DreamLab-internal (ADR-075 D1+D3) | mega-sprint Phase 1 | IS-Envelope per-kind shapes; 11 vectors |
 | 2026-05-07 | mesh-federation.json | initial DreamLab-internal (ADR-073 D2/D6/D9 + ADR-074 D9) | mega-sprint Phase 1 | Mesh federation behaviour; 9 vectors |

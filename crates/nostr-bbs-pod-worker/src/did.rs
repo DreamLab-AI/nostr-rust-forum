@@ -18,10 +18,14 @@ mod tests {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
         assert_eq!(doc["id"], format!("did:nostr:{PK_HEX}"));
-        assert!(doc["verificationMethod"][0]["publicKeyMultibase"]
+        // ADR-125: canonical did:nostr Multikey multibase — fe70102 + 64-hex,
+        // 71 chars, lowercase (C1/C2/C3). The old z+base58 form is superseded.
+        let mb = doc["verificationMethod"][0]["publicKeyMultibase"]
             .as_str()
-            .unwrap()
-            .starts_with('z'));
+            .unwrap();
+        assert!(mb.starts_with("fe70102"));
+        assert_eq!(mb.len(), 71);
+        assert_eq!(mb, mb.to_ascii_lowercase());
     }
 
     #[test]

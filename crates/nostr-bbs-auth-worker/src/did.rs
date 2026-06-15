@@ -71,10 +71,15 @@ mod tests {
         let pk = NostrPubkey::from_hex(VALID_PUBKEY).unwrap();
         let doc = render_did_document_tier1(&pk);
         assert_eq!(doc["id"], format!("did:nostr:{VALID_PUBKEY}"));
-        assert!(doc["verificationMethod"][0]["publicKeyMultibase"]
+        // ADR-125: canonical did:nostr Multikey multibase (C1/C2/C3).
+        // fe70102 prefix, 71 chars, lowercase, body round-trips to the DID body.
+        let mb = doc["verificationMethod"][0]["publicKeyMultibase"]
             .as_str()
-            .unwrap()
-            .starts_with('z'));
+            .unwrap();
+        assert!(mb.starts_with("fe70102"));
+        assert_eq!(mb.len(), 71);
+        assert_eq!(mb, mb.to_ascii_lowercase());
+        assert_eq!(&mb[7..], VALID_PUBKEY);
         assert_eq!(doc["alsoKnownAs"].as_array().unwrap().len(), 0);
     }
 

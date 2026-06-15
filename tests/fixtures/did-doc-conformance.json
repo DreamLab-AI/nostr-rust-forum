@@ -2,35 +2,55 @@
   "_meta": {
     "source": "DreamLab-internal",
     "commit": "in-tree",
-    "upstream_path": "docs/adr/ADR-074-cross-system-did-nostr-canonicalisation.md#D2",
-    "fetched_at": "2026-05-07",
+    "upstream_path": "docs/adr/ADR-125-did-nostr-multikey-convergence.md#2 (supersedes ADR-074 D2/D3/D4/D13)",
+    "fetched_at": "2026-06-15",
     "license": "internal",
-    "spec": "ADR-074 D2 — Canonical DID Document shape (Tier-3, all emitters)",
-    "vector_count": 7,
-    "schema": "fields: case, tier (1|3), document (DID Document JSON-LD object), valid (bool), violation? (which D-rule from ADR-074 the negative case targets), note?"
+    "spec": "ADR-125 — canonical did:nostr DID Document shape (Multikey). Ground truth: melvincarvalho/create-agent index.js + did-nostr CG (nostrcg.github.io/did-nostr).",
+    "vector_count": 9,
+    "schema": "fields: case, tier (1|3), document (DID Document JSON-LD object), valid (bool), violation? (which rule the negative case targets), note?",
+    "invariants": "I1 did:nostr:<hex> string unchanged. I2 publicKeyMultibase == 'fe70102' + same 64-char lowercase x-only hex (71 chars, parity 02). I4 ADR-074 D1 (x-only hex = canonical identity) stays."
   },
   "vectors": [
     {
-      "case": "tier3-canonical-full",
+      "case": "canonical-create-agent-minimal",
+      "tier": 1,
+      "document": {
+        "@context": ["https://w3id.org/did", "https://w3id.org/nostr/context"],
+        "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
+        "type": "DIDNostr",
+        "verificationMethod": [
+          {
+            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key1",
+            "type": "Multikey",
+            "controller": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
+            "publicKeyMultibase": "fe701028e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd"
+          }
+        ],
+        "authentication": ["#key1"],
+        "assertionMethod": ["#key1"],
+        "service": []
+      },
+      "valid": true,
+      "note": "THE canonical single did:nostr form per ADR-125 §2 / create-agent / did-nostr CG. type:DIDNostr top-level, Multikey VM, #key1 fragment, service:[]. No publicKeyHex (D2 dropped, no dual-publish). publicKeyMultibase = fe70102 + 64-char lowercase x-only hex (71 chars)."
+    },
+    {
+      "case": "tier3-agentbox-extension-full",
       "tier": 3,
       "document": {
-        "@context": [
-          "https://www.w3.org/ns/did/v1",
-          "https://w3id.org/security/suites/secp256k1-2019/v1"
-        ],
+        "@context": ["https://w3id.org/did", "https://w3id.org/nostr/context"],
         "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
+        "type": "DIDNostr",
         "alsoKnownAs": ["https://pod.example.com/8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd/profile/card"],
         "verificationMethod": [
           {
-            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0",
-            "type": "SchnorrSecp256k1VerificationKey2019",
+            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key1",
+            "type": "Multikey",
             "controller": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
-            "publicKeyHex": "8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
-            "publicKeyMultibase": "zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPv1E5pa"
+            "publicKeyMultibase": "fe701028e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd"
           }
         ],
-        "authentication": ["did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0"],
-        "assertionMethod": ["did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0"],
+        "authentication": ["#key1"],
+        "assertionMethod": ["#key1"],
         "service": [
           {
             "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#solid-pod",
@@ -55,54 +75,104 @@
         ]
       },
       "valid": true,
-      "note": "Canonical Tier-3 DID Document per ADR-074 D2. All four service entries present; both contexts in @context."
+      "note": "ADR-125 C4: a populated service[] is an AGENTBOX EXTENSION (superset), NOT the create-agent canonical form. SolidStorage/NostrRelay/SolidWebID/DIDNostrMesh are agentbox extensions, permitted (service is optional). The Multikey core (@context/type/VM/auth/assertion) is byte-identical to the minimal canonical form."
     },
     {
-      "case": "tier1-minimal-valid",
+      "case": "negative-missing-parity-byte",
       "tier": 1,
       "document": {
-        "@context": [
-          "https://www.w3.org/ns/did/v1",
-          "https://w3id.org/security/suites/secp256k1-2019/v1"
-        ],
+        "@context": ["https://w3id.org/did", "https://w3id.org/nostr/context"],
         "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
+        "type": "DIDNostr",
         "verificationMethod": [
           {
-            "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9#key-0",
-            "type": "SchnorrSecp256k1VerificationKey2019",
+            "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9#key1",
+            "type": "Multikey",
             "controller": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
-            "publicKeyHex": "611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
+            "publicKeyMultibase": "fe701611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9"
+          }
+        ],
+        "authentication": ["#key1"],
+        "assertionMethod": ["#key1"],
+        "service": []
+      },
+      "valid": false,
+      "violation": "ADR-125 C1/C2 (I2)",
+      "note": "publicKeyMultibase omits the 0x02 even-y parity byte: f + e701(varint) + 64-hex x-only = 69 chars (varint ‖ raw-32-byte-x-only, no SEC1 compressed framing). secp256k1-pub (0xe7) is defined over the 33-byte compressed key, so the parity byte is mandatory payload. CI MUST reject (length 69 ≠ 71)."
+    },
+    {
+      "case": "negative-uppercase-hex-under-f",
+      "tier": 1,
+      "document": {
+        "@context": ["https://w3id.org/did", "https://w3id.org/nostr/context"],
+        "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
+        "type": "DIDNostr",
+        "verificationMethod": [
+          {
+            "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9#key1",
+            "type": "Multikey",
+            "controller": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
+            "publicKeyMultibase": "fe70102611DF01BFCF85C26AE65453B772D8F1DFD25C264621C0277E1FC1518686FAEF9"
+          }
+        ],
+        "authentication": ["#key1"],
+        "assertionMethod": ["#key1"],
+        "service": []
+      },
+      "valid": false,
+      "violation": "ADR-125 C2/C3 (I2)",
+      "note": "Uppercase hex under an 'f' (base16-LOWER) multibase indicator. The canonical form is base16-lower throughout; 'F' upper is a different, malformed-here indicator. CI MUST reject (regex ^fe70102[0-9a-f]{64}$ fails)."
+    },
+    {
+      "case": "negative-legacy-z-base58-multibase",
+      "tier": 1,
+      "document": {
+        "@context": ["https://w3id.org/did", "https://w3id.org/nostr/context"],
+        "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
+        "type": "DIDNostr",
+        "verificationMethod": [
+          {
+            "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9#key1",
+            "type": "Multikey",
+            "controller": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
             "publicKeyMultibase": "zQ3shgHPsZWnQ5ZkJSrokRfaWS2v4WhwtJTH2x8RwgmpfsRPP"
           }
         ],
-        "authentication": ["did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9#key-0"]
-      },
-      "valid": true,
-      "note": "Minimal Tier-1 DID Document per ADR-074 D4: required fields only. Both contexts MUST be present even at Tier-1 (PRD-010 H4 fix)."
-    },
-    {
-      "case": "negative-missing-secp256k1-context",
-      "tier": 1,
-      "document": {
-        "@context": ["https://www.w3.org/ns/did/v1"],
-        "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
-        "verificationMethod": [
-          {
-            "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9#key-0",
-            "type": "SchnorrSecp256k1VerificationKey2019",
-            "controller": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
-            "publicKeyHex": "611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9"
-          }
-        ],
-        "authentication": ["did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9#key-0"]
+        "authentication": ["#key1"],
+        "assertionMethod": ["#key1"],
+        "service": []
       },
       "valid": false,
-      "violation": "ADR-074 D4",
-      "note": "Tier-1 omits secp256k1-2019/v1 context — pre-fix solid-pod-rs-nostr behaviour. PRD-010 H4 fixes; substrates MUST reject after fix."
+      "violation": "ADR-125 D3' (I2)",
+      "note": "Legacy z+base58btc multibase (the superseded ADR-074 D3 form). Canonical is f+base16-lower with the fe70102 framing. CI MUST reject the z indicator."
     },
     {
-      "case": "negative-stale-suite-2022",
-      "tier": 3,
+      "case": "negative-retains-publickeyhex",
+      "tier": 1,
+      "document": {
+        "@context": ["https://w3id.org/did", "https://w3id.org/nostr/context"],
+        "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
+        "type": "DIDNostr",
+        "verificationMethod": [
+          {
+            "id": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9#key1",
+            "type": "Multikey",
+            "controller": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
+            "publicKeyHex": "611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
+            "publicKeyMultibase": "fe70102611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9"
+          }
+        ],
+        "authentication": ["#key1"],
+        "assertionMethod": ["#key1"],
+        "service": []
+      },
+      "valid": false,
+      "violation": "ADR-125 §2.1 (D2 superseded, no dual-publish)",
+      "note": "Retains publicKeyHex alongside the Multikey form. ADR-125 drops the 2019 suite and does NOT dual-publish — publicKeyHex must not be emitted. CI MUST reject."
+    },
+    {
+      "case": "negative-stale-suite-2019",
+      "tier": 1,
       "document": {
         "@context": [
           "https://www.w3.org/ns/did/v1",
@@ -111,85 +181,59 @@
         "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
         "verificationMethod": [
           {
-            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0",
-            "type": "SchnorrSecp256k1VerificationKey2022",
+            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#nostr-schnorr",
+            "type": "SchnorrSecp256k1VerificationKey2019",
             "controller": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
             "publicKeyHex": "8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd"
           }
         ],
-        "authentication": ["did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0"]
+        "authentication": ["did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#nostr-schnorr"]
       },
       "valid": false,
-      "violation": "ADR-074 D1 + anti-drift Rule 2",
-      "note": "Stale suite identifier 2022 — anti-drift CI MUST reject (canonical is 2019)."
+      "violation": "ADR-125 (supersedes ADR-074 D2) + anti-drift Rule 1",
+      "note": "The superseded 2019 DID-doc shape (old @context, 2019 suite, publicKeyHex, #nostr-schnorr fragment). Anti-drift CI MUST reject after ADR-125; canonical VM type is Multikey."
     },
     {
       "case": "negative-stale-suite-2025",
       "tier": 3,
       "document": {
-        "@context": [
-          "https://www.w3.org/ns/did/v1",
-          "https://w3id.org/security/suites/secp256k1-2019/v1"
-        ],
+        "@context": ["https://w3id.org/did", "https://w3id.org/nostr/context"],
         "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
+        "type": "DIDNostr",
         "verificationMethod": [
           {
-            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0",
+            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key1",
             "type": "SchnorrSecp256k1VerificationKey2025",
             "controller": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
-            "publicKeyHex": "8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd"
+            "publicKeyMultibase": "fe701028e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd"
           }
         ],
-        "authentication": ["did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0"]
+        "authentication": ["#key1"]
       },
       "valid": false,
-      "violation": "ADR-074 D1 + anti-drift Rule 2",
-      "note": "Fabricated future suite identifier — anti-drift CI MUST reject."
-    },
-    {
-      "case": "negative-uppercase-hex-id",
-      "tier": 1,
-      "document": {
-        "@context": [
-          "https://www.w3.org/ns/did/v1",
-          "https://w3id.org/security/suites/secp256k1-2019/v1"
-        ],
-        "id": "did:nostr:8E0D3D3EB2881EC137A11DEBE736A9086715A8C8BEEEDA615780064D68BC25DD",
-        "verificationMethod": [
-          {
-            "id": "did:nostr:8E0D3D3EB2881EC137A11DEBE736A9086715A8C8BEEEDA615780064D68BC25DD#key-0",
-            "type": "SchnorrSecp256k1VerificationKey2019",
-            "controller": "did:nostr:8E0D3D3EB2881EC137A11DEBE736A9086715A8C8BEEEDA615780064D68BC25DD",
-            "publicKeyHex": "8E0D3D3EB2881EC137A11DEBE736A9086715A8C8BEEEDA615780064D68BC25DD"
-          }
-        ],
-        "authentication": ["did:nostr:8E0D3D3EB2881EC137A11DEBE736A9086715A8C8BEEEDA615780064D68BC25DD#key-0"]
-      },
-      "valid": false,
-      "violation": "ADR-074 D1",
-      "note": "DID id contains uppercase hex; canonical form is lowercase only."
+      "violation": "ADR-125 + anti-drift Rule 1",
+      "note": "Fabricated future suite identifier in the VM type — anti-drift CI MUST reject. Canonical type is Multikey."
     },
     {
       "case": "negative-mismatched-controller",
       "tier": 1,
       "document": {
-        "@context": [
-          "https://www.w3.org/ns/did/v1",
-          "https://w3id.org/security/suites/secp256k1-2019/v1"
-        ],
+        "@context": ["https://w3id.org/did", "https://w3id.org/nostr/context"],
         "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd",
+        "type": "DIDNostr",
         "verificationMethod": [
           {
-            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0",
-            "type": "SchnorrSecp256k1VerificationKey2019",
+            "id": "did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key1",
+            "type": "Multikey",
             "controller": "did:nostr:611df01bfcf85c26ae65453b772d8f1dfd25c264621c0277e1fc1518686faef9",
-            "publicKeyHex": "8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd"
+            "publicKeyMultibase": "fe701028e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd"
           }
         ],
-        "authentication": ["did:nostr:8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd#key-0"]
+        "authentication": ["#key1"],
+        "service": []
       },
       "valid": false,
-      "violation": "ADR-074 D2",
+      "violation": "ADR-125 §2 (controller binding)",
       "note": "verificationMethod.controller does not match document.id; verifiers MUST reject."
     }
   ]

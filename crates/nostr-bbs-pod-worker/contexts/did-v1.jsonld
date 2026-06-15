@@ -3,14 +3,12 @@
     "@version": 1.1,
     "id": "@id",
     "type": "@type",
-    "DIDNostr": "https://w3id.org/did/nostr#DIDNostr",
-    "SchnorrSecp256k1VerificationKey2019": "https://w3id.org/security#SchnorrSecp256k1VerificationKey2019",
+    "DIDNostr": "https://w3id.org/nostr/context#DIDNostr",
     "Multikey": "https://w3id.org/security#Multikey",
     "controller": {
       "@id": "https://w3id.org/security#controller",
       "@type": "@id"
     },
-    "publicKeyHex": "https://w3id.org/security#publicKeyHex",
     "publicKeyMultibase": "https://w3id.org/security#publicKeyMultibase",
     "alsoKnownAs": {
       "@id": "https://www.w3.org/ns/did#alsoKnownAs",

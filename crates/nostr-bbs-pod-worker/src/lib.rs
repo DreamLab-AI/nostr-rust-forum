@@ -23,6 +23,14 @@ mod content_negotiation;
 mod contexts;
 mod did;
 mod git;
+// Native-only pod-git identity + gitmark/blocktrails anchoring (ADR-124 §5.4,
+// ADR-089). Structurally absent from the CF Workers (`wasm32-unknown-unknown`)
+// build: CF cannot spawn `git` subprocesses, so the trail anchors only on the
+// native/agentbox deployment of the externally-pullable forum pod. On CF the
+// `git` module above keeps returning the 501 / `X-Git-Unavailable: cf-workers`
+// stub.
+#[cfg(not(target_arch = "wasm32"))]
+mod pod_git_anchor;
 mod notifications;
 mod patch;
 mod payments;

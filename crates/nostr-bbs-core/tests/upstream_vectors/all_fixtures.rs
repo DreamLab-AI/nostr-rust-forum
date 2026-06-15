@@ -90,8 +90,8 @@ fixture_test!(
 fixture_test!(
     did_doc_load_and_validate,
     "did-doc-conformance.json",
-    "ADR-074",
-    7
+    "ADR-125",
+    9
 );
 fixture_test!(
     is_envelope_load_and_validate,
