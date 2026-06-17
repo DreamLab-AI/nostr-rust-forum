@@ -43,6 +43,7 @@ use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::access_denied::AccessDenied;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
+use crate::components::message_input::MessageInput;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::topic_list::{classify_topics, TopicList, TopicSummary};
 use crate::components::zone_hero::ZoneHero;
@@ -275,9 +276,11 @@ pub fn SectionPage() -> impl IntoView {
 
     // -- New-topic composer state --
     let show_new_topic = RwSignal::new(false);
-    let new_topic_text = RwSignal::new(String::new());
-    let creating = RwSignal::new(false);
     let create_error = RwSignal::new(Option::<String>::None);
+    // Re-fills the composer if the publish fails (relay rejection / not
+    // resolved), so the user never loses a topic they typed. `MessageInput`
+    // clears its content on send, then restores from this signal on failure.
+    let topic_restore = RwSignal::new(Option::<String>::None);
     let is_authed = auth.is_authenticated();
 
     // `relay` (RelayConnection) is non-Copy; the new-topic composer's on:click
@@ -364,66 +367,64 @@ pub fn SectionPage() -> impl IntoView {
                 </Show>
             </div>
 
-            // Inline new-topic composer. Publishes a kind-42 ROOT e-tagging the
-            // resolved channel — the same shape category.rs uses, so the new
-            // topic appears in this list immediately on relay echo.
+            // Inline new-topic composer. Reuses the shared `MessageInput` so the
+            // topic body gets the same `@`-mention autocomplete (network search +
+            // local roster + selection) as replies — fixing the inability to tag
+            // a not-yet-cached member when *starting* a topic (the plain textarea
+            // had no autocomplete and never queried `/api/profiles/search`). The
+            // mentions picked from the dropdown are emitted as `["p", pubkey]`
+            // tags on the kind-42 root. Publishes the same shape category.rs uses,
+            // so the new topic appears in this list immediately on relay echo.
             <Show when=move || show_new_topic.get()>
-                <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-5 space-y-3">
-                    <textarea
-                        class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 resize-none"
-                        rows="3"
+                <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-5 space-y-2">
+                    <MessageInput
                         placeholder="Start a new topic — the first line becomes the title"
-                        prop:value=move || new_topic_text.get()
-                        on:input=move |ev| new_topic_text.set(event_target_value(&ev))
+                        // `MessageInput` fires `on_send` alongside `on_send_with_mentions`;
+                        // we drive creation from the mentions variant and no-op the other.
+                        on_send=Callback::new(|_: String| {})
+                        on_send_with_mentions=Callback::new(move |(body, mentions): (String, Vec<String>)| {
+                            let cid = resolved_channel.get_untracked().map(|c| c.id).unwrap_or_default();
+                            if cid.is_empty() {
+                                create_error.set(Some("Section not resolved yet".into()));
+                                topic_restore.set(Some(body));
+                                return;
+                            }
+                            if body.trim().len() < 3 {
+                                create_error.set(Some("Topic must be at least 3 characters".into()));
+                                topic_restore.set(Some(body));
+                                return;
+                            }
+                            create_error.set(None);
+                            // Sign via the async path so NIP-07 / extension (Podkey)
+                            // users can post — the sync signer only works for an
+                            // in-browser local key.
+                            let relay = composer_relay.get_value();
+                            let body_for_restore = body.clone();
+                            spawn_local(async move {
+                                match publish_topic_root(&auth, &relay, &cid, &body, mentions, toasts).await {
+                                    Ok(()) => {
+                                        show_new_topic.set(false);
+                                        toasts.show("Topic created".to_string(), ToastVariant::Success);
+                                    }
+                                    Err(e) => {
+                                        create_error.set(Some(e));
+                                        topic_restore.set(Some(body_for_restore));
+                                    }
+                                }
+                            });
+                        })
+                        restore_failed=topic_restore
                     />
                     {move || create_error.get().map(|e| view! {
                         <p class="text-red-400 text-sm">{e}</p>
                     })}
-                    <div class="flex gap-2">
-                        <button
-                            type="button"
-                            disabled=move || creating.get() || new_topic_text.get().trim().len() < 3
-                            on:click=move |_| {
-                                let body = new_topic_text.get_untracked();
-                                let cid = resolved_channel.get_untracked().map(|c| c.id).unwrap_or_default();
-                                if cid.is_empty() {
-                                    create_error.set(Some("Section not resolved yet".into()));
-                                    return;
-                                }
-                                if body.trim().len() < 3 {
-                                    create_error.set(Some("Topic must be at least 3 characters".into()));
-                                    return;
-                                }
-                                creating.set(true);
-                                create_error.set(None);
-                                // Sign via the async path so NIP-07 / extension
-                                // (Podkey) users can post — the sync signer only
-                                // works for an in-browser local key.
-                                let relay = composer_relay.get_value();
-                                spawn_local(async move {
-                                    match publish_topic_root(&auth, &relay, &cid, &body, toasts).await {
-                                        Ok(()) => {
-                                            new_topic_text.set(String::new());
-                                            show_new_topic.set(false);
-                                            toasts.show("Topic created".to_string(), ToastVariant::Success);
-                                        }
-                                        Err(e) => create_error.set(Some(e)),
-                                    }
-                                    creating.set(false);
-                                });
-                            }
-                            class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors text-sm"
-                        >
-                            {move || if creating.get() { "Creating..." } else { "Create Topic" }}
-                        </button>
-                        <button
-                            type="button"
-                            on:click=move |_| { show_new_topic.set(false); create_error.set(None); }
-                            class="text-gray-400 hover:text-white px-3 py-2 text-sm transition-colors"
-                        >
-                            "Cancel"
-                        </button>
-                    </div>
+                    <button
+                        type="button"
+                        on:click=move |_| { show_new_topic.set(false); create_error.set(None); }
+                        class="text-gray-400 hover:text-white px-3 py-1 text-sm transition-colors"
+                    >
+                        "Cancel"
+                    </button>
                 </div>
             </Show>
 
@@ -472,6 +473,7 @@ async fn publish_topic_root(
     relay: &RelayConnection,
     section_channel_id: &str,
     body: &str,
+    mentions: Vec<String>,
     toasts: crate::components::toast::ToastStore,
 ) -> Result<(), String> {
     if relay.connection_state().get_untracked() != ConnectionState::Connected {
@@ -489,10 +491,19 @@ async fn publish_topic_root(
         String::new(),
         "root".to_string(),
     ]];
-    // @handles typed into the topic body get ["p", pubkey] tags so mentioned
-    // users / agents (e.g. @junkiejarvis) are addressable and reachable via the
-    // relay's #p-filtered subscriptions.
+    // @handles get ["p", pubkey] tags so mentioned users / agents (e.g.
+    // @junkiejarvis) are addressable and reachable via the relay's #p-filtered
+    // subscriptions. Two sources, de-duped: the pubkeys the user picked from the
+    // autocomplete dropdown (authoritative — covers members not yet in the
+    // ProfileCache, which content resolution alone would miss), then any further
+    // @handles resolvable from the content for mentions typed without selecting.
+    let mut mention_pubkeys = mentions;
     for hex in crate::components::mention_autocomplete::resolve_content_mentions(body) {
+        if !mention_pubkeys.contains(&hex) {
+            mention_pubkeys.push(hex);
+        }
+    }
+    for hex in mention_pubkeys {
         if !tags
             .iter()
             .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == hex)

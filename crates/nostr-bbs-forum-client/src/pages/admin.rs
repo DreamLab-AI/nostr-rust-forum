@@ -48,11 +48,20 @@ pub fn AdminPage() -> impl IntoView {
     // Redirect non-admin users. Surface a toast BEFORE the navigate so the
     // user understands why they were bounced — silent redirects make /admin
     // appear broken to anyone without the role (Bug #4).
+    //
+    // The admin flag (`ZoneAccess::is_admin`) is fetched asynchronously from the
+    // relay whitelist after login (`ZoneAccess::loaded`). On a cold full-page
+    // load of `/admin` — a direct link or a refresh — the flag is briefly false
+    // before that fetch resolves; bouncing on it kicked genuine admins out to
+    // the forums and made `/admin` reachable only via in-app nav. Gate the
+    // bounce (and the access fallback below) on `loaded`, mirroring
+    // `AdminGatedGovernance`, so the page waits for the flag instead of racing it.
     let toasts = use_toasts();
+    let access_loaded = zone_access.loaded;
     Effect::new(move |_| {
-        if is_ready.get() && is_authed.get() && !is_admin.get() {
+        if is_ready.get() && is_authed.get() && access_loaded.get() && !is_admin.get() {
             toasts.show("Admin access required.", ToastVariant::Warning);
-            navigate.with_value(|nav| nav("/chat", NavigateOptions::default()));
+            navigate.with_value(|nav| nav("/forums", NavigateOptions::default()));
         }
     });
 
@@ -66,7 +75,11 @@ pub fn AdminPage() -> impl IntoView {
             }
         >
             <Show
-                when=move || is_authed.get() && is_admin.get()
+                // While the whitelist access fetch is still in flight, keep
+                // rendering (the inner Show shows a spinner) instead of flashing
+                // "Access Denied" or bouncing — only show denial once `loaded`
+                // resolves and the user is genuinely not an admin.
+                when=move || is_authed.get() && (!access_loaded.get() || is_admin.get())
                 fallback=|| view! {
                     <div class="flex items-center justify-center min-h-[60vh]">
                         <div class="text-center">
@@ -76,7 +89,16 @@ pub fn AdminPage() -> impl IntoView {
                     </div>
                 }
             >
-                <AdminPanelInner />
+                <Show
+                    when=move || is_admin.get()
+                    fallback=|| view! {
+                        <div class="flex items-center justify-center min-h-[60vh]">
+                            <div class="animate-pulse text-gray-400">"Loading..."</div>
+                        </div>
+                    }
+                >
+                    <AdminPanelInner />
+                </Show>
             </Show>
         </Show>
     }

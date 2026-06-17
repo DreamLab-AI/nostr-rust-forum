@@ -4,6 +4,7 @@
 //! Protocol terminology (NIP-07, nsec, PRF) is hidden behind "More options"
 //! unless `show_technical_details` is enabled in preferences.
 
+use leptos::leptos_dom::helpers::set_timeout;
 use leptos::prelude::*;
 use leptos_router::components::A;
 use leptos_router::hooks::{use_navigate, use_query_map};
@@ -28,6 +29,27 @@ pub fn LoginPage() -> impl IntoView {
     let has_nip07 = RwSignal::new(nip07::has_nip07_extension());
     let show_more = RwSignal::new(false);
     let show_tech = Memo::new(move |_| use_preferences().get().show_technical_details);
+
+    // NIP-07 providers (Podkey, nos2x, Alby) inject `window.nostr` at
+    // `document_start`, which on a COLD full-page load of /login can land *after*
+    // this component first mounts. The one-shot check above then misses the
+    // extension, so the page falls back to the recovery-key flow and the
+    // "Sign in with browser extension" button is hidden as "Not detected" — a
+    // direct visit to /login appears to do nothing, while arriving via in-app
+    // nav (where the provider is already live) works. Re-poll for a few seconds
+    // so the extension button lights up as soon as the provider is injected.
+    if !has_nip07.get_untracked() {
+        for delay_ms in [120u64, 300, 600, 1200, 2400] {
+            set_timeout(
+                move || {
+                    if !has_nip07.get_untracked() && nip07::has_nip07_extension() {
+                        has_nip07.set(true);
+                    }
+                },
+                std::time::Duration::from_millis(delay_ms),
+            );
+        }
+    }
 
     // Read returnTo query parameter — default to /forums.
     //
