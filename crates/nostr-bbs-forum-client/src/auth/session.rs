@@ -4,6 +4,7 @@
 //! listeners for zeroizing the in-memory private key, and session restoration.
 
 use gloo::storage::{LocalStorage, Storage};
+use leptos::leptos_dom::helpers::set_timeout;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
@@ -260,38 +261,52 @@ impl AuthStore {
         }
 
         if stored.is_nip07 {
-            if let Some(ref pubkey) = stored.public_key {
-                let has_ext = super::nip07::has_nip07_extension();
-                // Re-install the Nip07Signer so `get_signer()` works after a page
-                // reload. Without this the signer was None for restored extension
-                // (Podkey/NIP-07) sessions, so every authed NIP-98 request — the
-                // admin user list, pod, search — silently no-op'd (the admin panel
-                // showed "no users"). Mirrors the is_local_key branch below.
-                if has_ext {
-                    let s: Rc<dyn Signer> =
-                        Rc::new(super::nip07::Nip07Signer::from_pubkey(pubkey.clone()));
-                    self.signer.set_value(Some(SendWrapper::new(s)));
-                }
-                self.state.set(AuthState {
-                    state: if has_ext {
-                        AuthPhase::Authenticated
-                    } else {
-                        AuthPhase::Unauthenticated
-                    },
-                    pubkey: Some(pubkey.clone()),
-                    is_authenticated: has_ext,
-                    public_key: Some(pubkey.clone()),
-                    nickname: stored.nickname,
-                    avatar: stored.avatar,
-                    error: None,
-                    account_status: stored.account_status,
+            if let Some(pubkey) = stored.public_key.clone() {
+                let restore = Nip07Restore {
+                    pubkey,
+                    nickname: stored.nickname.clone(),
+                    avatar: stored.avatar.clone(),
+                    account_status: stored.account_status.clone(),
                     nsec_backed_up: stored.nsec_backed_up,
-                    is_ready: true,
-                    is_nip07: has_ext,
-                    is_passkey: false,
-                    is_local_key: false,
-                    extension_name: stored.extension_name,
-                });
+                    extension_name: stored.extension_name.clone(),
+                };
+                if super::nip07::has_nip07_extension() {
+                    // Provider already present: install the Nip07Signer so
+                    // `get_signer()` works after a reload (otherwise authed NIP-98
+                    // requests — admin user list, pod, search — silently no-op'd)
+                    // and authenticate immediately.
+                    apply_nip07_authed(self.state, self.signer, &restore);
+                } else {
+                    // Provider NOT injected yet. A NIP-07 extension (Podkey,
+                    // nos2x, Alby) injects `window.nostr` at document_start, which
+                    // on a COLD full-page load / refresh / deep-link can land
+                    // *after* this restore runs. The old code then immediately
+                    // marked the session unauthenticated-but-ready, so the auth
+                    // gate bounced a genuine NIP-07 session to /login — the user
+                    // had to "come in from the very top". Instead, restore the
+                    // identity provisionally with `is_ready = false` (the gate
+                    // shows a spinner, not a bounce) and re-poll for the provider;
+                    // authenticate as soon as it appears, and only finalise as
+                    // ready+unauthenticated if it never does (extension absent).
+                    self.state.set(AuthState {
+                        state: AuthPhase::Unauthenticated,
+                        pubkey: Some(restore.pubkey.clone()),
+                        is_authenticated: false,
+                        public_key: Some(restore.pubkey.clone()),
+                        nickname: restore.nickname.clone(),
+                        avatar: restore.avatar.clone(),
+                        error: None,
+                        account_status: restore.account_status.clone(),
+                        nsec_backed_up: restore.nsec_backed_up,
+                        is_ready: false,
+                        is_nip07: true,
+                        is_passkey: false,
+                        is_local_key: false,
+                        extension_name: restore.extension_name.clone(),
+                    });
+                    // ~3.6s grace (24 x 150ms) for the provider to inject.
+                    schedule_nip07_provider_repoll(self.state, self.signer, restore, 24);
+                }
                 return;
             }
         }
@@ -441,4 +456,79 @@ pub(super) fn register_pagehide_listener(store: AuthStore) {
     let _ =
         window.add_event_listener_with_callback("pageshow", pageshow_cb.as_ref().unchecked_ref());
     pageshow_cb.forget();
+}
+
+/// Snapshot of the fields needed to re-materialise a restored NIP-07 session
+/// once the browser extension's `window.nostr` provider is available.
+#[derive(Clone)]
+struct Nip07Restore {
+    pubkey: String,
+    nickname: Option<String>,
+    avatar: Option<String>,
+    account_status: AccountStatus,
+    nsec_backed_up: bool,
+    extension_name: Option<String>,
+}
+
+/// Install the `Nip07Signer` and mark the restored NIP-07 session authenticated
+/// and ready. Used both for the immediate path (provider already present at
+/// restore) and the re-poll path (provider injected shortly after a cold load).
+fn apply_nip07_authed(
+    state: RwSignal<AuthState>,
+    signer: StoredValue<Option<super::SignerHandle>>,
+    r: &Nip07Restore,
+) {
+    let s: Rc<dyn Signer> = Rc::new(super::nip07::Nip07Signer::from_pubkey(r.pubkey.clone()));
+    signer.set_value(Some(SendWrapper::new(s)));
+    state.set(AuthState {
+        state: AuthPhase::Authenticated,
+        pubkey: Some(r.pubkey.clone()),
+        is_authenticated: true,
+        public_key: Some(r.pubkey.clone()),
+        nickname: r.nickname.clone(),
+        avatar: r.avatar.clone(),
+        error: None,
+        account_status: r.account_status.clone(),
+        nsec_backed_up: r.nsec_backed_up,
+        is_ready: true,
+        is_nip07: true,
+        is_passkey: false,
+        is_local_key: false,
+        extension_name: r.extension_name.clone(),
+    });
+}
+
+/// Re-poll for a NIP-07 provider after a cold restore where `window.nostr` was
+/// not yet injected. Authenticates as soon as the provider appears; if it never
+/// does within the grace window, finalises the session as ready+unauthenticated
+/// so the auth gate can resolve (a genuinely-absent extension → redirect to
+/// /login) instead of spinning forever.
+fn schedule_nip07_provider_repoll(
+    state: RwSignal<AuthState>,
+    signer: StoredValue<Option<super::SignerHandle>>,
+    restore: Nip07Restore,
+    attempts_left: u32,
+) {
+    if attempts_left == 0 {
+        state.update(|s| {
+            if !s.is_authenticated {
+                s.is_ready = true;
+            }
+        });
+        return;
+    }
+    set_timeout(
+        move || {
+            // Resolved elsewhere already (e.g. an explicit login) — stop.
+            if state.get_untracked().is_authenticated {
+                return;
+            }
+            if super::nip07::has_nip07_extension() {
+                apply_nip07_authed(state, signer, &restore);
+            } else {
+                schedule_nip07_provider_repoll(state, signer, restore, attempts_left - 1);
+            }
+        },
+        std::time::Duration::from_millis(150),
+    );
 }
