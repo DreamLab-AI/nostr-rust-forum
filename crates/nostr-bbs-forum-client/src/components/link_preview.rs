@@ -235,11 +235,7 @@ async fn fetch_og_data(url: &str) -> Result<OgData, String> {
     // No endpoint configured ⇒ feature inert: report a soft failure so the card
     // falls back to the bare link rather than panicking on a missing base URL.
     let api = preview_api().ok_or("link-preview API not configured")?;
-    let fetch_url = format!(
-        "{}/preview?url={}",
-        api,
-        js_sys::encode_uri_component(url)
-    );
+    let fetch_url = format!("{}/preview?url={}", api, js_sys::encode_uri_component(url));
 
     let opts = web_sys::RequestInit::new();
     opts.set_method("GET");
