@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-pod-worker"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 edition = "2021"
 description = "Pod Worker: Solid pods + R2 storage + WAC ACL (nostr-bbs)"
 license = "AGPL-3.0-only"
@@ -27,6 +27,10 @@ solid-pod-rs-phase1 = [
 [dependencies]
 nostr-bbs-core = { workspace = true }
 nostr-bbs-rate-limit = { workspace = true }
+# Server-side image→ASCII rendering of pod image resources (decode feature pulls
+# the `image` decoders). Applied as a presentation transform on resource GET,
+# strictly AFTER the WAC/WebID access gate.
+nostr-bbs-ascii = { workspace = true, features = ["decode"] }
 worker = { workspace = true, features = ["d1"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

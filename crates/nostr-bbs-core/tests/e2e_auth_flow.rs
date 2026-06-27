@@ -136,18 +136,6 @@ fn random_keypair() -> ([u8; 32], String) {
     (sk, pk)
 }
 
-/// Signing key for NIP-26 scalar helpers.
-fn sk_scalar(n: u8) -> [u8; 32] {
-    let mut sk = [0u8; 32];
-    sk[31] = n;
-    sk
-}
-
-fn pk_hex_for_scalar(n: u8) -> String {
-    let sk = SigningKey::from_bytes(&sk_scalar(n)).unwrap();
-    hex::encode(sk.verifying_key().to_bytes())
-}
-
 fn admin_set_with(pubkey: &str) -> HashSet<String> {
     let mut s = HashSet::new();
     s.insert(pubkey.to_string());

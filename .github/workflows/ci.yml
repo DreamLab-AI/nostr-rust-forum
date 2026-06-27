@@ -101,6 +101,37 @@ jobs:
         run: cargo test --workspace
 
   # ---------------------------------------------------------------------------
+  # Test (security) — HARD GATE for the security-critical crates.
+  #
+  # The full-workspace `test` job above is advisory (pre-existing unrelated
+  # failures). This job runs the test suites that cover the security controls
+  # (crypto/signature verification, relay zone/COUNT read-gating, WAC/ACL,
+  # NIP-98 replay, SSRF guard, config validation) and DOES gate merges, so a
+  # regression in those controls fails CI instead of slipping through.
+  # ---------------------------------------------------------------------------
+  test-security:
+    name: test (security crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-security
+
+      - name: cargo test (security-critical crates)
+        run: |
+          cargo test \
+            -p nostr-bbs-core \
+            -p nostr-bbs-relay-worker \
+            -p nostr-bbs-pod-worker \
+            -p nostr-bbs-auth-worker \
+            -p nostr-bbs-preview-worker \
+            -p nostr-bbs-config
+
+  # ---------------------------------------------------------------------------
   # WASM check — verify portable crates compile for wasm32-unknown-unknown
   #
   # Most crates in this workspace target wasm32 (CF Workers, Leptos CSR).
@@ -162,16 +193,24 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
-    # Advisory: the action's musl toolchain bootstrap fails in CI (infra, not policy).
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          log-level: warn
-          command: check
-          arguments: --all-features
+          key: deny
+
+      # Install cargo-deny directly with the host toolchain instead of the
+      # EmbarkStudios action, whose musl toolchain bootstrap was failing in CI
+      # (infra, not policy). This makes the supply-chain check reliable enough to
+      # gate merges so a new advisory/licence/source violation blocks the PR.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: cargo deny check
+        run: cargo deny check
 
   # ---------------------------------------------------------------------------
   # Aggregator — single required status check for branch protection.
@@ -185,27 +224,32 @@ jobs:
       - fmt
       - clippy
       - test
+      - test-security
       - wasm
       - doc
       - deny
     steps:
       - name: Verify all jobs succeeded
         run: |
-          echo "fmt:    ${{ needs.fmt.result }}"
-          echo "clippy: ${{ needs.clippy.result }}"
-          echo "test:   ${{ needs.test.result }}"
-          echo "wasm:   ${{ needs.wasm.result }}"
-          echo "doc:    ${{ needs.doc.result }}"
-          echo "deny:   ${{ needs.deny.result }}"
+          echo "fmt:           ${{ needs.fmt.result }}"
+          echo "clippy:        ${{ needs.clippy.result }}"
+          echo "test:          ${{ needs.test.result }}"
+          echo "test-security: ${{ needs.test-security.result }}"
+          echo "wasm:          ${{ needs.wasm.result }}"
+          echo "doc:           ${{ needs.doc.result }}"
+          echo "deny:          ${{ needs.deny.result }}"
 
-          # Hard gates: fmt + wasm32 (the deploy-relevant checks). clippy/test/doc/
-          # deny are advisory (continue-on-error) — visible above, non-blocking.
+          # Hard gates: fmt, wasm32 (deploy-relevant), test-security (security
+          # control regressions), and deny (supply-chain policy). The broad
+          # `test`/`clippy`/`doc` jobs remain advisory (continue-on-error).
           for result in \
             "${{ needs.fmt.result }}" \
-            "${{ needs.wasm.result }}"; do
+            "${{ needs.wasm.result }}" \
+            "${{ needs.test-security.result }}" \
+            "${{ needs.deny.result }}"; do
             if [[ "$result" != "success" ]]; then
-              echo "A required job (fmt or wasm32) did not succeed."
+              echo "A required job (fmt, wasm32, test-security, or deny) did not succeed."
               exit 1
             fi
           done
-          echo "Required gates (fmt, wasm32) passed. Advisory checks above are non-blocking."
+          echo "Required gates (fmt, wasm32, test-security, deny) passed."

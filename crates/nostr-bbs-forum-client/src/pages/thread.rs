@@ -12,7 +12,7 @@
 //! - *Replies* are kind-42 events e-tagging the root, plus any NIP-22 kind-1111
 //!   comments addressed to the root.
 //!
-//! All data comes from the shared [`ChannelStore`] (the same kind-40/kind-42
+//! All data comes from the shared [`ChannelStore`](crate::stores::channels::ChannelStore) (the same kind-40/kind-42
 //! subscriptions that drive the index and the section topic list) — this page
 //! adds NO redundant per-page subscription beyond `ensure_subscribed`, which is
 //! idempotent and only tops up the per-channel history for a deep-linked
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn latest_version_no_edit_returns_original() {
         let orig = ev("orig", "alice", 100, "original", vec![]);
-        let (content, ts, edited) = latest_version(&orig, &[orig.clone()]);
+        let (content, ts, edited) = latest_version(&orig, std::slice::from_ref(&orig));
         assert_eq!(content, "original");
         assert_eq!(ts, 100);
         assert!(!edited);

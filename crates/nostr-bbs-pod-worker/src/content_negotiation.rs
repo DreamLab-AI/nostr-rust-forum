@@ -82,7 +82,15 @@ pub fn negotiate(accept_header: Option<&str>, stored_content_type: &str) -> Stri
                 }
             }
             HTML => {
-                return HTML.to_string();
+                // Only honor an explicit `text/html` request when the resource
+                // is actually stored as HTML. Otherwise a stored .json/.txt/.svg
+                // could be relabeled `text/html` purely via the Accept header and
+                // rendered as active content by the browser — a stored-XSS /
+                // content-type-confusion vector on the (often shared) pod origin.
+                // Fall through to the stored type instead of forcing HTML.
+                if stored_content_type == HTML {
+                    return HTML.to_string();
+                }
             }
             _ => continue,
         }
@@ -193,9 +201,25 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_html_returns_html() {
+    fn negotiate_html_request_does_not_relabel_nonhtml_stored() {
+        // Security: a stored JSON-LD resource must NOT be served as text/html
+        // just because the client sent `Accept: text/html` (content-type
+        // confusion / stored-XSS guard). It must fall back to the stored type.
         let result = negotiate(Some("text/html"), JSONLD);
+        assert_eq!(result, JSONLD);
+    }
+
+    #[test]
+    fn negotiate_html_only_when_stored_is_html() {
+        // text/html is honored only when the resource is genuinely stored as HTML.
+        let result = negotiate(Some("text/html"), HTML);
         assert_eq!(result, HTML);
+    }
+
+    #[test]
+    fn negotiate_html_request_on_image_returns_stored() {
+        let result = negotiate(Some("text/html"), "image/svg+xml");
+        assert_eq!(result, "image/svg+xml");
     }
 
     #[test]

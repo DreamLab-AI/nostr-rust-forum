@@ -3,7 +3,7 @@
 //! Displays a user's profile details in a glass-panel modal overlay. Fetches
 //! kind 0 metadata from the relay on open. Provides DM, copy pubkey, and
 //! mute actions. The overlay shell is the shared
-//! [`Modal`](crate::components::modal::Modal) primitive (backdrop-close, Esc,
+//! [`Modal`] primitive (backdrop-close, Esc,
 //! body-scroll-lock, `role="dialog"`, `aria-modal`).
 
 use std::rc::Rc;

@@ -880,7 +880,7 @@ pub fn SettingsPage() -> impl IntoView {
                     <div class="space-y-2">
                         <span class="text-sm font-medium text-gray-300">"Text size"</span>
                         <div class="flex gap-2" role="radiogroup" aria-label="Text size selection">
-                            {FontSize::all_variants().iter().cloned().map(|fs| {
+                            {FontSize::all_variants().iter().map(|fs| {
                                 let label = fs.label();
                                 let fs_for_class = fs.clone();
                                 let fs_for_aria = fs.clone();
@@ -918,7 +918,7 @@ pub fn SettingsPage() -> impl IntoView {
                     <div class="space-y-2">
                         <span class="text-sm font-medium text-gray-300">"Density"</span>
                         <div class="flex gap-2" role="radiogroup" aria-label="Density selection">
-                            {Density::all_variants().iter().cloned().map(|d| {
+                            {Density::all_variants().iter().map(|d| {
                                 let label = d.label();
                                 let d_for_class = d.clone();
                                 let d_for_aria = d.clone();

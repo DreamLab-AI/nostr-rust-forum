@@ -42,8 +42,6 @@ pub fn RsvpButtons(
     let relay = expect_context::<RelayConnection>();
 
     let rsvp_action = move |eid: String, status: RsvpStatus| {
-        let auth = auth.clone();
-        let toasts = toasts.clone();
         let relay = relay.clone();
         let signer = match auth.get_signer() {
             Some(s) => s,

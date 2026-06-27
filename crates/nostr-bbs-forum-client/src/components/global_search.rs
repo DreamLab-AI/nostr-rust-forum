@@ -23,6 +23,10 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A raw message search hit before relay hydration: `(event_id, score, content, label)`.
+/// Bodies are absent until the id→event hydration pass fills them in.
+type RawHit = (String, Option<f64>, Option<String>, Option<String>);
+
 /// Shared open-state for the global search overlay. The app shell provides this
 /// via context so a visible nav button can open the very same panel that the
 /// Cmd/Ctrl+K shortcut toggles.
@@ -263,8 +267,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 // The search API responds with `{results:[{id,score},...]}` —
                 // event bodies are NOT included, so hits must be hydrated
                 // id→event via the relay below (QA HIGH bug #4: blank rows).
-                let mut raw: Vec<(String, Option<f64>, Option<String>, Option<String>)> =
-                    Vec::new();
+                let mut raw: Vec<RawHit> = Vec::new();
                 let mut fetch_err: Option<String> = None;
 
                 let non_empty = |s: String| {

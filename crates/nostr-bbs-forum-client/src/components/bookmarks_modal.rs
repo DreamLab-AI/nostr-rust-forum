@@ -2,7 +2,7 @@
 //!
 //! Uses localStorage for persistence, with a reactive `RwSignal<Vec<Bookmark>>`
 //! provided via Leptos context. The overlay shell is the shared
-//! [`Modal`](crate::components::modal::Modal) primitive (backdrop-close, Esc,
+//! [`Modal`] primitive (backdrop-close, Esc,
 //! body-scroll-lock, `role="dialog"`, `aria-modal`).
 
 use gloo::storage::{LocalStorage, Storage};

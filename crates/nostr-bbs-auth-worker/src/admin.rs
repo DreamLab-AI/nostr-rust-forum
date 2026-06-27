@@ -55,6 +55,13 @@ pub async fn verify(
 /// Returns `false` on DB error or missing rows — never leaks ambient
 /// authority across error branches.
 pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
+    // Canonicalize to lowercase hex. Admin identities are stored lowercase (the
+    // static ADMIN_PUBKEYS set and the D1 rows), but a NIP-98 token can carry
+    // mixed-case hex; without normalization a legitimate admin presenting an
+    // upper-case pubkey would miss every lookup and be silently denied.
+    let pubkey_lc = pubkey.to_ascii_lowercase();
+    let pubkey = pubkey_lc.as_str();
+
     // Static admin set (ADMIN_PUBKEYS): deploy-time bootstrap/fallback.
     if let Ok(raw) = env
         .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)

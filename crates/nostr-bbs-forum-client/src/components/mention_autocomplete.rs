@@ -355,7 +355,7 @@ pub(crate) fn merge_candidates(
     local: Vec<MentionCandidate>,
     limit: usize,
 ) -> Vec<MentionCandidate> {
-    dedup_by_pubkey(network.into_iter().chain(local.into_iter()), limit)
+    dedup_by_pubkey(network.into_iter().chain(local), limit)
 }
 
 // -- Network search -----------------------------------------------------------
@@ -488,7 +488,6 @@ pub(crate) fn MentionAutocomplete(
                                             "flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-800/60 text-gray-200"
                                         };
                                         let candidate = c.clone();
-                                        let on_select = on_select;
                                         view! {
                                             <li
                                                 role="option"

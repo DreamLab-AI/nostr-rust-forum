@@ -9,7 +9,8 @@
 //!
 //! All three registry endpoints are NIP-98-authed **by the master** — the
 //! owner is derived from the NIP-98 author server-side. We sign exactly the way
-//! `pod_client` / `claim_username` do: through the auth-store [`Signer`] when
+//! `pod_client` / `claim_username` do: through the auth-store
+//! [`Signer`](nostr_bbs_core::signer::Signer) when
 //! present, falling back to the in-memory raw key.
 //!
 //! ## Gating

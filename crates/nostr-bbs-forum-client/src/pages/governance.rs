@@ -175,7 +175,6 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                         let action_id = action_id.clone();
                         let d_tag = panel_d_tag.clone();
                         let event_id = panel_event_id.clone();
-                        let auth = auth.clone();
                         let relay = relay.clone();
                         move |_: web_sys::MouseEvent| {
                             if loading.get_untracked() || sent.get_untracked() {

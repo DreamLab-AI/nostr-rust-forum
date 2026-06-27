@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BBS // nostr-rust-forum</title>
+    <meta name="description" content="Retro ASCII/BBS terminal interface for the Nostr forum kit." />
+    <meta name="theme-color" content="#0a0a0a" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0a0a'/><text x='1' y='13' font-family='monospace' font-size='12' fill='%23ffb000'>&gt;_</text></svg>" type="image/svg+xml" />
+    <link data-trunk rel="css" href="assets/bbs.css" />
+
+    <!-- Branding is injected by the host site into window.__ENV__ (THEME,
+         NODE_NAME, LOCATION, BANNER_URL, RELAY_URL, ZONE_CONFIG). The defaults
+         below let the BBS render standalone (e.g. `trunk serve`). -->
+    <script>
+      window.__ENV__ = window.__ENV__ || {
+        THEME: "amber",
+        NODE_NAME: "NOSTR-BBS",
+        LOCATION: "the decentralized frontier",
+        RELAY_URL: "",
+        ZONE_CONFIG: ""
+      };
+    </script>
+</head>
+<body>
+    <noscript>This BBS requires a WebAssembly-capable browser.</noscript>
+</body>
+</html>

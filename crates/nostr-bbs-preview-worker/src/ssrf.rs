@@ -34,6 +34,12 @@ pub const MAX_REDIRECTS: usize = 3;
 /// because OG/oEmbed parsers depend on a complete document.
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Maximum image body size (bytes) we will read into memory for ASCII
+/// rendering. Larger than [`MAX_BODY_BYTES`] because image payloads are bigger
+/// than HTML documents, but still capped to keep the worker within its memory
+/// and CPU budget (the decoder additionally guards decoded pixel area).
+pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Errors emitted by the SSRF-aware fetch helper.
 #[derive(Debug)]
 pub enum SsrfFetchError {
@@ -224,6 +230,21 @@ pub async fn read_text_capped(mut response: Response) -> Result<String, SsrfFetc
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Read the response body as raw bytes, rejecting bodies that exceed
+/// `max_bytes`. Mirrors [`read_text_capped`] but returns the undecoded bytes —
+/// used by the ASCII route, which needs the binary image payload rather than a
+/// UTF-8 document. Callers should pass [`MAX_IMAGE_BYTES`].
+pub async fn read_bytes_capped(
+    mut response: Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SsrfFetchError> {
+    let bytes = response.bytes().await?;
+    if bytes.len() > max_bytes {
+        return Err(SsrfFetchError::BodyTooLarge);
+    }
+    Ok(bytes)
+}
+
 /// Returns `true` if the URL should be blocked: it fails the egress allowlist
 /// (when one is configured), uses a non-http(s) scheme, carries userinfo, uses
 /// a non-standard port, or its hostname text matches a private, loopback,
@@ -317,28 +338,63 @@ pub(crate) fn is_private_url_with(raw_url: &str, allowlist: &AllowList) -> bool 
         .and_then(|s: &str| s.strip_suffix(']'))
         .unwrap_or(&hostname);
 
-    // IPv6 loopback
-    if host == "::1" {
-        return true;
+    // Parse as a real IPv6 address so every textual form is covered, not just a
+    // handful of known prefixes. Crucially, the IPv4-in-IPv6 transition forms
+    // embed an internal IPv4 that a prefix match misses — e.g. NAT64
+    // `[64:ff9b::7f00:1]` (127.0.0.1), 6to4 `[2002:7f00:1::]`, and
+    // IPv4-compatible `[::a9fe:a9fe]` (169.254.169.254). Extract the embedded
+    // IPv4 and re-check it against the private ranges.
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        if v6.is_loopback() || v6.is_unspecified() {
+            return true;
+        }
+        let seg = v6.segments();
+        // ULA fc00::/7, link-local fe80::/10, deprecated site-local fec0::/10.
+        if (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xffc0) == 0xfec0
+        {
+            return true;
+        }
+        let embedded_v4 = |hi: u16, lo: u16| {
+            is_private_ipv4([
+                (hi >> 8) as u8,
+                (hi & 0xff) as u8,
+                (lo >> 8) as u8,
+                (lo & 0xff) as u8,
+            ])
+        };
+        // 6to4 2002::/16 — IPv4 in segments 1..2.
+        if seg[0] == 0x2002 {
+            return embedded_v4(seg[1], seg[2]);
+        }
+        // NAT64 64:ff9b::/96 — IPv4 in the low 32 bits.
+        if seg[0] == 0x0064 && seg[1] == 0xff9b {
+            return embedded_v4(seg[6], seg[7]);
+        }
+        // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d): high 80
+        // bits zero, segment 5 either 0 (compat) or 0xffff (mapped).
+        if seg[0] == 0
+            && seg[1] == 0
+            && seg[2] == 0
+            && seg[3] == 0
+            && seg[4] == 0
+            && (seg[5] == 0 || seg[5] == 0xffff)
+        {
+            return embedded_v4(seg[6], seg[7]);
+        }
+        // Any other global-scope IPv6 literal is not in our private set.
+        return false;
     }
 
-    // ULA fc00::/7
-    if host.starts_with("fc") || host.starts_with("fd") {
+    // Fallback for inputs `Ipv6Addr` could not parse (should not occur after URL
+    // host normalization): keep the conservative textual prefix checks.
+    if host == "::1" || host.starts_with("fc") || host.starts_with("fd") || host.starts_with("fe80")
+    {
         return true;
     }
-
-    // Link-local fe80::/10
-    if host.starts_with("fe80") {
-        return true;
-    }
-
-    // IPv4-mapped IPv6 (::ffff:a.b.c.d) -- check embedded IPv4
     if let Some(rest) = host.strip_prefix("::ffff:") {
         if let Some(octets) = parse_ipv4(rest) {
             return is_private_ipv4(octets);
         }
-        // Hex-form mapped addresses that didn't match dotted-decimal above
-        // Block since we can't reliably parse hex octets without a full IPv6 parser
         return true;
     }
 
@@ -395,6 +451,26 @@ mod tests {
         assert!(is_private_url("ftp://example.com/file"));
         assert!(is_private_url("file:///etc/passwd"));
         assert!(is_private_url("gopher://localhost"));
+    }
+
+    #[test]
+    fn blocks_ipv6_transition_forms_embedding_internal_ipv4() {
+        // NAT64 64:ff9b::/96 embedding 127.0.0.1 and 169.254.169.254.
+        assert!(is_private_url("http://[64:ff9b::7f00:1]/"));
+        assert!(is_private_url("http://[64:ff9b::a9fe:a9fe]/"));
+        // IPv4-compatible ::a.b.c.d (low 32 bits) embedding loopback / metadata.
+        assert!(is_private_url("http://[::7f00:1]/"));
+        assert!(is_private_url("http://[::a9fe:a9fe]/"));
+        // 6to4 2002::/16 embedding 127.0.0.1.
+        assert!(is_private_url("http://[2002:7f00:1::]/"));
+        // Deprecated site-local fec0::/10.
+        assert!(is_private_url("http://[fec0::1]/"));
+    }
+
+    #[test]
+    fn allows_public_ipv6_literal() {
+        // A genuine global-scope IPv6 address must NOT be treated as private.
+        assert!(!is_private_url("http://[2606:4700:4700::1111]/"));
     }
 
     #[test]

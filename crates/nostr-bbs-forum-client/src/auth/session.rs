@@ -112,14 +112,21 @@ fn session_storage() -> Option<web_sys::Storage> {
         .flatten()
 }
 
-/// "Remember me" is the default. Only an explicit `"false"` flag in
-/// localStorage downgrades privkey persistence to sessionStorage scope.
+/// Whether to persist the raw private key to durable localStorage.
+///
+/// Defaults to **off** (sessionStorage scope only): a local-key / imported-nsec
+/// session holds the 32-byte Schnorr master secret, so durably persisting it to
+/// localStorage makes it readable by any same-origin script (a future XSS, a
+/// hostile dependency, or a browser extension) and survives tab close — turning
+/// a session-scoped compromise into full account takeover. Only an explicit
+/// `"true"` flag in localStorage (set when the user opts into "keep me signed
+/// in on this device") upgrades persistence to localStorage scope.
 fn remember_me() -> bool {
     local_storage()
         .and_then(|s| s.get_item(REMEMBER_ME_KEY).ok())
         .flatten()
-        .map(|v| v != "false")
-        .unwrap_or(true)
+        .map(|v| v == "true")
+        .unwrap_or(false)
 }
 
 /// Store privkey hex so an explicit login survives page reloads.

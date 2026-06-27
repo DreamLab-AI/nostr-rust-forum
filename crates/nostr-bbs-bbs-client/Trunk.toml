@@ -1,0 +1,16 @@
+# Trunk build for the retro ASCII/BBS client.
+#
+# Served under /community/bbs/ on the branded site. The branded website copies
+# the built `dist/community/bbs/` directory into its own deploy and injects the
+# branding keys (THEME, NODE_NAME, LOCATION, BANNER_URL, RELAY_URL, ZONE_CONFIG)
+# into `window.__ENV__` exactly as it already does for the main forum client.
+#
+#   trunk build --release --public-url /community/bbs/
+[build]
+target = "index.html"
+dist = "../../dist/community/bbs"
+public_url = "/community/bbs/"
+
+[serve]
+address = "127.0.0.1"
+port = 8081

@@ -39,6 +39,9 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
+      # RUSTSEC-2026-0185: quinn-proto QUIC out-of-order reassembly DoS. A
+      # transitive native dependency only; the kit's shipped surface is
+      # wasm32/Cloudflare Workers, which never instantiates a QUIC endpoint.
       - name: cargo audit
         run: >-
           cargo audit --deny warnings
@@ -47,3 +50,4 @@ jobs:
           --ignore RUSTSEC-2024-0436
           --ignore RUSTSEC-2026-0097
           --ignore RUSTSEC-2026-0173
+          --ignore RUSTSEC-2026-0185

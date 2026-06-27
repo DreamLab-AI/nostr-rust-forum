@@ -977,6 +977,29 @@ pub async fn register_verify(
         return json_err("Pubkey already registered", 409);
     }
 
+    // Step 6b: Web-of-Trust registration gate (ADR — opt-in via `wot_enabled`).
+    //
+    // When an admin has enabled WoT, only pubkeys present in `wot_entries` may
+    // register a passkey — unless the caller supplies a valid, unused invite
+    // code, which is the documented bypass. `is_allowed_by_wot` returns
+    // `Ok(true)` when WoT is disabled (the default), so this is a no-op for
+    // open instances. Without this gate the admin-facing `wot_enabled` flag (and
+    // the `inviteCode` field this endpoint accepts) silently do nothing and any
+    // pubkey can register regardless of the configured trust policy.
+    match crate::wot::is_allowed_by_wot(&pubkey, env).await {
+        Ok(true) => {}
+        Ok(false) => match body.invite_code.as_deref() {
+            Some(code)
+                if crate::invites::consume_for_registration(code, &pubkey, env)
+                    .await
+                    .is_ok() => {}
+            _ => {
+                return json_err("Registration is invite-only (Web-of-Trust enabled)", 403);
+            }
+        },
+        Err(_) => return json_err("Web-of-Trust check failed", 503),
+    }
+
     // Step 7: Store credential in D1 and consume challenge
     //
     // P0-01 fix: Generate the PRF salt server-side by deriving from a

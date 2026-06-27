@@ -218,7 +218,7 @@ mod tests {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
         assert_eq!(doc["id"], format!("did:nostr:{PK_HEX}"));
-        assert_eq!(doc["@context"][0], "https://w3id.org/did");
+        assert_eq!(doc["@context"][0], "https://www.w3.org/ns/cid/v1");
         // ADR-125: canonical Multikey doc has no `alsoKnownAs` (the WebID link
         // lives in `service`, populated only at Tier-3).
         assert!(doc["alsoKnownAs"].is_null());
@@ -254,7 +254,7 @@ mod tests {
         let ctx = doc["@context"].as_array().unwrap();
         // ADR-125 §2: canonical did:nostr Multikey contexts.
         assert_eq!(ctx.len(), 2);
-        assert_eq!(ctx[0], "https://w3id.org/did");
+        assert_eq!(ctx[0], "https://www.w3.org/ns/cid/v1");
         assert_eq!(ctx[1], "https://w3id.org/nostr/context");
     }
 

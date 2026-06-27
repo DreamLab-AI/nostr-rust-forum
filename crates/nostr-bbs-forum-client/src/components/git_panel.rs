@@ -193,7 +193,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     // ── fetch helpers (closures capturing signals) ───────────────────────────
 
     let load_status = {
-        let auth = auth.clone();
         move || {
             let Some(base) = pod_base_url.get() else {
                 return;
@@ -237,7 +236,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
 
     // Auto-load once pod URL is known.
     {
-        let load_status = load_status.clone();
         Effect::new(move |ran: Option<bool>| {
             if ran == Some(true) {
                 return true;
@@ -254,8 +252,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     // ── stage / unstage actions ──────────────────────────────────────────────
 
     let stage_file = {
-        let auth = auth.clone();
-        let load_status = load_status.clone();
         move |path: String| {
             let Some(base) = pod_base_url.get() else {
                 return;
@@ -266,7 +262,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
             let url = format!("{}/_git/stage", base.trim_end_matches('/'));
             let body = serde_json::to_string(&StagePaths { paths: &[path] }).unwrap();
             busy.set(true);
-            let load_status = load_status.clone();
             spawn_local(async move {
                 let _ = git_fetch_raw(&url, "POST", Some(body), &*signer).await;
                 busy.set(false);
@@ -276,8 +271,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     };
 
     let stage_all = {
-        let auth = auth.clone();
-        let load_status = load_status.clone();
         move || {
             let Some(base) = pod_base_url.get() else {
                 return;
@@ -288,7 +281,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
             let url = format!("{}/_git/stage", base.trim_end_matches('/'));
             let body = serde_json::to_string(&StageAll { all: true }).unwrap();
             busy.set(true);
-            let load_status = load_status.clone();
             spawn_local(async move {
                 let _ = git_fetch_raw(&url, "POST", Some(body), &*signer).await;
                 busy.set(false);
@@ -298,8 +290,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     };
 
     let unstage_file = {
-        let auth = auth.clone();
-        let load_status = load_status.clone();
         move |path: String| {
             let Some(base) = pod_base_url.get() else {
                 return;
@@ -310,7 +300,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
             let url = format!("{}/_git/unstage", base.trim_end_matches('/'));
             let body = serde_json::to_string(&StagePaths { paths: &[path] }).unwrap();
             busy.set(true);
-            let load_status = load_status.clone();
             spawn_local(async move {
                 let _ = git_fetch_raw(&url, "POST", Some(body), &*signer).await;
                 busy.set(false);
@@ -320,8 +309,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     };
 
     let unstage_all = {
-        let auth = auth.clone();
-        let load_status = load_status.clone();
         move || {
             let Some(base) = pod_base_url.get() else {
                 return;
@@ -332,7 +319,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
             let url = format!("{}/_git/unstage", base.trim_end_matches('/'));
             let body = serde_json::to_string(&StageAll { all: true }).unwrap();
             busy.set(true);
-            let load_status = load_status.clone();
             spawn_local(async move {
                 let _ = git_fetch_raw(&url, "POST", Some(body), &*signer).await;
                 busy.set(false);
@@ -342,8 +328,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     };
 
     let discard_file = {
-        let auth = auth.clone();
-        let load_status = load_status.clone();
         move |path: String| {
             let confirmed = web_sys::window()
                 .and_then(|w| {
@@ -365,7 +349,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
             let url = format!("{}/_git/discard", base.trim_end_matches('/'));
             let body = serde_json::to_string(&StagePaths { paths: &[path] }).unwrap();
             busy.set(true);
-            let load_status = load_status.clone();
             spawn_local(async move {
                 let _ = git_fetch_raw(&url, "POST", Some(body), &*signer).await;
                 busy.set(false);
@@ -377,8 +360,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     // ── commit action ────────────────────────────────────────────────────────
 
     let do_commit = {
-        let auth = auth.clone();
-        let load_status = load_status.clone();
         move || {
             let msg = commit_msg.get_untracked();
             if msg.trim().is_empty() {
@@ -394,7 +375,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
             let url = format!("{}/_git/commit", base.trim_end_matches('/'));
             let body = serde_json::to_string(&CommitBody { message: &msg }).unwrap();
             busy.set(true);
-            let load_status = load_status.clone();
             spawn_local(async move {
                 match git_fetch_raw(&url, "POST", Some(body), &*signer).await {
                     Ok((200, _)) | Ok((201, _)) => {
@@ -404,12 +384,12 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                     }
                     Ok((code, body)) => {
                         toasts.show(
-                            &format!("Commit failed: HTTP {code} — {body}"),
+                            format!("Commit failed: HTTP {code} — {body}"),
                             ToastVariant::Error,
                         );
                     }
                     Err(e) => {
-                        toasts.show(&format!("Commit error: {e}"), ToastVariant::Error);
+                        toasts.show(format!("Commit error: {e}"), ToastVariant::Error);
                     }
                 }
                 busy.set(false);
@@ -420,7 +400,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     // ── diff view ────────────────────────────────────────────────────────────
 
     let view_diff = {
-        let auth = auth.clone();
         move |path: String, staged: bool| {
             let Some(base) = pod_base_url.get() else {
                 return;
@@ -467,7 +446,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
     // ── log loading ──────────────────────────────────────────────────────────
 
     let load_log = {
-        let auth = auth.clone();
         move || {
             let Some(base) = pod_base_url.get() else {
                 return;
@@ -516,7 +494,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                     title="Refresh"
                     disabled=move || busy.get() || status_loading.get()
                     on:click={
-                        let load_status = load_status.clone();
                         move |_| load_status()
                     }
                 >
@@ -563,7 +540,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                             {format!("Staged Changes ({})", count)}
                                         </span>
                                         {if count > 0 {
-                                            let unstage_all = unstage_all.clone();
                                             view! {
                                                 <button
                                                     class="text-xs text-gray-400 hover:text-white transition-colors px-2 py-0.5 rounded hover:bg-gray-700"
@@ -586,8 +562,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                             .to_string();
                                         let full_path = f.path.clone();
                                         let diff_path = f.path.clone();
-                                        let unstage_file = unstage_file.clone();
-                                        let view_diff = view_diff.clone();
                                         let is_diff_shown = {
                                             let diff_path2 = diff_path.clone();
                                             move || diff_view.get().map(|(p, _)| p == diff_path2).unwrap_or(false)
@@ -611,7 +585,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                                         title="Unstage"
                                                         on:click={
                                                             let path = path.clone();
-                                                            let unstage_file = unstage_file.clone();
                                                             move |_| unstage_file(path.clone())
                                                         }
                                                     >
@@ -623,7 +596,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                                         title="View diff"
                                                         on:click={
                                                             let diff_path4 = diff_path.clone();
-                                                            let view_diff = view_diff.clone();
                                                             move |_| view_diff(diff_path4.clone(), true)
                                                         }
                                                     >
@@ -653,7 +625,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                             {format!("Changes ({})", count)}
                                         </span>
                                         {if count > 0 {
-                                            let stage_all = stage_all.clone();
                                             view! {
                                                 <button
                                                     class="text-xs text-gray-400 hover:text-white transition-colors px-2 py-0.5 rounded hover:bg-gray-700"
@@ -678,9 +649,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                         let stage_path = f.path.clone();
                                         let discard_path = f.path.clone();
                                         let diff_path = f.path.clone();
-                                        let stage_file = stage_file.clone();
-                                        let discard_file = discard_file.clone();
-                                        let view_diff = view_diff.clone();
                                         let is_diff_shown = {
                                             let diff_path2 = diff_path.clone();
                                             move || diff_view.get().map(|(p, _)| p == diff_path2).unwrap_or(false)
@@ -703,7 +671,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                                         class="opacity-0 group-hover:opacity-100 text-xs text-green-500 hover:text-green-400 transition-all px-1.5 py-0.5 rounded hover:bg-gray-700"
                                                         title="Stage"
                                                         on:click={
-                                                            let stage_file = stage_file.clone();
                                                             move |_| stage_file(stage_path.clone())
                                                         }
                                                     >
@@ -714,7 +681,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                                         class="opacity-0 group-hover:opacity-100 text-xs text-red-500 hover:text-red-400 transition-all px-1.5 py-0.5 rounded hover:bg-gray-700"
                                                         title="Discard changes"
                                                         on:click={
-                                                            let discard_file = discard_file.clone();
                                                             move |_| discard_file(discard_path.clone())
                                                         }
                                                     >
@@ -725,7 +691,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                                         class="opacity-0 group-hover:opacity-100 text-xs text-gray-500 hover:text-blue-400 transition-all px-1.5 py-0.5 rounded hover:bg-gray-700"
                                                         title="View diff"
                                                         on:click={
-                                                            let view_diff = view_diff.clone();
                                                             move |_| view_diff(diff_path.clone(), false)
                                                         }
                                                     >
@@ -765,7 +730,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                             .next()
                                             .unwrap_or(&path)
                                             .to_string();
-                                        let stage_file = stage_file.clone();
                                         view! {
                                             <div class="flex items-center gap-2 px-4 py-1.5 hover:bg-gray-800/60 group">
                                                 <span class="text-xs font-bold px-1 rounded text-gray-500 bg-gray-800">
@@ -778,7 +742,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                                     class="opacity-0 group-hover:opacity-100 text-xs text-green-500 hover:text-green-400 transition-all px-1.5 py-0.5 rounded hover:bg-gray-700"
                                                     title="Stage"
                                                     on:click={
-                                                        let stage_file = stage_file.clone();
                                                         move |_| stage_file(stage_path.clone())
                                                     }
                                                 >
@@ -809,7 +772,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                                     class="flex-1 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white text-sm font-semibold px-3 py-1.5 rounded-md transition-colors"
                                     disabled=move || busy.get() || commit_msg.get().trim().is_empty()
                                     on:click={
-                                        let do_commit = do_commit.clone();
                                         move |_| do_commit()
                                     }
                                 >
@@ -823,7 +785,6 @@ pub fn GitPanel(pod_base_url: Memo<Option<String>>, branch: Signal<String>) -> i
                             <button
                                 class="w-full flex items-center gap-2 px-4 py-2 text-xs text-gray-400 hover:text-white hover:bg-gray-800/60 transition-colors text-left"
                                 on:click={
-                                    let load_log = load_log.clone();
                                     move |_| {
                                         let expanded = !log_expanded.get_untracked();
                                         log_expanded.set(expanded);
@@ -912,7 +873,6 @@ pub fn AppManifestPanel(pod_base_url: Memo<Option<String>>) -> impl IntoView {
 
     // Load manifest when panel is expanded and URL is available
     let load_manifest = {
-        let auth = auth.clone();
         move || {
             let Some(base) = pod_base_url.get() else {
                 return;
@@ -942,7 +902,6 @@ pub fn AppManifestPanel(pod_base_url: Memo<Option<String>>) -> impl IntoView {
     };
 
     let save_manifest = {
-        let auth = auth.clone();
         move || {
             let gs = git_source.get_untracked();
             if !gs.is_empty() && !gs.starts_with("https://") {
@@ -970,7 +929,7 @@ pub fn AppManifestPanel(pod_base_url: Memo<Option<String>>) -> impl IntoView {
             let body = match serde_json::to_string_pretty(&manifest) {
                 Ok(s) => s,
                 Err(e) => {
-                    toasts.show(&format!("Serialization error: {e}"), ToastVariant::Error);
+                    toasts.show(format!("Serialization error: {e}"), ToastVariant::Error);
                     return;
                 }
             };
@@ -983,12 +942,12 @@ pub fn AppManifestPanel(pod_base_url: Memo<Option<String>>) -> impl IntoView {
                     }
                     Ok((code, body)) => {
                         toasts.show(
-                            &format!("Save failed: HTTP {code} — {body}"),
+                            format!("Save failed: HTTP {code} — {body}"),
                             ToastVariant::Error,
                         );
                     }
                     Err(e) => {
-                        toasts.show(&format!("Save error: {e}"), ToastVariant::Error);
+                        toasts.show(format!("Save error: {e}"), ToastVariant::Error);
                     }
                 }
                 saving.set(false);
@@ -1005,7 +964,6 @@ pub fn AppManifestPanel(pod_base_url: Memo<Option<String>>) -> impl IntoView {
             <button
                 class="w-full flex items-center justify-between px-4 py-2.5 bg-gray-800/80 hover:bg-gray-800 transition-colors text-left"
                 on:click={
-                    let load_manifest = load_manifest.clone();
                     move |_| {
                         let will_expand = !expanded.get_untracked();
                         expanded.set(will_expand);
@@ -1121,7 +1079,6 @@ pub fn AppManifestPanel(pod_base_url: Memo<Option<String>>) -> impl IntoView {
                                 class="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white text-sm font-semibold px-3 py-1.5 rounded-md transition-colors"
                                 disabled=move || saving.get() || git_source_error.get()
                                 on:click={
-                                    let save_manifest = save_manifest.clone();
                                     move |_| save_manifest()
                                 }
                             >

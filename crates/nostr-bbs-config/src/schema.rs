@@ -129,6 +129,16 @@ pub struct Branding {
     /// Welcome copy (rendered in onboarding modal).
     #[serde(default)]
     pub welcome_copy: Option<String>,
+    /// BBS node name shown in the retro ASCII/BBS interface status bar
+    /// (e.g. `"DREAMLAB BBS"`). Falls back to the deployment name when unset.
+    #[serde(default)]
+    pub node_name: Option<String>,
+    /// Location string shown in the BBS status bar (e.g. `"Manchester, UK"`).
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Banner image / ASCII-art URL rendered at the top of the BBS interface.
+    #[serde(default)]
+    pub banner_url: Option<String>,
 }
 
 /// Zone visibility for non-members (members and admins always see content).
@@ -320,9 +330,10 @@ pub struct Nip05 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct NativePod {
+    /// Whether the native (server-Tokio) pod tier is enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// Public base URL of the native server (e.g. "https://pods-native.example.com")
+    /// Public base URL of the native server (e.g. `https://pods-native.example.com`)
     #[serde(default)]
     pub base_url: String,
     /// Cohorts eligible for a native pod.  Empty = all authenticated users.

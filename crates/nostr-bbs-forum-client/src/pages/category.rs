@@ -13,7 +13,7 @@
 //!   replies e-tag the root.
 //!
 //! This page therefore lists the zone's *sections* (read from the shared
-//! [`ChannelStore`] — NO per-page relay subscription) with per-section topic
+//! [`ChannelStore`](crate::stores::channels::ChannelStore) — NO per-page relay subscription) with per-section topic
 //! counts, and offers a "New Topic" form whose **Section** dropdown is populated
 //! from those same resolved sections. Creating a topic publishes a kind-42 root
 //! e-tagging the selected section channel — it does NOT create a new channel.
@@ -66,7 +66,7 @@ fn sections_for_zone(
         .cloned()
         .collect();
     // Stable, deterministic order: by name.
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 

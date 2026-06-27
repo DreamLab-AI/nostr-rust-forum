@@ -451,14 +451,14 @@ impl NostrRelayDO {
 
         if treatment == EventTreatment::Ephemeral {
             Self::send_ok(ws, &event.id, true, "");
-            self.broadcast_event(&event);
+            self.broadcast_event(&event).await;
             return;
         }
 
         // Save to D1
         if self.save_event(&event, treatment).await {
             Self::send_ok(ws, &event.id, true, "");
-            self.broadcast_event(&event);
+            self.broadcast_event(&event).await;
 
             // Activity tracking: increment posts_created and update last_active
             // for content-producing event kinds (kind-1 text, kind-42 channel msg,
@@ -596,170 +596,47 @@ impl NostrRelayDO {
                 .and_then(|s| s.authed_pubkey.clone())
         };
 
-        // NIP-59: kind-1059 AUTH gating.
-        // If any filter requests kind-1059 (Sealed DMs), the session must be
-        // authenticated. We inject a mandatory #p tag constraint so that only
-        // events addressed to the authenticated pubkey are returned, preventing
-        // cross-recipient leakage.
-        let filters = {
-            let needs_kind_1059 = filters
-                .iter()
-                .any(|f| f.kinds.as_ref().is_some_and(|k| k.contains(&1059)));
-            if needs_kind_1059 {
-                match &session_pubkey {
-                    None => {
-                        Self::send_notice(
-                            &ws,
-                            "auth-required: must authenticate to receive kind-1059 DMs",
-                        );
-                        return;
-                    }
-                    Some(authed_pk) => {
-                        // Rewrite each filter that includes kind-1059 to also require
-                        // a #p tag matching the authenticated pubkey.
-                        filters
-                            .into_iter()
-                            .map(|mut f| {
-                                if f.kinds.as_ref().is_some_and(|k| k.contains(&1059)) {
-                                    // Enforce the #p filter for the authed pubkey.
-                                    // We override any existing #p to prevent a client
-                                    // from requesting another user's DMs.
-                                    f.extra
-                                        .insert("#p".to_string(), serde_json::json!([authed_pk]));
-                                }
-                                f
-                            })
-                            .collect::<Vec<_>>()
-                    }
-                }
-            } else {
-                filters
+        // NIP-59: kind-1059 (Sealed DM) read gate + mandatory #p rewrite. Shared
+        // with the COUNT path so both reject unauthenticated kind-1059 reads and
+        // bind results to the authed recipient identically.
+        let filters = match Self::gate_kind_1059_filters(filters, &session_pubkey) {
+            Some(f) => f,
+            None => {
+                Self::send_notice(
+                    &ws,
+                    "auth-required: must authenticate to receive kind-1059 DMs",
+                );
+                return;
             }
         };
 
         // Query D1 for matching events
         let events = self.query_events(&filters).await;
 
-        // ADR-099: the EFFECTIVE pubkey the session's READ scope derives from.
-        // When DEVICE_KEYS_ENABLED and the authed pubkey is a registered,
-        // non-revoked device key, cohorts / zone-read / admin status are computed
-        // for its OWNER (the device acts with the owner's read scope). Gate-off
-        // or a non-device pubkey ⇒ identity passthrough, so `access_pubkey ==
-        // session_pubkey` and every read decision below is unchanged.
-        //
-        // NOTE: the kind-1059 DM `#p` filter above is deliberately NOT rebound —
-        // it stays on the literal `session_pubkey`. A device key cannot decrypt
-        // the owner's NIP-17 gift-wraps (ADR-099 defers multi-device DMs to phase
-        // 2), so granting it the owner's DM scope would leak undecryptable (and
-        // policy-forbidden) traffic. Only cohort/zone READ scope is rebound here.
-        let access_pubkey: Option<String> = match &session_pubkey {
-            Some(pk) => Some(self.effective_pubkey(pk).await),
-            None => None,
-        };
-
-        // Load the config-driven zone definitions once for this REQ.
+        // Resolve the viewer's effective read scope once (ADR-099 device→owner
+        // rebinding, admin status, calendar cohorts), then apply the SHARED
+        // per-event zone/cohort/NIP-52-calendar gate (`authorize_event`). The
+        // exact same gate runs on the COUNT and live-broadcast paths, so the
+        // three read paths can never diverge on what a viewer may read.
         let zones = ZoneConfig::load(&self.env);
-        // Admin status of the requester (if any). Admins see every zone.
-        let is_admin = match &access_pubkey {
-            Some(pk) => self.admin_cache.is_admin(pk, &self.env).await,
-            None => false,
-        };
+        let ctx = self.resolve_viewer_context(session_pubkey.clone()).await;
 
-        // Phase C: resolve the viewer's cohort tags once for calendar-tier
-        // projection. Unauthenticated viewers have no cohorts. The admin flag
-        // here mirrors `is_admin` above but is read from the whitelist row so the
-        // projector remains correct even if the two sources ever diverge.
-        let (viewer_cohorts, cohort_admin) = match &access_pubkey {
-            Some(pk) => trust::get_viewer_cohorts(pk, &self.env).await,
-            None => (Vec::new(), false),
-        };
-        let viewer_is_admin = is_admin || cohort_admin;
-
-        // Zone-filter every matching event. Two event classes are zone-scoped:
-        //   - kind-40 channel DEFINITIONS: the channel id is the event's own id.
-        //   - kind-42 channel MESSAGES (content): the channel id is the `e` tag.
-        // Decision matrix for a NON-member (non-admin), per zone visibility:
-        //   Public : defs + content served to everyone (incl. unauth).
-        //   Locked : defs served (tile renders) but content withheld.
-        //   Hidden : defs AND content omitted.
-        // Members (cohort match) and admins always receive both. An unauth
-        // reader (session_pubkey == None) is treated as a non-member with no
-        // cohorts, so it is limited to Public zones for content and to
-        // non-Hidden zones for definitions — closing the prior gap where zone
-        // filtering only ran when session_pubkey.is_some().
-        // Count events actually DELIVERED to the reader this REQ. NIP-01 read
-        // activity is "events received on a subscription", so we tally post-zone
-        // filtering (an event withheld by zone access was never read) and batch
-        // a single `posts_read` increment at EOSE — never per filter, never per
-        // skipped event, and only for an authenticated whitelisted member.
+        // Count events actually DELIVERED to the reader this REQ (post-gate). An
+        // event withheld by zone access was never read, so we tally survivors and
+        // batch a single `posts_read` increment at EOSE for the TL0→TL1 promotion.
         let mut delivered: i32 = 0;
         for event in &events {
-            // Phase C: NIP-52 calendar kinds (31922 date, 31923 time, 31925 RSVP)
-            // are zone-scoped via a native `["zone", "<slug>"]` binding tag on the
-            // event itself (not via a channel-id lookup). The per-tier PROJECTION
-            // (full / free-busy / omit) is the COMPLETE access decision — there is
-            // no separate zone read-gate for calendar kinds. A live probe proved a
-            // gate-then-project ordering wrong (it omitted cross-zone events the
-            // projector should serve as free/busy or full), so the projector now
-            // decides everything, deny-by-default for unknown zones.
-            if calendar_projection::is_projected_calendar_kind(event.kind) {
-                if let Some(out) = self
-                    .project_calendar_for_viewer(
-                        event,
-                        &session_pubkey,
-                        &viewer_cohorts,
-                        viewer_is_admin,
-                        &zones,
-                    )
-                    .await
-                {
+            match self.authorize_event(event, &ctx, &zones).await {
+                ReadDecision::Deliver => {
+                    Self::send_event(&ws, sub_id, event);
+                    delivered += 1;
+                }
+                ReadDecision::DeliverAs(out) => {
                     Self::send_event(&ws, sub_id, &out);
                     delivered += 1;
                 }
-                continue;
+                ReadDecision::Withhold => {}
             }
-
-            // Resolve the channel id for zone-scoped channel kinds.
-            let channel_id: Option<String> = match event.kind {
-                40 => Some(event.id.clone()),
-                42 => filter::tag_value(event, "e"),
-                _ => None,
-            };
-
-            if let Some(cid) = channel_id {
-                let zone = trust::get_channel_zone(&cid, &self.env)
-                    .await
-                    .unwrap_or_else(|| "home".to_string());
-
-                if !is_admin {
-                    // Member iff their cohorts grant read on this zone. ADR-099:
-                    // uses the effective (device→owner) pubkey so a device key
-                    // inherits the owner's zone read access; identity passthrough
-                    // when the feature is off or the pubkey is not a device.
-                    let is_member = match &access_pubkey {
-                        Some(pk) => trust::has_zone_access(pk, &zone, &self.env).await,
-                        None => zones.is_public_read(&zone),
-                    };
-
-                    if !is_member {
-                        if event.kind == 40 {
-                            // Channel definition: served only if the zone is
-                            // not Hidden (Locked/Public tiles render).
-                            if !zones.defs_visible_to_nonmember(&zone) {
-                                continue;
-                            }
-                        } else {
-                            // Channel content (kind-42): withheld from non-members
-                            // of Locked/Hidden zones; only Public content reaches
-                            // them (already covered by is_member via is_public_read).
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            Self::send_event(&ws, sub_id, event);
-            delivered += 1;
         }
         Self::send_eose(&ws, sub_id);
 
@@ -965,22 +842,211 @@ impl NostrRelayDO {
 }
 
 // ---------------------------------------------------------------------------
+// Shared read-authorization (REQ / COUNT / live broadcast)
+// ---------------------------------------------------------------------------
+
+/// Resolved read scope for one viewer (session). Computed once per REQ/COUNT,
+/// or once per candidate session on the broadcast path, then reused for every
+/// event so the three read paths apply identical zone/cohort gating.
+pub(crate) struct ViewerContext {
+    pub session_pubkey: Option<String>,
+    pub access_pubkey: Option<String>,
+    pub is_admin: bool,
+    pub viewer_cohorts: Vec<String>,
+    pub viewer_is_admin: bool,
+}
+
+/// Per-event read decision shared by every read path.
+pub(crate) enum ReadDecision {
+    /// Deliver the event verbatim.
+    Deliver,
+    /// Deliver this calendar-projected / redacted replacement instead.
+    DeliverAs(NostrEvent),
+    /// Withhold the event from this viewer (zone/cohort/projection denial).
+    Withhold,
+}
+
+impl NostrRelayDO {
+    /// NIP-59 kind-1059 (Sealed DM) read gate + mandatory `#p` rewrite.
+    ///
+    /// If any filter requests kind-1059, the session must be authenticated; each
+    /// such filter is rewritten to require `#p == authed pubkey`, preventing a
+    /// client from reading another user's sealed DMs. Returns `None` when the
+    /// request must be rejected (kind-1059 requested by an unauthenticated
+    /// session). Shared by REQ and COUNT so neither can leak DMs.
+    fn gate_kind_1059_filters(
+        filters: Vec<NostrFilter>,
+        session_pubkey: &Option<String>,
+    ) -> Option<Vec<NostrFilter>> {
+        let needs_kind_1059 = filters
+            .iter()
+            .any(|f| f.kinds.as_ref().is_some_and(|k| k.contains(&1059)));
+        if !needs_kind_1059 {
+            return Some(filters);
+        }
+        session_pubkey.as_ref().map(|authed_pk| {
+            filters
+                .into_iter()
+                .map(|mut f| {
+                    if f.kinds.as_ref().is_some_and(|k| k.contains(&1059)) {
+                        f.extra
+                            .insert("#p".to_string(), serde_json::json!([authed_pk]));
+                    }
+                    f
+                })
+                .collect::<Vec<_>>()
+        })
+    }
+
+    /// Resolve a viewer's effective read scope (ADR-099 device→owner rebinding,
+    /// admin status, calendar cohorts). The kind-1059 DM `#p` filter is bound to
+    /// the literal `session_pubkey` upstream and deliberately NOT rebound here —
+    /// only cohort/zone READ scope is rebound to the owner.
+    pub(crate) async fn resolve_viewer_context(
+        &self,
+        session_pubkey: Option<String>,
+    ) -> ViewerContext {
+        let access_pubkey: Option<String> = match &session_pubkey {
+            Some(pk) => Some(self.effective_pubkey(pk).await),
+            None => None,
+        };
+        let is_admin = match &access_pubkey {
+            Some(pk) => self.admin_cache.is_admin(pk, &self.env).await,
+            None => false,
+        };
+        let (viewer_cohorts, cohort_admin) = match &access_pubkey {
+            Some(pk) => trust::get_viewer_cohorts(pk, &self.env).await,
+            None => (Vec::new(), false),
+        };
+        let viewer_is_admin = is_admin || cohort_admin;
+        ViewerContext {
+            session_pubkey,
+            access_pubkey,
+            is_admin,
+            viewer_cohorts,
+            viewer_is_admin,
+        }
+    }
+
+    /// Apply the zone / cohort / NIP-52-calendar read gate to a single event for
+    /// one resolved viewer. THE single source of truth for read authorization,
+    /// shared by REQ, COUNT, and live broadcast.
+    ///
+    /// Decision matrix for a NON-member (non-admin), per zone visibility:
+    ///   Public : defs + content served to everyone (incl. unauth).
+    ///   Locked : defs served (tile renders) but content withheld.
+    ///   Hidden : defs AND content omitted.
+    /// Members (cohort match) and admins always receive both. NIP-52 calendar
+    /// kinds are decided entirely by `project_calendar_for_viewer` (the per-tier
+    /// projection IS the access decision), deny-by-default for unknown zones.
+    pub(crate) async fn authorize_event(
+        &self,
+        event: &NostrEvent,
+        ctx: &ViewerContext,
+        zones: &ZoneConfig,
+    ) -> ReadDecision {
+        if calendar_projection::is_projected_calendar_kind(event.kind) {
+            return match self
+                .project_calendar_for_viewer(
+                    event,
+                    &ctx.session_pubkey,
+                    &ctx.viewer_cohorts,
+                    ctx.viewer_is_admin,
+                    zones,
+                )
+                .await
+            {
+                Some(out) => ReadDecision::DeliverAs(out),
+                None => ReadDecision::Withhold,
+            };
+        }
+
+        // Zone-scoped channel kinds: kind-40 defs (channel id == event id),
+        // kind-42 content (channel id == `e` tag).
+        let channel_id: Option<String> = match event.kind {
+            40 => Some(event.id.clone()),
+            42 => filter::tag_value(event, "e"),
+            _ => None,
+        };
+
+        if let Some(cid) = channel_id {
+            let zone = trust::get_channel_zone(&cid, &self.env)
+                .await
+                .unwrap_or_else(|| "home".to_string());
+
+            if !ctx.is_admin {
+                let is_member = match &ctx.access_pubkey {
+                    Some(pk) => trust::has_zone_access(pk, &zone, &self.env).await,
+                    None => zones.is_public_read(&zone),
+                };
+                if !is_member {
+                    if event.kind == 40 {
+                        // Channel definition: served only if the zone is not
+                        // Hidden (Locked/Public tiles render).
+                        if !zones.defs_visible_to_nonmember(&zone) {
+                            return ReadDecision::Withhold;
+                        }
+                    } else {
+                        // Channel content (kind-42): withheld from non-members of
+                        // Locked/Hidden zones.
+                        return ReadDecision::Withhold;
+                    }
+                }
+            }
+        }
+
+        ReadDecision::Deliver
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NIP-45: COUNT
 // ---------------------------------------------------------------------------
 
 impl NostrRelayDO {
-    /// Handle a COUNT request: return the number of matching events.
+    /// Handle a COUNT request: return the number of matching events the session
+    /// is AUTHORIZED to read.
     ///
-    /// Reuses `query_events()` which already handles NIP-40 expiration filtering
-    /// at the application layer and correctly processes tag filters.
+    /// Applies the same read authorization as REQ (kind-1059 auth gate + `#p`
+    /// rewrite, then the per-event zone/cohort/calendar gate). Without this,
+    /// COUNT is an existence/count oracle that leaks how many sealed DMs a pubkey
+    /// has received and message counts for Locked/Hidden zones and gated calendar
+    /// events — all of which REQ correctly withholds.
     pub(crate) async fn handle_count(
         &self,
+        session_id: u64,
         ws: &WebSocket,
         sub_id: &str,
         filters: Vec<NostrFilter>,
     ) {
+        let session_pubkey = {
+            let sessions = self.sessions.borrow();
+            sessions
+                .get(&session_id)
+                .and_then(|s| s.authed_pubkey.clone())
+        };
+
+        // kind-1059 gate identical to REQ; deny-by-default → count 0 on reject.
+        let filters = match Self::gate_kind_1059_filters(filters, &session_pubkey) {
+            Some(f) => f,
+            None => {
+                Self::send_count(ws, sub_id, 0);
+                return;
+            }
+        };
+
         let events = self.query_events(&filters).await;
-        Self::send_count(ws, sub_id, events.len() as u64);
+        let zones = ZoneConfig::load(&self.env);
+        let ctx = self.resolve_viewer_context(session_pubkey).await;
+
+        let mut count: u64 = 0;
+        for event in &events {
+            match self.authorize_event(event, &ctx, &zones).await {
+                ReadDecision::Deliver | ReadDecision::DeliverAs(_) => count += 1,
+                ReadDecision::Withhold => {}
+            }
+        }
+        Self::send_count(ws, sub_id, count);
     }
 }
 
@@ -1485,6 +1551,54 @@ impl NostrRelayDO {
 // D1 lookups themselves are exercised by integration tests; here we pin the
 // pure decision boundary that those lookups feed into.
 #[cfg(test)]
+mod count_auth_tests {
+    //! Read-authorization gate shared by REQ and COUNT. COUNT previously called
+    //! `query_events` directly with no gating, leaking existence/counts of sealed
+    //! DMs and zone-private content; it now routes through this same gate.
+    use super::*;
+
+    fn filter(json: serde_json::Value) -> NostrFilter {
+        serde_json::from_value(json).expect("valid filter")
+    }
+
+    #[test]
+    fn non_dm_filter_passes_through_unauthenticated() {
+        let filters = vec![filter(serde_json::json!({ "kinds": [1] }))];
+        assert!(NostrRelayDO::gate_kind_1059_filters(filters, &None).is_some());
+    }
+
+    #[test]
+    fn kind_1059_rejected_when_unauthenticated() {
+        let filters = vec![filter(serde_json::json!({ "kinds": [1059] }))];
+        // Deny-by-default: an unauthenticated COUNT/REQ for sealed DMs is rejected.
+        assert!(NostrRelayDO::gate_kind_1059_filters(filters, &None).is_none());
+    }
+
+    #[test]
+    fn kind_1059_injects_p_tag_for_authed_pubkey() {
+        let pk = "a".repeat(64);
+        let filters = vec![filter(serde_json::json!({ "kinds": [1059] }))];
+        let out = NostrRelayDO::gate_kind_1059_filters(filters, &Some(pk.clone()))
+            .expect("authed kind-1059 read allowed");
+        assert_eq!(out[0].extra.get("#p"), Some(&serde_json::json!([pk])));
+    }
+
+    #[test]
+    fn kind_1059_overrides_client_supplied_p_tag() {
+        let pk = "a".repeat(64);
+        let attacker_target = "b".repeat(64);
+        let filters = vec![filter(
+            serde_json::json!({ "kinds": [1059], "#p": [attacker_target] }),
+        )];
+        let out = NostrRelayDO::gate_kind_1059_filters(filters, &Some(pk.clone()))
+            .expect("authed kind-1059 read allowed");
+        // The #p constraint must be rebound to the authed pubkey so a client
+        // cannot count/read another user's sealed DMs.
+        assert_eq!(out[0].extra.get("#p"), Some(&serde_json::json!([pk])));
+    }
+}
+
+#[cfg(test)]
 mod write_gate_tests {
     use super::super::calendar_projection::{
         project_tier, Projection, COHORT_BUSINESS, COHORT_FAMILY, COHORT_FRIENDS, ZONE_BUSINESS,
@@ -1649,8 +1763,7 @@ mod write_gate_tests {
             Some(recipient.as_str())
         );
         // Whitelisted recipient ⇒ admitted; non-whitelisted ⇒ rejected.
-        let admitted =
-            |whitelisted: bool| matches!(gift_wrap_recipient(&ev), Some(_)) && whitelisted;
+        let admitted = |whitelisted: bool| gift_wrap_recipient(&ev).is_some() && whitelisted;
         assert!(admitted(true));
         assert!(!admitted(false));
     }
@@ -1749,7 +1862,7 @@ mod device_key_tests {
         whitelisted: &[String],
     ) -> bool {
         let principal = effective_principal(author, device_owner, enabled);
-        whitelisted.iter().any(|w| *w == principal)
+        whitelisted.contains(&principal)
     }
 
     #[test]

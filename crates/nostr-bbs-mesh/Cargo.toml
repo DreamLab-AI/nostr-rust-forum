@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-mesh"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 edition = "2021"
 description = "Federation mesh worker stub for nostr-bbs deployments (ADR-073)"
 license = "AGPL-3.0-only"
