@@ -7,7 +7,7 @@
 //!
 //! This component renders the section as a LIST OF TOPICS (title/first line,
 //! author, reply count, last activity) — NOT a flat linear chat. Each row links
-//! to the [`crate::pages::thread::ThreadPage`] for that topic. All data is
+//! to the [`crate::pages::ThreadPage`] for that topic. All data is
 //! sourced from the shared [`crate::stores::channels::ChannelStore`]; this
 //! component performs the topic/reply classification locally and adds no relay
 //! subscriptions of its own.
@@ -174,7 +174,7 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
         .into_iter()
         .filter_map(|id| roots.remove(&id))
         .collect();
-    out.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+    out.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
     out
 }
 

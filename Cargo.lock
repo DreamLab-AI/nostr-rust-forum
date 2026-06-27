@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-auth-worker"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2014,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-bbs-client"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -2031,7 +2031,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-config"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "proptest",
  "schemars",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-core"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "aes",
  "async-trait",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-forum-client"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-mesh"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "nostr-bbs-config",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-pod-worker"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-preview-worker"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "js-sys",
  "nostr-bbs-rate-limit",
@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-rate-limit"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "hex",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-relay-worker"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2185,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-search-worker"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2203,7 +2203,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-setup-skill"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "nostr-bbs-config",
@@ -2215,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-upstream-canary"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -3426,9 +3426,9 @@ dependencies = [
 
 [[package]]
 name = "solid-pod-rs"
-version = "0.5.0-alpha.2"
+version = "0.5.0-alpha.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6593a9d271a54ece80a32701fbb3cd0052994c2ba99c1d15f9dbc1f70d4fc92"
+checksum = "13cdb0796338f7b2fe73781d488e0536a07aa37cbd17e58e8027ffbe22e09c64"
 dependencies = [
  "async-trait",
  "base64",

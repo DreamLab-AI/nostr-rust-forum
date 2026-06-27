@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-upstream-canary"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 edition = "2021"
 description = "F26 / ADR-076 D5 validation: smoke-test the upstream `nostr` crate on the forum's WASM/CF Workers build matrix before any module deletion."
 license = "AGPL-3.0-only"

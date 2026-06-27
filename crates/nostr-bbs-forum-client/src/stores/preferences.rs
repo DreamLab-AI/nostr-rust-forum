@@ -192,17 +192,12 @@ impl Theme {
 }
 
 /// Base text-size selection (applied as a root font-size scale).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FontSize {
     Small,
+    #[default]
     Medium,
     Large,
-}
-
-impl Default for FontSize {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 impl FontSize {
@@ -239,16 +234,11 @@ impl FontSize {
 }
 
 /// Whitespace density selection.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Density {
+    #[default]
     Comfortable,
     Compact,
-}
-
-impl Default for Density {
-    fn default() -> Self {
-        Self::Comfortable
-    }
 }
 
 impl Density {

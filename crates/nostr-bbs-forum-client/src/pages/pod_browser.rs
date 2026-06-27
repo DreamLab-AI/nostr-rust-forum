@@ -686,7 +686,7 @@ pub fn PodBrowserPage() -> impl IntoView {
     };
 
     // Final safety net: revoke the outstanding object URL when the page unmounts.
-    on_cleanup(move || revoke_current_object_url());
+    on_cleanup(revoke_current_object_url);
 
     // Fetch container listing whenever current_path changes
     Effect::new(move |_| {

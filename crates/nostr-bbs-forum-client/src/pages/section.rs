@@ -17,7 +17,7 @@
 //!
 //! ## Data sourcing
 //!
-//! Topics are derived from the shared [`ChannelStore`] — the same global
+//! Topics are derived from the shared [`ChannelStore`](crate::stores::channels::ChannelStore) — the same global
 //! kind-40 / kind-42 subscriptions that drive the Forums index tiles. This
 //! eliminates the previous local two-stage subscription, which raced the
 //! NIP-42 AUTH handshake: an unauthenticated reader is zone-filtered to public

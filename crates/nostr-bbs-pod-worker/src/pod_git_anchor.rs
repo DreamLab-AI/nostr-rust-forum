@@ -276,7 +276,7 @@ pub fn commit(
         repo_root,
         &[
             "-c",
-            &format!("user.name=agent"),
+            "user.name=agent",
             "-c",
             &format!("user.email={agent_did}"),
             "commit",

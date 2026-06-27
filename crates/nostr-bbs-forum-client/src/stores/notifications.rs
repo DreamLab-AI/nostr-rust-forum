@@ -226,7 +226,7 @@ impl NotificationStoreV2 {
             list.insert(0, notification);
             // Keep the list time-ordered (newest first) even when backfilling
             // events that arrive out of order from the relay.
-            list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            list.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
             // Cap at 100 notifications.
             if list.len() > 100 {
                 list.truncate(100);

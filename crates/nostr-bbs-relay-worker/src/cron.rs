@@ -444,6 +444,10 @@ pub async fn sweep_inactive_demotions(env: &Env) -> Result<DemotionSweepResult, 
 /// Returns the trust level the row should hold AFTER this sweep. A return value
 /// equal to `current` means "not demoted this sweep".
 #[cfg(test)]
+// Signature mirrors the live `trust::check_demotion` policy inputs 1:1 so the
+// two stay in lockstep (see doc above); collapsing them into a struct here would
+// break that parity, so the arg count is intentional on this security-path model.
+#[allow(clippy::too_many_arguments)]
 fn decide_demotion(
     current: trust::TrustLevel,
     days_active: i32,

@@ -17,7 +17,7 @@ pub const CONTEXT_ACL: &str = include_str!("../contexts/acl.jsonld");
 /// Canonical `did:nostr` JSON-LD context (ADR-125 §2 Multikey form).
 ///
 /// This is the single context bundle the canonical DID document references
-/// in its `@context` (`https://w3id.org/did` + `https://w3id.org/nostr/context`).
+/// in its `@context` (`https://www.w3.org/ns/cid/v1` + `https://w3id.org/nostr/context`).
 /// It defines only the canonical terms — `DIDNostr`, `Multikey`,
 /// `publicKeyMultibase`, controller/VM/auth/assertion/service — and
 /// deliberately does NOT define the superseded `SchnorrSecp256k1VerificationKey2019`
@@ -41,14 +41,16 @@ pub fn context_for_iri(iri: &str) -> Option<(&'static str, &'static str)> {
             Some((CONTEXT_ACL, "application/ld+json"))
         }
 
-        // ADR-125 §2: the canonical did:nostr document references
-        // `https://w3id.org/did` and `https://w3id.org/nostr/context`. Both
-        // dereference to the bundled Multikey context. The legacy
-        // `did/v1` / `secp256k1-2019/v1` IRIs remain dereferenceable as
+        // did:nostr spec (nostrcg.github.io/did-nostr/): the canonical
+        // document now references `https://www.w3.org/ns/cid/v1` (CID v1.0)
+        // and `https://w3id.org/nostr/context`. Both dereference to the
+        // bundled Multikey context. The legacy `w3id.org/did`,
+        // `did/v1`, and `secp256k1-2019/v1` IRIs remain dereferenceable as
         // back-compat aliases for old resolvers, but they now serve the
         // SAME canonical Multikey body (no 2019 suite, no publicKeyHex) — the
         // 2019 shape is superseded, not dual-published.
-        "https://w3id.org/did"
+        "https://www.w3.org/ns/cid/v1"
+        | "https://w3id.org/did"
         | "https://w3id.org/nostr/context"
         | "https://www.w3.org/ns/did/v1"
         | "https://w3id.org/security/suites/secp256k1-2019/v1" => {
@@ -92,9 +94,11 @@ mod tests {
 
     #[test]
     fn canonical_did_nostr_iris_resolve() {
-        // ADR-125 §2: the canonical document references these two IRIs.
-        assert!(context_for_iri("https://w3id.org/did").is_some());
+        // did:nostr spec: the canonical document now references CID v1.0.
+        assert!(context_for_iri("https://www.w3.org/ns/cid/v1").is_some());
         assert!(context_for_iri("https://w3id.org/nostr/context").is_some());
+        // Back-compat: the old w3id.org/did IRI still resolves.
+        assert!(context_for_iri("https://w3id.org/did").is_some());
     }
 
     #[test]

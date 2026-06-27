@@ -3,7 +3,8 @@
 //!
 //! In production these [`PanelDefinition`]s arrive as governance events
 //! (`is_governance_kind`) over the relay and are validated with
-//! `validate_governance_event`; the human signs an [`ActionResponse`] back. The
+//! `validate_governance_event`; the human signs an
+//! [`ActionResponse`](nostr_bbs_core::governance::ActionResponse) back. The
 //! BBS "Door Games" screen renders the SAME panel shape in ASCII, so it is a
 //! genuine surface onto the human-in-the-loop agent plane rather than a mock.
 //!

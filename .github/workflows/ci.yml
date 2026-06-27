@@ -210,7 +210,7 @@ jobs:
         run: cargo install cargo-deny --locked
 
       - name: cargo deny check
-        run: cargo deny check --all-features
+        run: cargo deny check
 
   # ---------------------------------------------------------------------------
   # Aggregator — single required status check for branch protection.

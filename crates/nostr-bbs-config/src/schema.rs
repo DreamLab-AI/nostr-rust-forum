@@ -333,7 +333,7 @@ pub struct NativePod {
     /// Whether the native (server-Tokio) pod tier is enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// Public base URL of the native server (e.g. "https://pods-native.example.com")
+    /// Public base URL of the native server (e.g. `https://pods-native.example.com`)
     #[serde(default)]
     pub base_url: String,
     /// Cohorts eligible for a native pod.  Empty = all authenticated users.

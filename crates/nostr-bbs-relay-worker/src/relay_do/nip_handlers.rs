@@ -1764,7 +1764,7 @@ mod write_gate_tests {
         );
         // Whitelisted recipient ⇒ admitted; non-whitelisted ⇒ rejected.
         let admitted =
-            |whitelisted: bool| matches!(gift_wrap_recipient(&ev), Some(_)) && whitelisted;
+            |whitelisted: bool| gift_wrap_recipient(&ev).is_some() && whitelisted;
         assert!(admitted(true));
         assert!(!admitted(false));
     }
@@ -1863,7 +1863,7 @@ mod device_key_tests {
         whitelisted: &[String],
     ) -> bool {
         let principal = effective_principal(author, device_owner, enabled);
-        whitelisted.iter().any(|w| *w == principal)
+        whitelisted.contains(&principal)
     }
 
     #[test]

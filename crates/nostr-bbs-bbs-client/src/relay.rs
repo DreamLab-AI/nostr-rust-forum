@@ -58,7 +58,7 @@ impl Default for RelayStore {
     }
 }
 
-/// Insert an event newest-first, de-duplicated by id, capped at [`BUCKET_CAP`].
+/// Insert an event newest-first, de-duplicated by id, capped at `BUCKET_CAP`.
 pub fn insert_event(v: &mut Vec<NostrEvent>, ev: NostrEvent) {
     if v.iter().any(|e| e.id == ev.id) {
         return;

@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-core"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 edition = "2021"
 description = "nostr-bbs community forum — core types"
 license = "AGPL-3.0-only"
