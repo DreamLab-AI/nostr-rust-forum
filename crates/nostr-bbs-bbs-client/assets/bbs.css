@@ -42,7 +42,12 @@
 html, body {
   margin: 0;
   height: 100%;
-  background: var(--bg);
+  /* Phosphor burn in the shadows: the dark areas are never dead black — they
+     carry a faint theme-tinted phosphor residue that lifts toward the centre. */
+  background:
+    radial-gradient(ellipse 120% 100% at 50% 50%,
+      color-mix(in srgb, var(--accent) 5%, var(--bg)) 0%, var(--bg) 70%);
+  background-color: var(--bg);
   color: var(--fg);
   font-family: var(--font);
   font-size: 15px;
@@ -70,12 +75,15 @@ html, body {
   inset: 0;
   pointer-events: none;
   z-index: 49;
-  /* Centre phosphor bloom (tinted to the active theme) over a darkened-edge
-     vignette — gives the screen a lit-from-within CRT warmth. */
+  /* Phosphor burn-in: a broad theme-tinted bloom that lights the screen from
+     within and pools in the shadows, over a darkened-edge vignette. Kept well
+     below text brightness so glyphs stay crisp. */
   background:
-    radial-gradient(ellipse 80% 60% at 50% 42%,
-      color-mix(in srgb, var(--accent) 5%, transparent) 0%, rgba(0,0,0,0) 55%),
-    radial-gradient(ellipse at center, rgba(0,0,0,0) 58%, rgba(0,0,0,0.6) 100%);
+    radial-gradient(ellipse 95% 80% at 50% 48%,
+      color-mix(in srgb, var(--accent) 14%, transparent) 0%,
+      color-mix(in srgb, var(--accent) 6%, transparent) 40%,
+      rgba(0,0,0,0) 72%),
+    radial-gradient(ellipse at center, rgba(0,0,0,0) 52%, rgba(0,0,0,0.62) 100%);
 }
 
 /* Fill the viewport so the terminal is a full-screen CRT rather than a block
@@ -235,3 +243,26 @@ a, .bbs-link { color: var(--accent); }
 .ascii-img .p5 { color: color-mix(in srgb, var(--fg-bright) 62%, var(--bg)); }
 .ascii-img .p6 { color: color-mix(in srgb, var(--fg-bright) 80%, var(--bg)); }
 .ascii-img .p7 { color: var(--fg-bright); }
+
+/* ── Section heroes ──────────────────────────────────────────────────────────
+ * Each configured zone's banner image rendered as ASCII at the top of the
+ * Message Base, tinted to the zone accent. */
+.bbs-section-hero { margin: 0.3rem 0 0.6rem; }
+.bbs-section-hero .label { color: var(--accent); letter-spacing: 0.08em; }
+
+/* ── Phosphor persistence ─────────────────────────────────────────────────────
+ * When the screen text changes, the previous frame lingers as a faint phosphor
+ * afterglow and fades linearly to nothing — the slow decay of a real tube. The
+ * ghost is a text-only clone of the prior body region injected by the small
+ * script in index.html; here we only define how it looks + decays. */
+.phosphor-ghost {
+  position: fixed;
+  pointer-events: none;
+  z-index: 48;
+  overflow: hidden;
+  white-space: pre;
+  will-change: opacity;
+  opacity: 0.05;                     /* faint */
+  transition: opacity 3s linear;     /* slow, even decay to zero */
+}
+@media (prefers-reduced-motion: reduce) { .phosphor-ghost { display: none; } }

@@ -60,6 +60,11 @@ pub fn AsciiImg(
 ) -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
     let (preview_api, pod_api) = cfg.with_value(|c| (c.preview_api.clone(), c.pod_api.clone()));
+    // Resolve a root-relative src (e.g. a zone banner "/images/heroes/x.webp")
+    // to an absolute URL — the /ascii endpoint fetches server-side and cannot
+    // resolve a client-relative path.
+    #[cfg(target_arch = "wasm32")]
+    let src = make_absolute(&current_origin(), &src);
     let fetch_url = ascii_fetch_url(&preview_api, &pod_api, &src, cols, &ramp);
 
     let state = RwSignal::new(if fetch_url.is_some() {
@@ -101,6 +106,31 @@ pub fn AsciiImg(
 /// Is `src` a resource hosted under the configured pod API base?
 pub fn is_pod_url(pod_api: &str, src: &str) -> bool {
     !pod_api.is_empty() && src.starts_with(pod_api.trim_end_matches('/'))
+}
+
+/// Resolve a possibly root-relative URL against `origin`. Absolute http(s) URLs
+/// and empty strings pass through unchanged; `"/path"` and `"path"` are joined
+/// onto the origin. The `/ascii` endpoint fetches server-side, so the URL it
+/// receives must be absolute.
+pub fn make_absolute(origin: &str, src: &str) -> String {
+    let s = src.trim();
+    if s.is_empty() || s.starts_with("http://") || s.starts_with("https://") {
+        s.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            origin.trim_end_matches('/'),
+            s.trim_start_matches('/')
+        )
+    }
+}
+
+/// The current document origin (wasm), e.g. `https://dreamlab-ai.com`.
+#[cfg(target_arch = "wasm32")]
+fn current_origin() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_default()
 }
 
 /// Build the URL to fetch the ASCII fragment for `src`.
@@ -345,6 +375,27 @@ mod tests {
         );
         // Unreserved set is preserved verbatim.
         assert_eq!(encode_uri_component("-_.!~*'()AzZ09"), "-_.!~*'()AzZ09");
+    }
+
+    #[test]
+    fn make_absolute_resolves_root_relative_only() {
+        let o = "https://dreamlab-ai.com";
+        assert_eq!(
+            make_absolute(o, "/images/heroes/lake.webp"),
+            "https://dreamlab-ai.com/images/heroes/lake.webp"
+        );
+        assert_eq!(
+            make_absolute(o, "images/x.png"),
+            "https://dreamlab-ai.com/images/x.png"
+        );
+        // Already absolute / empty pass through untouched.
+        assert_eq!(
+            make_absolute(o, "https://cdn.other.com/x.png"),
+            "https://cdn.other.com/x.png"
+        );
+        assert_eq!(make_absolute(o, "  "), "");
+        // Trailing slash on origin is normalised.
+        assert_eq!(make_absolute("https://h/", "/a.png"), "https://h/a.png");
     }
 
     #[test]

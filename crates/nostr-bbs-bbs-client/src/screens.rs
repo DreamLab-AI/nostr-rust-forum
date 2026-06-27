@@ -89,8 +89,35 @@ fn message_base(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>)
     }
 }
 
+/// Configured zones' banner images rendered as on-theme ASCII "section heroes"
+/// at the top of the Message Base, each tinted to its zone accent.
+fn section_heroes(cfg: StoredValue<BbsConfig>) -> impl IntoView {
+    let zones = cfg.with_value(|c| c.zones.clone());
+    view! {
+        {zones
+            .into_iter()
+            .filter_map(|z| {
+                let url = z.banner_image_url.clone().filter(|u| !u.trim().is_empty())?;
+                let accent = z.accent_hex.clone().unwrap_or_default();
+                let style = if accent.is_empty() {
+                    String::new()
+                } else {
+                    format!("--accent:{accent}")
+                };
+                Some(view! {
+                    <div class="bbs-section-hero" style=style>
+                        <div class="label">{format!("\u{259E} {} \u{259A}", z.display_name)}</div>
+                        <AsciiImg src=url cols=84 />
+                    </div>
+                })
+            })
+            .collect_view()}
+    }
+}
+
 fn board_list(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     view! {
+        {section_heroes(cfg)}
         {move || {
             let chans = store.channels.get();
             if chans.is_empty() {
