@@ -3,6 +3,7 @@
 
 use leptos::prelude::*;
 
+use crate::ascii_img::AsciiImg;
 use crate::config::BbsConfig;
 use crate::menu::{parse_command, Command, Screen};
 use crate::relay::RelayStore;
@@ -89,7 +90,7 @@ pub fn StatusBar() -> impl IntoView {
 #[component]
 pub fn Banner() -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
-    let node = cfg.with_value(|c| c.node_name.clone());
+    let (node, banner_url) = cfg.with_value(|c| (c.node_name.clone(), c.banner_url.clone()));
     let art = "\
  ╔══════════════════════════════════════════════════════════╗
  ║   ▄▄▄   ▄▄▄  ▄▄▄    nostr-rust-forum // retro terminal    ║
@@ -97,6 +98,12 @@ pub fn Banner() -> impl IntoView {
  ║   ▀▀▀  ▀▀▀  ▀▀▀                                           ║
  ╚══════════════════════════════════════════════════════════╝";
     view! {
+        // Optional banner image — rendered on-theme as ASCII, never a raw <img>.
+        {banner_url.map(|src| view! {
+            <div class="bbs-ascii-row bbs-banner-img">
+                <AsciiImg src=src cols=100 />
+            </div>
+        })}
         <pre class="bbs-banner">
             {art}
             "\n  "

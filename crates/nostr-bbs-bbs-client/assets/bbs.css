@@ -171,3 +171,39 @@ html, body {
 @keyframes blink { 50% { opacity: 0; } }
 
 a, .bbs-link { color: var(--accent); }
+
+/* ── ASCII image rendering ───────────────────────────────────────────────────
+ * Images everywhere in the BBS are converted to ASCII server-side (preview /
+ * pod workers) and injected as <pre class="ascii-img"> fragments whose cells
+ * carry phosphor levels p0..p7. The levels map to a ramp from background to the
+ * active theme's bright phosphor via color-mix on the EXISTING theme vars, so
+ * they auto-recolour across all four themes with no per-theme duplication. */
+.bbs-ascii-row { margin: 0.4rem 0; }
+.bbs-banner-img { margin: 0.5rem 0 0; }
+.ascii-img-wrap { overflow-x: auto; }
+.ascii-img {
+  margin: 0;
+  font-family: var(--font);
+  font-size: 0.6rem;
+  line-height: 1;
+  letter-spacing: 0;
+  white-space: pre;
+  overflow-x: auto;
+  text-shadow: 0 0 2px currentColor; /* per-cell phosphor glow */
+}
+.ascii-img-status {
+  font-size: 0.8rem;
+  line-height: 1.2;
+  color: var(--fg-dim);
+  text-shadow: 0 0 3px var(--accent);
+}
+
+/* Phosphor ramp: background → bright phosphor, eased so midtones aren't muddy. */
+.ascii-img .p0 { color: color-mix(in srgb, var(--fg-bright)  6%, var(--bg)); }
+.ascii-img .p1 { color: color-mix(in srgb, var(--fg-bright) 12%, var(--bg)); }
+.ascii-img .p2 { color: color-mix(in srgb, var(--fg-bright) 20%, var(--bg)); }
+.ascii-img .p3 { color: color-mix(in srgb, var(--fg-bright) 31%, var(--bg)); }
+.ascii-img .p4 { color: color-mix(in srgb, var(--fg-bright) 45%, var(--bg)); }
+.ascii-img .p5 { color: color-mix(in srgb, var(--fg-bright) 62%, var(--bg)); }
+.ascii-img .p6 { color: color-mix(in srgb, var(--fg-bright) 80%, var(--bg)); }
+.ascii-img .p7 { color: var(--fg-bright); }

@@ -18,6 +18,8 @@ ignore = [
     # affected crate + replacement plan and set a review date for each of these.
     "RUSTSEC-2026-0097", # mirrors audit.yml ignore; pending justification/review
     "RUSTSEC-2026-0173", # mirrors audit.yml ignore; pending justification/review
+    "RUSTSEC-2026-0185", # quinn-proto QUIC DoS: transitive native dep, never
+                         # instantiated on the wasm32/CF-Workers surface.
 ]
 
 # ---------------------------------------------------------------------------

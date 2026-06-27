@@ -1,0 +1,20 @@
+[package]
+name = "nostr-bbs-ascii"
+version = "1.0.0-beta.3"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "On-theme ASCII-art image rendering for the nostr-bbs retro client (wasm-safe; phosphor-level HTML)"
+keywords = ["nostr", "bbs", "ascii", "ascii-art", "image"]
+categories = ["multimedia::images", "web-programming"]
+
+[features]
+# Pure projection + HTML/ANSI emit are always available and dependency-free, so
+# the crate compiles for any target (incl. wasm32) with no decoder pulled in.
+# `decode` adds the `image` decoders for server-side use (preview/pod workers).
+default = []
+decode = ["dep:image"]
+
+[dependencies]
+image = { workspace = true, optional = true }

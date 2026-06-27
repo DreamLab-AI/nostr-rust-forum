@@ -2,9 +2,10 @@
 //!
 //! The branded host site injects the same `__ENV__` globals the main forum
 //! client uses (`THEME`, `NODE_NAME`, `LOCATION`, `BANNER_URL`, `LOGO_URL`,
-//! `RELAY_URL`, `POD_API`, `ZONE_CONFIG`, optionally `VIEWER_PUBKEY`). These are
-//! projected from `forum.toml`'s `[branding]` / `[[zones]]` / `[relay]` / `[pod]`
-//! sections by `nostr_bbs_config` + the deploy pipeline.
+//! `RELAY_URL`, `POD_API`, `PREVIEW_API`, `ZONE_CONFIG`, optionally
+//! `VIEWER_PUBKEY`). These are projected from `forum.toml`'s `[branding]` /
+//! `[[zones]]` / `[relay]` / `[pod]` / `[preview]` sections by
+//! `nostr_bbs_config` + the deploy pipeline.
 //!
 //! Parsing is split into a pure [`BbsConfig::from_env_value`] (unit-tested on the
 //! native target) and a thin wasm [`BbsConfig::load`] that reads + stringifies
@@ -32,6 +33,9 @@ pub struct BbsConfig {
     pub relay_url: String,
     /// Solid pod API base URL (WebID, pod-git, storage).
     pub pod_api: String,
+    /// Preview-worker base URL — serves `GET /ascii?url=…&cols=…&ramp=…`
+    /// image→ASCII fragments for the on-theme image renderer.
+    pub preview_api: String,
     /// The signed-in viewer's hex pubkey, if the host injected one.
     pub viewer_pubkey: Option<String>,
     /// Config-driven zones (boards), shared with the rest of the kit.
@@ -48,6 +52,7 @@ impl Default for BbsConfig {
             logo_url: None,
             relay_url: String::new(),
             pod_api: String::new(),
+            preview_api: String::new(),
             viewer_pubkey: None,
             zones: Vec::new(),
         }
@@ -94,6 +99,8 @@ impl BbsConfig {
             logo_url: first_key(env, &["LOGO_URL", "LOGO"]),
             relay_url: first_key(env, &["RELAY_URL", "RELAY"]).unwrap_or_default(),
             pod_api: first_key(env, &["POD_API", "POD_URL", "POD_BASE_URL"]).unwrap_or_default(),
+            preview_api: first_key(env, &["PREVIEW_API", "PREVIEW_URL", "PREVIEW_BASE_URL"])
+                .unwrap_or_default(),
             viewer_pubkey: first_key(env, &["VIEWER_PUBKEY", "PUBKEY"]),
             zones: parse_zones(env),
         }
@@ -146,6 +153,7 @@ mod tests {
             "LOCATION": "Manchester, UK",
             "RELAY_URL": "wss://relay.example.com",
             "POD_API": "https://pods.example.com",
+            "PREVIEW_API": "https://preview.example.com",
             "VIEWER_PUBKEY": "ab12"
         }));
         assert_eq!(cfg.theme, Theme::Green);
@@ -153,6 +161,7 @@ mod tests {
         assert_eq!(cfg.location, "Manchester, UK");
         assert_eq!(cfg.relay_url, "wss://relay.example.com");
         assert_eq!(cfg.pod_api, "https://pods.example.com");
+        assert_eq!(cfg.preview_api, "https://preview.example.com");
         assert_eq!(cfg.viewer_pubkey.as_deref(), Some("ab12"));
     }
 
@@ -183,10 +192,13 @@ mod tests {
 
     #[test]
     fn alternate_endpoint_keys_supported() {
-        let cfg = BbsConfig::from_env_value(
-            &json!({ "POD_URL": "https://p.example", "RELAY": "wss://r.example" }),
-        );
+        let cfg = BbsConfig::from_env_value(&json!({
+            "POD_URL": "https://p.example",
+            "RELAY": "wss://r.example",
+            "PREVIEW_URL": "https://prev.example"
+        }));
         assert_eq!(cfg.pod_api, "https://p.example");
         assert_eq!(cfg.relay_url, "wss://r.example");
+        assert_eq!(cfg.preview_api, "https://prev.example");
     }
 }

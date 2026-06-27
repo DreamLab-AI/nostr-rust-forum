@@ -11,6 +11,7 @@
 //! ## Endpoints
 //!
 //!   GET /preview?url=...  -- fetch OG metadata or Twitter oEmbed
+//!   GET /ascii?url=...    -- render a remote image to phosphor ASCII-art HTML
 //!   GET /health           -- health check
 //!   GET /stats            -- cache statistics (CF Cache API)
 //!   OPTIONS               -- CORS preflight
@@ -25,6 +26,7 @@ mod ssrf;
 use serde::Serialize;
 use worker::*;
 
+use nostr_bbs_ascii::{render_bytes, GlyphRamp, RenderOptions};
 use oembed::TwitterCachePayload;
 use parse::OgCachePayload;
 
@@ -32,6 +34,7 @@ use parse::OgCachePayload;
 
 const CACHE_TTL_OG: u32 = 10 * 24 * 60 * 60; // 10 days (seconds)
 const CACHE_TTL_TWITTER: u32 = 24 * 60 * 60; // 1 day  (seconds)
+const CACHE_TTL_ASCII: u32 = 7 * 24 * 60 * 60; // 7 days (seconds) — ASCII of an image is deterministic
 
 // ── Response types ───────────────────────────────────────────────────────────
 
@@ -179,6 +182,64 @@ async fn put_to_cache(target_url: &str, payload: &CachePayload, ttl: u32, env: &
     }
 }
 
+// ── ASCII cache helpers (HTML payload, distinct key namespace) ───────────────
+
+/// Canonical, stable name for a glyph ramp — used in the ASCII cache key so two
+/// requests that normalise to the same ramp (e.g. `ramp=block` and
+/// `ramp=blocks`) share a cache entry.
+fn ramp_name(ramp: GlyphRamp) -> &'static str {
+    match ramp {
+        GlyphRamp::Standard => "standard",
+        GlyphRamp::Blocks => "blocks",
+        GlyphRamp::Dense => "dense",
+    }
+}
+
+/// Synthetic CF Cache API key for a rendered ASCII image. Deterministic in the
+/// full render input (url + cols + ramp + invert) and kept in a separate
+/// `/ascii/v1` path namespace so it can never collide with the JSON preview
+/// cache (`/v1`).
+fn ascii_cache_key(target_url: &str, cols: u32, ramp: &str, invert: bool) -> String {
+    format!(
+        "https://link-preview-cache.internal/ascii/v1?url={}&cols={}&ramp={}&invert={}",
+        percent_encode(target_url),
+        cols,
+        ramp,
+        invert as u8
+    )
+}
+
+async fn get_ascii_from_cache(key: &str) -> Option<Response> {
+    let cache = Cache::default();
+    cache.get(key, false).await.ok().flatten()
+}
+
+async fn put_ascii_to_cache(key: &str, html: &str, env: &Env) {
+    let cache = Cache::default();
+    let headers = cors_headers(env);
+    let _ = headers.set("Content-Type", "text/html; charset=utf-8");
+    let _ = headers.set(
+        "Cache-Control",
+        &format!("public, max-age={}", CACHE_TTL_ASCII),
+    );
+    if let Ok(response) = Response::from_body(ResponseBody::Body(html.as_bytes().to_vec()))
+        .map(|r| r.with_headers(headers))
+    {
+        let _ = cache.put(key, response).await;
+    }
+}
+
+/// Build a `text/html` response with the worker's CORS headers and an
+/// `X-Cache` state header (`HIT`/`MISS`).
+fn html_response(html: String, status: u16, env: &Env, cache_state: &str) -> Result<Response> {
+    let headers = cors_headers(env);
+    let _ = headers.set("Content-Type", "text/html; charset=utf-8");
+    let _ = headers.set("X-Cache", cache_state);
+    Ok(Response::from_body(ResponseBody::Body(html.into_bytes()))?
+        .with_headers(headers)
+        .with_status(status))
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn handle_preview(req: &Request, env: &Env) -> Result<Response> {
@@ -290,6 +351,125 @@ async fn handle_preview(req: &Request, env: &Env) -> Result<Response> {
     }
 }
 
+async fn handle_ascii(req: &Request, env: &Env) -> Result<Response> {
+    let url = req.url()?;
+
+    // Parse query params: required `url`; optional `cols`/`ramp`/`invert`.
+    let mut target_url: Option<String> = None;
+    let mut cols: Option<u32> = None;
+    let mut ramp_raw: Option<String> = None;
+    let mut invert = false;
+    for (k, v) in url.query_pairs() {
+        match k.as_ref() {
+            "url" => target_url = Some(v.into_owned()),
+            "cols" => cols = v.parse::<u32>().ok(),
+            "ramp" => ramp_raw = Some(v.into_owned()),
+            "invert" => invert = matches!(v.as_ref(), "1" | "true"),
+            _ => {}
+        }
+    }
+
+    let target_url = match target_url {
+        Some(u) => u,
+        None => {
+            return json_response(
+                &ErrorResponse {
+                    error: "Missing url parameter".to_string(),
+                },
+                400,
+                env,
+            )
+        }
+    };
+
+    // Validate URL
+    if Url::parse(&target_url).is_err() {
+        return json_response(
+            &ErrorResponse {
+                error: "Invalid URL".to_string(),
+            },
+            400,
+            env,
+        );
+    }
+
+    // SSRF check
+    if ssrf::is_private_url(&target_url) {
+        return json_response(
+            &ErrorResponse {
+                error: "URL not allowed (private or internal address)".to_string(),
+            },
+            400,
+            env,
+        );
+    }
+
+    // Build render options. `cols` defaults to the crate's 80; the crate clamps
+    // out-of-range values internally.
+    let ramp = GlyphRamp::parse(ramp_raw.as_deref().unwrap_or(""));
+    let mut opts = RenderOptions::default();
+    if let Some(c) = cols {
+        opts.cols = c;
+    }
+    opts.ramp = ramp;
+    opts.invert = invert;
+
+    let key = ascii_cache_key(&target_url, opts.cols, ramp_name(ramp), invert);
+
+    // Check CF Cache API (HTML payload).
+    if let Some(mut cached) = get_ascii_from_cache(&key).await {
+        if let Ok(html) = cached.text().await {
+            return html_response(html, 200, env, "HIT");
+        }
+    }
+
+    // Miss: SSRF-safe fetch of the image bytes, then render.
+    let headers = Headers::new();
+    let _ = headers.set("Accept", "image/*");
+    let _ = headers.set("User-Agent", "LinkPreviewAPI/1.0 (ASCII Render Bot)");
+
+    let response = match ssrf::ssrf_fetch_with_redirects(&target_url, &headers).await {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                &ErrorResponse {
+                    error: e.to_string(),
+                },
+                500,
+                env,
+            )
+        }
+    };
+
+    let bytes = match ssrf::read_bytes_capped(response, ssrf::MAX_IMAGE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return json_response(
+                &ErrorResponse {
+                    error: e.to_string(),
+                },
+                500,
+                env,
+            )
+        }
+    };
+
+    match render_bytes(&bytes, &opts) {
+        Ok(art) => {
+            let html = art.to_html();
+            put_ascii_to_cache(&key, &html, env).await;
+            html_response(html, 200, env, "MISS")
+        }
+        Err(e) => json_response(
+            &ErrorResponse {
+                error: e.to_string(),
+            },
+            422,
+            env,
+        ),
+    }
+}
+
 fn handle_health(env: &Env) -> Result<Response> {
     json_response(
         &HealthResponse {
@@ -351,6 +531,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     let result = match (req.method(), path) {
         (Method::Get, "/preview") => handle_preview(&req, &env).await,
+        (Method::Get, "/ascii") => handle_ascii(&req, &env).await,
         (Method::Get, "/health") => handle_health(&env),
         (Method::Get, "/stats") => handle_stats(&env),
         _ => json_response(
@@ -416,5 +597,66 @@ mod tests {
     fn preserves_unreserved_chars() {
         assert_eq!(percent_encode("abc-_.~"), "abc-_.~");
         assert_eq!(percent_encode("ABC123"), "ABC123");
+    }
+
+    // ── ASCII cache-key tests ──────────────────────────────────────────────
+    #[test]
+    fn ascii_cache_key_is_deterministic() {
+        let k1 = ascii_cache_key("https://example.com/cat.png", 80, "standard", false);
+        let k2 = ascii_cache_key("https://example.com/cat.png", 80, "standard", false);
+        assert_eq!(k1, k2);
+        assert!(k1.starts_with("https://link-preview-cache.internal/ascii/v1?url="));
+    }
+
+    #[test]
+    fn ascii_cache_key_varies_with_render_params() {
+        let base = ascii_cache_key("https://example.com/cat.png", 80, "standard", false);
+        // Each render parameter must change the key independently.
+        assert_ne!(
+            base,
+            ascii_cache_key("https://example.com/cat.png", 120, "standard", false)
+        );
+        assert_ne!(
+            base,
+            ascii_cache_key("https://example.com/cat.png", 80, "blocks", false)
+        );
+        assert_ne!(
+            base,
+            ascii_cache_key("https://example.com/cat.png", 80, "standard", true)
+        );
+        assert_ne!(
+            base,
+            ascii_cache_key("https://example.com/other.png", 80, "standard", false)
+        );
+    }
+
+    #[test]
+    fn ascii_cache_key_namespace_disjoint_from_preview() {
+        // The ASCII (`/ascii/v1`) and JSON preview (`/v1`) caches must never
+        // collide for the same target URL.
+        let ascii = ascii_cache_key("https://example.com/x.png", 80, "standard", false);
+        let preview = cache_key("https://example.com/x.png");
+        assert_ne!(ascii, preview);
+        assert!(ascii.contains("/ascii/v1?"));
+        assert!(preview.contains("/v1?"));
+    }
+
+    // ── Ramp normalisation ─────────────────────────────────────────────────
+    #[test]
+    fn ramp_name_is_canonical_across_aliases() {
+        // Aliased query strings normalise to the same canonical cache token, so
+        // `ramp=block` and `ramp=blocks` share a cache entry.
+        assert_eq!(ramp_name(GlyphRamp::parse("block")), "blocks");
+        assert_eq!(ramp_name(GlyphRamp::parse("blocks")), "blocks");
+        assert_eq!(ramp_name(GlyphRamp::parse("fine")), "dense");
+        assert_eq!(ramp_name(GlyphRamp::parse("dense")), "dense");
+        // Unknown values fall back to the standard ramp.
+        assert_eq!(ramp_name(GlyphRamp::parse("nonsense")), "standard");
+        assert_eq!(ramp_name(GlyphRamp::parse("")), "standard");
+    }
+
+    #[test]
+    fn ascii_ttl_is_a_week() {
+        const { assert!(CACHE_TTL_ASCII == 7 * 24 * 60 * 60) };
     }
 }

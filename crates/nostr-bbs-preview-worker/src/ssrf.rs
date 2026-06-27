@@ -34,6 +34,12 @@ pub const MAX_REDIRECTS: usize = 3;
 /// because OG/oEmbed parsers depend on a complete document.
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Maximum image body size (bytes) we will read into memory for ASCII
+/// rendering. Larger than [`MAX_BODY_BYTES`] because image payloads are bigger
+/// than HTML documents, but still capped to keep the worker within its memory
+/// and CPU budget (the decoder additionally guards decoded pixel area).
+pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Errors emitted by the SSRF-aware fetch helper.
 #[derive(Debug)]
 pub enum SsrfFetchError {
@@ -222,6 +228,21 @@ pub async fn read_text_capped(mut response: Response) -> Result<String, SsrfFetc
         return Err(SsrfFetchError::BodyTooLarge);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Read the response body as raw bytes, rejecting bodies that exceed
+/// `max_bytes`. Mirrors [`read_text_capped`] but returns the undecoded bytes —
+/// used by the ASCII route, which needs the binary image payload rather than a
+/// UTF-8 document. Callers should pass [`MAX_IMAGE_BYTES`].
+pub async fn read_bytes_capped(
+    mut response: Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SsrfFetchError> {
+    let bytes = response.bytes().await?;
+    if bytes.len() > max_bytes {
+        return Err(SsrfFetchError::BodyTooLarge);
+    }
+    Ok(bytes)
 }
 
 /// Returns `true` if the URL should be blocked: it fails the egress allowlist

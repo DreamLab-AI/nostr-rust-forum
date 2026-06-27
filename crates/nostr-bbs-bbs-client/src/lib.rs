@@ -10,6 +10,7 @@
 //! the native target; `chrome`, `screens`, and `app` render the Leptos UI.
 
 pub mod agent;
+pub mod ascii_img;
 pub mod chrome;
 pub mod config;
 pub mod identity;

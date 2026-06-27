@@ -207,6 +207,28 @@ fn add_html_safety_headers(headers: &Headers, content_type: &str) {
     }
 }
 
+/// True when an `Accept` request header opts in to server-side ASCII rendering
+/// by listing the `text/x-ascii-art` media type (case-insensitive match).
+fn accept_wants_ascii(accept_header: Option<&str>) -> bool {
+    accept_header
+        .map(|h| h.to_ascii_lowercase().contains("text/x-ascii-art"))
+        .unwrap_or(false)
+}
+
+/// Whether a pod resource GET opts in to server-side image→ASCII rendering.
+///
+/// Two equivalent opt-ins are honoured: a `?format=ascii` query param (the
+/// `format_param` value, case-insensitive) OR an `Accept` header that lists
+/// `text/x-ascii-art`. This decides *intent only*; the caller still gates the
+/// transform on an `image/*` content type AND on access control having already
+/// passed — ASCII rendering never exposes bytes the caller could not GET.
+fn ascii_requested(format_param: Option<&str>, accept_header: Option<&str>) -> bool {
+    format_param
+        .map(|f| f.eq_ignore_ascii_case("ascii"))
+        .unwrap_or(false)
+        || accept_wants_ascii(accept_header)
+}
+
 /// Append LDP Link headers and ACL link to a response.
 ///
 /// For non-`.acl` resources, includes `Link: <{path}.acl>; rel="acl"`.
@@ -963,6 +985,66 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .body()
                 .ok_or_else(|| Error::RustError("R2 object has no body".to_string()))?;
             let bytes = body.bytes().await?;
+
+            // ── Server-side image→ASCII rendering ───────────────────────────
+            // Presentation transform applied STRICTLY AFTER the WAC/WebID gate
+            // above (control only reaches here once `has_access` held), so we
+            // never render bytes the caller could not already GET. A caller opts
+            // in via `?format=ascii` or `Accept: text/x-ascii-art`, and only
+            // `image/*` resources are transformed. `cols`/`ramp`/`invert` query
+            // params tune the output. Any decode failure falls through to serve
+            // the original bytes unchanged; absent the opt-in, behaviour below
+            // is identical to before.
+            if obj_content_type.starts_with("image/") {
+                let mut format_param: Option<String> = None;
+                let mut opts = nostr_bbs_ascii::RenderOptions::default();
+                for (k, v) in url.query_pairs() {
+                    match k.as_ref() {
+                        "format" => format_param = Some(v.into_owned()),
+                        "cols" => {
+                            if let Some(c) = v.parse::<u32>().ok().filter(|c| *c > 0) {
+                                opts.cols = c;
+                            }
+                        }
+                        "ramp" => {
+                            let trimmed = v.trim();
+                            if !trimmed.is_empty() {
+                                opts.ramp = nostr_bbs_ascii::GlyphRamp::parse(trimmed);
+                            }
+                        }
+                        "invert" => {
+                            opts.invert = matches!(v.as_ref(), "1" | "true" | "yes" | "on");
+                        }
+                        _ => {}
+                    }
+                }
+
+                if ascii_requested(format_param.as_deref(), accept_header.as_deref()) {
+                    if let Ok(art) = nostr_bbs_ascii::render_bytes(&bytes, &opts) {
+                        // We are now emitting HTML built from pod bytes, so apply
+                        // the same active-content neutralization the worker uses
+                        // for any served HTML (`add_html_safety_headers`); the
+                        // shared `cors` builder already sets `nosniff`.
+                        let resp = Response::ok(art.to_html())?.with_headers(cors);
+                        resp.headers()
+                            .set("Content-Type", "text/html; charset=utf-8")
+                            .ok();
+                        resp.headers().set("ETag", &format!("\"{etag}\"")).ok();
+                        resp.headers().set("Vary", "Accept").ok();
+                        add_html_safety_headers(resp.headers(), "text/html; charset=utf-8");
+                        add_ldp_headers(resp.headers(), false, &resource_path);
+                        add_wac_allow(
+                            resp.headers(),
+                            acl_doc.as_ref(),
+                            agent_uri.as_deref(),
+                            &resource_path,
+                        );
+                        add_cache_control(resp.headers(), &resource_path);
+                        return Ok(resp);
+                    }
+                    // Decode failed → fall through and serve the original bytes.
+                }
+            }
 
             // Range request support
             if let Some((start, end)) = conditional::parse_range(&req_headers, bytes.len() as u64) {
@@ -1919,5 +2001,48 @@ mod tests {
 <body></body>
 </html>"##;
         assert!(validate_webid_html(html.as_bytes()).is_err());
+    }
+
+    // ── server-side image→ASCII opt-in detection ────────────────────────
+    // The opt-in is a presentation directive only; the resource GET handler
+    // still gates the actual transform on an `image/*` content type and on the
+    // WAC/WebID access check having already passed.
+
+    #[test]
+    fn accept_wants_ascii_detects_media_type() {
+        assert!(accept_wants_ascii(Some("text/x-ascii-art")));
+        // Among a normal browser-style Accept list, with a quality value.
+        assert!(accept_wants_ascii(Some(
+            "text/html,application/xhtml+xml,text/x-ascii-art;q=0.9,*/*;q=0.1"
+        )));
+        // Case-insensitive.
+        assert!(accept_wants_ascii(Some("TEXT/X-ASCII-ART")));
+    }
+
+    #[test]
+    fn accept_wants_ascii_absent_or_unrelated() {
+        assert!(!accept_wants_ascii(None));
+        assert!(!accept_wants_ascii(Some("image/png")));
+        assert!(!accept_wants_ascii(Some("text/html, */*")));
+    }
+
+    #[test]
+    fn ascii_requested_via_query_format() {
+        assert!(ascii_requested(Some("ascii"), None));
+        assert!(ascii_requested(Some("ASCII"), None)); // case-insensitive
+        assert!(!ascii_requested(Some("json"), None));
+        assert!(!ascii_requested(None, None));
+    }
+
+    #[test]
+    fn ascii_requested_via_accept_header() {
+        assert!(ascii_requested(None, Some("text/x-ascii-art")));
+        assert!(ascii_requested(
+            None,
+            Some("text/html, text/x-ascii-art;q=0.8")
+        ));
+        // Neither signal present → not requested; a raw image GET is unchanged.
+        assert!(!ascii_requested(None, Some("image/png, */*")));
+        assert!(!ascii_requested(Some("raw"), Some("*/*")));
     }
 }

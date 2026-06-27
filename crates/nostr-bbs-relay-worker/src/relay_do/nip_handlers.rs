@@ -1763,8 +1763,7 @@ mod write_gate_tests {
             Some(recipient.as_str())
         );
         // Whitelisted recipient ⇒ admitted; non-whitelisted ⇒ rejected.
-        let admitted =
-            |whitelisted: bool| gift_wrap_recipient(&ev).is_some() && whitelisted;
+        let admitted = |whitelisted: bool| gift_wrap_recipient(&ev).is_some() && whitelisted;
         assert!(admitted(true));
         assert!(!admitted(false));
     }

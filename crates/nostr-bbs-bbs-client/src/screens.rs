@@ -7,6 +7,7 @@
 use leptos::prelude::*;
 
 use crate::agent::sample_panels;
+use crate::ascii_img::{extract_image_urls, is_image_name, AsciiImg};
 use crate::chrome::{BbsState, MainMenu};
 use crate::config::BbsConfig;
 use crate::identity::Identity;
@@ -156,11 +157,16 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
                         .map(|p| {
                             let who = relay::short_id(&p.pubkey);
                             let body = p.content.clone();
+                            // Any image URLs in the post render on-theme as ASCII.
+                            let imgs = extract_image_urls(&p.content);
                             view! {
                                 <div class="bbs-row">
                                     <span class="accent">{format!("<{who}> ")}</span>
                                     {body}
                                 </div>
+                                {imgs.into_iter().map(|src| view! {
+                                    <div class="bbs-ascii-row"><AsciiImg src=src cols=64 /></div>
+                                }).collect_view()}
                             }
                         })
                         .collect_view()}
@@ -174,6 +180,13 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
 fn file_base(cfg: StoredValue<BbsConfig>) -> impl IntoView {
     let id = viewer(cfg);
     let listing = RwSignal::new(PodState::Idle);
+    // Pod base + viewer hex, used to build absolute URLs for image members so
+    // they can be rendered on-theme as ASCII.
+    let pod_api = cfg.with_value(|c| c.pod_api.clone());
+    let hex = id
+        .as_ref()
+        .map(|i| i.pubkey_hex.clone())
+        .unwrap_or_default();
 
     // Kick off the live container fetch when a viewer identity is present.
     if let Some(idv) = &id {
@@ -219,11 +232,16 @@ fn file_base(cfg: StoredValue<BbsConfig>) -> impl IntoView {
                             {items.into_iter().map(|r| {
                                 let mark = if r.is_container { "▸ " } else { "· " };
                                 let suffix = if r.is_container { "/" } else { "" };
+                                let img_url = (!r.is_container && is_image_name(&r.name))
+                                    .then(|| crate::pod::container_url(&pod_api, &hex, &r.name));
                                 view! {
                                     <div class="bbs-row">
                                         "    " <span class="accent">{mark}</span>
                                         {r.name} {suffix}
                                     </div>
+                                    {img_url.map(|src| view! {
+                                        <div class="bbs-ascii-row"><AsciiImg src=src cols=72 /></div>
+                                    })}
                                 }
                             }).collect_view()}
                         </div>
