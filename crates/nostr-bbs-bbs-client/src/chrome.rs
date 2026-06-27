@@ -5,6 +5,7 @@ use leptos::prelude::*;
 
 use crate::config::BbsConfig;
 use crate::menu::{parse_command, Command, Screen};
+use crate::relay::RelayStore;
 use crate::theme::Theme;
 
 /// Shared, `Copy` application state (all fields are `RwSignal`, which is `Copy`).
@@ -20,22 +21,16 @@ pub struct BbsState {
     pub cmd_open: RwSignal<bool>,
     /// Current command-line text.
     pub cmd_text: RwSignal<String>,
+    /// Currently-open board (kind-40 channel id) within Message Base, if any.
+    pub board: RwSignal<Option<String>>,
 }
 
 impl BbsState {
-    /// Number of selectable rows on the active screen (for list navigation).
-    pub fn list_len(&self, cfg: &BbsConfig) -> usize {
-        match self.screen.get() {
-            Screen::MainMenu => Screen::menu_order().len(),
-            Screen::MessageBase => cfg.zones.len().max(1),
-            _ => 0,
-        }
-    }
-
-    /// Navigate to a screen, resetting the selection.
+    /// Navigate to a screen, resetting the selection and any open board.
     pub fn go(&self, screen: Screen) {
         self.screen.set(screen);
         self.selection.set(0);
+        self.board.set(None);
         self.cmd_open.set(false);
         self.cmd_text.set(String::new());
     }
@@ -46,45 +41,46 @@ impl BbsState {
             Command::Go(s) => self.go(s),
             Command::Back => self.go(Screen::MainMenu),
             Command::Theme => self.theme.update(|t| *t = t.next()),
-            Command::Quit => {
-                self.go(Screen::MainMenu);
-            }
+            Command::Quit => self.go(Screen::MainMenu),
             Command::Unknown => {}
         }
     }
 
-    /// Activate the current selection (Enter). On the main menu this opens the
-    /// highlighted screen.
-    pub fn activate(&self) {
+    /// Activate the current selection on the main menu (Enter).
+    pub fn activate_menu(&self) {
         if self.screen.get() == Screen::MainMenu {
-            let idx = self.selection.get();
-            if let Some(s) = Screen::menu_order().get(idx) {
+            if let Some(s) = Screen::menu_order().get(self.selection.get()) {
                 self.go(*s);
             }
         }
     }
+
+    /// Open a Message Base board (kind-40 channel id).
+    pub fn open_board(&self, channel_id: String) {
+        self.board.set(Some(channel_id));
+    }
+
+    /// Close the open board, returning to the channel list.
+    pub fn close_board(&self) {
+        self.board.set(None);
+    }
 }
 
-/// Top status bar: connection indicator, node name, location, users.
+/// Top status bar: live connection indicator, node name, location.
 #[component]
 pub fn StatusBar() -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
-    let (online, node, loc) = cfg.with_value(|c| {
-        (
-            !c.relay_url.is_empty(),
-            c.node_name.clone(),
-            c.location.clone(),
-        )
-    });
+    let store = use_context::<RelayStore>().expect("relay");
+    let (node, loc) = cfg.with_value(|c| (c.node_name.clone(), c.location.clone()));
     view! {
         <div class="bbs-statusbar">
             <span>
-                <span class=move || if online { "ok" } else { "bad" }>
-                    {move || if online { "● ONLINE" } else { "○ OFFLINE" }}
+                <span class=move || if store.connected.get() { "ok" } else { "bad" }>
+                    {move || if store.connected.get() { "● ONLINE" } else { "○ CONNECTING" }}
                 </span>
                 " │ " {node}
             </span>
-            <span class="bbs-dim">{loc} " │ users: 1 │ NIP-01/42"</span>
+            <span class="bbs-dim">{loc} " │ NIP-01/42"</span>
         </div>
     }
 }
@@ -127,8 +123,7 @@ pub fn MainMenu(state: BbsState) -> impl IntoView {
                             class:selected=selected
                             on:click=move |_| state.go(s)
                         >
-                            "["<span class="key">{key}</span>"] "
-                            {s.title()}
+                            "[" <span class="key">{key}</span> "] " {s.title()}
                         </div>
                     }
                 })
@@ -151,8 +146,8 @@ pub fn Footer(state: BbsState) -> impl IntoView {
                 <span><span class="fk">"[0]"</span>" help"</span>
             </div>
             <div class="bbs-dim">
-                "screen: " {move || state.screen.get().title()}
-                " · theme: " {move || state.theme.get().label()}
+                "screen: " {move || state.screen.get().title()} " · theme: "
+                {move || state.theme.get().label()}
             </div>
         </div>
     }
@@ -162,7 +157,6 @@ pub fn Footer(state: BbsState) -> impl IntoView {
 #[component]
 pub fn CommandLine(state: BbsState) -> impl IntoView {
     let input_ref = NodeRef::<leptos::html::Input>::new();
-    // Focus the input whenever the command line opens.
     Effect::new(move |_| {
         if state.cmd_open.get() {
             if let Some(el) = input_ref.get() {
@@ -186,7 +180,10 @@ pub fn CommandLine(state: BbsState) -> impl IntoView {
                     on:input=move |ev| state.cmd_text.set(event_target_value(&ev))
                     on:keydown=move |ev| {
                         match ev.key().as_str() {
-                            "Enter" => { ev.prevent_default(); submit(); }
+                            "Enter" => {
+                                ev.prevent_default();
+                                submit();
+                            }
                             "Escape" => {
                                 ev.prevent_default();
                                 state.cmd_text.set(String::new());
@@ -202,10 +199,20 @@ pub fn CommandLine(state: BbsState) -> impl IntoView {
     }
 }
 
+/// Selectable-row count on the active screen (for ↑/↓ navigation).
+#[cfg(target_arch = "wasm32")]
+fn nav_len(state: &BbsState, store: &RelayStore) -> usize {
+    match state.screen.get() {
+        Screen::MainMenu => Screen::menu_order().len(),
+        Screen::MessageBase if state.board.get().is_none() => store.channels.get().len(),
+        _ => 0,
+    }
+}
+
 /// Install a window-level keydown handler implementing the BBS keyboard model.
 /// Leaks the closure for the app lifetime (a single global listener).
 #[cfg(target_arch = "wasm32")]
-pub fn install_key_handler(state: BbsState, cfg: StoredValue<BbsConfig>) {
+pub fn install_key_handler(state: BbsState, store: RelayStore) {
     use crate::menu::wrap_index;
     use wasm_bindgen::prelude::*;
     let handler =
@@ -214,20 +221,36 @@ pub fn install_key_handler(state: BbsState, cfg: StoredValue<BbsConfig>) {
             if state.cmd_open.get() {
                 return;
             }
-            let key = ev.key();
-            match key.as_str() {
+            match ev.key().as_str() {
                 "/" => {
                     ev.prevent_default();
                     state.cmd_open.set(true);
                 }
-                "Escape" => state.go(Screen::MainMenu),
-                "Enter" => state.activate(),
+                "Escape" => {
+                    if state.screen.get() == Screen::MessageBase && state.board.get().is_some() {
+                        state.close_board();
+                    } else {
+                        state.go(Screen::MainMenu);
+                    }
+                }
+                "Enter" => match state.screen.get() {
+                    Screen::MainMenu => state.activate_menu(),
+                    Screen::MessageBase if state.board.get().is_none() => {
+                        let chans = store.channels.get();
+                        if let Some(c) = chans.get(state.selection.get()) {
+                            let id = c.id.clone();
+                            state.open_board(id.clone());
+                            crate::relay::subscribe_board(&id);
+                        }
+                    }
+                    _ => {}
+                },
                 "ArrowUp" | "k" => {
-                    let len = state.list_len(&cfg.get_value());
+                    let len = nav_len(&state, &store);
                     state.selection.update(|i| *i = wrap_index(*i, -1, len));
                 }
                 "ArrowDown" | "j" => {
-                    let len = state.list_len(&cfg.get_value());
+                    let len = nav_len(&state, &store);
                     state.selection.update(|i| *i = wrap_index(*i, 1, len));
                 }
                 "t" | "T" => state.theme.update(|t| *t = t.next()),

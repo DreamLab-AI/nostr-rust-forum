@@ -48,5 +48,10 @@ web-sys = { workspace = true, features = [
     "EventTarget",
     "KeyboardEvent",
     "Location",
+    "WebSocket",
+    "MessageEvent",
+    "BinaryType",
+    "CloseEvent",
+    "ErrorEvent",
 ] }
 console_error_panic_hook = "0.1"
