@@ -2025,6 +2025,7 @@ dependencies = [
  "serde_json",
  "solid-pod-rs",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

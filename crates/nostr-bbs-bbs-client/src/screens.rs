@@ -11,6 +11,7 @@ use crate::chrome::{BbsState, MainMenu};
 use crate::config::BbsConfig;
 use crate::identity::Identity;
 use crate::menu::Screen;
+use crate::pod::PodState;
 use crate::relay::{self, RelayStore};
 use nostr_bbs_core::governance::{ActionStyle, PanelDefinition};
 
@@ -169,9 +170,31 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
     }
 }
 
-/// (2) File Base — the Solid pod browser (WebID-owned storage).
+/// (2) File Base — the live Solid pod browser (WebID-owned storage).
 fn file_base(cfg: StoredValue<BbsConfig>) -> impl IntoView {
     let id = viewer(cfg);
+    let listing = RwSignal::new(PodState::Idle);
+
+    // Kick off the live container fetch when a viewer identity is present.
+    if let Some(idv) = &id {
+        let (pod_api, hex) = (
+            cfg.with_value(|c| c.pod_api.clone()),
+            idv.pubkey_hex.clone(),
+        );
+        if !pod_api.is_empty() {
+            listing.set(PodState::Loading);
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(async move {
+                match crate::pod::fetch_container(&pod_api, &hex, "").await {
+                    Ok(items) => listing.set(PodState::Loaded(items)),
+                    Err(e) => listing.set(PodState::Error(e)),
+                }
+            });
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = (pod_api, hex);
+        }
+    }
+
     view! {
         {header(Screen::FileBase)}
         {match id {
@@ -179,12 +202,33 @@ fn file_base(cfg: StoredValue<BbsConfig>) -> impl IntoView {
                 <div class="bbs-panel">
                     "  WebID    : " <span class="accent">{id.webid.clone()}</span> "\n"
                     "  pod-git  : " {id.git_clone.clone()} "\n\n"
-                    "  /" {id.short()} "/\n"
-                    "    ├── inbox/        " <span class="bbs-dim">"(append-only; agents post here)"</span> "\n"
-                    "    ├── public/       " <span class="bbs-dim">"(world-readable, nosniff+sandbox)"</span> "\n"
-                    "    ├── profile/card  " <span class="bbs-dim">"(WebID document)"</span> "\n"
-                    "    └── private/      " <span class="bbs-dim">"(WAC deny-by-default)"</span>
+                    "  /" {id.short()} "/"
                 </div>
+                {move || match listing.get() {
+                    PodState::Idle | PodState::Loading => view! {
+                        <div class="bbs-panel bbs-dim">"    … loading container"</div>
+                    }.into_any(),
+                    PodState::Error(e) => view! {
+                        <div class="bbs-panel bbs-dim">"    pod unavailable: " {e}</div>
+                    }.into_any(),
+                    PodState::Loaded(items) if items.is_empty() => view! {
+                        <div class="bbs-panel bbs-dim">"    (empty container)"</div>
+                    }.into_any(),
+                    PodState::Loaded(items) => view! {
+                        <div class="bbs-list">
+                            {items.into_iter().map(|r| {
+                                let mark = if r.is_container { "▸ " } else { "· " };
+                                let suffix = if r.is_container { "/" } else { "" };
+                                view! {
+                                    <div class="bbs-row">
+                                        "    " <span class="accent">{mark}</span>
+                                        {r.name} {suffix}
+                                    </div>
+                                }
+                            }).collect_view()}
+                        </div>
+                    }.into_any(),
+                }}
             }.into_any(),
             None => view! {
                 <div class="bbs-panel bbs-dim">

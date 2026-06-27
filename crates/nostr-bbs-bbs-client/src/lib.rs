@@ -14,6 +14,7 @@ pub mod chrome;
 pub mod config;
 pub mod identity;
 pub mod menu;
+pub mod pod;
 pub mod relay;
 pub mod screens;
 pub mod theme;
