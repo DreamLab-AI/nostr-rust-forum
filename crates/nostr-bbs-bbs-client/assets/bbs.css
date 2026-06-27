@@ -266,3 +266,24 @@ a, .bbs-link { color: var(--accent); }
   transition: opacity 3s linear;     /* slow, even decay to zero */
 }
 @media (prefers-reduced-motion: reduce) { .phosphor-ghost { display: none; } }
+
+/* ── Mobile / touch ──────────────────────────────────────────────────────────
+ * First-class mobile: a single-column terminal that fills the dynamic viewport
+ * (100dvh dodges the mobile browser-chrome gap), larger touch targets, and a
+ * fitted banner. Touch navigation (slide to move the highlight, release to
+ * select) is driven by the small script in index.html; `touch-action: none` on
+ * the selectable lists hands those gestures to it instead of the browser. */
+.bbs-root, .bbs-crt { min-height: 100vh; min-height: 100dvh; }
+.bbs-menu, .bbs-list { touch-action: none; }
+
+@media (max-width: 640px) {
+  html, body { font-size: 13px; }
+  .bbs-root { padding: 0.4rem 0.6rem; max-width: 100%; }
+  .bbs-banner { font-size: 0.52rem; line-height: 1.05; }
+  .bbs-menu { grid-template-columns: 1fr; gap: 0.15rem; }
+  .bbs-menu-item, .bbs-row { padding: 0.7rem 0.5rem; }   /* roomy touch targets */
+  .ascii-img { font-size: 0.4rem; }
+  .bbs-statusbar { font-size: 0.78rem; }
+  .bbs-fkeys { font-size: 0.72rem; gap: 0.45rem; }
+  .bbs-cmdline input { font-size: 16px; }                /* stop iOS focus-zoom */
+}
