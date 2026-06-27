@@ -94,8 +94,8 @@ pub const GIT_CONFIG_PRIVKEY: &str = "nostr.privkey";
 /// upstream `solid_pod_rs::did_nostr_types` canonical renderer). No DID-doc
 /// field is constructed here — this keeps I1/I2 single-sourced.
 pub fn render_agent_did_doc(pubkey_hex: &str) -> AnchorResult<Value> {
-    let pk = nostr_bbs_core::did::NostrPubkey::from_hex(pubkey_hex)
-        .map_err(AnchorError::InvalidHex)?;
+    let pk =
+        nostr_bbs_core::did::NostrPubkey::from_hex(pubkey_hex).map_err(AnchorError::InvalidHex)?;
     Ok(nostr_bbs_core::did::render_did_document_tier1(&pk))
 }
 
@@ -105,8 +105,7 @@ pub fn render_agent_did_doc(pubkey_hex: &str) -> AnchorResult<Value> {
 /// `did:nostr:<hex>` identity rendered upstream (I1/I2).
 pub fn write_agent_did_json(repo_root: &Path, pubkey_hex: &str) -> AnchorResult<PathBuf> {
     let doc = render_agent_did_doc(pubkey_hex)?;
-    let body =
-        serde_json::to_vec_pretty(&doc).map_err(|e| AnchorError::Encode(e.to_string()))?;
+    let body = serde_json::to_vec_pretty(&doc).map_err(|e| AnchorError::Encode(e.to_string()))?;
     let path = repo_root.join(AGENT_DID_FILENAME);
     std::fs::write(&path, body).map_err(|e| AnchorError::Io(e.to_string()))?;
     Ok(path)
@@ -126,7 +125,10 @@ pub fn set_git_privkey(repo_root: &Path, privkey_hex: &str) -> AnchorResult<()> 
             "privkey must be 64 hex chars".into(),
         ));
     }
-    run_git(repo_root, &["config", "--local", GIT_CONFIG_PRIVKEY, privkey_hex])?;
+    run_git(
+        repo_root,
+        &["config", "--local", GIT_CONFIG_PRIVKEY, privkey_hex],
+    )?;
     Ok(())
 }
 
@@ -424,8 +426,7 @@ pub fn bootstrap_pod_identity_and_trail(
 // ---------------------------------------------------------------------------
 
 fn write_json(repo_root: &Path, filename: &str, value: &Value) -> AnchorResult<()> {
-    let body =
-        serde_json::to_vec_pretty(value).map_err(|e| AnchorError::Encode(e.to_string()))?;
+    let body = serde_json::to_vec_pretty(value).map_err(|e| AnchorError::Encode(e.to_string()))?;
     std::fs::write(repo_root.join(filename), body).map_err(|e| AnchorError::Io(e.to_string()))
 }
 
@@ -490,7 +491,10 @@ mod tests {
         // this stays green across the dep bump while still proving no key bytes
         // changed in this module.
         let mb = vm["publicKeyMultibase"].as_str().unwrap();
-        assert!(mb.ends_with(PK_HEX) || mb.starts_with('z'), "multibase {mb}");
+        assert!(
+            mb.ends_with(PK_HEX) || mb.starts_with('z'),
+            "multibase {mb}"
+        );
     }
 
     #[test]
@@ -515,7 +519,15 @@ mod tests {
 
     #[test]
     fn gitmark_has_exactly_five_keys() {
-        let m = build_gitmark("aaa", 0, "aaa", 0, "forum-pod", "contracts/x", "https://r/x.git");
+        let m = build_gitmark(
+            "aaa",
+            0,
+            "aaa",
+            0,
+            "forum-pod",
+            "contracts/x",
+            "https://r/x.git",
+        );
         let obj = m.as_object().unwrap();
         assert_eq!(obj.len(), 5, "gitmark must have exactly 5 keys");
         for k in ["@id", "genesis", "nick", "package", "repository"] {
@@ -603,10 +615,9 @@ mod tests {
         assert_eq!(gm["@id"], gm["genesis"]);
 
         // blocktrails.json: states[0] is the REAL genesis commit SHA.
-        let bt: Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join(BLOCKTRAILS_FILENAME)).unwrap(),
-        )
-        .unwrap();
+        let bt: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(BLOCKTRAILS_FILENAME)).unwrap())
+                .unwrap();
         assert_eq!(bt["states"][0], sha);
         assert_eq!(bt["@type"], "Blocktrail");
 

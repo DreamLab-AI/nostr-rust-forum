@@ -270,7 +270,20 @@ impl NostrEvent {
 
 impl UnsignedEvent {
     /// Convert to an upstream `EventBuilder` for signing via rust-nostr.
+    ///
+    /// NOTE: the upstream `nostr::Kind` is `u16`-backed, while this kit stores
+    /// `kind: u64` and computes canonical event ids over the full `u64`. Event
+    /// kinds above `u16::MAX` cannot be represented upstream and would be
+    /// truncated here, diverging from the kit's canonical serializer (and
+    /// producing an id mismatch). Every kind used by this forum is < 65536; the
+    /// assertion below catches any future out-of-range kind on this signing path
+    /// in debug builds rather than silently mis-signing.
     pub fn to_upstream_builder(&self) -> nostr::EventBuilder {
+        debug_assert!(
+            self.kind <= u16::MAX as u64,
+            "event kind {} exceeds u16::MAX; upstream nostr::Kind cannot represent it without truncation",
+            self.kind
+        );
         let tags: Vec<nostr::Tag> = self
             .tags
             .iter()

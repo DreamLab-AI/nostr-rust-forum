@@ -13,6 +13,11 @@ ignore = [
     "RUSTSEC-2025-0141", # unmaintained: transitive dep, no replacement available
     "RUSTSEC-2024-0384", # unmaintained: transitive dep, no replacement available
     "RUSTSEC-2024-0436", # unmaintained: transitive dep, no replacement available
+    # Kept in sync with .github/workflows/audit.yml so the cargo-deny gate and the
+    # weekly cargo-audit scan share one source of truth. TODO: document the
+    # affected crate + replacement plan and set a review date for each of these.
+    "RUSTSEC-2026-0097", # mirrors audit.yml ignore; pending justification/review
+    "RUSTSEC-2026-0173", # mirrors audit.yml ignore; pending justification/review
 ]
 
 # ---------------------------------------------------------------------------

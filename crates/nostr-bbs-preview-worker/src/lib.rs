@@ -323,6 +323,17 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Ok(Response::empty()?.with_headers(headers).with_status(204));
     }
 
+    // Install the egress allowlist from the JS `Env`. The lazy `std::env`
+    // fallback in `ssrf` is inert under the CF Workers WASM runtime (vars arrive
+    // via this `Env`, not the process environment), so without wiring it here the
+    // "authoritative" DNS-rebinding allowlist is permanently empty and the worker
+    // runs in denylist-only (rebind-vulnerable) mode. Cheap: a small RwLock write.
+    // When `PREVIEW_ALLOWED_HOSTS` is unset we leave the empty allowlist in place
+    // (hardened denylist applies), matching the documented default.
+    if let Ok(raw) = env.var("PREVIEW_ALLOWED_HOSTS").map(|v| v.to_string()) {
+        ssrf::set_allowlist(ssrf::AllowList::parse(&raw));
+    }
+
     // Rate limit: 30 requests per 60 seconds per IP
     let ip = nostr_bbs_rate_limit::client_ip(&req);
     if !nostr_bbs_rate_limit::check_rate_limit(&env, "RATE_LIMIT", &ip, 30, 60).await {

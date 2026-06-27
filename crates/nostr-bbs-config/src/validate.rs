@@ -40,6 +40,18 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
         return Err(format!("relay.url must use wss:// (got {})", cfg.relay.url));
     }
 
+    // mesh.peer_relays must each use wss:// (or a localhost dev URL), matching the
+    // transport-security requirement enforced on relay.url and governance.relay_url.
+    // A federation peer reached over plaintext ws:// would expose mesh traffic to
+    // tampering and disclosure.
+    for peer in &cfg.mesh.peer_relays {
+        if !peer.starts_with("wss://") && !peer.starts_with("ws://localhost") {
+            return Err(format!(
+                "mesh.peer_relays entries must use wss:// (got {peer})"
+            ));
+        }
+    }
+
     // relay.ingress_policy must be allowlist or open.
     if cfg.relay.ingress_policy != "allowlist" && cfg.relay.ingress_policy != "open" {
         return Err(format!(
@@ -180,7 +192,9 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
     // payments: when enabled, the token sub-table (if present) must be coherent.
     if let Some(token) = cfg.payments.token.as_ref() {
         if cfg.payments.enabled && token.ticker.is_empty() {
-            return Err("payments.token.ticker must not be empty when payments.enabled = true".into());
+            return Err(
+                "payments.token.ticker must not be empty when payments.enabled = true".into(),
+            );
         }
         if token.supply != 0 && token.rate != 0 && token.rate > token.supply {
             return Err(format!(
@@ -205,14 +219,27 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
         }
     }
 
-    // zone accent_hex, when set, must be a CSS hex colour (#rgb / #rrggbb).
-    for zone in &cfg.zones {
-        if let Some(accent) = zone.accent_hex.as_deref() {
-            if !is_valid_hex_colour(accent) {
+    // Zone ids must be unique. `ZoneConfig::get` resolves by FIRST match, so a
+    // duplicate `[[zones]]` id with weaker required_cohorts/visibility could
+    // silently shadow the intended access rule — an operator typo must fail
+    // validation, not quietly open (or close) a zone. Also validate accent_hex.
+    {
+        let mut seen_ids = std::collections::HashSet::new();
+        for zone in &cfg.zones {
+            if !seen_ids.insert(zone.id.as_str()) {
                 return Err(format!(
-                    "zone '{}' accent_hex must be a CSS hex colour like #3b82f6 (got {})",
-                    zone.id, accent
+                    "duplicate zone id '{}' — zone ids must be unique (a duplicate \
+                     would silently shadow the intended access rule)",
+                    zone.id
                 ));
+            }
+            if let Some(accent) = zone.accent_hex.as_deref() {
+                if !is_valid_hex_colour(accent) {
+                    return Err(format!(
+                        "zone '{}' accent_hex must be a CSS hex colour like #3b82f6 (got {})",
+                        zone.id, accent
+                    ));
+                }
             }
         }
     }
@@ -557,6 +584,28 @@ operator = "tier-2"
     fn governance_http_relay_url_rejected() {
         let mut cfg = baseline_cfg();
         cfg.governance.relay_url = "https://relay.example.com".into();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn mesh_plaintext_peer_relay_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.mesh.peer_relays = vec!["ws://peer.example.com".into()];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn mesh_wss_peer_relay_accepted() {
+        let mut cfg = baseline_cfg();
+        cfg.mesh.peer_relays = vec!["wss://peer.example.com".into()];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn duplicate_zone_id_rejected() {
+        let mut cfg = baseline_cfg();
+        let zone: Zone = toml::from_str("id = \"general\"\ndisplay_name = \"General\"").unwrap();
+        cfg.zones = vec![zone.clone(), zone];
         assert!(validate_config(&cfg).is_err());
     }
 

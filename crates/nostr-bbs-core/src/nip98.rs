@@ -303,6 +303,11 @@ pub fn create_token_at(
 /// )?;
 /// println!("Authenticated: {}", token.pubkey);
 /// ```
+/// ⚠️ **No replay protection.** Performs only stateless cryptographic and
+/// structural checks — the same valid token can be replayed within the
+/// tolerance window. For request authentication, prefer
+/// [`verify_nip98_with_replay`] / [`verify_token_at_with_replay`] backed by a
+/// [`Nip98ReplayStore`].
 pub fn verify_nip98(
     auth_header: &str,
     expected_url: &str,
@@ -335,6 +340,8 @@ pub fn verify_nip98(
 /// * `expected_url` - The URL that should appear in the `u` tag
 /// * `expected_method` - The HTTP method that should appear in the `method` tag
 /// * `body` - Optional request body bytes to verify against the `payload` tag
+///
+/// ⚠️ **No replay protection** — see [`verify_nip98_with_replay`].
 pub fn verify_token(
     auth_header: &str,
     expected_url: &str,
@@ -367,6 +374,8 @@ pub fn verify_token(
 /// * `expected_method` - The HTTP method that should appear in the `method` tag
 /// * `body` - Optional request body bytes to verify against the `payload` tag
 /// * `now` - The current Unix timestamp (seconds) used for tolerance checking
+///
+/// ⚠️ **No replay protection** — see [`verify_token_at_with_replay`].
 pub fn verify_token_at(
     auth_header: &str,
     expected_url: &str,
@@ -397,6 +406,11 @@ pub fn verify_token_at(
 /// * `now` - The current Unix timestamp (seconds) used for tolerance checking
 /// * `max_age_secs` - Maximum allowed absolute difference between `now` and the
 ///   event's `created_at` timestamp. Use [`TIMESTAMP_TOLERANCE`] for the default.
+///
+/// ⚠️ **No replay protection.** This is the stateless core; a valid token may be
+/// replayed within the tolerance window. Callers authenticating requests must
+/// layer a [`Nip98ReplayStore`] (see [`verify_nip98_with_replay`] /
+/// [`verify_token_at_with_replay`]).
 pub fn verify_token_full(
     auth_header: &str,
     expected_url: &str,

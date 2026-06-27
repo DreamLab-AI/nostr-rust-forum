@@ -29,11 +29,11 @@ mod git;
 // native/agentbox deployment of the externally-pullable forum pod. On CF the
 // `git` module above keeps returning the 501 / `X-Git-Unavailable: cf-workers`
 // stub.
-#[cfg(not(target_arch = "wasm32"))]
-mod pod_git_anchor;
 mod notifications;
 mod patch;
 mod payments;
+#[cfg(not(target_arch = "wasm32"))]
+mod pod_git_anchor;
 mod provision;
 mod quota;
 mod remote_storage;
@@ -167,13 +167,44 @@ fn cors_headers(env: &Env) -> Headers {
         .var("EXPECTED_ORIGIN")
         .map(|v| v.to_string())
         .unwrap_or_else(|_| "*".to_string());
+    let wildcard = origin == "*";
 
     let headers = Headers::new();
     headers.set("Access-Control-Allow-Origin", &origin).ok();
     for (name, value) in nostr_bbs_core::POD_CORS_HEADERS {
+        // Per the Fetch/CORS spec, `Access-Control-Allow-Credentials: true` is
+        // invalid alongside a wildcard `Allow-Origin` (browsers reject the
+        // combination). When no concrete `EXPECTED_ORIGIN` is configured we fall
+        // back to `*`, so we must NOT also advertise credentialed access — emit a
+        // spec-valid header set instead of a self-contradicting one.
+        if wildcard && *name == "Access-Control-Allow-Credentials" {
+            continue;
+        }
         headers.set(name, value).ok();
     }
+    // Defense-in-depth against MIME-sniffing of stored pod content into an
+    // executable type (stored-XSS). Applied to every response that uses this
+    // shared builder.
+    headers.set("X-Content-Type-Options", "nosniff").ok();
     headers
+}
+
+/// Neutralize active content for resources served as HTML.
+///
+/// Pod resources are *data*, not applications. A party who can store HTML in a
+/// world-readable container (e.g. `public/`, or a poisoned `/profile/card`)
+/// could otherwise execute script on the pod's web origin — a stored-XSS that,
+/// on a shared app/pod origin, can read another user's persisted key material.
+/// `Content-Security-Policy: sandbox` (without `allow-scripts`) runs the
+/// document with scripting disabled; `default-src 'none'` blocks subresource
+/// loads. JSON-LD (`application/ld+json`) WebID data is unaffected — browsers
+/// and RDF consumers parse it rather than execute it.
+fn add_html_safety_headers(headers: &Headers, content_type: &str) {
+    if content_type.starts_with("text/html") {
+        headers
+            .set("Content-Security-Policy", "default-src 'none'; sandbox")
+            .ok();
+    }
 }
 
 /// Append LDP Link headers and ACL link to a response.
@@ -464,6 +495,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let resp = Response::ok(json_str)?.with_headers(cors);
             resp.headers().set("Content-Type", "application/json").ok();
             resp.headers().set("Access-Control-Allow-Origin", "*").ok();
+            // This public endpoint forces a wildcard origin; a wildcard origin
+            // with `Allow-Credentials: true` is an invalid (browser-rejected)
+            // combination and NIP-05 lookups are unauthenticated, so strip the
+            // inherited credentials header to emit a spec-valid header set.
+            resp.headers()
+                .delete("Access-Control-Allow-Credentials")
+                .ok();
             return Ok(resp);
         }
         return json_error(&env, "Name not found", 404);
@@ -695,10 +733,14 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .d1("REPLAY_DB")
         .map_err(|e| Error::RustError(format!("REPLAY_DB D1 binding missing: {e}")))?;
 
-    let agent_uri = requester_pubkey.as_ref().map(|pk| {
+    // Build the WAC agent URI from the (NIP-98-verified) requester pubkey. Fail
+    // CLOSED on a malformed pubkey: rather than constructing an unvalidated
+    // `did:nostr:{pk}` identity that could be matched by an ACL grant, drop the
+    // agent identity entirely so deny-by-default WAC treats it as anonymous.
+    let agent_uri = requester_pubkey.as_ref().and_then(|pk| {
         did::NostrPubkey::from_hex(pk)
             .map(|p| nostr_bbs_core::did_nostr_uri(&p))
-            .unwrap_or_else(|_| format!("did:nostr:{pk}"))
+            .ok()
     });
 
     // -----------------------------------------------------------------------
@@ -856,6 +898,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let cors = cors_headers(&env);
                 let resp = Response::ok(html)?.with_headers(cors);
                 resp.headers().set("Content-Type", "text/html").ok();
+                // WebID cards are world-readable; sandbox them so a poisoned
+                // card cannot run script on the pod origin (validate_webid_html
+                // checks for a JSON-LD block but does not sanitize surrounding
+                // markup).
+                add_html_safety_headers(resp.headers(), "text/html");
                 add_ldp_headers(resp.headers(), false, &resource_path);
                 add_wac_allow(
                     resp.headers(),
@@ -931,6 +978,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                         &format!("bytes {start}-{end}/{}", bytes.len()),
                     )
                     .ok();
+                add_html_safety_headers(resp.headers(), &obj_content_type);
                 add_ldp_headers(resp.headers(), false, &resource_path);
                 add_wac_allow(
                     resp.headers(),
@@ -946,6 +994,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             resp.headers().set("Content-Type", &obj_content_type).ok();
             resp.headers().set("ETag", &format!("\"{etag}\"")).ok();
             resp.headers().set("Vary", "Accept").ok();
+            add_html_safety_headers(resp.headers(), &obj_content_type);
             add_ldp_headers(resp.headers(), false, &resource_path);
             add_wac_allow(
                 resp.headers(),

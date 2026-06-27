@@ -49,6 +49,12 @@ use session::{generate_challenge, SessionInfo};
 /// Maximum WebSocket connections per IP address.
 const MAX_CONNECTIONS_PER_IP: u32 = 20;
 
+/// Maximum filters accepted per REQ/COUNT frame. Matches the `max_filters`
+/// value advertised in NIP-11 (`nip11.rs`). Each filter is a separate D1 query
+/// in `query_events`, so an uncapped frame is a request-amplification DoS
+/// (especially on the unauthenticated COUNT path).
+const MAX_FILTERS: usize = 10;
+
 // ---------------------------------------------------------------------------
 // Durable Object
 // ---------------------------------------------------------------------------
@@ -222,6 +228,10 @@ impl DurableObject for NostrRelayDO {
                     .iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
                     .collect();
+                if filters.len() > MAX_FILTERS {
+                    Self::send_notice(&ws, "too many filters (max 10)");
+                    return Ok(());
+                }
                 self.handle_req(session_id, &sub_id, filters).await;
             }
             "CLOSE" => {
@@ -251,7 +261,11 @@ impl DurableObject for NostrRelayDO {
                     .iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
                     .collect();
-                self.handle_count(&ws, &sub_id, filters).await;
+                if filters.len() > MAX_FILTERS {
+                    Self::send_notice(&ws, "too many filters (max 10)");
+                    return Ok(());
+                }
+                self.handle_count(session_id, &ws, &sub_id, filters).await;
             }
             _ => {
                 Self::send_notice(&ws, &format!("Unknown message type: {msg_type}"));
