@@ -1,0 +1,52 @@
+[package]
+name = "nostr-bbs-bbs-client"
+version = "1.0.0-beta.2"
+edition = "2021"
+description = "nostr-bbs community forum — retro ASCII/BBS terminal client (Leptos CSR/WASM)"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+keywords = ["nostr", "bbs", "ascii", "leptos", "wasm"]
+categories = ["web-programming", "wasm"]
+rust-version = "1.85"
+
+# Pure logic (config/theme/menu) lives in the lib so it is unit-testable on the
+# native target; `main.rs` mounts the Leptos app from it for the wasm build.
+[lib]
+name = "nostr_bbs_bbs_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nostr-bbs-bbs-client"
+path = "src/main.rs"
+
+[dependencies]
+# Shared config schema (Branding, Zone, ZoneVisibility) — single source of truth
+# with the rest of the kit so the BBS chrome is driven by the same forum.toml.
+nostr-bbs-config = { workspace = true }
+# Kit core: event types + verify_event_strict, did:nostr identity, and the
+# agent-governance control-panel schema (PanelDefinition / ActionDef / FieldDef /
+# ActionRequest+Response). The BBS renders the SAME human-in-the-loop panels the
+# main client does, in ASCII — no reimplementation of the governance model.
+nostr-bbs-core = { workspace = true }
+# Solid pod / WebID / did:nostr URL formatting (pure `core` feature, wasm-safe) —
+# powers the File Base (pod browser), User List (WebID profiles), and System Info
+# screens against the same infrastructure the forum client uses.
+solid-pod-rs = { workspace = true }
+
+leptos = { workspace = true }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+web-sys = { workspace = true, features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Event",
+    "EventTarget",
+    "KeyboardEvent",
+    "Location",
+] }
+console_error_panic_hook = "0.1"

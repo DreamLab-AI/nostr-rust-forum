@@ -2013,6 +2013,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr-bbs-bbs-client"
+version = "1.0.0-beta.2"
+dependencies = [
+ "console_error_panic_hook",
+ "js-sys",
+ "leptos",
+ "nostr-bbs-config",
+ "nostr-bbs-core",
+ "serde",
+ "serde_json",
+ "solid-pod-rs",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "nostr-bbs-config"
 version = "1.0.0-beta.2"
 dependencies = [

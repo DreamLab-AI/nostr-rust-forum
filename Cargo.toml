@@ -24,6 +24,9 @@ members = [
     # Leptos CSR forum client.
     "crates/nostr-bbs-forum-client",
 
+    # Leptos CSR retro ASCII/BBS terminal client (served at /community/bbs/).
+    "crates/nostr-bbs-bbs-client",
+
     # F26 / ADR-076 D5 — upstream `nostr` crate WASM/CF Workers compatibility
     # canary. Validates that the absorption path (Shape A) is viable on the
     # forum's specific build matrix before any nostr-core module deletion.

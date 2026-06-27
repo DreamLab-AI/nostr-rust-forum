@@ -77,6 +77,14 @@ theme        = "neutral"                              # e.g. "neutral", "blue", 
 logo_url     = "https://forum.example.com/assets/logo.svg"
 welcome_copy = "Welcome to our community forum — a space to share, plan, and connect."
 
+# Retro ASCII/BBS interface (served at /community/bbs/ by nostr-bbs-bbs-client).
+# These keys theme the terminal/BBS chrome; all are optional.
+node_name    = "EXAMPLE BBS"                          # masthead + status-bar node id
+location     = "Manchester, UK"                       # status-bar location string
+banner_url   = ""                                     # optional ASCII-art / image banner
+# `theme` above also selects the BBS colour palette: amber | green | purple | sky
+# (anything else falls back to amber). Per-zone `accent_hex` themes each board.
+
 
 # ─── Zones ───────────────────────────────────────────────────────────────────
 # OPTIONAL but recommended. Zones are the top-level areas of your forum. Each

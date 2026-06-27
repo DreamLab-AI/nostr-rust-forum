@@ -1,0 +1,173 @@
+/* Retro ASCII/BBS terminal styling.
+ *
+ * Theme palettes are CSS custom properties switched by a `theme-*` class on the
+ * root element (see src/theme.rs). Per-zone accent colours are applied inline
+ * via `--accent` from each zone's `accent_hex`.
+ */
+
+:root {
+  --bg: #0a0a0a;
+  --bg-panel: #0f0f0f;
+  --fg: #ffb000;       /* amber default */
+  --fg-bright: #ffd47a;
+  --fg-dim: #8a5e00;
+  --accent: #ffb000;
+  --border: #6b4a00;
+  --select-bg: #ffb000;
+  --select-fg: #0a0a0a;
+  --font: "Cascadia Mono", "JetBrains Mono", "Fira Code", "DejaVu Sans Mono",
+    Menlo, Consolas, monospace;
+}
+
+/* ── Theme palettes ──────────────────────────────────────────────────────── */
+.theme-amber {
+  --fg: #ffb000; --fg-bright: #ffd47a; --fg-dim: #8a5e00;
+  --accent: #ffb000; --border: #6b4a00; --select-bg: #ffb000;
+}
+.theme-green {
+  --fg: #33ff66; --fg-bright: #b6ffc8; --fg-dim: #1f7a3a;
+  --accent: #33ff66; --border: #1f7a3a; --select-bg: #33ff66;
+}
+.theme-purple {
+  --fg: #c792ea; --fg-bright: #e6ccff; --fg-dim: #7a5aa0;
+  --accent: #c792ea; --border: #5a3f80; --select-bg: #c792ea;
+}
+.theme-sky {
+  --fg: #56c2ff; --fg-bright: #b6e6ff; --fg-dim: #2a6f99;
+  --accent: #56c2ff; --border: #2a6f99; --select-bg: #56c2ff;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+/* CRT scanlines + subtle flicker + vignette. */
+.bbs-crt::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 50;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0px,
+    rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, 0.28) 3px,
+    rgba(0, 0, 0, 0.28) 4px
+  );
+}
+.bbs-crt::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 49;
+  background: radial-gradient(ellipse at center, rgba(0,0,0,0) 60%, rgba(0,0,0,0.55) 100%);
+}
+@keyframes crt-flicker { 0%,100% { opacity: 1; } 50% { opacity: 0.97; } }
+
+.bbs-root {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  text-shadow: 0 0 4px var(--accent);
+  animation: crt-flicker 6s infinite;
+  padding: 0.5rem 1rem;
+  max-width: 100ch;
+  margin: 0 auto;
+}
+
+/* ── Status bar ──────────────────────────────────────────────────────────── */
+.bbs-statusbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.25rem;
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+.bbs-statusbar .ok { color: var(--accent); }
+.bbs-statusbar .bad { color: #ff5555; }
+
+/* ── Banner ──────────────────────────────────────────────────────────────── */
+.bbs-banner {
+  white-space: pre;
+  color: var(--fg-bright);
+  margin: 0.5rem 0;
+  font-size: 0.78rem;
+  line-height: 1.1;
+  overflow-x: auto;
+}
+.bbs-banner .tagline { color: var(--fg-dim); }
+
+/* ── Generic boxed panel ─────────────────────────────────────────────────── */
+.bbs-panel { white-space: pre-wrap; margin: 0.5rem 0; }
+.bbs-panel .title { color: var(--fg-bright); }
+
+/* ── Main menu ───────────────────────────────────────────────────────────── */
+.bbs-menu { display: grid; grid-template-columns: 1fr 1fr; gap: 0 2rem; }
+@media (max-width: 640px) { .bbs-menu { grid-template-columns: 1fr; } }
+.bbs-menu-item {
+  cursor: pointer;
+  padding: 0 0.25rem;
+  white-space: pre;
+}
+.bbs-menu-item .key { color: var(--accent); }
+.bbs-menu-item.selected, .bbs-menu-item:hover {
+  background: var(--select-bg);
+  color: var(--select-fg);
+  text-shadow: none;
+}
+.bbs-menu-item.selected .key { color: var(--select-fg); }
+
+/* ── Lists (boards, files, nodes, users) ─────────────────────────────────── */
+.bbs-list { margin: 0.25rem 0; }
+.bbs-row { white-space: pre; padding: 0 0.25rem; cursor: pointer; }
+.bbs-row.selected, .bbs-row:hover {
+  background: var(--select-bg); color: var(--select-fg); text-shadow: none;
+}
+.bbs-row .accent { color: var(--accent); }
+.bbs-row.selected .accent { color: var(--select-fg); }
+.bbs-dim { color: var(--fg-dim); }
+
+/* ── Command line + footer ───────────────────────────────────────────────── */
+.bbs-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--border);
+  padding-top: 0.25rem;
+  color: var(--fg-dim);
+  font-size: 0.8rem;
+}
+.bbs-fkeys { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+.bbs-fkeys .fk { color: var(--accent); }
+.bbs-cmdline {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  padding-top: 0.25rem;
+}
+.bbs-cmdline .prompt { color: var(--accent); }
+.bbs-cmdline input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg-bright);
+  font: inherit;
+  text-shadow: inherit;
+}
+.bbs-blink { animation: blink 1s step-end infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+a, .bbs-link { color: var(--accent); }
