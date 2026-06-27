@@ -70,12 +70,21 @@ html, body {
   inset: 0;
   pointer-events: none;
   z-index: 49;
-  background: radial-gradient(ellipse at center, rgba(0,0,0,0) 60%, rgba(0,0,0,0.55) 100%);
+  /* Centre phosphor bloom (tinted to the active theme) over a darkened-edge
+     vignette — gives the screen a lit-from-within CRT warmth. */
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 42%,
+      color-mix(in srgb, var(--accent) 5%, transparent) 0%, rgba(0,0,0,0) 55%),
+    radial-gradient(ellipse at center, rgba(0,0,0,0) 58%, rgba(0,0,0,0.6) 100%);
 }
+
+/* Fill the viewport so the terminal is a full-screen CRT rather than a block
+   floating in a void; the footer then pins to the bottom edge. */
+.bbs-crt { min-height: 100vh; }
 @keyframes crt-flicker { 0%,100% { opacity: 1; } 50% { opacity: 0.97; } }
 
 .bbs-root {
-  min-height: 100%;
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
   text-shadow: 0 0 4px var(--accent);
@@ -181,6 +190,25 @@ a, .bbs-link { color: var(--accent); }
 .bbs-ascii-row { margin: 0.4rem 0; }
 .bbs-banner-img { margin: 0.5rem 0 0; }
 .ascii-img-wrap { overflow-x: auto; }
+
+/* Content ASCII images (File Base, Message Base posts) read as contained
+   "files" — a subtle phosphor-framed box with a small label. The masthead
+   banner (.bbs-banner-img) is exempt so it stays edge-to-edge. */
+.bbs-ascii-row:not(.bbs-banner-img) {
+  width: max-content;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.6rem;
+  background: color-mix(in srgb, var(--accent) 3%, var(--bg));
+}
+.bbs-ascii-row:not(.bbs-banner-img)::before {
+  content: "▞ IMG ▚";
+  display: block;
+  margin-bottom: 0.2rem;
+  color: var(--fg-dim);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+}
 .ascii-img {
   margin: 0;
   font-family: var(--font);

@@ -59,5 +59,6 @@ web-sys = { workspace = true, features = [
     "RequestMode",
     "Response",
     "Headers",
+    "Storage",
 ] }
 console_error_panic_hook = "0.1"

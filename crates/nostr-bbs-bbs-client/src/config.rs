@@ -109,7 +109,17 @@ impl BbsConfig {
     /// Load configuration from the live `window.__ENV__` global (wasm).
     #[cfg(target_arch = "wasm32")]
     pub fn load() -> Self {
-        Self::from_env_value(&read_env_value().unwrap_or(Value::Null))
+        let mut cfg = Self::from_env_value(&read_env_value().unwrap_or(Value::Null));
+        // Adopt the forum's existing Nostr session. The BBS is served
+        // same-origin as the main forum (`/community/bbs/` vs `/community/`),
+        // so when the host hasn't injected `VIEWER_PUBKEY` we read the viewer's
+        // PUBLIC key from the forum client's localStorage session — logging in
+        // once at `/community/` carries into the BBS. Read-only: only the public
+        // key is read; the separate private-key entry is never touched.
+        if cfg.viewer_pubkey.is_none() {
+            cfg.viewer_pubkey = read_forum_session_pubkey();
+        }
+        cfg
     }
 
     /// Native fallback (e.g. `trunk serve` outside a browser) — defaults only.
@@ -117,6 +127,36 @@ impl BbsConfig {
     pub fn load() -> Self {
         BbsConfig::default()
     }
+}
+
+/// localStorage key under which the main forum client persists its session
+/// (a `StoredSession` JSON object with a `publicKey` field). Shared with the
+/// BBS because both are served from the same origin. Only read on wasm.
+#[cfg(target_arch = "wasm32")]
+const FORUM_SESSION_KEY: &str = "nostr_bbs_keys";
+
+/// Extract the viewer's public key from the forum client's stored-session JSON.
+///
+/// Returns `None` when the session is absent or logged out (`publicKey` missing
+/// or empty). Only ever reads the PUBLIC key — never any private-key material.
+/// Consumed by the wasm `read_forum_session_pubkey` and the unit tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn pubkey_from_session(json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(json)
+        .ok()?
+        .get("publicKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Read the forum client's session public key from localStorage (wasm).
+#[cfg(target_arch = "wasm32")]
+fn read_forum_session_pubkey() -> Option<String> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    let raw = storage.get_item(FORUM_SESSION_KEY).ok()??;
+    pubkey_from_session(&raw)
 }
 
 /// Read `window.__ENV__`, stringify it, and parse to a JSON [`Value`].
@@ -188,6 +228,19 @@ mod tests {
         }));
         assert_eq!(cfg.zones.len(), 1);
         assert_eq!(cfg.zones[0].id, "friends");
+    }
+
+    #[test]
+    fn forum_session_pubkey_extraction() {
+        // A logged-in forum StoredSession (privkey lives elsewhere, never here).
+        let pk = "a".repeat(64);
+        let json = format!(r#"{{"_v":2,"publicKey":"{pk}","isNip07":true,"nickname":"x"}}"#);
+        assert_eq!(pubkey_from_session(&json).as_deref(), Some(pk.as_str()));
+        // Logged out / absent / malformed → None (no identity).
+        assert_eq!(pubkey_from_session(r#"{"_v":2,"publicKey":null}"#), None);
+        assert_eq!(pubkey_from_session(r#"{"_v":2,"publicKey":"  "}"#), None);
+        assert_eq!(pubkey_from_session(r#"{"_v":2}"#), None);
+        assert_eq!(pubkey_from_session("not json"), None);
     }
 
     #[test]
