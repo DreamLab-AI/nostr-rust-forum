@@ -86,5 +86,56 @@
         setTimeout(function () { clearInterval(iv); }, 20000);
       })();
     </script>
+
+    <!-- Touch navigation: slide a finger over the menu/list to move the
+         highlight, lift to select. A thin bridge onto the existing keyboard
+         model — it hit-tests the item under the touch and drives the app's own
+         ArrowUp/ArrowDown/Enter handlers, so every screen behaves identically
+         to the keyboard. No-op without touch (mouse never fires these). -->
+    <script>
+      (function () {
+        function selectable() {
+          return Array.prototype.slice.call(document.querySelectorAll('.bbs-menu-item, .bbs-row'));
+        }
+        function fire(key) { document.dispatchEvent(new KeyboardEvent('keydown', { key: key, bubbles: true })); }
+        function itemAt(x, y) { var el = document.elementFromPoint(x, y); return el ? el.closest('.bbs-menu-item, .bbs-row') : null; }
+        var lastIdx = -1, active = false, over = false;
+        function curIndex(items) {
+          if (lastIdx >= 0) return lastIdx;            // track in JS — the DOM `.selected` lags the re-render
+          var d = items.findIndex(function (e) { return e.classList.contains('selected'); });
+          return d < 0 ? 0 : d;
+        }
+        function moveTo(item) {
+          var items = selectable();
+          var target = items.indexOf(item);
+          if (target < 0) return false;
+          var cur = curIndex(items);
+          if (target !== cur) {
+            var key = target > cur ? 'ArrowDown' : 'ArrowUp';
+            for (var i = 0; i < Math.abs(target - cur); i++) fire(key);
+          }
+          lastIdx = target;
+          item.scrollIntoView({ block: 'nearest' });
+          return true;
+        }
+        document.addEventListener('touchstart', function (e) {
+          var t = e.touches[0]; if (!t) return;
+          lastIdx = -1;
+          var it = itemAt(t.clientX, t.clientY);
+          if (!it) { active = false; return; }
+          active = true; over = true; moveTo(it);
+        }, { passive: true });
+        document.addEventListener('touchmove', function (e) {
+          if (!active) return;
+          var t = e.touches[0]; if (!t) return;
+          var it = itemAt(t.clientX, t.clientY);
+          if (it) { over = true; if (moveTo(it)) e.preventDefault(); } else { over = false; }
+        }, { passive: false });
+        document.addEventListener('touchend', function () {
+          if (active && over) fire('Enter');
+          active = false; lastIdx = -1;
+        }, { passive: true });
+      })();
+    </script>
 </body>
 </html>
