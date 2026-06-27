@@ -278,12 +278,52 @@ a, .bbs-link { color: var(--accent); }
 
 @media (max-width: 640px) {
   html, body { font-size: 13px; }
-  .bbs-root { padding: 0.4rem 0.6rem; max-width: 100%; }
-  .bbs-banner { font-size: 0.52rem; line-height: 1.05; }
-  .bbs-menu { grid-template-columns: 1fr; gap: 0.15rem; }
-  .bbs-menu-item, .bbs-row { padding: 0.7rem 0.5rem; }   /* roomy touch targets */
-  .ascii-img { font-size: 0.4rem; }
+  .bbs-root { padding: 0.3rem 0.5rem; max-width: 100%; }
+
+  /* Single full-screen list, zoomed: the masthead banner is dropped (the
+     status bar already carries the node name) and the active list fills the
+     viewport as large, finger-sized rows — a mobile-app-style menu rather than
+     a compact block floating up top. */
+  .bbs-banner { display: none; }
   .bbs-statusbar { font-size: 0.78rem; }
+
+  .bbs-menu {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    gap: 0;
+    margin: 0.3rem 0;
+  }
+  .bbs-menu-item {
+    flex: 1 1 0;                       /* rows grow to fill the screen evenly */
+    display: flex;
+    align-items: center;
+    font-size: 1.45rem;               /* zoomed */
+    padding: 0 0.7rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .bbs-menu-item:first-child { border-top: 1px solid var(--border); }
+  .bbs-menu-item .key { margin-right: 0.5rem; }
+
+  /* Dynamic lists fill + scroll, with large rows. */
+  .bbs-list {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    overflow-y: auto;
+    margin: 0.3rem 0;
+  }
+  .bbs-row {
+    display: flex;
+    align-items: center;
+    min-height: 3rem;
+    font-size: 1.15rem;
+    padding: 0.6rem 0.7rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .bbs-panel { flex: 1 1 auto; }
+
+  .ascii-img { font-size: 0.4rem; }
   .bbs-fkeys { font-size: 0.72rem; gap: 0.45rem; }
   .bbs-cmdline input { font-size: 16px; }                /* stop iOS focus-zoom */
 }
