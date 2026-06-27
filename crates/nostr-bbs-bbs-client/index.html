@@ -24,5 +24,67 @@
 </head>
 <body>
     <noscript>This BBS requires a WebAssembly-capable browser.</noscript>
+
+    <!-- Phosphor persistence: when the terminal text changes, the previous
+         frame lingers as a faint afterglow and fades (see .phosphor-ghost in
+         bbs.css). A pure DOM overlay — a text-only clone of the prior screen
+         body — so it adds nothing to the WASM bundle and degrades gracefully. -->
+    <script>
+      (function () {
+        try {
+          if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        } catch (e) {}
+        var THROTTLE_MS = 90, MAX_GHOSTS = 6, LIFE_MS = 3100;
+        function start(root) {
+          var prev = null, last = 0, live = [];
+          function bodyEls() {
+            var ch = Array.prototype.slice.call(root.children);
+            var b = ch.findIndex(function (c) { return c.classList && c.classList.contains('bbs-banner'); });
+            var f = ch.findIndex(function (c) { return c.classList && c.classList.contains('bbs-footer'); });
+            return ch.slice(b + 1, f === -1 ? ch.length : f);
+          }
+          function snap() {
+            var els = bodyEls(); if (!els.length) return null;
+            var rs = els.map(function (e) { return e.getBoundingClientRect(); });
+            var left = Math.min.apply(null, rs.map(function (r) { return r.left; }));
+            var top = Math.min.apply(null, rs.map(function (r) { return r.top; }));
+            var right = Math.max.apply(null, rs.map(function (r) { return r.right; }));
+            var bottom = Math.max.apply(null, rs.map(function (r) { return r.bottom; }));
+            return { html: els.map(function (e) { return e.outerHTML; }).join(''),
+                     left: left, top: top, w: right - left, h: bottom - top,
+                     font: getComputedStyle(root).font };
+          }
+          function ghost(p) {
+            var g = document.createElement('div');
+            g.className = 'phosphor-ghost';
+            g.style.cssText = 'left:' + p.left + 'px;top:' + p.top + 'px;width:' + p.w + 'px;height:' + p.h + 'px;font:' + p.font;
+            g.innerHTML = p.html;
+            // Text-only afterglow: drop heavy ASCII-image clones so ghosts stay light.
+            var imgs = g.querySelectorAll('.ascii-img-wrap, .ascii-img, .bbs-section-hero');
+            for (var i = 0; i < imgs.length; i++) imgs[i].remove();
+            document.body.appendChild(g);
+            live.push(g);
+            while (live.length > MAX_GHOSTS) { var o = live.shift(); if (o) o.remove(); }
+            requestAnimationFrame(function () { g.style.opacity = '0'; }); // next frame → transition
+            setTimeout(function () { g.remove(); var k = live.indexOf(g); if (k >= 0) live.splice(k, 1); }, LIFE_MS);
+          }
+          function tick() {
+            var cur = snap();
+            if (cur && prev && prev.html !== cur.html) {
+              var now = performance.now();
+              if (now - last > THROTTLE_MS) { ghost(prev); last = now; }
+            }
+            if (cur) prev = cur;
+            requestAnimationFrame(tick);
+          }
+          requestAnimationFrame(tick);
+        }
+        var iv = setInterval(function () {
+          var root = document.querySelector('.bbs-root');
+          if (root) { clearInterval(iv); start(root); }
+        }, 80);
+        setTimeout(function () { clearInterval(iv); }, 20000);
+      })();
+    </script>
 </body>
 </html>

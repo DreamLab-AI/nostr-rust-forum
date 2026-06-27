@@ -243,3 +243,26 @@ a, .bbs-link { color: var(--accent); }
 .ascii-img .p5 { color: color-mix(in srgb, var(--fg-bright) 62%, var(--bg)); }
 .ascii-img .p6 { color: color-mix(in srgb, var(--fg-bright) 80%, var(--bg)); }
 .ascii-img .p7 { color: var(--fg-bright); }
+
+/* ── Section heroes ──────────────────────────────────────────────────────────
+ * Each configured zone's banner image rendered as ASCII at the top of the
+ * Message Base, tinted to the zone accent. */
+.bbs-section-hero { margin: 0.3rem 0 0.6rem; }
+.bbs-section-hero .label { color: var(--accent); letter-spacing: 0.08em; }
+
+/* ── Phosphor persistence ─────────────────────────────────────────────────────
+ * When the screen text changes, the previous frame lingers as a faint phosphor
+ * afterglow and fades linearly to nothing — the slow decay of a real tube. The
+ * ghost is a text-only clone of the prior body region injected by the small
+ * script in index.html; here we only define how it looks + decays. */
+.phosphor-ghost {
+  position: fixed;
+  pointer-events: none;
+  z-index: 48;
+  overflow: hidden;
+  white-space: pre;
+  will-change: opacity;
+  opacity: 0.05;                     /* faint */
+  transition: opacity 3s linear;     /* slow, even decay to zero */
+}
+@media (prefers-reduced-motion: reduce) { .phosphor-ghost { display: none; } }
