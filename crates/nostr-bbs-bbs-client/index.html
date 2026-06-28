@@ -8,6 +8,8 @@
     <meta name="theme-color" content="#0a0a0a" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0a0a'/><text x='1' y='13' font-family='monospace' font-size='12' fill='%23ffb000'>&gt;_</text></svg>" type="image/svg+xml" />
     <link data-trunk rel="css" href="assets/bbs.css" />
+    <!-- UA 571-C sentry-gun door-game sound effects (copied verbatim to dist). -->
+    <link data-trunk rel="copy-dir" href="assets/sentry-sounds" />
 
     <!-- Branding is injected by the host site into window.__ENV__ (THEME,
          NODE_NAME, LOCATION, BANNER_URL, RELAY_URL, ZONE_CONFIG). The defaults
@@ -158,6 +160,173 @@
           var dy = t.clientY - sy, dx = t.clientX - sx;
           if (dy > 50 && Math.abs(dy) > Math.abs(dx)) goHome();
         }, { passive: true });
+      })();
+    </script>
+
+    <!-- Door game: UA 571-C remote sentry weapon system. A faithful Aliens
+         (1986) control deck in OUR phosphor skin — pure client-side, no auth,
+         no relay. Opened by a `bbs:sentry` event (Door Games launch / /sentry
+         command). Sounds adapted from the MIT-licensed CentriGUI project. -->
+    <script>
+      (function () {
+        var SND = 'sentry-sounds/', audio = {};
+        function snd(n) { if (!audio[n]) { var a = new Audio(SND + n + '.opus'); a.preload = 'auto'; audio[n] = a; } return audio[n]; }
+        function play(n, o) { try { var a = snd(n); a.loop = !!(o && o.loop); a.volume = (o && o.volume) != null ? o.volume : 1; a.currentTime = 0; a.play().catch(function(){}); } catch (e) {} }
+        function stop(n) { var a = audio[n]; if (a) { a.pause(); a.currentTime = 0; a.loop = false; } }
+
+        var MODES = [
+          ['system', 'SYSTEM MODE', ['AUTO-REMOTE', 'MAN-OVERRIDE', 'SEMI-AUTO']],
+          ['weapon', 'WEAPON', ['SAFE', 'ARMED']],
+          ['iff', 'IFF', ['SEARCH', 'TEST', 'ENGAGED', 'INTERROGATE']],
+          ['profile', 'TARGET PROFILE', ['SOFT', 'STANDARD', 'HARD']],
+          ['spectral', 'SPECTRAL', ['BIO', 'INERT']],
+          ['select', 'TARGET SELECT', ['MULTI-SPEC', 'INFRA-RED', 'UV']]
+        ];
+        var BOOT = [
+          '> UA 571-C REMOTE SENTRY WEAPON SYSTEM',
+          '> FIRMWARE 2.7.0  ::  WEYLAND-YUTANI CORP',
+          '> INITIATING SYSTEM CHECK ...........  OK',
+          '> SERVO MOTORS / TRAVERSE ..........  OK',
+          '> TARGETING ARRAY / IR-UV-MULTISPEC   OK',
+          '> AMMUNITION FEED  500 / 500 .......  OK',
+          '> IFF TRANSPONDER ..................  OK',
+          '> WEAPON SAFE  ::  AWAITING OPERATOR'
+        ];
+        var el = null, state = null, fireTimer = null, bootTimer = null;
+
+        function curTheme() { var c = document.querySelector('.bbs-crt'); var m = c && c.className.match(/theme-\w+/); return m ? m[0] : 'theme-amber'; }
+        function build() {
+          el = document.createElement('div');
+          el.className = 'sentry bbs-crt ' + curTheme();
+          el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', 'UA 571-C sentry weapon system');
+          el.innerHTML =
+            '<div class="sentry-close" data-act="close" role="button" tabindex="0">[ X ] CLOSE</div>' +
+            '<div class="sentry-inner">' +
+              '<pre class="sentry-boot" id="sentry-boot"></pre>' +
+              '<div id="sentry-deck" style="display:none">' +
+                '<div class="sentry-title">UA 571-C  //  REMOTE SENTRY WEAPON SYSTEM</div>' +
+                '<div class="sentry-modes" id="sentry-modes"></div>' +
+                '<div class="sentry-status">' +
+                  '<div class="sentry-box"><div class="lab">ROUNDS REMAINING</div><div class="sentry-rounds" id="s-rounds">500</div></div>' +
+                  '<div class="sentry-box"><div class="lab">TIME AT 100% (s)</div><div class="sentry-time" id="s-time">33.33</div></div>' +
+                  '<div class="sentry-box"><div class="sentry-critical" id="s-crit">CRITICAL</div></div>' +
+                  '<div class="sentry-box sentry-gaugewrap">' +
+                    '<div class="sentry-gauge" id="s-temp"><span class="gl">TEMP</span><div class="fill" style="height:30%"></div></div>' +
+                    '<div class="sentry-radar" id="s-radar"><div class="ring"></div><div class="ring r2"></div></div>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="sentry-actions">' +
+                  '<div class="sentry-btn" data-act="arm" role="button" tabindex="0">ARM</div>' +
+                  '<div class="sentry-btn" data-act="fire" role="button" tabindex="0">ENGAGE</div>' +
+                  '<div class="sentry-btn" data-act="reload" role="button" tabindex="0">RELOAD</div>' +
+                  '<div class="sentry-btn" data-act="diag" role="button" tabindex="0">DIAGNOSTIC</div>' +
+                '</div>' +
+                '<div class="sentry-log" id="sentry-log" aria-live="polite"></div>' +
+                '<div class="sentry-hint">select modes · ARM then ENGAGE to open fire · ESC to exit</div>' +
+              '</div>' +
+            '</div>';
+          document.body.appendChild(el);
+          var mc = el.querySelector('#sentry-modes');
+          MODES.forEach(function (m) {
+            var cell = document.createElement('div'); cell.className = 'sentry-cell';
+            cell.innerHTML = '<div class="lab">' + m[1] + '</div><div class="sentry-opts"></div>';
+            var wrap = cell.querySelector('.sentry-opts');
+            m[2].forEach(function (v, i) {
+              var o = document.createElement('div');
+              o.className = 'sentry-opt' + (i === 0 ? ' sel' : '') + (m[0] === 'weapon' && v === 'ARMED' ? ' danger' : '');
+              o.setAttribute('data-grp', m[0]); o.setAttribute('data-val', v); o.textContent = v;
+              wrap.appendChild(o);
+            });
+            mc.appendChild(cell);
+          });
+          el.addEventListener('click', onClick);
+          el.addEventListener('keydown', function (e) {
+            var a = e.target.getAttribute && e.target.getAttribute('data-act');
+            if (a && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onClick(e); }
+          });
+        }
+        function log(msg, hi) { var l = el.querySelector('#sentry-log'); var d = document.createElement('div'); if (hi) d.className = 'hi'; d.textContent = '> ' + msg; l.appendChild(d); l.scrollTop = l.scrollHeight; }
+        function getSel(grp) { var s = el.querySelector('.sentry-opt.sel[data-grp="' + grp + '"]'); return s ? s.getAttribute('data-val') : null; }
+        function selectOpt(grp, val) { el.querySelectorAll('.sentry-opt[data-grp="' + grp + '"]').forEach(function (o) { o.classList.toggle('sel', o.getAttribute('data-val') === val); }); }
+        function setRounds(n) { state.rounds = Math.max(0, Math.round(n)); el.querySelector('#s-rounds').textContent = state.rounds; el.querySelector('#s-time').textContent = (state.rounds / 15).toFixed(2); el.querySelector('#s-crit').classList.toggle('on', state.rounds <= 100); }
+        function setTemp(t) { state.temp = Math.max(0, Math.min(100, t)); var g = el.querySelector('#s-temp'); g.querySelector('.fill').style.height = state.temp + '%'; g.classList.toggle('hot', state.temp > 80); }
+
+        function onClick(e) {
+          var t = e.target, act = t.getAttribute('data-act');
+          if (act === 'close') { close(); return; }
+          if (t.classList && t.classList.contains('sentry-opt')) {
+            var grp = t.getAttribute('data-grp');
+            selectOpt(grp, t.getAttribute('data-val'));
+            play(grp === 'weapon' ? 'buttonclick' : 'bip', { volume: 0.7 });
+            if (grp === 'weapon') { log('WEAPON ' + t.getAttribute('data-val'), true); if (t.getAttribute('data-val') === 'SAFE') ceaseFire(); }
+            return;
+          }
+          if (act === 'arm') { selectOpt('weapon', 'ARMED'); play('buttonclick'); log('WEAPON ARMED', true); }
+          else if (act === 'fire') { state && state.firing ? ceaseFire(true) : engage(); }
+          else if (act === 'reload') { reload(); }
+          else if (act === 'diag') { diagnostic(); }
+        }
+        function engage() {
+          if (getSel('weapon') !== 'ARMED') { play('bip'); log('CANNOT ENGAGE — WEAPON SAFE'); return; }
+          if (state.rounds <= 0) { play('bip'); log('CANNOT ENGAGE — NO AMMUNITION'); return; }
+          if (state.firing) return;
+          state.firing = true; selectOpt('iff', 'ENGAGED');
+          el.querySelector('#s-radar').classList.add('fast');
+          var b = el.querySelector('[data-act="fire"]'); b.textContent = 'CEASE FIRE'; b.classList.add('armed');
+          log('** OPEN FIRE ** TARGET ' + getSel('profile'), true);
+          var beat = 0;
+          fireTimer = setInterval(function () {
+            if (state.rounds <= 0) { setRounds(0); ceaseFire(); play('gameover'); log('** AMMUNITION DEPLETED **', true); selectOpt('weapon', 'SAFE'); return; }
+            setRounds(state.rounds - 14); setTemp(state.temp + 4); beat++;
+            if (beat % 4 === 0) play('bip', { volume: 0.5 });
+            if (state.rounds <= 100 && beat % 2 === 0) play('bip', { volume: 0.85 });
+          }, 250);
+        }
+        function ceaseFire(manual) {
+          if (fireTimer) { clearInterval(fireTimer); fireTimer = null; }
+          if (!state) return; state.firing = false;
+          var b = el.querySelector('[data-act="fire"]'); if (b) { b.textContent = 'ENGAGE'; b.classList.remove('armed'); }
+          var r = el.querySelector('#s-radar'); if (r) r.classList.remove('fast');
+          if (manual) { play('buttonclick'); log('CEASE FIRE'); }
+        }
+        function reload() { ceaseFire(); setRounds(500); setTemp(30); selectOpt('weapon', 'SAFE'); selectOpt('iff', 'SEARCH'); play('screenon', { volume: 0.5 }); log('MAGAZINE RELOADED — 500 ROUNDS', true); }
+        function diagnostic() {
+          play('buttonclick'); log('RUNNING AUTO DIAGNOSTIC ...');
+          var step = 0, base = state.temp;
+          var iv = setInterval(function () {
+            step++; setTemp(step < 10 ? base + step * 6 : Math.max(base, 100 - (step - 10) * 6));
+            if (step === 10) log('SERVO / TARGETING / FEED ... ALL NOMINAL');
+            if (step >= 20) { clearInterval(iv); setTemp(base); log('DIAGNOSTIC COMPLETE — SYSTEM NOMINAL', true); play('bip'); }
+          }, 90);
+        }
+        function open() {
+          if (!el) build();
+          el.className = 'sentry bbs-crt ' + curTheme();
+          state = { rounds: 500, temp: 30, firing: false };
+          el.querySelector('#sentry-deck').style.display = 'none';
+          var boot = el.querySelector('#sentry-boot'); boot.textContent = ''; boot.style.display = '';
+          el.querySelector('#sentry-log').innerHTML = '';
+          el.classList.add('open');
+          document.documentElement.style.overflow = 'hidden';
+          play('screenon'); play('noisefan', { loop: true, volume: 0.22 });
+          var li = 0, ci = 0;
+          (function type() {
+            if (li >= BOOT.length) { bootTimer = setTimeout(showDeck, 350); return; }
+            var line = BOOT[li];
+            if (ci < line.length) { boot.textContent += line.charAt(ci); ci++; bootTimer = setTimeout(type, 8); }
+            else { boot.textContent += '\n'; li++; ci = 0; bootTimer = setTimeout(type, 90); }
+          })();
+          el.querySelector('.sentry-close').focus();
+        }
+        function showDeck() { if (!el || !el.classList.contains('open')) return; el.querySelector('#sentry-boot').style.display = 'none'; el.querySelector('#sentry-deck').style.display = 'block'; setRounds(500); setTemp(30); log('SYSTEM ONLINE — OPERATOR CONTROL', true); }
+        function close() {
+          if (bootTimer) { clearTimeout(bootTimer); bootTimer = null; }
+          ceaseFire(); stop('noisefan'); stop('screenon');
+          if (el) el.classList.remove('open');
+          document.documentElement.style.overflow = '';
+        }
+        document.addEventListener('bbs:sentry', open);
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && el && el.classList.contains('open')) { e.stopPropagation(); close(); } }, true);
       })();
     </script>
 </body>

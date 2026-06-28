@@ -187,6 +187,13 @@ html, body {
 .bbs-blink { animation: blink 1s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* Motion-sensitivity: silence the full-screen CRT flicker and the cursor blink
+   for users who ask for reduced motion (the phosphor-ghost + sentry already are). */
+@media (prefers-reduced-motion: reduce) {
+  .bbs-root { animation: none; }
+  .bbs-blink { animation: none; }
+}
+
 a, .bbs-link { color: var(--accent); }
 
 /* ── ASCII image rendering ───────────────────────────────────────────────────
@@ -343,4 +350,94 @@ a, .bbs-link { color: var(--accent); }
     font-size: 0.72rem;
   }
   .bbs-cmdline input { font-size: 16px; }                /* stop iOS focus-zoom */
+}
+
+/* ── Door game: UA 571-C sentry gun ───────────────────────────────────────────
+ * A faithful Aliens (1986) UA 571-C remote-sentry control deck — but rendered
+ * in OUR phosphor skin: it inherits the active theme's --accent/--fg/--bg via
+ * the theme-* class copied onto the overlay, with our scanlines + glow. Pure
+ * client-side, no auth. Logic in the script in index.html. */
+.sentry {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: none;
+  flex-direction: column;
+  overflow: auto;
+  padding: 1rem;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  text-shadow: 0 0 4px var(--accent);
+}
+.sentry.open { display: flex; }
+.sentry::before {                                   /* scanlines */
+  content: "";
+  position: fixed; inset: 0; pointer-events: none; z-index: 2;
+  background: repeating-linear-gradient(to bottom,
+    rgba(0,0,0,0) 0, rgba(0,0,0,0) 2px, rgba(0,0,0,0.26) 3px, rgba(0,0,0,0.26) 4px);
+}
+.sentry::after {                                    /* phosphor bloom + vignette */
+  content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 1;
+  background:
+    radial-gradient(ellipse 95% 80% at 50% 45%, color-mix(in srgb, var(--accent) 12%, transparent) 0%, rgba(0,0,0,0) 70%),
+    radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.6) 100%);
+}
+.sentry-inner { position: relative; z-index: 3; max-width: 96ch; width: 100%; margin: 0 auto; }
+.sentry-boot { white-space: pre-wrap; color: var(--fg-bright); min-height: 8rem; }
+.sentry-close {
+  position: fixed; top: 0.6rem; right: 1rem; z-index: 4; cursor: pointer;
+  color: var(--fg-bright); border: 1px solid var(--border); padding: 0.1rem 0.5rem;
+}
+.sentry-close:hover { background: var(--accent); color: var(--bg); text-shadow: none; }
+.sentry-title {
+  text-align: center; color: var(--fg-bright); letter-spacing: 0.18em;
+  border: 1px solid var(--border); padding: 0.5rem; margin-bottom: 0.6rem; white-space: pre;
+}
+.sentry-modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin-bottom: 0.6rem; }
+.sentry-cell { border: 1px solid var(--border); padding: 0.4rem 0.5rem; }
+.sentry-cell .lab { color: var(--fg-dim); font-size: 0.78rem; letter-spacing: 0.08em; }
+.sentry-opts { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem; }
+.sentry-opt { padding: 0.15rem 0.45rem; border: 1px solid var(--border); cursor: pointer; user-select: none; }
+.sentry-opt.sel { background: var(--accent); color: var(--bg); text-shadow: none; }
+.sentry-opt.danger.sel { background: #ff5555; color: #0a0a0a; }
+.sentry-status { display: grid; grid-template-columns: 1.4fr 1fr 0.8fr auto; gap: 0.6rem; align-items: stretch; }
+.sentry-box { border: 1px solid var(--border); padding: 0.4rem 0.5rem; display: flex; flex-direction: column; justify-content: center; }
+.sentry-box .lab { color: var(--fg-dim); font-size: 0.78rem; }
+.sentry-rounds { font-size: 2.4rem; line-height: 1; color: var(--fg-bright); }
+.sentry-time { font-size: 1.6rem; color: var(--fg-bright); }
+.sentry-critical { border: 2px solid #ff5555; color: #ff5555; text-align: center; padding: 0.4rem; opacity: 0.22; letter-spacing: 0.2em; }
+.sentry-critical.on { opacity: 1; animation: sentry-flash 0.5s step-end infinite; }
+@keyframes sentry-flash { 50% { opacity: 0.3; } }
+.sentry-gaugewrap { display: flex; gap: 0.5rem; align-items: flex-end; }
+.sentry-gauge { width: 1.4rem; height: 5rem; border: 1px solid var(--border); position: relative; }
+.sentry-gauge .fill { position: absolute; left: 0; right: 0; bottom: 0; background: var(--accent); transition: height 0.4s linear; }
+.sentry-gauge.hot .fill { background: #ff5555; }
+.sentry-gauge .gl { position: absolute; top: -1rem; left: 0; color: var(--fg-dim); font-size: 0.7rem; }
+.sentry-radar { width: 6rem; height: 6rem; border-radius: 50%; border: 1px solid var(--border); position: relative; overflow: hidden; align-self: center; }
+.sentry-radar::before {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  background: conic-gradient(from 0deg, color-mix(in srgb, var(--accent) 45%, transparent) 0deg, transparent 60deg);
+  animation: sentry-sweep 2.6s linear infinite;
+}
+.sentry-radar.fast::before { animation-duration: 0.9s; }
+.sentry-radar .ring { position: absolute; inset: 22%; border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); border-radius: 50%; }
+.sentry-radar .ring.r2 { inset: 40%; }
+@keyframes sentry-sweep { to { transform: rotate(360deg); } }
+.sentry-actions { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; margin: 0.7rem 0; }
+.sentry-btn { border: 1px solid var(--accent); color: var(--accent); padding: 0.45rem 0.9rem; cursor: pointer; letter-spacing: 0.06em; user-select: none; }
+.sentry-btn:hover { background: var(--accent); color: var(--bg); text-shadow: none; }
+.sentry-btn.armed { border-color: #ff5555; color: #ff5555; }
+.sentry-log { border: 1px solid var(--border); padding: 0.4rem 0.5rem; margin-top: 0.4rem; min-height: 3.5rem; max-height: 8rem; overflow-y: auto; color: var(--fg-dim); font-size: 0.85rem; white-space: pre-wrap; }
+.sentry-log .hi { color: var(--fg-bright); }
+.sentry-hint { text-align: center; color: var(--fg-dim); font-size: 0.78rem; margin-top: 0.4rem; }
+@media (max-width: 640px) {
+  .sentry { padding: 0.5rem; }
+  .sentry-modes { grid-template-columns: 1fr; }
+  .sentry-status { grid-template-columns: 1fr; }
+  .sentry-title { letter-spacing: 0.1em; font-size: 0.85rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sentry-critical.on { animation: none; }
+  .sentry-radar::before { animation: none; }
 }

@@ -43,6 +43,7 @@ its consequences. This index closes register gap **G6** (no ADR index existed).
 | 102 | Trust demotion (relay activity) | _Incoming_ — owned by concurrent trust-demotion work; see anomaly O1 | `ADR-102-*` (pending) |
 | 103 | Kit semver, crates.io publish, and yank policy | Accepted | `ADR-103-kit-semver-publish-yank-policy.md` |
 | 104 | NIP-59 gift-wrap recipient admission and relay gating | Accepted | `ADR-104-gift-wrap-recipient-admission.md` |
+| 105 | BBS door-games framework, auth-optional surfaces, and the M2 write-path | Accepted (write-path deferred) | `ADR-105-bbs-door-games-and-write-architecture.md` |
 
 > **ADR-102** is reserved for the trust-demotion decision being authored alongside
 > the `relay-worker/src/trust.rs` demotion wiring (anomaly register O1 —
