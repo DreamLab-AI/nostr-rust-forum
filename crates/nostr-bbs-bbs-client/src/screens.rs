@@ -142,8 +142,19 @@ fn board_list(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -
                                 format!("--accent:{accent}")
                             };
                             let selected = move || state.selection.get() == i;
+                            let chan_id = ev.id.clone();
                             view! {
-                                <div class="bbs-row" class:selected=selected style=style>
+                                <div
+                                    class="bbs-row"
+                                    class:selected=selected
+                                    style=style
+                                    role="option"
+                                    attr:aria-selected=move || if state.selection.get() == i { "true" } else { "false" }
+                                    on:click=move |_| {
+                                        state.selection.set(i);
+                                        state.open_board(chan_id.clone());
+                                    }
+                                >
                                     <span class="accent">"▓ "</span>
                                     {format!("{name:<24}")}
                                     <span class="bbs-dim">
@@ -381,9 +392,28 @@ fn panel_view(agent: String, p: PanelDefinition) -> impl IntoView {
 }
 
 /// (6) Door Games — agent-governance control panels (live, else samples).
+/// Launch the UA 571-C sentry-gun door game by dispatching the `bbs:sentry` DOM
+/// event handled by the overlay script in index.html. Pure client-side, no auth.
+#[cfg(target_arch = "wasm32")]
+fn launch_sentry() {
+    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+        if let Ok(ev) = web_sys::CustomEvent::new("bbs:sentry") {
+            let _ = doc.dispatch_event(&ev);
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn launch_sentry() {}
+
 fn door_games(store: RelayStore) -> impl IntoView {
     view! {
         {header(Screen::DoorGames)}
+        <div class="bbs-row">
+            <span class="bbs-link" on:click=move |_| launch_sentry()>
+                "  [ \u{25B6} PLAY ]  UA 571-C SENTRY GUN"
+            </span>
+            <span class="bbs-dim">"   \u{2014} Aliens (1986) remote sentry weapon system"</span>
+        </div>
         <div class="bbs-panel bbs-dim">"  Registered agents publish interactive control panels; you sign decisions back."</div>
         {move || {
             let live: Vec<_> = store
