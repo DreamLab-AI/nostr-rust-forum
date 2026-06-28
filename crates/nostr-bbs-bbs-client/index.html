@@ -137,5 +137,28 @@
         }, { passive: true });
       })();
     </script>
+
+    <!-- Home gesture: a swipe down from the top (not starting on a list row, so
+         it never clashes with the slide-to-select above) jumps back to the main
+         menu — the full options list — from any sub-screen. The only touch way
+         "back" on mobile, since there is no ESC key. -->
+    <script>
+      (function () {
+        function key(k) { document.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true })); }
+        function onMenu() { var f = document.querySelector('.bbs-footer'); return f && /Main Menu/.test(f.textContent || ''); }
+        function goHome() { var n = 0; (function step() { if (onMenu() || n++ > 12) return; key('Escape'); setTimeout(step, 70); })(); }
+        var sy = 0, sx = 0, arm = false;
+        document.addEventListener('touchstart', function (e) {
+          var t = e.touches[0]; if (!t) return;
+          sy = t.clientY; sx = t.clientX;
+          arm = sy < 60 && !(e.target.closest && e.target.closest('.bbs-menu-item, .bbs-row'));
+        }, { passive: true });
+        document.addEventListener('touchend', function (e) {
+          var t = e.changedTouches[0]; if (!t || !arm) return;
+          var dy = t.clientY - sy, dx = t.clientX - sx;
+          if (dy > 50 && Math.abs(dy) > Math.abs(dx)) goHome();
+        }, { passive: true });
+      })();
+    </script>
 </body>
 </html>
