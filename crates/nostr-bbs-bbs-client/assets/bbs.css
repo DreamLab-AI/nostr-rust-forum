@@ -323,7 +323,24 @@ a, .bbs-link { color: var(--accent); }
   }
   .bbs-panel { flex: 1 1 auto; }
 
+  /* No decorative banners anywhere on mobile — the zone "section hero" banners
+     are dropped too (the masthead already is). Content images survive: posted
+     pictures (.bbs-ascii-row) and link previews still render as ASCII. */
+  .bbs-section-hero { display: none; }
+
+  /* Posted/preview ASCII images stay, sized to the narrow column. */
   .ascii-img { font-size: 0.4rem; }
-  .bbs-fkeys { font-size: 0.72rem; gap: 0.45rem; }
+
+  /* Keyboard hints are meaningless without a keyboard — swap them for a touch
+     hint. Slide over rows to move the highlight, lift to select; swipe down
+     from the top to jump back to the full menu (see the script in index.html). */
+  .bbs-fkeys { display: none; }
+  .bbs-footer::before {
+    content: "swipe to move \00B7 tap to select \00B7 \2193 from top = menu";
+    display: block;
+    margin-bottom: 0.15rem;
+    color: var(--fg-dim);
+    font-size: 0.72rem;
+  }
   .bbs-cmdline input { font-size: 16px; }                /* stop iOS focus-zoom */
 }
