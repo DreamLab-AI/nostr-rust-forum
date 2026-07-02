@@ -173,6 +173,14 @@ pub fn subscribe_board(channel_id: &str) {
     }
 }
 
+/// Subscribe to a live tail of recent channel messages (kind-42) across all
+/// channels — the Chat "lobby" feed and the Code snippet view read from it.
+/// Reuses the shared `posts` bucket; idempotent (re-REQs on each screen entry).
+pub fn subscribe_chat() {
+    #[cfg(target_arch = "wasm32")]
+    wasm::subscribe_chat();
+}
+
 /// Callback invoked when the relay ACKs a publish with a NIP-01
 /// `["OK", id, accepted, message]` frame: `(accepted, message)`.
 pub type PublishAck = std::rc::Rc<dyn Fn(bool, String)>;
@@ -471,6 +479,14 @@ mod wasm {
             "bbs-board",
             serde_json::json!({ "kinds": [42], "#e": [channel_id], "limit": 100 }),
         );
+    }
+
+    pub fn subscribe_chat() {
+        SUBS.with(|m| {
+            m.borrow_mut().remove("bbs-chat");
+        });
+        send(&serde_json::json!(["CLOSE", "bbs-chat"]));
+        send_req("bbs-chat", serde_json::json!({ "kinds": [42], "limit": 60 }));
     }
 }
 

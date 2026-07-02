@@ -51,10 +51,10 @@ pub fn ScreenView(state: BbsState) -> impl IntoView {
         Screen::MainMenu => view! { <MainMenu state=state /> }.into_any(),
         Screen::Agents => agents(store).into_any(),
         Screen::Boards => boards(state, store, cfg).into_any(),
-        Screen::Chat => chat().into_any(),
+        Screen::Chat => chat(store).into_any(),
         Screen::Members => members(store, cfg).into_any(),
         Screen::Pod => pod(cfg).into_any(),
-        Screen::Code => code().into_any(),
+        Screen::Code => code(store).into_any(),
         Screen::Network => network(cfg, store).into_any(),
         Screen::Status => status(cfg, store).into_any(),
         Screen::Settings => settings(state, cfg).into_any(),
@@ -385,16 +385,24 @@ fn pod(cfg: StoredValue<BbsConfig>) -> impl IntoView {
         {match id {
             Some(id) => view! {
                 <div class="bbs-panel">
-                    "  WebID    : " <span class="accent">{id.webid.clone()}</span> "\n"
-                    "  pod-git  : " {id.git_clone.clone()} "\n\n"
-                    "  /" {id.short()} "/"
+                    "  Your pod is private, identity-keyed storage (WAC deny-by-default).\n"
+                    "  WebID   — your identity URL:  " <span class="accent">{id.webid.clone()}</span> "\n"
+                    "  pod-git — clone your pod:     " <span class="bbs-dim">"git clone "</span> {id.git_clone.clone()} "\n"
+                    <span class="bbs-dim">"  These are private paths — opening them raw in a browser is meant to return 401;\n  access needs your signed-in credentials.\n"</span>
+                    "\n  /" {id.short()} "/"
                 </div>
                 {move || match listing.get() {
                     PodState::Idle | PodState::Loading => view! {
                         <div class="bbs-panel bbs-dim">"    … loading container"</div>
                     }.into_any(),
                     PodState::Error(e) => view! {
-                        <div class="bbs-panel bbs-dim">"    pod unavailable: " {e}</div>
+                        <div class="bbs-panel bbs-dim">
+                            {if e.contains("401") || e.contains("403") || e.to_ascii_lowercase().contains("auth") {
+                                "    Your pod is private (WAC deny-by-default). Browsing it needs an\n    authenticated request — sign in to view your files.".to_string()
+                            } else {
+                                format!("    pod unavailable: {e}")
+                            }}
+                        </div>
                     }.into_any(),
                     PodState::Loaded(items) if items.is_empty() => view! {
                         <div class="bbs-panel bbs-dim">"    (empty container)"</div>
@@ -492,12 +500,39 @@ fn members(store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
 }
 
 /// (3) Chat — live channel + encrypted DMs.
-fn chat() -> impl IntoView {
+/// (3) Chat — a live "lobby" tail of recent channel messages (kind-42) across
+/// all channels. Posting/threads live in BOARDS; encrypted DMs (NIP-44/59) are a
+/// deferred follow-up. Subscribes to the shared kind-42 tail on entry.
+fn chat(store: RelayStore) -> impl IntoView {
+    relay::subscribe_chat();
     view! {
         {header(Screen::Chat)}
         <div class="bbs-panel bbs-dim">
-            "  Live channel posts (kind-42) and gift-wrapped DMs (NIP-44/59) stream over\n  the relay. AUTH (NIP-42) gates sealed DMs to the addressed recipient.\n\n  > _"
+            "  Recent messages stream here live. Reply or start a topic in BOARDS;\n  encrypted DMs (NIP-44/59) are coming."
         </div>
+        {move || {
+            let posts = store.posts.get();
+            if posts.is_empty() {
+                return view! {
+                    <div class="bbs-panel bbs-dim">"  (waiting for live messages — reads are deny-by-default at the relay)"</div>
+                }.into_any();
+            }
+            view! {
+                <div class="bbs-list">
+                    {posts.into_iter().take(60).map(|p| {
+                        let who = relay::short_id(&p.pubkey);
+                        let body = p.content.clone();
+                        let imgs = extract_image_urls(&p.content);
+                        view! {
+                            <div class="bbs-row"><span class="accent">{format!("<{who}> ")}</span>{body}</div>
+                            {imgs.into_iter().map(|src| view! {
+                                <div class="bbs-ascii-row"><AsciiImg src=src cols=64 /></div>
+                            }).collect_view()}
+                        }
+                    }).collect_view()}
+                </div>
+            }.into_any()
+        }}
     }
 }
 
@@ -717,10 +752,49 @@ fn agents(store: RelayStore) -> impl IntoView {
 }
 
 /// (6) Code — shared snippets / pod files.
-fn code() -> impl IntoView {
+/// (6) Code — shared snippets: kind-42 messages that are fenced (```) or tagged
+/// `#code` / `t=code`, surfaced from the live tail. Attachments live in the
+/// author's Solid pod under /public. Post one from BOARDS. Reads the shared tail.
+fn code(store: RelayStore) -> impl IntoView {
+    relay::subscribe_chat();
     view! {
         {header(Screen::Code)}
-        <div class="bbs-panel bbs-dim">"  Shared code snippets and pod-hosted files. Posts are signed Nostr events;\n  attachments live in the author's Solid pod under /public."</div>
+        <div class="bbs-panel bbs-dim">
+            "  Signed snippets — kind-42 posts fenced with ``` or tagged #code.\n  Attachments live in the author's Solid pod under /public. Share one from BOARDS."
+        </div>
+        {move || {
+            let snippets: Vec<_> = store
+                .posts
+                .get()
+                .into_iter()
+                .filter(|p| {
+                    p.content.contains("```")
+                        || p.content.to_ascii_lowercase().contains("#code")
+                        || p.tags.iter().any(|t| {
+                            t.first().map(String::as_str) == Some("t")
+                                && t.get(1).map(String::as_str) == Some("code")
+                        })
+                })
+                .collect();
+            if snippets.is_empty() {
+                return view! {
+                    <div class="bbs-panel bbs-dim">"  (no snippets yet — post a ``` fenced message in BOARDS)"</div>
+                }.into_any();
+            }
+            view! {
+                <div class="bbs-list">
+                    {snippets.into_iter().take(30).map(|p| {
+                        let who = relay::short_id(&p.pubkey);
+                        let body = p.content.clone();
+                        view! {
+                            <div class="bbs-panel">
+                                <span class="bbs-dim">{format!("// {who}")}</span> "\n" {body}
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+            }.into_any()
+        }}
     }
 }
 
