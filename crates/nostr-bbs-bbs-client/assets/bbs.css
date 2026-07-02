@@ -10,7 +10,7 @@
   --bg-panel: #0f0f0f;
   --fg: #ffb000;       /* amber default */
   --fg-bright: #ffd47a;
-  --fg-dim: #8a5e00;
+  --fg-dim: #c48a2a;   /* readable dim: subtitles/handles/hints stay legible on #0a0a0a */
   --accent: #ffb000;
   --border: #6b4a00;
   --select-bg: #ffb000;
@@ -21,19 +21,19 @@
 
 /* ── Theme palettes ──────────────────────────────────────────────────────── */
 .theme-amber {
-  --fg: #ffb000; --fg-bright: #ffd47a; --fg-dim: #8a5e00;
+  --fg: #ffb000; --fg-bright: #ffd47a; --fg-dim: #c48a2a;
   --accent: #ffb000; --border: #6b4a00; --select-bg: #ffb000;
 }
 .theme-green {
-  --fg: #33ff66; --fg-bright: #b6ffc8; --fg-dim: #1f7a3a;
+  --fg: #33ff66; --fg-bright: #b6ffc8; --fg-dim: #43b869;
   --accent: #33ff66; --border: #1f7a3a; --select-bg: #33ff66;
 }
 .theme-purple {
-  --fg: #c792ea; --fg-bright: #e6ccff; --fg-dim: #7a5aa0;
+  --fg: #c792ea; --fg-bright: #e6ccff; --fg-dim: #a483c8;
   --accent: #c792ea; --border: #5a3f80; --select-bg: #c792ea;
 }
 .theme-sky {
-  --fg: #56c2ff; --fg-bright: #b6e6ff; --fg-dim: #2a6f99;
+  --fg: #56c2ff; --fg-bright: #b6e6ff; --fg-dim: #59a3cc;
   --accent: #56c2ff; --border: #2a6f99; --select-bg: #56c2ff;
 }
 
@@ -50,8 +50,8 @@ html, body {
   background-color: var(--bg);
   color: var(--fg);
   font-family: var(--font);
-  font-size: 15px;
-  line-height: 1.35;
+  font-size: 16px;
+  line-height: 1.45;
 }
 
 /* CRT scanlines + subtle flicker + vignette. */
@@ -65,8 +65,8 @@ html, body {
     to bottom,
     rgba(0, 0, 0, 0) 0px,
     rgba(0, 0, 0, 0) 2px,
-    rgba(0, 0, 0, 0.28) 3px,
-    rgba(0, 0, 0, 0.28) 4px
+    rgba(0, 0, 0, 0.15) 3px,
+    rgba(0, 0, 0, 0.15) 4px
   );
 }
 .bbs-crt::after {
@@ -95,11 +95,25 @@ html, body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  text-shadow: 0 0 4px var(--accent);
+  /* Body copy carries only a hairline halo so glyphs stay crisp; the strong
+     phosphor bloom is re-applied below to headings / chrome / accents where it
+     reads as glow rather than smearing the text. */
+  text-shadow: 0 0 1.5px color-mix(in srgb, var(--accent) 55%, transparent);
   animation: crt-flicker 6s infinite;
   padding: 0.5rem 1rem;
   max-width: 100ch;
   margin: 0 auto;
+}
+
+/* Strong phosphor glow, scoped to the bright/large/accent elements. */
+.bbs-banner,
+.bbs-panel .title,
+.bbs-menu-item,
+.bbs-fkeys .fk,
+.bbs-row .accent,
+.bbs-section-hero .label,
+.bbs-statusbar .ok {
+  text-shadow: 0 0 4px var(--accent);
 }
 
 /* ── Status bar ──────────────────────────────────────────────────────────── */
@@ -129,7 +143,13 @@ html, body {
 
 /* ── Generic boxed panel ─────────────────────────────────────────────────── */
 .bbs-panel { white-space: pre-wrap; margin: 0.5rem 0; }
-.bbs-panel .title { color: var(--fg-bright); }
+/* Screen header line — the "you are here" signpost. Bright, weighted, and
+   spaced so each section reads as a distinct place rather than more body text. */
+.bbs-panel .title {
+  color: var(--fg-bright);
+  font-weight: bold;
+  letter-spacing: 0.04em;
+}
 
 /* ── Main menu ───────────────────────────────────────────────────────────── */
 .bbs-menu { display: grid; grid-template-columns: 1fr 1fr; gap: 0 2rem; }
@@ -218,11 +238,14 @@ a, .bbs-link { color: var(--accent); }
 }
 .bbs-ascii-row:not(.bbs-banner-img)::before {
   content: "▞ IMG ▚";
-  display: block;
-  margin-bottom: 0.2rem;
-  color: var(--fg-dim);
+  display: inline-block;
+  margin-bottom: 0.3rem;
+  padding: 0 0.4rem;
+  background: var(--fg-dim);
+  color: var(--bg);
   font-size: 0.7rem;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.12em;
+  text-shadow: none;
 }
 .ascii-img {
   margin: 0;
@@ -255,7 +278,18 @@ a, .bbs-link { color: var(--accent); }
  * Each configured zone's banner image rendered as ASCII at the top of the
  * Message Base, tinted to the zone accent. */
 .bbs-section-hero { margin: 0.3rem 0 0.6rem; }
-.bbs-section-hero .label { color: var(--accent); letter-spacing: 0.08em; }
+/* Each zone's banner gets a filled accent chip label — a strong, unmistakable
+   signpost of which zone this board belongs to (tinted to the zone accent_hex). */
+.bbs-section-hero .label {
+  display: inline-block;
+  background: color-mix(in srgb, var(--accent) 88%, var(--bg));
+  color: var(--bg);
+  padding: 0.1rem 0.55rem;
+  margin-bottom: 0.2rem;
+  font-weight: bold;
+  letter-spacing: 0.1em;
+  text-shadow: none;
+}
 
 /* ── Phosphor persistence ─────────────────────────────────────────────────────
  * When the screen text changes, the previous frame lingers as a faint phosphor
@@ -335,8 +369,9 @@ a, .bbs-link { color: var(--accent); }
      pictures (.bbs-ascii-row) and link previews still render as ASCII. */
   .bbs-section-hero { display: none; }
 
-  /* Posted/preview ASCII images stay, sized to the narrow column. */
-  .ascii-img { font-size: 0.4rem; }
+  /* Posted/preview ASCII images stay, sized to the narrow column (kept legible;
+     wide art scrolls horizontally in its own container rather than shrinking away). */
+  .ascii-img { font-size: 0.5rem; }
 
   /* Keyboard hints are meaningless without a keyboard — swap them for a touch
      hint. Slide over rows to move the highlight, lift to select; swipe down
