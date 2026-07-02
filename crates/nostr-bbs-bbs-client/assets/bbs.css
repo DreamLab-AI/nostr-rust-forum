@@ -214,7 +214,12 @@ html, body {
   .bbs-blink { animation: none; }
 }
 
+/* Clickable text controls (governance Approve/Reject, [send], [reply], sign-in,
+   theme-cycle, sentry door) carry role="button" — give them a pointer cursor so
+   they read as interactive, not static text (verify-live: cursor was `auto`). */
 a, .bbs-link { color: var(--accent); }
+.bbs-link, [role="button"] { cursor: pointer; }
+.bbs-link:hover { color: var(--fg-bright); }
 
 /* ── ASCII image rendering ───────────────────────────────────────────────────
  * Images everywhere in the BBS are converted to ASCII server-side (preview /
