@@ -14,7 +14,33 @@ use crate::identity::Identity;
 use crate::menu::Screen;
 use crate::pod::PodState;
 use crate::relay::{self, RelayStore};
-use nostr_bbs_core::governance::{ActionStyle, PanelDefinition};
+use crate::signer::BbsSigner;
+use nostr_bbs_core::governance::{
+    extract_d_tag, ActionStyle, PanelDefinition, KIND_ACTION_RESPONSE,
+};
+
+/// Inline status of a signed write (agent decision or board post).
+#[derive(Clone)]
+enum SendStatus {
+    Idle,
+    Sending,
+    // Constructed only on the wasm publish-ack path; read by `suffix()` on both.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Sent,
+    Err(String),
+}
+
+impl SendStatus {
+    /// Compact ASCII suffix rendered next to the control.
+    fn suffix(&self) -> String {
+        match self {
+            SendStatus::Idle => String::new(),
+            SendStatus::Sending => " …".to_string(),
+            SendStatus::Sent => " ✓ signed".to_string(),
+            SendStatus::Err(e) => format!(" ✗ {e}"),
+        }
+    }
+}
 
 /// Render the active screen.
 #[component]
@@ -172,6 +198,12 @@ fn board_list(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -
 }
 
 fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
+    let signer = use_context::<BbsSigner>();
+    let draft = RwSignal::new(String::new());
+    let status = RwSignal::new(SendStatus::Idle);
+    // Reply target: (parent event id, parent author pubkey). `None` = post to root.
+    let reply_to = RwSignal::new(None::<(String, String)>);
+    let channel_for_send = channel_id.clone();
     view! {
         <div class="bbs-panel">
             "  board " <span class="accent">{relay::short_id(&channel_id)}</span>
@@ -197,10 +229,16 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
                             let body = p.content.clone();
                             // Any image URLs in the post render on-theme as ASCII.
                             let imgs = extract_image_urls(&p.content);
+                            let reply_id = p.id.clone();
+                            let reply_pk = p.pubkey.clone();
                             view! {
                                 <div class="bbs-row">
                                     <span class="accent">{format!("<{who}> ")}</span>
                                     {body}
+                                    " "
+                                    <span class="bbs-link bbs-dim" role="button"
+                                        on:click=move |_| reply_to.set(Some((reply_id.clone(), reply_pk.clone())))
+                                    >"[reply]"</span>
                                 </div>
                                 {imgs.into_iter().map(|src| view! {
                                     <div class="bbs-ascii-row"><AsciiImg src=src cols=64 /></div>
@@ -211,6 +249,96 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
                 </div>
             }.into_any()
         }}
+        {board_composer(signer, channel_for_send, draft, status, reply_to)}
+    }
+}
+
+/// Compose box for a board: a signed kind-42 channel message (NIP-28), posting
+/// to the channel root or as a reply to a selected post. Fails closed — hidden
+/// with a prompt when no signer is available.
+fn board_composer(
+    signer: Option<BbsSigner>,
+    channel_id: String,
+    draft: RwSignal<String>,
+    status: RwSignal<SendStatus>,
+    reply_to: RwSignal<Option<(String, String)>>,
+) -> impl IntoView {
+    move || {
+        let signed_in = signer.and_then(|s| s.pubkey().get()).is_some();
+        if !signed_in {
+            return view! {
+                <div class="bbs-panel bbs-dim">
+                    "  Sign in (" <span class="accent">"[9] Settings"</span>
+                    ", or at /community/) to post to this board."
+                </div>
+            }
+            .into_any();
+        }
+        let cid = channel_id.clone();
+        let send: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+            let text = draft.get_untracked().trim().to_string();
+            if text.is_empty() || matches!(status.get_untracked(), SendStatus::Sending) {
+                return;
+            }
+            let signer = match signer {
+                Some(s) => s,
+                None => return,
+            };
+            let pubkey = match signer.pubkey_hex() {
+                Some(pk) => pk,
+                None => {
+                    status.set(SendStatus::Err("sign in first".to_string()));
+                    return;
+                }
+            };
+            let signer_rc = match signer.get_signer() {
+                Some(s) => s,
+                None => {
+                    status.set(SendStatus::Err("sign in first".to_string()));
+                    return;
+                }
+            };
+            let now = (js_sys::Date::now() / 1000.0) as u64;
+            let tags = relay::channel_message_tags(&cid, reply_to.get_untracked());
+            let unsigned = nostr_bbs_core::UnsignedEvent {
+                pubkey,
+                created_at: now,
+                kind: 42,
+                tags,
+                content: text,
+            };
+            status.set(SendStatus::Sending);
+            draft.set(String::new());
+            reply_to.set(None);
+            publish_signed(signer_rc, unsigned, status);
+        });
+        let send_click = send.clone();
+        let send_key = send.clone();
+        view! {
+            <div class="bbs-cmdline">
+                {move || reply_to.get().map(|(id, _)| view! {
+                    <span class="bbs-dim">
+                        "↳ reply to " {relay::short_id(&id)} " "
+                        <span class="bbs-link" role="button" on:click=move |_| reply_to.set(None)>"[clear]"</span>
+                        " "
+                    </span>
+                })}
+                <span class="prompt">"post/"</span>
+                <input
+                    prop:value=move || draft.get()
+                    on:input=move |ev| draft.set(event_target_value(&ev))
+                    on:keydown=move |ev| {
+                        if ev.key() == "Enter" {
+                            ev.prevent_default();
+                            send_key();
+                        }
+                    }
+                />
+                <span class="bbs-link accent" role="button" on:click=move |_| send_click()>"[ send ]"</span>
+                <span class="bbs-dim">{move || status.get().suffix()}</span>
+            </div>
+        }
+        .into_any()
     }
 }
 
@@ -367,8 +495,133 @@ fn chat() -> impl IntoView {
     }
 }
 
-/// Render one agent control panel (kit governance schema) in ASCII.
-fn panel_view(agent: String, p: PanelDefinition) -> impl IntoView {
+/// Sign `unsigned` with `signer`, publish it with an ack, and reflect the
+/// outcome into `status`. wasm-only; a native build (unit tests) is a no-op.
+fn publish_signed(
+    signer: std::rc::Rc<dyn nostr_bbs_core::signer::Signer>,
+    unsigned: nostr_bbs_core::UnsignedEvent,
+    status: RwSignal<SendStatus>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use nostr_bbs_core::signer::Signer;
+        wasm_bindgen_futures::spawn_local(async move {
+            match signer.sign_event(unsigned).await {
+                Ok(signed) => {
+                    let on_ok: crate::relay::PublishAck =
+                        std::rc::Rc::new(move |accepted: bool, message: String| {
+                            if accepted {
+                                status.set(SendStatus::Sent);
+                            } else {
+                                let msg = if message.trim().is_empty() {
+                                    "rejected by relay".to_string()
+                                } else {
+                                    message
+                                };
+                                status.set(SendStatus::Err(msg));
+                            }
+                        });
+                    crate::relay::publish_with_ack(&signed, Some(on_ok));
+                }
+                Err(e) => status.set(SendStatus::Err(format!("sign: {e}"))),
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (signer, unsigned);
+        status.set(SendStatus::Idle);
+    }
+}
+
+/// Context for an interactive (live) agent panel: the signer plus the panel's
+/// `d` tag and definition event id, which key the published 31403 ActionResponse
+/// (the publishing agent subscribes to responses on its panel `d` tag).
+#[derive(Clone)]
+struct PanelActionCtx {
+    signer: BbsSigner,
+    event_id: String,
+    d_tag: String,
+}
+
+/// One action affordance. On a live panel it signs + publishes a 31403
+/// ActionResponse and shows inline status; on a sample panel (`ctx = None`) it is
+/// an inert label.
+fn action_button(
+    a: nostr_bbs_core::governance::ActionDef,
+    ctx: Option<PanelActionCtx>,
+) -> impl IntoView {
+    let mark = match a.style {
+        ActionStyle::Primary => "▶",
+        ActionStyle::Secondary => "·",
+        ActionStyle::Destructive => "✗",
+    };
+    match ctx {
+        None => view! { <span class="accent">"[" {mark} " " {a.label} "] "</span> }.into_any(),
+        Some(ctx) => {
+            let status = RwSignal::new(SendStatus::Idle);
+            let label = a.label.clone();
+            let action_id = a.id.clone();
+            let on_click = move |_| {
+                if matches!(
+                    status.get_untracked(),
+                    SendStatus::Sending | SendStatus::Sent
+                ) {
+                    return;
+                }
+                let pubkey = match ctx.signer.pubkey_hex() {
+                    Some(pk) => pk,
+                    None => {
+                        status.set(SendStatus::Err("sign in first".to_string()));
+                        return;
+                    }
+                };
+                let signer_rc = match ctx.signer.get_signer() {
+                    Some(s) => s,
+                    None => {
+                        status.set(SendStatus::Err("sign in first".to_string()));
+                        return;
+                    }
+                };
+                let content = serde_json::json!({
+                    "action": action_id.clone(),
+                    "reasoning": format!(
+                        "Human selected '{}' via the BBS agent control plane",
+                        action_id
+                    ),
+                })
+                .to_string();
+                let now = (js_sys::Date::now() / 1000.0) as u64;
+                let unsigned = nostr_bbs_core::UnsignedEvent {
+                    pubkey,
+                    created_at: now,
+                    kind: KIND_ACTION_RESPONSE,
+                    tags: vec![
+                        vec!["d".to_string(), ctx.d_tag.clone()],
+                        vec!["e".to_string(), ctx.event_id.clone()],
+                    ],
+                    content,
+                };
+                status.set(SendStatus::Sending);
+                publish_signed(signer_rc, unsigned, status);
+            };
+            view! {
+                <span class="bbs-link accent" role="button" on:click=on_click>
+                    "[" {mark} " " {label} "]"
+                    {move || status.get().suffix()}
+                </span>
+                " "
+            }
+            .into_any()
+        }
+    }
+}
+
+/// Render one agent control panel (kit governance schema) in ASCII. With
+/// `action = Some`, the action buttons sign + publish a 31403 ActionResponse
+/// (the human-in-the-loop decision); on sample panels (`None`) they are inert.
+fn panel_view(agent: String, p: PanelDefinition, action: Option<PanelActionCtx>) -> impl IntoView {
+    let actions = p.actions.clone();
     view! {
         <div class="bbs-panel">
             "\n  ╓─ " <span class="title">{p.title.clone()}</span>
@@ -376,16 +629,9 @@ fn panel_view(agent: String, p: PanelDefinition) -> impl IntoView {
             "  ║ " <span class="bbs-dim">{p.description.clone()}</span> "\n"
             "  ╟─ fields: " {p.fields.iter().map(|f| f.label.clone()).collect::<Vec<_>>().join(" · ")} "\n"
             "  ╙─ "
-            {p.actions
+            {actions
                 .into_iter()
-                .map(|a| {
-                    let mark = match a.style {
-                        ActionStyle::Primary => "▶",
-                        ActionStyle::Secondary => "·",
-                        ActionStyle::Destructive => "✗",
-                    };
-                    view! { <span class="accent">"[" {mark} " " {a.label} "] "</span> }
-                })
+                .map(|a| action_button(a, action.clone()))
                 .collect_view()}
         </div>
     }
@@ -409,30 +655,55 @@ pub(crate) fn launch_sentry() {
 pub(crate) fn launch_sentry() {}
 
 fn agents(store: RelayStore) -> impl IntoView {
+    let signer = use_context::<BbsSigner>();
     view! {
         {header(Screen::Agents)}
         <div class="bbs-panel bbs-dim">"  Registered agents publish interactive control panels; you sign decisions back."</div>
+        {move || match signer.map(|s| s.pubkey().get()) {
+            Some(Some(pk)) => view! {
+                <div class="bbs-panel bbs-dim">
+                    "  signed in as " <span class="accent">{relay::short_id(&pk)}</span>
+                    " — decisions are signed back to the relay"
+                </div>
+            }.into_any(),
+            _ => view! {
+                <div class="bbs-panel bbs-dim">
+                    "  not signed in — open " <span class="accent">"[9] Settings"</span>
+                    " to sign in before acting on a panel"
+                </div>
+            }.into_any(),
+        }}
         {move || {
-            let live: Vec<_> = store
+            let live: Vec<(String, String, String, PanelDefinition)> = store
                 .governance
                 .get()
                 .iter()
-                .filter_map(|ev| relay::parse_panel(ev).map(|p| (relay::short_id(&ev.pubkey), p)))
+                .filter_map(|ev| {
+                    let p = relay::parse_panel(ev)?;
+                    let d = extract_d_tag(&ev.tags)?.to_string();
+                    Some((relay::short_id(&ev.pubkey), ev.id.clone(), d, p))
+                })
                 .collect();
             if !live.is_empty() {
                 return live
                     .into_iter()
-                    .map(|(agent, p)| panel_view(agent, p))
+                    .map(|(agent, event_id, d_tag, p)| {
+                        let ctx = signer.map(|s| PanelActionCtx {
+                            signer: s,
+                            event_id,
+                            d_tag,
+                        });
+                        panel_view(agent, p, ctx)
+                    })
                     .collect_view()
                     .into_any();
             }
-            // No live governance events yet — show representative panels so the
-            // human-in-the-loop surface is visible.
+            // No live governance events yet — representative panels (inert).
             view! {
                 <div class="bbs-panel bbs-dim">"  (no live agent panels — showing examples)"</div>
                 {sample_panels()
                     .into_iter()
-                    .map(|ap| panel_view(ap.agent.to_string(), ap.panel))
+                    .map(|ap| panel_view(ap.agent.to_string(), ap.panel, None))
                     .collect_view()}
             }.into_any()
         }}
@@ -487,6 +758,7 @@ fn status(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
 /// (9) Settings — theme + identity + node.
 fn settings(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     let node = cfg.with_value(|c| c.node_name.clone());
+    let signer = use_context::<BbsSigner>();
     view! {
         {header(Screen::Settings)}
         <div class="bbs-panel">
@@ -495,6 +767,60 @@ fn settings(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
             "  node      : " {node} "\n"
             "  identity  : keys derived from your passkey (PRF); never persisted server-side\n"
             "  storage   : per-user Solid pod (WAC deny-by-default)"
+        </div>
+        {signer.map(sign_in_panel)}
+    }
+}
+
+/// The BBS sign-in panel: shows the current signed-in identity with a sign-out
+/// affordance, or a key input (nsec / hex) + generate option when signed out.
+/// The key lives in memory only; the forum's same-origin local-key session is
+/// adopted automatically at load.
+fn sign_in_panel(signer: BbsSigner) -> impl IntoView {
+    let key_input = RwSignal::new(String::new());
+    let generated = RwSignal::new(None::<String>);
+    view! {
+        <div class="bbs-panel">
+            "  ── identity / sign-in ─────────────────────────────\n"
+            {move || match signer.pubkey().get() {
+                Some(pk) => view! {
+                    "  signed in : " <span class="accent">{relay::short_id(&pk)}</span> "   "
+                    <span class="bbs-link" role="button"
+                        on:click=move |_| { signer.logout(); generated.set(None); }
+                    >"[ sign out ]"</span> "\n"
+                    "  board posts & agent decisions are signed with this key (in memory only)"
+                }.into_any(),
+                None => {
+                    let login = move || {
+                        let input = key_input.get_untracked();
+                        if signer.login_with_key(&input).is_ok() {
+                            key_input.set(String::new());
+                            generated.set(None);
+                        }
+                    };
+                    view! {
+                        "  Signing in at " <span class="accent">"/community/"</span> " with a local key carries here.\n"
+                        "  Or paste an nsec / 64-char hex key, or generate a throwaway key:\n"
+                        <div class="bbs-cmdline">
+                            <span class="prompt">"key/"</span>
+                            <input
+                                prop:value=move || key_input.get()
+                                on:input=move |ev| key_input.set(event_target_value(&ev))
+                                on:keydown=move |ev| { if ev.key() == "Enter" { ev.prevent_default(); login(); } }
+                            />
+                            <span class="bbs-link accent" role="button" on:click=move |_| login()>"[ sign in ]"</span>
+                            " "
+                            <span class="bbs-link" role="button"
+                                on:click=move |_| { if let Ok(hex) = signer.generate() { generated.set(Some(hex)); } }
+                            >"[ generate ]"</span>
+                        </div>
+                        {move || signer.error().get().map(|e| view! { <div class="bbs-dim">"  ✗ " {e}</div> })}
+                        {move || generated.get().map(|hex| view! {
+                            <div class="bbs-dim">"  new key (back this up — shown once): " <span class="accent">{hex}</span></div>
+                        })}
+                    }.into_any()
+                }
+            }}
         </div>
     }
 }
