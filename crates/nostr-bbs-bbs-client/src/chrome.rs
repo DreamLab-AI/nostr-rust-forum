@@ -43,6 +43,7 @@ impl BbsState {
             Command::Back => self.go(Screen::MainMenu),
             Command::Theme => self.theme.update(|t| *t = t.next()),
             Command::Quit => self.go(Screen::MainMenu),
+            Command::Sentry => crate::screens::launch_sentry(),
             Command::Unknown => {}
         }
     }
@@ -86,17 +87,15 @@ pub fn StatusBar() -> impl IntoView {
     }
 }
 
-/// ASCII banner masthead.
+/// ASCII banner masthead. The masthead line is node-name driven (operator
+/// branding from `[branding].node_name`), never a hardcoded upstream kit name.
 #[component]
 pub fn Banner() -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
     let (node, banner_url) = cfg.with_value(|c| (c.node_name.clone(), c.banner_url.clone()));
-    let art = "\
- ╔══════════════════════════════════════════════════════════╗
- ║   ▄▄▄   ▄▄▄  ▄▄▄    nostr-rust-forum // retro terminal    ║
- ║   █▀▀▄ █▀▀▄ █▀▀     did:nostr · Solid pods · agent plane  ║
- ║   ▀▀▀  ▀▀▀  ▀▀▀                                           ║
- ╚══════════════════════════════════════════════════════════╝";
+    // Right-pad to the same field width the old hardcoded line used, so the
+    // box-art border stays aligned for typical node names.
+    let masthead = format!("{:<38}║", format!("{node} // retro terminal"));
     view! {
         // Optional banner image — rendered on-theme as ASCII, never a raw <img>.
         {banner_url.map(|src| view! {
@@ -105,7 +104,11 @@ pub fn Banner() -> impl IntoView {
             </div>
         })}
         <pre class="bbs-banner">
-            {art}
+            " ╔══════════════════════════════════════════════════════════╗\n"
+            " ║   ▄▄▄   ▄▄▄  ▄▄▄    " {masthead} "\n"
+            " ║   █▀▀▄ █▀▀▄ █▀▀     did:nostr · Solid pods · agent plane  ║\n"
+            " ║   ▀▀▀  ▀▀▀  ▀▀▀                                           ║\n"
+            " ╚══════════════════════════════════════════════════════════╝"
             "\n  "
             <span class="tagline">{node} " — press a number, or / for a command"</span>
         </pre>
@@ -211,7 +214,7 @@ pub fn CommandLine(state: BbsState) -> impl IntoView {
 fn nav_len(state: &BbsState, store: &RelayStore) -> usize {
     match state.screen.get() {
         Screen::MainMenu => Screen::menu_order().len(),
-        Screen::MessageBase if state.board.get().is_none() => store.channels.get().len(),
+        Screen::Boards if state.board.get().is_none() => store.channels.get().len(),
         _ => 0,
     }
 }
@@ -234,7 +237,7 @@ pub fn install_key_handler(state: BbsState, store: RelayStore) {
                     state.cmd_open.set(true);
                 }
                 "Escape" => {
-                    if state.screen.get() == Screen::MessageBase && state.board.get().is_some() {
+                    if state.screen.get() == Screen::Boards && state.board.get().is_some() {
                         state.close_board();
                     } else {
                         state.go(Screen::MainMenu);
@@ -242,7 +245,7 @@ pub fn install_key_handler(state: BbsState, store: RelayStore) {
                 }
                 "Enter" => match state.screen.get() {
                     Screen::MainMenu => state.activate_menu(),
-                    Screen::MessageBase if state.board.get().is_none() => {
+                    Screen::Boards if state.board.get().is_none() => {
                         let chans = store.channels.get();
                         if let Some(c) = chans.get(state.selection.get()) {
                             let id = c.id.clone();

@@ -3,10 +3,11 @@
 //! the Leptos views in `screens` and `chrome` render on top of it.
 //!
 //! Each screen maps to a REAL kit capability rather than being cosmetic:
-//! Message Base → config zones + kind-40/42 channels, File Base → the Solid pod
-//! browser, Node List → relays + federation mesh, User List → did:nostr WebID
-//! profiles, Door Games → the agent-governance control-panel plane, System Info
-//! → DID/relay/pod status, etc.
+//! Boards → config zones + kind-40/42 channels, Pod → the Solid pod browser,
+//! Network → relays + federation mesh, Members → did:nostr WebID profiles,
+//! Agents → the agent-governance control-panel plane (human-in-the-loop), Status
+//! → DID/relay/pod status, etc. Agents leads the menu: it is the highest-value
+//! feature and must not be buried behind wildcat-BBS jargon.
 
 /// One of the ten BBS screens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -14,22 +15,22 @@ pub enum Screen {
     /// The numbered main menu (landing screen).
     #[default]
     MainMenu,
-    /// Zones & boards — kind-40/42 channels, zone-gated reads.
-    MessageBase,
-    /// Solid pod browser — WebID-owned storage.
-    FileBase,
-    /// Relays & federation mesh peers.
-    NodeList,
-    /// Members — did:nostr WebID profiles.
-    UserList,
+    /// Agent control panels — approve, reject, act (human-in-the-loop).
+    Agents,
+    /// Zones & boards — kind-40/42 channels, zone-gated.
+    Boards,
     /// Live channel & encrypted DMs (NIP-44 / NIP-59).
     Chat,
-    /// Agent control panels — human-in-the-loop governance.
-    DoorGames,
+    /// Members — did:nostr WebID profiles.
+    Members,
+    /// Solid pod browser — WebID-owned storage.
+    Pod,
     /// Shared snippets & pod files.
-    CodeExchange,
+    Code,
+    /// Relays & federation mesh peers.
+    Network,
     /// Node / relay / pod / identity status.
-    SystemInfo,
+    Status,
     /// Theme + identity + node settings.
     Settings,
     /// Help / about.
@@ -40,14 +41,14 @@ impl Screen {
     /// The ten selectable screens, in main-menu order.
     pub fn menu_order() -> [Screen; 10] {
         [
-            Screen::MessageBase,
-            Screen::FileBase,
-            Screen::NodeList,
-            Screen::UserList,
+            Screen::Agents,
+            Screen::Boards,
             Screen::Chat,
-            Screen::DoorGames,
-            Screen::CodeExchange,
-            Screen::SystemInfo,
+            Screen::Members,
+            Screen::Pod,
+            Screen::Code,
+            Screen::Network,
+            Screen::Status,
             Screen::Settings,
             Screen::Help,
         ]
@@ -83,14 +84,14 @@ impl Screen {
     pub fn title(self) -> &'static str {
         match self {
             Screen::MainMenu => "Main Menu",
-            Screen::MessageBase => "Message Base",
-            Screen::FileBase => "File Base",
-            Screen::NodeList => "Node List",
-            Screen::UserList => "User List",
+            Screen::Agents => "Agents",
+            Screen::Boards => "Boards",
             Screen::Chat => "Chat",
-            Screen::DoorGames => "Door Games",
-            Screen::CodeExchange => "Code Exchange",
-            Screen::SystemInfo => "System Info",
+            Screen::Members => "Members",
+            Screen::Pod => "Pod",
+            Screen::Code => "Code",
+            Screen::Network => "Network",
+            Screen::Status => "Status",
             Screen::Settings => "Settings",
             Screen::Help => "Help",
         }
@@ -100,14 +101,14 @@ impl Screen {
     pub fn subtitle(self) -> &'static str {
         match self {
             Screen::MainMenu => "Select a board by number, or type / for a command",
-            Screen::MessageBase => "Zones & boards — kind-40/42 channels, zone-gated",
-            Screen::FileBase => "Solid pod browser — your WebID-owned storage",
-            Screen::NodeList => "Relays & federation mesh peers",
-            Screen::UserList => "Members — did:nostr WebID profiles",
+            Screen::Agents => "Agent control panels — approve, reject, act (human-in-the-loop)",
+            Screen::Boards => "Zones & boards — kind-40/42 channels, zone-gated",
             Screen::Chat => "Live channel & encrypted DMs (NIP-44/59)",
-            Screen::DoorGames => "Agent control panels — human-in-the-loop governance",
-            Screen::CodeExchange => "Shared snippets & pod files",
-            Screen::SystemInfo => "Node / relay / pod / identity status",
+            Screen::Members => "Members — did:nostr WebID profiles",
+            Screen::Pod => "Your Solid pod — WebID-owned storage",
+            Screen::Code => "Shared snippets & pod files",
+            Screen::Network => "Relays & federation mesh peers",
+            Screen::Status => "Node / relay / pod / identity status",
             Screen::Settings => "Theme, identity & node settings",
             Screen::Help => "About the BBS, zones, agents & pods",
         }
@@ -117,14 +118,14 @@ impl Screen {
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
             Screen::MainMenu => &["menu", "main", "home"],
-            Screen::MessageBase => &["msg", "messages", "boards", "m"],
-            Screen::FileBase => &["files", "file", "pod", "f"],
-            Screen::NodeList => &["nodes", "relays", "n"],
-            Screen::UserList => &["users", "members", "who", "u"],
+            Screen::Agents => &["agents", "gov", "door", "doors", "admin", "d", "agent"],
+            Screen::Boards => &["msg", "messages", "boards", "m", "board"],
             Screen::Chat => &["chat", "dm", "c"],
-            Screen::DoorGames => &["doors", "door", "agents", "agent", "gov", "d"],
-            Screen::CodeExchange => &["code", "snippets", "x"],
-            Screen::SystemInfo => &["sys", "system", "info", "s"],
+            Screen::Members => &["users", "members", "who", "u", "member"],
+            Screen::Pod => &["files", "file", "pod", "f", "pods"],
+            Screen::Code => &["code", "snippets", "x", "snippet"],
+            Screen::Network => &["nodes", "relays", "net", "n", "node"],
+            Screen::Status => &["sys", "system", "info", "status", "s"],
             Screen::Settings => &["settings", "set", "config"],
             Screen::Help => &["help", "about", "?"],
         }
@@ -142,6 +143,8 @@ pub enum Command {
     Theme,
     /// Quit back to the host site.
     Quit,
+    /// Launch the UA 571-C sentry-gun door game (Easter egg, off the main path).
+    Sentry,
     /// Unrecognised command.
     Unknown,
 }
@@ -149,8 +152,8 @@ pub enum Command {
 /// Parse a command-line string (without the leading `/`).
 ///
 /// Accepts a bare menu number (`"3"`), a screen alias (`"files"`), or a control
-/// word (`"back"`, `"theme"`, `"quit"`). Leading/trailing whitespace and case
-/// are ignored.
+/// word (`"back"`, `"theme"`, `"quit"`, `"sentry"`). Leading/trailing whitespace
+/// and case are ignored.
 pub fn parse_command(raw: &str) -> Command {
     let cmd = raw.trim().to_ascii_lowercase();
     if cmd.is_empty() {
@@ -160,6 +163,7 @@ pub fn parse_command(raw: &str) -> Command {
         "back" | "b" | "esc" => return Command::Back,
         "theme" | "t" | "color" | "colour" => return Command::Theme,
         "quit" | "q" | "exit" | "logoff" | "bye" => return Command::Quit,
+        "sentry" | "game" => return Command::Sentry,
         _ => {}
     }
     if let Some(ch) = cmd.chars().next() {
@@ -194,7 +198,7 @@ mod tests {
 
     #[test]
     fn menu_keys_are_one_through_zero_and_round_trip() {
-        assert_eq!(Screen::MessageBase.menu_key(), Some('1'));
+        assert_eq!(Screen::Agents.menu_key(), Some('1'));
         assert_eq!(Screen::Help.menu_key(), Some('0'));
         assert_eq!(Screen::MainMenu.menu_key(), None);
         for s in Screen::menu_order() {
@@ -210,16 +214,16 @@ mod tests {
 
     #[test]
     fn parse_bare_number_navigates() {
-        assert_eq!(parse_command("1"), Command::Go(Screen::MessageBase));
-        assert_eq!(parse_command(" 6 "), Command::Go(Screen::DoorGames));
+        assert_eq!(parse_command("1"), Command::Go(Screen::Agents));
+        assert_eq!(parse_command(" 6 "), Command::Go(Screen::Code));
         assert_eq!(parse_command("0"), Command::Go(Screen::Help));
     }
 
     #[test]
     fn parse_alias_navigates_case_insensitively() {
-        assert_eq!(parse_command("FILES"), Command::Go(Screen::FileBase));
-        assert_eq!(parse_command("agents"), Command::Go(Screen::DoorGames));
-        assert_eq!(parse_command("relays"), Command::Go(Screen::NodeList));
+        assert_eq!(parse_command("FILES"), Command::Go(Screen::Pod));
+        assert_eq!(parse_command("agents"), Command::Go(Screen::Agents));
+        assert_eq!(parse_command("relays"), Command::Go(Screen::Network));
     }
 
     #[test]
@@ -227,6 +231,13 @@ mod tests {
         assert_eq!(parse_command("back"), Command::Back);
         assert_eq!(parse_command("theme"), Command::Theme);
         assert_eq!(parse_command("quit"), Command::Quit);
+    }
+
+    #[test]
+    fn parse_sentry_command() {
+        assert_eq!(parse_command("sentry"), Command::Sentry);
+        assert_eq!(parse_command("game"), Command::Sentry);
+        assert_eq!(parse_command("SENTRY"), Command::Sentry);
     }
 
     #[test]

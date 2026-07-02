@@ -1,8 +1,8 @@
 //! The ten BBS screens. Each maps to a real kit capability and reuses the kit's
 //! own types (`nostr_bbs_config::Zone`, `nostr_bbs_core::governance`,
 //! `nostr_bbs_core::did` / `solid_pod_rs::webid`) and live relay data
-//! ([`RelayStore`]). Message Base, User List, and Door Games stream from the
-//! relay; the pod browser surfaces the WebID/pod URLs.
+//! ([`RelayStore`]). Boards, Members, and Agents stream from the relay; the
+//! pod browser surfaces the WebID/pod URLs.
 
 use leptos::prelude::*;
 
@@ -23,14 +23,14 @@ pub fn ScreenView(state: BbsState) -> impl IntoView {
     let store = use_context::<RelayStore>().expect("relay");
     move || match state.screen.get() {
         Screen::MainMenu => view! { <MainMenu state=state /> }.into_any(),
-        Screen::MessageBase => message_base(state, store, cfg).into_any(),
-        Screen::FileBase => file_base(cfg).into_any(),
-        Screen::NodeList => node_list(cfg, store).into_any(),
-        Screen::UserList => user_list(store, cfg).into_any(),
+        Screen::Agents => agents(store).into_any(),
+        Screen::Boards => boards(state, store, cfg).into_any(),
         Screen::Chat => chat().into_any(),
-        Screen::DoorGames => door_games(store).into_any(),
-        Screen::CodeExchange => code_exchange().into_any(),
-        Screen::SystemInfo => system_info(cfg, store).into_any(),
+        Screen::Members => members(store, cfg).into_any(),
+        Screen::Pod => pod(cfg).into_any(),
+        Screen::Code => code().into_any(),
+        Screen::Network => network(cfg, store).into_any(),
+        Screen::Status => status(cfg, store).into_any(),
         Screen::Settings => settings(state, cfg).into_any(),
         Screen::Help => help().into_any(),
     }
@@ -78,10 +78,10 @@ fn profile_name(ev: &nostr_bbs_core::event::NostrEvent) -> String {
         .unwrap_or_else(|| relay::short_id(&ev.pubkey))
 }
 
-/// (1) Message Base — live boards (kind-40) → posts (kind-42), zone-gated.
-fn message_base(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
+/// (2) Boards — live boards (kind-40) → posts (kind-42), zone-gated.
+fn boards(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     view! {
-        {header(Screen::MessageBase)}
+        {header(Screen::Boards)}
         {move || match state.board.get() {
             None => board_list(state, store, cfg).into_any(),
             Some(id) => board_posts(store, id).into_any(),
@@ -214,8 +214,8 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
     }
 }
 
-/// (2) File Base — the live Solid pod browser (WebID-owned storage).
-fn file_base(cfg: StoredValue<BbsConfig>) -> impl IntoView {
+/// (5) Pod — the live Solid pod browser (WebID-owned storage).
+fn pod(cfg: StoredValue<BbsConfig>) -> impl IntoView {
     let id = viewer(cfg);
     let listing = RwSignal::new(PodState::Idle);
     // Pod base + viewer hex, used to build absolute URLs for image members so
@@ -247,7 +247,7 @@ fn file_base(cfg: StoredValue<BbsConfig>) -> impl IntoView {
     }
 
     view! {
-        {header(Screen::FileBase)}
+        {header(Screen::Pod)}
         {match id {
             Some(id) => view! {
                 <div class="bbs-panel">
@@ -295,8 +295,8 @@ fn file_base(cfg: StoredValue<BbsConfig>) -> impl IntoView {
     }
 }
 
-/// (3) Node List — relay (live status) + federation mesh.
-fn node_list(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
+/// (7) Network — relay (live status) + federation mesh.
+fn network(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
     let (relay_url, pod) = cfg.with_value(|c| (c.relay_url.clone(), c.pod_api.clone()));
     let relay_disp = if relay_url.is_empty() {
         "(not configured)".to_string()
@@ -309,7 +309,7 @@ fn node_list(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
         pod
     };
     view! {
-        {header(Screen::NodeList)}
+        {header(Screen::Network)}
         <div class="bbs-list">
             <div class="bbs-row">
                 <span class=move || if store.connected.get() { "accent" } else { "bbs-dim" }>
@@ -323,11 +323,11 @@ fn node_list(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
     }
 }
 
-/// (4) User List — members as did:nostr WebID profiles (live kind-0).
-fn user_list(store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
+/// (4) Members — did:nostr WebID profiles (live kind-0).
+fn members(store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     let me = viewer(cfg);
     view! {
-        {header(Screen::UserList)}
+        {header(Screen::Members)}
         {move || {
             let profiles = store.profiles.get();
             if profiles.is_empty() {
@@ -357,7 +357,7 @@ fn user_list(store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     }
 }
 
-/// (5) Chat — live channel + encrypted DMs.
+/// (3) Chat — live channel + encrypted DMs.
 fn chat() -> impl IntoView {
     view! {
         {header(Screen::Chat)}
@@ -391,11 +391,14 @@ fn panel_view(agent: String, p: PanelDefinition) -> impl IntoView {
     }
 }
 
-/// (6) Door Games — agent-governance control panels (live, else samples).
+/// (1) Agents — agent-governance control panels (live, else samples). This is
+/// the headline feature: approve, reject, act — human-in-the-loop.
 /// Launch the UA 571-C sentry-gun door game by dispatching the `bbs:sentry` DOM
 /// event handled by the overlay script in index.html. Pure client-side, no auth.
+/// Reached via the `/sentry` command or the door link on the Help screen — it
+/// is an Easter egg, not the headline of this screen.
 #[cfg(target_arch = "wasm32")]
-fn launch_sentry() {
+pub(crate) fn launch_sentry() {
     if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
         if let Ok(ev) = web_sys::CustomEvent::new("bbs:sentry") {
             let _ = doc.dispatch_event(&ev);
@@ -403,17 +406,11 @@ fn launch_sentry() {
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
-fn launch_sentry() {}
+pub(crate) fn launch_sentry() {}
 
-fn door_games(store: RelayStore) -> impl IntoView {
+fn agents(store: RelayStore) -> impl IntoView {
     view! {
-        {header(Screen::DoorGames)}
-        <div class="bbs-row">
-            <span class="bbs-link" on:click=move |_| launch_sentry()>
-                "  [ \u{25B6} PLAY ]  UA 571-C SENTRY GUN"
-            </span>
-            <span class="bbs-dim">"   \u{2014} Aliens (1986) remote sentry weapon system"</span>
-        </div>
+        {header(Screen::Agents)}
         <div class="bbs-panel bbs-dim">"  Registered agents publish interactive control panels; you sign decisions back."</div>
         {move || {
             let live: Vec<_> = store
@@ -442,16 +439,16 @@ fn door_games(store: RelayStore) -> impl IntoView {
     }
 }
 
-/// (7) Code Exchange — shared snippets / pod files.
-fn code_exchange() -> impl IntoView {
+/// (6) Code — shared snippets / pod files.
+fn code() -> impl IntoView {
     view! {
-        {header(Screen::CodeExchange)}
+        {header(Screen::Code)}
         <div class="bbs-panel bbs-dim">"  Shared code snippets and pod-hosted files. Posts are signed Nostr events;\n  attachments live in the author's Solid pod under /public."</div>
     }
 }
 
-/// (8) System Info — node / relay / pod / identity status (live counts).
-fn system_info(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
+/// (8) Status — node / relay / pod / identity status (live counts).
+fn status(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
     let (node, loc, relay_url, pod) = cfg.with_value(|c| {
         (
             c.node_name.clone(),
@@ -467,7 +464,7 @@ fn system_info(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView 
         .unwrap_or_else(|| "(not signed in)".into());
     let webid_line = id.map(|i| i.webid).unwrap_or_else(|| "—".into());
     view! {
-        {header(Screen::SystemInfo)}
+        {header(Screen::Status)}
         <div class="bbs-panel">
             "  node      : " {node} "\n"
             "  location  : " {loc} "\n"
@@ -502,20 +499,23 @@ fn settings(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     }
 }
 
-/// (10) Help — about the kit.
+/// (0) Help — about the kit.
 fn help() -> impl IntoView {
     view! {
         {header(Screen::Help)}
         <div class="bbs-panel">
             "  This is the retro terminal face of a Nostr + Solid community forum.\n\n"
-            "  • Boards (Message Base) are zone-gated channels with cohort-gated reads,\n"
-            "    enforced deny-by-default at the relay.\n"
-            "  • Files (File Base) are your own Solid pod — WebID-owned, WAC-controlled,\n"
-            "    git-clonable.\n"
-            "  • Door Games are agent control panels: software agents publish interactive\n"
-            "    panels and you sign human decisions back (the governance plane).\n"
+            "  • Agents are control panels: software agents publish interactive panels\n"
+            "    and you sign human decisions back — approve, reject, act.\n"
+            "  • Boards are zone-gated channels with cohort-gated reads, enforced\n"
+            "    deny-by-default at the relay.\n"
+            "  • Pod is your own Solid pod — WebID-owned, WAC-controlled, git-clonable.\n"
             "  • Identity is a did:nostr Multikey DID; your key never leaves the device.\n\n"
-            "  Keys: number to open a board · / for commands · ESC back · T theme · 0 help"
+            "  Keys: number to open a board · / for commands · ESC back · T theme · 0 help\n\n"
+            "  • A door stands ajar… "
+            <span class="bbs-link" on:click=move |_| launch_sentry()>
+                "[ \u{25B6} UA 571-C SENTRY ]"
+            </span>
         </div>
     }
 }
