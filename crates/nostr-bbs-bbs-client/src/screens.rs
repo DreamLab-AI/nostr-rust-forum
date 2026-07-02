@@ -177,8 +177,14 @@ fn board_list(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -
                                     role="option"
                                     attr:aria-selected=move || if state.selection.get() == i { "true" } else { "false" }
                                     on:click=move |_| {
+                                        // Mirror the keyboard Enter path: opening a
+                                        // board MUST also fire the kind-42 relay
+                                        // subscription, or a click-opened board shows
+                                        // a permanent blank (no posts ever arrive).
                                         state.selection.set(i);
-                                        state.open_board(chan_id.clone());
+                                        let id = chan_id.clone();
+                                        state.open_board(id.clone());
+                                        crate::relay::subscribe_board(&id);
                                     }
                                 >
                                     <span class="accent">"▓ "</span>
