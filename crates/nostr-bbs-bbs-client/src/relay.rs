@@ -111,6 +111,33 @@ pub fn post_root_channel(ev: &NostrEvent) -> Option<String> {
         .cloned()
 }
 
+/// Build the NIP-28 tags for a kind-42 channel message, matching how the forum
+/// client composes board posts and replies:
+/// - every message anchors to the channel root: `["e", channel_id, "", "root"]`;
+/// - a reply additionally references the parent post and its author:
+///   `["e", reply_id, "", "reply"]` and `["p", reply_author]`.
+pub fn channel_message_tags(
+    channel_id: &str,
+    reply_to: Option<(String, String)>,
+) -> Vec<Vec<String>> {
+    let mut tags = vec![vec![
+        "e".to_string(),
+        channel_id.to_string(),
+        String::new(),
+        "root".to_string(),
+    ]];
+    if let Some((reply_id, reply_author)) = reply_to {
+        tags.push(vec![
+            "e".to_string(),
+            reply_id,
+            String::new(),
+            "reply".to_string(),
+        ]);
+        tags.push(vec!["p".to_string(), reply_author]);
+    }
+    tags
+}
+
 /// Parse a governance event's content into a control-panel definition.
 pub fn parse_panel(ev: &NostrEvent) -> Option<nostr_bbs_core::governance::PanelDefinition> {
     serde_json::from_str(&ev.content).ok()
@@ -146,33 +173,248 @@ pub fn subscribe_board(channel_id: &str) {
     }
 }
 
+/// Callback invoked when the relay ACKs a publish with a NIP-01
+/// `["OK", id, accepted, message]` frame: `(accepted, message)`.
+pub type PublishAck = std::rc::Rc<dyn Fn(bool, String)>;
+
+/// Publish a signed event as a NIP-01 `["EVENT", event]` frame (fire-and-forget).
+pub fn publish(event: &NostrEvent) {
+    #[cfg(target_arch = "wasm32")]
+    wasm::publish(event);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = event;
+    }
+}
+
+/// Publish a signed event and invoke `on_ok` when the relay responds with `OK`.
+/// If the socket is not open the callback fires immediately with `(false, …)` so
+/// the caller never hangs waiting for an ack that cannot arrive.
+pub fn publish_with_ack(event: &NostrEvent, on_ok: Option<PublishAck>) {
+    #[cfg(target_arch = "wasm32")]
+    wasm::publish_with_ack(event, on_ok);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (event, on_ok);
+    }
+}
+
+/// Register the signer used to answer NIP-42 AUTH challenges. Called by
+/// [`crate::signer::BbsSigner`] whenever the active signer changes.
+pub fn set_signer(signer: std::rc::Rc<dyn nostr_bbs_core::signer::Signer>) {
+    #[cfg(target_arch = "wasm32")]
+    wasm::set_signer(signer);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = signer;
+    }
+}
+
+/// De-register the AUTH signer (called on sign-out).
+pub fn clear_signer() {
+    #[cfg(target_arch = "wasm32")]
+    wasm::clear_signer();
+}
+
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    use super::RelayStore;
+    use super::{PublishAck, RelayStore};
     use leptos::prelude::*;
+    use nostr_bbs_core::signer::Signer;
+    use nostr_bbs_core::{NostrEvent, UnsignedEvent};
     use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
 
     thread_local! {
         static WS: RefCell<Option<web_sys::WebSocket>> = const { RefCell::new(None) };
+        /// Signer used to answer NIP-42 AUTH challenges (from `BbsSigner`).
+        static SIGNER: RefCell<Option<Rc<dyn Signer>>> = const { RefCell::new(None) };
+        /// The current relay URL, embedded in the kind-22242 AUTH `relay` tag.
+        static RELAY_URL: RefCell<String> = const { RefCell::new(String::new()) };
+        /// Active REQ frames by sub id, so they can be replayed after AUTH (the
+        /// relay re-evaluates gated zones once the socket is authenticated) and
+        /// on reconnect.
+        static SUBS: RefCell<HashMap<String, serde_json::Value>> = RefCell::new(HashMap::new());
+        /// Publish acks awaiting the relay's `OK`, keyed by event id.
+        static PENDING: RefCell<HashMap<String, PublishAck>> = RefCell::new(HashMap::new());
+    }
+
+    /// Return the socket iff it is OPEN.
+    fn ws_open() -> Option<web_sys::WebSocket> {
+        WS.with(|c| {
+            c.borrow()
+                .as_ref()
+                .filter(|ws| ws.ready_state() == web_sys::WebSocket::OPEN)
+                .cloned()
+        })
+    }
+
+    /// Send a raw text frame if the socket is open (else drop).
+    fn send_str(text: &str) {
+        if let Some(ws) = ws_open() {
+            let _ = ws.send_with_str(text);
+        }
     }
 
     fn send(frame: &serde_json::Value) {
-        let text = frame.to_string();
-        WS.with(|c| {
-            if let Some(ws) = c.borrow().as_ref() {
-                if ws.ready_state() == web_sys::WebSocket::OPEN {
-                    let _ = ws.send_with_str(&text);
+        send_str(&frame.to_string());
+    }
+
+    /// Record a REQ (for replay) and send it.
+    fn send_req(sub_id: &str, filter: serde_json::Value) {
+        SUBS.with(|m| {
+            m.borrow_mut().insert(sub_id.to_string(), filter.clone());
+        });
+        send(&serde_json::json!(["REQ", sub_id, filter]));
+    }
+
+    /// Re-send every tracked REQ (post-AUTH re-evaluation / reconnect).
+    fn replay_subs() {
+        SUBS.with(|m| {
+            for (sub_id, filter) in m.borrow().iter() {
+                send(&serde_json::json!(["REQ", sub_id, filter]));
+            }
+        });
+    }
+
+    pub fn set_signer(signer: Rc<dyn Signer>) {
+        SIGNER.with(|s| *s.borrow_mut() = Some(signer));
+    }
+
+    pub fn clear_signer() {
+        SIGNER.with(|s| *s.borrow_mut() = None);
+    }
+
+    pub fn publish(event: &NostrEvent) {
+        if let Ok(msg) = serde_json::to_string(&serde_json::json!(["EVENT", event])) {
+            send_str(&msg);
+        }
+    }
+
+    pub fn publish_with_ack(event: &NostrEvent, on_ok: Option<PublishAck>) {
+        let msg = match serde_json::to_string(&serde_json::json!(["EVENT", event])) {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(cb) = on_ok {
+                    cb(false, format!("serialize error: {e}"));
+                }
+                return;
+            }
+        };
+        match ws_open() {
+            Some(ws) => {
+                if let Some(cb) = on_ok {
+                    PENDING.with(|m| m.borrow_mut().insert(event.id.clone(), cb));
+                }
+                let _ = ws.send_with_str(&msg);
+            }
+            None => {
+                if let Some(cb) = on_ok {
+                    cb(false, "not connected to relay".to_string());
+                }
+            }
+        }
+    }
+
+    /// Answer a NIP-42 AUTH challenge: build + sign a kind-22242 event, send the
+    /// `["AUTH", signed]` frame, then replay subscriptions so the relay serves
+    /// gated zones. Fails closed (logs, no-op) when no signer is registered.
+    fn handle_auth_challenge(challenge: String) {
+        let signer = match SIGNER.with(|s| s.borrow().clone()) {
+            Some(s) => s,
+            None => {
+                web_sys::console::warn_1(
+                    &"[bbs-relay] AUTH challenge received but no signer; gated reads stay closed"
+                        .into(),
+                );
+                return;
+            }
+        };
+        let relay_url = RELAY_URL.with(|u| u.borrow().clone());
+        let now = (js_sys::Date::now() / 1000.0) as u64;
+        let unsigned = UnsignedEvent {
+            pubkey: signer.public_key().to_string(),
+            created_at: now,
+            kind: 22242,
+            tags: vec![
+                vec!["relay".to_string(), relay_url],
+                vec!["challenge".to_string(), challenge],
+            ],
+            content: String::new(),
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            match signer.sign_event(unsigned).await {
+                Ok(signed) => {
+                    if let Ok(msg) = serde_json::to_string(&serde_json::json!(["AUTH", signed])) {
+                        send_str(&msg);
+                        web_sys::console::log_1(&"[bbs-relay] NIP-42 AUTH response sent".into());
+                    }
+                    // Replay subs so the relay re-evaluates them authenticated.
+                    replay_subs();
+                }
+                Err(e) => {
+                    web_sys::console::warn_1(
+                        &format!("[bbs-relay] AUTH signing failed: {e}").into(),
+                    );
                 }
             }
         });
+    }
+
+    /// Route one relay frame: verified EVENTs into buckets, OK acks to their
+    /// pending callback, AUTH challenges to the NIP-42 handler. EOSE / NOTICE
+    /// are ignored.
+    fn handle_frame(store: RelayStore, txt: &str) {
+        let val: serde_json::Value = match serde_json::from_str(txt) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let arr = match val.as_array() {
+            Some(a) if !a.is_empty() => a,
+            _ => return,
+        };
+        match arr[0].as_str() {
+            Some("EVENT") => {
+                if arr.len() >= 3 {
+                    if let Ok(ev) = serde_json::from_value::<NostrEvent>(arr[2].clone()) {
+                        if nostr_bbs_core::verify_event_strict(&ev).is_ok() {
+                            store.ingest(ev);
+                        }
+                    }
+                }
+            }
+            Some("OK") => {
+                if arr.len() >= 3 {
+                    let id = arr[1].as_str().unwrap_or_default().to_string();
+                    let accepted = arr[2].as_bool().unwrap_or(false);
+                    let message = arr
+                        .get(3)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let cb = PENDING.with(|m| m.borrow_mut().remove(&id));
+                    if let Some(cb) = cb {
+                        cb(accepted, message);
+                    }
+                }
+            }
+            Some("AUTH") => {
+                if let Some(challenge) = arr.get(1).and_then(|v| v.as_str()) {
+                    handle_auth_challenge(challenge.to_string());
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn connect(store: RelayStore, url: &str) {
         if url.is_empty() {
             return;
         }
+        RELAY_URL.with(|u| *u.borrow_mut() = url.to_string());
         let ws = match web_sys::WebSocket::new(url) {
             Ok(w) => w,
             Err(_) => return,
@@ -180,10 +422,24 @@ mod wasm {
 
         let onopen = Closure::<dyn FnMut()>::new(move || {
             store.connected.set(true);
-            // Standing subscriptions: profiles + channels, and agent panels.
+            // A fresh socket is not yet NIP-42 authenticated; a gated REQ triggers
+            // the relay's AUTH challenge, answered in `handle_auth_challenge`,
+            // which then replays these subs so gated zones re-evaluate.
+            // Register the standing subscriptions (idempotent) then (re)send all
+            // tracked subs — including a board sub opened before a reconnect.
             let gov: Vec<u64> = nostr_bbs_core::governance::GOVERNANCE_KIND_RANGE.collect();
-            send(&serde_json::json!(["REQ", "bbs-meta", { "kinds": [0, 40], "limit": 200 }]));
-            send(&serde_json::json!(["REQ", "bbs-gov", { "kinds": gov, "limit": 100 }]));
+            SUBS.with(|m| {
+                let mut b = m.borrow_mut();
+                b.insert(
+                    "bbs-meta".to_string(),
+                    serde_json::json!({ "kinds": [0, 40], "limit": 200 }),
+                );
+                b.insert(
+                    "bbs-gov".to_string(),
+                    serde_json::json!({ "kinds": gov, "limit": 100 }),
+                );
+            });
+            replay_subs();
         });
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
@@ -191,11 +447,7 @@ mod wasm {
         let onmessage =
             Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
                 if let Some(txt) = e.data().as_string() {
-                    if let Some(ev) = super::parse_event_frame(&txt) {
-                        if nostr_bbs_core::verify_event_strict(&ev).is_ok() {
-                            store.ingest(ev);
-                        }
-                    }
+                    handle_frame(store, &txt);
                 }
             });
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
@@ -211,12 +463,14 @@ mod wasm {
     }
 
     pub fn subscribe_board(channel_id: &str) {
+        SUBS.with(|m| {
+            m.borrow_mut().remove("bbs-board");
+        });
         send(&serde_json::json!(["CLOSE", "bbs-board"]));
-        send(&serde_json::json!([
-            "REQ",
+        send_req(
             "bbs-board",
-            { "kinds": [42], "#e": [channel_id], "limit": 100 }
-        ]));
+            serde_json::json!({ "kinds": [42], "#e": [channel_id], "limit": 100 }),
+        );
     }
 }
 
@@ -280,6 +534,28 @@ mod tests {
         assert_eq!(channel_zone(&chan).as_deref(), Some("friends"));
         let post = ev("p", 42, 1, "hi", vec![vec!["e", "c"]]);
         assert_eq!(post_root_channel(&post).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn channel_message_tags_top_level_anchors_to_root() {
+        let tags = channel_message_tags("chan-id", None);
+        assert_eq!(tags, vec![vec!["e", "chan-id", "", "root"]]);
+    }
+
+    #[test]
+    fn channel_message_tags_reply_adds_parent_and_author() {
+        let tags = channel_message_tags(
+            "chan-id",
+            Some(("parent-id".to_string(), "author-pk".to_string())),
+        );
+        assert_eq!(
+            tags,
+            vec![
+                vec!["e", "chan-id", "", "root"],
+                vec!["e", "parent-id", "", "reply"],
+                vec!["p", "author-pk"],
+            ]
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod menu;
 pub mod pod;
 pub mod relay;
 pub mod screens;
+pub mod signer;
 pub mod theme;
 
 mod app;

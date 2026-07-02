@@ -27,9 +27,17 @@ pub fn App() -> impl IntoView {
     };
     let store = RelayStore::new();
 
+    // Write-path signer. Adopt the forum client's same-origin session key if the
+    // viewer already signed in at `/community/` with a local key; otherwise the
+    // signer stays empty (write actions disabled) until a BBS sign-in. Adopting
+    // registers the signer with the relay so NIP-42 AUTH challenges are answered.
+    let signer = crate::signer::BbsSigner::new();
+    signer.adopt_forum_session();
+
     let cfg_stored = StoredValue::new(cfg);
     provide_context(cfg_stored);
     provide_context(store);
+    provide_context(signer);
 
     // Open the relay connection once, after mount.
     Effect::new(move |_| {

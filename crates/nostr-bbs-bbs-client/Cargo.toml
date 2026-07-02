@@ -41,6 +41,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 web-sys = { workspace = true, features = [
     "Window",
+    "console",
     "Document",
     "Element",
     "HtmlElement",
@@ -63,3 +64,11 @@ web-sys = { workspace = true, features = [
     "Storage",
 ] }
 console_error_panic_hook = "0.1"
+# Write path: reuse the kit's audited signer (PrfSigner) + key parsing. `hex`
+# decodes the forum's persisted secret and generated keys; `zeroize` scrubs the
+# transient key buffers; `send_wrapper` carries the non-Send `Rc<dyn Signer>`
+# through Leptos context on the single-threaded wasm main thread (same pattern as
+# the forum client's AuthStore).
+hex = { workspace = true }
+zeroize = { workspace = true }
+send_wrapper = "0.6"
