@@ -39,7 +39,7 @@ use crate::stores::channels::ChannelStore;
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zones::{load_zones, section_to_zone};
 use crate::utils::slug_hash::section_slug;
-use crate::utils::zone_theme::zone_accent_style;
+use crate::utils::zone_theme::zone_accent_style_cfg;
 use crate::utils::{arrow_left_svg, set_timeout_once};
 
 /// Parsed channel metadata from the kind 40 event.
@@ -132,7 +132,11 @@ pub fn ChannelPage() -> impl IntoView {
             let zone = resolved_zone
                 .or_else(|| section_to_zone(&raw, &zones))
                 .unwrap_or_default();
-            zone_accent_style(&zone)
+            let accent = zones
+                .iter()
+                .find(|z| z.id == zone)
+                .and_then(|z| z.accent_hex.clone());
+            zone_accent_style_cfg(&zone, accent.as_deref())
         })
     };
 

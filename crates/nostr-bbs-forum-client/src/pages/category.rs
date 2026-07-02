@@ -40,7 +40,7 @@ use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::utils::capitalize;
-use crate::utils::zone_theme::zone_accent_style;
+use crate::utils::zone_theme::zone_accent_style_cfg;
 use wasm_bindgen_futures::spawn_local;
 
 /// The sections (kind-40 channels) belonging to `category_slug`, resolved from
@@ -200,13 +200,18 @@ pub fn CategoryPage() -> impl IntoView {
         // see the PR follow-up note for carrying the accent into thread.rs.
         <div
             class="max-w-5xl mx-auto p-4 sm:p-6"
-            style=move || zone_accent_style(&category_slug())
+            style=move || {
+                let slug = category_slug();
+                let accent = load_zones().into_iter().find(|z| z.id == slug).and_then(|z| z.accent_hex);
+                zone_accent_style_cfg(&slug, accent.as_deref())
+            }
         >
             // Zone hero banner
             {move || {
                 let slug = category_slug();
                 let zone = load_zones().into_iter().find(|z| z.id == slug);
                 let banner = zone.as_ref().and_then(|z| z.banner_image_url.clone()).unwrap_or_default();
+                let accent = zone.as_ref().and_then(|z| z.accent_hex.clone());
                 let label = zone.map(|z| z.label());
                 view! {
                     <ZoneHero
@@ -216,6 +221,7 @@ pub fn CategoryPage() -> impl IntoView {
                         icon=zone_icon()
                         banner_url=banner
                         zone_label=label.unwrap_or_default()
+                        accent_hex=accent.unwrap_or_default()
                     />
                 }
             }}

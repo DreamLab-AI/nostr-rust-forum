@@ -29,7 +29,8 @@
 //!     "write_cohorts": ["friends"],
 //!     "banner_image_url": "/images/heroes/public-hero.webp",
 //!     "visibility": "public",
-//!     "encrypted": false
+//!     "encrypted": false,
+//!     "accent_hex": "#22c55e"
 //!   },
 //!   { "id": "friends",  "display_name": "Friends",  "required_cohorts": ["friends"],
 //!     "banner_image_url": "/images/heroes/friends-hero.webp",     "visibility": "locked" },
@@ -39,6 +40,11 @@
 //!     "banner_image_url": "/images/heroes/business-hero.webp",    "visibility": "locked" }
 //! ]
 //! ```
+//!
+//! `accent_hex` (issue #34) is optional per-zone; when present it overrides
+//! the built-in colour for that zone via
+//! [`crate::utils::zone_theme::zone_accent_style_cfg`]. Omitted zones keep the
+//! built-in [`crate::utils::zone_theme::zone_theme`] default.
 //!
 //! `ZONE_CONFIG` may also be supplied already-parsed (a JS array) rather than a
 //! string; both are accepted.
@@ -85,6 +91,12 @@ pub struct Zone {
     #[serde(default)]
     #[allow(dead_code)]
     pub encrypted: bool,
+    /// Operator-configured accent colour override (issue #34), e.g. `"#22c55e"`.
+    /// Validated upstream as a CSS hex colour by `nostr_bbs_config::validate`.
+    /// When absent, rendering falls back to the built-in
+    /// [`crate::utils::zone_theme::zone_theme`] palette for this zone id.
+    #[serde(default)]
+    pub accent_hex: Option<String>,
 }
 
 impl Zone {
@@ -229,6 +241,7 @@ fn fallback_zones() -> Vec<Zone> {
             banner_image_url: Some("/images/heroes/members-hero.webp".to_string()),
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            accent_hex: None,
         },
         Zone {
             id: "members".to_string(),
@@ -238,6 +251,7 @@ fn fallback_zones() -> Vec<Zone> {
             banner_image_url: Some("/images/heroes/ai-commander-week.webp".to_string()),
             visibility: ZoneVisibility::Locked,
             encrypted: false,
+            accent_hex: None,
         },
         Zone {
             id: "private".to_string(),
@@ -247,6 +261,7 @@ fn fallback_zones() -> Vec<Zone> {
             banner_image_url: Some("/images/heroes/corporate-immersive.webp".to_string()),
             visibility: ZoneVisibility::Locked,
             encrypted: false,
+            accent_hex: None,
         },
     ]
 }
@@ -264,6 +279,7 @@ mod tests {
             banner_image_url: None,
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            accent_hex: None,
         }
     }
 
@@ -332,5 +348,21 @@ mod tests {
         let zones = sample_zones();
         assert!(section_routes_to_zone("family-events", "", &zones));
         assert!(section_routes_to_zone("anything", "", &zones));
+    }
+
+    #[test]
+    fn accent_hex_deserializes_when_present() {
+        // r##"…"##: the inner `"accent_hex":"#…"` contains `"#`, which would
+        // otherwise close an r#"…"# raw string early.
+        let json = r##"[{"id":"public","display_name":"Landing","accent_hex":"#22c55e"}]"##;
+        let zones: Vec<Zone> = serde_json::from_str(json).unwrap();
+        assert_eq!(zones[0].accent_hex.as_deref(), Some("#22c55e"));
+    }
+
+    #[test]
+    fn accent_hex_defaults_to_none_when_absent() {
+        let json = r#"[{"id":"friends","display_name":"Friends"}]"#;
+        let zones: Vec<Zone> = serde_json::from_str(json).unwrap();
+        assert_eq!(zones[0].accent_hex, None);
     }
 }

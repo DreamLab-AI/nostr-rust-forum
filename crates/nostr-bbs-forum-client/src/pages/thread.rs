@@ -46,7 +46,7 @@ use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_routes_to_zone, Zone, ZoneVisibility};
 use crate::utils::format_relative_time;
 use crate::utils::slug_hash::{matches_section_slug, matches_topic_slug, section_slug};
-use crate::utils::zone_theme::zone_accent_style;
+use crate::utils::zone_theme::zone_accent_style_cfg;
 
 use super::section::{category_display_name, resolve_channel};
 
@@ -620,7 +620,11 @@ pub fn ThreadPage() -> impl IntoView {
         // zone id, so expose its signature colour as `--zone-accent` on the root
         // (mirrors category.rs). The accent elements below read it via
         // `var(--zone-accent)`.
-        <div class="max-w-4xl mx-auto p-4 sm:p-6" style=move || zone_accent_style(&category_slug())>
+        <div class="max-w-4xl mx-auto p-4 sm:p-6" style=move || {
+            let slug = category_slug();
+            let accent = load_zones().into_iter().find(|z| z.id == slug).and_then(|z| z.accent_hex);
+            zone_accent_style_cfg(&slug, accent.as_deref())
+        }>
             <Breadcrumb items=vec![
                 BreadcrumbItem::link("Home", "/"),
                 BreadcrumbItem::link("Forums", "/forums"),

@@ -5,7 +5,7 @@
 
 use leptos::prelude::*;
 
-use crate::utils::zone_theme::{zone_accent_style, zone_theme};
+use crate::utils::zone_theme::{zone_accent_style_cfg, zone_theme};
 
 /// Visual hero header for different forum zones.
 ///
@@ -35,11 +35,16 @@ pub fn ZoneHero(
     /// absent so the chip never shows a raw slug.
     #[prop(optional)]
     zone_label: Option<String>,
+    /// Optional operator-configured accent hex for this zone (issue #34),
+    /// e.g. `Some("#22c55e")` from the resolved config `Zone::accent_hex`.
+    /// Preferred over the built-in [`zone_theme`] accent when present.
+    #[prop(optional)]
+    accent_hex: Option<String>,
 ) -> impl IntoView {
     let theme = zone_theme(&zone_id);
     let gradient = theme.gradient;
     let border_color = theme.border;
-    let accent_style = zone_accent_style(&zone_id);
+    let accent_style = zone_accent_style_cfg(&zone_id, accent_hex.as_deref());
 
     // The pill label: explicit operator display name, else humanise the id.
     let zone_label = zone_label
