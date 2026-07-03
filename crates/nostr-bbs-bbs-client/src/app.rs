@@ -45,7 +45,7 @@ pub fn App() -> impl IntoView {
     });
 
     #[cfg(target_arch = "wasm32")]
-    crate::chrome::install_key_handler(state, store);
+    crate::chrome::install_key_handler(state, store, cfg_stored);
 
     view! {
         <div class=move || format!("bbs-crt {}", state.theme.get().css_class())>

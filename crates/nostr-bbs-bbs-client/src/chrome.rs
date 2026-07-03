@@ -222,7 +222,7 @@ fn nav_len(state: &BbsState, store: &RelayStore) -> usize {
 /// Install a window-level keydown handler implementing the BBS keyboard model.
 /// Leaks the closure for the app lifetime (a single global listener).
 #[cfg(target_arch = "wasm32")]
-pub fn install_key_handler(state: BbsState, store: RelayStore) {
+pub fn install_key_handler(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) {
     use crate::menu::wrap_index;
     use wasm_bindgen::prelude::*;
     let handler =
@@ -259,8 +259,13 @@ pub fn install_key_handler(state: BbsState, store: RelayStore) {
                 "Enter" => match state.screen.get() {
                     Screen::MainMenu => state.activate_menu(),
                     Screen::Boards if state.board.get().is_none() => {
-                        let chans = store.channels.get();
-                        if let Some(c) = chans.get(state.selection.get()) {
+                        // Open the board at the selection index in the SAME
+                        // zone-grouped order the Boards screen renders.
+                        let zone_ids: Vec<String> =
+                            cfg.with_value(|c| c.zones.iter().map(|z| z.id.clone()).collect());
+                        let ordered =
+                            crate::relay::flat_zone_order(store.channels.get(), &zone_ids);
+                        if let Some(c) = ordered.get(state.selection.get()) {
                             let id = c.id.clone();
                             state.open_board(id.clone());
                             crate::relay::subscribe_board(&id);

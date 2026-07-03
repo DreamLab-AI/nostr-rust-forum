@@ -80,16 +80,6 @@ fn viewer(cfg: StoredValue<BbsConfig>) -> Option<Identity> {
     })
 }
 
-/// Look up a zone's accent colour by id (for board tinting).
-fn zone_accent(cfg: StoredValue<BbsConfig>, zone: &str) -> Option<String> {
-    cfg.with_value(|c| {
-        c.zones
-            .iter()
-            .find(|z| z.id == zone)
-            .and_then(|z| z.accent_hex.clone())
-    })
-}
-
 /// Profile display name from a kind-0 metadata event.
 fn profile_name(ev: &nostr_bbs_core::event::NostrEvent) -> String {
     serde_json::from_str::<serde_json::Value>(&ev.content)
@@ -115,91 +105,136 @@ fn boards(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> im
     }
 }
 
-/// Configured zones' banner images rendered as on-theme ASCII "section heroes"
-/// at the top of the Message Base, each tinted to its zone accent.
-fn section_heroes(cfg: StoredValue<BbsConfig>) -> impl IntoView {
-    let zones = cfg.with_value(|c| c.zones.clone());
+/// One zone's on-theme ASCII "section hero": an accent-tinted chip label and,
+/// when the zone has a banner image, its ASCII render. Rendered inline above the
+/// zone's own boards in the Boards list (see [`board_list`]).
+fn zone_hero(z: &nostr_bbs_config::schema::Zone) -> impl IntoView {
+    let url = z.banner_image_url.clone().filter(|u| !u.trim().is_empty());
+    let accent = z.accent_hex.clone().unwrap_or_default();
+    let style = if accent.is_empty() {
+        String::new()
+    } else {
+        format!("--accent:{accent}")
+    };
+    let label = format!("\u{259E} {} \u{259A}", z.display_name);
     view! {
-        {zones
-            .into_iter()
-            .filter_map(|z| {
-                let url = z.banner_image_url.clone().filter(|u| !u.trim().is_empty())?;
-                let accent = z.accent_hex.clone().unwrap_or_default();
-                let style = if accent.is_empty() {
-                    String::new()
-                } else {
-                    format!("--accent:{accent}")
-                };
-                Some(view! {
-                    <div class="bbs-section-hero" style=style>
-                        <div class="label">{format!("\u{259E} {} \u{259A}", z.display_name)}</div>
-                        <AsciiImg src=url cols=84 />
-                    </div>
-                })
-            })
-            .collect_view()}
+        <div class="bbs-section-hero" style=style>
+            <div class="label">{label}</div>
+            {url.map(|u| view! { <AsciiImg src=u cols=84 /> })}
+        </div>
     }
 }
 
-fn board_list(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
+/// One board row. `i` is the position in the zone-ordered channel list — the same
+/// index the keyboard selection / ENTER use (see [`relay::flat_zone_order`]), so
+/// click-open and arrow-nav stay consistent with the grouped visual order.
+fn board_row(
+    state: BbsState,
+    i: usize,
+    ev: nostr_bbs_core::event::NostrEvent,
+    zones: &[nostr_bbs_config::schema::Zone],
+    zone_ids: &[String],
+) -> impl IntoView {
+    let name = relay::channel_name(&ev);
+    let zone = relay::channel_zone(&ev).unwrap_or_default();
+    // Tint the row to its configured zone's accent (matched by zone index, so a
+    // section slug like "public-support" resolves to the "public" zone colour).
+    let accent = relay::channel_zone_index(&ev, zone_ids)
+        .and_then(|idx| zones.get(idx))
+        .and_then(|z| z.accent_hex.clone())
+        .unwrap_or_default();
+    let style = if accent.is_empty() {
+        String::new()
+    } else {
+        format!("--accent:{accent}")
+    };
+    let chan_id = ev.id.clone();
     view! {
-        {section_heroes(cfg)}
-        {move || {
-            let chans = store.channels.get();
-            if chans.is_empty() {
-                return view! {
-                    <div class="bbs-panel bbs-dim">
-                        "  No boards yet. Channels (kind-40) appear here as they arrive from the\n  relay; each is a zone-gated board. Define [[zones]] in forum.toml to theme them."
-                    </div>
-                }.into_any();
+        <div
+            class="bbs-row"
+            class:selected=move || state.selection.get() == i
+            style=style
+            role="option"
+            attr:aria-selected=move || if state.selection.get() == i { "true" } else { "false" }
+            on:click=move |_| {
+                // Mirror the keyboard Enter path: opening a board MUST also fire
+                // the kind-42 relay subscription, or a click-opened board shows a
+                // permanent blank (no posts ever arrive).
+                state.selection.set(i);
+                let id = chan_id.clone();
+                state.open_board(id.clone());
+                crate::relay::subscribe_board(&id);
             }
-            view! {
-                <div class="bbs-list">
-                    {chans
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, ev)| {
-                            let name = relay::channel_name(&ev);
-                            let zone = relay::channel_zone(&ev).unwrap_or_default();
-                            let accent = zone_accent(cfg, &zone).unwrap_or_default();
-                            let style = if accent.is_empty() {
-                                String::new()
-                            } else {
-                                format!("--accent:{accent}")
-                            };
-                            let selected = move || state.selection.get() == i;
-                            let chan_id = ev.id.clone();
-                            view! {
-                                <div
-                                    class="bbs-row"
-                                    class:selected=selected
-                                    style=style
-                                    role="option"
-                                    attr:aria-selected=move || if state.selection.get() == i { "true" } else { "false" }
-                                    on:click=move |_| {
-                                        // Mirror the keyboard Enter path: opening a
-                                        // board MUST also fire the kind-42 relay
-                                        // subscription, or a click-opened board shows
-                                        // a permanent blank (no posts ever arrive).
-                                        state.selection.set(i);
-                                        let id = chan_id.clone();
-                                        state.open_board(id.clone());
-                                        crate::relay::subscribe_board(&id);
-                                    }
-                                >
-                                    <span class="accent">"▓ "</span>
-                                    {format!("{name:<24}")}
-                                    <span class="bbs-dim">
-                                        {if zone.is_empty() { String::new() } else { format!(" @{zone}") }}
-                                    </span>
-                                </div>
-                            }
-                        })
-                        .collect_view()}
+        >
+            <span class="accent">"▓ "</span>
+            {format!("{name:<24}")}
+            <span class="bbs-dim">
+                {if zone.is_empty() { String::new() } else { format!(" @{zone}") }}
+            </span>
+        </div>
+    }
+}
+
+/// Boards list — interleaves each zone's hero with that zone's own boards (its
+/// sub-section menu), grouped by zone in config order, then any boards that match
+/// no configured zone under an "Other" divider. The channel order + selection
+/// index come from [`relay::flat_zone_order`], the same order the keyboard
+/// ENTER/arrows use, so grouped visuals stay consistent with navigation.
+fn board_list(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
+    move || {
+        let zones = cfg.with_value(|c| c.zones.clone());
+        let zone_ids: Vec<String> = zones.iter().map(|z| z.id.clone()).collect();
+        let ordered = relay::flat_zone_order(store.channels.get(), &zone_ids);
+        if ordered.is_empty() {
+            return view! {
+                <div class="bbs-panel bbs-dim">
+                    "  No boards yet. Channels (kind-40) appear here as they arrive from the\n  relay; each is a zone-gated board. Define [[zones]] in forum.toml to theme them."
                 </div>
-                <div class="bbs-panel bbs-dim">"  ↑↓ select · ENTER open board · reads are deny-by-default at the relay"</div>
-            }.into_any()
-        }}
+            }
+            .into_any();
+        }
+        // Group consecutive zone-ordered channels by zone, keeping each board's
+        // global index (for selection / ENTER). `None` zone = the "Other" group.
+        type BoardGroup = (
+            Option<usize>,
+            Vec<(usize, nostr_bbs_core::event::NostrEvent)>,
+        );
+        let mut groups: Vec<BoardGroup> = Vec::new();
+        for (i, ev) in ordered.into_iter().enumerate() {
+            let zi = relay::channel_zone_index(&ev, &zone_ids);
+            match groups.last_mut() {
+                Some((gzi, rows)) if *gzi == zi => rows.push((i, ev)),
+                _ => groups.push((zi, vec![(i, ev)])),
+            }
+        }
+        let rendered = groups
+            .into_iter()
+            .map(|(zi, rows)| {
+                let hero = match zi.and_then(|idx| zones.get(idx)) {
+                    Some(z) => zone_hero(z).into_any(),
+                    None => view! {
+                        <div class="bbs-section-hero"><div class="label">"\u{259E} Other \u{259A}"</div></div>
+                    }
+                    .into_any(),
+                };
+                let zones_ref = zones.clone();
+                let ids_ref = zone_ids.clone();
+                let list = view! {
+                    <div class="bbs-list">
+                        {rows
+                            .into_iter()
+                            .map(move |(i, ev)| board_row(state, i, ev, &zones_ref, &ids_ref))
+                            .collect_view()}
+                    </div>
+                };
+                view! { {hero} {list} }.into_any()
+            })
+            .collect::<Vec<_>>();
+        view! {
+            {rendered}
+            <div class="bbs-panel bbs-dim">"  ↑↓ select · ENTER open board · reads are deny-by-default at the relay"</div>
+        }
+        .into_any()
     }
 }
 

@@ -111,6 +111,33 @@ pub fn post_root_channel(ev: &NostrEvent) -> Option<String> {
         .cloned()
 }
 
+/// The 0-based index of the configured zone a channel belongs to — matched by
+/// its zone/section tag ([`channel_zone`]) being exactly `zone_ids[i]` or
+/// starting with `"{zone_ids[i]}-"` (boards are named e.g. `public-support`
+/// under the `public` zone). `None` when it matches no configured zone.
+pub fn channel_zone_index(ev: &NostrEvent, zone_ids: &[String]) -> Option<usize> {
+    let z = channel_zone(ev)?;
+    zone_ids.iter().position(|id| {
+        z == *id
+            || z.strip_prefix(id.as_str())
+                .is_some_and(|r| r.starts_with('-'))
+    })
+}
+
+/// Channels reordered so they group by configured-zone order (zone 0's boards,
+/// then zone 1's, …, then any that match no zone), preserving the incoming order
+/// within each group. This is the canonical order the Boards screen renders AND
+/// the order the keyboard selection / ENTER indexes into, so the zone grouping
+/// stays consistent with arrow-key navigation.
+pub fn flat_zone_order(channels: Vec<NostrEvent>, zone_ids: &[String]) -> Vec<NostrEvent> {
+    let mut indexed: Vec<(usize, NostrEvent)> = channels
+        .into_iter()
+        .map(|ev| (channel_zone_index(&ev, zone_ids).unwrap_or(usize::MAX), ev))
+        .collect();
+    indexed.sort_by_key(|(zi, _)| *zi); // stable sort preserves within-group order
+    indexed.into_iter().map(|(_, ev)| ev).collect()
+}
+
 /// Build the NIP-28 tags for a kind-42 channel message, matching how the forum
 /// client composes board posts and replies:
 /// - every message anchors to the channel root: `["e", channel_id, "", "root"]`;
@@ -610,6 +637,41 @@ mod tests {
         assert_eq!(channel_zone(&chan).as_deref(), Some("friends"));
         let post = ev("p", 42, 1, "hi", vec![vec!["e", "c"]]);
         assert_eq!(post_root_channel(&post).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn zone_index_matches_exact_and_prefixed() {
+        let ids = vec![
+            "public".to_string(),
+            "minimoonoir".to_string(),
+            "business".to_string(),
+        ];
+        let z = |zone: &str| ev("c", 40, 1, "{}", vec![vec!["zone", zone]]);
+        assert_eq!(channel_zone_index(&z("public"), &ids), Some(0));
+        assert_eq!(channel_zone_index(&z("public-support"), &ids), Some(0));
+        assert_eq!(channel_zone_index(&z("minimoonoir-photos"), &ids), Some(1));
+        assert_eq!(channel_zone_index(&z("business-projects"), &ids), Some(2));
+        assert_eq!(channel_zone_index(&z("family-chat"), &ids), None); // not configured
+        assert_eq!(channel_zone_index(&z("publicfoo"), &ids), None); // prefix, not "public-"
+    }
+
+    #[test]
+    fn flat_order_groups_by_zone_preserving_within_group() {
+        let ids = vec!["public".to_string(), "business".to_string()];
+        let z = |id: &str, zone: &str| ev(id, 40, 1, "{}", vec![vec!["zone", zone]]);
+        let chans = vec![
+            z("b1", "business-x"),
+            z("p1", "public-a"),
+            z("x1", "elsewhere"),
+            z("p2", "public-b"),
+            z("b2", "business-y"),
+        ];
+        let order: Vec<String> = flat_zone_order(chans, &ids)
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        // public group (original order p1,p2), then business (b1,b2), then unmatched (x1)
+        assert_eq!(order, vec!["p1", "p2", "b1", "b2", "x1"]);
     }
 
     #[test]
