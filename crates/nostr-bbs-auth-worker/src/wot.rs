@@ -429,13 +429,31 @@ pub async fn handle_override(
 /// - `Ok(false)` — WoT enabled AND pubkey is not trusted.
 /// - `Err(..)`   — transient DB failure; caller should treat as 500.
 pub async fn is_allowed_by_wot(pubkey: &str, env: &Env) -> Result<bool> {
-    let settings = load_settings(env).await;
+    // A transient D1 failure while reading EITHER the policy row or the entries
+    // table must surface as `Err` (caller -> 503), never a silent decision. The
+    // shared `load_settings` helper collapses a query error into `Ok(None)` via
+    // `.ok().flatten()`, which is correct for the admin status/refresh handlers
+    // (they render defaults) but WRONG on the registration gate: a settings-read
+    // blip on a `wot_enabled = 1` instance would be read as "unconfigured" and
+    // short-circuit to `Ok(true)`, silently DISABLING the gate (fail-open
+    // bypass). Read the policy row directly here and propagate its error so the
+    // gate fails closed to 503, mirroring the entries lookup below.
+    let db = env.d1("DB")?;
+    let settings = db
+        .prepare(
+            "SELECT wot_enabled, wot_referente_pubkey, wot_last_fetched_at, wot_follow_count \
+             FROM instance_settings WHERE id = 1",
+        )
+        .first::<SettingsRow>(None)
+        .await?;
+
+    // `Ok(None)` from a healthy DB means no policy row -> WoT unconfigured ->
+    // open registration (the documented default for a fresh instance).
     let enabled = matches!(settings, Some(ref s) if s.wot_enabled == 1);
     if !enabled {
         return Ok(true);
     }
 
-    let db = env.d1("DB")?;
     // Propagate a transient D1 error as Err (caller maps it to 503) rather than
     // swallowing it into Ok(None) -> deny. A DB blip must not silently deny a
     // legitimately-trusted pubkey during registration; the documented contract
