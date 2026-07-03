@@ -9,6 +9,18 @@
 //! - **DID:nostr** document generation (delegates to `solid_pod_rs::did_nostr_types`)
 //! - **Key management** including HKDF derivation from WebAuthn PRF output
 //! - **Value types** (`EventId`, `Timestamp`, `Tag`, etc.)
+//!
+//! ## DID:nostr conformance (closeout, 1.0.0-beta.4)
+//!
+//! The did-doc conformance fixture (`tests/fixtures/did-doc-conformance.json`)
+//! and its `did_doc_load_and_validate` reference-vector gate were
+//! re-canonicalised to the ADR-125 Multikey form, matching the upstream
+//! `solid-pod-rs` CID v1.0 migration: the superseded 2019-suite /
+//! `publicKeyHex` vectors are dropped, the fixture is byte-identical to the
+//! canonical upstream document, and the minimum-vector gate is aligned to 7.
+//! The rendered documents themselves are produced by `solid_pod_rs`
+//! (`render_did_document_tier1` / `tier3`); this crate only adds the
+//! forum-side Tier-1/Tier-3 conveniences and the conformance wiring.
 
 pub mod calendar;
 pub mod deletion;
