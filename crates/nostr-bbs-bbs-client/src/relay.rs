@@ -152,6 +152,45 @@ pub fn short_id(id: &str) -> String {
     }
 }
 
+/// A NIP-42 AUTH challenge deferred until a signer exists.
+///
+/// The relay issues its AUTH challenge exactly once, at connect — which is
+/// before a user pastes a key in Settings sign-in (`login_with_key`/`generate`
+/// → [`set_signer`]). Discarding the challenge would leave the socket
+/// unauthenticated for the whole session, so gated-zone reads never load. We
+/// stash the unanswered challenge here and consume it when the signer arrives.
+///
+/// Pure logic (no wasm/WebSocket dependency) so it is unit-testable on native;
+/// the wasm client keeps one instance in a `thread_local`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PendingAuth {
+    challenge: Option<String>,
+}
+
+impl PendingAuth {
+    /// Empty — no challenge waiting. `const` so it can init a `thread_local`.
+    pub const fn new() -> Self {
+        PendingAuth { challenge: None }
+    }
+
+    /// Record a challenge that arrived with no signer to answer it. Keeps only
+    /// the newest — the relay honours the latest challenge it issued.
+    pub fn stash(&mut self, challenge: String) {
+        self.challenge = Some(challenge);
+    }
+
+    /// Take the stashed challenge, if any, clearing it so it is answered exactly
+    /// once. Returns `None` when nothing is pending.
+    pub fn take(&mut self) -> Option<String> {
+        self.challenge.take()
+    }
+
+    /// Whether a challenge is waiting to be answered.
+    pub fn is_pending(&self) -> bool {
+        self.challenge.is_some()
+    }
+}
+
 /// Connect to the relay and start the standing subscriptions. No-op on native /
 /// when the URL is empty.
 pub fn connect(store: RelayStore, url: &str) {
@@ -208,7 +247,10 @@ pub fn publish_with_ack(event: &NostrEvent, on_ok: Option<PublishAck>) {
 }
 
 /// Register the signer used to answer NIP-42 AUTH challenges. Called by
-/// [`crate::signer::BbsSigner`] whenever the active signer changes.
+/// [`crate::signer::BbsSigner`] whenever the active signer changes. If the relay
+/// already issued its one-shot AUTH challenge before this signer existed (the
+/// paste-login path), that stashed challenge is answered immediately and the
+/// subscriptions are replayed so gated zones re-evaluate authenticated.
 pub fn set_signer(signer: std::rc::Rc<dyn nostr_bbs_core::signer::Signer>) {
     #[cfg(target_arch = "wasm32")]
     wasm::set_signer(signer);
@@ -242,6 +284,11 @@ mod wasm {
         static SIGNER: RefCell<Option<Rc<dyn Signer>>> = const { RefCell::new(None) };
         /// The current relay URL, embedded in the kind-22242 AUTH `relay` tag.
         static RELAY_URL: RefCell<String> = const { RefCell::new(String::new()) };
+        /// A NIP-42 AUTH challenge received before any signer was registered.
+        /// The relay challenges once at connect, so a paste-login after connect
+        /// must answer this stashed challenge (see `set_signer`).
+        static PENDING_AUTH: RefCell<super::PendingAuth> =
+            const { RefCell::new(super::PendingAuth::new()) };
         /// Active REQ frames by sub id, so they can be replayed after AUTH (the
         /// relay re-evaluates gated zones once the socket is authenticated) and
         /// on reconnect.
@@ -290,6 +337,13 @@ mod wasm {
 
     pub fn set_signer(signer: Rc<dyn Signer>) {
         SIGNER.with(|s| *s.borrow_mut() = Some(signer));
+        // Answer a challenge the relay issued before this signer existed (the
+        // paste-login / generate path). `handle_auth_challenge` now sees the
+        // signer, signs the kind-22242 response, and replays subscriptions so
+        // gated zones re-evaluate authenticated.
+        if let Some(challenge) = PENDING_AUTH.with(|c| c.borrow_mut().take()) {
+            handle_auth_challenge(challenge);
+        }
     }
 
     pub fn clear_signer() {
@@ -329,14 +383,17 @@ mod wasm {
 
     /// Answer a NIP-42 AUTH challenge: build + sign a kind-22242 event, send the
     /// `["AUTH", signed]` frame, then replay subscriptions so the relay serves
-    /// gated zones. Fails closed (logs, no-op) when no signer is registered.
+    /// gated zones. When no signer is registered yet it stashes the challenge in
+    /// `PENDING_AUTH` (fail-closed until `set_signer` answers it on sign-in).
     fn handle_auth_challenge(challenge: String) {
         let signer = match SIGNER.with(|s| s.borrow().clone()) {
             Some(s) => s,
             None => {
+                // Stash it: the relay challenges once at connect, often before
+                // the user pastes a key. `set_signer` answers this on sign-in.
+                PENDING_AUTH.with(|c| c.borrow_mut().stash(challenge));
                 web_sys::console::warn_1(
-                    &"[bbs-relay] AUTH challenge received but no signer; gated reads stay closed"
-                        .into(),
+                    &"[bbs-relay] AUTH challenge stashed; awaiting sign-in to authenticate".into(),
                 );
                 return;
             }
@@ -486,7 +543,10 @@ mod wasm {
             m.borrow_mut().remove("bbs-chat");
         });
         send(&serde_json::json!(["CLOSE", "bbs-chat"]));
-        send_req("bbs-chat", serde_json::json!({ "kinds": [42], "limit": 60 }));
+        send_req(
+            "bbs-chat",
+            serde_json::json!({ "kinds": [42], "limit": 60 }),
+        );
     }
 }
 
@@ -572,6 +632,35 @@ mod tests {
                 vec!["p", "author-pk"],
             ]
         );
+    }
+
+    #[test]
+    fn pending_auth_starts_empty() {
+        let p = PendingAuth::new();
+        assert!(!p.is_pending());
+        assert_eq!(p, PendingAuth::default());
+    }
+
+    #[test]
+    fn pending_auth_stashes_and_consumes_once() {
+        let mut p = PendingAuth::new();
+        p.stash("challenge-1".to_string());
+        assert!(p.is_pending());
+        // set_signer takes it exactly once…
+        assert_eq!(p.take(), Some("challenge-1".to_string()));
+        // …and a second take (or an early one) yields nothing: no double-AUTH.
+        assert!(!p.is_pending());
+        assert_eq!(p.take(), None);
+    }
+
+    #[test]
+    fn pending_auth_keeps_newest_challenge() {
+        // If the relay re-challenges before a signer arrives, the latest wins —
+        // an older challenge would be rejected as stale.
+        let mut p = PendingAuth::new();
+        p.stash("old".to_string());
+        p.stash("new".to_string());
+        assert_eq!(p.take(), Some("new".to_string()));
     }
 
     #[test]
