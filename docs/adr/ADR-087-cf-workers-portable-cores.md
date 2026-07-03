@@ -1,6 +1,11 @@
 # ADR-087 — CF-Workers-portable cores for solid-pod-rs Phase 1 surfaces
 
-- **Status:** Draft
+- **Status:** Draft — decision deferred (closeout 2026-07-03). No option (a/b/c)
+  has been selected; the three Phase-1 surfaces (`provision-keys`,
+  `nip05-endpoint`, `export-jsonld`) remain structurally unreachable from the
+  wasm32 CF Workers target, so ADR-086's pod-federation fallback is degenerate
+  (pod returns the same data D1 already holds). This is a genuine open spec
+  decision, not implemented work — it awaits a champion for the upstream split.
 - **Date:** 2026-05-16
 - **Owners:** Cross-stack — NRF consumer (`nostr-bbs-pod-worker`) and upstream
   `solid-pod-rs`. Authored by `nrf-aligner` following Phase 1 impact

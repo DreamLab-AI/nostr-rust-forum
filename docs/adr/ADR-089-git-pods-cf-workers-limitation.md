@@ -1,6 +1,12 @@
 # ADR-089 — git-pods unavailability on Cloudflare Workers deployments
 
-- **Status:** Draft
+- **Status:** Superseded by [ADR-093](ADR-093-native-pod-mesh.md) (2026-07-03).
+  The CF-tier git-pods gap this ADR deferred is resolved by the two-tier native
+  pod mesh: ADR-093 ships the hybrid CF Workers + agentbox architecture, and its
+  §7 records that option D there "corresponds to sidecar option (c) of ADR-089,
+  now implemented." The git-capable tier is the agentbox native pod; CF-tier pods
+  remain non-git by design (option (a)), as documented here. This record is kept
+  for the constraint analysis; the open question it left is closed by ADR-093.
 - **Date:** 2026-05-16
 - **Owners:** Cross-stack — NRF consumer (`nostr-bbs-pod-worker`) and upstream
   `solid-pod-rs` git-pods initiative (JSS #471, alpha.12). Authored by

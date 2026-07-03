@@ -4,7 +4,7 @@
   **Amended 2026-07-03 (closeout):** the M2 write-path is now **implemented** in
   `nostr-bbs-bbs-client`, but it **diverges from the §2.3 decision** — it holds key
   material directly via the kit's audited signer rather than delegating to a forum
-  `sign()` seam. See [§6 Amendment](#6-amendment-2026-07-03--shipped-write-path-diverges-from-23).
+  `sign()` seam. See §6 (Amendment, 2026-07-03) below.
 - **Date:** 2026-06-28
 - **Owners:** `nostr-bbs-bbs-client` (the retro client), with a future write seam onto
   `nostr-bbs-forum-client` (the signer/session it will reuse).

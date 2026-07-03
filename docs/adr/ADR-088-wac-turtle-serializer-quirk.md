@@ -1,6 +1,9 @@
 # ADR-088 — WAC Turtle serializer bare-path IRI quirk
 
-- **Status:** Draft
+- **Status:** Draft — decision deferred (closeout 2026-07-03). No option (a/b/c)
+  selected. The quirk has **zero live impact** today (pod-worker writes JSON-LD
+  ACLs and never round-trips Turtle), so this is a forward-looking latent-risk
+  note, not scheduled work.
 - **Date:** 2026-05-16
 - **Owners:** Cross-stack — NRF consumer (`nostr-bbs-pod-worker::acl`) and
   upstream `solid-pod-rs::wac::serializer`. Authored by `nrf-aligner`
