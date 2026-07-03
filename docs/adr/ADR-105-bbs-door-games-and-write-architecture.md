@@ -1,7 +1,10 @@
 # ADR-105 — BBS door-games framework, auth-optional public surfaces, and the M2 write-path
 
-- **Status:** Accepted (door-games framework + auth-optional principle implemented;
-  the M2 write-path is **decided, implementation deferred**)
+- **Status:** Accepted (door-games framework + auth-optional principle implemented).
+  **Amended 2026-07-03 (closeout):** the M2 write-path is now **implemented** in
+  `nostr-bbs-bbs-client`, but it **diverges from the §2.3 decision** — it holds key
+  material directly via the kit's audited signer rather than delegating to a forum
+  `sign()` seam. See [§6 Amendment](#6-amendment-2026-07-03--shipped-write-path-diverges-from-23).
 - **Date:** 2026-06-28
 - **Owners:** `nostr-bbs-bbs-client` (the retro client), with a future write seam onto
   `nostr-bbs-forum-client` (the signer/session it will reuse).
@@ -145,3 +148,45 @@ on Message Base board rows (`screens.rs:146`). The decision:
   crate can replace the seam later without changing the BBS's call site.
 - **Read-only forever.** Rejected by the PRD: it strands the BBS as a viewer and
   fails the parity vision.
+
+## 6. Amendment (2026-07-03) — shipped write-path diverges from §2.3
+
+The M2 write-path shipped, but **not** as the §2.3 delegated-`sign()`-seam decision
+described. This amendment records what was actually built and why, so the register
+matches the code (the decision's key-custody assertion is security-load-bearing).
+
+**What shipped.** `nostr-bbs-bbs-client` gained a **crypto-owning** signer
+(`src/signer.rs` — module doc: "the crypto-owning module"). `BbsSigner::install`
+wraps a `Keypair` in the kit's audited `nostr_bbs_core::signer::PrfSigner` and holds
+it in-process; `relay.rs::publish` now emits `["EVENT", …]` (contradicting §1's "then
+`relay.rs` only ever sends `REQ`/`CLOSE`, never `EVENT`"); `screens.rs::publish_signed`
+signs and publishes, and the governance `action_button` signs + publishes a kind-31403
+`ActionResponse`. The write-path is live, not deferred.
+
+**How it diverges from §2.3.** §2.3 decided the BBS would **never hold private-key
+material** and would instead hand an unsigned template to a forum `sign()` bridge.
+The shipped design instead **holds the key directly**, via two acquisition paths:
+
+1. **Adopt the forum session, same-origin.** For local-key / imported-nsec logins it
+   reads the forum's `nostr_bbs_sk` hex from `localStorage`/`sessionStorage` (the BBS
+   is served same-origin at `/community/bbs/`), decodes it into a `Keypair`, and
+   scrubs the transient hex.
+2. **Minimal in-memory login.** Paste an `nsec1…`/hex key or generate a fresh one; the
+   `Keypair` lives only in memory, is zeroized on drop, and is never persisted by the
+   BBS. Passkey / NIP-07 users (no readable `nostr_bbs_sk`) take this path or sign in
+   at `/community/`.
+
+**Rationale for accepting the divergence.** It reuses the kit's NCC-audited crypto
+(BIP-340 Schnorr + NIP-44 via `PrfSigner`) with **no hand-rolled cryptography**, which
+the delegated seam was partly meant to guarantee. The same-origin boundary means the
+adopted key confers **no new exposure**: any same-origin script — including the JS
+`sign()` bridge §2.3 envisioned — can already read `nostr_bbs_sk`, so a direct-hold and
+a same-origin delegated seam sit on the identical trust boundary. The in-memory path
+fails closed (no signer ⇒ write actions disabled).
+
+**Residual boundary to note.** A passkey/NIP-07 user who takes path 2 with a
+freshly-generated key is signing under a **distinct** in-memory key, not their
+passkey-derived root — operators surfacing BBS governance writes should be aware the
+BBS does not itself derive from the PRF root. Closing that (a true forum-signer
+delegation for passkey sessions) remains the option §2.3 preferred; it is deferred,
+not lost. Until then, the crypto-owning `BbsSigner` above is the accepted design.
