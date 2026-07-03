@@ -3,8 +3,12 @@
 #
 # Per ADR-082 D5: the forum substrate consumes cross-substrate fixtures from
 # VisionClaw (the master host). This script clones VisionClaw, copies
-# docs/specs/fixtures/ into tests/fixtures/ at the workspace root, and writes
+# tests/fixtures/ into tests/fixtures/ at the workspace root, and writes
 # CHECKSUM.txt for CI drift detection.
+#
+# Canonical source path: VisionClaw's fixtures were relocated from
+# tests/fixtures/ to tests/fixtures/ on 2026-06-29 (VisionClaw commit
+# 031f539a5, clean-room documentation rebuild). This script tracks that move.
 #
 # Usage:
 #   scripts/sync-fixtures.sh                    # full sync
@@ -36,30 +40,34 @@ if [[ "$SOURCE" =~ ^https://.*\.git$ ]]; then
   TMPDIR=$(mktemp -d)
   trap "rm -rf $TMPDIR" EXIT
   git clone --depth=1 --filter=blob:none --sparse --quiet "$SOURCE" "$TMPDIR"
-  (cd "$TMPDIR" && git sparse-checkout add docs/specs/fixtures)
+  (cd "$TMPDIR" && git sparse-checkout add tests/fixtures)
   # Use cp if rsync is not available
   if command -v rsync &>/dev/null; then
-    rsync -a --delete --exclude='CHECKSUM.txt' \
-      "$TMPDIR/docs/specs/fixtures/" "$TARGET_DIR/"
+    rsync -a --delete \
+      --exclude='CHECKSUM.txt' --exclude='CHECKSUMS.txt' \
+      --exclude='mod.rs' --exclude='data-model' --exclude='ontology' --exclude='ontologies' \
+      "$TMPDIR/tests/fixtures/" "$TARGET_DIR/"
   else
     rm -rf "$TARGET_DIR"/*.json "$TARGET_DIR"/*.md "$TARGET_DIR"/*.txt "$TARGET_DIR"/schemas 2>/dev/null
     mkdir -p "$TARGET_DIR/schemas"
-    cp -a "$TMPDIR/docs/specs/fixtures/"*.json "$TMPDIR/docs/specs/fixtures/"*.md "$TMPDIR/docs/specs/fixtures/"*.txt "$TARGET_DIR/" 2>/dev/null || true
-    cp -a "$TMPDIR/docs/specs/fixtures/schemas/"* "$TARGET_DIR/schemas/" 2>/dev/null || true
+    cp -a "$TMPDIR/tests/fixtures/"*.json "$TMPDIR/tests/fixtures/"*.md "$TMPDIR/tests/fixtures/"*.txt "$TARGET_DIR/" 2>/dev/null || true
+    cp -a "$TMPDIR/tests/fixtures/schemas/"* "$TARGET_DIR/schemas/" 2>/dev/null || true
   fi
 else
-  if [ ! -d "$SOURCE/docs/specs/fixtures" ]; then
-    echo "ERROR: VISIONCLAW_FIXTURES_PATH=$SOURCE has no docs/specs/fixtures/" >&2
+  if [ ! -d "$SOURCE/tests/fixtures" ]; then
+    echo "ERROR: VISIONCLAW_FIXTURES_PATH=$SOURCE has no tests/fixtures/" >&2
     exit 1
   fi
   if command -v rsync &>/dev/null; then
-    rsync -a --delete --exclude='CHECKSUM.txt' \
-      "$SOURCE/docs/specs/fixtures/" "$TARGET_DIR/"
+    rsync -a --delete \
+      --exclude='CHECKSUM.txt' --exclude='CHECKSUMS.txt' \
+      --exclude='mod.rs' --exclude='data-model' --exclude='ontology' --exclude='ontologies' \
+      "$SOURCE/tests/fixtures/" "$TARGET_DIR/"
   else
     rm -rf "$TARGET_DIR"/*.json "$TARGET_DIR"/*.md "$TARGET_DIR"/*.txt "$TARGET_DIR"/schemas 2>/dev/null
     mkdir -p "$TARGET_DIR/schemas"
-    cp -a "$SOURCE/docs/specs/fixtures/"*.json "$SOURCE/docs/specs/fixtures/"*.md "$SOURCE/docs/specs/fixtures/"*.txt "$TARGET_DIR/" 2>/dev/null || true
-    cp -a "$SOURCE/docs/specs/fixtures/schemas/"* "$TARGET_DIR/schemas/" 2>/dev/null || true
+    cp -a "$SOURCE/tests/fixtures/"*.json "$SOURCE/tests/fixtures/"*.md "$SOURCE/tests/fixtures/"*.txt "$TARGET_DIR/" 2>/dev/null || true
+    cp -a "$SOURCE/tests/fixtures/schemas/"* "$TARGET_DIR/schemas/" 2>/dev/null || true
   fi
 fi
 
