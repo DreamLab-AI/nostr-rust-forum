@@ -11,11 +11,15 @@
 //!
 //! # Status
 //!
-//! Sprint v9-v11: scaffold only. The mesh feature is gated by
-//! `[mesh] mode = "federated"` in the operator config (default `"standalone"`),
-//! and the relay-worker's runtime continues to short-circuit when in
-//! standalone mode. Full implementation lands in Sprint v12+ per the PRD-012
-//! Phase X3 plan.
+//! **Scaffold only — federation is designed, not shipped (closeout 2026-07-03).**
+//! No concrete [`MeshTransport`] implementation exists anywhere in this
+//! repository, and this crate is **not** a dependency of
+//! `nostr-bbs-relay-worker`. The mesh feature is gated by
+//! `[mesh] mode = "federated"` in the operator config (default `"standalone"`);
+//! the relay-worker's runtime short-circuits in standalone mode and has no
+//! federated code path to take when set to `"federated"`. **Standalone is the
+//! supported deployment mode** — do not assume an AUTH-gated trust boundary is
+//! live. Full implementation is deferred (ADR-073, PRD-012 Phase X3).
 //!
 //! # Architecture sketch
 //!

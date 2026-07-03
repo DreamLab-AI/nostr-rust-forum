@@ -179,7 +179,7 @@ graph TD
 |-------|---------|
 | `nostr-bbs-core` | Nostr protocol primitives shared by all workers and the client. Event creation, signing, validation, filter matching, NIP-44 encryption, NIP-98 HTTP auth, bech32 encoding, WASM bridge. **Includes `governance` module**: Agent Control Surface types (kinds 31400-31405), `BrokerCase` aggregate root with `DecisionOrchestrator`, `RegisteredAgent`, tag-extraction helpers. |
 | `nostr-bbs-config` | Operator configuration schema. Zone definitions, deployment topology, branding overlay points. Consumed by `forum-config/` packages. |
-| `nostr-bbs-mesh` | Private relay mesh federation. NIP-42 AUTH gate, peer discovery, cross-system message routing via IS-Envelope. |
+| `nostr-bbs-mesh` | **Scaffold only** (ADR-073, deferred). Defines the `MeshTransport` trait and `PeerSession` state for a future NIP-42-gated relay federation. No concrete transport, peer discovery, or IS-Envelope routing exists in code, and the crate is **not** a dependency of `nostr-bbs-relay-worker`. Standalone is the supported deployment mode. |
 | `nostr-bbs-setup-skill` | Provider-abstracted AI configurator. Guides operators through initial deployment setup with LLM backend independence. |
 | `nostr-bbs-rate-limit` | Shared application-layer rate limiting via Cloudflare KV, consumed by all workers. |
 
