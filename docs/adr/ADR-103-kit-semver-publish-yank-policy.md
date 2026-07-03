@@ -110,3 +110,23 @@ API-breaking under §2.1; it stays on the `1.0.0-beta` line under §2.2.
   more friction, deliberately, until `1.0.0` freezes the surface.
 - **Operational.** Every publish updates the CHANGELOG with the version and whether
   it is API-breaking; every yank states its reason and the fixed version.
+
+## 4. Addendum — residue reconciliation (2026-07-03, closeout)
+
+The §2.5 "everything that reports a version derives from it" rule was stated but
+not fully enforced: the closeout audit found four version reports still hardcoded
+after the beta.2 normalisation. These were reconciled on 2026-07-03:
+
+- `relay-worker/src/lib.rs` `/health` — was `"3.0.0"`, now `env!("CARGO_PKG_VERSION")`.
+- `pod-worker/src/lib.rs` `/health` and `pod-worker/src/remote_storage.rs`
+  `/.well-known/solid` — were `"6.0.0"`, now `env!("CARGO_PKG_VERSION")`.
+- `README.md` release badge and `SECURITY.md` supported-version table — the two
+  markdown surfaces code cannot reach — bumped `beta.2` → `beta.3`. These stay on
+  the **manual bump checklist** (§2.5, "a single documented bump checklist where
+  it cannot"): update both in the same commit that bumps `Cargo.toml`.
+
+The same sweep dropped the **phantom NIP-90 advertisement** (relay `/health`,
+`nip11.rs` `supported_nips`, and the README NIP-coverage table). NIP-90's module
+was removed in R4 (§2.3) and no DVM kinds are handled, so advertising 90 was a
+false capability claim, not a semver concern. With these fixes the R2 drift class
+is closed at every version-reporting surface, not just `nip11.rs`.

@@ -16,7 +16,7 @@ mitigation within 7 days for critical issues.
 
 | Version | Supported |
 |---------|-----------|
-| 1.0.0-beta.2 | Yes (current) |
+| 1.0.0-beta.3 | Yes (current) |
 
 ## Past Security Fixes
 

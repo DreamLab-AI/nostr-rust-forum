@@ -415,7 +415,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "status": "ok",
                 "service": "pod-api",
                 "runtime": "workers-rs",
-                "version": "6.0.0",
+                // ADR-103 §2.5: derive from Cargo.toml, never a hardcoded literal.
+                "version": env!("CARGO_PKG_VERSION"),
                 "features": [
                     "ldp-containers",
                     "conditional-requests",

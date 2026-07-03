@@ -348,7 +348,7 @@ nostr-bbs-upstream-canary      (standalone, publish = false)
 
 The relay advertises its supported NIPs in the NIP-11 information document
 (`crates/nostr-bbs-relay-worker/src/nip11.rs`): `1, 9, 11, 16, 29, 33, 40, 42, 45,
-50, 56, 59, 65, 90, 98`.
+50, 56, 59, 65, 98`.
 
 | NIP | Description | Crate |
 |-----|-------------|-------|
@@ -369,7 +369,6 @@ The relay advertises its supported NIPs in the NIP-11 information document
 | 56 | Reporting (kind-1984, relay-enforced moderation) | nostr-bbs-relay-worker |
 | 59 | Gift wrap | nostr-bbs-core, nostr-bbs-relay-worker |
 | 65 | Relay list metadata | nostr-bbs-relay-worker |
-| 90 | Data vending machines | nostr-bbs-relay-worker |
 | 98 | HTTP Auth | nostr-bbs-core, all workers |
 | app:31400-31405 | Agent Control Surface Protocol | nostr-bbs-core, relay-worker, auth-worker, forum-client |
 

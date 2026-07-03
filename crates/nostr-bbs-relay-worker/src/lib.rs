@@ -230,9 +230,13 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
             env,
             &serde_json::json!({
                 "status": "healthy",
-                "version": "3.0.0",
+                // ADR-103 §2.5: version reports derive from Cargo.toml, never a
+                // hardcoded literal (R2 drift class). NIP-90 dropped — the DVM
+                // module was removed in R4 (ADR-103 §2.3) and no DVM kinds are
+                // handled, so advertising 90 would be a phantom capability claim.
+                "version": env!("CARGO_PKG_VERSION"),
                 "runtime": "workers-rs",
-                "nips": [1, 9, 11, 16, 17, 29, 33, 40, 42, 45, 50, 59, 65, 90, 98],
+                "nips": [1, 9, 11, 16, 17, 29, 33, 40, 42, 45, 50, 59, 65, 98],
             }),
             200,
         );

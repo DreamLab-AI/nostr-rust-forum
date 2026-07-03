@@ -40,7 +40,10 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         // delivered to the recipient's declared DM relays (kind-10050). No
         // such inbox routing exists here, so advertising NIP-17 would
         // overstate capability — only the NIP-59 transport is implemented.
-        "supported_nips": [1, 9, 11, 16, 29, 33, 40, 42, 45, 50, 56, 59, 65, 90, 98],
+        // NIP-90 (DVM) is likewise NOT advertised: the `nip90` module was
+        // removed in the R4 sweep (ADR-103 §2.3) and no DVM kinds are handled,
+        // so listing 90 would be a phantom capability claim.
+        "supported_nips": [1, 9, 11, 16, 29, 33, 40, 42, 45, 50, 56, 59, 65, 98],
         "software": "https://github.com/DreamLab-AI/nostr-rust-forum",
         "version": env!("CARGO_PKG_VERSION"),
         "limitation": {

@@ -59,7 +59,8 @@ pub fn solid_discovery(pod_base: &str) -> serde_json::Value {
     json!({
         "@context": "http://www.w3.org/ns/solid/terms#",
         "server": "nostr-bbs Pod Worker",
-        "version": "6.0.0",
+        // ADR-103 §2.5: derive from Cargo.toml, never a hardcoded literal.
+        "version": env!("CARGO_PKG_VERSION"),
         "runtime": "workers-rs",
         "features": [
             "ldp-basic-container",
