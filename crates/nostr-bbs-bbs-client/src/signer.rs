@@ -7,26 +7,37 @@
 //! [`nostr_bbs_core::Keypair`], [`nostr_bbs_core::decode_nsec`]). No BIP-340,
 //! NIP-44, or bech32 is re-implemented here.
 //!
-//! A signer is obtained two ways, in priority order:
+//! A signer is obtained three ways, in priority order:
 //!
-//! 1. **Adopt the forum session, same-origin.** For local-key / imported-nsec
-//!    logins the forum client persists the raw 32-byte secret as hex under the
-//!    localStorage/sessionStorage key `nostr_bbs_sk` (see the forum's
-//!    `auth::session`). The BBS is served same-origin (`/community/bbs/` vs
-//!    `/community/`), so it reads the SAME key material the forum already holds.
-//!    This adds no new exposure boundary: any same-origin script can already read
-//!    that entry. The transient hex is scrubbed after decoding (audit B8
-//!    hardening, mirrored from the forum's `read_privkey_session`).
+//! 1. **Adopt the forum session, same-origin — local key.** For local-key /
+//!    imported-nsec logins the forum client persists the raw 32-byte secret as
+//!    hex under the localStorage/sessionStorage key `nostr_bbs_sk` (see the
+//!    forum's `auth::session`). The BBS is served same-origin (`/community/bbs/`
+//!    vs `/community/`), so it reads the SAME key material the forum already
+//!    holds into an in-memory [`PrfSigner`]. This adds no new exposure boundary:
+//!    any same-origin script can already read that entry. The transient hex is
+//!    scrubbed after decoding (audit B8 hardening, mirrored from the forum's
+//!    `read_privkey_session`).
 //!
-//! 2. **Minimal in-memory BBS login.** Paste an `nsec1…` / 64-char hex key, or
-//!    generate a fresh one. The resulting [`Keypair`] lives only in memory and is
-//!    zeroized on drop (via [`nostr_bbs_core::SecretKey`]); the BBS never persists
-//!    it. Passkey and NIP-07 sessions have no readable `nostr_bbs_sk`, so those
-//!    users take this path (or sign in at `/community/` with a local key).
+//! 2. **Adopt the forum session, same-origin — NIP-07 extension.** PodKey /
+//!    passkey / nos2x / Alby sessions expose no readable `nostr_bbs_sk` — the key
+//!    lives in the extension. When the forum's stored session records
+//!    `isNip07:true` and that extension (`window.nostr`) is present same-origin,
+//!    the BBS re-attaches a [`crate::nip07::Nip07Signer`] to it, so signing in at
+//!    `/community/` carries here with NO key exposure. Signatures (posts,
+//!    governance, the relay's NIP-42 AUTH) round-trip through the extension's
+//!    approval prompt; the BBS never sees private key material.
+//!
+//! 3. **Minimal in-memory BBS login.** Paste an `nsec1…` / 64-char hex key, or
+//!    generate a fresh one, or click "sign in with extension" when a NIP-07
+//!    provider is present. A pasted/generated [`Keypair`] lives only in memory
+//!    and is zeroized on drop (via [`nostr_bbs_core::SecretKey`]); the BBS never
+//!    persists it.
 //!
 //! Fail closed: with no signer the write actions are disabled and the UI directs
-//! the user to sign in. The signer is registered with the relay module
-//! ([`crate::relay::set_signer`]) so NIP-42 AUTH challenges can be answered.
+//! the user to sign in. Every path routes through [`BbsSigner::install_signer`],
+//! which registers the signer with the relay module ([`crate::relay::set_signer`])
+//! so NIP-42 AUTH challenges can be answered.
 
 use std::rc::Rc;
 
@@ -97,16 +108,24 @@ impl BbsSigner {
             .with_value(|s| s.as_ref().map(|sw| (**sw).clone()))
     }
 
-    /// Install a keypair as the active signer (in-memory) and register it with
-    /// the relay so NIP-42 AUTH challenges can be answered.
-    fn install(&self, keypair: Keypair) {
-        let pubkey_hex = keypair.public.to_hex();
-        let signer: Rc<dyn Signer> = Rc::new(PrfSigner::new(keypair));
+    /// Install an already-built signer as the active signer and register it with
+    /// the relay so NIP-42 AUTH challenges can be answered. Every sign-in path —
+    /// the in-memory keypair ([`PrfSigner`]) and the NIP-07 browser extension
+    /// ([`crate::nip07::Nip07Signer`]) — funnels through here, so the AUTH / relay
+    /// wiring lives in exactly one place regardless of signer backend.
+    fn install_signer(&self, signer: Rc<dyn Signer>, pubkey_hex: String) {
         self.signer
             .set_value(Some(SendWrapper::new(signer.clone())));
         self.pubkey.set(Some(pubkey_hex));
         self.error.set(None);
         crate::relay::set_signer(signer);
+    }
+
+    /// Install a local keypair as the active in-memory signer ([`PrfSigner`]).
+    fn install(&self, keypair: Keypair) {
+        let pubkey_hex = keypair.public.to_hex();
+        let signer: Rc<dyn Signer> = Rc::new(PrfSigner::new(keypair));
+        self.install_signer(signer, pubkey_hex);
     }
 
     /// Sign in with a pasted `nsec1…` / 64-char hex private key.
@@ -133,6 +152,37 @@ impl BbsSigner {
         Ok(privkey_hex)
     }
 
+    /// Sign in with a NIP-07 browser extension (`window.nostr` — PodKey, nos2x,
+    /// Alby, or a passkey provider that exposes NIP-07).
+    ///
+    /// Reads the extension's pubkey ([`crate::nip07::nip07_get_pubkey`]) and
+    /// installs a [`crate::nip07::Nip07Signer`] that routes every signature —
+    /// board posts, governance decisions, and the relay's NIP-42 AUTH challenge —
+    /// back through the extension's approval prompt. The private key never enters
+    /// the BBS. Async because the extension may prompt the user; errors surface on
+    /// the [`error`](Self::error) signal and are also returned. Fails closed when
+    /// no provider is present.
+    pub async fn login_with_extension(&self) -> Result<(), String> {
+        if !crate::nip07::has_nip07_extension() {
+            let e = "No NIP-07 browser extension detected.".to_string();
+            self.error.set(Some(e.clone()));
+            return Err(e);
+        }
+        match crate::nip07::nip07_get_pubkey().await {
+            Ok(pubkey) => {
+                let signer: Rc<dyn Signer> =
+                    Rc::new(crate::nip07::Nip07Signer::from_pubkey(pubkey.clone()));
+                self.install_signer(signer, pubkey);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("Extension sign-in failed: {e}");
+                self.error.set(Some(msg.clone()));
+                Err(msg)
+            }
+        }
+    }
+
     /// Sign out: drop the in-memory signer and de-register it from the relay.
     pub fn logout(&self) {
         self.signer.set_value(None);
@@ -141,19 +191,46 @@ impl BbsSigner {
         crate::relay::clear_signer();
     }
 
-    /// Adopt the forum client's persisted session key, same-origin (wasm only).
-    /// Returns `true` if a usable key was found and installed.
+    /// Adopt the forum client's same-origin session, wasm only. Returns `true`
+    /// if a usable signer was found and installed.
+    ///
+    /// Two adoption paths, in priority order:
+    ///
+    /// 1. **Local key** — the forum persisted the raw secret hex under
+    ///    `nostr_bbs_sk`; parse it into an in-memory [`PrfSigner`].
+    /// 2. **NIP-07 extension** — the forum's stored session records
+    ///    `isNip07:true` and the extension (`window.nostr`) is present
+    ///    same-origin; re-attach a [`crate::nip07::Nip07Signer`] to it. No key is
+    ///    read or exposed; the extension answers the relay's AUTH challenge (via
+    ///    its approval popup, or replayed from `PendingAuth` if the challenge
+    ///    arrives before this signer is installed).
     #[cfg(target_arch = "wasm32")]
     pub fn adopt_forum_session(&self) -> bool {
-        match read_forum_privkey_hex() {
-            Some(hex_key) => match parse_secret_key(&hex_key) {
-                Ok(kp) => {
+        // A present-but-unparseable raw key must fall through to the NIP-07 path,
+        // not dead-end, so gate the local-key choice on a successful parse.
+        let local_kp = read_forum_privkey_hex()
+            .as_deref()
+            .and_then(|hex| parse_secret_key(hex).ok());
+        let session_json = crate::config::read_forum_session_json();
+        match choose_adoption(
+            local_kp.is_some(),
+            session_json.as_deref(),
+            crate::nip07::has_nip07_extension(),
+        ) {
+            AdoptChoice::LocalKey => match local_kp {
+                Some(kp) => {
                     self.install(kp);
                     true
                 }
-                Err(_) => false,
+                None => false,
             },
-            None => false,
+            AdoptChoice::Nip07(pubkey) => {
+                let signer: Rc<dyn Signer> =
+                    Rc::new(crate::nip07::Nip07Signer::from_pubkey(pubkey.clone()));
+                self.install_signer(signer, pubkey);
+                true
+            }
+            AdoptChoice::None => false,
         }
     }
 
@@ -162,6 +239,48 @@ impl BbsSigner {
     pub fn adopt_forum_session(&self) -> bool {
         false
     }
+}
+
+/// Which backend a forum-session adoption should install. Pure decision split
+/// out of [`BbsSigner::adopt_forum_session`] so the priority/selection logic is
+/// unit-testable on the native target without browser storage or `window.nostr`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AdoptChoice {
+    /// A valid raw `nostr_bbs_sk` secret is present → in-memory [`PrfSigner`].
+    LocalKey,
+    /// The forum session is NIP-07 and the extension is present → a
+    /// [`crate::nip07::Nip07Signer`] for this hex pubkey.
+    Nip07(String),
+    /// Nothing adoptable — stay signed out.
+    None,
+}
+
+/// Decide how to adopt the forum's same-origin session.
+///
+/// A readable local key wins over NIP-07 (it is the prompt-free path and needs no
+/// extension round-trip). NIP-07 is chosen only when there is no usable local key
+/// AND the session was extension-backed (`isNip07:true`) AND the provider is
+/// present same-origin AND a pubkey is recorded — otherwise there is nothing to
+/// re-attach to, so we stay signed out (fail closed).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) fn choose_adoption(
+    local_key_valid: bool,
+    session_json: Option<&str>,
+    extension_present: bool,
+) -> AdoptChoice {
+    if local_key_valid {
+        return AdoptChoice::LocalKey;
+    }
+    if extension_present {
+        if let Some(json) = session_json {
+            if crate::config::session_is_nip07(json) {
+                if let Some(pubkey) = crate::config::pubkey_from_session(json) {
+                    return AdoptChoice::Nip07(pubkey);
+                }
+            }
+        }
+    }
+    AdoptChoice::None
 }
 
 /// Parse a user-supplied secret key (64-char hex or `nsec1…` bech32) into a
@@ -283,5 +402,65 @@ mod tests {
         // All-zero bytes are a syntactically valid hex string but not a valid
         // secp256k1 secret key — must fail closed, not produce a bogus signer.
         assert!(parse_secret_key(&"00".repeat(32)).is_err());
+    }
+
+    // ── adoption selection ──────────────────────────────────────────────────
+
+    fn nip07_session(pk: &str) -> String {
+        format!(r#"{{"_v":2,"publicKey":"{pk}","isNip07":true,"nickname":"x"}}"#)
+    }
+
+    #[test]
+    fn local_key_wins_even_with_nip07_session_and_extension() {
+        // A readable local key is the prompt-free path; it takes priority over an
+        // extension re-attach regardless of the stored session flags.
+        let pk = "ab".repeat(32);
+        let choice = choose_adoption(true, Some(&nip07_session(&pk)), true);
+        assert_eq!(choice, AdoptChoice::LocalKey);
+    }
+
+    #[test]
+    fn nip07_chosen_when_no_local_key_and_extension_present() {
+        let pk = "cd".repeat(32);
+        let choice = choose_adoption(false, Some(&nip07_session(&pk)), true);
+        assert_eq!(choice, AdoptChoice::Nip07(pk));
+    }
+
+    #[test]
+    fn nip07_session_without_extension_is_not_adopted() {
+        // isNip07 session but no provider present → cannot sign, so stay signed
+        // out (the PendingAuth/AUTH path never gets a usable signer). Fail closed.
+        let pk = "ef".repeat(32);
+        assert_eq!(
+            choose_adoption(false, Some(&nip07_session(&pk)), false),
+            AdoptChoice::None
+        );
+    }
+
+    #[test]
+    fn non_nip07_session_with_extension_is_not_adopted() {
+        // A local-key/passkey forum session (isNip07 absent/false) must not be
+        // silently re-attached to whatever extension happens to be installed —
+        // that could sign as the wrong identity.
+        let pk = "11".repeat(32);
+        let local_key_session =
+            format!(r#"{{"_v":2,"publicKey":"{pk}","isNip07":false,"isLocalKey":true}}"#);
+        assert_eq!(
+            choose_adoption(false, Some(&local_key_session), true),
+            AdoptChoice::None
+        );
+    }
+
+    #[test]
+    fn nip07_session_missing_pubkey_is_not_adopted() {
+        // isNip07 but no recorded pubkey → nothing to re-attach to.
+        let choice = choose_adoption(false, Some(r#"{"_v":2,"isNip07":true}"#), true);
+        assert_eq!(choice, AdoptChoice::None);
+    }
+
+    #[test]
+    fn no_session_and_no_key_stays_signed_out() {
+        assert_eq!(choose_adoption(false, None, true), AdoptChoice::None);
+        assert_eq!(choose_adoption(false, None, false), AdoptChoice::None);
     }
 }

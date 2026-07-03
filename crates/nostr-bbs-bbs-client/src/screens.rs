@@ -726,6 +726,18 @@ fn publish_signed(
     }
 }
 
+/// Kick off a NIP-07 browser-extension sign-in (async — the extension may prompt
+/// for the pubkey / approval). wasm-only; a native build (unit tests) is a no-op.
+/// Failures surface on the signer's `error` signal, which the panel renders.
+fn start_extension_login(signer: BbsSigner) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = signer.login_with_extension().await;
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = signer;
+}
+
 /// Context for an interactive (live) agent panel: the signer plus the panel's
 /// `d` tag and definition event id, which key the published 31403 ActionResponse
 /// (the publishing agent subscribes to responses on its panel `d` tag).
@@ -1029,8 +1041,19 @@ fn sign_in_panel(signer: BbsSigner) -> impl IntoView {
                             generated.set(None);
                         }
                     };
+                    // Only offered when a NIP-07 provider (PodKey / nos2x / Alby)
+                    // is present; signs via the extension with no key exposure.
+                    let ext_available = crate::nip07::has_nip07_extension();
                     view! {
-                        "  Signing in at " <span class="accent">"/community/"</span> " with a local key carries here.\n"
+                        {ext_available.then(|| view! {
+                            "  Browser signer detected (PodKey / nos2x / Alby) — signs with no key exposure:\n"
+                            <div class="bbs-cmdline">
+                                <span class="bbs-link accent" role="button"
+                                    on:click=move |_| start_extension_login(signer)
+                                >"[ sign in with extension ]"</span>
+                            </div>
+                        })}
+                        "  Signing in at " <span class="accent">"/community/"</span> " with a local key or browser signer carries here.\n"
                         "  Or paste an nsec / 64-char hex key, or generate a throwaway key:\n"
                         <div class="bbs-cmdline">
                             <span class="prompt">"key/"</span>

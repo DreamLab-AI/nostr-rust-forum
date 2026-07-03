@@ -72,3 +72,7 @@ console_error_panic_hook = "0.1"
 hex = { workspace = true }
 zeroize = { workspace = true }
 send_wrapper = "0.6"
+# NIP-07 signer: implements the kit's async `Signer` trait for `window.nostr`
+# extension sessions (PodKey / nos2x / Alby), matching how the forum client's
+# `Nip07Signer` is defined — same `async_trait(?Send)` erasure as core's PrfSigner.
+async-trait = { workspace = true }

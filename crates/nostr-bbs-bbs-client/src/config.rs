@@ -139,9 +139,9 @@ const FORUM_SESSION_KEY: &str = "nostr_bbs_keys";
 ///
 /// Returns `None` when the session is absent or logged out (`publicKey` missing
 /// or empty). Only ever reads the PUBLIC key — never any private-key material.
-/// Consumed by the wasm `read_forum_session_pubkey` and the unit tests.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn pubkey_from_session(json: &str) -> Option<String> {
+/// Consumed by the wasm `read_forum_session_pubkey`, the signer's NIP-07 adopt
+/// path ([`crate::signer::BbsSigner::adopt_forum_session`]), and the unit tests.
+pub(crate) fn pubkey_from_session(json: &str) -> Option<String> {
     serde_json::from_str::<Value>(json)
         .ok()?
         .get("publicKey")
@@ -151,12 +151,31 @@ fn pubkey_from_session(json: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether the forum client's stored session was established via a NIP-07 browser
+/// extension (`"isNip07": true`). These sessions persist no readable
+/// `nostr_bbs_sk`, so the BBS adopts them by re-attaching a `Nip07Signer` to the
+/// same same-origin `window.nostr` provider rather than importing a raw key.
+/// Missing/false/malformed all read as `false` (fail-closed).
+pub(crate) fn session_is_nip07(json: &str) -> bool {
+    serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|v| v.get("isNip07").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// Read the forum client's raw stored-session JSON from localStorage (wasm).
+/// The signer's adopt path parses both `publicKey` and `isNip07` from it via the
+/// pure helpers above, so the storage access lives in one place.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn read_forum_session_json() -> Option<String> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    storage.get_item(FORUM_SESSION_KEY).ok()?
+}
+
 /// Read the forum client's session public key from localStorage (wasm).
 #[cfg(target_arch = "wasm32")]
 fn read_forum_session_pubkey() -> Option<String> {
-    let storage = web_sys::window()?.local_storage().ok()??;
-    let raw = storage.get_item(FORUM_SESSION_KEY).ok()??;
-    pubkey_from_session(&raw)
+    pubkey_from_session(&read_forum_session_json()?)
 }
 
 /// Read `window.__ENV__`, stringify it, and parse to a JSON [`Value`].
@@ -241,6 +260,21 @@ mod tests {
         assert_eq!(pubkey_from_session(r#"{"_v":2,"publicKey":"  "}"#), None);
         assert_eq!(pubkey_from_session(r#"{"_v":2}"#), None);
         assert_eq!(pubkey_from_session("not json"), None);
+    }
+
+    #[test]
+    fn forum_session_nip07_detection() {
+        // Extension-backed session → true; drives the BBS NIP-07 adopt path.
+        assert!(session_is_nip07(
+            r#"{"_v":2,"publicKey":"ab","isNip07":true}"#
+        ));
+        // Local-key / passkey / absent / malformed → false (fail closed).
+        assert!(!session_is_nip07(
+            r#"{"_v":2,"publicKey":"ab","isNip07":false,"isLocalKey":true}"#
+        ));
+        assert!(!session_is_nip07(r#"{"_v":2,"publicKey":"ab"}"#));
+        assert!(!session_is_nip07(r#"{"_v":2,"isNip07":"yes"}"#));
+        assert!(!session_is_nip07("not json"));
     }
 
     #[test]
