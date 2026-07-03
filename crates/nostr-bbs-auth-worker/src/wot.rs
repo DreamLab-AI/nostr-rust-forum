@@ -436,12 +436,15 @@ pub async fn is_allowed_by_wot(pubkey: &str, env: &Env) -> Result<bool> {
     }
 
     let db = env.d1("DB")?;
+    // Propagate a transient D1 error as Err (caller maps it to 503) rather than
+    // swallowing it into Ok(None) -> deny. A DB blip must not silently deny a
+    // legitimately-trusted pubkey during registration; the documented contract
+    // above requires the transient-failure signal to reach the caller.
     let row = db
         .prepare("SELECT pubkey, added_at, source FROM wot_entries WHERE pubkey = ?1 LIMIT 1")
         .bind(&[js_str(pubkey)])?
         .first::<WotRow>(None)
-        .await
-        .unwrap_or(None);
+        .await?;
     Ok(row.is_some())
 }
 
