@@ -12,7 +12,7 @@ The kit ships **vanilla**. An operator stands up a community by copying
 [`forum.example.toml`](forum.example.toml) to `forum.toml`, filling in their zones,
 branding, and deployment values — no forking, no code changes.
 
-[![Release](https://img.shields.io/badge/release-v1.0.0--beta.2-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.0.0--beta.3-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-green)](LICENSE)
 [![Identity](https://img.shields.io/badge/identity-did%3Anostr%20Multikey-8b5cf6)](#identity--keys)
 [![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20WASM-orange)](#architecture)
@@ -128,8 +128,11 @@ dashboard that turns agent requests into approve/reject/configure cards.
 **Agents & federation**
 - **Agent Control Surface Protocol** — agents publish interactive control panels
   (kinds 31400-31405); the forum renders them as signed human-in-the-loop decisions.
-- **Private relay mesh** — NIP-42-authenticated relay federation across systems via
-  `did:nostr` (ADR-073/104).
+- **Private relay mesh (designed, not shipped)** — cross-system relay federation
+  via `did:nostr` (ADR-073/104). The `nostr-bbs-mesh` crate is **scaffold only**:
+  it defines the `MeshTransport` trait and session state but ships no concrete
+  transport, and it is not a dependency of `nostr-bbs-relay-worker`. **Standalone
+  is the supported deployment mode**; federation lands in a later sprint.
 - **Edge + native two-tier pods** — Cloudflare Workers pods plus an optional native
   solid-pod-rs tier fronted by a Cloudflare Tunnel, routed by WebID.
 
@@ -307,14 +310,15 @@ governance schema (`agent_registry`, `broker_cases`, `broker_decisions`,
 
 ## Architecture
 
-Twelve crates in a Cargo workspace:
+Fourteen crates in a Cargo workspace:
 
 | Crate | Type | Purpose |
 |-------|------|---------|
 | `nostr-bbs-core` | Library | Shared Nostr protocol: NIP-01/07/09/29/33/40/42/44/45/50/52/98, key management, event validation, NIP-52 zone/venue tags + `to_free_busy()`, `did:nostr` Multikey DID rendering, governance domain model (kinds 31400-31405), WASM bridge |
 | `nostr-bbs-config` | Library | Complete operator configuration schema: zones (visibility, cohorts, banners, accent, encryption), deployment, webauthn, pod, relay, admin, branding, trust, invites, moderation, mesh, ratelimit, features, nip05, native-pod, provision, export, git, governance, payments, calendar |
-| `nostr-bbs-mesh` | Library | Private relay mesh federation, NIP-42 AUTH gate, peer discovery |
+| `nostr-bbs-mesh` | Library | **Scaffold only** (ADR-073, deferred): `MeshTransport` trait + `PeerSession` state for a future NIP-42-gated relay federation. No concrete transport is implemented and the crate is **not** a dependency of `nostr-bbs-relay-worker`; standalone is the supported mode |
 | `nostr-bbs-setup-skill` | Library | Provider-abstracted AI configurator for operator onboarding |
+| `nostr-bbs-ascii` | Library | On-theme ASCII-art image rendering: server-side decode in the workers, phosphor-level HTML emit consumed by the retro BBS client |
 | `nostr-bbs-auth-worker` | CF Worker | WebAuthn register/login (passkey), NIP-98 verification, pod provisioning (CF + native-tier), governance REST API, rate limiting (D1 + KV + R2) |
 | `nostr-bbs-pod-worker` | CF Worker | Solid pod storage: LDP containers, WAC ACL, JSON Patch, conditional requests, quotas, WebID, micropayments (R2 + KV) |
 | `nostr-bbs-preview-worker` | CF Worker | Link preview with SSRF protection, OG/meta parsing, oEmbed, rate limiting |
@@ -322,6 +326,7 @@ Twelve crates in a Cargo workspace:
 | `nostr-bbs-search-worker` | CF Worker | Semantic vector search via Workers AI BGE-small embeddings, RVF binary format, in-memory cosine k-NN, rate limiting (R2 + KV) |
 | `nostr-bbs-rate-limit` | Library | Shared application-layer rate limiting via Cloudflare KV, consumed by all workers |
 | `nostr-bbs-forum-client` | Leptos App | Browser client (Leptos 0.7 CSR + Trunk): passkey auth, 22 pages, 60+ components, config-driven zone tiles, reactive display-name resolution, admin panel, Source-Control pod browser, governance dashboard |
+| `nostr-bbs-bbs-client` | Leptos App | Retro ASCII/BBS terminal client served at `/community/bbs/` (Leptos CSR + Trunk): phosphor-CRT render skin, door games, message-base/roster/pod browsing. Read-only render skin today; the M2 write-path reuses the forum's signer (ADR-105) |
 | `nostr-bbs-upstream-canary` | Test | Validates upstream `nostr` crate compatibility on the WASM/CF Workers build matrix |
 
 ```
@@ -333,7 +338,9 @@ nostr-bbs-search-worker ---+
 nostr-bbs-config ------------> nostr-bbs-core
 nostr-bbs-mesh --------------> nostr-bbs-core + nostr-bbs-config
 nostr-bbs-rate-limit --------> nostr-bbs-core (shared KV rate limiter)
+nostr-bbs-bbs-client --------> nostr-bbs-core + nostr-bbs-config (retro client, /community/bbs/)
 nostr-bbs-preview-worker       (standalone)
+nostr-bbs-ascii                (standalone; ASCII-art render helpers)
 nostr-bbs-upstream-canary      (standalone, publish = false)
 ```
 
@@ -422,12 +429,20 @@ this kit and supplies values); the kit itself stays vendor-neutral, enforced by
 
 ## Federation Transports
 
+> **Status (2026-07-03): designed, not shipped.** `nostr-bbs-mesh` is a scaffold
+> crate (`MeshTransport` trait + session state only, no concrete transport) and is
+> not wired into `nostr-bbs-relay-worker`. **Standalone is the supported deployment
+> mode.** The `[mesh]` config block below is accepted by the schema but the relay
+> short-circuits when `mode = "standalone"` (the default) and has no federated
+> code path to take when set to `"federated"`. The section below describes the
+> intended design (ADR-073), not a live capability.
+
 As a Cloudflare Workers application the forum cannot join a Tailscale tailnet
 directly, so private peers are reached over relay transports.
 
-**Nostr relays (all components).** `nostr-bbs-mesh` connects to peer relays over
-standard NIP-01 WebSocket — private infrastructure relays (e.g. over Tailscale
-between your nodes) or public relays for censorship resistance:
+**Nostr relays (all components).** `nostr-bbs-mesh` is designed to connect to peer
+relays over standard NIP-01 WebSocket — private infrastructure relays (e.g. over
+Tailscale between your nodes) or public relays for censorship resistance:
 
 ```toml
 # forum.toml
