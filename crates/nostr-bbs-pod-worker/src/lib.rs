@@ -40,14 +40,15 @@ mod remote_storage;
 mod storage;
 mod webid;
 
-// JSS Phase 1 staging (ADR-086): inert re-export shims for the
-// `provision-keys`, `export-jsonld`, and `nip05-endpoint` upstream features.
-// These modules compile to empty surfaces today; activation is gated on the
-// `solid-pod-rs-phase1` feature AND the workspace bumping `solid-pod-rs` to
-// `0.4.0-alpha.11`. See `docs/consumer-surface-map.md`.
+// JSS Phase 1 staging (ADR-086/087): inert re-export shim for the upstream
+// `export-jsonld` feature. Compiles to an empty surface today; activation is
+// gated on the `solid-pod-rs-phase1` feature. See `docs/consumer-surface-map.md`.
+//
+// The `provision-keys` and `nip05-endpoint` shims were removed at closeout
+// (2026-07-03): CF-native equivalents already serve those paths (`provision.rs`
+// and the `/.well-known/nostr.json` handler below), so the parked shims only
+// advertised upstream parity the wasm32 CF Workers target cannot link (ADR-087).
 mod export;
-mod key_provisioning;
-mod nip05_endpoint;
 
 use acl::{
     coerce_required_mode_for_acl, evaluate_access, find_effective_acl, wac_allow_header, AccessMode,
