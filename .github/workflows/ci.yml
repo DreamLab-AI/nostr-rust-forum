@@ -1,10 +1,13 @@
 # CI pipeline for nostr-rust-forum (nostr-bbs-rs kit)
 #
 # Jobs:
-#   fmt       — cargo fmt --check
-#   clippy    — cargo clippy -D warnings (blocking)
-#   test      — cargo test --workspace (native, 322+ tests)
-#   wasm      — cargo check --target wasm32-unknown-unknown (portable crates)
+#   fmt       — cargo fmt --check (hard gate)
+#   clippy    — cargo clippy -D warnings (advisory, continue-on-error)
+#   test      — cargo test --workspace (native, advisory; ~1280 tests, pre-existing
+#               unrelated failures — NOT a merge gate; see test-security below)
+#   test-security — hard gate: security-critical crate suites (crypto, relay
+#               read-gating, WAC/ACL, NIP-98 replay, SSRF, config)
+#   wasm      — cargo check --target wasm32-unknown-unknown (portable crates, hard gate)
 #   doc       — cargo doc --no-deps (catch broken links)
 #   deny      — cargo-deny licence/advisory/ban/source policy
 #   ci-pass   — single required status check aggregator

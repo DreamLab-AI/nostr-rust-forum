@@ -26,7 +26,7 @@ cargo test --workspace
 # Single crate
 cargo test -p nostr-bbs-core
 
-# Governance domain model tests (19 tests)
+# Governance domain model tests (23 tests)
 cargo test -p nostr-bbs-core governance
 
 # WASM compilation check (forum client does not run native tests)
@@ -59,7 +59,16 @@ scripts/sync-fixtures.sh --verify
 
 1. Create a feature or fix branch from `dev`
 2. Make your changes with clear, atomic commits
-3. Ensure `cargo test --workspace` passes
+3. Ensure the **security-critical crate suite passes** — this is the CI hard gate
+   (`ci.yml` `test-security`):
+   ```bash
+   cargo test -p nostr-bbs-core -p nostr-bbs-relay-worker -p nostr-bbs-pod-worker \
+              -p nostr-bbs-auth-worker -p nostr-bbs-preview-worker -p nostr-bbs-config
+   ```
+   Run the full `cargo test --workspace` locally too and do not add new failures,
+   but note it is **advisory** in CI (the `test` job is `continue-on-error` — the
+   full suite has pre-existing failures unrelated to the security controls, so it
+   does not block merge today). The wasm32 check and `cargo-deny` are also hard gates.
 4. Ensure `scripts/anti-drift-lint.sh` exits cleanly
 5. Open a PR against `dev` with a description of what changed and why
 6. At least one maintainer review is required before merge

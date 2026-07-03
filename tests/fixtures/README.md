@@ -31,7 +31,7 @@ The following fixtures MUST be populated before PRD-010 P0 implementation lands:
 
 ## Agent Control Surface Protocol
 
-The governance domain model in `nostr-bbs-core::governance` has 19 unit tests
+The governance domain model in `nostr-bbs-core::governance` has 23 unit tests
 covering: kind range validation, tag extraction, panel definition round-trip,
 BrokerCase lifecycle (creation, claiming, release, decisions), self-review
 prevention, terminal state idempotency, DecisionOrchestrator, and share-state
