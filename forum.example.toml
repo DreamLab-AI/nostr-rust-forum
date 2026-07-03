@@ -8,8 +8,9 @@
 #      $EDITOR forum.toml
 #
 #  This is the single source of truth for every deployment-specific setting.
-#  The worker crates load it at startup (`nostr_bbs_config::load_from_path`) and
-#  the forum-client reads its shape at build time. To rebrand, change hostnames,
+#  The deploy pipeline validates it (`nostr_bbs_config::load_from_path`) and
+#  projects its values into each worker's env bindings / secrets; the
+#  forum-client reads its shape at build time. To rebrand, change hostnames,
 #  re-cut your cohort/zone taxonomy, or federate, edit THIS file — never the kit
 #  source.
 #

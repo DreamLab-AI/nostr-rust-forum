@@ -10,6 +10,71 @@ use nostr_bbs_core::governance::{
 use serde_json::json;
 use worker::Env;
 
+/// One NIP-11 retention rule: a set of event kinds and how long they are kept.
+///
+/// This is the SINGLE SOURCE OF TRUTH shared by the advertised NIP-11
+/// `retention` document (built in [`relay_info`]) and the cron DELETE sweep
+/// ([`crate::cron::sweep_retention`]). Because both read the same
+/// [`RETENTION_POLICY`], the relay can only advertise a window it actually
+/// enforces — the two can never drift.
+pub(crate) struct RetentionRule {
+    pub kinds: RetentionKinds,
+    /// Retention window in seconds. `None` = retained indefinitely (never swept).
+    pub time: Option<i64>,
+}
+
+/// The set of event kinds a [`RetentionRule`] applies to.
+pub(crate) enum RetentionKinds {
+    /// Explicit kind numbers, e.g. `[1]` or `[0, 3]`.
+    List(&'static [u64]),
+    /// Inclusive kind range, serialised in NIP-11's nested-pair form
+    /// (`[[lo, hi]]`).
+    Range(u64, u64),
+}
+
+impl RetentionKinds {
+    /// The NIP-11 JSON form of the `kinds` field for this rule.
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            RetentionKinds::List(ks) => json!(ks),
+            RetentionKinds::Range(lo, hi) => json!([[lo, hi]]),
+        }
+    }
+}
+
+/// Canonical per-kind retention policy. Drives BOTH the NIP-11 document and the
+/// cron retention sweep. Kinds with `time: None` are retained forever.
+pub(crate) const RETENTION_POLICY: &[RetentionRule] = &[
+    RetentionRule {
+        kinds: RetentionKinds::List(&[0]),
+        time: None,
+    },
+    RetentionRule {
+        kinds: RetentionKinds::List(&[3]),
+        time: None,
+    },
+    RetentionRule {
+        kinds: RetentionKinds::List(&[1]),
+        time: Some(7_776_000),
+    },
+    RetentionRule {
+        kinds: RetentionKinds::List(&[7]),
+        time: Some(2_592_000),
+    },
+    RetentionRule {
+        kinds: RetentionKinds::List(&[9024]),
+        time: Some(86_400),
+    },
+    RetentionRule {
+        kinds: RetentionKinds::Range(10_000, 19_999),
+        time: None,
+    },
+    RetentionRule {
+        kinds: RetentionKinds::Range(30_000, 39_999),
+        time: None,
+    },
+];
+
 /// Build the NIP-11 relay information JSON value.
 ///
 /// The relay name is taken from the `RELAY_NAME` env var (falling back to
@@ -23,6 +88,21 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
 
     let admin_pubkey = String::new();
     let contact = String::new();
+
+    // Built from the shared `RETENTION_POLICY` so the advertised windows and the
+    // cron sweep (`crate::cron::sweep_retention`) can never diverge.
+    let retention: Vec<serde_json::Value> = RETENTION_POLICY
+        .iter()
+        .map(|r| {
+            json!({
+                "kinds": r.kinds.to_json(),
+                "time": match r.time {
+                    Some(secs) => json!(secs),
+                    None => serde_json::Value::Null,
+                },
+            })
+        })
+        .collect();
 
     json!({
         "name": relay_name,
@@ -68,15 +148,9 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
             "payment_required": false,
             "restricted_writes": true,
         },
-        "retention": [
-            { "kinds": [0], "time": serde_json::Value::Null },
-            { "kinds": [3], "time": serde_json::Value::Null },
-            { "kinds": [1], "time": 7776000 },
-            { "kinds": [7], "time": 2592000 },
-            { "kinds": [9024], "time": 86400 },
-            { "kinds": [[10000, 19999]], "time": serde_json::Value::Null },
-            { "kinds": [[30000, 39999]], "time": serde_json::Value::Null },
-        ],
+        // Enforced by `crate::cron::sweep_retention`; sourced from
+        // `RETENTION_POLICY` above so the advertised policy is the swept policy.
+        "retention": retention,
         // nostr-bbs kit namespaced extension: the Agent Control Surface Protocol.
         // This relay gates governance kinds 31400-31405 behind the
         // `agent_registry` table (only registered `did:nostr` agent pubkeys may

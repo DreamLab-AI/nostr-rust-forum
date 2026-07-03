@@ -122,6 +122,21 @@ async fn admin_set(env: &Env) -> HashSet<String> {
     use nostr_bbs_core::admin_shared::PubkeyRow;
 
     let mut set = HashSet::new();
+
+    // Seed the static `ADMIN_PUBKEYS` set first. These deploy-time bootstrap
+    // admins pass the NIP-98 admin gate (`admin::is_admin`) via the same env
+    // var, but `validate_moderation_event` rejects their signed event unless
+    // the signer is present in this set. Seeding here keeps the two authorities
+    // in agreement so a static admin's moderation action isn't silently 400'd.
+    if let Ok(raw) = env
+        .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)
+        .map(|v| v.to_string())
+    {
+        for pk in nostr_bbs_core::admin_pubkeys_from_env_str(&raw) {
+            set.insert(pk);
+        }
+    }
+
     let Ok(db) = env.d1("DB") else {
         return set;
     };
@@ -217,6 +232,17 @@ pub async fn handle_action(
     let admins = admin_set(env).await;
     if let Err(e) = validate_moderation_event(&body.event, &admins) {
         return error_json(env, &format!("Invalid moderation event: {e}"), 400);
+    }
+
+    // The NIP-98 signer must match the event signer (no impersonation): an
+    // authenticated admin cannot submit a moderation event signed by a
+    // different key. Mirrors the reporter binding in `handle_report`.
+    if body.event.pubkey != admin_pubkey {
+        return error_json(
+            env,
+            "Event pubkey does not match NIP-98 signer",
+            403,
+        );
     }
 
     // Extract the target pubkey (ban/mute) or pubkey:ts tuple (warn).

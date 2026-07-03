@@ -39,7 +39,12 @@ fn detect_media(url: &str) -> MediaType {
 
     // YouTube: youtube.com/watch?v=ID or youtu.be/ID
     if lower.contains("youtube.com/watch") {
-        if let Some(pos) = lower.find("v=") {
+        // Search and slice the SAME string. `lower` and `url` can differ in
+        // byte length (non-ASCII case folding), so a position found in `lower`
+        // must never index `url` — that could split a char boundary and panic.
+        // Search `url` directly ("v=" is already lowercase) so the extracted,
+        // case-sensitive video ID is preserved.
+        if let Some(pos) = url.find("v=") {
             let after_v = &url[pos + 2..];
             let video_id: String = after_v
                 .chars()

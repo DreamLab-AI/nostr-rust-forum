@@ -553,6 +553,7 @@ impl NostrRelayDO {
     pub(crate) async fn handle_req(
         &self,
         session_id: u64,
+        ip: &str,
         sub_id: &str,
         filters: Vec<NostrFilter>,
     ) {
@@ -563,6 +564,13 @@ impl NostrRelayDO {
                 None => return,
             }
         };
+
+        // Per-IP rate limit, consistent with the EVENT path. REQ was previously
+        // ungated, letting one IP drive unbounded D1 scans; gate it identically.
+        if !self.check_rate_limit(ip) {
+            Self::send_notice(&ws, "rate limit exceeded");
+            return;
+        }
 
         // Check subscription limit
         {
@@ -1015,10 +1023,19 @@ impl NostrRelayDO {
     pub(crate) async fn handle_count(
         &self,
         session_id: u64,
+        ip: &str,
         ws: &WebSocket,
         sub_id: &str,
         filters: Vec<NostrFilter>,
     ) {
+        // Per-IP rate limit, consistent with the EVENT/REQ paths. COUNT was
+        // previously ungated and is an equally cheap way to force unbounded D1
+        // scans; gate it identically.
+        if !self.check_rate_limit(ip) {
+            Self::send_notice(ws, "rate limit exceeded");
+            return;
+        }
+
         let session_pubkey = {
             let sessions = self.sessions.borrow();
             sessions

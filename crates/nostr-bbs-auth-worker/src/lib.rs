@@ -240,7 +240,7 @@ async fn route(
     // WebAuthn Registration -- Verify
     if path == "/auth/register/verify" && *method == Method::Post {
         let cf_country = req.headers().get("CF-IPCountry").ok().flatten();
-        return webauthn::register_verify(body_bytes, cf_country.as_deref(), env).await;
+        return webauthn::register_verify(req, body_bytes, cf_country.as_deref(), env).await;
     }
 
     // WebAuthn Authentication -- Generate options

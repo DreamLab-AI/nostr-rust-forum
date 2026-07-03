@@ -575,6 +575,15 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                 }
             };
 
+            // Verify event-id integrity and Schnorr signature before dedup or
+            // dispatch. Never hand forged authorship to callbacks — drop it.
+            if let Err(e) = nostr_bbs_core::verify_event_strict(&event) {
+                web_sys::console::warn_1(
+                    &format!("[Relay] Dropping event failing verification: {:?}", e).into(),
+                );
+                return;
+            }
+
             {
                 let mut inner = inner_rc.borrow_mut();
                 if !inner.seen_events.insert(event.id.clone()) {

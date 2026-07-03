@@ -816,4 +816,21 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         }
         Err(e) => console_error!("trust demotion sweep failed: {e}"),
     }
+
+    // Enforce the NIP-11 retention policy and NIP-40 expiration: DELETE rows
+    // past their kind's retention window and past their expiration tag. Paged
+    // and circuit-broken; a failure is logged but never breaks the tick.
+    match cron::sweep_retention(&env).await {
+        Ok(result) => {
+            if result.retention_deleted > 0 || result.expired_deleted > 0 || result.truncated {
+                console_log!(
+                    "retention sweep: retention_deleted={} expired_deleted={} truncated={}",
+                    result.retention_deleted,
+                    result.expired_deleted,
+                    result.truncated
+                );
+            }
+        }
+        Err(e) => console_error!("retention sweep failed: {e}"),
+    }
 }

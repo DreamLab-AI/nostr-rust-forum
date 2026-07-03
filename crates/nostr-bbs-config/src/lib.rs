@@ -2,9 +2,14 @@
 //!
 //! Implements [PRD-012 §5 X1] and [ADR-085]: a single `forum.toml` file is the
 //! source of truth for every deployment-specific setting (branding, hostnames,
-//! rate limits, custody tier, federation peers, ...). Worker crates in the
-//! `nostr-bbs-*-worker` set load this at startup; the `forum-client` reads its
-//! shape via `option_env!` slots populated at build time.
+//! rate limits, custody tier, federation peers, ...). This crate is a
+//! **build-time / deploy-time validator**, not a runtime startup check: the
+//! deploy pipeline loads and validates `forum.toml` through this crate before
+//! deployment, then projects the individual values into each worker's wrangler
+//! env bindings / secrets and into the `forum-client`'s `option_env!` slots.
+//! The `nostr-bbs-*-worker` crates run as Cloudflare Workers (wasm, with no
+//! runtime filesystem) and read those env bindings at runtime — they do not
+//! call [`load_from_path`] or read `forum.toml` directly at startup.
 //!
 //! # Example
 //!

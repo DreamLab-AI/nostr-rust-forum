@@ -165,9 +165,17 @@ pub(crate) fn LinkPreview(
                     PreviewState::Loaded(ref data) => {
                         let title = data.title.clone().unwrap_or_default();
                         let desc = data.description.clone().unwrap_or_default();
-                        let image = data.image.clone();
+                        // Drop og:image unless it is a safe http(s) URL.
+                        let image = data.image.clone().filter(|u| is_web_url(u));
                         let site = data.site_name.clone().unwrap_or_default();
-                        let href = data.url.clone().unwrap_or_else(|| url_for_display.clone());
+                        // Use og:url only if it is a safe http(s) URL; otherwise
+                        // fall back to the displayed URL, which is always http(s)
+                        // (extract_urls only accepts those schemes).
+                        let href = data
+                            .url
+                            .clone()
+                            .filter(|u| is_web_url(u))
+                            .unwrap_or_else(|| url_for_display.clone());
 
                         // Sanitize: strip any HTML tags from title/description
                         let title = strip_tags(&title);
@@ -267,6 +275,13 @@ async fn fetch_og_data(url: &str) -> Result<OgData, String> {
 }
 
 /// Strip HTML tags from a string (naive approach, no regex crate needed).
+/// Only `http`/`https` URLs are safe to place in an `href` or `src`. og:url and
+/// og:image come from the fetched (untrusted) page, so this blocks script-bearing
+/// schemes such as `javascript:` and `data:` from reaching the DOM.
+fn is_web_url(u: &str) -> bool {
+    u.starts_with("http://") || u.starts_with("https://")
+}
+
 fn strip_tags(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut in_tag = false;

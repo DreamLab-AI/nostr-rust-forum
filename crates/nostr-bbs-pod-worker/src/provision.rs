@@ -69,7 +69,7 @@ fn render_public_type_index_acl(owner_did: &str) -> Vec<u8> {
                 "@id": "#owner",
                 "@type": "acl:Authorization",
                 "acl:agent": { "@id": owner_did },
-                "acl:accessTo": { "@id": PUBLIC_TYPE_INDEX_PATH },
+                "acl:accessTo": { "@id": format!("/{PUBLIC_TYPE_INDEX_PATH}") },
                 "acl:mode": [
                     { "@id": "acl:Read" },
                     { "@id": "acl:Write" },
@@ -80,7 +80,7 @@ fn render_public_type_index_acl(owner_did: &str) -> Vec<u8> {
                 "@id": "#public",
                 "@type": "acl:Authorization",
                 "acl:agentClass": { "@id": "foaf:Agent" },
-                "acl:accessTo": { "@id": PUBLIC_TYPE_INDEX_PATH },
+                "acl:accessTo": { "@id": format!("/{PUBLIC_TYPE_INDEX_PATH}") },
                 "acl:mode": { "@id": "acl:Read" }
             }
         ]
@@ -474,5 +474,27 @@ mod tests {
         let ids: Vec<&str> = graph.iter().filter_map(|e| e["@id"].as_str()).collect();
         assert!(ids.contains(&"#owner"));
         assert!(ids.contains(&"#public"));
+    }
+
+    /// Regression: solid-pod-rs's wac evaluator only matches leading-slash
+    /// pod-relative `acl:accessTo` IRIs. If the accessTo is emitted without the
+    /// leading slash the public-read carve-out never matches AND the owner is
+    /// locked out of `publicTypeIndex.jsonld`. Every authorization's accessTo
+    /// must therefore start with "/".
+    #[test]
+    fn render_public_type_index_acl_access_to_has_leading_slash() {
+        let body = render_public_type_index_acl("did:nostr:aabb");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let graph = v["@graph"].as_array().unwrap();
+        for entry in graph {
+            let access_to = entry["acl:accessTo"]["@id"]
+                .as_str()
+                .expect("acl:accessTo @id must be a string");
+            assert!(
+                access_to.starts_with('/'),
+                "acl:accessTo must be a leading-slash pod-relative path: {access_to}"
+            );
+            assert_eq!(access_to, format!("/{PUBLIC_TYPE_INDEX_PATH}"));
+        }
     }
 }

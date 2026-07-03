@@ -825,6 +825,7 @@ pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> 
 /// extracting the credential from authenticator data (NOT from client-supplied
 /// fields), and storing it in D1.
 pub async fn register_verify(
+    req: &Request,
     body_bytes: &[u8],
     _cf_country: Option<&str>,
     env: &Env,
@@ -836,6 +837,30 @@ pub async fn register_verify(
         Some(pk) if is_valid_pubkey(pk) => pk.to_lowercase(),
         _ => return json_err("Invalid pubkey", 400),
     };
+
+    // P1: Prove control of `body.pubkey` before binding it to a passkey
+    // credential. Without this, `body.pubkey` is only shape-validated, so an
+    // attacker can register their own authenticator against an arbitrary
+    // (victim's) Nostr pubkey — forging that identity / squatting the key. We
+    // require a NIP-98 `Authorization` header signed by `body.pubkey` over this
+    // exact request (URL + method + body hash), reusing the same NIP-98
+    // verification the `/api` handlers use. The signer pubkey MUST equal the
+    // claimed pubkey, else the ceremony is rejected.
+    let auth_header = match req.headers().get("Authorization").ok().flatten() {
+        Some(h) => h,
+        None => return json_err("NIP-98 Authorization required", 401),
+    };
+    let request_url = canonicalise_url(&req.url().map(|u| u.to_string()).unwrap_or_default());
+    let nip98_result =
+        match auth::verify_nip98_replay(&auth_header, &request_url, "POST", Some(body_bytes), env)
+            .await
+        {
+            Ok(token) => token,
+            Err(_) => return json_err("Invalid NIP-98 token", 401),
+        };
+    if nip98_result.pubkey != pubkey {
+        return json_err("NIP-98 pubkey mismatch", 401);
+    }
 
     // Extract attestation response (credential ID comes from authenticator, not client fields)
     let cred_response = match &body.response {

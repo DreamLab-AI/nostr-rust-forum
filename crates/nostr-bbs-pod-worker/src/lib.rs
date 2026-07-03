@@ -1419,31 +1419,40 @@ async fn handle_acl_request(
 ) -> Result<Response> {
     let r2_key = format!("pods/{owner_pubkey}{acl_path}");
 
-    // Derive the parent resource path: strip `.acl` suffix
-    let parent_path = acl_path.strip_suffix(".acl").unwrap_or(acl_path);
-    // Normalize empty parent to "/"
-    let parent_path = if parent_path.is_empty() {
-        "/"
-    } else {
-        parent_path
-    };
+    // Derive the protected resource this `.acl`/`.meta` sidecar governs AND
+    // the AccessMode the WAC check must run against, via the SHARED
+    // sidecar-elevation decision `acl::effective_acl_target`
+    // (`solid_pod_rs::wac::effective_acl_target`) — the single source of truth
+    // co-owned with solid-pod-rs' native server. For any sidecar path this
+    // returns `(protected_resource, AccessMode::Control)`: reading OR writing
+    // an `.acl`/`.meta` discloses/rewrites the full authorization graph of the
+    // protected resource, which WAC §4.3.5 gates on `acl:Control` of that
+    // resource — never `acl:Read` of the sidecar. Deriving it here (rather
+    // than re-stripping `.acl` locally) keeps the forum on the shared policy
+    // and covers `.meta` sidecars identically.
+    let (protected_resource, acl_required_mode) =
+        acl::effective_acl_target(acl_path, AccessMode::Read);
+    let parent_path: &str = &protected_resource;
 
-    // Resolve effective ACL for the parent to determine access
+    // Resolve effective ACL for the protected resource to determine access.
     let parent_acl = find_effective_acl(bucket, kv, owner_pubkey, parent_path).await;
 
     match *method {
         Method::Get | Method::Head => {
-            // Reading an ACL requires acl:Read on the parent OR acl:Control
+            // P2-1 FIX: reading an `.acl`/`.meta` sidecar requires
+            // `acl:Control` on the PROTECTED resource — never mere `acl:Read`.
+            // The previous `evaluate_access(Read) || evaluate_access(Control)`
+            // shortcut let ANY Read-holder (including anonymous on a
+            // public-readable container) fetch the sidecar and read off the
+            // entire authorization graph — who-can-do-what — an information-
+            // disclosure leak. `acl_required_mode` is the shared decision
+            // (`AccessMode::Control` for every sidecar path), so the read gate
+            // now matches the write gate: a single `Control` check.
             let can_read = evaluate_access(
                 parent_acl.as_ref(),
                 agent_uri,
                 parent_path,
-                AccessMode::Read,
-            ) || evaluate_access(
-                parent_acl.as_ref(),
-                agent_uri,
-                parent_path,
-                AccessMode::Control,
+                acl_required_mode,
             );
 
             if !can_read {

@@ -207,11 +207,14 @@ proptest! {
     }
 }
 
-// ── (E1c-3) Control coercion: any HTTP method on .acl path → Control ─────────
+// ── (E1c-3) Control coercion: ANY HTTP method on .acl path → Control ─────────
 //
-// Models `coerce_required_mode_for_acl(path, method)` for the case where
-// path ends in `.acl` and method is in {PUT, POST, DELETE, PATCH}: result
-// must be Control. This proptest enumerates every common method.
+// Models the SHARED sidecar-elevation policy the real
+// `coerce_required_mode_for_acl` now delegates to
+// (`solid_pod_rs::wac::effective_acl_target`): a `.acl`/`.meta` sidecar path
+// collapses to Control for EVERY method — reads AND writes — because both
+// disclose or rewrite the protected resource's authorization graph (P2-1).
+// A non-sidecar path passes through the standard HTTP-method mapping.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccessMode {
@@ -232,13 +235,12 @@ fn method_to_mode_local(method: &str) -> AccessMode {
 
 fn coerce_required_mode_for_acl_local(path: &str, method: &str) -> AccessMode {
     let base = method_to_mode_local(method);
-    if !path.ends_with(".acl") {
-        return base;
+    // Shared policy: a sidecar (`.acl`/`.meta`) elevates to Control for EVERY
+    // method — reads included (P2-1). Non-sidecar paths keep `base`.
+    if path.ends_with(".acl") || path.ends_with(".meta") {
+        return AccessMode::Control;
     }
-    match base {
-        AccessMode::Read => AccessMode::Read,
-        AccessMode::Write | AccessMode::Append | AccessMode::Control => AccessMode::Control,
-    }
+    base
 }
 
 proptest! {
@@ -263,12 +265,14 @@ proptest! {
     }
 
     #[test]
-    fn read_methods_on_acl_path_remain_read(
+    fn read_methods_on_acl_path_require_control(
         path in r"/[a-z/]{1,30}\.acl",
         method in prop_oneof![Just("GET"), Just("HEAD")],
     ) {
+        // P2-1: reading an `.acl` sidecar must elevate to Control — a mere
+        // `acl:Read` holder must not read the authorization graph.
         let mode = coerce_required_mode_for_acl_local(&path, method);
-        prop_assert_eq!(mode, AccessMode::Read);
+        prop_assert_eq!(mode, AccessMode::Control);
     }
 
     #[test]

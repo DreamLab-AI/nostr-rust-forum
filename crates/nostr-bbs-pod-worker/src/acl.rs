@@ -16,10 +16,19 @@
 //!
 //! @see <https://solid.github.io/web-access-control-spec/>
 
-// Pure-logic re-exports from solid-pod-rs 0.4.0-alpha.4 `wac` module. These
-// were the kit's hand-rolled implementations; the upstream surface is API-
-// shape compatible and battle-tested in the JSS port.
-pub use solid_pod_rs::wac::{method_to_mode, wac_allow_header, AccessMode, AclDocument};
+// Pure-logic re-exports from the solid-pod-rs `wac` module. These were the
+// kit's hand-rolled implementations; the upstream surface is API-shape
+// compatible and battle-tested in the JSS port.
+//
+// `effective_acl_target` is the SHARED sidecar-elevation policy — the single
+// source of truth co-owned with solid-pod-rs' native server (it internally
+// consults `protected_resource_for_acl`). The forum re-exports it here so
+// every WAC decision (the pod-worker's `.acl` handler AND
+// `coerce_required_mode_for_acl` below) funnels through one module and cannot
+// drift from upstream.
+pub use solid_pod_rs::wac::{
+    effective_acl_target, method_to_mode, wac_allow_header, AccessMode, AclDocument,
+};
 
 /// All access modes, used for iterating when building WAC-Allow headers.
 pub const ALL_MODES: &[AccessMode] = &[
@@ -49,34 +58,27 @@ pub fn evaluate_access(
 // Kit-specific: WAC Control coercion for `*.acl` paths (Sprint v9 STREAM-B B3)
 // ---------------------------------------------------------------------------
 
-/// Determine if a path targets an `.acl` sidecar (matches `lib.rs::is_acl_path`).
-fn path_is_acl(path: &str) -> bool {
-    path.ends_with(".acl")
-}
-
-/// Coerce the required `AccessMode` for a request when the target resource is
-/// an `.acl` sidecar.
+/// Coerce the required `AccessMode` for a request whose target may be an
+/// `.acl` / `.meta` sidecar, delegating to the SHARED sidecar-elevation
+/// policy [`effective_acl_target`] (`solid_pod_rs::wac::effective_acl_target`).
 ///
-/// Per the WAC spec, only holders of `acl:Control` on the parent resource may
-/// **write** an ACL document, and reading an ACL requires either `acl:Read`
-/// on the parent OR `acl:Control`. The standard HTTP-method mapping (PUT →
-/// Write) is therefore unsafe for `.acl` paths because a principal with mere
-/// `acl:Write` would otherwise be able to escalate to `acl:Control` by
-/// overwriting the sidecar. Coerce write-class methods to `Control` so the
-/// caller never grants `.acl` writes purely on `acl:Write`.
+/// A sidecar governs another resource's authorization graph, so WAC §4.3.5
+/// requires `acl:Control` on the protected resource for ANY access — read AND
+/// write. `effective_acl_target` is the single source of truth for that
+/// decision (co-owned with solid-pod-rs' native server), so the forum no
+/// longer re-derives it: a sidecar path collapses to `Control`, and a normal
+/// path passes through the standard HTTP-method mapping unchanged.
 ///
-/// GET/HEAD remain `Read` because callers compose this with an additional
-/// `Control` check at the handler level.
+/// This closes BOTH the write escalation (a mere `acl:Write` holder seizing
+/// `acl:Control` by overwriting a sidecar) and the read-side disclosure (P2-1
+/// — an `acl:Read` holder reading the sidecar's authorization graph). Reads
+/// and writes now elevate identically, matching the pod-worker's `.acl`
+/// handler, which composes the same `effective_acl_target` decision.
 pub fn coerce_required_mode_for_acl(path: &str, method: &str) -> AccessMode {
     let base = method_to_mode(method);
-    if !path_is_acl(path) {
-        return base;
-    }
-    match base {
-        AccessMode::Read => AccessMode::Read,
-        // Any write/append against an .acl resource MUST require Control.
-        AccessMode::Write | AccessMode::Append | AccessMode::Control => AccessMode::Control,
-    }
+    // Delegate sidecar detection + elevation to the shared policy: for an
+    // `.acl`/`.meta` path the returned mode is `Control`; otherwise `base`.
+    effective_acl_target(path, base).1
 }
 
 // ---------------------------------------------------------------------------
@@ -841,11 +843,31 @@ mod tests {
     }
 
     #[test]
-    fn coerce_acl_path_get_remains_read() {
-        // Reading still requires Read (handler composes with Control fallback).
+    fn coerce_acl_path_get_requires_control() {
+        // P2-1: reading an `.acl` sidecar now elevates to Control under the
+        // shared policy — a mere `acl:Read` holder must not read the
+        // authorization graph. (Was `Read` under the drifted local copy that
+        // relied on a separate handler-level Control check.)
         assert_eq!(
             coerce_required_mode_for_acl("/profile/card.acl", "GET"),
-            AccessMode::Read
+            AccessMode::Control
+        );
+        assert_eq!(
+            coerce_required_mode_for_acl("/profile/card.acl", "HEAD"),
+            AccessMode::Control
+        );
+    }
+
+    #[test]
+    fn coerce_meta_sidecar_also_elevates() {
+        // The shared policy governs `.meta` sidecars identically to `.acl`.
+        assert_eq!(
+            coerce_required_mode_for_acl("/data.meta", "GET"),
+            AccessMode::Control
+        );
+        assert_eq!(
+            coerce_required_mode_for_acl("/data.meta", "PUT"),
+            AccessMode::Control
         );
     }
 
@@ -859,6 +881,51 @@ mod tests {
             coerce_required_mode_for_acl("/profile/card", "POST"),
             AccessMode::Append
         );
+    }
+
+    // ── P2-1: `.acl` read requires Control, never mere Read (info-disclosure) ──
+    //
+    // `handle_acl_request`'s GET/HEAD branch needs the worker R2/KV runtime
+    // and is not unit-testable natively. Its load-bearing decision is the
+    // SHARED sidecar-elevation policy: a GET on an `.acl`/`.meta` path runs the
+    // WAC check as `acl:Control` on the PROTECTED resource — never `acl:Read`
+    // on the sidecar. This test drives that exact decision through
+    // `effective_acl_target` + `evaluate_access`, the two functions the
+    // handler composes, on a PUBLIC-READABLE container.
+
+    #[test]
+    fn read_only_agent_denied_get_acl_on_public_container() {
+        // A public-readable container: foaf:Agent may Read `/public/`.
+        let container_acl = make_doc(vec![auth_read_public("/public/")]);
+        let read_agent = Some("did:nostr:reader");
+
+        // The requested sidecar path and the shared elevation decision.
+        let (protected, required) = effective_acl_target("/public/.acl", AccessMode::Read);
+        assert_eq!(protected, "/public/");
+        assert_eq!(
+            required,
+            AccessMode::Control,
+            "reading an .acl must elevate to acl:Control on the protected resource"
+        );
+
+        // P2-1 FIX: the read-only agent is DENIED the sidecar — a public-read
+        // ACL confers no Control.
+        assert!(
+            !evaluate_access(Some(&container_acl), read_agent, &protected, required),
+            "a non-Control agent must be DENIED GET /public/.acl even though /public/ is public-readable"
+        );
+        // Anonymous is likewise denied.
+        assert!(!evaluate_access(Some(&container_acl), None, &protected, required));
+
+        // Regression guard: prove the container really IS public-readable, so
+        // the deny above is the P2-1 fix and not an artefact of an empty ACL.
+        // Under the OLD `Read || Control` shortcut both of these Read grants
+        // would have leaked the sidecar to the reader and to anonymous.
+        assert!(
+            evaluate_access(Some(&container_acl), read_agent, "/public/", AccessMode::Read),
+            "container must be public-readable, else the P2-1 scenario is vacuous"
+        );
+        assert!(evaluate_access(Some(&container_acl), None, "/public/", AccessMode::Read));
     }
 
     // ── ACL doc size cap ───────────────────────────────────────────────
