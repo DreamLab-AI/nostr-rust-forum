@@ -255,7 +255,152 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
                 </div>
             }.into_any()
         }}
-        {board_composer(signer, channel_for_send, draft, status, reply_to)}
+        {board_composer(signer, channel_for_send, store, draft, status, reply_to)}
+    }
+}
+
+/// Extract lowercased `@handle` tokens (alphanumeric / `_` / `-`) from `content`.
+fn parse_handles(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+            {
+                j += 1;
+            }
+            if j > start {
+                out.push(content[start..j].to_ascii_lowercase());
+            }
+            i = j.max(start);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A kind-0 profile's `(name, display_name-without-spaces)`, both lowercased.
+fn profile_handles(ev: &nostr_bbs_core::event::NostrEvent) -> (String, String) {
+    serde_json::from_str::<serde_json::Value>(&ev.content)
+        .ok()
+        .map(|v| {
+            let name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let disp = v
+                .get("display_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .replace(' ', "");
+            (name, disp)
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve `@handle` mentions in `content` to `["p", pubkey]` tags by matching
+/// each handle (case-insensitively) against loaded kind-0 profile `name` /
+/// `display_name`. Skips handles already p-tagged in `existing` and de-dups.
+///
+/// This is what lets a BBS `@junkiejarvis` mention actually reach the agent:
+/// agents subscribe with `{kinds:[42], #p:[<agent-pubkey>]}`, so a bare content
+/// mention with no p-tag is invisible to them.
+fn mention_ptags(
+    content: &str,
+    profiles: &[nostr_bbs_core::event::NostrEvent],
+    existing: &[Vec<String>],
+) -> Vec<Vec<String>> {
+    let handles = parse_handles(content);
+    if handles.is_empty() {
+        return Vec::new();
+    }
+    let already: std::collections::HashSet<&str> = existing
+        .iter()
+        .filter(|t| t.first().map(String::as_str) == Some("p"))
+        .filter_map(|t| t.get(1).map(String::as_str))
+        .collect();
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ev in profiles {
+        let (name, disp) = profile_handles(ev);
+        let hit = handles
+            .iter()
+            .any(|h| (!name.is_empty() && *h == name) || (!disp.is_empty() && *h == disp));
+        if hit && !already.contains(ev.pubkey.as_str()) && seen.insert(ev.pubkey.clone()) {
+            out.push(vec!["p".to_string(), ev.pubkey.clone()]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+    use nostr_bbs_core::event::NostrEvent;
+
+    fn profile(pubkey: &str, name: &str, display: &str) -> NostrEvent {
+        NostrEvent {
+            id: String::new(),
+            pubkey: pubkey.to_string(),
+            created_at: 0,
+            kind: 0,
+            tags: vec![],
+            content: format!(r#"{{"name":"{name}","display_name":"{display}"}}"#),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn parses_handles_case_insensitive() {
+        assert_eq!(
+            parse_handles("hi @JunkieJarvis and @bob-1!"),
+            vec!["junkiejarvis", "bob-1"]
+        );
+        assert!(parse_handles("no mentions here").is_empty());
+        assert_eq!(parse_handles("email a@b is not a handle start"), vec!["b"]);
+    }
+
+    #[test]
+    fn resolves_mention_to_ptag() {
+        let profiles = vec![
+            profile(
+                "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+                "junkiejarvis",
+                "JunkieJarvis",
+            ),
+            profile("aa".repeat(32).as_str(), "alice", "Alice"),
+        ];
+        let base = relay::channel_message_tags("chan", None);
+        let tags = mention_ptags("@junkiejarvis what's on this week?", &profiles, &base);
+        assert_eq!(
+            tags,
+            vec![vec![
+                "p".to_string(),
+                "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn skips_already_ptagged_and_dedups() {
+        let jj = "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9";
+        let profiles = vec![profile(jj, "junkiejarvis", "JunkieJarvis")];
+        // Reply already p-tags jj as the parent author → no duplicate p-tag.
+        let base = relay::channel_message_tags("chan", Some(("root".into(), jj.into())));
+        assert!(mention_ptags("@junkiejarvis hi", &profiles, &base).is_empty());
+    }
+
+    #[test]
+    fn unknown_handle_yields_nothing() {
+        let profiles = vec![profile("aa".repeat(32).as_str(), "alice", "Alice")];
+        assert!(mention_ptags("@nobody hello", &profiles, &[]).is_empty());
     }
 }
 
@@ -265,6 +410,7 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
 fn board_composer(
     signer: Option<BbsSigner>,
     channel_id: String,
+    store: RelayStore,
     draft: RwSignal<String>,
     status: RwSignal<SendStatus>,
     reply_to: RwSignal<Option<(String, String)>>,
@@ -305,7 +451,12 @@ fn board_composer(
                 }
             };
             let now = (js_sys::Date::now() / 1000.0) as u64;
-            let tags = relay::channel_message_tags(&cid, reply_to.get_untracked());
+            let mut tags = relay::channel_message_tags(&cid, reply_to.get_untracked());
+            // Resolve @handle mentions to `["p", pubkey]` so agent mentions
+            // (e.g. @junkiejarvis) reach the agent's `#p` subscription — a bare
+            // content mention alone is invisible to it.
+            let mentions = mention_ptags(&text, &store.profiles.get_untracked(), &tags);
+            tags.extend(mentions);
             let unsigned = nostr_bbs_core::UnsignedEvent {
                 pubkey,
                 created_at: now,

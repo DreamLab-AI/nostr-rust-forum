@@ -231,6 +231,19 @@ pub fn install_key_handler(state: BbsState, store: RelayStore) {
             if state.cmd_open.get() {
                 return;
             }
+            // A focused text field (Settings sign-in key, board composer) owns its
+            // keystrokes too — otherwise digits / j / k / t / ? typed into a field
+            // leak to the global BBS navigation (e.g. a key starting "6…" jumps to
+            // the Code screen). Bail whenever an <input>/<textarea> has focus.
+            if let Some(el) = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.active_element())
+            {
+                let tag = el.tag_name();
+                if tag.eq_ignore_ascii_case("input") || tag.eq_ignore_ascii_case("textarea") {
+                    return;
+                }
+            }
             match ev.key().as_str() {
                 "/" => {
                     ev.prevent_default();
