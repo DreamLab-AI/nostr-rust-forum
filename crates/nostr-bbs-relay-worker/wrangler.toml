@@ -20,6 +20,17 @@ ZONE_CONFIG = "[]"
 # Must match the auth-worker and the client window.__ENV__ to take effect.
 DEVICE_KEYS_ENABLED = "false"
 
+# Escalation-default posture (REC-6 share / WP-9). The default authority
+# boundary the Agent Control Surface assumes, projected in the NIP-11
+# `nostr_bbs.escalation_defaults` block so a mesh agent can discover it.
+# ESCALATION_DEFAULT_TIER is the RiskTier (low|medium|high|critical) at/above
+# which an agent action escalates to a human; anything strictly below acts
+# autonomously. Default "medium" means only `low` is autonomous, matching the
+# member-surface suppression. This is a SCAFFOLD: the authoritative schema is
+# owned by agentbox (REC-6); an unrecognised tier folds to the medium default.
+ESCALATION_DEFAULT_TIER    = "medium"
+ESCALATION_DEFAULT_POSTURE = "escalate_to_human"
+
 # Mesh federation (PRD-010 Phase 3 / ADR-073)
 MESH_MODE               = "standalone"
 MESH_PEER_RELAYS        = ""

@@ -9,28 +9,44 @@
 //! store, which is fed by the relay governance subscription in `app.rs`.
 
 use leptos::prelude::*;
+use leptos_router::components::A;
 use std::rc::Rc;
 
+use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
 use crate::relay::RelayConnection;
 use crate::stores::panel_registry::{use_panel_registry, ActionEntry, PanelEntry};
+use crate::stores::zone_access::use_zone_access;
 use wasm_bindgen_futures::spawn_local;
 
 // ── Governance page component ────────────────────────────────────────────────
 
 /// The Agent Control Surface.
 ///
-/// `member_view` (F7): when `true`, the non-admin member surface suppresses
-/// `low` risk-tier action requests (approval-fatigue response, ADR-106
-/// Decision 4). Suppression is a **view filter** — the events remain in the
-/// store and stay visible on the admin surface (`member_view = false`, the
-/// default) and through the decisions read API. WP-1 mounts the member route
-/// with `member_view = true`.
+/// The surface is split by ROUTE, not by conditional render (ADR-106 Decision 2,
+/// F1). `member_view = true` is mounted only at the auth-only `/governance`
+/// member route (`MemberGatedGovernance`); it renders [`ReadOnlyPanelCard`] and
+/// [`ReadOnlyActionRow`], neither of which compiles in a 31403 publish path — so
+/// an ordinary member's client never mounts a response control. The admin write
+/// surface (`member_view = false`, the default) lives at the distinct
+/// `/governance/admin` route behind `AdminGatedGovernance`, where [`PanelCard`]
+/// and [`ActionRow`] carry the Approve/Reject/action controls.
+///
+/// `member_view` also drives the F7 approval-fatigue filter: the member surface
+/// suppresses `low` risk-tier action requests. Suppression is a **view filter** —
+/// the events remain in the store, stay visible on the admin surface, and are
+/// readable through the decisions read API (ADR-106 Decision 4).
 #[component]
 pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoView {
     let registry = use_panel_registry();
     let state = registry.state;
+
+    // An admin who lands on the read-only member route gets a link across to the
+    // write surface. Rendering a navigation link is not a write handler, so the
+    // member component tree still mounts no publish path.
+    let zone_access = use_zone_access();
+    let is_admin = Memo::new(move |_| zone_access.is_admin.get());
 
     let panels = Memo::new(move |_| {
         let s = state.read();
@@ -67,9 +83,29 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
         <div class="governance-page max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
             <div class="governance-header mb-8">
                 <h1 class="text-3xl font-bold text-white mb-2">"Agent Control Surface"</h1>
-                <p class="text-gray-400">
-                    "Interactive panels published by registered agents. Review decisions, monitor status, and respond to action requests."
-                </p>
+                {move || if member_view {
+                    view! {
+                        <p class="text-gray-400">
+                            "Panels published by registered agents, with their outcomes. This is a read-only view — administrators respond to action requests."
+                        </p>
+                    }.into_any()
+                } else {
+                    view! {
+                        <p class="text-gray-400">
+                            "Interactive panels published by registered agents. Review decisions, monitor status, and respond to action requests."
+                        </p>
+                    }.into_any()
+                }}
+                // An admin viewing the read-only member route gets a link to the
+                // distinct admin write surface (`/governance/admin`).
+                {move || (member_view && is_admin.get()).then(|| view! {
+                    <A
+                        href=base_href("/governance/admin")
+                        attr:class="inline-flex items-center gap-1.5 mt-3 text-sm px-3 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 border border-amber-500/20 hover:bg-amber-500/20 transition-colors"
+                    >
+                        "Open admin controls →"
+                    </A>
+                })}
             </div>
 
             <div class="governance-stats grid grid-cols-3 gap-4 mb-8">
@@ -109,7 +145,14 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                         key=|item| item.event_id.clone()
                         let:item
                     >
-                        <ActionRow item=item />
+                        // Route-split (ADR-106 Decision 2): the member surface
+                        // mounts a read-only row with no publish path; the admin
+                        // surface mounts the writable ActionRow.
+                        {if member_view {
+                            view! { <ReadOnlyActionRow item=item /> }.into_any()
+                        } else {
+                            view! { <ActionRow item=item /> }.into_any()
+                        }}
                     </For>
                 </div>
             </Show>
@@ -129,7 +172,13 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                         key=|panel| panel.d_tag.clone()
                         let:panel
                     >
-                        <PanelCard panel=panel />
+                        // Route-split (ADR-106 Decision 2): read-only card for the
+                        // member surface, writable card for the admin surface.
+                        {if member_view {
+                            view! { <ReadOnlyPanelCard panel=panel /> }.into_any()
+                        } else {
+                            view! { <PanelCard panel=panel /> }.into_any()
+                        }}
                     </For>
                 </div>
             </Show>
@@ -479,6 +528,131 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
             >
                 <span class="text-green-400 text-xs font-medium">"Response sent"</span>
             </Show>
+        </div>
+    }
+}
+
+// ── Read-only member components (F1, ADR-106 Decision 2) ─────────────────────
+//
+// These are the ONLY panel/action components the member route (`member_view =
+// true`) mounts. They render panels and their outcomes but compile in no relay
+// handle, no signer, and no 31403 publish path — the split-by-route invariant
+// (DDD Invariant 1: "the member read path publishes nothing"). A grep of this
+// region for `publish`/`sign_event`/`RelayConnection` returns nothing; the write
+// machinery lives only in [`PanelCard`] and [`ActionRow`] above, which the
+// member route never instantiates.
+
+/// Read-only panel card for the member surface. Mirrors [`PanelCard`]'s
+/// presentation — title, schema, description, counts, agent name, disclosure
+/// badge — but renders each declared action as a non-interactive label instead
+/// of a publishing button. A member sees *what* an agent can be asked, never a
+/// control that acts.
+#[component]
+fn ReadOnlyPanelCard(panel: PanelEntry) -> impl IntoView {
+    let schema_str = format!("{:?}", panel.definition.schema);
+    let schema_badge = match schema_str.as_str() {
+        "ActionInbox" => "Inbox",
+        "Dashboard" => "Dashboard",
+        "ConfigForm" => "Config",
+        "StatusBoard" => "Status",
+        "ChatBridge" => "Chat",
+        _ => "Panel",
+    };
+    let title = panel.definition.title.clone();
+    let description = panel.definition.description.clone();
+    let agent_name =
+        crate::components::user_display::use_display_name_memo(panel.agent_pubkey.clone());
+    let agent_badge_pubkey = panel.agent_pubkey.clone();
+    let field_count = panel.definition.fields.len();
+    let action_count = panel.definition.actions.len();
+
+    view! {
+        <div class="panel-card bg-gray-800 rounded-lg p-5 border border-gray-700/50">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="text-lg font-semibold text-white">{title}</h3>
+                <span class="text-xs px-2 py-1 rounded-full bg-amber-400/10 text-amber-400 font-medium">{schema_badge}</span>
+            </div>
+            <p class="text-gray-400 text-sm mb-4">{description}</p>
+            <div class="flex items-center gap-4 text-xs text-gray-500 mb-3">
+                <span>{format!("{field_count} fields")}</span>
+                <span>{format!("{action_count} actions")}</span>
+                <span>{move || agent_name.get()}</span>
+                <AgentBadge pubkey=agent_badge_pubkey compact=true />
+            </div>
+            <div class="flex flex-wrap gap-2">
+                {panel.definition.actions.iter().map(|action| {
+                    let label = action.label.clone();
+                    view! {
+                        <span class="px-3 py-1.5 text-xs rounded bg-gray-700/60 text-gray-400 border border-gray-600/60">
+                            {label}
+                        </span>
+                    }
+                }).collect_view()}
+            </div>
+        </div>
+    }
+}
+
+/// Read-only action row for the member surface. Mirrors [`ActionRow`]'s decision
+/// context — priority, title, reasoning, agent, risk tier + confidence,
+/// disclosure badge — but replaces the Approve/Reject controls with a static
+/// "Awaiting administrator decision" status. No signer, no relay, no 31403.
+#[component]
+fn ReadOnlyActionRow(item: ActionEntry) -> impl IntoView {
+    let priority_class = match item.priority.as_str() {
+        "critical" => "bg-red-500/20 text-red-400 border-red-500/30",
+        "high" => "bg-orange-500/20 text-orange-400 border-orange-500/30",
+        "medium" => "bg-blue-500/20 text-blue-400 border-blue-500/30",
+        "low" => "bg-gray-500/20 text-gray-400 border-gray-500/30",
+        _ => "bg-gray-500/20 text-gray-400 border-gray-500/30",
+    };
+
+    let title_tag = nostr_bbs_core::governance::extract_tag(
+        &item
+            .d_tag
+            .split('|')
+            .map(|s| vec![s.to_string()])
+            .collect::<Vec<_>>(),
+        "title",
+    )
+    .map(|s| s.to_string())
+    .unwrap_or_else(|| item.d_tag.clone());
+
+    let reasoning = item.reasoning.clone().unwrap_or_default();
+    let priority = item.priority.clone();
+    let confidence = item.confidence;
+    let risk_tier = item.risk_tier.clone();
+    let agent_name =
+        crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
+    let agent_badge_pubkey = item.agent_pubkey.clone();
+
+    view! {
+        <div class="action-row bg-gray-800 rounded-lg p-4 border border-gray-700/50 flex items-center gap-4">
+            <div class="flex-shrink-0">
+                <span class={format!("inline-block px-2 py-1 text-xs font-medium rounded border {priority_class}")}>{priority}</span>
+            </div>
+            <div class="flex-1 min-w-0">
+                <span class="text-white font-medium block truncate">{title_tag}</span>
+                <span class="text-gray-500 text-xs block truncate">
+                    {reasoning}" · "{move || agent_name.get()}
+                </span>
+                {move || {
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(t) = risk_tier.clone() {
+                        parts.push(format!("risk: {t}"));
+                    }
+                    if let Some(c) = confidence {
+                        parts.push(format!("confidence: {:.0}%", (c * 100.0).clamp(0.0, 100.0)));
+                    }
+                    (!parts.is_empty()).then(|| view! {
+                        <span class="text-amber-400/80 text-xs block truncate">{parts.join(" · ")}</span>
+                    })
+                }}
+                <AgentBadge pubkey=agent_badge_pubkey compact=true />
+            </div>
+            <span class="flex-shrink-0 text-xs text-gray-500 border border-gray-600/60 rounded px-2.5 py-1">
+                "Awaiting administrator decision"
+            </span>
         </div>
     }
 }

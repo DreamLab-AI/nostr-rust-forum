@@ -4,11 +4,62 @@
 //! policies per <https://github.com/nostr-protocol/nips/blob/master/11.md>.
 
 use nostr_bbs_core::governance::{
-    KIND_ACTION_REQUEST, KIND_ACTION_RESPONSE, KIND_PANEL_DEFINITION, KIND_PANEL_RETIRED,
+    RiskTier, KIND_ACTION_REQUEST, KIND_ACTION_RESPONSE, KIND_PANEL_DEFINITION, KIND_PANEL_RETIRED,
     KIND_PANEL_STATE, KIND_PANEL_UPDATE,
 };
 use serde_json::json;
 use worker::Env;
+
+/// Default escalation tier when `ESCALATION_DEFAULT_TIER` is unset (REC-6).
+const DEFAULT_ESCALATION_TIER: &str = "medium";
+/// Default authority posture when `ESCALATION_DEFAULT_POSTURE` is unset (REC-6).
+const DEFAULT_ESCALATION_POSTURE: &str = "escalate_to_human";
+
+/// Forum-side projection of the agent authority-boundary default (REC-6 share,
+/// WP-9). REC-6's authoritative schema is owned by agentbox; this relay reflects
+/// the shipped forum default so a NIP-11-reading agent can discover the boundary
+/// posture the surface currently assumes. It is a SCAFFOLD and labelled as such:
+/// `status` is `scaffolded` and `schema_owner` names agentbox, so a reader does
+/// not mistake it for the finalised authority model. When agentbox's REC-6
+/// schema lands, this field shape aligns to it (ADR-106 Decision 4 consequence;
+/// PRD WP-9).
+///
+/// `default_escalation_tier` is the [`RiskTier`] at (or above) which an agent
+/// action requires a human decision rather than acting autonomously. The shipped
+/// forum default escalates at `medium` and above — only `low` acts autonomously,
+/// which is exactly the tier the member surface suppresses
+/// ([`RiskTier::is_member_suppressed`]), so the projected default and the
+/// enforced view filter stay consistent. An unrecognised configured tier is
+/// normalised through [`RiskTier::parse`] so the relay can never advertise a tier
+/// the forum does not model.
+pub(crate) fn escalation_defaults_block(default_tier: &str, posture: &str) -> serde_json::Value {
+    let tier = RiskTier::parse(default_tier).as_str();
+    let risk_tiers: Vec<&'static str> = [
+        RiskTier::Low,
+        RiskTier::Medium,
+        RiskTier::High,
+        RiskTier::Critical,
+    ]
+    .iter()
+    .map(|t| t.as_str())
+    .collect();
+    json!({
+        "status": "scaffolded",
+        "schema_owner": "agentbox:REC-6",
+        "registry_gated": true,
+        "default_escalation_tier": tier,
+        "autonomous_below_default": true,
+        "default_posture": posture,
+        "risk_tiers": risk_tiers,
+        "note": "Forum-side reflection of the agent authority-boundary default. \
+                 The authoritative escalation-default schema is owned by agentbox \
+                 (REC-6); until it lands this projects the shipped forum default \
+                 (escalate at or above the default tier; only 'low' acts \
+                 autonomously). When REC-6 promotes this to a governance event \
+                 kind it is gated identically to kinds 31400-31405 via the \
+                 agent_registry.",
+    })
+}
 
 /// One NIP-11 retention rule: a set of event kinds and how long they are kept.
 ///
@@ -88,6 +139,18 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
 
     let admin_pubkey = String::new();
     let contact = String::new();
+
+    // REC-6 (WP-9): the default authority-boundary posture, sourced from config
+    // so an operator sets it without a code change. Falls back to a conservative
+    // default (escalate at/above medium; only `low` is autonomous).
+    let escalation_default_tier = env
+        .var("ESCALATION_DEFAULT_TIER")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| DEFAULT_ESCALATION_TIER.to_string());
+    let escalation_posture = env
+        .var("ESCALATION_DEFAULT_POSTURE")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| DEFAULT_ESCALATION_POSTURE.to_string());
 
     // Built from the shared `RETENTION_POLICY` so the advertised windows and the
     // cron sweep (`crate::cron::sweep_retention`) can never diverge.
@@ -187,7 +250,54 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
                 "panel_retired_kind": KIND_PANEL_RETIRED,
                 "agent_auth": "nip98",
                 "agent_identity": "did:nostr",
-            }
+            },
+            // REC-6 share (WP-9): forum-side reflection of the agentbox
+            // authority-boundary default. Scaffolded and schema-owned by
+            // agentbox — see `escalation_defaults_block`.
+            "escalation_defaults": escalation_defaults_block(
+                &escalation_default_tier,
+                &escalation_posture,
+            ),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escalation_block_reflects_config_and_lists_all_risk_tiers() {
+        let block = escalation_defaults_block("high", "escalate_to_human");
+        assert_eq!(block["status"], "scaffolded");
+        assert_eq!(block["schema_owner"], "agentbox:REC-6");
+        assert_eq!(block["registry_gated"], true);
+        assert_eq!(block["default_escalation_tier"], "high");
+        assert_eq!(block["default_posture"], "escalate_to_human");
+        let tiers = block["risk_tiers"].as_array().expect("risk_tiers array");
+        assert_eq!(tiers.len(), 4);
+        assert_eq!(tiers[0], "low");
+        assert_eq!(tiers[3], "critical");
+    }
+
+    #[test]
+    fn escalation_block_normalises_unknown_tier_to_default() {
+        // A junk configured tier must not advertise an unmodelled tier; parse
+        // folds it to the medium default.
+        let block = escalation_defaults_block("bananas", "escalate_to_human");
+        assert_eq!(block["default_escalation_tier"], "medium");
+    }
+
+    #[test]
+    fn projected_default_matches_member_suppression_boundary() {
+        // The shipped default (medium) means only `low` acts autonomously — the
+        // exact tier the member surface suppresses. This keeps the advertised
+        // default consistent with the enforced view filter (RiskTier::is_member_suppressed).
+        let block = escalation_defaults_block(DEFAULT_ESCALATION_TIER, DEFAULT_ESCALATION_POSTURE);
+        let tier = block["default_escalation_tier"]
+            .as_str()
+            .expect("tier string");
+        assert!(RiskTier::Low.is_member_suppressed());
+        assert!(!RiskTier::parse(tier).is_member_suppressed());
+    }
 }

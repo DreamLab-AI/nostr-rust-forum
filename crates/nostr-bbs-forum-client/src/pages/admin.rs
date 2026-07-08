@@ -9,6 +9,7 @@ use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::admin::agents_roster::AgentsRoster;
 use crate::admin::audit_log::AuditLogTab;
 use crate::admin::calendar::AdminCalendar;
 use crate::admin::channel_form::{ChannelForm, ChannelFormData};
@@ -249,6 +250,7 @@ fn AdminPanelInner() -> impl IntoView {
                 <TabButton tab=AdminTab::Users active=active_tab label="Users" />
                 <PendingTabButton active=active_tab pending=admin.state.stats />
                 <TabButton tab=AdminTab::Sections active=active_tab label="Sections" />
+                <TabButton tab=AdminTab::Agents active=active_tab label="Agents" />
                 <TabButton tab=AdminTab::Calendar active=active_tab label="Calendar" />
                 <TabButton tab=AdminTab::Settings active=active_tab label="Settings" />
                 <TabButton tab=AdminTab::Reports active=active_tab label="Reports" />
@@ -264,6 +266,7 @@ fn AdminPanelInner() -> impl IntoView {
                     AdminTab::Users => view! { <UsersTab /> }.into_any(),
                     AdminTab::Pending => view! { <RegistrationsPanel /> }.into_any(),
                     AdminTab::Sections => view! { <SectionRequests /> }.into_any(),
+                    AdminTab::Agents => view! { <AgentsRoster /> }.into_any(),
                     AdminTab::Calendar => view! { <AdminCalendar /> }.into_any(),
                     AdminTab::Settings => view! { <SettingsTab /> }.into_any(),
                     AdminTab::Reports => view! { <ReportsTab /> }.into_any(),
