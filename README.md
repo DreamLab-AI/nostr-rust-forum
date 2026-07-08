@@ -12,7 +12,7 @@ The kit ships **vanilla**. An operator stands up a community by copying
 [`forum.example.toml`](forum.example.toml) to `forum.toml`, filling in their zones,
 branding, and deployment values — no forking, no code changes.
 
-[![Release](https://img.shields.io/badge/release-v1.0.0--beta.3-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.0.0--beta.4-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--only-green)](LICENSE)
 [![Identity](https://img.shields.io/badge/identity-did%3Anostr%20Multikey-8b5cf6)](#identity--keys)
 [![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20WASM-orange)](#architecture)
@@ -163,7 +163,7 @@ portable across every system that speaks the method.
 - **Auth reads the raw signature, not the document.** NIP-98 (HTTP) and NIP-42
   (relay) verify a Schnorr signature against the raw event pubkey — re-encoding the
   DID document can never affect the auth path.
-- The pod + identity layers run on **solid-pod-rs `0.5.0-alpha.2`** (the JSS Rust
+- The pod + identity layers run on **solid-pod-rs `0.5.0-alpha.4`** (the JSS Rust
   port), which is the single canonical encoder of record for the Multikey DID document.
 
 ---
@@ -493,7 +493,7 @@ embeds as the governance surface of a larger agent platform.
 
 | Foundation | Project | Role |
 |:-----------|:--------|:-----|
-| **solid-pod-rs** | [solid-pod-rs](https://github.com/melvincarvalho/solid-pod-rs) | Cryptographic foundation — JSS Rust port, `did:nostr` Multikey identity (`0.5.0-alpha.2`) |
+| **solid-pod-rs** | [solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs) | Cryptographic foundation — JSS Rust port, `did:nostr` Multikey identity (`0.5.0-alpha.4`) |
 | **JSS** | [JavaScriptSolidServer](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer) | Upstream Solid server reference and AGPL-3.0 lineage |
 | **did-nostr** | [did:nostr](https://github.com/nicholasgasior/did-nostr) | Nostr-keyed DID method for cross-system identity |
 

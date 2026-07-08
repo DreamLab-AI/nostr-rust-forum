@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
+## [1.0.0-beta.4] - 2026-07-08
+
+### Changed
+
+- **nostr-bbs-core** bumped to `1.0.0-beta.4` (did-doc canonicalisation gate,
+  shared WAC/did:nostr policy from solid-pod-rs `0.5.0-alpha.4`). The other 13
+  crates remain at `1.0.0-beta.3` per ADR-103 (only the changed crate bumps).
+- **solid-pod-rs** dependency raised to `0.5.0-alpha.4`.
+
+### Added
+
+- **COM-13/F2** Agent disclosure badge — renders at all author sites; public
+  `/api/agents/disclosure` endpoint for transparency.
+- **F8** Admin Agents roster tab — wired to the nine `/api/governance/*`
+  endpoints for operator-managed agent lifecycle.
+- **F1** Member read-only view of agent roster.
+- **COM-16/COM-17** Decision integrity and graduated escalation enforcement.
+- **REC-6** Escalation-default projection for new operator deployments.
+- **F6** Supersession authority aligned to canonical DDD §7a.
+- **NIP-07** Browser-extension signing (PodKey/nos2x/Alby).
+- Zone hero board grouping — boards interleaved under their zone hero banner.
+
+### Fixed
+
+- Closeout security audit remediation (shared WAC/did:nostr policy).
+- DID-doc fixture converged to CID/v1 and ADR-125 canonical form.
+- WoT registration gate fail-closed on settings-read D1 error.
+
 ## [ADR backfill] - 2026-06-11
 
 ### Added
