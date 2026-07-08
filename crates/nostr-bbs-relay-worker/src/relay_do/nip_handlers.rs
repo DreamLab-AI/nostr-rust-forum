@@ -104,6 +104,117 @@ pub fn governance_response_blocked(kind: u64, is_admin: bool) -> bool {
     kind == governance::KIND_ACTION_RESPONSE && !is_admin
 }
 
+/// The `broker_cases` columns the 31403 projection reads to hydrate a case
+/// aggregate (COM-16). Deserialised straight from a D1 row.
+#[derive(serde::Deserialize)]
+pub(crate) struct BrokerCaseRow {
+    pub category: String,
+    pub state: String,
+    pub created_by: String,
+    pub from_share_state: Option<String>,
+    pub to_share_state: Option<String>,
+}
+
+/// The persistable result of projecting a 31403 onto a case: the row to append
+/// to `broker_decisions` and the new `broker_cases.state`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResponseProjection {
+    pub decision_id: String,
+    /// `broker_decisions.outcome` — the canonical action string.
+    pub outcome: String,
+    /// `broker_decisions.outcome_detail` — delegate target / pattern id /
+    /// precedent scope / amend diff; `None` for approve/reject.
+    pub outcome_detail: Option<String>,
+    pub prior_decision_id: Option<String>,
+    /// `broker_cases.state` after the decision — never `under_review` for a
+    /// well-formed outcome.
+    pub new_state: governance::broker::CaseState,
+    pub reasoning: String,
+}
+
+/// Plan the 31403 ActionResponse projection (COM-16 / F3).
+///
+/// This is the relay's consumer of the tested escalation state machine: it
+/// hydrates a `BrokerCase` from the case's D1 row (or a sensible default when
+/// the row is absent — a response can arrive before its request projected) and
+/// routes the parsed outcome through **`DecisionOrchestrator::decide`**, so a
+/// `delegate`/`promote`/`precedent` outcome reaches the matching `CaseState`
+/// instead of the former fixed `under_review` fallback. The `Env`/D1 read + write
+/// stay in [`NostrRelayDO::project_action_response`]; this pure seam is what makes
+/// the lifecycle unit-testable in the worker crate without a live D1.
+pub(crate) fn plan_action_response(
+    case_id: &str,
+    case_row: Option<&BrokerCaseRow>,
+    event_id: &str,
+    content: &str,
+    responder_pubkey: &str,
+    latest_decision_id: Option<String>,
+    now: u64,
+) -> std::result::Result<ResponseProjection, governance::broker::OrchestrationError> {
+    use governance::broker::{
+        CaseCategory, CaseSnapshot, CaseState, DecisionOrchestrator, DecisionOutcome, ShareState,
+    };
+
+    // Parse the typed outcome from the signed 31403 content; a malformed or
+    // unknown action is rejected (the case is left untouched, never parked).
+    let outcome = DecisionOutcome::from_response_content(content).ok_or_else(|| {
+        governance::broker::OrchestrationError::ShareTransitionRejected(
+            "unrecognised or malformed 31403 action response".to_string(),
+        )
+    })?;
+    let reasoning = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("reasoning")
+                .and_then(|r| r.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let decision_id = format!("dec-{}", &event_id[..16.min(event_id.len())]);
+
+    let snapshot = match case_row {
+        Some(row) => CaseSnapshot {
+            id: case_id.to_string(),
+            category: CaseCategory::parse(&row.category),
+            created_by: row.created_by.clone(),
+            state: CaseState::parse(&row.state),
+            from_state: row.from_share_state.as_deref().and_then(ShareState::parse),
+            to_state: row.to_share_state.as_deref().and_then(ShareState::parse),
+            latest_decision_id,
+        },
+        None => CaseSnapshot {
+            id: case_id.to_string(),
+            category: CaseCategory::ManualSubmission,
+            created_by: String::new(),
+            state: CaseState::Open,
+            from_state: None,
+            to_state: None,
+            latest_decision_id,
+        },
+    };
+
+    // Hydrate the aggregate and route through the tested orchestrator.
+    let mut case = snapshot.hydrate(now);
+    let orch = DecisionOrchestrator;
+    let report = orch.decide(
+        &mut case,
+        decision_id.clone(),
+        outcome.clone(),
+        responder_pubkey,
+        reasoning.clone(),
+        now,
+    )?;
+
+    Ok(ResponseProjection {
+        decision_id,
+        outcome: outcome.action_str().to_string(),
+        outcome_detail: outcome.detail().map(str::to_string),
+        prior_decision_id: report.entry.prior_decision_id.clone(),
+        new_state: case.state,
+        reasoning,
+    })
+}
+
 /// ADR-099: resolve the EFFECTIVE principal a session's access derives from.
 ///
 /// When device keys are enabled and the authing `pubkey` is a registered,
@@ -1276,6 +1387,16 @@ impl NostrRelayDO {
         }
     }
 
+    /// Project a signed 31403 ActionResponse onto `broker_decisions` and the
+    /// case's state (COM-16 / F3).
+    ///
+    /// The parsed outcome — including the non-binary `delegate`/`promote`/
+    /// `precedent` forms — is routed through the tested `DecisionOrchestrator`
+    /// (via [`plan_action_response`], which calls `DecisionOrchestrator::decide`),
+    /// so the resulting `CaseState` matches the outcome instead of the former
+    /// projection's fixed `under_review` fallback. A malformed, terminal or
+    /// self-review response yields an error and persists nothing — the case is
+    /// left unchanged, never parked.
     pub(crate) async fn project_action_response(&self, event: &NostrEvent) {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
@@ -1287,42 +1408,92 @@ impl NostrRelayDO {
             return;
         }
 
-        let action = serde_json::from_str::<governance::ActionResponse>(&event.content)
-            .map(|r| r.action)
-            .unwrap_or_else(|_| "unknown".to_string());
+        // Hydrate the case aggregate from its D1 projection: the orchestrator
+        // reads category/state/created_by/share-states, and the latest decision
+        // id links the provenance chain.
+        let case_row = db
+            .prepare(
+                "SELECT category, state, created_by, from_share_state, to_share_state \
+                 FROM broker_cases WHERE id = ?1 LIMIT 1",
+            )
+            .bind(&[JsValue::from_str(case_id)])
+            .ok();
+        let case_row = match case_row {
+            Some(stmt) => stmt.first::<BrokerCaseRow>(None).await.ok().flatten(),
+            None => None,
+        };
 
-        let reasoning = serde_json::from_str::<governance::ActionResponse>(&event.content)
-            .map(|r| r.reasoning)
-            .unwrap_or_default();
+        #[derive(serde::Deserialize)]
+        struct LatestDecisionRow {
+            decision_id: String,
+        }
+        let latest_stmt = db
+            .prepare(
+                "SELECT decision_id FROM broker_decisions \
+                 WHERE case_id = ?1 ORDER BY decided_at DESC LIMIT 1",
+            )
+            .bind(&[JsValue::from_str(case_id)])
+            .ok();
+        let latest_decision_id = match latest_stmt {
+            Some(stmt) => stmt
+                .first::<LatestDecisionRow>(None)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.decision_id),
+            None => None,
+        };
 
-        let decision_id = format!("dec-{}", &event.id[..16.min(event.id.len())]);
+        let proj = match plan_action_response(
+            case_id,
+            case_row.as_ref(),
+            &event.id,
+            &event.content,
+            &event.pubkey,
+            latest_decision_id,
+            event.created_at,
+        ) {
+            Ok(proj) => proj,
+            Err(_) => return,
+        };
+
+        let detail_val = proj
+            .outcome_detail
+            .as_deref()
+            .map(JsValue::from_str)
+            .unwrap_or(JsValue::NULL);
+        let prior_val = proj
+            .prior_decision_id
+            .as_deref()
+            .map(JsValue::from_str)
+            .unwrap_or(JsValue::NULL);
 
         let stmt = db.prepare(
             "INSERT OR IGNORE INTO broker_decisions \
-             (decision_id, case_id, outcome, broker_pubkey, reasoning, decided_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (decision_id, case_id, outcome, outcome_detail, broker_pubkey, reasoning, \
+              prior_decision_id, decided_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         );
         if let Ok(bound) = stmt.bind(&[
-            JsValue::from_str(&decision_id),
+            JsValue::from_str(&proj.decision_id),
             JsValue::from_str(case_id),
-            JsValue::from_str(&action),
+            JsValue::from_str(&proj.outcome),
+            detail_val,
             JsValue::from_str(&event.pubkey),
-            JsValue::from_str(&reasoning),
+            JsValue::from_str(&proj.reasoning),
+            prior_val,
             JsValue::from_f64(event.created_at as f64),
         ]) {
             let _ = bound.run().await;
         }
 
-        let new_state = match action.as_str() {
-            "approve" => "resolved",
-            "reject" => "rejected",
-            _ => "under_review",
-        };
+        // Move the case to the CaseState the orchestrator produced — never
+        // `under_review` for a well-formed non-binary outcome.
         let update_stmt = db.prepare(
             "UPDATE broker_cases SET state = ?1, assigned_to = ?2, updated_at = ?3 WHERE id = ?4",
         );
         if let Ok(bound) = update_stmt.bind(&[
-            JsValue::from_str(new_state),
+            JsValue::from_str(proj.new_state.as_str()),
             JsValue::from_str(&event.pubkey),
             JsValue::from_f64(event.created_at as f64),
             JsValue::from_str(case_id),
@@ -1612,6 +1783,147 @@ mod count_auth_tests {
         // The #p constraint must be rebound to the authed pubkey so a client
         // cannot count/read another user's sealed DMs.
         assert_eq!(out[0].extra.get("#p"), Some(&serde_json::json!([pk])));
+    }
+}
+
+#[cfg(test)]
+mod governance_projection_tests {
+    //! COM-16 / F3: the 31403 ActionResponse projection routes non-binary
+    //! outcomes through the tested `DecisionOrchestrator`. These exercise the
+    //! pure `plan_action_response` seam — the worker-side assembly of a
+    //! `CaseSnapshot` from a D1 row plus the orchestrator call — without a live
+    //! D1. The env-bound read/write in `project_action_response` is a thin shell
+    //! over this.
+    use super::*;
+    use nostr_bbs_core::governance::broker::{CaseState, OrchestrationError};
+
+    fn open_case_row() -> BrokerCaseRow {
+        BrokerCaseRow {
+            category: "manual_submission".into(),
+            state: "open".into(),
+            created_by: "agent-alice".into(),
+            from_share_state: None,
+            to_share_state: None,
+        }
+    }
+
+    #[test]
+    fn delegate_response_reaches_delegated_not_under_review() {
+        let row = open_case_row();
+        let proj = plan_action_response(
+            "case-1",
+            Some(&row),
+            &"e".repeat(64),
+            r#"{"action":"delegate","delegate_to":"human-carol","reasoning":"reassign"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("delegate projects");
+        assert_eq!(proj.outcome, "delegate");
+        assert_eq!(proj.outcome_detail.as_deref(), Some("human-carol"));
+        assert_eq!(proj.new_state, CaseState::Delegated);
+        // The falsification target for WP-4.
+        assert_ne!(proj.new_state, CaseState::UnderReview);
+    }
+
+    #[test]
+    fn promote_and_precedent_reach_matching_states() {
+        let row = open_case_row();
+        let promote = plan_action_response(
+            "case-1",
+            Some(&row),
+            &"a".repeat(64),
+            r#"{"action":"promote","pattern_id":"pat-9"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("promote projects");
+        assert_eq!(promote.new_state, CaseState::Promoted);
+
+        let precedent = plan_action_response(
+            "case-1",
+            Some(&open_case_row()),
+            &"b".repeat(64),
+            r#"{"action":"precedent","scope":"org-wide"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("precedent projects");
+        assert_eq!(precedent.new_state, CaseState::Precedent);
+    }
+
+    #[test]
+    fn binary_outcomes_reach_decided_with_no_detail() {
+        let proj = plan_action_response(
+            "case-1",
+            Some(&open_case_row()),
+            &"c".repeat(64),
+            r#"{"action":"approve","reasoning":"ok"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("approve projects");
+        assert_eq!(proj.new_state, CaseState::Decided);
+        assert_eq!(proj.outcome_detail, None);
+    }
+
+    #[test]
+    fn absent_case_row_defaults_to_open_and_still_projects() {
+        // A 31403 that arrives before its 31402 projected: no row yet. The
+        // planner defaults to an open ManualSubmission case so the decision is
+        // still recorded rather than dropped.
+        let proj = plan_action_response(
+            "case-unknown",
+            None,
+            &"d".repeat(64),
+            r#"{"action":"reject","reasoning":"no"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("projects against default snapshot");
+        assert_eq!(proj.new_state, CaseState::Decided);
+    }
+
+    #[test]
+    fn terminal_case_row_rejects_second_response() {
+        let mut row = open_case_row();
+        row.state = "decided".into();
+        let err = plan_action_response(
+            "case-1",
+            Some(&row),
+            &"f".repeat(64),
+            r#"{"action":"approve","reasoning":"again"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OrchestrationError::Case(
+                nostr_bbs_core::governance::broker::CaseError::AlreadyTerminal(_)
+            )
+        ));
+    }
+
+    #[test]
+    fn malformed_response_is_rejected() {
+        let err = plan_action_response(
+            "case-1",
+            Some(&open_case_row()),
+            &"0".repeat(64),
+            r#"{"action":"escalate"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, OrchestrationError::ShareTransitionRejected(_)));
     }
 }
 

@@ -9,6 +9,7 @@
 //! store, which is fed by the relay governance subscription in `app.rs`.
 
 use leptos::prelude::*;
+use std::rc::Rc;
 
 use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
@@ -18,8 +19,16 @@ use wasm_bindgen_futures::spawn_local;
 
 // ── Governance page component ────────────────────────────────────────────────
 
+/// The Agent Control Surface.
+///
+/// `member_view` (F7): when `true`, the non-admin member surface suppresses
+/// `low` risk-tier action requests (approval-fatigue response, ADR-106
+/// Decision 4). Suppression is a **view filter** — the events remain in the
+/// store and stay visible on the admin surface (`member_view = false`, the
+/// default) and through the decisions read API. WP-1 mounts the member route
+/// with `member_view = true`.
 #[component]
-pub fn GovernancePage() -> impl IntoView {
+pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoView {
     let registry = use_panel_registry();
     let state = registry.state;
 
@@ -32,13 +41,27 @@ pub fn GovernancePage() -> impl IntoView {
 
     let actions = Memo::new(move |_| {
         let s = state.read();
-        let mut v = s.actions.clone();
+        let mut v: Vec<ActionEntry> = s
+            .actions
+            .iter()
+            .filter(|a| !member_view || a.is_member_visible())
+            .cloned()
+            .collect();
         v.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         v
     });
 
     let panel_count = Memo::new(move |_| state.read().panels.len());
-    let action_count = Memo::new(move |_| state.read().actions.len());
+    // Count only the requests this surface renders, so the stat and the
+    // empty-state gate agree with the F7 member suppression.
+    let action_count = Memo::new(move |_| {
+        state
+            .read()
+            .actions
+            .iter()
+            .filter(|a| !member_view || a.is_member_visible())
+            .count()
+    });
 
     view! {
         <div class="governance-page max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -176,6 +199,10 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                     };
                     let loading = RwSignal::new(false);
                     let sent = RwSignal::new(false);
+                    // F4: relay-rejection state. The publish state advances to
+                    // `sent` only on a relay OK; a rejection re-enables the
+                    // control for a retry instead of reading as sent.
+                    let rejected = RwSignal::new(false);
                     let on_click = {
                         let action_id = action_id.clone();
                         let d_tag = panel_d_tag.clone();
@@ -190,6 +217,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                                 None => return,
                             };
                             loading.set(true);
+                            rejected.set(false);
                             let content = serde_json::json!({
                                 "action": action_id,
                                 "reasoning": format!("Human selected '{action_id}' on this panel via the governance UI"),
@@ -211,9 +239,28 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                             spawn_local(async move {
                                 match auth.sign_event_async(unsigned).await {
                                     Ok(signed) => {
-                                        relay.publish(&signed);
-                                        sent.set(true);
-                                        loading.set(false);
+                                        // F4: advance to Sent only on a relay OK;
+                                        // a rejection (accepted = false) surfaces
+                                        // as retryable, never as sent.
+                                        let ack: crate::relay::PublishCallback =
+                                            Rc::new(move |accepted: bool, message: String| {
+                                                loading.set(false);
+                                                if accepted {
+                                                    sent.set(true);
+                                                } else {
+                                                    rejected.set(true);
+                                                    web_sys::console::warn_1(
+                                                        &format!("[governance] panel action rejected by relay: {message}").into(),
+                                                    );
+                                                }
+                                            });
+                                        if let Err(e) = relay.publish_with_ack(&signed, Some(ack)) {
+                                            web_sys::console::warn_1(
+                                                &format!("[governance] panel action publish failed: {e}").into(),
+                                            );
+                                            loading.set(false);
+                                            rejected.set(true);
+                                        }
                                     }
                                     Err(e) => {
                                         web_sys::console::warn_1(
@@ -233,6 +280,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                         >
                             {move || if sent.get() { "✓ Sent".to_string() }
                                 else if loading.get() { "…".to_string() }
+                                else if rejected.get() { "⚠ Retry".to_string() }
                                 else { label.clone() }}
                         </button>
                     }
@@ -271,6 +319,10 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
     let priority = item.priority.clone();
     let d_tag = item.d_tag.clone();
     let event_id = item.event_id.clone();
+    // F5: the agent's stated confidence + risk tier, shown at decision time so a
+    // human sees them before responding. Sourced from the 31402 ActionRequest.
+    let confidence = item.confidence;
+    let risk_tier = item.risk_tier.clone();
     // Resolve the requesting agent's name reactively (display_name > name >
     // NIP-05 > shortened pubkey). Re-renders when kind-0 metadata arrives.
     let agent_name =
@@ -282,6 +334,9 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
     let approve_loading = RwSignal::new(false);
     let reject_loading = RwSignal::new(false);
     let response_sent = RwSignal::new(false);
+    // F4: relay-rejection state. `response_sent` advances only on a relay OK; a
+    // rejection re-shows the controls (retryable) rather than reading as sent.
+    let response_rejected = RwSignal::new(false);
 
     let send_response = {
         let event_id = event_id.clone();
@@ -291,6 +346,7 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
             let event_id = event_id.clone();
             let d_tag = d_tag.clone();
             loading_sig.set(true);
+            response_rejected.set(false);
 
             let auth = use_auth();
             let pubkey = match auth.pubkey().get_untracked() {
@@ -324,9 +380,27 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
             spawn_local(async move {
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {
-                        r.publish(&signed);
-                        response_sent.set(true);
-                        loading_sig.set(false);
+                        // F4: advance to "Response sent" only when the relay
+                        // acknowledges with OK; a rejection surfaces as retryable.
+                        let ack: crate::relay::PublishCallback =
+                            Rc::new(move |accepted: bool, message: String| {
+                                loading_sig.set(false);
+                                if accepted {
+                                    response_sent.set(true);
+                                } else {
+                                    response_rejected.set(true);
+                                    web_sys::console::warn_1(
+                                        &format!("[governance] action response rejected by relay: {message}").into(),
+                                    );
+                                }
+                            });
+                        if let Err(e) = r.publish_with_ack(&signed, Some(ack)) {
+                            web_sys::console::warn_1(
+                                &format!("[governance] Failed to publish action response: {e}").into(),
+                            );
+                            loading_sig.set(false);
+                            response_rejected.set(true);
+                        }
                     }
                     Err(e) => {
                         web_sys::console::warn_1(
@@ -360,26 +434,46 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                 <span class="text-gray-500 text-xs block truncate">
                     {reasoning}" · "{move || agent_name.get()}
                 </span>
+                // F5: agent-declared risk tier + confidence, at decision time.
+                {move || {
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(t) = risk_tier.clone() {
+                        parts.push(format!("risk: {t}"));
+                    }
+                    if let Some(c) = confidence {
+                        parts.push(format!("confidence: {:.0}%", (c * 100.0).clamp(0.0, 100.0)));
+                    }
+                    (!parts.is_empty()).then(|| view! {
+                        <span class="text-amber-400/80 text-xs block truncate">{parts.join(" · ")}</span>
+                    })
+                }}
                 <AgentBadge pubkey=agent_badge_pubkey compact=true />
             </div>
             <Show
                 when=move || response_sent.get()
                 fallback=move || view! {
-                    <div class="flex gap-2 flex-shrink-0">
-                        <button
-                            class="px-3 py-1.5 text-xs rounded bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20 transition-colors disabled:opacity-50"
-                            disabled=move || !is_authed.get() || approve_loading.get()
-                            on:click=on_approve.clone()
-                        >
-                            {move || if approve_loading.get() { "..." } else { "Approve" }}
-                        </button>
-                        <button
-                            class="px-3 py-1.5 text-xs rounded bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors disabled:opacity-50"
-                            disabled=move || !is_authed.get() || reject_loading.get()
-                            on:click=on_reject.clone()
-                        >
-                            {move || if reject_loading.get() { "..." } else { "Reject" }}
-                        </button>
+                    <div class="flex flex-col items-end gap-1 flex-shrink-0">
+                        <div class="flex gap-2">
+                            <button
+                                class="px-3 py-1.5 text-xs rounded bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20 transition-colors disabled:opacity-50"
+                                disabled=move || !is_authed.get() || approve_loading.get()
+                                on:click=on_approve.clone()
+                            >
+                                {move || if approve_loading.get() { "..." } else { "Approve" }}
+                            </button>
+                            <button
+                                class="px-3 py-1.5 text-xs rounded bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+                                disabled=move || !is_authed.get() || reject_loading.get()
+                                on:click=on_reject.clone()
+                            >
+                                {move || if reject_loading.get() { "..." } else { "Reject" }}
+                            </button>
+                        </div>
+                        // F4: a relay-rejected response reads as rejected + retryable,
+                        // never as sent.
+                        <Show when=move || response_rejected.get() fallback=|| ()>
+                            <span class="text-red-400 text-xs font-medium">"⚠ Rejected by relay — retry"</span>
+                        </Show>
                     </div>
                 }
             >

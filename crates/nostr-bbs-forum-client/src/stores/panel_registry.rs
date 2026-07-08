@@ -28,6 +28,27 @@ pub struct ActionEntry {
     pub priority: String,
     pub created_at: u64,
     pub event_id: String,
+    /// Agent-declared confidence in the requested action (F5), displayed at
+    /// decision time. Sourced from the 31402 ActionRequest, never inferred.
+    pub confidence: Option<f32>,
+    /// Agent-declared risk tier (F7), sourced from the 31402 ActionRequest.
+    /// Drives member-surface suppression via [`ActionEntry::is_member_visible`].
+    pub risk_tier: Option<String>,
+}
+
+impl ActionEntry {
+    /// F7 (approval-fatigue response): whether the member (non-admin) surface
+    /// shows this request. A `low` risk tier is suppressed so a member sees only
+    /// the requests a tier says warrant attention. This is a **view filter** —
+    /// the 31402/31403 events still exist in the store and stay visible on the
+    /// admin surface and through the decisions read API (ADR-106 Decision 4). An
+    /// unlabelled request (no tier) is shown (fail-open on visibility).
+    pub fn is_member_visible(&self) -> bool {
+        match &self.risk_tier {
+            Some(t) => !governance::RiskTier::parse(t).is_member_suppressed(),
+            None => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -98,6 +119,8 @@ impl PanelRegistry {
                             priority,
                             created_at: event.created_at,
                             event_id: event.id.clone(),
+                            confidence: req.confidence,
+                            risk_tier: req.risk_tier.map(|t| t.as_str().to_string()),
                         });
                     });
                 }

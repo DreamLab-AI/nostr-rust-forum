@@ -10,6 +10,7 @@
 //! | POST   | /api/governance/agents/revoke    | admin | Deactivate an agent                  |
 //! | GET    | /api/governance/cases           | any   | List broker cases (optional ?state=)  |
 //! | GET    | /api/governance/cases/:id       | any   | Get a single broker case             |
+//! | GET    | /api/governance/decisions       | any   | List broker decisions (?case_id=, paged) |
 //! | POST   | /api/governance/roles/grant     | admin | Grant a broker role to a pubkey      |
 //! | POST   | /api/governance/roles/revoke    | admin | Revoke a broker role from a pubkey   |
 //! | GET    | /api/governance/roles           | any   | List broker role assignments         |
@@ -167,6 +168,65 @@ struct RoleRow {
     role: String,
     granted_by: String,
     granted_at: f64,
+}
+
+/// One `broker_decisions` row (COM-17 / F5). Carries the full audit shape,
+/// including the non-binary `outcome_detail` (delegate target / pattern / scope
+/// / diff) and the `prior_decision_id` provenance link written by the relay's
+/// orchestrator projection.
+#[derive(Deserialize, serde::Serialize)]
+struct DecisionRow {
+    decision_id: String,
+    case_id: String,
+    outcome: String,
+    outcome_detail: Option<String>,
+    broker_pubkey: String,
+    reasoning: String,
+    prior_decision_id: Option<String>,
+    decided_at: f64,
+}
+
+/// Normalised pagination + filter for the decisions read API (COM-17 / F5).
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct DecisionsQuery {
+    case_id: Option<String>,
+    limit: u32,
+    offset: u32,
+}
+
+const DECISIONS_DEFAULT_LIMIT: u32 = 100;
+const DECISIONS_MAX_LIMIT: u32 = 200;
+
+/// Pure query-string parser for `GET /api/governance/decisions`.
+///
+/// - `case_id` — optional exact-match filter (empty string is treated as absent).
+/// - `limit` — page size, clamped to `1..=DECISIONS_MAX_LIMIT`, default 100.
+/// - `offset` — page offset, default 0.
+///
+/// Split out so the pagination/clamp contract is unit-testable without a D1
+/// binding (the handler itself is Env-bound), mirroring `normalize_provision`.
+fn parse_decisions_query(query: &[(String, String)]) -> DecisionsQuery {
+    let case_id = query
+        .iter()
+        .find(|(k, _)| k == "case_id")
+        .map(|(_, v)| v.clone())
+        .filter(|s| !s.is_empty());
+    let limit = query
+        .iter()
+        .find(|(k, _)| k == "limit")
+        .and_then(|(_, v)| v.parse::<u32>().ok())
+        .unwrap_or(DECISIONS_DEFAULT_LIMIT)
+        .clamp(1, DECISIONS_MAX_LIMIT);
+    let offset = query
+        .iter()
+        .find(|(k, _)| k == "offset")
+        .and_then(|(_, v)| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    DecisionsQuery {
+        case_id,
+        limit,
+        offset,
+    }
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -427,6 +487,58 @@ pub async fn handle_get_case(
     }
 }
 
+/// `GET /api/governance/decisions` (NIP-98 authed) — COM-17 / F5.
+///
+/// The read side over `broker_decisions`: the append-only audit trail the
+/// relay's orchestrator projection writes. Mirrors `handle_list_cases` (same
+/// `require_authed` gate, same `relay_db` binding, newest-first), adding
+/// pagination (`?limit=`, `?offset=`) and an optional `?case_id=` filter so an
+/// operator can page a case's decision history. Returns each row's `outcome`,
+/// `outcome_detail`, `reasoning` and `prior_decision_id`.
+pub async fn handle_list_decisions(
+    query: &[(String, String)],
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/governance/decisions");
+    if let Err((body, status)) = require_authed(auth_header, &url, "GET", None, env).await {
+        return json_response(env, &body, status);
+    }
+
+    let q = parse_decisions_query(query);
+    let db = relay_db(env)?;
+
+    let result = if let Some(case_id) = &q.case_id {
+        db.prepare(
+            "SELECT * FROM broker_decisions WHERE case_id = ?1 \
+             ORDER BY decided_at DESC LIMIT ?2 OFFSET ?3",
+        )
+        .bind(&[
+            JsValue::from_str(case_id),
+            JsValue::from_f64(q.limit as f64),
+            JsValue::from_f64(q.offset as f64),
+        ])?
+        .all()
+        .await?
+    } else {
+        db.prepare("SELECT * FROM broker_decisions ORDER BY decided_at DESC LIMIT ?1 OFFSET ?2")
+            .bind(&[
+                JsValue::from_f64(q.limit as f64),
+                JsValue::from_f64(q.offset as f64),
+            ])?
+            .all()
+            .await?
+    };
+
+    let rows = result.results::<DecisionRow>()?;
+    json_response(
+        env,
+        &json!({ "decisions": rows, "limit": q.limit, "offset": q.offset }),
+        200,
+    )
+}
+
 pub async fn handle_grant_role(
     body_bytes: &[u8],
     auth_header: Option<&str>,
@@ -647,5 +759,52 @@ mod tests {
         assert_eq!(p1.cohorts, p2.cohorts);
         assert_eq!(p1.name, p2.name);
         assert_eq!(p1.rate_limit_per_min, p2.rate_limit_per_min);
+    }
+
+    // ---- COM-17 / F5: decisions read-API pagination (pure parser) ----
+
+    fn q(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn decisions_query_defaults_when_empty() {
+        let parsed = parse_decisions_query(&q(&[]));
+        assert_eq!(
+            parsed,
+            DecisionsQuery {
+                case_id: None,
+                limit: DECISIONS_DEFAULT_LIMIT,
+                offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn decisions_query_reads_case_id_limit_offset() {
+        let parsed = parse_decisions_query(&q(&[
+            ("case_id", "case-42"),
+            ("limit", "25"),
+            ("offset", "50"),
+        ]));
+        assert_eq!(parsed.case_id.as_deref(), Some("case-42"));
+        assert_eq!(parsed.limit, 25);
+        assert_eq!(parsed.offset, 50);
+    }
+
+    #[test]
+    fn decisions_query_clamps_limit_and_ignores_junk() {
+        // Over-max clamps down; zero clamps up to 1; non-numeric falls back.
+        assert_eq!(parse_decisions_query(&q(&[("limit", "9999")])).limit, DECISIONS_MAX_LIMIT);
+        assert_eq!(parse_decisions_query(&q(&[("limit", "0")])).limit, 1);
+        assert_eq!(
+            parse_decisions_query(&q(&[("limit", "abc")])).limit,
+            DECISIONS_DEFAULT_LIMIT
+        );
+        // Empty case_id is treated as absent (no filter).
+        assert_eq!(parse_decisions_query(&q(&[("case_id", "")])).case_id, None);
     }
 }

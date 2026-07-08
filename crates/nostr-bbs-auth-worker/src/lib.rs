@@ -518,6 +518,10 @@ async fn route_sprint_api(
             return Ok(Some(resp));
         }
     }
+    if path == "/api/governance/decisions" && *method == Method::Get {
+        let resp = governance_api::handle_list_decisions(&query, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
     if path == "/api/governance/roles/grant" && *method == Method::Post {
         let resp = governance_api::handle_grant_role(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
