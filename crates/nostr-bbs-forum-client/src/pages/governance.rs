@@ -16,7 +16,7 @@ use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
 use crate::relay::RelayConnection;
-use crate::stores::panel_registry::{use_panel_registry, ActionEntry, PanelEntry};
+use crate::stores::panel_registry::{use_panel_registry, ActionEntry, DecisionView, PanelEntry};
 use crate::stores::zone_access::use_zone_access;
 use wasm_bindgen_futures::spawn_local;
 
@@ -223,6 +223,8 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
     let relay = expect_context::<RelayConnection>();
     let panel_d_tag = panel.d_tag.clone();
     let panel_event_id = panel.event_id.clone();
+    // F6: supersession history for this panel's case (DDD §7a.3).
+    let history_d_tag = panel.d_tag.clone();
 
     view! {
         <div class="panel-card bg-gray-800 rounded-lg p-5 border border-gray-700/50 hover:border-amber-400/30 transition-colors">
@@ -335,6 +337,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                     }
                 }).collect_view()}
             </div>
+            <SupersessionHistory d_tag=history_d_tag />
         </div>
     }
 }
@@ -367,6 +370,8 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
     let reasoning = item.reasoning.clone().unwrap_or_default();
     let priority = item.priority.clone();
     let d_tag = item.d_tag.clone();
+    // F6: supersession history for this action's case (DDD §7a.3).
+    let history_d_tag = item.d_tag.clone();
     let event_id = item.event_id.clone();
     // F5: the agent's stated confidence + risk tier, shown at decision time so a
     // human sees them before responding. Sourced from the 31402 ActionRequest.
@@ -497,6 +502,7 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                     })
                 }}
                 <AgentBadge pubkey=agent_badge_pubkey compact=true />
+                <SupersessionHistory d_tag=history_d_tag />
             </div>
             <Show
                 when=move || response_sent.get()
@@ -565,6 +571,8 @@ fn ReadOnlyPanelCard(panel: PanelEntry) -> impl IntoView {
     let agent_badge_pubkey = panel.agent_pubkey.clone();
     let field_count = panel.definition.fields.len();
     let action_count = panel.definition.actions.len();
+    // F6: supersession history for this panel's case (DDD §7a.3).
+    let history_d_tag = panel.d_tag.clone();
 
     view! {
         <div class="panel-card bg-gray-800 rounded-lg p-5 border border-gray-700/50">
@@ -589,6 +597,7 @@ fn ReadOnlyPanelCard(panel: PanelEntry) -> impl IntoView {
                     }
                 }).collect_view()}
             </div>
+            <SupersessionHistory d_tag=history_d_tag />
         </div>
     }
 }
@@ -625,6 +634,8 @@ fn ReadOnlyActionRow(item: ActionEntry) -> impl IntoView {
     let agent_name =
         crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
     let agent_badge_pubkey = item.agent_pubkey.clone();
+    // F6: supersession history for this action's case (DDD §7a.3).
+    let history_d_tag = item.d_tag.clone();
 
     view! {
         <div class="action-row bg-gray-800 rounded-lg p-4 border border-gray-700/50 flex items-center gap-4">
@@ -649,10 +660,92 @@ fn ReadOnlyActionRow(item: ActionEntry) -> impl IntoView {
                     })
                 }}
                 <AgentBadge pubkey=agent_badge_pubkey compact=true />
+                <SupersessionHistory d_tag=history_d_tag />
             </div>
             <span class="flex-shrink-0 text-xs text-gray-500 border border-gray-600/60 rounded px-2.5 py-1">
                 "Awaiting administrator decision"
             </span>
         </div>
+    }
+}
+
+// ── Supersession history (F6, DDD §7a.3) ─────────────────────────────────────
+
+/// Render the supersession history for a case `d`-tag. Mounted on both the member
+/// (read-only) and admin panel/action surfaces (ADR-106 Decision 2): it is a pure
+/// read of the [`PanelRegistry`] decision chain, mounting no publish path, so the
+/// member route stays write-free.
+///
+/// Each observed decision (kind-31403) is listed oldest-first; a decision a later
+/// authorised decision has superseded (§7a.1) is dimmed and struck through and
+/// marked "Superseded", the current effective decision is marked "Current". A
+/// case with a single, un-superseded decision still shows its outcome. A case
+/// with no observed decisions renders nothing.
+#[component]
+fn SupersessionHistory(d_tag: String) -> impl IntoView {
+    let registry = use_panel_registry();
+    let chain = Memo::new(move |_| registry.decision_chain(&d_tag));
+
+    view! {
+        <Show when=move || !chain.get().is_empty() fallback=|| ()>
+            <div class="supersession-history mt-3 pt-3 border-t border-gray-700/50">
+                <span class="text-xs uppercase tracking-wide text-gray-500 block mb-1.5">
+                    "Decision history"
+                </span>
+                <ol class="space-y-1">
+                    <For
+                        each=move || chain.get()
+                        key=|v: &DecisionView| (v.entry.event_id.clone(), v.superseded, v.effective)
+                        let:v
+                    >
+                        <DecisionChainRow view=v />
+                    </For>
+                </ol>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn DecisionChainRow(view: DecisionView) -> impl IntoView {
+    let signer = view.entry.signer_pubkey.clone();
+    let signer_short = if signer.len() > 12 {
+        format!("{}…{}", &signer[..8], &signer[signer.len() - 4..])
+    } else {
+        signer
+    };
+    let outcome = view.entry.outcome.clone();
+    let reason = view.entry.reason.clone();
+    let superseded = view.superseded;
+    let effective = view.effective;
+    let is_supersede = view.entry.supersedes.is_some();
+
+    let outcome_class = if superseded {
+        "line-through text-gray-500"
+    } else {
+        "text-gray-200 font-medium"
+    };
+
+    view! {
+        <li class="flex items-center gap-2 text-xs">
+            {is_supersede.then(|| view! {
+                <span class="text-amber-400/70" title="supersedes a prior decision">"↳"</span>
+            })}
+            <span class=outcome_class>{outcome}</span>
+            <span class="text-gray-500 truncate">{signer_short}</span>
+            {(!reason.is_empty()).then(|| view! {
+                <span class="text-gray-600 truncate italic">{reason}</span>
+            })}
+            {superseded.then(|| view! {
+                <span class="ml-auto flex-shrink-0 px-1.5 py-0.5 rounded bg-gray-700/60 text-gray-400 border border-gray-600/50">
+                    "Superseded"
+                </span>
+            })}
+            {effective.then(|| view! {
+                <span class="ml-auto flex-shrink-0 px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20">
+                    "Current"
+                </span>
+            })}
+        </li>
     }
 }

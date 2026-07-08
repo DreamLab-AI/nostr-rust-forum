@@ -172,8 +172,11 @@ struct RoleRow {
 
 /// One `broker_decisions` row (COM-17 / F5). Carries the full audit shape,
 /// including the non-binary `outcome_detail` (delegate target / pattern / scope
-/// / diff) and the `prior_decision_id` provenance link written by the relay's
-/// orchestrator projection.
+/// / diff), the `prior_decision_id` provenance link written by the relay's
+/// orchestrator projection, and the F6 `superseded_by` marker (DDD §7a): the
+/// decision id that supersedes this row, or `None` when this is the current
+/// effective decision. Exposing it lets a decisions-API consumer render the
+/// supersession chain without a second query.
 #[derive(Deserialize, serde::Serialize)]
 struct DecisionRow {
     decision_id: String,
@@ -183,6 +186,8 @@ struct DecisionRow {
     broker_pubkey: String,
     reasoning: String,
     prior_decision_id: Option<String>,
+    #[serde(default)]
+    superseded_by: Option<String>,
     decided_at: f64,
 }
 

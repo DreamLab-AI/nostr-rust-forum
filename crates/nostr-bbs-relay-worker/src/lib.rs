@@ -599,6 +599,9 @@ async fn ensure_schema(env: &Env) {
         "ALTER TABLE whitelist ADD COLUMN suspended_until INTEGER",
         "ALTER TABLE whitelist ADD COLUMN silenced INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE whitelist ADD COLUMN user_notes TEXT",
+        // F6 (DDD §7a): supersession marker on the append-only decision trail.
+        // Idempotent for already-deployed DBs whose broker_decisions predates F6.
+        "ALTER TABLE broker_decisions ADD COLUMN superseded_by TEXT",
     ];
     for stmt in alter_stmts {
         let _ = db.prepare(stmt).run().await;
@@ -707,6 +710,10 @@ async fn ensure_schema(env: &Env) {
             updated_at INTEGER NOT NULL\
         )",
         // Individual decisions on broker cases (append-only audit trail).
+        // F6 (DDD §7a): `superseded_by` names the decision that supersedes this
+        // row (NULL = current/effective). It is a projection-derived column — the
+        // superseding kind-31403 marks the prior row without ever mutating the
+        // underlying Nostr event (Invariant 5).
         "CREATE TABLE IF NOT EXISTS broker_decisions (\
             decision_id TEXT PRIMARY KEY NOT NULL, \
             case_id TEXT NOT NULL REFERENCES broker_cases(id), \
@@ -715,6 +722,7 @@ async fn ensure_schema(env: &Env) {
             broker_pubkey TEXT NOT NULL, \
             reasoning TEXT NOT NULL DEFAULT '', \
             prior_decision_id TEXT, \
+            superseded_by TEXT, \
             decided_at INTEGER NOT NULL\
         )",
         // Role assignments for broker governance (which pubkeys can claim cases).
