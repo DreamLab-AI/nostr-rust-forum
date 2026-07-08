@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use super::use_admin;
 use crate::auth::use_auth;
+use crate::components::agent_badge::AgentBadge;
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::utils::{format_relative_time, search_client};
@@ -212,6 +213,9 @@ fn StatsDashboardInner() -> impl IntoView {
                                     // Tracked: the enclosing closure re-runs
                                     // when kind-0 metadata fills the cache.
                                     let pk_short = use_display_name_tracked(&entry.pubkey);
+                                    // Disclosure badge (COM-13/F2): marks the
+                                    // author of this activity item as an agent.
+                                    let pk_badge = entry.pubkey.clone();
                                     let time_str = format_relative_time(entry.created_at);
                                     let preview = entry.content_preview.clone();
                                     let has_content = !preview.is_empty();
@@ -224,6 +228,7 @@ fn StatsDashboardInner() -> impl IntoView {
                                             <div class="flex-1 min-w-0">
                                                 <div class="flex items-center gap-2 text-xs">
                                                     <span class="text-gray-300 font-mono">{pk_short}</span>
+                                                    <AgentBadge pubkey=pk_badge compact=true />
                                                     <span class="text-gray-600">{time_str}</span>
                                                 </div>
                                                 {has_content.then(|| view! {

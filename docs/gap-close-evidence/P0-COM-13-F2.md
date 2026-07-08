@@ -52,17 +52,30 @@ principal from the registry, never from event content"):
      principal (`registered_by`) resolved to a human label via the shared
      profile cache. Follows the existing `Badge` / `use_display_name_tracked`
      idioms.
-   - Wired at every author-render site: the post/thread author line
-     (`components/message_bubble.rs`, beside the existing `BadgeBar`), the
-     governance `PanelCard` (`pages/governance.rs`, beside `agent_name`), and
-     the governance `ActionRow`.
+   - Wired at **three** author-render sites in the first pass: the channel
+     post author line (`components/message_bubble.rs`, beside the existing
+     `BadgeBar`), the governance `PanelCard` (`pages/governance.rs`, beside
+     `agent_name`), and the governance `ActionRow`.
+
+> **Correction (2026-07-08).** The original text of this bullet claimed the
+> badge was wired at "every author-render site". That was **false** — it was
+> wired at only three of the many author-render loci. An adversarial verifier
+> refuted the closure (AgentBadge at 3 of ≥8 author-render sites). The
+> **"Gap-close addendum (2026-07-08)"** section below wires the remaining sites
+> and records the full site-by-site map, including the surfaces deliberately
+> left un-badged with a justification for each. Treat the sentence above as
+> describing the **first pass only**.
 
 ## Why each falsification clause fails to hold
 
-- *"any agent-authored item renders without a badge"* — `AgentBadge` is mounted
-  at all three author-render loci; it fires whenever the author pubkey resolves
-  in the active-disclosure cache. Test `active_agent_is_disclosed_with_authorising_principal`
-  proves an `active = 1` row projects to a disclosure carrying its principal.
+- *"any agent-authored item renders without a badge"* — `AgentBadge` fires
+  whenever the author pubkey resolves in the active-disclosure cache. **The
+  first pass mounted it at only three loci and so did NOT hold this clause for
+  the other author-render sites** (the refutation was correct). The gap-close
+  addendum below mounts it at every author-render site (see the map), restoring
+  the clause. Test `active_agent_is_disclosed_with_authorising_principal` proves
+  an `active = 1` row projects to a disclosure carrying its principal; the
+  wiring is what carries that projection to each rendered author.
 - *"a human item renders a badge"* — the cache only holds active-registry
   pubkeys; a human pubkey misses the lookup → `None` → no badge. Tests
   `inactive_agent_is_excluded` and `empty_registry_discloses_nothing` prove the
@@ -147,7 +160,145 @@ This is the expected result for a single-substrate slice: the forum half of the
 cross-substrate canary is complete; the agentbox + visionclaw halves are the
 live-session dependency.
 
+## Gap-close addendum (2026-07-08) — all author-render sites
+
+**Refutation being closed.** The adversarial verifier found `AgentBadge` wired
+at only **3** of at least **8** author-render sites, so agent-authored replies,
+quoted posts, pinned posts, topics, calendar events and thread posts rendered
+**without** disclosure. The "wired at every author-render site" claim above was
+false. This addendum wires the remaining sites and records a site-by-site map.
+
+**Working-tree state:** branch `gap-close/2026-07`; pre-commit HEAD
+`7157a92`. **Component reused verbatim** — no change to
+`components/agent_badge.rs`; each new site follows the existing
+`message_bubble` idiom (clone the author pubkey into a `*_badge_pubkey` local,
+mount `<AgentBadge pubkey=… compact=true />` beside the rendered name).
+
+### Author-render site map
+
+Every call site of `use_display_name_memo` / `use_display_name_tracked` in the
+forum-client (the helpers that render a human-readable author label), classified
+as **badge-wired** or **justified-no**. Grep source:
+`grep -rn "use_display_name_memo\|use_display_name_tracked" src/`.
+
+| # | File · symbol | What the name labels | Badge? |
+|---|---|---|---|
+| 1 | `components/message_bubble.rs` · MessageBubble | channel post author | **yes** (pass 1) |
+| 2 | `pages/governance.rs` · PanelCard | panel-publishing agent | **yes** (pass 1) |
+| 3 | `pages/governance.rs` · ActionRow | action-requesting agent | **yes** (pass 1) |
+| 4 | `components/quoted_message.rs` · QuotedMessage | quoted/replied-to author | **yes** (gap-close) |
+| 5 | `components/thread_view.rs` · ThreadView | threaded-reply author | **yes** (gap-close) |
+| 6 | `components/pinned_messages.rs` · PinnedMessages | pinned-message author | **yes** (gap-close) |
+| 7 | `components/topic_list.rs` · TopicRow | topic root author | **yes** (gap-close) |
+| 8 | `components/topic_list.rs` · TopicRow | topic last-reply author | **yes** (gap-close) |
+| 9 | `components/event_card.rs` · EventCard | calendar-event host | **yes** (gap-close) |
+| 10 | `pages/note_view.rs` · NoteView | note (deep-link) author | **yes** (gap-close) |
+| 11 | `pages/thread.rs` · RootPost | thread root-post author | **yes** (gap-close) |
+| 12 | `pages/thread.rs` · ReplyCard | thread reply author | **yes** (gap-close) |
+| 13 | `components/bookmarks_modal.rs` · BookmarksModal | bookmarked-message author | **yes** (gap-close) |
+| 14 | `admin/calendar.rs` · AdminEventRow | calendar-event host | **yes** (gap-close) |
+| 15 | `admin/stats.rs` · recent-activity row | author of the previewed event | **yes** (gap-close) |
+| 16 | `components/mention_text.rs` (×3) | @-mention inside body text | justified-no — **reference, not author** |
+| 17 | `components/global_search.rs` (×4) | search-result subtitle "by X" / user hit | justified-no — **transient overlay; string-composed subtitle; navigates to a badged surface** |
+| 18 | `components/profile_modal.rs` · ProfileModal | subject of the profile card | justified-no — **profile subject, not an item author** |
+| 19 | `pages/profile.rs` · profile page | subject of the profile page | justified-no — **profile subject, not an item author** |
+| 20 | `pages/settings.rs` | the viewer's own key | justified-no — **self / settings** |
+| 21 | `pages/dm_chat.rs` · header | DM conversation partner | justified-no — **private 1:1 partner, not public forum authorship** |
+| 22 | `pages/dm_list.rs` · row | DM conversation partner | justified-no — **private 1:1 roster, not public forum authorship** |
+| 23 | `admin/user_table.rs` (×2) | member being administered | justified-no — **member roster / admin target, not an item author** |
+| 24 | `admin/registrations.rs` | sign-up applicant awaiting approval | justified-no — **applicant identity, no authored item shown** |
+| 25 | `admin/section_requests.rs` | section-creation requester | justified-no — **applicant/requester, no authored item shown** |
+| 26 | `admin/audit_log.rs` · actor | moderator who performed the action | justified-no — **moderation actor in a forensic table, not a forum-content author** |
+| 27 | `admin/audit_log.rs` · target | user acted upon | justified-no — **moderation subject, not an author** |
+| 28 | `admin/reports.rs` · reporter | who filed the report | justified-no — **moderation reporter, not the author of shown content** |
+| — | `pages/signup.rs:326` | — | n/a — a code comment, not a call site |
+| — | `components/agent_badge.rs:157` | the badge resolving the **principal** name | n/a — the badge itself, not an author render |
+
+**Justified-no categories (why the badge would be wrong or noise there):**
+
+- **Reference, not authorship** — an `@mention` links to a user *named inside*
+  someone else's post; badging it would attribute the mentioned user as the
+  post's author.
+- **Profile subject** — a profile card/page *is* that person; there is no
+  authored item on the row to disclose. (Per the falsification scope this is a
+  reasoned exclusion; if a product decision later wants an agent marker on the
+  profile card itself, that is an additive follow-up, not an author-render gap.)
+- **Self / settings** — the viewer's own key.
+- **Private 1:1 DM** — an explicitly-chosen conversation partner; the agent
+  registry exists to keep *public forum* authorship honest, not to annotate
+  private contacts. No public-content author is rendered.
+- **Member roster / admin target / applicant** — management surfaces list an
+  identity being administered or an applicant awaiting approval; no authored
+  forum item is displayed on the row.
+- **Moderation actor / subject** — an audit-log or report row names *who
+  moderated* or *who was moderated*, inside an admin forensic table. That is a
+  different disclosure axis from "who authored this content"; the report card
+  even previews the reported content but renders the *reporter's* name, not the
+  content author's.
+- **Transient search overlay** — the Cmd/K search dropdown composes its "by X"
+  subtitle from a `-> String` method inside a compact, dismiss-on-navigate
+  overlay; each hit links straight to a surface (channel / thread / note) that
+  *is* badged, so the disclosure is carried at the destination.
+
+### Gap-close receipts
+
+**R4 — forum-client compiles clean with all 12 new render sites.**
+
+```
+$ date -u +"%Y-%m-%dT%H:%M:%SZ"
+2026-07-08T11:50:40Z
+$ cargo check -p nostr-bbs-forum-client
+    Checking nostr-bbs-forum-client v1.0.0-beta.3 (…/crates/nostr-bbs-forum-client)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.84s
+```
+
+(Native `cargo check` per the R3 note above — `wasm32-unknown-unknown` hits the
+same unrelated local secp256k1 toolchain issue; native check is the documented
+equivalent.)
+
+**R5 — the existing `agent_disclosure` worker tests still pass (no regression).**
+
+```
+$ date -u +"%Y-%m-%dT%H:%M:%SZ"
+2026-07-08T11:50:54Z
+$ cargo test -p nostr-bbs-relay-worker agent_disclosure
+test agent_disclosure::tests::active_agent_is_disclosed_with_authorising_principal ... ok
+test agent_disclosure::tests::disclosure_serialises_only_the_minimal_public_fields ... ok
+test agent_disclosure::tests::empty_registry_discloses_nothing ... ok
+test agent_disclosure::tests::inactive_agent_is_excluded ... ok
+test agent_disclosure::tests::parses_d1_shaped_row_with_numeric_active ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 172 filtered out
+```
+
+**R6 — render-site census (post-fix).**
+
+```
+$ grep -rl "<AgentBadge" src/ | wc -l      # files with a mounted badge
+12
+$ grep -rho "<AgentBadge" src/ | wc -l     # total mounted render sites
+15
+```
+
+15 mounted render sites across 12 files (rows 1–15 of the map; `topic_list.rs`
+and `pages/thread.rs` and `pages/governance.rs` each carry two).
+
+### Honest maturity
+
+- **Badge mechanism:** `integrated` — endpoint, cache, component, and now the
+  full author-render wiring are in place and compile clean; the worker
+  projection is unit-tested.
+- **Coverage of author-render sites:** now **complete** for every site that
+  renders a forum-content author/host; the exclusions above are reasoned
+  non-authorship surfaces, enumerated so the claim is auditable rather than
+  asserted.
+- **Live canary (`forum-canary-agent-badge`):** unchanged — still
+  `pending-live-session`. This fix widens *where* the badge renders; it does not
+  stand up the cross-substrate live loop (agentbox + visionclaw), which remains
+  the deployment-time dependency recorded above.
+
 ## Files touched
+
+**First pass (7157a92):**
 
 - `crates/nostr-bbs-relay-worker/src/agent_disclosure.rs` (new)
 - `crates/nostr-bbs-relay-worker/src/lib.rs` (module decl + public route)
@@ -156,3 +307,17 @@ live-session dependency.
 - `crates/nostr-bbs-forum-client/src/app.rs` (provider wiring)
 - `crates/nostr-bbs-forum-client/src/pages/governance.rs` (PanelCard + ActionRow badge)
 - `crates/nostr-bbs-forum-client/src/components/message_bubble.rs` (author-line badge)
+
+**Gap-close (this addendum):**
+
+- `crates/nostr-bbs-forum-client/src/components/quoted_message.rs` (quoted-author badge)
+- `crates/nostr-bbs-forum-client/src/components/thread_view.rs` (thread-reply badge)
+- `crates/nostr-bbs-forum-client/src/components/pinned_messages.rs` (pinned-author badge)
+- `crates/nostr-bbs-forum-client/src/components/topic_list.rs` (root + last-reply badges)
+- `crates/nostr-bbs-forum-client/src/components/event_card.rs` (event-host badge)
+- `crates/nostr-bbs-forum-client/src/pages/note_view.rs` (note-author badge)
+- `crates/nostr-bbs-forum-client/src/pages/thread.rs` (root-post + reply badges)
+- `crates/nostr-bbs-forum-client/src/components/bookmarks_modal.rs` (bookmarked-author badge)
+- `crates/nostr-bbs-forum-client/src/admin/calendar.rs` (admin event-host badge)
+- `crates/nostr-bbs-forum-client/src/admin/stats.rs` (recent-activity author badge)
+- `docs/gap-close-evidence/P0-COM-13-F2.md` (this correction + addendum)
