@@ -2127,6 +2127,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solid-pod-rs",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -3551,9 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "solid-pod-rs"
-version = "0.5.0-alpha.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13cdb0796338f7b2fe73781d488e0536a07aa37cbd17e58e8027ffbe22e09c64"
+version = "0.5.0-alpha.4"
 dependencies = [
  "async-trait",
  "base64",

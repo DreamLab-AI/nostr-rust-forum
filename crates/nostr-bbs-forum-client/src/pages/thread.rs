@@ -31,6 +31,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::access_denied::AccessDenied;
+use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::link_preview::LinkPreview;
@@ -812,6 +813,8 @@ fn RootPost(
     let author = use_display_name_memo(post.pubkey.clone());
     let time = format_relative_time(post.created_at);
     let pk = post.pubkey.clone();
+    // Disclosure badge (COM-13/F2): marks the topic-root author as an agent.
+    let author_badge_pubkey = post.pubkey.clone();
     let content = post.content.clone();
     let edited = post.edited;
     let post_id = post.id.clone();
@@ -842,6 +845,7 @@ fn RootPost(
                 <div class="flex-1 min-w-0">
                     <div class="flex items-baseline gap-2 flex-wrap">
                         <span class="font-semibold text-[color:var(--zone-accent)]">{move || author.get()}</span>
+                        <AgentBadge pubkey=author_badge_pubkey compact=true />
                         <span class="text-xs text-gray-500">{time}</span>
                         {edited.then(|| view! {
                             <span class="text-xs text-gray-600 italic">"(edited)"</span>
@@ -892,6 +896,8 @@ fn ReplyCard(
     let author = use_display_name_memo(reply.pubkey.clone());
     let time = format_relative_time(reply.created_at);
     let pk = reply.pubkey.clone();
+    // Disclosure badge (COM-13/F2): marks the reply author as an agent.
+    let author_badge_pubkey = reply.pubkey.clone();
     let content = reply.content.clone();
     let edited = reply.edited;
     let post_id = reply.id.clone();
@@ -916,6 +922,7 @@ fn ReplyCard(
                 <div class="flex-1 min-w-0">
                     <div class="flex items-baseline gap-2 flex-wrap">
                         <span class="font-semibold text-sm text-amber-400">{move || author.get()}</span>
+                        <AgentBadge pubkey=author_badge_pubkey compact=true />
                         <span class="text-xs text-gray-600">{time}</span>
                         {edited.then(|| view! {
                             <span class="text-xs text-gray-600 italic">"(edited)"</span>

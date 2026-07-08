@@ -207,10 +207,14 @@ fn parse_mentions(input: &str) -> Vec<Segment> {
                 let at_this = &remaining[pos..];
 
                 if at_this.starts_with("nostr:npub1") {
-                    let after_nostr = &at_this[6..]; // skip "nostr:"
+                    let after_nostr = &at_this[6..]; // skip "nostr:" (ASCII, safe)
+                    // bech32 npubs are ASCII [a-z0-9]; restrict to ASCII so the
+                    // char count equals the byte length and every slice below
+                    // lands on a char boundary (a multibyte char like 'é' would
+                    // otherwise panic when used as a byte index).
                     let npub_len = after_nostr
                         .chars()
-                        .take_while(|c| c.is_alphanumeric())
+                        .take_while(|c| c.is_ascii_alphanumeric())
                         .count();
                     let npub = &after_nostr[..npub_len];
                     segments.push(Segment::NpubMention(npub.to_string()));
@@ -281,12 +285,18 @@ fn find_next_at(input: &str) -> Option<usize> {
         if b != b'@' {
             continue;
         }
-        // Quick hex check (64 chars).
-        if i + 65 <= input.len() {
-            let candidate = &input[i + 1..i + 65];
-            if candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(i);
-            }
+        // Quick hex check (64 chars). Iterate over chars instead of slicing a
+        // fixed 64-byte window, so multibyte content can never split a char
+        // boundary and panic. Hex digits are ASCII (1 byte), so 64 matching
+        // chars is exactly a 64-byte hex run.
+        let after = &input[i + 1..];
+        let hex_run = after
+            .chars()
+            .take(64)
+            .take_while(|c| c.is_ascii_hexdigit())
+            .count();
+        if hex_run == 64 {
+            return Some(i);
         }
         // Username check (≥3 valid chars).
         let after = &input[i + 1..];
@@ -418,6 +428,32 @@ mod tests {
         let segs = parse_mentions("see nostr:npub1abcdefghijk for more");
         let has_npub = segs.iter().any(|s| matches!(s, Segment::NpubMention(_)));
         assert!(has_npub);
+    }
+
+    #[test]
+    fn parse_npub_with_multibyte_does_not_panic() {
+        // 'é' is a 2-byte char; the old code counted it via is_alphanumeric()
+        // then used that char count as a byte index into the npub run, splitting
+        // the char and panicking. Regression: the run must stop at the non-ASCII
+        // char and parsing must complete.
+        let segs = parse_mentions("see nostr:npub1é rest");
+        let npub = segs.iter().find_map(|s| match s {
+            Segment::NpubMention(n) => Some(n.clone()),
+            _ => None,
+        });
+        assert_eq!(npub.as_deref(), Some("npub1"));
+        assert!(segs
+            .iter()
+            .any(|s| matches!(s, Segment::Text(t) if t.contains('é'))));
+    }
+
+    #[test]
+    fn parse_multibyte_near_at_hex_window_does_not_panic() {
+        // A 4-byte emoji straddling the 64-char hex window boundary would make
+        // the old `&input[i+1..i+65]` slice split a char and panic. Must not.
+        let input = format!("@{}😀 tail", "a".repeat(62));
+        let segs = parse_mentions(&input);
+        assert!(!segs.is_empty());
     }
 
     #[test]

@@ -72,6 +72,11 @@ console_error_panic_hook = "0.1"
 hex = { workspace = true }
 zeroize = { workspace = true }
 send_wrapper = "0.6"
+# URL parsing for authority-exact first-party (pod) checks — a bare string
+# prefix cannot distinguish `pods.example.com` from `pods.example.com.evil.com`,
+# and the pod ASCII fragment is injected as trusted HTML, so the pod-host match
+# must compare parsed scheme/host/port, not a substring.
+url = { workspace = true }
 # NIP-07 signer: implements the kit's async `Signer` trait for `window.nostr`
 # extension sessions (PodKey / nos2x / Alby), matching how the forum client's
 # `Nip07Signer` is defined — same `async_trait(?Send)` erasure as core's PrfSigner.

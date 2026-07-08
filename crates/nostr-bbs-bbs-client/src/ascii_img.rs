@@ -20,6 +20,7 @@
 //! unit-tested on the native target; the `fetch` itself is wasm-only.
 
 use leptos::prelude::*;
+use url::Url;
 
 use crate::config::BbsConfig;
 
@@ -104,8 +105,27 @@ pub fn AsciiImg(
 }
 
 /// Is `src` a resource hosted under the configured pod API base?
+///
+/// Uses a parsed-URL **exact authority match** (scheme + host + port), not a
+/// bare string prefix. A pod URL is treated as first-party and its ASCII
+/// fragment is injected as trusted HTML (see [`AsciiImg`]), so a lookalike host
+/// like `https://pods.example.com.evil.com/x.png` — which *prefix*-matches
+/// `pods.example.com` — must NOT be classified as pod-hosted, or it becomes a
+/// stored-XSS sink. Only a genuine same-origin pod host qualifies.
 pub fn is_pod_url(pod_api: &str, src: &str) -> bool {
-    !pod_api.is_empty() && src.starts_with(pod_api.trim_end_matches('/'))
+    if pod_api.is_empty() {
+        return false;
+    }
+    let (Ok(base), Ok(target)) = (Url::parse(pod_api), Url::parse(src)) else {
+        return false;
+    };
+    // host_str() is None for cannot-be-a-base / hostless URLs; require both
+    // present and byte-equal (url normalises host case), same scheme, same
+    // effective port (default port for the scheme when unspecified).
+    base.host_str().is_some()
+        && base.scheme() == target.scheme()
+        && base.host_str() == target.host_str()
+        && base.port_or_known_default() == target.port_or_known_default()
 }
 
 /// Resolve a possibly root-relative URL against `origin`. Absolute http(s) URLs
@@ -301,6 +321,31 @@ mod tests {
         assert!(!is_pod_url(
             "https://pods.example.com",
             "https://cdn.other.com/x.png"
+        ));
+    }
+
+    #[test]
+    fn pod_url_rejects_authority_lookalikes() {
+        // Stored-XSS regression: a bare-prefix check would classify these as
+        // pod-hosted (and inject their fragment as trusted HTML). An authority
+        // match must reject every one.
+        let pod = "https://pods.example.com";
+        // Suffix-appended lookalike domain (the classic `.evil.com` bypass).
+        assert!(!is_pod_url(pod, "https://pods.example.com.evil.com/x.png"));
+        // Userinfo trick: real host is evil.com, pod host is only in userinfo.
+        assert!(!is_pod_url(pod, "https://pods.example.com@evil.com/x.png"));
+        // Scheme downgrade must not match an https pod base.
+        assert!(!is_pod_url(pod, "http://pods.example.com/x.png"));
+        // Non-default port on the same host is a different authority.
+        assert!(!is_pod_url(pod, "https://pods.example.com:8443/x.png"));
+        // Sub-host prefix without a dot boundary.
+        assert!(!is_pod_url(pod, "https://pods.example.computer/x.png"));
+        // Relative / non-absolute src cannot be a pod URL.
+        assert!(!is_pod_url(pod, "/pods/ab/x.png"));
+        // Explicit default port on both sides still matches the genuine host.
+        assert!(is_pod_url(
+            "https://pods.example.com:443",
+            "https://pods.example.com/pods/ab/x.png"
         ));
     }
 

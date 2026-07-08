@@ -17,7 +17,7 @@
 //! expected to reject publication from non-admin signers; this module
 //! provides a pure-function validator to support that check.
 
-use crate::event::{NostrEvent, UnsignedEvent};
+use crate::event::{verify_event_strict, NostrEvent, UnsignedEvent};
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -117,6 +117,12 @@ pub enum ModerationEventError {
     /// A mute with `expiration` must carry a parseable unix-seconds value.
     #[error("invalid `expiration` tag: {0}")]
     InvalidExpires(String),
+
+    /// The event's id or Schnorr signature failed verification. The admin
+    /// authorisation below trusts `event.pubkey`, so an unverified event lets
+    /// an attacker set `pubkey` to an admin's key and forge admin-only actions.
+    #[error("event verification failed: {0}")]
+    InvalidSignature(String),
 }
 
 // ── Tag helpers ───────────────────────────────────────────────────────────
@@ -155,6 +161,12 @@ pub fn validate_moderation_event(
     event: &NostrEvent,
     admin_set: &HashSet<String>,
 ) -> Result<(), ModerationEventError> {
+    // Verify the event's id + Schnorr signature before trusting `event.pubkey`
+    // for the admin authorisation check below. Without this, an attacker can
+    // set `pubkey` to an admin's key and forge admin-only moderation actions.
+    verify_event_strict(event)
+        .map_err(|e| ModerationEventError::InvalidSignature(e.to_string()))?;
+
     if !MOD_KINDS.contains(&event.kind) {
         return Err(ModerationEventError::UnknownKind(event.kind));
     }
@@ -538,6 +550,41 @@ mod tests {
     }
 
     // ---- error cases ----
+
+    #[test]
+    fn tampered_event_rejected_even_for_admin() {
+        // A ban validly signed by the admin, then mutated after signing so its
+        // id/signature no longer verify. Even though `pubkey` is in the admin
+        // set and every d-tag check would pass, verification must reject it —
+        // otherwise the pubkey field alone would authorise the action.
+        let u = build_ban(&admin_pk_hex(), &target_pk(), "spam", 1_700_000_000);
+        let mut signed = sign(u);
+        // Mutate content post-signing: recomputed id no longer matches.
+        signed.content = "tampered after signing".to_string();
+        let err = validate_moderation_event(&signed, &admin_set()).unwrap_err();
+        assert!(
+            matches!(err, ModerationEventError::InvalidSignature(_)),
+            "expected InvalidSignature, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn forged_admin_pubkey_rejected() {
+        // Attacker signs a ban with their OWN key, then rewrites the pubkey
+        // field to the admin's pubkey to impersonate an admin. The id/signature
+        // were bound to the attacker's key, so verification rejects it before
+        // the admin-set check ever trusts `pubkey`.
+        let attacker = SigningKey::from_bytes(&[0x09u8; 32]).unwrap();
+        let attacker_pk = hex::encode(attacker.verifying_key().to_bytes());
+        let u = build_ban(&attacker_pk, &target_pk(), "forged", 1_700_000_000);
+        let mut signed = sign_event_deterministic(u, &attacker).unwrap();
+        signed.pubkey = admin_pk_hex();
+        let err = validate_moderation_event(&signed, &admin_set()).unwrap_err();
+        assert!(
+            matches!(err, ModerationEventError::InvalidSignature(_)),
+            "expected InvalidSignature, got: {err:?}"
+        );
+    }
 
     #[test]
     fn non_admin_cannot_ban() {

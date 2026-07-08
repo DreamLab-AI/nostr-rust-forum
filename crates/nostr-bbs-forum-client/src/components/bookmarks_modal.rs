@@ -10,6 +10,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::app::base_href;
+use crate::components::agent_badge::AgentBadge;
 use crate::components::modal::Modal;
 use crate::components::user_display::use_display_name_tracked;
 use crate::utils::format_relative_time;
@@ -196,6 +197,9 @@ pub(crate) fn BookmarksModal(
                                     // Tracked: the enclosing closure re-runs
                                     // when kind-0 metadata fills the cache.
                                     let author_short = use_display_name_tracked(&bm.author_pubkey);
+                                    // Disclosure badge (COM-13/F2): marks the
+                                    // bookmarked message's author as an agent.
+                                    let author_badge_pubkey = bm.author_pubkey.clone();
                                     let author_color = crate::utils::pubkey_color(&bm.author_pubkey);
                                     let time_str = format_relative_time(bm.timestamp);
                                     let href = base_href(&format!("/chat/{}", bm.channel_id));
@@ -215,6 +219,7 @@ pub(crate) fn BookmarksModal(
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2 text-xs text-gray-500 mb-1">
                                                         <span class="font-medium text-gray-400">{author_short}</span>
+                                                        <AgentBadge pubkey=author_badge_pubkey compact=true />
                                                         <span>{"\u{00B7}"}</span>
                                                         <span>{time_str}</span>
                                                     </div>

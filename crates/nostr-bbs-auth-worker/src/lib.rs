@@ -240,7 +240,7 @@ async fn route(
     // WebAuthn Registration -- Verify
     if path == "/auth/register/verify" && *method == Method::Post {
         let cf_country = req.headers().get("CF-IPCountry").ok().flatten();
-        return webauthn::register_verify(body_bytes, cf_country.as_deref(), env).await;
+        return webauthn::register_verify(req, body_bytes, cf_country.as_deref(), env).await;
     }
 
     // WebAuthn Authentication -- Generate options
@@ -517,6 +517,10 @@ async fn route_sprint_api(
             let resp = governance_api::handle_get_case(case_id, auth_header, env, origin).await?;
             return Ok(Some(resp));
         }
+    }
+    if path == "/api/governance/decisions" && *method == Method::Get {
+        let resp = governance_api::handle_list_decisions(&query, auth_header, env, origin).await?;
+        return Ok(Some(resp));
     }
     if path == "/api/governance/roles/grant" && *method == Method::Post {
         let resp = governance_api::handle_grant_role(body_bytes, auth_header, env, origin).await?;

@@ -8,6 +8,7 @@ use nostr_bbs_core::NostrEvent;
 use std::rc::Rc;
 
 use crate::auth::use_auth;
+use crate::components::agent_badge::AgentBadge;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
@@ -229,6 +230,9 @@ where
     let end_str = entry.end_time.map(format_datetime).unwrap_or_default();
     // Reactive: resolves the host's nickname when kind-0 metadata arrives.
     let pk_short = use_display_name_memo(entry.host_pubkey.clone());
+    // Disclosure badge (COM-13/F2): marks the event host as an agent and names
+    // its authorising principal when the host pubkey is active in the registry.
+    let host_badge_pubkey = entry.host_pubkey.clone();
     let _total_rsvp = entry.rsvp_accepted + entry.rsvp_tentative;
 
     let card_opacity = if is_past { "opacity-60" } else { "" };
@@ -263,6 +267,7 @@ where
                             }
                         })}
                         <span class="font-mono">{move || pk_short.get()}</span>
+                        <AgentBadge pubkey=host_badge_pubkey compact=true />
                     </div>
 
                     // RSVP stats

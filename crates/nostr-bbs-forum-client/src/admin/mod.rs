@@ -4,6 +4,7 @@
 //! methods for calling the relay-worker admin endpoints with NIP-98 auth and
 //! creating kind-40 channel events.
 
+pub mod agents_roster;
 pub mod audit_log;
 pub mod calendar;
 pub mod channel_form;
@@ -33,6 +34,7 @@ pub enum AdminTab {
     Users,
     Pending,
     Sections,
+    Agents,
     Calendar,
     Settings,
     Reports,

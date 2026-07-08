@@ -104,6 +104,261 @@ pub fn governance_response_blocked(kind: u64, is_admin: bool) -> bool {
     kind == governance::KIND_ACTION_RESPONSE && !is_admin
 }
 
+/// The `broker_cases` columns the 31403 projection reads to hydrate a case
+/// aggregate (COM-16). Deserialised straight from a D1 row.
+#[derive(serde::Deserialize)]
+pub(crate) struct BrokerCaseRow {
+    pub category: String,
+    pub state: String,
+    pub created_by: String,
+    pub from_share_state: Option<String>,
+    pub to_share_state: Option<String>,
+}
+
+/// The persistable result of projecting a 31403 onto a case: the row to append
+/// to `broker_decisions` and the new `broker_cases.state`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResponseProjection {
+    pub decision_id: String,
+    /// `broker_decisions.outcome` — the canonical action string.
+    pub outcome: String,
+    /// `broker_decisions.outcome_detail` — delegate target / pattern id /
+    /// precedent scope / amend diff; `None` for approve/reject.
+    pub outcome_detail: Option<String>,
+    pub prior_decision_id: Option<String>,
+    /// `broker_cases.state` after the decision — never `under_review` for a
+    /// well-formed outcome.
+    pub new_state: governance::broker::CaseState,
+    pub reasoning: String,
+}
+
+/// Plan the 31403 ActionResponse projection (COM-16 / F3).
+///
+/// This is the relay's consumer of the tested escalation state machine: it
+/// hydrates a `BrokerCase` from the case's D1 row (or a sensible default when
+/// the row is absent — a response can arrive before its request projected) and
+/// routes the parsed outcome through **`DecisionOrchestrator::decide`**, so a
+/// `delegate`/`promote`/`precedent` outcome reaches the matching `CaseState`
+/// instead of the former fixed `under_review` fallback. The `Env`/D1 read + write
+/// stay in [`NostrRelayDO::project_action_response`]; this pure seam is what makes
+/// the lifecycle unit-testable in the worker crate without a live D1.
+pub(crate) fn plan_action_response(
+    case_id: &str,
+    case_row: Option<&BrokerCaseRow>,
+    event_id: &str,
+    content: &str,
+    responder_pubkey: &str,
+    latest_decision_id: Option<String>,
+    now: u64,
+) -> std::result::Result<ResponseProjection, governance::broker::OrchestrationError> {
+    use governance::broker::{
+        CaseCategory, CaseSnapshot, CaseState, DecisionOrchestrator, DecisionOutcome, ShareState,
+    };
+
+    // Parse the typed outcome from the signed 31403 content; a malformed or
+    // unknown action is rejected (the case is left untouched, never parked).
+    let outcome = DecisionOutcome::from_response_content(content).ok_or_else(|| {
+        governance::broker::OrchestrationError::ShareTransitionRejected(
+            "unrecognised or malformed 31403 action response".to_string(),
+        )
+    })?;
+    let reasoning = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("reasoning")
+                .and_then(|r| r.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let decision_id = format!("dec-{}", &event_id[..16.min(event_id.len())]);
+
+    let snapshot = match case_row {
+        Some(row) => CaseSnapshot {
+            id: case_id.to_string(),
+            category: CaseCategory::parse(&row.category),
+            created_by: row.created_by.clone(),
+            state: CaseState::parse(&row.state),
+            from_state: row.from_share_state.as_deref().and_then(ShareState::parse),
+            to_state: row.to_share_state.as_deref().and_then(ShareState::parse),
+            latest_decision_id,
+        },
+        None => CaseSnapshot {
+            id: case_id.to_string(),
+            category: CaseCategory::ManualSubmission,
+            created_by: String::new(),
+            state: CaseState::Open,
+            from_state: None,
+            to_state: None,
+            latest_decision_id,
+        },
+    };
+
+    // Hydrate the aggregate and route through the tested orchestrator.
+    let mut case = snapshot.hydrate(now);
+    let orch = DecisionOrchestrator;
+    let report = orch.decide(
+        &mut case,
+        decision_id.clone(),
+        outcome.clone(),
+        responder_pubkey,
+        reasoning.clone(),
+        now,
+    )?;
+
+    Ok(ResponseProjection {
+        decision_id,
+        outcome: outcome.action_str().to_string(),
+        outcome_detail: outcome.detail().map(str::to_string),
+        prior_decision_id: report.entry.prior_decision_id.clone(),
+        new_state: case.state,
+        reasoning,
+    })
+}
+
+/// F6 (DDD §7a): the derived decision id the relay assigns a governance event.
+///
+/// The 31403 projection keys `broker_decisions.decision_id` as `dec-<first 16
+/// hex of the event id>`. Supersession references a *prior decision event* by
+/// `e`-tag; resolving that event id to its decision id is this same deterministic
+/// derivation, so the superseded row can be located without a second lookup.
+pub(crate) fn decision_id_for_event(event_id: &str) -> String {
+    format!("dec-{}", &event_id[..16.min(event_id.len())])
+}
+
+/// The persistable result of projecting a *superseding* 31403 onto a case
+/// (F6, `DDD-judgment-broker-context.md` §7a). Distinct from
+/// [`ResponseProjection`]: it also names the decision it supersedes, so the
+/// projection can mark that prior row `superseded_by` (retained, auditable —
+/// never mutated) while appending this one and moving the case to `Superseded`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupersessionProjection {
+    /// `broker_decisions.decision_id` of the superseding decision.
+    pub decision_id: String,
+    /// The decision id this supersedes: the superseding row's
+    /// `prior_decision_id` AND the value written to the superseded row's
+    /// `superseded_by` column.
+    pub superseded_decision_id: String,
+    pub outcome: String,
+    pub outcome_detail: Option<String>,
+    pub reasoning: String,
+    /// `broker_cases.state` after the supersession — always `Superseded` for a
+    /// well-formed, authorised supersede.
+    pub new_state: governance::broker::CaseState,
+}
+
+/// Why a superseding 31403 was rejected at the projection (F6, DDD §7a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SupersessionError {
+    /// The superseder is neither the original signer nor a higher governance
+    /// role (§7a.1). The `RelayGovernanceGate` rejects this on ingest.
+    Unauthorised { superseder: String },
+    /// The superseding content carried no recognised `DecisionOutcome`.
+    MalformedOutcome,
+    /// No stated reason (§7a.2 point 3).
+    MissingReason,
+    /// The `supersedes` `e`-tag did not resolve to a prior decision.
+    MissingSupersededDecision,
+}
+
+/// Plan the *supersession* projection for a superseding kind-31403 (F6,
+/// `DDD-judgment-broker-context.md` §7a).
+///
+/// Pure seam behind the async [`NostrRelayDO::project_supersession`] and the
+/// ingest-time authority gate, mirroring how [`plan_action_response`] is the pure
+/// seam over `DecisionOrchestrator::decide`. It:
+///
+/// 1. computes the §7a.1 authority (`supersede_authority`) from the original
+///    signer + role ranks the relay supplies;
+/// 2. routes the superseding decision through the single-sourced aggregate
+///    `BrokerCase::supersede`, which enforces authority, a stated reason and
+///    outcome-detail completeness, appends the superseding decision **without
+///    mutating the prior one**, and moves the case to `Superseded`.
+///
+/// An unauthorised superseder yields `Err(Unauthorised)` — the testable rejection
+/// the canon requires (§7a.4). `superseded_event_id` is the `e`-tag target;
+/// `original_signer`/`original_rank`/`superseder_rank`/`case_created_by` are read
+/// from D1 by the async caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_supersession(
+    superseding_event_id: &str,
+    superseded_event_id: Option<&str>,
+    content: &str,
+    superseder_pubkey: &str,
+    original_signer: &str,
+    original_rank: u8,
+    superseder_rank: u8,
+    case_created_by: &str,
+    now: u64,
+) -> std::result::Result<SupersessionProjection, SupersessionError> {
+    use governance::broker::{
+        supersede_authority, CaseCategory, CaseSnapshot, CaseState, DecisionOutcome,
+    };
+
+    let superseded_event_id =
+        superseded_event_id.ok_or(SupersessionError::MissingSupersededDecision)?;
+    if superseded_event_id.is_empty() {
+        return Err(SupersessionError::MissingSupersededDecision);
+    }
+    let superseded_decision_id = decision_id_for_event(superseded_event_id);
+
+    let outcome =
+        DecisionOutcome::from_response_content(content).ok_or(SupersessionError::MalformedOutcome)?;
+    let reasoning = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("reasoning")
+                .and_then(|r| r.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+
+    let authority =
+        supersede_authority(original_signer, superseder_pubkey, original_rank, superseder_rank);
+
+    // Route through the single-sourced aggregate: a hydrated Decided case that
+    // the superseding decision acts on. The snapshot's created_by preserves the
+    // self-review guard; state=Decided is a superseding-eligible terminal state.
+    let snapshot = CaseSnapshot {
+        id: String::new(),
+        category: CaseCategory::ManualSubmission,
+        created_by: case_created_by.to_string(),
+        state: CaseState::Decided,
+        from_state: None,
+        to_state: None,
+        latest_decision_id: Some(superseded_decision_id.clone()),
+    };
+    let mut case = snapshot.hydrate(now);
+    let superseding_decision_id = decision_id_for_event(superseding_event_id);
+
+    case.supersede(
+        superseding_decision_id.clone(),
+        superseded_decision_id.clone(),
+        outcome.clone(),
+        superseder_pubkey,
+        reasoning.clone(),
+        authority,
+        now,
+    )
+    .map_err(|e| match e {
+        governance::broker::CaseError::UnauthorisedSupersession { superseder } => {
+            SupersessionError::Unauthorised { superseder }
+        }
+        governance::broker::CaseError::MissingSupersessionReason => {
+            SupersessionError::MissingReason
+        }
+        _ => SupersessionError::MalformedOutcome,
+    })?;
+
+    Ok(SupersessionProjection {
+        decision_id: superseding_decision_id,
+        superseded_decision_id,
+        outcome: outcome.action_str().to_string(),
+        outcome_detail: outcome.detail().map(str::to_string),
+        reasoning,
+        new_state: case.state,
+    })
+}
+
 /// ADR-099: resolve the EFFECTIVE principal a session's access derives from.
 ///
 /// When device keys are enabled and the authing `pubkey` is a registered,
@@ -367,6 +622,32 @@ impl NostrRelayDO {
             return;
         }
 
+        // F6 (DDD §7a.1): a *superseding* kind-31403 — one carrying an `e`-tag
+        // with the `supersedes` marker — is additionally authority-gated. Only
+        // the original decision's signer, or a human of a strictly higher
+        // governance role, may supersede a published decision. The
+        // `RelayGovernanceGate` rejects any other superseder here, exactly as it
+        // rejects an orphan response under Invariant 2 — before the event is
+        // saved or projected.
+        if event.kind == governance::KIND_ACTION_RESPONSE {
+            if let Some(superseded_event_id) =
+                governance::extract_supersedes_target(&event.tags)
+            {
+                if !self
+                    .supersession_authorised(&event.pubkey, superseded_event_id)
+                    .await
+                {
+                    Self::send_ok(
+                        ws,
+                        &event.id,
+                        false,
+                        "blocked: unauthorised supersession",
+                    );
+                    return;
+                }
+            }
+        }
+
         // Zone enforcement for channel messages (kind-42)
         if event.kind == 42 {
             let Some(channel_id) = filter::tag_value(&event, "e") else {
@@ -495,14 +776,28 @@ impl NostrRelayDO {
 
             // Agent Control Surface: project ActionRequest events (31402)
             // into the broker_cases table for D1-queryable governance inbox.
+            // F6 (DDD §7a.2): an ActionRequest carrying an `appeal` `e`-tag
+            // marker is an *appeal* — it reopens the cited case rather than
+            // opening a fresh one.
             if event.kind == governance::KIND_ACTION_REQUEST {
-                self.project_action_request(&event).await;
+                if governance::extract_appeal_target(&event.tags).is_some() {
+                    self.project_appeal(&event).await;
+                } else {
+                    self.project_action_request(&event).await;
+                }
             }
 
             // Agent Control Surface: project ActionResponse events (31403)
-            // into broker_decisions and update the broker_cases state.
+            // into broker_decisions and update the broker_cases state. F6 (DDD
+            // §7a): a *superseding* response (with a `supersedes` `e`-tag) marks
+            // the superseded decision `Superseded` and chains forward, rather
+            // than recording a first-order decision.
             if event.kind == governance::KIND_ACTION_RESPONSE {
-                self.project_action_response(&event).await;
+                if governance::extract_supersedes_target(&event.tags).is_some() {
+                    self.project_supersession(&event).await;
+                } else {
+                    self.project_action_response(&event).await;
+                }
             }
         } else {
             Self::send_ok(ws, &event.id, false, "error: failed to save event");
@@ -553,6 +848,7 @@ impl NostrRelayDO {
     pub(crate) async fn handle_req(
         &self,
         session_id: u64,
+        ip: &str,
         sub_id: &str,
         filters: Vec<NostrFilter>,
     ) {
@@ -563,6 +859,13 @@ impl NostrRelayDO {
                 None => return,
             }
         };
+
+        // Per-IP rate limit, consistent with the EVENT path. REQ was previously
+        // ungated, letting one IP drive unbounded D1 scans; gate it identically.
+        if !self.check_rate_limit(ip) {
+            Self::send_notice(&ws, "rate limit exceeded");
+            return;
+        }
 
         // Check subscription limit
         {
@@ -1015,10 +1318,19 @@ impl NostrRelayDO {
     pub(crate) async fn handle_count(
         &self,
         session_id: u64,
+        ip: &str,
         ws: &WebSocket,
         sub_id: &str,
         filters: Vec<NostrFilter>,
     ) {
+        // Per-IP rate limit, consistent with the EVENT/REQ paths. COUNT was
+        // previously ungated and is an equally cheap way to force unbounded D1
+        // scans; gate it identically.
+        if !self.check_rate_limit(ip) {
+            Self::send_notice(ws, "rate limit exceeded");
+            return;
+        }
+
         let session_pubkey = {
             let sessions = self.sessions.borrow();
             sessions
@@ -1259,6 +1571,16 @@ impl NostrRelayDO {
         }
     }
 
+    /// Project a signed 31403 ActionResponse onto `broker_decisions` and the
+    /// case's state (COM-16 / F3).
+    ///
+    /// The parsed outcome — including the non-binary `delegate`/`promote`/
+    /// `precedent` forms — is routed through the tested `DecisionOrchestrator`
+    /// (via [`plan_action_response`], which calls `DecisionOrchestrator::decide`),
+    /// so the resulting `CaseState` matches the outcome instead of the former
+    /// projection's fixed `under_review` fallback. A malformed, terminal or
+    /// self-review response yields an error and persists nothing — the case is
+    /// left unchanged, never parked.
     pub(crate) async fn project_action_response(&self, event: &NostrEvent) {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
@@ -1270,43 +1592,345 @@ impl NostrRelayDO {
             return;
         }
 
-        let action = serde_json::from_str::<governance::ActionResponse>(&event.content)
-            .map(|r| r.action)
-            .unwrap_or_else(|_| "unknown".to_string());
+        // Hydrate the case aggregate from its D1 projection: the orchestrator
+        // reads category/state/created_by/share-states, and the latest decision
+        // id links the provenance chain.
+        let case_row = db
+            .prepare(
+                "SELECT category, state, created_by, from_share_state, to_share_state \
+                 FROM broker_cases WHERE id = ?1 LIMIT 1",
+            )
+            .bind(&[JsValue::from_str(case_id)])
+            .ok();
+        let case_row = match case_row {
+            Some(stmt) => stmt.first::<BrokerCaseRow>(None).await.ok().flatten(),
+            None => None,
+        };
 
-        let reasoning = serde_json::from_str::<governance::ActionResponse>(&event.content)
-            .map(|r| r.reasoning)
-            .unwrap_or_default();
+        #[derive(serde::Deserialize)]
+        struct LatestDecisionRow {
+            decision_id: String,
+        }
+        let latest_stmt = db
+            .prepare(
+                "SELECT decision_id FROM broker_decisions \
+                 WHERE case_id = ?1 ORDER BY decided_at DESC LIMIT 1",
+            )
+            .bind(&[JsValue::from_str(case_id)])
+            .ok();
+        let latest_decision_id = match latest_stmt {
+            Some(stmt) => stmt
+                .first::<LatestDecisionRow>(None)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.decision_id),
+            None => None,
+        };
 
-        let decision_id = format!("dec-{}", &event.id[..16.min(event.id.len())]);
+        let proj = match plan_action_response(
+            case_id,
+            case_row.as_ref(),
+            &event.id,
+            &event.content,
+            &event.pubkey,
+            latest_decision_id,
+            event.created_at,
+        ) {
+            Ok(proj) => proj,
+            Err(_) => return,
+        };
+
+        let detail_val = proj
+            .outcome_detail
+            .as_deref()
+            .map(JsValue::from_str)
+            .unwrap_or(JsValue::NULL);
+        let prior_val = proj
+            .prior_decision_id
+            .as_deref()
+            .map(JsValue::from_str)
+            .unwrap_or(JsValue::NULL);
 
         let stmt = db.prepare(
             "INSERT OR IGNORE INTO broker_decisions \
-             (decision_id, case_id, outcome, broker_pubkey, reasoning, decided_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (decision_id, case_id, outcome, outcome_detail, broker_pubkey, reasoning, \
+              prior_decision_id, decided_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         );
         if let Ok(bound) = stmt.bind(&[
-            JsValue::from_str(&decision_id),
+            JsValue::from_str(&proj.decision_id),
             JsValue::from_str(case_id),
-            JsValue::from_str(&action),
+            JsValue::from_str(&proj.outcome),
+            detail_val,
             JsValue::from_str(&event.pubkey),
-            JsValue::from_str(&reasoning),
+            JsValue::from_str(&proj.reasoning),
+            prior_val,
             JsValue::from_f64(event.created_at as f64),
         ]) {
             let _ = bound.run().await;
         }
 
-        let new_state = match action.as_str() {
-            "approve" => "resolved",
-            "reject" => "rejected",
-            _ => "under_review",
-        };
+        // Move the case to the CaseState the orchestrator produced — never
+        // `under_review` for a well-formed non-binary outcome.
         let update_stmt = db.prepare(
             "UPDATE broker_cases SET state = ?1, assigned_to = ?2, updated_at = ?3 WHERE id = ?4",
         );
         if let Ok(bound) = update_stmt.bind(&[
-            JsValue::from_str(new_state),
+            JsValue::from_str(proj.new_state.as_str()),
             JsValue::from_str(&event.pubkey),
+            JsValue::from_f64(event.created_at as f64),
+            JsValue::from_str(case_id),
+        ]) {
+            let _ = bound.run().await;
+        }
+    }
+
+    /// F6 (DDD §7a.1): the governance-role rank of a pubkey for the
+    /// supersession-authority gradient.
+    ///
+    /// Combines the relay's own admin status (a whitelist admin ranks at least
+    /// `admin`) with any explicit `broker_roles` grant (e.g. `owner`), taking the
+    /// maximum. The absolute number is meaningless; only the ordering matters
+    /// (`governance::broker::governance_role_rank`).
+    pub(crate) async fn governance_rank(&self, pubkey: &str) -> u8 {
+        use governance::broker::governance_role_rank;
+        let mut rank = 0u8;
+        if self.admin_cache.is_admin(pubkey, &self.env).await {
+            rank = rank.max(governance_role_rank("admin"));
+        }
+        if let Ok(db) = self.env.d1("DB") {
+            #[derive(serde::Deserialize)]
+            struct RoleRow {
+                role: String,
+            }
+            if let Ok(stmt) = db
+                .prepare("SELECT role FROM broker_roles WHERE pubkey = ?1")
+                .bind(&[JsValue::from_str(pubkey)])
+            {
+                if let Ok(result) = stmt.all().await {
+                    if let Ok(rows) = result.results::<RoleRow>() {
+                        for row in rows {
+                            rank = rank.max(governance_role_rank(&row.role));
+                        }
+                    }
+                }
+            }
+        }
+        rank
+    }
+
+    /// F6 (DDD §7a.1): whether `superseder` may supersede the decision published
+    /// on `superseded_event_id`.
+    ///
+    /// Deny-by-default: if the superseded decision cannot be located (so its
+    /// original signer is unknown), authority cannot be established and the
+    /// supersession is rejected. Otherwise the pure
+    /// `governance::broker::supersede_authority` decides from the two role ranks.
+    pub(crate) async fn supersession_authorised(
+        &self,
+        superseder: &str,
+        superseded_event_id: &str,
+    ) -> bool {
+        let db = match self.env.d1("DB") {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+        let superseded_decision_id = decision_id_for_event(superseded_event_id);
+
+        #[derive(serde::Deserialize)]
+        struct SignerRow {
+            broker_pubkey: String,
+        }
+        let original_signer = match db
+            .prepare("SELECT broker_pubkey FROM broker_decisions WHERE decision_id = ?1 LIMIT 1")
+            .bind(&[JsValue::from_str(&superseded_decision_id)])
+        {
+            Ok(stmt) => stmt
+                .first::<SignerRow>(None)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.broker_pubkey),
+            Err(_) => None,
+        };
+        let Some(original_signer) = original_signer else {
+            return false;
+        };
+
+        let original_rank = self.governance_rank(&original_signer).await;
+        let superseder_rank = self.governance_rank(superseder).await;
+        governance::broker::supersede_authority(
+            &original_signer,
+            superseder,
+            original_rank,
+            superseder_rank,
+        )
+        .is_authorised()
+    }
+
+    /// Project a *superseding* kind-31403 onto `broker_decisions` and the case
+    /// (F6, `DDD-judgment-broker-context.md` §7a).
+    ///
+    /// The authority was already enforced at ingest by the `RelayGovernanceGate`
+    /// (`supersession_authorised`); this re-derives it as defence-in-depth and
+    /// persists nothing on an unauthorised or malformed supersession — the prior
+    /// decision stands, unmutated. On success it: appends the superseding
+    /// decision row (its `prior_decision_id` = the superseded decision), marks
+    /// the superseded row `superseded_by` this decision (retained, auditable —
+    /// the Nostr event itself is never touched), and moves the case to
+    /// `Superseded`.
+    pub(crate) async fn project_supersession(&self, event: &NostrEvent) {
+        let db = match self.env.d1("DB") {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+
+        let case_id = governance::extract_d_tag(&event.tags).unwrap_or("");
+        if case_id.is_empty() {
+            return;
+        }
+        let superseded_event_id = match governance::extract_supersedes_target(&event.tags) {
+            Some(id) => id,
+            None => return,
+        };
+        let superseded_decision_id = decision_id_for_event(superseded_event_id);
+
+        // Original signer of the superseded decision + the two role ranks.
+        #[derive(serde::Deserialize)]
+        struct SignerRow {
+            broker_pubkey: String,
+        }
+        let original_signer = match db
+            .prepare("SELECT broker_pubkey FROM broker_decisions WHERE decision_id = ?1 LIMIT 1")
+            .bind(&[JsValue::from_str(&superseded_decision_id)])
+        {
+            Ok(stmt) => stmt
+                .first::<SignerRow>(None)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.broker_pubkey),
+            Err(_) => None,
+        };
+        let Some(original_signer) = original_signer else {
+            return;
+        };
+
+        // Case creator (self-review guard input).
+        #[derive(serde::Deserialize)]
+        struct CreatorRow {
+            created_by: String,
+        }
+        let case_created_by = match db
+            .prepare("SELECT created_by FROM broker_cases WHERE id = ?1 LIMIT 1")
+            .bind(&[JsValue::from_str(case_id)])
+        {
+            Ok(stmt) => stmt
+                .first::<CreatorRow>(None)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.created_by)
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+
+        let original_rank = self.governance_rank(&original_signer).await;
+        let superseder_rank = self.governance_rank(&event.pubkey).await;
+
+        let proj = match plan_supersession(
+            &event.id,
+            Some(superseded_event_id),
+            &event.content,
+            &event.pubkey,
+            &original_signer,
+            original_rank,
+            superseder_rank,
+            &case_created_by,
+            event.created_at,
+        ) {
+            Ok(proj) => proj,
+            // Unauthorised / malformed: persist nothing; the prior decision stands.
+            Err(_) => return,
+        };
+
+        let detail_val = proj
+            .outcome_detail
+            .as_deref()
+            .map(JsValue::from_str)
+            .unwrap_or(JsValue::NULL);
+
+        // Append the superseding decision, referencing the one it supersedes.
+        let insert_stmt = db.prepare(
+            "INSERT OR IGNORE INTO broker_decisions \
+             (decision_id, case_id, outcome, outcome_detail, broker_pubkey, reasoning, \
+              prior_decision_id, decided_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        );
+        if let Ok(bound) = insert_stmt.bind(&[
+            JsValue::from_str(&proj.decision_id),
+            JsValue::from_str(case_id),
+            JsValue::from_str(&proj.outcome),
+            detail_val,
+            JsValue::from_str(&event.pubkey),
+            JsValue::from_str(&proj.reasoning),
+            JsValue::from_str(&proj.superseded_decision_id),
+            JsValue::from_f64(event.created_at as f64),
+        ]) {
+            let _ = bound.run().await;
+        }
+
+        // Mark the superseded decision Superseded (retained/auditable). This is a
+        // projection-state edit to a derived column — the Nostr event on the
+        // relay is never mutated (Invariant 5).
+        let mark_stmt = db.prepare(
+            "UPDATE broker_decisions SET superseded_by = ?1 WHERE decision_id = ?2",
+        );
+        if let Ok(bound) = mark_stmt.bind(&[
+            JsValue::from_str(&proj.decision_id),
+            JsValue::from_str(&proj.superseded_decision_id),
+        ]) {
+            let _ = bound.run().await;
+        }
+
+        // Move the case to Superseded.
+        let update_stmt = db.prepare(
+            "UPDATE broker_cases SET state = ?1, assigned_to = ?2, updated_at = ?3 WHERE id = ?4",
+        );
+        if let Ok(bound) = update_stmt.bind(&[
+            JsValue::from_str(proj.new_state.as_str()),
+            JsValue::from_str(&event.pubkey),
+            JsValue::from_f64(event.created_at as f64),
+            JsValue::from_str(case_id),
+        ]) {
+            let _ = bound.run().await;
+        }
+    }
+
+    /// Project an *appeal* kind-31402 (F6, `DDD-judgment-broker-context.md`
+    /// §7a.2/§7a.3): reopen the cited case for a fresh human decision.
+    ///
+    /// An appeal reopens; it does not overturn. Only a terminal
+    /// (`decided`/`delegated`/`promoted`/`precedent`/`superseded`) case is
+    /// reopened — the `WHERE state IN (...)` guard makes this the domain
+    /// `reopen` transition (an already-open case is untouched). The overturning,
+    /// if any, is a subsequent authorised kind-31403 on the now-`reopened` case.
+    pub(crate) async fn project_appeal(&self, event: &NostrEvent) {
+        let db = match self.env.d1("DB") {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let case_id = governance::extract_d_tag(&event.tags).unwrap_or("");
+        if case_id.is_empty() {
+            return;
+        }
+        let stmt = db.prepare(
+            "UPDATE broker_cases SET state = 'reopened', updated_at = ?1 \
+             WHERE id = ?2 AND state IN \
+             ('decided','delegated','promoted','precedent','superseded')",
+        );
+        if let Ok(bound) = stmt.bind(&[
             JsValue::from_f64(event.created_at as f64),
             JsValue::from_str(case_id),
         ]) {
@@ -1595,6 +2219,343 @@ mod count_auth_tests {
         // The #p constraint must be rebound to the authed pubkey so a client
         // cannot count/read another user's sealed DMs.
         assert_eq!(out[0].extra.get("#p"), Some(&serde_json::json!([pk])));
+    }
+}
+
+#[cfg(test)]
+mod governance_projection_tests {
+    //! COM-16 / F3: the 31403 ActionResponse projection routes non-binary
+    //! outcomes through the tested `DecisionOrchestrator`. These exercise the
+    //! pure `plan_action_response` seam — the worker-side assembly of a
+    //! `CaseSnapshot` from a D1 row plus the orchestrator call — without a live
+    //! D1. The env-bound read/write in `project_action_response` is a thin shell
+    //! over this.
+    use super::*;
+    use nostr_bbs_core::governance::broker::{CaseState, OrchestrationError};
+
+    fn open_case_row() -> BrokerCaseRow {
+        BrokerCaseRow {
+            category: "manual_submission".into(),
+            state: "open".into(),
+            created_by: "agent-alice".into(),
+            from_share_state: None,
+            to_share_state: None,
+        }
+    }
+
+    #[test]
+    fn delegate_response_reaches_delegated_not_under_review() {
+        let row = open_case_row();
+        let proj = plan_action_response(
+            "case-1",
+            Some(&row),
+            &"e".repeat(64),
+            r#"{"action":"delegate","delegate_to":"human-carol","reasoning":"reassign"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("delegate projects");
+        assert_eq!(proj.outcome, "delegate");
+        assert_eq!(proj.outcome_detail.as_deref(), Some("human-carol"));
+        assert_eq!(proj.new_state, CaseState::Delegated);
+        // The falsification target for WP-4.
+        assert_ne!(proj.new_state, CaseState::UnderReview);
+    }
+
+    #[test]
+    fn promote_and_precedent_reach_matching_states() {
+        let row = open_case_row();
+        let promote = plan_action_response(
+            "case-1",
+            Some(&row),
+            &"a".repeat(64),
+            r#"{"action":"promote","pattern_id":"pat-9"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("promote projects");
+        assert_eq!(promote.new_state, CaseState::Promoted);
+
+        let precedent = plan_action_response(
+            "case-1",
+            Some(&open_case_row()),
+            &"b".repeat(64),
+            r#"{"action":"precedent","scope":"org-wide"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("precedent projects");
+        assert_eq!(precedent.new_state, CaseState::Precedent);
+    }
+
+    #[test]
+    fn binary_outcomes_reach_decided_with_no_detail() {
+        let proj = plan_action_response(
+            "case-1",
+            Some(&open_case_row()),
+            &"c".repeat(64),
+            r#"{"action":"approve","reasoning":"ok"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("approve projects");
+        assert_eq!(proj.new_state, CaseState::Decided);
+        assert_eq!(proj.outcome_detail, None);
+    }
+
+    #[test]
+    fn absent_case_row_defaults_to_open_and_still_projects() {
+        // A 31403 that arrives before its 31402 projected: no row yet. The
+        // planner defaults to an open ManualSubmission case so the decision is
+        // still recorded rather than dropped.
+        let proj = plan_action_response(
+            "case-unknown",
+            None,
+            &"d".repeat(64),
+            r#"{"action":"reject","reasoning":"no"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("projects against default snapshot");
+        assert_eq!(proj.new_state, CaseState::Decided);
+    }
+
+    #[test]
+    fn terminal_case_row_rejects_second_response() {
+        let mut row = open_case_row();
+        row.state = "decided".into();
+        let err = plan_action_response(
+            "case-1",
+            Some(&row),
+            &"f".repeat(64),
+            r#"{"action":"approve","reasoning":"again"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OrchestrationError::Case(
+                nostr_bbs_core::governance::broker::CaseError::AlreadyTerminal(_)
+            )
+        ));
+    }
+
+    #[test]
+    fn malformed_response_is_rejected() {
+        let err = plan_action_response(
+            "case-1",
+            Some(&open_case_row()),
+            &"0".repeat(64),
+            r#"{"action":"escalate"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, OrchestrationError::ShareTransitionRejected(_)));
+    }
+
+    // ── F6: supersession-authority projection (DDD §7a) ──────────────────
+    //
+    // These exercise the pure `plan_supersession` seam — the worker-side
+    // authority computation + aggregate supersede — that the env-bound
+    // `project_supersession` shell wraps. The ingest-time gate
+    // (`supersession_authorised`) is the same `supersede_authority` call over the
+    // same ranks, so an unauthorised supersession is rejected here exactly as the
+    // relay rejects it before save (canon §7a.4: "an unauthorised supersede
+    // rejected by RelayGovernanceGate").
+
+    /// admin-rank = 3 (`governance_role_rank("admin")`); owner-rank = 4.
+    const ADMIN_RANK: u8 = 3;
+    const OWNER_RANK: u8 = 4;
+
+    #[test]
+    fn authorised_supersede_by_original_signer_accepted() {
+        let superseded_event = "a".repeat(64);
+        let superseding_event = "b".repeat(64);
+        // bob (the original signer) revokes his own prior Approve with a Reject.
+        let proj = plan_supersession(
+            &superseding_event,
+            Some(&superseded_event),
+            r#"{"action":"reject","reasoning":"revoked: grant no longer holds"}"#,
+            "human-bob",     // superseder
+            "human-bob",     // original signer — same ⇒ OriginalSigner authority
+            ADMIN_RANK,      // original rank
+            ADMIN_RANK,      // superseder rank
+            "agent-alice",   // case creator (self-review guard)
+            3_000,
+        )
+        .expect("original signer may supersede");
+        assert_eq!(proj.outcome, "reject");
+        // The superseding decision references the one it supersedes (§7a.2).
+        assert_eq!(
+            proj.superseded_decision_id,
+            decision_id_for_event(&superseded_event)
+        );
+        assert_eq!(proj.decision_id, decision_id_for_event(&superseding_event));
+        // The case moves to Superseded (§7a.3).
+        assert_eq!(proj.new_state, CaseState::Superseded);
+    }
+
+    #[test]
+    fn authorised_supersede_by_higher_role_accepted() {
+        let superseded_event = "a".repeat(64);
+        let superseding_event = "c".repeat(64);
+        // carol (owner, rank 4) supersedes bob's (admin, rank 3) decision.
+        let proj = plan_supersession(
+            &superseding_event,
+            Some(&superseded_event),
+            r#"{"action":"reject","reasoning":"overridden by governance"}"#,
+            "human-carol",
+            "human-bob",
+            ADMIN_RANK,
+            OWNER_RANK,
+            "agent-alice",
+            3_000,
+        )
+        .expect("higher role may supersede");
+        assert_eq!(proj.new_state, CaseState::Superseded);
+    }
+
+    #[test]
+    fn unauthorised_supersede_by_equal_role_rejected() {
+        let superseded_event = "a".repeat(64);
+        let superseding_event = "d".repeat(64);
+        // mallory (a different admin, equal rank) may NOT supersede bob's
+        // decision — the authority gradient is not collapsed (§7a.1).
+        let err = plan_supersession(
+            &superseding_event,
+            Some(&superseded_event),
+            r#"{"action":"reject","reasoning":"I disagree"}"#,
+            "human-mallory",
+            "human-bob",
+            ADMIN_RANK,
+            ADMIN_RANK,
+            "agent-alice",
+            3_000,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SupersessionError::Unauthorised {
+                superseder: "human-mallory".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unauthorised_supersede_by_lower_role_rejected() {
+        let superseded_event = "a".repeat(64);
+        let superseding_event = "e".repeat(64);
+        // A lower-rank different signer is rejected.
+        let err = plan_supersession(
+            &superseding_event,
+            Some(&superseded_event),
+            r#"{"action":"reject","reasoning":"nope"}"#,
+            "human-dave",
+            "human-carol",
+            OWNER_RANK,   // original outranks superseder
+            ADMIN_RANK,
+            "agent-alice",
+            3_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SupersessionError::Unauthorised { .. }));
+    }
+
+    #[test]
+    fn supersede_without_reason_rejected() {
+        let superseded_event = "a".repeat(64);
+        let superseding_event = "f".repeat(64);
+        let err = plan_supersession(
+            &superseding_event,
+            Some(&superseded_event),
+            r#"{"action":"reject"}"#, // no reasoning field
+            "human-bob",
+            "human-bob",
+            ADMIN_RANK,
+            ADMIN_RANK,
+            "agent-alice",
+            3_000,
+        )
+        .unwrap_err();
+        assert_eq!(err, SupersessionError::MissingReason);
+    }
+
+    #[test]
+    fn supersede_without_referenced_event_rejected() {
+        let err = plan_supersession(
+            &"b".repeat(64),
+            None, // no supersedes e-tag target
+            r#"{"action":"reject","reasoning":"x"}"#,
+            "human-bob",
+            "human-bob",
+            ADMIN_RANK,
+            ADMIN_RANK,
+            "agent-alice",
+            3_000,
+        )
+        .unwrap_err();
+        assert_eq!(err, SupersessionError::MissingSupersededDecision);
+    }
+
+    #[test]
+    fn supersession_chain_renders_effective_and_superseded_decisions() {
+        // Two supersessions chained: dec(A) --superseded_by--> dec(B)
+        // --superseded_by--> dec(C). The projection expresses the chain via the
+        // superseding row's prior_decision_id link + the superseded row's
+        // superseded_by mark; the client renders the newest as effective and the
+        // earlier ones as history. Here we assert the projection produces the
+        // chain data a renderer consumes.
+        let ev_a = "a".repeat(64);
+        let ev_b = "b".repeat(64);
+        let ev_c = "c".repeat(64);
+        let dec_a = decision_id_for_event(&ev_a);
+        let dec_b = decision_id_for_event(&ev_b);
+        let dec_c = decision_id_for_event(&ev_c);
+
+        // B supersedes A (original signer bob).
+        let first = plan_supersession(
+            &ev_b,
+            Some(&ev_a),
+            r#"{"action":"reject","reasoning":"revoke"}"#,
+            "human-bob",
+            "human-bob",
+            ADMIN_RANK,
+            ADMIN_RANK,
+            "agent-alice",
+            3_000,
+        )
+        .expect("B supersedes A");
+        assert_eq!(first.decision_id, dec_b);
+        assert_eq!(first.superseded_decision_id, dec_a);
+        assert_eq!(first.new_state, CaseState::Superseded);
+
+        // C supersedes B (higher-role owner carol) — forward-chaining (§7a.3).
+        let second = plan_supersession(
+            &ev_c,
+            Some(&ev_b),
+            r#"{"action":"approve","reasoning":"re-granted on review"}"#,
+            "human-carol",
+            "human-bob",
+            ADMIN_RANK,
+            OWNER_RANK,
+            "agent-alice",
+            3_100,
+        )
+        .expect("C supersedes B");
+        assert_eq!(second.decision_id, dec_c);
+        assert_eq!(second.superseded_decision_id, dec_b);
+        // The effective decision is the newest (C); A and B are retained history.
+        assert_eq!(second.new_state, CaseState::Superseded);
+        assert_eq!(second.outcome, "approve");
     }
 }
 

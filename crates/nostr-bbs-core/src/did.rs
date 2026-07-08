@@ -79,10 +79,12 @@ pub fn is_valid_hex_pubkey(s: &str) -> bool {
 ///
 /// Full delegation to `solid_pod_rs::did_nostr_types::render_did_document_tier1`
 /// — the canonical create-agent / ADR-125 Multikey form. As of solid-pod-rs
-/// 0.5.0-alpha.2 the upstream document already carries canonical relative
-/// `authentication`/`assertionMethod` (`["#key1"]`), `service: []`, and no
-/// `alsoKnownAs`, so the forum emits it verbatim — no fragment re-pinning and
-/// no absolute-ref rewrite (the `did:nostr:<hex>` string is unchanged, I1).
+/// 0.5.0-alpha.4 the upstream minimal document is fully aligned to the did:nostr
+/// CG spec: it carries the canonical relative `authentication`/`assertionMethod`
+/// (`["#key1"]`) and OMITS the optional members entirely — no empty `service: []`
+/// (the pre-alignment shape) and no `alsoKnownAs`. The forum emits it verbatim —
+/// no fragment re-pinning and no absolute-ref rewrite (the `did:nostr:<hex>`
+/// string is unchanged, I1). `service`/`alsoKnownAs` appear only at Tier-3.
 pub fn render_did_document_tier1(pk: &NostrPubkey) -> Value {
     upstream::render_did_document_tier1(&pk.to_upstream())
 }
@@ -278,12 +280,18 @@ mod tests {
     }
 
     #[test]
-    fn tier1_has_empty_service_section() {
+    fn tier1_omits_service_section() {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
-        // ADR-125 / create-agent: the canonical doc carries `service: []` at
-        // Tier-1 (entries are added only at Tier-3).
-        assert!(doc["service"].as_array().unwrap().is_empty());
+        // solid-pod-rs 0.5.0-alpha.4 aligned the canonical minimal doc to the
+        // did:nostr CG spec: the optional `service` member is OMITTED entirely
+        // at Tier-1 (an empty `service: []` was the pre-alignment shape).
+        // Entries are added only at Tier-3.
+        assert!(
+            doc.get("service").is_none(),
+            "canonical minimal did:nostr doc must omit `service` (got {:?})",
+            doc.get("service")
+        );
     }
 
     // ── Tier-3 document ───────────────────────────────────────────────
@@ -383,11 +391,15 @@ mod tests {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let local = render_did_document_tier1(&pk);
         let up = upstream::render_did_document_tier1(&pk.to_upstream());
-        // Full delegation (alpha.2): the forum emits the upstream canonical
-        // Multikey document verbatim — relative authentication/assertionMethod
-        // and `service: []` included.
+        // Full delegation (alpha.4): the forum emits the upstream canonical
+        // Multikey document verbatim — relative authentication/assertionMethod,
+        // with the optional `service`/`alsoKnownAs` members omitted (spec-aligned
+        // minimal form).
         assert_eq!(local, up);
         assert_eq!(local["authentication"][0], "#key1");
-        assert!(local["service"].as_array().unwrap().is_empty());
+        assert!(
+            local.get("service").is_none(),
+            "canonical minimal did:nostr doc must omit `service`"
+        );
     }
 }

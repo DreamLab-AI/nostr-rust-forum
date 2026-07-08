@@ -9,7 +9,7 @@
 //! The outer gift wrap reveals only the recipient (needed for relay routing) and
 //! a throwaway pubkey. The sender's identity is hidden inside the encrypted seal.
 
-use crate::event::{sign_event, NostrEvent, UnsignedEvent};
+use crate::event::{sign_event, verify_event_strict, NostrEvent, UnsignedEvent};
 use crate::keys::generate_keypair;
 use crate::nip04;
 use crate::nip44;
@@ -69,6 +69,23 @@ pub enum GiftWrapError {
     /// The inner event structure is malformed.
     #[error("parse error: {0}")]
     ParseError(String),
+
+    /// The decrypted seal's id/signature failed verification. NIP-59 requires
+    /// the seal (kind 13) to be signed by the sender; an unverified seal lets
+    /// an attacker forge the `sender_pubkey`.
+    #[error("seal verification failed: {0}")]
+    SealVerification(String),
+
+    /// The rumor's author does not match the verified seal signer. NIP-59
+    /// binds `rumor.pubkey == seal.pubkey`; a mismatch means the inner author
+    /// is attacker-controlled independent of who signed the seal.
+    #[error("author mismatch: rumor pubkey {rumor} != seal pubkey {seal}")]
+    AuthorMismatch {
+        /// The pubkey claimed inside the rumor.
+        rumor: String,
+        /// The verified pubkey that signed the seal.
+        seal: String,
+    },
 }
 
 // ── Output types ─────────────────────────────────────────────────────────────
@@ -333,6 +350,13 @@ pub fn unwrap_gift(
         });
     }
 
+    // Verify the seal's id + Schnorr signature before trusting `seal.pubkey`
+    // as the sender. NIP-59: the seal is signed by the sender's real key.
+    // Without this, an attacker can forge the seal's pubkey to impersonate any
+    // author.
+    verify_event_strict(&seal)
+        .map_err(|e| GiftWrapError::SealVerification(e.to_string()))?;
+
     // Decrypt layer 2: seal → rumor
     // The seal's pubkey is the sender's real key
     let sender_pk_bytes = hex_to_32(&seal.pubkey)?;
@@ -347,6 +371,16 @@ pub fn unwrap_gift(
         return Err(GiftWrapError::InvalidKind {
             expected: KIND_RUMOR,
             actual: rumor.kind,
+        });
+    }
+
+    // Bind the rumor's author to the verified seal signer. NIP-59 requires
+    // rumor.pubkey == seal.pubkey; otherwise the inner author is
+    // attacker-controlled independent of who actually signed the seal.
+    if rumor.pubkey != seal.pubkey {
+        return Err(GiftWrapError::AuthorMismatch {
+            rumor: rumor.pubkey.clone(),
+            seal: seal.pubkey.clone(),
         });
     }
 
@@ -387,6 +421,21 @@ pub enum SignerGiftWrapError {
     /// Throwaway-key generation or signing failed (gift-wrap outer layer).
     #[error("key error: {0}")]
     KeyError(String),
+
+    /// The decrypted seal's id/signature failed verification (see
+    /// [`GiftWrapError::SealVerification`]).
+    #[error("seal verification failed: {0}")]
+    SealVerification(String),
+
+    /// The rumor's author does not match the verified seal signer (see
+    /// [`GiftWrapError::AuthorMismatch`]).
+    #[error("author mismatch: rumor pubkey {rumor} != seal pubkey {seal}")]
+    AuthorMismatch {
+        /// The pubkey claimed inside the rumor.
+        rumor: String,
+        /// The verified pubkey that signed the seal.
+        seal: String,
+    },
 }
 
 /// Seal a rumor using a [`Signer`] for the sender's identity operations.
@@ -465,6 +514,11 @@ pub async fn unwrap_gift_with_signer(
         });
     }
 
+    // Verify the seal's id + Schnorr signature before trusting `seal.pubkey`
+    // as the sender (NIP-59: the seal is signed by the sender's real key).
+    verify_event_strict(&seal)
+        .map_err(|e| SignerGiftWrapError::SealVerification(e.to_string()))?;
+
     // Layer 2: seal → rumor. The seal's pubkey is the sender's real key.
     let rumor_json = signer.nip44_decrypt(&seal.pubkey, &seal.content).await?;
     let rumor: UnsignedEvent = serde_json::from_str(&rumor_json)
@@ -474,6 +528,15 @@ pub async fn unwrap_gift_with_signer(
         return Err(SignerGiftWrapError::InvalidKind {
             expected: KIND_RUMOR,
             actual: rumor.kind,
+        });
+    }
+
+    // Bind the rumor's author to the verified seal signer (NIP-59:
+    // rumor.pubkey == seal.pubkey).
+    if rumor.pubkey != seal.pubkey {
+        return Err(SignerGiftWrapError::AuthorMismatch {
+            rumor: rumor.pubkey.clone(),
+            seal: seal.pubkey.clone(),
         });
     }
 
@@ -654,6 +717,52 @@ mod tests {
         assert!(
             matches!(result, Err(GiftWrapError::Decryption(_))),
             "expected Decryption error, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn unwrap_rejects_bad_seal_signature() {
+        // A gift wrap whose inner seal (kind 13) has a corrupted signature must
+        // be rejected: an unverified seal lets an attacker forge the sender.
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let recipient_pk_bytes = hex_to_32(&recipient_pk).unwrap();
+
+        let rumor = create_rumor(&sender_pk, &recipient_pk, "forged");
+        let mut seal = seal_rumor(&rumor, &sender_sk, &recipient_pk_bytes).unwrap();
+        // Corrupt the seal's signature so verify_event_strict fails.
+        seal.sig = "00".repeat(64);
+        let wrapped = wrap_seal(&seal, &recipient_pk).unwrap();
+
+        let result = unwrap_gift(&wrapped, &recipient_sk);
+        assert!(
+            matches!(result, Err(GiftWrapError::SealVerification(_))),
+            "expected SealVerification, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn unwrap_rejects_rumor_pubkey_mismatch() {
+        // The seal is validly signed by `sender_sk`, but the rumor inside
+        // claims a DIFFERENT author (`victim_pk`). NIP-59 requires
+        // rumor.pubkey == seal.pubkey, so this impersonation must be rejected.
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let (_, victim_pk) = test_keypair();
+        let recipient_pk_bytes = hex_to_32(&recipient_pk).unwrap();
+
+        let rumor = create_rumor(&victim_pk, &recipient_pk, "impersonation");
+        let seal = seal_rumor(&rumor, &sender_sk, &recipient_pk_bytes).unwrap();
+        // The seal itself is signed by the real sender, not the victim.
+        assert_eq!(seal.pubkey, sender_pk);
+
+        let wrapped = wrap_seal(&seal, &recipient_pk).unwrap();
+        let result = unwrap_gift(&wrapped, &recipient_sk);
+        assert!(
+            matches!(result, Err(GiftWrapError::AuthorMismatch { .. })),
+            "expected AuthorMismatch, got: {:?}",
             result
         );
     }
@@ -871,5 +980,52 @@ mod tests {
                 actual: 1
             })
         ));
+    }
+
+    #[test]
+    fn signer_unwrap_rejects_bad_seal_signature() {
+        // Same protection as the raw path: a corrupted seal signature is
+        // rejected by the signer-driven unwrap.
+        let (sender_sk, sender_pk) = test_keypair();
+        let recipient = gen_kp().unwrap();
+        let recipient_pk = recipient.public.to_hex();
+        let recipient_pk_bytes = hex_to_32(&recipient_pk).unwrap();
+        let recipient_signer = PrfSigner::new(recipient);
+
+        let rumor = create_rumor(&sender_pk, &recipient_pk, "forged");
+        let mut seal = seal_rumor(&rumor, &sender_sk, &recipient_pk_bytes).unwrap();
+        seal.sig = "00".repeat(64);
+        let wrapped = wrap_seal(&seal, &recipient_pk).unwrap();
+
+        let result = block_on(unwrap_gift_with_signer(&wrapped, &recipient_signer));
+        assert!(
+            matches!(result, Err(SignerGiftWrapError::SealVerification(_))),
+            "expected SealVerification, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn signer_unwrap_rejects_rumor_pubkey_mismatch() {
+        // Same protection as the raw path: a rumor authored by a different
+        // pubkey than the verified seal signer is rejected.
+        let (sender_sk, sender_pk) = test_keypair();
+        let (_, victim_pk) = test_keypair();
+        let recipient = gen_kp().unwrap();
+        let recipient_pk = recipient.public.to_hex();
+        let recipient_pk_bytes = hex_to_32(&recipient_pk).unwrap();
+        let recipient_signer = PrfSigner::new(recipient);
+
+        let rumor = create_rumor(&victim_pk, &recipient_pk, "impersonation");
+        let seal = seal_rumor(&rumor, &sender_sk, &recipient_pk_bytes).unwrap();
+        assert_eq!(seal.pubkey, sender_pk);
+        let wrapped = wrap_seal(&seal, &recipient_pk).unwrap();
+
+        let result = block_on(unwrap_gift_with_signer(&wrapped, &recipient_signer));
+        assert!(
+            matches!(result, Err(SignerGiftWrapError::AuthorMismatch { .. })),
+            "expected AuthorMismatch, got: {:?}",
+            result
+        );
     }
 }

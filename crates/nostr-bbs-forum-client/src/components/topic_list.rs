@@ -19,6 +19,7 @@ use leptos_router::components::A;
 use nostr_bbs_core::NostrEvent;
 
 use crate::app::base_href;
+use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::user_display::use_display_name_memo;
 use crate::utils::format_relative_time;
@@ -231,6 +232,10 @@ pub fn TopicList(
 fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
     let author_name = use_display_name_memo(topic.pubkey.clone());
     let last_name = use_display_name_memo(topic.last_pubkey.clone());
+    // Disclosure badges (COM-13/F2): mark the topic's root author and the
+    // most-recent participant as agents, naming their authorising principals.
+    let root_badge_pubkey = topic.pubkey.clone();
+    let last_badge_pubkey = topic.last_pubkey.clone();
     let title = topic_title(&topic.content);
     let reply_count = topic.reply_count;
     let reply_label = if reply_count == 1 {
@@ -255,6 +260,7 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
                     <div class="flex items-center gap-2 mt-1 text-xs text-gray-500 flex-wrap">
                         <span>"by "</span>
                         <span class="text-gray-400">{move || author_name.get()}</span>
+                        <AgentBadge pubkey=root_badge_pubkey compact=true />
                         <span class="text-gray-700">"\u{2022}"</span>
                         <span class="flex items-center gap-1">
                             <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -273,8 +279,9 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
                         {activity}
                     </div>
                     {has_replies.then(|| view! {
-                        <div class="mt-1 text-gray-600">
+                        <div class="mt-1 text-gray-600 flex items-center gap-1 justify-end">
                             "last: "<span class="text-gray-400">{move || last_name.get()}</span>
+                            <AgentBadge pubkey=last_badge_pubkey compact=true />
                         </div>
                     })}
                 </div>

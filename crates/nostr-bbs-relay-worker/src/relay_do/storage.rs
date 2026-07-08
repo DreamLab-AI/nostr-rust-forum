@@ -20,6 +20,14 @@ use super::NostrRelayDO;
 
 const MAX_QUERY_LIMIT: u32 = 1000;
 
+/// DoS bound on the TOTAL rows a single REQ/COUNT frame may scan across ALL of
+/// its filters. The dispatcher already caps a frame to `MAX_FILTERS` filters
+/// and each filter is clamped to `MAX_QUERY_LIMIT` rows, but without a
+/// frame-wide budget a client could still force `MAX_FILTERS * MAX_QUERY_LIMIT`
+/// rows of D1 work per frame. This makes that worst case an explicit, enforced
+/// ceiling: once the budget is spent, remaining filters are clamped or skipped.
+const MAX_ROWS_PER_FRAME: u32 = super::MAX_FILTERS as u32 * MAX_QUERY_LIMIT;
+
 // ---------------------------------------------------------------------------
 // D1 row type for query results
 // ---------------------------------------------------------------------------
@@ -247,7 +255,16 @@ impl NostrRelayDO {
         let now = auth::js_now_secs();
         let mut events = Vec::new();
 
+        // Per-frame row budget (DoS bound). Spent down as each filter's clamped
+        // limit is consumed; once exhausted, remaining filters are skipped so a
+        // single REQ/COUNT can never scan more than `MAX_ROWS_PER_FRAME` rows.
+        let mut rows_budget: u32 = MAX_ROWS_PER_FRAME;
+
         for filter in filters {
+            if rows_budget == 0 {
+                break;
+            }
+
             let mut conditions: Vec<String> = Vec::new();
             let mut params: Vec<JsValue> = Vec::new();
             let mut param_idx = 1u32;
@@ -260,7 +277,12 @@ impl NostrRelayDO {
                 format!("WHERE {}", conditions.join(" AND "))
             };
 
-            let limit = filter.limit.unwrap_or(500).min(MAX_QUERY_LIMIT);
+            let limit = filter
+                .limit
+                .unwrap_or(500)
+                .min(MAX_QUERY_LIMIT)
+                .min(rows_budget);
+            rows_budget -= limit;
             let limit_placeholder = format!("?{param_idx}");
             params.push(JsValue::from_f64(limit as f64));
 

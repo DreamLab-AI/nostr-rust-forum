@@ -90,6 +90,9 @@ async-trait = "0.1"
 toml = "0.8"
 schemars = { version = "0.8", features = ["url"] }
 
+# URL parsing (authority-exact first-party checks — wasm-safe, pure Rust)
+url = "2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -138,7 +141,12 @@ wasm-bindgen-test = "0.3"
 # (commit 9b4076a), so registry and git are the same code — the alpha.15
 # aliasing (published crate != advanced untagged HEAD) is resolved and the
 # interim git+tag pin is retired per the deny.toml plan.
-solid-pod-rs = { version = "0.5.0-alpha.3", default-features = false, features = ["core"] }
+# DEV: local path until solid-pod-rs shared-policy release is published; re-pin to the crates.io version then.
+# Requirement bumped to 0.5.0-alpha.4 (the local working tree) so the
+# `[patch.crates-io]` below resolves the shared WAC + did:nostr policy
+# (`wac::effective_acl_target`, `wac::protected_resource_for_acl`, the
+# tightened `did_nostr_types::verify_webid_tag`, and `webid_declares_pubkey`).
+solid-pod-rs = { version = "0.5.0-alpha.4", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.3).
 nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.3" }
@@ -165,3 +173,16 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# ---------------------------------------------------------------------------
+# DEV: local path until solid-pod-rs shared-policy release is published;
+# re-pin to the crates.io version then (drop this whole section).
+#
+# Consume the NEW shared WAC + did:nostr policy from the solid-pod-rs working
+# tree (0.5.0-alpha.4, not yet published) so the forum calls the canonical
+# `wac::effective_acl_target` / `wac::protected_resource_for_acl` sidecar
+# decision and the tightened `did_nostr_types::verify_webid_tag` /
+# `webid_declares_pubkey` instead of a drifted local copy.
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+solid-pod-rs = { path = "/home/devuser/workspace/solid-pod-rs/crates/solid-pod-rs" }

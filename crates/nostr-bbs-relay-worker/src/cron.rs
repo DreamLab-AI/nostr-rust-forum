@@ -432,6 +432,211 @@ pub async fn sweep_inactive_demotions(env: &Env) -> Result<DemotionSweepResult, 
     })
 }
 
+// ---------------------------------------------------------------------------
+// Retention / NIP-40 expiry sweep
+//
+// The NIP-11 document (`nip11::relay_info`) advertises a `retention` policy —
+// finite windows for kinds 1/7/9024, indefinite for the rest — and NIP-40 lets
+// any event carry an `["expiration", <unix_ts>]` tag. Neither was ever
+// enforced: `events` grew unbounded and expired events were only *skipped on
+// read* (`relay_do::storage::query_events`), never deleted. This sweep, run on
+// the scheduled (cron) trigger, DELETEs rows past their kind's retention window
+// AND rows past their NIP-40 expiration — paged and circuit-broken like the
+// profile-backfill and demotion sweeps so it never issues an unbounded
+// statement or blows the worker CPU budget.
+//
+// The retention windows are read from `nip11::RETENTION_POLICY`, the SAME
+// constant the NIP-11 document is built from, so advertised policy and enforced
+// policy can never drift.
+// ---------------------------------------------------------------------------
+
+/// Rows selected (and deleted) per DELETE page. Kept in line with the other
+/// sweeps so one page is a single bounded statement set.
+pub(crate) const RETENTION_BATCH_SIZE: u32 = 200;
+
+/// Circuit breaker: the maximum number of rows a single retention sweep will
+/// delete in one cron invocation, bounding worst-case D1 work. A healthy forum
+/// deletes far fewer than this per tick; a large first sweep simply completes
+/// over successive ticks.
+const RETENTION_MAX_ROWS: u64 = 50_000;
+
+/// Minimal id row for the retention/expiry candidate pages.
+#[derive(Deserialize)]
+struct EventIdRow {
+    id: String,
+}
+
+/// Outcome of [`sweep_retention`].
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RetentionSweepResult {
+    /// Rows deleted because they were past their kind's retention window.
+    pub retention_deleted: u64,
+    /// Rows deleted because their NIP-40 `expiration` tag was already in the past.
+    pub expired_deleted: u64,
+    /// `true` if the sweep hit [`RETENTION_MAX_ROWS`] before exhausting
+    /// candidates (the remainder is swept on the next tick).
+    pub truncated: bool,
+}
+
+/// Paged, bounded retention + NIP-40-expiry sweep (run from the cron trigger).
+///
+/// Two phases, both paged identically (SELECT a bounded page of ids, then
+/// batch-DELETE exactly that page, repeat until a short page or the shared
+/// circuit breaker):
+///
+///  1. **Kind retention** — for every [`crate::nip11::RETENTION_POLICY`] rule
+///     with a finite window, delete events of those kinds whose `created_at` is
+///     older than `now - window`.
+///  2. **NIP-40 expiry** — delete events carrying an `["expiration", <ts>]` tag
+///     whose timestamp is already in the past, regardless of kind.
+///
+/// DELETE-by-id (rather than `DELETE … LIMIT`, which D1's SQLite build does not
+/// enable) keeps every statement bounded and portable. Errors abort the sweep
+/// with a message; the caller logs and swallows so a sweep failure never breaks
+/// the scheduled tick.
+pub async fn sweep_retention(env: &Env) -> Result<RetentionSweepResult, String> {
+    let db = env
+        .d1("DB")
+        .map_err(|e| format!("DB binding missing: {e:?}"))?;
+
+    let now = auth::js_now_secs() as i64;
+    let mut budget: u64 = RETENTION_MAX_ROWS;
+    let mut retention_deleted: u64 = 0;
+    let mut expired_deleted: u64 = 0;
+
+    // ---- Phase 1: per-kind retention windows ----
+    for rule in crate::nip11::RETENTION_POLICY {
+        let window = match rule.time {
+            Some(secs) => secs,
+            None => continue, // indefinite retention → nothing to prune
+        };
+        let cutoff = now - window;
+
+        // Kind predicate + its bound parameters. Range rules use an inclusive
+        // bound; list rules an `IN (…)` over an explicit, statically-sized set.
+        let (kind_pred, kind_binds): (String, Vec<JsValue>) = match &rule.kinds {
+            crate::nip11::RetentionKinds::Range(lo, hi) => (
+                "kind >= ?1 AND kind <= ?2".to_string(),
+                vec![JsValue::from_f64(*lo as f64), JsValue::from_f64(*hi as f64)],
+            ),
+            crate::nip11::RetentionKinds::List(ks) => {
+                let placeholders: Vec<String> = (1..=ks.len()).map(|i| format!("?{i}")).collect();
+                (
+                    format!("kind IN ({})", placeholders.join(", ")),
+                    ks.iter().map(|k| JsValue::from_f64(*k as f64)).collect(),
+                )
+            }
+        };
+        // The created_at cutoff and LIMIT are the two params after the kind set.
+        let cutoff_idx = kind_binds.len() + 1;
+        let limit_idx = cutoff_idx + 1;
+        let sql = format!(
+            "SELECT id FROM events \
+             WHERE {kind_pred} AND created_at < ?{cutoff_idx} \
+             LIMIT ?{limit_idx}"
+        );
+
+        loop {
+            if budget == 0 {
+                return Ok(RetentionSweepResult {
+                    retention_deleted,
+                    expired_deleted,
+                    truncated: true,
+                });
+            }
+            let page = budget.min(RETENTION_BATCH_SIZE as u64) as u32;
+
+            let mut binds = kind_binds.clone();
+            binds.push(JsValue::from_f64(cutoff as f64));
+            binds.push(JsValue::from_f64(page as f64));
+
+            let deleted = delete_id_page(&db, &sql, &binds).await?;
+            retention_deleted += deleted as u64;
+            budget = budget.saturating_sub(deleted as u64);
+
+            if deleted < page {
+                break; // exhausted this rule's candidates
+            }
+        }
+    }
+
+    // ---- Phase 2: NIP-40 expiration (any kind) ----
+    // `json_each` walks the outer tags array; each `.value` is a
+    // `[name, value, …]` sub-array. An event is expired when it carries an
+    // `["expiration", <ts>]` tag whose timestamp is already in the past.
+    let expiry_sql = "SELECT e.id AS id FROM events e, json_each(e.tags) je \
+         WHERE json_extract(je.value, '$[0]') = 'expiration' \
+           AND CAST(json_extract(je.value, '$[1]') AS INTEGER) < ?1 \
+         LIMIT ?2";
+
+    loop {
+        if budget == 0 {
+            return Ok(RetentionSweepResult {
+                retention_deleted,
+                expired_deleted,
+                truncated: true,
+            });
+        }
+        let page = budget.min(RETENTION_BATCH_SIZE as u64) as u32;
+
+        let binds = [JsValue::from_f64(now as f64), JsValue::from_f64(page as f64)];
+
+        let deleted = delete_id_page(&db, expiry_sql, &binds).await?;
+        expired_deleted += deleted as u64;
+        budget = budget.saturating_sub(deleted as u64);
+
+        if deleted < page {
+            break;
+        }
+    }
+
+    Ok(RetentionSweepResult {
+        retention_deleted,
+        expired_deleted,
+        truncated: false,
+    })
+}
+
+/// SELECT a bounded page of event ids with `sql`/`binds`, then batch-DELETE
+/// exactly those ids. Returns the page length (== rows deleted). A page shorter
+/// than the requested LIMIT means the candidate set is exhausted and the caller
+/// stops paging.
+async fn delete_id_page(
+    db: &worker::D1Database,
+    sql: &str,
+    binds: &[JsValue],
+) -> Result<u32, String> {
+    let stmt = db.prepare(sql);
+    let bound = stmt
+        .bind(binds)
+        .map_err(|e| format!("retention page bind failed: {e:?}"))?;
+    let rows: Vec<EventIdRow> = bound
+        .all()
+        .await
+        .map_err(|e| format!("retention page query failed: {e:?}"))?
+        .results()
+        .map_err(|e| format!("retention page parse failed: {e:?}"))?;
+
+    let page_len = rows.len() as u32;
+    if page_len == 0 {
+        return Ok(0);
+    }
+
+    let mut deletes = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let del = db.prepare("DELETE FROM events WHERE id = ?1");
+        let bound_del = del
+            .bind(&[JsValue::from_str(&row.id)])
+            .map_err(|e| format!("retention delete bind failed: {e:?}"))?;
+        deletes.push(bound_del);
+    }
+    db.batch(deletes)
+        .await
+        .map_err(|e| format!("retention delete batch failed: {e:?}"))?;
+
+    Ok(page_len)
+}
+
 /// Pure model of the demotion decision the sweep applies per row (ADR-102).
 ///
 /// This is a side-effect-free mirror of the policy `trust::check_demotion`

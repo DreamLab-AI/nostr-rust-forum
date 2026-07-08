@@ -249,6 +249,9 @@ pub fn App() -> impl IntoView {
     provide_announcer();
     crate::stores::badges::provide_badges();
     provide_panel_registry();
+    // Agent disclosure cache (COM-13/F2): one fetch of the active agent set for
+    // the whole page; every AgentBadge reads it reactively.
+    crate::components::agent_badge::provide_agent_disclosure();
     // Popover coordinator: only one header popover (Notifications,
     // Bookmarks, …) can be open at a time. Bug #18 — clicking one used
     // to leave the other open *and* intercept the channel cards behind
@@ -575,10 +578,13 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/profile/:pubkey") view=AuthGatedProfile />
                     <Route path=path!("/settings") view=AuthGatedSettings />
                     <Route path=path!("/admin") view=AdminPage />
-                    // The Agent Control Surface is an operations/admin tool, not
-                    // an ordinary member feature. It is gated to admins both in
-                    // the nav (hidden below) and on the route (admin guard).
-                    <Route path=path!("/governance") view=AdminGatedGovernance />
+                    // Agent Control Surface, split by route (ADR-106 Decision 2,
+                    // F1). `/governance` is the auth-only read-only MEMBER surface
+                    // (panels + outcomes, no response control mounted).
+                    // `/governance/admin` is the admin WRITE surface (Approve /
+                    // Reject / panel actions), behind the admin guard.
+                    <Route path=path!("/governance") view=MemberGatedGovernance />
+                    <Route path=path!("/governance/admin") view=AdminGatedGovernance />
                     <Route path=path!("/pod") view=AuthGatedPod />
                 </FlatRoutes>
             </Layout>
@@ -755,13 +761,14 @@ fn Layout(children: Children) -> impl IntoView {
                                 {events_icon()}
                                 "Events"
                             </A>
-                            // Agent Control Surface — admin/ops only (issue #22).
-                            {move || is_admin.get().then(|| view! {
-                                <A href=base_href("/governance") attr:class=nav_link_class("/governance")>
-                                    {governance_icon()}
-                                    "Agents"
-                                </A>
-                            })}
+                            // Agent Control Surface — read-only member view at
+                            // /governance (F1). Any authenticated member reaches
+                            // the panels + outcomes; the admin write surface is a
+                            // distinct route linked from the page for admins.
+                            <A href=base_href("/governance") attr:class=nav_link_class("/governance")>
+                                {governance_icon()}
+                                "Agents"
+                            </A>
                             <A href=base_href("/pod") attr:class=nav_link_class("/pod")>
                                 {pod_icon()}
                                 "Pod"
@@ -840,13 +847,11 @@ fn Layout(children: Children) -> impl IntoView {
                                 {events_icon()}
                                 "Events"
                             </A>
-                            // Agent Control Surface — admin/ops only (issue #22).
-                            {move || is_admin.get().then(|| view! {
-                                <A href=base_href("/governance") attr:class=mobile_link_class("/governance") on:click=close_mobile>
-                                    {governance_icon()}
-                                    "Agents"
-                                </A>
-                            })}
+                            // Agent Control Surface — read-only member view (F1).
+                            <A href=base_href("/governance") attr:class=mobile_link_class("/governance") on:click=close_mobile>
+                                {governance_icon()}
+                                "Agents"
+                            </A>
                             <A href=base_href("/pod") attr:class=mobile_link_class("/pod") on:click=close_mobile>
                                 {pod_icon()}
                                 "Pod"
@@ -1097,12 +1102,49 @@ auth_gated!(AuthGatedProfile, ProfilePage);
 auth_gated!(AuthGatedSettings, SettingsPage);
 auth_gated!(AuthGatedPod, PodBrowserPage);
 
-/// Admin-gated Agent Control Surface (`/governance`, issue #22).
+/// Member (auth-only) read-only Agent Control Surface (`/governance`, F1,
+/// ADR-106 Decision 2).
 ///
-/// The governance page exposes agent/ops controls that are not meant for
-/// ordinary members. This gate mirrors `AdminPage`: it requires both auth and
-/// the admin flag from the relay whitelist (`ZoneAccess::is_admin`). Non-admins
-/// are bounced with an explanatory toast rather than a silent redirect.
+/// Any authenticated member reaches this route. It mounts
+/// `GovernancePage(member_view = true)`, which renders only the read-only
+/// `ReadOnlyPanelCard`/`ReadOnlyActionRow` components — no 31403 publish path is
+/// compiled into the member component tree. The admin write surface is a
+/// distinct route (`/governance/admin`, `AdminGatedGovernance`). Splitting by
+/// route rather than by conditional render is what guarantees the member client
+/// never ships a response control (ADR-106 Decision 2; DDD Invariant 1).
+#[component]
+fn MemberGatedGovernance() -> impl IntoView {
+    let auth = use_auth();
+    let is_authed = auth.is_authenticated();
+    let is_ready = auth.is_ready();
+    let navigate = StoredValue::new(use_navigate());
+    let location = use_location();
+
+    Effect::new(move |_| {
+        if is_ready.get() && !is_authed.get() {
+            let current = location.pathname.get();
+            if let Some(target) = login_redirect_target(&current) {
+                navigate.with_value(|nav| nav(&target, NavigateOptions::default()));
+            }
+        }
+    });
+
+    view! {
+        <Show when=move || is_ready.get() fallback=|| { loading_spinner() }>
+            <Show when=move || is_authed.get() fallback=|| { redirect_spinner() }>
+                <GovernancePage member_view=true />
+            </Show>
+        </Show>
+    }
+}
+
+/// Admin-gated Agent Control Surface (`/governance/admin`, issue #22, F1).
+///
+/// The write surface exposes agent/ops controls (Approve / Reject / panel
+/// actions) that are not meant for ordinary members. This gate mirrors
+/// `AdminPage`: it requires both auth and the admin flag from the relay
+/// whitelist (`ZoneAccess::is_admin`). Non-admins are bounced with an
+/// explanatory toast rather than a silent redirect.
 ///
 /// The admin flag is fetched asynchronously after login (`ZoneAccess::loaded`),
 /// so the redirect waits for that fetch to complete — otherwise a genuine admin

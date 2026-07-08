@@ -7,6 +7,7 @@
 use leptos::prelude::*;
 
 use crate::auth::use_auth;
+use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::mention_text::MentionText;
 use crate::components::reaction_bar::{Reaction, ReactionBar};
@@ -180,6 +181,9 @@ pub fn ThreadView(
                     {move || {
                         replies.get().into_iter().map(|reply| {
                             let pk = reply.pubkey.clone();
+                            // Disclosure badge (COM-13/F2): marks this reply's
+                            // author as an agent and names its authorising principal.
+                            let pk_for_agent_badge = reply.pubkey.clone();
                             let time = format_relative_time(reply.created_at);
                             let content = reply.content.clone();
                             let eid = reply.id.clone();
@@ -197,6 +201,7 @@ pub fn ThreadView(
                                             <span class="font-semibold text-xs text-amber-400">
                                                 {move || display_name.get()}
                                             </span>
+                                            <AgentBadge pubkey=pk_for_agent_badge compact=true />
                                             <span class="text-xs text-gray-600">{time.clone()}</span>
                                         </div>
                                         <div class="text-xs text-gray-300 leading-relaxed">
