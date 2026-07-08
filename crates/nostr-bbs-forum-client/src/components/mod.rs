@@ -12,6 +12,9 @@ pub mod particle_canvas;
 pub mod fx;
 
 // -- Core UI (Stream 1) ------------------------------------------------------
+// Agent disclosure badge (COM-13/F2, ADR-106 Decision 3): marks agent-authored
+// items with the authorising principal read from the server-side registry.
+pub mod agent_badge;
 pub mod avatar;
 pub mod badge;
 pub mod confirm_dialog;

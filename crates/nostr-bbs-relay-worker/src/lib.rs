@@ -19,6 +19,7 @@
 // Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
 #![allow(dead_code)]
 
+mod agent_disclosure;
 mod audit;
 mod auth;
 mod cron;
@@ -255,6 +256,14 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
     // Whitelist list (public)
     if path == "/api/whitelist/list" && method == Method::Get {
         return whitelist::handle_whitelist_list(&req, env).await;
+    }
+
+    // Agent disclosure (public) — COM-13/F2, ADR-106 Decision 3.
+    // Minimal active-agent set (pubkey, name, registered_by) for the client's
+    // disclosure badge. Sources the authorising principal from the registry,
+    // never from event content.
+    if path == "/api/agents/disclosure" && method == Method::Get {
+        return agent_disclosure::handle_agent_disclosure(env).await;
     }
 
     // Whitelist add (NIP-98 admin only)

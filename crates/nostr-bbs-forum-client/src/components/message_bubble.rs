@@ -3,6 +3,7 @@
 
 use leptos::prelude::*;
 
+use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::badge_display::BadgeBar;
 use crate::components::bookmarks_modal::use_bookmarks;
@@ -113,6 +114,9 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
     // Display name resolved through ProfileCache > NameCache > shortened pubkey.
     let display_name = use_display_name_memo(msg_pubkey.clone());
 
+    // Disclosure badge (COM-13/F2): marks this author as an agent and names the
+    // authorising principal when the pubkey is active in the agent registry.
+    let pk_for_agent_badge = msg_pubkey.clone();
     // Badge IDs for this message's author (from the shared badge store)
     let pk_for_badges = msg_pubkey.clone();
     let author_badge_ids = Signal::derive(move || {
@@ -169,6 +173,7 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                         {move || display_name.get()}
                     </span>
                     <BadgeBar badge_ids=author_badge_ids max=3 />
+                    <AgentBadge pubkey=pk_for_agent_badge compact=true />
                     <span class="text-xs text-gray-600 opacity-0 group-hover:opacity-100 transition-opacity">
                         {time_display}
                     </span>

@@ -11,6 +11,7 @@
 use leptos::prelude::*;
 
 use crate::auth::use_auth;
+use crate::components::agent_badge::AgentBadge;
 use crate::relay::RelayConnection;
 use crate::stores::panel_registry::{use_panel_registry, ActionEntry, PanelEntry};
 use wasm_bindgen_futures::spawn_local;
@@ -133,6 +134,9 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
     // agent's kind-0 metadata arrives instead of showing a raw hex pubkey.
     let agent_name =
         crate::components::user_display::use_display_name_memo(panel.agent_pubkey.clone());
+    // Disclosure badge (COM-13/F2): names the authorising principal when this
+    // panel's publisher is an active registered agent.
+    let agent_badge_pubkey = panel.agent_pubkey.clone();
     let field_count = panel.definition.fields.len();
     let action_count = panel.definition.actions.len();
 
@@ -159,6 +163,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                 <span>{format!("{field_count} fields")}</span>
                 <span>{format!("{action_count} actions")}</span>
                 <span>{move || agent_name.get()}</span>
+                <AgentBadge pubkey=agent_badge_pubkey compact=true />
             </div>
             <div class="flex gap-2">
                 {panel.definition.actions.iter().map(|action| {
@@ -270,6 +275,9 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
     // NIP-05 > shortened pubkey). Re-renders when kind-0 metadata arrives.
     let agent_name =
         crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
+    // Disclosure badge (COM-13/F2): names the authorising principal when the
+    // requesting agent is active in the registry.
+    let agent_badge_pubkey = item.agent_pubkey.clone();
 
     let approve_loading = RwSignal::new(false);
     let reject_loading = RwSignal::new(false);
@@ -352,6 +360,7 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                 <span class="text-gray-500 text-xs block truncate">
                     {reasoning}" · "{move || agent_name.get()}
                 </span>
+                <AgentBadge pubkey=agent_badge_pubkey compact=true />
             </div>
             <Show
                 when=move || response_sent.get()

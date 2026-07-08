@@ -249,6 +249,9 @@ pub fn App() -> impl IntoView {
     provide_announcer();
     crate::stores::badges::provide_badges();
     provide_panel_registry();
+    // Agent disclosure cache (COM-13/F2): one fetch of the active agent set for
+    // the whole page; every AgentBadge reads it reactively.
+    crate::components::agent_badge::provide_agent_disclosure();
     // Popover coordinator: only one header popover (Notifications,
     // Bookmarks, …) can be open at a time. Bug #18 — clicking one used
     // to leave the other open *and* intercept the channel cards behind
