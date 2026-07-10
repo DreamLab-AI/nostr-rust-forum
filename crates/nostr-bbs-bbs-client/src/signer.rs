@@ -35,7 +35,7 @@
 //!    persists it.
 //!
 //! Fail closed: with no signer the write actions are disabled and the UI directs
-//! the user to sign in. Every path routes through [`BbsSigner::install_signer`],
+//! the user to sign in. Every path routes through `BbsSigner::install_signer`,
 //! which registers the signer with the relay module ([`crate::relay::set_signer`])
 //! so NIP-42 AUTH challenges can be answered.
 

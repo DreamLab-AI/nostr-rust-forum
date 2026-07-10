@@ -104,7 +104,7 @@ fn cache_entry_at_t60_boundary_is_expired() {
     // The < strict comparison means exactly TTL is treated as expired.
     let loaded_at: u64 = 1_000;
     let now: u64 = 1_060;
-    assert!(!(now.saturating_sub(loaded_at) < CACHE_TTL_SECS));
+    assert!(now.saturating_sub(loaded_at) >= CACHE_TTL_SECS);
 }
 
 #[test]
@@ -326,20 +326,20 @@ const AUTO_HIDE_THRESHOLD: u64 = 3;
 
 #[test]
 fn one_report_does_not_trigger_auto_hide() {
-    assert!(!(1u64 >= AUTO_HIDE_THRESHOLD));
+    const { assert!(1u64 < AUTO_HIDE_THRESHOLD) };
 }
 
 #[test]
 fn two_reports_does_not_trigger_auto_hide() {
-    assert!(!(2u64 >= AUTO_HIDE_THRESHOLD));
+    const { assert!(2u64 < AUTO_HIDE_THRESHOLD) };
 }
 
 #[test]
 fn three_reports_triggers_auto_hide() {
-    assert!(3u64 >= AUTO_HIDE_THRESHOLD);
+    const { assert!(3u64 >= AUTO_HIDE_THRESHOLD) };
 }
 
 #[test]
 fn many_reports_still_triggers_auto_hide() {
-    assert!(100u64 >= AUTO_HIDE_THRESHOLD);
+    const { assert!(100u64 >= AUTO_HIDE_THRESHOLD) };
 }

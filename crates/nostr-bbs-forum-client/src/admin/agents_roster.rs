@@ -522,7 +522,7 @@ mod tests {
     use super::*;
 
     fn pk(c: char) -> String {
-        std::iter::repeat(c).take(64).collect()
+        std::iter::repeat_n(c, 64).collect()
     }
 
     #[test]

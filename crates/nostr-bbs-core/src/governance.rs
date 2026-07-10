@@ -142,10 +142,13 @@ pub enum ActionPriority {
 /// auditable through the admin surface and the decisions read API (ADR-106
 /// Decision 4). If REC-6 later supplies a relay-side default it overrides this
 /// agent-declared tier; until then the agent's declaration stands.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskTier {
     Low,
+    /// Default tier: an unlabelled or unrecognised request is shown to members
+    /// (fail-open on visibility).
+    #[default]
     Medium,
     High,
     Critical,
@@ -178,12 +181,6 @@ impl RiskTier {
     /// attention. An absent tier is treated as `Medium` (shown) by callers.
     pub fn is_member_suppressed(self) -> bool {
         matches!(self, RiskTier::Low)
-    }
-}
-
-impl Default for RiskTier {
-    fn default() -> Self {
-        RiskTier::Medium
     }
 }
 
@@ -834,7 +831,7 @@ pub mod broker {
         /// on ingest — this method is the pure, unit-testable seam behind that
         /// gate. A missing reason is rejected (§7a.2 point 3).
         ///
-        /// Unlike [`record_decision`], this deliberately does NOT reject a
+        /// Unlike [`Self::record_decision`], this deliberately does NOT reject a
         /// terminal (`Decided`/`Superseded`) case — superseding a *resolved*
         /// decision is the whole point (§7a.3: `Resolved/Rejected/Superseded
         /// --(superseding 31403)--> Superseded`). The self-review guard still

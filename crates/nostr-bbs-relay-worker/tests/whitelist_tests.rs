@@ -268,8 +268,12 @@ fn malformed_cohort_json_falls_back_to_empty() {
 #[test]
 fn cohort_default_when_omitted_is_home() {
     // src/whitelist.rs:296: body.cohorts.unwrap_or_else(|| vec!["home".to_string()])
-    let body_cohorts: Option<Vec<String>> = None;
-    let resolved = body_cohorts.unwrap_or_else(|| vec!["home".to_string()]);
+    // Helper hides the `None` behind a function boundary so the fallback path is
+    // exercised the same way production sees an absent `cohorts` field.
+    fn omitted_cohorts() -> Option<Vec<String>> {
+        None
+    }
+    let resolved = omitted_cohorts().unwrap_or_else(|| vec!["home".to_string()]);
     assert_eq!(resolved, vec!["home"]);
 }
 

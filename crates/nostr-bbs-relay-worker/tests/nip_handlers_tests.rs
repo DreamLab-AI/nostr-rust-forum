@@ -597,7 +597,7 @@ fn nineteenth_subscription_below_cap() {
 #[test]
 fn twentieth_subscription_at_cap() {
     let count = 20;
-    assert!(!(count < MAX_SUBSCRIPTIONS));
+    assert!(count >= MAX_SUBSCRIPTIONS);
 }
 
 // ---------------------------------------------------------------------------
