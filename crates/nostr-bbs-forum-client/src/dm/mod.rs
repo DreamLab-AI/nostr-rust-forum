@@ -610,7 +610,7 @@ async fn process_gift_wrap_event(
         Err(e) => {
             let msg = e.to_string();
             web_sys::console::warn_1(
-                &format!("[DM] Gift unwrap failed for {}: {}", &event.id, msg).into(),
+                &format!("[DM] Gift unwrap failed for {}: {}", event.id, msg).into(),
             );
             // A NIP-07 extension that implements only NIP-04 (no `window.nostr
             // .nip44`) cannot decrypt gift wraps at all — every unwrap fails the
@@ -710,7 +710,7 @@ async fn process_kind4_event(
         Ok(pt) => pt,
         Err(e) => {
             web_sys::console::warn_1(
-                &format!("[DM] Decrypt failed for {}: {}", &event.id, e).into(),
+                &format!("[DM] Decrypt failed for {}: {}", event.id, e).into(),
             );
             return;
         }
