@@ -7,3 +7,6 @@ node_modules/
 *.db
 
 .env
+
+# Generic AQE skill library (agent tooling, not project source) — untracked 2026-07-10
+.claude/skills/
