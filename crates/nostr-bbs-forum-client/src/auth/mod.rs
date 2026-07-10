@@ -348,7 +348,10 @@ impl AuthStore {
     /// Generate a new random keypair and register as a local-key user.
     ///
     /// Returns the hex-encoded private key so the signup UI can show it for
-    /// backup. The privkey is held in memory and never persisted to storage.
+    /// backup. The privkey is held in memory and persisted via
+    /// [`save_privkey_session`], which defaults to sessionStorage scope
+    /// (cleared on tab close) unless the user has opted into "remember me"
+    /// (localStorage). It is never written to durable storage by default.
     pub fn register_with_generated_key(&self, display_name: &str) -> Result<String, String> {
         let keypair = nostr_bbs_core::generate_keypair()
             .map_err(|e| format!("Key generation failed: {e}"))?;
