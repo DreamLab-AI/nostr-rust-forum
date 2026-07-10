@@ -436,8 +436,8 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                     Ok(signed) => {
                         // F4: advance to "Response sent" only when the relay
                         // acknowledges with OK; a rejection surfaces as retryable.
-                        let ack: crate::relay::PublishCallback =
-                            Rc::new(move |accepted: bool, message: String| {
+                        let ack: crate::relay::PublishCallback = Rc::new(
+                            move |accepted: bool, message: String| {
                                 loading_sig.set(false);
                                 if accepted {
                                     response_sent.set(true);
@@ -447,10 +447,12 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                                         &format!("[governance] action response rejected by relay: {message}").into(),
                                     );
                                 }
-                            });
+                            },
+                        );
                         if let Err(e) = r.publish_with_ack(&signed, Some(ack)) {
                             web_sys::console::warn_1(
-                                &format!("[governance] Failed to publish action response: {e}").into(),
+                                &format!("[governance] Failed to publish action response: {e}")
+                                    .into(),
                             );
                             loading_sig.set(false);
                             response_rejected.set(true);

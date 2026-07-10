@@ -354,8 +354,7 @@ pub fn unwrap_gift(
     // as the sender. NIP-59: the seal is signed by the sender's real key.
     // Without this, an attacker can forge the seal's pubkey to impersonate any
     // author.
-    verify_event_strict(&seal)
-        .map_err(|e| GiftWrapError::SealVerification(e.to_string()))?;
+    verify_event_strict(&seal).map_err(|e| GiftWrapError::SealVerification(e.to_string()))?;
 
     // Decrypt layer 2: seal → rumor
     // The seal's pubkey is the sender's real key
@@ -516,8 +515,7 @@ pub async fn unwrap_gift_with_signer(
 
     // Verify the seal's id + Schnorr signature before trusting `seal.pubkey`
     // as the sender (NIP-59: the seal is signed by the sender's real key).
-    verify_event_strict(&seal)
-        .map_err(|e| SignerGiftWrapError::SealVerification(e.to_string()))?;
+    verify_event_strict(&seal).map_err(|e| SignerGiftWrapError::SealVerification(e.to_string()))?;
 
     // Layer 2: seal → rumor. The seal's pubkey is the sender's real key.
     let rumor_json = signer.nip44_decrypt(&seal.pubkey, &seal.content).await?;

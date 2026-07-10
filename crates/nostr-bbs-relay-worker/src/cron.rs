@@ -579,7 +579,10 @@ pub async fn sweep_retention(env: &Env) -> Result<RetentionSweepResult, String> 
         }
         let page = budget.min(RETENTION_BATCH_SIZE as u64) as u32;
 
-        let binds = [JsValue::from_f64(now as f64), JsValue::from_f64(page as f64)];
+        let binds = [
+            JsValue::from_f64(now as f64),
+            JsValue::from_f64(page as f64),
+        ];
 
         let deleted = delete_id_page(&db, expiry_sql, &binds).await?;
         expired_deleted += deleted as u64;

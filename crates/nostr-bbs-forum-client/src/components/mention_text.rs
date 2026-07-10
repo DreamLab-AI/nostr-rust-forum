@@ -208,10 +208,10 @@ fn parse_mentions(input: &str) -> Vec<Segment> {
 
                 if at_this.starts_with("nostr:npub1") {
                     let after_nostr = &at_this[6..]; // skip "nostr:" (ASCII, safe)
-                    // bech32 npubs are ASCII [a-z0-9]; restrict to ASCII so the
-                    // char count equals the byte length and every slice below
-                    // lands on a char boundary (a multibyte char like 'é' would
-                    // otherwise panic when used as a byte index).
+                                                     // bech32 npubs are ASCII [a-z0-9]; restrict to ASCII so the
+                                                     // char count equals the byte length and every slice below
+                                                     // lands on a char boundary (a multibyte char like 'é' would
+                                                     // otherwise panic when used as a byte index).
                     let npub_len = after_nostr
                         .chars()
                         .take_while(|c| c.is_ascii_alphanumeric())

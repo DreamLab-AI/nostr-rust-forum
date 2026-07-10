@@ -915,17 +915,32 @@ mod tests {
             "a non-Control agent must be DENIED GET /public/.acl even though /public/ is public-readable"
         );
         // Anonymous is likewise denied.
-        assert!(!evaluate_access(Some(&container_acl), None, &protected, required));
+        assert!(!evaluate_access(
+            Some(&container_acl),
+            None,
+            &protected,
+            required
+        ));
 
         // Regression guard: prove the container really IS public-readable, so
         // the deny above is the P2-1 fix and not an artefact of an empty ACL.
         // Under the OLD `Read || Control` shortcut both of these Read grants
         // would have leaked the sidecar to the reader and to anonymous.
         assert!(
-            evaluate_access(Some(&container_acl), read_agent, "/public/", AccessMode::Read),
+            evaluate_access(
+                Some(&container_acl),
+                read_agent,
+                "/public/",
+                AccessMode::Read
+            ),
             "container must be public-readable, else the P2-1 scenario is vacuous"
         );
-        assert!(evaluate_access(Some(&container_acl), None, "/public/", AccessMode::Read));
+        assert!(evaluate_access(
+            Some(&container_acl),
+            None,
+            "/public/",
+            AccessMode::Read
+        ));
     }
 
     // ── ACL doc size cap ───────────────────────────────────────────────

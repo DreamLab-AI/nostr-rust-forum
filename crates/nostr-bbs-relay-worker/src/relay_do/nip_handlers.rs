@@ -301,8 +301,8 @@ pub(crate) fn plan_supersession(
     }
     let superseded_decision_id = decision_id_for_event(superseded_event_id);
 
-    let outcome =
-        DecisionOutcome::from_response_content(content).ok_or(SupersessionError::MalformedOutcome)?;
+    let outcome = DecisionOutcome::from_response_content(content)
+        .ok_or(SupersessionError::MalformedOutcome)?;
     let reasoning = serde_json::from_str::<serde_json::Value>(content)
         .ok()
         .and_then(|v| {
@@ -312,8 +312,12 @@ pub(crate) fn plan_supersession(
         })
         .unwrap_or_default();
 
-    let authority =
-        supersede_authority(original_signer, superseder_pubkey, original_rank, superseder_rank);
+    let authority = supersede_authority(
+        original_signer,
+        superseder_pubkey,
+        original_rank,
+        superseder_rank,
+    );
 
     // Route through the single-sourced aggregate: a hydrated Decided case that
     // the superseding decision acts on. The snapshot's created_by preserves the
@@ -630,19 +634,12 @@ impl NostrRelayDO {
         // rejects an orphan response under Invariant 2 — before the event is
         // saved or projected.
         if event.kind == governance::KIND_ACTION_RESPONSE {
-            if let Some(superseded_event_id) =
-                governance::extract_supersedes_target(&event.tags)
-            {
+            if let Some(superseded_event_id) = governance::extract_supersedes_target(&event.tags) {
                 if !self
                     .supersession_authorised(&event.pubkey, superseded_event_id)
                     .await
                 {
-                    Self::send_ok(
-                        ws,
-                        &event.id,
-                        false,
-                        "blocked: unauthorised supersession",
-                    );
+                    Self::send_ok(ws, &event.id, false, "blocked: unauthorised supersession");
                     return;
                 }
             }
@@ -1884,9 +1881,8 @@ impl NostrRelayDO {
         // Mark the superseded decision Superseded (retained/auditable). This is a
         // projection-state edit to a derived column — the Nostr event on the
         // relay is never mutated (Invariant 5).
-        let mark_stmt = db.prepare(
-            "UPDATE broker_decisions SET superseded_by = ?1 WHERE decision_id = ?2",
-        );
+        let mark_stmt =
+            db.prepare("UPDATE broker_decisions SET superseded_by = ?1 WHERE decision_id = ?2");
         if let Ok(bound) = mark_stmt.bind(&[
             JsValue::from_str(&proj.decision_id),
             JsValue::from_str(&proj.superseded_decision_id),
@@ -2359,7 +2355,10 @@ mod governance_projection_tests {
             2_000,
         )
         .unwrap_err();
-        assert!(matches!(err, OrchestrationError::ShareTransitionRejected(_)));
+        assert!(matches!(
+            err,
+            OrchestrationError::ShareTransitionRejected(_)
+        ));
     }
 
     // ── F6: supersession-authority projection (DDD §7a) ──────────────────
@@ -2385,11 +2384,11 @@ mod governance_projection_tests {
             &superseding_event,
             Some(&superseded_event),
             r#"{"action":"reject","reasoning":"revoked: grant no longer holds"}"#,
-            "human-bob",     // superseder
-            "human-bob",     // original signer — same ⇒ OriginalSigner authority
-            ADMIN_RANK,      // original rank
-            ADMIN_RANK,      // superseder rank
-            "agent-alice",   // case creator (self-review guard)
+            "human-bob",   // superseder
+            "human-bob",   // original signer — same ⇒ OriginalSigner authority
+            ADMIN_RANK,    // original rank
+            ADMIN_RANK,    // superseder rank
+            "agent-alice", // case creator (self-review guard)
             3_000,
         )
         .expect("original signer may supersede");
@@ -2461,7 +2460,7 @@ mod governance_projection_tests {
             r#"{"action":"reject","reasoning":"nope"}"#,
             "human-dave",
             "human-carol",
-            OWNER_RANK,   // original outranks superseder
+            OWNER_RANK, // original outranks superseder
             ADMIN_RANK,
             "agent-alice",
             3_000,

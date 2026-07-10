@@ -145,20 +145,23 @@ pub fn AgentBadge(
     let pubkey_for_lookup = pubkey;
 
     // Reactive disclosure lookup — re-evaluates when the fetch resolves.
-    let disclosure = Memo::new(move |_| {
-        try_use_agent_disclosure().and_then(|c| c.lookup(&pubkey_for_lookup))
-    });
+    let disclosure =
+        Memo::new(move |_| try_use_agent_disclosure().and_then(|c| c.lookup(&pubkey_for_lookup)));
 
     // Human label for the authorising principal, resolved through the shared
     // profile cache. Falls back to the shortened principal pubkey while (or if)
     // its kind-0 metadata is unavailable.
     let principal_label = Memo::new(move |_| {
-        disclosure.get().map(|d| {
-            crate::components::user_display::use_display_name_tracked(&d.registered_by)
-        })
+        disclosure
+            .get()
+            .map(|d| crate::components::user_display::use_display_name_tracked(&d.registered_by))
     });
 
-    let size = if compact { BadgeSize::Sm } else { BadgeSize::Md };
+    let size = if compact {
+        BadgeSize::Sm
+    } else {
+        BadgeSize::Md
+    };
 
     view! {
         {move || {

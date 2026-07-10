@@ -265,7 +265,8 @@ impl DurableObject for NostrRelayDO {
                     Self::send_notice(&ws, "too many filters (max 10)");
                     return Ok(());
                 }
-                self.handle_count(session_id, &ip, &ws, &sub_id, filters).await;
+                self.handle_count(session_id, &ip, &ws, &sub_id, filters)
+                    .await;
             }
             _ => {
                 Self::send_notice(&ws, &format!("Unknown message type: {msg_type}"));

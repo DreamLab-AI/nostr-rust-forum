@@ -1663,15 +1663,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(del.detail(), Some("carol"));
-        let prom = DecisionOutcome::from_response_content(
-            r#"{"action":"promote","pattern_id":"pat-9"}"#,
-        )
-        .unwrap();
+        let prom =
+            DecisionOutcome::from_response_content(r#"{"action":"promote","pattern_id":"pat-9"}"#)
+                .unwrap();
         assert_eq!(prom.detail(), Some("pat-9"));
-        let prec = DecisionOutcome::from_response_content(
-            r#"{"action":"precedent","scope":"org-wide"}"#,
-        )
-        .unwrap();
+        let prec =
+            DecisionOutcome::from_response_content(r#"{"action":"precedent","scope":"org-wide"}"#)
+                .unwrap();
         assert_eq!(prec.detail(), Some("org-wide"));
     }
 
@@ -1724,14 +1722,7 @@ mod tests {
         let decision_id = format!("dec-{}", &event_id[..16.min(event_id.len())]);
         let mut case = snap.hydrate(now);
         let orch = DecisionOrchestrator;
-        let report = orch.decide(
-            &mut case,
-            decision_id,
-            outcome.clone(),
-            responder,
-            "",
-            now,
-        )?;
+        let report = orch.decide(&mut case, decision_id, outcome.clone(), responder, "", now)?;
         Ok((
             outcome.action_str().to_string(),
             outcome.detail().map(str::to_string),
@@ -1788,9 +1779,14 @@ mod tests {
             (r#"{"action":"approve","reasoning":"ok"}"#, "approve"),
             (r#"{"action":"reject","reasoning":"no"}"#, "reject"),
         ] {
-            let (action, detail, state, _) =
-                decide(&snapshot(CaseState::Open), &"c".repeat(64), content, "human-bob", 2000)
-                    .unwrap();
+            let (action, detail, state, _) = decide(
+                &snapshot(CaseState::Open),
+                &"c".repeat(64),
+                content,
+                "human-bob",
+                2000,
+            )
+            .unwrap();
             assert_eq!(action, expect);
             assert_eq!(state, CaseState::Decided);
             assert_eq!(detail, None);
@@ -1840,7 +1836,10 @@ mod tests {
             2000,
         )
         .unwrap_err();
-        assert!(matches!(err, OrchestrationError::ShareTransitionRejected(_)));
+        assert!(matches!(
+            err,
+            OrchestrationError::ShareTransitionRejected(_)
+        ));
     }
 
     #[test]

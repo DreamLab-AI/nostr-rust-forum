@@ -803,7 +803,10 @@ mod tests {
     #[test]
     fn decisions_query_clamps_limit_and_ignores_junk() {
         // Over-max clamps down; zero clamps up to 1; non-numeric falls back.
-        assert_eq!(parse_decisions_query(&q(&[("limit", "9999")])).limit, DECISIONS_MAX_LIMIT);
+        assert_eq!(
+            parse_decisions_query(&q(&[("limit", "9999")])).limit,
+            DECISIONS_MAX_LIMIT
+        );
         assert_eq!(parse_decisions_query(&q(&[("limit", "0")])).limit, 1);
         assert_eq!(
             parse_decisions_query(&q(&[("limit", "abc")])).limit,

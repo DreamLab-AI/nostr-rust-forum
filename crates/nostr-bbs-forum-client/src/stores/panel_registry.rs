@@ -161,11 +161,10 @@ impl PanelRegistry {
                 // the supersession history. A superseding decision carries an
                 // `e`-tag with the `supersedes` marker referencing the prior
                 // decision event.
-                let outcome = governance::broker::DecisionOutcome::from_response_content(
-                    &event.content,
-                )
-                .map(|o| o.action_str().to_string())
-                .unwrap_or_else(|| "decision".to_string());
+                let outcome =
+                    governance::broker::DecisionOutcome::from_response_content(&event.content)
+                        .map(|o| o.action_str().to_string())
+                        .unwrap_or_else(|| "decision".to_string());
                 let reason = serde_json::from_str::<serde_json::Value>(&event.content)
                     .ok()
                     .and_then(|v| {

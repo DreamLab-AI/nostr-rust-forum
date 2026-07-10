@@ -152,7 +152,12 @@ async fn mutate_then_reload(
 }
 
 /// Fire a GET reload into the roster signal.
-fn reload(auth: AuthStore, toasts: ToastStore, roster: RwSignal<Vec<AgentRosterEntry>>, loading: RwSignal<bool>) {
+fn reload(
+    auth: AuthStore,
+    toasts: ToastStore,
+    roster: RwSignal<Vec<AgentRosterEntry>>,
+    loading: RwSignal<bool>,
+) {
     loading.set(true);
     spawn_local(async move {
         match load_roster(auth).await {

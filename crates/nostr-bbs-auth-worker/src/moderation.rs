@@ -238,11 +238,7 @@ pub async fn handle_action(
     // authenticated admin cannot submit a moderation event signed by a
     // different key. Mirrors the reporter binding in `handle_report`.
     if body.event.pubkey != admin_pubkey {
-        return error_json(
-            env,
-            "Event pubkey does not match NIP-98 signer",
-            403,
-        );
+        return error_json(env, "Event pubkey does not match NIP-98 signer", 403);
     }
 
     // Extract the target pubkey (ban/mute) or pubkey:ts tuple (warn).
