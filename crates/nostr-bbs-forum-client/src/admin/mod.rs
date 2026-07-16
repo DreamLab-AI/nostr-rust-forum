@@ -584,6 +584,12 @@ impl AdminStore {
     // -- Channel management ---------------------------------------------------
 
     /// Create a kind-40 channel using the Signer trait (async, NIP-07 compatible).
+    ///
+    /// `relay` is passed in rather than resolved via `expect_context`: this
+    /// method runs inside the caller's `spawn_local`, where the reactive
+    /// owner (and therefore context) is not available — resolving it here
+    /// panicked the whole app on the first Create Channel click. Callers
+    /// grab the connection in component scope and move a clone in.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_channel_with_zone_signer(
         &self,
@@ -594,11 +600,11 @@ impl AdminStore {
         zone: u8,
         cohort: Option<&str>,
         signer: &dyn Signer,
+        relay: RelayConnection,
     ) -> Result<(), String> {
         let creating = self.state.channel_creating;
         creating.set(true);
 
-        let relay = expect_context::<RelayConnection>();
         let conn = relay.connection_state();
         if conn.get_untracked() != ConnectionState::Connected {
             creating.set(false);

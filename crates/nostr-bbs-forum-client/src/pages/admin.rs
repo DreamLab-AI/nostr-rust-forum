@@ -378,10 +378,15 @@ fn ChannelsTab() -> impl IntoView {
     let auth = use_auth();
     let channels = admin.state.channels;
 
+    // Resolved here, in component scope: context is NOT reachable from inside
+    // the spawn_local below (no reactive owner), so the store method takes the
+    // connection as a parameter instead of calling expect_context itself.
+    let relay_for_create = expect_context::<RelayConnection>();
     let admin_for_create = admin.clone();
     let on_create_channel = move |data: ChannelFormData| {
         if let Some(signer) = auth.get_signer() {
             let admin_clone = admin_for_create.clone();
+            let relay = relay_for_create.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 if let Err(e) = admin_clone
                     .create_channel_with_zone_signer(
@@ -392,6 +397,7 @@ fn ChannelsTab() -> impl IntoView {
                         data.zone,
                         data.cohort.as_deref(),
                         &*signer,
+                        relay,
                     )
                     .await
                 {
