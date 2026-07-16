@@ -9,6 +9,8 @@ use leptos::prelude::*;
 use std::collections::HashMap;
 
 use leptos_router::components::A;
+use leptos_router::hooks::use_navigate;
+use leptos_router::NavigateOptions;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
@@ -81,6 +83,31 @@ pub fn ForumsPage() -> impl IntoView {
     let za_loaded = zone_access.loaded;
     let za_cohorts = zone_access.cohorts;
     let za_admin = zone_access.is_admin;
+
+    // Zone-first landing (ADR-107): a user authorised for exactly one locked
+    // zone is auto-forwarded to that zone's channel list, so they land on their
+    // zone's topics rather than the generic index. `home_zone()` returns `None`
+    // until the access fetch completes (so we never forward prematurely) and for
+    // admins / multi-zone members, who keep seeing the index unchanged. The
+    // navigation replaces the history entry so "back" skips the bare index.
+    {
+        let za_forward = zone_access;
+        let navigate = StoredValue::new(use_navigate());
+        Effect::new(move |_| {
+            if let Some(zone) = za_forward.home_zone() {
+                let target = format!("/forums/{}", zone.id);
+                navigate.with_value(|nav| {
+                    nav(
+                        &target,
+                        NavigateOptions {
+                            replace: true,
+                            ..Default::default()
+                        },
+                    );
+                });
+            }
+        });
+    }
 
     // Config-driven zone list, sourced once from `window.__ENV__.ZONE_CONFIG`
     // (falls back to the legacy 3-zone list). Stored in a StoredValue so the
@@ -169,7 +196,13 @@ pub fn ForumsPage() -> impl IntoView {
                     <div class="relative z-10">
                         <h2 class="text-xl font-bold text-white mb-2">
                             {move || {
-                                let name = welcome_name.get().unwrap_or_default();
+                                let raw = welcome_name.get().unwrap_or_default();
+                                // Strip trailing whitespace and ASCII punctuation so a
+                                // display name ending in a title suffix (e.g.
+                                // "…, PhD,") doesn't render "Welcome, …,!".
+                                let name = raw.trim_end_matches(|c: char| {
+                                    c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '-')
+                                });
                                 if name.is_empty() {
                                     "Welcome!".to_string()
                                 } else {

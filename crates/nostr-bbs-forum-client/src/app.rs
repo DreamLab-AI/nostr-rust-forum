@@ -76,6 +76,16 @@ pub(crate) fn current_app_path(pathname: &str) -> String {
     }
 }
 
+// -- Dev-auth panel (no-op when feature is disabled) -------------------------
+
+#[cfg(feature = "dev-auth")]
+fn dev_auth_panel() -> impl IntoView {
+    view! { <crate::auth::dev::DevAuthPanel /> }
+}
+
+#[cfg(not(feature = "dev-auth"))]
+fn dev_auth_panel() -> impl IntoView {}
+
 // -- SVG icon helpers ---------------------------------------------------------
 
 fn brand_icon() -> impl IntoView {
@@ -323,11 +333,81 @@ pub fn App() -> impl IntoView {
             // (QA HIGH bug #5b — the claimed handle vanished on the next
             // connect). The nickname is only ever the display name.
             let nickname = auth.nickname().get_untracked().unwrap_or_default();
+            let nickname = nickname.trim().to_string();
             let claimed = crate::components::onboarding_modal::claimed_username_cached(&pubkey);
+
+            // No display name AND no claimed handle: there is nothing safe to
+            // put in a kind-0 that would not overwrite an existing profile with
+            // blanks. But the relay only auto-whitelists a pubkey once it has
+            // seen that pubkey's kind-0, so a brand-new NIP-07 user (whose
+            // nickname never hydrates) would be authenticated yet permanently
+            // unable to post. Resolve without clobbering: consult the relay's
+            // existing kind-0 first — if one is already present the user is
+            // already whitelisted, so leave it untouched; only when none exists
+            // do we publish a minimal kind-0 purely to register for whitelist.
+            if nickname.is_empty() && claimed.is_none() {
+                published_profile.set(true);
+                let pk = pubkey.clone();
+                let r_whitelist = r.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Some(entry) = crate::stores::profile_cache::fetch_profile(&pk).await {
+                        let has_profile = entry
+                            .display_name
+                            .as_deref()
+                            .map(str::trim)
+                            .is_some_and(|s| !s.is_empty())
+                            || entry
+                                .name
+                                .as_deref()
+                                .map(str::trim)
+                                .is_some_and(|s| !s.is_empty());
+                        if has_profile {
+                            // Relay already holds this pubkey's kind-0 (and has
+                            // auto-whitelisted it) — never overwrite it.
+                            return;
+                        }
+                    }
+                    let now = (js_sys::Date::now() / 1000.0) as u64;
+                    let unsigned = nostr_bbs_core::UnsignedEvent {
+                        pubkey: pk.clone(),
+                        created_at: now,
+                        kind: 0,
+                        tags: vec![],
+                        content: "{}".to_string(),
+                    };
+                    match auth.sign_event_async(unsigned).await {
+                        Ok(signed) => {
+                            r_whitelist.publish(&signed);
+                            web_sys::console::log_1(
+                                &format!(
+                                    "[app] Published minimal kind-0 for auto-whitelist: {}",
+                                    &pk[..8]
+                                )
+                                .into(),
+                            );
+                        }
+                        Err(e) => {
+                            web_sys::console::warn_1(
+                                &format!("[app] Failed to publish minimal kind-0: {e}").into(),
+                            );
+                        }
+                    }
+                });
+                return;
+            }
+
+            // We have a display name and/or a claimed handle — build a full,
+            // non-clobbering kind-0. When the display name is absent but a
+            // handle is claimed, surface the handle as the display name.
+            let display_name = if nickname.is_empty() {
+                claimed.clone().unwrap_or_default()
+            } else {
+                nickname.clone()
+            };
             let mut obj = serde_json::Map::new();
             obj.insert(
                 "display_name".into(),
-                serde_json::Value::String(nickname.clone()),
+                serde_json::Value::String(display_name),
             );
             match &claimed {
                 Some(username) => {
@@ -669,6 +749,41 @@ fn Layout(children: Children) -> impl IntoView {
     });
 
     let zone_access = crate::stores::zone_access::use_zone_access();
+
+    // Zone-first nav (ADR-107): when the member is authorised for exactly one
+    // locked zone, the "Forums" nav item points straight at that zone and shows
+    // its name; multi-zone members and admins keep the generic "Forums" →
+    // /forums. Clones are taken before `zone_access` is (potentially) moved into
+    // the `is_admin` memo below; each reactive closure owns its own clone.
+    let forums_href_desktop = {
+        let za = zone_access;
+        move || match za.home_zone() {
+            Some(z) => base_href(&format!("/forums/{}", z.id)),
+            None => base_href("/forums"),
+        }
+    };
+    let forums_label_desktop = {
+        let za = zone_access;
+        move || match za.home_zone() {
+            Some(z) => z.label(),
+            None => "Forums".to_string(),
+        }
+    };
+    let forums_href_mobile = {
+        let za = zone_access;
+        move || match za.home_zone() {
+            Some(z) => base_href(&format!("/forums/{}", z.id)),
+            None => base_href("/forums"),
+        }
+    };
+    let forums_label_mobile = {
+        let za = zone_access;
+        move || match za.home_zone() {
+            Some(z) => z.label(),
+            None => "Forums".to_string(),
+        }
+    };
+
     let is_admin = Memo::new(move |_| zone_access.is_admin.get());
 
     // Helper: returns active or inactive CSS for nav links
@@ -727,6 +842,9 @@ fn Layout(children: Children) -> impl IntoView {
             // Screen reader announcer
             <ScreenReaderAnnouncer />
 
+            // Dev-auth: floating identity picker
+            {dev_auth_panel()}
+
             // Header
             <header class="border-b border-gray-800/50 bg-gray-900/80 backdrop-blur-md sticky top-0 z-50">
                 <nav class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
@@ -749,9 +867,9 @@ fn Layout(children: Children) -> impl IntoView {
                                 </A>
                             }
                         >
-                            <A href=base_href("/forums") attr:class=nav_link_class("/forums")>
+                            <A href=forums_href_desktop attr:class=nav_link_class("/forums")>
                                 {forums_icon()}
-                                "Forums"
+                                {forums_label_desktop}
                             </A>
                             <A href=base_href("/dm") attr:class=nav_link_class("/dm")>
                                 {dm_icon()}
@@ -767,7 +885,7 @@ fn Layout(children: Children) -> impl IntoView {
                             // distinct route linked from the page for admins.
                             <A href=base_href("/governance") attr:class=nav_link_class("/governance")>
                                 {governance_icon()}
-                                "Agents"
+                                "Governance"
                             </A>
                             <A href=base_href("/pod") attr:class=nav_link_class("/pod")>
                                 {pod_icon()}
@@ -835,9 +953,9 @@ fn Layout(children: Children) -> impl IntoView {
                                 </A>
                             }
                         >
-                            <A href=base_href("/forums") attr:class=mobile_link_class("/forums") on:click=close_mobile>
+                            <A href=forums_href_mobile attr:class=mobile_link_class("/forums") on:click=close_mobile>
                                 {forums_icon()}
-                                "Forums"
+                                {forums_label_mobile}
                             </A>
                             <A href=base_href("/dm") attr:class=mobile_link_class("/dm") on:click=close_mobile>
                                 {dm_icon()}
@@ -850,7 +968,7 @@ fn Layout(children: Children) -> impl IntoView {
                             // Agent Control Surface — read-only member view (F1).
                             <A href=base_href("/governance") attr:class=mobile_link_class("/governance") on:click=close_mobile>
                                 {governance_icon()}
-                                "Agents"
+                                "Governance"
                             </A>
                             <A href=base_href("/pod") attr:class=mobile_link_class("/pod") on:click=close_mobile>
                                 {pod_icon()}

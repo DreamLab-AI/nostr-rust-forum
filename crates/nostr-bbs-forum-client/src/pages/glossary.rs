@@ -65,7 +65,7 @@ pub fn GlossaryPage() -> impl IntoView {
             // Breadcrumb
             <div class="flex items-center gap-2 text-sm text-gray-500 mb-6">
                 <A href=base_href("/") attr:class="hover:text-amber-400 transition-colors">"Home"</A>
-                <span>"/"</span>
+                <span class="breadcrumb-separator">{"\u{203A}"}</span>
                 <span class="text-gray-300">"Glossary"</span>
             </div>
 

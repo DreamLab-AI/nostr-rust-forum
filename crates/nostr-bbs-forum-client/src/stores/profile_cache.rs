@@ -491,6 +491,23 @@ struct BatchResponseFlat {
     fetched_at: Option<u64>,
 }
 
+/// Fetch a single profile's kind-0 metadata directly from the relay-worker
+/// projection, bypassing the debounced batch queue and the reactive cache.
+///
+/// Used by the auth layer to hydrate a restored identity's display name and
+/// avatar immediately after an nsec/local-key login (QA #11), so the header
+/// shows the real profile instead of a truncated pubkey until the user
+/// re-saves. Degrades to `None` on any error or empty projection — the caller
+/// keeps its pubkey fallback and never surfaces an error.
+pub async fn fetch_profile(pubkey: &str) -> Option<ProfileEntry> {
+    if pubkey.is_empty() {
+        return None;
+    }
+    let key = pubkey.to_string();
+    let batch = fetch_batch(std::slice::from_ref(&key)).await;
+    batch.into_iter().find(|e| e.pubkey == pubkey)
+}
+
 /// Fetch a batch of profiles from the relay-worker. Returns an empty vec
 /// (logged at debug level) on any non-200 response, including 404 — this is
 /// the deliberate graceful-degrade path that lets the UI ship before the

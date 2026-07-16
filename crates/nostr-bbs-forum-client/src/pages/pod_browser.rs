@@ -1098,7 +1098,7 @@ pub fn PodBrowserPage() -> impl IntoView {
                         let nav = navigate_to;
                         view! {
                             {if i > 0 {
-                                Some(view! { <span class="text-gray-600">"/"</span> })
+                                Some(view! { <span class="breadcrumb-separator text-gray-600">{"\u{203A}"}</span> })
                             } else {
                                 None
                             }}

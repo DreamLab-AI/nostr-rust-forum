@@ -111,6 +111,14 @@ fn AdminPanelInner() -> impl IntoView {
     provide_admin();
 
     let admin = use_admin();
+    // Deep-link support: `/admin?tab=channels` opens the panel straight on a
+    // named tab. The empty-zone "Create a section" CTA (see `pages/category.rs`)
+    // relies on this — sections are created via the Channels tab's "Create
+    // Channel" form, NOT the "Sections" tab (which is join-request approvals).
+    // Resolve once on mount, before first render.
+    if let Some(tab) = initial_tab_from_query() {
+        admin.state.active_tab.set(tab);
+    }
     let auth = use_auth();
     let relay = expect_context::<RelayConnection>();
     let conn_state = relay.connection_state();
@@ -279,6 +287,35 @@ fn AdminPanelInner() -> impl IntoView {
             <DangerZone />
         </div>
     }
+}
+
+/// Resolve an initial [`AdminTab`] from the `?tab=` query parameter, if present
+/// and recognised. Tolerant of a missing `?`, extra parameters, and unknown
+/// slugs (returns `None`, leaving the default Overview tab). Slugs are plain
+/// ASCII so no percent-decoding is required.
+fn initial_tab_from_query() -> Option<AdminTab> {
+    let search = web_sys::window()?.location().search().ok()?;
+    let query = search.strip_prefix('?').unwrap_or(search.as_str());
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        if key != "tab" {
+            return None;
+        }
+        match value {
+            "overview" => Some(AdminTab::Overview),
+            "channels" => Some(AdminTab::Channels),
+            "users" => Some(AdminTab::Users),
+            "pending" => Some(AdminTab::Pending),
+            "sections" => Some(AdminTab::Sections),
+            "agents" => Some(AdminTab::Agents),
+            "calendar" => Some(AdminTab::Calendar),
+            "settings" => Some(AdminTab::Settings),
+            "reports" => Some(AdminTab::Reports),
+            "audit" | "auditlog" => Some(AdminTab::AuditLog),
+            "pods" | "nativepods" => Some(AdminTab::NativePods),
+            _ => None,
+        }
+    })
 }
 
 // -- Tab button ---------------------------------------------------------------

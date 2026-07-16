@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
+## [Unreleased]
+
+Soak-test fix sprint (2026-07-16) — 16 issues surfaced by a 10-persona browser
+soak of `nostr-bbs-forum-client`; see the operator overlay's
+`docs/sprint/soak-test-2026-07-16.md`. All changes are confined to
+`nostr-bbs-forum-client`. Issue numbers below follow the in-code `#N` references.
+
+### Fixed
+
+- **Breadcrumb separators** unified to a styled `›` (was a bare `/`) across the
+  Settings, Events, Glossary, Note and Pod-browser breadcrumbs, all now using
+  the shared `.breadcrumb-separator` class.
+- **Settings — Username section** no longer renders for accounts without a
+  legacy handle. Onboarding captures a display name only, so the card is now
+  reactive and appears solely to release a still-resolving legacy handle;
+  everyone else manages their display name under Profile. (#6)
+- **Settings — display-name length** is now stated honestly: a live `n/50`
+  counter, helper copy, and an at-limit message, instead of clipping silently at
+  50 characters. (#13)
+- **Humanised error messages** for avatar/media upload, whitelist / zone-access
+  lookup, and channel creation. The user sees a friendly, actionable message;
+  the raw `JsValue` / fetch detail goes to the browser console rather than the
+  UI. (#14/#16)
+- **Avatar upload input-reset ordering** — the file `<input>` value is no longer
+  cleared before the blob bytes are read (which invalidated the selected `File`
+  in some browsers, surfacing `NotFoundError`). It is cleared only in early
+  returns that never touch the blob and in the upload's terminal branch, still
+  letting a re-select of the same file re-fire `change`. (#16)
+- **Notifications — own join suppression**: never raise a "New member" alert for
+  the signed-in user's own join. (#8)
+- **Notifications — per-pubkey baseline**: the sync baseline and dedup set are
+  now keyed per pubkey, so a recovery-key login (a different account on the same
+  device) starts from a fresh `now()` floor and never inherits the previous
+  user's history — the cause of the stale historical-join backlog. A one-time
+  backlog snapshot records already-known members without notifying, while genuine
+  post-baseline joins still notify (the dropped-join trap). (#10/#12/#15)
+- **Notification drawer outside-click** is now a capture-phase document
+  `pointerdown` listener instead of a full-viewport click-catcher `<div>`, which
+  swallowed the first click on controls behind it — most visibly the header
+  "Log Out" button. The underlying control now receives the same click. (#9)
+- **nsec / local-key recovery login** rehydrates the account's kind-0 profile
+  (display name + avatar) from the relay projection, so the header shows the real
+  identity instead of a truncated pubkey until the user re-saves. Fire-and-forget,
+  silent on failure, and never clobbers an in-session edit. (#11)
+- **Forums welcome greeting** trims trailing whitespace and punctuation from the
+  display name, so a name ending in a title suffix (e.g. "…, PhD,") no longer
+  renders "Welcome, …,!".
+- **Auto-whitelist for name-less users**: a brand-new user with no display name
+  and no claimed handle now registers for auto-whitelist by publishing a minimal
+  kind-0 — but only when the relay holds none, so an existing profile is never
+  clobbered. Previously such a user could be authenticated yet permanently unable
+  to post. (#5)
+
+### Changed
+
+- **Governance empty states** are now role-aware. Members see read-only "About
+  governance" guidance; admins see the management-surface copy naming the
+  Approve/Reject controls and a "Register an agent" affordance to get the first
+  policy flowing.
+- **Nav label** "Agents" renamed to "Governance" (desktop and mobile).
+- **Empty zones** show admins a "Create a section" CTA that deep-links to the
+  admin panel's Channels tab (`/admin?tab=channels`), where sections are actually
+  created; members keep the informational copy and a link back to Forums.
+- **Channel-creation pending state** now tracks the full async publish lifecycle
+  (relay ack, rejection, or ~10 s timeout) via `AdminState.channel_creating`,
+  with a one-shot guard so a late ack cannot overwrite a timeout error; the create
+  button re-enables for retry.
+- **Admin Settings "Default Zone"** options derive from the live `ZONE_CONFIG`
+  rather than a hardcoded legacy zone list.
+
+### Added
+
+- **Zone-first landing and scoped navigation** ([ADR-107](docs/adr/ADR-107-zone-first-landing-and-scoped-navigation.md)):
+  a member authorised for exactly one locked zone now lands on that zone instead
+  of the generic forums index. The home zone is derived client-side from
+  `ZONE_CONFIG × cohorts` via `Zone::is_member` (`home_zone_for`) — exactly one
+  accessible locked zone, admins exempt, no hardcoded zone ids. The `/forums`
+  index auto-forwards to the zone root with replace navigation (so "back" skips
+  the bare index); the header + mobile nav anchor is re-labelled to the zone and
+  points at the zone root; and the zone-page breadcrumb re-roots to
+  `Home › {Zone}` (dropping the global "Forums" crumb). Multi-zone members and
+  admins are unchanged, deep links and the `returnTo` flow (ADR-090) are
+  untouched, and the feature is dormant when no `ZONE_CONFIG` locked zone matches
+  the member's cohorts.
+- **Admin panel deep-linking**: `/admin?tab=<slug>` opens the panel on a named
+  tab (channels, users, pending, sections, settings, reports, audit, pods…).
+- **`dev-auth` cargo feature** (off by default): pre-provisioned deterministic
+  dev identities (admin / user / jarvis), a floating identity picker, a
+  zone-access bypass, and a local jarvis DM echo-bot for offline UI testing
+  without touching the relay whitelist. Not compiled into release builds.
+
 ## [1.0.0-beta.4] - 2026-07-08
 
 ### Changed

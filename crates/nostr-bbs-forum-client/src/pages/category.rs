@@ -76,6 +76,11 @@ pub fn CategoryPage() -> impl IntoView {
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
     let zone_access = use_zone_access();
+    // Copy signal for the empty-state closure below — admins get a direct path
+    // to seed the zone's first section.
+    let za_admin = zone_access.is_admin;
+    // Copy for the zone-first breadcrumb (ADR-107); `ZoneAccess` is `Copy`.
+    let za_breadcrumb = zone_access;
     let store = use_channel_store();
     let toasts = use_toasts();
 
@@ -226,11 +231,30 @@ pub fn CategoryPage() -> impl IntoView {
                 }
             }}
 
-            <Breadcrumb items=vec![
-                BreadcrumbItem::link("Home", "/"),
-                BreadcrumbItem::link("Forums", "/forums"),
-                BreadcrumbItem::current(display_name()),
-            ] />
+            // Zone-first breadcrumb (ADR-107): single-locked-zone members drop
+            // the global "Forums" crumb (their landing IS the zone); everyone
+            // else keeps Home › Forums › {Zone}.
+            {move || {
+                let zone_label = display_name();
+                if za_breadcrumb.home_zone().is_some() {
+                    view! {
+                        <Breadcrumb items=vec![
+                            BreadcrumbItem::link("Home", "/"),
+                            BreadcrumbItem::current(zone_label),
+                        ] />
+                    }
+                    .into_any()
+                } else {
+                    view! {
+                        <Breadcrumb items=vec![
+                            BreadcrumbItem::link("Home", "/"),
+                            BreadcrumbItem::link("Forums", "/forums"),
+                            BreadcrumbItem::current(zone_label),
+                        ] />
+                    }
+                    .into_any()
+                }
+            }}
 
             // New Topic button + inline form. Discoverable on the page (not just
             // via direct URL): the trigger is always rendered for authed users
@@ -400,15 +424,48 @@ pub fn CategoryPage() -> impl IntoView {
                                 <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
                         }.into_any());
-                        view! {
-                            <EmptyState
-                                icon=empty_icon
-                                title="No sections yet".to_string()
-                                description="This zone has no sections. An admin can seed one for the community.".to_string()
-                                action_label="Back to Forums".to_string()
-                                action_href=base_href("/forums")
-                            />
-                        }.into_any()
+                        // Admins get a "Create a section" CTA that deep-links to
+                        // the admin panel's Channels tab (`?tab=channels`) — its
+                        // "Create Channel" form is where sections are actually
+                        // created (sections ARE channels). The admin panel's
+                        // "Sections" tab is join-request approvals, not creation,
+                        // so we must not land on bare /admin (Overview). Everyone
+                        // else keeps the informational copy and a link back to
+                        // the forums index.
+                        if za_admin.get() {
+                            view! {
+                                <EmptyState
+                                    icon=empty_icon
+                                    title="No sections yet".to_string()
+                                    description="This zone has no sections. Create the first one to get the community started.".to_string()
+                                    action_label="Create a section".to_string()
+                                    action_href=base_href("/admin?tab=channels")
+                                />
+                            }.into_any()
+                        } else {
+                            // Non-admins can't seed sections. Pick an escape that
+                            // doesn't loop: a single-locked-zone member is
+                            // auto-forwarded /forums → /forums/{home_zone}
+                            // (ADR-107), so a "Back to Forums" link would bounce
+                            // straight back to this same empty page. For them the
+                            // real escape is the site root (matching the
+                            // zone-first breadcrumb's "Home" crumb); multi-zone
+                            // members and public-only users keep the forums index.
+                            let (action_label, action_href) = if za_breadcrumb.home_zone().is_some() {
+                                ("Back to Home".to_string(), base_href("/"))
+                            } else {
+                                ("Back to Forums".to_string(), base_href("/forums"))
+                            };
+                            view! {
+                                <EmptyState
+                                    icon=empty_icon
+                                    title="No sections yet".to_string()
+                                    description="This zone has no sections. An admin can seed one for the community.".to_string()
+                                    action_label=action_label
+                                    action_href=action_href
+                                />
+                            }.into_any()
+                        }
                     } else {
                         let cards: Vec<_> = secs.iter().map(|s| {
                             let mc = store.count_for(&s.id);

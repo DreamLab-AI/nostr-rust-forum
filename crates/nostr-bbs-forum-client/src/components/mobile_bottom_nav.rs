@@ -10,6 +10,7 @@ use leptos_router::hooks::use_location;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::stores::zone_access::use_zone_access;
 
 /// Fixed bottom navigation bar visible only on mobile (< 640px).
 ///
@@ -20,6 +21,9 @@ pub(crate) fn MobileBottomNav() -> impl IntoView {
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
     let location = use_location();
+    // Zone-first nav (ADR-107): single-locked-zone members get a Forums tab that
+    // points at their zone and carries its name; everyone else keeps /forums.
+    let zone_access = use_zone_access();
 
     let pathname = move || {
         let p = location.pathname.get();
@@ -83,7 +87,16 @@ pub(crate) fn MobileBottomNav() -> impl IntoView {
                 </A>
 
                 // Forums
-                <A href=base_href("/forums") attr:class=item_class("/forums")>
+                <A
+                    href={
+                        let za = zone_access;
+                        move || match za.home_zone() {
+                            Some(z) => base_href(&format!("/forums/{}", z.id)),
+                            None => base_href("/forums"),
+                        }
+                    }
+                    attr:class=item_class("/forums")
+                >
                     <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
                         <rect x="3" y="3" width="7" height="7" rx="1"
                             stroke-linecap="round" stroke-linejoin="round"/>
@@ -94,7 +107,13 @@ pub(crate) fn MobileBottomNav() -> impl IntoView {
                         <rect x="14" y="14" width="7" height="7" rx="1"
                             stroke-linecap="round" stroke-linejoin="round"/>
                     </svg>
-                    <span>"Forums"</span>
+                    <span>{
+                        let za = zone_access;
+                        move || match za.home_zone() {
+                            Some(z) => z.label(),
+                            None => "Forums".to_string(),
+                        }
+                    }</span>
                 </A>
 
                 // Profile

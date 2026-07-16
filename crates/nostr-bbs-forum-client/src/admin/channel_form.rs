@@ -5,6 +5,8 @@
 
 use leptos::prelude::*;
 
+use crate::admin::use_admin;
+
 /// Predefined channel sections.
 /// Format: (section_id, display_label).
 const SECTIONS: &[(&str, &str)] = &[
@@ -47,7 +49,10 @@ where
     let zone = RwSignal::new(0u8);
     let cohort = RwSignal::new(String::new());
     let validation_error = RwSignal::new(Option::<String>::None);
-    let is_submitting = RwSignal::new(false);
+    // Pending state is owned by the admin store so it tracks the full async
+    // publish lifecycle: it stays true until the relay confirms, rejects, or the
+    // create handler times out — at which point the button re-enables for retry.
+    let is_submitting = use_admin().state.channel_creating;
 
     let is_valid = Memo::new(move |_| {
         let n = name.get();
@@ -98,9 +103,16 @@ where
             return;
         }
 
-        is_submitting.set(true);
+        // Ignore repeat submits while a publish is already in flight.
+        if is_submitting.get_untracked() {
+            return;
+        }
+
         let z = zone.get_untracked();
         let c = cohort.get_untracked();
+        // The create handler owns `is_submitting` (state.channel_creating): it
+        // flips it true on entry and resets it on relay ack, rejection, or the
+        // ~10s timeout, so the button reflects the real publish lifecycle.
         on_submit(ChannelFormData {
             name: n.trim().to_string(),
             description: description.get_untracked().trim().to_string(),
@@ -113,8 +125,6 @@ where
                 None
             },
         });
-        is_submitting.set(false);
-        // Form reset is handled by the parent when it signals success via callback.
     };
 
     view! {

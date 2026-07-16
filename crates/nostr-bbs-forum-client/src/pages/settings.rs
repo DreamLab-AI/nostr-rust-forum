@@ -43,6 +43,11 @@ const POD_API: &str = match option_env!("VITE_POD_API_URL") {
 /// Client-side size cap for profile picture uploads (~2 MB).
 const MAX_AVATAR_BYTES: f64 = 2.0 * 1024.0 * 1024.0;
 
+/// Maximum length of the display-name (nickname) field. Kept as a named const
+/// so the input `maxlength`, the helper copy, and the live counter can never
+/// drift apart — the cap is stated honestly rather than clipping silently (#13).
+const MAX_NICKNAME_LEN: usize = 50;
+
 /// Read a key from the `window.__ENV__` runtime-config object injected by the
 /// deploy (mirrors the private reader in `utils::relay_url`). Returns `None`
 /// for a missing/undefined/empty value.
@@ -445,9 +450,14 @@ pub fn SettingsPage() -> impl IntoView {
         let Some(file) = input.files().and_then(|fl| fl.get(0)) else {
             return;
         };
-        // Reset so re-selecting the same file re-fires `change`.
-        input.set_value("");
+        // NB: do NOT reset the input value yet. Clearing it before the blob
+        // bytes are read can invalidate the selected File in some browsers
+        // (observed `NotFoundError` on read). We reset only in early returns
+        // that never touch the blob, or in the upload's terminal branches once
+        // the bytes are safely read — still letting a re-select of the same
+        // file re-fire `change` (#16).
         if file.size() > MAX_AVATAR_BYTES {
+            input.set_value("");
             toasts_for_pic.show(
                 "Image too large — maximum size is 2 MB",
                 ToastVariant::Warning,
@@ -455,10 +465,12 @@ pub fn SettingsPage() -> impl IntoView {
             return;
         }
         let Some(pk) = auth.pubkey().get_untracked() else {
+            input.set_value("");
             toasts_for_pic.show("Not authenticated", ToastVariant::Error);
             return;
         };
         let Some(signer) = auth.get_signer() else {
+            input.set_value("");
             toasts_for_pic.show("Not authenticated", ToastVariant::Error);
             return;
         };
@@ -468,6 +480,7 @@ pub fn SettingsPage() -> impl IntoView {
         let claimed = claimed_username.get_untracked();
         let bio = about.get_untracked().trim().to_string();
         let bday = birthday.get_untracked().trim().to_string();
+        let input_reset = input.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let filename = avatar_filename(&file.type_());
             let mut result =
@@ -482,6 +495,11 @@ pub fn SettingsPage() -> impl IntoView {
                     Err(e) => Err(format!("pod provisioning failed: {e}")),
                 };
             }
+            // Every upload attempt (including the 404 retry) has now finished
+            // reading the blob, so it is finally safe to clear the input. This
+            // preserves the re-select-same-file-refires-change behaviour without
+            // invalidating the File mid-read.
+            input_reset.set_value("");
             match result {
                 Ok(url) => {
                     pic_uploading.set(false);
@@ -597,7 +615,7 @@ pub fn SettingsPage() -> impl IntoView {
             // Breadcrumb
             <div class="flex items-center gap-2 text-sm text-gray-500 mb-6">
                 <A href=base_href("/") attr:class="hover:text-amber-400 transition-colors">"Home"</A>
-                <span>"/"</span>
+                <span class="breadcrumb-separator">{"\u{203A}"}</span>
                 <span class="text-gray-300">"Settings"</span>
             </div>
 
@@ -606,60 +624,54 @@ pub fn SettingsPage() -> impl IntoView {
             </h1>
 
             <div class="space-y-6">
-                // -- Section 0: Username --
-                <div class="glass-card p-6 space-y-4">
-                    <h2 class="text-lg font-semibold text-white flex items-center gap-2">
-                        {handle_icon()}
-                        "Username"
-                    </h2>
-                    <div class="border-t border-gray-700/50"></div>
+                // -- Section 0: Username (legacy handle release only) --
+                // The whole card is reactive on `claimed_username` and renders
+                // ONLY when a legacy handle still resolves. We no longer mint
+                // new usernames (onboarding captures a display name only), so a
+                // user without a legacy handle sees no Username section at all —
+                // their display name lives under Profile below (#6).
+                {move || {
+                    claimed_username.get().filter(|name| !name.is_empty()).map(|name| {
+                        let nip05 = claimed_nip05.get().unwrap_or_default();
+                        view! {
+                            <div class="glass-card p-6 space-y-4">
+                                <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                                    {handle_icon()}
+                                    "Username"
+                                </h2>
+                                <div class="border-t border-gray-700/50"></div>
 
-                    {move || {
-                        match claimed_username.get() {
-                            Some(name) if !name.is_empty() => {
-                                // A legacy handle minted on a previous build still
-                                // resolves. We no longer mint new ones (onboarding
-                                // captures a display name only), so the only action
-                                // here is to release the handle.
-                                let nip05 = claimed_nip05.get().unwrap_or_default();
-                                view! {
-                                    <div class="space-y-3">
-                                        <div>
-                                            <span class="text-xs text-gray-500 uppercase tracking-wide">"Current"</span>
-                                            <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1 flex items-center gap-2">
-                                                <span class="text-amber-300 font-mono">"@" {name.clone()}</span>
-                                            </div>
-                                        </div>
-                                        <div>
-                                            <span class="text-xs text-gray-500 uppercase tracking-wide">"NIP-05"</span>
-                                            <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1">
-                                                <code class="text-xs text-gray-300 font-mono break-all">{nip05}</code>
-                                            </div>
-                                        </div>
-                                        <div class="flex gap-3 pt-1">
-                                            <button
-                                                on:click=move |_| confirm_release_open.set(true)
-                                                disabled=move || release_pending.get()
-                                                class="text-sm text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded-lg px-4 py-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                            >
-                                                {move || if release_pending.get() {
-                                                    "Releasing..."
-                                                } else {
-                                                    "Release username"
-                                                }}
-                                            </button>
+                                <div class="space-y-3">
+                                    <div>
+                                        <span class="text-xs text-gray-500 uppercase tracking-wide">"Current"</span>
+                                        <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1 flex items-center gap-2">
+                                            <span class="text-amber-300 font-mono">"@" {name}</span>
                                         </div>
                                     </div>
-                                }.into_any()
-                            }
-                            _ => view! {
-                                <p class="text-sm text-gray-400">
-                                    "Your display name is what everyone sees next to your posts and mentions. Set it under Profile below."
-                                </p>
-                            }.into_any(),
+                                    <div>
+                                        <span class="text-xs text-gray-500 uppercase tracking-wide">"NIP-05"</span>
+                                        <div class="bg-gray-800 rounded-lg px-3 py-2 mt-1">
+                                            <code class="text-xs text-gray-300 font-mono break-all">{nip05}</code>
+                                        </div>
+                                    </div>
+                                    <div class="flex gap-3 pt-1">
+                                        <button
+                                            on:click=move |_| confirm_release_open.set(true)
+                                            disabled=move || release_pending.get()
+                                            class="text-sm text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded-lg px-4 py-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
+                                            {move || if release_pending.get() {
+                                                "Releasing..."
+                                            } else {
+                                                "Release username"
+                                            }}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
                         }
-                    }}
-                </div>
+                    })
+                }}
 
                 // -- Section 1: Profile --
                 <div class="glass-card p-6 space-y-4">
@@ -671,14 +683,48 @@ pub fn SettingsPage() -> impl IntoView {
 
                     <div class="space-y-3">
                         <div class="space-y-1">
-                            <label class="block text-sm font-medium text-gray-300">"Nickname"</label>
+                            <label class="flex items-center justify-between text-sm font-medium text-gray-300">
+                                <span>"Nickname"</span>
+                                <span
+                                    class=move || {
+                                        let at_limit =
+                                            nickname.get().chars().count() >= MAX_NICKNAME_LEN;
+                                        if at_limit {
+                                            "text-xs font-normal text-amber-400"
+                                        } else {
+                                            "text-xs font-normal text-gray-500"
+                                        }
+                                    }
+                                    aria-live="polite"
+                                >
+                                    {move || {
+                                        format!(
+                                            "{}/{}",
+                                            nickname.get().chars().count(),
+                                            MAX_NICKNAME_LEN,
+                                        )
+                                    }}
+                                </span>
+                            </label>
                             <input
                                 type="text"
                                 prop:value=move || nickname.get()
                                 on:input=move |ev| nickname.set(event_target_value(&ev))
-                                maxlength="50"
+                                maxlength=MAX_NICKNAME_LEN.to_string()
                                 class="w-full bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500 transition-colors"
                             />
+                            <p class="text-xs text-gray-500">
+                                {move || {
+                                    if nickname.get().chars().count() >= MAX_NICKNAME_LEN {
+                                        "Maximum length reached — nicknames are capped at 50 characters.".to_string()
+                                    } else {
+                                        format!(
+                                            "Your display name, shown next to your posts. Up to {} characters.",
+                                            MAX_NICKNAME_LEN,
+                                        )
+                                    }
+                                }}
+                            </p>
                         </div>
                         <div class="space-y-1">
                             <label class="block text-sm font-medium text-gray-300">"About"</label>

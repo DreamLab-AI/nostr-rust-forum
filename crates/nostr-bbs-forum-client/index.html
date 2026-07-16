@@ -3,8 +3,8 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Nostr BBS Forum</title>
-    <meta name="description" content="Nostr BBS Community Forum — Decentralized, private, Nostr-powered" />
+    <title>dreamlab</title>
+    <meta name="description" content="dreamlab — fast oldschool forum tech, decentralized and Nostr-powered" />
     <meta name="theme-color" content="#111827" />
 
     <!-- GitHub Pages SPA deep-link restore: picks up redirect from root 404.html -->
@@ -43,6 +43,20 @@
     <!-- Forum-specific styles (imports design-tokens.css for @import fallback) -->
     <link data-trunk rel="css" href="style.css" />
 
+    <!-- Runtime config placeholder — DO NOT commit real endpoints, admin keys,
+         or branding here.
+         The deploy pipeline REPLACES this entire <script> block with the
+         operator's real `window.__ENV__` (relay/auth/pod/search endpoints,
+         zones, branding, build metadata). It is intentionally empty in the kit
+         so an un-injected build (local Trunk, or CI without the deploy step)
+         falls back to the client's own safe defaults — the production relay,
+         a brand-neutral forum name, the legacy zone list, and "dev"/"local"
+         build strings — rather than shipping any operator- or dev-specific
+         endpoints that are unreachable off the dev box. -->
+    <script>
+    window.__ENV__ = window.__ENV__ || {};
+    </script>
+
     <!-- Trunk WASM bundle injection (workspace: specify package + binary).
          data-wasm-opt="0" disables Trunk's bundled wasm-opt 122 which rejects
          Rust 1.90's bulk-memory ops. We run a manually-installed binaryen 119
@@ -59,7 +73,7 @@
     <!-- Loading screen — replaced by Leptos mount_to_body() -->
     <div id="loading-screen" class="loading-screen">
         <div class="loading-ring"></div>
-        <h1 class="loading-logo gradient-text">Nostr BBS</h1>
+        <h1 class="loading-logo gradient-text">dreamlab</h1>
         <p class="loading-status">Initializing&hellip;</p>
     </div>
 

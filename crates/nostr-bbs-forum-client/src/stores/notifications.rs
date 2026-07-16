@@ -12,8 +12,10 @@
 //! existing channel-store subscriptions already stream every event.
 //!
 //! Suppression rules:
-//! - never notify on the user's OWN events (author == current pubkey),
-//! - never notify on backlog (anything older than the sync baseline timestamp),
+//! - never notify on the user's OWN events (author/subject == current pubkey),
+//! - never notify on backlog (anything older than the per-pubkey sync baseline —
+//!   a fresh baseline is stamped the first time each account logs in on a
+//!   device, so a recovery-key login never inherits prior history),
 //! - never notify twice for the same event id,
 //! - never notify on a post the user has already read (its `created_at` is at
 //!   or before the channel's last-read position).
@@ -28,14 +30,21 @@ use crate::auth::use_auth;
 use crate::stores::channels::use_channel_store;
 use crate::stores::profile_cache::try_use_profile_cache;
 use crate::stores::read_position::use_read_positions;
+use crate::stores::zone_access::use_zone_access;
 use crate::utils::shorten_pubkey;
 
 const STORAGE_KEY: &str = "nostrbbs:notifications";
-/// Persisted producer sync state (baseline high-water mark + already-notified
-/// event ids). Separate key so it survives the 7-day eviction of the visible
-/// notification list — otherwise a backlog post would re-notify once its
-/// notification aged out (see [`SyncState`]).
+/// Prefix for the per-pubkey producer sync state (baseline high-water mark +
+/// already-notified event ids). The signed-in pubkey is appended (see
+/// [`sync_state_key`]) so a different account logging in on the same device
+/// (e.g. a recovery-key login) starts from a fresh baseline instead of
+/// inheriting the previous user's history — the cause of the stale historical
+/// join-notification backlog (#10/#12). A separate key from the visible list
+/// also lets it survive the 7-day eviction of that list — otherwise a backlog
+/// post would re-notify once its notification aged out (see [`SyncState`]).
 const SYNC_STATE_KEY: &str = "nostrbbs:notif_sync";
+/// Storage-key owner suffix used before a pubkey is known (anonymous browsing).
+const ANON_OWNER: &str = "anon";
 const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 /// Cap on persisted dedup ids so the set can't grow without bound. Far above the
 /// 100-notification visible cap; old ids are evicted FIFO-style on overflow.
@@ -78,14 +87,15 @@ struct PersistedNotifications {
 /// Two fields, both load-bearing for the "burst reader" workflow (log in, glance,
 /// leave; come back later to genuine unread activity):
 ///
-/// - `baseline`: the FIRST-EVER-sync wall-clock floor, captured once and then
-///   persisted forever (until the user clears storage). It exists only to stop
-///   the very first sync from dumping the entire channel history as
-///   notifications. Crucially it is NOT reset to `now()` on later logins — so a
-///   post that arrived while the user was away (`created_at > baseline`) still
-///   qualifies. Resetting it every `init_sync` (the old behaviour) is exactly
-///   why a burst reader saw nothing: everything that happened between sessions
-///   fell at-or-before the freshly-captured baseline and was filed as backlog.
+/// - `baseline`: the first-sync wall-clock floor for THIS account, captured once
+///   and then persisted (per-pubkey) until the user clears storage. It exists
+///   only to stop the first sync from dumping the entire channel history as
+///   notifications. It is NOT reset to `now()` on the same account's later
+///   logins — so a post that arrived while the user was away
+///   (`created_at > baseline`) still qualifies (the burst-reader case). A
+///   DIFFERENT account (recovery-key login) has no persisted state under its own
+///   key, so it gets a fresh `now()` floor and never inherits this account's
+///   history (#10/#12).
 /// - `notified_ids`: event ids already turned into a notification. Persisted so
 ///   a still-on-relay backlog post is not re-notified after its visible
 ///   notification is evicted by the 7-day rule, and so a reload does not
@@ -107,11 +117,17 @@ pub struct NotificationStoreV2 {
     /// Set once `init_sync` has attached its effects, so the bell can call it
     /// idempotently from its (post-context) mount.
     synced: RwSignal<bool>,
-    /// First-ever-sync floor (UNIX secs), loaded from / persisted to storage so
-    /// it is stable across logins. Only the very first sync uses it to avoid
-    /// dumping all history; thereafter the read-position is the real "already
-    /// seen" signal. See [`SyncState`].
+    /// First-sync floor (UNIX secs) for the CURRENT account, loaded from /
+    /// persisted to its per-pubkey storage key so it is stable across that
+    /// account's logins. Only the first sync uses it to avoid dumping all
+    /// history; thereafter the read-position is the real "already seen" signal.
+    /// A different account gets its own fresh floor. See [`SyncState`].
     baseline: RwSignal<u64>,
+    /// Pubkey whose sync state (baseline + dedup) is currently loaded. `None`
+    /// until the resolver's first pass. Appended to [`SYNC_STATE_KEY`] so state
+    /// is scoped per account; a change here (login / account switch) reloads the
+    /// baseline and resets the dedup sets.
+    owner: RwSignal<Option<String>>,
     /// Channel ids already turned into a "new topic" notification (in-memory;
     /// channel creations are rare and the persisted `notified_ids` covers reload
     /// dedup for posts, which is where flooding matters).
@@ -125,14 +141,15 @@ pub struct NotificationStoreV2 {
 impl NotificationStoreV2 {
     fn new() -> Self {
         let loaded = load_from_storage();
-        let sync_state = load_sync_state();
-        let seen: HashSet<String> = sync_state.notified_ids.into_iter().collect();
+        // Sync state is loaded per-pubkey by `init_sync`'s resolver once auth
+        // resolves — not here, where the signed-in account is not yet known.
         Self {
             items: RwSignal::new(loaded),
             synced: RwSignal::new(false),
-            baseline: RwSignal::new(sync_state.baseline),
+            baseline: RwSignal::new(0),
+            owner: RwSignal::new(None),
             seen_channels: RwSignal::new(HashSet::new()),
-            seen_messages: RwSignal::new(seen),
+            seen_messages: RwSignal::new(HashSet::new()),
         }
     }
 
@@ -256,18 +273,13 @@ impl NotificationStoreV2 {
         }
         self.synced.set(true);
 
-        // First-ever sync floor: if no baseline has ever been persisted, capture
-        // `now()` so this initial sync does not dump the entire channel backlog
-        // as notifications. On every SUBSEQUENT login the persisted value is
-        // reused (NOT reset) so activity that arrived between sessions still
-        // qualifies as new. This is the fix for the silent producer: a burst
-        // reader (log in → glance → leave → return) now gets notified for what
-        // happened while they were away, instead of having it all re-filed as
-        // backlog under a freshly-stamped `now()`.
+        // Provisional floor: stamp `now` immediately so no producer effect ever
+        // runs against baseline 0 (which would treat the entire channel history
+        // as unread "new" activity and flood the bell). The per-pubkey resolver
+        // below refines this to the signed-in account's own persisted baseline
+        // once auth resolves.
         if self.baseline.get_untracked() == 0 {
-            let now = now_secs();
-            self.baseline.set(now);
-            self.persist_sync_state();
+            self.baseline.set(now_secs());
         }
 
         let store = *self;
@@ -276,10 +288,56 @@ impl NotificationStoreV2 {
         let auth = use_auth();
         let my_pubkey = auth.pubkey();
 
+        // Join-effect dedup state, declared up-front so the resolver below can
+        // reset it on an account switch. `known_profiles` holds pubkeys already
+        // decided (notified, suppressed as backlog, or our own); `join_seeded`
+        // guards the one-time backlog snapshot.
+        let known_profiles: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+        let join_seeded: RwSignal<bool> = RwSignal::new(false);
+        // Loaded channel posts, read point-in-time by the join-alert effect to
+        // tell a genuine first-time join from an existing member's profile edit
+        // (both surface a post-baseline kind-0, so the timestamp alone cannot).
+        let msgs_for_joins = channels_store.channel_messages;
+
+        // -- Per-pubkey sync-state resolver (#10/#12) -------------------------
+        // Baseline + dedup are persisted PER PUBKEY. A different account logging
+        // in on this device (recovery-key login, shared browser) therefore
+        // starts from a fresh `now` baseline and never inherits the previous
+        // user's history — exactly what produced the backlog of stale historical
+        // join notifications. For the SAME account across logins the persisted
+        // baseline is reused, preserving the burst-reader behaviour (activity
+        // that arrived while away still notifies). Tracks `my_pubkey` so it
+        // re-runs when auth resolves or the account switches.
+        Effect::new(move |_| {
+            let owner_key = my_pubkey.get().unwrap_or_else(|| ANON_OWNER.to_string());
+            if store.owner.get_untracked().as_deref() == Some(owner_key.as_str()) {
+                return; // already loaded for this account
+            }
+            let state = load_sync_state(&owner_key);
+            store.owner.set(Some(owner_key));
+            // Reset per-account dedup so a switch never leaks the prior
+            // account's "already seen" sets.
+            store.seen_channels.set(HashSet::new());
+            store
+                .seen_messages
+                .set(state.notified_ids.iter().cloned().collect());
+            known_profiles.set(HashSet::new());
+            join_seeded.set(false);
+            if state.baseline == 0 {
+                // First login for this account on this device: floor at now so
+                // all pre-existing history is backlog, not a flood.
+                store.baseline.set(now_secs());
+                store.persist_sync_state();
+            } else {
+                store.baseline.set(state.baseline);
+            }
+        });
+
         // -- New topics (kind-40 channel creation) ----------------------------
         let channels_sig = channels_store.channels;
         Effect::new(move |_| {
-            let baseline = store.baseline.get_untracked();
+            // Tracked read: re-run once the per-pubkey baseline resolves.
+            let baseline = store.baseline.get();
             let channels = channels_sig.get();
             for c in channels.iter() {
                 if store.seen_channels.with_untracked(|s| s.contains(&c.id)) {
@@ -317,7 +375,8 @@ impl NotificationStoreV2 {
         let messages_sig = channels_store.channel_messages;
         let channels_for_msgs = channels_store.channels;
         Effect::new(move |_| {
-            let baseline = store.baseline.get_untracked();
+            // Tracked read: re-run once the per-pubkey baseline resolves.
+            let baseline = store.baseline.get();
             let me = my_pubkey.get();
             let msgs = messages_sig.get();
             // Channel id -> display name for the notification body.
@@ -417,6 +476,110 @@ impl NotificationStoreV2 {
                 store.persist_sync_state();
             }
         });
+
+        // -- New user profiles (admin-only join alerts) ----------------------
+        // Watch the ProfileCache entries signal for kind-0 events from pubkeys
+        // not previously known. Only fires for admin users.
+        let zone_access = use_zone_access();
+        if let Some(cache) = try_use_profile_cache() {
+            let entries_sig = cache.entries;
+            Effect::new(move |_| {
+                // Tracked reads: re-run when admin status resolves, when the
+                // per-pubkey baseline lands, when auth resolves (own-join
+                // suppression) and on every new profile.
+                if !zone_access.is_admin.get() {
+                    return;
+                }
+                let baseline = store.baseline.get();
+                if baseline == 0 {
+                    return;
+                }
+                let me = my_pubkey.get();
+                let entries = entries_sig.get();
+
+                // One-time backlog snapshot (#10/#12): the first time we have a
+                // resolved baseline as an admin, record every pubkey already
+                // known to us as pre-existing WITHOUT notifying. This suppresses
+                // the historical-member flood deterministically even when the
+                // profile projection carries no per-member join timestamp.
+                // Genuine joins that arrive AFTER this snapshot still notify —
+                // that is the Carol-Chen case (#15).
+                if !join_seeded.get_untracked() {
+                    join_seeded.set(true);
+                    known_profiles.update(|s| {
+                        for pk in entries.keys() {
+                            s.insert(pk.clone());
+                        }
+                    });
+                    return;
+                }
+
+                for (pk, entry) in entries.iter() {
+                    if known_profiles.with_untracked(|s| s.contains(pk)) {
+                        continue;
+                    }
+                    // #8: never alert on our OWN join. Mark known so a later
+                    // re-render can't resurface it.
+                    if me.as_deref() == Some(pk.as_str()) {
+                        known_profiles.update(|s| {
+                            s.insert(pk.clone());
+                        });
+                        continue;
+                    }
+                    // A profile whose kind-0 predates the baseline is an existing
+                    // member being lazily fetched now (e.g. the admin viewed
+                    // their post), not a new join — suppress it. Marking known
+                    // here is safe: a genuine NEW member's kind-0 is
+                    // post-baseline, so it never lands in this branch on its
+                    // first sighting. (The #15 dropped-join trap was the OLD
+                    // order — mark-known BEFORE the backlog/own checks — which
+                    // permanently suppressed a pubkey first seen as backlog even
+                    // when its genuine, post-baseline join arrived later.)
+                    if entry.fetched_at <= baseline {
+                        known_profiles.update(|s| {
+                            s.insert(pk.clone());
+                        });
+                        continue;
+                    }
+                    // A member who edited their display name/avatar after the
+                    // baseline produces a post-baseline kind-0 that is
+                    // indistinguishable, on timestamp alone, from a genuine
+                    // first-time join (the #15 trap in reverse). Existing
+                    // members betray themselves through activity: any post they
+                    // authored predating the baseline proves they are not new.
+                    // Point-in-time (untracked) scan of the loaded posts — when
+                    // the admin views the member's post that post is loaded, so
+                    // a long-standing member's pre-baseline history suppresses
+                    // the false "joined" alert while a genuine join (no
+                    // pre-baseline posts) still notifies.
+                    let posted_before_baseline = msgs_for_joins.with_untracked(|by_channel| {
+                        by_channel.values().any(|events| {
+                            events.iter().any(|ev| {
+                                ev.pubkey.as_str() == pk.as_str() && ev.created_at <= baseline
+                            })
+                        })
+                    });
+                    if posted_before_baseline {
+                        known_profiles.update(|s| {
+                            s.insert(pk.clone());
+                        });
+                        continue;
+                    }
+                    known_profiles.update(|s| {
+                        s.insert(pk.clone());
+                    });
+                    let label = entry.best_label().unwrap_or_else(|| shorten_pubkey(pk));
+                    store.add_at(
+                        NotificationKind::JoinRequest,
+                        "New member",
+                        &format!("{} joined the forum", label),
+                        Some("/admin"),
+                        entry.fetched_at,
+                        Some(format!("join:{}", pk)),
+                    );
+                }
+            });
+        }
     }
 
     fn persist(&self) {
@@ -426,16 +589,21 @@ impl NotificationStoreV2 {
         let _ = LocalStorage::set(STORAGE_KEY, data);
     }
 
-    /// Persist the producer sync state (baseline + already-notified ids) to its
-    /// own localStorage key. Cheap; called at most once per effect run.
+    /// Persist the producer sync state (baseline + already-notified ids) to the
+    /// CURRENT account's per-pubkey localStorage key. No-op until the resolver
+    /// has established an owner. Cheap; called at most once per effect run.
     fn persist_sync_state(&self) {
+        let owner = match self.owner.get_untracked() {
+            Some(o) => o,
+            None => return,
+        };
         let state = SyncState {
             baseline: self.baseline.get_untracked(),
             notified_ids: self
                 .seen_messages
                 .with_untracked(|s| s.iter().cloned().collect()),
         };
-        let _ = LocalStorage::set(SYNC_STATE_KEY, state);
+        let _ = LocalStorage::set(sync_state_key(&owner), state);
     }
 }
 
@@ -507,11 +675,17 @@ fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
 }
 
-/// Load the persisted producer sync state, tolerating absence and schema drift
-/// (returns the default — baseline 0, empty set — on any parse failure, so a
-/// corrupt blob just means "first sync" rather than a crash).
-fn load_sync_state() -> SyncState {
-    LocalStorage::get::<SyncState>(SYNC_STATE_KEY).unwrap_or_default()
+/// Compute the per-pubkey localStorage key for the producer sync state.
+fn sync_state_key(owner: &str) -> String {
+    format!("{}:{}", SYNC_STATE_KEY, owner)
+}
+
+/// Load the persisted producer sync state for `owner`, tolerating absence and
+/// schema drift (returns the default — baseline 0, empty set — on any parse
+/// failure, so a corrupt or missing blob just means "first sync" rather than a
+/// crash).
+fn load_sync_state(owner: &str) -> SyncState {
+    LocalStorage::get::<SyncState>(&sync_state_key(owner)).unwrap_or_default()
 }
 
 /// Pure suppression predicate for a kind-42 post (extracted so it is unit
@@ -790,6 +964,16 @@ mod tests {
         let back: SyncState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.baseline, state.baseline);
         assert_eq!(back.notified_ids, state.notified_ids);
+    }
+
+    #[test]
+    fn sync_state_key_is_scoped_per_pubkey() {
+        // Per-pubkey keying is what stops a recovery-key login (a different
+        // account on the same device) from inheriting the prior user's baseline
+        // and dedup set (#10/#12).
+        assert_eq!(sync_state_key(ME), format!("nostrbbs:notif_sync:{ME}"));
+        assert_ne!(sync_state_key(ME), sync_state_key(OTHER));
+        assert_eq!(sync_state_key(ANON_OWNER), "nostrbbs:notif_sync:anon");
     }
 
     #[test]

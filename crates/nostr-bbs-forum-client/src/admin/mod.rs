@@ -122,6 +122,10 @@ pub struct AdminState {
     pub error: RwSignal<Option<String>>,
     pub success: RwSignal<Option<String>>,
     pub active_tab: RwSignal<AdminTab>,
+    /// True while a channel-creation publish is awaiting relay confirmation.
+    /// Drives the create form's pending state so it can reset on success,
+    /// rejection, or timeout and let the admin retry.
+    pub channel_creating: RwSignal<bool>,
 }
 
 // -- AdminStore ---------------------------------------------------------------
@@ -146,6 +150,7 @@ impl AdminStore {
                 error: RwSignal::new(None),
                 success: RwSignal::new(None),
                 active_tab: RwSignal::new(AdminTab::Overview),
+                channel_creating: RwSignal::new(false),
             },
         }
     }
@@ -590,10 +595,14 @@ impl AdminStore {
         cohort: Option<&str>,
         signer: &dyn Signer,
     ) -> Result<(), String> {
+        let creating = self.state.channel_creating;
+        creating.set(true);
+
         let relay = expect_context::<RelayConnection>();
         let conn = relay.connection_state();
         if conn.get_untracked() != ConnectionState::Connected {
-            return Err("Relay not connected".to_string());
+            creating.set(false);
+            return Err("Could not reach the server — the channel was not created.".to_string());
         }
 
         let pubkey_hex = signer.public_key().to_string();
@@ -614,8 +623,13 @@ impl AdminStore {
             tags.push(vec!["cohort".into(), c.into()]);
         }
 
-        let content_json = serde_json::to_string(&content)
-            .map_err(|e| format!("JSON serialization failed: {e}"))?;
+        let content_json = match serde_json::to_string(&content) {
+            Ok(json) => json,
+            Err(e) => {
+                creating.set(false);
+                return Err(format!("JSON serialization failed: {e}"));
+            }
+        };
         let unsigned = nostr_bbs_core::UnsignedEvent {
             pubkey: pubkey_hex,
             created_at: now,
@@ -624,10 +638,13 @@ impl AdminStore {
             content: content_json,
         };
 
-        let signed = signer
-            .sign_event(unsigned)
-            .await
-            .map_err(|e| format!("Signing failed: {e}"))?;
+        let signed = match signer.sign_event(unsigned).await {
+            Ok(signed) => signed,
+            Err(e) => {
+                creating.set(false);
+                return Err(format!("Signing failed: {e}"));
+            }
+        };
 
         let success_sig = self.state.success;
         let error_sig = self.state.error;
@@ -640,29 +657,70 @@ impl AdminStore {
         let event_created_at = signed.created_at;
         let event_pubkey = signed.pubkey.clone();
 
-        let ack = Rc::new(move |accepted: bool, message: String| {
-            if accepted {
-                success_sig.set(Some(format!("Channel '{}' created", channel_name)));
-                channels_sig.update(|list| {
-                    if !list.iter().any(|c| c.id == event_id) {
-                        list.push(AdminChannel {
-                            id: event_id.clone(),
-                            name: channel_name.clone(),
-                            description: channel_desc.clone(),
-                            section: channel_section.clone(),
-                            created_at: event_created_at,
-                            creator: event_pubkey.clone(),
-                        });
-                    }
-                });
-                stats_sig.update(|s| {
-                    s.total_channels = channels_sig.get_untracked().len() as u32;
-                });
-            } else {
-                error_sig.set(Some(format!("Relay rejected: {}", message)));
-            }
-        });
-        let _ = relay.publish_with_ack(&signed, Some(ack));
+        // Shared one-shot guard: whichever of the relay ack or the timeout fires
+        // first wins; the loser is a no-op. This prevents a late relay OK from
+        // overwriting a timeout error (or vice versa) and double-resetting state.
+        let resolved = Rc::new(std::cell::Cell::new(false));
+
+        let ack = {
+            let resolved = resolved.clone();
+            Rc::new(move |accepted: bool, message: String| {
+                if resolved.replace(true) {
+                    return;
+                }
+                creating.set(false);
+                if accepted {
+                    success_sig.set(Some(format!("Channel '{}' created", channel_name)));
+                    channels_sig.update(|list| {
+                        if !list.iter().any(|c| c.id == event_id) {
+                            list.push(AdminChannel {
+                                id: event_id.clone(),
+                                name: channel_name.clone(),
+                                description: channel_desc.clone(),
+                                section: channel_section.clone(),
+                                created_at: event_created_at,
+                                creator: event_pubkey.clone(),
+                            });
+                        }
+                    });
+                    stats_sig.update(|s| {
+                        s.total_channels = channels_sig.get_untracked().len() as u32;
+                    });
+                } else {
+                    // Surface the relay's NIP-01 OK=false / NOTICE reason when present.
+                    let reason = message.trim();
+                    let detail = if reason.is_empty() {
+                        "the server rejected the channel.".to_string()
+                    } else {
+                        reason.to_string()
+                    };
+                    error_sig.set(Some(format!("Could not create the channel — {detail}")));
+                }
+            })
+        };
+
+        if let Err(e) = relay.publish_with_ack(&signed, Some(ack)) {
+            resolved.set(true);
+            creating.set(false);
+            return Err(format!("Could not send the channel to the server: {e}"));
+        }
+
+        // Guard against a silent hang: if the relay never confirms (unreachable,
+        // dropped socket, or queued send that never lands), surface a friendly
+        // error after ~10s and clear the pending state so the admin can retry.
+        let timeout_error = error_sig;
+        crate::utils::set_timeout_once(
+            move || {
+                if resolved.replace(true) {
+                    return;
+                }
+                creating.set(false);
+                timeout_error.set(Some(
+                    "Could not reach the server — the channel was not created.".to_string(),
+                ));
+            },
+            10_000,
+        );
 
         Ok(())
     }

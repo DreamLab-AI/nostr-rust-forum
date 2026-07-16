@@ -132,10 +132,20 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
 
             <Show
                 when=move || action_count.get() != 0
-                fallback=|| view! {
-                    <div class="bg-gray-800/50 rounded-lg p-8 text-center mb-8">
-                        <p class="text-gray-500">"No pending actions. Agents will publish action requests here when human review is needed."</p>
-                    </div>
+                fallback=move || if member_view {
+                    // Member surface: no decision to make, only to follow.
+                    view! {
+                        <div class="bg-gray-800/50 rounded-lg p-8 text-center mb-8">
+                            <p class="text-gray-500">"No action requests are awaiting a decision. When an agent needs administrator review, the request appears here for you to follow — administrators respond on the community's behalf."</p>
+                        </div>
+                    }.into_any()
+                } else {
+                    // Admin surface: names the Approve/Reject controls that appear here.
+                    view! {
+                        <div class="bg-gray-800/50 rounded-lg p-8 text-center mb-8">
+                            <p class="text-gray-500">"No action requests pending. When an agent asks for human review, its request appears here with Approve and Reject controls."</p>
+                        </div>
+                    }.into_any()
                 }
             >
                 <h2 class="text-xl font-semibold text-white mb-4">"Pending Actions"</h2>
@@ -159,10 +169,41 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
 
             <Show
                 when=move || panel_count.get() != 0
-                fallback=|| view! {
-                    <div class="bg-gray-800/50 rounded-lg p-8 text-center">
-                        <p class="text-gray-500">"No agent panels registered yet. Panels appear here when agents publish kind-31400 PanelDefinition events."</p>
-                    </div>
+                fallback=move || if member_view {
+                    // Member surface: explain what governance is and that
+                    // published policies/proposals will surface here to read.
+                    view! {
+                        <div class="bg-gray-800/50 rounded-lg p-8 text-center max-w-2xl mx-auto">
+                            <h3 class="text-lg font-semibold text-white mb-2">"About governance"</h3>
+                            <p class="text-gray-400 text-sm mb-3">
+                                "Governance is where you can see how the forum's registered agents are configured and the decisions they take on the community's behalf. Published policies and proposals appear here for you to review."
+                            </p>
+                            <p class="text-gray-500 text-sm">
+                                "Nothing has been published yet. This is a read-only view — administrators respond to any action requests."
+                            </p>
+                        </div>
+                    }.into_any()
+                } else {
+                    // Admin surface: state it is the management surface, describe
+                    // what admins can do, and offer a clear affordance for getting
+                    // the first policy published.
+                    view! {
+                        <div class="bg-gray-800/50 rounded-lg p-8 text-center max-w-2xl mx-auto">
+                            <h3 class="text-lg font-semibold text-white mb-2">"Governance management surface"</h3>
+                            <p class="text-gray-400 text-sm mb-3">
+                                "This is the admin control surface. From here you review agent decisions, monitor status, and respond to action requests as they arrive."
+                            </p>
+                            <p class="text-gray-500 text-sm mb-5">
+                                "No policies have been published yet. Policies and panels are published by registered agents (kind-31400 PanelDefinition events) — register an agent to get the first one flowing."
+                            </p>
+                            <A
+                                href=base_href("/admin")
+                                attr:class="inline-flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold transition-colors"
+                            >
+                                "Register an agent →"
+                            </A>
+                        </div>
+                    }.into_any()
                 }
             >
                 <h2 class="text-xl font-semibold text-white mb-4">"Agent Panels"</h2>

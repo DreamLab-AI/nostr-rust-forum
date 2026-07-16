@@ -4,18 +4,22 @@
 //! read status, with "Mark all read" action and click-to-navigate behavior.
 //!
 //! NOT built on the shared [`Modal`](crate::components::modal::Modal) primitive
-//! by design: this is a right-docked *drawer* (`fixed right-0 top-16 bottom-0`,
+//! by design: this is a right-docked *drawer* (`fixed right-0 top-16`,
 //! full-height, slide-in-from-right), not a centered dialog. Its header carries
-//! "Mark all read" / "Clear" actions rather than a title + close-X, and its
-//! backdrop is a transparent click-catcher (no blur). `Modal` renders a centered
-//! floating card with a mandatory title bar and scale-in animation, so wrapping
-//! this drawer in it would change its layout and behaviour. Backdrop-click close
-//! is implemented here; a drawer variant on `Modal` would be a non-minimal fork
-//! of the shared primitive.
+//! "Mark all read" / "Clear" actions rather than a title + close-X, and it has
+//! no backdrop at all. `Modal` renders a centered floating card with a mandatory
+//! title bar and scale-in animation, so wrapping this drawer in it would change
+//! its layout and behaviour. Outside-click close is implemented here via a
+//! capture-phase document `pointerdown` listener (#9) rather than a
+//! full-viewport click-catcher `<div>` — that backdrop swallowed the first click
+//! on controls behind it (e.g. the header "Log Out" button). A drawer variant on
+//! `Modal` would be a non-minimal fork of the shared primitive.
 
+use gloo::events::{EventListener, EventListenerOptions};
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
+use wasm_bindgen::JsCast;
 
 use crate::stores::notifications::{use_notification_store, Notification, NotificationKind};
 use crate::utils::format_relative_time;
@@ -38,18 +42,49 @@ pub fn NotificationCenter(
         is_open.set(false);
     };
 
-    let on_backdrop = move |_| {
-        is_open.set(false);
-    };
+    // #9: close the drawer on an outside pointerdown captured at the DOCUMENT
+    // level, instead of a full-viewport click-catcher `<div>`. That backdrop sat
+    // above the page and swallowed the FIRST click on any control behind it (the
+    // header "Log Out" button most visibly) — you had to click twice. A
+    // capture-phase document listener closes the drawer WITHOUT consuming the
+    // event, so the underlying control still receives the same click. Clicks on
+    // the bell (its own toggle owns the open state) and inside the drawer are
+    // ignored via `closest()` marker attributes.
+    let outside_listener = EventListener::new_with_options(
+        &gloo::utils::document(),
+        "pointerdown",
+        EventListenerOptions::run_in_capture_phase(),
+        move |event| {
+            if !is_open.get_untracked() {
+                return;
+            }
+            let inside = event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .map(|el| {
+                    el.closest("[data-notification-panel]")
+                        .ok()
+                        .flatten()
+                        .is_some()
+                        || el
+                            .closest("[data-notification-bell]")
+                            .ok()
+                            .flatten()
+                            .is_some()
+                })
+                .unwrap_or(false);
+            if !inside {
+                is_open.set(false);
+            }
+        },
+    );
+    // Keep the listener alive for the component's lifetime; gloo removes it on
+    // drop. SendWrapper satisfies `on_cleanup`'s Send bound on this !Send handle.
+    let listener_holder = send_wrapper::SendWrapper::new(outside_listener);
+    on_cleanup(move || drop(listener_holder));
 
     view! {
         <Show when=move || is_open.get()>
-            // Backdrop
-            <div
-                class="fixed inset-0 z-40"
-                on:click=on_backdrop
-            ></div>
-
             // Panel
             //
             // Height is set explicitly via `h-[calc(100dvh-4rem)]` (viewport minus
@@ -60,7 +95,10 @@ pub fn NotificationCenter(
             // the 65px header instead of the viewport and collapsed the drawer to
             // ~2px tall, leaving its rows in the DOM but unpainted. An explicit
             // height is immune to which ancestor is the containing block.
-            <div class="fixed right-0 top-16 w-96 max-w-[90vw] h-[calc(100dvh-4rem)] z-50 glass-card border-l border-gray-700/50 shadow-2xl flex flex-col animate-slide-in-down">
+            <div
+                data-notification-panel=""
+                class="fixed right-0 top-16 w-96 max-w-[90vw] h-[calc(100dvh-4rem)] z-50 glass-card border-l border-gray-700/50 shadow-2xl flex flex-col animate-slide-in-down"
+            >
                 // Header
                 <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700/50 flex-shrink-0">
                     <span class="text-sm font-semibold text-white">"Notifications"</span>

@@ -14,6 +14,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::fx::webgpu_hero::WebGPUHero;
+use crate::stores::zone_access::use_zone_access;
 
 /// Fetch setup status from the relay API.
 /// Returns `true` if no admin exists and initial setup is needed.
@@ -51,6 +52,10 @@ fn relay_api_base() -> String {
 pub fn HomePage() -> impl IntoView {
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
+    // Zone-first landing (ADR-107): the authenticated "Enter Forum" CTA points
+    // straight at a single-locked-zone member's home zone (else /forums, which
+    // itself forwards). Reactive so it resolves once zone access loads.
+    let zone_access = use_zone_access();
 
     // Setup status: None = loading, Some(true) = needs setup, Some(false) = normal
     let needs_setup: RwSignal<Option<bool>> = RwSignal::new(None);
@@ -105,11 +110,10 @@ pub fn HomePage() -> impl IntoView {
 
                 <div class="space-y-2">
                     <p class="text-xl text-gray-300 leading-relaxed">
-                        "A friendly, private place to talk with your community."
+                        "Fast oldschool forum tech"
                     </p>
                     <p class="text-lg text-gray-400 leading-relaxed">
-                        "Join the conversation, share files, and keep your own space — "
-                        "with your own groups for the people who matter."
+                        "A dreamlab, DreamLab AI Ltd, and Minimoomaa co-production"
                     </p>
                 </div>
 
@@ -164,7 +168,13 @@ pub fn HomePage() -> impl IntoView {
                     // Logged in, normal mode
                     <Show when=move || is_authed.get() && needs_setup.get() == Some(false)>
                         <A
-                            href=base_href("/forums")
+                            href={
+                                let za = zone_access;
+                                move || match za.home_zone() {
+                                    Some(z) => base_href(&format!("/forums/{}", z.id)),
+                                    None => base_href("/forums"),
+                                }
+                            }
                             attr:class="bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold px-8 py-3 rounded-xl text-lg transition-all duration-300 hover:shadow-lg hover:shadow-amber-500/20"
                         >
                             "Enter Forum"
@@ -185,9 +195,9 @@ pub fn HomePage() -> impl IntoView {
                         description="Your conversations stay between you and the people you choose. We can't read them."
                     />
                     <FeatureCard
-                        icon="\u{1F465}"
-                        title="Your own groups"
-                        description="Keep separate spaces for friends, family, and work — each with its own members."
+                        icon="\u{1F4E6}"
+                        title="Private Solid Server"
+                        description="Your own Solid pod with plugins — personal storage, linked data, and apps that work for you."
                     />
                 </div>
 

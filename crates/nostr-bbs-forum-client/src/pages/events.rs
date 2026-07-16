@@ -296,7 +296,7 @@ pub fn EventsPage() -> impl IntoView {
                 // Breadcrumb
                 <nav class="breadcrumb-nav mb-6">
                     <A href=base_href("/") attr:class="hover:text-amber-400 transition-colors">"Home"</A>
-                    <span class="breadcrumb-separator">"/"</span>
+                    <span class="breadcrumb-separator">{"\u{203A}"}</span>
                     <span class="text-gray-400">"Events"</span>
                 </nav>
 

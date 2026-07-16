@@ -12,9 +12,22 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::auth::use_auth;
+use crate::stores::zones::{load_zones, Zone};
+
+/// Friendly copy shown to the user when the whitelist/access lookup fails.
+///
+/// Raw `JsValue` / fetch errors are logged to the browser console for
+/// debugging; the user only ever sees this reassuring message.
+const ACCESS_LOAD_ERROR: &str =
+    "Could not load your access details — check your connection and try again.";
 
 /// Reactive zone access state provided via Leptos context.
-#[derive(Clone, Debug)]
+///
+/// `Copy`: every field is a copyable reactive handle (`Memo`/`Signal`/
+/// `RwSignal`), so `ZoneAccess` copies freely into the `move ||` reactive
+/// closures that read `home_zone()` for zone-first nav/breadcrumbs (ADR-107)
+/// without turning their enclosing `view!` children into `FnOnce`.
+#[derive(Clone, Copy, Debug)]
 pub struct ZoneAccess {
     /// Whether the user has Home access.
     pub home: Memo<bool>,
@@ -50,6 +63,51 @@ impl ZoneAccess {
             return true;
         }
         zone.is_member(&self.cohorts.get())
+    }
+
+    /// Reactively resolve the caller's home zone (ADR-107 — zone-first landing).
+    ///
+    /// Returns the single LOCKED zone the member is authorised for, or `None`
+    /// for admins, multi-zone members, and until the whitelist/access fetch has
+    /// completed (`loaded`). Reads `loaded`, `is_admin` and `cohorts` so callers
+    /// re-run when any of them change. Only meaningful once `loaded` is true.
+    pub fn home_zone(&self) -> Option<Zone> {
+        // Read all three signals unconditionally so every caller is reactive on
+        // each, regardless of the `loaded` early-return below.
+        let loaded = self.loaded.get();
+        let is_admin = self.is_admin.get();
+        let cohorts = self.cohorts.get();
+        if !loaded {
+            return None;
+        }
+        home_zone_for(&load_zones(), &cohorts, is_admin)
+    }
+}
+
+/// Pure home-zone derivation (ADR-107 — zone-first landing).
+///
+/// The "home zone" is the single LOCKED zone a member is authorised for. It is
+/// `None` when:
+/// - the user is an admin (admins see every zone, so there is no single home);
+/// - no accessible locked zone exists; or
+/// - more than one accessible locked zone exists (a genuine multi-zone member).
+///
+/// A zone counts only when it has non-empty `required_cohorts` (an open/public
+/// landing zone, with empty `required_cohorts`, is never a home zone) AND the
+/// user's cohorts satisfy [`Zone::is_member`].
+pub fn home_zone_for(zones: &[Zone], cohorts: &[String], is_admin: bool) -> Option<Zone> {
+    if is_admin {
+        return None;
+    }
+    let mut locked_accessible = zones
+        .iter()
+        .filter(|z| !z.required_cohorts.is_empty() && z.is_member(cohorts));
+    let first = locked_accessible.next()?;
+    // Exactly one accessible locked zone → that is the home zone; two or more
+    // means a genuine multi-zone member with no single landing target.
+    match locked_accessible.next() {
+        Some(_) => None,
+        None => Some(first.clone()),
     }
 }
 
@@ -97,7 +155,7 @@ pub fn provide_zone_access() {
         flags,
         cohorts: cohorts_sig,
     };
-    provide_context(access.clone());
+    provide_context(access);
 
     // Fetch access flags from relay when user authenticates
     Effect::new(move |_| {
@@ -110,6 +168,20 @@ pub fn provide_zone_access() {
                 let loaded_sig = loaded;
                 let cohorts_set = cohorts_sig;
                 loaded_sig.set(false);
+
+                // Dev-auth: bypass the relay API and apply local flags
+                #[cfg(feature = "dev-auth")]
+                {
+                    crate::auth::dev::dev_apply_zone_access(
+                        admin_sig,
+                        flags_sig,
+                        loaded_sig,
+                        cohorts_set,
+                        &pk,
+                    );
+                }
+
+                #[cfg(not(feature = "dev-auth"))]
                 leptos::task::spawn_local(async move {
                     match fetch_user_access(&pk).await {
                         Ok((h, d, m, admin, cohorts)) => {
@@ -156,22 +228,54 @@ fn relay_api_base() -> String {
 /// zones can compute membership without the legacy 3-flag mapping.
 async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool, Vec<String>), String> {
     let url = format!("{}/api/check-whitelist?pubkey={}", relay_api_base(), pubkey);
-    let win = web_sys::window().ok_or("No window")?;
+    let win = web_sys::window().ok_or_else(|| {
+        web_sys::console::error_1(&"[zone_access] no window object available".into());
+        ACCESS_LOAD_ERROR.to_string()
+    })?;
     let resp_val = JsFuture::from(win.fetch_with_str(&url))
         .await
-        .map_err(|e| format!("fetch error: {e:?}"))?;
-    let resp: web_sys::Response = resp_val
-        .dyn_into()
-        .map_err(|_| "Not a Response".to_string())?;
+        .map_err(|e| {
+            web_sys::console::error_1(
+                &format!("[zone_access] fetch failed for {url}: {e:?}").into(),
+            );
+            ACCESS_LOAD_ERROR.to_string()
+        })?;
+    let resp: web_sys::Response = resp_val.dyn_into().map_err(|e| {
+        web_sys::console::error_1(
+            &format!("[zone_access] unexpected fetch response type: {e:?}").into(),
+        );
+        ACCESS_LOAD_ERROR.to_string()
+    })?;
     if !resp.ok() {
-        return Err(format!("HTTP {}", resp.status()));
+        web_sys::console::error_1(
+            &format!(
+                "[zone_access] check-whitelist returned HTTP {}",
+                resp.status()
+            )
+            .into(),
+        );
+        return Err(ACCESS_LOAD_ERROR.to_string());
     }
-    let text = JsFuture::from(resp.text().map_err(|e| format!("{e:?}"))?)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let text_str = text.as_string().ok_or("Not a string")?;
-    let val: serde_json::Value =
-        serde_json::from_str(&text_str).map_err(|e| format!("JSON parse: {e}"))?;
+    let text_promise = resp.text().map_err(|e| {
+        web_sys::console::error_1(
+            &format!("[zone_access] failed to read response body: {e:?}").into(),
+        );
+        ACCESS_LOAD_ERROR.to_string()
+    })?;
+    let text = JsFuture::from(text_promise).await.map_err(|e| {
+        web_sys::console::error_1(
+            &format!("[zone_access] failed to await response body: {e:?}").into(),
+        );
+        ACCESS_LOAD_ERROR.to_string()
+    })?;
+    let text_str = text.as_string().ok_or_else(|| {
+        web_sys::console::error_1(&"[zone_access] response body was not a string".into());
+        ACCESS_LOAD_ERROR.to_string()
+    })?;
+    let val: serde_json::Value = serde_json::from_str(&text_str).map_err(|e| {
+        web_sys::console::error_1(&format!("[zone_access] JSON parse failed: {e}").into());
+        ACCESS_LOAD_ERROR.to_string()
+    })?;
 
     let is_admin = val
         .get("isAdmin")
@@ -241,4 +345,70 @@ async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool, Vec<
 /// Retrieve the zone access store from context.
 pub fn use_zone_access() -> ZoneAccess {
     expect_context::<ZoneAccess>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stores::zones::ZoneVisibility;
+
+    fn locked_zone(id: &str, cohort: &str) -> Zone {
+        Zone {
+            id: id.to_string(),
+            display_name: String::new(),
+            required_cohorts: vec![cohort.to_string()],
+            write_cohorts: None,
+            banner_image_url: None,
+            visibility: ZoneVisibility::Locked,
+            encrypted: false,
+            accent_hex: None,
+        }
+    }
+
+    fn public_zone(id: &str) -> Zone {
+        Zone {
+            id: id.to_string(),
+            display_name: String::new(),
+            required_cohorts: vec![],
+            write_cohorts: None,
+            banner_image_url: None,
+            visibility: ZoneVisibility::Public,
+            encrypted: false,
+            accent_hex: None,
+        }
+    }
+
+    #[test]
+    fn home_zone_single_locked_membership_returns_it() {
+        let zones = vec![public_zone("public"), locked_zone("business", "business")];
+        let cohorts = vec!["business".to_string()];
+        let hz = home_zone_for(&zones, &cohorts, false);
+        assert_eq!(hz.map(|z| z.id), Some("business".to_string()));
+    }
+
+    #[test]
+    fn home_zone_admin_is_none() {
+        let zones = vec![locked_zone("business", "business")];
+        let cohorts = vec!["business".to_string()];
+        assert!(home_zone_for(&zones, &cohorts, true).is_none());
+    }
+
+    #[test]
+    fn home_zone_multiple_locked_memberships_is_none() {
+        let zones = vec![
+            locked_zone("business", "business"),
+            locked_zone("family", "family"),
+        ];
+        let cohorts = vec!["business".to_string(), "family".to_string()];
+        assert!(home_zone_for(&zones, &cohorts, false).is_none());
+    }
+
+    #[test]
+    fn home_zone_public_only_access_is_none() {
+        // A member with no cohorts can only read the public zone; a public zone
+        // (empty required_cohorts) never counts as a home zone.
+        let zones = vec![public_zone("public"), locked_zone("business", "business")];
+        let cohorts: Vec<String> = vec![];
+        assert!(home_zone_for(&zones, &cohorts, false).is_none());
+    }
 }

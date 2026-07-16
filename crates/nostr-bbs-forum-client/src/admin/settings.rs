@@ -30,15 +30,16 @@ struct SettingsResponse {
 }
 
 /// Setting type for rendering the correct input widget.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum SettingType {
     Text,
     Integer,
     Bool,
-    Enum(&'static [&'static str]),
+    Enum(Vec<String>),
 }
 
 /// Definition for a known setting.
+#[derive(Clone)]
 struct SettingDef {
     key: &'static str,
     label: &'static str,
@@ -47,132 +48,149 @@ struct SettingDef {
     default: &'static str,
 }
 
-const SETTING_DEFS: &[SettingDef] = &[
-    // General
-    SettingDef {
-        key: "community_name",
-        label: "Community Name",
-        category: "General",
-        setting_type: SettingType::Text,
-        default: "Community Forum",
-    },
-    SettingDef {
-        key: "community_description",
-        label: "Community Description",
-        category: "General",
-        setting_type: SettingType::Text,
-        default: "",
-    },
-    SettingDef {
-        key: "welcome_message",
-        label: "Welcome Message",
-        category: "General",
-        setting_type: SettingType::Text,
-        default: "Welcome to the community!",
-    },
-    // Access
-    SettingDef {
-        key: "registration_mode",
-        label: "Registration Mode",
-        category: "Access",
-        setting_type: SettingType::Enum(&["open", "invite", "closed"]),
-        default: "invite",
-    },
-    SettingDef {
-        key: "default_zone",
-        label: "Default Zone",
-        category: "Access",
-        setting_type: SettingType::Enum(&["home", "members", "private"]),
-        default: "home",
-    },
-    SettingDef {
-        key: "auto_whitelist",
-        label: "Auto-Whitelist New Users",
-        category: "Access",
-        setting_type: SettingType::Bool,
-        default: "false",
-    },
-    // Moderation
-    SettingDef {
-        key: "auto_hide_threshold",
-        label: "Auto-Hide Report Threshold",
-        category: "Moderation",
-        setting_type: SettingType::Integer,
-        default: "3",
-    },
-    SettingDef {
-        key: "max_post_length",
-        label: "Max Post Length",
-        category: "Moderation",
-        setting_type: SettingType::Integer,
-        default: "64000",
-    },
-    // Trust
-    SettingDef {
-        key: "tl1_days_active",
-        label: "TL1: Days Active Required",
-        category: "Trust",
-        setting_type: SettingType::Integer,
-        default: "3",
-    },
-    SettingDef {
-        key: "tl1_posts_read",
-        label: "TL1: Posts Read Required",
-        category: "Trust",
-        setting_type: SettingType::Integer,
-        default: "10",
-    },
-    SettingDef {
-        key: "tl1_posts_created",
-        label: "TL1: Posts Created Required",
-        category: "Trust",
-        setting_type: SettingType::Integer,
-        default: "1",
-    },
-    SettingDef {
-        key: "tl2_days_active",
-        label: "TL2: Days Active Required",
-        category: "Trust",
-        setting_type: SettingType::Integer,
-        default: "14",
-    },
-    SettingDef {
-        key: "tl2_posts_read",
-        label: "TL2: Posts Read Required",
-        category: "Trust",
-        setting_type: SettingType::Integer,
-        default: "50",
-    },
-    SettingDef {
-        key: "tl2_posts_created",
-        label: "TL2: Posts Created Required",
-        category: "Trust",
-        setting_type: SettingType::Integer,
-        default: "10",
-    },
-    // Engagement
-    SettingDef {
-        key: "enable_reactions",
-        label: "Enable Reactions",
-        category: "Engagement",
-        setting_type: SettingType::Bool,
-        default: "true",
-    },
-    SettingDef {
-        key: "enable_dms",
-        label: "Enable Direct Messages",
-        category: "Engagement",
-        setting_type: SettingType::Bool,
-        default: "true",
-    },
-    SettingDef {
-        key: "enable_calendar",
-        label: "Enable Calendar",
-        category: "Engagement",
-        setting_type: SettingType::Bool,
-        default: "true",
-    },
-];
+/// Build the settings definitions, deriving zone options from the live
+/// `ZONE_CONFIG` so the "Default Zone" dropdown always matches the
+/// operator's configured zones rather than a hardcoded legacy list.
+fn setting_defs() -> Vec<SettingDef> {
+    let zone_ids: Vec<String> = {
+        let zones = crate::stores::zones::load_zones();
+        if zones.is_empty() {
+            vec!["public".into()]
+        } else {
+            zones.iter().map(|z| z.id.clone()).collect()
+        }
+    };
+    let default_zone = zone_ids.first().cloned().unwrap_or_else(|| "public".into());
+
+    vec![
+        // General
+        SettingDef {
+            key: "community_name",
+            label: "Community Name",
+            category: "General",
+            setting_type: SettingType::Text,
+            default: "Community Forum",
+        },
+        SettingDef {
+            key: "community_description",
+            label: "Community Description",
+            category: "General",
+            setting_type: SettingType::Text,
+            default: "",
+        },
+        SettingDef {
+            key: "welcome_message",
+            label: "Welcome Message",
+            category: "General",
+            setting_type: SettingType::Text,
+            default: "Welcome to the community!",
+        },
+        // Access
+        SettingDef {
+            key: "registration_mode",
+            label: "Registration Mode",
+            category: "Access",
+            setting_type: SettingType::Enum(vec!["open".into(), "invite".into(), "closed".into()]),
+            default: "invite",
+        },
+        SettingDef {
+            key: "default_zone",
+            label: "Default Zone",
+            category: "Access",
+            setting_type: SettingType::Enum(zone_ids),
+            // Leak the first zone id so it can serve as the &'static default.
+            // Safe: this runs once per tab mount and the tiny alloc is harmless.
+            default: Box::leak(default_zone.into_boxed_str()),
+        },
+        SettingDef {
+            key: "auto_whitelist",
+            label: "Auto-Whitelist New Users",
+            category: "Access",
+            setting_type: SettingType::Bool,
+            default: "false",
+        },
+        // Moderation
+        SettingDef {
+            key: "auto_hide_threshold",
+            label: "Auto-Hide Report Threshold",
+            category: "Moderation",
+            setting_type: SettingType::Integer,
+            default: "3",
+        },
+        SettingDef {
+            key: "max_post_length",
+            label: "Max Post Length",
+            category: "Moderation",
+            setting_type: SettingType::Integer,
+            default: "64000",
+        },
+        // Trust
+        SettingDef {
+            key: "tl1_days_active",
+            label: "TL1: Days Active Required",
+            category: "Trust",
+            setting_type: SettingType::Integer,
+            default: "3",
+        },
+        SettingDef {
+            key: "tl1_posts_read",
+            label: "TL1: Posts Read Required",
+            category: "Trust",
+            setting_type: SettingType::Integer,
+            default: "10",
+        },
+        SettingDef {
+            key: "tl1_posts_created",
+            label: "TL1: Posts Created Required",
+            category: "Trust",
+            setting_type: SettingType::Integer,
+            default: "1",
+        },
+        SettingDef {
+            key: "tl2_days_active",
+            label: "TL2: Days Active Required",
+            category: "Trust",
+            setting_type: SettingType::Integer,
+            default: "14",
+        },
+        SettingDef {
+            key: "tl2_posts_read",
+            label: "TL2: Posts Read Required",
+            category: "Trust",
+            setting_type: SettingType::Integer,
+            default: "50",
+        },
+        SettingDef {
+            key: "tl2_posts_created",
+            label: "TL2: Posts Created Required",
+            category: "Trust",
+            setting_type: SettingType::Integer,
+            default: "10",
+        },
+        // Engagement
+        SettingDef {
+            key: "enable_reactions",
+            label: "Enable Reactions",
+            category: "Engagement",
+            setting_type: SettingType::Bool,
+            default: "true",
+        },
+        SettingDef {
+            key: "enable_dms",
+            label: "Enable Direct Messages",
+            category: "Engagement",
+            setting_type: SettingType::Bool,
+            default: "true",
+        },
+        SettingDef {
+            key: "enable_calendar",
+            label: "Enable Calendar",
+            category: "Engagement",
+            setting_type: SettingType::Bool,
+            default: "true",
+        },
+    ]
+}
 
 const CATEGORIES: &[&str] = &["General", "Access", "Moderation", "Trust", "Engagement"];
 
@@ -252,7 +270,7 @@ pub fn SettingsTab() -> impl IntoView {
                             settings.set(resp.settings);
                         } else {
                             // API may not exist yet -- populate with defaults
-                            let defaults: Vec<SettingEntry> = SETTING_DEFS
+                            let defaults: Vec<SettingEntry> = setting_defs()
                                 .iter()
                                 .map(|d| SettingEntry {
                                     key: d.key.to_string(),
@@ -266,7 +284,7 @@ pub fn SettingsTab() -> impl IntoView {
                     }
                     Err(_) => {
                         // Populate with defaults on fetch failure
-                        let defaults: Vec<SettingEntry> = SETTING_DEFS
+                        let defaults: Vec<SettingEntry> = setting_defs()
                             .iter()
                             .map(|d| SettingEntry {
                                 key: d.key.to_string(),
@@ -381,8 +399,10 @@ pub fn SettingsTab() -> impl IntoView {
                     </div>
                 }
             >
-                {CATEGORIES.iter().map(|&category| {
-                    let defs: Vec<&SettingDef> = SETTING_DEFS.iter().filter(|d| d.category == category).collect();
+                {
+                    let all_defs = setting_defs();
+                    CATEGORIES.iter().map(|&category| {
+                    let defs: Vec<SettingDef> = all_defs.iter().filter(|d| d.category == category).cloned().collect();
                     let cat_icon = category_icon(category);
                     view! {
                         <div class="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
@@ -422,7 +442,8 @@ pub fn SettingsTab() -> impl IntoView {
                             </div>
                         </div>
                     }
-                }).collect_view()}
+                }).collect_view()
+                }
             </Show>
         </div>
     }
@@ -504,11 +525,11 @@ fn SettingRow(
                                 }
                                 class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-colors"
                             >
-                                {options.iter().map(|&opt| {
-                                    let opt_str = opt.to_string();
-                                    let opt_val = opt_str.clone();
+                                {options.iter().map(|opt| {
+                                    let opt_val = opt.clone();
+                                    let opt_label = crate::utils::capitalize(opt);
                                     view! {
-                                        <option value=opt_val>{crate::utils::capitalize(&opt_str)}</option>
+                                        <option value=opt_val>{opt_label}</option>
                                     }
                                 }).collect_view()}
                             </select>

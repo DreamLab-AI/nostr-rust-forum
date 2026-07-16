@@ -32,6 +32,10 @@ pub fn DmChatPage() -> impl IntoView {
     provide_dm_store();
     let dm_store = use_dm_store();
 
+    // Dev-auth: activate the local jarvis echo bot
+    #[cfg(feature = "dev-auth")]
+    crate::auth::dev::spawn_jarvis_echo_bot();
+
     let params = use_params_map();
     let recipient_pubkey = move || params.read().get("pubkey").unwrap_or_default();
 

@@ -167,6 +167,8 @@ pub fn SectionPage() -> impl IntoView {
     let store = use_channel_store();
     let read_store = use_read_positions();
     let zone_access = use_zone_access();
+    // Copy for the zone-first breadcrumb (ADR-107); `ZoneAccess` is `Copy`.
+    let za_breadcrumb = zone_access;
     let toasts = use_toasts();
 
     let params = use_params_map();
@@ -328,15 +330,35 @@ pub fn SectionPage() -> impl IntoView {
                 }
             }}
 
-            <Breadcrumb items=vec![
-                BreadcrumbItem::link("Home", "/"),
-                BreadcrumbItem::link("Forums", "/forums"),
-                BreadcrumbItem::link(
-                    category_display_name(&category_slug()),
-                    format!("/forums/{}", category_slug()),
-                ),
-                BreadcrumbItem::current(header_name()),
-            ] />
+            // Zone-first breadcrumb (ADR-107): single-locked-zone members drop
+            // the global "Forums" crumb but keep the zone as the landing link;
+            // everyone else keeps Home › Forums › {Zone} › {Section}.
+            {move || {
+                let slug = category_slug();
+                let zone_label = category_display_name(&slug);
+                let zone_href = format!("/forums/{}", slug);
+                let section_label = header_name();
+                if za_breadcrumb.home_zone().is_some() {
+                    view! {
+                        <Breadcrumb items=vec![
+                            BreadcrumbItem::link("Home", "/"),
+                            BreadcrumbItem::link(zone_label, zone_href),
+                            BreadcrumbItem::current(section_label),
+                        ] />
+                    }
+                    .into_any()
+                } else {
+                    view! {
+                        <Breadcrumb items=vec![
+                            BreadcrumbItem::link("Home", "/"),
+                            BreadcrumbItem::link("Forums", "/forums"),
+                            BreadcrumbItem::link(zone_label, zone_href),
+                            BreadcrumbItem::current(section_label),
+                        ] />
+                    }
+                    .into_any()
+                }
+            }}
 
             <div class="flex items-start justify-between gap-3 mt-2 mb-4">
                 <div class="min-w-0">

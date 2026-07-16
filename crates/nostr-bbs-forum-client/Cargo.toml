@@ -15,6 +15,10 @@ rust-version = "1.85"
 name = "nostr-bbs-forum-client"
 path = "src/main.rs"
 
+[features]
+default = []
+dev-auth = []
+
 [dependencies]
 nostr-bbs-core = { workspace = true }
 # `solid-pod-rs` core feature — wasm32-safe pure-logic surface. Exposes

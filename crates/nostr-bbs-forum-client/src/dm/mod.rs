@@ -442,6 +442,34 @@ impl DMStore {
         Ok(())
     }
 
+    /// Inject a message directly into the store (dev-auth echo bot only).
+    #[cfg(feature = "dev-auth")]
+    pub fn inject_dev_message(&self, msg: DMMessage) {
+        self.state.update(|s| {
+            if s.seen_ids.insert(msg.id.clone()) {
+                // Update conversation summary
+                let convo = s
+                    .conversations
+                    .entry(msg.sender_pubkey.clone())
+                    .or_insert_with(|| DMConversation {
+                        pubkey: msg.sender_pubkey.clone(),
+                        name: crate::components::user_display::use_display_name(&msg.sender_pubkey),
+                        last_message: String::new(),
+                        last_timestamp: 0,
+                        unread_count: 0,
+                    });
+                convo.last_message = truncate_message(&msg.content, 80);
+                convo.last_timestamp = msg.timestamp;
+                convo.unread_count += 1;
+
+                // Only push to visible messages if this conversation is selected
+                if s.current_conversation.as_deref() == Some(&msg.sender_pubkey) {
+                    s.messages.push(msg);
+                }
+            }
+        });
+    }
+
     /// Unsubscribe from all active DM subscriptions.
     pub fn cleanup(&self, relay: &RelayConnection) {
         // Invalidate any pending auth-retry timers from this page.

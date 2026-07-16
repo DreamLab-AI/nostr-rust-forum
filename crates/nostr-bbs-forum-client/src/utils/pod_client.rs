@@ -28,11 +28,14 @@ pub async fn upload_to_pod_signer(
     let base_url = pod_api_url.unwrap_or(POD_API);
     let url = format!("{}/pods/{}/media/public/{}", base_url, pubkey, filename);
 
-    // Read blob into bytes for NIP-98 payload hash
+    // Read blob into bytes for NIP-98 payload hash. A raw JsValue debug dump
+    // here (e.g. `NotFoundError`) is meaningless to a user, so surface a
+    // friendly message and log the underlying detail to the console (#16).
     let array_buf_promise = blob.array_buffer();
-    let array_buf = JsFuture::from(array_buf_promise)
-        .await
-        .map_err(|e| format!("Blob read: {e:?}"))?;
+    let array_buf = JsFuture::from(array_buf_promise).await.map_err(|e| {
+        web_sys::console::error_1(&e);
+        "Could not read the selected file — please choose it again.".to_string()
+    })?;
     let bytes: Vec<u8> = js_sys::Uint8Array::new(&array_buf).to_vec();
 
     // Create NIP-98 auth token via signer
@@ -58,9 +61,15 @@ pub async fn upload_to_pod_signer(
     init.set_body(&js_sys::Uint8Array::from(bytes.as_slice()).into());
 
     let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
+    // A network-layer failure (offline, DNS, CORS) rejects the fetch promise
+    // with an opaque JsValue — give the user something actionable and keep the
+    // detail in the console (#16).
     let resp_val = JsFuture::from(window.fetch_with_request(&req))
         .await
-        .map_err(|e| format!("Fetch: {e:?}"))?;
+        .map_err(|e| {
+            web_sys::console::error_1(&e);
+            "Could not reach the media server — check your connection.".to_string()
+        })?;
     let resp: web_sys::Response = resp_val.unchecked_into();
 
     if !resp.ok() {
@@ -120,11 +129,13 @@ pub async fn upload_to_pod(
     let base_url = pod_api_url.unwrap_or(POD_API);
     let url = format!("{}/pods/{}/media/public/{}", base_url, pubkey, filename);
 
-    // Read blob into bytes for NIP-98 payload hash
+    // Read blob into bytes for NIP-98 payload hash. Friendly message + console
+    // detail rather than a raw JsValue debug dump in the UI (#16).
     let array_buf_promise = blob.array_buffer();
-    let array_buf = JsFuture::from(array_buf_promise)
-        .await
-        .map_err(|e| format!("Blob read: {e:?}"))?;
+    let array_buf = JsFuture::from(array_buf_promise).await.map_err(|e| {
+        web_sys::console::error_1(&e);
+        "Could not read the selected file — please choose it again.".to_string()
+    })?;
     let bytes: Vec<u8> = js_sys::Uint8Array::new(&array_buf).to_vec();
 
     // Create NIP-98 auth token
@@ -148,9 +159,13 @@ pub async fn upload_to_pod(
     init.set_body(&js_sys::Uint8Array::from(bytes.as_slice()).into());
 
     let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
+    // Friendly network-failure copy; opaque JsValue detail goes to the console (#16).
     let resp_val = JsFuture::from(window.fetch_with_request(&req))
         .await
-        .map_err(|e| format!("Fetch: {e:?}"))?;
+        .map_err(|e| {
+            web_sys::console::error_1(&e);
+            "Could not reach the media server — check your connection.".to_string()
+        })?;
     let resp: web_sys::Response = resp_val.unchecked_into();
 
     if !resp.ok() {

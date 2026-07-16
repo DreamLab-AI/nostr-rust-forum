@@ -210,6 +210,8 @@ pub fn ThreadPage() -> impl IntoView {
     let store = use_channel_store();
     let read_store = use_read_positions();
     let zone_access = use_zone_access();
+    // Copy for the zone-first breadcrumb (ADR-107); `ZoneAccess` is `Copy`.
+    let za_breadcrumb = zone_access;
     let toasts = use_toasts();
 
     let params = use_params_map();
@@ -626,16 +628,39 @@ pub fn ThreadPage() -> impl IntoView {
             let accent = load_zones().into_iter().find(|z| z.id == slug).and_then(|z| z.accent_hex);
             zone_accent_style_cfg(&slug, accent.as_deref())
         }>
-            <Breadcrumb items=vec![
-                BreadcrumbItem::link("Home", "/"),
-                BreadcrumbItem::link("Forums", "/forums"),
-                BreadcrumbItem::link(
-                    category_display_name(&category_slug()),
-                    format!("/forums/{}", category_slug()),
-                ),
-                BreadcrumbItem::link(section_name(), section_href()),
-                BreadcrumbItem::current(topic_title()),
-            ] />
+            // Zone-first breadcrumb (ADR-107): single-locked-zone members drop
+            // the global "Forums" crumb but keep the zone as the landing link;
+            // everyone else keeps Home › Forums › {Zone} › {Section} › {Topic}.
+            {move || {
+                let slug = category_slug();
+                let zone_label = category_display_name(&slug);
+                let zone_href = format!("/forums/{}", slug);
+                let sec_name = section_name();
+                let sec_href = section_href();
+                let topic = topic_title();
+                if za_breadcrumb.home_zone().is_some() {
+                    view! {
+                        <Breadcrumb items=vec![
+                            BreadcrumbItem::link("Home", "/"),
+                            BreadcrumbItem::link(zone_label, zone_href),
+                            BreadcrumbItem::link(sec_name, sec_href),
+                            BreadcrumbItem::current(topic),
+                        ] />
+                    }
+                    .into_any()
+                } else {
+                    view! {
+                        <Breadcrumb items=vec![
+                            BreadcrumbItem::link("Home", "/"),
+                            BreadcrumbItem::link("Forums", "/forums"),
+                            BreadcrumbItem::link(zone_label, zone_href),
+                            BreadcrumbItem::link(sec_name, sec_href),
+                            BreadcrumbItem::current(topic),
+                        ] />
+                    }
+                    .into_any()
+                }
+            }}
 
             {move || {
                 if loading.get() {

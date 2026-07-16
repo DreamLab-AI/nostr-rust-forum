@@ -369,6 +369,13 @@ impl AuthStore {
                                 is_local_key: true,
                                 extension_name: None,
                             });
+                            // Refresh nickname/avatar from the relay so a
+                            // session persisted before the display name was
+                            // saved (or updated on another device) still shows
+                            // the real identity, not a truncated pubkey (QA
+                            // #11). Fire-and-forget, silent on failure, and
+                            // never overwrites an in-session edit.
+                            self.hydrate_profile_from_relay(pubkey.clone());
                             return;
                         }
                     }

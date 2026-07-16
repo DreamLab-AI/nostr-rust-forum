@@ -10,6 +10,9 @@ pub mod passkey;
 mod session;
 mod webauthn;
 
+#[cfg(feature = "dev-auth")]
+pub mod dev;
+
 use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
@@ -471,7 +474,7 @@ impl AuthStore {
             state: AuthPhase::Authenticated,
             pubkey: Some(pubkey.clone()),
             is_authenticated: true,
-            public_key: Some(pubkey),
+            public_key: Some(pubkey.clone()),
             nickname,
             avatar,
             error: None,
@@ -485,7 +488,100 @@ impl AuthStore {
         });
 
         key_bytes.zeroize();
+
+        // Fire-and-forget: an nsec recovery login restores the pubkey but not
+        // the user's kind-0 display name/avatar, so the header shows only a
+        // truncated pubkey until they manually re-save their profile (QA #11).
+        // Fetch the user's own kind-0 metadata off the relay projection and
+        // hydrate the display fields + persisted session. Non-blocking, silent
+        // on failure (keeps the pubkey fallback).
+        self.hydrate_profile_from_relay(pubkey);
+
         Ok(())
+    }
+
+    /// Fetch the authenticated user's own kind-0 profile and hydrate the
+    /// reactive nickname/avatar plus the persisted `StoredSession`.
+    ///
+    /// Runs fire-and-forget (spawned) so it never blocks the login flow, and
+    /// degrades silently when the relay projection is unreachable — the
+    /// truncated-pubkey fallback simply persists. A profile field is only
+    /// applied when it has NOT changed since the fetch was spawned, so a
+    /// nickname/avatar the user edited locally during this session (e.g. a
+    /// profile save that lands first) is never clobbered.
+    pub(super) fn hydrate_profile_from_relay(&self, pubkey: String) {
+        if pubkey.is_empty() {
+            return;
+        }
+        let store = *self;
+        // Snapshot the values present right after login. If either differs
+        // when the fetch returns, the user touched it in-session — leave it.
+        let (pre_nickname, pre_avatar) = {
+            let st = store.state.get_untracked();
+            (st.nickname, st.avatar)
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(entry) = crate::stores::profile_cache::fetch_profile(&pubkey).await else {
+                return;
+            };
+
+            // The nickname is the kind-0 DISPLAY name: prefer `display_name`,
+            // fall back to `name` (mirrors the settings page). NIP-05 is a
+            // claimed handle, not a display name, so it is deliberately excluded.
+            let fetched_nickname = entry
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    entry
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .map(String::from);
+            let fetched_avatar = entry
+                .picture
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| p.starts_with("http://") || p.starts_with("https://"))
+                .map(String::from);
+
+            // Nothing usable came back — keep the pubkey fallback intact.
+            if fetched_nickname.is_none() && fetched_avatar.is_none() {
+                return;
+            }
+
+            let mut changed = false;
+            let mut new_nickname = None;
+            let mut new_avatar = None;
+            store.state.update(|s| {
+                if let Some(nick) = fetched_nickname {
+                    // Only apply if untouched since login and actually new.
+                    if s.nickname == pre_nickname && s.nickname.as_deref() != Some(nick.as_str()) {
+                        s.nickname = Some(nick);
+                        changed = true;
+                    }
+                }
+                if let Some(av) = fetched_avatar {
+                    if s.avatar == pre_avatar && s.avatar.as_deref() != Some(av.as_str()) {
+                        s.avatar = Some(av);
+                        changed = true;
+                    }
+                }
+                new_nickname = s.nickname.clone();
+                new_avatar = s.avatar.clone();
+            });
+
+            // Persist so the restored identity survives the next reload.
+            if changed {
+                store.update_storage_field(|stored| {
+                    stored.nickname = new_nickname;
+                    stored.avatar = new_avatar;
+                });
+            }
+        });
     }
 
     /// Login with a NIP-07 browser extension (nos2x, Alby, etc.).
