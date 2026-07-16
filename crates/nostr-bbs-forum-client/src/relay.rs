@@ -13,7 +13,7 @@ use nostr_bbs_core::{NostrEvent, UnsignedEvent};
 use send_wrapper::SendWrapper;
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -27,6 +27,19 @@ const MAX_RECONNECT_DELAY_MS: u32 = 30_000;
 
 /// Base reconnect delay in milliseconds.
 const BASE_RECONNECT_DELAY_MS: u32 = 1_000;
+
+/// Client-side send pacing: at most this many REQ/EVENT/CLOSE frames per
+/// rolling second. The relay-worker drops frames beyond a per-IP cap
+/// (`MAX_EVENTS_PER_SECOND = 10` in `relay_do/broadcast.rs`) with only a
+/// NOTICE — at boot the client's burst (initial REQs + kind-0/10002
+/// publishes + the post-AUTH replay) exceeded it, silently losing the
+/// message subscriptions ("0 messages" everywhere). Pacing below the cap
+/// leaves headroom for the AUTH frame and clock skew; overflow is delayed
+/// into the next window, never dropped.
+const MAX_SENDS_PER_SECOND: usize = 8;
+
+/// Rolling window for [`MAX_SENDS_PER_SECOND`], in milliseconds.
+const SEND_WINDOW_MS: f64 = 1_000.0;
 
 /// Connection state for the relay WebSocket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +111,13 @@ struct RelayInner {
     sub_counter: u32,
     reconnect_attempts: u32,
     pending_messages: Vec<String>,
+    /// Timestamps (ms) of frames sent in the current [`SEND_WINDOW_MS`]
+    /// window — the client half of the relay's per-IP rate limit.
+    send_times: Vec<f64>,
+    /// Frames awaiting a send slot. Drained FIFO by [`drain_send_queue`].
+    send_queue: VecDeque<String>,
+    /// Whether a delayed drain is already scheduled (avoids timer pile-up).
+    drain_scheduled: bool,
     relay_url: String,
     seen_events: HashSet<String>,
     auth_signer: Option<AuthSignCallback>,
@@ -164,6 +184,66 @@ unsafe impl Send for RelayConnection {}
 #[cfg(target_arch = "wasm32")]
 unsafe impl Sync for RelayConnection {}
 
+/// Queue a frame for paced sending and kick the drain. See
+/// [`MAX_SENDS_PER_SECOND`] for why the client self-limits.
+fn queue_paced(inner_rc: &Rc<RefCell<RelayInner>>, msg: String) {
+    inner_rc.borrow_mut().send_queue.push_back(msg);
+    drain_send_queue(inner_rc.clone());
+}
+
+/// Send queued frames while the rolling window has budget; when the budget
+/// is exhausted, schedule a one-shot drain for when the oldest send ages out
+/// of the window. Frames are only dequeued while the socket is OPEN — on a
+/// closed socket they wait for the reconnect flush in `on_open`.
+fn drain_send_queue(inner_rc: Rc<RefCell<RelayInner>>) {
+    let (batch, ws, retry_in) = {
+        let mut inner = inner_rc.borrow_mut();
+        let now = js_sys::Date::now();
+        inner.send_times.retain(|&ts| ts >= now - SEND_WINDOW_MS);
+
+        let ws = match &inner.ws {
+            Some(ws) if ws.ready_state() == WebSocket::OPEN => ws.clone(),
+            _ => return,
+        };
+
+        let budget = MAX_SENDS_PER_SECOND.saturating_sub(inner.send_times.len());
+        let mut batch = Vec::new();
+        for _ in 0..budget {
+            match inner.send_queue.pop_front() {
+                Some(m) => {
+                    inner.send_times.push(now);
+                    batch.push(m);
+                }
+                None => break,
+            }
+        }
+
+        let retry_in = if inner.send_queue.is_empty() || inner.drain_scheduled {
+            None
+        } else {
+            inner.drain_scheduled = true;
+            // Wake just after the oldest timestamp leaves the window.
+            let oldest = inner.send_times.first().copied().unwrap_or(now);
+            Some(((oldest + SEND_WINDOW_MS - now).max(0.0) as i32) + 15)
+        };
+        (batch, ws, retry_in)
+    };
+
+    for msg in batch {
+        let _ = ws.send_with_str(&msg);
+    }
+    if let Some(delay_ms) = retry_in {
+        let rc = inner_rc.clone();
+        crate::utils::set_timeout_once(
+            move || {
+                rc.borrow_mut().drain_scheduled = false;
+                drain_send_queue(rc.clone());
+            },
+            delay_ms,
+        );
+    }
+}
+
 impl RelayConnection {
     /// Create a new relay connection manager. Does not connect immediately.
     pub fn new() -> Self {
@@ -175,6 +255,9 @@ impl RelayConnection {
             sub_counter: 0,
             reconnect_attempts: 0,
             pending_messages: Vec::new(),
+            send_times: Vec::new(),
+            send_queue: VecDeque::new(),
+            drain_scheduled: false,
             relay_url,
             seen_events: HashSet::new(),
             auth_signer: None,
@@ -296,34 +379,40 @@ impl RelayConnection {
         let on_open = Closure::wrap(Box::new(move || {
             web_sys::console::log_1(&"[Relay] WebSocket connected".into());
             state.set(ConnectionState::Connected);
-            let authed_sink = {
+            let (frames, authed_sink) = {
                 let mut inner = inner_rc.borrow_mut();
                 inner.reconnect_attempts = 0;
                 inner.seen_events.clear();
-                // Flush pending messages
-                let pending: Vec<String> = inner.pending_messages.drain(..).collect();
-                if let Some(ws) = &inner.ws {
-                    for msg in pending {
-                        let _ = ws.send_with_str(&msg);
+                // Flush pending frames queued while the socket was down —
+                // EXCEPT REQs: every live subscription is replayed below, so
+                // flushing a queued REQ too double-sends it (observed at boot,
+                // where the duplicate burned rate-limit budget).
+                let mut frames: Vec<String> = inner
+                    .pending_messages
+                    .drain(..)
+                    .filter(|m| !m.starts_with("[\"REQ\""))
+                    .collect();
+                // Replay subscriptions on (re)connect
+                for (sub_id, sub) in inner.subscriptions.iter() {
+                    let mut req = vec![
+                        serde_json::Value::String("REQ".into()),
+                        serde_json::Value::String(sub_id.clone()),
+                    ];
+                    for filter in &sub.filters {
+                        if let Ok(v) = serde_json::to_value(filter) {
+                            req.push(v);
+                        }
                     }
-                    // Replay subscriptions on reconnect
-                    for (sub_id, sub) in inner.subscriptions.iter() {
-                        let mut req = vec![
-                            serde_json::Value::String("REQ".into()),
-                            serde_json::Value::String(sub_id.clone()),
-                        ];
-                        for filter in &sub.filters {
-                            if let Ok(v) = serde_json::to_value(filter) {
-                                req.push(v);
-                            }
-                        }
-                        if let Ok(msg) = serde_json::to_string(&req) {
-                            let _ = ws.send_with_str(&msg);
-                        }
+                    if let Ok(msg) = serde_json::to_string(&req) {
+                        frames.push(msg);
                     }
                 }
-                inner.authed_sink
+                (frames, inner.authed_sink)
             };
+            // Borrow released — the paced queue re-borrows per frame.
+            for msg in frames {
+                queue_paced(&inner_rc, msg);
+            }
             // A fresh socket is not yet NIP-42 authenticated — gated REQs must
             // wait for the AUTH handshake to flip this back to true. Set after
             // the borrow ends so a reactive effect reading `authenticated`
@@ -396,6 +485,10 @@ impl RelayConnection {
             // NOTE: subscriptions are preserved so they can be replayed on reconnect.
             inner.pending_publishes.clear();
             inner.pending_messages.clear();
+            // Stale queued frames must not double-send after a reconnect —
+            // the on_open flush + replay rebuilds everything still relevant.
+            inner.send_queue.clear();
+            inner.send_times.clear();
         });
     }
 
@@ -479,17 +572,19 @@ impl RelayConnection {
         Ok(())
     }
 
-    /// Send a raw string message to the WebSocket.
+    /// Send a raw string message to the WebSocket, paced under the relay's
+    /// per-IP rate limit. Queued in `pending_messages` while disconnected.
     fn send_raw(&self, msg: &str) {
         self.with_inner(|rc| {
-            let mut inner = rc.borrow_mut();
-            if let Some(ws) = &inner.ws {
-                if ws.ready_state() == WebSocket::OPEN {
-                    let _ = ws.send_with_str(msg);
-                    return;
-                }
+            let is_open = {
+                let inner = rc.borrow();
+                matches!(&inner.ws, Some(ws) if ws.ready_state() == WebSocket::OPEN)
+            };
+            if is_open {
+                queue_paced(rc, msg.to_string());
+            } else {
+                rc.borrow_mut().pending_messages.push(msg.to_string());
             }
-            inner.pending_messages.push(msg.to_string());
         });
     }
 
@@ -727,9 +822,10 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                         // `inner.borrow_mut()`. Holding this borrow across the
                         // set would re-enter the same RefCell and panic
                         // ("already borrowed").
-                        let authed_sink = {
+                        let (frames, authed_sink) = {
                             let inner = replay_rc.borrow();
-                            if let Some(ws) = ws {
+                            let mut frames = Vec::new();
+                            if ws.is_some() {
                                 for (sub_id, sub) in inner.subscriptions.iter() {
                                     let mut req = vec![
                                         serde_json::Value::String("REQ".into()),
@@ -741,15 +837,23 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                                         }
                                     }
                                     if let Ok(msg) = serde_json::to_string(&req) {
-                                        let _ = ws.send_with_str(&msg);
+                                        frames.push(msg);
                                     }
                                 }
-                                web_sys::console::log_1(
-                                    &"[Relay] replayed subscriptions post-AUTH".into(),
-                                );
                             }
-                            inner.authed_sink
+                            (frames, inner.authed_sink)
                         };
+                        // Paced: the boot replay is exactly the burst that
+                        // tripped the relay's per-IP limit and dropped the
+                        // message REQs ("0 messages" symptom).
+                        if !frames.is_empty() {
+                            for msg in frames {
+                                queue_paced(&replay_rc, msg);
+                            }
+                            web_sys::console::log_1(
+                                &"[Relay] replayed subscriptions post-AUTH (paced)".into(),
+                            );
+                        }
                         // Mark the session authenticated so AUTH-gated consumers
                         // (DM store) can now safely (re-)issue their kind-1059
                         // REQs. Doing this *after* the AUTH response is sent and

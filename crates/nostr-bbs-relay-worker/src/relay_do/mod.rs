@@ -66,6 +66,10 @@ pub struct NostrRelayDO {
     pub(crate) sessions: RefCell<HashMap<u64, SessionInfo>>,
     pub(crate) next_session_id: RefCell<u64>,
     pub(crate) rate_limits: RefCell<HashMap<String, Vec<f64>>>,
+    /// Lazily-resolved per-IP message budget per rolling second (EVENT/REQ/
+    /// COUNT frames). `RATE_LIMIT_MSGS_PER_SEC` env var, else the built-in
+    /// default. Cached after first read — `Env::var` crosses the JS boundary.
+    pub(crate) rate_limit_per_sec: std::cell::Cell<Option<usize>>,
     pub(crate) connection_counts: RefCell<HashMap<String, u32>>,
     /// WI-2: 60s-TTL cache of active ban/mute actions keyed by target pubkey.
     pub(crate) mod_cache: ModCache,
@@ -82,6 +86,7 @@ impl DurableObject for NostrRelayDO {
             sessions: RefCell::new(HashMap::new()),
             next_session_id: RefCell::new(1),
             rate_limits: RefCell::new(HashMap::new()),
+            rate_limit_per_sec: std::cell::Cell::new(None),
             connection_counts: RefCell::new(HashMap::new()),
             mod_cache: ModCache::new(),
             admin_cache: AdminCache::new(),

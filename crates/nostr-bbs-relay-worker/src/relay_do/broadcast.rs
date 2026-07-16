@@ -134,19 +134,42 @@ impl NostrRelayDO {
 // Rate limiting
 // ---------------------------------------------------------------------------
 
-/// Maximum events per second per IP.
-const MAX_EVENTS_PER_SECOND: usize = 10;
+/// Default maximum EVENT/REQ/COUNT frames per second per IP, when the
+/// `RATE_LIMIT_MSGS_PER_SEC` env var is unset. Note the limit is per IP, so
+/// several users behind one NAT share a single budget — a client booting the
+/// forum sends ~10 frames (initial REQs, kind-0/10002 publishes, post-AUTH
+/// replay), which is why the old hardcoded 10 broke concurrent boots. The
+/// forum client also self-paces below this (`relay.rs MAX_SENDS_PER_SECOND`).
+const DEFAULT_MAX_MSGS_PER_SECOND: usize = 30;
 
 impl NostrRelayDO {
+    /// Per-IP frame budget: `RATE_LIMIT_MSGS_PER_SEC` env var, else
+    /// [`DEFAULT_MAX_MSGS_PER_SECOND`]. Cached after first resolution.
+    fn max_msgs_per_second(&self) -> usize {
+        if let Some(v) = self.rate_limit_per_sec.get() {
+            return v;
+        }
+        let v = self
+            .env
+            .var("RATE_LIMIT_MSGS_PER_SEC")
+            .ok()
+            .and_then(|s| s.to_string().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_MSGS_PER_SECOND);
+        self.rate_limit_per_sec.set(Some(v));
+        v
+    }
+
     pub(crate) fn check_rate_limit(&self, ip: &str) -> bool {
         let now = js_sys::Date::now();
         let cutoff = now - 1000.0;
+        let limit = self.max_msgs_per_second();
 
         let mut rate_limits = self.rate_limits.borrow_mut();
         let timestamps = rate_limits.entry(ip.to_string()).or_default();
         timestamps.retain(|&ts| ts >= cutoff);
 
-        if timestamps.len() >= MAX_EVENTS_PER_SECOND {
+        if timestamps.len() >= limit {
             return false;
         }
         timestamps.push(now);

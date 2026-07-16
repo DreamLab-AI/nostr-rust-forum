@@ -1,8 +1,12 @@
 //! Pod API upload client with NIP-98 authentication.
 //!
-//! Uploads compressed images and thumbnails to the user's Solid pod via the
-//! pod-api Cloudflare Worker. Each upload is authenticated with a NIP-98
-//! `Authorization: Nostr <token>` header.
+//! Uploads compressed images and thumbnails to the user's Solid pod. Each
+//! upload is authenticated with a NIP-98 `Authorization: Nostr <token>`
+//! header and written with `PUT` — the Solid verb for creating/replacing a
+//! resource at a known URL. Both backends accept it: the pod-api Cloudflare
+//! Worker treats PUT as the primary resource write, and `solid-pod-rs`
+//! accepts *only* PUT for direct file URLs (its POST is container-only, so
+//! the previous POST-to-file upload 404'd against self-hosted pods).
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -40,15 +44,15 @@ pub async fn upload_to_pod_signer(
 
     // Create NIP-98 auth token via signer
     let token =
-        crate::auth::nip98::create_nip98_token_with_signer(signer, &url, "POST", Some(&bytes))
+        crate::auth::nip98::create_nip98_token_with_signer(signer, &url, "PUT", Some(&bytes))
             .await
             .map_err(|e| format!("NIP-98 error: {e}"))?;
     let auth_header = format!("Nostr {}", token);
 
-    // POST to pod API
+    // PUT to pod API
     let window = web_sys::window().ok_or("No window")?;
     let init = web_sys::RequestInit::new();
-    init.set_method("POST");
+    init.set_method("PUT");
 
     let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
     headers
@@ -139,14 +143,14 @@ pub async fn upload_to_pod(
     let bytes: Vec<u8> = js_sys::Uint8Array::new(&array_buf).to_vec();
 
     // Create NIP-98 auth token
-    let token = crate::auth::nip98::create_nip98_token(privkey, &url, "POST", Some(&bytes))
+    let token = crate::auth::nip98::create_nip98_token(privkey, &url, "PUT", Some(&bytes))
         .map_err(|e| format!("NIP-98 error: {e}"))?;
     let auth_header = format!("Nostr {}", token);
 
-    // POST to pod API
+    // PUT to pod API
     let window = web_sys::window().ok_or("No window")?;
     let init = web_sys::RequestInit::new();
-    init.set_method("POST");
+    init.set_method("PUT");
 
     let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
     headers
