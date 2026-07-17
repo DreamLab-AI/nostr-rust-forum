@@ -903,7 +903,10 @@ mod tests {
             z("p2", "public-b"),
         ];
         let ids_of = |v: Vec<NostrEvent>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
-        assert_eq!(ids_of(boards_in_zone(chans.clone(), &ids, 0)), vec!["p1", "p2"]);
+        assert_eq!(
+            ids_of(boards_in_zone(chans.clone(), &ids, 0)),
+            vec!["p1", "p2"]
+        );
         assert_eq!(ids_of(boards_in_zone(chans.clone(), &ids, 1)), vec!["b1"]);
         assert_eq!(ids_of(boards_in_zone(chans, &ids, OTHER_ZONE)), vec!["x1"]);
     }
@@ -967,7 +970,13 @@ mod tests {
     #[test]
     fn group_threads_counts_replies_and_tracks_last_activity() {
         let posts = vec![
-            ev("R1", 42, 100, "first thread", vec![vec!["e", "C", "", "root"]]),
+            ev(
+                "R1",
+                42,
+                100,
+                "first thread",
+                vec![vec!["e", "C", "", "root"]],
+            ),
             ev(
                 "A",
                 42,
@@ -982,7 +991,13 @@ mod tests {
                 "nested reply",
                 vec![vec!["e", "C", "", "root"], vec!["e", "A", "", "reply"]],
             ),
-            ev("R2", 42, 120, "second thread", vec![vec!["e", "C", "", "root"]]),
+            ev(
+                "R2",
+                42,
+                120,
+                "second thread",
+                vec![vec!["e", "C", "", "root"]],
+            ),
         ];
         let threads = group_threads(&posts, "C");
         assert_eq!(threads.len(), 2);
@@ -1000,7 +1015,13 @@ mod tests {
     fn group_threads_ignores_other_channels_and_promotes_orphans() {
         let posts = vec![
             ev("R1", 42, 100, "here", vec![vec!["e", "C", "", "root"]]),
-            ev("X", 42, 90, "elsewhere", vec![vec!["e", "OTHER", "", "root"]]),
+            ev(
+                "X",
+                42,
+                90,
+                "elsewhere",
+                vec![vec!["e", "OTHER", "", "root"]],
+            ),
             // Orphan reply — its parent P is not loaded, so it becomes its own
             // single-post thread rather than vanishing.
             ev(
@@ -1037,7 +1058,13 @@ mod tests {
                 "reply",
                 vec![vec!["e", "C", "", "root"], vec!["e", "R1", "", "reply"]],
             ),
-            ev("R2", 42, 120, "other thread", vec![vec!["e", "C", "", "root"]]),
+            ev(
+                "R2",
+                42,
+                120,
+                "other thread",
+                vec![vec!["e", "C", "", "root"]],
+            ),
         ];
         let msgs = thread_messages(&posts, "C", "R1");
         let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();

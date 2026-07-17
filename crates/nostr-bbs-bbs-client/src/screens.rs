@@ -108,6 +108,7 @@ pub fn ScreenView(state: BbsState) -> impl IntoView {
         Screen::Agents => agents(store).into_any(),
         Screen::Boards => boards(state, store, cfg).into_any(),
         Screen::Chat => chat(store).into_any(),
+        Screen::Dm => crate::dm::dm_screen(state, cfg).into_any(),
         Screen::Members => members(store, cfg).into_any(),
         Screen::Pod => pod(cfg).into_any(),
         Screen::Code => code(store).into_any(),
@@ -222,10 +223,7 @@ fn boards(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> im
 
 /// Resolve a zone selector to its `(display_name, accent_hex)`. `OTHER_ZONE`
 /// (and any out-of-range index) becomes the neutral "Other" group.
-fn zone_label(
-    zone_sel: usize,
-    zones: &[nostr_bbs_config::schema::Zone],
-) -> (String, String) {
+fn zone_label(zone_sel: usize, zones: &[nostr_bbs_config::schema::Zone]) -> (String, String) {
     if zone_sel == relay::OTHER_ZONE {
         return ("Other".to_string(), String::new());
     }
@@ -241,11 +239,7 @@ fn zone_label(
 /// Top-level Zones screen — one accent **card** per configured zone (plus an
 /// "Other" card when boards match no zone), each with its display name and board
 /// count. Never a clipped `@handle`. Tap a card (or ↑↓ + ENTER) to open the zone.
-fn zones_screen(
-    state: BbsState,
-    store: RelayStore,
-    cfg: StoredValue<BbsConfig>,
-) -> impl IntoView {
+fn zones_screen(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     move || {
         let zones = cfg.with_value(|c| c.zones.clone());
         let zone_ids: Vec<String> = zones.iter().map(|z| z.id.clone()).collect();
@@ -1237,7 +1231,7 @@ fn chat(store: RelayStore) -> impl IntoView {
     view! {
         {header(Screen::Chat)}
         <div class="bbs-panel bbs-dim">
-            "  Recent messages stream here live. Reply or start a topic in BOARDS;\n  encrypted DMs (NIP-44/59) are coming."
+            "  Recent messages stream here live. Reply or start a topic in BOARDS;\n  open the ✉ DMs tab for private, encrypted (NIP-44/59) threads."
         </div>
         {move || {
             let posts = store.posts.get();
@@ -1313,6 +1307,34 @@ fn start_extension_login(signer: BbsSigner) {
     });
     #[cfg(not(target_arch = "wasm32"))]
     let _ = signer;
+}
+
+/// F9 — native passkey sign-in. Runs the WebAuthn PRF ceremony on-device and,
+/// on success, installs the derived keypair through the SAME path as the
+/// generate/paste logins — so no backup sheet follows (the passkey IS the
+/// backup). `saved_pubkey` is the adopted forum-session pubkey (if any): when
+/// present the login ceremony re-authenticates it, else a fresh passkey is
+/// registered on-device. `pending` guards against double-submit and drives the
+/// button's "waiting for your passkey" state.
+fn start_passkey_login(signer: BbsSigner, saved_pubkey: Option<String>, pending: RwSignal<bool>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if pending.get_untracked() {
+            return;
+        }
+        pending.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            match crate::passkey::passkey_sign_in(saved_pubkey).await {
+                Ok(outcome) => signer.login_with_passkey(outcome.keypair),
+                Err(e) => signer.error().set(Some(e.to_string())),
+            }
+            pending.set(false);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (signer, saved_pubkey, pending);
+    }
 }
 
 /// Context for an interactive (live) agent panel: the signer plus the panel's
@@ -1735,6 +1757,12 @@ fn sign_in_panel(signer: BbsSigner) -> impl IntoView {
     let generated = RwSignal::new(None::<String>);
     // Toggles the backup sheet for a signed-in local key.
     let show_backup = RwSignal::new(false);
+    // F9: pending flag for the native passkey ceremony (biometric + round-trips).
+    let passkey_pending = RwSignal::new(false);
+    // Returning users carry a pubkey from the adopted forum session; when present
+    // the passkey ceremony re-authenticates it, else it registers a new credential.
+    let saved_pubkey = use_context::<StoredValue<BbsConfig>>()
+        .and_then(|cfg| cfg.with_value(|c| c.viewer_pubkey.clone()));
     view! {
         <div class="bbs-panel">
             "  ── identity / sign-in ─────────────────────────────\n"
@@ -1784,7 +1812,23 @@ fn sign_in_panel(signer: BbsSigner) -> impl IntoView {
                                     on:keydown=on_activate(move || start_extension_login(signer))
                                 >"[ \u{25B8} Sign in with extension ]"</span>
                             })}
-                            <span class="bbs-dim">"  Sign in with a passkey — no key to paste, works on any phone:"</span>
+                            {crate::passkey::is_passkey_supported().then(|| {
+                                let sp = saved_pubkey.clone();
+                                let sp_key = saved_pubkey.clone();
+                                view! {
+                                    <span class="bbs-dim">"  Sign in with a passkey \u{2014} Face ID / Touch ID / fingerprint, no key to paste:"</span>
+                                    <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
+                                        class:bbs-pending=move || passkey_pending.get()
+                                        on:click=move |_| start_passkey_login(signer, sp.clone(), passkey_pending)
+                                        on:keydown=on_activate(move || start_passkey_login(signer, sp_key.clone(), passkey_pending))
+                                    >{move || if passkey_pending.get() {
+                                        "[ \u{2026} waiting for your passkey ]"
+                                    } else {
+                                        "[ \u{25B8} Sign in with a passkey ]"
+                                    }}</span>
+                                }
+                            })}
+                            <span class="bbs-dim">"  Or continue at /community/ (opens the forum sign-in) \u{2014} works without a passkey:"</span>
                             <a class="bbs-link accent bbs-cta" href="../" rel="noopener"
                             >"[ \u{25B8} Continue at /community/ \u{2197} ]"</a>
                             <label class="bbs-dim" for="bbs-signin-key">"  Or paste an nsec / 64-char hex key:"</label>

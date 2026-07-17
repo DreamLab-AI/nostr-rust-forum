@@ -71,6 +71,22 @@ web-sys = { workspace = true, features = [
     "HtmlCanvasElement",
     "CanvasRenderingContext2d",
     "ImageBitmap",
+    # F9 native passkey sign-in (WebAuthn PRF → derived key). navigator.credentials
+    # + the credential option wrappers the ceremony casts into; the remaining
+    # PublicKeyCredential*/Authenticator*/AuthenticationExtensions* bindings mirror
+    # the forum client's WebAuthn surface.
+    "Navigator",
+    "CredentialsContainer",
+    "CredentialCreationOptions",
+    "CredentialRequestOptions",
+    "PublicKeyCredential",
+    "PublicKeyCredentialCreationOptions",
+    "PublicKeyCredentialRequestOptions",
+    "AuthenticatorResponse",
+    "AuthenticatorAttestationResponse",
+    "AuthenticatorAssertionResponse",
+    "AuthenticationExtensionsClientInputs",
+    "AuthenticationExtensionsClientOutputs",
 ] }
 console_error_panic_hook = "0.1"
 # Write path: reuse the kit's audited signer (PrfSigner) + key parsing. `hex`

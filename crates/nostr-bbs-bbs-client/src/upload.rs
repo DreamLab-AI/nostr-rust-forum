@@ -207,7 +207,10 @@ async fn nip98_header(
         vec!["method".to_string(), method.to_string()],
     ];
     if let Some(bytes) = body {
-        tags.push(vec!["payload".to_string(), hex::encode(Sha256::digest(bytes))]);
+        tags.push(vec![
+            "payload".to_string(),
+            hex::encode(Sha256::digest(bytes)),
+        ]);
     }
     let unsigned = nostr_bbs_core::UnsignedEvent {
         pubkey: signer.public_key().to_string(),

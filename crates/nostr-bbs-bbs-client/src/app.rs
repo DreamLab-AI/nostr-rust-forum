@@ -57,6 +57,21 @@ pub fn App() -> impl IntoView {
     provide_context(store);
     provide_context(signer);
 
+    // Encrypted-DM store (F8). Created here so it shares App's reactive owner,
+    // exactly like RelayStore above.
+    crate::dm::provide_dm_store();
+
+    // Shared open-state for the F11 search palette (the `⌕` footer twin, the
+    // `/search` command, and the Cmd/Ctrl+K accelerator all drive one overlay).
+    provide_context(crate::search::SearchOpen::new());
+
+    // Notifications (F12): provide the mentions/replies store and start watching
+    // the shared kind-42 stream. Provided AFTER the relay + signer contexts it
+    // reads; `init_sync` is idempotent.
+    crate::notifications::provide_notification_store();
+    let notif = crate::notifications::use_notification_store();
+    notif.init_sync();
+
     // Open the relay connection once, after mount.
     Effect::new(move |_| {
         crate::relay::connect(store, &relay_url);
@@ -70,6 +85,14 @@ pub fn App() -> impl IntoView {
         apply_prefs(text_large, reduced_motion);
     });
 
+    // F12: opening Boards (where replies/mentions live) clears the unread badge.
+    // `notif` is `Copy`; captured into the effect. Reads `state.screen` reactively.
+    Effect::new(move |_| {
+        if state.screen.get() == Screen::Boards {
+            notif.mark_all_read();
+        }
+    });
+
     #[cfg(target_arch = "wasm32")]
     crate::chrome::install_key_handler(state, store, cfg_stored);
 
@@ -81,6 +104,7 @@ pub fn App() -> impl IntoView {
                 <ScreenView state=state />
                 <Footer state=state />
                 <CommandLine state=state />
+                <crate::search::SearchOverlay state=state />
                 <BottomNav state=state />
             </div>
         </div>
@@ -135,10 +159,7 @@ fn apply_prefs(text_large: bool, reduced_motion: bool) {
     }
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item("bbs_text_size", if text_large { "large" } else { "normal" });
-        let _ = storage.set_item(
-            "bbs_reduced_motion",
-            if reduced_motion { "1" } else { "0" },
-        );
+        let _ = storage.set_item("bbs_reduced_motion", if reduced_motion { "1" } else { "0" });
     }
 }
 

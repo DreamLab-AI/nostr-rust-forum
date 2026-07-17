@@ -152,6 +152,16 @@ impl BbsSigner {
         Ok(privkey_hex)
     }
 
+    /// Adopt a passkey-derived keypair (F9). The WebAuthn PRF ceremony
+    /// ([`crate::passkey`]) hands us a [`Keypair`]; install it through the SAME
+    /// in-memory path as the generate/paste/adopt logins ([`Self::install`]).
+    /// The passkey itself is the recovery factor, so — unlike `generate()` — no
+    /// one-time backup sheet follows; the key lives in memory only and is never
+    /// persisted by the BBS.
+    pub fn login_with_passkey(&self, keypair: Keypair) {
+        self.install(keypair);
+    }
+
     /// Sign in with a NIP-07 browser extension (`window.nostr` — PodKey, nos2x,
     /// Alby, or a passkey provider that exposes NIP-07).
     ///

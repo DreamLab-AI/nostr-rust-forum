@@ -65,6 +65,7 @@ impl BbsState {
             Command::Theme => self.theme.update(|t| *t = t.next()),
             Command::Quit => self.go(Screen::MainMenu),
             Command::Sentry => crate::screens::launch_sentry(),
+            Command::Search => crate::search::open_search(None),
             Command::Unknown => {}
         }
     }
@@ -193,14 +194,16 @@ pub fn StatusBar(state: BbsState) -> impl IntoView {
 /// Persistent, skinned bottom navigation bar — the tap-first return path that
 /// replaces the undocumented "swipe down from top" gesture as the *primary* way
 /// home (the swipe stays as an accelerator). Menu / Boards / Agents are always
-/// present; DMs (a placeholder until the encrypted-DM feature lands) and the
-/// "You" tab are auth-gated like the forum's mobile nav — and when signed out
-/// the "You" slot becomes a first-class **Sign in** entry so a newcomer always
-/// has a visible way in. The active screen is highlighted.
+/// present; DMs and the "You" tab are auth-gated like the forum's mobile nav —
+/// and when signed out the "You" slot becomes a first-class **Sign in** entry so
+/// a newcomer always has a visible way in. The Boards item carries the F12
+/// mentions/replies unread badge. The active screen is highlighted.
 #[component]
 pub fn BottomNav(state: BbsState) -> impl IntoView {
     let signer = use_context::<BbsSigner>();
     let authed = move || signer.and_then(|s| s.pubkey().get()).is_some();
+    // F12: unread mentions/replies count for the Boards badge (a `Memo`, `Copy`).
+    let unread = crate::notifications::use_notification_store().unread_count();
     view! {
         <nav class="bbs-bottomnav" aria-label="Primary navigation">
             <button
@@ -218,13 +221,24 @@ pub fn BottomNav(state: BbsState) -> impl IntoView {
             >
                 <span class="ico">"\u{25A4}"</span>
                 <span class="lab">"Boards"</span>
+                {move || {
+                    let n = unread.get();
+                    (n > 0).then(|| {
+                        let text = if n > 99 { "99+".to_string() } else { n.to_string() };
+                        let label = format!("{n} unread notifications");
+                        view! {
+                            <span class="bbs-navbadge" role="status" aria-label=label>
+                                {text}
+                            </span>
+                        }
+                    })
+                }}
             </button>
             {move || authed().then(|| view! {
                 <button
-                    class="bbs-navitem bbs-navitem-soon"
-                    disabled=true
-                    attr:aria-disabled="true"
-                    title="Direct messages — coming soon"
+                    class="bbs-navitem"
+                    class:active=move || state.screen.get() == Screen::Dm
+                    on:click=move |_| state.go(Screen::Dm)
                 >
                     <span class="ico">"\u{2709}"</span>
                     <span class="lab">"DMs"</span>
@@ -311,6 +325,13 @@ pub fn Footer(state: BbsState) -> impl IntoView {
         <div class="bbs-footer">
             <div class="bbs-fkeys">
                 <span><span class="fk">"[/]"</span>" cmd"</span>
+                <span
+                    class="fk bbs-link"
+                    role="button"
+                    tabindex="0"
+                    aria-label="Open search"
+                    on:click=move |_| crate::search::open_search(None)
+                >"[\u{2315}]"</span>
                 <span><span class="fk">"[ESC]"</span>" back"</span>
                 <span><span class="fk">"[↑↓/jk]"</span>" move"</span>
                 <span><span class="fk">"[ENTER]"</span>" select"</span>
@@ -339,7 +360,17 @@ pub fn CommandLine(state: BbsState) -> impl IntoView {
     let submit = move || {
         // Fired from the input's Enter/click handlers (imperative), so read the
         // text untracked — no reactive subscription is wanted here.
-        let cmd = parse_command(&state.cmd_text.get_untracked());
+        let raw = state.cmd_text.get_untracked();
+        // `/search <q>` (or `find <q>`) opens the global-search palette seeded
+        // with the query. Handled before the screen-nav parser because the
+        // `Command` enum is `Copy` and cannot carry the query `String`.
+        if let Some(q) = crate::search::query::parse_search_command(&raw) {
+            crate::search::open_search(Some(q));
+            state.cmd_text.set(String::new());
+            state.cmd_open.set(false);
+            return;
+        }
+        let cmd = parse_command(&raw);
         state.apply(cmd);
         state.cmd_text.set(String::new());
         state.cmd_open.set(false);
@@ -422,6 +453,12 @@ pub fn install_key_handler(state: BbsState, store: RelayStore, cfg: StoredValue<
             if state.cmd_open.get_untracked() {
                 return;
             }
+            // Modifier combos (Cmd/Ctrl/Alt + key) are app/browser accelerators
+            // (e.g. Cmd/Ctrl+K opens global search) — never BBS nav keys. Let
+            // them through so they don't ALSO move the selection / open a screen.
+            if ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
+                return;
+            }
             // A focused text field (Settings sign-in key, board composer) owns its
             // keystrokes too — otherwise digits / j / k / t / ? typed into a field
             // leak to the global BBS navigation (e.g. a key starting "6…" jumps to
@@ -470,8 +507,8 @@ pub fn install_key_handler(state: BbsState, store: RelayStore, cfg: StoredValue<
                     Screen::MainMenu => state.activate_menu(),
                     Screen::Boards => match state.board.get_untracked() {
                         None => {
-                            let zone_ids: Vec<String> = cfg
-                                .with_value(|c| c.zones.iter().map(|z| z.id.clone()).collect());
+                            let zone_ids: Vec<String> =
+                                cfg.with_value(|c| c.zones.iter().map(|z| z.id.clone()).collect());
                             match state.zone.get_untracked() {
                                 // Zones cards: open the selected zone.
                                 None => {
@@ -503,10 +540,8 @@ pub fn install_key_handler(state: BbsState, store: RelayStore, cfg: StoredValue<
                         // Thread list: open the selected thread. (In the thread
                         // view itself Enter is inert — the composer input owns it.)
                         Some(cid) if state.thread.get_untracked().is_none() => {
-                            let threads = crate::relay::group_threads(
-                                &store.posts.get_untracked(),
-                                &cid,
-                            );
+                            let threads =
+                                crate::relay::group_threads(&store.posts.get_untracked(), &cid);
                             if let Some(t) = threads.get(state.selection.get_untracked()) {
                                 state.open_thread(t.root.id.clone());
                             }

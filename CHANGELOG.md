@@ -102,8 +102,10 @@ overlay's `docs/sprint/bbs-redesign-2026-07.md`. Reimagines the retro BBS client
 (`nostr-bbs-bbs-client`, served at `/community/bbs/`) after a live mobile UX
 audit: the phosphor skin, ASCII image rendering, numbered menu and keyboard model
 are kept, while the modem-era interaction grammar is replaced by the main forum's
-proven patterns. Delivered in three tranches — **T1 (F1–F6) shipped; T2 and T3
-in progress**. The ship commit finalises wording as later tranches land.
+proven patterns. Delivered in three tranches — **all shipped**: T1 (F1–F6),
+T2 (F7, F10, F13–F15) and T3 (F8, F9, F11, F12). Feature-matched to the main
+board and verified by mobile-emulated browser testing and an adversarial review
+panel (which caught and fixed a cross-account DM leak before release).
 
 ### Added
 
@@ -159,16 +161,45 @@ in progress**. The ship commit finalises wording as later tranches land.
   degrading to `[ image unavailable ]` only when every route fails. No raw
   `JsValue`, no WASM panic. *(T2)*
 
-### In progress
+### Added (T2 / T3)
 
-- **T2** — threaded topics (F7), image upload with inline ASCII preview (F10),
-  a11y/density prefs (F13), nsec backup/recovery sheet (F14), profile detail
-  (F15).
-- **T3** — encrypted DMs incl. Jarvis 1:1 (F8), native passkey sign-in (F9),
-  global search (F11), notifications badge (F12). Each closes a shared-crate
-  reuse (`image_compress`, `pod_client`, `dm`, `search_client`,
-  `auth/{passkey,webauthn}`) over the common `Signer` trait rather than new
-  domain code.
+- **Threaded topics (F7)** — boards drill Zones → Boards → **Thread list**
+  (root kind-42s with reply count + last activity) → **Thread view** (root +
+  `e`-tagged replies, chronological); legacy unthreaded posts render as
+  single-post threads. *(T2)*
+- **In-composer image upload (F10)** — a `[ ▸ image ]` affordance validates
+  (`is_accepted_image`, 5 MB cap) with friendly terminal errors, compresses
+  client-side, uploads to the viewer's pod over **NIP-98 PUT**
+  (`upload_to_pod_signer`), posts the URL, and renders it inline as phosphor
+  ASCII. *(T2)*
+- **Accessibility/density prefs (F13)** — Settings toggles for text size and
+  reduced motion, persisted to `localStorage` and applied as root classes;
+  reduced motion defaults to the OS `prefers-reduced-motion`. *(T2)*
+- **nsec backup sheet (F14)** — a shown-once key backup (copy + written-it-down
+  confirm, no-reset warning) after a throwaway key is generated and for any
+  readable local key in Settings. *(T2)*
+- **Profile detail (F15)** — member rows are tappable to a kind-0 profile panel
+  (name / about / short-id / `did:nostr` WebID). *(T2)*
+- **Encrypted DMs incl. Jarvis 1:1 (F8)** — a NIP-44/59 gift-wrapped DM screen
+  (inbox → per-peer thread → composer) over a dedicated NIP-42-authenticated DM
+  socket, with a one-tap "Message Jarvis" quick-start. Decrypted state is wiped
+  on sign-out / account switch (app-root owner watcher). *(T3)*
+- **Native passkey sign-in (F9)** — WebAuthn PRF → HKDF-derived Nostr key
+  (byte-identical to the forum's derivation, so a BBS passkey resolves to the
+  same identity as one made at `/community/`), adopted in-memory via the same
+  install path as generate/paste; feature-detected and gracefully absent when
+  unsupported. *(T3)*
+- **Global search (F11)** — a phosphor search palette (Ctrl/Cmd+K accelerator +
+  a `/search` command + a tappable affordance) over the search-worker, graceful
+  when the worker is unreachable. *(T3)*
+- **Notifications (F12)** — a bottom-bar unread badge for replies/mentions, with
+  own-event suppression and a **per-pubkey first-seen baseline** so a fresh login
+  never surfaces the historical backlog; visible items are scoped per pubkey so a
+  new viewer on a shared device sees none of the prior owner's. *(T3)*
+
+  T2/T3 close shared-crate reuse (`image_compress`, `pod_client`, `dm`,
+  `search_client`, `auth/{passkey,webauthn}`) over the common `Signer` trait
+  rather than new domain code.
 
 ## [1.0.0-beta.4] - 2026-07-08
 

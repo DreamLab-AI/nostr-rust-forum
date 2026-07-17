@@ -204,6 +204,7 @@ html, body {
 .bbs-cmdline input {
   flex: 1 1 8ch;
   min-width: 0;                 /* allow the field to shrink instead of overflowing */
+  min-height: 44px;             /* ≥44px touch target (DM composer reuses this) */
   background: transparent;
   border: none;
   outline: none;
@@ -211,8 +212,14 @@ html, body {
   font: inherit;
   text-shadow: inherit;
 }
-/* Composer control labels never shatter across lines at 360 px. */
-.bbs-cmdline .bbs-link { white-space: nowrap; }
+/* Composer control labels never shatter across lines at 360 px, and carry a
+   ≥44px tap box so the DM [ open ] / [ send ] actions clear the mobile target
+   minimum (they reuse .bbs-cmdline .bbs-link). */
+.bbs-cmdline .bbs-link {
+  white-space: nowrap;
+  display: inline-flex; align-items: center;
+  min-height: 44px;
+}
 .bbs-blink { animation: blink 1s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
@@ -419,7 +426,7 @@ a, .bbs-link { color: var(--accent); }
 
 /* Breadcrumb / back control on board + thread views. */
 .bbs-crumb { display: flex; align-items: center; flex-wrap: wrap; white-space: normal; }
-.bbs-crumb .bbs-link { display: inline-flex; align-items: center; }
+.bbs-crumb .bbs-link { display: inline-flex; align-items: center; min-height: 44px; }
 
 /* Persistent, skinned bottom navigation bar. */
 .bbs-bottomnav {
@@ -657,4 +664,146 @@ html.bbs-reduced-motion .sentry-radar::before { animation: none; }
 @media (prefers-reduced-motion: reduce) {
   .sentry-critical.on { animation: none; }
   .sentry-radar::before { animation: none; }
+}
+
+/* ── F8 Encrypted DMs ──────────────────────────────────────────────────────── */
+/* Conversation (inbox) row — mirrors .bbs-thread-row: flex, ellipsised preview,
+   ≥44px tap target, never overflows a 360px viewport. */
+.bbs-dm-convo {
+  display: flex; align-items: center; gap: 0.5rem;
+  white-space: normal; min-height: 44px;
+}
+.bbs-dm-convo .bbs-chip { flex: 0 0 auto; }
+.bbs-dm-name { flex: 0 0 auto; max-width: 40%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bbs-dm-preview {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bbs-dm-unread { flex: 0 0 auto; color: var(--accent); }
+
+/* Thread bubbles — wrap long text, break unbreakable tokens (URLs/hex) so nothing
+   pushes the page wide. Sent messages tint toward the bright phosphor + right-align. */
+.bbs-dm-thread { margin: 0.25rem 0; }
+.bbs-dm-msg {
+  white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+  padding: 0.15rem 0.25rem; cursor: default;
+}
+.bbs-dm-msg.bbs-dm-sent { color: var(--fg-bright); text-align: right; }
+.bbs-dm-msg.bbs-dm-sent .accent { color: var(--accent); }
+
+/* F9 native passkey CTA — "waiting for your passkey" pending state. Dim + a
+   gentle pulse while the WebAuthn ceremony / round-trips are in flight; the
+   button keeps its ≥44 px .bbs-cta box. */
+.bbs-cta.bbs-pending {
+  opacity: 0.65;
+  cursor: progress;
+  animation: bbs-pending-pulse 1.1s ease-in-out infinite;
+}
+@keyframes bbs-pending-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .bbs-cta.bbs-pending { animation: none; }
+}
+
+/* ── F11 Global search palette ─────────────────────────────────────────────
+ * A phosphor command palette (Cmd/Ctrl+K, /search, or the [⌕] footer twin).
+ * Top-anchored, backdrop-dimmed; full-screen on mobile. Reuses the theme vars,
+ * so it recolours with the active CRT theme. Sits above the status/bottom bars
+ * (z 48/50) but below the sentry Easter egg (z 100). */
+.bbs-search-overlay {
+  position: fixed; inset: 0; z-index: 90;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  display: flex; justify-content: center;
+  padding: 8vh 0.75rem 1rem;
+  overflow-y: auto;
+}
+.bbs-search-panel {
+  width: 100%; max-width: 64ch; height: max-content;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 0 24px color-mix(in srgb, var(--accent) 22%, transparent);
+  display: flex; flex-direction: column;
+}
+.bbs-search-head {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+.bbs-search-glyph { font-size: 1.1rem; }
+.bbs-search-input {
+  flex: 1 1 auto; min-width: 0;
+  background: transparent; border: none; outline: none;
+  color: var(--fg); font: inherit; font-size: 16px;  /* 16px: no iOS focus-zoom */
+  min-height: 44px;
+}
+.bbs-search-input::placeholder { color: var(--fg-dim); }
+.bbs-search-esc {
+  white-space: nowrap; min-height: 44px;
+  display: inline-flex; align-items: center;
+  padding: 0 0.4rem; font-size: 0.85rem;
+}
+.bbs-search-body { padding: 0.25rem; overflow-y: auto; max-height: 60vh; }
+.bbs-search-list { display: flex; flex-direction: column; }
+.bbs-search-row {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.3rem 0.4rem; min-height: 44px; cursor: pointer;
+}
+.bbs-search-row.selected, .bbs-search-row:hover {
+  background: var(--select-bg); color: var(--select-fg);
+}
+.bbs-search-row.selected .accent, .bbs-search-row:hover .accent,
+.bbs-search-row.selected .bbs-dim, .bbs-search-row:hover .bbs-dim { color: var(--select-fg); }
+.bbs-search-text { display: flex; flex-direction: column; min-width: 0; }
+.bbs-search-title {
+  display: flex; align-items: baseline; gap: 0.4rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bbs-search-sub {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 0.8rem;
+}
+.bbs-search-score {
+  color: var(--accent); font-size: 0.75rem;
+  border: 1px solid var(--border); padding: 0 0.3rem;
+}
+.bbs-search-row.selected .bbs-search-score,
+.bbs-search-row:hover .bbs-search-score { color: var(--select-fg); border-color: var(--select-fg); }
+.bbs-search-empty { padding: 1.2rem 0.6rem; text-align: center; }
+.bbs-search-note { padding: 0.4rem 0.6rem; border-top: 1px solid var(--border); font-size: 0.8rem; }
+.bbs-search-foot {
+  padding: 0.4rem 0.6rem; border-top: 1px solid var(--border);
+  font-size: 0.75rem;
+}
+@media (max-width: 480px) {
+  .bbs-search-overlay { padding: 0; }
+  .bbs-search-panel { max-width: none; min-height: 100dvh; }
+  .bbs-search-body { max-height: none; flex: 1 1 auto; }
+}
+
+/* ── F12 notifications badge ─────────────────────────────────────────────────
+ * Small pill carrying the unread mentions/replies count, overlaid on a
+ * bottom-nav item. The extra `.bbs-navitem { position: relative }` rule below is
+ * appended AFTER the base rule so it wins by source order (same specificity) and
+ * establishes the positioning context for the absolutely-placed badge. */
+.bbs-navitem { position: relative; }
+.bbs-navbadge {
+  position: absolute;
+  top: 3px;
+  left: calc(50% + 0.4rem);
+  min-width: 1.1rem;
+  height: 1.1rem;
+  padding: 0 0.25rem;
+  box-sizing: border-box;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 0.7rem; line-height: 1;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--bg);
+  text-shadow: none;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+@media (max-width: 640px) {
+  /* Lift the badge type clear of the ~12 px mobile floor (A11y). */
+  .bbs-navbadge { font-size: 0.8rem; height: 1.2rem; min-width: 1.2rem; }
 }

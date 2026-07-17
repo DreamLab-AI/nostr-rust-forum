@@ -520,7 +520,14 @@ mod tests {
 
     #[test]
     fn no_route_yields_empty_candidate_list() {
-        assert!(ascii_fetch_urls("", "https://pods.example.com", "https://cdn.other.com/x.png", 80, "standard").is_empty());
+        assert!(ascii_fetch_urls(
+            "",
+            "https://pods.example.com",
+            "https://cdn.other.com/x.png",
+            80,
+            "standard"
+        )
+        .is_empty());
         assert!(ascii_fetch_urls("", "", "  ", 80, "standard").is_empty());
     }
 

@@ -16,6 +16,9 @@ pub enum Screen {
     /// the numbered menu when signed out and the viewer hasn't chosen to look
     /// around. Not a numbered menu item; reached only as the signed-out entry.
     Landing,
+    /// Encrypted 1:1 direct messages (NIP-44 sealed, NIP-59 gift-wrapped). Reached
+    /// from the bottom-nav "DMs" tab / `/dm`; not a numbered main-menu item.
+    Dm,
     /// The numbered main menu (home screen once past onboarding).
     #[default]
     MainMenu,
@@ -88,6 +91,7 @@ impl Screen {
     pub fn title(self) -> &'static str {
         match self {
             Screen::Landing => "Welcome",
+            Screen::Dm => "Direct Messages",
             Screen::MainMenu => "Main Menu",
             Screen::Agents => "Agents",
             Screen::Boards => "Boards",
@@ -106,6 +110,7 @@ impl Screen {
     pub fn subtitle(self) -> &'static str {
         match self {
             Screen::Landing => "What this is, and how to get in",
+            Screen::Dm => "Encrypted 1:1 — NIP-44 sealed, NIP-59 gift-wrapped",
             Screen::MainMenu => "Select a board by number, or type / for a command",
             Screen::Agents => "Agent control panels — approve, reject, act (human-in-the-loop)",
             Screen::Boards => "Zones & boards — kind-40/42 channels, zone-gated",
@@ -124,10 +129,11 @@ impl Screen {
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
             Screen::Landing => &["welcome", "start", "landing"],
+            Screen::Dm => &["dm", "dms", "inbox"],
             Screen::MainMenu => &["menu", "main", "home"],
             Screen::Agents => &["agents", "gov", "door", "doors", "admin", "d", "agent"],
             Screen::Boards => &["msg", "messages", "boards", "m", "board"],
-            Screen::Chat => &["chat", "dm", "c"],
+            Screen::Chat => &["chat", "c"],
             Screen::Members => &["users", "members", "who", "u", "member"],
             Screen::Pod => &["files", "file", "pod", "f", "pods"],
             Screen::Code => &["code", "snippets", "x", "snippet"],
@@ -152,6 +158,10 @@ pub enum Command {
     Quit,
     /// Launch the UA 571-C sentry-gun door game (Easter egg, off the main path).
     Sentry,
+    /// Open the global-search overlay (F11). A bare `search` / `find` maps here;
+    /// `search <q>` with a query is intercepted earlier by the command line so
+    /// the query text survives (this enum is `Copy` and carries no `String`).
+    Search,
     /// Unrecognised command.
     Unknown,
 }
@@ -171,6 +181,7 @@ pub fn parse_command(raw: &str) -> Command {
         "theme" | "t" | "color" | "colour" => return Command::Theme,
         "quit" | "q" | "exit" | "logoff" | "bye" => return Command::Quit,
         "sentry" | "game" => return Command::Sentry,
+        "search" | "find" => return Command::Search,
         _ => {}
     }
     if let Some(ch) = cmd.chars().next() {
@@ -180,7 +191,7 @@ pub fn parse_command(raw: &str) -> Command {
             }
         }
     }
-    for screen in [Screen::Landing, Screen::MainMenu]
+    for screen in [Screen::Landing, Screen::MainMenu, Screen::Dm]
         .into_iter()
         .chain(Screen::menu_order())
     {
@@ -248,6 +259,18 @@ mod tests {
         assert_eq!(parse_command("sentry"), Command::Sentry);
         assert_eq!(parse_command("game"), Command::Sentry);
         assert_eq!(parse_command("SENTRY"), Command::Sentry);
+    }
+
+    #[test]
+    fn parse_search_command_word() {
+        assert_eq!(parse_command("search"), Command::Search);
+        assert_eq!(parse_command("FIND"), Command::Search);
+    }
+
+    #[test]
+    fn parse_dm_alias_navigates() {
+        assert_eq!(parse_command("dm"), Command::Go(Screen::Dm));
+        assert_eq!(parse_command("inbox"), Command::Go(Screen::Dm));
     }
 
     #[test]

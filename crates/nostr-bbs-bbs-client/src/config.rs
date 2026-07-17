@@ -40,6 +40,10 @@ pub struct BbsConfig {
     /// Preview-worker base URL — serves `GET /ascii?url=…&cols=…&ramp=…`
     /// image→ASCII fragments for the on-theme image renderer.
     pub preview_api: String,
+    /// Search-worker base URL — serves `POST /search` (semantic / keyword
+    /// message search) for the global-search palette (F11). Empty → the palette
+    /// searches only the live relay stores (boards, members, open-board posts).
+    pub search_api: String,
     /// The signed-in viewer's hex pubkey, if the host injected one.
     pub viewer_pubkey: Option<String>,
     /// Config-driven zones (boards), shared with the rest of the kit.
@@ -58,6 +62,7 @@ impl Default for BbsConfig {
             relay_url: String::new(),
             pod_api: String::new(),
             preview_api: String::new(),
+            search_api: String::new(),
             viewer_pubkey: None,
             zones: Vec::new(),
         }
@@ -106,6 +111,8 @@ impl BbsConfig {
             relay_url: first_key(env, &["RELAY_URL", "RELAY"]).unwrap_or_default(),
             pod_api: first_key(env, &["POD_API", "POD_URL", "POD_BASE_URL"]).unwrap_or_default(),
             preview_api: first_key(env, &["PREVIEW_API", "PREVIEW_URL", "PREVIEW_BASE_URL"])
+                .unwrap_or_default(),
+            search_api: first_key(env, &["SEARCH_API", "SEARCH_URL", "SEARCH_BASE_URL"])
                 .unwrap_or_default(),
             viewer_pubkey: first_key(env, &["VIEWER_PUBKEY", "PUBKEY"]),
             zones: parse_zones(env),
@@ -221,6 +228,7 @@ mod tests {
             "RELAY_URL": "wss://relay.example.com",
             "POD_API": "https://pods.example.com",
             "PREVIEW_API": "https://preview.example.com",
+            "SEARCH_API": "https://search.example.com",
             "VIEWER_PUBKEY": "ab12"
         }));
         assert_eq!(cfg.theme, Theme::Green);
@@ -230,6 +238,7 @@ mod tests {
         assert_eq!(cfg.relay_url, "wss://relay.example.com");
         assert_eq!(cfg.pod_api, "https://pods.example.com");
         assert_eq!(cfg.preview_api, "https://preview.example.com");
+        assert_eq!(cfg.search_api, "https://search.example.com");
         assert_eq!(cfg.viewer_pubkey.as_deref(), Some("ab12"));
     }
 
