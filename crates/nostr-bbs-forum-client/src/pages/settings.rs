@@ -486,8 +486,10 @@ pub fn SettingsPage() -> impl IntoView {
             let mut result =
                 upload_to_pod_signer(&file, &filename, &pk, signer.as_ref(), None).await;
             // Pods are provisioned eagerly at signup, but accounts predating
-            // that may not have one yet — on 404, provision once and retry.
-            if matches!(&result, Err(e) if e.starts_with("HTTP 404")) {
+            // that (or whose eager provision failed) may not have one yet — an
+            // unprovisioned pod's WAC gate returns 403 (deny-by-default), and a
+            // missing container returns 404. Either way, provision once + retry.
+            if matches!(&result, Err(e) if e.starts_with("HTTP 404") || e.starts_with("HTTP 403")) {
                 result = match provision_pod(auth).await {
                     Ok(()) => {
                         upload_to_pod_signer(&file, &filename, &pk, signer.as_ref(), None).await
@@ -1517,7 +1519,10 @@ fn avatar_filename(mime: &str) -> String {
 /// provisioning. Called once when an avatar upload 404s, after which the
 /// upload is retried. 201 = created, 409 = already exists; both are success.
 async fn provision_pod(auth: crate::auth::AuthStore) -> Result<(), String> {
-    let url = format!("{}/.provision", POD_API);
+    // Per-pod endpoint: POST /pods/{pubkey}/.provision (a bare /.provision is
+    // 404, leaving the pod unprovisioned so media uploads 403 on the WAC gate).
+    let pubkey = auth.pubkey().get_untracked().ok_or("no pubkey")?;
+    let url = format!("{}/pods/{}/.provision", POD_API, pubkey);
     let signer = auth.get_signer().ok_or("no signer")?;
     let token = crate::auth::nip98::create_nip98_token_with_signer(&*signer, &url, "POST", None)
         .await

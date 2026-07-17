@@ -172,7 +172,10 @@ async fn claim_username(
 /// created, 409 = already exists; both are success. Fire-and-forget — a failure
 /// is non-fatal because the lazy first-access path still provisions later.
 async fn provision_pod(auth: crate::auth::AuthStore) -> Result<(), String> {
-    let url = format!("{}/.provision", POD_API);
+    // The pod-worker provisions per-pod at POST /pods/{pubkey}/.provision (a bare
+    // /.provision is 404, which left the pod unprovisioned → uploads 403'd).
+    let pubkey = auth.pubkey().get_untracked().ok_or("no pubkey")?;
+    let url = format!("{}/pods/{}/.provision", POD_API, pubkey);
     let signer = auth.get_signer().ok_or("no signer")?;
     let token = crate::auth::nip98::create_nip98_token_with_signer(&*signer, &url, "POST", None)
         .await
