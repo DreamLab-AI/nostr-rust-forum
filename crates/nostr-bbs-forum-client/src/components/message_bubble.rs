@@ -236,12 +236,16 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                     reactions=message.reactions
                 />
 
-                // Threaded replies (NIP-22 kind-1111)
+                // Threaded replies (NIP-22 kind-1111). Threading is one level
+                // deep: a message that is itself a reply (`has_reply`) shows its
+                // thread but offers no reply affordance, so a second-level reply
+                // (a reply to a reply) can never be started.
                 <ThreadView
                     root_event_id=channel_id_thread
                     parent_event_id=event_id_thread
                     parent_pubkey=pk_thread
                     replies=thread_replies
+                    allow_reply=!has_reply
                 />
             </div>
         </div>

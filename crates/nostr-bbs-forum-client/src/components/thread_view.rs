@@ -44,6 +44,12 @@ pub fn ThreadView(
     parent_pubkey: String,
     /// Reactive list of replies to this message.
     replies: RwSignal<Vec<ThreadReply>>,
+    /// Whether this message may be replied to. Threading is one level deep: a
+    /// message that is itself a reply does NOT offer a reply affordance (the
+    /// caller passes `false`), so users can't start an unsupported second-level
+    /// thread. Existing replies still render; only the "Reply" button is gated.
+    #[prop(default = true)]
+    allow_reply: bool,
 ) -> impl IntoView {
     let expanded = RwSignal::new(false);
     let show_composer = RwSignal::new(false);
@@ -158,8 +164,10 @@ pub fn ThreadView(
                     </button>
                 </Show>
 
-                // Reply button
-                <Show when=move || is_authed.get()>
+                // Reply button — only on a top-level message; threading is one
+                // level deep, so a message that is itself a reply offers no
+                // reply affordance (`allow_reply = false`).
+                <Show when=move || is_authed.get() && allow_reply>
                     <button
                         class="opacity-0 group-hover:opacity-100 flex items-center gap-1 text-xs text-gray-500 hover:text-amber-400 transition-all"
                         on:click=move |_| {
