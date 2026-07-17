@@ -17,6 +17,7 @@ pub mod fx;
 pub mod agent_badge;
 pub mod avatar;
 pub mod badge;
+pub mod bbs_sash;
 pub mod confirm_dialog;
 pub mod empty_state;
 // Inline plain-English explainer for hard terms (relay / WebID / encrypted …)

@@ -231,6 +231,11 @@ pub fn CategoryPage() -> impl IntoView {
                 }
             }}
 
+            // Switch-to-BBS sash: also under the ZONE hero so single-locked-zone
+            // members (zone-first nav, ADR-107) — who never see the /forums index
+            // — still meet it.
+            {crate::components::bbs_sash::bbs_switch_sash()}
+
             // Zone-first breadcrumb (ADR-107): single-locked-zone members drop
             // the global "Forums" crumb (their landing IS the zone); everyone
             // else keeps Home › Forums › {Zone}.

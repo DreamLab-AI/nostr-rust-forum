@@ -46,31 +46,6 @@ fn zone_accent(zone_id: &str) -> &'static str {
     ACCENTS[idx % ACCENTS.len()]
 }
 
-// -- BBS switch sash ----------------------------------------------------------
-
-/// A thin, glitchy amber terminal ribbon under the hero that switches the reader
-/// into the retro ASCII/BBS rendering of the same community. Rendered only when
-/// the deployment ships a BBS (`bbs_enabled()`, default on). The BBS is a
-/// separate SPA at `<base>/bbs/` (not a router route), so this is a plain
-/// full-navigation `<a>`, not a Leptos `<A>`. The label carries `data-text` so
-/// the CSS RGB-split glitch pseudo-elements can echo it.
-fn bbs_switch_sash() -> impl IntoView {
-    if !crate::utils::relay_url::bbs_enabled() {
-        return ().into_any();
-    }
-    let href = crate::utils::relay_url::bbs_url_override().unwrap_or_else(|| base_href("/bbs/"));
-    let label = "Enter the retro BBS terminal";
-    view! {
-        <a class="bbs-sash" href=href
-           aria-label="Switch to the retro ASCII BBS interface">
-            <span class="caret" aria-hidden="true">"\u{25B8}"</span>
-            <span class="label" data-text=label>{label}</span>
-            <span class="caret" aria-hidden="true">"\u{25C2}"</span>
-        </a>
-    }
-    .into_any()
-}
-
 // -- Welcome card helpers -----------------------------------------------------
 
 fn is_welcome_dismissed() -> bool {
@@ -196,7 +171,7 @@ pub fn ForumsPage() -> impl IntoView {
                 </div>
             </div>
 
-            {bbs_switch_sash()}
+            {crate::components::bbs_sash::bbs_switch_sash()}
 
             <Breadcrumb items=vec![
                 BreadcrumbItem::link("Home", "/"),
