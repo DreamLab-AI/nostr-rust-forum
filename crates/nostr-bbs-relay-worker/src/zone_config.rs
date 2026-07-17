@@ -58,6 +58,13 @@ pub struct Zone {
     /// Client-side NIP-44 encryption flag (relay only records it).
     #[serde(default)]
     pub encrypted: bool,
+    /// Auto-approval: when `true`, a brand-new joiner (first kind-0 auto-whitelist)
+    /// is automatically granted this zone's `required_cohorts`, so they land in
+    /// the zone without an admin approving them. When `false` (the default), the
+    /// zone's cohort must be granted manually by an admin. Per-zone, so an
+    /// operator can open one zone to the public while keeping others gated.
+    #[serde(default)]
+    pub auto_approve: bool,
 }
 
 impl Zone {
@@ -89,7 +96,13 @@ impl ZoneConfig {
         if trimmed.is_empty() {
             return Self::default();
         }
-        match serde_json::from_str::<Vec<Zone>>(trimmed) {
+        Self::from_json(trimmed)
+    }
+
+    /// Parse a `ZONE_CONFIG` JSON array from a string. Malformed input yields an
+    /// empty config (deny-by-default). Shared by [`Self::load`] and unit tests.
+    pub fn from_json(raw: &str) -> Self {
+        match serde_json::from_str::<Vec<Zone>>(raw.trim()) {
             Ok(zones) => Self { zones },
             Err(_) => Self::default(),
         }
@@ -98,6 +111,24 @@ impl ZoneConfig {
     /// Look up a zone definition by id.
     pub fn get(&self, id: &str) -> Option<&Zone> {
         self.zones.iter().find(|z| z.id == id)
+    }
+
+    /// Cohorts a brand-new joiner should be auto-granted: the de-duplicated union
+    /// of `required_cohorts` across every zone flagged `auto_approve = true`.
+    /// Empty when no zone opts in — callers keep their existing default in that
+    /// case, so auto-approval is strictly additive and opt-in per zone.
+    pub fn auto_approve_cohorts(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for z in &self.zones {
+            if z.auto_approve {
+                for c in &z.required_cohorts {
+                    if !out.contains(c) {
+                        out.push(c.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Whether a zone with this id exists in config.

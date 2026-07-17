@@ -9,6 +9,7 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 use crate::auth;
+use crate::zone_config::ZoneConfig;
 
 use super::broadcast::EventTreatment;
 use super::filter::{self, CountResult, NostrFilter};
@@ -347,11 +348,14 @@ impl NostrRelayDO {
         matches!(stmt.first::<serde_json::Value>(None).await, Ok(Some(_)))
     }
 
-    /// Auto-whitelist a new user with the "members" cohort.
+    /// Auto-whitelist a new user with the base `members` cohort plus the cohorts
+    /// of any zone flagged `auto_approve` in `ZONE_CONFIG`.
     ///
     /// Called when a user publishes their first kind-0 profile event. Gives them
-    /// immediate access to the Members zone without admin intervention.
-    /// Admin can later assign additional cohorts for other zones.
+    /// immediate base access without admin intervention, and — for each zone the
+    /// operator has opted into auto-approval — the cohort that zone requires, so
+    /// new joiners land straight in it. Zones without `auto_approve` still need an
+    /// admin to grant their cohort. Admins can always adjust cohorts afterwards.
     ///
     /// **First-user-is-admin**: If the whitelist table is empty, the first user
     /// to register automatically becomes admin with all-zone access.
@@ -396,7 +400,10 @@ impl NostrRelayDO {
                 &pubkey[..8]
             );
         } else {
-            // Normal registration: members zone only, not admin
+            // Normal registration: the base `members` cohort, additively plus the
+            // required cohorts of every `auto_approve` zone (config-driven, so an
+            // operator opens specific zones to new joiners without a code change).
+            let cohorts_json = new_joiner_cohorts_json(&ZoneConfig::load(&self.env));
             let stmt = db.prepare(
                 "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by, is_admin) \
                  VALUES (?1, ?2, ?3, ?4, 0) \
@@ -404,12 +411,65 @@ impl NostrRelayDO {
             );
             if let Ok(bound) = stmt.bind(&[
                 JsValue::from_str(pubkey),
-                JsValue::from_str(r#"["members"]"#),
+                JsValue::from_str(&cohorts_json),
                 JsValue::from_f64(now as f64),
                 JsValue::from_str("auto-registration"),
             ]) {
                 let _ = bound.run().await;
             }
         }
+    }
+}
+
+/// Build the JSON cohort array a brand-new joiner is auto-granted: the base
+/// `members` cohort plus the de-duplicated cohorts of every `auto_approve` zone.
+/// With no auto-approve zone configured this is exactly `["members"]`, preserving
+/// the historic default. Pure so it is unit-testable without a live `Env`.
+pub(crate) fn new_joiner_cohorts_json(zones: &ZoneConfig) -> String {
+    let mut cohorts = vec!["members".to_string()];
+    for c in zones.auto_approve_cohorts() {
+        if !cohorts.contains(&c) {
+            cohorts.push(c);
+        }
+    }
+    serde_json::to_string(&cohorts).unwrap_or_else(|_| r#"["members"]"#.to_string())
+}
+
+#[cfg(test)]
+mod auto_approve_tests {
+    use super::new_joiner_cohorts_json;
+    use crate::zone_config::ZoneConfig;
+
+    #[test]
+    fn no_auto_approve_zone_keeps_members_only() {
+        let z = ZoneConfig::from_json(
+            r#"[{"id":"public","required_cohorts":[],"visibility":"public"},
+                {"id":"minimoonoir","required_cohorts":["friends"],"visibility":"locked"}]"#,
+        );
+        assert_eq!(new_joiner_cohorts_json(&z), r#"["members"]"#);
+    }
+
+    #[test]
+    fn auto_approve_zone_grants_its_cohort_additively() {
+        let z = ZoneConfig::from_json(
+            r#"[{"id":"public","required_cohorts":[],"visibility":"public"},
+                {"id":"minimoonoir","required_cohorts":["friends"],"visibility":"locked","auto_approve":true},
+                {"id":"family","required_cohorts":["family"],"visibility":"locked"},
+                {"id":"business","required_cohorts":["business"],"visibility":"hidden"}]"#,
+        );
+        // members base + minimoonoir's friends; family/business NOT auto-granted.
+        assert_eq!(new_joiner_cohorts_json(&z), r#"["members","friends"]"#);
+    }
+
+    #[test]
+    fn multiple_auto_approve_zones_union_without_dupes() {
+        let z = ZoneConfig::from_json(
+            r#"[{"id":"a","required_cohorts":["friends"],"auto_approve":true},
+                {"id":"b","required_cohorts":["friends","extra"],"auto_approve":true}]"#,
+        );
+        assert_eq!(
+            new_joiner_cohorts_json(&z),
+            r#"["members","friends","extra"]"#
+        );
     }
 }

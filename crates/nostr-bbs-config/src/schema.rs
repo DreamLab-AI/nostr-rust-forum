@@ -194,6 +194,14 @@ pub struct Zone {
     /// only records the flag; encryption/decryption is a client concern.
     #[serde(default)]
     pub encrypted: bool,
+    /// Auto-approve new joiners into this zone. When `true`, a brand-new user
+    /// (first kind-0 auto-whitelist) is automatically granted this zone's
+    /// `required_cohorts`, so they land in it without an admin approving them.
+    /// When `false` (default), the zone's cohort is admin-granted only. Per-zone,
+    /// so an operator can open one zone while keeping others gated. Projected into
+    /// the relay's `ZONE_CONFIG` where the relay enforces it at auto-whitelist.
+    #[serde(default)]
+    pub auto_approve: bool,
 }
 
 /// Trust system thresholds.
