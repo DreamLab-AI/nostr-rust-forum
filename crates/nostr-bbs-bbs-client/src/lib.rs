@@ -21,6 +21,7 @@ pub mod relay;
 pub mod screens;
 pub mod signer;
 pub mod theme;
+pub mod upload;
 
 mod app;
 pub use app::App;

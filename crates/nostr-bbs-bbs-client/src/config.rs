@@ -23,6 +23,10 @@ pub struct BbsConfig {
     pub theme: Theme,
     /// Node name shown in the masthead / status bar.
     pub node_name: String,
+    /// Strapline rendered under the node name in the banner and the
+    /// logged-out landing masthead. Operator branding (`[branding].tagline`);
+    /// the kit default stays descriptive and brand-neutral.
+    pub tagline: String,
     /// Location string shown in the status bar.
     pub location: String,
     /// Optional ASCII-art / image banner URL.
@@ -47,6 +51,7 @@ impl Default for BbsConfig {
         BbsConfig {
             theme: Theme::Amber,
             node_name: "NOSTR-BBS".to_string(),
+            tagline: "retro terminal · did:nostr · Solid pods".to_string(),
             location: "the decentralized frontier".to_string(),
             banner_url: None,
             logo_url: None,
@@ -94,6 +99,7 @@ impl BbsConfig {
                 .unwrap_or(default.theme),
             node_name: first_key(env, &["NODE_NAME", "FORUM_NAME", "SITE_NAME"])
                 .unwrap_or(default.node_name),
+            tagline: first_key(env, &["TAGLINE", "STRAPLINE"]).unwrap_or(default.tagline),
             location: str_key(env, "LOCATION").unwrap_or(default.location),
             banner_url: first_key(env, &["BANNER_URL", "BANNER"]),
             logo_url: first_key(env, &["LOGO_URL", "LOGO"]),
@@ -200,6 +206,7 @@ mod tests {
         let cfg = BbsConfig::from_env_value(&json!({}));
         assert_eq!(cfg.theme, Theme::Amber);
         assert_eq!(cfg.node_name, "NOSTR-BBS");
+        assert_eq!(cfg.tagline, "retro terminal · did:nostr · Solid pods");
         assert!(cfg.relay_url.is_empty());
         assert!(cfg.zones.is_empty());
     }
@@ -208,7 +215,8 @@ mod tests {
     fn reads_branding_and_endpoints() {
         let cfg = BbsConfig::from_env_value(&json!({
             "THEME": "green",
-            "NODE_NAME": "DREAMLAB BBS",
+            "NODE_NAME": "MINIMOONOIR",
+            "TAGLINE": "private secure forums",
             "LOCATION": "Manchester, UK",
             "RELAY_URL": "wss://relay.example.com",
             "POD_API": "https://pods.example.com",
@@ -216,7 +224,8 @@ mod tests {
             "VIEWER_PUBKEY": "ab12"
         }));
         assert_eq!(cfg.theme, Theme::Green);
-        assert_eq!(cfg.node_name, "DREAMLAB BBS");
+        assert_eq!(cfg.node_name, "MINIMOONOIR");
+        assert_eq!(cfg.tagline, "private secure forums");
         assert_eq!(cfg.location, "Manchester, UK");
         assert_eq!(cfg.relay_url, "wss://relay.example.com");
         assert_eq!(cfg.pod_api, "https://pods.example.com");

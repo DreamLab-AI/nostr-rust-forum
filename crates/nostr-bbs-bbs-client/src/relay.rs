@@ -138,6 +138,50 @@ pub fn flat_zone_order(channels: Vec<NostrEvent>, zone_ids: &[String]) -> Vec<No
     indexed.into_iter().map(|(_, ev)| ev).collect()
 }
 
+/// Sentinel zone selector for the "Other" group — boards that match no
+/// configured zone. Used as a [`BbsState::zone`](crate::chrome::BbsState) value
+/// distinct from a real `cfg.zones` index.
+pub const OTHER_ZONE: usize = usize::MAX;
+
+/// The ordered, selectable zone entries for the top-level Zones screen: one
+/// entry per configured zone (in config order), plus a trailing `OTHER_ZONE`
+/// entry when any channel matches no configured zone. Each entry carries its
+/// zone selector and that zone's board count. The order is stable and is the
+/// same order the keyboard selection / ENTER index into, so the Zones cards stay
+/// consistent with arrow-key navigation.
+pub fn zone_entries(channels: &[NostrEvent], zone_ids: &[String]) -> Vec<(usize, usize)> {
+    let mut counts = vec![0usize; zone_ids.len()];
+    let mut other = 0usize;
+    for ev in channels {
+        match channel_zone_index(ev, zone_ids) {
+            Some(i) => counts[i] += 1,
+            None => other += 1,
+        }
+    }
+    let mut out: Vec<(usize, usize)> = (0..zone_ids.len()).map(|i| (i, counts[i])).collect();
+    if other > 0 {
+        out.push((OTHER_ZONE, other));
+    }
+    out
+}
+
+/// The boards belonging to one selected zone (`OTHER_ZONE` = the unmatched
+/// group), preserving the incoming channel order. This is the list the
+/// per-zone board screen renders and the order its selection / ENTER index into.
+pub fn boards_in_zone(
+    channels: Vec<NostrEvent>,
+    zone_ids: &[String],
+    zone_sel: usize,
+) -> Vec<NostrEvent> {
+    channels
+        .into_iter()
+        .filter(|ev| match channel_zone_index(ev, zone_ids) {
+            Some(i) => zone_sel == i,
+            None => zone_sel == OTHER_ZONE,
+        })
+        .collect()
+}
+
 /// Build the NIP-28 tags for a kind-42 channel message, matching how the forum
 /// client composes board posts and replies:
 /// - every message anchors to the channel root: `["e", channel_id, "", "root"]`;
@@ -163,6 +207,157 @@ pub fn channel_message_tags(
         tags.push(vec!["p".to_string(), reply_author]);
     }
     tags
+}
+
+/// The parent post id a kind-42 reply points at — the `reply`-marked `e` tag
+/// (NIP-10 / NIP-28 threading). `None` for a thread root, which anchors to the
+/// channel only (`["e", channel_id, "", "root"]`, no reply marker).
+pub fn reply_parent(ev: &NostrEvent) -> Option<String> {
+    ev.tags
+        .iter()
+        .find(|t| {
+            t.first().map(String::as_str) == Some("e")
+                && t.get(3).map(String::as_str) == Some("reply")
+        })
+        .and_then(|t| t.get(1).cloned())
+}
+
+/// Whether a kind-42 post is a thread ROOT in `channel_id`: anchored to the
+/// channel and carrying no reply marker. Legacy unthreaded posts (channel
+/// messages with no reply tag) are roots too, so they render as single-post
+/// threads.
+pub fn is_thread_root(ev: &NostrEvent, channel_id: &str) -> bool {
+    post_root_channel(ev).as_deref() == Some(channel_id) && reply_parent(ev).is_none()
+}
+
+/// One thread in a board: its root post, how many replies sit beneath it, and
+/// the timestamp of the most recent activity (root or any reply).
+#[derive(Clone, Debug)]
+pub struct ThreadInfo {
+    /// The root kind-42 post that opened the thread.
+    pub root: NostrEvent,
+    /// Number of replies resolving to this root (any nesting depth).
+    pub reply_count: usize,
+    /// Newest `created_at` across the root and all its replies.
+    pub last_activity: u64,
+}
+
+/// Walk a reply's parent chain up to the thread root it belongs to. Returns the
+/// root id, or `None` when the parent is not among the loaded channel posts (an
+/// orphan whose root hasn't arrived). Bounded so a malformed cycle can't hang.
+fn resolve_root(
+    reply_id: &str,
+    parent_of: &std::collections::HashMap<String, String>,
+    root_ids: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let mut cur = parent_of.get(reply_id)?.clone();
+    for _ in 0..64 {
+        if root_ids.contains(&cur) {
+            return Some(cur);
+        }
+        match parent_of.get(&cur) {
+            Some(next) => cur = next.clone(),
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Partition a channel's kind-42 posts into threads: each root post (no reply
+/// marker) with its reply count and last-activity time. Replies attach to their
+/// thread root by following the `reply`-marked `e` tag up to a root; an orphan
+/// reply (root not loaded) becomes its own single-post thread so no message is
+/// lost. Sorted most-recent-activity first.
+pub fn group_threads(posts: &[NostrEvent], channel_id: &str) -> Vec<ThreadInfo> {
+    let in_chan: Vec<&NostrEvent> = posts
+        .iter()
+        .filter(|p| post_root_channel(p).as_deref() == Some(channel_id))
+        .collect();
+    let root_ids: std::collections::HashSet<String> = in_chan
+        .iter()
+        .filter(|p| reply_parent(p).is_none())
+        .map(|p| p.id.clone())
+        .collect();
+    let parent_of: std::collections::HashMap<String, String> = in_chan
+        .iter()
+        .filter_map(|p| reply_parent(p).map(|par| (p.id.clone(), par)))
+        .collect();
+
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut last: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for p in &in_chan {
+        if root_ids.contains(&p.id) {
+            counts.insert(p.id.clone(), 0);
+            last.insert(p.id.clone(), p.created_at);
+        }
+    }
+    let mut orphans: Vec<&NostrEvent> = Vec::new();
+    for p in &in_chan {
+        if root_ids.contains(&p.id) {
+            continue;
+        }
+        match resolve_root(&p.id, &parent_of, &root_ids) {
+            Some(root) => {
+                *counts.entry(root.clone()).or_insert(0) += 1;
+                last.entry(root)
+                    .and_modify(|t| *t = (*t).max(p.created_at))
+                    .or_insert(p.created_at);
+            }
+            None => orphans.push(p),
+        }
+    }
+    let mut out: Vec<ThreadInfo> = in_chan
+        .iter()
+        .filter(|p| root_ids.contains(&p.id))
+        .map(|p| ThreadInfo {
+            root: (*p).clone(),
+            reply_count: counts.get(&p.id).copied().unwrap_or(0),
+            last_activity: last.get(&p.id).copied().unwrap_or(p.created_at),
+        })
+        .collect();
+    for o in orphans {
+        out.push(ThreadInfo {
+            root: o.clone(),
+            reply_count: 0,
+            last_activity: o.created_at,
+        });
+    }
+    out.sort_by_key(|t| std::cmp::Reverse(t.last_activity));
+    out
+}
+
+/// All posts belonging to one thread — the root plus every reply that resolves
+/// to it — in chronological (oldest-first) order so the conversation reads
+/// top-down. The root always leads even when a reply predates a re-broadcast.
+pub fn thread_messages(posts: &[NostrEvent], channel_id: &str, root_id: &str) -> Vec<NostrEvent> {
+    let in_chan: Vec<&NostrEvent> = posts
+        .iter()
+        .filter(|p| post_root_channel(p).as_deref() == Some(channel_id))
+        .collect();
+    let root_ids: std::collections::HashSet<String> = in_chan
+        .iter()
+        .filter(|p| reply_parent(p).is_none())
+        .map(|p| p.id.clone())
+        .collect();
+    let parent_of: std::collections::HashMap<String, String> = in_chan
+        .iter()
+        .filter_map(|p| reply_parent(p).map(|par| (p.id.clone(), par)))
+        .collect();
+    let mut out: Vec<NostrEvent> = in_chan
+        .iter()
+        .filter(|p| {
+            p.id == root_id
+                || resolve_root(&p.id, &parent_of, &root_ids).as_deref() == Some(root_id)
+        })
+        .map(|p| (*p).clone())
+        .collect();
+    out.sort_by(|a, b| {
+        // Root first, then chronological — a re-broadcast reply can't jump ahead.
+        (a.id != root_id)
+            .cmp(&(b.id != root_id))
+            .then(a.created_at.cmp(&b.created_at))
+    });
+    out
 }
 
 /// Parse a governance event's content into a control-panel definition.
@@ -675,6 +870,45 @@ mod tests {
     }
 
     #[test]
+    fn zone_entries_counts_boards_and_appends_other_when_unmatched() {
+        let ids = vec!["public".to_string(), "business".to_string()];
+        let z = |id: &str, zone: &str| ev(id, 40, 1, "{}", vec![vec!["zone", zone]]);
+        let chans = vec![
+            z("p1", "public-a"),
+            z("p2", "public-b"),
+            z("b1", "business-x"),
+            z("x1", "elsewhere"),
+        ];
+        let entries = zone_entries(&chans, &ids);
+        // public (2), business (1), then the Other group (1 unmatched).
+        assert_eq!(entries, vec![(0, 2), (1, 1), (OTHER_ZONE, 1)]);
+    }
+
+    #[test]
+    fn zone_entries_omits_other_when_all_matched_but_keeps_empty_zones() {
+        let ids = vec!["public".to_string(), "family".to_string()];
+        let chans = vec![ev("p1", 40, 1, "{}", vec![vec!["zone", "public"]])];
+        // Every configured zone gets a card (family has 0), no Other group.
+        assert_eq!(zone_entries(&chans, &ids), vec![(0, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn boards_in_zone_filters_to_the_selected_zone_and_other() {
+        let ids = vec!["public".to_string(), "business".to_string()];
+        let z = |id: &str, zone: &str| ev(id, 40, 1, "{}", vec![vec!["zone", zone]]);
+        let chans = vec![
+            z("p1", "public-a"),
+            z("b1", "business-x"),
+            z("x1", "elsewhere"),
+            z("p2", "public-b"),
+        ];
+        let ids_of = |v: Vec<NostrEvent>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids_of(boards_in_zone(chans.clone(), &ids, 0)), vec!["p1", "p2"]);
+        assert_eq!(ids_of(boards_in_zone(chans.clone(), &ids, 1)), vec!["b1"]);
+        assert_eq!(ids_of(boards_in_zone(chans, &ids, OTHER_ZONE)), vec!["x1"]);
+    }
+
+    #[test]
     fn channel_message_tags_top_level_anchors_to_root() {
         let tags = channel_message_tags("chan-id", None);
         assert_eq!(tags, vec![vec!["e", "chan-id", "", "root"]]);
@@ -694,6 +928,121 @@ mod tests {
                 vec!["p", "author-pk"],
             ]
         );
+    }
+
+    #[test]
+    fn reply_parent_reads_reply_marked_e_tag() {
+        let root = ev("R", 42, 10, "hi", vec![vec!["e", "C", "", "root"]]);
+        assert_eq!(reply_parent(&root), None);
+        let reply = ev(
+            "A",
+            42,
+            20,
+            "re",
+            vec![
+                vec!["e", "C", "", "root"],
+                vec!["e", "R", "", "reply"],
+                vec!["p", "pk"],
+            ],
+        );
+        assert_eq!(reply_parent(&reply).as_deref(), Some("R"));
+    }
+
+    #[test]
+    fn is_thread_root_distinguishes_roots_from_replies() {
+        let root = ev("R", 42, 10, "hi", vec![vec!["e", "C", "", "root"]]);
+        let reply = ev(
+            "A",
+            42,
+            20,
+            "re",
+            vec![vec!["e", "C", "", "root"], vec!["e", "R", "", "reply"]],
+        );
+        assert!(is_thread_root(&root, "C"));
+        assert!(!is_thread_root(&reply, "C"));
+        // A root anchored to a DIFFERENT channel is not a root here.
+        assert!(!is_thread_root(&root, "OTHER"));
+    }
+
+    #[test]
+    fn group_threads_counts_replies_and_tracks_last_activity() {
+        let posts = vec![
+            ev("R1", 42, 100, "first thread", vec![vec!["e", "C", "", "root"]]),
+            ev(
+                "A",
+                42,
+                150,
+                "reply to R1",
+                vec![vec!["e", "C", "", "root"], vec!["e", "R1", "", "reply"]],
+            ),
+            ev(
+                "B",
+                42,
+                170,
+                "nested reply",
+                vec![vec!["e", "C", "", "root"], vec!["e", "A", "", "reply"]],
+            ),
+            ev("R2", 42, 120, "second thread", vec![vec!["e", "C", "", "root"]]),
+        ];
+        let threads = group_threads(&posts, "C");
+        assert_eq!(threads.len(), 2);
+        // R1: 2 replies (A + nested B), last activity 170. Sorted by activity
+        // desc so R1 (170) precedes R2 (120).
+        assert_eq!(threads[0].root.id, "R1");
+        assert_eq!(threads[0].reply_count, 2);
+        assert_eq!(threads[0].last_activity, 170);
+        assert_eq!(threads[1].root.id, "R2");
+        assert_eq!(threads[1].reply_count, 0);
+        assert_eq!(threads[1].last_activity, 120);
+    }
+
+    #[test]
+    fn group_threads_ignores_other_channels_and_promotes_orphans() {
+        let posts = vec![
+            ev("R1", 42, 100, "here", vec![vec!["e", "C", "", "root"]]),
+            ev("X", 42, 90, "elsewhere", vec![vec!["e", "OTHER", "", "root"]]),
+            // Orphan reply — its parent P is not loaded, so it becomes its own
+            // single-post thread rather than vanishing.
+            ev(
+                "O",
+                42,
+                110,
+                "orphan",
+                vec![vec!["e", "C", "", "root"], vec!["e", "P", "", "reply"]],
+            ),
+        ];
+        let threads = group_threads(&posts, "C");
+        assert_eq!(threads.len(), 2); // R1 + orphan O; OTHER-channel X excluded
+        assert!(threads.iter().any(|t| t.root.id == "R1"));
+        assert!(threads
+            .iter()
+            .any(|t| t.root.id == "O" && t.reply_count == 0));
+    }
+
+    #[test]
+    fn thread_messages_returns_root_plus_replies_chronological() {
+        let posts = vec![
+            ev(
+                "B",
+                42,
+                170,
+                "nested",
+                vec![vec!["e", "C", "", "root"], vec!["e", "A", "", "reply"]],
+            ),
+            ev("R1", 42, 100, "root", vec![vec!["e", "C", "", "root"]]),
+            ev(
+                "A",
+                42,
+                150,
+                "reply",
+                vec![vec!["e", "C", "", "root"], vec!["e", "R1", "", "reply"]],
+            ),
+            ev("R2", 42, 120, "other thread", vec![vec!["e", "C", "", "root"]]),
+        ];
+        let msgs = thread_messages(&posts, "C", "R1");
+        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+        // Root R1 first, then A, then nested B (oldest→newest); R2 excluded.
+        assert_eq!(ids, vec!["R1", "A", "B"]);
     }
 
     #[test]

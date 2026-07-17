@@ -12,7 +12,11 @@
 /// One of the ten BBS screens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
-    /// The numbered main menu (landing screen).
+    /// Logged-out onboarding landing — what this is + how to get in. Shown before
+    /// the numbered menu when signed out and the viewer hasn't chosen to look
+    /// around. Not a numbered menu item; reached only as the signed-out entry.
+    Landing,
+    /// The numbered main menu (home screen once past onboarding).
     #[default]
     MainMenu,
     /// Agent control panels — approve, reject, act (human-in-the-loop).
@@ -83,6 +87,7 @@ impl Screen {
     /// Short title (shown in the menu and the screen header).
     pub fn title(self) -> &'static str {
         match self {
+            Screen::Landing => "Welcome",
             Screen::MainMenu => "Main Menu",
             Screen::Agents => "Agents",
             Screen::Boards => "Boards",
@@ -100,6 +105,7 @@ impl Screen {
     /// One-line description of the real kit feature behind the screen.
     pub fn subtitle(self) -> &'static str {
         match self {
+            Screen::Landing => "What this is, and how to get in",
             Screen::MainMenu => "Select a board by number, or type / for a command",
             Screen::Agents => "Agent control panels — approve, reject, act (human-in-the-loop)",
             Screen::Boards => "Zones & boards — kind-40/42 channels, zone-gated",
@@ -117,6 +123,7 @@ impl Screen {
     /// Command-line aliases that jump to this screen (typed after `/`).
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
+            Screen::Landing => &["welcome", "start", "landing"],
             Screen::MainMenu => &["menu", "main", "home"],
             Screen::Agents => &["agents", "gov", "door", "doors", "admin", "d", "agent"],
             Screen::Boards => &["msg", "messages", "boards", "m", "board"],
@@ -173,7 +180,10 @@ pub fn parse_command(raw: &str) -> Command {
             }
         }
     }
-    for screen in [Screen::MainMenu].into_iter().chain(Screen::menu_order()) {
+    for screen in [Screen::Landing, Screen::MainMenu]
+        .into_iter()
+        .chain(Screen::menu_order())
+    {
         if screen.aliases().contains(&cmd.as_str()) {
             return Command::Go(screen);
         }

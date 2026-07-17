@@ -7,6 +7,7 @@ use crate::ascii_img::AsciiImg;
 use crate::config::BbsConfig;
 use crate::menu::{parse_command, Command, Screen};
 use crate::relay::RelayStore;
+use crate::signer::BbsSigner;
 use crate::theme::Theme;
 
 /// Shared, `Copy` application state (all fields are `RwSignal`, which is `Copy`).
@@ -22,16 +23,36 @@ pub struct BbsState {
     pub cmd_open: RwSignal<bool>,
     /// Current command-line text.
     pub cmd_text: RwSignal<String>,
-    /// Currently-open board (kind-40 channel id) within Message Base, if any.
+    /// Selected zone within the Boards drill-down: `None` = the top-level Zones
+    /// screen; `Some(i)` = a configured `cfg.zones[i]`; `Some(OTHER_ZONE)` = the
+    /// unmatched "Other" group. Boards navigate Zones → Boards-in-zone → posts.
+    pub zone: RwSignal<Option<usize>>,
+    /// Currently-open board (kind-40 channel id) within the selected zone, if any.
     pub board: RwSignal<Option<String>>,
+    /// Currently-open thread within the board: the root kind-42 event id, or
+    /// `None` for the board's thread list. Boards drill Zones → Boards → Threads
+    /// → Thread view; this is the deepest level.
+    pub thread: RwSignal<Option<String>>,
+    /// Whether a signed-out viewer chose "look around" from the Landing screen —
+    /// past onboarding, browsing read-only. The Landing screen is the signed-out
+    /// entry until this is set (or the viewer signs in).
+    pub looking_around: RwSignal<bool>,
+    /// Accessibility preference: larger body type (persisted; applied as a class
+    /// on the document root so the whole rem-based layout scales).
+    pub text_large: RwSignal<bool>,
+    /// Accessibility preference: suppress the CRT flicker / cursor blink /
+    /// phosphor-ghost motion (persisted; defaults to the OS `prefers-reduced-motion`).
+    pub reduced_motion: RwSignal<bool>,
 }
 
 impl BbsState {
-    /// Navigate to a screen, resetting the selection and any open board.
+    /// Navigate to a screen, resetting the selection and the Boards drill-down.
     pub fn go(&self, screen: Screen) {
         self.screen.set(screen);
         self.selection.set(0);
+        self.zone.set(None);
         self.board.set(None);
+        self.thread.set(None);
         self.cmd_open.set(false);
         self.cmd_text.set(String::new());
     }
@@ -48,37 +69,119 @@ impl BbsState {
         }
     }
 
-    /// Activate the current selection on the main menu (Enter).
+    /// Activate the current selection on the main menu (Enter). Called from the
+    /// global keydown handler (an imperative, non-reactive context), so the
+    /// signal reads are untracked — there is no effect to subscribe.
     pub fn activate_menu(&self) {
-        if self.screen.get() == Screen::MainMenu {
-            if let Some(s) = Screen::menu_order().get(self.selection.get()) {
+        if self.screen.get_untracked() == Screen::MainMenu {
+            if let Some(s) = Screen::menu_order().get(self.selection.get_untracked()) {
                 self.go(*s);
             }
         }
     }
 
-    /// Open a Message Base board (kind-40 channel id).
-    pub fn open_board(&self, channel_id: String) {
-        self.board.set(Some(channel_id));
+    /// Open a zone in the Boards drill-down (a `cfg.zones` index or `OTHER_ZONE`),
+    /// showing that zone's boards. Resets the selection to the first board.
+    pub fn open_zone(&self, zone_sel: usize) {
+        self.zone.set(Some(zone_sel));
+        self.board.set(None);
+        self.selection.set(0);
     }
 
-    /// Close the open board, returning to the channel list.
+    /// Close the open zone, returning to the top-level Zones cards.
+    pub fn close_zone(&self) {
+        self.zone.set(None);
+        self.board.set(None);
+        self.thread.set(None);
+        self.selection.set(0);
+    }
+
+    /// Open a board (kind-40 channel id) within the selected zone. Resets the
+    /// thread drill-down to the board's thread list.
+    pub fn open_board(&self, channel_id: String) {
+        self.board.set(Some(channel_id));
+        self.thread.set(None);
+        self.selection.set(0);
+    }
+
+    /// Close the open board, returning to the zone's board list.
     pub fn close_board(&self) {
         self.board.set(None);
+        self.thread.set(None);
+        self.selection.set(0);
+    }
+
+    /// Open a thread (root kind-42 event id) within the current board.
+    pub fn open_thread(&self, root_id: String) {
+        self.thread.set(Some(root_id));
+        self.selection.set(0);
+    }
+
+    /// Close the open thread, returning to the board's thread list.
+    pub fn close_thread(&self) {
+        self.thread.set(None);
+        self.selection.set(0);
+    }
+
+    /// Leave the Landing screen to browse read-only ("look around").
+    pub fn look_around(&self) {
+        self.looking_around.set(true);
+        self.go(Screen::MainMenu);
     }
 }
 
 /// Top status bar: live connection indicator, node name, location.
+///
+/// Three states, so "connected but not yet authenticated" no longer reads as
+/// "node down": `○ CONNECTING` (socket not open) · `◐ SIGN IN TO READ`
+/// (connected, no signer — NIP-42 reads are deny-by-default, so a signed-out
+/// viewer sees empty zones; tap it to open the sign-in sheet) · `● ONLINE`
+/// (connected and signed in).
 #[component]
-pub fn StatusBar() -> impl IntoView {
+pub fn StatusBar(state: BbsState) -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
     let store = use_context::<RelayStore>().expect("relay");
+    let signer = use_context::<BbsSigner>();
     let (node, loc) = cfg.with_value(|c| (c.node_name.clone(), c.location.clone()));
+    let authed = move || signer.and_then(|s| s.pubkey().get()).is_some();
+    // Three-way status class: connecting / needs-auth / online.
+    let status_class = move || {
+        if !store.connected.get() {
+            "bad"
+        } else if authed() {
+            "ok"
+        } else {
+            "warn"
+        }
+    };
     view! {
         <div class="bbs-statusbar">
             <span>
-                <span class=move || if store.connected.get() { "ok" } else { "bad" }>
-                    {move || if store.connected.get() { "● ONLINE" } else { "○ CONNECTING" }}
+                <span
+                    class=status_class
+                    class:bbs-link=move || store.connected.get() && !authed()
+                    role="button"
+                    on:click=move |_| {
+                        // Imperative click handler (not a reactive context) — read
+                        // untracked so this doesn't warn about tracking outside an
+                        // effect. Only the "needs auth" state is a live link.
+                        let connected = store.connected.get_untracked();
+                        let signed =
+                            signer.and_then(|s| s.pubkey().get_untracked()).is_some();
+                        if connected && !signed {
+                            state.go(Screen::Settings);
+                        }
+                    }
+                >
+                    {move || {
+                        if !store.connected.get() {
+                            "\u{25CB} CONNECTING"
+                        } else if authed() {
+                            "\u{25CF} ONLINE"
+                        } else {
+                            "\u{25D0} SIGN IN TO READ"
+                        }
+                    }}
                 </span>
                 " │ " {node}
             </span>
@@ -87,15 +190,78 @@ pub fn StatusBar() -> impl IntoView {
     }
 }
 
-/// ASCII banner masthead. The masthead line is node-name driven (operator
-/// branding from `[branding].node_name`), never a hardcoded upstream kit name.
+/// Persistent, skinned bottom navigation bar — the tap-first return path that
+/// replaces the undocumented "swipe down from top" gesture as the *primary* way
+/// home (the swipe stays as an accelerator). Menu / Boards / Agents are always
+/// present; DMs (a placeholder until the encrypted-DM feature lands) and the
+/// "You" tab are auth-gated like the forum's mobile nav — and when signed out
+/// the "You" slot becomes a first-class **Sign in** entry so a newcomer always
+/// has a visible way in. The active screen is highlighted.
+#[component]
+pub fn BottomNav(state: BbsState) -> impl IntoView {
+    let signer = use_context::<BbsSigner>();
+    let authed = move || signer.and_then(|s| s.pubkey().get()).is_some();
+    view! {
+        <nav class="bbs-bottomnav" aria-label="Primary navigation">
+            <button
+                class="bbs-navitem"
+                class:active=move || state.screen.get() == Screen::MainMenu
+                on:click=move |_| state.go(Screen::MainMenu)
+            >
+                <span class="ico">"\u{2261}"</span>
+                <span class="lab">"Menu"</span>
+            </button>
+            <button
+                class="bbs-navitem"
+                class:active=move || state.screen.get() == Screen::Boards
+                on:click=move |_| state.go(Screen::Boards)
+            >
+                <span class="ico">"\u{25A4}"</span>
+                <span class="lab">"Boards"</span>
+            </button>
+            {move || authed().then(|| view! {
+                <button
+                    class="bbs-navitem bbs-navitem-soon"
+                    disabled=true
+                    attr:aria-disabled="true"
+                    title="Direct messages — coming soon"
+                >
+                    <span class="ico">"\u{2709}"</span>
+                    <span class="lab">"DMs"</span>
+                </button>
+            })}
+            <button
+                class="bbs-navitem"
+                class:active=move || state.screen.get() == Screen::Agents
+                on:click=move |_| state.go(Screen::Agents)
+            >
+                <span class="ico">"\u{25B8}"</span>
+                <span class="lab">"Agents"</span>
+            </button>
+            <button
+                class="bbs-navitem"
+                class:active=move || state.screen.get() == Screen::Settings
+                on:click=move |_| state.go(Screen::Settings)
+            >
+                {move || if authed() {
+                    view! { <span class="ico">"\u{2699}"</span><span class="lab">"You"</span> }.into_any()
+                } else {
+                    view! { <span class="ico">"\u{23FB}"</span><span class="lab">"Sign in"</span> }.into_any()
+                }}
+            </button>
+        </nav>
+    }
+}
+
+/// Banner masthead. Node name + tagline are operator branding
+/// (`[branding].node_name` / `.tagline`), never a hardcoded upstream kit name.
+/// Plain styled text rather than box-glyph art: nothing to misalign with long
+/// node names, clip on narrow screens, or mojibake under a wrong charset.
 #[component]
 pub fn Banner() -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
-    let (node, banner_url) = cfg.with_value(|c| (c.node_name.clone(), c.banner_url.clone()));
-    // Right-pad to the same field width the old hardcoded line used, so the
-    // box-art border stays aligned for typical node names.
-    let masthead = format!("{:<38}║", format!("{node} // retro terminal"));
+    let (node, tagline, banner_url) =
+        cfg.with_value(|c| (c.node_name.clone(), c.tagline.clone(), c.banner_url.clone()));
     view! {
         // Optional banner image — rendered on-theme as ASCII, never a raw <img>.
         {banner_url.map(|src| view! {
@@ -103,15 +269,11 @@ pub fn Banner() -> impl IntoView {
                 <AsciiImg src=src cols=100 />
             </div>
         })}
-        <pre class="bbs-banner">
-            " ╔══════════════════════════════════════════════════════════╗\n"
-            " ║   ▄▄▄   ▄▄▄  ▄▄▄    " {masthead} "\n"
-            " ║   █▀▀▄ █▀▀▄ █▀▀     did:nostr · Solid pods · agent plane  ║\n"
-            " ║   ▀▀▀  ▀▀▀  ▀▀▀                                           ║\n"
-            " ╚══════════════════════════════════════════════════════════╝"
-            "\n  "
-            <span class="tagline">{node} " — press a number, or / for a command"</span>
-        </pre>
+        <div class="bbs-banner">
+            <div class="bbs-banner-node">{node}</div>
+            <div class="bbs-banner-tag">{tagline}</div>
+            <span class="tagline">"press a number, or / for a command (tap works too)"</span>
+        </div>
     }
 }
 
@@ -175,7 +337,9 @@ pub fn CommandLine(state: BbsState) -> impl IntoView {
         }
     });
     let submit = move || {
-        let cmd = parse_command(&state.cmd_text.get());
+        // Fired from the input's Enter/click handlers (imperative), so read the
+        // text untracked — no reactive subscription is wanted here.
+        let cmd = parse_command(&state.cmd_text.get_untracked());
         state.apply(cmd);
         state.cmd_text.set(String::new());
         state.cmd_open.set(false);
@@ -209,12 +373,36 @@ pub fn CommandLine(state: BbsState) -> impl IntoView {
     }
 }
 
-/// Selectable-row count on the active screen (for ↑/↓ navigation).
+/// Selectable-row count on the active screen (for ↑/↓ navigation). Boards has
+/// four depths: the Zones cards, a zone's board list, a board's thread list, and
+/// the (unselectable) thread view. Called from the global keydown handler (an
+/// imperative, non-reactive context), so all signal reads are untracked — there
+/// is no effect to subscribe.
 #[cfg(target_arch = "wasm32")]
-fn nav_len(state: &BbsState, store: &RelayStore) -> usize {
-    match state.screen.get() {
+fn nav_len(state: &BbsState, store: &RelayStore, cfg: &StoredValue<BbsConfig>) -> usize {
+    match state.screen.get_untracked() {
         Screen::MainMenu => Screen::menu_order().len(),
-        Screen::Boards if state.board.get().is_none() => store.channels.get().len(),
+        Screen::Boards => match state.board.get_untracked() {
+            None => {
+                let zone_ids: Vec<String> =
+                    cfg.with_value(|c| c.zones.iter().map(|z| z.id.clone()).collect());
+                match state.zone.get_untracked() {
+                    None => {
+                        crate::relay::zone_entries(&store.channels.get_untracked(), &zone_ids).len()
+                    }
+                    Some(z) => {
+                        crate::relay::boards_in_zone(store.channels.get_untracked(), &zone_ids, z)
+                            .len()
+                    }
+                }
+            }
+            // In a board: the thread LIST is row-selectable; the open thread view
+            // is not (the composer owns it).
+            Some(cid) if state.thread.get_untracked().is_none() => {
+                crate::relay::group_threads(&store.posts.get_untracked(), &cid).len()
+            }
+            Some(_) => 0,
+        },
         _ => 0,
     }
 }
@@ -227,8 +415,11 @@ pub fn install_key_handler(state: BbsState, store: RelayStore, cfg: StoredValue<
     use wasm_bindgen::prelude::*;
     let handler =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
+            // This runs in a raw JS event closure — an imperative, non-reactive
+            // context — so every signal read below is untracked (there is no
+            // effect to subscribe; a plain `.get()` here warns at runtime).
             // While the command line is open the <input> owns the keystrokes.
-            if state.cmd_open.get() {
+            if state.cmd_open.get_untracked() {
                 return;
             }
             // A focused text field (Settings sign-in key, board composer) owns its
@@ -243,6 +434,18 @@ pub fn install_key_handler(state: BbsState, store: RelayStore, cfg: StoredValue<
                 if tag.eq_ignore_ascii_case("input") || tag.eq_ignore_ascii_case("textarea") {
                     return;
                 }
+                // A focused custom button (zone card, thread/member row, back
+                // control, toggle) or native <button>/<a> owns Enter/Space — its
+                // own handler activates it, so don't ALSO drive the global nav
+                // model (which would double-navigate). Other keys still pass so
+                // arrows / digits keep working while a control is focused.
+                let k = ev.key();
+                let is_button = tag.eq_ignore_ascii_case("button")
+                    || tag.eq_ignore_ascii_case("a")
+                    || el.get_attribute("role").as_deref() == Some("button");
+                if is_button && (k == "Enter" || k == " " || k == "Spacebar") {
+                    return;
+                }
             }
             match ev.key().as_str() {
                 "/" => {
@@ -250,35 +453,74 @@ pub fn install_key_handler(state: BbsState, store: RelayStore, cfg: StoredValue<
                     state.cmd_open.set(true);
                 }
                 "Escape" => {
-                    if state.screen.get() == Screen::Boards && state.board.get().is_some() {
+                    // Walk the Boards drill-down back one level per press: thread
+                    // view → thread list → zone board list → Zones cards → menu.
+                    let in_boards = state.screen.get_untracked() == Screen::Boards;
+                    if in_boards && state.thread.get_untracked().is_some() {
+                        state.close_thread();
+                    } else if in_boards && state.board.get_untracked().is_some() {
                         state.close_board();
+                    } else if in_boards && state.zone.get_untracked().is_some() {
+                        state.close_zone();
                     } else {
                         state.go(Screen::MainMenu);
                     }
                 }
-                "Enter" => match state.screen.get() {
+                "Enter" => match state.screen.get_untracked() {
                     Screen::MainMenu => state.activate_menu(),
-                    Screen::Boards if state.board.get().is_none() => {
-                        // Open the board at the selection index in the SAME
-                        // zone-grouped order the Boards screen renders.
-                        let zone_ids: Vec<String> =
-                            cfg.with_value(|c| c.zones.iter().map(|z| z.id.clone()).collect());
-                        let ordered =
-                            crate::relay::flat_zone_order(store.channels.get(), &zone_ids);
-                        if let Some(c) = ordered.get(state.selection.get()) {
-                            let id = c.id.clone();
-                            state.open_board(id.clone());
-                            crate::relay::subscribe_board(&id);
+                    Screen::Boards => match state.board.get_untracked() {
+                        None => {
+                            let zone_ids: Vec<String> = cfg
+                                .with_value(|c| c.zones.iter().map(|z| z.id.clone()).collect());
+                            match state.zone.get_untracked() {
+                                // Zones cards: open the selected zone.
+                                None => {
+                                    let entries = crate::relay::zone_entries(
+                                        &store.channels.get_untracked(),
+                                        &zone_ids,
+                                    );
+                                    if let Some((zsel, _)) =
+                                        entries.get(state.selection.get_untracked())
+                                    {
+                                        state.open_zone(*zsel);
+                                    }
+                                }
+                                // Board list: open the selected board in this zone.
+                                Some(z) => {
+                                    let boards = crate::relay::boards_in_zone(
+                                        store.channels.get_untracked(),
+                                        &zone_ids,
+                                        z,
+                                    );
+                                    if let Some(c) = boards.get(state.selection.get_untracked()) {
+                                        let id = c.id.clone();
+                                        state.open_board(id.clone());
+                                        crate::relay::subscribe_board(&id);
+                                    }
+                                }
+                            }
                         }
-                    }
+                        // Thread list: open the selected thread. (In the thread
+                        // view itself Enter is inert — the composer input owns it.)
+                        Some(cid) if state.thread.get_untracked().is_none() => {
+                            let threads = crate::relay::group_threads(
+                                &store.posts.get_untracked(),
+                                &cid,
+                            );
+                            if let Some(t) = threads.get(state.selection.get_untracked()) {
+                                state.open_thread(t.root.id.clone());
+                            }
+                        }
+                        Some(_) => {}
+                    },
                     _ => {}
                 },
                 "ArrowUp" | "k" => {
-                    let len = nav_len(&state, &store);
+                    let len = nav_len(&state, &store, &cfg);
                     state.selection.update(|i| *i = wrap_index(*i, -1, len));
                 }
                 "ArrowDown" | "j" => {
-                    let len = nav_len(&state, &store);
+                    let len = nav_len(&state, &store, &cfg);
                     state.selection.update(|i| *i = wrap_index(*i, 1, len));
                 }
                 "t" | "T" => state.theme.update(|t| *t = t.next()),

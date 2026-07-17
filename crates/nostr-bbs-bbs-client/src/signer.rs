@@ -239,6 +239,25 @@ impl BbsSigner {
     pub fn adopt_forum_session(&self) -> bool {
         false
     }
+
+    /// The readable raw secret hex for a signed-in LOCAL key — the same-origin
+    /// forum `nostr_bbs_sk` entry — so the Settings backup sheet (F14) can show
+    /// it once. Returns `None` when signed out or when the session is a NIP-07
+    /// extension (which exposes no readable key — nothing to back up here). Never
+    /// exposes new material: any same-origin script can already read that entry.
+    #[cfg(target_arch = "wasm32")]
+    pub fn local_secret_hex(&self) -> Option<String> {
+        if self.pubkey.get_untracked().is_none() {
+            return None;
+        }
+        read_forum_privkey_hex().filter(|h| !h.trim().is_empty())
+    }
+
+    /// Native fallback: no browser storage to read.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn local_secret_hex(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Which backend a forum-session adoption should install. Pure decision split

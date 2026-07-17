@@ -62,6 +62,15 @@ web-sys = { workspace = true, features = [
     "Response",
     "Headers",
     "Storage",
+    "MediaQueryList",
+    "DomTokenList",
+    # Composer image upload (F10): file pick + canvas compression.
+    "File",
+    "FileList",
+    "Blob",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "ImageBitmap",
 ] }
 console_error_panic_hook = "0.1"
 # Write path: reuse the kit's audited signer (PrfSigner) + key parsing. `hex`
@@ -71,6 +80,11 @@ console_error_panic_hook = "0.1"
 # the forum client's AuthStore).
 hex = { workspace = true }
 zeroize = { workspace = true }
+# Composer image upload (F10): base64-encode the signed NIP-98 event and
+# SHA-256 the payload for the `payload` tag — the same primitives the forum
+# client's pod_client uses, built here on the shared `Signer` trait.
+base64 = { workspace = true }
+sha2 = { workspace = true }
 send_wrapper = "0.6"
 # URL parsing for authority-exact first-party (pod) checks — a bare string
 # prefix cannot distinguish `pods.example.com` from `pods.example.com.evil.com`,

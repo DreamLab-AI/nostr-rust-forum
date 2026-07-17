@@ -15,9 +15,16 @@
 //! recolours them per active theme via `color-mix` on the theme vars.
 //!
 //! This module is the CLIENT side: [`AsciiImg`] fetches the fragment for a given
-//! image URL (through the preview endpoint, or directly with `?format=ascii` for
-//! pod-hosted images) and injects it. The pure URL/parsing helpers are
-//! unit-tested on the native target; the `fetch` itself is wasm-only.
+//! image URL and injects it. Pod-hosted images are tried **directly** with
+//! `?format=ascii` first (the DreamLab pod-worker renders them itself), then
+//! **fall back** to the preview endpoint. That fallback is load-bearing: a pod
+//! that does not implement `?format=ascii` (e.g. a local `solid-pod-rs` dev pod,
+//! which ignores the param and returns the raw image as `application/octet-stream`)
+//! makes the direct fetch fail the `text/html` gate; the client then routes the
+//! public pod URL through the preview-worker, which converts it server-side. Only
+//! when every route fails does it degrade to `[ image unavailable ]` — never a
+//! raw `JsValue` and never a panic. The pure URL/parsing helpers are unit-tested
+//! on the native target; the `fetch` itself is wasm-only.
 
 use leptos::prelude::*;
 use url::Url;
@@ -66,24 +73,33 @@ pub fn AsciiImg(
     // resolve a client-relative path.
     #[cfg(target_arch = "wasm32")]
     let src = make_absolute(&current_origin(), &src);
-    let fetch_url = ascii_fetch_url(&preview_api, &pod_api, &src, cols, &ramp);
+    let fetch_urls = ascii_fetch_urls(&preview_api, &pod_api, &src, cols, &ramp);
 
-    let state = RwSignal::new(if fetch_url.is_some() {
-        AsciiState::Loading
-    } else {
+    let state = RwSignal::new(if fetch_urls.is_empty() {
         AsciiState::Error
+    } else {
+        AsciiState::Loading
     });
 
-    if let Some(url) = fetch_url {
+    if !fetch_urls.is_empty() {
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
-            match fetch_ascii(&url).await {
-                Ok(html) => state.set(AsciiState::Loaded(html)),
-                Err(_) => state.set(AsciiState::Error),
+            // Try each candidate in priority order (pod-direct, then preview
+            // fallback); the first `text/html` fragment wins. A pod that ignores
+            // `?format=ascii` (raw image / wrong content-type) or 401s simply
+            // falls through to the next route. When every candidate fails we
+            // degrade to `[ image unavailable ]` — never a raw `JsValue`, never
+            // a panic.
+            for url in &fetch_urls {
+                if let Ok(html) = fetch_ascii(url).await {
+                    state.set(AsciiState::Loaded(html));
+                    return;
+                }
             }
+            state.set(AsciiState::Error);
         });
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = url;
+        let _ = fetch_urls;
     }
 
     move || match state.get() {
@@ -153,16 +169,57 @@ fn current_origin() -> String {
         .unwrap_or_default()
 }
 
-/// Build the URL to fetch the ASCII fragment for `src`.
+/// Build the ordered list of candidate URLs to fetch the ASCII fragment for
+/// `src`. [`AsciiImg`] tries them in order and injects the first that returns a
+/// `text/html` fragment, so position encodes priority:
 ///
-/// * Pod-hosted images are fetched directly with `?format=ascii` (plus
-///   `cols`/`ramp`), since the pod-worker renders them itself.
-/// * Everything else goes through the preview-worker's `/ascii` endpoint with
-///   the image URL percent-encoded.
+/// 1. **Pod-hosted images** are fetched directly with `?format=ascii` (plus
+///    `cols`/`ramp`) — the DreamLab pod-worker renders them itself, saving a hop.
+/// 2. **Fallback for pod images**, and the sole route for everything else, is the
+///    preview-worker's `/ascii` endpoint with the image URL percent-encoded. For
+///    a pod image this fallback is what keeps the signature ASCII render working
+///    when the pod does not implement `?format=ascii` (a local `solid-pod-rs` dev
+///    pod returns the raw image, failing the direct fetch's `text/html` gate):
+///    the preview-worker fetches the public pod URL server-side and converts it.
 ///
-/// Returns `None` when neither endpoint can serve the image (no preview API
-/// configured and the URL isn't pod-hosted), so the caller renders the
+/// Returns an empty vec when no route can serve the image (blank `src`, or a
+/// non-pod URL with no preview API configured), so the caller renders the
 /// `[ image unavailable ]` placeholder.
+pub fn ascii_fetch_urls(
+    preview_api: &str,
+    pod_api: &str,
+    src: &str,
+    cols: u32,
+    ramp: &str,
+) -> Vec<String> {
+    if src.trim().is_empty() {
+        return Vec::new();
+    }
+    // The preview-worker route: sole route for non-pod images, fallback for pods.
+    let preview_route = {
+        let base = preview_api.trim_end_matches('/');
+        (!base.is_empty()).then(|| {
+            format!(
+                "{base}/ascii?url={}&cols={cols}&ramp={ramp}",
+                encode_uri_component(src)
+            )
+        })
+    };
+    let mut urls = Vec::new();
+    if is_pod_url(pod_api, src) {
+        let sep = if src.contains('?') { '&' } else { '?' };
+        urls.push(format!("{src}{sep}format=ascii&cols={cols}&ramp={ramp}"));
+        urls.extend(preview_route);
+    } else {
+        urls.extend(preview_route);
+    }
+    urls
+}
+
+/// The primary (highest-priority) fetch URL for `src`, or `None` when no route
+/// can serve it. This is the first element of [`ascii_fetch_urls`] — pod-direct
+/// for pod-hosted images, the preview endpoint otherwise. Prefer
+/// [`ascii_fetch_urls`] when the fallback chain matters (as [`AsciiImg`] does).
 pub fn ascii_fetch_url(
     preview_api: &str,
     pod_api: &str,
@@ -170,21 +227,9 @@ pub fn ascii_fetch_url(
     cols: u32,
     ramp: &str,
 ) -> Option<String> {
-    if src.trim().is_empty() {
-        return None;
-    }
-    if is_pod_url(pod_api, src) {
-        let sep = if src.contains('?') { '&' } else { '?' };
-        Some(format!("{src}{sep}format=ascii&cols={cols}&ramp={ramp}"))
-    } else if !preview_api.is_empty() {
-        let base = preview_api.trim_end_matches('/');
-        Some(format!(
-            "{base}/ascii?url={}&cols={cols}&ramp={ramp}",
-            encode_uri_component(src)
-        ))
-    } else {
-        None
-    }
+    ascii_fetch_urls(preview_api, pod_api, src, cols, ramp)
+        .into_iter()
+        .next()
 }
 
 /// Whether a filename looks like a renderable raster image.
@@ -408,6 +453,75 @@ mod tests {
         )
         .is_none());
         assert!(ascii_fetch_url("", "", "  ", 80, "standard").is_none());
+    }
+
+    #[test]
+    fn pod_image_falls_back_to_preview_route() {
+        // A local `solid-pod-rs` pod ignores `?format=ascii` and returns the raw
+        // image, so the direct fetch fails the `text/html` gate. The candidate
+        // list must carry a preview-worker fallback (the public pod URL routed
+        // server-side) so the ASCII still renders. Ordering is pod-direct first.
+        let urls = ascii_fetch_urls(
+            "https://preview.example.com",
+            "https://pods.example.com",
+            "https://pods.example.com/pods/ab/media/public/cat.jpg",
+            64,
+            "standard",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://pods.example.com/pods/ab/media/public/cat.jpg?format=ascii&cols=64&ramp=standard".to_string(),
+                "https://preview.example.com/ascii?url=https%3A%2F%2Fpods.example.com%2Fpods%2Fab%2Fmedia%2Fpublic%2Fcat.jpg&cols=64&ramp=standard".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pod_image_without_preview_has_only_direct_candidate() {
+        // No preview API configured → the pod-direct route is the only candidate;
+        // if it fails there is nothing to fall back to (graceful `[ image
+        // unavailable ]`).
+        let urls = ascii_fetch_urls(
+            "",
+            "https://pods.example.com",
+            "https://pods.example.com/pods/ab/cat.png",
+            72,
+            "standard",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://pods.example.com/pods/ab/cat.png?format=ascii&cols=72&ramp=standard"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn external_image_has_single_preview_candidate() {
+        // Non-pod images have no direct route — only the preview endpoint, so
+        // there is exactly one candidate and no spurious pod-direct fetch.
+        let urls = ascii_fetch_urls(
+            "https://preview.example.com",
+            "https://pods.example.com",
+            "https://cdn.other.com/x.png",
+            80,
+            "standard",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://preview.example.com/ascii?url=https%3A%2F%2Fcdn.other.com%2Fx.png&cols=80&ramp=standard"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn no_route_yields_empty_candidate_list() {
+        assert!(ascii_fetch_urls("", "https://pods.example.com", "https://cdn.other.com/x.png", 80, "standard").is_empty());
+        assert!(ascii_fetch_urls("", "", "  ", 80, "standard").is_empty());
     }
 
     #[test]

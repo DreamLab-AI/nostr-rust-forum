@@ -96,6 +96,80 @@ soak of `nostr-bbs-forum-client`; see the operator overlay's
   zone-access bypass, and a local jarvis DM echo-bot for offline UI testing
   without touching the relay whitelist. Not compiled into release builds.
 
+BBS mobile-first redesign — "split the difference" (2026-07); see
+[ADR-108](docs/adr/ADR-108-bbs-mobile-first-redesign.md) and the operator
+overlay's `docs/sprint/bbs-redesign-2026-07.md`. Reimagines the retro BBS client
+(`nostr-bbs-bbs-client`, served at `/community/bbs/`) after a live mobile UX
+audit: the phosphor skin, ASCII image rendering, numbered menu and keyboard model
+are kept, while the modem-era interaction grammar is replaced by the main forum's
+proven patterns. Delivered in three tranches — **T1 (F1–F6) shipped; T2 and T3
+in progress**. The ship commit finalises wording as later tranches land.
+
+### Added
+
+- **BBS onboarding landing (F3)** — a logged-out newcomer now sees a
+  plain-language "what is this / why join" hero with value-prop chips and three
+  stacked ≥44 px CTAs (**Sign in** · **Create account** → `/community/` ·
+  **Look around**) before the numbered menu, replacing the trope-soup landing
+  that offered only a jargon menu and a buried `[0] Help`. The masthead is now a
+  compact, config-driven `NODE_NAME` + `TAGLINE` text masthead
+  (`window.__ENV__`) instead of box-glyph art, so it is legible at 360 px and
+  carries operator branding without a fork. *(T1)*
+- **BBS mobile sign-in sheet (F1/F2)** — the cramped single-line `.bbs-cmdline`
+  sign-in row is rebuilt as a vertical stack of full-width, ≥44 px,
+  nowrap-labelled options in priority order: extension (if a NIP-07 provider is
+  present) → **Continue at `/community/`** (passkey/WebAuthn, session adopted
+  back — the extension-free primary path) → paste nsec/hex → generate a throwaway
+  key. The input gains an `id`/`name` for autofill. Fixes the broken 32 px
+  buttons and the missing extension-free path on real iOS Safari / Android
+  Chrome. *(T1)*
+- **BBS zones-as-cards navigation (F4/F5)** — the flat, all-zones-at-once board
+  list becomes a Zones → Boards → Threads → Thread drill-down: one accent card
+  per configured zone, a left-side always-visible zone chip on board rows
+  (replacing the clipped right-appended `@handle`), channel/profile names
+  resolved before hex, a real tappable `← Back` control and a `Zone › Board`
+  breadcrumb (replacing the dead `[ESC] back to boards` label), and top-anchored
+  content with friendly empty states. Overflow drops from a measured 101–128 px
+  to 0 px at 360/390. Depth is added via new `BbsState` signals, keeping the
+  non-routed state machine (`leptos_router` deliberately not adopted). *(T1)*
+- **BBS persistent bottom nav (F6)** — a skinned terminal bottom bar
+  (Menu / Boards / DMs / Agents / You), auth-gated like the forum's, replaces the
+  undocumented swipe-from-top return path (swipe kept as an accelerator). *(T1)*
+- **BBS three-state status bar** — connected-but-unauthenticated now shows
+  `◐ SIGN IN TO READ` (linking to the sign-in sheet) instead of an ambiguous
+  `○ CONNECTING` that read as "node down". *(T1)*
+
+### Changed
+
+- **BBS hotkeys demoted to accelerators** — every hotkey now has a visible,
+  tappable twin, and keyboard-centric in-content copy ("Keys: … ESC back",
+  "Sign in ([9] Settings)") is reworded tap-first with the key hint as a
+  parenthetical. The full keyboard model, four CRT themes and the UA 571-C sentry
+  door game are retained unchanged. *(T1)*
+
+### Fixed
+
+- **BBS ASCII image render fallback (F10)** — a pod-hosted image whose direct
+  `?format=ascii` fetch does not return an ASCII fragment (a local `solid-pod-rs`
+  dev pod ignores the param and serves the raw image as
+  `application/octet-stream`, failing the `text/html` gate; an owner-only `.acl`
+  401s) no longer dead-ends at `[ image unavailable ]`. `AsciiImg` now tries an
+  ordered candidate list — pod-direct first, then the preview-worker's `/ascii`
+  route over the public pod URL — and injects the first `text/html` fragment,
+  degrading to `[ image unavailable ]` only when every route fails. No raw
+  `JsValue`, no WASM panic. *(T2)*
+
+### In progress
+
+- **T2** — threaded topics (F7), image upload with inline ASCII preview (F10),
+  a11y/density prefs (F13), nsec backup/recovery sheet (F14), profile detail
+  (F15).
+- **T3** — encrypted DMs incl. Jarvis 1:1 (F8), native passkey sign-in (F9),
+  global search (F11), notifications badge (F12). Each closes a shared-crate
+  reuse (`image_compress`, `pod_client`, `dm`, `search_client`,
+  `auth/{passkey,webauthn}`) over the common `Signer` trait rather than new
+  domain code.
+
 ## [1.0.0-beta.4] - 2026-07-08
 
 ### Changed

@@ -131,15 +131,20 @@ html, body {
 .bbs-statusbar .bad { color: #ff5555; }
 
 /* ── Banner ──────────────────────────────────────────────────────────────── */
+/* Plain text masthead (node name + tagline), not box-glyph art: nothing to
+   misalign, clip, or mojibake. */
 .bbs-banner {
-  white-space: pre;
   color: var(--fg-bright);
   margin: 0.5rem 0;
-  font-size: 0.78rem;
-  line-height: 1.1;
-  overflow-x: auto;
+  line-height: 1.3;
 }
-.bbs-banner .tagline { color: var(--fg-dim); }
+.bbs-banner-node {
+  font-size: 1.25rem; letter-spacing: 0.3em; text-transform: uppercase;
+}
+.bbs-banner-tag { color: var(--fg); opacity: 0.85; letter-spacing: 0.08em; }
+/* Never below the 12 px mobile type floor: 0.85rem is 11.05 px on the 13 px
+   mobile root, so clamp the hint up to 12 px (A11y). */
+.bbs-banner .tagline { color: var(--fg-dim); font-size: max(12px, 0.85rem); }
 
 /* ── Generic boxed panel ─────────────────────────────────────────────────── */
 .bbs-panel { white-space: pre-wrap; margin: 0.5rem 0; }
@@ -194,9 +199,11 @@ html, body {
   border-top: 1px solid var(--border);
   padding-top: 0.25rem;
 }
+.bbs-cmdline { flex-wrap: wrap; }
 .bbs-cmdline .prompt { color: var(--accent); }
 .bbs-cmdline input {
-  flex: 1;
+  flex: 1 1 8ch;
+  min-width: 0;                 /* allow the field to shrink instead of overflowing */
   background: transparent;
   border: none;
   outline: none;
@@ -204,6 +211,8 @@ html, body {
   font: inherit;
   text-shadow: inherit;
 }
+/* Composer control labels never shatter across lines at 360 px. */
+.bbs-cmdline .bbs-link { white-space: nowrap; }
 .bbs-blink { animation: blink 1s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
@@ -296,6 +305,159 @@ a, .bbs-link { color: var(--accent); }
   text-shadow: none;
 }
 
+/* ── Redesign T1: landing, sign-in stack, zone cards, breadcrumb, bottom nav ──
+ * Tap-first controls that split the difference between the retro skin and the
+ * forum's proven patterns. Everything interactive here is a ≥44 px target with
+ * a nowrap label so nothing shatters or clips at 360/390 px. */
+
+/* Logged-out onboarding landing. */
+.bbs-landing { display: flex; flex-direction: column; gap: 0.7rem; margin: 0.5rem 0; }
+.bbs-landing-masthead {
+  color: var(--fg-bright); margin: 0;
+  font-size: 1.35rem; line-height: 1.2; letter-spacing: 0.3em;
+  text-transform: uppercase; text-shadow: 0 0 6px var(--accent);
+  overflow-wrap: anywhere;
+}
+.bbs-landing-tagline { color: var(--fg); letter-spacing: 0.08em; opacity: 0.85; }
+.bbs-landing-props { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+/* Value-prop chips reuse the section-hero accent-chip look. */
+.bbs-prop {
+  display: inline-block;
+  background: color-mix(in srgb, var(--accent) 88%, var(--bg));
+  color: var(--bg); padding: 0.15rem 0.6rem;
+  font-weight: bold; letter-spacing: 0.05em; text-shadow: none;
+}
+.bbs-landing-cta { display: flex; flex-direction: column; gap: 0.5rem; }
+.bbs-landing-foot { font-size: 0.85rem; }
+
+/* Full-width ≥44 px call-to-action buttons (landing + sign-in sheet). */
+.bbs-cta {
+  display: block; width: 100%; min-height: 44px; line-height: 42px;
+  box-sizing: border-box; white-space: nowrap; text-align: center;
+  border: 1px solid var(--border); padding: 0 0.75rem;
+  text-decoration: none;
+}
+.bbs-cta:hover { background: color-mix(in srgb, var(--accent) 12%, var(--bg)); }
+
+/* Sign-in sheet: a vertical stack, never a cramped single flex row. */
+.bbs-signin { display: flex; flex-direction: column; gap: 0.5rem; margin: 0.4rem 0; }
+.bbs-signin .bbs-dim, .bbs-signin label { display: block; }
+.bbs-signin .bbs-key {
+  width: 100%; min-height: 44px; box-sizing: border-box;
+  background: transparent; border: 1px solid var(--border);
+  color: var(--fg-bright); font: inherit; text-shadow: inherit;
+  padding: 0 0.6rem; outline: none;
+}
+.bbs-signin .bbs-key:focus { border-color: var(--accent); }
+.bbs-signin-backup { white-space: pre-wrap; word-break: break-all; margin-top: 0.3rem; }
+
+/* Zone cards + board rows + thread/member rows: a fixed, always-visible left
+   accent chip and an ellipsised name — kills the 24-char pre-pad + clipped
+   right-edge @handle. Button semantics + a ≥44 px target (was 39 px, and a bare
+   `role=option` announced as static text — now `role=button`, focusable). */
+.bbs-zone-card, .bbs-board-row, .bbs-thread-row, .bbs-member-row {
+  display: flex; align-items: center; gap: 0.5rem; white-space: normal;
+  min-height: 44px;
+}
+.bbs-zone-card:focus-visible, .bbs-board-row:focus-visible,
+.bbs-thread-row:focus-visible, .bbs-member-row:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -2px;
+}
+.bbs-chip { flex: 0 0 auto; }
+.bbs-zone-name, .bbs-board-name, .bbs-member-name {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bbs-zone-count { flex: 0 0 auto; }
+.bbs-zone-card.selected .bbs-zone-count, .bbs-zone-card:hover .bbs-zone-count { color: var(--select-fg); }
+.bbs-member-id { flex: 0 0 auto; }
+
+/* Identity block (member profile): the resolved did:nostr and WebID are 64-char
+   unbreakable tokens. Inside a bare .bbs-panel (white-space:pre-wrap, no break
+   rule) they push the whole document wider than the viewport (scrollWidth 677 vs
+   360). Break them the same way .bbs-signin-backup does so the overflow-0
+   invariant holds at 360/390 — pre-wrap still keeps the "\n"-aligned labels. */
+.bbs-idblock { word-break: break-all; overflow-wrap: anywhere; }
+
+/* Thread rows: a snippet that ellipsises + a fixed reply-count/last-activity
+   meta column. */
+.bbs-thread-snip {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bbs-thread-meta { flex: 0 0 auto; }
+.bbs-thread-row.selected .bbs-thread-meta, .bbs-thread-row:hover .bbs-thread-meta { color: var(--select-fg); }
+
+/* Thread view: the root post is subtly framed so it reads as the topic opener. */
+.bbs-post-row.bbs-post-root {
+  border-left: 2px solid var(--accent);
+  padding-left: 0.4rem;
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg));
+}
+
+/* Composer image affordance: the file input is visually hidden (its own
+   `[ ▸ image ]` control triggers it) but stays focusable/operable. */
+.bbs-file-input {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); border: 0;
+}
+.bbs-ascii-pending { opacity: 0.85; }
+
+/* Segmented a11y toggles (text size / motion) — inactive is dim, active is the
+   bright accent so the current choice is unmistakable. */
+.bbs-toggle { color: var(--fg-dim); cursor: pointer; white-space: nowrap; min-height: 44px; display: inline-flex; align-items: center; }
+.bbs-toggle.active { color: var(--accent); text-shadow: 0 0 4px var(--accent); }
+.bbs-toggle:hover { color: var(--fg-bright); }
+
+/* Key-backup sheet (F14): the "no reset" warning reads as a stop sign. */
+.bbs-backup { border: 1px solid var(--border); padding: 0.4rem 0.6rem; margin: 0.4rem 0; }
+.bbs-backup-warn {
+  color: var(--fg-bright); white-space: pre-wrap;
+  border-left: 2px solid #ff5555; padding-left: 0.5rem; margin-bottom: 0.4rem;
+}
+
+/* Breadcrumb / back control on board + thread views. */
+.bbs-crumb { display: flex; align-items: center; flex-wrap: wrap; white-space: normal; }
+.bbs-crumb .bbs-link { display: inline-flex; align-items: center; }
+
+/* Persistent, skinned bottom navigation bar. */
+.bbs-bottomnav {
+  display: flex; align-items: stretch; justify-content: space-around;
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg));
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.bbs-navitem {
+  flex: 1 1 0; min-height: 48px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0.1rem;
+  background: transparent; border: none; color: var(--fg-dim);
+  font: inherit; text-shadow: inherit; cursor: pointer; padding: 0.3rem 0.2rem;
+}
+.bbs-navitem .ico { font-size: 1.1rem; line-height: 1; color: var(--accent); }
+.bbs-navitem .lab { font-size: 0.7rem; letter-spacing: 0.03em; }
+.bbs-navitem:hover:not(:disabled) { color: var(--fg-bright); }
+.bbs-navitem.active { background: var(--select-bg); color: var(--select-fg); text-shadow: none; }
+.bbs-navitem.active .ico { color: var(--select-fg); text-shadow: none; }
+.bbs-navitem:disabled, .bbs-navitem[aria-disabled="true"] { opacity: 0.5; cursor: default; }
+
+/* Status bar third state: connected-but-unauthenticated (deny-by-default reads). */
+.bbs-statusbar .warn { color: var(--fg-bright); }
+
+/* ── Accessibility prefs (F13) ─────────────────────────────────────────────────
+ * Applied as classes on <html> (see app::apply_prefs) so the whole rem-based
+ * layout scales and the CRT motion stops even when the OS pref isn't set. The
+ * text-size class beats the base `html, body` rule on specificity. */
+html.bbs-text-large { font-size: 18px; }
+@media (max-width: 640px) { html.bbs-text-large { font-size: 15px; } }
+html.bbs-reduced-motion .bbs-root,
+html.bbs-reduced-motion .bbs-blink { animation: none; }
+html.bbs-reduced-motion .phosphor-ghost { display: none; }
+html.bbs-reduced-motion .sentry-critical.on,
+html.bbs-reduced-motion .sentry-radar::before { animation: none; }
+
 /* ── Phosphor persistence ─────────────────────────────────────────────────────
  * When the screen text changes, the previous frame lingers as a faint phosphor
  * afterglow and fades linearly to nothing — the slow decay of a real tube. The
@@ -331,7 +493,16 @@ a, .bbs-link { color: var(--accent); }
      viewport as large, finger-sized rows — a mobile-app-style menu rather than
      a compact block floating up top. */
   .bbs-banner { display: none; }
-  .bbs-statusbar { font-size: 0.78rem; }
+  /* The onboarding masthead is exempt from the banner drop — it is the
+     newcomer's first signpost (F3). Slightly smaller on phones. */
+  .bbs-landing-masthead { display: block; font-size: 1.1rem; }
+  /* Status/footer/nav-labels rendered ~9–11 px; lift clear of the 12 px type
+     floor on a 13 px root (0.95rem = 12.35 px). Colours are untouched, so the
+     amber-palette AA contrast (10.8:1 status, 6.6:1 dim) is unchanged (A11y). */
+  .bbs-statusbar { font-size: 0.95rem; }
+  .bbs-footer { font-size: 0.95rem; }
+  .bbs-navitem .lab { font-size: 0.95rem; }
+  .bbs-landing-foot { font-size: 0.95rem; }
 
   .bbs-menu {
     display: flex;
@@ -362,12 +533,18 @@ a, .bbs-link { color: var(--accent); }
   .bbs-row {
     display: flex;
     align-items: center;
-    min-height: 3rem;
+    /* Large finger rows, never under the 44 px touch minimum (3rem is 39 px on
+       the 13 px mobile root, below target — clamp up). */
+    min-height: max(3rem, 44px);
     font-size: 1.15rem;
     padding: 0.6rem 0.7rem;
     border-bottom: 1px solid var(--border);
   }
-  .bbs-panel { flex: 1 1 auto; }
+  /* Top-anchor content: panels take their natural height (was `flex:1 1 auto`,
+     which grew the header and bottom-anchored the body, wasting ~50% of the
+     screen). The scrollable `.bbs-list` still fills; the footer/bottom-nav pin
+     to the bottom via the footer's `margin-top:auto`. */
+  .bbs-panel { flex: 0 0 auto; }
 
   /* No decorative banners anywhere on mobile — the zone "section hero" banners
      are dropped too (the masthead already is). Content images survive: posted
@@ -379,17 +556,17 @@ a, .bbs-link { color: var(--accent); }
   .ascii-img { font-size: 0.5rem; }
 
   /* Keyboard hints are meaningless without a keyboard — swap them for a touch
-     hint. Slide over rows to move the highlight, lift to select; swipe down
-     from the top to jump back to the full menu (see the script in index.html). */
+     hint that names the bottom bar (the primary return path). Slide over rows to
+     move the highlight, lift to select; the bar below jumps between sections. */
   .bbs-fkeys { display: none; }
   .bbs-footer::before {
-    content: "swipe to move \00B7 tap to select \00B7 \2193 from top = menu";
+    content: "use the bar below to move around \00B7 slide over rows, lift to open";
     display: block;
     margin-bottom: 0.15rem;
     color: var(--fg-dim);
-    font-size: 0.72rem;
+    font-size: 0.95rem;              /* ≥12 px on the 13 px mobile root (A11y) */
   }
-  .bbs-cmdline input { font-size: 16px; }                /* stop iOS focus-zoom */
+  .bbs-cmdline input, .bbs-signin .bbs-key { font-size: 16px; }  /* stop iOS focus-zoom */
 }
 
 /* ── Door game: UA 571-C sentry gun ───────────────────────────────────────────

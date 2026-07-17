@@ -42,12 +42,68 @@ impl SendStatus {
     }
 }
 
+/// A keydown handler that activates a `role="button"` control on Enter / Space,
+/// so every tappable control is also keyboard-operable (WCAG: custom buttons
+/// must respond to both keys, not just click). Pairs with `tabindex="0"`.
+fn on_activate<F: Fn() + 'static>(action: F) -> impl Fn(web_sys::KeyboardEvent) + 'static {
+    move |ev: web_sys::KeyboardEvent| {
+        let k = ev.key();
+        if k == "Enter" || k == " " || k == "Spacebar" {
+            ev.prevent_default();
+            action();
+        }
+    }
+}
+
+/// First non-blank line of `content`, truncated to `max` chars with an ellipsis
+/// — the one-line preview for thread rows and breadcrumbs.
+fn snippet(content: &str, max: usize) -> String {
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.is_empty() {
+        return "(no text)".to_string();
+    }
+    let mut out = String::new();
+    for (n, ch) in line.chars().enumerate() {
+        if n >= max {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A compact "time ago" label (`now`, `3m`, `2h`, `5d`) for a unix timestamp
+/// relative to `now` — the thread-row last-activity column.
+fn fmt_ago(now: u64, ts: u64) -> String {
+    let d = now.saturating_sub(ts);
+    if d < 60 {
+        "now".to_string()
+    } else if d < 3600 {
+        format!("{}m", d / 60)
+    } else if d < 86_400 {
+        format!("{}h", d / 3600)
+    } else {
+        format!("{}d", d / 86_400)
+    }
+}
+
+/// Current unix time in seconds (wasm clock; 0 on the native test target).
+fn now_secs() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
+}
+
 /// Render the active screen.
 #[component]
 pub fn ScreenView(state: BbsState) -> impl IntoView {
     let cfg = use_context::<StoredValue<BbsConfig>>().expect("config");
     let store = use_context::<RelayStore>().expect("relay");
     move || match state.screen.get() {
+        Screen::Landing => landing(state, cfg).into_any(),
         Screen::MainMenu => view! { <MainMenu state=state /> }.into_any(),
         Screen::Agents => agents(store).into_any(),
         Screen::Boards => boards(state, store, cfg).into_any(),
@@ -94,13 +150,215 @@ fn profile_name(ev: &nostr_bbs_core::event::NostrEvent) -> String {
         .unwrap_or_else(|| relay::short_id(&ev.pubkey))
 }
 
-/// (2) Boards — live boards (kind-40) → posts (kind-42), zone-gated.
+/// The `about` bio from a kind-0 metadata event, if present and non-empty.
+fn profile_about(ev: &nostr_bbs_core::event::NostrEvent) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&ev.content)
+        .ok()
+        .and_then(|v| {
+            v.get("about")
+                .and_then(|a| a.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// Logged-out onboarding landing — the signed-out entry screen. States what the
+/// BBS is and how to get in within one phone screen, without opening Help:
+/// a simple text masthead (operator node name + tagline, no box-glyph art so
+/// nothing can mojibake or clip), three plain-language value-prop chips, and
+/// three ≥44 px tap targets — Sign in (the sign-in sheet), Create account (the
+/// forum at `/community/`), and Look around (browse read-only).
+fn landing(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
+    let (node, tagline) = cfg.with_value(|c| (c.node_name.clone(), c.tagline.clone()));
+    view! {
+        <div class="bbs-landing">
+            <div class="bbs-landing-masthead">{node}</div>
+            <div class="bbs-landing-tagline">{tagline}</div>
+            <div class="bbs-landing-props">
+                <span class="bbs-prop">"\u{25B8} agent control plane"</span>
+                <span class="bbs-prop">"\u{25B8} zone-gated boards"</span>
+                <span class="bbs-prop">"\u{25B8} your own Solid pod"</span>
+            </div>
+            <div class="bbs-landing-cta">
+                <span class="bbs-link accent bbs-cta" role="button"
+                    on:click=move |_| state.go(Screen::Settings)
+                >"[ \u{25B8} Sign in ]"</span>
+                <a class="bbs-link accent bbs-cta" href="../" rel="noopener"
+                >"[ \u{25B8} Create account \u{2197} ]"</a>
+                <span class="bbs-link bbs-cta" role="button"
+                    on:click=move |_| state.look_around()
+                >"[ \u{25B8} Look around ]"</span>
+            </div>
+            <div class="bbs-dim bbs-landing-foot">
+                "  New here? " <span class="accent">"Create account"</span>
+                " sets you up at /community/ in seconds — no email or phone needed."
+            </div>
+        </div>
+    }
+}
+
+/// (2) Boards — a tap-first drill-down: Zones (cards) → a zone's boards → posts.
+/// Each level has an explicit tappable back control and a breadcrumb; the
+/// keyboard model (↑↓ / ENTER / ESC) stays as an accelerator over the same
+/// order.
 fn boards(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     view! {
         {header(Screen::Boards)}
         {move || match state.board.get() {
-            None => board_list(state, store, cfg).into_any(),
-            Some(id) => board_posts(store, id).into_any(),
+            Some(id) => match state.thread.get() {
+                // Deepest level: a thread's root + replies + reply composer.
+                Some(root) => thread_view(state, store, cfg, id, root).into_any(),
+                // A board opens on its thread list.
+                None => thread_list(state, store, cfg, id).into_any(),
+            },
+            None => match state.zone.get() {
+                Some(z) => board_list_for_zone(state, store, cfg, z).into_any(),
+                None => zones_screen(state, store, cfg).into_any(),
+            },
+        }}
+    }
+}
+
+/// Resolve a zone selector to its `(display_name, accent_hex)`. `OTHER_ZONE`
+/// (and any out-of-range index) becomes the neutral "Other" group.
+fn zone_label(
+    zone_sel: usize,
+    zones: &[nostr_bbs_config::schema::Zone],
+) -> (String, String) {
+    if zone_sel == relay::OTHER_ZONE {
+        return ("Other".to_string(), String::new());
+    }
+    match zones.get(zone_sel) {
+        Some(z) => (
+            z.display_name.clone(),
+            z.accent_hex.clone().unwrap_or_default(),
+        ),
+        None => ("Other".to_string(), String::new()),
+    }
+}
+
+/// Top-level Zones screen — one accent **card** per configured zone (plus an
+/// "Other" card when boards match no zone), each with its display name and board
+/// count. Never a clipped `@handle`. Tap a card (or ↑↓ + ENTER) to open the zone.
+fn zones_screen(
+    state: BbsState,
+    store: RelayStore,
+    cfg: StoredValue<BbsConfig>,
+) -> impl IntoView {
+    move || {
+        let zones = cfg.with_value(|c| c.zones.clone());
+        let zone_ids: Vec<String> = zones.iter().map(|z| z.id.clone()).collect();
+        let channels = store.channels.get();
+        let entries = relay::zone_entries(&channels, &zone_ids);
+        if entries.is_empty() {
+            return view! {
+                <div class="bbs-panel bbs-dim">
+                    "  No zones yet. Zones and their boards load from config ([[zones]] in\n  forum.toml) and the relay; sign in if a zone looks empty (reads are\n  deny-by-default at the relay)."
+                </div>
+            }
+            .into_any();
+        }
+        let cards = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, (zsel, count))| {
+                let (name, accent) = zone_label(zsel, &zones);
+                let style = if accent.is_empty() {
+                    String::new()
+                } else {
+                    format!("--accent:{accent}")
+                };
+                let count_label = format!("{count} board{}", if count == 1 { "" } else { "s" });
+                let aria_label = format!("Open zone {name}, {count_label}");
+                view! {
+                    <div
+                        // Real button semantics: keyboard-focusable, activatable by
+                        // Enter/Space, ≥44 px — not a `role="option"` without a
+                        // listbox parent (announced as static text) at 39 px.
+                        class="bbs-row bbs-zone-card"
+                        class:selected=move || state.selection.get() == i
+                        style=style
+                        role="button"
+                        tabindex="0"
+                        aria-label=aria_label
+                        on:click=move |_| {
+                            state.selection.set(i);
+                            state.open_zone(zsel);
+                        }
+                        on:keydown=on_activate(move || {
+                            state.selection.set(i);
+                            state.open_zone(zsel);
+                        })
+                    >
+                        <span class="accent bbs-chip">"\u{2593}"</span>
+                        <span class="bbs-zone-name">{name}</span>
+                        <span class="bbs-dim bbs-zone-count">{count_label}</span>
+                    </div>
+                }
+            })
+            .collect_view();
+        view! {
+            <div class="bbs-panel bbs-dim">"  Pick a zone to see its boards."</div>
+            <div class="bbs-list">{cards}</div>
+            <div class="bbs-panel bbs-dim">"  Tap a zone to open it (\u{2191}\u{2193} then Enter also work)."</div>
+        }
+        .into_any()
+    }
+}
+
+/// One zone's board list — the middle drill-down level. A tappable `← Zones`
+/// back control + breadcrumb, the zone's ASCII hero (desktop), then its boards
+/// as ellipsised rows with a left accent chip. Friendly empty state when the
+/// zone has no boards yet.
+fn board_list_for_zone(
+    state: BbsState,
+    store: RelayStore,
+    cfg: StoredValue<BbsConfig>,
+    zone_sel: usize,
+) -> impl IntoView {
+    let zones = cfg.with_value(|c| c.zones.clone());
+    let (zone_name, _accent) = zone_label(zone_sel, &zones);
+    let hero = if zone_sel == relay::OTHER_ZONE {
+        None
+    } else {
+        zones.get(zone_sel).map(zone_hero)
+    };
+    view! {
+        <div class="bbs-panel bbs-crumb">
+            <span class="bbs-link accent" role="button" tabindex="0"
+                aria-label="Back to zones"
+                on:click=move |_| state.close_zone()
+                on:keydown=on_activate(move || state.close_zone())
+            >
+                "\u{2190} Zones"
+            </span>
+            <span class="bbs-dim">"  \u{203A}  "</span>
+            <span class="accent">{zone_name}</span>
+        </div>
+        {hero}
+        {move || {
+            let zone_ids: Vec<String> = cfg.with_value(|c| c.zones.iter().map(|z| z.id.clone()).collect());
+            let zones_ref = cfg.with_value(|c| c.zones.clone());
+            let boards = relay::boards_in_zone(store.channels.get(), &zone_ids, zone_sel);
+            if boards.is_empty() {
+                return view! {
+                    <div class="bbs-panel bbs-dim">
+                        "  No boards in this zone yet. Boards (kind-40 channels) appear here as\n  they arrive from the relay — sign in if this zone is cohort-gated."
+                    </div>
+                }
+                .into_any();
+            }
+            let rows = boards
+                .into_iter()
+                .enumerate()
+                .map(move |(i, ev)| board_row(state, i, ev, &zones_ref, &zone_ids))
+                .collect_view();
+            view! {
+                <div class="bbs-list">{rows}</div>
+                <div class="bbs-panel bbs-dim">"  Tap a board to open it (\u{2191}\u{2193} then Enter also work)."</div>
+            }
+            .into_any()
         }}
     }
 }
@@ -135,8 +393,9 @@ fn board_row(
     zones: &[nostr_bbs_config::schema::Zone],
     zone_ids: &[String],
 ) -> impl IntoView {
+    // Resolved channel name (kind-40), hex only as a dim fallback inside
+    // `channel_name`; never the raw id in the primary label.
     let name = relay::channel_name(&ev);
-    let zone = relay::channel_zone(&ev).unwrap_or_default();
     // Tint the row to its configured zone's accent (matched by zone index, so a
     // section slug like "public-support" resolves to the "public" zone colour).
     let accent = relay::channel_zone_index(&ev, zone_ids)
@@ -148,137 +407,221 @@ fn board_row(
     } else {
         format!("--accent:{accent}")
     };
-    let chan_id = ev.id.clone();
+    let aria_label = format!("Open board {name}");
+    // Mirror the keyboard Enter path: opening a board MUST also fire the kind-42
+    // relay subscription, or a click-opened board shows a permanent blank (no
+    // posts ever arrive). One closure, shared by click + keyboard activation.
+    let open = {
+        let chan_id = ev.id.clone();
+        move || {
+            state.selection.set(i);
+            state.open_board(chan_id.clone());
+            crate::relay::subscribe_board(&chan_id);
+        }
+    };
+    let open_key = open.clone();
     view! {
         <div
-            class="bbs-row"
+            // A fixed-width left accent chip that is never clipped, and a name
+            // that ellipsises instead of being padded to 24 chars and having its
+            // zone `@handle` clipped off the right edge at 360 px. Button
+            // semantics (focusable, Enter/Space) — not a bare `role="option"`.
+            class="bbs-row bbs-board-row"
             class:selected=move || state.selection.get() == i
             style=style
-            role="option"
-            attr:aria-selected=move || if state.selection.get() == i { "true" } else { "false" }
-            on:click=move |_| {
-                // Mirror the keyboard Enter path: opening a board MUST also fire
-                // the kind-42 relay subscription, or a click-opened board shows a
-                // permanent blank (no posts ever arrive).
-                state.selection.set(i);
-                let id = chan_id.clone();
-                state.open_board(id.clone());
-                crate::relay::subscribe_board(&id);
-            }
+            role="button"
+            tabindex="0"
+            aria-label=aria_label
+            on:click=move |_| open()
+            on:keydown=on_activate(move || open_key())
         >
-            <span class="accent">"▓ "</span>
-            {format!("{name:<24}")}
-            <span class="bbs-dim">
-                {if zone.is_empty() { String::new() } else { format!(" @{zone}") }}
-            </span>
+            <span class="accent bbs-chip">"\u{2593}"</span>
+            <span class="bbs-board-name">{name}</span>
         </div>
     }
 }
 
-/// Boards list — interleaves each zone's hero with that zone's own boards (its
-/// sub-section menu), grouped by zone in config order, then any boards that match
-/// no configured zone under an "Other" divider. The channel order + selection
-/// index come from [`relay::flat_zone_order`], the same order the keyboard
-/// ENTER/arrows use, so grouped visuals stay consistent with navigation.
-fn board_list(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
-    move || {
-        let zones = cfg.with_value(|c| c.zones.clone());
-        let zone_ids: Vec<String> = zones.iter().map(|z| z.id.clone()).collect();
-        let ordered = relay::flat_zone_order(store.channels.get(), &zone_ids);
-        if ordered.is_empty() {
-            return view! {
-                <div class="bbs-panel bbs-dim">
-                    "  No boards yet. Channels (kind-40) appear here as they arrive from the\n  relay; each is a zone-gated board. Define [[zones]] in forum.toml to theme them."
-                </div>
-            }
-            .into_any();
-        }
-        // Group consecutive zone-ordered channels by zone, keeping each board's
-        // global index (for selection / ENTER). `None` zone = the "Other" group.
-        type BoardGroup = (
-            Option<usize>,
-            Vec<(usize, nostr_bbs_core::event::NostrEvent)>,
-        );
-        let mut groups: Vec<BoardGroup> = Vec::new();
-        for (i, ev) in ordered.into_iter().enumerate() {
-            let zi = relay::channel_zone_index(&ev, &zone_ids);
-            match groups.last_mut() {
-                Some((gzi, rows)) if *gzi == zi => rows.push((i, ev)),
-                _ => groups.push((zi, vec![(i, ev)])),
-            }
-        }
-        let rendered = groups
-            .into_iter()
-            .map(|(zi, rows)| {
-                let hero = match zi.and_then(|idx| zones.get(idx)) {
-                    Some(z) => zone_hero(z).into_any(),
-                    None => view! {
-                        <div class="bbs-section-hero"><div class="label">"\u{259E} Other \u{259A}"</div></div>
-                    }
-                    .into_any(),
-                };
-                let zones_ref = zones.clone();
-                let ids_ref = zone_ids.clone();
-                let list = view! {
-                    <div class="bbs-list">
-                        {rows
-                            .into_iter()
-                            .map(move |(i, ev)| board_row(state, i, ev, &zones_ref, &ids_ref))
-                            .collect_view()}
-                    </div>
-                };
-                view! { {hero} {list} }.into_any()
-            })
-            .collect::<Vec<_>>();
-        view! {
-            {rendered}
-            <div class="bbs-panel bbs-dim">"  ↑↓ select · ENTER open board · reads are deny-by-default at the relay"</div>
-        }
-        .into_any()
-    }
+/// Resolve `(zone_display_name, board_name)` for a channel from the loaded
+/// kind-40 channels — the board was opened by tap/ENTER so it is present. Names,
+/// never hex; falls back to a short id / "Other".
+fn board_crumb(
+    store: &RelayStore,
+    cfg: StoredValue<BbsConfig>,
+    channel_id: &str,
+) -> (String, String) {
+    let zones = cfg.with_value(|c| c.zones.clone());
+    let zone_ids: Vec<String> = zones.iter().map(|z| z.id.clone()).collect();
+    let channels = store.channels.get_untracked();
+    let chan = channels.iter().find(|c| c.id == channel_id);
+    let board = chan
+        .map(relay::channel_name)
+        .unwrap_or_else(|| relay::short_id(channel_id));
+    let zone = chan
+        .and_then(|c| relay::channel_zone_index(c, &zone_ids))
+        .and_then(|i| zones.get(i))
+        .map(|z| z.display_name.clone())
+        .unwrap_or_else(|| "Other".to_string());
+    (zone, board)
 }
 
-fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
+/// A board's THREAD LIST — the third drill-down level. A tappable `← Boards`
+/// back control + `Zone › Board` breadcrumb (resolved names, not hex), one
+/// tappable row per thread (root snippet + reply count + last activity),
+/// top-anchored, a friendly empty state, and a "start a topic" composer pinned
+/// below (posting here opens a NEW thread — `reply_to = None`).
+fn thread_list(
+    state: BbsState,
+    store: RelayStore,
+    cfg: StoredValue<BbsConfig>,
+    channel_id: String,
+) -> impl IntoView {
     let signer = use_context::<BbsSigner>();
+    let pod_api = cfg.with_value(|c| c.pod_api.clone());
     let draft = RwSignal::new(String::new());
     let status = RwSignal::new(SendStatus::Idle);
-    // Reply target: (parent event id, parent author pubkey). `None` = post to root.
+    // A new-topic composer: no reply target, so the post is a thread root.
     let reply_to = RwSignal::new(None::<(String, String)>);
     let channel_for_send = channel_id.clone();
+    let (crumb_zone, crumb_board) = board_crumb(&store, cfg, &channel_id);
     view! {
-        <div class="bbs-panel">
-            "  board " <span class="accent">{relay::short_id(&channel_id)}</span>
-            <span class="bbs-dim">"   [ESC] back to boards"</span> "\n"
+        <div class="bbs-panel bbs-crumb">
+            <span class="bbs-link accent" role="button" tabindex="0"
+                aria-label="Back to boards"
+                on:click=move |_| state.close_board()
+                on:keydown=on_activate(move || state.close_board())
+            >
+                "\u{2190} Boards"
+            </span>
+            <span class="bbs-dim">"  " {crumb_zone} "  \u{203A}  "</span>
+            <span class="accent">{crumb_board}</span>
         </div>
         {move || {
-            let cid = channel_id.clone();
-            let posts: Vec<_> = store
-                .posts
-                .get()
-                .into_iter()
-                .filter(|p| relay::post_root_channel(p).as_deref() == Some(cid.as_str()))
-                .collect();
-            if posts.is_empty() {
-                return view! { <div class="bbs-panel bbs-dim">"  (no messages yet — or you lack read access to this zone)"</div> }.into_any();
+            let threads = relay::group_threads(&store.posts.get(), &channel_id);
+            if threads.is_empty() {
+                return view! { <div class="bbs-panel bbs-dim">"  No topics here yet. Start one with the box below \u{2014}\n  or sign in to unlock cohort-gated zones (reads are deny-by-default)."</div> }.into_any();
             }
+            let now = now_secs();
             view! {
                 <div class="bbs-list">
-                    {posts
+                    {threads
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let who = relay::short_id(&t.root.pubkey);
+                            let preview = snippet(&t.root.content, 52);
+                            let replies = t.reply_count;
+                            let ago = fmt_ago(now, t.last_activity);
+                            let root_id = t.root.id.clone();
+                            let open = move || state.open_thread(root_id.clone());
+                            let open_key = open.clone();
+                            let meta = format!(
+                                "{} repl{} \u{00B7} {}",
+                                replies,
+                                if replies == 1 { "y" } else { "ies" },
+                                ago,
+                            );
+                            let aria = format!("Open thread by {who}: {preview} ({meta})");
+                            view! {
+                                <div
+                                    class="bbs-row bbs-thread-row"
+                                    class:selected=move || state.selection.get() == i
+                                    role="button"
+                                    tabindex="0"
+                                    aria-label=aria
+                                    on:click=move |_| open()
+                                    on:keydown=on_activate(move || open_key())
+                                >
+                                    <span class="accent bbs-chip">"\u{25B8}"</span>
+                                    <span class="bbs-thread-snip">{preview}</span>
+                                    <span class="bbs-dim bbs-thread-meta">{meta}</span>
+                                </div>
+                            }
+                        })
+                        .collect_view()}
+                </div>
+            }.into_any()
+        }}
+        {board_composer(signer, channel_for_send, store, draft, status, reply_to, None, pod_api)}
+    }
+}
+
+/// A THREAD VIEW — the deepest level: the root post and its replies in
+/// chronological order, with a `← Topics` back control and a `Zone › Board ›
+/// Topic` breadcrumb. The composer posts a reply to the thread root by default;
+/// a per-post `[reply]` retargets it to that specific post.
+fn thread_view(
+    state: BbsState,
+    store: RelayStore,
+    cfg: StoredValue<BbsConfig>,
+    channel_id: String,
+    root_id: String,
+) -> impl IntoView {
+    let signer = use_context::<BbsSigner>();
+    let pod_api = cfg.with_value(|c| c.pod_api.clone());
+    let draft = RwSignal::new(String::new());
+    let status = RwSignal::new(SendStatus::Idle);
+    // Default reply target = the thread root, so posting continues this thread;
+    // a per-post [reply] overrides it, and [clear] returns to the root.
+    let root_author = store
+        .posts
+        .get_untracked()
+        .iter()
+        .find(|p| p.id == root_id)
+        .map(|p| p.pubkey.clone());
+    let default_reply = root_author.map(|a| (root_id.clone(), a));
+    let reply_to = RwSignal::new(default_reply.clone());
+    let (crumb_zone, crumb_board) = board_crumb(&store, cfg, &channel_id);
+    let crumb_topic = store
+        .posts
+        .get_untracked()
+        .iter()
+        .find(|p| p.id == root_id)
+        .map(|p| snippet(&p.content, 28))
+        .unwrap_or_else(|| relay::short_id(&root_id));
+    let channel_for_send = channel_id.clone();
+    let root_for_msgs = root_id.clone();
+    view! {
+        <div class="bbs-panel bbs-crumb">
+            <span class="bbs-link accent" role="button" tabindex="0"
+                aria-label="Back to topics"
+                on:click=move |_| state.close_thread()
+                on:keydown=on_activate(move || state.close_thread())
+            >
+                "\u{2190} Topics"
+            </span>
+            <span class="bbs-dim">"  " {crumb_zone} " \u{203A} " {crumb_board} " \u{203A} "</span>
+            <span class="accent">{crumb_topic}</span>
+        </div>
+        {move || {
+            let msgs = relay::thread_messages(&store.posts.get(), &channel_id, &root_for_msgs);
+            if msgs.is_empty() {
+                return view! { <div class="bbs-panel bbs-dim">"  This topic hasn\u{2019}t loaded yet \u{2014} it may be in a cohort-gated zone.\n  Sign in, or reply below to start it off."</div> }.into_any();
+            }
+            let root_ref = root_for_msgs.clone();
+            view! {
+                <div class="bbs-list">
+                    {msgs
                         .into_iter()
                         .map(|p| {
                             let who = relay::short_id(&p.pubkey);
                             let body = p.content.clone();
-                            // Any image URLs in the post render on-theme as ASCII.
                             let imgs = extract_image_urls(&p.content);
                             let reply_id = p.id.clone();
                             let reply_pk = p.pubkey.clone();
+                            let is_root = p.id == root_ref;
                             view! {
-                                <div class="bbs-row">
+                                <div class="bbs-row bbs-post-row" class:bbs-post-root=is_root>
                                     <span class="accent">{format!("<{who}> ")}</span>
                                     {body}
                                     " "
-                                    <span class="bbs-link bbs-dim" role="button"
+                                    <span class="bbs-link bbs-dim" role="button" tabindex="0"
+                                        aria-label="Reply to this post"
                                         on:click=move |_| reply_to.set(Some((reply_id.clone(), reply_pk.clone())))
+                                        on:keydown={
+                                            let reply_id = p.id.clone();
+                                            let reply_pk = p.pubkey.clone();
+                                            on_activate(move || reply_to.set(Some((reply_id.clone(), reply_pk.clone()))))
+                                        }
                                     >"[reply]"</span>
                                 </div>
                                 {imgs.into_iter().map(|src| view! {
@@ -290,7 +633,7 @@ fn board_posts(store: RelayStore, channel_id: String) -> impl IntoView {
                 </div>
             }.into_any()
         }}
-        {board_composer(signer, channel_for_send, store, draft, status, reply_to)}
+        {board_composer(signer, channel_for_send, store, draft, status, reply_to, default_reply, pod_api)}
     }
 }
 
@@ -439,9 +782,14 @@ mod mention_tests {
     }
 }
 
-/// Compose box for a board: a signed kind-42 channel message (NIP-28), posting
-/// to the channel root or as a reply to a selected post. Fails closed — hidden
+/// Compose box for a board: a signed kind-42 channel message (NIP-28), posting a
+/// new thread root (`reply_to = None`) or a reply to a selected post. Carries an
+/// image affordance (F10): pick → validate → compress → PUT to the pod →
+/// insert the URL, which posts as a normal kind-42 rendered on-theme as ASCII.
+/// `default_reply` is the baseline reply target that `[clear]` returns to (the
+/// thread root in a thread view; `None` in a thread list). Fails closed — hidden
 /// with a prompt when no signer is available.
+#[allow(clippy::too_many_arguments)]
 fn board_composer(
     signer: Option<BbsSigner>,
     channel_id: String,
@@ -449,19 +797,29 @@ fn board_composer(
     draft: RwSignal<String>,
     status: RwSignal<SendStatus>,
     reply_to: RwSignal<Option<(String, String)>>,
+    default_reply: Option<(String, String)>,
+    pod_api: String,
 ) -> impl IntoView {
+    // True while an image is compressing/uploading — drives the optimistic
+    // "▞ IMG ▚ …uploading" placeholder before the URL lands in the draft.
+    let img_pending = RwSignal::new(false);
     move || {
         let signed_in = signer.and_then(|s| s.pubkey().get()).is_some();
         if !signed_in {
             return view! {
                 <div class="bbs-panel bbs-dim">
-                    "  Sign in (" <span class="accent">"[9] Settings"</span>
-                    ", or at /community/) to post to this board."
+                    "  Sign in to post here — tap " <span class="accent">"Sign in"</span>
+                    " on the bottom bar, or open Settings (" <span class="accent">"[9]"</span>
+                    "). You can also sign in at /community/."
                 </div>
             }
             .into_any();
         }
         let cid = channel_id.clone();
+        let default_clear = default_reply.clone();
+        // Local clone moved into the send closure — the outer view closure is
+        // `Fn`, so we cannot move the captured `default_reply` out of it.
+        let default_send = default_reply.clone();
         let send: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
             let text = draft.get_untracked().trim().to_string();
             if text.is_empty() || matches!(status.get_untracked(), SendStatus::Sending) {
@@ -501,21 +859,33 @@ fn board_composer(
             };
             status.set(SendStatus::Sending);
             draft.set(String::new());
-            reply_to.set(None);
+            // Return to the baseline reply target (thread root, or None).
+            reply_to.set(default_send.clone());
             publish_signed(signer_rc, unsigned, status);
         });
         let send_click = send.clone();
         let send_key = send.clone();
+        let file_input = NodeRef::<leptos::html::Input>::new();
+        let pod_for_pick = pod_api.clone();
         view! {
             <div class="bbs-cmdline">
-                {move || reply_to.get().map(|(id, _)| view! {
-                    <span class="bbs-dim">
-                        "↳ reply to " {relay::short_id(&id)} " "
-                        <span class="bbs-link" role="button" on:click=move |_| reply_to.set(None)>"[clear]"</span>
-                        " "
-                    </span>
+                {move || reply_to.get().map(|(id, _)| {
+                    // Clone into locals inside the map callback — the outer view
+                    // closure is `Fn`, so `default_clear` must be borrowed, not moved.
+                    let d_click = default_clear.clone();
+                    let d_key = default_clear.clone();
+                    view! {
+                        <span class="bbs-dim">
+                            "↳ reply to " {relay::short_id(&id)} " "
+                            <span class="bbs-link" role="button" tabindex="0"
+                                on:click=move |_| reply_to.set(d_click.clone())
+                                on:keydown=on_activate(move || reply_to.set(d_key.clone()))
+                            >"[clear]"</span>
+                            " "
+                        </span>
+                    }
                 })}
-                <span class="prompt">"post/"</span>
+                <span class="prompt">{move || if reply_to.get().is_some() { "reply/" } else { "post/" }}</span>
                 <input
                     prop:value=move || draft.get()
                     on:input=move |ev| draft.set(event_target_value(&ev))
@@ -526,12 +896,129 @@ fn board_composer(
                         }
                     }
                 />
-                <span class="bbs-link accent" role="button" on:click=move |_| send_click()>"[ send ]"</span>
+                <span class="bbs-link accent" role="button" tabindex="0"
+                    aria-label="Add an image"
+                    on:click=move |_| { if let Some(inp) = file_input.get_untracked() { let _ = inp.click(); } }
+                    on:keydown=on_activate(move || { if let Some(inp) = file_input.get_untracked() { let _ = inp.click(); } })
+                >"[ \u{25B8} image ]"</span>
+                <input
+                    node_ref=file_input
+                    type="file"
+                    accept="image/*"
+                    class="bbs-file-input"
+                    on:change=move |ev| pick_image(ev, signer, pod_for_pick.clone(), draft, status, img_pending)
+                />
+                <span class="bbs-link accent" role="button" tabindex="0"
+                    on:click=move |_| send_click()
+                    on:keydown={ let s = send.clone(); on_activate(move || s()) }
+                >"[ send ]"</span>
                 <span class="bbs-dim">{move || status.get().suffix()}</span>
             </div>
+            {move || img_pending.get().then(|| view! {
+                <div class="bbs-ascii-row bbs-ascii-pending">
+                    <pre class="ascii-img ascii-img-status">"[ compressing & uploading image … ]"</pre>
+                </div>
+            })}
         }
         .into_any()
     }
+}
+
+/// Handle a composer image pick (F10): validate client-side, then compress and
+/// PUT to the pod off-thread. Friendly errors go through the `SendStatus::Err`
+/// inline channel; the returned URL is appended to the draft so a normal send
+/// posts it. wasm-only — the native build (unit tests) is a no-op.
+#[cfg(target_arch = "wasm32")]
+fn pick_image(
+    ev: web_sys::Event,
+    signer: Option<BbsSigner>,
+    pod_api: String,
+    draft: RwSignal<String>,
+    status: RwSignal<SendStatus>,
+    img_pending: RwSignal<bool>,
+) {
+    use wasm_bindgen::JsCast;
+    let input: web_sys::HtmlInputElement = match ev
+        .target()
+        .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        Some(i) => i,
+        None => return,
+    };
+    let file = match input.files().and_then(|fl| fl.get(0)) {
+        Some(f) => f,
+        None => return,
+    };
+    // Clear the input so re-picking the same file fires `change` again.
+    input.set_value("");
+    let signer = match signer {
+        Some(s) => s,
+        None => {
+            status.set(SendStatus::Err("sign in to add an image".to_string()));
+            return;
+        }
+    };
+    // Client-side validation before any network call (friendly terminal errors).
+    if !crate::upload::is_accepted_image(&file) {
+        status.set(SendStatus::Err("only JPG/PNG/WEBP/GIF images".to_string()));
+        return;
+    }
+    let size = file.size() as u64;
+    if size > crate::upload::MAX_FILE_SIZE {
+        let mb = (size as f64 / (1024.0 * 1024.0)).ceil() as u64;
+        status.set(SendStatus::Err(format!(
+            "that file is {mb} MB — the limit is 5 MB"
+        )));
+        return;
+    }
+    let pubkey = match signer.pubkey_hex() {
+        Some(p) => p,
+        None => {
+            status.set(SendStatus::Err("sign in first".to_string()));
+            return;
+        }
+    };
+    let signer_rc = match signer.get_signer() {
+        Some(s) => s,
+        None => {
+            status.set(SendStatus::Err("sign in first".to_string()));
+            return;
+        }
+    };
+    img_pending.set(true);
+    status.set(SendStatus::Sending);
+    wasm_bindgen_futures::spawn_local(async move {
+        match crate::upload::compress_and_upload(&file, &pubkey, signer_rc.as_ref(), &pod_api).await
+        {
+            Ok(url) => {
+                draft.update(|d| {
+                    if !d.is_empty() && !d.ends_with(' ') {
+                        d.push(' ');
+                    }
+                    d.push_str(&url);
+                });
+                status.set(SendStatus::Idle);
+                img_pending.set(false);
+            }
+            Err(e) => {
+                web_sys::console::error_1(&format!("[bbs-upload] {e}").into());
+                status.set(SendStatus::Err(e));
+                img_pending.set(false);
+            }
+        }
+    });
+}
+
+/// Native no-op — the image pipeline is browser-only.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_image(
+    _ev: web_sys::Event,
+    _signer: Option<BbsSigner>,
+    _pod_api: String,
+    _draft: RwSignal<String>,
+    _status: RwSignal<SendStatus>,
+    _img_pending: RwSignal<bool>,
+) {
 }
 
 /// (5) Pod — the live Solid pod browser (WebID-owned storage).
@@ -651,37 +1138,93 @@ fn network(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
     }
 }
 
-/// (4) Members — did:nostr WebID profiles (live kind-0).
+/// (4) Members — did:nostr WebID profiles (live kind-0). Roster rows are
+/// tappable → a profile panel (F15): kind-0 name/about/short-id + the member's
+/// did:nostr and WebID, with a back control to the roster.
 fn members(store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     let me = viewer(cfg);
+    let pod_api = cfg.with_value(|c| c.pod_api.clone());
+    // Selected member's pubkey — `None` shows the roster, `Some` the profile.
+    let selected = RwSignal::new(None::<String>);
     view! {
         {header(Screen::Members)}
-        {move || {
-            let profiles = store.profiles.get();
-            if profiles.is_empty() {
-                return view! { <div class="bbs-panel bbs-dim">"  Member roster loads from the relay (kind-0). Each member is a did:nostr\n  identity with a WebID profile; private keys never leave the device."</div> }.into_any();
+        {move || match selected.get() {
+            Some(pk) => member_profile(selected, store, pod_api.clone(), pk).into_any(),
+            None => {
+                let profiles = store.profiles.get();
+                if profiles.is_empty() {
+                    return view! { <div class="bbs-panel bbs-dim">"  Member roster loads from the relay (kind-0). Each member is a did:nostr\n  identity with a WebID profile; private keys never leave the device."</div> }.into_any();
+                }
+                view! {
+                    <div class="bbs-list">
+                        {profiles
+                            .into_iter()
+                            .map(|ev| {
+                                let name = profile_name(&ev);
+                                let who = relay::short_id(&ev.pubkey);
+                                let pk = ev.pubkey.clone();
+                                let open = move || selected.set(Some(pk.clone()));
+                                let open_key = open.clone();
+                                let aria = format!("View profile of {name}");
+                                view! {
+                                    <div class="bbs-row bbs-member-row" role="button" tabindex="0"
+                                        aria-label=aria
+                                        on:click=move |_| open()
+                                        on:keydown=on_activate(move || open_key())
+                                    >
+                                        <span class="accent bbs-chip">"\u{25CF}"</span>
+                                        <span class="bbs-member-name">{name}</span>
+                                        <span class="bbs-dim bbs-member-id">{format!("#{who}")}</span>
+                                    </div>
+                                }
+                            })
+                            .collect_view()}
+                    </div>
+                }.into_any()
             }
-            view! {
-                <div class="bbs-list">
-                    {profiles
-                        .into_iter()
-                        .map(|ev| {
-                            let name = profile_name(&ev);
-                            let who = relay::short_id(&ev.pubkey);
-                            view! {
-                                <div class="bbs-row">
-                                    <span class="accent">"● "</span> {format!("{name:<20}")}
-                                    <span class="bbs-dim">{format!(" #{who}")}</span>
-                                </div>
-                            }
-                        })
-                        .collect_view()}
-                </div>
-            }.into_any()
         }}
         {me.map(|id| view! {
             <div class="bbs-panel">"  you: " <span class="accent">{id.did.clone()}</span></div>
         })}
+    }
+}
+
+/// One member's profile panel (F15): kind-0 name + about + short id, and the
+/// resolved did:nostr / WebID. No raster avatar — this is an ASCII surface.
+fn member_profile(
+    selected: RwSignal<Option<String>>,
+    store: RelayStore,
+    pod_api: String,
+    pubkey: String,
+) -> impl IntoView {
+    // The member was opened by tap, so their kind-0 (if any) is already loaded.
+    let profiles = store.profiles.get_untracked();
+    let ev = profiles.iter().find(|e| e.pubkey == pubkey);
+    let name = ev
+        .map(profile_name)
+        .unwrap_or_else(|| relay::short_id(&pubkey));
+    let about = ev.and_then(profile_about);
+    let short = relay::short_id(&pubkey);
+    let id = Identity::derive(&pubkey, &pod_api);
+    view! {
+        <div class="bbs-panel bbs-crumb">
+            <span class="bbs-link accent" role="button" tabindex="0"
+                aria-label="Back to members"
+                on:click=move |_| selected.set(None)
+                on:keydown=on_activate(move || selected.set(None))
+            >
+                "\u{2190} Members"
+            </span>
+        </div>
+        <div class="bbs-panel bbs-idblock">
+            "  \u{25CF} " <span class="accent">{name}</span> "\n"
+            {about.map(|a| view! { "\n  " {a} "\n" })}
+            "\n  short id : " <span class="bbs-dim">{short}</span> "\n"
+            {id.map(|i| view! {
+                "  did      : " <span class="accent">{i.did.clone()}</span> "\n"
+                "  webid    : " <span class="bbs-dim">{i.webid.clone()}</span>
+            }.into_any()).unwrap_or_else(|| view! { "  did      : " <span class="bbs-dim">"(unavailable)"</span> }.into_any())}
+        </div>
     }
 }
 
@@ -731,7 +1274,6 @@ fn publish_signed(
 ) {
     #[cfg(target_arch = "wasm32")]
     {
-        use nostr_bbs_core::signer::Signer;
         wasm_bindgen_futures::spawn_local(async move {
             match signer.sign_event(unsigned).await {
                 Ok(signed) => {
@@ -907,8 +1449,9 @@ fn agents(store: RelayStore) -> impl IntoView {
             }.into_any(),
             _ => view! {
                 <div class="bbs-panel bbs-dim">
-                    "  not signed in — open " <span class="accent">"[9] Settings"</span>
-                    " to sign in before acting on a panel"
+                    "  Not signed in — tap " <span class="accent">"Sign in"</span>
+                    " on the bottom bar (or Settings, " <span class="accent">"[9]"</span>
+                    ") before acting on a panel."
                 </div>
             }.into_any(),
         }}
@@ -1033,7 +1576,7 @@ fn status(cfg: StoredValue<BbsConfig>, store: RelayStore) -> impl IntoView {
     }
 }
 
-/// (9) Settings — theme + identity + node.
+/// (9) Settings — theme + accessibility prefs + identity + node.
 fn settings(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
     let node = cfg.with_value(|c| c.node_name.clone());
     let signer = use_context::<BbsSigner>();
@@ -1041,33 +1584,185 @@ fn settings(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
         {header(Screen::Settings)}
         <div class="bbs-panel">
             "  theme     : " <span class="accent">{move || state.theme.get().label()}</span> "   "
-            <span class="bbs-link" on:click=move |_| state.theme.update(|t| *t = t.next())>"[ cycle (T) ]"</span> "\n"
+            <span class="bbs-link" role="button" tabindex="0"
+                on:click=move |_| state.theme.update(|t| *t = t.next())
+                on:keydown=on_activate(move || state.theme.update(|t| *t = t.next()))
+            >"[ cycle (T) ]"</span> "\n"
             "  node      : " {node} "\n"
             "  identity  : keys derived from your passkey (PRF); never persisted server-side\n"
             "  storage   : per-user Solid pod (WAC deny-by-default)"
         </div>
+        {a11y_panel(state)}
         {signer.map(sign_in_panel)}
     }
 }
 
-/// The BBS sign-in panel: shows the current signed-in identity with a sign-out
-/// affordance, or a key input (nsec / hex) + generate option when signed out.
-/// The key lives in memory only; the forum's same-origin local-key session is
-/// adopted automatically at load.
+/// Accessibility / density preferences (F13): text size + reduced motion. Both
+/// persist to localStorage and apply as classes on the document root (see
+/// `app::apply_prefs`); reduced motion defaults to the OS `prefers-reduced-motion`.
+fn a11y_panel(state: BbsState) -> impl IntoView {
+    view! {
+        <div class="bbs-panel">
+            "  ── accessibility ──────────────────────────────────\n"
+            "  text size : "
+            {toggle(
+                "normal",
+                move || !state.text_large.get(),
+                move || state.text_large.set(false),
+            )}
+            " "
+            {toggle(
+                "large",
+                move || state.text_large.get(),
+                move || state.text_large.set(true),
+            )}
+            "\n"
+            "  motion    : "
+            {toggle(
+                "full",
+                move || !state.reduced_motion.get(),
+                move || state.reduced_motion.set(false),
+            )}
+            " "
+            {toggle(
+                "reduced",
+                move || state.reduced_motion.get(),
+                move || state.reduced_motion.set(true),
+            )}
+        </div>
+    }
+}
+
+/// A small `[ label ]` segmented toggle: highlighted (accent) when `active`,
+/// keyboard- and tap-operable, invoking `set` to select this option.
+fn toggle(
+    label: &'static str,
+    active: impl Fn() -> bool + Copy + Send + 'static,
+    set: impl Fn() + Clone + 'static,
+) -> impl IntoView {
+    let set_key = set.clone();
+    view! {
+        <span
+            class="bbs-toggle"
+            class:active=active
+            role="button"
+            tabindex="0"
+            attr:aria-pressed=move || if active() { "true" } else { "false" }
+            on:click=move |_| set()
+            on:keydown=on_activate(move || set_key())
+        >
+            "[ " {label} " ]"
+        </span>
+    }
+}
+
+/// Copy `text` to the clipboard (wasm). Best-effort via `navigator.clipboard.
+/// writeText`, reached reflectively through `js_sys` so no extra `web-sys`
+/// feature is needed; the returned promise and any failure are ignored (the hex
+/// stays on screen to copy by hand).
+#[cfg(target_arch = "wasm32")]
+fn copy_to_clipboard(text: &str) {
+    use wasm_bindgen::{JsCast, JsValue};
+    let win = match web_sys::window() {
+        Some(w) => w,
+        None => return,
+    };
+    let nav = match js_sys::Reflect::get(&win, &JsValue::from_str("navigator")) {
+        Ok(n) if !n.is_undefined() && !n.is_null() => n,
+        _ => return,
+    };
+    let clip = match js_sys::Reflect::get(&nav, &JsValue::from_str("clipboard")) {
+        Ok(c) if !c.is_undefined() && !c.is_null() => c,
+        _ => return,
+    };
+    if let Ok(func) = js_sys::Reflect::get(&clip, &JsValue::from_str("writeText")) {
+        if let Ok(f) = func.dyn_into::<js_sys::Function>() {
+            let _ = f.call1(&clip, &JsValue::from_str(text));
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn copy_to_clipboard(_text: &str) {}
+
+/// One-time key-backup sheet (F14): the secret shown once as nsec + hex, each
+/// with a copy control, a blunt "no reset / no recovery" warning, and a
+/// "written it down" confirm that dismisses the sheet. The BBS never persists a
+/// generated/pasted key, so this is the only chance to save it.
+fn backup_sheet(secret_hex: String, dismiss: impl Fn() + Clone + 'static) -> impl IntoView {
+    let nsec = nostr_bbs_core::encode_nsec(&secret_hex).unwrap_or_default();
+    let nsec_click = nsec.clone();
+    let nsec_key = nsec.clone();
+    let hex_click = secret_hex.clone();
+    let hex_key = secret_hex.clone();
+    let dismiss_key = dismiss.clone();
+    view! {
+        <div class="bbs-panel bbs-backup">
+            <div class="bbs-backup-warn">"  \u{26A0} This key IS your account. There is no reset and no recovery \u{2014}\n  if you lose it the identity is gone. Save it now, offline."</div>
+            <div class="bbs-signin-backup">
+                "  nsec : " <span class="accent">{nsec}</span> "  "
+                <span class="bbs-link" role="button" tabindex="0"
+                    on:click=move |_| copy_to_clipboard(&nsec_click)
+                    on:keydown=on_activate(move || copy_to_clipboard(&nsec_key))
+                >"[ copy ]"</span>
+            </div>
+            <div class="bbs-signin-backup">
+                "  hex  : " <span class="accent">{secret_hex}</span> "  "
+                <span class="bbs-link" role="button" tabindex="0"
+                    on:click=move |_| copy_to_clipboard(&hex_click)
+                    on:keydown=on_activate(move || copy_to_clipboard(&hex_key))
+                >"[ copy ]"</span>
+            </div>
+            <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
+                on:click=move |_| dismiss()
+                on:keydown=on_activate(move || dismiss_key())
+            >"[ \u{2713} I\u{2019}ve written it down ]"</span>
+        </div>
+    }
+}
+
+/// The BBS sign-in panel — a **vertical stack** of full-width, ≥44 px options in
+/// priority order, so it works on a phone with no browser extension:
+///   1. Sign in with extension (only when a NIP-07 provider is present)
+///   2. Continue at /community/ (always — the extension-free primary path; the
+///      adopted session carries back same-origin)
+///   3. Paste an nsec / hex key (own full-width row) → Sign in
+///   4. Generate a throwaway key → the F14 backup sheet (nsec + hex, shown once)
+/// Signed in with a local key, a "Back up my key" control re-opens that sheet;
+/// the key lives in memory only and the forum's same-origin local-key session is
+/// adopted at load.
 fn sign_in_panel(signer: BbsSigner) -> impl IntoView {
     let key_input = RwSignal::new(String::new());
     let generated = RwSignal::new(None::<String>);
+    // Toggles the backup sheet for a signed-in local key.
+    let show_backup = RwSignal::new(false);
     view! {
         <div class="bbs-panel">
             "  ── identity / sign-in ─────────────────────────────\n"
             {move || match signer.pubkey().get() {
-                Some(pk) => view! {
-                    "  signed in : " <span class="accent">{relay::short_id(&pk)}</span> "   "
-                    <span class="bbs-link" role="button"
-                        on:click=move |_| { signer.logout(); generated.set(None); }
-                    >"[ sign out ]"</span> "\n"
-                    "  board posts & agent decisions are signed with this key (in memory only)"
-                }.into_any(),
+                Some(pk) => {
+                    // A readable local secret (adopted/pasted forum key) can be
+                    // backed up here; a NIP-07 session exposes none, so no sheet.
+                    let backup = signer.local_secret_hex();
+                    view! {
+                        "  signed in : " <span class="accent">{relay::short_id(&pk)}</span> "   "
+                        <span class="bbs-link" role="button" tabindex="0"
+                            on:click=move |_| { signer.logout(); generated.set(None); show_backup.set(false); }
+                            on:keydown=on_activate(move || { signer.logout(); generated.set(None); show_backup.set(false); })
+                        >"[ sign out ]"</span> "\n"
+                        "  board posts & agent decisions are signed with this key (in memory only)\n"
+                        {backup.clone().map(|_| view! {
+                            <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
+                                on:click=move |_| show_backup.update(|b| *b = !*b)
+                                on:keydown=on_activate(move || show_backup.update(|b| *b = !*b))
+                            >"[ \u{25B8} Back up my key ]"</span>
+                        })}
+                        {move || if show_backup.get() {
+                            backup.clone().map(|hex| backup_sheet(hex, move || show_backup.set(false)).into_any())
+                        } else {
+                            None
+                        }}
+                    }.into_any()
+                }
                 None => {
                     let login = move || {
                         let input = key_input.get_untracked();
@@ -1076,40 +1771,56 @@ fn sign_in_panel(signer: BbsSigner) -> impl IntoView {
                             generated.set(None);
                         }
                     };
+                    let login_key = login;
                     // Only offered when a NIP-07 provider (PodKey / nos2x / Alby)
                     // is present; signs via the extension with no key exposure.
                     let ext_available = crate::nip07::has_nip07_extension();
                     view! {
-                        {ext_available.then(|| view! {
-                            "  Browser signer detected (PodKey / nos2x / Alby) — signs with no key exposure:\n"
-                            <div class="bbs-cmdline">
-                                <span class="bbs-link accent" role="button"
+                        <div class="bbs-signin">
+                            {ext_available.then(|| view! {
+                                <span class="bbs-dim">"  Browser signer detected — signs with no key exposure:"</span>
+                                <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
                                     on:click=move |_| start_extension_login(signer)
-                                >"[ sign in with extension ]"</span>
-                            </div>
-                        })}
-                        "  Signing in at " <span class="accent">"/community/"</span> " with a local key or browser signer carries here.\n"
-                        "  Or paste an nsec / 64-char hex key, or generate a throwaway key:\n"
-                        <div class="bbs-cmdline">
-                            <span class="prompt">"key/"</span>
+                                    on:keydown=on_activate(move || start_extension_login(signer))
+                                >"[ \u{25B8} Sign in with extension ]"</span>
+                            })}
+                            <span class="bbs-dim">"  Sign in with a passkey — no key to paste, works on any phone:"</span>
+                            <a class="bbs-link accent bbs-cta" href="../" rel="noopener"
+                            >"[ \u{25B8} Continue at /community/ \u{2197} ]"</a>
+                            <label class="bbs-dim" for="bbs-signin-key">"  Or paste an nsec / 64-char hex key:"</label>
                             <input
+                                id="bbs-signin-key"
+                                name="bbs-signin-key"
+                                class="bbs-key"
+                                autocomplete="off"
+                                autocapitalize="none"
+                                spellcheck="false"
+                                placeholder="nsec1… or 64-char hex"
                                 prop:value=move || key_input.get()
                                 on:input=move |ev| key_input.set(event_target_value(&ev))
                                 on:keydown=move |ev| { if ev.key() == "Enter" { ev.prevent_default(); login(); } }
                             />
-                            <span class="bbs-link accent" role="button" on:click=move |_| login()>"[ sign in ]"</span>
-                            " "
-                            <span class="bbs-link" role="button"
+                            <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
+                                on:click=move |_| login()
+                                on:keydown=on_activate(move || login_key())
+                            >"[ \u{25B8} Sign in ]"</span>
+                            <span class="bbs-link bbs-cta" role="button" tabindex="0"
                                 on:click=move |_| { if let Ok(hex) = signer.generate() { generated.set(Some(hex)); } }
-                            >"[ generate ]"</span>
+                                on:keydown=on_activate(move || { if let Ok(hex) = signer.generate() { generated.set(Some(hex)); } })
+                            >"[ Generate a throwaway key ]"</span>
                         </div>
                         {move || signer.error().get().map(|e| view! { <div class="bbs-dim">"  ✗ " {e}</div> })}
-                        {move || generated.get().map(|hex| view! {
-                            <div class="bbs-dim">"  new key (back this up — shown once): " <span class="accent">{hex}</span></div>
-                        })}
                     }.into_any()
                 }
             }}
+            // The one-time backup sheet for a freshly generated throwaway key lives
+            // OUTSIDE the signed-in/out match: `generate()` installs the key and sets
+            // the pubkey synchronously, so the signed-OUT arm (and anything nested in
+            // it) is torn down the instant the key is created. Rendered here as a
+            // sibling of the match, it survives that flip and shows the shown-once
+            // nsec/hex + copy + confirm (F14). `generate()` deliberately never
+            // persists the key, so this sheet is the only chance to save it.
+            {move || generated.get().map(|hex| backup_sheet(hex, move || generated.set(None)).into_any())}
         </div>
     }
 }
@@ -1126,7 +1837,9 @@ fn help() -> impl IntoView {
             "    deny-by-default at the relay.\n"
             "  • Pod is your own Solid pod — WebID-owned, WAC-controlled, git-clonable.\n"
             "  • Identity is a did:nostr Multikey DID; your key never leaves the device.\n\n"
-            "  Keys: number to open a board · / for commands · ESC back · T theme · 0 help\n\n"
+            "  Tap the bottom bar to move around; tap a zone, then a board, to read it.\n"
+            "  Power users: number keys jump to a screen, / opens the command line,\n"
+            "  ESC steps back, T cycles the theme, ? opens Help.\n\n"
             "  • A door stands ajar… "
             <span class="bbs-link" on:click=move |_| launch_sentry()>
                 "[ \u{25B6} UA 571-C SENTRY ]"
