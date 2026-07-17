@@ -86,6 +86,43 @@ fn dev_auth_panel() -> impl IntoView {
 #[cfg(not(feature = "dev-auth"))]
 fn dev_auth_panel() -> impl IntoView {}
 
+/// Publish a kind-0 profile, retrying if the relay rejects it because the author
+/// is not yet whitelisted. A brand-new joiner is authenticated client-side and
+/// publishes their kind-0 immediately, but the whitelist row is created a moment
+/// later by the auth-worker username-claim; the relay rejects a non-whitelisted
+/// author, so the first publish is dropped and the display name is lost (the
+/// user then only sees their pubkey). Re-publishing the SAME signed event once
+/// the claim lands succeeds (a rejected event was never stored, so its id is
+/// free). Backs off a few times, then gives up quietly.
+fn publish_kind0_retrying(
+    relay: RelayConnection,
+    signed: nostr_bbs_core::NostrEvent,
+    attempts_left: u32,
+) {
+    let relay_for_retry = relay.clone();
+    let signed_for_retry = signed.clone();
+    let on_ok: crate::relay::PublishCallback =
+        std::rc::Rc::new(move |accepted: bool, message: String| {
+            if accepted {
+                return;
+            }
+            if attempts_left == 0 {
+                web_sys::console::warn_1(
+                    &format!("[app] kind-0 still rejected after retries: {message}").into(),
+                );
+                return;
+            }
+            let relay_next = relay_for_retry.clone();
+            let signed_next = signed_for_retry.clone();
+            // Wait for the username-claim's cross-D1 whitelist write to land.
+            crate::utils::set_timeout_once(
+                move || publish_kind0_retrying(relay_next, signed_next, attempts_left - 1),
+                2500,
+            );
+        });
+    let _ = relay.publish_with_ack(&signed, Some(on_ok));
+}
+
 // -- SVG icon helpers ---------------------------------------------------------
 
 fn brand_icon() -> impl IntoView {
@@ -377,7 +414,7 @@ pub fn App() -> impl IntoView {
                     };
                     match auth.sign_event_async(unsigned).await {
                         Ok(signed) => {
-                            r_whitelist.publish(&signed);
+                            publish_kind0_retrying(r_whitelist, signed, 4);
                             web_sys::console::log_1(
                                 &format!(
                                     "[app] Published minimal kind-0 for auto-whitelist: {}",
@@ -438,7 +475,10 @@ pub fn App() -> impl IntoView {
             wasm_bindgen_futures::spawn_local(async move {
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {
-                        r.publish(&signed);
+                        // Retry on relay rejection: a new joiner publishes this
+                        // before the username-claim whitelists them, so the first
+                        // attempt is dropped and the display name would be lost.
+                        publish_kind0_retrying(r, signed, 4);
                         published_profile.set(true);
                         web_sys::console::log_1(
                             &format!(

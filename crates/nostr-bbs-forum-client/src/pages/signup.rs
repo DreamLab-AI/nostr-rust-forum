@@ -201,6 +201,7 @@ async fn provision_pod(auth: crate::auth::AuthStore) -> Result<(), String> {
 #[component]
 pub fn SignupPage() -> impl IntoView {
     let auth = use_auth();
+    let zone_access = crate::stores::zone_access::use_zone_access();
     let pubkey = auth.pubkey();
     let is_authed = auth.is_authenticated();
     let error = auth.error();
@@ -272,10 +273,18 @@ pub fn SignupPage() -> impl IntoView {
                     let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
                     if !pubkey.is_empty() {
                         let handle = derive_username(&display_for_handle, &pubkey);
-                        if let Err(e) = claim_username(&handle, real_opt.as_deref(), auth).await {
-                            web_sys::console::warn_1(
+                        match claim_username(&handle, real_opt.as_deref(), auth).await {
+                            Ok(()) => {
+                                // The claim just granted this joiner their cohorts
+                                // server-side (auto-approval). Re-fetch zone access
+                                // so the client learns them now — without this a
+                                // new joiner keeps the empty cohorts read before
+                                // the grant and is never landed in their zone.
+                                zone_access.refresh();
+                            }
+                            Err(e) => web_sys::console::warn_1(
                                 &format!("[signup] handle claim deferred: {e}").into(),
-                            );
+                            ),
                         }
                     }
                     // Eagerly provision the Solid pod (non-blocking; lazy path

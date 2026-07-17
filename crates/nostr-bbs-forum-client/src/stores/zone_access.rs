@@ -49,9 +49,23 @@ pub struct ZoneAccess {
     /// check-whitelist response). Drives config-driven zone membership so the
     /// tile renderer is no longer coupled to the legacy 3-flag model.
     pub cohorts: RwSignal<Vec<String>>,
+    /// Bumped to force a re-fetch of the whitelist. Signup grants the user's
+    /// cohorts server-side AFTER the client's initial fetch (username-claim
+    /// creates the whitelist row), so a brand-new joiner would otherwise be
+    /// stuck with the empty cohorts read before the grant landed. `refresh()`
+    /// bumps this; the fetch effect tracks it and re-reads.
+    refresh_trigger: RwSignal<u32>,
 }
 
 impl ZoneAccess {
+    /// Force a re-fetch of the whitelist/cohorts from the relay. Call after an
+    /// action that changes the user's server-side access (e.g. a new joiner's
+    /// username-claim grants their cohorts) so the client picks up the grant
+    /// without a full reload — driving the zone-first landing and tile gating.
+    pub fn refresh(&self) {
+        self.refresh_trigger.update(|n| *n = n.wrapping_add(1));
+    }
+
     /// Config-driven membership check for an arbitrary zone.
     ///
     /// A zone is "entered" (rendered as a normal, openable tile) when the user
@@ -136,6 +150,7 @@ pub fn provide_zone_access() {
     let is_admin_sig = RwSignal::new(false);
     let loaded = RwSignal::new(false);
     let cohorts_sig = RwSignal::new(Vec::<String>::new());
+    let refresh_trigger = RwSignal::new(0u32);
 
     let home = Memo::new(move |_| flags.get().0);
     let members = Memo::new(move |_| flags.get().1);
@@ -154,11 +169,15 @@ pub fn provide_zone_access() {
         loaded,
         flags,
         cohorts: cohorts_sig,
+        refresh_trigger,
     };
     provide_context(access);
 
-    // Fetch access flags from relay when user authenticates
+    // Fetch access flags from relay when user authenticates. Also re-runs when
+    // `refresh_trigger` is bumped (e.g. by signup after the username-claim grants
+    // the new joiner's cohorts server-side).
     Effect::new(move |_| {
+        refresh_trigger.track();
         let authed = is_authed.get();
         let pk = pubkey.get();
         if authed {

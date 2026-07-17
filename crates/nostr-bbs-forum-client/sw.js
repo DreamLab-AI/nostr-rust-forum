@@ -74,6 +74,19 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // The retro BBS is a SEPARATE SPA mounted under this SW's scope at
+  // `<scope>bbs/` (e.g. /community/bbs/). It has its own index.html and its own
+  // assets — the forum SW must NOT touch it. Without this bypass the navigate
+  // branch below would (a) cache the BBS index.html under this SW's
+  // `./index.html` key, poisoning the forum's offline shell with BBS markup,
+  // and (b) on any offline/stale path serve the forum shell for a /bbs/ URL,
+  // which the forum router can't resolve (→ NotFound / "404"). Leave every
+  // BBS request to the network so both apps stay independent.
+  const scopePath = new URL(self.registration.scope).pathname;
+  if (url.pathname === scopePath + 'bbs' || url.pathname.startsWith(scopePath + 'bbs/')) {
+    return; // no respondWith → default browser network handling
+  }
+
   // Network-first WITH HTTP-cache bypass for the SPA navigation document.
   // This is the crux of the stale-deploy fix: a plain fetch(request) may return
   // a stale browser-HTTP-cached index.html, re-pinning the old BUILD_HASH and
