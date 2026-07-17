@@ -70,6 +70,22 @@ pub fn forum_name() -> String {
         .unwrap_or_else(|| "Community Forum".to_string())
 }
 
+/// Whether the retro ASCII/BBS client is available for this deployment, driving
+/// the "switch interface" sash. The kit deploys the BBS at `<base>/bbs/` by
+/// default, so this is ON unless an operator explicitly injects
+/// `window.__ENV__.BBS_ENABLED = "false"`.
+pub fn bbs_enabled() -> bool {
+    window_env("BBS_ENABLED")
+        .map(|v| v.to_ascii_lowercase() != "false")
+        .unwrap_or(true)
+}
+
+/// Optional absolute URL override for the BBS (`window.__ENV__.BBS_URL`). When
+/// absent, callers use the base-relative `/bbs/` path (the kit's default mount).
+pub fn bbs_url_override() -> Option<String> {
+    window_env("BBS_URL")
+}
+
 /// Read a key from the `window.__ENV__` object (runtime config injected by index.html).
 fn window_env(key: &str) -> Option<String> {
     let window = web_sys::window()?;
