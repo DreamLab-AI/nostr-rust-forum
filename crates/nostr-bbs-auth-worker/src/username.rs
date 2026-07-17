@@ -283,15 +283,24 @@ pub async fn claim(
         }
     }
 
-    // Auto-whitelist the joiner into the Landing group (members cohort) at claim
-    // time so they are immediately visible in the admin whitelist interface and
-    // can post in the public/Landing zone — per the operator model (admins
-    // elevate further from there). Claiming is a reliable, deliberate join
-    // signal, unlike the relay's kind-0 auto_whitelist which depends on the
-    // client actually publishing a kind-0 after onboarding. Cross-D1 write to
-    // the relay's whitelist via the RELAY_DB binding; ON CONFLICT(pubkey) DO
-    // NOTHING preserves any cohorts an admin already set and never demotes an
-    // existing member/admin. Best-effort — failure is non-fatal.
+    // Auto-whitelist the joiner at claim time so they are immediately visible in
+    // the admin whitelist interface and can post in the zones they are approved
+    // for. Claiming is a reliable, deliberate join signal, unlike the relay's
+    // kind-0 auto_whitelist which depends on the client actually publishing a
+    // kind-0 after onboarding. The granted cohorts are config-driven: the base
+    // `members` cohort plus the `required_cohorts` of every zone flagged
+    // `auto_approve` in `ZONE_CONFIG` — so an operator opens a specific zone to
+    // new joiners (e.g. minimoonoir) from config, with no code change. With no
+    // auto-approve zone this is exactly `["members"]` (historic default).
+    // Cross-D1 write to the relay's whitelist via the RELAY_DB binding;
+    // ON CONFLICT(pubkey) DO NOTHING preserves any cohorts an admin already set
+    // and never demotes an existing member/admin. Best-effort — non-fatal.
+    let cohorts_json = crate::zone_approval::new_joiner_cohorts_json(
+        env.var("ZONE_CONFIG")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
     if let Ok(relay_db) = env.d1("RELAY_DB") {
         if let Ok(bound) = relay_db
             .prepare(
@@ -300,7 +309,7 @@ pub async fn claim(
             )
             .bind(&[
                 JsValue::from_str(pubkey),
-                JsValue::from_str(r#"["members"]"#),
+                JsValue::from_str(&cohorts_json),
                 JsValue::from_f64(now as f64),
                 JsValue::from_str("auto-registration"),
             ])

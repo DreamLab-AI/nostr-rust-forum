@@ -29,6 +29,7 @@ mod username;
 mod webauthn;
 mod welcome;
 mod wot;
+mod zone_approval;
 
 use worker::*;
 
