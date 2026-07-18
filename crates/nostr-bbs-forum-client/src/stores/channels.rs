@@ -86,6 +86,12 @@ pub struct ChannelStore {
     /// channel id, newest-wins. Applied when the kind-40 arrives (a kind-41 can
     /// outrun its kind-40 on the wire). Transient — not cached.
     pending_meta: RwSignal<HashMap<String, MetaUpdate>>,
+    /// Event ids deleted via kind-5 (NIP-09), lowercased. A tombstone both
+    /// removes the target from `channel_messages` AND suppresses a kind-42 that
+    /// arrives AFTER its deletion (backfill order is not guaranteed). Transient
+    /// — rebuilt from the relay's replayed kind-5s each session. See
+    /// [`fold_deletions`].
+    tombstones: RwSignal<HashSet<String>>,
 }
 
 impl ChannelStore {
@@ -106,7 +112,23 @@ impl ChannelStore {
             ensured: RwSignal::new(HashSet::new()),
             meta_updated_at: RwSignal::new(cached.meta_updated_at),
             pending_meta: RwSignal::new(HashMap::new()),
+            tombstones: RwSignal::new(HashSet::new()),
         }
+    }
+
+    /// Optimistically tombstone + remove a message by id.
+    ///
+    /// Used by the delete UI so the actor doesn't wait on the relay echo; it is
+    /// idempotent with the kind-5 fold that runs when the deletion broadcast
+    /// arrives ([`fold_deletions`]).
+    pub fn remove_message(&self, event_id: &str) {
+        let deleted = [event_id.to_lowercase()];
+        let tombstones = self.tombstones;
+        self.channel_messages.update(|m| {
+            tombstones.update(|t| {
+                fold_deletions(m, t, &deleted);
+            });
+        });
     }
 
     // -- Derived count accessors (ADR-091) ------------------------------------
@@ -157,8 +179,10 @@ impl ChannelStore {
         }
 
         let channels_sig = self.channels;
+        let channel_msgs_sig = self.channel_messages;
         let meta_ts_sig = self.meta_updated_at;
         let pending_meta_sig = self.pending_meta;
+        let tombstones_sig = self.tombstones;
         let loading_sig = self.loading;
         let eose_sig = self.eose_received;
         let store = *self;
@@ -170,6 +194,7 @@ impl ChannelStore {
         // Kind 40: channel creation. Kind 41: channel metadata edit (admin
         // rename) — folded last-write-wins; pin/unpin control 41s are ignored
         // (they carry empty content, so [`parse_meta_update`] returns `None`).
+        // Kind 5: NIP-09 deletion — removes the target post and tombstones its id.
         let on_event = Rc::new(move |event: NostrEvent| {
             match event.kind {
                 40 => {
@@ -227,6 +252,16 @@ impl ChannelStore {
                         }
                     }
                 }
+                5 => {
+                    let deleted = deletion_targets(&event);
+                    if !deleted.is_empty() {
+                        channel_msgs_sig.update(|m| {
+                            tombstones_sig.update(|t| {
+                                fold_deletions(m, t, &deleted);
+                            });
+                        });
+                    }
+                }
                 _ => {}
             }
         });
@@ -244,6 +279,7 @@ impl ChannelStore {
                 store_for_eose.channel_messages.set(HashMap::new());
                 store_for_eose.last_active.set(HashMap::new());
                 store_for_eose.meta_updated_at.set(HashMap::new());
+                store_for_eose.tombstones.set(HashSet::new());
             } else {
                 channels_sig.update(|list| {
                     list.retain(|c| ids.contains(&c.id));
@@ -262,8 +298,9 @@ impl ChannelStore {
 
         let id = relay.subscribe(
             vec![Filter {
-                // kind-40 = channel creation, kind-41 = metadata edit (rename).
-                kinds: Some(vec![40, 41]),
+                // kind-40 = channel creation, kind-41 = metadata edit (rename),
+                // kind-5 = post deletion (NIP-09).
+                kinds: Some(vec![5, 40, 41]),
                 ..Default::default()
             }],
             on_event,
@@ -315,9 +352,17 @@ impl ChannelStore {
         let channels_sig = self.channels;
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
+        let tombstones = self.tombstones;
         let store = *self;
 
         let on_msg = Rc::new(move |event: NostrEvent| {
+            // Suppress a message that was already deleted — a kind-5 can land
+            // before its target kind-42 in the same backfill (arrival order is
+            // not guaranteed), so the tombstone is the durable gate.
+            if tombstones.with_untracked(|t| is_tombstoned(t, &event.id)) {
+                return;
+            }
+
             // Extract the root e-tag value (prefer explicit "root" marker)
             let tag_val = event
                 .tags
@@ -428,9 +473,14 @@ impl ChannelStore {
 
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
+        let tombstones = self.tombstones;
 
         let on_event = Rc::new(move |event: NostrEvent| {
             if event.kind != 42 {
+                return;
+            }
+            // Skip messages already deleted via kind-5 (see `start_msg_sync`).
+            if tombstones.with_untracked(|t| is_tombstoned(t, &event.id)) {
                 return;
             }
             // Re-resolve here as well in case channel metadata arrived after
@@ -641,6 +691,63 @@ fn buffer_pending_meta(pending: &mut HashMap<String, MetaUpdate>, update: MetaUp
             pending.insert(update.channel_id.clone(), update);
         }
     }
+}
+
+// -- kind-5 deletion folding (post deletion) ----------------------------------
+
+/// Event ids referenced by a kind-5 deletion's `["e", <id>]` tags, lowercased.
+///
+/// Non-kind-5 events, and kind-5s carrying no `e` tag, yield an empty list — a
+/// no-op fold. (Replaceable-event `a` tags used elsewhere, e.g. calendar
+/// deletions, are ignored here; forum posts are addressed by event id.)
+pub fn deletion_targets(event: &NostrEvent) -> Vec<String> {
+    if event.kind != 5 {
+        return Vec::new();
+    }
+    event
+        .tags
+        .iter()
+        .filter(|t| t.len() >= 2 && t[0] == "e")
+        .map(|t| t[1].to_lowercase())
+        .collect()
+}
+
+/// Fold deleted ids into the message store: record each as a tombstone and drop
+/// any matching event from every channel. Returns `true` when at least one
+/// stored message was removed.
+///
+/// The tombstone set is what makes deletion arrival-order independent: a kind-5
+/// landing BEFORE its target (same EOSE backfill or live) records the id, and
+/// the kind-42 handlers consult [`is_tombstoned`] before inserting, so the post
+/// never reappears; a kind-5 landing AFTER removes the already-stored copy here.
+///
+/// TRUST MODEL: identical to the kind-41 fold — the relay gates WHO may delete
+/// (own events always; others' events admin/TL3+, enforced by the relay's kind-5
+/// gate), so the client folds any stored/broadcast kind-5 unconditionally with
+/// no author check; re-checking here would duplicate — and could disagree with —
+/// the server's authority.
+pub fn fold_deletions(
+    channel_messages: &mut HashMap<String, Vec<NostrEvent>>,
+    tombstones: &mut HashSet<String>,
+    deleted: &[String],
+) -> bool {
+    let mut removed = false;
+    for id in deleted {
+        tombstones.insert(id.clone());
+        for events in channel_messages.values_mut() {
+            let before = events.len();
+            events.retain(|e| e.id.to_lowercase() != *id);
+            if events.len() != before {
+                removed = true;
+            }
+        }
+    }
+    removed
+}
+
+/// Whether `id` (any casing) has been deleted (tombstoned).
+pub fn is_tombstoned(tombstones: &HashSet<String>, id: &str) -> bool {
+    tombstones.contains(&id.to_lowercase())
 }
 
 #[cfg(test)]
@@ -856,5 +963,79 @@ mod tests {
         buffer_pending_meta(&mut pending, u_old);
         assert_eq!(pending.get("chan").unwrap().name.as_deref(), Some("Second"));
         assert_eq!(pending.get("chan").unwrap().created_at, 1500);
+    }
+
+    // -- kind-5 deletion folding --------------------------------------------
+
+    #[test]
+    fn kind5_removes_target_message() {
+        let target = ev(42, 100, &[&["e", "chan", "", "root"]], "delete me");
+        let keep = ev(42, 200, &[&["e", "chan", "", "root"]], "keep me");
+        let tid = target.id.clone();
+        let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
+        msgs.insert("chan".into(), vec![target, keep]);
+        let mut tomb = HashSet::new();
+
+        let del = ev(5, 300, &[&["e", tid.as_str()]], "");
+        let targets = deletion_targets(&del);
+        assert_eq!(targets, vec![tid.to_lowercase()]);
+        assert!(fold_deletions(&mut msgs, &mut tomb, &targets));
+        assert_eq!(msgs["chan"].len(), 1);
+        assert_eq!(msgs["chan"][0].content, "keep me");
+        assert!(is_tombstoned(&tomb, &tid));
+    }
+
+    #[test]
+    fn kind5_before_target_suppresses_later_message() {
+        // Deletion lands with the target not yet stored (backfill order): nothing
+        // is removed, but the tombstone must suppress the message when it arrives.
+        let late = ev(42, 100, &[&["e", "chan", "", "root"]], "arrives late");
+        let lid = late.id.clone();
+        let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
+        let mut tomb = HashSet::new();
+
+        let del = ev(5, 90, &[&["e", lid.as_str()]], "");
+        assert!(!fold_deletions(
+            &mut msgs,
+            &mut tomb,
+            &deletion_targets(&del)
+        ));
+        assert!(is_tombstoned(&tomb, &lid));
+    }
+
+    #[test]
+    fn kind5_without_e_tag_is_noop() {
+        let del = ev(5, 100, &[&["p", "somebody"]], "");
+        assert!(deletion_targets(&del).is_empty());
+
+        let keep = ev(42, 100, &[&["e", "chan", "", "root"]], "keep");
+        let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
+        msgs.insert("chan".into(), vec![keep]);
+        let mut tomb = HashSet::new();
+        assert!(!fold_deletions(
+            &mut msgs,
+            &mut tomb,
+            &deletion_targets(&del)
+        ));
+        assert_eq!(msgs["chan"].len(), 1);
+        assert!(tomb.is_empty());
+    }
+
+    #[test]
+    fn kind5_unknown_id_removes_nothing() {
+        let keep = ev(42, 100, &[&["e", "chan", "", "root"]], "keep");
+        let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
+        msgs.insert("chan".into(), vec![keep]);
+        let mut tomb = HashSet::new();
+
+        let del = ev(5, 200, &[&["e", "nonexistent-id"]], "");
+        assert!(!fold_deletions(
+            &mut msgs,
+            &mut tomb,
+            &deletion_targets(&del)
+        ));
+        assert_eq!(msgs["chan"].len(), 1);
+        // Still recorded, so a message with that id could never appear later.
+        assert!(is_tombstoned(&tomb, "nonexistent-id"));
     }
 }

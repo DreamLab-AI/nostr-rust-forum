@@ -9,6 +9,18 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ### Added
 
+- **Post deletion — own posts for everyone, any post for admins** (operator
+  issue #44 follow-up). NIP-09 kind-5 deletion end-to-end: the relay's
+  `process_deletion` now honours the privilege its EVENT gate already
+  admitted (admin/TL3+ may delete others' events — previously the SQL's
+  author constraint made that a silent no-op; without the privilege the
+  constraint remains, so a gate regression cannot widen deletion). The
+  forum client subscribes to kind-5, folds deletions arrival-order
+  independently via a tombstone set (a deletion seen before its target
+  still suppresses it), and gains quiet author-or-admin trash affordances
+  with confirm dialogs on thread roots (warns the whole topic disappears),
+  replies, and chat bubbles, with optimistic removal on relay OK.
+
 - **Straight-to-forums root + About page** (operator issue #42). `/` now
   redirects authenticated members to `/forums` (holding on the loading
   spinner until the session resolves, so neither branch flashes); the

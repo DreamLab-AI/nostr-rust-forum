@@ -34,6 +34,7 @@ use crate::components::access_denied::AccessDenied;
 use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
+use crate::components::confirm_dialog::ConfirmDialog;
 use crate::components::link_preview::LinkPreview;
 use crate::components::media_embed::MediaEmbed;
 use crate::components::mention_text::{normalise_mention_pubkey, MentionText};
@@ -496,6 +497,11 @@ pub fn ThreadPage() -> impl IntoView {
     // Reply composer → kind-42 e-tagging the topic root (NIP-10 root+reply).
     let relay_for_send = relay;
     let relay_for_edit = relay_for_send.clone();
+    let relay_for_delete = relay_for_send.clone();
+
+    // Admin gate for the delete affordance (author-or-admin; the relay is the
+    // real boundary — see the kind-5 gate). `ZoneAccess::is_admin` is a signal.
+    let is_admin = Signal::derive(move || zone_access.is_admin.get());
     let do_send_reply = {
         let relay = relay_for_send;
         move |(content, mention_pubkeys): (String, Vec<String>)| {
@@ -723,6 +729,58 @@ pub fn ThreadPage() -> impl IntoView {
         })
     };
 
+    // -- Delete flow ------------------------------------------------------
+    //
+    // Publish a NIP-09 kind-5 deletion for `target_id`. The relay gates WHO may
+    // delete (own posts always; others' posts admin/TL3+); the store's kind-5
+    // fold removes it when the relay echoes, and we optimistically remove on OK
+    // so the deleter never waits on the echo. Author/admin gating happens at the
+    // affordance level (`DeleteControls`).
+    let publish_delete = {
+        let relay = relay_for_delete;
+        Callback::new(move |target_id: String| {
+            let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
+            if pubkey.is_empty() {
+                toasts.show("Not authenticated".to_string(), ToastVariant::Error);
+                return;
+            }
+            let now = (js_sys::Date::now() / 1000.0) as u64;
+            let unsigned = nostr_bbs_core::UnsignedEvent {
+                pubkey,
+                created_at: now,
+                kind: 5,
+                tags: vec![vec!["e".to_string(), target_id.clone()]],
+                content: String::new(),
+            };
+            let relay = relay.clone();
+            spawn_local(async move {
+                match auth.sign_event_async(unsigned).await {
+                    Ok(signed) => {
+                        let on_ok = Rc::new(move |accepted: bool, message: String| {
+                            if accepted {
+                                store.remove_message(&target_id);
+                                toasts.show("Post deleted".to_string(), ToastVariant::Success);
+                            } else {
+                                let reason = if message.trim().is_empty() {
+                                    "Delete rejected by relay".to_string()
+                                } else {
+                                    format!("Delete rejected: {message}")
+                                };
+                                toasts.show(reason, ToastVariant::Error);
+                            }
+                        });
+                        if let Err(e) = relay.publish_with_ack(&signed, Some(on_ok)) {
+                            toasts.show(format!("Delete failed: {e}"), ToastVariant::Error);
+                        }
+                    }
+                    Err(e) => {
+                        toasts.show(format!("Failed to sign deletion: {e}"), ToastVariant::Error);
+                    }
+                }
+            });
+        })
+    };
+
     view! {
         <Show
             when=move || has_zone_access.get()
@@ -801,6 +859,8 @@ pub fn ThreadPage() -> impl IntoView {
                             on_save_edit=publish_edit
                             on_reply=on_reply
                             can_reply=is_authed.into()
+                            is_admin=is_admin
+                            on_delete=publish_delete
                         />
                     }.into_any()
                 } else {
@@ -833,6 +893,8 @@ pub fn ThreadPage() -> impl IntoView {
                                     on_save_edit=publish_edit
                                     on_reply=on_reply
                                     can_reply=is_authed.into()
+                                    is_admin=is_admin
+                                    on_delete=publish_delete
                                 />
                             }
                         }).collect_view()}
@@ -955,6 +1017,64 @@ fn EditControls(
     }
 }
 
+/// Delete affordance: a quiet trash button shown when the viewer is the post's
+/// author OR an admin. Opens a [`ConfirmDialog`] (deletion is permanent and
+/// removes the post for everyone; a topic ROOT additionally warns that its
+/// replies become unreachable) and fires `on_delete` with the post id.
+#[component]
+fn DeleteControls(
+    post_id: String,
+    post_pubkey: String,
+    /// The topic ROOT deletes the whole topic — the confirm copy warns so.
+    is_root: bool,
+    my_pubkey: Signal<String>,
+    is_admin: Signal<bool>,
+    on_delete: Callback<String>,
+) -> impl IntoView {
+    let can_delete = Signal::derive(move || {
+        let mine = my_pubkey.get();
+        is_admin.get() || (!mine.is_empty() && mine.eq_ignore_ascii_case(&post_pubkey))
+    });
+    let show_confirm = RwSignal::new(false);
+    let pid = StoredValue::new(post_id);
+    let on_confirm = Callback::new(move |()| on_delete.run(pid.get_value()));
+    let (dialog_title, dialog_message) = if is_root {
+        (
+            "Delete topic".to_string(),
+            "Delete this topic? This is permanent and removes it for everyone. \
+             Its replies will become unreachable."
+                .to_string(),
+        )
+    } else {
+        (
+            "Delete post".to_string(),
+            "Delete this post? This is permanent and removes it for everyone.".to_string(),
+        )
+    };
+
+    view! {
+        <Show when=move || can_delete.get()>
+            <button
+                class="ml-auto opacity-60 hover:opacity-100 text-xs text-gray-500 hover:text-red-400 transition-colors flex items-center gap-1"
+                title="Delete post"
+                on:click=move |_| show_confirm.set(true)
+            >
+                <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m2 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6M10 11v6M14 11v6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                "Delete"
+            </button>
+            <ConfirmDialog
+                is_open=show_confirm
+                title=dialog_title.clone()
+                message=dialog_message.clone()
+                confirm_label="Delete".to_string()
+                on_confirm=on_confirm
+            />
+        </Show>
+    }
+}
+
 /// The topic root post, rendered prominently at the top of the thread.
 #[component]
 fn RootPost(
@@ -964,6 +1084,8 @@ fn RootPost(
     on_save_edit: Callback<(String, String)>,
     on_reply: Callback<ReplyTarget>,
     can_reply: Signal<bool>,
+    is_admin: Signal<bool>,
+    on_delete: Callback<String>,
 ) -> impl IntoView {
     let author = use_display_name_memo(post.pubkey.clone());
     // Quote-and-append: tapping Reply focuses the bottom composer. A StoredValue
@@ -1018,6 +1140,14 @@ fn RootPost(
                             my_pubkey=my_pubkey
                             editing_id=editing_id
                         />
+                        <DeleteControls
+                            post_id=post_id.clone()
+                            post_pubkey=post_pubkey.clone()
+                            is_root=true
+                            my_pubkey=my_pubkey
+                            is_admin=is_admin
+                            on_delete=on_delete
+                        />
                         <Show when=move || can_reply.get()>
                             <button
                                 class="text-xs text-gray-500 hover:text-[color:var(--zone-accent)] transition-colors ml-auto"
@@ -1066,6 +1196,8 @@ fn ReplyCard(
     on_save_edit: Callback<(String, String)>,
     on_reply: Callback<ReplyTarget>,
     can_reply: Signal<bool>,
+    is_admin: Signal<bool>,
+    on_delete: Callback<String>,
 ) -> impl IntoView {
     let author = use_display_name_memo(reply.pubkey.clone());
     // Quote-and-append: tapping Reply quotes THIS post and focuses the composer.
@@ -1115,6 +1247,14 @@ fn ReplyCard(
                             post_pubkey=post_pubkey.clone()
                             my_pubkey=my_pubkey
                             editing_id=editing_id
+                        />
+                        <DeleteControls
+                            post_id=post_id.clone()
+                            post_pubkey=post_pubkey.clone()
+                            is_root=false
+                            my_pubkey=my_pubkey
+                            is_admin=is_admin
+                            on_delete=on_delete
                         />
                         <Show when=move || can_reply.get()>
                             <button

@@ -7,6 +7,7 @@ use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::badge_display::BadgeBar;
 use crate::components::bookmarks_modal::use_bookmarks;
+use crate::components::confirm_dialog::ConfirmDialog;
 use crate::components::link_preview::LinkPreview;
 use crate::components::media_embed::MediaEmbed;
 use crate::components::mention_text::MentionText;
@@ -15,6 +16,7 @@ use crate::components::quoted_message::QuotedMessage;
 use crate::components::reaction_bar::{Reaction, ReactionBar};
 use crate::components::report_button::ReportButton;
 use crate::components::thread_view::{ThreadReply, ThreadView};
+use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::stores::badges::use_badges;
 use crate::utils::format_relative_time;
@@ -149,8 +151,10 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
     let event_id_react = event_id.clone();
     let event_id_report = event_id.clone();
     let event_id_pin = event_id.clone();
+    let event_id_delete = event_id.clone();
     let event_id_thread = event_id.clone();
     let pk_report = msg_pubkey.clone();
+    let pk_delete = msg_pubkey.clone();
     let pk_thread = msg_pubkey.clone();
     let channel_id_pin = channel_id.clone();
     let channel_id_thread = channel_id;
@@ -184,6 +188,8 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                     <div class="flex items-center gap-0.5 ml-auto">
                         // Pin button (admin only)
                         <PinButton channel_id=channel_id_pin event_id=event_id_pin />
+                        // Delete button (author or admin)
+                        <DeleteMessageButton event_id=event_id_delete pubkey=pk_delete />
                         // Report button (TL1+)
                         <ReportButton event_id=event_id_report reported_pubkey=pk_report />
                         // Bookmark button
@@ -256,6 +262,99 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
         </div>
     }
     .into_any()
+}
+
+/// Author-or-admin delete affordance for a chat message.
+///
+/// Publishes a NIP-09 kind-5 deletion; the shared [`ChannelStore`] folds it out
+/// on the relay echo (kind-5 fold) and we optimistically remove on OK so the
+/// actor never waits. Visibility is gated to the message author or an admin;
+/// the relay is the real boundary (own posts always; others' posts admin/TL3+).
+#[component]
+fn DeleteMessageButton(
+    #[prop(into)] event_id: String,
+    #[prop(into)] pubkey: String,
+) -> impl IntoView {
+    let can_delete = {
+        let pubkey = pubkey.clone();
+        Signal::derive(move || {
+            let is_admin = use_context::<crate::stores::zone_access::ZoneAccess>()
+                .map(|za| za.is_admin.get())
+                .unwrap_or(false);
+            let mine = crate::auth::use_auth().pubkey().get().unwrap_or_default();
+            is_admin || (!mine.is_empty() && mine.eq_ignore_ascii_case(&pubkey))
+        })
+    };
+    let show_confirm = RwSignal::new(false);
+    let eid = StoredValue::new(event_id);
+
+    // Context lookups happen inside the confirm handler (mirrors PinButton) so a
+    // bubble rendered without a relay never panics at render time.
+    let on_confirm = Callback::new(move |()| {
+        let relay = expect_context::<crate::relay::RelayConnection>();
+        let auth = crate::auth::use_auth();
+        let toasts = use_toasts();
+        let store = crate::stores::channels::use_channel_store();
+        let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
+        if pubkey.is_empty() {
+            return;
+        }
+        let now = (js_sys::Date::now() / 1000.0) as u64;
+        let target = eid.get_value();
+        let unsigned = nostr_bbs_core::UnsignedEvent {
+            pubkey,
+            created_at: now,
+            kind: 5,
+            tags: vec![vec!["e".to_string(), target.clone()]],
+            content: String::new(),
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            match auth.sign_event_async(unsigned).await {
+                Ok(signed) => {
+                    let on_ok = std::rc::Rc::new(move |accepted: bool, message: String| {
+                        if accepted {
+                            store.remove_message(&target);
+                            toasts.show("Message deleted", ToastVariant::Success);
+                        } else {
+                            let reason = if message.trim().is_empty() {
+                                "Delete rejected by relay".to_string()
+                            } else {
+                                format!("Delete rejected: {message}")
+                            };
+                            toasts.show(reason, ToastVariant::Error);
+                        }
+                    });
+                    if let Err(e) = relay.publish_with_ack(&signed, Some(on_ok)) {
+                        toasts.show(format!("Delete failed: {e}"), ToastVariant::Error);
+                    }
+                }
+                Err(e) => {
+                    toasts.show(format!("Failed to sign deletion: {e}"), ToastVariant::Error);
+                }
+            }
+        });
+    });
+
+    view! {
+        <Show when=move || can_delete.get()>
+            <button
+                class="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-gray-700/50 text-gray-600 hover:text-red-400"
+                aria-label="Delete message"
+                on:click=move |_: leptos::ev::MouseEvent| show_confirm.set(true)
+            >
+                <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m2 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6M10 11v6M14 11v6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </button>
+            <ConfirmDialog
+                is_open=show_confirm
+                title="Delete message".to_string()
+                message="Delete this message? This is permanent and removes it for everyone.".to_string()
+                confirm_label="Delete".to_string()
+                on_confirm=on_confirm
+            />
+        </Show>
+    }
 }
 
 /// Extract URLs from text content.

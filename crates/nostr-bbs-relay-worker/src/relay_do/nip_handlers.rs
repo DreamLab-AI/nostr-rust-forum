@@ -749,9 +749,16 @@ impl NostrRelayDO {
             // After activity update, check for trust promotion
             let _ = trust::check_promotion(&event.pubkey, &self.env).await;
 
-            // NIP-09: Process deletion events -- remove targeted events by same author
+            // NIP-09: Process deletion events. Same-author targets always
+            // delete; admins and TL3+ (Trusted) may delete anyone's events —
+            // the moderation privilege the earlier kind-5 gate admits. The
+            // flag is re-derived here because `trust_level` is scoped to the
+            // non-admin gating block above (admins skip it entirely).
             if event.kind == 5 {
-                self.process_deletion(&event).await;
+                let can_delete_any = is_admin
+                    || trust::get_trust_level(&event.pubkey, &self.env).await
+                        >= TrustLevel::Trusted;
+                self.process_deletion(&event, can_delete_any).await;
             }
 
             // NIP-56: Process report events -- insert into reports table and check auto-hide
@@ -1364,8 +1371,11 @@ impl NostrRelayDO {
 // ---------------------------------------------------------------------------
 
 impl NostrRelayDO {
-    /// Process a kind-5 deletion event: delete targeted events by the same author.
-    pub(crate) async fn process_deletion(&self, deletion_event: &NostrEvent) {
+    /// Process a kind-5 deletion event: delete targeted events by the same
+    /// author, or — when `can_delete_any` (admin / TL3+, mirroring the EVENT
+    /// gate) — anyone's. Without the flag the SQL keeps the author constraint,
+    /// so a gate regression can never widen deletion via this path alone.
+    pub(crate) async fn process_deletion(&self, deletion_event: &NostrEvent, can_delete_any: bool) {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
             Err(_) => return,
@@ -1379,16 +1389,24 @@ impl NostrRelayDO {
             .map(|t| t[1].as_str())
             .collect();
 
-        // Delete events owned by the same pubkey
         for target_id in &target_ids {
-            let stmt = db.prepare("DELETE FROM events WHERE id = ?1 AND pubkey = ?2");
-            let _ = match stmt.bind(&[
-                JsValue::from_str(target_id),
-                JsValue::from_str(&deletion_event.pubkey),
-            ]) {
-                Ok(s) => s.run().await,
-                Err(_) => continue,
+            let result = if can_delete_any {
+                let stmt = db.prepare("DELETE FROM events WHERE id = ?1");
+                match stmt.bind(&[JsValue::from_str(target_id)]) {
+                    Ok(s) => s.run().await,
+                    Err(_) => continue,
+                }
+            } else {
+                let stmt = db.prepare("DELETE FROM events WHERE id = ?1 AND pubkey = ?2");
+                match stmt.bind(&[
+                    JsValue::from_str(target_id),
+                    JsValue::from_str(&deletion_event.pubkey),
+                ]) {
+                    Ok(s) => s.run().await,
+                    Err(_) => continue,
+                }
             };
+            let _ = result;
         }
 
         // Collect "a" tags (parameterized replaceable targets: "kind:pubkey:d-tag")
@@ -1411,8 +1429,10 @@ impl NostrRelayDO {
             let pubkey = parts[1];
             let d_tag = parts[2];
 
-            // Only allow deletion of own events
-            if pubkey != deletion_event.pubkey {
+            // Own events only, unless the author holds delete-any privilege
+            // (the a-ref names its owner, so the SQL below stays scoped to
+            // exactly that pubkey's replaceable event either way).
+            if !can_delete_any && pubkey != deletion_event.pubkey {
                 continue;
             }
 
