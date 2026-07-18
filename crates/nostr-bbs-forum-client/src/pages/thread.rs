@@ -95,6 +95,14 @@ struct ReplyTarget {
 /// kind-42 store stream with no relay-side support required.
 const EDIT_MARKER: &str = "edit";
 
+/// Marker placed on a kind-42 reply's `e` tag identifying the SIBLING it quotes:
+/// `["e", <sibling_id>, "", "quote"]`. The reply's "reply" marker always points
+/// at the topic root (so the topic list folds it and the reply list matches it);
+/// the quote marker is a separate, purely presentational reference the card
+/// renders inline. Non-standard but NIP-10-compatible (an ordinary `e` tag to any
+/// relay/other client).
+const QUOTE_MARKER: &str = "quote";
+
 /// If `event` is an edit, return the id of the post it replaces.
 ///
 /// An edit is a kind-42 carrying `["e", <target>, _, "edit"]`. The target must
@@ -192,14 +200,14 @@ fn root_e_tag(event: &NostrEvent) -> Option<String> {
         .map(|t| t[1].clone())
 }
 
-/// The `["e", <id>, "", "reply"]` parent this event replies to, if any —
-/// distinct from the channel/topic root. Used to render an inline quote of the
-/// exact message a quote-reply targets.
-fn reply_e_tag(event: &NostrEvent) -> Option<String> {
+/// The `["e", <id>, "", "quote"]` sibling this reply quotes, if any. Rendered as
+/// an inline quote block; distinct from the "reply" marker, which always points
+/// at the topic root so the topic list folds the reply correctly.
+fn quoted_e_tag(event: &NostrEvent) -> Option<String> {
     event
         .tags
         .iter()
-        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "reply")
+        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == QUOTE_MARKER)
         .map(|t| t[1].clone())
 }
 
@@ -397,7 +405,7 @@ pub fn ThreadPage() -> impl IntoView {
                     // Quote target: a "reply" e-tag pointing at a SIBLING reply
                     // (not the topic root). Resolve the quoted author + snippet so
                     // the card can show what it is answering, inline, no nesting.
-                    let quote = reply_e_tag(e)
+                    let quote = quoted_e_tag(e)
                         .map(|id| id.to_lowercase())
                         .filter(|id| *id != root_id_lower)
                         .and_then(|target_id| {
@@ -516,20 +524,33 @@ pub fn ThreadPage() -> impl IntoView {
                 Some(t) => (t.id.clone(), t.pubkey.clone()),
                 None => (root.id.clone(), root.pubkey.clone()),
             };
-            // NIP-10: channel as root anchor, the target as the reply parent,
-            // notify the topic-root author, plus the quoted author, then mentions.
+            // NIP-10: channel as root anchor, the TOPIC ROOT as the reply parent
+            // (so the topic list folds it and the reply list matches it), notify
+            // the topic-root author, then mentions.
             let mut tags = vec![
                 vec!["e".to_string(), cid, String::new(), "root".to_string()],
                 vec![
                     "e".to_string(),
-                    parent_id,
+                    root.id.clone(),
                     String::new(),
                     "reply".to_string(),
                 ],
                 vec!["p".to_string(), root.pubkey.clone()],
             ];
-            if parent_pk != root.pubkey && !parent_pk.is_empty() {
-                tags.push(vec!["p".to_string(), parent_pk]);
+            // Quote-and-append: when the reader tapped Reply on a specific sibling,
+            // reference it with a separate "quote" marker (rendered inline in the
+            // card) and notify its author. The reply itself still threads under the
+            // topic root above, so it appends at the bottom like any other reply.
+            if parent_id != root.id {
+                tags.push(vec![
+                    "e".to_string(),
+                    parent_id.clone(),
+                    String::new(),
+                    QUOTE_MARKER.to_string(),
+                ]);
+                if parent_pk != root.pubkey && !parent_pk.is_empty() {
+                    tags.push(vec!["p".to_string(), parent_pk]);
+                }
             }
             for pk in mention_pubkeys {
                 if let Some(hex) = normalise_mention_pubkey(&pk) {
@@ -1214,8 +1235,9 @@ mod tests {
     }
 
     #[test]
-    fn reply_e_tag_extracts_reply_marker_target() {
-        // A quote-reply targets a specific sibling via the "reply" marker.
+    fn quoted_e_tag_extracts_quote_marker_sibling() {
+        // A quote-reply threads under the topic root ("reply") and quotes a
+        // sibling ("quote"); only the quote marker is the inline-quoted target.
         let quote_reply = ev(
             "q",
             "bob",
@@ -1223,14 +1245,24 @@ mod tests {
             "quoting you",
             vec![
                 vec!["e", "chan", "", "root"],
-                vec!["e", "sibling", "", "reply"],
+                vec!["e", "topicroot", "", "reply"],
+                vec!["e", "sibling", "", "quote"],
                 vec!["p", "alice"],
             ],
         );
-        assert_eq!(reply_e_tag(&quote_reply).as_deref(), Some("sibling"));
-        // A plain root/topic post has no reply-marker target.
-        let root = ev("r", "alice", 100, "hi", vec![vec!["e", "chan", "", "root"]]);
-        assert_eq!(reply_e_tag(&root), None);
+        assert_eq!(quoted_e_tag(&quote_reply).as_deref(), Some("sibling"));
+        // A plain reply (reply → root, no quote marker) quotes nothing.
+        let plain = ev(
+            "p",
+            "carol",
+            200,
+            "hi",
+            vec![
+                vec!["e", "chan", "", "root"],
+                vec!["e", "topicroot", "", "reply"],
+            ],
+        );
+        assert_eq!(quoted_e_tag(&plain), None);
     }
 
     #[test]
