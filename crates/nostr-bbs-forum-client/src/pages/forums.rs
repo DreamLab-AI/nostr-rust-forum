@@ -162,8 +162,10 @@ pub fn ForumsPage() -> impl IntoView {
                 <div class="ambient-orb ambient-orb-1" aria-hidden="true"></div>
                 <div class="ambient-orb ambient-orb-2" aria-hidden="true"></div>
                 <div class="relative z-10 text-center">
+                    // Operator-branded (issue #21): same runtime name as the
+                    // logged-out landing hero, so the index and home agree.
                     <h1 class="text-4xl sm:text-5xl font-bold candy-gradient mb-3">
-                        "Forums"
+                        {crate::utils::relay_url::forum_name()}
                     </h1>
                     <p class="text-gray-400 text-lg max-w-xl mx-auto">
                         "Explore zones, dive into categories, and join the conversation"

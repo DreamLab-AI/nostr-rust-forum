@@ -945,10 +945,12 @@ fn Layout(children: Children) -> impl IntoView {
             // Header
             <header class="border-b border-gray-800/50 bg-gray-900/80 backdrop-blur-md sticky top-0 z-50">
                 <nav class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-                    // Brand
-                    <a href="/" class="flex items-center gap-2 text-xl sm:text-2xl font-bold text-amber-400 hover:text-amber-300 transition-colors">
+                    // Brand — links to the forum's own home, not the host
+                    // site root (issue #21: the wordmark must stay inside the
+                    // SPA when the forum is mounted under a base path).
+                    <a href=base_href("/") class="flex items-center gap-2 text-xl sm:text-2xl font-bold text-amber-400 hover:text-amber-300 transition-colors">
                         {brand_icon()}
-                        "Forum"
+                        {crate::utils::relay_url::brand_label()}
                     </a>
 
                     // Desktop nav
@@ -1128,7 +1130,7 @@ fn Layout(children: Children) -> impl IntoView {
                     <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
                         <div class="flex items-center gap-2 text-gray-500">
                             {brand_icon()}
-                            <span class="text-sm">"Forum"</span>
+                            <span class="text-sm">{crate::utils::relay_url::brand_label()}</span>
                         </div>
                         <div class="flex items-center gap-3 text-xs text-gray-600">
                             <span>"End-to-end encrypted"</span>

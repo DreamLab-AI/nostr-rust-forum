@@ -70,13 +70,24 @@ pub fn forum_name() -> String {
         .unwrap_or_else(|| "Community Forum".to_string())
 }
 
+/// Compact brand label for the header/footer wordmark.
+///
+/// Distinct from [`forum_name`] (the full display name used in landing copy):
+/// this is the short form that fits the top-left nav. Resolved at runtime from
+/// `window.__ENV__.BRAND_LABEL`, falling back to a brand-neutral default.
+pub fn brand_label() -> String {
+    window_env("BRAND_LABEL")
+        .or_else(|| option_env!("BRAND_LABEL").map(String::from))
+        .unwrap_or_else(|| "Forum".to_string())
+}
+
 /// Whether the retro ASCII/BBS client is available for this deployment, driving
 /// the "switch interface" sash. The kit deploys the BBS at `<base>/bbs/` by
 /// default, so this is ON unless an operator explicitly injects
 /// `window.__ENV__.BBS_ENABLED = "false"`.
 pub fn bbs_enabled() -> bool {
     window_env("BBS_ENABLED")
-        .map(|v| v.to_ascii_lowercase() != "false")
+        .map(|v| !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true)
 }
 
