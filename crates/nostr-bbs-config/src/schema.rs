@@ -164,8 +164,19 @@ pub enum ZoneVisibility {
 /// Zone definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
-    /// Slug identifier (`"public"`, `"friends"`, `"family"`, `"business"`, ...).
+    /// Stable internal identifier (`"public"`, `"friends"`, `"family"`,
+    /// `"business"`, ...). This is the key channels' `section` tags and cohort
+    /// rules resolve against — renaming it orphans channels, so it must never
+    /// change once deployed. For the URL segment, prefer [`slug`](Self::slug).
     pub id: String,
+    /// Optional URL slug (issue #45). When present the client addresses this
+    /// zone as `/<slug>` (e.g. `/welcome`, `/dreamlab`) instead of
+    /// `/forums/<id>`, keeping the address bar short while the internal
+    /// [`id`](Self::id) stays fixed. Validated as lowercase `[a-z0-9-]+`, unique
+    /// across zones, and non-colliding with any other zone's `id`. Absent ⇒ the
+    /// URL falls back to `id`.
+    #[serde(default)]
+    pub slug: Option<String>,
     /// Display name.
     pub display_name: String,
     /// Cohorts required to READ this zone. Admins bypass this unconditionally.

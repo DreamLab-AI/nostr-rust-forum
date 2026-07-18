@@ -63,11 +63,12 @@ use crate::utils::zone_theme::zone_accent_style_cfg;
 ///
 /// `pub(crate)` so the thread page can render the same breadcrumb zone label.
 pub(crate) fn category_display_name(slug: &str) -> String {
-    load_zones()
-        .into_iter()
-        .find(|z| z.id == slug)
-        .map(|z| z.label())
-        .unwrap_or_else(|| capitalize(slug))
+    {
+        let zs = load_zones();
+        crate::stores::zones::resolve_zone_param(slug, &zs).cloned()
+    }
+    .map(|z| z.label())
+    .unwrap_or_else(|| capitalize(slug))
 }
 
 /// Humanise a section slug for breadcrumb display when no channel resolves.
@@ -179,7 +180,9 @@ pub fn SectionPage() -> impl IntoView {
     // remains the real boundary; unknown zones default accessible).
     let has_zone_access = Memo::new(move |_| {
         let cat = category_slug();
-        match load_zones().into_iter().find(|z| z.id == cat) {
+        let zs = load_zones();
+        let resolved = crate::stores::zones::resolve_zone_param(&cat, &zs).cloned();
+        match resolved {
             Some(zone) => {
                 zone.visibility == ZoneVisibility::Public || zone_access.is_member_of(&zone)
             }
@@ -303,7 +306,9 @@ pub fn SectionPage() -> impl IntoView {
             class="max-w-4xl mx-auto p-4 sm:p-6"
             style=move || {
                 let slug = category_slug();
-                let accent = load_zones().into_iter().find(|z| z.id == slug).and_then(|z| z.accent_hex);
+                let zs = load_zones();
+                let accent = crate::stores::zones::resolve_zone_param(&slug, &zs)
+                    .and_then(|z| z.accent_hex.clone());
                 zone_accent_style_cfg(&slug, accent.as_deref())
             }
         >
@@ -312,7 +317,8 @@ pub fn SectionPage() -> impl IntoView {
             // banner image and palette, not just a bare heading.
             {move || {
                 let slug = category_slug();
-                let zone = load_zones().into_iter().find(|z| z.id == slug);
+                let zs = load_zones();
+                let zone = crate::stores::zones::resolve_zone_param(&slug, &zs).cloned();
                 let banner = zone.as_ref().and_then(|z| z.banner_image_url.clone()).unwrap_or_default();
                 let accent = zone.as_ref().and_then(|z| z.accent_hex.clone());
                 let label = zone.as_ref().map(|z| z.label()).unwrap_or_default();
@@ -336,7 +342,7 @@ pub fn SectionPage() -> impl IntoView {
             {move || {
                 let slug = category_slug();
                 let zone_label = category_display_name(&slug);
-                let zone_href = format!("/forums/{}", slug);
+                let zone_href = format!("/{}", slug);
                 let section_label = header_name();
                 if za_breadcrumb.home_zone().is_some() {
                     view! {
@@ -383,7 +389,7 @@ pub fn SectionPage() -> impl IntoView {
                             show_new_topic.update(|v| *v = !*v);
                             create_error.set(None);
                         }
-                        class="flex-shrink-0 flex items-center gap-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 px-4 py-2 rounded-lg transition-colors text-sm font-medium"
+                        class="flex-shrink-0 flex items-center gap-2 za-chip-btn border px-4 py-2 rounded-lg transition-colors text-sm font-medium"
                     >
                         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <circle cx="12" cy="12" r="10"/>
@@ -460,7 +466,7 @@ pub fn SectionPage() -> impl IntoView {
                 if loading.get() {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">
-                            <div class="animate-spin w-6 h-6 border-2 border-amber-400 border-t-transparent rounded-full"></div>
+                            <div class="animate-spin w-6 h-6 border-2 za-spinner rounded-full"></div>
                             <span class="text-gray-400 text-sm">"Loading topics..."</span>
                         </div>
                     }.into_any()
@@ -480,7 +486,7 @@ pub fn SectionPage() -> impl IntoView {
                             <p class="text-gray-400 text-sm mb-4">
                                 "This section could not be found in this zone."
                             </p>
-                            <A href=base_href(&format!("/forums/{}", category_slug())) attr:class="text-amber-400 hover:text-amber-300 text-sm underline">
+                            <A href=base_href(&format!("/{}", category_slug())) attr:class="za-text hover:opacity-80 text-sm underline">
                                 "Back to zone"
                             </A>
                         </div>

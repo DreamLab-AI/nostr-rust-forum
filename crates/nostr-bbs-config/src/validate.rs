@@ -222,9 +222,15 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
     // Zone ids must be unique. `ZoneConfig::get` resolves by FIRST match, so a
     // duplicate `[[zones]]` id with weaker required_cohorts/visibility could
     // silently shadow the intended access rule — an operator typo must fail
-    // validation, not quietly open (or close) a zone. Also validate accent_hex.
+    // validation, not quietly open (or close) a zone. Also validate accent_hex
+    // and the optional URL slug (issue #45).
     {
+        // Full id set up front so a slug can be checked against EVERY zone id,
+        // not just the ones seen earlier in the loop.
+        let all_ids: std::collections::HashSet<&str> =
+            cfg.zones.iter().map(|z| z.id.as_str()).collect();
         let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_slugs = std::collections::HashSet::new();
         for zone in &cfg.zones {
             if !seen_ids.insert(zone.id.as_str()) {
                 return Err(format!(
@@ -241,10 +247,42 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
                     ));
                 }
             }
+            // Slug (issue #45): the client resolves a URL segment to a zone by
+            // slug-or-id, so a slug must be a clean URL segment, unique, and must
+            // not equal a *different* zone's id (which would make one URL resolve
+            // to two zones). A slug equal to its own id is a harmless identity.
+            if let Some(slug) = zone.slug.as_deref() {
+                if !is_valid_slug(slug) {
+                    return Err(format!(
+                        "zone '{}' slug must be lowercase letters, digits, and hyphens \
+                         ([a-z0-9-]+) (got {})",
+                        zone.id, slug
+                    ));
+                }
+                if !seen_slugs.insert(slug) {
+                    return Err(format!(
+                        "duplicate zone slug '{slug}' — zone slugs must be unique"
+                    ));
+                }
+                if slug != zone.id && all_ids.contains(slug) {
+                    return Err(format!(
+                        "zone '{}' slug '{}' collides with another zone's id — a slug must \
+                         not shadow a different zone",
+                        zone.id, slug
+                    ));
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// True for a non-empty lowercase URL slug: `[a-z0-9-]+`.
+fn is_valid_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// True for `#rgb`, `#rrggbb`, or `#rrggbbaa` CSS hex colour strings.
@@ -654,6 +692,7 @@ operator = "tier-2"
         let mut cfg = baseline_cfg();
         cfg.zones = vec![Zone {
             id: "public".into(),
+            slug: None,
             display_name: "Public".into(),
             required_cohorts: Vec::new(),
             write_cohorts: None,
@@ -671,6 +710,7 @@ operator = "tier-2"
         let mut cfg = baseline_cfg();
         cfg.zones = vec![Zone {
             id: "public".into(),
+            slug: None,
             display_name: "Public".into(),
             required_cohorts: Vec::new(),
             write_cohorts: None,
@@ -681,6 +721,83 @@ operator = "tier-2"
             auto_approve: false,
         }];
         assert!(validate_config(&cfg).is_err());
+    }
+
+    /// Build a zone with just an id + optional slug (other fields defaulted) for
+    /// the slug validation tests (issue #45).
+    fn zone_with_slug(id: &str, slug: Option<&str>) -> Zone {
+        Zone {
+            id: id.into(),
+            slug: slug.map(str::to_string),
+            display_name: id.into(),
+            required_cohorts: Vec::new(),
+            write_cohorts: None,
+            banner_image_url: None,
+            accent_hex: None,
+            visibility: ZoneVisibility::Public,
+            encrypted: false,
+            auto_approve: false,
+        }
+    }
+
+    #[test]
+    fn zone_valid_slug_accepted() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![zone_with_slug("business", Some("dreamlab"))];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn zone_slug_equal_to_own_id_accepted() {
+        // A slug identical to its own id is a harmless identity, not a collision.
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![zone_with_slug("welcome", Some("welcome"))];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn zone_duplicate_slug_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![
+            zone_with_slug("public", Some("welcome")),
+            zone_with_slug("friends", Some("welcome")),
+        ];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn zone_slug_colliding_with_other_zone_id_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![
+            zone_with_slug("family", None),
+            // "business" zone claims the slug "family" — a different zone's id.
+            zone_with_slug("business", Some("family")),
+        ];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn zone_invalid_slug_chars_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![zone_with_slug("business", Some("DreamLab!"))];
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn zone_slug_toml_round_trip() {
+        let zone: Zone =
+            toml::from_str("id = \"business\"\ndisplay_name = \"Business\"\nslug = \"dreamlab\"")
+                .unwrap();
+        assert_eq!(zone.slug.as_deref(), Some("dreamlab"));
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![zone];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn zone_slug_absent_defaults_none() {
+        let zone: Zone = toml::from_str("id = \"public\"\ndisplay_name = \"Public\"").unwrap();
+        assert!(zone.slug.is_none());
     }
 
     #[test]

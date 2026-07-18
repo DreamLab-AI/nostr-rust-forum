@@ -537,6 +537,9 @@ mod tests {
     fn zone(id: &str, required: &[&str]) -> Zone {
         Zone {
             id: id.to_string(),
+            // issue #45: `slug` added to the shared config schema; this test
+            // helper doesn't exercise slugs, so it stays `None`.
+            slug: None,
             display_name: id.to_string(),
             required_cohorts: required.iter().map(|s| s.to_string()).collect(),
             write_cohorts: None,

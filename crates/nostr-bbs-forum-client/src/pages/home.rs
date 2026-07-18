@@ -175,7 +175,7 @@ pub fn HomePage() -> impl IntoView {
                             href={
                                 let za = zone_access;
                                 move || match za.home_zone() {
-                                    Some(z) => base_href(&format!("/forums/{}", z.id)),
+                                    Some(z) => base_href(&format!("/{}", crate::stores::zones::zone_slug(&z))),
                                     None => base_href("/forums"),
                                 }
                             }

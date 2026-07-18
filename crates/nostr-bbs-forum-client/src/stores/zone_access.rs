@@ -374,6 +374,7 @@ mod tests {
     fn locked_zone(id: &str, cohort: &str) -> Zone {
         Zone {
             id: id.to_string(),
+            slug: None,
             display_name: String::new(),
             required_cohorts: vec![cohort.to_string()],
             write_cohorts: None,
@@ -387,6 +388,7 @@ mod tests {
     fn public_zone(id: &str) -> Zone {
         Zone {
             id: id.to_string(),
+            slug: None,
             display_name: String::new(),
             required_cohorts: vec![],
             write_cohorts: None,

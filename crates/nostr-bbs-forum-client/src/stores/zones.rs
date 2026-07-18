@@ -69,8 +69,17 @@ pub enum ZoneVisibility {
 /// `nostr_bbs_config::schema::Zone`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Zone {
-    /// Slug identifier (`"public"`, `"friends"`, `"family"`, `"business"`).
+    /// Stable internal identifier (`"public"`, `"friends"`, `"family"`,
+    /// `"business"`). Sections (`section` tag) and cohort rules resolve against
+    /// this — it never changes once deployed. The URL segment prefers
+    /// [`slug`](Self::slug) when set.
     pub id: String,
+    /// Optional URL slug (issue #45). When present the client addresses this
+    /// zone as `/<slug>` instead of `/forums/<id>`; [`id`](Self::id) remains the
+    /// resolution key. `ZONE_CONFIG` may omit it. Mirrors
+    /// `nostr_bbs_config::schema::Zone::slug`.
+    #[serde(default)]
+    pub slug: Option<String>,
     /// Display name surfaced on the tile (also used as banner `alt`).
     #[serde(default)]
     pub display_name: String,
@@ -171,6 +180,47 @@ fn read_zone_config_json() -> Option<String> {
         .and_then(|s| s.as_string())
 }
 
+/// URL slug for a zone: its explicit `slug` when set and non-empty, else its
+/// `id` (issue #45).
+///
+/// This is the segment the client puts in the address bar (`/<slug>`). The `id`
+/// remains the stable key for section/cohort resolution — only the URL uses the
+/// slug — so this is a pure display-of-URL concern.
+pub fn zone_path_for_id(zone_id: &str) -> String {
+    let zones = load_zones();
+    zones
+        .iter()
+        .find(|z| z.id == zone_id)
+        .map(|z| zone_slug(z).to_string())
+        .unwrap_or_else(|| zone_id.to_string())
+}
+
+pub fn zone_slug(z: &Zone) -> &str {
+    match z.slug.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => &z.id,
+    }
+}
+
+/// Resolve a URL path segment (the `:category` param) to a zone by slug OR id,
+/// case-insensitively, with slug taking precedence (issue #45).
+///
+/// New `/<slug>` links pass the slug; legacy `/forums/<id>` links pass the id;
+/// both resolve here so navigation never regresses during the rename. Slug is
+/// tried first so it wins any (config-invalid but defensively-handled) overlap
+/// with another zone's id. Sections/cohorts continue to key on [`Zone::id`].
+pub fn resolve_zone_param<'a>(param: &str, zones: &'a [Zone]) -> Option<&'a Zone> {
+    let needle = param.to_lowercase();
+    zones
+        .iter()
+        .find(|z| {
+            z.slug
+                .as_deref()
+                .is_some_and(|s| s.to_lowercase() == needle)
+        })
+        .or_else(|| zones.iter().find(|z| z.id.to_lowercase() == needle))
+}
+
 /// Resolve a channel's `section` tag to the id of the owning config zone.
 ///
 /// Channels carry a free-form `section` tag (e.g. `"family-events"`). With
@@ -235,6 +285,7 @@ fn fallback_zones() -> Vec<Zone> {
     vec![
         Zone {
             id: "home".to_string(),
+            slug: None,
             display_name: "Home".to_string(),
             required_cohorts: vec![],
             write_cohorts: None,
@@ -245,6 +296,7 @@ fn fallback_zones() -> Vec<Zone> {
         },
         Zone {
             id: "members".to_string(),
+            slug: None,
             display_name: "Members".to_string(),
             required_cohorts: vec!["members".to_string()],
             write_cohorts: None,
@@ -255,6 +307,7 @@ fn fallback_zones() -> Vec<Zone> {
         },
         Zone {
             id: "private".to_string(),
+            slug: None,
             display_name: "Private".to_string(),
             required_cohorts: vec!["private".to_string()],
             write_cohorts: None,
@@ -273,6 +326,7 @@ mod tests {
     fn zone(id: &str) -> Zone {
         Zone {
             id: id.to_string(),
+            slug: None,
             display_name: String::new(),
             required_cohorts: vec![],
             write_cohorts: None,
@@ -280,6 +334,13 @@ mod tests {
             visibility: ZoneVisibility::Public,
             encrypted: false,
             accent_hex: None,
+        }
+    }
+
+    fn zone_with_slug(id: &str, slug: Option<&str>) -> Zone {
+        Zone {
+            slug: slug.map(str::to_string),
+            ..zone(id)
         }
     }
 
@@ -364,5 +425,83 @@ mod tests {
         let json = r#"[{"id":"friends","display_name":"Friends"}]"#;
         let zones: Vec<Zone> = serde_json::from_str(json).unwrap();
         assert_eq!(zones[0].accent_hex, None);
+    }
+
+    // -- Zone URL slugs (issue #45) -----------------------------------------
+
+    #[test]
+    fn zone_slug_uses_slug_when_present() {
+        let z = zone_with_slug("business", Some("dreamlab"));
+        assert_eq!(zone_slug(&z), "dreamlab");
+    }
+
+    #[test]
+    fn zone_slug_falls_back_to_id() {
+        assert_eq!(zone_slug(&zone_with_slug("family", None)), "family");
+        // An empty slug also falls back to the id.
+        assert_eq!(zone_slug(&zone_with_slug("family", Some(""))), "family");
+    }
+
+    #[test]
+    fn resolve_zone_param_matches_slug() {
+        let zones = vec![
+            zone_with_slug("business", Some("dreamlab")),
+            zone_with_slug("family", None),
+        ];
+        assert_eq!(
+            resolve_zone_param("dreamlab", &zones).map(|z| z.id.as_str()),
+            Some("business")
+        );
+    }
+
+    #[test]
+    fn resolve_zone_param_matches_id_for_legacy_links() {
+        let zones = vec![
+            zone_with_slug("business", Some("dreamlab")),
+            zone_with_slug("family", None),
+        ];
+        // Old /forums/<id> links still resolve by id.
+        assert_eq!(
+            resolve_zone_param("business", &zones).map(|z| z.id.as_str()),
+            Some("business")
+        );
+        assert_eq!(
+            resolve_zone_param("family", &zones).map(|z| z.id.as_str()),
+            Some("family")
+        );
+    }
+
+    #[test]
+    fn resolve_zone_param_is_case_insensitive() {
+        let zones = vec![zone_with_slug("business", Some("dreamlab"))];
+        assert_eq!(
+            resolve_zone_param("DreamLab", &zones).map(|z| z.id.as_str()),
+            Some("business")
+        );
+        assert_eq!(
+            resolve_zone_param("BUSINESS", &zones).map(|z| z.id.as_str()),
+            Some("business")
+        );
+    }
+
+    #[test]
+    fn resolve_zone_param_slug_takes_precedence_over_id() {
+        // param equals zone A's id AND zone B's slug — slug wins (defensive; the
+        // config validator forbids this overlap, but the resolver stays
+        // deterministic regardless).
+        let zones = vec![
+            zone_with_slug("welcome", None),           // id "welcome"
+            zone_with_slug("public", Some("welcome")), // slug "welcome"
+        ];
+        assert_eq!(
+            resolve_zone_param("welcome", &zones).map(|z| z.id.as_str()),
+            Some("public")
+        );
+    }
+
+    #[test]
+    fn resolve_zone_param_unknown_is_none() {
+        let zones = vec![zone_with_slug("business", Some("dreamlab"))];
+        assert!(resolve_zone_param("nope", &zones).is_none());
     }
 }

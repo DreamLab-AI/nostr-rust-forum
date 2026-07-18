@@ -89,7 +89,11 @@ pub fn ChannelPage() -> impl IntoView {
                             c.section.clone()
                         };
                         section_to_zone(&section, &zones).map(|zone| {
-                            base_href(&format!("/forums/{}/{}", zone, section_slug(&c.id)))
+                            base_href(&format!(
+                                "/{}/{}",
+                                crate::stores::zones::zone_path_for_id(&zone),
+                                section_slug(&c.id)
+                            ))
                         })
                     })
             })
@@ -641,7 +645,7 @@ pub fn ChannelPage() -> impl IntoView {
                             />
                             // Export button
                             <button
-                                class="text-gray-500 hover:text-amber-400 transition-colors p-1 rounded hover:bg-gray-700/50"
+                                class="text-gray-500 hover:text-[color:var(--zone-accent)] transition-colors p-1 rounded hover:bg-gray-700/50"
                                 title="Export messages"
                                 on:click=move |_| show_export.set(true)
                             >
@@ -670,7 +674,7 @@ pub fn ChannelPage() -> impl IntoView {
                     </div>
                 </div>
                 // Subtle bottom gradient line
-                <div class="absolute bottom-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-amber-500/20 to-transparent"></div>
+                <div class="absolute bottom-0 left-0 right-0 h-px" style="background:linear-gradient(to right, transparent, color-mix(in srgb, var(--zone-accent) 20%, transparent), transparent)"></div>
             </div>
 
             // Error banner

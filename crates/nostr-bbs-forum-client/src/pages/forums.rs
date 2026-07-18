@@ -88,7 +88,7 @@ pub fn ForumsPage() -> impl IntoView {
         let navigate = StoredValue::new(use_navigate());
         Effect::new(move |_| {
             if let Some(zone) = za_forward.home_zone() {
-                let target = format!("/forums/{}", zone.id);
+                let target = format!("/{}", crate::stores::zones::zone_slug(&zone));
                 navigate.with_value(|nav| {
                     nav(
                         &target,
@@ -250,7 +250,7 @@ pub fn ForumsPage() -> impl IntoView {
                                     .iter()
                                     .find(|z| z.visibility == ZoneVisibility::Public)
                                     .or_else(|| zs.first())
-                                    .map(|z| (base_href(&format!("/forums/{}", z.id)), z.label()));
+                                    .map(|z| (base_href(&format!("/{}", crate::stores::zones::zone_slug(z))), z.label()));
                                 match zone {
                                     Some((href, label)) => view! {
                                         <A
@@ -400,7 +400,10 @@ fn zone_tile(
     // The zone's channel-list page (CategoryPage). The banner links here so a
     // single click on a zone always lands on its list of channels, never deep
     // inside one channel's linear chat.
-    let zone_href = base_href(&format!("/forums/{}", zone_id));
+    let zone_href = base_href(&format!(
+        "/{}",
+        crate::stores::zones::zone_path_for_id(&zone_id)
+    ));
 
     let cards_view = if has_cats {
         let mut entries: Vec<(String, SectionCounts)> = cats.into_iter().collect();

@@ -266,7 +266,9 @@ pub fn ThreadPage() -> impl IntoView {
     // is the real boundary; unknown zones default accessible).
     let has_zone_access = Memo::new(move |_| {
         let cat = category_slug();
-        match load_zones().into_iter().find(|z| z.id == cat) {
+        let zs = load_zones();
+        let resolved = crate::stores::zones::resolve_zone_param(&cat, &zs).cloned();
+        match resolved {
             Some(zone) => {
                 zone.visibility == ZoneVisibility::Public || zone_access.is_member_of(&zone)
             }
@@ -466,9 +468,9 @@ pub fn ThreadPage() -> impl IntoView {
     // Section href (hashed) for breadcrumb back-link — REAL section name shown.
     let section_href = move || {
         match resolved_channel.get() {
-            Some(ch) => format!("/forums/{}/{}", category_slug(), section_slug(&ch.id)),
+            Some(ch) => format!("/{}/{}", category_slug(), section_slug(&ch.id)),
             // Preserve whatever section param brought us here.
-            None => format!("/forums/{}/{}", category_slug(), section_param()),
+            None => format!("/{}/{}", category_slug(), section_param()),
         }
     };
     let section_name = move || {
@@ -792,7 +794,9 @@ pub fn ThreadPage() -> impl IntoView {
         // `var(--zone-accent)`.
         <div class="max-w-4xl mx-auto p-4 sm:p-6" style=move || {
             let slug = category_slug();
-            let accent = load_zones().into_iter().find(|z| z.id == slug).and_then(|z| z.accent_hex);
+            let zs = load_zones();
+            let accent = crate::stores::zones::resolve_zone_param(&slug, &zs)
+                .and_then(|z| z.accent_hex.clone());
             zone_accent_style_cfg(&slug, accent.as_deref())
         }>
             // Zone-first breadcrumb (ADR-107): single-locked-zone members drop
@@ -801,7 +805,7 @@ pub fn ThreadPage() -> impl IntoView {
             {move || {
                 let slug = category_slug();
                 let zone_label = category_display_name(&slug);
-                let zone_href = format!("/forums/{}", slug);
+                let zone_href = format!("/{}", slug);
                 let sec_name = section_name();
                 let sec_href = section_href();
                 let topic = topic_title();
@@ -1003,7 +1007,7 @@ fn EditControls(
         let pid = pid_click.clone();
         Some(view! {
             <button
-                class="ml-auto opacity-60 hover:opacity-100 text-xs text-gray-400 hover:text-amber-400 transition-colors flex items-center gap-1"
+                class="ml-auto opacity-60 hover:opacity-100 text-xs text-gray-400 hover:text-[color:var(--zone-accent)] transition-colors flex items-center gap-1"
                 title="Edit post"
                 on:click=move |_| editing_id.set(Some(pid.clone()))
             >
@@ -1236,7 +1240,7 @@ fn ReplyCard(
                 <Avatar pubkey=pk size=AvatarSize::Sm />
                 <div class="flex-1 min-w-0">
                     <div class="flex items-baseline gap-2 flex-wrap">
-                        <span class="font-semibold text-sm text-amber-400">{move || author.get()}</span>
+                        <span class="font-semibold text-sm text-[color:var(--zone-accent)]">{move || author.get()}</span>
                         <AgentBadge pubkey=author_badge_pubkey compact=true />
                         <span class="text-xs text-gray-600">{time}</span>
                         {edited.then(|| view! {
@@ -1258,7 +1262,7 @@ fn ReplyCard(
                         />
                         <Show when=move || can_reply.get()>
                             <button
-                                class="text-xs text-gray-600 hover:text-amber-400 transition-colors ml-auto"
+                                class="text-xs text-gray-600 hover:text-[color:var(--zone-accent)] transition-colors ml-auto"
                                 on:click=move |_: leptos::ev::MouseEvent| {
                                     let (id, pubkey, snippet) = reply_info.get_value();
                                     on_reply.run(ReplyTarget { id, pubkey, author: author.get_untracked(), snippet });
@@ -1271,7 +1275,7 @@ fn ReplyCard(
                         let qn = use_display_name_memo(q.pubkey.clone());
                         view! {
                             <div class="mt-1 mb-0.5 pl-2 border-l-2 border-gray-600 text-xs text-gray-500 truncate">
-                                <span class="text-amber-400/80">{move || qn.get()}</span>
+                                <span class="text-[color:var(--zone-accent)] opacity-80">{move || qn.get()}</span>
                                 ": "
                                 <span class="italic">{q.snippet.clone()}</span>
                             </div>

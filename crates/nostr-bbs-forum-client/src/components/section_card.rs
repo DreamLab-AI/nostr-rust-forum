@@ -34,11 +34,7 @@ pub fn SectionCard(
 ) -> impl IntoView {
     // #9: the URL carries a privacy hash of the channel id, never the section
     // name. The real name is resolved for display by the section page.
-    let href = base_href(&format!(
-        "/forums/{}/{}",
-        category,
-        section_slug(&channel_id)
-    ));
+    let href = base_href(&format!("/{}/{}", category, section_slug(&channel_id)));
 
     let has_messages = last_activity > 0;
     let activity_display = format_relative_time(last_activity);
@@ -64,7 +60,7 @@ pub fn SectionCard(
         view! {
             <button
                 type="button"
-                class="flex-shrink-0 p-1 rounded text-gray-500 hover:text-amber-400 hover:bg-gray-700/50 transition-colors"
+                class="flex-shrink-0 p-1 rounded text-gray-500 za-hover-text hover:bg-gray-700/50 transition-colors"
                 aria-label="Edit section"
                 on:click=move |ev| {
                     ev.stop_propagation();
@@ -86,12 +82,12 @@ pub fn SectionCard(
                 <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2 flex-wrap">
                         // Section icon
-                        <div class="w-6 h-6 rounded flex items-center justify-center bg-amber-500/10 text-amber-400 flex-shrink-0">
+                        <div class="w-6 h-6 rounded flex items-center justify-center za-icon-tile flex-shrink-0">
                             <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
                         </div>
-                        <h3 class="font-semibold text-white group-hover:text-amber-400 transition-colors truncate">
+                        <h3 class="font-semibold text-white za-group-hover-text truncate">
                             {name}
                         </h3>
                         {is_recent.then(|| view! {
@@ -108,7 +104,7 @@ pub fn SectionCard(
                 // Stats badge + admin pencil
                 <div class="flex-shrink-0 flex items-center gap-2">
                     {edit_pencil}
-                    <span class="text-xs text-amber-400 bg-amber-500/10 rounded px-2 py-0.5 font-medium">
+                    <span class="text-xs za-chip rounded px-2 py-0.5 font-medium">
                         {msg_label}
                     </span>
                 </div>

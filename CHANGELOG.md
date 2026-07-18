@@ -9,6 +9,25 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ### Added
 
+- **Zone URL slugs** (operator issue #45). Zones may carry a `slug` in
+  operator config (validated: lowercase kebab, unique, no collision with
+  another zone's id) — the URL segment decouples from the immutable zone id,
+  so operators can rename addresses without orphaning channels. Short
+  top-level routes (`/<zone>`, `/<zone>/<section>`, `/<zone>/<section>/<topic>`)
+  alias the `/forums/*` tree (which keeps working for old links); pages
+  resolve the param as slug-or-id, and every zone link now emits the short
+  slug form (tiles, cards, breadcrumb targets, zone-first forwarding,
+  mobile nav, home CTA).
+
+### Fixed
+
+- **Residual brand-amber accents on zone surfaces** (operator issue #43
+  follow-up). Hover states (index card glow, section-card borders,
+  breadcrumb links), "N new"/unread chips, message-count chips, New Topic
+  affordances, form focus rings and spinners now follow `--zone-accent`
+  via CSS custom-property utilities with a brand-amber fallback — a no-op
+  outside zone scopes, so non-zone surfaces keep the site brand colour.
+
 - **Admin new-joiner alerts.** A notification producer polls the whitelist
   (NIP-98, admin-gated) while an admin is signed in and raises a JoinRequest
   bell notification for each member holding no zone-gating cohort — i.e.

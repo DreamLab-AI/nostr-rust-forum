@@ -772,6 +772,24 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/governance") view=MemberGatedGovernance />
                     <Route path=path!("/governance/admin") view=AdminGatedGovernance />
                     <Route path=path!("/pod") view=AuthGatedPod />
+                    // Zone URL slugs (issue #45): top-level aliases so a zone
+                    // reads as `/<slug>` (e.g. `/welcome`, `/dreamlab`) with no
+                    // `/forums` segment. They render the SAME gated views as the
+                    // `/forums` tree and expose the SAME param names
+                    // (:category/:section/:topic), so the pages work unchanged;
+                    // the queen's sweep teaches the pages slug↔id resolution.
+                    //
+                    // Declared LAST, after every static route. `FlatRoutes` ranks
+                    // static path segments above dynamic ones, so `/about`,
+                    // `/login`, `/forums/*`, `/governance/*`, `/profile/:pubkey`,
+                    // etc. all out-score these dynamic aliases at equal depth —
+                    // the legacy `/forums/*` routes above stay intact as redirect
+                    // targets. An unknown single segment (`/nope`) falls through
+                    // to `/:category` → CategoryPage, whose own "Zone Not Found"
+                    // handles it (the desired behaviour, not a 404).
+                    <Route path=path!("/:category") view=AuthGatedCategory />
+                    <Route path=path!("/:category/:section") view=AuthGatedSection />
+                    <Route path=path!("/:category/:section/:topic") view=AuthGatedThread />
                 </FlatRoutes>
             </Layout>
         </Router>

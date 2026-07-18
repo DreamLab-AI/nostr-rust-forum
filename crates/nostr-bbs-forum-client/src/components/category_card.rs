@@ -45,11 +45,7 @@ pub fn CategoryCard(
     // #9: the section tag is hashed into the URL — its plaintext (which can
     // reveal the section name) never appears in the address bar. The section
     // page resolves the hash back to the real channel for display.
-    let href = base_href(&format!(
-        "/forums/{}/{}",
-        zone_id,
-        section_slug(&section_id)
-    ));
+    let href = base_href(&format!("/{}/{}", zone_id, section_slug(&section_id)));
 
     // Inline styles derived from the single resolved accent hex (issue #43),
     // replacing the old per-key Tailwind class tables. Alphas mirror the weights
@@ -81,9 +77,9 @@ pub fn CategoryCard(
         format!("{} posts", post_count)
     };
 
-    // Bright "N new" chip (issue #24). Solid amber so unread activity stands out
-    // against the muted total-count chip when scanning the index; hidden when
-    // there is nothing new. `aria-label` spells it out for screen readers.
+    // Bright "N new" chip (issue #24). Solid zone accent (issue #43) so unread
+    // activity stands out against the muted total-count chip when scanning the
+    // index; hidden when there is nothing new. `aria-label` is for screen readers.
     let has_unread = unread_count > 0;
     let unread_label = format!("{} new", unread_count);
     let unread_aria = format!(
@@ -141,7 +137,7 @@ pub fn CategoryCard(
                         </span>
                         {has_unread.then(|| view! {
                             <span
-                                class="inline-flex items-center gap-1 text-xs font-semibold rounded-full px-2.5 py-0.5 bg-amber-400 text-gray-900 shadow-sm shadow-amber-500/30 animate-pulse"
+                                class="inline-flex items-center gap-1 text-xs font-semibold rounded-full px-2.5 py-0.5 za-solid text-gray-900 shadow-sm animate-pulse"
                                 aria-label=unread_aria
                             >
                                 <span class="w-1.5 h-1.5 rounded-full bg-gray-900/70" aria-hidden="true"></span>

@@ -68,7 +68,7 @@ pub fn ChannelCard(channel: ChannelInfo) -> impl IntoView {
     });
 
     view! {
-        <A href=href attr:class="block bg-gray-800 hover:bg-gray-750 border border-gray-700 hover:border-amber-500/30 rounded-lg transition-all duration-200 no-underline text-inherit hover:-translate-y-0.5 hover:shadow-lg hover:shadow-amber-500/5">
+        <A href=href attr:class="block bg-gray-800 hover:bg-gray-750 border border-gray-700 za-hover-border rounded-lg transition-all duration-200 no-underline text-inherit hover:-translate-y-0.5 hover:shadow-lg">
             <div class="p-4">
                 <div class="flex gap-4">
                     // Category icon
@@ -106,14 +106,14 @@ pub fn ChannelCard(channel: ChannelInfo) -> impl IntoView {
                                     (count > 0).then(|| {
                                         let n = if count > 99 { "99+".to_string() } else { count.to_string() };
                                         view! {
-                                            <span class="inline-flex items-center gap-1 h-5 px-2 text-xs font-bold text-gray-900 bg-amber-400 rounded-full shadow-sm shadow-amber-400/40 animate-pulse">
+                                            <span class="inline-flex items-center gap-1 h-5 px-2 text-xs font-bold text-gray-900 za-solid rounded-full shadow-sm animate-pulse">
                                                 <span class="w-1.5 h-1.5 rounded-full bg-gray-900"></span>
                                                 {format!("{} new", n)}
                                             </span>
                                         }
                                     })
                                 }}
-                                <span class="text-xs text-amber-400 bg-amber-500/10 rounded px-2 py-0.5 font-medium">
+                                <span class="text-xs za-chip rounded px-2 py-0.5 font-medium">
                                     {msg_count_label}
                                 </span>
                             </div>

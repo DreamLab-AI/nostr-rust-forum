@@ -63,8 +63,9 @@ fn home_icon() -> impl IntoView {
 ///
 /// Renders items in a horizontally-scrollable row. The last item is styled as
 /// the current page (white text, no link). Earlier items are gray links that
-/// highlight amber on hover. A home icon is prepended when the first item
-/// points to `"/"`.
+/// highlight the zone accent on hover (`.za-hover-text`, issue #43) — falling
+/// back to brand amber outside a zone context. A home icon is prepended when
+/// the first item points to `"/"`.
 #[component]
 pub(crate) fn Breadcrumb(
     /// Ordered breadcrumb segments, from root to current page.
@@ -90,7 +91,7 @@ pub(crate) fn Breadcrumb(
                 let full_href = base_href(href);
                 let show_home = is_home;
                 view! {
-                    <A href=full_href attr:class="text-gray-400 hover:text-amber-400 transition-colors">
+                    <A href=full_href attr:class="text-gray-400 za-hover-text">
                         {show_home.then(home_icon)}
                         {label}
                     </A>
