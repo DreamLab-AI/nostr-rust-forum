@@ -21,6 +21,7 @@ use crate::stores::channels::use_channel_store;
 use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
+use crate::utils::zone_theme::{resolved_accent_hex, zone_tile_style};
 
 /// Per-section post tallies projected into each category card.
 ///
@@ -35,16 +36,8 @@ pub struct SectionCounts {
 
 // -- Zone -> section routing --------------------------------------------------
 // `section_to_zone` is the canonical resolver in `stores::zones` (imported above).
-
-/// Deterministic accent colour per zone, derived from the zone id so themed
-/// gradients/badges stay stable across renders without hardcoding zone names.
-fn zone_accent(zone_id: &str) -> &'static str {
-    const ACCENTS: &[&str] = &["amber", "pink", "purple", "sky", "emerald", "blue"];
-    let idx = zone_id
-        .bytes()
-        .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as usize;
-    ACCENTS[idx % ACCENTS.len()]
-}
+// Zone accent colour is resolved config-first via `resolved_accent_hex`
+// (issue #43) — the old zone-id hash into an arbitrary palette is gone.
 
 // -- Welcome card helpers -----------------------------------------------------
 
@@ -151,6 +144,32 @@ pub fn ForumsPage() -> impl IntoView {
             }
         }
         map
+    });
+
+    // Live card labels (issue #44): when a section resolves to exactly one
+    // channel, the index card shows that channel's kind-40/41 name and
+    // description — so an admin rename propagates here too, instead of the
+    // stale hardcoded `section_description` map. Multi-channel sections keep
+    // the humanized section id (there is no single canonical channel to name
+    // them after).
+    let section_meta = Memo::new(move |_| {
+        let chans = store.channels.get();
+        let mut by_section = HashMap::<String, Vec<usize>>::new();
+        for (i, ch) in chans.iter().enumerate() {
+            if !ch.section.is_empty() {
+                by_section.entry(ch.section.clone()).or_default().push(i);
+            }
+        }
+        let mut meta = HashMap::<String, (String, String)>::new();
+        for (section, idxs) in by_section {
+            if let [only] = idxs.as_slice() {
+                let ch = &chans[*only];
+                if !ch.name.trim().is_empty() {
+                    meta.insert(section, (ch.name.clone(), ch.description.clone()));
+                }
+            }
+        }
+        meta
     });
 
     view! {
@@ -268,6 +287,7 @@ pub fn ForumsPage() -> impl IntoView {
             <Show when=move || !loading.get()>
                 {move || {
                     let zc = zone_categories.get();
+                    let sec_meta = section_meta.get();
                     let all_zones = zones.get_value();
                     let cohorts = za_cohorts.get();
                     let is_admin = za_admin.get();
@@ -285,7 +305,7 @@ pub fn ForumsPage() -> impl IntoView {
                             // normal tile.
                             (ZoneVisibility::Public, _) | (_, true) => {
                                 let cats = zc.get(&zone.id).cloned().unwrap_or_default();
-                                rendered.push(zone_tile(zone, cats));
+                                rendered.push(zone_tile(zone, cats, &sec_meta));
                             }
                             // Locked zone, non-member: greyed locked tile.
                             (ZoneVisibility::Locked, false) => {
@@ -357,13 +377,23 @@ pub fn ForumsPage() -> impl IntoView {
 /// The tile is headed by the zone's `banner_image_url` (responsive, lazy,
 /// `alt = display_name`) and lists the zone's category cards below. When the
 /// zone has no topics yet it shows an "enter" link instead.
-fn zone_tile(zone: &Zone, cats: HashMap<String, SectionCounts>) -> AnyView {
+fn zone_tile(
+    zone: &Zone,
+    cats: HashMap<String, SectionCounts>,
+    sec_meta: &HashMap<String, (String, String)>,
+) -> AnyView {
     let zone_id = zone.id.clone();
     let label = zone.label();
     let label_alt = label.clone();
-    let accent = zone_accent(&zone.id);
-    let gradient = zone_gradient(accent);
-    let border = zone_border(accent);
+    // Issue #43: one accent hex, config-first (operator `accent_hex` when set,
+    // else the built-in palette), drives the tile border/gradient, the accent
+    // edge stripe, the heading colour and every category card — so a zone reads
+    // as one colour end-to-end instead of a hash-picked Tailwind palette that
+    // ignored config and could clash with the drill-down pages.
+    let accent_hex = resolved_accent_hex(&zone.id, zone.accent_hex.as_deref());
+    let tile_style = zone_tile_style(&accent_hex);
+    let edge_style = format!("background: {}", accent_hex);
+    let heading_style = format!("color: {}", accent_hex);
     let banner = zone.banner_image_url.clone().unwrap_or_default();
     let has_banner = !banner.is_empty();
     let has_cats = !cats.is_empty();
@@ -378,16 +408,27 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, SectionCounts>) -> AnyView {
         let cards: Vec<_> = entries
             .into_iter()
             .map(|(section_id, counts)| {
-                let display_name = humanize_section_id(&section_id);
+                // Prefer the live channel name/description (kind-40/41, folds
+                // admin renames — issue #44) when the section maps to exactly
+                // one channel; otherwise humanize the section id and fall back
+                // to the static description.
+                let (display_name, description) = match sec_meta.get(&section_id) {
+                    Some((name, desc)) if !desc.is_empty() => (name.clone(), desc.clone()),
+                    Some((name, _)) => (name.clone(), section_description(&section_id).to_string()),
+                    None => (
+                        humanize_section_id(&section_id),
+                        section_description(&section_id).to_string(),
+                    ),
+                };
                 view! {
                     <CategoryCard
                         name=display_name
-                        description=section_description(&section_id).to_string()
+                        description=description
                         section_id=section_id
                         icon="sparkle"
                         post_count=counts.total
                         unread_count=counts.unread
-                        accent_color=accent
+                        accent_hex=accent_hex.clone()
                         zone_id=zone_id.clone()
                     />
                 }
@@ -400,10 +441,13 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, SectionCounts>) -> AnyView {
         }
         .into_any()
     } else {
+        // Tint the empty-zone CTA with the zone accent too, so an empty zone
+        // still reads in its own colour rather than a hardcoded amber.
+        let cta_style = format!("color: {}", accent_hex);
         view! {
             <A href=zone_href.clone() attr:class="block glass-card-interactive p-4 text-center no-underline text-inherit">
                 <p class="text-gray-400 text-sm mb-2">"No topics yet"</p>
-                <span class="text-amber-400 font-medium text-sm hover:text-amber-300 transition-colors">
+                <span class="font-medium text-sm hover:opacity-80 transition-opacity" style=cta_style>
                     "Enter & start a conversation →"
                 </span>
             </A>
@@ -417,10 +461,15 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, SectionCounts>) -> AnyView {
             // channel list (CategoryPage at /forums/{zone}); the section cards
             // below are deep-link shortcuts straight into a single channel.
             <A href=zone_href attr:class="block mb-4 no-underline text-inherit group">
-                <div class=format!(
-                    "relative rounded-2xl overflow-hidden bg-gradient-to-br {} border {} backdrop-blur-sm transition group-hover:ring-1 group-hover:ring-white/20",
-                    gradient, border
-                )>
+                <div
+                    class="relative rounded-2xl overflow-hidden border backdrop-blur-sm transition group-hover:ring-1 group-hover:ring-white/20"
+                    style=tile_style
+                >
+                    // Accent edge — unmistakable zone identity at a glance
+                    // (issue #43): a thin solid stripe down the left in the
+                    // zone accent. The zone NAME text below stays the primary
+                    // label, so colour is never the only signal (WCAG 1.4.1).
+                    <div class="absolute inset-y-0 left-0 w-1 z-20 pointer-events-none" style=edge_style></div>
                     {has_banner.then(|| view! {
                         <img
                             src=banner.clone()
@@ -435,7 +484,7 @@ fn zone_tile(zone: &Zone, cats: HashMap<String, SectionCounts>) -> AnyView {
                     } else {
                         "relative z-10 p-6"
                     }>
-                        <h2 class="text-xl sm:text-2xl font-bold text-white">{label}</h2>
+                        <h2 class="text-xl sm:text-2xl font-bold" style=heading_style>{label}</h2>
                         <span class="text-sm text-gray-300 group-hover:text-white transition-colors">
                             "View channels →"
                         </span>
@@ -487,32 +536,6 @@ fn locked_tile(zone: &Zone) -> AnyView {
         </section>
     }
     .into_any()
-}
-
-/// Gradient class for zone hero cards.
-fn zone_gradient(accent: &str) -> &'static str {
-    match accent {
-        "amber" => "from-amber-500/20 via-orange-500/10 to-yellow-500/5",
-        "purple" => "from-purple-500/20 via-indigo-500/10 to-violet-500/5",
-        "pink" => "from-pink-500/20 via-rose-500/10 to-fuchsia-500/5",
-        "sky" => "from-sky-500/20 via-blue-500/10 to-cyan-500/5",
-        "emerald" => "from-emerald-500/20 via-teal-500/10 to-green-500/5",
-        "blue" => "from-blue-500/20 via-indigo-500/10 to-sky-500/5",
-        _ => "from-gray-500/20 via-gray-500/10 to-gray-500/5",
-    }
-}
-
-/// Border class for zone hero cards.
-fn zone_border(accent: &str) -> &'static str {
-    match accent {
-        "amber" => "border-amber-500/20",
-        "purple" => "border-purple-500/20",
-        "pink" => "border-pink-500/20",
-        "sky" => "border-sky-500/20",
-        "emerald" => "border-emerald-500/20",
-        "blue" => "border-blue-500/20",
-        _ => "border-gray-500/20",
-    }
 }
 
 /// Convert a section ID like "private-welcome" to "Welcome".

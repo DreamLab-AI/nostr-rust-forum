@@ -213,13 +213,12 @@ fn search_icon() -> impl IntoView {
     }
 }
 
-fn forums_icon() -> impl IntoView {
+fn about_icon() -> impl IntoView {
     view! {
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="3" y="3" width="7" height="7" rx="1" stroke-linecap="round" stroke-linejoin="round"/>
-            <rect x="14" y="3" width="7" height="7" rx="1" stroke-linecap="round" stroke-linejoin="round"/>
-            <rect x="3" y="14" width="7" height="7" rx="1" stroke-linecap="round" stroke-linejoin="round"/>
-            <rect x="14" y="14" width="7" height="7" rx="1" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="12" cy="12" r="10" stroke-linecap="round" stroke-linejoin="round"/>
+            <line x1="12" y1="16" x2="12" y2="12" stroke-linecap="round" stroke-linejoin="round"/>
+            <line x1="12" y1="8" x2="12.01" y2="8" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
     }
 }
@@ -725,7 +724,12 @@ pub fn App() -> impl IntoView {
                     </div>
                 }>
                     // Public routes (no auth required)
-                    <Route path=path!("/") view=HomePage />
+                    // Root: authed members skip the marketing landing and go
+                    // straight to their forums (issue #42 — fewer clicks to
+                    // entry); logged-out visitors get the landing. The same
+                    // landing is always reachable at /about.
+                    <Route path=path!("/") view=HomeOrForums />
+                    <Route path=path!("/about") view=HomePage />
                     <Route path=path!("/login") view=LoginPage />
                     // /connect: magic-link sign-in (ADR-098). MUST NOT be
                     // auth-gated — it is the route that authenticates the device
@@ -847,40 +851,11 @@ fn Layout(children: Children) -> impl IntoView {
 
     let zone_access = crate::stores::zone_access::use_zone_access();
 
-    // Zone-first nav (ADR-107): when the member is authorised for exactly one
-    // locked zone, the "Forums" nav item points straight at that zone and shows
-    // its name; multi-zone members and admins keep the generic "Forums" →
-    // /forums. Clones are taken before `zone_access` is (potentially) moved into
-    // the `is_admin` memo below; each reactive closure owns its own clone.
-    let forums_href_desktop = {
-        let za = zone_access;
-        move || match za.home_zone() {
-            Some(z) => base_href(&format!("/forums/{}", z.id)),
-            None => base_href("/forums"),
-        }
-    };
-    let forums_label_desktop = {
-        let za = zone_access;
-        move || match za.home_zone() {
-            Some(z) => z.label(),
-            None => "Forums".to_string(),
-        }
-    };
-    let forums_href_mobile = {
-        let za = zone_access;
-        move || match za.home_zone() {
-            Some(z) => base_href(&format!("/forums/{}", z.id)),
-            None => base_href("/forums"),
-        }
-    };
-    let forums_label_mobile = {
-        let za = zone_access;
-        move || match za.home_zone() {
-            Some(z) => z.label(),
-            None => "Forums".to_string(),
-        }
-    };
-
+    // The header carries no "Forums" item any more (issue #42): the brand
+    // wordmark links to "/", which now lands authed members straight on their
+    // forums, so a dedicated nav link was redundant. `zone_access` is retained
+    // solely to drive the admin-only nav item. (ADR-107 zone-first forwarding —
+    // sending a single-zone member into their zone — lives at /forums.)
     let is_admin = Memo::new(move |_| zone_access.is_admin.get());
 
     // Helper: returns active or inactive CSS for nav links
@@ -966,10 +941,6 @@ fn Layout(children: Children) -> impl IntoView {
                                 </A>
                             }
                         >
-                            <A href=forums_href_desktop attr:class=nav_link_class("/forums")>
-                                {forums_icon()}
-                                {forums_label_desktop}
-                            </A>
                             <A href=base_href("/dm") attr:class=nav_link_class("/dm")>
                                 {dm_icon()}
                                 "DMs"
@@ -989,6 +960,13 @@ fn Layout(children: Children) -> impl IntoView {
                             <A href=base_href("/pod") attr:class=nav_link_class("/pod")>
                                 {pod_icon()}
                                 "Pod"
+                            </A>
+                            // About: the marketing landing, reachable in-app
+                            // (issue #42). Last among the text items so it
+                            // stays low-key.
+                            <A href=base_href("/about") attr:class=nav_link_class("/about")>
+                                {about_icon()}
+                                "About"
                             </A>
                             {move || is_admin.get().then(|| view! {
                                 <A href=base_href("/admin") attr:class=nav_link_class("/admin")>
@@ -1052,10 +1030,6 @@ fn Layout(children: Children) -> impl IntoView {
                                 </A>
                             }
                         >
-                            <A href=forums_href_mobile attr:class=mobile_link_class("/forums") on:click=close_mobile>
-                                {forums_icon()}
-                                {forums_label_mobile}
-                            </A>
                             <A href=base_href("/dm") attr:class=mobile_link_class("/dm") on:click=close_mobile>
                                 {dm_icon()}
                                 "DMs"
@@ -1072,6 +1046,12 @@ fn Layout(children: Children) -> impl IntoView {
                             <A href=base_href("/pod") attr:class=mobile_link_class("/pod") on:click=close_mobile>
                                 {pod_icon()}
                                 "Pod"
+                            </A>
+                            // About: the marketing landing, reachable in-app
+                            // (issue #42). Last among the text items.
+                            <A href=base_href("/about") attr:class=mobile_link_class("/about") on:click=close_mobile>
+                                {about_icon()}
+                                "About"
                             </A>
                             <button
                                 class="w-full flex items-center gap-2 text-gray-300 hover:text-white px-4 py-3 rounded-lg hover:bg-gray-800 transition-colors text-left"
@@ -1318,6 +1298,31 @@ auth_gated!(AuthGatedEvents, EventsPage);
 auth_gated!(AuthGatedProfile, ProfilePage);
 auth_gated!(AuthGatedSettings, SettingsPage);
 auth_gated!(AuthGatedPod, PodBrowserPage);
+
+/// Root route (`/`): authed members skip the marketing landing and are
+/// redirected straight to their forums (issue #42 — reduce clicks to entry);
+/// logged-out visitors get the landing (`HomePage`, also served verbatim at
+/// `/about`).
+///
+/// The branch waits on `is_ready` before committing, mirroring the auth gates:
+/// deciding on the pre-hydration default (`is_authenticated == false`) would
+/// flash the landing to an authed member on reload and momentarily aim a
+/// logged-out visitor at a redirect. Until the session resolves we hold on the
+/// loading spinner, then either redirect (authed) or render the landing.
+#[component]
+fn HomeOrForums() -> impl IntoView {
+    let auth = use_auth();
+    let is_authed = auth.is_authenticated();
+    let is_ready = auth.is_ready();
+
+    view! {
+        <Show when=move || is_ready.get() fallback=|| { loading_spinner() }>
+            <Show when=move || is_authed.get() fallback=|| view! { <HomePage /> }>
+                <Redirect path="/forums" />
+            </Show>
+        </Show>
+    }
+}
 
 /// Member (auth-only) read-only Agent Control Surface (`/governance`, F1,
 /// ADR-106 Decision 2).

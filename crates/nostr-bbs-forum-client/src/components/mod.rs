@@ -47,6 +47,7 @@ pub mod notification_bell;
 
 // -- Forum/BBS Hierarchy (Stream 5) ------------------------------------------
 pub mod category_card;
+pub mod channel_edit_modal;
 pub mod section_card;
 pub mod topic_list;
 

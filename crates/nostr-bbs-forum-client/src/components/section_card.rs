@@ -25,6 +25,12 @@ pub fn SectionCard(
     last_activity: u64,
     /// Parent category slug for building the href.
     category: String,
+    /// Admin-only edit hook. When `Some`, a pencil affordance is shown that
+    /// fires this callback (the caller opens the rename modal); `None` for
+    /// non-admins renders no pencil. `default = None` keeps the setter taking a
+    /// runtime `Option` so the caller can gate it on `is_admin`.
+    #[prop(default = None)]
+    on_edit: Option<Callback<()>>,
 ) -> impl IntoView {
     // #9: the URL carries a privacy hash of the channel id, never the section
     // name. The real name is resolved for display by the section page.
@@ -51,6 +57,29 @@ pub fn SectionCard(
 
     let has_desc = !description.is_empty();
 
+    // Admin pencil: stop the click from reaching the wrapping <A> (both
+    // propagation and the default anchor navigation) so editing never
+    // navigates into the section.
+    let edit_pencil = on_edit.map(|cb| {
+        view! {
+            <button
+                type="button"
+                class="flex-shrink-0 p-1 rounded text-gray-500 hover:text-amber-400 hover:bg-gray-700/50 transition-colors"
+                aria-label="Edit section"
+                on:click=move |ev| {
+                    ev.stop_propagation();
+                    ev.prevent_default();
+                    cb.run(());
+                }
+            >
+                <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 20h9" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4 12.5-12.5z" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </button>
+        }
+    });
+
     view! {
         <A href=href attr:class="block section-list-card no-underline text-inherit group">
             <div class="flex items-start justify-between gap-3">
@@ -76,8 +105,9 @@ pub fn SectionCard(
                     })}
                 </div>
 
-                // Stats badge
-                <div class="flex-shrink-0 text-right">
+                // Stats badge + admin pencil
+                <div class="flex-shrink-0 flex items-center gap-2">
+                    {edit_pencil}
                     <span class="text-xs text-amber-400 bg-amber-500/10 rounded px-2 py-0.5 font-medium">
                         {msg_label}
                     </span>

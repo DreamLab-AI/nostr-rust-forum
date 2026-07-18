@@ -31,6 +31,7 @@ use std::rc::Rc;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
+use crate::components::channel_edit_modal::ChannelEditModal;
 use crate::components::empty_state::EmptyState;
 use crate::components::section_card::SectionCard;
 use crate::components::toast::{use_toasts, ToastVariant};
@@ -124,6 +125,12 @@ pub fn CategoryPage() -> impl IntoView {
     let create_error = RwSignal::new(Option::<String>::None);
     // Selected SECTION = the channel id of the section the topic lands in.
     let selected_section = RwSignal::new(String::new());
+
+    // -- Admin section-rename state (issue #44) --
+    // `edit_target` re-mounts the modal with fresh prefilled props each time a
+    // pencil is clicked; `edit_open` toggles its visibility.
+    let edit_target = RwSignal::new(Option::<ChannelMeta>::None);
+    let edit_open = RwSignal::new(false);
 
     // Keep `selected_section` valid: preselect the only/first section so the
     // form is immediately submittable instead of stuck on "Please select".
@@ -472,9 +479,21 @@ pub fn CategoryPage() -> impl IntoView {
                             }.into_any()
                         }
                     } else {
+                        // Admins get a per-card pencil that opens the rename
+                        // modal seeded with that section's current metadata.
+                        let is_admin = za_admin.get();
                         let cards: Vec<_> = secs.iter().map(|s| {
                             let mc = store.count_for(&s.id);
                             let la = last_active.get(&s.id).copied().unwrap_or(0);
+                            let on_edit = if is_admin {
+                                let meta = s.clone();
+                                Some(Callback::new(move |_: ()| {
+                                    edit_target.set(Some(meta.clone()));
+                                    edit_open.set(true);
+                                }))
+                            } else {
+                                None
+                            };
                             view! {
                                 <SectionCard
                                     name=s.name.clone()
@@ -483,6 +502,7 @@ pub fn CategoryPage() -> impl IntoView {
                                     message_count=mc
                                     last_activity=la
                                     category=cat.clone()
+                                    on_edit=on_edit
                                 />
                             }
                         }).collect();
@@ -494,6 +514,20 @@ pub fn CategoryPage() -> impl IntoView {
                     }
                 }}
             </Show>
+
+            // Admin section-rename modal. Re-created whenever `edit_target`
+            // changes so each open prefills the newly-clicked section's fields;
+            // the store folds the kind-41 edit back in when the relay echoes it.
+            {move || edit_target.get().map(|meta| view! {
+                <ChannelEditModal
+                    is_open=edit_open
+                    channel_id=meta.id
+                    section=meta.section
+                    picture=meta.picture
+                    initial_name=meta.name
+                    initial_description=meta.description
+                />
+            })}
         </div>
         </Show>
         </Show>

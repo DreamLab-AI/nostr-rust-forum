@@ -1,5 +1,9 @@
 //! Landing page with animated constellation hero + login/signup CTAs.
 //!
+//! Serves two routes (issue #42): the logged-out landing at `/` (authed members
+//! are redirected past it straight to their forums) and the always-available
+//! `/about` page reachable from the in-app nav.
+//!
 //! When no admin exists (first deploy), shows a prominent "Set Up Admin Account"
 //! flow with passkey registration. Once an admin exists, shows the normal
 //! login/signup CTAs.

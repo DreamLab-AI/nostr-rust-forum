@@ -34,9 +34,21 @@
 //! client-side into [`crate::stores::zones::Zone::accent_hex`]). Callers that
 //! have a resolved [`crate::stores::zones::Zone`] in scope should use
 //! [`zone_accent_style_cfg`], which prefers the configured hex and falls back
-//! to the built-in [`zone_theme`] accent when absent — the *other* styling
-//! (gradient, border, accent text class) stays driven by the built-in palette
-//! regardless of config, since only the accent hex is operator-tunable today.
+//! to the built-in [`zone_theme`] accent when absent.
+//!
+//! ## Configured accent drives the whole tile (issue #43)
+//!
+//! The forum *index* used to colour its zone tiles from a local hash of the
+//! zone id (an arbitrary Tailwind palette name), which ignored the configured
+//! accent entirely and could disagree with the drill-down pages. The index now
+//! resolves one accent hex per zone via [`resolved_accent_hex`] (configured
+//! hex first, built-in [`zone_theme`] fallback) and paints the tile border,
+//! background gradient, accent edge, heading and every category card from that
+//! single hex via the inline-style builders below ([`hex_rgba`],
+//! [`zone_tile_style`]). Because the gradient/border are now emitted as
+//! `rgba()` derived from the resolved hex — not fixed Tailwind classes — a
+//! green-configured zone can no longer render an amber gradient. The built-in
+//! [`ZoneTheme`] struct stays as the fallback *source* of `accent_hex`.
 
 /// A coherent colour palette for a single zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +154,63 @@ pub fn zone_accent_style_cfg(zone_id: &str, cfg_accent: Option<&str>) -> String 
     format!("--zone-accent: {};", hex)
 }
 
+/// Format an alpha channel for `rgba()`: clamped to `[0, 1]`, up to three
+/// decimal places, trailing zeros trimmed (`0.25 -> "0.25"`, `1.0 -> "1"`).
+/// Keeping it deterministic avoids f32 Display drift (`0.16000001`) in styles.
+fn fmt_alpha(alpha: f32) -> String {
+    let s = format!("{:.3}", alpha.clamp(0.0, 1.0));
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Parse a `#rrggbb` hex colour into a CSS `rgba(r,g,b,a)` string at `alpha`.
+///
+/// Returns `None` for anything that is not a leading-`#`, six-hex-digit colour
+/// (missing `#`, short/long, non-hex garbage), so callers can fall back to the
+/// built-in palette rather than emitting broken CSS. This is the single parser
+/// every configured-accent inline style is built from (issue #43).
+pub fn hex_rgba(hex: &str, alpha: f32) -> Option<String> {
+    let body = hex.strip_prefix('#')?;
+    if body.len() != 6 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&body[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&body[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&body[4..6], 16).ok()?;
+    Some(format!("rgba({},{},{},{})", r, g, b, fmt_alpha(alpha)))
+}
+
+/// Resolve the single accent hex for a zone: the operator-configured
+/// `cfg_accent` when it is present and a parseable `#rrggbb`, otherwise the
+/// built-in [`zone_theme`] accent for `zone_id`.
+///
+/// This is the config-first source of truth the forum index paints every tile
+/// and card from (issue #43) — a malformed or blank configured value never
+/// leaks into the style, it degrades to the built-in palette instead.
+pub fn resolved_accent_hex(zone_id: &str, cfg_accent: Option<&str>) -> String {
+    cfg_accent
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .filter(|h| hex_rgba(h, 1.0).is_some())
+        .map(str::to_string)
+        .unwrap_or_else(|| zone_theme(zone_id).accent_hex.to_string())
+}
+
+/// Inline style for an index zone tile, driven entirely by a resolved accent
+/// hex (see [`resolved_accent_hex`]): a subtle accent border, a diagonal accent
+/// gradient tuned to match the weight of the old Tailwind `from-*/20 via-*/10`
+/// stops, and the `--zone-accent` custom property so descendants can theme off
+/// it. Falls back to neutral slate rgba only if `accent_hex` is unparseable.
+pub fn zone_tile_style(accent_hex: &str) -> String {
+    let border = hex_rgba(accent_hex, 0.25).unwrap_or_else(|| "rgba(148,163,184,0.25)".to_string());
+    let strong = hex_rgba(accent_hex, 0.16).unwrap_or_else(|| "rgba(148,163,184,0.16)".to_string());
+    let mid = hex_rgba(accent_hex, 0.06).unwrap_or_else(|| "rgba(148,163,184,0.06)".to_string());
+    format!(
+        "border-color: {border}; \
+         background: linear-gradient(135deg, {strong}, {mid} 55%, transparent); \
+         --zone-accent: {accent_hex};"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +286,78 @@ mod tests {
             zone_accent_style_cfg("business", Some("   ")),
             "--zone-accent: #a855f7;"
         );
+    }
+
+    // -- hex_rgba (issue #43) --------------------------------------------------
+
+    #[test]
+    fn hex_rgba_parses_valid_colour() {
+        // Operator green #22c55e -> 34,197,94.
+        assert_eq!(
+            hex_rgba("#22c55e", 0.25).as_deref(),
+            Some("rgba(34,197,94,0.25)")
+        );
+    }
+
+    #[test]
+    fn hex_rgba_rejects_missing_hash() {
+        assert_eq!(hex_rgba("22c55e", 0.25), None);
+    }
+
+    #[test]
+    fn hex_rgba_rejects_short_hex() {
+        // Three-digit shorthand is not accepted; only full #rrggbb.
+        assert_eq!(hex_rgba("#abc", 1.0), None);
+        assert_eq!(hex_rgba("#22c55", 1.0), None);
+    }
+
+    #[test]
+    fn hex_rgba_rejects_garbage() {
+        assert_eq!(hex_rgba("#gggggg", 0.5), None);
+        assert_eq!(hex_rgba("not-a-colour", 0.5), None);
+        assert_eq!(hex_rgba("", 0.5), None);
+    }
+
+    #[test]
+    fn hex_rgba_formats_alpha_without_trailing_zeros() {
+        // 1.0 collapses to "1", a mid value keeps its significant digits, and
+        // 0 collapses to "0" — no "1.000"/"0.500"/"0.000" noise in the style.
+        assert_eq!(hex_rgba("#000000", 1.0).as_deref(), Some("rgba(0,0,0,1)"));
+        assert_eq!(
+            hex_rgba("#ffffff", 0.5).as_deref(),
+            Some("rgba(255,255,255,0.5)")
+        );
+        assert_eq!(
+            hex_rgba("#ffffff", 0.0).as_deref(),
+            Some("rgba(255,255,255,0)")
+        );
+        // Out-of-range alpha is clamped, not emitted verbatim.
+        assert_eq!(hex_rgba("#000000", 2.0).as_deref(), Some("rgba(0,0,0,1)"));
+    }
+
+    // -- resolved_accent_hex (issue #43) --------------------------------------
+
+    #[test]
+    fn resolved_accent_prefers_configured_hex() {
+        // Operator green wins over the built-in amber default for `public`.
+        assert_eq!(resolved_accent_hex("public", Some("#22c55e")), "#22c55e");
+    }
+
+    #[test]
+    fn resolved_accent_falls_back_when_absent_or_invalid() {
+        // Absent -> built-in; malformed/blank config never leaks, also -> built-in.
+        assert_eq!(resolved_accent_hex("minimoonoir", None), "#3b82f6");
+        assert_eq!(resolved_accent_hex("business", Some("nope")), "#a855f7");
+        assert_eq!(resolved_accent_hex("business", Some("   ")), "#a855f7");
+    }
+
+    // -- zone_tile_style (issue #43) ------------------------------------------
+
+    #[test]
+    fn zone_tile_style_derives_every_channel_from_the_hex() {
+        let style = zone_tile_style("#22c55e");
+        assert!(style.contains("border-color: rgba(34,197,94,0.25)"));
+        assert!(style.contains("linear-gradient(135deg, rgba(34,197,94,0.16)"));
+        assert!(style.contains("--zone-accent: #22c55e;"));
     }
 }

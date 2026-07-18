@@ -7,6 +7,37 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added
+
+- **Straight-to-forums root + About page** (operator issue #42). `/` now
+  redirects authenticated members to `/forums` (holding on the loading
+  spinner until the session resolves, so neither branch flashes); the
+  logged-out landing is unchanged at `/` and is always reachable at the new
+  `/about` route. The header's zone-first "Forums" nav item is removed (the
+  brand wordmark is the forums link) and a low-key "About" item joins the
+  desktop and mobile navs.
+- **Admin channel rename/describe via kind-41** (operator issue #44). The
+  channel store now subscribes to kinds 40+41 and folds JSON
+  `{name, about, picture}` metadata updates into channel state — last-write-
+  wins by a metadata timestamp floored at the kind-40 `created_at`,
+  pin/unpin kind-41s (empty content) ignored, 41-before-40 buffered.
+  Admin-only pencil on section cards opens a shared-Modal edit dialog
+  (name ≤80, about ≤280) publishing `["e", cid, "", "root"]` +
+  `["section", …]`-tagged kind-41s; the relay's existing TL2-own/TL3-any
+  gate is unchanged. Forum-index cards for single-channel sections now show
+  the live channel name/description instead of a stale hardcoded map.
+
+### Fixed
+
+- **Forums index ignored configured zone colours** (operator issue #43). The
+  index had a local zone-id-hash → arbitrary-Tailwind-palette picker, so
+  tiles never reflected `[[zones]] accent_hex`. Zone accents are now
+  resolved config-first (`resolved_accent_hex`) and drive the tile border,
+  gradient wash, 4px accent edge stripe, heading colour, empty-zone CTA and
+  every category card via inline `hex_rgba` styles — one colour per zone,
+  index through drill-down, with the zone name text always present so
+  colour is never the only signal.
+
 ## [1.0.0-beta.5] — 2026-07-18
 
 Workspace release: every crate changed since its last version stamp moves to
