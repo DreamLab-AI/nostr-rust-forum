@@ -93,7 +93,7 @@ impl BbsNotifKind {
 /// A single notification entry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BbsNotification {
-    /// Stable dedup id derived from the source event id ([`dedup_key`]).
+    /// Stable dedup id derived from the source event id (`dedup_key`).
     pub id: String,
     /// Reply vs mention.
     pub kind: BbsNotifKind,

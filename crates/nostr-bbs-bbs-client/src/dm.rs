@@ -834,7 +834,6 @@ fn dm_inbox(
     let new_err = RwSignal::new(None::<String>);
 
     let start_dm = {
-        let store = store;
         std::rc::Rc::new(move || match parse_peer_input(&new_peer.get_untracked()) {
             Ok(pk) => {
                 new_err.set(None);
@@ -849,7 +848,6 @@ fn dm_inbox(
 
     // "Message Jarvis" quick-start (only when the agent is configured and isn't us).
     let jarvis_cta = jarvis.clone().filter(|j| *j != my_pk).map(|j| {
-        let store = store;
         let open = move || store.open_peer(&j);
         let open_key = open.clone();
         view! {
@@ -857,7 +855,7 @@ fn dm_inbox(
                 <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
                     aria-label="Message the Jarvis AI agent"
                     on:click=move |_| open()
-                    on:keydown=on_activate(move || open_key())
+                    on:keydown=on_activate(open_key)
                 >"[ \u{25B8} Message Jarvis (AI) ]"</span>
             </div>
         }
@@ -905,7 +903,6 @@ fn dm_inbox(
                         let name = peer_label(&peer, jarvis_ref.as_deref());
                         let preview = c.last_message.clone();
                         let unread = c.unread_count;
-                        let store = store;
                         let open = move || store.open_peer(&peer);
                         let open_key = open.clone();
                         let badge = if unread > 0 { format!("({unread})") } else { String::new() };
@@ -914,7 +911,7 @@ fn dm_inbox(
                             <div class="bbs-row bbs-dm-convo" role="button" tabindex="0"
                                 aria-label=aria
                                 on:click=move |_| open()
-                                on:keydown=on_activate(move || open_key())
+                                on:keydown=on_activate(open_key)
                             >
                                 <span class="accent bbs-chip">"\u{2709}"</span>
                                 <span class="bbs-dm-name accent">{name}</span>

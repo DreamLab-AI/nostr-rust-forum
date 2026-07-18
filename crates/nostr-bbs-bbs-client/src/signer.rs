@@ -154,7 +154,7 @@ impl BbsSigner {
 
     /// Adopt a passkey-derived keypair (F9). The WebAuthn PRF ceremony
     /// ([`crate::passkey`]) hands us a [`Keypair`]; install it through the SAME
-    /// in-memory path as the generate/paste/adopt logins ([`Self::install`]).
+    /// in-memory path as the generate/paste/adopt logins (`Self::install`).
     /// The passkey itself is the recovery factor, so — unlike `generate()` — no
     /// one-time backup sheet follows; the key lives in memory only and is never
     /// persisted by the BBS.

@@ -44,9 +44,13 @@ use query::{empty_state_message, format_score, name_matches, rank_and_dedup, tru
 
 /// Max local message rows scanned from the open board, and the worker `limit`.
 const LOCAL_MSG_CAP: usize = 20;
+// Consumed only on the wasm fetch/debounce path; the native (unit-test) build
+// never references them.
+#[cfg(target_arch = "wasm32")]
 const WORKER_LIMIT: usize = 12;
 /// Total rows rendered (local + remote, after merge/dedup).
 const RESULT_CAP: usize = 40;
+#[cfg(target_arch = "wasm32")]
 const DEBOUNCE_MS: i32 = 300;
 
 /// Shared open-state for the search overlay, carried through Leptos context so

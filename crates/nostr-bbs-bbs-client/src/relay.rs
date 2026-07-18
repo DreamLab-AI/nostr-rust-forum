@@ -255,9 +255,9 @@ fn resolve_root(
         if root_ids.contains(&cur) {
             return Some(cur);
         }
-        match parent_of.get(&cur) {
-            Some(next) => cur = next.clone(),
-            None => return None,
+        {
+            let next = parent_of.get(&cur)?;
+            cur = next.clone()
         }
     }
     None

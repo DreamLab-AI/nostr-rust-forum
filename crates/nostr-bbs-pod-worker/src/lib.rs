@@ -1880,7 +1880,10 @@ mod tests {
         );
         // Non-image extensions keep the generic type.
         assert_eq!(
-            refine_image_content_type("/media/public/notes.txt", "application/octet-stream".to_string()),
+            refine_image_content_type(
+                "/media/public/notes.txt",
+                "application/octet-stream".to_string()
+            ),
             "application/octet-stream"
         );
     }

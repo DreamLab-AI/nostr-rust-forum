@@ -461,7 +461,7 @@ fn board_row(
             tabindex="0"
             aria-label=aria_label
             on:click=move |_| open()
-            on:keydown=on_activate(move || open_key())
+            on:keydown=on_activate(open_key)
         >
             <span class="accent bbs-chip">"\u{2593}"</span>
             <span class="bbs-board-name">{name}</span>
@@ -558,7 +558,7 @@ fn thread_list(
                                     tabindex="0"
                                     aria-label=aria
                                     on:click=move |_| open()
-                                    on:keydown=on_activate(move || open_key())
+                                    on:keydown=on_activate(open_key)
                                 >
                                     <span class="accent bbs-chip">"\u{25B8}"</span>
                                     <span class="bbs-thread-snip">{preview}</span>
@@ -941,8 +941,8 @@ fn board_composer(
                 />
                 <span class="bbs-link accent" role="button" tabindex="0"
                     aria-label="Add an image"
-                    on:click=move |_| { if let Some(inp) = file_input.get_untracked() { let _ = inp.click(); } }
-                    on:keydown=on_activate(move || { if let Some(inp) = file_input.get_untracked() { let _ = inp.click(); } })
+                    on:click=move |_| { if let Some(inp) = file_input.get_untracked() { inp.click(); } }
+                    on:keydown=on_activate(move || { if let Some(inp) = file_input.get_untracked() { inp.click(); } })
                 >"[ \u{25B8} image ]"</span>
                 <input
                     node_ref=file_input
@@ -1213,7 +1213,7 @@ fn members(store: RelayStore, cfg: StoredValue<BbsConfig>) -> impl IntoView {
                                     <div class="bbs-row bbs-member-row" role="button" tabindex="0"
                                         aria-label=aria
                                         on:click=move |_| open()
-                                        on:keydown=on_activate(move || open_key())
+                                        on:keydown=on_activate(open_key)
                                     >
                                         <span class="accent bbs-chip">"\u{25CF}"</span>
                                         <span class="bbs-member-name">{name}</span>
@@ -1806,7 +1806,7 @@ fn toggle(
             tabindex="0"
             attr:aria-pressed=move || if active() { "true" } else { "false" }
             on:click=move |_| set()
-            on:keydown=on_activate(move || set_key())
+            on:keydown=on_activate(set_key)
         >
             "[ " {label} " ]"
         </span>
@@ -1871,7 +1871,7 @@ fn backup_sheet(secret_hex: String, dismiss: impl Fn() + Clone + 'static) -> imp
             </div>
             <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
                 on:click=move |_| dismiss()
-                on:keydown=on_activate(move || dismiss_key())
+                on:keydown=on_activate(dismiss_key)
             >"[ \u{2713} I\u{2019}ve written it down ]"</span>
         </div>
     }
@@ -1884,6 +1884,7 @@ fn backup_sheet(secret_hex: String, dismiss: impl Fn() + Clone + 'static) -> imp
 ///      adopted session carries back same-origin)
 ///   3. Paste an nsec / hex key (own full-width row) → Sign in
 ///   4. Generate a throwaway key → the F14 backup sheet (nsec + hex, shown once)
+///
 /// Signed in with a local key, a "Back up my key" control re-opens that sheet;
 /// the key lives in memory only and the forum's same-origin local-key session is
 /// adopted at load.
@@ -1981,7 +1982,7 @@ fn sign_in_panel(signer: BbsSigner) -> impl IntoView {
                             />
                             <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
                                 on:click=move |_| login()
-                                on:keydown=on_activate(move || login_key())
+                                on:keydown=on_activate(login_key)
                             >"[ \u{25B8} Sign in ]"</span>
                             <span class="bbs-link bbs-cta" role="button" tabindex="0"
                                 on:click=move |_| { if let Ok(hex) = signer.generate() { generated.set(Some(hex)); } }

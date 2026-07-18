@@ -1,8 +1,8 @@
 //! Pure logic for BBS global search (F11) — query parsing, request-body
 //! building, response parsing, ranking, and match/formatting helpers.
 //!
-//! This module has NO Leptos / web-sys / wasm dependency (only `std` + `serde`
-//! + `serde_json`) so it is unit-testable on the native target. The Leptos
+//! This module has NO Leptos / web-sys / wasm dependency (only `std`, `serde`
+//! and `serde_json`) so it is unit-testable on the native target. The Leptos
 //! search overlay in `search.rs` (`#[path = "search_core.rs"] pub mod core;`)
 //! renders on top of these functions.
 //!
