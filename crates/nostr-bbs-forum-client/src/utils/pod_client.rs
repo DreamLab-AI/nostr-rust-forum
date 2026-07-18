@@ -104,6 +104,7 @@ async fn put_blob_signer(
             .await
             .map_err(|e| format!("NIP-98 error: {e}"))?;
     let auth_header = format!("Nostr {}", token);
+    let content_type = media_content_type(blob, filename);
 
     // PUT to pod API
     let window = web_sys::window().ok_or("No window")?;
@@ -115,7 +116,7 @@ async fn put_blob_signer(
         .set("Authorization", &auth_header)
         .map_err(|e| format!("{e:?}"))?;
     headers
-        .set("Content-Type", "application/octet-stream")
+        .set("Content-Type", &content_type)
         .map_err(|e| format!("{e:?}"))?;
     init.set_headers(&headers);
     init.set_body(&js_sys::Uint8Array::from(bytes.as_slice()).into());
@@ -202,6 +203,7 @@ pub async fn upload_to_pod(
     let token = crate::auth::nip98::create_nip98_token(privkey, &url, "PUT", Some(&bytes))
         .map_err(|e| format!("NIP-98 error: {e}"))?;
     let auth_header = format!("Nostr {}", token);
+    let content_type = media_content_type(blob, filename);
 
     // PUT to pod API
     let window = web_sys::window().ok_or("No window")?;
@@ -213,7 +215,7 @@ pub async fn upload_to_pod(
         .set("Authorization", &auth_header)
         .map_err(|e| format!("{e:?}"))?;
     headers
-        .set("Content-Type", "application/octet-stream")
+        .set("Content-Type", &content_type)
         .map_err(|e| format!("{e:?}"))?;
     init.set_headers(&headers);
     init.set_body(&js_sys::Uint8Array::from(bytes.as_slice()).into());
@@ -275,6 +277,32 @@ pub async fn upload_image_with_thumbnail(
     let thumb_url = upload_to_pod(thumb_blob, &thumb_name, pubkey, privkey, None).await?;
 
     Ok((image_url, thumb_url))
+}
+
+/// Resolve the media `Content-Type` to send on upload. Prefer the blob's own
+/// MIME (the browser sets it from the picked file), falling back to the file
+/// extension. A correct `image/*` type matters: the pod-worker stores and serves
+/// exactly what we PUT, and it also emits `X-Content-Type-Options: nosniff` — so
+/// an `application/octet-stream` image is refused by `<img>` and skipped by the
+/// BBS ASCII-art transform (which only fires on `image/*`). Uploading the real
+/// type is what makes posted images and avatars actually render.
+fn media_content_type(blob: &Blob, filename: &str) -> String {
+    let bt = blob.type_();
+    if !bt.is_empty() && bt != "application/octet-stream" {
+        return bt;
+    }
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 /// Generate a thumbnail filename from the original: "photo.jpg" -> "photo_thumb.jpg"

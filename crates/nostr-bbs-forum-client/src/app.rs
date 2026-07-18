@@ -433,53 +433,104 @@ pub fn App() -> impl IntoView {
                 return;
             }
 
-            // We have a display name and/or a claimed handle — build a full,
-            // non-clobbering kind-0. When the display name is absent but a
+            // We have a display name and/or a claimed handle — (re)publish a
+            // full, non-clobbering kind-0. When the display name is absent but a
             // handle is claimed, surface the handle as the display name.
             let display_name = if nickname.is_empty() {
                 claimed.clone().unwrap_or_default()
             } else {
                 nickname.clone()
             };
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "display_name".into(),
-                serde_json::Value::String(display_name),
-            );
-            match &claimed {
-                Some(username) => {
-                    obj.insert("name".into(), serde_json::Value::String(username.clone()));
-                    obj.insert(
-                        "nip05".into(),
-                        serde_json::Value::String(crate::components::onboarding_modal::nip05_for(
-                            username,
-                        )),
-                    );
-                }
-                None => {
-                    obj.insert("name".into(), serde_json::Value::String(nickname.clone()));
-                }
-            }
-            let content =
-                serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default();
-
-            let now = (js_sys::Date::now() / 1000.0) as u64;
-            let unsigned = nostr_bbs_core::UnsignedEvent {
-                pubkey: pubkey.clone(),
-                created_at: now,
-                kind: 0,
-                tags: vec![],
-                content,
-            };
+            // Set the session guard up front so a relay reconnect cannot re-fire
+            // this effect while the async publish below is in flight.
+            published_profile.set(true);
 
             wasm_bindgen_futures::spawn_local(async move {
+                // kind-0 is replaceable, so rebuilding it here from only
+                // name/nip05 would CLOBBER fields this effect does not carry —
+                // most visibly the avatar `picture`, but also `about`/`birthday`
+                // set via Settings. Consult the relay's existing kind-0 first:
+                // if it already holds this identity the user is registered and
+                // there is nothing to add, so leave it untouched; when a publish
+                // IS needed, merge over the existing profile so the avatar and
+                // any claimed nip05 survive.
+                let existing = crate::stores::profile_cache::fetch_profile(&pubkey).await;
+
+                if let Some(e) = &existing {
+                    let has_label = e
+                        .display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|s| !s.is_empty())
+                        || e.name
+                            .as_deref()
+                            .map(str::trim)
+                            .is_some_and(|s| !s.is_empty());
+                    let identity_current = match &claimed {
+                        Some(u) => {
+                            e.name.as_deref() == Some(u.as_str())
+                                && e.nip05.as_deref()
+                                    == Some(
+                                        crate::components::onboarding_modal::nip05_for(u).as_str(),
+                                    )
+                        }
+                        None => {
+                            e.display_name.as_deref().map(str::trim) == Some(display_name.trim())
+                        }
+                    };
+                    if has_label && identity_current {
+                        // Already registered with this identity — do not clobber.
+                        return;
+                    }
+                }
+
+                // Seed from the existing profile so a set avatar / claimed nip05
+                // is preserved, then override the fields this effect manages.
+                let mut obj = serde_json::Map::new();
+                if let Some(e) = &existing {
+                    if let Some(pic) = e.picture.as_deref().filter(|s| !s.is_empty()) {
+                        obj.insert("picture".into(), serde_json::Value::String(pic.to_string()));
+                    }
+                    if let Some(nip) = e.nip05.as_deref().filter(|s| !s.is_empty()) {
+                        obj.insert("nip05".into(), serde_json::Value::String(nip.to_string()));
+                    }
+                }
+                obj.insert(
+                    "display_name".into(),
+                    serde_json::Value::String(display_name.clone()),
+                );
+                match &claimed {
+                    Some(username) => {
+                        obj.insert("name".into(), serde_json::Value::String(username.clone()));
+                        obj.insert(
+                            "nip05".into(),
+                            serde_json::Value::String(
+                                crate::components::onboarding_modal::nip05_for(username),
+                            ),
+                        );
+                    }
+                    None => {
+                        obj.insert("name".into(), serde_json::Value::String(nickname.clone()));
+                    }
+                }
+                let content =
+                    serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default();
+
+                let now = (js_sys::Date::now() / 1000.0) as u64;
+                let unsigned = nostr_bbs_core::UnsignedEvent {
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind: 0,
+                    tags: vec![],
+                    content,
+                };
+
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {
                         // Retry on relay rejection: a new joiner publishes this
                         // before the username-claim whitelists them, so the first
                         // attempt is dropped and the display name would be lost.
                         publish_kind0_retrying(r, signed, 4);
-                        published_profile.set(true);
                         web_sys::console::log_1(
                             &format!(
                                 "[app] Published kind-0 profile for auto-whitelist: {}",

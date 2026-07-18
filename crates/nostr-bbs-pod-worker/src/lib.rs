@@ -208,6 +208,33 @@ fn add_html_safety_headers(headers: &Headers, content_type: &str) {
     }
 }
 
+/// Recover an image `Content-Type` from a resource path extension when the
+/// stored type is the generic `application/octet-stream`.
+///
+/// The old upload client PUT every blob as `application/octet-stream`, so images
+/// stored before the client fix carry that type. Combined with `nosniff` (set on
+/// every response above) browsers refuse to render them in `<img>`, and the
+/// image→ASCII transform below is gated on an `image/*` type, so the BBS shows
+/// "image unavailable". Deriving the real type from the extension lets those
+/// already-stored avatars and photos render without a re-upload. Only overrides
+/// the generic/empty stored type — a real stored type is always respected.
+fn refine_image_content_type(path: &str, stored: String) -> String {
+    if !stored.is_empty() && stored != "application/octet-stream" {
+        return stored;
+    }
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        "png" => "image/png".to_string(),
+        "webp" => "image/webp".to_string(),
+        "gif" => "image/gif".to_string(),
+        "avif" => "image/avif".to_string(),
+        "svg" => "image/svg+xml".to_string(),
+        "bmp" => "image/bmp".to_string(),
+        _ => stored,
+    }
+}
+
 /// True when an `Accept` request header opts in to server-side ASCII rendering
 /// by listing the `text/x-ascii-art` media type (case-insensitive match).
 fn accept_wants_ascii(accept_header: Option<&str>) -> bool {
@@ -948,6 +975,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .http_metadata()
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".to_string());
+            // Recover a real image type for legacy octet-stream uploads so they
+            // render in `<img>` (nosniff) and reach the image→ASCII transform.
+            let stored_content_type =
+                refine_image_content_type(&resource_path, stored_content_type);
             let obj_content_type =
                 content_negotiation::negotiate(accept_header.as_deref(), &stored_content_type);
             let etag = object.etag();
@@ -1819,6 +1850,40 @@ async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refine_image_content_type_recovers_from_octet_stream() {
+        // Legacy uploads stored as octet-stream recover their real image type
+        // from the path extension so they render and reach the ASCII transform.
+        for (path, want) in [
+            ("/media/public/moomaa1.jpg", "image/jpeg"),
+            ("/media/public/x.jpeg", "image/jpeg"),
+            ("/media/public/x.PNG", "image/png"),
+            ("/media/public/x.webp", "image/webp"),
+            ("/media/public/x.gif", "image/gif"),
+            ("/media/public/x.svg", "image/svg+xml"),
+        ] {
+            assert_eq!(
+                refine_image_content_type(path, "application/octet-stream".to_string()),
+                want,
+                "path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn refine_image_content_type_respects_real_stored_type() {
+        // A real stored content-type is never overridden by the extension.
+        assert_eq!(
+            refine_image_content_type("/media/public/x.jpg", "image/png".to_string()),
+            "image/png"
+        );
+        // Non-image extensions keep the generic type.
+        assert_eq!(
+            refine_image_content_type("/media/public/notes.txt", "application/octet-stream".to_string()),
+            "application/octet-stream"
+        );
+    }
 
     #[test]
     fn parse_pod_route_valid() {
