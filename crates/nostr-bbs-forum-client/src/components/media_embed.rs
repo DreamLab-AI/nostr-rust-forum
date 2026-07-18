@@ -133,11 +133,18 @@ pub(crate) fn MediaEmbed(
                             }
                         }
                     >
+                        // MUST load eagerly: this <img> sits inside the
+                        // hidden-until-loaded <a> above, and a `loading="lazy"`
+                        // image inside a display:none box never intersects the
+                        // viewport, so the browser never fetches it — on:load
+                        // never fires and the skeleton deadlocks forever (an
+                        // already-cached image masks the bug, which is how it
+                        // survived verification).
                         <img
                             src=img_url
                             alt="Embedded image"
                             class="max-h-[400px] w-auto rounded-lg border border-gray-700/50 hover:border-amber-500/30 transition-colors cursor-pointer"
-                            loading="lazy"
+                            decoding="async"
                             on:load=move |_| loaded.set(true)
                             on:error=move |_| errored.set(true)
                         />
