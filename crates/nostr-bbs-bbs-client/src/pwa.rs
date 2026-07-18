@@ -99,7 +99,7 @@ pub fn resolve_boot_zone_index(
     None
 }
 
-/// Hex-decode a [`WrappedKeyEnvelope`] into `(iv, ciphertext)`, validating the IV
+/// Hex-decode a [`nostr_bbs_core::WrappedKeyEnvelope`] into `(iv, ciphertext)`, validating the IV
 /// length against [`AES_IV_LEN`]. `None` on any malformed hex or a wrong-length
 /// IV — a corrupt record must read as "not baked", never a decrypt attempt with
 /// a bad IV. Pure so the codec boundary is testable off-wasm.

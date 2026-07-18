@@ -7,6 +7,66 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.5] — 2026-07-18
+
+Workspace release: every crate changed since its last version stamp moves to
+`1.0.0-beta.5` (ascii, auth-worker, bbs-client, config, core, forum-client,
+mesh, pod-worker, preview-worker, relay-worker); `rate-limit`,
+`search-worker`, `setup-skill` and `upstream-canary` are unchanged and keep
+their prior versions.
+
+### Added
+
+- **Zone-bound one-shot BBS PWA (ADR-109).** A single-locked-zone member can
+  install their zone as a mobile app: a gated "Install mobile app" Settings
+  section (forum-client) takes explicit consent with a lost-phone warning and
+  bakes the key on-device (non-extractable AES-256-GCM wrap in IndexedDB +
+  BootProfile); the BBS ships a manifest + maskable icons + a network-first
+  service worker, boots one-shot via `?pwa=1` pinned to the bound zone, and
+  handles iOS home-screen storage isolation with a one-time first-launch
+  rebind. Shared contract in `nostr-bbs-core::boot_profile`; feature is gated
+  on `window.__ENV__.BBS_PWA_ENABLED` (default off). Design trio:
+  `docs/prd/prd-zone-bound-bbs-pwa.md`,
+  `docs/adr/ADR-109-zone-bound-bbs-pwa-install.md`,
+  `docs/ddd/ddd-zone-bound-bbs-pwa.md`.
+- **Quote-and-append topic replies** (forum-client). Every post in a topic
+  carries a "Reply" that quotes that message and appends the reply at the
+  bottom (flat, chronological, never nested); the card shows an inline quote
+  and the quoted author is p-tagged. Threading stays correct by structure:
+  the NIP-10 `reply` marker always targets the topic root, the quoted sibling
+  rides a separate `quote` marker.
+- **Per-zone auto-approval** (auth-worker + relay-worker + config). Zones gain
+  an `auto_approve` flag; new joiners are additively granted an auto-approved
+  zone's `required_cohorts` at username-claim time.
+
+### Fixed
+
+- **Avatar survives login** (forum-client): the auto-whitelist kind-0
+  republish now consults the relay's existing profile and merges, instead of
+  clobbering `picture`/`about`/`birthday` on every reconnect.
+- **Media serves with its real MIME** (forum-client + pod-worker): uploads
+  send the blob's type (extension fallback), and the pod-worker recovers
+  `image/*` from the path for legacy `application/octet-stream` objects — so
+  images render in `<img>` (nosniff) and reach the BBS ASCII transform.
+- **Posted images no longer print their pod URL** (forum-client): embedded
+  media URLs are stripped from the visible body; the embed carries a
+  hover-revealed "open full" affordance instead.
+- **BBS resolves author nyms** (bbs-client): board threads, chat, topic list,
+  snippets and DM rows resolve kind-0 display names instead of raw truncated
+  pubkeys.
+- **Forum→BBS sash navigates** (forum-client): `rel="external"` + an explicit
+  hard navigation so the Leptos router no longer intercepts the click into a
+  404.
+- **Photo upload 403** (forum-client): pod provisioning uses
+  `POST /pods/{pubkey}/.provision` and the upload self-heals (provision +
+  retry) on 403/404.
+- **One-deep channel replies** (forum-client): a channel message that is
+  itself a reply no longer offers a Reply affordance.
+- **New-joiner signup race** (forum-client): kind-0 publish retries until the
+  whitelist claim lands, and zone access refreshes after the claim; the forum
+  service worker no longer intercepts `<base>/bbs/` navigations.
+
+
 Soak-test fix sprint (2026-07-16) — 16 issues surfaced by a 10-persona browser
 soak of `nostr-bbs-forum-client`; see the operator overlay's
 `docs/sprint/soak-test-2026-07-16.md`. All changes are confined to

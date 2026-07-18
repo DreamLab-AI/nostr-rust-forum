@@ -661,6 +661,7 @@ operator = "tier-2"
             accent_hex: Some("#3b82f6".into()),
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            auto_approve: false,
         }];
         assert!(validate_config(&cfg).is_ok());
     }
@@ -677,6 +678,7 @@ operator = "tier-2"
             accent_hex: Some("blue".into()),
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            auto_approve: false,
         }];
         assert!(validate_config(&cfg).is_err());
     }
