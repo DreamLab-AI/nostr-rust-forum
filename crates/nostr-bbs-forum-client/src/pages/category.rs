@@ -51,7 +51,12 @@ fn sections_for_zone(
     category_slug: &str,
     zones: &[Zone],
 ) -> Vec<ChannelMeta> {
-    let cat = category_slug.to_lowercase();
+    // The URL param may be the zone's slug (short URLs, issue #45) or its
+    // legacy id — canonicalise to the zone ID, which is what
+    // `section_to_zone` yields for channel routing.
+    let cat = crate::stores::zones::resolve_zone_param(category_slug, zones)
+        .map(|z| z.id.to_lowercase())
+        .unwrap_or_else(|| category_slug.to_lowercase());
     let mut out: Vec<ChannelMeta> = channels
         .iter()
         .filter(|ch| {

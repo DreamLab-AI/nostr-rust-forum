@@ -117,7 +117,12 @@ pub(crate) fn resolve_channel(
     section_slug: &str,
     zones: &[Zone],
 ) -> Option<ChannelMeta> {
-    let cat = category_slug.to_lowercase();
+    // The URL param may be the zone's slug (short URLs, issue #45) or its
+    // legacy id — canonicalise to the zone ID, which is what
+    // `section_to_zone` yields for channel routing.
+    let cat = crate::stores::zones::resolve_zone_param(category_slug, zones)
+        .map(|z| z.id.to_lowercase())
+        .unwrap_or_else(|| category_slug.to_lowercase());
     let sec = section_slug.to_lowercase();
     channels
         .iter()
@@ -143,7 +148,12 @@ fn resolve_section(
     section_slug_param: &str,
     zones: &[Zone],
 ) -> Option<ChannelMeta> {
-    let cat = category_slug.to_lowercase();
+    // The URL param may be the zone's slug (short URLs, issue #45) or its
+    // legacy id — canonicalise to the zone ID, which is what
+    // `section_to_zone` yields for channel routing.
+    let cat = crate::stores::zones::resolve_zone_param(category_slug, zones)
+        .map(|z| z.id.to_lowercase())
+        .unwrap_or_else(|| category_slug.to_lowercase());
     // Hashed form (#9): match the channel-id hash (SectionCard links) OR the
     // section-tag hash (CategoryCard links group channels by section tag).
     if let Some(found) = channels.iter().find(|c| {
