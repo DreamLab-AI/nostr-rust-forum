@@ -12,6 +12,7 @@
 //! the `__ENV__` object.
 
 use nostr_bbs_config::schema::Zone;
+use nostr_bbs_core::BootProfile;
 use serde_json::Value;
 
 use crate::theme::Theme;
@@ -48,6 +49,20 @@ pub struct BbsConfig {
     pub viewer_pubkey: Option<String>,
     /// Config-driven zones (boards), shared with the rest of the kit.
     pub zones: Vec<Zone>,
+    /// ADR-109 feature flag (`BBS_PWA_ENABLED` in `__ENV__`). Gates the whole
+    /// zone-bound PWA surface: the `?pwa=1` one-shot boot, the service-worker
+    /// registration, and any install affordance. **Default off** — the operator
+    /// overlay sets it to `"true"` at deploy time; a missing/absent flag disables
+    /// the feature so a bare `trunk serve` never boots into pwa mode.
+    pub pwa_enabled: bool,
+    /// Whether this launch requested the PWA one-shot boot via `?pwa=1` in the
+    /// location query (read only in the wasm [`Self::load`]; always `false` in the
+    /// pure [`Self::from_env_value`] so unit tests stay deterministic).
+    pub pwa_mode: bool,
+    /// The device-resident [`BootProfile`] read from `localStorage`, if present
+    /// and valid — names the bound zone the installed app pins to. Read only in
+    /// the wasm [`Self::load`]; `None` in [`Self::from_env_value`].
+    pub boot_profile: Option<BootProfile>,
 }
 
 impl Default for BbsConfig {
@@ -65,6 +80,9 @@ impl Default for BbsConfig {
             search_api: String::new(),
             viewer_pubkey: None,
             zones: Vec::new(),
+            pwa_enabled: false,
+            pwa_mode: false,
+            boot_profile: None,
         }
     }
 }
@@ -81,6 +99,21 @@ fn str_key(env: &Value, key: &str) -> Option<String> {
 /// Read the first present non-empty string among `keys`.
 fn first_key(env: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| str_key(env, k))
+}
+
+/// Read a boolean feature flag from `__ENV__`, accepting either a real JSON
+/// boolean or the string forms `"true"`/`"1"` (case-insensitive) the deploy
+/// pipeline emits. Any other value — including a missing key — reads as `false`
+/// (fail-closed / default-off, per ADR-109's `BBS_PWA_ENABLED`).
+fn env_flag(env: &Value, key: &str) -> bool {
+    match env.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => {
+            let t = s.trim().to_ascii_lowercase();
+            t == "true" || t == "1"
+        }
+        _ => false,
+    }
 }
 
 /// Parse `ZONE_CONFIG` (a JSON string or an already-parsed array) into zones.
@@ -116,6 +149,11 @@ impl BbsConfig {
                 .unwrap_or_default(),
             viewer_pubkey: first_key(env, &["VIEWER_PUBKEY", "PUBKEY"]),
             zones: parse_zones(env),
+            // Feature flag is a pure read of `__ENV__`; the location/localStorage
+            // reads that set `pwa_mode` / `boot_profile` live only in wasm `load`.
+            pwa_enabled: env_flag(env, "BBS_PWA_ENABLED"),
+            pwa_mode: false,
+            boot_profile: None,
         }
     }
 
@@ -132,6 +170,15 @@ impl BbsConfig {
         if cfg.viewer_pubkey.is_none() {
             cfg.viewer_pubkey = read_forum_session_pubkey();
         }
+        // ADR-109 one-shot boot inputs. `?pwa=1` in the launch query marks a PWA
+        // boot (the manifest `start_url` carries it); the BootProfile in
+        // localStorage names the bound zone. Both are read here — never in the
+        // pure `from_env_value` — so the native unit tests stay deterministic.
+        let search = web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .unwrap_or_default();
+        cfg.pwa_mode = nostr_bbs_core::is_pwa_boot(&search);
+        cfg.boot_profile = read_boot_profile();
         cfg
     }
 
@@ -189,6 +236,26 @@ pub(crate) fn read_forum_session_json() -> Option<String> {
 #[cfg(target_arch = "wasm32")]
 fn read_forum_session_pubkey() -> Option<String> {
     pubkey_from_session(&read_forum_session_json()?)
+}
+
+/// Read + validate the device-resident [`BootProfile`] from localStorage (wasm).
+/// A corrupt or foreign record reads as `None` (never a panic) via
+/// [`nostr_bbs_core::parse_boot_profile`]. On iOS's isolated installed-app bucket
+/// this is absent on first launch — the one-shot boot then falls through to the
+/// rebind screen. Non-secret: the key material lives in IndexedDB, not here.
+#[cfg(target_arch = "wasm32")]
+fn read_boot_profile() -> Option<BootProfile> {
+    use gloo::storage::{LocalStorage, Storage};
+    let raw: String = LocalStorage::get(nostr_bbs_core::BOOTPROFILE_KEY).ok()?;
+    nostr_bbs_core::parse_boot_profile(&raw)
+}
+
+/// Whether this launch should enter the ADR-109 one-shot PWA boot: either the
+/// `?pwa=1` query is present, or a valid [`BootProfile`] is stored. Pure so the
+/// boot decision is unit-testable; the feature flag (`pwa_enabled`) is applied
+/// by the caller (`app.rs`), keeping the gate and the mode read separable.
+pub fn boot_is_pwa(pwa_mode: bool, bp: &Option<BootProfile>) -> bool {
+    pwa_mode || bp.as_ref().map(BootProfile::validate).unwrap_or(false)
 }
 
 /// Read `window.__ENV__`, stringify it, and parse to a JSON [`Value`].
@@ -293,6 +360,48 @@ mod tests {
         assert!(!session_is_nip07(r#"{"_v":2,"publicKey":"ab"}"#));
         assert!(!session_is_nip07(r#"{"_v":2,"isNip07":"yes"}"#));
         assert!(!session_is_nip07("not json"));
+    }
+
+    #[test]
+    fn pwa_enabled_flag_defaults_off_and_reads_truthy_forms() {
+        // Missing / absent → disabled (fail-closed, per ADR-109 override).
+        assert!(!BbsConfig::from_env_value(&json!({})).pwa_enabled);
+        // The deploy pipeline emits the string "true".
+        assert!(BbsConfig::from_env_value(&json!({ "BBS_PWA_ENABLED": "true" })).pwa_enabled);
+        assert!(BbsConfig::from_env_value(&json!({ "BBS_PWA_ENABLED": "TRUE" })).pwa_enabled);
+        assert!(BbsConfig::from_env_value(&json!({ "BBS_PWA_ENABLED": "1" })).pwa_enabled);
+        // A real JSON boolean also works.
+        assert!(BbsConfig::from_env_value(&json!({ "BBS_PWA_ENABLED": true })).pwa_enabled);
+        // Anything else is off.
+        assert!(!BbsConfig::from_env_value(&json!({ "BBS_PWA_ENABLED": "false" })).pwa_enabled);
+        assert!(!BbsConfig::from_env_value(&json!({ "BBS_PWA_ENABLED": "no" })).pwa_enabled);
+        assert!(!BbsConfig::from_env_value(&json!({ "BBS_PWA_ENABLED": 0 })).pwa_enabled);
+    }
+
+    #[test]
+    fn from_env_value_never_sets_pwa_mode_or_boot_profile() {
+        // The pure parser must not touch location/localStorage — those reads live
+        // only in the wasm `load()`, so unit tests stay deterministic.
+        let cfg = BbsConfig::from_env_value(&json!({ "BBS_PWA_ENABLED": "true" }));
+        assert!(!cfg.pwa_mode);
+        assert!(cfg.boot_profile.is_none());
+    }
+
+    #[test]
+    fn boot_is_pwa_truth_table() {
+        use nostr_bbs_core::BootProfile;
+        let valid = BootProfile::new("minimoonoir".into(), 1_784_000_000);
+        let mut invalid = valid.clone();
+        invalid.zone = "  ".into(); // fails validate()
+                                    // pwa_mode true → always a pwa boot, regardless of the profile.
+        assert!(boot_is_pwa(true, &None));
+        assert!(boot_is_pwa(true, &Some(invalid.clone())));
+        // A valid BootProfile alone → pwa boot (Android/desktop carry-in).
+        assert!(boot_is_pwa(false, &Some(valid)));
+        // Neither → not a pwa boot.
+        assert!(!boot_is_pwa(false, &None));
+        // An invalid BootProfile is not enough on its own.
+        assert!(!boot_is_pwa(false, &Some(invalid)));
     }
 
     #[test]

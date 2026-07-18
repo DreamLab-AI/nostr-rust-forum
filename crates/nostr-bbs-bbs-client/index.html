@@ -11,6 +11,20 @@
     <!-- UA 571-C sentry-gun door-game sound effects (copied verbatim to dist). -->
     <link data-trunk rel="copy-dir" href="assets/sentry-sounds" />
 
+    <!-- Zone-bound PWA install surface (ADR-109). The manifest, icons/ dir, and
+         the network-first service worker are copied verbatim into
+         dist/community/bbs/; the SW is registered from Rust (crate::pwa::register_sw)
+         so scope + guards live in one place. `name`/`short_name` are the neutral
+         kit defaults — the operator overlay brands them at deploy time. -->
+    <link data-trunk rel="copy-file" href="manifest.webmanifest" />
+    <link data-trunk rel="copy-dir" href="assets/icons" />
+    <link data-trunk rel="copy-file" href="bbs-sw.js" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="BBS" />
+    <link rel="apple-touch-icon" href="icons/icon-192.png" />
+
     <!-- Branding is injected by the host site into window.__ENV__ (THEME,
          NODE_NAME, LOCATION, BANNER_URL, RELAY_URL, ZONE_CONFIG). The defaults
          below let the BBS render standalone (e.g. `trunk serve`). -->

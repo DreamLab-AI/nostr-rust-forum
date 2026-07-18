@@ -212,6 +212,102 @@ pub fn SettingsPage() -> impl IntoView {
         });
     };
 
+    // -- Section 4f: Install mobile app (ADR-109) --------------------------
+    // Gated on the ADR-107 single-locked-zone predicate (reused verbatim) AND
+    // the BBS_PWA_ENABLED runtime flag (default OFF). Admins and multi/zero-zone
+    // members never see it. The forum side bakes the key + BootProfile, then
+    // links to the BBS where installation actually happens (ADR-109 Decision 3).
+    let za = crate::stores::zone_access::use_zone_access();
+    let pwa_feature_on = crate::utils::pwa_install::feature_enabled();
+    let pwa_is_ios = crate::utils::pwa_install::platform_is_ios();
+    let pwa_consented = RwSignal::new(false);
+    let pwa_busy = RwSignal::new(false);
+    let pwa_baked = RwSignal::new(false);
+    // Whether a readable forum key exists to bake here (local-key / imported
+    // nsec). Passkey / NIP-07 sessions have none — they rebind in the app.
+    let pwa_can_bake = Memo::new(move |_| auth.get().is_local_key);
+
+    // Reflect the current bake state on mount (only worth checking when gated in).
+    if pwa_feature_on {
+        wasm_bindgen_futures::spawn_local(async move {
+            pwa_baked.set(crate::utils::bake::is_baked().await);
+        });
+    }
+
+    // Install: bake the key (when a readable one exists) then link to the BBS
+    // one-shot boot, where the real install prompt / Add-to-Home-Screen lives.
+    let on_pwa_install = move |_: leptos::ev::MouseEvent| {
+        if pwa_busy.get_untracked() || !pwa_consented.get_untracked() {
+            return;
+        }
+        let zones = crate::stores::zones::load_zones();
+        let Some(zone) = crate::stores::zone_access::home_zone_for(
+            &zones,
+            &za.cohorts.get_untracked(),
+            za.is_admin.get_untracked(),
+        ) else {
+            return;
+        };
+        let zone_id = zone.id;
+        if auth.get().is_local_key {
+            if let Some(secret) = auth.get_privkey_bytes() {
+                pwa_busy.set(true);
+                let zone_id = zone_id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match crate::utils::bake::bake(&secret, &zone_id).await {
+                        Ok(()) => {
+                            pwa_baked.set(true);
+                            proceed_to_install(zone_id.clone());
+                        }
+                        Err(e) => {
+                            web_sys::console::error_1(
+                                &format!("[settings] bake failed: {e}").into(),
+                            );
+                            toasts.show(
+                                "Couldn't save the app key on this device. Please try again.",
+                                ToastVariant::Error,
+                            );
+                            pwa_busy.set(false);
+                        }
+                    }
+                });
+                return;
+            }
+        }
+        // Passkey / NIP-07: no readable key to bake here — the app re-establishes
+        // it on first launch (passkey tap or paste recovery key). Just link across.
+        proceed_to_install(zone_id);
+    };
+
+    // Forget this device (forum-side unbake): delete the baked record + profile.
+    let on_pwa_forget = move |_: leptos::ev::MouseEvent| {
+        let ok = web_sys::window()
+            .and_then(|w| {
+                w.confirm_with_message(
+                    "Forget this device? This removes the saved key from this phone only \
+                     — it does not protect a phone already in someone else's hands. If the \
+                     phone may be lost or stolen, tell an admin to rotate your key.",
+                )
+                .ok()
+            })
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+        wasm_bindgen_futures::spawn_local(async move {
+            match crate::utils::bake::unbake().await {
+                Ok(()) => pwa_baked.set(false),
+                Err(e) => {
+                    web_sys::console::error_1(&format!("[settings] unbake failed: {e}").into());
+                    toasts.show(
+                        "Couldn't remove the saved key. Please try again.",
+                        ToastVariant::Error,
+                    );
+                }
+            }
+        });
+    };
+
     // Confirm dialog for nsec export
     let confirm_nsec_open = RwSignal::new(false);
 
@@ -1252,6 +1348,116 @@ pub fn SettingsPage() -> impl IntoView {
                     </div>
                 </Show>
 
+                // -- Section 4f: Install mobile app (ADR-109, gated) --
+                // Visible only to a non-admin member with exactly one locked
+                // zone (ADR-107 predicate) AND when BBS_PWA_ENABLED is set.
+                <Show when=move || {
+                    pwa_feature_on
+                        && crate::utils::pwa_install::install_option_visible(
+                            &crate::stores::zones::load_zones(),
+                            &za.cohorts.get(),
+                            za.is_admin.get(),
+                        )
+                }>
+                    <div class="glass-card p-6 space-y-4">
+                        <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                            {install_icon()}
+                            "Install mobile app"
+                        </h2>
+                        <div class="border-t border-gray-700/50"></div>
+
+                        <p class="text-sm text-gray-400">
+                            "Add this zone to your phone's home screen and open it like an app — signed in, straight into your zone, with no password."
+                        </p>
+
+                        // Consent warning (verbatim, ADR-109 §11.2 — do not alter).
+                        <div class="bg-gray-800/70 border border-amber-500/30 rounded-lg p-3">
+                            <p class="text-sm text-amber-100/90 leading-relaxed">
+                                "This saves your key on this phone so the app can sign you in without a password. Anyone who unlocks this phone can read your zone and post as you. If your phone is lost or stolen, tell an admin at once to rotate your key. 'Forget this device' removes the saved key from this phone only — it does not protect a phone already in someone else's hands."
+                            </p>
+                        </div>
+
+                        // Passkey / NIP-07: nothing to bake here; the app rebinds.
+                        <Show when=move || !pwa_can_bake.get()>
+                            <p class="text-sm text-gray-400" data-testid="pwa-passkey-note">
+                                "This account signs in with a passkey or browser extension, so there's no saved key to copy across. Install the app, then confirm once on first launch — a passkey tap, or paste your recovery key."
+                            </p>
+                        </Show>
+
+                        // Explicit consent — Install stays disabled until ticked.
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input
+                                type="checkbox"
+                                prop:checked=move || pwa_consented.get()
+                                on:change=move |_| pwa_consented.update(|c| *c = !*c)
+                                class="mt-1 rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
+                                data-testid="pwa-consent"
+                            />
+                            <span class="text-sm text-gray-300">
+                                "I understand and want to install this zone as an app on this device."
+                            </span>
+                        </label>
+
+                        // iOS: manual Add-to-Home-Screen steps + rebind note.
+                        <Show when=move || pwa_is_ios>
+                            <div class="bg-gray-800 rounded-lg p-3 space-y-2" data-testid="pwa-ios-steps">
+                                <p class="text-xs text-amber-300 font-semibold">"On iPhone / iPad"</p>
+                                <ol class="list-decimal list-inside text-sm text-gray-300 space-y-1">
+                                    {crate::utils::pwa_install::ios_instructions()
+                                        .into_iter()
+                                        .map(|s| view! { <li>{s}</li> })
+                                        .collect_view()}
+                                </ol>
+                                <p class="text-xs text-gray-400">
+                                    {crate::utils::pwa_install::ios_rebind_note()}
+                                </p>
+                            </div>
+                        </Show>
+
+                        <div class="flex flex-wrap items-center gap-3 pt-1">
+                            <button
+                                on:click=on_pwa_install
+                                prop:disabled=move || !pwa_consented.get() || pwa_busy.get()
+                                class="text-sm bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors"
+                                data-testid="pwa-install"
+                            >
+                                {move || {
+                                    if pwa_busy.get() {
+                                        "Saving…"
+                                    } else if pwa_is_ios {
+                                        "Continue to the app"
+                                    } else if pwa_can_bake.get() {
+                                        "Install app"
+                                    } else {
+                                        "Open the app to install"
+                                    }
+                                }}
+                            </button>
+
+                            <Show when=move || pwa_baked.get()>
+                                <button
+                                    on:click=on_pwa_forget
+                                    class="text-sm text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded-lg px-3 py-1 transition-colors"
+                                    data-testid="pwa-forget"
+                                >
+                                    "Forget this device"
+                                </button>
+                            </Show>
+                        </div>
+
+                        // Status line.
+                        <p class="text-xs text-gray-500" data-testid="pwa-status">
+                            {move || {
+                                if pwa_baked.get() {
+                                    "Saved on this device."
+                                } else {
+                                    "Not installed on this device."
+                                }
+                            }}
+                        </p>
+                    </div>
+                </Show>
+
                 // -- Section 5: Account --
                 <div class="glass-card p-6 space-y-4">
                     <h2 class="text-lg font-semibold text-white flex items-center gap-2">
@@ -1550,6 +1756,23 @@ async fn provision_pod(auth: crate::auth::AuthStore) -> Result<(), String> {
 
 // -- SVG icon helpers ---------------------------------------------------------
 
+/// After a bake (or for a passkey/NIP-07 session that has nothing to bake),
+/// hand off to the BBS one-shot boot where installation actually happens. On
+/// the forum origin no `beforeinstallprompt` is stashed, so this redirects; the
+/// deferred-prompt branch is defensive for the rare build/scope where it fires.
+fn proceed_to_install(zone_id: String) {
+    use crate::utils::pwa_install;
+    if pwa_install::deferred_prompt_available() {
+        wasm_bindgen_futures::spawn_local(async move {
+            if !pwa_install::trigger_prompt().await {
+                pwa_install::open_installed_app(&zone_id);
+            }
+        });
+    } else {
+        pwa_install::open_installed_app(&zone_id);
+    }
+}
+
 fn section_icon(d: &'static str) -> impl IntoView {
     view! {
         <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1569,6 +1792,10 @@ fn mute_icon() -> impl IntoView {
 fn device_icon() -> impl IntoView {
     // Smartphone outline.
     section_icon("M7 2h10a2 2 0 012 2v16a2 2 0 01-2 2H7a2 2 0 01-2-2V4a2 2 0 012-2zM11 18h2")
+}
+fn install_icon() -> impl IntoView {
+    // Smartphone with a download arrow (install to home screen).
+    section_icon("M7 3h10a2 2 0 012 2v14a2 2 0 01-2 2H7a2 2 0 01-2-2V5a2 2 0 012-2zM12 7v6m0 0l-2.5-2.5M12 13l2.5-2.5M10 18h4")
 }
 fn palette_icon() -> impl IntoView {
     section_icon("M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 011.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z")

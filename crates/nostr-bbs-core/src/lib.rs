@@ -37,6 +37,7 @@ pub mod signer;
 pub mod types;
 
 pub mod admin_shared;
+pub mod boot_profile;
 pub mod cors;
 pub mod d1_helpers;
 pub mod did;
@@ -78,6 +79,12 @@ pub use nip98::{
     TIMESTAMP_TOLERANCE as NIP98_TIMESTAMP_TOLERANCE,
 };
 pub use types::{EventId, Tag, Timestamp};
+
+pub use boot_profile::{
+    is_pwa_boot, parse_boot_profile, resolve_pinned_zone_index, BootProfile, WrappedKeyEnvelope,
+    AES_ALG, AES_IV_LEN, AES_KEY_BITS, BAKED_DB, BAKED_RECORD_ID, BAKED_STORE, BOOTPROFILE_KEY,
+    BOOTPROFILE_MODE, BOOTPROFILE_V, PWA_QUERY_FLAG, PWA_QUERY_VALUE,
+};
 
 pub use calendar::{
     create_calendar_event, create_calendar_event_signer, create_date_calendar_event, create_rsvp,

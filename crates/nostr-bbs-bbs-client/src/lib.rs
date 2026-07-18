@@ -20,6 +20,7 @@ pub mod nip07;
 pub mod notifications;
 pub mod passkey;
 pub mod pod;
+pub mod pwa;
 pub mod relay;
 pub mod screens;
 pub mod search;

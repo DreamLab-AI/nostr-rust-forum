@@ -25,9 +25,26 @@ pub fn App() -> impl IntoView {
     let signer = crate::signer::BbsSigner::new();
     signer.adopt_forum_session();
 
-    // Signed-out newcomers land on the onboarding screen; anyone with an adopted
-    // session (signed in at `/community/`) drops straight into the main menu.
-    let initial_screen = if signer.pubkey().get_untracked().is_some() {
+    // ADR-109 one-shot PWA boot, gated on the `BBS_PWA_ENABLED` flag (default
+    // off). `pwa` is true when this launch carries `?pwa=1` or a valid
+    // BootProfile. `pinned` resolves the bound zone from an EXISTING BootProfile
+    // only (the Android/desktop carry-in) — the iOS sole-locked-zone fallback is
+    // applied later, at rebind time, so no Boards flash precedes the rebind.
+    let pwa_enabled = cfg.pwa_enabled;
+    let pwa = pwa_enabled && crate::config::boot_is_pwa(cfg.pwa_mode, &cfg.boot_profile);
+    let pinned = cfg.boot_profile.as_ref().and_then(|bp| {
+        let ids: Vec<String> = cfg.zones.iter().map(|z| z.id.clone()).collect();
+        nostr_bbs_core::resolve_pinned_zone_index(&bp.zone, &ids)
+    });
+    #[cfg(target_arch = "wasm32")]
+    let cfg_for_boot = cfg.clone();
+
+    // A one-shot boot with a resolved pin lands directly on Boards (skipping
+    // Landing AND MainMenu); otherwise the existing rule applies — MainMenu when
+    // a session was adopted, else the onboarding Landing.
+    let initial_screen = if pwa && pinned.is_some() {
+        Screen::Boards
+    } else if signer.has_key() {
         Screen::MainMenu
     } else {
         Screen::Landing
@@ -49,7 +66,15 @@ pub fn App() -> impl IntoView {
         looking_around: RwSignal::new(false),
         text_large: RwSignal::new(init_text_large),
         reduced_motion: RwSignal::new(init_reduced),
+        pwa_mode: RwSignal::new(pwa),
+        pinned_zone: RwSignal::new(pinned),
     };
+    // Enter the pinned zone on first render when the one-shot boot resolved one.
+    if pwa {
+        if let Some(idx) = pinned {
+            state.enter_pwa(idx);
+        }
+    }
     let store = RelayStore::new();
 
     let cfg_stored = StoredValue::new(cfg);
@@ -95,6 +120,24 @@ pub fn App() -> impl IntoView {
 
     #[cfg(target_arch = "wasm32")]
     crate::chrome::install_key_handler(state, store, cfg_stored);
+
+    // ADR-109: register the network-first BBS service worker + capture the
+    // deferred install prompt (only when the feature flag is on). Then, for a
+    // one-shot boot with no already-adopted session, unwrap the baked key
+    // (Android/desktop shared storage) or route to the iOS rebind screen.
+    #[cfg(target_arch = "wasm32")]
+    {
+        if pwa_enabled {
+            crate::pwa::register_sw();
+            crate::pwa::init_install_capture();
+        }
+        if pwa && !signer.has_key() {
+            let cfg_boot = cfg_for_boot;
+            wasm_bindgen_futures::spawn_local(async move {
+                crate::pwa::adopt_baked_or_rebind(&signer, &cfg_boot, state).await;
+            });
+        }
+    }
 
     view! {
         <div class=move || format!("bbs-crt {}", state.theme.get().css_class())>

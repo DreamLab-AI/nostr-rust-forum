@@ -193,6 +193,38 @@ impl BbsSigner {
         }
     }
 
+    /// Adopt a baked (ADR-109) 32-byte secret as the active in-memory signer.
+    ///
+    /// The durable copy is the AES-GCM-wrapped record in IndexedDB (written by the
+    /// forum bake, or by the BBS local re-bake after an iOS rebind); this installs
+    /// a live [`PrfSigner`] from the unwrapped secret through the SAME
+    /// `install()`/`install_signer()` seam as every other path — so the relay is
+    /// registered and NIP-42 AUTH is answered identically. The BBS never
+    /// re-persists the secret here (the durable copy stays in IndexedDB). The
+    /// caller-owned buffer is left to the caller to zeroize (it holds it in a
+    /// [`zeroize::Zeroizing`]); the local copy taken here is scrubbed. Returns
+    /// `false` when the bytes are not a valid secp256k1 scalar (fail closed).
+    pub fn adopt_baked_key(&self, secret: &[u8; 32]) -> bool {
+        let mut arr = *secret;
+        let parsed = nostr_bbs_core::SecretKey::from_bytes(arr);
+        arr.zeroize();
+        match parsed {
+            Ok(sk) => {
+                let public = sk.public_key();
+                self.install(Keypair { secret: sk, public });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Whether a signer is installed (a pubkey is present). The `app.rs` boot gate
+    /// uses this to decide whether the PWA one-shot boot still needs to unwrap the
+    /// baked key or route to rebind — an already-adopted forum session skips both.
+    pub fn has_key(&self) -> bool {
+        self.pubkey.get_untracked().is_some()
+    }
+
     /// Sign out: drop the in-memory signer and de-register it from the relay.
     pub fn logout(&self) {
         self.signer.set_value(None);

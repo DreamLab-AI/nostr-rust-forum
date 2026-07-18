@@ -1,8 +1,10 @@
 //! Shared utility functions used across forum-client components.
 
+pub mod bake;
 pub mod devices;
 pub mod image_compress;
 pub mod pod_client;
+pub mod pwa_install;
 pub mod relay_url;
 pub mod sanitize;
 pub mod search_client;

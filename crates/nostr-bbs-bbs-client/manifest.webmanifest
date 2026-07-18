@@ -1,0 +1,17 @@
+{
+  "id": "/community/bbs/",
+  "scope": "/community/bbs/",
+  "start_url": "/community/bbs/?pwa=1",
+  "name": "BBS",
+  "short_name": "BBS",
+  "description": "Zone-bound retro terminal for this community.",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0a0a0a",
+  "background_color": "#0a0a0a",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

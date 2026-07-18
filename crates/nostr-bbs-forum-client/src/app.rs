@@ -277,6 +277,12 @@ fn redirect_spinner() -> impl IntoView {
 
 #[component]
 pub fn App() -> impl IntoView {
+    // Defensive, no-op-safe capture of any `beforeinstallprompt` that fires on
+    // the forum origin (the real prompt lives on the BBS page, ADR-109). Called
+    // once, as early as possible per MDN (the event can originate from an
+    // earlier load). Harmless when it never fires here.
+    crate::utils::pwa_install::init_capture();
+
     provide_auth();
     provide_zone_access();
     provide_render_tier();

@@ -43,10 +43,23 @@ pub struct BbsState {
     /// Accessibility preference: suppress the CRT flicker / cursor blink /
     /// phosphor-ghost motion (persisted; defaults to the OS `prefers-reduced-motion`).
     pub reduced_motion: RwSignal<bool>,
+    /// ADR-109 one-shot PWA mode: the installed home-screen app booted pinned to
+    /// one zone. When set, the Zones-as-cards shelf and the "← Zones" back-crumb
+    /// are suppressed and Boards always resolves to [`Self::pinned_zone`] — the
+    /// other zones are navigation-unreachable (the relay stays the real boundary).
+    pub pwa_mode: RwSignal<bool>,
+    /// The resolved `cfg.zones` index the PWA boot is locked to (the BootProfile's
+    /// bound zone), or `None` outside pwa mode / when the bound zone was
+    /// renamed/removed since the bake.
+    pub pinned_zone: RwSignal<Option<usize>>,
 }
 
 impl BbsState {
     /// Navigate to a screen, resetting the selection and the Boards drill-down.
+    ///
+    /// In pwa mode the zone pin is honoured: navigating to Boards re-opens the
+    /// pinned zone's board list (not the Zones cards), so "the app is that zone"
+    /// holds no matter how Boards is reached (bottom-nav tap, `/board`, digit key).
     pub fn go(&self, screen: Screen) {
         self.screen.set(screen);
         self.selection.set(0);
@@ -55,6 +68,25 @@ impl BbsState {
         self.thread.set(None);
         self.cmd_open.set(false);
         self.cmd_text.set(String::new());
+        if screen == Screen::Boards && self.pwa_mode.get_untracked() {
+            if let Some(idx) = self.pinned_zone.get_untracked() {
+                self.zone.set(Some(idx));
+            }
+        }
+    }
+
+    /// Enter the ADR-109 one-shot PWA boot pinned to `zone_index`: land directly
+    /// on that zone's Boards, skipping Landing/MainMenu and the Zones shelf. Called
+    /// once on first render (from `app.rs`) when the baked key + BootProfile
+    /// resolve a bound zone.
+    pub fn enter_pwa(&self, zone_index: usize) {
+        self.pwa_mode.set(true);
+        self.pinned_zone.set(Some(zone_index));
+        self.screen.set(Screen::Boards);
+        self.zone.set(Some(zone_index));
+        self.board.set(None);
+        self.thread.set(None);
+        self.selection.set(0);
     }
 
     /// Apply a parsed command-line [`Command`].
@@ -89,12 +121,19 @@ impl BbsState {
         self.selection.set(0);
     }
 
-    /// Close the open zone, returning to the top-level Zones cards.
+    /// Close the open zone, returning to the top-level Zones cards — except in
+    /// pwa mode, where there is no Zones shelf to return to: the pin re-opens the
+    /// bound zone's board list instead, so "back" from a board stays inside the
+    /// app's one zone rather than exposing a zone shelf that isn't the app.
     pub fn close_zone(&self) {
-        self.zone.set(None);
         self.board.set(None);
         self.thread.set(None);
         self.selection.set(0);
+        if self.pwa_mode.get_untracked() {
+            self.zone.set(self.pinned_zone.get_untracked());
+        } else {
+            self.zone.set(None);
+        }
     }
 
     /// Open a board (kind-40 channel id) within the selected zone. Resets the

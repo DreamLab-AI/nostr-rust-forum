@@ -2119,6 +2119,7 @@ dependencies = [
  "async-trait",
  "base64",
  "console_error_panic_hook",
+ "gloo",
  "hex",
  "js-sys",
  "leptos",

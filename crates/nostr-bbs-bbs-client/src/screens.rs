@@ -104,6 +104,7 @@ pub fn ScreenView(state: BbsState) -> impl IntoView {
     let store = use_context::<RelayStore>().expect("relay");
     move || match state.screen.get() {
         Screen::Landing => landing(state, cfg).into_any(),
+        Screen::Rebind => rebind(state, cfg).into_any(),
         Screen::MainMenu => view! { <MainMenu state=state /> }.into_any(),
         Screen::Agents => agents(store).into_any(),
         Screen::Boards => boards(state, store, cfg).into_any(),
@@ -228,7 +229,21 @@ fn boards(state: BbsState, store: RelayStore, cfg: StoredValue<BbsConfig>) -> im
             },
             None => match state.zone.get() {
                 Some(z) => board_list_for_zone(state, store, cfg, z).into_any(),
-                None => zones_screen(state, store, cfg).into_any(),
+                // In pwa mode there is no Zones shelf — a None zone re-pins to the
+                // bound zone and other zones are navigation-unreachable (the relay
+                // stays the real boundary). Fall through to zones_screen only if
+                // the pin is unresolved (a renamed/removed bound zone), never
+                // widening access.
+                None => {
+                    if state.pwa_mode.get() {
+                        match state.pinned_zone.get() {
+                            Some(z) => board_list_for_zone(state, store, cfg, z).into_any(),
+                            None => zones_screen(state, store, cfg).into_any(),
+                        }
+                    } else {
+                        zones_screen(state, store, cfg).into_any()
+                    }
+                }
             },
         }}
     }
@@ -331,16 +346,22 @@ fn board_list_for_zone(
     } else {
         zones.get(zone_sel).map(zone_hero)
     };
+    // In pwa mode the app IS this zone — there is nowhere to go "back" to, so the
+    // "← Zones" crumb is suppressed (pwa mode is constant for the session, so an
+    // untracked read is correct here).
+    let pinned_app = state.pwa_mode.get_untracked();
     view! {
         <div class="bbs-panel bbs-crumb">
-            <span class="bbs-link accent" role="button" tabindex="0"
-                aria-label="Back to zones"
-                on:click=move |_| state.close_zone()
-                on:keydown=on_activate(move || state.close_zone())
-            >
-                "\u{2190} Zones"
-            </span>
-            <span class="bbs-dim">"  \u{203A}  "</span>
+            {(!pinned_app).then(|| view! {
+                <span class="bbs-link accent" role="button" tabindex="0"
+                    aria-label="Back to zones"
+                    on:click=move |_| state.close_zone()
+                    on:keydown=on_activate(move || state.close_zone())
+                >
+                    "\u{2190} Zones"
+                </span>
+                <span class="bbs-dim">"  \u{203A}  "</span>
+            })}
             <span class="accent">{zone_name}</span>
         </div>
         {hero}
@@ -1646,7 +1667,91 @@ fn settings(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
         </div>
         {a11y_panel(state)}
         {signer.map(sign_in_panel)}
+        {install_banner()}
+        {forget_device_panel(state, cfg)}
     }
+}
+
+/// ADR-109 install affordance. The BBS page carries the manifest + service
+/// worker, so it is the surface that captures `beforeinstallprompt` — this button
+/// appears **only after** that deferred event lands (`installable` flips, which
+/// needs a prior user gesture), never on first paint, and firing it consumes the
+/// prompt. wasm-only; the native build renders nothing.
+#[cfg(target_arch = "wasm32")]
+fn install_banner() -> impl IntoView {
+    let installable = crate::pwa::installable();
+    view! {
+        {move || installable.get().then(|| view! {
+            <div class="bbs-panel">
+                "  ── install ───────────────────────────────────────\n"
+                "  Add this BBS to your home screen for a one-tap, zone-bound app.\n"
+                <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
+                    aria-label="Install this app to your home screen"
+                    on:click=move |_| { wasm_bindgen_futures::spawn_local(async { crate::pwa::prompt_install().await; }); }
+                    on:keydown=on_activate(move || { wasm_bindgen_futures::spawn_local(async { crate::pwa::prompt_install().await; }); })
+                >"[ \u{25B8} Install to home screen ]"</span>
+            </div>
+        })}
+    }
+}
+
+/// Native no-op — the install prompt is browser-only.
+#[cfg(not(target_arch = "wasm32"))]
+fn install_banner() -> impl IntoView {}
+
+/// ADR-109 "Forget this device" (BBS-owned, Decision 6). Shown when this device
+/// carries a bake (a BootProfile is present, or the app booted in pwa mode); it
+/// deletes the wrapped key + BootProfile from this origin's storage and signs the
+/// in-memory signer out. Local + after-the-fact — the copy states plainly that it
+/// cannot protect a phone already in someone else's hands.
+fn forget_device_panel(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
+    let signer = use_context::<BbsSigner>();
+    // Synchronous "is this device baked?" proxy: a stored BootProfile, or a live
+    // pwa-mode boot. The authoritative record is the IndexedDB key, cleared below.
+    let baked = cfg.with_value(|c| c.boot_profile.is_some()) || state.pwa_mode.get_untracked();
+    baked.then(|| {
+        view! {
+            <div class="bbs-panel">
+                "  ── this device ───────────────────────────────────\n"
+                <span class="bbs-dim">"  A signing key is saved on this phone so the app opens without a password.\n  'Forget this device' removes the saved key from this phone only \u{2014} it does\n  not protect a phone already in someone else\u{2019}s hands. If it is lost or stolen,\n  tell an admin at once to rotate your key.\n"</span>
+                {signer.map(|s| view! {
+                    <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
+                        aria-label="Forget this device"
+                        on:click=move |_| start_forget_device(s, state)
+                        on:keydown=on_activate(move || start_forget_device(s, state))
+                    >"[ \u{2717} Forget this device ]"</span>
+                })}
+            </div>
+        }
+    })
+}
+
+/// Confirm, then delete the baked key + BootProfile from this origin and sign
+/// out, dropping back out of pwa mode to the main menu. wasm-only.
+fn start_forget_device(signer: BbsSigner, state: BbsState) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ok = web_sys::window()
+            .and_then(|w| {
+                w.confirm_with_message(
+                    "Forget this device? This removes the saved key from this phone only.",
+                )
+                .ok()
+            })
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+        wasm_bindgen_futures::spawn_local(async move {
+            crate::pwa::forget_device().await;
+            signer.logout();
+            state.pwa_mode.set(false);
+            state.pinned_zone.set(None);
+            state.go(Screen::MainMenu);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (signer, state);
 }
 
 /// Accessibility / density preferences (F13): text size + reduced motion. Both
@@ -1919,5 +2024,203 @@ fn help() -> impl IntoView {
                 "[ \u{25B6} UA 571-C SENTRY ]"
             </span>
         </div>
+    }
+}
+
+/// ADR-109 iOS first-launch **rebind** — reached only during a PWA boot when no
+/// baked key exists in this (isolated) installed-app bucket. It re-establishes
+/// the SAME identity once (passkey PRF, or a one-time recovery-key paste), then
+/// the caller re-bakes locally so subsequent launches are one-shot. Passkey vs
+/// paste is chosen by [`crate::pwa::rebind_path`]: passkeys live in the OS
+/// keychain (not per-origin storage), so a passkey path needs a known pubkey to
+/// authenticate against; without one we fall back to paste.
+fn rebind(state: BbsState, cfg: StoredValue<BbsConfig>) -> impl IntoView {
+    let signer = use_context::<BbsSigner>().expect("signer");
+    let saved_pubkey = cfg.with_value(|c| c.viewer_pubkey.clone());
+    // "Has passkey" = passkey support AND a pubkey to authenticate against
+    // (`passkey_authenticate` needs it — there is no discovery oracle).
+    let has_passkey = crate::passkey::is_passkey_supported() && saved_pubkey.is_some();
+    let key_input = RwSignal::new(String::new());
+    let pending = RwSignal::new(false);
+    let body = match crate::pwa::rebind_path(has_passkey) {
+        crate::pwa::RebindPath::Passkey => {
+            rebind_passkey_view(signer, cfg, state, saved_pubkey, pending).into_any()
+        }
+        crate::pwa::RebindPath::PasteRecoveryKey => {
+            rebind_paste_view(signer, cfg, state, key_input).into_any()
+        }
+    };
+    view! {
+        {header(Screen::Rebind)}
+        <div class="bbs-panel bbs-dim">
+            "  This device needs to re-link once. Your identity is re-created here on this\n  device \u{2014} nothing is transferred. After this, the app opens straight into your\n  zone."
+        </div>
+        {body}
+        {move || signer.error().get().map(|e| view! { <div class="bbs-dim">"  \u{2717} " {e}</div> })}
+    }
+}
+
+/// Passkey rebind: a single "Unlock with passkey" tap re-derives the identical
+/// key via WebAuthn PRF (iOS 17.4+ needs no gesture, but a tap is fine).
+fn rebind_passkey_view(
+    signer: BbsSigner,
+    cfg: StoredValue<BbsConfig>,
+    state: BbsState,
+    saved_pubkey: Option<String>,
+    pending: RwSignal<bool>,
+) -> impl IntoView {
+    view! {
+        <div class="bbs-signin">
+            <span class="bbs-dim">"  Unlock with your passkey \u{2014} Face ID / Touch ID / fingerprint. This\n  re-creates the same identity on this device; nothing is transferred."</span>
+            <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
+                class:bbs-pending=move || pending.get()
+                on:click={
+                    let sp = saved_pubkey.clone();
+                    move |_| start_rebind_passkey(signer, cfg, state, sp.clone(), pending)
+                }
+                on:keydown={
+                    let sp = saved_pubkey.clone();
+                    on_activate(move || start_rebind_passkey(signer, cfg, state, sp.clone(), pending))
+                }
+            >{move || if pending.get() {
+                "[ \u{2026} waiting for your passkey ]"
+            } else {
+                "[ \u{25B8} Unlock with passkey ]"
+            }}</span>
+        </div>
+    }
+}
+
+/// Paste rebind: paste the nsec / hex recovery key once; the caller installs it
+/// and re-bakes it into this app's isolated storage so later launches are
+/// one-shot.
+fn rebind_paste_view(
+    signer: BbsSigner,
+    cfg: StoredValue<BbsConfig>,
+    state: BbsState,
+    key_input: RwSignal<String>,
+) -> impl IntoView {
+    let submit = move || start_rebind_paste(signer, cfg, state, key_input);
+    view! {
+        <div class="bbs-signin">
+            <label class="bbs-dim" for="bbs-rebind-key">"  Paste your nsec / 64-char hex key once to re-link this device:"</label>
+            <input
+                id="bbs-rebind-key"
+                name="bbs-rebind-key"
+                class="bbs-key"
+                autocomplete="off"
+                autocapitalize="none"
+                spellcheck="false"
+                placeholder="nsec1… or 64-char hex"
+                prop:value=move || key_input.get()
+                on:input=move |ev| key_input.set(event_target_value(&ev))
+                on:keydown=move |ev| { if ev.key() == "Enter" { ev.prevent_default(); submit(); } }
+            />
+            <span class="bbs-link accent bbs-cta" role="button" tabindex="0"
+                on:click=move |_| submit()
+                on:keydown=on_activate(submit)
+            >"[ \u{25B8} Re-link this device ]"</span>
+        </div>
+    }
+}
+
+/// Run the passkey rebind ceremony, then re-bake + pin. wasm-only. `pubkey` is
+/// the identity to re-authenticate (the Passkey path is only chosen when it is
+/// `Some`; an empty pubkey makes `passkey_authenticate` fail closed).
+fn start_rebind_passkey(
+    signer: BbsSigner,
+    cfg: StoredValue<BbsConfig>,
+    state: BbsState,
+    pubkey: Option<String>,
+    pending: RwSignal<bool>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if pending.get_untracked() {
+            return;
+        }
+        pending.set(true);
+        let pubkey = pubkey.unwrap_or_default();
+        let (boot_profile, zones) = cfg.with_value(|c| (c.boot_profile.clone(), c.zones.clone()));
+        wasm_bindgen_futures::spawn_local(async move {
+            match crate::passkey::passkey_authenticate(&pubkey).await {
+                Ok(outcome) => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(outcome.keypair.secret.as_bytes());
+                    let sk = zeroize::Zeroizing::new(arr);
+                    {
+                        use zeroize::Zeroize;
+                        arr.zeroize();
+                    }
+                    signer.login_with_passkey(outcome.keypair);
+                    complete_rebind(state, &boot_profile, &zones, &sk).await;
+                }
+                Err(e) => signer.error().set(Some(e.to_string())),
+            }
+            pending.set(false);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (signer, cfg, state, pubkey, pending);
+}
+
+/// Parse the pasted recovery key, install it, then re-bake + pin. wasm-only.
+fn start_rebind_paste(
+    signer: BbsSigner,
+    cfg: StoredValue<BbsConfig>,
+    state: BbsState,
+    key_input: RwSignal<String>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let input = key_input.get_untracked();
+        match crate::signer::parse_secret_key(&input) {
+            Ok(keypair) => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(keypair.secret.as_bytes());
+                let sk = zeroize::Zeroizing::new(arr);
+                {
+                    use zeroize::Zeroize;
+                    arr.zeroize();
+                }
+                // Install the identity in memory (the passkey/local path — the
+                // BBS never persists a plaintext key; the durable copy is the
+                // re-bake below).
+                signer.login_with_passkey(keypair);
+                key_input.set(String::new());
+                let (boot_profile, zones) =
+                    cfg.with_value(|c| (c.boot_profile.clone(), c.zones.clone()));
+                wasm_bindgen_futures::spawn_local(async move {
+                    complete_rebind(state, &boot_profile, &zones, &sk).await;
+                });
+            }
+            Err(e) => signer.error().set(Some(e)),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (signer, cfg, state, key_input);
+}
+
+/// After a successful rebind sign-in: resolve the bound zone (exact from a
+/// BootProfile, else the sole locked zone), re-bake the secret into THIS app's
+/// isolated storage so subsequent launches are one-shot, and enter the pinned
+/// zone. When the zone is ambiguous the sign-in still stands, but there is no
+/// one-shot pin — land on the main menu. wasm-only.
+#[cfg(target_arch = "wasm32")]
+async fn complete_rebind(
+    state: BbsState,
+    boot_profile: &Option<nostr_bbs_core::BootProfile>,
+    zones: &[nostr_bbs_config::schema::Zone],
+    secret: &[u8; 32],
+) {
+    match crate::pwa::resolve_boot_zone_index(boot_profile, zones) {
+        Some(idx) => {
+            let zone_id = zones[idx].id.clone();
+            if let Err(e) = crate::pwa::bake_local(secret, &zone_id).await {
+                web_sys::console::warn_1(&format!("[bbs-pwa] local re-bake failed: {e:?}").into());
+            }
+            state.enter_pwa(idx);
+        }
+        None => state.go(Screen::MainMenu),
     }
 }

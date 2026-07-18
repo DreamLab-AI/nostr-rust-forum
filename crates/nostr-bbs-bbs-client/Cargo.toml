@@ -64,6 +64,27 @@ web-sys = { workspace = true, features = [
     "Storage",
     "MediaQueryList",
     "DomTokenList",
+    # Zone-bound one-shot PWA (ADR-109): baked-key unwrap (WebCrypto AES-GCM over
+    # a non-extractable CryptoKey in IndexedDB), the `?pwa=1` boot read, and the
+    # scoped service-worker registration for installability.
+    "Crypto",
+    "SubtleCrypto",
+    "CryptoKey",
+    "AesKeyGenParams",
+    "AesGcmParams",
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbObjectStore",
+    "IdbObjectStoreParameters",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbVersionChangeEvent",
+    "UrlSearchParams",
+    "Url",
+    "ServiceWorkerContainer",
+    "ServiceWorkerRegistration",
     # Composer image upload (F10): file pick + canvas compression.
     "File",
     "FileList",
@@ -96,6 +117,10 @@ console_error_panic_hook = "0.1"
 # the forum client's AuthStore).
 hex = { workspace = true }
 zeroize = { workspace = true }
+# Zone-bound PWA (ADR-109): `gloo::storage::LocalStorage` reads/writes the
+# non-secret BootProfile record (`nostr_bbs_bootprofile`) that drives the
+# one-shot boot, matching the forum client's bake-side storage layer.
+gloo = { workspace = true }
 # Composer image upload (F10): base64-encode the signed NIP-98 event and
 # SHA-256 the payload for the `payload` tag — the same primitives the forum
 # client's pod_client uses, built here on the shared `Signer` trait.

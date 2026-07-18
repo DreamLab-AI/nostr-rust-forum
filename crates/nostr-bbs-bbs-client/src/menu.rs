@@ -19,6 +19,13 @@ pub enum Screen {
     /// Encrypted 1:1 direct messages (NIP-44 sealed, NIP-59 gift-wrapped). Reached
     /// from the bottom-nav "DMs" tab / `/dm`; not a numbered main-menu item.
     Dm,
+    /// Transient iOS first-launch **rebind** (ADR-109). Reached only during a
+    /// PWA one-shot boot when no baked key exists in the installed app's
+    /// (isolated) storage: the member re-establishes the SAME identity once — a
+    /// passkey PRF tap or a one-time paste of their recovery key — after which the
+    /// key is re-baked locally and subsequent launches are one-shot. Not a
+    /// numbered menu item and unreachable from the command line.
+    Rebind,
     /// The numbered main menu (home screen once past onboarding).
     #[default]
     MainMenu,
@@ -92,6 +99,7 @@ impl Screen {
         match self {
             Screen::Landing => "Welcome",
             Screen::Dm => "Direct Messages",
+            Screen::Rebind => "Re-link this device",
             Screen::MainMenu => "Main Menu",
             Screen::Agents => "Agents",
             Screen::Boards => "Boards",
@@ -111,6 +119,7 @@ impl Screen {
         match self {
             Screen::Landing => "What this is, and how to get in",
             Screen::Dm => "Encrypted 1:1 — NIP-44 sealed, NIP-59 gift-wrapped",
+            Screen::Rebind => "One-time re-link on this device — same identity, no transfer",
             Screen::MainMenu => "Select a board by number, or type / for a command",
             Screen::Agents => "Agent control panels — approve, reject, act (human-in-the-loop)",
             Screen::Boards => "Zones & boards — kind-40/42 channels, zone-gated",
@@ -130,6 +139,9 @@ impl Screen {
         match self {
             Screen::Landing => &["welcome", "start", "landing"],
             Screen::Dm => &["dm", "dms", "inbox"],
+            // Reached only programmatically during a PWA boot — deliberately not
+            // wired into `parse_command`'s alias sweep, so it cannot be typed.
+            Screen::Rebind => &[],
             Screen::MainMenu => &["menu", "main", "home"],
             Screen::Agents => &["agents", "gov", "door", "doors", "admin", "d", "agent"],
             Screen::Boards => &["msg", "messages", "boards", "m", "board"],
