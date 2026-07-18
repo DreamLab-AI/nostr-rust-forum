@@ -298,6 +298,11 @@ pub fn App() -> impl IntoView {
     provide_read_positions();
     provide_mute_store();
     provide_preferences();
+
+    // Admin alert producer: bell notifications for new members awaiting zone
+    // access (no-op for non-admins). Mounted after the auth / zone-access /
+    // notification providers it captures.
+    crate::stores::admin_alerts::start_admin_alerts();
     provide_announcer();
     crate::stores::badges::provide_badges();
     provide_panel_registry();

@@ -9,6 +9,16 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ### Added
 
+- **Admin new-joiner alerts.** A notification producer polls the whitelist
+  (NIP-98, admin-gated) while an admin is signed in and raises a JoinRequest
+  bell notification for each member holding no zone-gating cohort — i.e.
+  joiners awaiting a zone grant when no `auto_approve` zone is configured.
+  Alerts link to the admin panel, dedupe via a persisted seen-set, exclude
+  agents/admins, and collapse bursts (>5 unseen) into one summary. Pairs
+  with removing `auto_approve` from operator config: new joiners then get
+  the public zone only, see other zones as locked tiles, and admins are
+  alerted to grant access.
+
 - **Post deletion — own posts for everyone, any post for admins** (operator
   issue #44 follow-up). NIP-09 kind-5 deletion end-to-end: the relay's
   `process_deletion` now honours the privilege its EVENT gate already

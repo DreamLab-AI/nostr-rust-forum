@@ -170,11 +170,9 @@ impl AdminStore {
         self.state.is_loading.set(true);
         self.state.error.set(None);
 
-        let url = format!("{}/api/whitelist/list", Self::api_base());
-        match fetch_with_nip98_get_signer(&url, signer).await {
-            Ok(body) => {
-                let parsed: WhitelistResponse = serde_json::from_str(&body)
-                    .map_err(|e| format!("Failed to parse whitelist: {e}"))?;
+        match fetch_whitelist_rows(signer).await {
+            Ok(rows) => {
+                let parsed = WhitelistResponse { users: rows };
                 if parsed.users.is_empty() {
                     self.state.error.set(Some(
                         "Whitelist is empty. No users have been approved yet.".to_string(),
@@ -844,6 +842,27 @@ pub fn use_admin() -> AdminStore {
 #[derive(Deserialize)]
 struct WhitelistResponse {
     users: Vec<WhitelistUser>,
+}
+
+/// Fetch the raw whitelist rows (NIP-98 signed GET, admin-gated server-side).
+///
+/// Standalone so non-panel consumers — the admin new-joiner alert producer in
+/// [`crate::stores::admin_alerts`] — can read the whitelist without an
+/// [`AdminStore`] (whose fetch also drives panel signals and real-name
+/// enrichment).
+pub(crate) async fn fetch_whitelist_rows(
+    signer: &dyn Signer,
+) -> Result<Vec<WhitelistUser>, String> {
+    let url = format!(
+        "{}/api/whitelist/list",
+        crate::utils::relay_url::relay_api_base()
+    );
+    let body = fetch_with_nip98_get_signer(&url, signer)
+        .await
+        .map_err(|e| format!("Failed to fetch whitelist: {e}"))?;
+    let parsed: WhitelistResponse =
+        serde_json::from_str(&body).map_err(|e| format!("Failed to parse whitelist: {e}"))?;
+    Ok(parsed.users)
 }
 
 /// Infer a legacy section ID from a channel name for channels that lack a
