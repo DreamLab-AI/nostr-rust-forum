@@ -64,6 +64,29 @@ struct ReplyView {
     created_at: u64,
     /// `true` when an edit replaced the original content.
     edited: bool,
+    /// When this reply quote-targets a specific sibling (not the topic root),
+    /// the quoted parent's author + snippet for an inline quote block. `None`
+    /// for a plain top-level reply to the topic.
+    quote: Option<QuotedRef>,
+}
+
+/// A quoted parent shown inline above a quote-reply.
+#[derive(Clone, Debug)]
+struct QuotedRef {
+    pubkey: String,
+    snippet: String,
+}
+
+/// The post a new reply is quoting — set when the reader taps "Reply" on a post,
+/// consumed by the single bottom composer, and cleared after send/dismiss. A
+/// reply always appends to the bottom of the topic; the target only decides which
+/// message it quotes and whose author is notified.
+#[derive(Clone)]
+struct ReplyTarget {
+    id: String,
+    pubkey: String,
+    author: String,
+    snippet: String,
 }
 
 /// Marker placed on a kind-42 that REPLACES (edits) an earlier post by the same
@@ -166,6 +189,17 @@ fn root_e_tag(event: &NostrEvent) -> Option<String> {
         .iter()
         .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
         .or_else(|| event.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
+        .map(|t| t[1].clone())
+}
+
+/// The `["e", <id>, "", "reply"]` parent this event replies to, if any —
+/// distinct from the channel/topic root. Used to render an inline quote of the
+/// exact message a quote-reply targets.
+fn reply_e_tag(event: &NostrEvent) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "reply")
         .map(|t| t[1].clone())
 }
 
@@ -360,12 +394,31 @@ pub fn ThreadPage() -> impl IntoView {
                 .into_iter()
                 .map(|e| {
                     let (content, created_at, edited) = latest_version(e, events);
+                    // Quote target: a "reply" e-tag pointing at a SIBLING reply
+                    // (not the topic root). Resolve the quoted author + snippet so
+                    // the card can show what it is answering, inline, no nesting.
+                    let quote = reply_e_tag(e)
+                        .map(|id| id.to_lowercase())
+                        .filter(|id| *id != root_id_lower)
+                        .and_then(|target_id| {
+                            events
+                                .iter()
+                                .find(|ev| ev.id.to_lowercase() == target_id)
+                                .map(|tgt| {
+                                    let (tgt_content, _, _) = latest_version(tgt, events);
+                                    QuotedRef {
+                                        pubkey: tgt.pubkey.clone(),
+                                        snippet: first_line(&tgt_content),
+                                    }
+                                })
+                        });
                     ReplyView {
                         id: e.id.clone(),
                         pubkey: e.pubkey.clone(),
                         content,
                         created_at,
                         edited,
+                        quote,
                     }
                 })
                 .collect()
@@ -385,6 +438,7 @@ pub fn ThreadPage() -> impl IntoView {
             content,
             created_at,
             edited,
+            quote: None,
         })
     });
 
@@ -425,6 +479,12 @@ pub fn ThreadPage() -> impl IntoView {
     let is_authed = auth.is_authenticated();
     let restore_failed = RwSignal::<Option<String>>::new(None);
 
+    // Quote-and-append: the post the next reply quotes (None = a plain reply to
+    // the topic). Set by the "Reply" affordance on any post, shown as a chip
+    // above the composer, cleared on send/dismiss. Replies always append to the
+    // bottom — the target only decides which message is quoted and notified.
+    let reply_target = RwSignal::<Option<ReplyTarget>>::new(None);
+
     // Reply composer → kind-42 e-tagging the topic root (NIP-10 root+reply).
     let relay_for_send = relay;
     let relay_for_edit = relay_for_send.clone();
@@ -447,18 +507,30 @@ pub fn ThreadPage() -> impl IntoView {
 
             let original = content.clone();
             let now = (js_sys::Date::now() / 1000.0) as u64;
-            // NIP-10: channel as root anchor, the topic root as the reply parent,
-            // notify the root author, then per-mention p tags.
+            // Quote-and-append: the reply appends at the bottom of the topic. If
+            // the reader tapped "Reply" on a specific post, the NIP-10 reply
+            // marker points at THAT post (quoted inline in the card) and its
+            // author is notified; otherwise the reply parent is the topic root.
+            let target = reply_target.get_untracked();
+            let (parent_id, parent_pk) = match &target {
+                Some(t) => (t.id.clone(), t.pubkey.clone()),
+                None => (root.id.clone(), root.pubkey.clone()),
+            };
+            // NIP-10: channel as root anchor, the target as the reply parent,
+            // notify the topic-root author, plus the quoted author, then mentions.
             let mut tags = vec![
                 vec!["e".to_string(), cid, String::new(), "root".to_string()],
                 vec![
                     "e".to_string(),
-                    root.id.clone(),
+                    parent_id,
                     String::new(),
                     "reply".to_string(),
                 ],
                 vec!["p".to_string(), root.pubkey.clone()],
             ];
+            if parent_pk != root.pubkey && !parent_pk.is_empty() {
+                tags.push(vec!["p".to_string(), parent_pk]);
+            }
             for pk in mention_pubkeys {
                 if let Some(hex) = normalise_mention_pubkey(&pk) {
                     if !tags.iter().any(|t| t[0] == "p" && t[1] == hex) {
@@ -484,6 +556,9 @@ pub fn ThreadPage() -> impl IntoView {
                 tags,
                 content,
             };
+            // Consumed — the next reply defaults back to the topic unless the
+            // reader taps "Reply" on another post.
+            reply_target.set(None);
 
             let relay = relay.clone();
             spawn_local(async move {
@@ -516,6 +591,19 @@ pub fn ThreadPage() -> impl IntoView {
     };
     let send_callback = Callback::new(do_send_reply);
     let noop_send = Callback::new(|_: String| {});
+
+    // Tap "Reply" on any post → quote it, then bring the single bottom composer
+    // into view. The reply still appends to the bottom of the topic
+    // (quote-and-append), never nests.
+    let on_reply = Callback::new(move |t: ReplyTarget| {
+        reply_target.set(Some(t));
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("thread-reply-composer"))
+        {
+            el.scroll_into_view();
+        }
+    });
 
     // -- Edit flow --------------------------------------------------------
     //
@@ -690,6 +778,8 @@ pub fn ThreadPage() -> impl IntoView {
                             my_pubkey=my_pubkey
                             editing_id=editing_id
                             on_save_edit=publish_edit
+                            on_reply=on_reply
+                            can_reply=is_authed.into()
                         />
                     }.into_any()
                 } else {
@@ -720,6 +810,8 @@ pub fn ThreadPage() -> impl IntoView {
                                     my_pubkey=my_pubkey
                                     editing_id=editing_id
                                     on_save_edit=publish_edit
+                                    on_reply=on_reply
+                                    can_reply=is_authed.into()
                                 />
                             }
                         }).collect_view()}
@@ -727,9 +819,22 @@ pub fn ThreadPage() -> impl IntoView {
                 </div>
             </Show>
 
-            // Reply composer
+            // Reply composer (always appends at the bottom; shows a quote chip
+            // when the reader tapped "Reply" on a specific post).
             <Show when=move || is_authed.get() && topic_root.get().is_some() && !loading.get()>
-                <div class="mt-6 bg-gray-800 border border-gray-700 rounded-lg p-3">
+                <div id="thread-reply-composer" class="mt-6 bg-gray-800 border border-gray-700 rounded-lg p-3">
+                    {move || reply_target.get().map(|t| view! {
+                        <div class="flex items-center gap-2 mb-2 px-2 py-1.5 rounded bg-gray-900/60 border-l-2 border-[color:var(--zone-accent)] text-xs">
+                            <span class="text-gray-400 shrink-0">"Replying to"</span>
+                            <span class="text-[color:var(--zone-accent)] font-medium shrink-0">{t.author.clone()}</span>
+                            <span class="text-gray-500 truncate flex-1 min-w-0 italic">{t.snippet.clone()}</span>
+                            <button
+                                class="text-gray-500 hover:text-gray-300 shrink-0 px-1"
+                                aria-label="Cancel reply target"
+                                on:click=move |_| reply_target.set(None)
+                            >"\u{2715}"</button>
+                        </div>
+                    })}
                     <MessageInput
                         on_send=noop_send
                         on_send_with_mentions=send_callback
@@ -834,8 +939,17 @@ fn RootPost(
     my_pubkey: Signal<String>,
     editing_id: RwSignal<Option<String>>,
     on_save_edit: Callback<(String, String)>,
+    on_reply: Callback<ReplyTarget>,
+    can_reply: Signal<bool>,
 ) -> impl IntoView {
     let author = use_display_name_memo(post.pubkey.clone());
+    // Quote-and-append: tapping Reply focuses the bottom composer. A StoredValue
+    // keeps the target Copy so the inline on:click handler stays `Fn`.
+    let reply_info = StoredValue::new((
+        post.id.clone(),
+        post.pubkey.clone(),
+        first_line(&post.content),
+    ));
     let time = format_relative_time(post.created_at);
     let pk = post.pubkey.clone();
     // Disclosure badge (COM-13/F2): marks the topic-root author as an agent.
@@ -881,6 +995,16 @@ fn RootPost(
                             my_pubkey=my_pubkey
                             editing_id=editing_id
                         />
+                        <Show when=move || can_reply.get()>
+                            <button
+                                class="text-xs text-gray-500 hover:text-[color:var(--zone-accent)] transition-colors ml-auto"
+                                on:click=move |_: leptos::ev::MouseEvent| {
+                                    let (id, pubkey, snippet) = reply_info.get_value();
+                                    on_reply.run(ReplyTarget { id, pubkey, author: author.get_untracked(), snippet });
+                                }
+                                aria-label="Reply to this topic"
+                            >"\u{21A9} Reply"</button>
+                        </Show>
                     </div>
                     <Show
                         when=move || is_editing.get()
@@ -917,8 +1041,19 @@ fn ReplyCard(
     my_pubkey: Signal<String>,
     editing_id: RwSignal<Option<String>>,
     on_save_edit: Callback<(String, String)>,
+    on_reply: Callback<ReplyTarget>,
+    can_reply: Signal<bool>,
 ) -> impl IntoView {
     let author = use_display_name_memo(reply.pubkey.clone());
+    // Quote-and-append: tapping Reply quotes THIS post and focuses the composer.
+    // StoredValue keeps the target Copy so the inline on:click handler stays `Fn`.
+    let reply_info = StoredValue::new((
+        reply.id.clone(),
+        reply.pubkey.clone(),
+        first_line(&reply.content),
+    ));
+    // Inline quote of the sibling this reply targets (never the topic root).
+    let quote = reply.quote.clone();
     let time = format_relative_time(reply.created_at);
     let pk = reply.pubkey.clone();
     // Disclosure badge (COM-13/F2): marks the reply author as an agent.
@@ -958,7 +1093,27 @@ fn ReplyCard(
                             my_pubkey=my_pubkey
                             editing_id=editing_id
                         />
+                        <Show when=move || can_reply.get()>
+                            <button
+                                class="text-xs text-gray-600 hover:text-amber-400 transition-colors ml-auto"
+                                on:click=move |_: leptos::ev::MouseEvent| {
+                                    let (id, pubkey, snippet) = reply_info.get_value();
+                                    on_reply.run(ReplyTarget { id, pubkey, author: author.get_untracked(), snippet });
+                                }
+                                aria-label="Reply to this post"
+                            >"\u{21A9} Reply"</button>
+                        </Show>
                     </div>
+                    {quote.map(|q| {
+                        let qn = use_display_name_memo(q.pubkey.clone());
+                        view! {
+                            <div class="mt-1 mb-0.5 pl-2 border-l-2 border-gray-600 text-xs text-gray-500 truncate">
+                                <span class="text-amber-400/80">{move || qn.get()}</span>
+                                ": "
+                                <span class="italic">{q.snippet.clone()}</span>
+                            </div>
+                        }
+                    })}
                     <Show
                         when=move || is_editing.get()
                         fallback={
@@ -1056,6 +1211,26 @@ mod tests {
             vec![vec!["e", "root", "", "reply"]],
         );
         assert_eq!(edit_target(&reply), None);
+    }
+
+    #[test]
+    fn reply_e_tag_extracts_reply_marker_target() {
+        // A quote-reply targets a specific sibling via the "reply" marker.
+        let quote_reply = ev(
+            "q",
+            "bob",
+            300,
+            "quoting you",
+            vec![
+                vec!["e", "chan", "", "root"],
+                vec!["e", "sibling", "", "reply"],
+                vec!["p", "alice"],
+            ],
+        );
+        assert_eq!(reply_e_tag(&quote_reply).as_deref(), Some("sibling"));
+        // A plain root/topic post has no reply-marker target.
+        let root = ev("r", "alice", 100, "hi", vec![vec!["e", "chan", "", "root"]]);
+        assert_eq!(reply_e_tag(&root), None);
     }
 
     #[test]
