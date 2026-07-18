@@ -249,16 +249,21 @@ pub fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
     zones.first().map(|z| z.id.clone())
 }
 
-/// Whether a channel's `section` tag routes to the given zone id.
+/// Whether a channel's `section` tag routes to the given zone URL param.
 ///
 /// Derived from [`section_to_zone`]: a section routes to `category_slug` when
-/// the canonical resolver maps it to that zone (case-insensitively). An empty
-/// `category_slug` matches everything (the un-scoped/legacy lookup contract).
+/// the canonical resolver maps it to that zone (case-insensitively). The param
+/// may be the zone's URL slug (short URLs, issue #45) or its legacy id — it is
+/// canonicalised to the zone ID before comparison, since `section_to_zone`
+/// always yields ids. An empty `category_slug` matches everything (the
+/// un-scoped/legacy lookup contract).
 pub fn section_routes_to_zone(section: &str, category_slug: &str, zones: &[Zone]) -> bool {
-    let cat = category_slug.to_lowercase();
-    if cat.is_empty() {
+    if category_slug.is_empty() {
         return true;
     }
+    let cat = resolve_zone_param(category_slug, zones)
+        .map(|z| z.id.to_lowercase())
+        .unwrap_or_else(|| category_slug.to_lowercase());
     section_to_zone(section, zones)
         .map(|z| z.to_lowercase() == cat)
         .unwrap_or(false)
@@ -503,5 +508,19 @@ mod tests {
     fn resolve_zone_param_unknown_is_none() {
         let zones = vec![zone_with_slug("business", Some("dreamlab"))];
         assert!(resolve_zone_param("nope", &zones).is_none());
+    }
+
+    #[test]
+    fn section_routes_to_zone_accepts_slug_param() {
+        // Regression (issue #45 rollout): "public-intros" routes to zone id
+        // "public"; the URL param may be the slug "welcome" and must still
+        // match after canonicalisation. Legacy id and unknown params keep
+        // their old behaviour.
+        let zones = vec![zone_with_slug("public", Some("welcome")), zone("friends")];
+        assert!(section_routes_to_zone("public-intros", "welcome", &zones));
+        assert!(section_routes_to_zone("public-intros", "public", &zones));
+        assert!(!section_routes_to_zone("friends-music", "welcome", &zones));
+        assert!(section_routes_to_zone("anything", "", &zones));
+        assert!(!section_routes_to_zone("public-intros", "nope", &zones));
     }
 }
