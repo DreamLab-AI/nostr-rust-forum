@@ -80,6 +80,9 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
     let (media_urls, link_urls): (Vec<_>, Vec<_>) =
         urls.into_iter().partition(|url| is_media_url(url));
     let first_link_url = link_urls.into_iter().next();
+    // Hide embedded media URLs from the visible text — the embed below carries
+    // its own hover "open full" affordance, so the bare URL is just noise.
+    let body_text = crate::components::mention_text::strip_media_urls(&content, &media_urls);
 
     // Bookmark toggle via StoredValue (Copy-friendly)
     let is_bookmarked = bookmarks.is_bookmarked_signal(event_id.clone());
@@ -215,10 +218,12 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                     />
                 })}
 
-                // Message text with mentions + markdown
-                <div class="mt-0.5 text-sm text-gray-200 leading-relaxed">
-                    <MentionText content=content />
-                </div>
+                // Message text with mentions + markdown (media URLs stripped)
+                {(!body_text.is_empty()).then(|| view! {
+                    <div class="mt-0.5 text-sm text-gray-200 leading-relaxed">
+                        <MentionText content=body_text />
+                    </div>
+                })}
 
                 // Media embeds (images, YouTube)
                 {media_urls.into_iter().map(|url| {

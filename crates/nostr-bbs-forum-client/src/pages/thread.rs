@@ -907,10 +907,12 @@ fn PostBody(content: String) -> impl IntoView {
     let urls = extract_urls(&content);
     let (media_urls, link_urls): (Vec<_>, Vec<_>) = urls.into_iter().partition(|u| is_media_url(u));
     let first_link = link_urls.into_iter().next();
-    let text = content.clone();
+    // Hide embedded media URLs from the visible text — the embed below (with its
+    // own hover "open full" icon) is the representation.
+    let text = crate::components::mention_text::strip_media_urls(&content, &media_urls);
     view! {
         <>
-            <MentionText content=text />
+            {(!text.is_empty()).then(|| view! { <MentionText content=text /> })}
             {media_urls.into_iter().map(|u| view! { <MediaEmbed url=u /> }).collect_view()}
             {first_link.map(|u| view! { <LinkPreview url=u /> })}
         </>

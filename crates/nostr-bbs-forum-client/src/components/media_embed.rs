@@ -124,9 +124,10 @@ pub(crate) fn MediaEmbed(
                         href=full_url
                         target="_blank"
                         rel="noopener noreferrer"
+                        title="Open full image"
                         class=move || {
                             if loaded.get() && !errored.get() {
-                                "block"
+                                "relative inline-block group"
                             } else {
                                 "hidden"
                             }
@@ -140,6 +141,19 @@ pub(crate) fn MediaEmbed(
                             on:load=move |_| loaded.set(true)
                             on:error=move |_| errored.set(true)
                         />
+                        // Hover-revealed "open full" affordance — hidden by default,
+                        // so the raw URL never has to be shown as text.
+                        <span
+                            class="absolute top-2 right-2 p-1.5 rounded-md bg-black/60 text-gray-100 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"
+                            aria-hidden="true"
+                        >
+                            <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="15 3 21 3 21 9" stroke-linecap="round" stroke-linejoin="round"/>
+                                <polyline points="9 21 3 21 3 15" stroke-linecap="round" stroke-linejoin="round"/>
+                                <line x1="21" y1="3" x2="14" y2="10" stroke-linecap="round"/>
+                                <line x1="3" y1="21" x2="10" y2="14" stroke-linecap="round"/>
+                            </svg>
+                        </span>
                     </a>
                 </div>
             }

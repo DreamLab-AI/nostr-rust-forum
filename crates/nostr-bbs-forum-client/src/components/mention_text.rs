@@ -154,6 +154,24 @@ pub(crate) fn MentionText(
 /// Resolve a `@username` token to a hex pubkey by walking the event's `p`
 /// tags and asking the NameCache whether the cached display name matches
 /// the typed username (case-insensitive).
+/// Remove already-embedded media URLs from post text so an image renders as its
+/// inline embed WITHOUT the raw URL also showing as a line of text. The embed
+/// carries its own hover "open full" affordance, so the bare URL is pure noise.
+/// Leftover blank lines / trailing whitespace from the removal are collapsed;
+/// non-media links are left untouched (they still read as links + get a preview).
+pub(crate) fn strip_media_urls(content: &str, media_urls: &[String]) -> String {
+    let mut out = content.to_string();
+    for u in media_urls {
+        out = out.replace(u, "");
+    }
+    out.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 fn resolve_username_via_tags(username: &str, tags: &[Vec<String>]) -> Option<String> {
     let want = username.to_lowercase();
     for tag in tags {
@@ -362,6 +380,20 @@ fn render_markdown_inline(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_media_urls_removes_embedded_and_trims() {
+        let url = "https://pods.example/p/img.jpg".to_string();
+        // Caption + image URL → caption only, no dangling blank line.
+        assert_eq!(
+            strip_media_urls(&format!("first pic!\n{url}"), std::slice::from_ref(&url)),
+            "first pic!"
+        );
+        // URL-only message → empty (so the caller renders no text node).
+        assert_eq!(strip_media_urls(&url, std::slice::from_ref(&url)), "");
+        // Non-media text is untouched when nothing is stripped.
+        assert_eq!(strip_media_urls("just words", &[]), "just words");
+    }
 
     #[test]
     fn parse_plain_text() {
