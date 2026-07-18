@@ -970,6 +970,10 @@ fn dm_thread(
     let my_pk_msgs = my_pk.clone();
     let peer_msgs = peer.clone();
     let my_pk_self = my_pk.clone();
+    // Resolve the counterparty's nym from loaded kind-0 profiles (Jarvis-aware);
+    // RelayStore is shared via context, same as the board screens use.
+    let relay_store = use_context::<crate::relay::RelayStore>();
+    let jarvis_msgs = jarvis.clone();
     view! {
         <div class="bbs-panel bbs-crumb">
             <span class="bbs-link accent" role="button" tabindex="0"
@@ -994,11 +998,19 @@ fn dm_thread(
                 }.into_any();
             }
             let me = my_pk_self.clone();
+            // Counterparty nym: Jarvis-aware, else the loaded kind-0 profile,
+            // else a short id — so DM rows show a name, not a raw pubkey.
+            let peer_name = if jarvis_msgs.as_deref() == Some(peer_msgs.as_str()) {
+                "Jarvis (AI)".to_string()
+            } else {
+                let profiles = relay_store.map(|s| s.profiles.get()).unwrap_or_default();
+                crate::screens::author_label(&profiles, &peer_msgs)
+            };
             view! {
                 <div class="bbs-list bbs-dm-thread">
                     {msgs.into_iter().map(|m| {
                         let is_me = m.sender_pubkey == me;
-                        let who = if is_me { "you".to_string() } else { crate::relay::short_id(&m.sender_pubkey) };
+                        let who = if is_me { "you".to_string() } else { peer_name.clone() };
                         let body = m.content.clone();
                         view! {
                             <div class="bbs-row bbs-dm-msg" class:bbs-dm-sent=is_me>

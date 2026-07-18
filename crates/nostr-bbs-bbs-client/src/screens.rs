@@ -151,6 +151,19 @@ fn profile_name(ev: &nostr_bbs_core::event::NostrEvent) -> String {
         .unwrap_or_else(|| relay::short_id(&ev.pubkey))
 }
 
+/// Display label for a message author's pubkey, resolved from the loaded kind-0
+/// `profiles` (display_name → name), falling back to a short id until that
+/// author's profile has loaded. The BBS subscribes to `kinds:[0,40]`, so a
+/// whitelisted author's nym is normally already present — this stops the board
+/// from showing raw `<hex…hex>` handles where the main board shows a name.
+pub(crate) fn author_label(profiles: &[nostr_bbs_core::event::NostrEvent], pubkey: &str) -> String {
+    profiles
+        .iter()
+        .find(|ev| ev.pubkey == pubkey)
+        .map(profile_name)
+        .unwrap_or_else(|| relay::short_id(pubkey))
+}
+
 /// The `about` bio from a kind-0 metadata event, if present and non-empty.
 fn profile_about(ev: &nostr_bbs_core::event::NostrEvent) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(&ev.content)
@@ -495,13 +508,14 @@ fn thread_list(
                 return view! { <div class="bbs-panel bbs-dim">"  No topics here yet. Start one with the box below \u{2014}\n  or sign in to unlock cohort-gated zones (reads are deny-by-default)."</div> }.into_any();
             }
             let now = now_secs();
+            let profiles = store.profiles.get();
             view! {
                 <div class="bbs-list">
                     {threads
                         .into_iter()
                         .enumerate()
                         .map(|(i, t)| {
-                            let who = relay::short_id(&t.root.pubkey);
+                            let who = author_label(&profiles, &t.root.pubkey);
                             let preview = snippet(&t.root.content, 52);
                             let replies = t.reply_count;
                             let ago = fmt_ago(now, t.last_activity);
@@ -592,12 +606,13 @@ fn thread_view(
                 return view! { <div class="bbs-panel bbs-dim">"  This topic hasn\u{2019}t loaded yet \u{2014} it may be in a cohort-gated zone.\n  Sign in, or reply below to start it off."</div> }.into_any();
             }
             let root_ref = root_for_msgs.clone();
+            let profiles = store.profiles.get();
             view! {
                 <div class="bbs-list">
                     {msgs
                         .into_iter()
                         .map(|p| {
-                            let who = relay::short_id(&p.pubkey);
+                            let who = author_label(&profiles, &p.pubkey);
                             let body = p.content.clone();
                             let imgs = extract_image_urls(&p.content);
                             let reply_id = p.id.clone();
@@ -737,6 +752,19 @@ mod mention_tests {
         );
         assert!(parse_handles("no mentions here").is_empty());
         assert_eq!(parse_handles("email a@b is not a handle start"), vec!["b"]);
+    }
+
+    #[test]
+    fn author_label_resolves_nym_else_short_id() {
+        let alice = "a".repeat(64);
+        let bob = "b".repeat(64);
+        let profiles = vec![profile(&alice, "alice", "Alice")];
+        // Known author → display name (not the raw pubkey).
+        assert_eq!(author_label(&profiles, &alice), "Alice");
+        // Unknown author → short id, never the full 64-hex pubkey.
+        let got = author_label(&profiles, &bob);
+        assert_eq!(got, relay::short_id(&bob));
+        assert_ne!(got, bob);
     }
 
     #[test]
@@ -1240,10 +1268,11 @@ fn chat(store: RelayStore) -> impl IntoView {
                     <div class="bbs-panel bbs-dim">"  (waiting for live messages — reads are deny-by-default at the relay)"</div>
                 }.into_any();
             }
+            let profiles = store.profiles.get();
             view! {
                 <div class="bbs-list">
                     {posts.into_iter().take(60).map(|p| {
-                        let who = relay::short_id(&p.pubkey);
+                        let who = author_label(&profiles, &p.pubkey);
                         let body = p.content.clone();
                         let imgs = extract_image_urls(&p.content);
                         view! {
@@ -1544,10 +1573,11 @@ fn code(store: RelayStore) -> impl IntoView {
                     <div class="bbs-panel bbs-dim">"  (no snippets yet — post a ``` fenced message in BOARDS)"</div>
                 }.into_any();
             }
+            let profiles = store.profiles.get();
             view! {
                 <div class="bbs-list">
                     {snippets.into_iter().take(30).map(|p| {
-                        let who = relay::short_id(&p.pubkey);
+                        let who = author_label(&profiles, &p.pubkey);
                         let body = p.content.clone();
                         view! {
                             <div class="bbs-panel">
