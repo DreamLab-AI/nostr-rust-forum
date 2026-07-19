@@ -47,7 +47,18 @@ pub(crate) fn Modal(
             doc.add_event_listener_with_callback("keydown", esc_closure.as_ref().unchecked_ref());
     }
     let esc_ref = send_wrapper::SendWrapper::new(esc_closure);
-    on_cleanup(move || drop(esc_ref));
+    // MUST remove the listener before dropping the closure: the `document`
+    // keydown listener holds a reference to `esc_closure`, and dropping the
+    // wasm-bindgen `Closure` while it is still registered leaves the browser
+    // calling into freed memory — every keystroke after any modal has closed
+    // throws "closure invoked after being dropped". Remove, then drop.
+    on_cleanup(move || {
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            let _ = doc
+                .remove_event_listener_with_callback("keydown", esc_ref.as_ref().unchecked_ref());
+        }
+        drop(esc_ref);
+    });
 
     // Body scroll lock — ref-counted, and ALWAYS released on unmount. Several
     // flows (DeleteUserModal, ConfirmDialog confirm paths) close by having the
