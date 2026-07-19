@@ -226,6 +226,86 @@ pub fn ios_rebind_note() -> &'static str {
      recovery key. After that it opens straight into your zone."
 }
 
+/// Coarse browser family for install-guidance copy. UA sniffing is acceptable
+/// here — the result only selects advisory text, and every branch fails safe
+/// to the generic copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BrowserFamily {
+    /// Chrome, Edge, Brave, Chromium — native install prompt + toolbar icon.
+    Chromium,
+    /// Firefox — no PWA install support at all on desktop.
+    Firefox,
+    /// Safari on macOS — File → Add to Dock (no prompt event).
+    Safari,
+    /// Anything else — generic guidance.
+    Other,
+}
+
+/// Detect the browser family from the user agent.
+pub fn browser_family() -> BrowserFamily {
+    let ua = web_sys::window()
+        .and_then(|w| w.navigator().user_agent().ok())
+        .unwrap_or_default()
+        .to_lowercase();
+    family_from_ua(&ua)
+}
+
+/// Pure classifier (unit-tested). Order matters: Chromium UAs contain
+/// "safari", and Edge contains "chrome".
+pub(crate) fn family_from_ua(ua: &str) -> BrowserFamily {
+    if ua.contains("firefox") {
+        BrowserFamily::Firefox
+    } else if ua.contains("chrome")
+        || ua.contains("chromium")
+        || ua.contains("crios")
+        || ua.contains("edg")
+    {
+        BrowserFamily::Chromium
+    } else if ua.contains("safari") {
+        BrowserFamily::Safari
+    } else {
+        BrowserFamily::Other
+    }
+}
+
+/// Manual install guidance shown when the browser never offered an install
+/// prompt (Firefox desktop, Safari on Mac, or a Chromium build that withheld
+/// the event). Returns `(heading, steps)`. UK English.
+pub fn manual_install_steps(family: BrowserFamily) -> (&'static str, Vec<&'static str>) {
+    match family {
+        BrowserFamily::Chromium => (
+            "In Chrome / Edge",
+            vec![
+                "Look for the install icon at the right-hand end of the address bar (a small screen with a down arrow).",
+                "Click it and choose \"Install\".",
+                "The app opens in its own window, signed in — find it later in your launcher or taskbar.",
+            ],
+        ),
+        BrowserFamily::Safari => (
+            "In Safari on Mac",
+            vec![
+                "Open the File menu.",
+                "Choose \"Add to Dock…\".",
+                "Open the app from your Dock — it starts signed in.",
+            ],
+        ),
+        BrowserFamily::Firefox => (
+            "In Firefox",
+            vec![
+                "Firefox can't install web apps, so there's no app icon to add.",
+                "Bookmark this site instead — your saved key keeps signing you in on this device — or use Chrome, Edge or Safari to install the app.",
+            ],
+        ),
+        BrowserFamily::Other => (
+            "In this browser",
+            vec![
+                "Look for an \"Install app\" or \"Add to Home Screen\" option in your browser's menu.",
+                "If there isn't one, bookmark this site — your saved key keeps signing you in on this device.",
+            ],
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

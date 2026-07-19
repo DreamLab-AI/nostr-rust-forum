@@ -223,6 +223,8 @@ pub fn SettingsPage() -> impl IntoView {
     let pwa_is_ios = crate::utils::pwa_install::platform_is_ios();
     let pwa_consented = RwSignal::new(false);
     let pwa_busy = RwSignal::new(false);
+    // Manual install guidance (shown when this browser never offers a prompt).
+    let pwa_show_manual = RwSignal::new(false);
     let pwa_baked = RwSignal::new(false);
     // Whether a readable forum key exists to bake here (local-key / imported
     // nsec). Passkey / NIP-07 sessions have none — they rebind in the app.
@@ -258,7 +260,7 @@ pub fn SettingsPage() -> impl IntoView {
                     match crate::utils::bake::bake(&secret, &zone_id).await {
                         Ok(()) => {
                             pwa_baked.set(true);
-                            proceed_to_install(zone_id.clone());
+                            proceed_to_install(zone_id.clone(), pwa_show_manual);
                         }
                         Err(e) => {
                             web_sys::console::error_1(
@@ -277,7 +279,7 @@ pub fn SettingsPage() -> impl IntoView {
         }
         // Passkey / NIP-07: no readable key to bake here — the app re-establishes
         // it on first launch (passkey tap or paste recovery key). Just link across.
-        proceed_to_install(zone_id);
+        proceed_to_install(zone_id, pwa_show_manual);
     };
 
     // Forget this device (forum-side unbake): delete the baked record + profile.
@@ -1363,12 +1365,12 @@ pub fn SettingsPage() -> impl IntoView {
                     <div class="glass-card p-6 space-y-4">
                         <h2 class="text-lg font-semibold text-white flex items-center gap-2">
                             {install_icon()}
-                            "Install mobile app"
+                            "Install the app"
                         </h2>
                         <div class="border-t border-gray-700/50"></div>
 
                         <p class="text-sm text-gray-400">
-                            "Add this zone to your phone's home screen and open it like an app — signed in, straight into your zone, with no password."
+                            "Add this zone to your phone or computer and open it like an app — signed in, straight into your zone, with no password."
                         </p>
 
                         // Consent warning (verbatim, ADR-109 §11.2 — do not alter).
@@ -1445,6 +1447,28 @@ pub fn SettingsPage() -> impl IntoView {
                                 </button>
                             </Show>
                         </div>
+
+                        // Manual install guidance — shown when this browser
+                        // never offered an install prompt (Firefox desktop,
+                        // Safari on Mac, withheld Chromium event). The key is
+                        // already baked at this point, so whatever route the
+                        // user takes (install, dock, bookmark), sign-in holds.
+                        <Show when=move || pwa_show_manual.get()>
+                            <div class="bg-gray-800 rounded-lg p-3 space-y-2" data-testid="pwa-manual-steps">
+                                {
+                                    let (heading, steps) =
+                                        crate::utils::pwa_install::manual_install_steps(
+                                            crate::utils::pwa_install::browser_family(),
+                                        );
+                                    view! {
+                                        <p class="text-xs text-amber-300 font-semibold">{heading}</p>
+                                        <ol class="list-decimal list-inside text-sm text-gray-300 space-y-1">
+                                            {steps.into_iter().map(|s| view! { <li>{s}</li> }).collect_view()}
+                                        </ol>
+                                    }
+                                }
+                            </div>
+                        </Show>
 
                         // Status line.
                         <p class="text-xs text-gray-500" data-testid="pwa-status">
@@ -1758,21 +1782,28 @@ async fn provision_pod(auth: crate::auth::AuthStore) -> Result<(), String> {
 // -- SVG icon helpers ---------------------------------------------------------
 
 /// After a bake (or for a passkey/NIP-07 session that has nothing to bake),
-/// fire the stashed install prompt (the forum now carries its own manifest, so
-/// `beforeinstallprompt` fires on this very page) or fall back to the one-shot
-/// boot URL — where iOS users use Share → Add to Home Screen. The installed
-/// app opens the MAIN forum interface; the retro BBS remains separately
-/// installable from its own pages.
-fn proceed_to_install(zone_id: String) {
+/// fire the stashed install prompt (the forum carries its own manifest, so
+/// `beforeinstallprompt` fires on this very page). When no prompt is
+/// available: iOS keeps the one-shot hand-off (its Add-to-Home-Screen steps
+/// are already on screen), every other browser gets inline manual guidance
+/// (`show_manual`) — Firefox desktop cannot install at all and Safari on Mac
+/// uses File → Add to Dock, so a redirect would just reload this page.
+fn proceed_to_install(zone_id: String, show_manual: RwSignal<bool>) {
     use crate::utils::pwa_install;
     if pwa_install::deferred_prompt_available() {
         wasm_bindgen_futures::spawn_local(async move {
             if !pwa_install::trigger_prompt().await {
-                pwa_install::open_installed_app(&zone_id);
+                if pwa_install::platform_is_ios() {
+                    pwa_install::open_installed_app(&zone_id);
+                } else {
+                    show_manual.set(true);
+                }
             }
         });
-    } else {
+    } else if pwa_install::platform_is_ios() {
         pwa_install::open_installed_app(&zone_id);
+    } else {
+        show_manual.set(true);
     }
 }
 
