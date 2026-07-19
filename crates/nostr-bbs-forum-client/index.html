@@ -68,6 +68,16 @@
          Trunk's correct asset-copy directive is rel="copy-file"; the [[copy]]
          table in Trunk.toml is silently ignored. -->
     <link data-trunk rel="copy-file" href="sw.js" />
+
+    <!-- PWA manifest: installs the MAIN forum interface as the home-screen app
+         (scope /community/, one-shot boot via ?pwa=1). Copied verbatim so the
+         relative href resolves at the served base; the deploy re-brands
+         name/short_name. The retro BBS keeps its own nested-scope manifest at
+         /community/bbs/ for those who prefer that interface. -->
+    <link data-trunk rel="copy-file" href="manifest.webmanifest" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Forum" />
 </head>
 <body>
     <!-- Loading screen — replaced by Leptos mount_to_body() -->

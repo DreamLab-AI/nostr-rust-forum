@@ -303,6 +303,81 @@ pub fn App() -> impl IntoView {
     // access (no-op for non-admins). Mounted after the auth / zone-access /
     // notification providers it captures.
     crate::stores::admin_alerts::start_admin_alerts();
+
+    // PWA one-shot boot for the MAIN interface (ADR-109 amendment): when
+    // launched with `?pwa=1` (the installed app's start_url) and no live
+    // session, adopt the baked key into a normal local-key session and strip
+    // the flag from the URL. Falls through silently to the login page when
+    // nothing is baked (fresh iOS home-screen storage, forgotten device).
+    {
+        let auth = use_auth();
+        let is_pwa = web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .map(|q| nostr_bbs_core::is_pwa_boot(&q))
+            .unwrap_or(false);
+        if is_pwa {
+            if let Some(w) = web_sys::window() {
+                // Clean the address bar so in-app reloads boot normally; the
+                // adopted session (or the bake, on relaunch) carries auth.
+                let path = w.location().pathname().unwrap_or_default();
+                let _ = w.history().and_then(|h| {
+                    h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&path))
+                });
+            }
+            if !auth.is_authenticated().get_untracked() {
+                leptos::task::spawn_local(async move {
+                    if crate::utils::bake::is_baked().await {
+                        if let Some(secret) = crate::utils::bake::adopt_baked_secret().await {
+                            let hex = hex::encode(&secret[..]);
+                            if let Err(e) = auth.login_with_local_key(&hex) {
+                                web_sys::console::warn_1(
+                                    &format!("[pwa] baked-key adoption failed: {e}").into(),
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // iOS home-screen storage isolation: the installed app starts with an
+        // EMPTY origin partition, so there is nothing to adopt and the user
+        // logs in manually once. When that happens in standalone display mode
+        // with no bake present, re-bake automatically (keyed to the resolved
+        // home zone) so every later launch is one-shot — the forum-side
+        // equivalent of the BBS first-launch rebind.
+        let zone_access = use_zone_access();
+        let standalone = web_sys::window()
+            .and_then(|w| w.match_media("(display-mode: standalone)").ok())
+            .flatten()
+            .map(|m| m.matches())
+            .unwrap_or(false);
+        if standalone {
+            let rebaked = StoredValue::new(false);
+            Effect::new(move |_| {
+                if rebaked.get_value() || !auth.is_authenticated().get() {
+                    return;
+                }
+                let Some(zone) = zone_access.home_zone() else {
+                    return;
+                };
+                rebaked.set_value(true);
+                leptos::task::spawn_local(async move {
+                    if crate::utils::bake::is_baked().await {
+                        return;
+                    }
+                    let Some(secret) = auth.get_privkey_bytes() else {
+                        return;
+                    };
+                    if let Err(e) = crate::utils::bake::bake(&secret, &zone.id).await {
+                        web_sys::console::warn_1(
+                            &format!("[pwa] standalone auto-rebake failed: {e}").into(),
+                        );
+                    }
+                });
+            });
+        }
+    }
     provide_announcer();
     crate::stores::badges::provide_badges();
     provide_panel_registry();

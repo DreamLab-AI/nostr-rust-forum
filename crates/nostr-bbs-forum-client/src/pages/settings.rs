@@ -216,7 +216,8 @@ pub fn SettingsPage() -> impl IntoView {
     // Gated on the ADR-107 single-locked-zone predicate (reused verbatim) AND
     // the BBS_PWA_ENABLED runtime flag (default OFF). Admins and multi/zero-zone
     // members never see it. The forum side bakes the key + BootProfile, then
-    // links to the BBS where installation actually happens (ADR-109 Decision 3).
+    // fires the install prompt for the MAIN interface (its manifest lives on
+    // this very page; the retro BBS stays separately installable).
     let za = crate::stores::zone_access::use_zone_access();
     let pwa_feature_on = crate::utils::pwa_install::feature_enabled();
     let pwa_is_ios = crate::utils::pwa_install::platform_is_ios();
@@ -234,7 +235,7 @@ pub fn SettingsPage() -> impl IntoView {
         });
     }
 
-    // Install: bake the key (when a readable one exists) then link to the BBS
+    // Install: bake the key (when a readable one exists) then prompt/hand off
     // one-shot boot, where the real install prompt / Add-to-Home-Screen lives.
     let on_pwa_install = move |_: leptos::ev::MouseEvent| {
         if pwa_busy.get_untracked() || !pwa_consented.get_untracked() {
@@ -1757,9 +1758,11 @@ async fn provision_pod(auth: crate::auth::AuthStore) -> Result<(), String> {
 // -- SVG icon helpers ---------------------------------------------------------
 
 /// After a bake (or for a passkey/NIP-07 session that has nothing to bake),
-/// hand off to the BBS one-shot boot where installation actually happens. On
-/// the forum origin no `beforeinstallprompt` is stashed, so this redirects; the
-/// deferred-prompt branch is defensive for the rare build/scope where it fires.
+/// fire the stashed install prompt (the forum now carries its own manifest, so
+/// `beforeinstallprompt` fires on this very page) or fall back to the one-shot
+/// boot URL — where iOS users use Share → Add to Home Screen. The installed
+/// app opens the MAIN forum interface; the retro BBS remains separately
+/// installable from its own pages.
 fn proceed_to_install(zone_id: String) {
     use crate::utils::pwa_install;
     if pwa_install::deferred_prompt_available() {

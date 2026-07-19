@@ -11,7 +11,8 @@
 //! 3. **iOS instruction text** — Add-to-Home-Screen is manual on iOS, and the
 //!    isolated-storage rebind note is stated up front.
 //!
-//! The `beforeinstallprompt` capture here ([`init_capture`]) is **defensive only**:
+//! The `beforeinstallprompt` capture here ([`init_capture`]) is the PRIMARY
+//! install path now the forum carries its own manifest:
 //! the event does not fire on the forum origin, so the listener is a harmless
 //! no-op that simply records the event on the rare build/scope where it does.
 
@@ -83,17 +84,20 @@ fn is_ios_ua(ua: &str, platform: &str, max_touch_points: i32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// (c) Install flow — link to the BBS where the prompt actually fires
+// (c) Install flow — the MAIN interface is the installed app
 // ---------------------------------------------------------------------------
 
-/// Full-document navigate to the BBS one-shot boot URL (`<base>/bbs/?pwa=1`),
-/// mirroring [`crate::components::bbs_sash`]: a plain `<a>` would be hijacked by
-/// the Leptos router, so we force `location.set_href`. The BBS page carries the
-/// manifest + service worker and fires its own `beforeinstallprompt`; the forum
-/// page cannot prompt for the `/community/bbs/` scope. `zone_id` is the bound
-/// zone (already written into the BootProfile) — logged for traceability.
+/// Full-document navigate to the forum's own one-shot boot URL
+/// (`<base>/?pwa=1`, the manifest `start_url`). The forum page now carries its
+/// own manifest + service worker, so `beforeinstallprompt` fires here and the
+/// stashed prompt (see below) is the primary install path; this navigation is
+/// the fallback for browsers that never fired it (iOS: Share → Add to Home
+/// Screen from this page). The retro BBS keeps its nested-scope manifest at
+/// `<base>/bbs/` for users who prefer installing that interface instead.
+/// `zone_id` is the bound zone (already in the BootProfile) — logged for
+/// traceability.
 pub fn open_installed_app(zone_id: &str) {
-    let href = base_href("/bbs/?pwa=1");
+    let href = base_href("/?pwa=1");
     web_sys::console::log_1(
         &format!("[pwa_install] opening installed app for zone '{zone_id}' → {href}").into(),
     );

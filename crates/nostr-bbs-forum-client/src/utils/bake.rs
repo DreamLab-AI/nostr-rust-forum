@@ -174,6 +174,79 @@ pub async fn is_baked() -> bool {
         .is_some()
 }
 
+/// READ side for the forum's own `?pwa=1` one-shot boot: decrypt and return
+/// the baked 32-byte secret, or `None` when nothing usable is stored.
+///
+/// Mirrors `nostr-bbs-bbs-client::pwa::unwrap_baked_secret` byte-for-byte
+/// (same record shape, same Reflect-built AES-GCM params as [`bake`]), so a
+/// key baked for either interface adopts in both — the installed app choice
+/// is purely which manifest the user installed from. Failures are quiet
+/// (`None`): the caller falls back to the normal login page.
+pub async fn adopt_baked_secret() -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    use zeroize::Zeroize;
+
+    let db = open_baked_db().await.ok()?;
+    let tx = db.transaction_with_str(BAKED_STORE).ok()?;
+    let store = tx.object_store(BAKED_STORE).ok()?;
+    let req = store.get(&JsValue::from_str(BAKED_RECORD_ID)).ok()?;
+    let record = idb_await(&req).await.ok()?;
+    db.close();
+    if record.is_undefined() || record.is_null() {
+        return None;
+    }
+
+    let envelope = js_sys::Reflect::get(&record, &REC_ENVELOPE.into()).ok()?;
+    let iv_hex = js_sys::Reflect::get(&envelope, &ENV_IV_HEX.into())
+        .ok()?
+        .as_string()?;
+    let ct_hex = js_sys::Reflect::get(&envelope, &ENV_CT_HEX.into())
+        .ok()?
+        .as_string()?;
+    let iv = hex::decode(&iv_hex).ok()?;
+    let mut ct = hex::decode(&ct_hex).ok()?;
+    if iv.len() != AES_IV_LEN {
+        ct.zeroize();
+        return None;
+    }
+
+    let wrap_key: web_sys::CryptoKey = js_sys::Reflect::get(&record, &REC_WRAP_KEY.into())
+        .ok()?
+        .dyn_into()
+        .ok()?;
+
+    let crypto = web_sys::window()?.crypto().ok()?;
+    let subtle = crypto.subtle();
+    let dec_algo = js_object(&[(&"name".into(), &AES_ALG.into())]);
+    let iv_view = js_sys::Uint8Array::from(&iv[..]);
+    js_sys::Reflect::set(&dec_algo, &"iv".into(), &iv_view).ok()?;
+
+    let promise = match subtle.decrypt_with_object_and_u8_array(&dec_algo, &wrap_key, &ct) {
+        Ok(p) => p,
+        Err(_) => {
+            ct.zeroize();
+            return None;
+        }
+    };
+    let plain_js = match JsFuture::from(promise).await {
+        Ok(v) => v,
+        Err(_) => {
+            ct.zeroize();
+            return None;
+        }
+    };
+    ct.zeroize();
+
+    let mut vec = js_sys::Uint8Array::new(&plain_js).to_vec();
+    if vec.len() != 32 {
+        vec.zeroize();
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&vec);
+    vec.zeroize();
+    Some(zeroize::Zeroizing::new(out))
+}
+
 // ---------------------------------------------------------------------------
 // IndexedDB plumbing (mirrors stores::indexed_db, scoped to the baked-key DB)
 // ---------------------------------------------------------------------------
