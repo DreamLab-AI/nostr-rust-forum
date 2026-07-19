@@ -145,6 +145,20 @@ pub async fn ensure_schema(env: &Env) {
         let _ = db.prepare(stmt).run().await;
     }
 
+    // --- Zone-bound invites: nullable zone_id column --------------------
+    //
+    // A zone-bound invite additionally grants the zone's `required_cohorts`
+    // to the redeemer's whitelist row. Only the zone *id* is frozen into the
+    // row; the required_cohorts are resolved from `ZONE_CONFIG` at redeem
+    // time (config-derived, so re-scoping a zone in config re-scopes every
+    // outstanding invite for it). `ALTER TABLE ADD COLUMN` is idempotent
+    // here: the error when the column already exists is swallowed by design,
+    // matching the `real_name` evolution pattern below.
+    let _ = db
+        .prepare("ALTER TABLE invitations ADD COLUMN zone_id TEXT")
+        .run()
+        .await;
+
     // --- WI-5: welcome-bot outbox --------------------------------------
     let welcome_stmts = [
         "CREATE TABLE IF NOT EXISTS welcome_messages (\

@@ -18,7 +18,7 @@
 //! | POST   | /api/invites/:code/redeem   | authed | Redeem an invite, become a member      |
 //! | POST   | /api/invites/:id/revoke     | authed | Revoke an invite you issued (or admin) |
 
-use nostr_bbs_core::d1_helpers::{js_i64, js_str};
+use nostr_bbs_core::d1_helpers::{js_i64, js_opt_str, js_str};
 use serde::Deserialize;
 use serde_json::json;
 use worker::{Env, Response, Result};
@@ -35,6 +35,13 @@ struct CreateBody {
     /// Optional max-uses override. Defaults to 1 (single-use invite). Admins
     /// may raise this; regular users are capped at 1 use per code.
     max_uses: Option<u32>,
+    /// Optional zone this invite grants access to (a `ZONE_CONFIG` zone id,
+    /// e.g. `zone2`). When present the invite is *zone-bound*: redeeming it
+    /// additionally grants the zone's `required_cohorts` to the redeemer.
+    /// Minting a zone-bound invite is ADMIN-ONLY — a regular member must not
+    /// be able to grant zone access. `None` ⇒ a plain member invite (existing
+    /// member-can-mint behaviour).
+    zone_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -53,6 +60,18 @@ struct InviteRow {
     revoked_at: Option<i64>,
     revoked_by: Option<String>,
     created_at: i64,
+    /// Zone this invite grants (a `ZONE_CONFIG` id), or `None` for a plain
+    /// member invite. The zone's `required_cohorts` are resolved from config
+    /// at redeem time — only the id is frozen into the row.
+    #[serde(default)]
+    zone_id: Option<String>,
+}
+
+/// Whitelist cohort projection read back from the relay's shared D1 before a
+/// merge-grant.
+#[derive(Deserialize)]
+struct WhitelistCohortsRow {
+    cohorts: String,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +170,101 @@ async fn active_invite_count(pubkey: &str, now: i64, env: &Env) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Zone resolution (pure) + grant (D1)
+// ---------------------------------------------------------------------------
+
+/// Minimal projection of a `ZONE_CONFIG` entry — only what zone-bound invites
+/// need. Extra fields in the JSON are ignored.
+#[derive(Debug, Clone, Deserialize)]
+struct ZoneMeta {
+    id: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    required_cohorts: Vec<String>,
+}
+
+/// Resolve a zone by id from a `ZONE_CONFIG` JSON string. Returns `None` when
+/// the config is absent/malformed or when no zone carries that id. This is the
+/// single source of truth for both "does this zone exist?" (create-time
+/// validation) and "what cohorts does it grant?" (redeem-time resolution) — the
+/// cohorts are never frozen into the invite row.
+fn resolve_zone(zone_config: Option<&str>, zone_id: &str) -> Option<ZoneMeta> {
+    let raw = zone_config?;
+    let zones: Vec<ZoneMeta> = serde_json::from_str(raw.trim()).ok()?;
+    zones.into_iter().find(|z| z.id == zone_id)
+}
+
+/// Merge `add` cohorts into an existing JSON cohort array string, de-duplicating
+/// and preserving every existing cohort (never clobbers). The whitelist stores
+/// cohorts as a JSON array string (see relay `whitelist.rs` / auth `username.rs`).
+/// A malformed/empty existing value is treated as an empty set so the grant
+/// still lands.
+fn merge_cohorts_json(existing: &str, add: &[String]) -> String {
+    let mut cohorts: Vec<String> = serde_json::from_str(existing.trim()).unwrap_or_default();
+    for c in add {
+        if !cohorts.contains(c) {
+            cohorts.push(c.clone());
+        }
+    }
+    serde_json::to_string(&cohorts).unwrap_or_else(|_| existing.to_string())
+}
+
+/// Grant `zone_cohorts` to `pubkey` on the relay's shared whitelist (RELAY_DB).
+///
+/// Reads the existing row, MERGES the zone cohorts in (dedup, existing cohorts
+/// preserved) and writes back. If the redeemer has no whitelist row yet, creates
+/// one seeded with the base `members` cohort plus the zone cohorts — mirroring
+/// the auto-registration insert in `username.rs`. Best-effort: any D1 error is a
+/// non-fatal no-op (the redeem still succeeds; an admin can re-grant).
+async fn grant_zone_cohorts(env: &Env, pubkey: &str, zone_cohorts: &[String]) {
+    if zone_cohorts.is_empty() {
+        return;
+    }
+    let Ok(db) = env.d1("RELAY_DB") else {
+        return;
+    };
+
+    let existing = match db
+        .prepare("SELECT cohorts FROM whitelist WHERE pubkey = ?1")
+        .bind(&[js_str(pubkey)])
+    {
+        Ok(stmt) => stmt.first::<WhitelistCohortsRow>(None).await.ok().flatten(),
+        Err(_) => None,
+    };
+
+    let now = now_secs() as i64;
+    match existing {
+        Some(row) => {
+            let merged = merge_cohorts_json(&row.cohorts, zone_cohorts);
+            if let Ok(stmt) = db
+                .prepare("UPDATE whitelist SET cohorts = ?1 WHERE pubkey = ?2")
+                .bind(&[js_str(&merged), js_str(pubkey)])
+            {
+                let _ = stmt.run().await;
+            }
+        }
+        None => {
+            let seeded = merge_cohorts_json(r#"["members"]"#, zone_cohorts);
+            if let Ok(stmt) = db
+                .prepare(
+                    "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by, is_admin) \
+                     VALUES (?1, ?2, ?3, ?4, 0) ON CONFLICT (pubkey) DO NOTHING",
+                )
+                .bind(&[
+                    js_str(pubkey),
+                    js_str(&seeded),
+                    js_i64(now),
+                    js_str("invite-zone-grant"),
+                ])
+            {
+                let _ = stmt.run().await;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/invites/create
 // ---------------------------------------------------------------------------
 
@@ -175,6 +289,22 @@ pub async fn handle_create(
     let settings = load_settings(env).await;
     let member = load_member(&pubkey, env).await;
     let caller_is_admin = is_admin(&pubkey, env).await;
+
+    // Zone binding: admin-only to mint, and the zone must exist in ZONE_CONFIG.
+    // A plain member invite (`zone_id: None`) keeps the member-can-mint path.
+    let zone_id: Option<String> = match body.zone_id.as_deref().map(str::trim) {
+        Some(z) if !z.is_empty() => {
+            if !caller_is_admin {
+                return error_json(env, "Only admins can mint zone-bound invites", 403);
+            }
+            let zone_config = env.var("ZONE_CONFIG").ok().map(|v| v.to_string());
+            if resolve_zone(zone_config.as_deref(), z).is_none() {
+                return error_json(env, &format!("Unknown zone: {z}"), 400);
+            }
+            Some(z.to_string())
+        }
+        _ => None,
+    };
 
     if !caller_is_admin {
         // Tenure gate: first_seen_at must be at least min_days_active days old.
@@ -233,8 +363,8 @@ pub async fn handle_create(
 
     let insert = db
         .prepare(
-            "INSERT INTO invitations (id, code, issued_by, max_uses, uses, expires_at, created_at) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+            "INSERT INTO invitations (id, code, issued_by, max_uses, uses, expires_at, created_at, zone_id) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
         )
         .bind(&[
             js_str(&id),
@@ -243,6 +373,7 @@ pub async fn handle_create(
             js_i64(max_uses),
             js_i64(expires_at),
             js_i64(now),
+            js_opt_str(zone_id.as_deref()),
         ])?
         .run()
         .await;
@@ -260,6 +391,7 @@ pub async fn handle_create(
             "expires_at": expires_at,
             "max_uses": max_uses,
             "issued_by": pubkey,
+            "zone_id": zone_id,
         }),
         200,
     )
@@ -287,7 +419,7 @@ pub async fn handle_list_mine(
 
     let result = db
         .prepare(
-            "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at \
+            "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id \
              FROM invitations WHERE issued_by = ?1 ORDER BY created_at DESC LIMIT 100",
         )
         .bind(&[js_str(&pubkey)])?
@@ -349,7 +481,7 @@ pub async fn handle_preview(code: &str, env: &Env) -> Result<Response> {
 
     let row = db
         .prepare(
-            "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at \
+            "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id \
              FROM invitations WHERE code = ?1",
         )
         .bind(&[js_str(code)])?
@@ -375,6 +507,21 @@ pub async fn handle_preview(code: &str, env: &Env) -> Result<Response> {
     // Public preview -- don't leak issuer pubkey fully; show a short prefix.
     let issuer_prefix: String = row.issued_by.chars().take(8).collect();
 
+    // Zone-bound invites carry the human-readable zone name so the landing
+    // page can render "You have been invited to <Zone>". Resolved from
+    // ZONE_CONFIG at read time; falls back to the raw id if config is missing.
+    let (zone_id, zone_display_name) = match row.zone_id.as_deref() {
+        Some(zid) => {
+            let zone_config = env.var("ZONE_CONFIG").ok().map(|v| v.to_string());
+            let display = resolve_zone(zone_config.as_deref(), zid)
+                .map(|z| z.display_name)
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| zid.to_string());
+            (Some(zid.to_string()), Some(display))
+        }
+        None => (None, None),
+    };
+
     json_response(
         env,
         &json!({
@@ -384,6 +531,8 @@ pub async fn handle_preview(code: &str, env: &Env) -> Result<Response> {
             "expires_at": row.expires_at,
             "state": state,
             "issuer_prefix": issuer_prefix,
+            "zone_id": zone_id,
+            "zone_display_name": zone_display_name,
         }),
         status_code,
     )
@@ -424,7 +573,7 @@ pub async fn handle_redeem(
 
     let row = db
         .prepare(
-            "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at \
+            "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id \
              FROM invitations WHERE code = ?1",
         )
         .bind(&[js_str(code)])?
@@ -514,6 +663,19 @@ pub async fn handle_redeem(
         .run()
         .await;
 
+    // Zone-bound invite: additionally grant the zone's required_cohorts to the
+    // redeemer's whitelist row (cohorts resolved from ZONE_CONFIG at redeem
+    // time, never frozen into the invite). Best-effort — a grant failure does
+    // not fail the redemption.
+    let mut granted_cohorts: Vec<String> = Vec::new();
+    if let Some(zid) = row.zone_id.as_deref() {
+        let zone_config = env.var("ZONE_CONFIG").ok().map(|v| v.to_string());
+        if let Some(zone) = resolve_zone(zone_config.as_deref(), zid) {
+            grant_zone_cohorts(env, &redeemer, &zone.required_cohorts).await;
+            granted_cohorts = zone.required_cohorts;
+        }
+    }
+
     json_response(
         env,
         &json!({
@@ -521,6 +683,8 @@ pub async fn handle_redeem(
             "invitation_id": row.id,
             "issuer": row.issued_by,
             "joined_at": now,
+            "zone_id": row.zone_id,
+            "granted_cohorts": granted_cohorts,
         }),
         200,
     )
@@ -553,7 +717,7 @@ pub async fn handle_revoke(
     };
 
     let row = db
-        .prepare("SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at FROM invitations WHERE id = ?1")
+        .prepare("SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id FROM invitations WHERE id = ?1")
         .bind(&[js_str(invite_id)])?
         .first::<InviteRow>(None)
         .await
@@ -617,7 +781,7 @@ pub async fn consume_for_registration(
 
     let Ok(stmt) = db
         .prepare(
-            "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at \
+            "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id \
              FROM invitations WHERE code = ?1",
         )
         .bind(&[js_str(code)])
@@ -707,6 +871,16 @@ pub async fn consume_for_registration(
     };
     let _ = mem_stmt.run().await;
 
+    // Zone-bound invite consumed at WebAuthn registration: grant the zone's
+    // required_cohorts (resolved from ZONE_CONFIG) on the whitelist, mirroring
+    // the /redeem path so both invite-consumption routes are consistent.
+    if let Some(zid) = row.zone_id.as_deref() {
+        let zone_config = env.var("ZONE_CONFIG").ok().map(|v| v.to_string());
+        if let Some(zone) = resolve_zone(zone_config.as_deref(), zid) {
+            grant_zone_cohorts(env, redeemer, &zone.required_cohorts).await;
+        }
+    }
+
     Ok(())
 }
 
@@ -760,6 +934,7 @@ mod tests {
             revoked_at: None,
             revoked_by: None,
             created_at: 0,
+            zone_id: None,
         };
         assert_eq!(classify(&r, 100), "active");
     }
@@ -776,6 +951,7 @@ mod tests {
             revoked_at: None,
             revoked_by: None,
             created_at: 0,
+            zone_id: None,
         };
         assert_eq!(classify(&r, 100), "expired");
     }
@@ -792,6 +968,7 @@ mod tests {
             revoked_at: None,
             revoked_by: None,
             created_at: 0,
+            zone_id: None,
         };
         assert_eq!(classify(&r, 100), "used");
     }
@@ -808,6 +985,7 @@ mod tests {
             revoked_at: Some(10),
             revoked_by: Some("admin".into()),
             created_at: 0,
+            zone_id: None,
         };
         assert_eq!(classify(&r, 100), "revoked");
     }
@@ -816,5 +994,79 @@ mod tests {
     fn create_body_defaults_empty() {
         let body: CreateBody = serde_json::from_str("{}").unwrap();
         assert!(body.max_uses.is_none());
+        assert!(body.zone_id.is_none());
+    }
+
+    #[test]
+    fn create_body_parses_zone_id() {
+        let body: CreateBody = serde_json::from_str(r#"{"zone_id":"zone2"}"#).unwrap();
+        assert_eq!(body.zone_id.as_deref(), Some("zone2"));
+    }
+
+    // --- ZONE_CONFIG fixture mirrors the deployed dreamlab projection -------
+    const ZC: &str = r#"[
+        {"id":"zone1","slug":"welcome","display_name":"Welcome","required_cohorts":[],"visibility":"public"},
+        {"id":"zone2","slug":"minimoonoir","display_name":"Minimoonoir","required_cohorts":["zone2"],"visibility":"locked"},
+        {"id":"zone3","slug":"family","display_name":"Family","required_cohorts":["zone3"],"visibility":"locked"},
+        {"id":"zone4","slug":"dreamlab","display_name":"DreamLab","required_cohorts":["zone4"],"visibility":"locked"}
+    ]"#;
+
+    #[test]
+    fn resolve_zone_finds_locked_zone_and_cohorts() {
+        let z = resolve_zone(Some(ZC), "zone3").expect("zone3 exists");
+        assert_eq!(z.id, "zone3");
+        assert_eq!(z.display_name, "Family");
+        assert_eq!(z.required_cohorts, vec!["zone3".to_string()]);
+    }
+
+    #[test]
+    fn resolve_zone_rejects_unknown_zone() {
+        assert!(resolve_zone(Some(ZC), "zone9").is_none());
+        assert!(resolve_zone(Some(ZC), "").is_none());
+    }
+
+    #[test]
+    fn resolve_zone_handles_absent_or_malformed_config() {
+        assert!(resolve_zone(None, "zone2").is_none());
+        assert!(resolve_zone(Some("not json"), "zone2").is_none());
+    }
+
+    #[test]
+    fn resolve_zone_public_zone_has_empty_cohorts() {
+        let z = resolve_zone(Some(ZC), "zone1").expect("zone1 exists");
+        assert!(z.required_cohorts.is_empty());
+    }
+
+    #[test]
+    fn merge_cohorts_dedups_and_preserves_existing() {
+        // Existing member with zone2 already; grant zone3 → both kept, no dupes.
+        let merged = merge_cohorts_json(
+            r#"["members","zone2"]"#,
+            &["zone3".to_string(), "zone2".to_string()],
+        );
+        let parsed: Vec<String> = serde_json::from_str(&merged).unwrap();
+        assert_eq!(parsed, vec!["members", "zone2", "zone3"]);
+    }
+
+    #[test]
+    fn merge_cohorts_into_members_only_row() {
+        let merged = merge_cohorts_json(r#"["members"]"#, &["zone4".to_string()]);
+        let parsed: Vec<String> = serde_json::from_str(&merged).unwrap();
+        assert_eq!(parsed, vec!["members", "zone4"]);
+    }
+
+    #[test]
+    fn merge_cohorts_empty_grant_is_noop() {
+        let merged = merge_cohorts_json(r#"["members","zone2"]"#, &[]);
+        let parsed: Vec<String> = serde_json::from_str(&merged).unwrap();
+        assert_eq!(parsed, vec!["members", "zone2"]);
+    }
+
+    #[test]
+    fn merge_cohorts_tolerates_malformed_existing() {
+        // Malformed existing value → treated as empty set so the grant still lands.
+        let merged = merge_cohorts_json("garbage", &["zone2".to_string()]);
+        let parsed: Vec<String> = serde_json::from_str(&merged).unwrap();
+        assert_eq!(parsed, vec!["zone2"]);
     }
 }

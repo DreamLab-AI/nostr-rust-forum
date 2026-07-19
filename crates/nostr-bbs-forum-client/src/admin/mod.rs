@@ -8,6 +8,7 @@ pub mod agents_roster;
 pub mod audit_log;
 pub mod calendar;
 pub mod channel_form;
+pub mod invites;
 pub mod overview;
 pub mod registrations;
 pub mod reports;
@@ -33,6 +34,7 @@ pub enum AdminTab {
     Channels,
     Users,
     Pending,
+    Invites,
     Sections,
     Agents,
     Calendar,

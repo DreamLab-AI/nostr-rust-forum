@@ -21,8 +21,8 @@ use crate::components::toast::{provide_toasts, use_toasts, ToastContainer, Toast
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage, EventsPage,
-    ForumsPage, GlossaryPage, GovernancePage, HomePage, LoginPage, NoteViewPage, PodBrowserPage,
-    ProfilePage, SectionPage, SettingsPage, SetupPage, SignupPage, ThreadPage,
+    ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, LoginPage, NoteViewPage,
+    PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage, SignupPage, ThreadPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
@@ -821,6 +821,11 @@ pub fn App() -> impl IntoView {
                     // here via /glossary#<slug>.
                     <Route path=path!("/glossary") view=GlossaryPage />
                     <Route path=path!("/view/:note_id") view=NoteViewPage />
+                    // Zone-bound invite landing (PUBLIC — branches on auth). A
+                    // static "join" segment out-scores the `/:category` dynamic
+                    // aliases declared last, so `/join/<code>` never resolves to a
+                    // zone. The page itself gates the redeem action behind auth.
+                    <Route path=path!("/join/:code") view=JoinPage />
                     // Auth-gated routes
                     <Route path=path!("/setup") view=AuthGatedSetup />
                     // Chat is consolidated into Forums (the canonical,

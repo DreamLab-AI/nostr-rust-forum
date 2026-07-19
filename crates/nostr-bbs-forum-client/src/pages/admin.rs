@@ -13,6 +13,7 @@ use crate::admin::agents_roster::AgentsRoster;
 use crate::admin::audit_log::AuditLogTab;
 use crate::admin::calendar::AdminCalendar;
 use crate::admin::channel_form::{ChannelForm, ChannelFormData};
+use crate::admin::invites::InvitesPanel;
 use crate::admin::overview::{ConnectionStatusBar, OverviewTab};
 use crate::admin::registrations::RegistrationsPanel;
 use crate::admin::reports::ReportsTab;
@@ -277,6 +278,7 @@ fn AdminPanelInner() -> impl IntoView {
                 <TabButton tab=AdminTab::Channels active=active_tab label="Channels" />
                 <TabButton tab=AdminTab::Users active=active_tab label="Users" />
                 <PendingTabButton active=active_tab pending=admin.state.stats />
+                <TabButton tab=AdminTab::Invites active=active_tab label="Invites" />
                 <TabButton tab=AdminTab::Sections active=active_tab label="Sections" />
                 <TabButton tab=AdminTab::Agents active=active_tab label="Agents" />
                 <TabButton tab=AdminTab::Calendar active=active_tab label="Calendar" />
@@ -293,6 +295,7 @@ fn AdminPanelInner() -> impl IntoView {
                     AdminTab::Channels => view! { <ChannelsTab /> }.into_any(),
                     AdminTab::Users => view! { <UsersTab /> }.into_any(),
                     AdminTab::Pending => view! { <RegistrationsPanel /> }.into_any(),
+                    AdminTab::Invites => view! { <InvitesPanel /> }.into_any(),
                     AdminTab::Sections => view! { <SectionRequests /> }.into_any(),
                     AdminTab::Agents => view! { <AgentsRoster /> }.into_any(),
                     AdminTab::Calendar => view! { <AdminCalendar /> }.into_any(),
@@ -326,6 +329,7 @@ fn initial_tab_from_query() -> Option<AdminTab> {
             "channels" => Some(AdminTab::Channels),
             "users" => Some(AdminTab::Users),
             "pending" => Some(AdminTab::Pending),
+            "invites" => Some(AdminTab::Invites),
             "sections" => Some(AdminTab::Sections),
             "agents" => Some(AdminTab::Agents),
             "calendar" => Some(AdminTab::Calendar),
