@@ -709,6 +709,72 @@ pub async fn handle_admin_registrations(
     }
 }
 
+/// POST /api/admin/registrations/dismiss — persistently dismiss a pending
+/// registration.
+///
+/// Flips the reservation's `status` from `'active'` to `'dismissed'`, so it
+/// drops out of [`list_reservations`] (which filters on `status = 'active'`)
+/// and STAYS dismissed across reloads. Before this route existed the admin
+/// panel's "dismiss" was client-side only — the row was hidden until the next
+/// refetch and then came back forever. Idempotent: dismissing an already
+/// dismissed / unknown pubkey succeeds with `dismissed: false`. The row is
+/// kept (not deleted) as an audit trail; its UNIQUE(username/pubkey) slots
+/// stay occupied, so a dismissed identity cannot silently re-reserve.
+pub async fn handle_admin_dismiss_registration(
+    body_bytes: &[u8],
+    auth_header: Option<&str>,
+    env: &Env,
+    origin: &str,
+) -> Result<Response> {
+    let url = canonical_url(origin, "/api/admin/registrations/dismiss");
+    if let Err((body, status)) =
+        require_admin(auth_header, &url, "POST", Some(body_bytes), env).await
+    {
+        return json_response(env, &body, status);
+    }
+
+    #[derive(Deserialize)]
+    struct DismissBody {
+        pubkey: String,
+    }
+    let parsed: DismissBody = match serde_json::from_slice(body_bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            return json_response(env, &json!({ "error": "invalid JSON body" }), 400);
+        }
+    };
+    let pubkey = parsed.pubkey.to_lowercase();
+    if pubkey.len() != 64 || !pubkey.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return json_response(env, &json!({ "error": "invalid pubkey" }), 400);
+    }
+
+    let db = match env.d1("DB") {
+        Ok(db) => db,
+        Err(e) => {
+            return json_response(
+                env,
+                &json!({ "error": format!("D1 unavailable: {e}") }),
+                500,
+            )
+        }
+    };
+    let stmt = db.prepare(
+        "UPDATE username_reservations SET status = 'dismissed' \
+         WHERE pubkey = ?1 AND status = 'active'",
+    );
+    let result = match stmt.bind(&[JsValue::from_str(&pubkey)]) {
+        Ok(s) => s.run().await,
+        Err(e) => return json_response(env, &json!({ "error": format!("bind failed: {e}") }), 500),
+    };
+    match result {
+        Ok(r) => {
+            let changed = r.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0);
+            json_response(env, &json!({ "ok": true, "dismissed": changed > 0 }), 200)
+        }
+        Err(e) => json_response(env, &json!({ "error": format!("update failed: {e}") }), 500),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // JSS Phase 1 — Federated NIP-05 resolution (ADR-086)
 // ---------------------------------------------------------------------------

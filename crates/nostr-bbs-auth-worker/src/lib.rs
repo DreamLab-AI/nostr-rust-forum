@@ -598,6 +598,13 @@ async fn route_sprint_api(
         let resp = username::handle_admin_registrations(auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
+    // Admin-gated persistent dismissal of a pending reservation.
+    if path == "/api/admin/registrations/dismiss" && *method == Method::Post {
+        let resp =
+            username::handle_admin_dismiss_registration(body_bytes, auth_header, env, origin)
+                .await?;
+        return Ok(Some(resp));
+    }
 
     Ok(None)
 }

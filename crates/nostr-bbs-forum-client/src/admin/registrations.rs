@@ -134,16 +134,38 @@ pub fn RegistrationsPanel() -> impl IntoView {
         }) as std::rc::Rc<dyn Fn(String)>
     });
 
-    // Reject: drop locally from the registrations list (the reservation stays
-    // on the auth-worker but is hidden from review until the next refetch).
+    // Reject: persistently dismiss on the auth-worker (the reservation's
+    // status flips to 'dismissed' and drops out of every future fetch), then
+    // remove locally. Previously this was client-side only — the row was
+    // hidden until the next refetch and came back forever.
     let reject_user = StoredValue::new_local({
         let admin_for_reject = admin.clone();
         std::rc::Rc::new(move |pubkey: String| {
-            registrations.update(|list| list.retain(|r| r.pubkey != pubkey));
-            admin_for_reject.recompute_pending();
-            selected.update(|s| s.retain(|p| p != &pubkey));
+            let Some(signer) = auth.get_signer() else {
+                action_msg.set(Some(("No signing key — log in first".to_string(), false)));
+                return;
+            };
+            let admin_clone = admin_for_reject.clone();
             let short = format!("{}…", &pubkey[..8.min(pubkey.len())]);
-            action_msg.set(Some((format!("Dismissed {short}"), true)));
+            spawn_local(async move {
+                let url = format!(
+                    "{}/api/admin/registrations/dismiss",
+                    crate::utils::relay_url::auth_api_base()
+                );
+                let body = serde_json::json!({ "pubkey": pubkey }).to_string();
+                match crate::auth::nip98::fetch_with_nip98_post_signer(&url, &body, &*signer).await
+                {
+                    Ok(_) => {
+                        registrations.update(|list| list.retain(|r| r.pubkey != pubkey));
+                        admin_clone.recompute_pending();
+                        action_msg.set(Some((format!("Dismissed {short}"), true)));
+                    }
+                    Err(e) => {
+                        action_msg.set(Some((format!("Dismiss failed: {e}"), false)));
+                    }
+                }
+                selected.update(|s| s.retain(|p| p != &pubkey));
+            });
         }) as std::rc::Rc<dyn Fn(String)>
     });
 
