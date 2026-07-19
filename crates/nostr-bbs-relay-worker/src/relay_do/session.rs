@@ -101,8 +101,22 @@ impl NostrRelayDO {
             }
         }
 
-        let challenge = generate_challenge(session_id);
         let storage = self.state.storage();
+
+        // NIP-42 across hibernation: the challenge issued to this session at
+        // connect time was persisted to DO storage (`ws_chal:{id}`). RESTORE it
+        // so a client that connected — but had not yet authed — before the DO
+        // hibernated can still answer its ORIGINAL challenge. Minting a fresh
+        // one here (as the code previously did) left that client answering an
+        // old challenge the recovered session no longer knew, so its AUTH failed
+        // "challenge mismatch" forever. If no persisted challenge is found we
+        // mint a new one AND re-send AUTH so the client answers the new value.
+        let persisted_challenge = Self::load_challenge(&storage, session_id).await;
+        let (challenge, reissue_challenge) = recovered_challenge(persisted_challenge, session_id);
+        if reissue_challenge {
+            Self::persist_challenge(&storage, session_id, &challenge).await;
+            Self::send_auth(ws, &challenge);
+        }
 
         // Also recover any other connected WebSockets we've lost track of.
         let all_ws = self.state.get_websockets();
@@ -128,7 +142,15 @@ impl NostrRelayDO {
                 continue;
             }
 
-            let ch = generate_challenge(sid);
+            // Restore this other session's NIP-42 challenge (see the primary
+            // session above): reuse the persisted value so a pending AUTH still
+            // validates, else mint + persist + re-issue AUTH on its socket.
+            let persisted_ch = Self::load_challenge(&storage, sid).await;
+            let (ch, reissue) = recovered_challenge(persisted_ch, sid);
+            if reissue {
+                Self::persist_challenge(&storage, sid, &ch).await;
+                Self::send_auth(&other_ws, &ch);
+            }
 
             // Restore subscriptions and auth state from DO storage. The
             // `sessions` RefCell is not borrowed while these await.
@@ -219,6 +241,40 @@ impl NostrRelayDO {
         storage.get::<String>(&key).await.unwrap_or_default()
     }
 
+    /// Load the persisted NIP-42 challenge for a session from DO transactional
+    /// storage. Returns `None` when absent (the DO never persisted it, or it was
+    /// cleared on disconnect), signalling that the recovering session must mint
+    /// and re-issue a fresh challenge.
+    async fn load_challenge(storage: &worker::durable::Storage, session_id: u64) -> Option<String> {
+        let key = format!("ws_chal:{session_id}");
+        storage.get::<String>(&key).await.unwrap_or_default()
+    }
+
+    /// Persist a session's NIP-42 challenge to DO transactional storage so it
+    /// survives hibernation and a pre-hibernation AUTH response still validates.
+    async fn persist_challenge(
+        storage: &worker::durable::Storage,
+        session_id: u64,
+        challenge: &str,
+    ) {
+        let key = format!("ws_chal:{session_id}");
+        if let Err(e) = storage.put(&key, challenge.to_string()).await {
+            console_log!(
+                "[RelayDO] Failed to persist challenge for #{}: {:?}",
+                session_id,
+                e
+            );
+        }
+    }
+
+    /// Persist the challenge issued to a freshly-connected session (called from
+    /// `fetch`). Mirrors [`save_auth`](Self::save_auth) / [`save_subscriptions`]
+    /// so the AUTH handshake survives a hibernation that occurs before the client
+    /// answers the challenge.
+    pub(crate) async fn save_challenge(&self, session_id: u64, challenge: &str) {
+        Self::persist_challenge(&self.state.storage(), session_id, challenge).await;
+    }
+
     /// Persist current subscription state for a session to DO transactional storage.
     pub(crate) async fn save_subscriptions(&self, session_id: u64) {
         let subs_json = {
@@ -257,6 +313,7 @@ impl NostrRelayDO {
         let storage = self.state.storage();
         let _ = storage.delete(&format!("ws_sub:{session_id}")).await;
         let _ = storage.delete(&format!("ws_auth:{session_id}")).await;
+        let _ = storage.delete(&format!("ws_chal:{session_id}")).await;
     }
 
     pub(crate) async fn remove_session(&self, ws: &WebSocket) {
@@ -308,6 +365,26 @@ impl NostrRelayDO {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Decide the NIP-42 challenge for a session recovered from hibernation.
+///
+/// Returns `(challenge, reissue)`:
+/// - `reissue == false`: the persisted challenge was restored verbatim, so a
+///   client that connected before hibernation and is now answering its ORIGINAL
+///   challenge validates. Do NOT re-send AUTH (that would rotate the challenge
+///   and invalidate the client's in-flight response).
+/// - `reissue == true`: no usable persisted challenge existed, so a fresh one
+///   was minted; the caller MUST persist it and re-send AUTH so the client
+///   answers the new value.
+///
+/// Pure over its inputs so the restore-vs-reissue decision is unit-testable
+/// without a `worker::State` / DO storage.
+pub(crate) fn recovered_challenge(persisted: Option<String>, session_id: u64) -> (String, bool) {
+    match persisted {
+        Some(c) if !c.is_empty() => (c, false),
+        _ => (generate_challenge(session_id), true),
+    }
+}
+
 /// Generate a unique challenge string for NIP-42 AUTH.
 ///
 /// NIP-42 challenge unpredictability is the entire security property of the
@@ -323,4 +400,46 @@ pub(crate) fn generate_challenge(session_id: u64) -> String {
     let r1 = u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes"));
     let r2 = u64::from_be_bytes(bytes[8..].try_into().expect("8 bytes"));
     format!("{:016x}{:016x}", r1, r2 ^ session_id)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovered_challenge_reuses_persisted_value() {
+        // A persisted challenge must be restored verbatim with reissue=false so
+        // a pre-hibernation AUTH response validates across the boundary.
+        let (ch, reissue) = recovered_challenge(Some("deadbeef".to_string()), 7);
+        assert_eq!(ch, "deadbeef");
+        assert!(!reissue, "persisted challenge must not trigger a re-issue");
+    }
+
+    #[test]
+    fn recovered_challenge_mints_when_absent() {
+        // No persisted challenge => mint a fresh one and signal a re-issue.
+        let (ch, reissue) = recovered_challenge(None, 42);
+        assert_eq!(ch.len(), 32, "challenge is 128 bits hex-encoded");
+        assert!(reissue, "absent challenge must trigger mint + re-issue");
+    }
+
+    #[test]
+    fn recovered_challenge_treats_empty_as_absent() {
+        // An empty stored string is not a usable challenge; treat as absent.
+        let (ch, reissue) = recovered_challenge(Some(String::new()), 3);
+        assert_eq!(ch.len(), 32);
+        assert!(reissue);
+    }
+
+    #[test]
+    fn generate_challenge_is_unique_and_sized() {
+        let a = generate_challenge(1);
+        let b = generate_challenge(1);
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b, "CSPRNG-backed challenges must differ");
+    }
 }

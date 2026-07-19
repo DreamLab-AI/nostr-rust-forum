@@ -132,11 +132,24 @@ pub(crate) fn LinkPreview(
         ) {
             let html_el: &web_sys::Element = &el;
             observer.observe(html_el);
-        }
 
-        // Leak the closure intentionally -- observer holds the reference.
-        // It disconnects after first intersection so only one fetch happens.
-        callback.forget();
+            // Previously this leaked `callback` via `.forget()` with no
+            // `on_cleanup`. The observer normally self-disconnects after the
+            // first intersection, but if the card unmounts (channel switch,
+            // message list re-render) *before* it ever intersects, the
+            // observer and its closure stayed alive and could still invoke
+            // `state_sig.set(..)` against a disposed signal. `on_cleanup`
+            // registered here re-runs before this effect's next execution
+            // AND on final disposal, so it also guards against stacking a
+            // second observer if the effect re-runs (e.g. the preference
+            // toggles off then on) while the first one is still pending.
+            let guard = send_wrapper::SendWrapper::new((observer, callback));
+            on_cleanup(move || {
+                let (observer, callback) = guard.take();
+                observer.disconnect();
+                drop(callback);
+            });
+        }
     });
 
     view! {

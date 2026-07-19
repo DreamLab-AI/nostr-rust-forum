@@ -27,6 +27,13 @@ struct ImageAttachment {
 /// Maximum message length in characters.
 const MAX_CHARS: usize = 4096;
 
+/// Storage slot for a pending one-shot `setTimeout` `Closure`, wrapped in
+/// `SendWrapper` to satisfy `on_cleanup`'s `Send + Sync` bound on this
+/// otherwise-`!Send` wasm-bindgen type. Re-assigning `Some(..)` drops
+/// whatever closure was previously stored, so it never leaks via `.forget()`.
+type PendingTimerClosure =
+    StoredValue<Option<send_wrapper::SendWrapper<wasm_bindgen::closure::Closure<dyn FnMut()>>>>;
+
 /// Common emojis for the quick picker.
 const EMOJIS: &[&str] = &[
     "\u{1F44D}",
@@ -245,6 +252,10 @@ pub(crate) fn MessageInput(
     }
 
     let draft_timer: RwSignal<Option<i32>> = RwSignal::new(None);
+    // Holds the pending draft-save `Closure` so it can be dropped (instead of
+    // leaked via `.forget()`) once it fires or the component unmounts.
+    // Re-assigning `Some(..)` drops whatever closure was previously stored.
+    let draft_closure: PendingTimerClosure = StoredValue::new(None);
     let schedule_draft_save = {
         let cid = channel_id.clone();
         move || {
@@ -267,7 +278,7 @@ pub(crate) fn MessageInput(
                     draft_timer.set(Some(tid));
                 }
             }
-            cb.forget();
+            draft_closure.set_value(Some(send_wrapper::SendWrapper::new(cb)));
         }
     };
 
@@ -333,6 +344,10 @@ pub(crate) fn MessageInput(
     //
     // `local` is computed by the caller inside a reactive scope (so it
     // subscribes to the ProfileCache) and threaded through here.
+    // Holds the pending mention-search debounce `Closure`, mirroring
+    // `draft_closure` above: dropped (not leaked) on the next debounce reset
+    // and on component cleanup.
+    let mention_closure: PendingTimerClosure = StoredValue::new(None);
     let trigger_mention_search = move |query: String, local: Vec<MentionCandidate>| {
         // Cancel any previous pending network fetch.
         if let Some(h) = mention_debounce.get_untracked() {
@@ -381,8 +396,27 @@ pub(crate) fn MessageInput(
                 mention_debounce.set(Some(h));
             }
         }
-        cb.forget();
+        mention_closure.set_value(Some(send_wrapper::SendWrapper::new(cb)));
     };
+
+    // Both `schedule_draft_save` and `trigger_mention_search` leave a pending
+    // `setTimeout` running against `content`/`mention_*` signals that belong
+    // to this component's reactive scope. If the composer unmounts (message
+    // sent, edit cancelled, channel switched) before either timer fires, the
+    // callback runs against disposed signals. Clear both outstanding timers
+    // on cleanup so nothing fires post-unmount.
+    on_cleanup(move || {
+        if let Some(w) = web_sys::window() {
+            if let Some(tid) = draft_timer.get_untracked() {
+                w.clear_timeout_with_handle(tid);
+            }
+            if let Some(h) = mention_debounce.get_untracked() {
+                w.clear_timeout_with_handle(h);
+            }
+        }
+        draft_closure.set_value(None);
+        mention_closure.set_value(None);
+    });
 
     let update_mention_state = move || {
         let Some(el) = textarea_ref.get_untracked() else {

@@ -1,6 +1,6 @@
 # ADR-109: Zone-bound one-shot BBS PWA install
 
-**Status:** Accepted (design ratified; implementation pending)
+**Status:** Accepted — Implemented (shipped in release 1.0.0-beta.5)
 **Date:** 2026-07-18
 **Decision Owners:** nostr-rust-forum maintainers (DreamLab AI)
 **Related:** [ADR-107 Zone-first landing and scoped navigation](ADR-107-zone-first-landing-and-scoped-navigation.md), [ADR-108 BBS mobile-first redesign](ADR-108-bbs-mobile-first-redesign.md), [ADR-105 BBS door-games and write-path](ADR-105-bbs-door-games-and-write-architecture.md), [ADR-099 Revocable device keys](ADR-099-revocable-device-keys.md), [ADR-100 Key lifecycle](ADR-100-key-lifecycle.md), [ADR-094 Deterministic purpose-scoped subkey derivation](ADR-094-deterministic-subkey-derivation.md), [ADR-090 Path discipline at the FORUM_BASE boundary](ADR-090-forum-base-path-discipline.md), ADR-022 NIP-29 Group Access Model (upstream/historical kit record — the relay zone read gate), [PRD BBS retro client](../prd/prd-bbs-retro-client.md), [DDD BBS bounded contexts](../ddd/ddd-bbs-bounded-contexts.md), relay admin alias/delete surface (`crates/nostr-bbs-relay-worker/src/user_admin.rs`)

@@ -35,7 +35,7 @@ pub mod test_exports {
     pub use super::broadcast::{event_treatment, EventTreatment};
     pub use super::filter::{d_tag_value, event_matches_filters, tag_value, NostrFilter};
     pub use super::mod_cache::{resolve_block, ActionRow, Block, ModCache};
-    pub use super::nip_handlers::governance_response_blocked;
+    pub use super::nip_handlers::{governance_response_blocked, is_ban_gated_kind};
 }
 
 use std::cell::RefCell;
@@ -150,6 +150,13 @@ impl DurableObject for NostrRelayDO {
             let count = counts.get(&ip).copied().unwrap_or(0);
             counts.insert(ip, count + 1);
         }
+
+        // NIP-42: persist the challenge to DO storage BEFORE sending it, so a
+        // hibernation that occurs before the client answers can restore the same
+        // challenge in `recover_session` and the client's original AUTH response
+        // still validates (otherwise the recovered session mints a new challenge
+        // the client never saw and every AUTH fails "challenge mismatch").
+        self.save_challenge(session_id, &challenge).await;
 
         // NIP-42: Send AUTH challenge to the newly connected client
         {

@@ -47,6 +47,26 @@ fn is_nip29_admin_kind(kind: u64) -> bool {
     (9000..=9020).contains(&kind) || (39000..=39002).contains(&kind)
 }
 
+/// WI-2: content-bearing kinds a banned or muted author must NOT publish.
+///
+/// The moderation ingress gate (`ModCache::is_blocked`) previously fired only
+/// for kinds 1 and 42, so a banned user could still publish reactions (7),
+/// deletions (5), reports (1984), long-form articles (30023), channel
+/// create/metadata (40/41) and NIP-52 calendar events + RSVPs (31922/31923/
+/// 31925). This enumerates every user-authored content kind the ban must cover.
+/// Admins bypass at the call site. Gift wraps (1059) are intentionally excluded:
+/// each is signed by a throwaway ephemeral key, so an author-keyed ban cannot
+/// apply — those are bounded by the recipient-whitelist gate instead.
+///
+/// Pure predicate so the gate scope is unit-testable without an `Env`.
+pub fn is_ban_gated_kind(kind: u64) -> bool {
+    matches!(kind, 1 | 5 | 7 | 40 | 41 | 42 | 30023)
+        || kind == KIND_REPORT_NIP56
+        || kind == nostr_bbs_core::KIND_CALENDAR_DATE_EVENT
+        || kind == nostr_bbs_core::KIND_CALENDAR_EVENT
+        || kind == KIND_CALENDAR_RSVP
+}
+
 /// Phase C (write side): whether an RSVP (kind 31925) is permitted to be written,
 /// given the AUTHOR's resolved projection tier for the RSVP's TARGET event.
 ///
@@ -495,13 +515,15 @@ impl NostrRelayDO {
             return;
         }
 
-        // WI-2: kind-1 / kind-42 ingress check against moderation_actions
-        // (60s DO cache). Applies to any content-producing kind we care
-        // about. Admins bypass so they can e.g. publish warnings even
-        // while under moderation for other reasons.
+        // WI-2: moderation ingress check against moderation_actions (60s DO
+        // cache). Applies to EVERY user-authored content kind a banned/muted
+        // author must not publish (see `is_ban_gated_kind`) — not just kind-1
+        // and kind-42, which let bans leak through reactions, deletions,
+        // reports, articles and calendar events. Admins bypass so they can e.g.
+        // publish warnings even while under moderation for other reasons.
         //
         // P2-03: use admin_cache to avoid redundant D1 queries on every event.
-        if matches!(event.kind, 1 | 42)
+        if is_ban_gated_kind(event.kind)
             && !self.admin_cache.is_admin(&event.pubkey, &self.env).await
             && self.mod_cache.is_blocked(&event.pubkey, &self.env).await
         {
@@ -651,14 +673,28 @@ impl NostrRelayDO {
                 Self::send_ok(ws, &event.id, false, "invalid: missing channel tag");
                 return;
             };
-            let zone = trust::get_channel_zone(&channel_id, &self.env)
-                .await
-                .unwrap_or_else(|| "home".to_string());
-            // Writes route through the write gate (write_cohorts ?? required_cohorts)
-            // so a public zone can be read-by-all yet write-restricted.
-            if !is_admin && !trust::has_zone_write_access(&event.pubkey, &zone, &self.env).await {
-                Self::send_ok(ws, &event.id, false, "zone access denied");
-                return;
+            // Only a channel EXPLICITLY bound to a zone (a `channel_zones` row,
+            // written solely by the admin-only /api/admin/channel-zone endpoint)
+            // is write-gated. An undeclared channel is UNSCOPED: it belongs to no
+            // private zone, so any whitelisted member (already gated above) may
+            // post to it.
+            //
+            // Finding-5 fix: this previously defaulted an undeclared channel to
+            // the "home" zone. Absent a matching ZONE_CONFIG entry (the four-zone
+            // model ships public/friends/family/business, no "home"), the write
+            // gate then denied ALL non-admins — silently write-locking every
+            // freshly-created channel to admins until an admin bound it. Since
+            // channel creation never writes `channel_zones`, that lockout was
+            // permanent for non-admin-created channels, including the creator's
+            // own new channel. Writes route through the write gate
+            // (write_cohorts ?? required_cohorts) so a public zone can still be
+            // read-by-all yet write-restricted.
+            if let Some(zone) = trust::get_channel_zone(&channel_id, &self.env).await {
+                if !is_admin && !trust::has_zone_write_access(&event.pubkey, &zone, &self.env).await
+                {
+                    Self::send_ok(ws, &event.id, false, "zone access denied");
+                    return;
+                }
             }
         }
 
@@ -1277,26 +1313,32 @@ impl NostrRelayDO {
         };
 
         if let Some(cid) = channel_id {
-            let zone = trust::get_channel_zone(&cid, &self.env)
-                .await
-                .unwrap_or_else(|| "home".to_string());
-
-            if !ctx.is_admin {
-                let is_member = match &ctx.access_pubkey {
-                    Some(pk) => trust::has_zone_access(pk, &zone, &self.env).await,
-                    None => zones.is_public_read(&zone),
-                };
-                if !is_member {
-                    if event.kind == 40 {
-                        // Channel definition: served only if the zone is not
-                        // Hidden (Locked/Public tiles render).
-                        if !zones.defs_visible_to_nonmember(&zone) {
+            // Only a channel EXPLICITLY bound to a zone is read-gated. An
+            // undeclared channel is UNSCOPED (public read), mirroring the write
+            // path that lets any whitelisted member post to it — a channel you
+            // may post to, you (and everyone) may read. Finding-5 fix: defaulting
+            // an undeclared channel to a private "home" zone previously hid every
+            // new channel's tile AND messages from all non-admins, including the
+            // channel's own author, since "home" is not a configured zone and an
+            // unknown zone denies by default.
+            if let Some(zone) = trust::get_channel_zone(&cid, &self.env).await {
+                if !ctx.is_admin {
+                    let is_member = match &ctx.access_pubkey {
+                        Some(pk) => trust::has_zone_access(pk, &zone, &self.env).await,
+                        None => zones.is_public_read(&zone),
+                    };
+                    if !is_member {
+                        if event.kind == 40 {
+                            // Channel definition: served only if the zone is not
+                            // Hidden (Locked/Public tiles render).
+                            if !zones.defs_visible_to_nonmember(&zone) {
+                                return ReadDecision::Withhold;
+                            }
+                        } else {
+                            // Channel content (kind-42): withheld from non-members
+                            // of Locked/Hidden zones.
                             return ReadDecision::Withhold;
                         }
-                    } else {
-                        // Channel content (kind-42): withheld from non-members of
-                        // Locked/Hidden zones.
-                        return ReadDecision::Withhold;
                     }
                 }
             }

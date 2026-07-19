@@ -15,8 +15,8 @@
 
 use nostr_bbs_core::event::NostrEvent;
 use nostr_bbs_relay_worker::test_exports::{
-    d_tag_value, event_matches_filters, event_treatment, governance_response_blocked, tag_value,
-    EventTreatment, NostrFilter,
+    d_tag_value, event_matches_filters, event_treatment, governance_response_blocked,
+    is_ban_gated_kind, tag_value, EventTreatment, NostrFilter,
 };
 
 // ---------------------------------------------------------------------------
@@ -688,4 +688,48 @@ fn action_response_gate_only_targets_31403() {
         nostr_bbs_core::governance::KIND_PANEL_DEFINITION,
         false
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Finding-4: moderation ban gate covers all user-content kinds, not just 1/42
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ban_gate_covers_text_and_channel_messages() {
+    // The original scope (regression guard).
+    assert!(is_ban_gated_kind(1)); // text note
+    assert!(is_ban_gated_kind(42)); // channel message
+}
+
+#[test]
+fn ban_gate_covers_reactions_deletions_and_reports() {
+    // The kinds a banned user could previously still publish.
+    assert!(is_ban_gated_kind(5)); // NIP-09 deletion
+    assert!(is_ban_gated_kind(7)); // NIP-25 reaction
+    assert!(is_ban_gated_kind(nostr_bbs_core::KIND_REPORT_NIP56)); // 1984 report
+}
+
+#[test]
+fn ban_gate_covers_channel_management_and_articles() {
+    assert!(is_ban_gated_kind(40)); // channel create
+    assert!(is_ban_gated_kind(41)); // channel metadata
+    assert!(is_ban_gated_kind(30023)); // long-form article
+}
+
+#[test]
+fn ban_gate_covers_calendar_and_rsvp_kinds() {
+    assert!(is_ban_gated_kind(nostr_bbs_core::KIND_CALENDAR_DATE_EVENT)); // 31922
+    assert!(is_ban_gated_kind(nostr_bbs_core::KIND_CALENDAR_EVENT)); // 31923
+    assert!(is_ban_gated_kind(nostr_bbs_core::KIND_CALENDAR_RSVP)); // 31925
+}
+
+#[test]
+fn ban_gate_excludes_gift_wraps_and_profiles() {
+    // Gift wraps (1059) are ephemeral-authored — an author-keyed ban cannot
+    // apply, and the recipient-whitelist gate bounds them instead. Profile
+    // (kind-0) and AUTH (22242) are not content posts.
+    assert!(!is_ban_gated_kind(1059));
+    assert!(!is_ban_gated_kind(0));
+    assert!(!is_ban_gated_kind(22242));
+    assert!(!is_ban_gated_kind(10002)); // relay list metadata
 }

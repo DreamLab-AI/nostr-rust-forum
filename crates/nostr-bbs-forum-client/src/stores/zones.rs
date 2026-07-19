@@ -13,7 +13,8 @@
 //! client through the already-injected `window.__ENV__` global, under the key
 //! `ZONE_CONFIG`. The client reads it once at module load. No new relay route,
 //! no extra fetch. If the key is absent or unparseable, we fall back to the
-//! legacy hardcoded 3-zone list so existing deployments do not regress.
+//! generic 4-zone list (`public`/`friends`/`family`/`business`, matching the
+//! example below) so a vanilla/dev deployment still renders sensibly.
 //!
 //! ### Expected `window.__ENV__.ZONE_CONFIG` shape
 //!
@@ -284,39 +285,54 @@ fn humanize(id: &str) -> String {
 }
 
 /// Legacy fallback zones, used when `ZONE_CONFIG` is unavailable. Mirrors the
-/// previous hardcoded `home`/`members`/`private` list, expressed in the new
-/// config shape so the renderer has a single code path.
+/// generic 4-zone model documented in the module-level `ZONE_CONFIG` example
+/// above (`public`/`friends`/`family`/`business`), expressed in the new config
+/// shape so the renderer has a single code path. These ids are the same ones
+/// exercised by `zone_theme`/`zone_hero`'s `"public"` matchers and by this
+/// module's own tests (`sample_zones()`), so a vanilla/dev deployment with no
+/// `ZONE_CONFIG` still behaves consistently with the rest of the client.
 fn fallback_zones() -> Vec<Zone> {
     vec![
         Zone {
-            id: "home".to_string(),
+            id: "public".to_string(),
             slug: None,
-            display_name: "Home".to_string(),
+            display_name: "Public".to_string(),
             required_cohorts: vec![],
             write_cohorts: None,
-            banner_image_url: Some("/images/heroes/members-hero.webp".to_string()),
+            banner_image_url: Some("/images/heroes/public-hero.webp".to_string()),
             visibility: ZoneVisibility::Public,
             encrypted: false,
             accent_hex: None,
         },
         Zone {
-            id: "members".to_string(),
+            id: "friends".to_string(),
             slug: None,
-            display_name: "Members".to_string(),
-            required_cohorts: vec!["members".to_string()],
+            display_name: "Friends".to_string(),
+            required_cohorts: vec!["friends".to_string()],
             write_cohorts: None,
-            banner_image_url: Some("/images/heroes/ai-commander-week.webp".to_string()),
+            banner_image_url: Some("/images/heroes/friends-hero.webp".to_string()),
             visibility: ZoneVisibility::Locked,
             encrypted: false,
             accent_hex: None,
         },
         Zone {
-            id: "private".to_string(),
+            id: "family".to_string(),
             slug: None,
-            display_name: "Private".to_string(),
-            required_cohorts: vec!["private".to_string()],
+            display_name: "Family".to_string(),
+            required_cohorts: vec!["family".to_string()],
             write_cohorts: None,
-            banner_image_url: Some("/images/heroes/corporate-immersive.webp".to_string()),
+            banner_image_url: Some("/images/heroes/family-hero.webp".to_string()),
+            visibility: ZoneVisibility::Locked,
+            encrypted: true,
+            accent_hex: None,
+        },
+        Zone {
+            id: "business".to_string(),
+            slug: None,
+            display_name: "Business".to_string(),
+            required_cohorts: vec!["business".to_string()],
+            write_cohorts: None,
+            banner_image_url: Some("/images/heroes/business-hero.webp".to_string()),
             visibility: ZoneVisibility::Locked,
             encrypted: false,
             accent_hex: None,

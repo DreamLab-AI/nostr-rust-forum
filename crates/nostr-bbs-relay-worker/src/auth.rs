@@ -30,8 +30,20 @@ use worker::Env;
 /// so replay protection was silently skipped.
 const REPLAY_DB: &str = "REPLAY_DB";
 
-/// Admin-cache TTL in seconds (5 minutes).
-const ADMIN_CACHE_TTL_SECS: u64 = 300;
+/// Admin-cache TTL in seconds.
+///
+/// Finding-2 fix: admin status gates *security-sensitive* decisions (moderation
+/// bypass, NIP-29 group actions, governance responses, zone-write bypass), so a
+/// stale cache means a DEMOTED admin keeps those privileges for the whole TTL.
+/// Admin changes are applied by the /api/whitelist/set-admin endpoint, which
+/// runs in a separate Worker execution context from this Durable Object and so
+/// cannot reach in and invalidate this per-DO cache directly. The TTL is
+/// therefore the revocation-latency ceiling; it is kept short (30s) to bound how
+/// long a revoked admin retains access, while still absorbing the burst of
+/// admin checks a single EVENT triggers. `AdminCache::invalidate` additionally
+/// clears an entry immediately whenever this DO itself observes an admin-status
+/// change.
+const ADMIN_CACHE_TTL_SECS: u64 = 30;
 
 /// Current Unix timestamp in seconds from the JS runtime.
 pub fn js_now_secs() -> u64 {
@@ -117,6 +129,23 @@ impl AdminCache {
         }
 
         result
+    }
+
+    /// Drop the cached admin-status entry for `pubkey`, forcing the next
+    /// [`is_admin`](Self::is_admin) call to re-read D1. Called when this DO
+    /// observes an admin-status change (e.g. a mirrored moderation/role event
+    /// touching the pubkey) so a promotion/demotion is honoured immediately
+    /// rather than after the TTL.
+    #[allow(dead_code)]
+    pub fn invalidate(&self, pubkey: &str) {
+        self.entries.borrow_mut().remove(pubkey);
+    }
+
+    /// Clear the entire admin-status cache. Called on a bulk admin-model change
+    /// (e.g. a database reset) where per-pubkey invalidation is impractical.
+    #[allow(dead_code)]
+    pub fn invalidate_all(&self) {
+        self.entries.borrow_mut().clear();
     }
 }
 

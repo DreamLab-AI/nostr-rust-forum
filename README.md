@@ -328,7 +328,7 @@ Fourteen crates in a Cargo workspace:
 | `nostr-bbs-search-worker` | CF Worker | Semantic vector search via Workers AI BGE-small embeddings, RVF binary format, in-memory cosine k-NN, rate limiting (R2 + KV) |
 | `nostr-bbs-rate-limit` | Library | Shared application-layer rate limiting via Cloudflare KV, consumed by all workers |
 | `nostr-bbs-forum-client` | Leptos App | Browser client (Leptos 0.7 CSR + Trunk): passkey auth, 22 pages, 60+ components, config-driven zone tiles, reactive display-name resolution, admin panel, Source-Control pod browser, governance dashboard |
-| `nostr-bbs-bbs-client` | Leptos App | Retro ASCII/BBS terminal client served at `/community/bbs/` (Leptos CSR + Trunk): phosphor-CRT render skin, door games, message-base/roster/pod browsing. Read-only render skin today; the M2 write-path reuses the forum's signer (ADR-105) |
+| `nostr-bbs-bbs-client` | Leptos App | Retro ASCII/BBS terminal client served at `/community/bbs/` (Leptos CSR + Trunk): phosphor-CRT render skin, door games, message-base/roster/pod browsing, and a message write path that reuses the forum's signer (ADR-105) |
 | `nostr-bbs-upstream-canary` | Test | Validates upstream `nostr` crate compatibility on the WASM/CF Workers build matrix |
 
 ```

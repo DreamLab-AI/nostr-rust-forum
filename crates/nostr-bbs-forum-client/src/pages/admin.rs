@@ -173,17 +173,37 @@ fn AdminPanelInner() -> impl IntoView {
     let admin_for_dismiss_err = admin.clone();
     let admin_for_dismiss_success = admin.clone();
 
-    // Auto-dismiss toasts after 5 seconds
+    // Auto-dismiss toasts after 5 seconds. `AdminPanelInner` provides a fresh
+    // `AdminStore` on every mount (`provide_admin()` above); if the admin
+    // navigates away before the timer fires, the old callback would run
+    // `clear_error`/`clear_success` against that disposed store. `on_cleanup`
+    // registered inside the effect re-runs before the effect's next
+    // execution *and* on final disposal, so the pending timer is always
+    // cancelled and its closure dropped before it can fire post-unmount.
     Effect::new(move |_| {
         if error.get().is_some() {
             let admin_clone = admin_for_dismiss_err.clone();
-            auto_dismiss(move || admin_clone.clear_error());
+            if let Some((handle, guard)) = auto_dismiss(move || admin_clone.clear_error()) {
+                on_cleanup(move || {
+                    if let Some(w) = web_sys::window() {
+                        w.clear_timeout_with_handle(handle);
+                    }
+                    drop(guard);
+                });
+            }
         }
     });
     Effect::new(move |_| {
         if success.get().is_some() {
             let admin_clone = admin_for_dismiss_success.clone();
-            auto_dismiss(move || admin_clone.clear_success());
+            if let Some((handle, guard)) = auto_dismiss(move || admin_clone.clear_success()) {
+                on_cleanup(move || {
+                    if let Some(w) = web_sys::window() {
+                        w.clear_timeout_with_handle(handle);
+                    }
+                    drop(guard);
+                });
+            }
         }
     });
 
@@ -909,16 +929,22 @@ fn checkbox_checked(ev: &leptos::ev::Event) -> bool {
         .unwrap_or(false)
 }
 
+/// The `setTimeout` handle plus a guard holding the one-shot `Closure`, so
+/// the caller can cancel the timer and drop the closure (instead of leaking
+/// it via `.forget()`) if the surrounding component unmounts before it fires.
+type PendingDismissTimer = (
+    i32,
+    send_wrapper::SendWrapper<wasm_bindgen::closure::Closure<dyn FnMut()>>,
+);
+
 /// Set a 5-second timer that calls the given closure.
-fn auto_dismiss(f: impl Fn() + 'static) {
+fn auto_dismiss(f: impl FnOnce() + 'static) -> Option<PendingDismissTimer> {
     let cb = wasm_bindgen::closure::Closure::once(Box::new(f) as Box<dyn FnOnce()>);
-    if let Some(w) = web_sys::window() {
-        let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
-            cb.as_ref().unchecked_ref(),
-            5000,
-        );
-    }
-    cb.forget();
+    let window = web_sys::window()?;
+    let handle = window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 5000)
+        .ok()?;
+    Some((handle, send_wrapper::SendWrapper::new(cb)))
 }
 
 /// Return a Tailwind class for a small colored dot representing the section.

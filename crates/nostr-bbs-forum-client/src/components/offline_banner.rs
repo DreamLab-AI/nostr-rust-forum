@@ -49,9 +49,26 @@ pub fn OfflineBanner() -> impl IntoView {
         let _ =
             window.add_event_listener_with_callback("offline", on_offline.as_ref().unchecked_ref());
 
-        // Leak intentionally -- these listeners live for the app lifetime
-        on_online.forget();
-        on_offline.forget();
+        // These `window` listeners write to `set_online`/`set_show_restored`,
+        // which belong to this component's reactive scope. They previously
+        // leaked via `.forget()` with no `on_cleanup`, so if `OfflineBanner`
+        // ever unmounts (it is not app-root-pinned — nothing prevents a
+        // future call site from mounting/unmounting it conditionally), a
+        // later online/offline event would still fire against disposed
+        // signals. Remove the listeners and drop the closures on cleanup.
+        let window_for_cleanup = window.clone();
+        let guard = send_wrapper::SendWrapper::new((on_online, on_offline));
+        on_cleanup(move || {
+            let (on_online, on_offline) = guard.take();
+            let _ = window_for_cleanup
+                .remove_event_listener_with_callback("online", on_online.as_ref().unchecked_ref());
+            let _ = window_for_cleanup.remove_event_listener_with_callback(
+                "offline",
+                on_offline.as_ref().unchecked_ref(),
+            );
+            drop(on_online);
+            drop(on_offline);
+        });
     });
 
     view! {

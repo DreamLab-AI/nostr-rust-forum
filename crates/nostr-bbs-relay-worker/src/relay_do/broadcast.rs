@@ -160,6 +160,26 @@ impl NostrRelayDO {
         v
     }
 
+    /// Per-IP sliding-window frame limiter.
+    ///
+    /// Atomicity (Finding-3): this is deliberately NOT the shared KV
+    /// `nostr_bbs_rate_limit::check_rate_limit`, whose non-atomic get-then-put
+    /// lets concurrent requests each read the same pre-increment counter and
+    /// burst past the limit. All relay WebSocket traffic is routed to a single
+    /// named Durable Object instance (`env.durable_object("RELAY").get_by_name(
+    /// "main")`), which runs single-threaded in one V8 isolate. The read
+    /// (`timestamps.len()`) and the write (`timestamps.push`) execute
+    /// synchronously with no `.await` between them, so no other task can
+    /// interleave: the check-and-increment is atomic by construction and the
+    /// per-IP budget is enforced exactly, with no oversell window.
+    ///
+    /// Residual window: the `rate_limits` map is in-memory and is not restored
+    /// by `recover_session`, so a DO hibernation clears it. The first second
+    /// after a wake therefore starts each IP with a fresh empty window, allowing
+    /// at most one extra `limit`-sized burst per hibernation cycle. This is
+    /// bounded and self-heals within the 1s window; persisting the sliding
+    /// window to DO storage on every frame would cost a storage write per
+    /// message purely to shave a single post-wake burst, which is not worth it.
     pub(crate) fn check_rate_limit(&self, ip: &str) -> bool {
         let now = js_sys::Date::now();
         let cutoff = now - 1000.0;

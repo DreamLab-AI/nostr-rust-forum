@@ -1,6 +1,6 @@
 # PRD — Zone-bound one-shot BBS PWA ("install this zone as an app")
 
-- **Status:** Draft (v1 spec — implementation not started)
+- **Status:** Shipped (v1 spec implemented — released in 1.0.0-beta.5)
 - **Date:** 2026-07-18
 - **Owners:** `nostr-bbs-forum-client` (owns the install entry point, consent, and
   the key bake) and `nostr-bbs-bbs-client` (owns the manifest, service worker,

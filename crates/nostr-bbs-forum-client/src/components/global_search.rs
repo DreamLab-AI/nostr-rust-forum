@@ -43,6 +43,12 @@ const SEARCH_API: &str = match option_env!("VITE_SEARCH_API_URL") {
 };
 const RECENT_KEY: &str = "nostrbbs_recent_searches";
 const MAX_RECENT: usize = 5;
+
+/// Storage slot for the pending debounce `setTimeout` `Closure`, wrapped in
+/// `SendWrapper` to satisfy `on_cleanup`'s `Send + Sync` bound on this
+/// otherwise-`!Send` wasm-bindgen type. Re-assigning `Some(..)` drops
+/// whatever closure was previously stored, so it never leaks via `.forget()`.
+type PendingDebounceClosure = StoredValue<Option<send_wrapper::SendWrapper<Closure<dyn FnMut()>>>>;
 const DEBOUNCE_MS: i32 = 300;
 const SEMANTIC_DEBOUNCE_MS: i32 = 500;
 
@@ -242,7 +248,13 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
         }
     });
 
-    // Debounced search
+    // Debounced search. `dh` holds the pending `setTimeout` handle (0 = none)
+    // so a new keystroke can cancel the previous debounce timer; without the
+    // `on_cleanup` below (added alongside removing the `.forget()` on the
+    // debounce closure), closing/unmounting the search overlay mid-debounce
+    // left the timer running and its closure leaked, firing `do_search`
+    // (and the `results`/`loading`/`search_error` signal writes inside it)
+    // against a disposed component scope.
     let dh = RwSignal::new(0i32);
     let do_search = move || {
         let q = query.get_untracked();
@@ -424,6 +436,20 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
             loading.set(false);
         });
     };
+    // Holds the pending debounce `Closure` so re-triggering (every keystroke)
+    // or unmounting drops the previous one instead of leaking it via
+    // `.forget()` — a fast typist cancelling-and-rescheduling on every
+    // keystroke would otherwise accumulate one leaked closure per keystroke.
+    let debounce_closure: PendingDebounceClosure = StoredValue::new(None);
+    on_cleanup(move || {
+        if let Some(w) = web_sys::window() {
+            let h = dh.get_untracked();
+            if h != 0 {
+                w.clear_timeout_with_handle(h);
+            }
+        }
+        debounce_closure.set_value(None);
+    });
     let trigger = move || {
         if let Some(w) = web_sys::window() {
             let p = dh.get_untracked();
@@ -447,7 +473,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 )
                 .unwrap_or(0);
             dh.set(h);
-            f.forget();
+            debounce_closure.set_value(Some(send_wrapper::SendWrapper::new(f)));
         }
     };
     let on_input = move |ev: leptos::ev::Event| {
