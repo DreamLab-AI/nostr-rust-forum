@@ -5,7 +5,7 @@
 //! same time, with the most recently-opened one painting over (and
 //! click-blocking) the others. Each popover registers a stable string key and
 //! checks `is_active(key)` from its `is_open` derivation; opening one with
-//! `open(key)` automatically closes every other.
+//! `toggle(key)` automatically closes every other.
 
 use leptos::prelude::*;
 
@@ -23,22 +23,12 @@ impl PopoverCoord {
         }
     }
 
-    /// Open the popover with this key, closing any other that was open.
-    pub fn open(&self, key: &'static str) {
-        self.active.set(Some(key));
-    }
-
     /// Close the popover with this key if it is currently active.
     /// No-op if a different popover is active.
     pub fn close(&self, key: &'static str) {
         if self.active.with_untracked(|a| *a == Some(key)) {
             self.active.set(None);
         }
-    }
-
-    /// Close any open popover.
-    pub fn close_all(&self) {
-        self.active.set(None);
     }
 
     /// Reactively true while `key` is the currently active popover.

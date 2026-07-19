@@ -12,9 +12,6 @@
 //!
 //! Port of `workers/pod-api/index.ts`.
 
-// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
-#![allow(dead_code)]
-
 mod acl;
 mod auth;
 mod conditional;
@@ -37,7 +34,6 @@ mod pod_git_anchor;
 mod provision;
 mod quota;
 mod remote_storage;
-mod storage;
 mod webid;
 
 // JSS Phase 1 staging (ADR-086/087): inert re-export shim for the upstream
@@ -420,6 +416,9 @@ fn json_ok(env: &Env, body: &serde_json::Value, status: u16) -> Result<Response>
     Ok(resp)
 }
 
+// Invoked via wasm-bindgen as the worker's wasm entry point; on native builds
+// nothing calls it directly, so it would otherwise be flagged dead-code there.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
@@ -979,8 +978,21 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             // render in `<img>` (nosniff) and reach the image→ASCII transform.
             let stored_content_type =
                 refine_image_content_type(&resource_path, stored_content_type);
-            let obj_content_type =
-                content_negotiation::negotiate(accept_header.as_deref(), &stored_content_type);
+            let obj_content_type = match content_negotiation::negotiate(
+                accept_header.as_deref(),
+                &stored_content_type,
+            ) {
+                content_negotiation::Negotiated::ContentType(ct) => ct,
+                content_negotiation::Negotiated::NotAcceptable => {
+                    // e.g. `Accept: text/turtle` against a JSON-LD-stored RDF
+                    // resource: this crate has no Turtle serializer, so
+                    // silently substituting JSON-LD would violate content
+                    // negotiation and break Turtle-only Solid/LDP clients.
+                    let resp = json_error(&env, "Not Acceptable", 406)?;
+                    resp.headers().set("Vary", "Accept").ok();
+                    return Ok(resp);
+                }
+            };
             let etag = object.etag();
             let cors = cors_headers(&env);
 

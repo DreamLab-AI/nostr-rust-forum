@@ -49,14 +49,6 @@ impl VectorStore {
         self.entries.push((label, arr));
     }
 
-    /// Delete vectors by labels. Returns count deleted.
-    #[allow(dead_code)]
-    pub fn delete(&mut self, labels: &[u64]) -> usize {
-        let before = self.entries.len();
-        self.entries.retain(|(l, _)| !labels.contains(l));
-        before - self.entries.len()
-    }
-
     /// Cosine similarity k-NN search. Returns (label, score) pairs sorted by
     /// descending score (1.0 = identical, 0.0 = orthogonal).
     pub fn search(&self, query: &[f32], k: usize, min_score: f32) -> Vec<(u64, f32)> {
@@ -630,57 +622,6 @@ mod tests {
         // Query with wrong dimension
         let wrong_dim = vec![1.0f32; DIM / 2];
         let results = store.search(&wrong_dim, 5, 0.0);
-        assert!(results.is_empty());
-    }
-
-    // ── delete ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn delete_removes_vector() {
-        let mut store = VectorStore::new();
-        store.insert(1, &unit_vec(0));
-        store.insert(2, &unit_vec(1));
-        let deleted = store.delete(&[1]);
-        assert_eq!(deleted, 1);
-        assert_eq!(store.count(), 1);
-    }
-
-    #[test]
-    fn delete_nonexistent_label() {
-        let mut store = VectorStore::new();
-        store.insert(1, &unit_vec(0));
-        let deleted = store.delete(&[999]);
-        assert_eq!(deleted, 0);
-        assert_eq!(store.count(), 1);
-    }
-
-    #[test]
-    fn delete_multiple() {
-        let mut store = VectorStore::new();
-        for i in 0..5 {
-            store.insert(i, &unit_vec(i as usize % DIM));
-        }
-        let deleted = store.delete(&[0, 2, 4]);
-        assert_eq!(deleted, 3);
-        assert_eq!(store.count(), 2);
-    }
-
-    #[test]
-    fn delete_all() {
-        let mut store = VectorStore::new();
-        store.insert(1, &unit_vec(0));
-        store.insert(2, &unit_vec(1));
-        let deleted = store.delete(&[1, 2]);
-        assert_eq!(deleted, 2);
-        assert_eq!(store.count(), 0);
-    }
-
-    #[test]
-    fn delete_then_search_doesnt_find() {
-        let mut store = VectorStore::new();
-        store.insert(1, &unit_vec(0));
-        store.delete(&[1]);
-        let results = store.search(&unit_vec(0), 5, 0.0);
         assert!(results.is_empty());
     }
 

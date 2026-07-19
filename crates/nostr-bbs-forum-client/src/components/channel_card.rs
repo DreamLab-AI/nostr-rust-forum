@@ -22,6 +22,11 @@ pub struct ChannelInfo {
 }
 
 /// Display a single channel as a card in the channel list.
+// The `#[component]` macro expands `channel` into a generated Props struct
+// field; rustc's dead_code pass flags that generated field even though the
+// function body below reads `channel.*` throughout. Known leptos_macro
+// false positive (props struct is a compiler-generated shim, not real API).
+#[allow(dead_code)]
 #[component]
 pub fn ChannelCard(channel: ChannelInfo) -> impl IntoView {
     let href = base_href(&format!("/chat/{}", channel.id));

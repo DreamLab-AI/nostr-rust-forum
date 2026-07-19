@@ -35,11 +35,12 @@ struct BgeRequest<'a> {
 
 #[derive(Deserialize)]
 struct BgeResponse {
-    /// `[batch, dim]` per Workers AI BGE schema.
-    #[serde(default)]
-    #[allow(dead_code)]
-    shape: Vec<usize>,
     /// One f32 vector per input text.
+    ///
+    /// The Workers AI BGE schema also returns a `shape: [batch, dim]` field;
+    /// it is not captured here (serde ignores unknown fields by default) since
+    /// nothing reads it — `data.len()` and each vector's `.len()` are checked
+    /// directly in `run_bge`.
     data: Vec<Vec<f32>>,
 }
 

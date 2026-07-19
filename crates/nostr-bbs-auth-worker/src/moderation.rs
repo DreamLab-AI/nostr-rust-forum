@@ -24,7 +24,7 @@
 use nostr_bbs_core::d1_helpers::{js_i64, js_opt_i64, js_opt_str, js_str};
 use nostr_bbs_core::{
     validate_moderation_event, NostrEvent, KIND_BAN, KIND_MUTE, KIND_REPORT, KIND_REPORT_NIP56,
-    KIND_UNBAN, KIND_UNMUTE, KIND_WARNING, MOD_KINDS,
+    KIND_UNBAN, KIND_UNMUTE, KIND_WARNING,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -709,11 +709,6 @@ fn first_tag<'a>(event: &'a NostrEvent, name: &str) -> Option<&'a str> {
         .find(|t| t.len() >= 2 && t[0] == name)
         .map(|t| t[1].as_str())
 }
-
-// Reference the unused constant so clippy doesn't warn when route extensions
-// (e.g. unban/unmute) land in a follow-up. The parent module keeps the star.
-#[allow(dead_code)]
-const _REF_MOD_KINDS: &[u64] = MOD_KINDS;
 
 // ---------------------------------------------------------------------------
 // Tests

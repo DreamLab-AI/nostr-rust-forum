@@ -127,19 +127,6 @@ pub(super) fn get_credential_id(credential: &JsValue) -> Result<String, PasskeyE
         .ok_or_else(|| PasskeyError::JsError("Missing credential.id".into()))
 }
 
-/// Extract the userHandle bytes from an assertion response.
-pub(super) fn get_user_handle(assertion: &JsValue) -> Result<Vec<u8>, PasskeyError> {
-    use super::webauthn::arraybuffer_to_vec;
-    let response = Reflect::get(assertion, &"response".into())
-        .map_err(|_| PasskeyError::JsError("Missing response".into()))?;
-    let user_handle = Reflect::get(&response, &"userHandle".into())
-        .map_err(|_| PasskeyError::JsError("Missing userHandle".into()))?;
-    if user_handle.is_null() || user_handle.is_undefined() {
-        return Err(PasskeyError::JsError("userHandle is null".into()));
-    }
-    arraybuffer_to_vec(&user_handle)
-}
-
 // -- Fetch helper -------------------------------------------------------------
 
 /// POST JSON to a URL and return the response body text.

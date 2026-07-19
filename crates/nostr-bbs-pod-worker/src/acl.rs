@@ -31,6 +31,10 @@ pub use solid_pod_rs::wac::{
 };
 
 /// All access modes, used for iterating when building WAC-Allow headers.
+/// `wac_allow_header` (re-exported above from `solid_pod_rs::wac`) does this
+/// iteration internally today, so this local copy is currently only
+/// exercised by this module's unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const ALL_MODES: &[AccessMode] = &[
     AccessMode::Read,
     AccessMode::Write,
@@ -324,6 +328,13 @@ fn resolve_kv_fallback(text: &str) -> Option<AclDocument> {
 /// bug (a stale KV `acl:{owner}` entry must never shadow a more-specific R2
 /// delegation sidecar). [`find_effective_acl`] is a thin async I/O loop that
 /// feeds R2/KV reads into exactly this decision.
+///
+/// Only invoked from this module's own unit tests today — `find_effective_acl`
+/// inlines the equivalent R2-then-KV walk directly against the worker's async
+/// R2/KV bindings rather than delegating to this pure core. Kept (not
+/// deleted) as the tested source of truth for the precedence rule; flagged
+/// dead outside `cfg(test)` builds.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_effective_acl<'a>(
     r2_candidates: impl IntoIterator<Item = (&'a [u8], bool)>,
     kv_text: Option<&str>,

@@ -14,6 +14,12 @@ use crate::components::toast::{use_toasts, ToastVariant};
 
 // ── API response types ───────────────────────────────────────────────────────
 
+// NOTE: `is_clean`, `old_path`, `hash`, and `date` below are populated from
+// the `/_git/` REST API's JSON response (server schema) but the panel UI does
+// not currently render them (it derives its own "clean" state from
+// staged/unstaged/untracked and shows `short_hash`/`date_relative` instead).
+// Kept (not deleted) because they are part of the wire format; scoped rather
+// than dropped from the schema.
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {
@@ -23,6 +29,7 @@ pub struct GitStatus {
     pub staged: Vec<GitFileStatus>,
     pub unstaged: Vec<GitFileStatus>,
     pub untracked: Vec<String>,
+    #[allow(dead_code)]
     pub is_clean: bool,
 }
 
@@ -31,16 +38,19 @@ pub struct GitStatus {
 pub struct GitFileStatus {
     pub path: String,
     pub change_type: String, // "modified", "added", "deleted", "renamed", "copied"
+    #[allow(dead_code)]
     pub old_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitCommit {
+    #[allow(dead_code)]
     pub hash: String,
     pub short_hash: String,
     pub message: String,
     pub author: String,
+    #[allow(dead_code)]
     pub date: String,
     pub date_relative: String,
 }

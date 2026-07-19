@@ -1,8 +1,5 @@
 //! nostr-bbs community forum -- Leptos CSR application entry point.
 
-// WASM entry points and Leptos component helpers appear unused in native builds.
-#![allow(dead_code)]
-
 mod admin;
 mod app;
 mod auth;

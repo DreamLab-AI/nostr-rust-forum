@@ -59,11 +59,19 @@ impl NostrRelayDO {
     /// authenticated operations continue working across hibernation boundaries.
     ///
     /// Lints:
-    /// - `await_holding_refcell_ref`: the DO runs single-threaded in a V8
-    ///   isolate, so there is no concurrent borrow hazard.
-    /// - `map_entry`: values depend on async storage loads, which cannot be
-    ///   computed inside an `Entry::or_insert_with` closure.
-    #[allow(clippy::await_holding_refcell_ref, clippy::map_entry)]
+    /// - `map_entry`: whether to insert depends on async storage loads that
+    ///   must run between the `contains_key` check and the `insert`, so the
+    ///   `Entry` API (which wants both computed up front) doesn't fit.
+    ///
+    /// Borrow discipline: the DO runs single-threaded in a V8 isolate, so
+    /// there is no *concurrent* borrow hazard, but an `.await` still yields
+    /// to the executor and can let a re-entrant call reach `self.sessions`
+    /// before this call resumes. Holding a `RefMut` across an `.await` would
+    /// make that reentry panic (`RefCell` already borrowed) or observe a
+    /// half-updated map. So every `sessions` borrow here is scoped to end
+    /// before the next `.await` -- check-and-release, `.await` the storage
+    /// load while unborrowed, then re-borrow (re-checking) to apply it.
+    #[allow(clippy::map_entry)]
     pub(crate) async fn recover_session(&self, ws: &WebSocket) -> u64 {
         let tags = self.state.get_tags(ws);
 
@@ -96,9 +104,8 @@ impl NostrRelayDO {
         let challenge = generate_challenge(session_id);
         let storage = self.state.storage();
 
-        // Also recover any other connected WebSockets we've lost track of
+        // Also recover any other connected WebSockets we've lost track of.
         let all_ws = self.state.get_websockets();
-        let mut sessions = self.sessions.borrow_mut();
 
         for other_ws in all_ws {
             let other_tags = self.state.get_tags(&other_ws);
@@ -111,16 +118,28 @@ impl NostrRelayDO {
                     other_ip = ip_str.to_string();
                 }
             }
-            if let Some(sid) = other_sid {
+            let Some(sid) = other_sid else {
+                continue;
+            };
+
+            // Check-and-release: no borrow held across the `.await` below.
+            let already_tracked = self.sessions.borrow().contains_key(&sid);
+            if already_tracked {
+                continue;
+            }
+
+            let ch = generate_challenge(sid);
+
+            // Restore subscriptions and auth state from DO storage. The
+            // `sessions` RefCell is not borrowed while these await.
+            let subscriptions = Self::load_subscriptions(&storage, sid).await;
+            let authed_pubkey = Self::load_auth(&storage, sid).await;
+
+            // Re-borrow to apply; re-check in case a re-entrant call raced
+            // ahead and inserted this sid while we were awaiting storage.
+            {
+                let mut sessions = self.sessions.borrow_mut();
                 if !sessions.contains_key(&sid) {
-                    let ch = generate_challenge(sid);
-
-                    // Restore subscriptions from DO storage
-                    let subscriptions = Self::load_subscriptions(&storage, sid).await;
-
-                    // Restore auth state from DO storage
-                    let authed_pubkey = Self::load_auth(&storage, sid).await;
-
                     sessions.insert(
                         sid,
                         SessionInfo {
@@ -131,40 +150,49 @@ impl NostrRelayDO {
                             challenge: ch,
                         },
                     );
-                    let mut next = self.next_session_id.borrow_mut();
-                    if sid >= *next {
-                        *next = sid + 1;
-                    }
                 }
+            }
+
+            let mut next = self.next_session_id.borrow_mut();
+            if sid >= *next {
+                *next = sid + 1;
             }
         }
 
         // If the current WS wasn't covered by the get_websockets loop
-        // (shouldn't happen, but be safe), insert it
-        if !sessions.contains_key(&session_id) {
+        // (shouldn't happen, but be safe), insert it.
+        let current_tracked = self.sessions.borrow().contains_key(&session_id);
+        if !current_tracked {
             let subscriptions = Self::load_subscriptions(&storage, session_id).await;
             let authed_pubkey = Self::load_auth(&storage, session_id).await;
 
-            sessions.insert(
-                session_id,
-                SessionInfo {
-                    ws: ws.clone(),
-                    ip: recovered_ip,
-                    subscriptions,
-                    authed_pubkey,
-                    challenge,
-                },
-            );
+            let mut sessions = self.sessions.borrow_mut();
+            if !sessions.contains_key(&session_id) {
+                sessions.insert(
+                    session_id,
+                    SessionInfo {
+                        ws: ws.clone(),
+                        ip: recovered_ip,
+                        subscriptions,
+                        authed_pubkey,
+                        challenge,
+                    },
+                );
+            }
         }
 
-        let sub_count: usize = sessions.values().map(|s| s.subscriptions.len()).sum();
-        let auth_count = sessions
-            .values()
-            .filter(|s| s.authed_pubkey.is_some())
-            .count();
+        let (total, sub_count, auth_count) = {
+            let sessions = self.sessions.borrow();
+            let sub_count: usize = sessions.values().map(|s| s.subscriptions.len()).sum();
+            let auth_count = sessions
+                .values()
+                .filter(|s| s.authed_pubkey.is_some())
+                .count();
+            (sessions.len(), sub_count, auth_count)
+        };
         console_log!(
             "[RelayDO] Recovered {} session(s) from hibernation (active: #{}, {} subs, {} authed)",
-            sessions.len(),
+            total,
             session_id,
             sub_count,
             auth_count,

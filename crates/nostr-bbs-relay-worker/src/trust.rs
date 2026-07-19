@@ -428,11 +428,6 @@ pub async fn increment_posts_created(pubkey: &str, env: &Env) {
     }
 }
 
-/// Increment the `posts_read` counter for a pubkey by one.
-pub async fn increment_posts_read(pubkey: &str, env: &Env) {
-    increment_posts_read_by(pubkey, 1, env).await;
-}
-
 /// Increment the `posts_read` counter for a pubkey by `count`.
 ///
 /// Batched per REQ so a subscription that delivers N matching events to a

@@ -121,14 +121,6 @@ pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
     Ok(pubkeys)
 }
 
-/// Check whether `pubkey` is an admin using the cached list.
-pub async fn is_admin_cached(pubkey: &str, env: &Env) -> bool {
-    match get_admin_pubkeys(env).await {
-        Ok(list) => list.iter().any(|a| a == pubkey),
-        Err(_) => false,
-    }
-}
-
 /// Invalidate the KV admin cache so the next request re-fetches from D1.
 async fn bust_cache(env: &Env) {
     if let Ok(kv) = env.kv("KV") {

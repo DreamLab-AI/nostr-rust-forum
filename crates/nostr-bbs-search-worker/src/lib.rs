@@ -15,9 +15,6 @@
 //! - `embed.rs` -- Workers AI BGE-small embeddings + hash fallback
 //! - `auth.rs`  -- NIP-98 admin verification
 
-// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
-#![allow(dead_code)]
-
 mod auth;
 mod embed;
 mod store;
@@ -104,6 +101,12 @@ struct SearchRequest {
     k: usize,
     #[serde(default, rename = "minScore")]
     min_score: f32,
+    /// Optional model identity of a caller-supplied `embedding`. When the
+    /// caller sends a raw vector (rather than `query` text we embed
+    /// ourselves) this is the only way we can verify it was produced by the
+    /// same model as the index. See `check_model_match`.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn default_k() -> usize {
@@ -119,6 +122,39 @@ struct IngestEntry {
 #[derive(Deserialize)]
 struct IngestRequest {
     entries: Vec<IngestEntry>,
+    /// Model identity that produced `entries[].embedding`. Recorded alongside
+    /// the index so a later query with a different embedding model can be
+    /// detected instead of silently producing meaningless cosine scores.
+    /// Defaults to the worker's own currently-active embedding model when
+    /// omitted (back-compat with callers that pre-date this field).
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Sentinel used when the model that produced a set of vectors is not known
+/// (e.g. entries persisted before this field existed). Comparisons never
+/// fail loudly against "unknown" on either side, since there is nothing
+/// verifiable to compare.
+const MODEL_UNKNOWN: &str = "unknown";
+
+/// Compare the model tag recorded at index time against the model tag for
+/// the current query. Returns `Err` with a caller-facing JSON error body
+/// when both sides are known and disagree -- mixing vectors from different
+/// embedding models produces cosine scores that are numerically well-formed
+/// but semantically meaningless, so this must fail loudly rather than
+/// silently returning garbage rankings.
+fn check_model_match(indexed: &str, queried: &str) -> std::result::Result<(), serde_json::Value> {
+    if indexed == MODEL_UNKNOWN || queried == MODEL_UNKNOWN || indexed == queried {
+        return Ok(());
+    }
+    Err(serde_json::json!({
+        "error": "Embedding model mismatch between index and query",
+        "indexModel": indexed,
+        "queryModel": queried,
+        "detail": "The stored vectors were embedded with a different model than this query. \
+                   Cosine scores across embedding spaces are not comparable. Re-embed the \
+                   query with the index's model, or re-ingest the index with the query's model.",
+    }))
 }
 
 #[derive(Deserialize)]
@@ -159,10 +195,15 @@ async fn load_store(env: &Env) -> Result<VectorStore> {
 }
 
 /// Persist the vector store to R2 as RVF binary + mapping to KV.
+///
+/// `model` is the embedding model identity that produced `store`'s vectors
+/// (or `MODEL_UNKNOWN` when not known) -- recorded so a later query can
+/// verify it is searching in the same embedding space.
 async fn persist_store(
     store: &VectorStore,
     id_to_label: &std::collections::HashMap<String, u64>,
     next_label: u64,
+    model: &str,
     env: &Env,
 ) -> Result<()> {
     let store_key = env
@@ -175,12 +216,13 @@ async fn persist_store(
     let bucket = env.bucket("VECTORS")?;
     bucket.put(&store_key, rvf_bytes).execute().await?;
 
-    // Persist id↔label mapping to KV
+    // Persist id↔label mapping (+ index-time model identity) to KV
     let kv = env.kv("SEARCH_CONFIG")?;
     let pairs: Vec<(&str, u64)> = id_to_label.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let mapping = serde_json::json!({
         "pairs": pairs,
         "next": next_label,
+        "model": model,
     });
     kv.put(
         &format!("{store_key}:mapping"),
@@ -192,13 +234,14 @@ async fn persist_store(
     Ok(())
 }
 
-/// Load id↔label mapping from KV.
+/// Load id↔label mapping (+ recorded index-time model identity) from KV.
 async fn load_mapping(
     env: &Env,
 ) -> Result<(
     std::collections::HashMap<String, u64>,
     std::collections::HashMap<u64, String>,
     u64,
+    String,
 )> {
     let store_key = env
         .var("RVF_STORE_KEY")
@@ -211,6 +254,9 @@ async fn load_mapping(
     if let Some(json_str) = kv.get(&mapping_key).text().await? {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
             let next = val["next"].as_u64().unwrap_or(1);
+            // Mappings persisted before this field existed have no "model"
+            // key; treat that as unknown rather than assuming a value.
+            let model = val["model"].as_str().unwrap_or(MODEL_UNKNOWN).to_string();
             let mut id_to_label = std::collections::HashMap::new();
             let mut label_to_id = std::collections::HashMap::new();
 
@@ -223,7 +269,7 @@ async fn load_mapping(
                 }
             }
 
-            return Ok((id_to_label, label_to_id, next));
+            return Ok((id_to_label, label_to_id, next, model));
         }
     }
 
@@ -231,6 +277,7 @@ async fn load_mapping(
         std::collections::HashMap::new(),
         std::collections::HashMap::new(),
         1,
+        MODEL_UNKNOWN.to_string(),
     ))
 }
 
@@ -252,8 +299,15 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         }
     };
 
-    let embedding = if !body.embedding.is_empty() {
-        body.embedding
+    // Track the model that actually produced `embedding` so we can verify
+    // it matches the model the index was built with (see `check_model_match`).
+    let (embedding, query_model): (Vec<f32>, String) = if !body.embedding.is_empty() {
+        // Caller supplied a raw vector; its model is only known if they told
+        // us via the optional `model` field.
+        (
+            body.embedding,
+            body.model.unwrap_or_else(|| MODEL_UNKNOWN.to_string()),
+        )
     } else if let Some(ref text) = body.query {
         if text.is_empty() {
             return json_response(
@@ -265,8 +319,8 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         }
         // Embed the query with the same model used at ingest time so the
         // query vector lives in the same space as the stored vectors.
-        let (mut embs, _model) = embed::embed_texts(env, std::slice::from_ref(text)).await;
-        embs.pop().unwrap_or_default()
+        let (mut embs, model) = embed::embed_texts(env, std::slice::from_ref(text)).await;
+        (embs.pop().unwrap_or_default(), model.to_string())
     } else {
         return json_response(
             req,
@@ -297,7 +351,17 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    let (_, label_to_id, _) = load_mapping(env).await?;
+    let (_, label_to_id, _, indexed_model) = load_mapping(env).await?;
+
+    // Fail loudly rather than returning numerically valid but semantically
+    // meaningless cosine scores across mismatched embedding spaces.
+    if let Err(err_body) = check_model_match(&indexed_model, &query_model) {
+        console_error!(
+            "Search worker: embedding model mismatch (index={indexed_model}, query={query_model})"
+        );
+        return json_response(req, env, &err_body, 409);
+    }
+
     let results = store.search(&embedding, k, body.min_score);
 
     let results_json: Vec<serde_json::Value> = results
@@ -416,7 +480,32 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
     }
 
     let mut store = load_store(env).await?;
-    let (mut id_to_label, _, mut next_label) = load_mapping(env).await?;
+    let (mut id_to_label, _, mut next_label, indexed_model) = load_mapping(env).await?;
+
+    // The caller-declared model for these entries' embeddings; falls back to
+    // this worker's currently-active embedding model for older callers that
+    // pre-date the `model` field (best-effort -- matches historical behavior
+    // where ingested vectors were assumed to come from whatever `/embed`
+    // would currently produce).
+    let ingest_model = body.model.clone().unwrap_or_else(|| {
+        if embed::ai_binding_available(env) {
+            embed::MODEL_LABEL_SEMANTIC.to_string()
+        } else {
+            embed::MODEL_LABEL_FALLBACK.to_string()
+        }
+    });
+
+    // Fail loudly instead of silently mixing embedding spaces: if the index
+    // already holds vectors from a known, different model, reject the
+    // ingest rather than corrupting the index with incomparable vectors.
+    if store.count() > 0 {
+        if let Err(err_body) = check_model_match(&indexed_model, &ingest_model) {
+            console_error!(
+                "Search worker: ingest rejected, embedding model mismatch (index={indexed_model}, ingest={ingest_model})"
+            );
+            return json_response(req, env, &err_body, 409);
+        }
+    }
 
     let mut accepted = 0u32;
     let mut rejected = 0u32;
@@ -437,8 +526,8 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         accepted += 1;
     }
 
-    // Persist to R2 + KV
-    persist_store(&store, &id_to_label, next_label, env).await?;
+    // Persist to R2 + KV, recording the model identity used for this ingest.
+    persist_store(&store, &id_to_label, next_label, &ingest_model, env).await?;
 
     json_response(
         req,
@@ -448,6 +537,7 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
             "rejected": rejected,
             "totalVectors": store.count(),
             "engine": "rvf-rust",
+            "model": ingest_model,
         }),
         200,
     )
@@ -489,6 +579,9 @@ async fn handle_status(req: &Request, env: &Env) -> Result<Response> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+// Invoked via wasm-bindgen glue generated by the `#[event(fetch)]` macro;
+// appears unreferenced on native (non-wasm32) builds.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
@@ -575,8 +668,53 @@ async fn route(req: &Request, env: &Env, path: &str) -> Result<Response> {
 // Cron keep-warm
 // ---------------------------------------------------------------------------
 
+// Invoked via wasm-bindgen glue generated by the `#[event(scheduled)]` macro;
+// appears unreferenced on native (non-wasm32) builds.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // Touch R2 to keep the connection warm
     let _ = load_store(&env).await;
+}
+
+#[cfg(test)]
+mod model_match_tests {
+    use super::*;
+
+    #[test]
+    fn matching_models_pass() {
+        assert!(check_model_match("bge-small-en-v1.5", "bge-small-en-v1.5").is_ok());
+    }
+
+    #[test]
+    fn differing_known_models_fail_loudly() {
+        let err = check_model_match("bge-small-en-v1.5", "hash-fallback-v1")
+            .expect_err("mismatched known models must be rejected");
+        assert_eq!(
+            err["error"],
+            "Embedding model mismatch between index and query"
+        );
+        assert_eq!(err["indexModel"], "bge-small-en-v1.5");
+        assert_eq!(err["queryModel"], "hash-fallback-v1");
+    }
+
+    #[test]
+    fn unknown_index_model_does_not_block() {
+        // Entries persisted before the model field existed: nothing to
+        // verify against, so the happy path proceeds.
+        assert!(check_model_match(MODEL_UNKNOWN, "bge-small-en-v1.5").is_ok());
+    }
+
+    #[test]
+    fn unknown_query_model_does_not_block() {
+        // Caller supplied a raw embedding without declaring its model:
+        // cannot verify, so we let it through rather than blocking all
+        // legacy/unlabeled callers.
+        assert!(check_model_match("bge-small-en-v1.5", MODEL_UNKNOWN).is_ok());
+    }
+
+    #[test]
+    fn both_unknown_does_not_block() {
+        assert!(check_model_match(MODEL_UNKNOWN, MODEL_UNKNOWN).is_ok());
+    }
 }

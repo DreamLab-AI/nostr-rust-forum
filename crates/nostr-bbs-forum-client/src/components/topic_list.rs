@@ -34,7 +34,10 @@ pub struct TopicSummary {
     pub pubkey: String,
     /// First line / full content of the root post (the topic title/body).
     pub content: String,
-    /// Root post creation time.
+    /// Root post creation time. Not currently rendered by the list row (which
+    /// shows `last_activity` instead) but kept on the struct as it is real
+    /// derived data a future "posted" column could use without recomputation.
+    #[allow(dead_code)]
     pub created_at: u64,
     /// Number of replies (kind-42 / kind-1111) e-tagging this root.
     pub reply_count: u32,

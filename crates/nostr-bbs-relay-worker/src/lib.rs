@@ -16,9 +16,6 @@
 //! - `whitelist.rs` -- Whitelist management HTTP handlers
 //! - `auth.rs` -- NIP-98 admin verification wrapper
 
-// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
-#![allow(dead_code)]
-
 mod agent_disclosure;
 mod audit;
 mod auth;
@@ -152,6 +149,9 @@ fn json_response(
 // Entry point
 // ---------------------------------------------------------------------------
 
+// Invoked via wasm-bindgen by the Workers runtime; appears unused on native
+// builds because there is no native caller of the `#[event(fetch)]` glue.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Idempotent schema migrations (trust columns, new tables, etc.)
@@ -809,6 +809,9 @@ fn accepts_nostr_json(req: &Request) -> bool {
 /// semantics match its precondition (time-driven, not request-driven). The
 /// sweep is paged and bounded; a sweep error is logged but never propagated, so
 /// it cannot break the keep-warm tick.
+// Invoked via wasm-bindgen by the Workers runtime; appears unused on native
+// builds because there is no native caller of the `#[event(scheduled)]` glue.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let db = match env.d1("DB") {

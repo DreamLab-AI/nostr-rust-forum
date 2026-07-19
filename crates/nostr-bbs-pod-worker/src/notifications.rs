@@ -2,6 +2,13 @@
 //!
 //! Subscribers register via POST to `{resource}.notifications` with a webhook URL.
 //! On resource change, the pod-worker sends a POST to the webhook URL.
+//!
+//! `notify_change` (the delivery side) is wired into `fetch()`'s write paths.
+//! `subscribe`/`unsubscribe` (the registration side described above) have no
+//! route calling them yet in this crate — reserved for the
+//! `POST {resource}.notifications` handler; kept, not deleted, since removing
+//! them would foreclose ever populating the subscriber list `notify_change`
+//! reads.
 
 use serde::{Deserialize, Serialize};
 use worker::*;
@@ -14,6 +21,7 @@ pub struct Subscription {
 }
 
 /// Store a notification subscription in KV.
+#[allow(dead_code)]
 pub async fn subscribe(
     kv: &kv::KvStore,
     owner_pubkey: &str,
@@ -41,6 +49,7 @@ pub async fn subscribe(
 }
 
 /// Remove a notification subscription from KV.
+#[allow(dead_code)]
 pub async fn unsubscribe(
     kv: &kv::KvStore,
     owner_pubkey: &str,

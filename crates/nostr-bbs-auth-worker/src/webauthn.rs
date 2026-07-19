@@ -141,11 +141,6 @@ fn js_u64(v: u64) -> JsValue {
     JsValue::from_f64(v as f64)
 }
 
-/// Convert an i32 to JsValue.
-fn js_i32(v: i32) -> JsValue {
-    JsValue::from_f64(v as f64)
-}
-
 /// Convert a u32 to JsValue.
 fn js_u32(v: u32) -> JsValue {
     JsValue::from_f64(v as f64)
@@ -165,12 +160,6 @@ struct RegisterOptionsBody {
 struct RegisterVerifyBody {
     pubkey: Option<String>,
     response: Option<CredentialResponse>,
-    #[serde(rename = "credentialId")]
-    credential_id_flat: Option<String>,
-    #[serde(rename = "publicKey")]
-    public_key_flat: Option<String>,
-    #[serde(rename = "prfSalt")]
-    prf_salt: Option<String>,
     /// WI-4: optional invite code allowing registration bypass when
     /// Web-of-Trust gating is enabled.
     #[serde(rename = "inviteCode")]
@@ -179,7 +168,6 @@ struct RegisterVerifyBody {
 
 #[derive(Deserialize)]
 struct CredentialResponse {
-    id: Option<String>,
     response: Option<InnerAttestationResponse>,
 }
 
@@ -243,7 +231,6 @@ struct CredentialLookupBody {
 
 #[derive(Deserialize)]
 struct CredentialRow {
-    credential_id: Option<String>,
     prf_salt: Option<String>,
 }
 
@@ -1623,7 +1610,7 @@ mod tests {
         assert!(!is_valid_pubkey(&pk));
     }
 
-    // ── js_str / js_i32 / js_u32 / js_u64 ──────────────────────────────
+    // ── js_str / js_u32 / js_u64 ───────────────────────────────────────
     // These are trivial wrappers; we test they don't panic.
 
     // Note: JsValue-based tests require wasm32 target, so we only test

@@ -36,6 +36,14 @@
 //! - **I4**: ADR-074 §D1 (x-only hex = canonical identity) is untouched.
 
 #![cfg(not(target_arch = "wasm32"))]
+// This whole subsystem is exercised end-to-end by its own unit tests
+// (`mod tests` below) but is not yet invoked from `fetch()` or any other
+// production call site in this crate — the native/agentbox pod-git
+// anchoring entry point (`bootstrap_pod_identity_and_trail` and friends)
+// awaits wiring into whatever native binary/cron drives ADR-089's
+// externally-pullable pod-git tier. Kept, not deleted: it's a tested,
+// ADR-124/089-tracked subsystem, not abandoned code.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

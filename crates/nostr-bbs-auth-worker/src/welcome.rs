@@ -87,39 +87,6 @@ async fn load_config(env: &Env) -> Option<WelcomeConfigRow> {
     .flatten()
 }
 
-/// Map a CloudFlare `CF-IPCountry` code to `"en"` or `"es"`.
-pub fn locale_from_country(country: Option<&str>) -> &'static str {
-    match country.map(|s| s.to_ascii_uppercase()) {
-        Some(c)
-            if matches!(
-                c.as_str(),
-                "ES" | "MX"
-                    | "AR"
-                    | "CL"
-                    | "CO"
-                    | "PE"
-                    | "VE"
-                    | "EC"
-                    | "UY"
-                    | "PY"
-                    | "BO"
-                    | "CR"
-                    | "GT"
-                    | "HN"
-                    | "NI"
-                    | "PA"
-                    | "DO"
-                    | "SV"
-                    | "CU"
-                    | "PR"
-            ) =>
-        {
-            "es"
-        }
-        _ => "en",
-    }
-}
-
 /// Default greeting text when the admin hasn't supplied one yet.
 fn default_message(locale: &str) -> &'static str {
     match locale {
@@ -420,108 +387,12 @@ pub async fn handle_test(
 }
 
 // ---------------------------------------------------------------------------
-// Public helper: called by webauthn::register_verify on first registration.
-// ---------------------------------------------------------------------------
-
-/// Queue a welcome greeting for `new_pubkey`. Silently no-ops when the
-/// welcome bot is disabled or misconfigured: registration must not fail
-/// because of a greeting-level problem.
-pub async fn send_on_first_registration(new_pubkey: &str, country_code: Option<&str>, env: &Env) {
-    let Some(cfg) = load_config(env).await else {
-        return;
-    };
-    if cfg.welcome_enabled != 1 {
-        return;
-    }
-    let (Some(blob), Some(bot_pubkey)) = (
-        cfg.welcome_bot_nsec_encrypted.as_deref(),
-        cfg.welcome_bot_pubkey.as_deref(),
-    ) else {
-        return;
-    };
-
-    let locale = locale_from_country(country_code);
-    let message = match locale {
-        "es" => cfg
-            .welcome_message_es
-            .clone()
-            .unwrap_or_else(|| default_message("es").to_string()),
-        _ => cfg
-            .welcome_message_en
-            .clone()
-            .unwrap_or_else(|| default_message("en").to_string()),
-    };
-
-    let Ok(nsec) = decrypt_nsec(blob, env) else {
-        return;
-    };
-    let Ok(event) = sign_welcome(
-        &nsec,
-        bot_pubkey,
-        new_pubkey,
-        &message,
-        cfg.welcome_channel_id.as_deref(),
-        now_secs(),
-    ) else {
-        return;
-    };
-
-    // Best-effort insert into outbox table. Errors are silently swallowed.
-    if let Ok(db) = env.d1("DB") {
-        let event_id = event
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let json_str = serde_json::to_string(&event).unwrap_or_default();
-        let Ok(stmt) = db
-            .prepare(
-                "INSERT OR IGNORE INTO welcome_messages \
-                 (event_id, target_pubkey, locale, signed_json, sent_at, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-            )
-            .bind(&[
-                js_str(&event_id),
-                js_str(new_pubkey),
-                js_str(locale),
-                js_str(&json_str),
-                js_i64(now_secs() as i64),
-            ])
-        else {
-            return;
-        };
-        let _ = stmt.run().await;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn locale_from_country_en_default() {
-        assert_eq!(locale_from_country(None), "en");
-        assert_eq!(locale_from_country(Some("US")), "en");
-        assert_eq!(locale_from_country(Some("GB")), "en");
-    }
-
-    #[test]
-    fn locale_from_country_es_for_latam_and_iberia() {
-        for code in ["ES", "MX", "AR", "CL", "CO", "PE", "VE", "EC", "UY"] {
-            assert_eq!(locale_from_country(Some(code)), "es", "code = {code}");
-        }
-    }
-
-    #[test]
-    fn locale_from_country_is_case_insensitive() {
-        assert_eq!(locale_from_country(Some("es")), "es");
-        assert_eq!(locale_from_country(Some("mx")), "es");
-        assert_eq!(locale_from_country(Some("gb")), "en");
-    }
 
     #[test]
     fn default_message_es_non_empty() {

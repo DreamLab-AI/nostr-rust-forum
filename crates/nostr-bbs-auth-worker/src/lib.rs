@@ -10,9 +10,6 @@
 //! - `pod.rs` -- Pod provisioning and profile retrieval
 //! - `auth.rs` -- NIP-98 verification wrapper
 
-// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
-#![allow(dead_code)]
-
 mod admin;
 mod admins;
 mod auth;
@@ -108,6 +105,16 @@ impl RouteError {
             Self::Internal(_) => "Internal server error",
         }
     }
+
+    /// The underlying (server-side only) error detail, for structured logging.
+    /// Kept out of `user_message` so we never leak internals to the client, but
+    /// read here so the payload is genuinely used (not dead) and the original
+    /// `worker::Error` still reaches the logs.
+    fn detail(&self) -> &str {
+        match self {
+            Self::BadRequest(d) | Self::Internal(d) => d,
+        }
+    }
 }
 
 impl From<worker::Error> for RouteError {
@@ -127,6 +134,11 @@ fn is_client_error(msg: &str) -> bool {
         || msg.starts_with("parse:")
 }
 
+// Invoked via wasm-bindgen by the Workers runtime; appears unused on native
+// builds because there is no native caller of the `#[event(fetch)]` glue. The
+// scoped allow keeps this entry (and its whole reachable call tree) live on
+// wasm while restoring the dead-code guard for the rest of the crate on native.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Wrap the entire handler so NO errors ever leak to the workers-rs framework.
@@ -190,7 +202,11 @@ async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         Ok(resp) => Ok(with_cors(resp, env)),
         Err(e) => {
             let route_err = RouteError::from(e);
-            console_error!("Route error: {:?}", route_err);
+            console_error!(
+                "Route error ({}): {}",
+                route_err.status(),
+                route_err.detail()
+            );
             Ok(error_response(
                 env,
                 route_err.user_message(),
@@ -812,8 +828,11 @@ mod tests {
 }
 
 /// Cron keep-warm: prevents cold starts by pinging D1.
+// Invoked via wasm-bindgen by the Workers runtime; appears unused on native
+// builds because there is no native caller of the `#[event(scheduled)]` glue.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(scheduled)]
-async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) -> () {
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let db = match env.d1("DB") {
         Ok(db) => db,
         Err(_) => return,

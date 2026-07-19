@@ -52,16 +52,6 @@ use crate::utils::relay_url::auth_api_base;
 
 // -- localStorage helpers -----------------------------------------------------
 
-/// Legacy v1 onboarding flag — also used as the "onboarding complete" marker
-/// so the modal stops auto-popping once the user has submitted (or deferred).
-const LEGACY_ONBOARDED_KEY: &str = "nostrbbs:onboarded";
-/// Suppress duration when user clicks "I'll do this later" (7 days, ms).
-const SKIP_DURATION_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
-/// Maximum real-name length (mirrors the auth-worker `REAL_NAME_MAX_LEN` rule;
-/// the server is authoritative — this is only a friendly client-side cap).
-const REAL_NAME_MAX_LEN: usize = 100;
-/// Maximum display-name length (kind-0 `name`/`display_name`).
-const DISPLAY_NAME_MAX_LEN: usize = 50;
 /// NIP-05 host that backs legacy claimed usernames. Baked at build time from
 /// `NOSTR_BBS_NIP05_DOMAIN`; placeholder only for un-configured local builds.
 /// Retained for the dormant `nip05_for` / `username_from_nip05` helpers and the
@@ -81,15 +71,6 @@ fn pubkey8(pubkey: &str) -> String {
 
 fn claimed_key(pubkey: &str) -> String {
     format!("nostr_bbs_username_claimed_{}", pubkey8(pubkey))
-}
-
-fn skipped_key(pubkey: &str) -> String {
-    format!("nostr_bbs_username_skipped_until_{}", pubkey8(pubkey))
-}
-
-/// Has the user already claimed a legacy handle (locally cached)?
-fn has_claimed_locally(pubkey: &str) -> bool {
-    claimed_username_cached(pubkey).is_some()
 }
 
 /// Read the locally-cached claimed username (the legacy claim flow stored the
@@ -115,46 +96,6 @@ fn mark_claimed_locally(pubkey: &str, username: &str) {
 fn clear_claimed_locally(pubkey: &str) {
     if let Some(s) = local_storage() {
         let _ = s.remove_item(&claimed_key(pubkey));
-    }
-}
-
-/// Set the device-wide "onboarding complete" marker so the modal never
-/// auto-pops again for any pubkey on this device.
-fn mark_onboarded() {
-    if let Some(s) = local_storage() {
-        let _ = s.set_item(LEGACY_ONBOARDED_KEY, "1");
-    }
-}
-
-/// Read the "skip until" timestamp from localStorage, returning `true`
-/// if the user has skipped recently and the suppression has not expired.
-fn is_skipping(pubkey: &str) -> bool {
-    let Some(s) = local_storage() else {
-        return false;
-    };
-    let Some(raw) = s.get_item(&skipped_key(pubkey)).ok().flatten() else {
-        return false;
-    };
-    raw.parse::<f64>()
-        .map(|until| js_sys::Date::now() < until)
-        .unwrap_or(false)
-}
-
-fn set_skipped(pubkey: &str) {
-    if let Some(s) = local_storage() {
-        let until = js_sys::Date::now() + SKIP_DURATION_MS;
-        let _ = s.set_item(&skipped_key(pubkey), &format!("{:.0}", until));
-        // ALSO set the legacy "onboarded" flag so the modal stops auto-popping
-        // for any pubkey on this device. Clicking "I'll do this later" should
-        // mean "stop pestering me", not "ask again in 7 days". Users can still
-        // edit their profile from Settings any time.
-        let _ = s.set_item(LEGACY_ONBOARDED_KEY, "1");
-    }
-}
-
-fn clear_skipped(pubkey: &str) {
-    if let Some(s) = local_storage() {
-        let _ = s.remove_item(&skipped_key(pubkey));
     }
 }
 
@@ -198,16 +139,6 @@ fn urlencoding_encode(s: &str) -> String {
 
 // -- Component context types --------------------------------------------------
 
-/// Optional pre-fill — used by the Settings "Edit profile" flow.
-///
-/// `initial` carries the current display name to seed the field when the modal
-/// is force-opened from Settings.
-#[derive(Clone, Copy, Debug)]
-pub struct OnboardingPrefill {
-    pub initial: RwSignal<Option<String>>,
-    pub force_open: RwSignal<bool>,
-}
-
 /// Reactive holder for the user's legacy CLAIMED username / NIP-05 handle.
 ///
 /// Dormant in the modal but still provided and read by `pages/settings.rs`.
@@ -216,14 +147,13 @@ pub struct OnboardingPrefill {
 #[derive(Clone, Copy, Debug)]
 pub struct ClaimedUsername(pub RwSignal<Option<String>>);
 
-/// Provide an `OnboardingPrefill` context so other pages (Settings) can
-/// open the modal pre-filled, plus the shared (dormant) `ClaimedUsername`
-/// signal.
+/// Provide the shared (dormant) `ClaimedUsername` signal so other pages
+/// (Settings) can read/write the legacy claimed-username context.
+///
+/// NOTE: this used to also provide an `OnboardingPrefill` context for the
+/// modal's "Edit profile" pre-fill, but that had zero consumers (the modal UI
+/// itself was removed — see the note below) and was deleted as dead code.
 pub fn provide_onboarding_prefill() {
-    provide_context(OnboardingPrefill {
-        initial: RwSignal::new(None),
-        force_open: RwSignal::new(false),
-    });
     provide_context(ClaimedUsername(RwSignal::new(None)));
 }
 
@@ -320,18 +250,6 @@ pub async fn release_username() -> Result<(), String> {
     }
 }
 
-// -- Icons --------------------------------------------------------------------
-
-fn handle_icon() -> impl IntoView {
-    view! {
-        <svg class="w-6 h-6 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="12" cy="12" r="9" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M16 9a4 4 0 11-4-4M16 9v3a2 2 0 002 2"
-                stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-    }
-}
-
 // -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
@@ -399,14 +317,6 @@ mod tests {
         assert_eq!(
             claimed_key("0123456789abcdef"),
             "nostr_bbs_username_claimed_01234567"
-        );
-    }
-
-    #[test]
-    fn skipped_key_format() {
-        assert_eq!(
-            skipped_key("0123456789abcdef"),
-            "nostr_bbs_username_skipped_until_01234567"
         );
     }
 

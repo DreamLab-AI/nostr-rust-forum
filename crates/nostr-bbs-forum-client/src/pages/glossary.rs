@@ -11,7 +11,7 @@
 //!
 //! Each entry is an `<h2 id="…">` so `InfoTerm`'s `slug` prop can deep-link to
 //! it (e.g. `/glossary#nip44`). The slugs used by call sites must stay in sync
-//! with the `id`s defined here — they are listed in [`SLUGS`] for reference.
+//! with the `id`s defined here.
 //!
 //! Brand-neutral by construction: this page references only generic protocol
 //! concepts and the in-app feature names, never a deploy-specific brand.
@@ -20,21 +20,6 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::app::base_href;
-
-/// Anchor slugs defined on this page. `InfoTerm` call sites link to
-/// `/glossary#<slug>`; keep these in sync with the `id=` attributes below.
-pub(crate) const SLUGS: &[&str] = &[
-    "encryption",
-    "nip44",
-    "relay",
-    "nip98",
-    "giftwrap",
-    "pod",
-    "keys",
-    "npub",
-    "nsec",
-    "zones",
-];
 
 /// A single glossary entry: an anchored heading plus a plain-English body.
 #[component]

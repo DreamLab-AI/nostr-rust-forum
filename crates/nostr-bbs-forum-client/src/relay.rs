@@ -162,10 +162,6 @@ pub struct RelayNotice {
 pub struct RelayConnection {
     inner: SharedInner,
     state: RwSignal<ConnectionState>,
-    /// Latest relay NOTICE surfaced for the UI (rate-limited against rapid
-    /// duplicates inside `handle_relay_message`). Components can read this to
-    /// raise a warn toast.
-    notice: RwSignal<Option<RelayNotice>>,
     /// Whether the current socket has completed NIP-42 AUTH. Flips `true` once
     /// the AUTH response is signed + sent (and subscriptions replayed), and back
     /// to `false` whenever the socket (re)connects or disconnects. AUTH-gated
@@ -281,7 +277,6 @@ impl RelayConnection {
         Self {
             inner: SendWrapper::new(inner),
             state: RwSignal::new(ConnectionState::Disconnected),
-            notice,
             authenticated,
         }
     }
@@ -293,12 +288,6 @@ impl RelayConnection {
     /// handshake. Resets to `false` on every (re)connect and on disconnect.
     pub fn authenticated(&self) -> RwSignal<bool> {
         self.authenticated
-    }
-
-    /// Reactive signal carrying the latest relay NOTICE (rate-limited). A
-    /// consumer can raise a warn toast when this changes.
-    pub fn notices(&self) -> RwSignal<Option<RelayNotice>> {
-        self.notice
     }
 
     /// Get the reactive connection state signal.

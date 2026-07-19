@@ -142,7 +142,10 @@ wasm-bindgen-test = "0.3"
 # aliasing (published crate != advanced untagged HEAD) is resolved and the
 # interim git+tag pin is retired per the deny.toml plan.
 # Published to crates.io as 0.5.0-alpha.4 (gap-close/2026-07 sprint).
-solid-pod-rs = { version = "0.5.0-alpha.4", default-features = false, features = ["core"] }
+# EXACT pin (`=`): a caret range would let the crates.io pivot silently pull a
+# newer published alpha (e.g. 0.5.0-alpha.5, MSRV 1.88) at resolve time.
+# Bumping is an intentional, verified step — not a resolver surprise.
+solid-pod-rs = { version = "=0.5.0-alpha.4", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.3).
 nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.5" }

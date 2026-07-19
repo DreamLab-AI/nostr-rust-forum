@@ -44,6 +44,10 @@ its consequences. This index closes register gap **G6** (no ADR index existed).
 | 103 | Kit semver, crates.io publish, and yank policy | Accepted | `ADR-103-kit-semver-publish-yank-policy.md` |
 | 104 | NIP-59 gift-wrap recipient admission and relay gating | Accepted | `ADR-104-gift-wrap-recipient-admission.md` |
 | 105 | BBS door-games framework, auth-optional surfaces, and the M2 write-path | Accepted (write-path deferred) | `ADR-105-bbs-door-games-and-write-architecture.md` |
+| 106 | Gap-Close Forum Governance Surfaces | Proposed | `ADR-106-gap-close-forum-governance-surfaces.md` |
+| 107 | Zone-first landing and scoped navigation | Accepted | `ADR-107-zone-first-landing-and-scoped-navigation.md` |
+| 108 | BBS mobile-first redesign ("split the difference") | Accepted (T1 shipped; T2/T3 in progress) | `ADR-108-bbs-mobile-first-redesign.md` |
+| 109 | Zone-bound one-shot BBS PWA install | Accepted (design ratified; implementation pending) | `ADR-109-zone-bound-bbs-pwa-install.md` |
 
 > **ADR-102** is now written (retrospective, 2026-07-03):
 > `ADR-102-trust-demotion-inactivity-sweep.md`. The decision it documents shipped in

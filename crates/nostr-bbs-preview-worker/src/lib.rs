@@ -16,9 +16,6 @@
 //!   GET /stats            -- cache statistics (CF Cache API)
 //!   OPTIONS               -- CORS preflight
 
-// Worker entry points are invoked via wasm-bindgen and appear unused in native builds.
-#![allow(dead_code)]
-
 mod oembed;
 mod parse;
 mod ssrf;
@@ -495,6 +492,9 @@ fn handle_stats(env: &Env) -> Result<Response> {
 
 // ── Router ───────────────────────────────────────────────────────────────────
 
+// wasm-bindgen registers this as the fetch handler; it is invoked only from the
+// generated glue on the wasm32 target and appears unused to native `cargo check`.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // CORS preflight
@@ -559,6 +559,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 }
 
 // Cron keep-warm: prevents cold starts by running periodically
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, _env: Env, _ctx: ScheduleContext) {
     // No persistent storage to touch -- the cron itself keeps the isolate warm

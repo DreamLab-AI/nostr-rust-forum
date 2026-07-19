@@ -193,13 +193,6 @@ impl AuthStore {
         None
     }
 
-    /// Build a PodClient from the current pod_url and pubkey, if both are available.
-    pub fn pod_client(&self) -> Option<crate::utils::solid::PodClient> {
-        let pod_url = self.pod_url.get_untracked()?;
-        let pubkey = self.state.get_untracked().pubkey?;
-        Some(crate::utils::solid::PodClient::new(pod_url, pubkey))
-    }
-
     /// Sign an unsigned event using the in-memory private key.
     ///
     /// The raw key bytes never leave this module — the `SigningKey` is

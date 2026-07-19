@@ -474,7 +474,13 @@ pub struct TokenOpBody {
 #[derive(Debug, Deserialize)]
 pub struct EstimateBody {
     pub endpoint: String,
+    // Accepted (mirrors `JobCreateBody::params`, so callers can reuse the
+    // same body for `/estimate` and `/create`) but not yet read:
+    // `estimate_endpoint_cost` only varies cost by endpoint today, not by
+    // per-call params. Reserved for parameterized (e.g. GPU-metered) cost
+    // estimates.
     #[serde(default)]
+    #[allow(dead_code)]
     pub params: Option<serde_json::Value>,
 }
 

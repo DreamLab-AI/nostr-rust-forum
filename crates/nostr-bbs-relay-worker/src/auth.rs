@@ -118,11 +118,6 @@ impl AdminCache {
 
         result
     }
-
-    /// Invalidate a single entry (e.g. after an admin status change).
-    pub fn invalidate(&self, pubkey: &str) {
-        self.entries.borrow_mut().remove(pubkey);
-    }
 }
 
 // ---------------------------------------------------------------------------

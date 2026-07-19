@@ -56,6 +56,11 @@ pub fn topic_slug(root_event_id: &str) -> String {
 }
 
 /// True when `slug` has the shape of a section hash (`s` + 12 hex chars).
+// TODO(dead-code): no production call site currently resolves a raw slug via
+// this shape check (only exercised by the unit tests below); scoped rather
+// than deleted since it validates the scheme documented in this module and a
+// future deep-link resolver may need it.
+#[allow(dead_code)]
 pub fn is_section_slug(slug: &str) -> bool {
     let mut chars = slug.chars();
     match chars.next() {
@@ -67,6 +72,7 @@ pub fn is_section_slug(slug: &str) -> bool {
 }
 
 /// True when `slug` has the shape of a topic hash (`t` + 16 hex chars).
+#[allow(dead_code)] // see is_section_slug above — test-only usage today
 pub fn is_topic_slug(slug: &str) -> bool {
     let mut chars = slug.chars();
     match chars.next() {

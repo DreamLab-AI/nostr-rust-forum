@@ -9,10 +9,9 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 use crate::auth;
-use crate::zone_config::ZoneConfig;
 
 use super::broadcast::EventTreatment;
-use super::filter::{self, CountResult, NostrFilter};
+use super::filter::{self, NostrFilter};
 use super::NostrRelayDO;
 
 // ---------------------------------------------------------------------------
@@ -346,130 +345,5 @@ impl NostrRelayDO {
         };
 
         matches!(stmt.first::<serde_json::Value>(None).await, Ok(Some(_)))
-    }
-
-    /// Auto-whitelist a new user with the base `members` cohort plus the cohorts
-    /// of any zone flagged `auto_approve` in `ZONE_CONFIG`.
-    ///
-    /// Called when a user publishes their first kind-0 profile event. Gives them
-    /// immediate base access without admin intervention, and — for each zone the
-    /// operator has opted into auto-approval — the cohort that zone requires, so
-    /// new joiners land straight in it. Zones without `auto_approve` still need an
-    /// admin to grant their cohort. Admins can always adjust cohorts afterwards.
-    ///
-    /// **First-user-is-admin**: If the whitelist table is empty, the first user
-    /// to register automatically becomes admin with all-zone access.
-    pub(crate) async fn auto_whitelist(&self, pubkey: &str) {
-        let db = match self.env.d1("DB") {
-            Ok(db) => db,
-            Err(_) => return,
-        };
-
-        let now = auth::js_now_secs();
-
-        // Check if any admin exists (more robust than checking if table is empty --
-        // handles the case where users registered but none got admin due to bugs)
-        let no_admin_exists = {
-            let stmt = db.prepare("SELECT COUNT(*) as cnt FROM whitelist WHERE is_admin = 1");
-            match stmt.first::<CountResult>(None).await {
-                Ok(Some(row)) => (row.cnt as u64) == 0,
-                _ => false,
-            }
-        };
-
-        if no_admin_exists {
-            // Promote this user to admin with all zones.
-            // Use UPSERT so it works whether the user is new or already in the whitelist.
-            let stmt = db.prepare(
-                "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by, is_admin) \
-                 VALUES (?1, ?2, ?3, ?4, 1) \
-                 ON CONFLICT (pubkey) DO UPDATE SET \
-                   cohorts = excluded.cohorts, \
-                   is_admin = 1",
-            );
-            if let Ok(bound) = stmt.bind(&[
-                JsValue::from_str(pubkey),
-                JsValue::from_str(r#"["home","members","private"]"#),
-                JsValue::from_f64(now as f64),
-                JsValue::from_str("auto-registration"),
-            ]) {
-                let _ = bound.run().await;
-            }
-            worker::console_log!(
-                "[auto_whitelist] No admin exists -- promoting {} to admin with all zones",
-                &pubkey[..8]
-            );
-        } else {
-            // Normal registration: the base `members` cohort, additively plus the
-            // required cohorts of every `auto_approve` zone (config-driven, so an
-            // operator opens specific zones to new joiners without a code change).
-            let cohorts_json = new_joiner_cohorts_json(&ZoneConfig::load(&self.env));
-            let stmt = db.prepare(
-                "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by, is_admin) \
-                 VALUES (?1, ?2, ?3, ?4, 0) \
-                 ON CONFLICT (pubkey) DO NOTHING",
-            );
-            if let Ok(bound) = stmt.bind(&[
-                JsValue::from_str(pubkey),
-                JsValue::from_str(&cohorts_json),
-                JsValue::from_f64(now as f64),
-                JsValue::from_str("auto-registration"),
-            ]) {
-                let _ = bound.run().await;
-            }
-        }
-    }
-}
-
-/// Build the JSON cohort array a brand-new joiner is auto-granted: the base
-/// `members` cohort plus the de-duplicated cohorts of every `auto_approve` zone.
-/// With no auto-approve zone configured this is exactly `["members"]`, preserving
-/// the historic default. Pure so it is unit-testable without a live `Env`.
-pub(crate) fn new_joiner_cohorts_json(zones: &ZoneConfig) -> String {
-    let mut cohorts = vec!["members".to_string()];
-    for c in zones.auto_approve_cohorts() {
-        if !cohorts.contains(&c) {
-            cohorts.push(c);
-        }
-    }
-    serde_json::to_string(&cohorts).unwrap_or_else(|_| r#"["members"]"#.to_string())
-}
-
-#[cfg(test)]
-mod auto_approve_tests {
-    use super::new_joiner_cohorts_json;
-    use crate::zone_config::ZoneConfig;
-
-    #[test]
-    fn no_auto_approve_zone_keeps_members_only() {
-        let z = ZoneConfig::from_json(
-            r#"[{"id":"public","required_cohorts":[],"visibility":"public"},
-                {"id":"minimoonoir","required_cohorts":["friends"],"visibility":"locked"}]"#,
-        );
-        assert_eq!(new_joiner_cohorts_json(&z), r#"["members"]"#);
-    }
-
-    #[test]
-    fn auto_approve_zone_grants_its_cohort_additively() {
-        let z = ZoneConfig::from_json(
-            r#"[{"id":"public","required_cohorts":[],"visibility":"public"},
-                {"id":"minimoonoir","required_cohorts":["friends"],"visibility":"locked","auto_approve":true},
-                {"id":"family","required_cohorts":["family"],"visibility":"locked"},
-                {"id":"business","required_cohorts":["business"],"visibility":"hidden"}]"#,
-        );
-        // members base + minimoonoir's friends; family/business NOT auto-granted.
-        assert_eq!(new_joiner_cohorts_json(&z), r#"["members","friends"]"#);
-    }
-
-    #[test]
-    fn multiple_auto_approve_zones_union_without_dupes() {
-        let z = ZoneConfig::from_json(
-            r#"[{"id":"a","required_cohorts":["friends"],"auto_approve":true},
-                {"id":"b","required_cohorts":["friends","extra"],"auto_approve":true}]"#,
-        );
-        assert_eq!(
-            new_joiner_cohorts_json(&z),
-            r#"["members","friends","extra"]"#
-        );
     }
 }

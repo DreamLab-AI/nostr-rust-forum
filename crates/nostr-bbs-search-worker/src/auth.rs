@@ -48,17 +48,6 @@ pub async fn verify_nip98_replay(
     .await
 }
 
-/// Return the list of admin pubkeys from the `ADMIN_PUBKEYS` environment
-/// variable, parsed through the canonical shared parser so the semantics match
-/// the auth-worker exactly.
-pub fn admin_pubkeys(env: &Env) -> Vec<String> {
-    let raw = env
-        .var(nostr_bbs_core::ADMIN_PUBKEYS_VAR)
-        .map(|v| v.to_string())
-        .unwrap_or_default();
-    nostr_bbs_core::admin_pubkeys_from_env_str(&raw)
-}
-
 /// Check whether a pubkey is listed in the `ADMIN_PUBKEYS` environment variable.
 pub fn is_admin(pubkey: &str, env: &Env) -> bool {
     let raw = env

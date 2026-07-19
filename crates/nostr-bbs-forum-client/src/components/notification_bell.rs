@@ -34,6 +34,7 @@ impl NotificationStore {
     }
 
     /// Number of unread notifications.
+    #[allow(dead_code)] // legacy shim, kept alongside sibling methods below
     pub fn unread_count(&self) -> Memo<usize> {
         let items = self.items;
         Memo::new(move |_| items.get().iter().filter(|n| !n.read).count())
@@ -70,6 +71,7 @@ pub fn provide_notifications() -> NotificationStore {
 }
 
 /// Read the notification store from context.
+#[allow(dead_code)] // legacy shim, no current callers — see `provide_notifications`
 pub fn use_notifications() -> NotificationStore {
     use_context::<NotificationStore>().unwrap_or_else(|| {
         let store = NotificationStore::new();

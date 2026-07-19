@@ -60,8 +60,7 @@ struct CachedData {
 /// Subscribe once at app root — all pages read from these signals.
 ///
 /// ADR-091: post counts are NEVER stored as an independent field.
-/// Use [`ChannelStore::count_for`] / [`ChannelStore::count_map`] /
-/// [`ChannelStore::total_messages`] — they derive from `channel_messages`
+/// Use [`ChannelStore::count_for`] — it derives from `channel_messages`
 /// which already dedups by event id. This eliminates the count-inflation
 /// class of bugs.
 #[derive(Clone, Copy)]
@@ -138,19 +137,6 @@ impl ChannelStore {
     pub fn count_for(&self, cid: &str) -> u32 {
         self.channel_messages
             .with(|m| m.get(cid).map(|v| v.len() as u32).unwrap_or(0))
-    }
-
-    /// Full count map (cid → count). Useful as a single Signal for filters
-    /// that need to read multiple counts in one update tick.
-    pub fn count_map(&self) -> HashMap<String, u32> {
-        self.channel_messages
-            .with(|m| m.iter().map(|(k, v)| (k.clone(), v.len() as u32)).collect())
-    }
-
-    /// Sum of all channel post counts.
-    pub fn total_messages(&self) -> u32 {
-        self.channel_messages
-            .with(|m| m.values().map(|v| v.len() as u32).sum())
     }
 
     fn load_cache() -> CachedData {

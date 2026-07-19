@@ -327,13 +327,6 @@ pub async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
     cors_json_response(env, &serde_json::Value::Array(profiles), 200)
 }
 
-// `_req` is kept on `handle_search` so future enhancements (e.g. per-Origin
-// CORS branching) don't change the public signature again.
-#[allow(dead_code)]
-fn _ensure_request_arg_used(req: &Request) -> &Request {
-    req
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

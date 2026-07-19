@@ -158,6 +158,11 @@ pub async fn get_quota_d1(db: &D1Database, pubkey: &str) -> QuotaInfo {
 }
 
 /// Set the quota limit for a user in D1. Used by admin endpoints.
+///
+/// No admin HTTP route calls this yet in this crate — reserved for that
+/// future endpoint (unlike `set_quota`/`check_quota` below, which are the
+/// deprecated *legacy* KV path and have been removed as genuinely dead).
+#[allow(dead_code)]
 pub async fn set_quota_d1(db: &D1Database, pubkey: &str, limit: u64) -> Result<QuotaInfo> {
     let now = (js_sys::Date::now() / 1000.0) as i64;
     db.prepare(
@@ -209,42 +214,11 @@ pub async fn update_usage(kv: &kv::KvStore, pubkey: &str, delta: i64) -> Result<
     Ok(())
 }
 
-/// Set the quota limit for a user. Used by admin endpoints.
-#[deprecated(note = "Use set_quota_d1 for atomic quota operations")]
-pub async fn set_quota(kv: &kv::KvStore, pubkey: &str, limit: u64) -> Result<QuotaInfo> {
-    #[allow(deprecated)]
-    let mut info = get_quota(kv, pubkey).await?;
-    info.limit = limit;
-    let key = format!("quota:{pubkey}");
-    let json = serde_json::to_string(&info)
-        .map_err(|e| Error::RustError(format!("quota serialize: {e}")))?;
-    kv.put(&key, &json)?.execute().await?;
-    Ok(info)
-}
-
-/// Check if a write of `additional_bytes` would exceed the user's quota.
-///
-/// Returns `Ok(())` if the write is permitted, or `Err` with a descriptive
-/// message if the quota would be exceeded.
-#[deprecated(note = "Use check_and_reserve_d1 for atomic check+reserve")]
-pub async fn check_quota(kv: &kv::KvStore, pubkey: &str, additional_bytes: u64) -> Result<()> {
-    // SECURITY: check_quota and update_usage are not atomic as a pair.
-    // Use check_and_reserve_d1 for atomic check+reserve.
-    #[allow(deprecated)]
-    let info = get_quota(kv, pubkey).await?;
-    let projected = info
-        .used
-        .checked_add(additional_bytes)
-        .ok_or_else(|| Error::RustError("Storage quota arithmetic overflow".into()))?;
-    if projected > info.limit {
-        Err(Error::RustError(format!(
-            "Storage quota exceeded: {}/{} bytes (need {} more)",
-            info.used, info.limit, additional_bytes
-        )))
-    } else {
-        Ok(())
-    }
-}
+// `set_quota` and `check_quota` (deprecated, KV-backed legacy path) were
+// removed here: both were already marked `#[deprecated]` in favour of the
+// atomic D1 path, had zero callers anywhere in the crate (production or
+// test), and are genuinely dead on every build target — see
+// `set_quota_d1`/`check_and_reserve_d1` for the current atomic equivalents.
 
 // ---------------------------------------------------------------------------
 // Tests

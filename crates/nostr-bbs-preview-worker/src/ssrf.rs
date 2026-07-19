@@ -51,8 +51,6 @@ pub enum SsrfFetchError {
     Worker(worker::Error),
     /// Response body exceeded [`MAX_BODY_BYTES`].
     BodyTooLarge,
-    /// Non-2xx final status.
-    HttpStatus(u16),
 }
 
 impl From<worker::Error> for SsrfFetchError {
@@ -70,7 +68,6 @@ impl std::fmt::Display for SsrfFetchError {
             SsrfFetchError::BodyTooLarge => {
                 write!(f, "response body exceeds {MAX_BODY_BYTES} bytes")
             }
-            SsrfFetchError::HttpStatus(s) => write!(f, "HTTP {s}"),
         }
     }
 }

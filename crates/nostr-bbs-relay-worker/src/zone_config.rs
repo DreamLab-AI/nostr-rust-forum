@@ -40,31 +40,15 @@ pub enum ZoneVisibility {
 pub struct Zone {
     /// Slug identifier (`"public"`, `"friends"`, `"family"`, `"business"`, ...).
     pub id: String,
-    /// Display name (surfaced on the tile).
-    #[serde(default)]
-    pub display_name: String,
     /// Cohorts required to READ. Empty + `Public` ⇒ unauthenticated read.
     #[serde(default)]
     pub required_cohorts: Vec<String>,
     /// Cohorts required to WRITE; falls back to `required_cohorts` when absent.
     #[serde(default)]
     pub write_cohorts: Option<Vec<String>>,
-    /// Banner image rendered on the (possibly locked) tile.
-    #[serde(default)]
-    pub banner_image_url: Option<String>,
     /// Visibility policy for non-members.
     #[serde(default)]
     pub visibility: ZoneVisibility,
-    /// Client-side NIP-44 encryption flag (relay only records it).
-    #[serde(default)]
-    pub encrypted: bool,
-    /// Auto-approval: when `true`, a brand-new joiner (first kind-0 auto-whitelist)
-    /// is automatically granted this zone's `required_cohorts`, so they land in
-    /// the zone without an admin approving them. When `false` (the default), the
-    /// zone's cohort must be granted manually by an admin. Per-zone, so an
-    /// operator can open one zone to the public while keeping others gated.
-    #[serde(default)]
-    pub auto_approve: bool,
 }
 
 impl Zone {
@@ -111,29 +95,6 @@ impl ZoneConfig {
     /// Look up a zone definition by id.
     pub fn get(&self, id: &str) -> Option<&Zone> {
         self.zones.iter().find(|z| z.id == id)
-    }
-
-    /// Cohorts a brand-new joiner should be auto-granted: the de-duplicated union
-    /// of `required_cohorts` across every zone flagged `auto_approve = true`.
-    /// Empty when no zone opts in — callers keep their existing default in that
-    /// case, so auto-approval is strictly additive and opt-in per zone.
-    pub fn auto_approve_cohorts(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for z in &self.zones {
-            if z.auto_approve {
-                for c in &z.required_cohorts {
-                    if !out.contains(c) {
-                        out.push(c.clone());
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Whether a zone with this id exists in config.
-    pub fn is_known(&self, id: &str) -> bool {
-        self.get(id).is_some()
     }
 
     /// Whether the zone is readable with no auth and no cohort membership.
@@ -193,10 +154,10 @@ mod tests {
 
     fn cfg() -> ZoneConfig {
         let json = r#"[
-            {"id":"public","display_name":"Public","required_cohorts":[],"write_cohorts":["friends"],"visibility":"public"},
-            {"id":"friends","display_name":"Friends","required_cohorts":["friends"],"visibility":"locked"},
-            {"id":"family","display_name":"Family","required_cohorts":["family"],"visibility":"locked","encrypted":true},
-            {"id":"business","display_name":"Business","required_cohorts":["business"],"visibility":"hidden"}
+            {"id":"public","required_cohorts":[],"write_cohorts":["friends"],"visibility":"public"},
+            {"id":"friends","required_cohorts":["friends"],"visibility":"locked"},
+            {"id":"family","required_cohorts":["family"],"visibility":"locked"},
+            {"id":"business","required_cohorts":["business"],"visibility":"hidden"}
         ]"#;
         ZoneConfig {
             zones: serde_json::from_str(json).unwrap(),

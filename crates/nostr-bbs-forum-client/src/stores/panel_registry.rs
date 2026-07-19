@@ -231,16 +231,6 @@ impl PanelRegistry {
             _ => {}
         }
     }
-
-    pub fn panel_count(&self) -> Memo<usize> {
-        let state = self.state;
-        Memo::new(move |_| state.read().panels.len())
-    }
-
-    pub fn pending_action_count(&self) -> Memo<usize> {
-        let state = self.state;
-        Memo::new(move |_| state.read().actions.len())
-    }
 }
 
 /// Resolve the rendered supersession chain for a case `d`-tag (F6, DDD §7a.3).

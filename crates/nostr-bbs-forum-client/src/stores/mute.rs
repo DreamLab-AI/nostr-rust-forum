@@ -30,30 +30,6 @@ impl MuteStore {
 
     // -- Channel mute ---------------------------------------------------------
 
-    /// Toggle mute state for a channel. Returns `true` if now muted.
-    pub fn toggle_mute_channel(&self, channel_id: &str) -> bool {
-        let mut now_muted = false;
-        self.inner.update(|d| {
-            if let Some(pos) = d.muted_channels.iter().position(|c| c == channel_id) {
-                d.muted_channels.remove(pos);
-            } else {
-                d.muted_channels.push(channel_id.to_string());
-                now_muted = true;
-            }
-        });
-        self.persist();
-        now_muted
-    }
-
-    /// Check if a channel is muted.
-    pub fn is_channel_muted(&self, channel_id: &str) -> bool {
-        self.inner
-            .get()
-            .muted_channels
-            .iter()
-            .any(|c| c == channel_id)
-    }
-
     /// Reactive signal for whether a specific channel is muted.
     #[allow(dead_code)]
     pub fn channel_muted_signal(&self, channel_id: String) -> Memo<bool> {

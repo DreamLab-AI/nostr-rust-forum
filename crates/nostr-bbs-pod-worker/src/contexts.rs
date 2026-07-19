@@ -4,6 +4,12 @@
 //! Solid/RDF client that requests them via their canonical IRIs gets the
 //! authoritative version baked into the binary, avoiding external round-trips
 //! in the WASM Worker environment.
+//!
+//! `context_for_iri` and the bundled `CONTEXT_*` bodies are not yet wired
+//! into a `fetch()` route (no `.well-known` context-dereference handler
+//! exists in `lib.rs` today) — reserved for that future route and validated
+//! directly by this module's unit tests in the meantime.
+#![cfg_attr(not(test), allow(dead_code))]
 
 /// FOAF (Friend of a Friend) vocabulary context.
 pub const CONTEXT_FOAF: &str = include_str!("../contexts/foaf.jsonld");
