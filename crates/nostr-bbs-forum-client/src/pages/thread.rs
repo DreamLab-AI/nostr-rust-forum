@@ -262,6 +262,19 @@ pub fn ThreadPage() -> impl IntoView {
     let section_param = move || params.read().get("section").unwrap_or_default();
     let topic_param = move || params.read().get("topic").unwrap_or_default();
 
+    // Canonicalised zone URL slug: the `:category` param may be the zone's
+    // configured slug OR its immutable id (both resolve via
+    // `resolve_zone_param` so legacy `/zone1/…` links keep working), but every
+    // link THIS page emits must read `/welcome/…` — never the raw id — so a
+    // user arriving via an id URL never sees it propagate into child links.
+    let category_url_slug = move || {
+        let raw = category_slug();
+        let zs = load_zones();
+        crate::stores::zones::resolve_zone_param(&raw, &zs)
+            .map(|z| crate::stores::zones::zone_slug(z).to_string())
+            .unwrap_or(raw)
+    };
+
     // Zone access gate — identical contract to SectionPage (ADR-022: the relay
     // is the real boundary; unknown zones default accessible).
     let has_zone_access = Memo::new(move |_| {
@@ -468,9 +481,9 @@ pub fn ThreadPage() -> impl IntoView {
     // Section href (hashed) for breadcrumb back-link — REAL section name shown.
     let section_href = move || {
         match resolved_channel.get() {
-            Some(ch) => format!("/{}/{}", category_slug(), section_slug(&ch.id)),
+            Some(ch) => format!("/{}/{}", category_url_slug(), section_slug(&ch.id)),
             // Preserve whatever section param brought us here.
-            None => format!("/{}/{}", category_slug(), section_param()),
+            None => format!("/{}/{}", category_url_slug(), section_param()),
         }
     };
     let section_name = move || {
@@ -805,7 +818,7 @@ pub fn ThreadPage() -> impl IntoView {
             {move || {
                 let slug = category_slug();
                 let zone_label = category_display_name(&slug);
-                let zone_href = format!("/{}", slug);
+                let zone_href = format!("/{}", category_url_slug());
                 let sec_name = section_name();
                 let sec_href = section_href();
                 let topic = topic_title();

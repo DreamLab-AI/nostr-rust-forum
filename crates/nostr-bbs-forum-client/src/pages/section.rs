@@ -186,6 +186,19 @@ pub fn SectionPage() -> impl IntoView {
     let category_slug = move || params.read().get("category").unwrap_or_default();
     let section_slug = move || params.read().get("section").unwrap_or_default();
 
+    // Canonicalised zone URL slug: the `:category` param may be the zone's
+    // configured slug OR its immutable id (both resolve via
+    // `resolve_zone_param` so legacy `/zone1/…` links keep working), but every
+    // link THIS page emits must read `/welcome/…` — never the raw id — so a
+    // user arriving via an id URL never sees it propagate into child links.
+    let category_url_slug = move || {
+        let raw = category_slug();
+        let zs = load_zones();
+        crate::stores::zones::resolve_zone_param(&raw, &zs)
+            .map(|z| crate::stores::zones::zone_slug(z).to_string())
+            .unwrap_or(raw)
+    };
+
     // Zone access gate: the category slug IS the zone ID (ADR-022 — the relay
     // remains the real boundary; unknown zones default accessible).
     let has_zone_access = Memo::new(move |_| {
@@ -304,7 +317,7 @@ pub fn SectionPage() -> impl IntoView {
     // hold it in a Copy StoredValue the children can copy into the handler.
     let composer_relay = StoredValue::new(relay.clone());
 
-    let category_for_topics = Signal::derive(category_slug);
+    let category_for_topics = Signal::derive(category_url_slug);
 
     view! {
         <Show
@@ -352,7 +365,7 @@ pub fn SectionPage() -> impl IntoView {
             {move || {
                 let slug = category_slug();
                 let zone_label = category_display_name(&slug);
-                let zone_href = format!("/{}", slug);
+                let zone_href = format!("/{}", category_url_slug());
                 let section_label = header_name();
                 if za_breadcrumb.home_zone().is_some() {
                     view! {
@@ -496,7 +509,7 @@ pub fn SectionPage() -> impl IntoView {
                             <p class="text-gray-400 text-sm mb-4">
                                 "This section could not be found in this zone."
                             </p>
-                            <A href=base_href(&format!("/{}", category_slug())) attr:class="za-text hover:opacity-80 text-sm underline">
+                            <A href=base_href(&format!("/{}", category_url_slug())) attr:class="za-text hover:opacity-80 text-sm underline">
                                 "Back to zone"
                             </A>
                         </div>

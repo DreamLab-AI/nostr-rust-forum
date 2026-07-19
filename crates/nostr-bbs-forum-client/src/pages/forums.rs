@@ -383,6 +383,11 @@ fn zone_tile(
     sec_meta: &HashMap<String, (String, String)>,
 ) -> AnyView {
     let zone_id = zone.id.clone();
+    // URL slug (never the raw immutable zone id) fed to each CategoryCard's
+    // href — the zone id keys existing posted content and channel `section`
+    // tags and must never change, but the *emitted* URL should read
+    // `/welcome/…` rather than `/zone1/…` when a slug alias is configured.
+    let zone_slug = crate::stores::zones::zone_slug(zone).to_string();
     let label = zone.label();
     let label_alt = label.clone();
     // Issue #43: one accent hex, config-first (operator `accent_hex` when set,
@@ -432,7 +437,8 @@ fn zone_tile(
                         post_count=counts.total
                         unread_count=counts.unread
                         accent_hex=accent_hex.clone()
-                        zone_id=zone_id.clone()
+                        zone_slug=zone_slug.clone()
+                        zone_label=label.clone()
                     />
                 }
             })

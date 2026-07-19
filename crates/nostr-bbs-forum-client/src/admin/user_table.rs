@@ -699,6 +699,12 @@ fn UserRow(
                     fallback={
                         let cohorts_disp = cohorts_for_display.clone();
                         move || {
+                            // Zone-scoped so each cohort badge can be labelled with
+                            // its owning zone's display_name rather than the raw
+                            // cohort id (issue: zone alias leak fix). The cohort
+                            // VALUE stored on the user is untouched — only the
+                            // rendered text changes.
+                            let zones = crate::stores::zones::load_zones();
                             view! {
                                 <div class="flex flex-wrap gap-1">
                                     {is_admin_user.then(|| view! {
@@ -708,7 +714,7 @@ fn UserRow(
                                     })}
                                     {cohorts_disp.iter().map(|c| {
                                         let badge_class = cohort_badge_class(c);
-                                        let label = c.clone();
+                                        let label = cohort_label(c, &zones);
                                         view! {
                                             <span class=badge_class>
                                                 {label}
@@ -886,6 +892,28 @@ fn CohortEditor(editing_cohorts: RwSignal<Vec<String>>) -> impl IntoView {
             }).collect_view()}
         </div>
     }
+}
+
+/// Resolve a raw cohort id to a display label for the read-only user-table
+/// badge. The cohort VALUE stored on the whitelisted user is immutable (it
+/// gates existing `required_cohorts`/`write_cohorts` config and must never
+/// change); only the rendered badge TEXT is affected. Prefers the
+/// `display_name` of the zone the cohort gates — the same lookup
+/// [`available_cohorts`] uses to label the editor checkboxes — so e.g.
+/// `"zone2"` shows as "Minimoonoir" instead of the raw generic id. Falls back
+/// to a humanised cohort id for cohorts with no matching zone (`"members"`,
+/// `"agent"`, and other non-zone-gated cohorts).
+fn cohort_label(cohort: &str, zones: &[crate::stores::zones::Zone]) -> String {
+    zones
+        .iter()
+        .find(|z| {
+            z.required_cohorts.iter().any(|c| c == cohort)
+                || z.write_cohorts
+                    .as_ref()
+                    .is_some_and(|w| w.iter().any(|c| c == cohort))
+        })
+        .map(|z| z.label())
+        .unwrap_or_else(|| capitalize(cohort))
 }
 
 /// Capitalise a cohort id for display (`"friends"` -> `"Friends"`).

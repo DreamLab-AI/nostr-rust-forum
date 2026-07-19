@@ -441,7 +441,17 @@ pub fn CategoryPage() -> impl IntoView {
             <Show when=move || !loading.get()>
                 {move || {
                     let secs = zone_sections.get();
-                    let cat = category_slug();
+                    // Canonicalise the `:category` URL param to the zone's URL
+                    // slug before handing it to SectionCard — the param may be
+                    // the zone's slug OR its immutable id (legacy links both
+                    // route here via `resolve_zone_param`), but every outbound
+                    // section href must read `/welcome/…`, never `/zone1/…`.
+                    let cat = {
+                        let zs = load_zones();
+                        crate::stores::zones::resolve_zone_param(&category_slug(), &zs)
+                            .map(|z| crate::stores::zones::zone_slug(z).to_string())
+                            .unwrap_or_else(category_slug)
+                    };
                     let last_active = store.last_active.get();
 
                     if secs.is_empty() {

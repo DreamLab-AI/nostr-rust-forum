@@ -36,8 +36,15 @@ pub fn CategoryCard(
     /// icon — is derived from this one value via [`hex_rgba`], so the card
     /// always matches its zone's tile instead of a hash-picked palette.
     accent_hex: String,
-    /// Parent zone id for building the href.
-    zone_id: String,
+    /// URL slug for the parent zone — its configured `slug`
+    /// ([`crate::stores::zones::zone_slug`]) or, absent that, its immutable
+    /// `id`. Used to build the href; callers must resolve this from the zone,
+    /// never pass the raw internal zone id directly, so URLs read `/welcome/…`
+    /// rather than `/zone1/…` when a slug alias is configured.
+    zone_slug: String,
+    /// Human-readable zone label (the operator `display_name`, or a humanised
+    /// id when absent) shown in the card's watermark badge.
+    zone_label: String,
     /// Optional picture URL for background image.
     #[prop(optional, into)]
     picture: String,
@@ -45,7 +52,7 @@ pub fn CategoryCard(
     // #9: the section tag is hashed into the URL — its plaintext (which can
     // reveal the section name) never appears in the address bar. The section
     // page resolves the hash back to the real channel for display.
-    let href = base_href(&format!("/{}/{}", zone_id, section_slug(&section_id)));
+    let href = base_href(&format!("/{}/{}", zone_slug, section_slug(&section_id)));
 
     // Inline styles derived from the single resolved accent hex (issue #43),
     // replacing the old per-key Tailwind class tables. Alphas mirror the weights
@@ -146,7 +153,7 @@ pub fn CategoryCard(
                         })}
                     </div>
                     <span class="text-xs text-gray-500">
-                        {zone_id.replace('-', " ")}
+                        {zone_label}
                     </span>
                 </div>
             </div>
