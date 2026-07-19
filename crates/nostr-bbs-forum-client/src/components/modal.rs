@@ -49,9 +49,25 @@ pub(crate) fn Modal(
     let esc_ref = send_wrapper::SendWrapper::new(esc_closure);
     on_cleanup(move || drop(esc_ref));
 
-    // Body scroll lock
+    // Body scroll lock — ref-counted, and ALWAYS released on unmount. Several
+    // flows (DeleteUserModal, ConfirmDialog confirm paths) close by having the
+    // parent unmount the modal while `is_open` is still true; without the
+    // cleanup the effect never observes `false` and `<body>` keeps
+    // `overflow: hidden`, leaving the whole page unscrollable until reload.
+    // The count (rather than a plain toggle) keeps stacked modals honest: the
+    // body unlocks only when the last open modal releases.
+    let holds_lock = StoredValue::new(false);
     Effect::new(move |_| {
-        toggle_body_scroll(is_open.get());
+        let open = is_open.get();
+        if open != holds_lock.get_value() {
+            holds_lock.set_value(open);
+            adjust_body_scroll_lock(open);
+        }
+    });
+    on_cleanup(move || {
+        if holds_lock.get_value() {
+            adjust_body_scroll_lock(false);
+        }
     });
 
     let panel_style = max_width
@@ -117,10 +133,24 @@ pub(crate) fn Modal(
     }
 }
 
-/// Toggle `overflow: hidden` on `<body>` to prevent background scroll.
-fn toggle_body_scroll(lock: bool) {
+/// Open-modal count backing the body scroll lock (WASM is single-threaded;
+/// the atomic is just the cheapest shared cell).
+static SCROLL_LOCKS: AtomicU32 = AtomicU32::new(0);
+
+/// Acquire (+1) or release (−1) the shared body scroll lock, applying
+/// `overflow: hidden` to `<body>` while any modal holds it. Saturates at zero
+/// so a stray release can never wedge the counter.
+fn adjust_body_scroll_lock(lock: bool) {
+    let count = if lock {
+        SCROLL_LOCKS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        let prev = SCROLL_LOCKS.load(Ordering::Relaxed);
+        let next = prev.saturating_sub(1);
+        SCROLL_LOCKS.store(next, Ordering::Relaxed);
+        next
+    };
     if let Some(body) = gloo::utils::document().body() {
         let style = body.style();
-        let _ = style.set_property("overflow", if lock { "hidden" } else { "" });
+        let _ = style.set_property("overflow", if count > 0 { "hidden" } else { "" });
     }
 }
