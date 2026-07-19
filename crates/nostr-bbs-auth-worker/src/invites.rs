@@ -212,11 +212,20 @@ fn merge_cohorts_json(existing: &str, add: &[String]) -> String {
 
 /// Grant `zone_cohorts` to `pubkey` on the relay's shared whitelist (RELAY_DB).
 ///
-/// Reads the existing row, MERGES the zone cohorts in (dedup, existing cohorts
-/// preserved) and writes back. If the redeemer has no whitelist row yet, creates
-/// one seeded with the base `members` cohort plus the zone cohorts — mirroring
-/// the auto-registration insert in `username.rs`. Best-effort: any D1 error is a
-/// non-fatal no-op (the redeem still succeeds; an admin can re-grant).
+/// **Ensure-then-merge** (race-safe). The redeemer is frequently a brand-new
+/// signup whose whitelist row is being created *concurrently* by the auth-worker
+/// username-claim (`username.rs`). A naive SELECT-then-branch loses the grant:
+/// if the SELECT sees no row but the claim's `INSERT ... members` lands before
+/// this function's `INSERT ... members+zone ON CONFLICT DO NOTHING`, the conflict
+/// silently drops the zone cohort. To close that window we:
+///   1. INSERT a row seeded with `members` + the zone cohorts, `ON CONFLICT DO
+///      NOTHING` — guarantees a row exists afterwards (ours, or the claim's).
+///   2. Re-read the (now-guaranteed) row and UPDATE it with the zone cohorts
+///      merged into whatever is there. The UPDATE is idempotent and correct
+///      whether we or the claim won step 1, so a concurrent bare-`members`
+///      insert can no longer clobber the grant.
+/// Best-effort: any D1 error is a non-fatal no-op (the redeem still succeeds; an
+/// admin can re-grant).
 async fn grant_zone_cohorts(env: &Env, pubkey: &str, zone_cohorts: &[String]) {
     if zone_cohorts.is_empty() {
         return;
@@ -225,6 +234,28 @@ async fn grant_zone_cohorts(env: &Env, pubkey: &str, zone_cohorts: &[String]) {
         return;
     };
 
+    let now = now_secs() as i64;
+
+    // 1. Ensure a row exists. If we win the insert it already carries the zone
+    //    cohorts; if the username-claim wins, DO NOTHING and step 2 merges.
+    let seeded = merge_cohorts_json(r#"["members"]"#, zone_cohorts);
+    if let Ok(stmt) = db
+        .prepare(
+            "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by, is_admin) \
+             VALUES (?1, ?2, ?3, ?4, 0) ON CONFLICT (pubkey) DO NOTHING",
+        )
+        .bind(&[
+            js_str(pubkey),
+            js_str(&seeded),
+            js_i64(now),
+            js_str("invite-zone-grant"),
+        ])
+    {
+        let _ = stmt.run().await;
+    }
+
+    // 2. Merge the zone cohorts into whatever row now exists. Covers the case
+    //    where a concurrent claim-insert of ["members"] won step 1.
     let existing = match db
         .prepare("SELECT cohorts FROM whitelist WHERE pubkey = ?1")
         .bind(&[js_str(pubkey)])
@@ -232,31 +263,12 @@ async fn grant_zone_cohorts(env: &Env, pubkey: &str, zone_cohorts: &[String]) {
         Ok(stmt) => stmt.first::<WhitelistCohortsRow>(None).await.ok().flatten(),
         Err(_) => None,
     };
-
-    let now = now_secs() as i64;
-    match existing {
-        Some(row) => {
-            let merged = merge_cohorts_json(&row.cohorts, zone_cohorts);
+    if let Some(row) = existing {
+        let merged = merge_cohorts_json(&row.cohorts, zone_cohorts);
+        if merged != row.cohorts {
             if let Ok(stmt) = db
                 .prepare("UPDATE whitelist SET cohorts = ?1 WHERE pubkey = ?2")
                 .bind(&[js_str(&merged), js_str(pubkey)])
-            {
-                let _ = stmt.run().await;
-            }
-        }
-        None => {
-            let seeded = merge_cohorts_json(r#"["members"]"#, zone_cohorts);
-            if let Ok(stmt) = db
-                .prepare(
-                    "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by, is_admin) \
-                     VALUES (?1, ?2, ?3, ?4, 0) ON CONFLICT (pubkey) DO NOTHING",
-                )
-                .bind(&[
-                    js_str(pubkey),
-                    js_str(&seeded),
-                    js_i64(now),
-                    js_str("invite-zone-grant"),
-                ])
             {
                 let _ = stmt.run().await;
             }
