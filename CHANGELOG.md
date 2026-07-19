@@ -7,6 +7,43 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.6] — 2026-07-19
+
+Workspace release: every kit crate moves to `1.0.0-beta.6`; the four library
+crates (`nostr-bbs-core`, `-config`, `-mesh`, `-rate-limit`) are published to
+crates.io so consumers can pivot off the git-SHA pin.
+
+### Security & hardening (full-stack audit remediation, two passes)
+
+- **Device-key proof-of-possession** (auth-worker): device registration now
+  requires a device-key-signed proof (kind-27236 committing to owner + short
+  expiry, verified via the canonical Schnorr path) and rejects binding a key
+  that is already a known principal — closing a latent silent admin-lockout /
+  identity-hijack primitive.
+- **NIP-42 AUTH across Durable Object hibernation** (relay): the per-session
+  challenge is persisted to DO storage and restored on `recover_session`
+  (previously a fresh challenge was minted that the client never saw, breaking
+  AUTH permanently across the hibernation boundary).
+- **Relay moderation/access**: ban gate widened from kinds 1/42 to all
+  user-content kinds; new channels no longer default write-locked to admins;
+  admin-status cache TTL cut 5 min → 30 s; `recover_session` no longer holds a
+  `RefMut` across `.await`.
+- **Publish hygiene**: the crate-wide `#![allow(dead_code)]` is removed from
+  the worker crates and scoped to the wasm entry points, and the genuinely
+  orphaned code it masked is deleted — so the published crates ship with the
+  compiler's dead-code guard intact.
+- **Client cleanup discipline**: a systemic `on_cleanup` sweep fixes leaked
+  document listeners / timers / observers (modal keydown + scroll-lock,
+  message-input draft/mention timers, link-preview observer, global-search
+  debounce, offline-banner listeners, admin auto-dismiss) that fired against
+  disposed reactive scopes after unmount.
+- `solid-pod-rs` pinned exact (`=0.5.0-alpha.4`) so the crates.io pivot cannot
+  silently forward-drift.
+
+(Related `solid-pod-rs` criticals — an unverified deposit oracle and an SSRF
+cluster — are fixed in that repository, not this kit.)
+
+
 ### Added
 
 - **Zone URL slugs** (operator issue #45). Zones may carry a `slug` in

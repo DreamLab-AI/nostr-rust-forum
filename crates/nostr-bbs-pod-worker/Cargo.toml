@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-pod-worker"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 edition = "2021"
 description = "Pod Worker: Solid pods + R2 storage + WAC ACL (nostr-bbs)"
 license = "AGPL-3.0-only"
