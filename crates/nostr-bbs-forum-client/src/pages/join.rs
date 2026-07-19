@@ -40,14 +40,20 @@ use crate::utils::zone_theme::{resolved_accent_hex, zone_accent_style_cfg};
 /// Preview of an invite from `GET {AUTH_API}/api/invites/:code`.
 ///
 /// Serde is deliberately forgiving (every field `#[serde(default)]`) so a
-/// backend that ships a slightly different envelope shape (`valid` vs `ok`,
-/// extra fields) never breaks the client. Validity is the union of `valid`/`ok`.
+/// backend that ships a slightly different envelope shape never breaks the
+/// client. The WI-4 backend signals validity via `state` (`"active"` when the
+/// invite is redeemable); `valid`/`ok` are also accepted for any variant that
+/// ships a boolean envelope instead.
 #[derive(Clone, Debug, Default, Deserialize)]
 struct InvitePreview {
     #[serde(default)]
     valid: bool,
     #[serde(default)]
     ok: bool,
+    /// Lifecycle state from the WI-4 preview: `"active"` = redeemable;
+    /// `"expired"`/`"exhausted"`/`"revoked"` = dead.
+    #[serde(default)]
+    state: Option<String>,
     #[serde(default)]
     zone_id: Option<String>,
     #[serde(default)]
@@ -60,7 +66,7 @@ struct InvitePreview {
 
 impl InvitePreview {
     fn is_valid(&self) -> bool {
-        self.valid || self.ok
+        self.valid || self.ok || self.state.as_deref() == Some("active")
     }
 }
 
