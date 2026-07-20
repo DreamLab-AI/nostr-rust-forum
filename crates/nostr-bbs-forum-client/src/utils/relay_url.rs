@@ -58,6 +58,26 @@ pub fn auth_api_base() -> String {
         .to_string()
 }
 
+/// Base URL for the PRIMARY pod HTTP API (Solid pods, media, deprovision).
+///
+/// Resolves the operator's own pod server (the CF pod-worker on DreamLab).
+/// NOTE (federation): this is the *primary* home only. Once federated pods land
+/// (e.g. an agentbox native pod server), a pod's real home must be resolved
+/// per-user from their WebID/storage triple — do NOT assume every pod lives on
+/// this host. Callers that mutate a pod (e.g. deprovision) must target the pod's
+/// actual home; today that is always the primary, so this resolver suffices.
+pub fn pod_api_base() -> String {
+    if let Some(url) = window_env("POD_API_URL") {
+        return url;
+    }
+    if let Some(url) = window_env("VITE_POD_API_URL") {
+        return url;
+    }
+    option_env!("VITE_POD_API_URL")
+        .unwrap_or("https://api.example.com")
+        .to_string()
+}
+
 /// Display name for the forum, used in landing copy and titles.
 ///
 /// Resolved at runtime from `window.__ENV__.FORUM_NAME` so an operator can

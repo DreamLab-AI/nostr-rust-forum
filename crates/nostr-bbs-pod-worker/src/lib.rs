@@ -130,6 +130,11 @@ fn is_provision_path(path: &str) -> bool {
     path == "/.provision"
 }
 
+/// Check whether a resource path targets the pod deprovision endpoint.
+fn is_deprovision_path(path: &str) -> bool {
+    path == "/.deprovision"
+}
+
 /// Forum Worker pod names are Nostr x-only pubkeys.
 ///
 /// Native solid-pod-rs can create named pods through `POST /.pods`; this
@@ -853,6 +858,83 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "containers": ["profile/", "public/", "private/", "inbox/", "settings/", "media/", "media/public/"]
             }),
             201,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deprovision endpoint: POST /pods/{pubkey}/.deprovision
+    //
+    // Full pod teardown: prefix-deletes every R2 object under `pods/{pubkey}`
+    // and releases the owner's quota. Owner OR admin only. Handled BEFORE the
+    // standard WAC gate so an admin who is not the resource owner is not blocked
+    // by owner-only ACLs (the counterpart to `.provision`). Closes the
+    // orphaned-pod gap: the relay `user/delete` purges relay/D1 state but cannot
+    // reach pod R2, so a deleted user's pod used to linger forever.
+    //
+    // Federation boundary: this reaps ONLY this server's own R2. A user whose
+    // pod is federated on another home (e.g. a future agentbox native pod
+    // server) has no objects here, so the call is a safe no-op — the forum never
+    // deletes pods it does not host. Notifying a remote home to reap its own pod
+    // is a separate, governed decision made when federation connects, not here.
+    // -----------------------------------------------------------------------
+    if is_deprovision_path(&resource_path) {
+        if method != Method::Post {
+            return json_error(&env, "Method not allowed; use POST", 405);
+        }
+        let req_pk = match requester_pubkey.as_ref() {
+            Some(pk) => pk.clone(),
+            None => return json_error(&env, "Authentication required", 401),
+        };
+        let is_owner = req_pk == owner_pubkey;
+        if !is_owner && !is_admin_user(&env, &req_pk).await {
+            return json_error(&env, "Only the pod owner or an admin can deprovision", 403);
+        }
+
+        // Prefix-delete every object under `pods/{owner_pubkey}`. Pubkeys are a
+        // fixed 64-hex length always followed by `/`, so this prefix can match
+        // only THIS pod's keys — never a different owner's.
+        let prefix = format!("pods/{owner_pubkey}");
+        let mut objects_deleted: u64 = 0;
+        let mut bytes_freed: i64 = 0;
+        let mut cursor: Option<String> = None;
+        loop {
+            let builder = bucket.list().prefix(&prefix);
+            let builder = match cursor.take() {
+                Some(c) => builder.cursor(c),
+                None => builder,
+            };
+            let page = builder.execute().await?;
+            for obj in page.objects() {
+                let key = obj.key();
+                bytes_freed += obj.size() as i64;
+                bucket.delete(&key).await?;
+                objects_deleted += 1;
+            }
+            if page.truncated() {
+                cursor = page.cursor();
+                if cursor.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Release the freed bytes from the owner's quota (best-effort — a stale
+        // quota row must not fail the teardown).
+        if bytes_freed > 0 {
+            let _ = quota::update_usage_d1(&quota_db, &owner_pubkey, -bytes_freed).await;
+        }
+
+        return json_ok(
+            &env,
+            &serde_json::json!({
+                "status": "deprovisioned",
+                "pubkey": owner_pubkey,
+                "objectsDeleted": objects_deleted,
+                "bytesFreed": bytes_freed,
+            }),
+            200,
         );
     }
 
@@ -2031,6 +2113,14 @@ mod tests {
         assert!(!is_provision_path("/provision"));
         assert!(!is_provision_path("/.provision/extra"));
         assert!(!is_provision_path("/public/.provision"));
+    }
+
+    #[test]
+    fn is_deprovision_path_detects_endpoint() {
+        assert!(is_deprovision_path("/.deprovision"));
+        assert!(!is_deprovision_path("/deprovision"));
+        assert!(!is_deprovision_path("/.deprovision/extra"));
+        assert!(!is_deprovision_path("/public/.deprovision"));
     }
 
     #[test]

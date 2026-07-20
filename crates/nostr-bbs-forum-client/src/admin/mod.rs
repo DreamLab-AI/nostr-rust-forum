@@ -479,6 +479,27 @@ impl AdminStore {
             return Err(msg);
         }
 
+        // 1b. Pod: deprovision the user's Solid pod on the PRIMARY pod server
+        //     (R2 prefix-delete + quota release). Best-effort — the relay delete
+        //     already revoked access, so a pod-purge failure must not fail the
+        //     whole deletion. Closes the orphaned-pod gap (the relay cannot reach
+        //     pod R2). Federation note: this targets the primary pod server only;
+        //     a federated pod on another home (e.g. a future agentbox native
+        //     server) has nothing here and is intentionally left to its own
+        //     server — the forum never deletes pods it does not host. When
+        //     federation connects, resolve the user's pod home and call THAT
+        //     server's `/.deprovision` (identical contract).
+        let pod_url = format!(
+            "{}/pods/{}/.deprovision",
+            crate::utils::relay_url::pod_api_base(),
+            pubkey
+        );
+        if let Err(e) = fetch_with_nip98_post_signer(&pod_url, "{}", signer).await {
+            web_sys::console::warn_1(
+                &format!("[admin] pod deprovision failed (relay delete succeeded): {e}").into(),
+            );
+        }
+
         // 2. Auth: drop the member's handle/real_name. Best-effort — a failure
         //    here must not leave the user half-deleted on the relay side, so we
         //    only log it and still report success for the access revocation.
