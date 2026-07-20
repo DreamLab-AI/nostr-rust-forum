@@ -412,7 +412,11 @@ fn zone_tile(
 
     let cards_view = if has_cats {
         let mut entries: Vec<(String, SectionCounts)> = cats.into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // Order: operator-pinned sections (zone.section_order) first, in that
+        // order (lets a "primary" section like rants sit at the top of the zone
+        // tile); every other section falls to alphabetical after them. Empty
+        // section_order ⇒ the historic all-alphabetical order.
+        entries.sort_by(|a, b| crate::stores::zones::section_cmp(&a.0, &b.0, &zone.section_order));
         let cards: Vec<_> = entries
             .into_iter()
             .map(|(section_id, counts)| {
