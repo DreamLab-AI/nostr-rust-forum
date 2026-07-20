@@ -1909,6 +1909,25 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
 async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
     use nostr_bbs_core::admin_shared::IsAdminRow;
 
+    // Canonical source first: the relay's DB (dreamlab-relay, bound as RELAY_DB)
+    // carries the whitelist `is_admin` bit set by the dynamic-admin / set-admin
+    // flow. The pod-worker's own REPLAY_DB (dreamlab-auth) does NOT hold it for
+    // relay-side admins, so without this check every admin-gated pod op
+    // (deprovision, admin provisioning) 403s. A missing binding falls through
+    // gracefully to the REPLAY_DB checks below.
+    if let Ok(relay_db) = env.d1("RELAY_DB") {
+        if let Ok(stmt) = relay_db
+            .prepare(nostr_bbs_core::WHITELIST_IS_ADMIN_SQL)
+            .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+        {
+            if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
+                if row.is_admin == 1 {
+                    return true;
+                }
+            }
+        }
+    }
+
     let db = match env.d1("REPLAY_DB") {
         Ok(db) => db,
         Err(_) => return false,
