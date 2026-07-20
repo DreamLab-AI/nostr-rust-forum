@@ -22,9 +22,11 @@
 
 use std::collections::HashSet;
 
+use gloo::events::EventListener;
 use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsCast;
 
 use crate::auth::use_auth;
 use crate::stores::channels::use_channel_store;
@@ -272,6 +274,9 @@ impl NotificationStoreV2 {
             return;
         }
         self.synced.set(true);
+
+        // Reconcile read-state across same-account tabs / PWA clients (once).
+        self.init_cross_tab_sync();
 
         // Provisional floor: stamp `now` immediately so no producer effect ever
         // runs against baseline 0 (which would treat the entire channel history
@@ -582,6 +587,35 @@ impl NotificationStoreV2 {
         }
     }
 
+    /// Keep this tab's `items` in lock-step with any OTHER same-account client
+    /// (a second tab, or the installed PWA open alongside a browser tab — under
+    /// "remember me" / passkey every client auto-authenticates the same account
+    /// off shared localStorage).
+    ///
+    /// Root cause of "mark all read keeps resetting" (multi-client clobber):
+    /// each client holds its OWN in-memory `items`, but they share the single
+    /// [`STORAGE_KEY`] entry with no reconciliation. Tab A marking all read
+    /// persists `read:true`; a STALE tab B then persists its own `read:false`
+    /// snapshot (on its next `mark_read` / `add` / producer write) and silently
+    /// reverts the shared key back to unread. The `storage` event fires ONLY in
+    /// the OTHER tabs when one writes localStorage, so on a write to our key we
+    /// reload `items` from that authoritative snapshot — after which no client
+    /// holds a stale list to clobber with. Load-only (never re-persists) so it
+    /// can never echo into a cross-tab write loop.
+    fn init_cross_tab_sync(&self) {
+        let items = self.items;
+        let listener = EventListener::new(&gloo::utils::window(), "storage", move |event| {
+            let changed = event
+                .dyn_ref::<web_sys::StorageEvent>()
+                .and_then(|e| e.key());
+            if storage_change_is_ours(changed.as_deref()) {
+                items.set(load_items_no_persist());
+            }
+        });
+        // The store lives for the whole app session; keep the listener alive.
+        listener.forget();
+    }
+
     fn persist(&self) {
         let data = PersistedNotifications {
             items: self.items.get_untracked(),
@@ -771,6 +805,27 @@ fn post_preview(content: &str) -> String {
     }
 }
 
+/// Whether a `storage` event on `changed_key` should reload the notification
+/// list: a targeted write to OUR [`STORAGE_KEY`], or a whole-storage clear
+/// (`None`, e.g. `localStorage.clear()` on logout in another tab). Any other
+/// key (e.g. the per-pubkey sync state) is irrelevant to the visible list.
+/// Extracted pure so the cross-tab dispatch is unit-testable without a DOM.
+fn storage_change_is_ours(changed_key: Option<&str>) -> bool {
+    matches!(changed_key, Some(STORAGE_KEY) | None)
+}
+
+/// Parse the persisted notification list WITHOUT re-persisting it — the
+/// read-only path used by the cross-tab `storage` handler ([`NotificationStoreV2::init_cross_tab_sync`]).
+/// Re-persisting here would bounce a fresh `storage` event back to the other
+/// tabs; mirrors [`load_from_storage`] minus the migration write-back.
+fn load_items_no_persist() -> Vec<Notification> {
+    let now = now_secs();
+    match LocalStorage::get::<serde_json::Value>(STORAGE_KEY) {
+        Ok(value) => parse_persisted_items(&value, now),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Load notifications from localStorage, evicting entries older than 7 days and
 /// dropping any that fail to deserialize against the current schema.
 ///
@@ -845,6 +900,18 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "a");
         assert_eq!(items[0].kind, NotificationKind::Mention);
+    }
+
+    #[test]
+    fn cross_tab_reload_only_on_our_key_or_clear() {
+        // The cross-tab `storage` handler reloads `items` only when another tab
+        // wrote OUR list key or cleared all storage (logout) — never for an
+        // unrelated key like the per-pubkey sync state. This is what stops a
+        // stale second tab from clobbering a "mark all read" (the reset bug).
+        assert!(storage_change_is_ours(Some(STORAGE_KEY)));
+        assert!(storage_change_is_ours(None)); // localStorage.clear()
+        assert!(!storage_change_is_ours(Some(&sync_state_key(ME))));
+        assert!(!storage_change_is_ours(Some("nostrbbs:something-else")));
     }
 
     #[test]

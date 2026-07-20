@@ -62,6 +62,9 @@ web-sys = { workspace = true, features = [
     "Response",
     "Headers",
     "Storage",
+    # Cross-tab notification read-state sync (see notifications.rs): the `storage`
+    # event fires in OTHER same-origin tabs on a localStorage write, carrying the key.
+    "StorageEvent",
     "MediaQueryList",
     "DomTokenList",
     # Zone-bound one-shot PWA (ADR-109): baked-key unwrap (WebCrypto AES-GCM over

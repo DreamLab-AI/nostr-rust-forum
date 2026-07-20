@@ -62,6 +62,9 @@ web-sys = { workspace = true, features = [
     "AuthenticationExtensionsClientInputs",
     "AuthenticationExtensionsClientOutputs",
     "Storage",
+    # Cross-tab notification read-state sync: the `storage` event (fired only in
+    # OTHER same-origin tabs when one writes localStorage) carries the changed key.
+    "StorageEvent",
     "HtmlDocument",
     "Headers",
     "RequestInit",
