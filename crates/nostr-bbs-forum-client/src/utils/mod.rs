@@ -15,6 +15,7 @@ pub mod slug_hash;
 #[allow(dead_code)]
 pub mod zone_theme;
 
+use gloo::events::EventListener;
 use leptos::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -23,6 +24,39 @@ use wasm_bindgen::JsCast;
 
 /// Slot type for a one-shot WASM timer closure (used by `set_timeout_once`).
 type TimerSlot = Rc<Cell<Option<Closure<dyn FnMut()>>>>;
+
+/// Run `reload` whenever ANOTHER same-origin tab writes `key` in localStorage
+/// (or clears all storage, e.g. logout). The DOM `storage` event fires only in
+/// the OTHER tabs, never the writer.
+///
+/// This is the cross-tab-consistency primitive behind the "mark all read keeps
+/// resetting" class of bug (first fixed in `stores::notifications`): a reactive
+/// store that persists a whole-snapshot to a single shared localStorage key
+/// lets a STALE sibling tab (every tab auto-authenticates the same account
+/// under remember-me / passkey) clobber a fresh tab's write on its next
+/// persist. Reloading the store's signal from the authoritative localStorage
+/// snapshot on each sibling write means no stale copy survives to clobber with.
+///
+/// `reload` must be LOAD-ONLY (read localStorage, set the signal) — persisting
+/// inside it would bounce another `storage` event to the siblings and could
+/// echo. The listener is leaked (`.forget()`) because the stores it serves are
+/// provided once at the app root and live for the whole session.
+pub fn on_cross_tab_storage_write<F>(key: &'static str, reload: F)
+where
+    F: Fn() + 'static,
+{
+    let listener = EventListener::new(&gloo::utils::window(), "storage", move |event| {
+        let changed = event
+            .dyn_ref::<web_sys::StorageEvent>()
+            .and_then(|e| e.key());
+        // `None` = a whole-storage clear() in another tab; `Some(k)` = a targeted
+        // write we act on only when it hit our key.
+        if changed.is_none() || changed.as_deref() == Some(key) {
+            reload();
+        }
+    });
+    listener.forget();
+}
 
 /// Format a UNIX timestamp as a human-readable relative time string.
 ///

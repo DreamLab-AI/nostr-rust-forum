@@ -306,6 +306,14 @@ pub fn provide_preferences() {
     apply_preferences(&initial);
     let prefs = RwSignal::new(initial);
     provide_context(prefs);
+    // Cross-tab sync: reload + re-apply appearance when a sibling tab saves prefs,
+    // so a theme/font/density change in one tab is not reverted by a stale sibling
+    // persisting its whole Preferences snapshot. See stores/notifications.rs.
+    crate::utils::on_cross_tab_storage_write(PREFS_KEY, move || {
+        let fresh = load_preferences();
+        apply_preferences(&fresh);
+        prefs.set(fresh);
+    });
 }
 
 /// Retrieve the preferences signal from context.

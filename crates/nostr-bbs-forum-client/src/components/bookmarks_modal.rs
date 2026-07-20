@@ -121,6 +121,13 @@ impl BookmarkStore {
 pub fn provide_bookmarks() {
     let store = BookmarkStore::new();
     provide_context(store);
+    // Cross-tab sync: without it, bookmarking a post in one tab is lost when a
+    // stale sibling tab (same account) bookmarks something else and persists its
+    // whole list. Reload load-only from any sibling's write. See notifications.rs.
+    let sig = store.bookmarks;
+    crate::utils::on_cross_tab_storage_write(BOOKMARKS_KEY, move || {
+        sig.set(load_bookmarks());
+    });
 }
 
 /// Get the bookmark store from context.
