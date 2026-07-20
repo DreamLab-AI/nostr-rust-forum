@@ -885,9 +885,13 @@ pub(crate) fn MessageInput(
                         on:click=move |_| show_preview.update(|v| *v = !*v)
                         title="Toggle markdown preview"
                     >
+                        // Eye icon — unmistakably "preview/view", so it is not
+                        // confused with the image-attach button (which is a photo
+                        // glyph). The old rectangle read as a picture frame and sent
+                        // users hunting for image-attach to the empty preview pane.
                         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M2 4h20v16H2z" stroke-linecap="round" stroke-linejoin="round"/>
-                            <path d="M6 12l2-2v4m4-6l2 3 2-3m2 0v3l2 3" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" stroke-linecap="round" stroke-linejoin="round"/>
+                            <circle cx="12" cy="12" r="3"/>
                         </svg>
                     </button>
 
@@ -937,8 +941,13 @@ pub(crate) fn MessageInput(
                                 on:click=open_file_picker
                                 aria-label="Attach image"
                             >
+                                // Photo glyph (frame + sun + mountain) — the universal
+                                // "insert image" affordance. Replaces the paperclip,
+                                // which users did not read as "attach image".
                                 <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <circle cx="8.5" cy="8.5" r="1.5"/>
+                                    <path d="M21 15l-5-5L5 21" stroke-linecap="round" stroke-linejoin="round"/>
                                 </svg>
                             </button>
                         })

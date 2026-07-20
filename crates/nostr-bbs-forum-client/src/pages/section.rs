@@ -436,6 +436,11 @@ pub fn SectionPage() -> impl IntoView {
                 <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-5 space-y-2">
                     <MessageInput
                         placeholder="Start a new topic — the first line becomes the title"
+                        // Attach an image when starting a topic (parity with replies,
+                        // which already set this). Without it the composer renders no
+                        // image button, so users clicked the preview toggle and saw
+                        // "Nothing to preview" (2026-07-20 fix).
+                        enable_image_upload=true
                         // `MessageInput` fires `on_send` alongside `on_send_with_mentions`;
                         // we drive creation from the mentions variant and no-op the other.
                         on_send=Callback::new(|_: String| {})

@@ -789,6 +789,7 @@ pub fn ChannelPage() -> impl IntoView {
                         <MessageInput
                             on_send=noop_send
                             on_send_with_mentions=send_callback
+                            enable_image_upload=true
                             channel_id=channel_id()
                         />
                     </div>
