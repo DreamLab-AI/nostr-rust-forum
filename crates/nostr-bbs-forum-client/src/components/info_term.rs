@@ -58,6 +58,13 @@ pub(crate) fn InfoTerm(
     /// top when not provided.
     #[prop(into, optional)]
     slug: Option<String>,
+    /// When `true`, the tooltip bubble opens DOWNWARD instead of the default
+    /// upward. Use where the term sits directly ABOVE interactive content (e.g.
+    /// in helper text below a text input): an upward bubble would cover the
+    /// control, and its clickable "Learn more →" link would steal the click
+    /// (the DM recipient-box → glossary misclick).
+    #[prop(optional)]
+    below: bool,
 ) -> impl IntoView {
     let aria = format!("{term}: {explainer}");
     // Stable per-instance id so `aria-describedby` can point screen readers at
@@ -70,6 +77,14 @@ pub(crate) fn InfoTerm(
     let learn_more_href = match slug.as_deref() {
         Some(s) if !s.is_empty() => base_href(&format!("/glossary#{s}")),
         _ => base_href("/glossary"),
+    };
+    // Flip the bubble downward when requested. Done with an inline style (higher
+    // specificity than the default `bottom-full mb-2` classes) so we do not have
+    // to rely on a `top-full` Tailwind utility being present in the build.
+    let bubble_flip_style = if below {
+        "top:100%;bottom:auto;margin-top:0.5rem;margin-bottom:0;"
+    } else {
+        ""
     };
     view! {
         <span
@@ -90,6 +105,7 @@ pub(crate) fn InfoTerm(
                        opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 \
                        transition-opacity duration-150 normal-case tracking-normal text-left \
                        rs-no-print"
+                style=bubble_flip_style
                 role="tooltip"
             >
                 {explainer}

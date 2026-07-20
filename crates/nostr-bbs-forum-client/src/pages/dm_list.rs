@@ -348,6 +348,7 @@ pub fn DmListPage() -> impl IntoView {
                             term="npub"
                             explainer="A person's public username code (starts with \"npub\"). Safe to share — it's how others find you."
                             slug="npub"
+                            below=true
                         />
                         " or 64-character key instead."
                     </p>
