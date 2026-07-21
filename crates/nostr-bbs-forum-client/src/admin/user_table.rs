@@ -34,8 +34,25 @@ fn available_cohorts() -> Vec<(String, String)> {
         if let Some(write) = &zone.write_cohorts {
             cohorts.extend(write.iter().cloned());
         }
+        // Prefer the NAMED cohort. The dual-accept `required_cohorts` lists both a
+        // zone's generic id ("zone2") and its slug ("minimoonoir"); admins only
+        // need the named one, so drop the generic id when the slug cohort is also
+        // offered. Zones without a distinct slug keep whatever they declare.
+        // Hidden ids are never stripped from users who already hold them — the
+        // editor seeds from each user's own cohorts and only toggles shown ones.
+        let named_slug: Option<String> = zone
+            .slug
+            .as_ref()
+            .filter(|s| !s.is_empty() && s.as_str() != zone.id.as_str())
+            .cloned();
+        let hide_generic_id = named_slug
+            .as_ref()
+            .is_some_and(|s| cohorts.iter().any(|c| c == s));
         for c in cohorts {
             if c.is_empty() {
+                continue;
+            }
+            if hide_generic_id && c == zone.id {
                 continue;
             }
             if seen.insert(c.clone()) {
