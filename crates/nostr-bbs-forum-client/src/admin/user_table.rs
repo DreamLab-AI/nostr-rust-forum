@@ -729,15 +729,25 @@ fn UserRow(
                                             "Admin"
                                         </span>
                                     })}
-                                    {cohorts_disp.iter().map(|c| {
-                                        let badge_class = cohort_badge_class(c);
-                                        let label = cohort_label(c, &zones);
-                                        view! {
-                                            <span class=badge_class>
-                                                {label}
-                                            </span>
-                                        }
-                                    }).collect_view()}
+                                    {
+                                        // Dedupe by resolved label: a user holding both a
+                                        // zone's generic id and its slug (dual-accept, e.g.
+                                        // "zone4" + "dreamlab") would otherwise show the
+                                        // same zone badge twice.
+                                        let mut seen_labels = std::collections::BTreeSet::new();
+                                        cohorts_disp.iter().filter_map(|c| {
+                                            let label = cohort_label(c, &zones);
+                                            if !seen_labels.insert(label.clone()) {
+                                                return None;
+                                            }
+                                            let badge_class = cohort_badge_class(c);
+                                            Some(view! {
+                                                <span class=badge_class>
+                                                    {label}
+                                                </span>
+                                            })
+                                        }).collect_view()
+                                    }
                                 </div>
                             }
                         }
@@ -868,29 +878,55 @@ fn UserRow(
     }
 }
 
+/// All cohort ids that gate the SAME zone. A zone's generic id ("zone4") and its
+/// slug ("dreamlab") are dual-accept equivalents (either grants access), so the
+/// editor treats them as ONE membership toggle: returns `[id, slug]` for a
+/// zone-gating cohort, else `[cohort]`. Without this a user holding both names
+/// (legacy + generic) could only ever remove one from the editor, leaving an
+/// un-removable orphan.
+fn zone_equiv_group(cohort: &str, zones: &[crate::stores::zones::Zone]) -> Vec<String> {
+    for z in zones {
+        let slug = z.slug.as_deref().unwrap_or("");
+        if z.id == cohort || (!slug.is_empty() && slug == cohort) {
+            let mut group = vec![z.id.clone()];
+            if !slug.is_empty() && slug != z.id {
+                group.push(slug.to_string());
+            }
+            return group;
+        }
+    }
+    vec![cohort.to_string()]
+}
+
 /// Inline cohort editor with a checkbox per cohort. The cohort set is derived
 /// from the live `ZONE_CONFIG` via [`available_cohorts`] (Task #7) so it always
 /// matches the operator's real zones rather than a hardcoded list.
 #[component]
 fn CohortEditor(editing_cohorts: RwSignal<Vec<String>>) -> impl IntoView {
+    let zones = crate::stores::zones::load_zones();
     let cohorts = available_cohorts();
     view! {
         <div class="flex flex-wrap gap-2">
             {cohorts.into_iter().map(|(cohort_id, zone_label)| {
-                let cohort_for_check = cohort_id.clone();
-                let cohort_for_toggle = cohort_id.clone();
                 let label = capitalize(&cohort_id);
+                // Every cohort name that gates this same zone, so one checkbox
+                // controls the whole zone even when the user also holds the
+                // legacy/generic name. Toggling off removes every equivalent.
+                let group = zone_equiv_group(&cohort_id, &zones);
+                let group_check = group.clone();
+                let group_toggle = group;
+                let primary = cohort_id.clone();
 
                 let is_checked = move || {
-                    editing_cohorts.get().contains(&cohort_for_check)
+                    editing_cohorts.get().iter().any(|c| group_check.contains(c))
                 };
 
                 let on_toggle = move |_| {
                     editing_cohorts.update(|list| {
-                        if list.contains(&cohort_for_toggle) {
-                            list.retain(|c| c != &cohort_for_toggle);
+                        if list.iter().any(|c| group_toggle.contains(c)) {
+                            list.retain(|c| !group_toggle.contains(c));
                         } else {
-                            list.push(cohort_for_toggle.clone());
+                            list.push(primary.clone());
                         }
                     });
                 };
