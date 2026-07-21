@@ -413,6 +413,16 @@ impl AuthStore {
         Ok(privkey_hex)
     }
 
+    /// Set the "stay signed in on this device" preference for nsec/local-key
+    /// logins. `true` persists the key to durable localStorage (survives a
+    /// browser restart); `false` (the default) keeps it session-scoped (cleared
+    /// on tab close). Call BEFORE [`Self::login_with_local_key`] so the key is
+    /// saved into the chosen scope. No effect on passkey / NIP-07 logins, which
+    /// never persist a raw key.
+    pub fn set_remember_me(&self, enabled: bool) {
+        session::set_remember_me(enabled);
+    }
+
     /// Login with a local nsec/hex private key.
     ///
     /// Accepts either a 64-character hex string or an nsec1... bech32 key.
