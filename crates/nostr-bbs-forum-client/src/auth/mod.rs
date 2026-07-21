@@ -416,11 +416,20 @@ impl AuthStore {
     /// Set the "stay signed in on this device" preference for nsec/local-key
     /// logins. `true` persists the key to durable localStorage (survives a
     /// browser restart); `false` (the default) keeps it session-scoped (cleared
-    /// on tab close). Call BEFORE [`Self::login_with_local_key`] so the key is
-    /// saved into the chosen scope. No effect on passkey / NIP-07 logins, which
-    /// never persist a raw key.
+    /// on tab close). No effect on passkey / NIP-07 logins, which never persist a
+    /// raw key.
+    ///
+    /// Re-persists the current in-memory key into the newly-chosen scope, so an
+    /// opt-in made mid-session — e.g. at the end of signup, after the generated
+    /// key was already saved session-scoped — actually moves it to durable
+    /// localStorage (or back to sessionStorage when opting out). A no-op re-save
+    /// when logged out: the login page sets the flag before
+    /// [`Self::login_with_local_key`] persists the key.
     pub fn set_remember_me(&self, enabled: bool) {
         session::set_remember_me(enabled);
+        if let Some(bytes) = self.privkey.get_value() {
+            save_privkey_session(&hex::encode(&bytes));
+        }
     }
 
     /// Login with a local nsec/hex private key.
