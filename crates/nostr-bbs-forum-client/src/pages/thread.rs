@@ -394,23 +394,55 @@ pub fn ThreadPage() -> impl IntoView {
             let root_chain = edit_chain_ids(&root, events);
             // First pass: the genuine replies (reference the root, are not edits
             // of anything, and are not part of the root's edit chain).
+            // A reply candidate: a kind-42/1111 that is neither the root, an edit
+            // of the root, nor an edit of another reply.
+            let is_candidate = |e: &NostrEvent| -> bool {
+                if e.id.eq_ignore_ascii_case(&root.id) {
+                    return false; // the root itself is not a reply
+                }
+                if e.kind != 42 && e.kind != 1111 {
+                    return false;
+                }
+                if root_chain.contains(&e.id.to_lowercase()) {
+                    return false; // an edit of the root
+                }
+                edit_target(e).is_none() // an edit of another reply is not a reply
+            };
+            // Transitive thread membership. A reply belongs to this topic if it
+            // references the ROOT *or any event already in the topic*. The old
+            // one-level test (references-root-directly) silently dropped nested
+            // replies — a reply to a reply — most visibly JunkieJarvis, which
+            // (per standard NIP-10) threads under the specific message that tagged
+            // it rather than the topic root, so its answers never rendered.
+            // Fixpoint over the channel's candidate events; converges in
+            // max-reply-depth passes.
+            let mut thread_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            thread_ids.insert(root_id_lower.clone());
+            loop {
+                let mut added = false;
+                for e in events.iter() {
+                    let lid = e.id.to_lowercase();
+                    if thread_ids.contains(&lid) || !is_candidate(e) {
+                        continue;
+                    }
+                    if referenced_event_ids(e)
+                        .iter()
+                        .any(|r| thread_ids.contains(r))
+                    {
+                        thread_ids.insert(lid);
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
             let originals: Vec<&NostrEvent> = events
                 .iter()
                 .filter(|e| {
-                    if e.id.eq_ignore_ascii_case(&root.id) {
-                        return false; // the root itself is not a reply
-                    }
-                    if e.kind != 42 && e.kind != 1111 {
-                        return false;
-                    }
-                    let lid = e.id.to_lowercase();
-                    if root_chain.contains(&lid) {
-                        return false; // an edit of the root
-                    }
-                    if edit_target(e).is_some() {
-                        return false; // an edit of some other reply
-                    }
-                    referenced_event_ids(e).iter().any(|r| r == &root_id_lower)
+                    !e.id.eq_ignore_ascii_case(&root.id)
+                        && thread_ids.contains(&e.id.to_lowercase())
                 })
                 .collect();
 
