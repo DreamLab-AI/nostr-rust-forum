@@ -1,5 +1,14 @@
 # Agent Control Surface Protocol: Value Assessment & Sprint Plan
 
+> **Correction (2026-07-22, VisionClaw doc-drift audit / ADR-131·ADR-132):** the
+> VisionClaw stack described below is historical. Neo4j was fully removed (sole store
+> is Oxigraph + SQLite, VisionClaw ADR-132), and `BrokerActor`/`ServerNostrActor`
+> never merged to VisionClaw main — they lived only on the `crashbug` branch (now the
+> `archive/crashbug` tag). The four-tier `enterprise_auth.rs` RBAC exists on the
+> `sprint-3/jss-cut-scaffold` branch pending the AUTH-001 merge decision (PRD-024
+> Tock-2). Value comparisons below remain useful; the cited implementation does not run.
+
+
 **Status:** DRAFT — awaiting sign-off
 **Date:** 2026-05-12
 **Author:** Operator mega-sprint (automated)
