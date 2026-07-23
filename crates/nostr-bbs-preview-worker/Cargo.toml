@@ -1,6 +1,7 @@
 [package]
 name = "nostr-bbs-preview-worker"
 version = "1.0.0-beta.6"
+publish = false           # deployable application (built from source at KIT_REF), not a crates.io dependency
 edition = "2021"
 description = "Link preview Worker: OG metadata + Twitter oEmbed + SSRF protection (nostr-bbs)"
 license = "AGPL-3.0-only"

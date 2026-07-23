@@ -1,6 +1,7 @@
 [package]
 name = "nostr-bbs-auth-worker"
 version = "1.0.0-beta.6"
+publish = false           # deployable application (built from source at KIT_REF), not a crates.io dependency
 edition = "2021"
 description = "nostr-bbs community forum — auth worker"
 license = "AGPL-3.0-only"
