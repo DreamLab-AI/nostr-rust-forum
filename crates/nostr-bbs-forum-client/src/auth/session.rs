@@ -20,15 +20,16 @@ use nostr_bbs_core::signer::Signer;
 
 /// Storage key for the local-key privkey.
 ///
-/// Lives in **localStorage** by default so an explicit login survives page
-/// reloads (QA: "session lost on every reload"). When the user opts out of
-/// persistence via the remember-me flag (`nostr_bbs_remember` == "false"),
-/// the key is written to sessionStorage instead (cleared on tab close).
+/// Written to **sessionStorage** by default (cleared on tab close). Opting into
+/// "stay signed in on this device" sets the remember-me flag
+/// (`nostr_bbs_remember` == "true") and upgrades persistence to durable
+/// localStorage so the login survives a browser restart. See [`remember_me`].
 ///
 /// **TRANSITIONAL PATH** (audit C2/B8): persisting a Schnorr private key in
 /// web storage is acceptable only as a bridge for the "local-key" import
-/// flow (NIP-19 `nsec` paste). Passkey users never hit this code path —
-/// their key is re-derived from the authenticator on every authenticate.
+/// flow (NIP-19 `nsec` paste), and durable localStorage scope only on the
+/// user's explicit opt-in. Passkey users never hit this code path — their key
+/// is re-derived from the authenticator on every authenticate.
 const SESSION_PRIVKEY_KEY: &str = "nostr_bbs_sk";
 
 /// localStorage flag controlling privkey persistence scope. Anything other
@@ -127,6 +128,19 @@ fn remember_me() -> bool {
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false)
+}
+
+/// Set the "stay signed in on this device" preference (audit C2/B8).
+///
+/// `true` upgrades local-key / nsec persistence to durable localStorage
+/// (survives browser close); `false` keeps it in sessionStorage (cleared on tab
+/// close). Call BEFORE [`save_privkey_session`] so the key lands in the chosen
+/// scope. Only meaningful for nsec/local-key logins — passkey / NIP-07 never
+/// persist a raw key, so this flag does not affect them.
+pub(super) fn set_remember_me(enabled: bool) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(REMEMBER_ME_KEY, if enabled { "true" } else { "false" });
+    }
 }
 
 /// Store privkey hex so an explicit login survives page reloads.

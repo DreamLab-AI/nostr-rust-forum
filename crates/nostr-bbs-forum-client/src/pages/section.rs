@@ -311,6 +311,16 @@ pub fn SectionPage() -> impl IntoView {
     let topic_restore = RwSignal::new(Option::<String>::None);
     let is_authed = auth.is_authenticated();
 
+    // Gate with a one-shot self-heal refresh (see [`zone_access_gate`]) so a
+    // just-granted member doesn't flash "Access Denied" on a stale cohort read
+    // right after an invite redeem — it auto-retries once, showing a neutral
+    // "checking" state meanwhile.
+    let access_gate = crate::stores::zone_access::zone_access_gate(
+        zone_access,
+        is_authed.into(),
+        has_zone_access.into(),
+    );
+
     // `relay` (RelayConnection) is non-Copy; the new-topic composer's on:click
     // sits inside two <Show> children closures, which must be `Fn`. Capturing
     // `relay` directly would move it out of the children env (FnOnce, E0525), so
@@ -321,8 +331,26 @@ pub fn SectionPage() -> impl IntoView {
 
     view! {
         <Show
-            when=move || has_zone_access.get()
-            fallback=move || view! { <AccessDenied zone_id=category_slug() /> }
+            when=move || {
+                access_gate.get() == crate::stores::zone_access::AccessGate::Granted
+            }
+            fallback=move || {
+                // Still resolving (initial fetch or one-shot self-heal retry) →
+                // neutral "checking" state, never "Access Denied".
+                if access_gate.get() == crate::stores::zone_access::AccessGate::Checking {
+                    view! {
+                        <div class="max-w-lg mx-auto p-8 text-center">
+                            <div class="glass-card p-8">
+                                <div class="w-12 h-12 rounded-full border-2 border-gray-700 border-t-amber-400 animate-spin mx-auto mb-4"></div>
+                                <p class="text-gray-400 text-sm">"Checking your access…"</p>
+                            </div>
+                        </div>
+                    }
+                    .into_any()
+                } else {
+                    view! { <AccessDenied zone_id=category_slug() /> }.into_any()
+                }
+            }
         >
         // Root carries the zone accent as `--zone-accent` for descendants.
         <div
@@ -436,6 +464,11 @@ pub fn SectionPage() -> impl IntoView {
                 <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-5 space-y-2">
                     <MessageInput
                         placeholder="Start a new topic — the first line becomes the title"
+                        // Attach an image when starting a topic (parity with replies,
+                        // which already set this). Without it the composer renders no
+                        // image button, so users clicked the preview toggle and saw
+                        // "Nothing to preview" (2026-07-20 fix).
+                        enable_image_upload=true
                         // `MessageInput` fires `on_send` alongside `on_send_with_mentions`;
                         // we drive creation from the mentions variant and no-op the other.
                         on_send=Callback::new(|_: String| {})

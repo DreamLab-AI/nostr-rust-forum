@@ -248,6 +248,18 @@ pub fn DmListPage() -> impl IntoView {
     let is_loading = dm_store.is_loading();
     let error = dm_store.error();
 
+    // Proactive capability warning: a NIP-07 extension WITHOUT a usable NIP-44
+    // interface can never decrypt gift-wrapped DMs. The old warning only fired
+    // AFTER an unwrap failed — but when the relay's NIP-42 AUTH never completes
+    // for such an extension (or the inbox is simply empty), no unwrap is ever
+    // attempted, so the user saw a blank inbox with no explanation. Gate a
+    // persistent banner on the capability directly so the limitation is always
+    // surfaced. Re-probes when auth settles (the extension may inject `nip44`
+    // slightly after load).
+    let show_nip07_dm_warning = Memo::new(move |_| {
+        auth.get().is_nip07 && !crate::auth::nip07::nip07_has_nip44()
+    });
+
     view! {
         <div class="max-w-2xl mx-auto p-4 sm:p-6">
             // Header
@@ -283,6 +295,22 @@ pub fn DmListPage() -> impl IntoView {
                     }}
                 </button>
             </div>
+
+            // NIP-07 extension can't read encrypted DMs — warn up front, not
+            // after a silent decrypt failure.
+            {move || show_nip07_dm_warning.get().then(|| view! {
+                <div class="bg-amber-900/40 border border-amber-600/50 rounded-lg px-4 py-3 mb-4">
+                    <p class="text-amber-200 text-sm font-semibold mb-0.5">
+                        "This browser extension can’t read encrypted messages"
+                    </p>
+                    <p class="text-amber-100/80 text-xs leading-snug">
+                        "You’re signed in with a Nostr extension that doesn’t support NIP-44 \
+                         encryption, which direct messages require. You can browse and post, but \
+                         DMs sent to you can’t be decrypted here. To read them, sign in with your \
+                         key (nsec) instead, or switch to an extension that supports NIP-44."
+                    </p>
+                </div>
+            })}
 
             // New DM input — search by name, with raw-key paste as a fallback.
             <Show when=move || show_new_dm.get()>
@@ -348,6 +376,7 @@ pub fn DmListPage() -> impl IntoView {
                             term="npub"
                             explainer="A person's public username code (starts with \"npub\"). Safe to share — it's how others find you."
                             slug="npub"
+                            below=true
                         />
                         " or 64-character key instead."
                     </p>

@@ -80,7 +80,17 @@ fn load_from_storage() -> Option<MuteData> {
 
 /// Provide the mute store in Leptos context. Call once at app root.
 pub fn provide_mute_store() {
-    provide_context(MuteStore::new());
+    let store = MuteStore::new();
+    provide_context(store);
+    // Cross-tab sync: without it, muting someone in one tab is silently undone
+    // when a stale sibling tab (same account) toggles another mute and persists
+    // its whole list. Reload load-only from any sibling's write. See notifications.rs.
+    let inner = store.inner;
+    crate::utils::on_cross_tab_storage_write(STORAGE_KEY, move || {
+        if let Some(data) = load_from_storage() {
+            inner.set(data);
+        }
+    });
 }
 
 /// Retrieve the mute store from context.

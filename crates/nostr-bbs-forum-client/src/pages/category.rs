@@ -116,6 +116,16 @@ pub fn CategoryPage() -> impl IntoView {
         }
     });
 
+    // Gate with a one-shot self-heal refresh so a just-granted member (e.g. a
+    // fresh invite redeem, whose cohort read is momentarily stale) doesn't flash
+    // "Access Restricted" — it auto-retries once and shows a neutral "checking"
+    // state meanwhile, instead of making the user click through twice.
+    let access_gate = crate::stores::zone_access::zone_access_gate(
+        zone_access,
+        is_authed.into(),
+        has_zone_access.into(),
+    );
+
     // Sections (channels) for this zone, derived reactively from the shared
     // store. `Signal::derive` (not `Memo`) — `ChannelMeta` is not `PartialEq`.
     let zone_sections = Signal::derive(move || {
@@ -195,25 +205,43 @@ pub fn CategoryPage() -> impl IntoView {
             }
         >
         <Show
-            when=move || has_zone_access.get()
-            fallback=move || view! {
-                <div class="max-w-lg mx-auto p-8 text-center">
-                    <div class="glass-card p-8">
-                        <div class="w-14 h-14 rounded-full bg-red-500/10 flex items-center justify-center mx-auto mb-4">
-                            <svg class="w-7 h-7 text-red-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                                <rect x="3" y="11" width="18" height="11" rx="2" ry="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                <path d="M7 11V7a5 5 0 0110 0v4" stroke-linecap="round" stroke-linejoin="round"/>
-                            </svg>
+            when=move || {
+                access_gate.get() == crate::stores::zone_access::AccessGate::Granted
+            }
+            fallback=move || {
+                // Still resolving (initial fetch or the one-shot self-heal
+                // retry) → neutral "checking" state, never "restricted".
+                if access_gate.get() == crate::stores::zone_access::AccessGate::Checking {
+                    return view! {
+                        <div class="max-w-lg mx-auto p-8 text-center">
+                            <div class="glass-card p-8">
+                                <div class="w-12 h-12 rounded-full border-2 border-gray-700 border-t-amber-400 animate-spin mx-auto mb-4"></div>
+                                <p class="text-gray-400 text-sm">"Checking your access…"</p>
+                            </div>
                         </div>
-                        <h2 class="text-xl font-bold text-white mb-2">"Access Restricted"</h2>
-                        <p class="text-gray-400 text-sm mb-4">
-                            {move || format!("You don't have access to the {} zone.", capitalize(&category_slug()))}
-                        </p>
-                        <a href=base_href("/forums") class="za-text hover:opacity-80 text-sm underline">
-                            "Back to Forums"
-                        </a>
+                    }
+                    .into_any();
+                }
+                view! {
+                    <div class="max-w-lg mx-auto p-8 text-center">
+                        <div class="glass-card p-8">
+                            <div class="w-14 h-14 rounded-full bg-red-500/10 flex items-center justify-center mx-auto mb-4">
+                                <svg class="w-7 h-7 text-red-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <path d="M7 11V7a5 5 0 0110 0v4" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                            </div>
+                            <h2 class="text-xl font-bold text-white mb-2">"Access Restricted"</h2>
+                            <p class="text-gray-400 text-sm mb-4">
+                                {move || format!("You don't have access to the {} zone.", capitalize(&category_slug()))}
+                            </p>
+                            <a href=base_href("/forums") class="za-text hover:opacity-80 text-sm underline">
+                                "Back to Forums"
+                            </a>
+                        </div>
                     </div>
-                </div>
+                }
+                .into_any()
             }
         >
         // The page-root carries the zone accent as `--zone-accent`. Descendant

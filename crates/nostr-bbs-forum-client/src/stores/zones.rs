@@ -107,6 +107,15 @@ pub struct Zone {
     /// [`crate::utils::zone_theme::zone_theme`] palette for this zone id.
     #[serde(default)]
     pub accent_hex: Option<String>,
+    /// Operator-configured priority order for this zone's section tiles, by
+    /// full `section` id (e.g. `"zone2-rants"`). Sections listed here render
+    /// FIRST, in this order (so an operator can pin a primary section to the top
+    /// of the zone tile); any section not listed falls to alphabetical order
+    /// after them. Empty (default) ⇒ the historic all-alphabetical order.
+    /// Read from `ZONE_CONFIG`; ignored by the relay/auth workers (a pure
+    /// client rendering concern).
+    #[serde(default)]
+    pub section_order: Vec<String>,
 }
 
 impl Zone {
@@ -250,6 +259,22 @@ pub fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
     zones.first().map(|z| z.id.clone())
 }
 
+/// Compare two section ids for zone-tile ordering. An operator-pinned section
+/// (present in `section_order`, e.g. a zone's `[[zones]].section_order`) sorts
+/// before an unpinned one; two pinned sections keep their configured order; two
+/// unpinned sections sort alphabetically. This is the primary-section-first
+/// rule the zone tile uses so an operator can float a section (e.g.
+/// `"zone2-rants"`) to the top rather than accept pure alphabetical order.
+pub fn section_cmp(a: &str, b: &str, section_order: &[String]) -> std::cmp::Ordering {
+    let rank = |sid: &str| section_order.iter().position(|s| s == sid);
+    match (rank(a), rank(b)) {
+        (Some(ra), Some(rb)) => ra.cmp(&rb),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
 /// Whether a channel's `section` tag routes to the given zone URL param.
 ///
 /// Derived from [`section_to_zone`]: a section routes to `category_slug` when
@@ -303,6 +328,7 @@ fn fallback_zones() -> Vec<Zone> {
             visibility: ZoneVisibility::Public,
             encrypted: false,
             accent_hex: None,
+            section_order: Vec::new(),
         },
         Zone {
             id: "friends".to_string(),
@@ -314,6 +340,7 @@ fn fallback_zones() -> Vec<Zone> {
             visibility: ZoneVisibility::Locked,
             encrypted: false,
             accent_hex: None,
+            section_order: Vec::new(),
         },
         Zone {
             id: "family".to_string(),
@@ -325,6 +352,7 @@ fn fallback_zones() -> Vec<Zone> {
             visibility: ZoneVisibility::Locked,
             encrypted: true,
             accent_hex: None,
+            section_order: Vec::new(),
         },
         Zone {
             id: "business".to_string(),
@@ -336,6 +364,7 @@ fn fallback_zones() -> Vec<Zone> {
             visibility: ZoneVisibility::Locked,
             encrypted: false,
             accent_hex: None,
+            section_order: Vec::new(),
         },
     ]
 }
@@ -343,6 +372,40 @@ fn fallback_zones() -> Vec<Zone> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section_cmp_pins_configured_first_then_alphabetical() {
+        // The Minimoonoir case: pin rants first; the rest fall alphabetical.
+        let order = vec!["zone2-rants".to_string()];
+        let mut v = vec![
+            "zone2-photos",
+            "zone2-music",
+            "zone2-rants",
+            "zone2-fairfield-events",
+        ];
+        v.sort_by(|a, b| section_cmp(a, b, &order));
+        assert_eq!(
+            v,
+            vec![
+                "zone2-rants",
+                "zone2-fairfield-events",
+                "zone2-music",
+                "zone2-photos"
+            ]
+        );
+
+        // Empty order ⇒ pure alphabetical (historic behaviour, unchanged).
+        let none: Vec<String> = vec![];
+        let mut w = vec!["b", "a", "c"];
+        w.sort_by(|a, b| section_cmp(a, b, &none));
+        assert_eq!(w, vec!["a", "b", "c"]);
+
+        // Several pinned sections keep their CONFIGURED order, not alphabetical.
+        let order2 = vec!["z-two".to_string(), "a-one".to_string()];
+        let mut x = vec!["a-one", "m-mid", "z-two"];
+        x.sort_by(|a, b| section_cmp(a, b, &order2));
+        assert_eq!(x, vec!["z-two", "a-one", "m-mid"]);
+    }
 
     fn zone(id: &str) -> Zone {
         Zone {
@@ -355,6 +418,7 @@ mod tests {
             visibility: ZoneVisibility::Public,
             encrypted: false,
             accent_hex: None,
+            section_order: Vec::new(),
         }
     }
 

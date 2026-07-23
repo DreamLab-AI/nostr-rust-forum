@@ -221,6 +221,9 @@ pub fn SignupPage() -> impl IntoView {
     // unless the user takes the explicit advanced override.
     let sheet_ready = RwSignal::new(false);
     let advanced_override = RwSignal::new(false);
+    // Opt-in at the finish step: store the generated key in this browser and stay
+    // signed in. Default OFF — for personal use only, never org/agent collaboration.
+    let remember = RwSignal::new(false);
     // Phase 2: the raw technical identifiers (public key / WebID / git clone)
     // are collapsed by default — they are informational, not the safety net.
     let show_advanced = RwSignal::new(false);
@@ -312,6 +315,9 @@ pub fn SignupPage() -> impl IntoView {
     // The real exit: confirm backup + navigate away. Performs no gating itself
     // so it can be reused by both the gated finish button and the override.
     let finish_signup = Callback::new(move |()| {
+        // Honour the "keep me signed in" opt-in: on = move the generated key to
+        // durable localStorage; off (default) = leave it session-scoped.
+        auth.set_remember_me(remember.get_untracked());
         auth.confirm_nsec_backup();
         let dest = return_to();
         navigate.with_value(|nav| nav(&dest, NavigateOptions::default()));
@@ -636,6 +642,26 @@ pub fn SignupPage() -> impl IntoView {
 
                             // Gated finish control + advanced override.
                             <div class="rs-screen-controls space-y-3">
+                                // Optional: store the key locally and stay signed
+                                // in. Default OFF, with an explicit caveat that this
+                                // is a personal-use convenience, not an org / agent
+                                // collaboration flow (those want managed keys).
+                                <label class="flex items-start gap-2 cursor-pointer select-none rounded-xl border border-gray-700/60 bg-gray-800/40 p-3">
+                                    <input
+                                        type="checkbox"
+                                        data-testid="signup-remember"
+                                        prop:checked=move || remember.get()
+                                        on:change=move |ev| remember.set(event_target_checked(&ev))
+                                        class="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500 focus:ring-offset-0"
+                                    />
+                                    <span class="text-xs text-gray-400 leading-snug">
+                                        <span class="text-gray-300 font-medium">"Keep me signed in on this device"</span>
+                                        " — stores your key in this browser so you won\u{2019}t need your recovery sheet next time. "
+                                        "Convenient for personal use on your own device. "
+                                        <span class="text-amber-400/90">"Not suitable for organisation or agent collaboration"</span>
+                                        " — those should use a passkey or managed keys, not a browser-stored key — and never use it on a shared or public computer."
+                                    </span>
+                                </label>
                                 <button
                                     data-testid="signup-finish"
                                     prop:disabled=move || {
@@ -677,4 +703,13 @@ pub fn SignupPage() -> impl IntoView {
             </div>
         </div>
     }
+}
+
+/// Read a checkbox's `checked` state from a DOM `change` event.
+fn event_target_checked(ev: &leptos::ev::Event) -> bool {
+    use wasm_bindgen::JsCast;
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .map(|el| el.checked())
+        .unwrap_or(false)
 }

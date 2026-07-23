@@ -1,25 +1,40 @@
 //! Single channel view page -- the FLAT, linear chat of one channel (kind-42).
 //! Route: /chat/:channel_id
 //!
+//! ## Redirect to the threaded topic-list (soak-fix 2026-07)
+//!
+//! This page's flat composer publishes ROOT-only kind-42 events (only
+//! `["e", channel_id, "", "root"]`, no NIP-10 "reply" marker), so a post made
+//! here becomes a NEW TOPIC rather than a threaded reply. Every deep-link that
+//! used to land here (notifications, search, bookmarks, note-view, channel
+//! cards) is therefore REDIRECTED to the section topic-list
+//! (`/:category/:section`, [`crate::pages::section::SectionPage`]), whose
+//! per-topic [`crate::pages::thread::ThreadPage`] composer threads replies
+//! correctly. Fixing it at this single resolver covers all entry points at once.
+//!
+//! The redirect resolves `channel_id` → its owning zone/section from the shared
+//! [`ChannelStore`] and navigates (with `replace`) as soon as that is known. The
+//! flat view is only ever shown as a graceful FALLBACK for a channel that never
+//! resolves (e.g. a stale link to a deleted channel) — while resolution is
+//! pending a neutral spinner shows instead of the root-only composer.
+//!
 //! ## Relationship to the BBS section view (#8 reconciliation)
 //!
 //! A *section* (kind-40 channel) is presented two ways:
 //! - `/forums/:category/:section` ([`crate::pages::section::SectionPage`]) — the
 //!   BBS TOPIC LIST: kind-42 roots with reply counts, the canonical browse view.
 //! - `/chat/:channel_id` (this page) — the flat, real-time chat log of every
-//!   message in the channel, retained as a deep-link target for search results,
-//!   bookmarks, note-view links, and the channel-list dashboard (`chat.rs`).
+//!   message in the channel, now only reached as the unresolvable-channel
+//!   fallback described above.
 //!
-//! These no longer DUPLICATE each other: the old `SectionPage` was itself a flat
-//! chat (a second copy of this view). It is now a topic list, so the only flat
-//! chat surface is here. To keep the two connected (not orphaned), this page
-//! offers a "View as topics" link that jumps to the channel's BBS section view
-//! (with the privacy-hashed section slug, #9). The link is omitted when the
-//! channel's owning zone cannot be resolved from the store.
+//! When the fallback flat view IS shown it offers a "View as topics" link back
+//! to the channel's BBS section view (with the privacy-hashed section slug, #9);
+//! that link is omitted when the channel's owning zone cannot be resolved.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
-use leptos_router::hooks::use_params_map;
+use leptos_router::hooks::{use_navigate, use_params_map};
+use leptos_router::NavigateOptions;
 use nostr_bbs_core::NostrEvent;
 use std::rc::Rc;
 
@@ -61,11 +76,16 @@ pub fn ChannelPage() -> impl IntoView {
     let params = use_params_map();
     let channel_id = move || params.read().get("channel_id").unwrap_or_default();
 
-    // BBS topic-list href for this channel: resolve the channel (and thus its
-    // owning zone) from the shared store, then build the privacy-hashed section
-    // URL (#9). `None` when the channel/zone is not yet known — the link is then
-    // hidden rather than pointing somewhere broken.
-    let section_topics_href = {
+    // BBS topic-list PATH for this channel (app-relative, no `FORUM_BASE`):
+    // resolve the channel (and thus its owning zone) from the shared store,
+    // then build the privacy-hashed section URL (#9). `None` when the
+    // channel/zone is not yet known.
+    //
+    // Two consumers, one resolver: the raw path feeds `use_navigate` in the
+    // flat→threaded redirect below (the router re-adds the base), and
+    // `section_topics_href` adds the base for the fallback "View as topics"
+    // `<A>` link.
+    let section_topics_path = {
         let store = use_context::<ChannelStore>();
         Signal::derive(move || {
             let raw = channel_id();
@@ -89,16 +109,66 @@ pub fn ChannelPage() -> impl IntoView {
                             c.section.clone()
                         };
                         section_to_zone(&section, &zones).map(|zone| {
-                            base_href(&format!(
+                            format!(
                                 "/{}/{}",
                                 crate::stores::zones::zone_path_for_id(&zone),
                                 section_slug(&c.id)
-                            ))
+                            )
                         })
                     })
             })
         })
     };
+    let section_topics_href =
+        Signal::derive(move || section_topics_path.get().map(|p| base_href(&p)));
+
+    // Route the flat view to the THREADED topic-list (soak-fix 2026-07).
+    //
+    // The flat composer on this page publishes ROOT-only kind-42 events (only
+    // `["e", channel_id, "", "root"]`, no NIP-10 "reply" marker), so every post
+    // made here becomes a NEW TOPIC instead of a threaded reply — the reported
+    // "reply creates a new topic" bug. Every deep-link that used to land here
+    // (notifications, search, bookmarks, note-view, channel cards) is redirected
+    // to the section topic-list, whose per-topic `ThreadPage` composer threads
+    // replies correctly. Doing it here, at the single resolver, fixes all of
+    // those entry points at once.
+    //
+    // `replace` so the flat URL never lingers in history (Back returns to where
+    // the deep-link was clicked, not into a redirect bounce). `redirected`
+    // guards a single fire. Resolution waits on the store: until the owning zone
+    // is known the target is `None`, the flat view is withheld (a neutral
+    // spinner shows), and the flat composer is only ever mounted as a graceful
+    // fallback for a channel that never resolves (e.g. a stale link to a deleted
+    // channel).
+    let navigate = StoredValue::new(use_navigate());
+    let redirected = RwSignal::new(false);
+    Effect::new(move |_| {
+        if redirected.get_untracked() {
+            return;
+        }
+        if let Some(path) = section_topics_path.get() {
+            redirected.set(true);
+            navigate.with_value(|nav| {
+                nav(
+                    &path,
+                    NavigateOptions {
+                        replace: true,
+                        ..Default::default()
+                    },
+                )
+            });
+        }
+    });
+
+    // Only reveal the flat composer once the channel proves unresolvable: the
+    // store has finished its initial channel load (EOSE) and still has no owning
+    // zone for this id. Before that we are either about to redirect (target
+    // resolved) or still waiting, so the redirect spinner shows instead of the
+    // root-only composer.
+    let store_eose = use_context::<ChannelStore>().map(|s| s.eose_received);
+    let show_flat_fallback = Signal::derive(move || {
+        section_topics_path.get().is_none() && store_eose.map(|s| s.get()).unwrap_or(true)
+    });
 
     // Zone accent carry-through (issue #29): /chat/:channel_id has no :category
     // route param, so resolve the channel's owning zone from its `section` tag
@@ -152,7 +222,10 @@ pub fn ChannelPage() -> impl IntoView {
     let channel_info: RwSignal<Option<ChannelHeader>> = RwSignal::new(None);
     let pinned = RwSignal::new(Vec::<PinnedMessage>::new());
     let loading = RwSignal::new(true);
-    let last_read_event_id = read_store.last_read_event_id(&channel_id());
+    // Held in a `StoredValue` (Copy) so the reply-divider closure below can be
+    // move-captured into the `Show`-gated flat view without making that view
+    // `FnOnce`.
+    let last_read_event_id = StoredValue::new(read_store.last_read_event_id(&channel_id()));
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let show_export = RwSignal::new(false);
 
@@ -581,6 +654,18 @@ pub fn ChannelPage() -> impl IntoView {
     };
 
     view! {
+        <Show
+            when=move || show_flat_fallback.get()
+            fallback=|| view! {
+                // Resolving the owning zone → about to redirect to the threaded
+                // topic-list. Neutral spinner (matches the app-level redirect
+                // spinner) rather than a flash of the root-only flat composer.
+                <div class="flex flex-col items-center justify-center h-[calc(100vh-64px)] gap-3">
+                    <div class="animate-spin w-6 h-6 border-2 border-amber-400 border-t-transparent rounded-full"></div>
+                    <span class="text-gray-400 text-sm">"Opening topics\u{2026}"</span>
+                </div>
+            }
+        >
         <div class="flex flex-col h-[calc(100vh-64px)]" style=move || zone_accent.get()>
             // Channel header
             <div class="bg-gray-800 border-b border-gray-700 relative">
@@ -750,7 +835,7 @@ pub fn ChannelPage() -> impl IntoView {
                                     </div>
                                 }.into_any()
                             } else {
-                                let last_read = last_read_event_id.clone();
+                                let last_read = last_read_event_id.get_value();
                                 let mut found_divider = false;
                                 view! {
                                     <div class="space-y-1">
@@ -789,6 +874,7 @@ pub fn ChannelPage() -> impl IntoView {
                         <MessageInput
                             on_send=noop_send
                             on_send_with_mentions=send_callback
+                            enable_image_upload=true
                             channel_id=channel_id()
                         />
                     </div>
@@ -810,6 +896,7 @@ pub fn ChannelPage() -> impl IntoView {
                 }}
             </Show>
         </div>
+        </Show>
     }
 }
 

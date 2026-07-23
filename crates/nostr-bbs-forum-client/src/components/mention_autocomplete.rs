@@ -47,10 +47,15 @@ use wasm_bindgen_futures::JsFuture;
 use crate::stores::profile_cache::{try_use_profile_cache, ProfileEntry};
 use crate::utils::relay_url::relay_api_base;
 
-/// Minimum query length before the relay search endpoint is hit. Below this,
-/// only the cheap local sources (read-only ProfileCache + known-users seed)
-/// populate the dropdown — so a bare `@` already shows the local roster.
-pub(crate) const NETWORK_SEARCH_MIN_LEN: usize = 2;
+/// Minimum query length before the relay search endpoint is hit.
+///
+/// `0` — the network is queried even for a bare `@` (empty query), because the
+/// relay serves a **recent-members roster** in that case. Without this the only
+/// candidates on an empty query were the read-only ProfileCache (cold on a fresh
+/// load) plus the hardcoded known-users seed, so a bare `@` showed nothing but
+/// the four "house agents". The fetch is debounced by the composer, and the
+/// relay's roster query is bounded + indexed, so hitting it on `@` is cheap.
+pub(crate) const NETWORK_SEARCH_MIN_LEN: usize = 0;
 
 /// One autocomplete candidate. `pubkey` is the canonical 64-char hex pubkey
 /// used to build the `["p", pubkey]` tag; the optional metadata drives display.
@@ -378,10 +383,11 @@ fn url_encode(s: &str) -> String {
 /// (never an error to the UI) when the endpoint is missing or the table is
 /// empty — the local sources keep the dropdown useful regardless.
 pub(crate) async fn search_profiles(query: &str, limit: usize) -> Vec<MentionCandidate> {
+    // An EMPTY query is intentionally allowed through: the relay returns a
+    // recent-members roster for it, which is what populates the @mention dropdown
+    // on a bare `@` (before the user has typed anything to match). A non-empty
+    // query filters by case-insensitive substring as before.
     let query = query.trim();
-    if query.is_empty() {
-        return Vec::new();
-    }
     // Lowercase the query the client sends so handle search is case-insensitive
     // even against a relay-worker whose query path doesn't fold case itself
     // (the current worker does, via `LOWER(...)`, but the client must not rely

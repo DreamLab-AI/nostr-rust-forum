@@ -361,6 +361,60 @@ async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool, Vec<
     Ok((home, members, private, false, cohorts))
 }
 
+/// Render state for a zone-access gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessGate {
+    /// Access confirmed — render the zone.
+    Granted,
+    /// Access still resolving (initial fetch or the one-shot self-heal retry).
+    /// Show a neutral "checking" state, never "Access Restricted".
+    Checking,
+    /// Settled non-member — safe to show "Access Restricted".
+    Restricted,
+}
+
+/// Resolve the gate state for a zone page, with a ONE-SHOT self-heal refresh.
+///
+/// `has_access` is the page's own membership check (public zone OR
+/// [`ZoneAccess::is_member_of`]). A freshly-granted member — e.g. immediately
+/// after redeeming a zone invite — can momentarily read stale cohorts and look
+/// like a non-member, which previously flashed "Access Restricted" until the
+/// user retried by hand. This gate instead:
+/// - returns `Granted` as soon as access is present;
+/// - while an authed user looks like a non-member, fires **one** `refresh()` to
+///   re-read cohorts (catching a just-landed grant) and reports `Checking` until
+///   that settles;
+/// - only reports `Restricted` once loaded AND the retry has run (or for
+///   anonymous users, who cannot gain access by refreshing).
+pub fn zone_access_gate(
+    access: ZoneAccess,
+    is_authed: Signal<bool>,
+    has_access: Signal<bool>,
+) -> Memo<AccessGate> {
+    let za_loaded = access.loaded;
+    let retried = RwSignal::new(false);
+
+    Effect::new(move |_| {
+        if is_authed.get() && za_loaded.get() && !has_access.get() && !retried.get_untracked() {
+            retried.set(true);
+            access.refresh();
+        }
+    });
+
+    Memo::new(move |_| {
+        if has_access.get() {
+            AccessGate::Granted
+        } else if !is_authed.get() {
+            // Anonymous users cannot gain access by refreshing.
+            AccessGate::Restricted
+        } else if za_loaded.get() && retried.get() {
+            AccessGate::Restricted
+        } else {
+            AccessGate::Checking
+        }
+    })
+}
+
 /// Retrieve the zone access store from context.
 pub fn use_zone_access() -> ZoneAccess {
     expect_context::<ZoneAccess>()
@@ -382,6 +436,7 @@ mod tests {
             visibility: ZoneVisibility::Locked,
             encrypted: false,
             accent_hex: None,
+            section_order: Vec::new(),
         }
     }
 
@@ -396,6 +451,7 @@ mod tests {
             visibility: ZoneVisibility::Public,
             encrypted: false,
             accent_hex: None,
+            section_order: Vec::new(),
         }
     }
 

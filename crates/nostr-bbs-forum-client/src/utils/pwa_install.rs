@@ -346,6 +346,7 @@ mod tests {
             visibility: ZoneVisibility::Locked,
             encrypted: false,
             accent_hex: None,
+            section_order: Vec::new(),
         }
     }
 
@@ -360,6 +361,7 @@ mod tests {
             visibility: ZoneVisibility::Public,
             encrypted: false,
             accent_hex: None,
+            section_order: Vec::new(),
         }
     }
 

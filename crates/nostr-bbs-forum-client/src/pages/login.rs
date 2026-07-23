@@ -28,6 +28,10 @@ pub fn LoginPage() -> impl IntoView {
     let nip07_pending = RwSignal::new(false);
     let has_nip07 = RwSignal::new(nip07::has_nip07_extension());
     let show_more = RwSignal::new(false);
+    // "Stay signed in on this device" opt-in for nsec/local-key logins. Off by
+    // default — a pasted key is the account's master secret, so durable
+    // persistence is a real risk on shared devices.
+    let remember = RwSignal::new(false);
     let show_tech = Memo::new(move |_| use_preferences().get().show_technical_details);
 
     // NIP-07 providers (Podkey, nos2x, Alby) inject `window.nostr` at
@@ -95,12 +99,38 @@ pub fn LoginPage() -> impl IntoView {
             return;
         }
         auth.clear_error();
+        // Persist the key across browser restarts only when the user opted in;
+        // otherwise it stays session-scoped (cleared on tab close). Must run
+        // before the login so `save_privkey_session` picks the right scope.
+        auth.set_remember_me(remember.get_untracked());
         match auth.login_with_local_key(&trimmed) {
             Ok(()) => {
                 let dest = return_to();
                 navigate.with_value(|nav| nav(&dest, NavigateOptions::default()));
             }
             Err(e) => auth.set_error(&e),
+        }
+    };
+
+    // Reusable "Stay signed in" checkbox + privacy warning, shown beside every
+    // nsec/local-key input (never for passkey / NIP-07, which don't persist a
+    // raw key). Both key inputs bind the same `remember` signal.
+    let remember_row = move || {
+        view! {
+            <label class="flex items-start gap-2 cursor-pointer select-none">
+                <input
+                    type="checkbox"
+                    prop:checked=move || remember.get()
+                    on:change=move |ev| remember.set(event_target_checked(&ev))
+                    class="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500 focus:ring-offset-0"
+                />
+                <span class="text-xs text-gray-400 leading-snug">
+                    <span class="text-gray-300 font-medium">"Stay signed in on this device"</span>
+                    " — saves your key in this browser so you don't have to paste it again. "
+                    "Only do this on a device that's yours: anyone who can use it (or a malicious "
+                    "script) could read your key. Leave off on shared or public computers."
+                </span>
+            </label>
         }
     };
 
@@ -148,6 +178,7 @@ pub fn LoginPage() -> impl IntoView {
                                             {move || if show_tech.get() { "Key stored locally in your browser; cleared on logout" } else { "Your key never leaves your browser" }}
                                         </p>
                                     </div>
+                                    {remember_row()}
                                     <button
                                         on:click=move |_: web_sys::MouseEvent| do_key_login()
                                         class="w-full bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold py-3 rounded-xl transition-colors text-sm"
@@ -232,6 +263,7 @@ pub fn LoginPage() -> impl IntoView {
                                         prop:value=move || key_input.get()
                                         class="w-full bg-gray-900 border border-gray-600 focus:border-amber-500 rounded-lg px-4 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500 text-sm font-mono"
                                     />
+                                    {remember_row()}
                                     <button
                                         on:click=move |_: web_sys::MouseEvent| do_key_login()
                                         class="w-full bg-gray-700 hover:bg-gray-600 text-white py-2.5 rounded-lg transition-colors text-sm font-semibold"
@@ -335,4 +367,13 @@ fn biometric_icon() -> impl IntoView {
                 stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
     }
+}
+
+/// Read a checkbox's `checked` state from a DOM `change` event.
+fn event_target_checked(ev: &leptos::ev::Event) -> bool {
+    use wasm_bindgen::JsCast;
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .map(|el| el.checked())
+        .unwrap_or(false)
 }

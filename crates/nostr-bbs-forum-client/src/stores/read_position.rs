@@ -120,7 +120,18 @@ fn load_from_storage() -> Option<ReadPositions> {
 
 /// Provide the read-position store in Leptos context. Call once at app root.
 pub fn provide_read_positions() {
-    provide_context(ReadPositionStore::new());
+    let store = ReadPositionStore::new();
+    provide_context(store);
+    // Cross-tab sync: without it, reading channel X in one tab is reverted when a
+    // stale sibling tab (same account under remember-me / passkey) later marks
+    // channel Y read and persists its whole map — the "N new" chip on X reappears.
+    // Reload the map load-only from any sibling's write. See notifications.rs.
+    let inner = store.inner;
+    crate::utils::on_cross_tab_storage_write(STORAGE_KEY, move || {
+        if let Some(rp) = load_from_storage() {
+            inner.set(rp);
+        }
+    });
 }
 
 /// Retrieve the read-position store from context.

@@ -258,14 +258,22 @@ impl ChannelStore {
             // (they were deleted or the DB was wiped)
             let ids = relay_ids.borrow();
             if ids.is_empty() {
-                // Relay returned zero channels — clear everything.
-                // Counts are derived from channel_messages (ADR-091), so
-                // clearing that map zeroes all counts automatically.
-                channels_sig.set(Vec::new());
-                store_for_eose.channel_messages.set(HashMap::new());
-                store_for_eose.last_active.set(HashMap::new());
-                store_for_eose.meta_updated_at.set(HashMap::new());
-                store_for_eose.tombstones.set(HashSet::new());
+                // Empty EOSE. Only trust it as "the relay has no channels" when
+                // there is nothing displayed to lose. If channels are already
+                // shown (from cache or a prior sync), an empty EOSE is almost
+                // always a transient artifact — a cold/reconnecting relay DO that
+                // EOSEs before (re)delivering its stored kind-40s — and wiping
+                // them here is the "panels flicker/disappear" bug. Keep them: real
+                // deletions still arrive as kind-5 tombstones (handled above), and
+                // a genuine reset is reconciled on a fresh reload. Counts are
+                // derived from channel_messages (ADR-091).
+                if channels_sig.get_untracked().is_empty() {
+                    channels_sig.set(Vec::new());
+                    store_for_eose.channel_messages.set(HashMap::new());
+                    store_for_eose.last_active.set(HashMap::new());
+                    store_for_eose.meta_updated_at.set(HashMap::new());
+                    store_for_eose.tombstones.set(HashSet::new());
+                }
             } else {
                 channels_sig.update(|list| {
                     list.retain(|c| ids.contains(&c.id));

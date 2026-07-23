@@ -41,8 +41,12 @@
 
 use std::collections::HashSet;
 
+#[cfg(target_arch = "wasm32")]
+use gloo::events::EventListener;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 
 use nostr_bbs_core::event::NostrEvent;
 
@@ -239,6 +243,9 @@ impl NotificationStore {
         }
         self.synced.set(true);
 
+        // Reconcile read-state across same-account tabs / PWA clients (once).
+        self.init_cross_tab_sync();
+
         // Provisional floor so no producer effect runs against baseline 0 (which
         // would treat the entire history as unread and flood the badge). The
         // per-pubkey resolver below refines it once auth resolves.
@@ -334,6 +341,38 @@ impl NotificationStore {
             }
         });
     }
+
+    /// Keep this tab's `items` in lock-step with any OTHER same-account tab /
+    /// PWA client (all auto-authenticate the same account off shared
+    /// localStorage). Without this, one tab marking notifications read persists
+    /// `read:true`, then a STALE sibling tab persists its own `read:false`
+    /// snapshot on its next write and reverts the shared per-pubkey list back to
+    /// unread ("mark all read keeps resetting"). The `storage` event fires only
+    /// in the OTHER tabs, so on a write to THIS owner's list key we reload from
+    /// that authoritative snapshot. Load-only, so it can't echo into a loop. A
+    /// faithful port of the forum client's `init_cross_tab_sync`.
+    #[cfg(target_arch = "wasm32")]
+    fn init_cross_tab_sync(&self) {
+        let store = *self;
+        let listener = EventListener::new(&gloo::utils::window(), "storage", move |event| {
+            let changed = event
+                .dyn_ref::<web_sys::StorageEvent>()
+                .and_then(|e| e.key());
+            let owner = store
+                .owner
+                .get_untracked()
+                .unwrap_or_else(|| ANON_OWNER.to_string());
+            if storage_change_is_ours(changed.as_deref(), &owner) {
+                store.items.set(load_items_no_persist(&owner));
+            }
+        });
+        // The store lives for the whole app session; keep the listener alive.
+        listener.forget();
+    }
+
+    /// No-op off-wasm (host unit tests): there is no DOM `storage` event.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn init_cross_tab_sync(&self) {}
 
     fn persist(&self) {
         let owner = self
@@ -592,6 +631,38 @@ fn load_sync_state(owner: &str) -> SyncState {
         .unwrap_or_default()
 }
 
+/// Whether a `storage` event on `changed_key` should reload THIS owner's list:
+/// a targeted write to `owner`'s per-pubkey items key, or a whole-storage clear
+/// (`None`, e.g. `localStorage.clear()` on logout in another tab). A write to a
+/// different account's list, or to the sync-state key, is irrelevant. Pure so
+/// the cross-tab dispatch is unit-testable without a DOM. (Off-wasm the only
+/// caller is the `#[cfg(test)]` unit test, so a non-test native build sees it
+/// unused — hence the targeted allow.)
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn storage_change_is_ours(changed_key: Option<&str>, owner: &str) -> bool {
+    match changed_key {
+        None => true,
+        Some(k) => k == items_key(owner),
+    }
+}
+
+/// Load `owner`'s visible list WITHOUT re-persisting — the read-only path used
+/// by the cross-tab `storage` handler ([`NotificationStore::init_cross_tab_sync`]).
+/// Re-persisting there would bounce a fresh `storage` event to the other tabs;
+/// mirrors [`load_items`] minus the migration write-back. Only the wasm cross-tab
+/// handler calls it, so it is wasm-gated to keep native builds warning-clean.
+#[cfg(target_arch = "wasm32")]
+fn load_items_no_persist(owner: &str) -> Vec<BbsNotification> {
+    let now = now_secs();
+    match ls_get(&items_key(owner)) {
+        Some(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => parse_persisted_items(&value, now),
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    }
+}
+
 /// Load `owner`'s visible list (per-pubkey scoped), evicting >7-day entries and
 /// dropping schema-drifted ones, then re-persisting the cleaned list so the
 /// drift heals on first load.
@@ -725,6 +796,18 @@ mod tests {
         assert_eq!(sync_state_key(ME), format!("bbsnotif:sync:{ME}"));
         assert_ne!(sync_state_key(ME), sync_state_key(OTHER));
         assert_eq!(sync_state_key(ANON_OWNER), "bbsnotif:sync:anon");
+    }
+
+    #[test]
+    fn cross_tab_reload_matches_current_owner_key_or_clear() {
+        // The cross-tab `storage` handler reloads only when another tab wrote
+        // THIS owner's list key or cleared all storage — not for a different
+        // account's list nor for our own sync-state key. This is what stops a
+        // stale sibling tab from clobbering a "mark all read" (the reset bug).
+        assert!(storage_change_is_ours(Some(&items_key(ME)), ME));
+        assert!(storage_change_is_ours(None, ME)); // localStorage.clear()
+        assert!(!storage_change_is_ours(Some(&items_key(OTHER)), ME));
+        assert!(!storage_change_is_ours(Some(&sync_state_key(ME)), ME));
     }
 
     #[test]
