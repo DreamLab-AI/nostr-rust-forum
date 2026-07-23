@@ -25,6 +25,41 @@ pub fn has_nip07_extension() -> bool {
     }
 }
 
+/// Whether the installed NIP-07 extension exposes a usable NIP-44 interface
+/// (`window.nostr.nip44` with callable `encrypt` **and** `decrypt`).
+///
+/// This is the exact capability required to read gift-wrapped DMs (kind-1059):
+/// the seal is NIP-44-encrypted, so without it the DM inbox can never decrypt,
+/// no matter how the session authenticates. A synchronous probe (no await) so a
+/// view can gate a warning banner on it directly. Returns `false` when there is
+/// no extension, no `nip44` object, or either primitive is missing/not a
+/// function — i.e. deny-by-capability, matching what `nip07_nip44_decrypt`
+/// would hit at runtime.
+pub fn nip07_has_nip44() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let Ok(nostr) = js_sys::Reflect::get(&window, &"nostr".into()) else {
+        return false;
+    };
+    if nostr.is_undefined() || nostr.is_null() {
+        return false;
+    }
+    let Ok(nip44) = js_sys::Reflect::get(&nostr, &"nip44".into()) else {
+        return false;
+    };
+    if nip44.is_undefined() || nip44.is_null() {
+        return false;
+    }
+    let has_fn = |name: &str| {
+        js_sys::Reflect::get(&nip44, &name.into())
+            .ok()
+            .map(|f| f.is_function())
+            .unwrap_or(false)
+    };
+    has_fn("encrypt") && has_fn("decrypt")
+}
+
 /// Get the extension name if available (checks common extension identifiers).
 pub fn get_extension_name() -> Option<String> {
     let window = web_sys::window()?;
