@@ -31,9 +31,6 @@ const SEARCH_MAX_LIMIT: u32 = 50;
 /// Default `/api/profiles/search` result count.
 const SEARCH_DEFAULT_LIMIT: u32 = 20;
 
-/// Minimum prefix length for typeahead. Prevents whole-table scans.
-const SEARCH_MIN_PREFIX: usize = 2;
-
 // ---------------------------------------------------------------------------
 // Request bodies
 // ---------------------------------------------------------------------------
@@ -269,16 +266,7 @@ pub async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         }
     }
 
-    // Lowercase + length guard.
     let q = q.to_lowercase();
-    if q.chars().count() < SEARCH_MIN_PREFIX {
-        return cors_json_response(
-            env,
-            &json!({ "error": format!("q must be at least {SEARCH_MIN_PREFIX} chars") }),
-            400,
-        );
-    }
-
     let limit = limit.clamp(1, SEARCH_MAX_LIMIT);
 
     let db = match env.d1("DB") {
@@ -286,32 +274,46 @@ pub async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         Err(_) => return cors_json_response(env, &json!({ "error": "Database unavailable" }), 500),
     };
 
-    // Case-insensitive SUBSTRING match across every human-facing handle
-    // column (`name`, `display_name`, `nip05`). Both sides are folded to
-    // lower-case — `q` is lowercased above and each column is wrapped in
-    // `LOWER(...)` — so a query like "reddread" surfaces a stored
-    // "RedDreadTest1" regardless of how the metadata was cased on publish.
+    // Two query shapes:
     //
-    // Substring (not prefix) parity with the client's `MentionCandidate::matches`
-    // (`.contains`): typing a fragment from the middle of a handle — e.g.
-    // "dread" or "test" — still finds the user, so the typeahead behaves the
-    // same whether a candidate comes from the relay or the local cache.
+    //   * **Roster mode** (empty `q`): the composer opens the @mention dropdown on
+    //     a bare `@` and must show real, recently-active members immediately —
+    //     otherwise the only candidates are the hardcoded client-side seed bots
+    //     ("I only see the house agents"). Return the most-recently-active
+    //     profiles ordered by the indexed `last_kind0_at`, bounded by `limit`.
+    //     This is NOT a wildcard scan: no `LIKE`, just an ordered LIMIT.
     //
-    // The literal `%`/`_` LIKE wildcards are stripped from the query so a user
-    // can't turn the typeahead into a full wildcard scan.
-    let pattern = search_like_pattern(&q);
+    //   * **Filter mode** (non-empty `q`, any length ≥ 1): case-insensitive
+    //     SUBSTRING match across every human-facing handle column (`name`,
+    //     `display_name`, `nip05`). Both sides fold to lower-case — `q` is
+    //     lowercased above and each column is wrapped in `LOWER(...)` — so
+    //     "reddread" surfaces a stored "RedDreadTest1". Substring (not prefix)
+    //     keeps parity with the client's `MentionCandidate::matches` (`.contains`)
+    //     so a mid-handle fragment ("dread", "test") still finds the user. The
+    //     literal `%`/`_` LIKE wildcards are stripped so the typeahead can't be
+    //     coerced into a full wildcard scan. (Previously `q` shorter than 2 chars
+    //     was rejected with 400; that hard floor is what left a
+    //     bare `@` showing only the seed. A 1-char `LIKE %x%` is still bounded by
+    //     LIMIT, so it is admitted.)
+    let (sql, binds): (&str, Vec<JsValue>) = if q.is_empty() {
+        (
+            "SELECT pubkey, name, display_name, picture, nip05 FROM profiles \
+             ORDER BY last_kind0_at DESC LIMIT ?1",
+            vec![JsValue::from_f64(limit as f64)],
+        )
+    } else {
+        let pattern = search_like_pattern(&q);
+        (
+            "SELECT pubkey, name, display_name, picture, nip05 FROM profiles \
+             WHERE LOWER(name) LIKE ?1 \
+                OR LOWER(display_name) LIKE ?1 \
+                OR LOWER(nip05) LIKE ?1 \
+             ORDER BY last_kind0_at DESC LIMIT ?2",
+            vec![JsValue::from_str(&pattern), JsValue::from_f64(limit as f64)],
+        )
+    };
 
-    let stmt = db.prepare(
-        "SELECT pubkey, name, display_name, picture, nip05 FROM profiles \
-         WHERE LOWER(name) LIKE ?1 \
-            OR LOWER(display_name) LIKE ?1 \
-            OR LOWER(nip05) LIKE ?1 \
-         ORDER BY last_kind0_at DESC LIMIT ?2",
-    );
-
-    let binds = [JsValue::from_str(&pattern), JsValue::from_f64(limit as f64)];
-
-    let bound = match stmt.bind(&binds) {
+    let bound = match db.prepare(sql).bind(&binds) {
         Ok(s) => s,
         Err(_) => return cors_json_response(env, &json!({ "error": "Bind failed" }), 500),
     };
@@ -402,5 +404,15 @@ mod tests {
     fn search_does_not_match_unrelated() {
         let pattern = search_like_pattern(&"alice".to_lowercase());
         assert!(!sql_like_match("RedDreadTest1", &pattern));
+    }
+
+    #[test]
+    fn single_char_query_still_filters() {
+        // A 1-char query is now admitted (was rejected with 400): the composer's
+        // first typed char after `@` must already narrow the roster, not scan.
+        let pattern = search_like_pattern(&"r".to_lowercase());
+        assert_eq!(pattern, "%r%");
+        assert!(sql_like_match("RedDread", &pattern));
+        assert!(!sql_like_match("Bob", &pattern));
     }
 }
