@@ -186,8 +186,10 @@ pub fn JoinPage() -> impl IntoView {
     };
 
     // Signed in → redeem the invite (NIP-98 POST). On success, refresh cohorts
-    // and flip to the "You are in" interstitial.
-    let do_redeem = move |_: leptos::ev::MouseEvent| {
+    // and flip to the "You are in" interstitial. Extracted as an arg-free trigger
+    // so both the manual button and the auto-redeem Effect below can fire it
+    // (the closure is `Copy` — it captures only Copy reactive handles).
+    let run_redeem = move || {
         if redeem_state.get_untracked() == RedeemState::Working {
             return;
         }
@@ -214,6 +216,46 @@ pub fn JoinPage() -> impl IntoView {
             }
         });
     };
+    let do_redeem = move |_: leptos::ev::MouseEvent| run_redeem();
+
+    // Auto-redeem: the invite code is never threaded into the signup/registration
+    // flow, so historically the zone cohort was granted ONLY if a returning-from-
+    // signup user manually clicked "Join <zone>". Users who didn't make it back to
+    // this page (or closed the tab after signup) were silently left un-provisioned
+    // — the reported "invite link doesn't assign the zone" bug. Here we fire the
+    // redeem automatically the moment an authenticated visitor is looking at a
+    // valid, zone-bound invite: that is exactly the returnTo-from-signup landing,
+    // and also covers an already-registered user clicking the link. The button
+    // below stays as a manual/retry affordance for the error path. Redemption is
+    // idempotent server-side, and the one-shot guard prevents an Effect re-run
+    // (auth/preview settling) from firing it twice.
+    let auto_redeem_started = StoredValue::new(false);
+    Effect::new(move |_| {
+        if !is_authed.get() {
+            return;
+        }
+        // Only for a valid, zone-bound preview (a plain member invite has no zone
+        // to grant, so there is nothing to auto-redeem).
+        let zone_bound = matches!(
+            preview.get(),
+            Some(Ok(ref p))
+                if p.is_valid()
+                    && p.zone_id.as_deref().map(|z| !z.is_empty()).unwrap_or(false)
+        );
+        if !zone_bound || auto_redeem_started.get_value() {
+            return;
+        }
+        if redeem_state.get_untracked() != RedeemState::Idle {
+            return;
+        }
+        // Signer may not be installed the instant auth flips; bail and let the
+        // Effect re-run when it settles rather than erroring the state.
+        if auth.get_signer().is_none() {
+            return;
+        }
+        auto_redeem_started.set_value(true);
+        run_redeem();
+    });
 
     // "Open <zone>": full reload into the zone so cohorts re-derive and the
     // newly-granted zone is visible (SPA nav would keep the stale cohort read).
