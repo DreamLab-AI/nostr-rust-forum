@@ -43,7 +43,11 @@ signs the decisions that matter. This repo is the surface where that signature l
   sovereignty layer. This forum's per-user Solid pods are that server's kit; the identity
   spine (`did:nostr` Multikey) is shared verbatim.
 - **[narrativegoldmine](https://github.com/DreamLab-AI/knowledgeGraph)** — the published,
-  browsable rendering of the knowledge corpus VisionClaw reasons over.
+  browsable rendering of the knowledge corpus VisionClaw reasons over, served at
+  [narrativegoldmine.com](https://narrativegoldmine.com). Since July 2026 it also releases
+  the corpus itself: 7,457 pages under ODbL-1.0 and the rdflib pipeline (AGPL-3.0) that
+  builds them into 252,974 triples and 96,377 edges. Mostly AI-generated synthetic content
+  produced under human direction, by design: an ontology testbed, not an encyclopaedia.
 - **[dreamlab-ai-website](https://github.com/DreamLab-AI/dreamlab-ai-website)** — a thin
   *consumer* of this kit: it embeds the forum's governance dashboard at `/governance`.
 
