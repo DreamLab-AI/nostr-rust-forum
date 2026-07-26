@@ -3555,9 +3555,9 @@ dependencies = [
 
 [[package]]
 name = "solid-pod-rs"
-version = "0.5.0-alpha.4"
+version = "0.5.0-alpha.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68a1516adc6955961413280e164643f0857c32d17b8c66d6940788deb4f416d2"
+checksum = "615d04af22c42d2a20e9695e779b99c432e0781dc6816a0e1aeb0881c7453aa8"
 dependencies = [
  "async-trait",
  "base64",
