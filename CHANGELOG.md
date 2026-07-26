@@ -7,6 +7,24 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.7] — 2026-07-26
+
+Workspace release: every kit crate moves to `1.0.0-beta.7`; the six library
+crates (`nostr-bbs-core`, `-config`, `-mesh`, `-rate-limit`, `-ascii`,
+`-setup-skill`) are published to crates.io. Restores the registry == git-HEAD
+invariant after the solid-pod-rs pin advanced on `main`.
+
+### Changed
+
+- **Adopt solid-pod-rs `0.5.0-alpha.7` — did:nostr CG spec 0.1.1** (pin
+  `=0.5.0-alpha.4` → `=0.5.0-alpha.7`). DID documents now carry the
+  three-context `@context` (`[did/v1, cid/v1, nostr/context]`, DID Core
+  first as DID Core requires). Production rendering fully delegates to
+  upstream; the tier1 tests, the did-doc-conformance fixture's positive
+  vectors, and the context docstrings move to the three-context shape in
+  lockstep. Both context forms expand identically under JSON-LD, so peers
+  parsing (rather than byte-comparing) documents are unaffected.
+
 ## [1.0.0-beta.6] — 2026-07-19
 
 Workspace release: every kit crate moves to `1.0.0-beta.6`; the four library
