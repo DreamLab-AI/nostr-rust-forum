@@ -134,6 +134,8 @@ fn map_upstream_err(e: UpstreamError) -> Nip44Error {
                 ErrorV2::TryFromSlice => Nip44Error::InvalidPayload("slice conversion"),
                 ErrorV2::FromSlice(_) => Nip44Error::InvalidPayload("from slice"),
                 ErrorV2::Utf8Encode(_) => Nip44Error::InvalidPayload("invalid UTF-8 in plaintext"),
+                // nostr 0.44.5+: payload below the v2 minimum length.
+                ErrorV2::PayloadTooShort => Nip44Error::InvalidPayload("payload too short"),
             }
         }
     }

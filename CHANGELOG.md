@@ -7,6 +7,26 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.8] — 2026-07-26
+
+Hotfix release on top of `beta.7`, published the same day: moving off the
+yanked `nostr 0.44.x` range surfaced two compile breaks in the published
+crates. `beta.7` is yanked on crates.io (it only builds against yanked
+`nostr` versions); consumers should move straight to `beta.8`.
+
+### Fixed
+
+- **`nostr` 0.44.2 → 0.44.6** — the entire `0.44.0–0.44.4` range is yanked
+  on crates.io; the kit's lockfile was on `0.44.2`, and the freshly
+  published `beta.7` crates could not compile in a downstream fresh resolve
+  (which selects `0.44.6`). The two upstream error enums gained variants:
+  `nip04::Error::InvalidIVLen` now maps into the kit's
+  `Nip04Error::UpstreamCryptoError` (the kit's own wire pre-check already
+  reports `InvalidIvLength(n)` with the real length before delegating), and
+  `nip44::v2::ErrorV2::PayloadTooShort` maps to
+  `Nip44Error::InvalidPayload("payload too short")`. Full workspace green
+  on `0.44.6`.
+
 ## [1.0.0-beta.7] — 2026-07-26
 
 Workspace release: every kit crate moves to `1.0.0-beta.7`; the six library
