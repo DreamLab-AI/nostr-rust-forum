@@ -206,7 +206,7 @@ method.
 - **Auth reads the raw signature, not the document.** NIP-98 (HTTP) and NIP-42 (relay)
   verify a Schnorr signature against the raw event pubkey, so re-encoding the DID document
   cannot affect the auth path.
-- The pod + identity layers build on **solid-pod-rs `0.5.0-alpha.6`** (the JSS Rust port),
+- The pod + identity layers build on **solid-pod-rs `0.5.0-alpha.7`** (the JSS Rust port),
   the canonical encoder of record for the Multikey DID document.
 
 Signup issues a 100%-client-side printable **recovery sheet** (nsec/npub/relay QRs, restore
@@ -326,7 +326,7 @@ embeds as the governance surface of a larger agent platform.
 
 | Foundation | Project | Role |
 |:-----------|:--------|:-----|
-| **solid-pod-rs** | [solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs) | Cryptographic foundation — JSS Rust port, `did:nostr` Multikey identity (`0.5.0-alpha.6`) |
+| **solid-pod-rs** | [solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs) | Cryptographic foundation — JSS Rust port, `did:nostr` Multikey identity (`0.5.0-alpha.7`) |
 | **JSS** | [JavaScriptSolidServer](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer) | Upstream Solid server reference and AGPL-3.0 lineage |
 | **did-nostr** | [did:nostr](https://github.com/nicholasgasior/did-nostr) | Nostr-keyed DID method for cross-system identity |
 

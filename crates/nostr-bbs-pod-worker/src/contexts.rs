@@ -23,7 +23,9 @@ pub const CONTEXT_ACL: &str = include_str!("../contexts/acl.jsonld");
 /// Canonical `did:nostr` JSON-LD context (ADR-125 §2 Multikey form).
 ///
 /// This is the single context bundle the canonical DID document references
-/// in its `@context` (`https://www.w3.org/ns/cid/v1` + `https://w3id.org/nostr/context`).
+/// in its `@context` (did:nostr CG 0.1.1 three-context form:
+/// `https://www.w3.org/ns/did/v1` + `https://www.w3.org/ns/cid/v1` +
+/// `https://w3id.org/nostr/context`).
 /// It defines only the canonical terms — `DIDNostr`, `Multikey`,
 /// `publicKeyMultibase`, controller/VM/auth/assertion/service — and
 /// deliberately does NOT define the superseded `SchnorrSecp256k1VerificationKey2019`

@@ -79,8 +79,10 @@ pub fn is_valid_hex_pubkey(s: &str) -> bool {
 ///
 /// Full delegation to `solid_pod_rs::did_nostr_types::render_did_document_tier1`
 /// — the canonical create-agent / ADR-125 Multikey form. As of solid-pod-rs
-/// 0.5.0-alpha.4 the upstream minimal document is fully aligned to the did:nostr
-/// CG spec: it carries the canonical relative `authentication`/`assertionMethod`
+/// 0.5.0-alpha.7 the upstream minimal document is fully aligned to the did:nostr
+/// CG spec 0.1.1: `@context` is the three-context form (`did/v1` first, as
+/// DID Core requires, then `cid/v1`, then the nostr context), and it
+/// carries the canonical relative `authentication`/`assertionMethod`
 /// (`["#key1"]`) and OMITS the optional members entirely — no empty `service: []`
 /// (the pre-alignment shape) and no `alsoKnownAs`. The forum emits it verbatim —
 /// no fragment re-pinning and no absolute-ref rewrite (the `did:nostr:<hex>`
@@ -220,7 +222,8 @@ mod tests {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
         assert_eq!(doc["id"], format!("did:nostr:{PK_HEX}"));
-        assert_eq!(doc["@context"][0], "https://www.w3.org/ns/cid/v1");
+        // did:nostr CG 0.1.1: DID Core context leads.
+        assert_eq!(doc["@context"][0], "https://www.w3.org/ns/did/v1");
         // ADR-125: canonical Multikey doc has no `alsoKnownAs` (the WebID link
         // lives in `service`, populated only at Tier-3).
         assert!(doc["alsoKnownAs"].is_null());
@@ -254,10 +257,12 @@ mod tests {
         let pk = NostrPubkey::from_hex(PK_HEX).unwrap();
         let doc = render_did_document_tier1(&pk);
         let ctx = doc["@context"].as_array().unwrap();
-        // ADR-125 §2: canonical did:nostr Multikey contexts.
-        assert_eq!(ctx.len(), 2);
-        assert_eq!(ctx[0], "https://www.w3.org/ns/cid/v1");
-        assert_eq!(ctx[1], "https://w3id.org/nostr/context");
+        // ADR-125 §2 / did:nostr CG 0.1.1: canonical three-context form,
+        // DID Core first (required by DID Core, aligned with DID 1.1).
+        assert_eq!(ctx.len(), 3);
+        assert_eq!(ctx[0], "https://www.w3.org/ns/did/v1");
+        assert_eq!(ctx[1], "https://www.w3.org/ns/cid/v1");
+        assert_eq!(ctx[2], "https://w3id.org/nostr/context");
     }
 
     #[test]
