@@ -29,6 +29,11 @@ protocol bounded by human bandwidth, AI collapses the cost of that routing to ne
 and so the human role is promoted from router to **judgment broker** — the person who
 signs the decisions that matter. This repo is the surface where that signature lands.
 
+The guardrail has two halves. The machine half is neurosymbolic: agents in the mesh run
+bounded by a shared OWL 2 EL ontology, so the errors formal semantics can catch are caught
+by a reasoner. This forum is the human half — the decisions no reasoner should close on
+its own are signed here, by a person, with a key.
+
 - **[VisionFlow](https://github.com/DreamLab-AI/VisionFlow)** — ecosystem canon: ADRs,
   the compatibility matrix, the maturity vocabulary, the vision report. Start here for the
   whole picture.
