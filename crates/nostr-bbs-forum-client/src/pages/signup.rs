@@ -455,6 +455,26 @@ pub fn SignupPage() -> impl IntoView {
                             <p class="text-xs text-gray-500 text-center">
                                 "You can choose a shareable @-handle later in Settings."
                             </p>
+
+                            // Advanced tier, kept behind a disclosure so it never
+                            // raises the floor for the ordinary in-browser signup
+                            // above. Framed for the audience it is actually for:
+                            // people running agents or working under compliance
+                            // rules, consistent with the Podkey advanced-identity
+                            // copy and the dreamlab-ai sovereign-identity section.
+                            <details class="text-center">
+                                <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-400 select-none">
+                                    "Managing AI agents, or working under compliance rules?"
+                                </summary>
+                                <p class="text-xs text-gray-500 mt-2 leading-relaxed text-left">
+                                    "The account above creates a key in this browser — the right choice for most people. "
+                                    "If you operate agents or need auditable, phishing-resistant custody, sign in with a "
+                                    <A href=base_href("/login") attr:class="text-amber-400 hover:text-amber-300 underline">
+                                        "passkey or the Podkey browser extension"
+                                    </A>
+                                    " instead: your key is hardware-backed, never exported, and unlocked with biometrics or a security key."
+                                </p>
+                            </details>
                         </div>
                     </Show>
 
