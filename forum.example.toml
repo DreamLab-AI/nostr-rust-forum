@@ -120,6 +120,8 @@ visibility       = "locked"
 accent_hex       = "#10b981"                           # green
 banner_image_url = "/images/heroes/friends-hero.webp"
 encrypted        = false
+kanban           = true                                # per-zone task board (kinds 30301/30302);
+                                                       # read/write follow this zone's cohorts
 
 [[zones]]
 id               = "family"

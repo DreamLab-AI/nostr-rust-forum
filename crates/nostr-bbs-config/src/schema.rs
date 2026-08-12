@@ -213,6 +213,13 @@ pub struct Zone {
     /// the relay's `ZONE_CONFIG` where the relay enforces it at auto-whitelist.
     #[serde(default)]
     pub auto_approve: bool,
+    /// Whether this zone offers a collaborative kanban task board. Board data
+    /// rides zone-tagged Kanbanstr kinds (30301/30302); read/write follow the
+    /// zone's `required_cohorts` / `write_cohorts` exactly like calendar
+    /// events. Projected into `ZONE_CONFIG` so the client knows to surface the
+    /// board entry; the relay gates by zone tag regardless of this flag.
+    #[serde(default)]
+    pub kanban: bool,
 }
 
 /// Trust system thresholds.

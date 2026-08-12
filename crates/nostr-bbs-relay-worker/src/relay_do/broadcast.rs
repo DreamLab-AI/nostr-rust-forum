@@ -54,12 +54,14 @@ impl NostrRelayDO {
             None
         };
 
-        // Only zone-scoped kinds (kind-40 defs, kind-42 content, NIP-52 calendar)
-        // require the per-recipient read gate. Everything else broadcasts to every
-        // matching subscriber as before, so the common hot path adds no async work.
+        // Only zone-scoped kinds (kind-40 defs, kind-42 content, NIP-52 calendar,
+        // kanban boards/cards) require the per-recipient read gate. Everything
+        // else broadcasts to every matching subscriber as before, so the common
+        // hot path adds no async work.
         let needs_gate = event.kind == 40
             || event.kind == 42
-            || calendar_projection::is_projected_calendar_kind(event.kind);
+            || calendar_projection::is_projected_calendar_kind(event.kind)
+            || nostr_bbs_core::is_kanban_kind(event.kind);
 
         // Snapshot delivery candidates so we never hold the `sessions` borrow
         // across the async zone/cohort lookups in the read gate below.

@@ -20,7 +20,7 @@ use crate::components::screen_reader::{provide_announcer, ScreenReaderAnnouncer}
 use crate::components::toast::{provide_toasts, use_toasts, ToastContainer, ToastVariant};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
-    AdminPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage, EventsPage,
+    AdminPage, BoardPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage, EventsPage,
     ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, LoginPage, NoteViewPage,
     PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage, SignupPage, ThreadPage,
 };
@@ -838,6 +838,10 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/dm/:pubkey") view=AuthGatedDmChat />
                     <Route path=path!("/forums") view=AuthGatedForums />
                     <Route path=path!("/forums/:category") view=AuthGatedCategory />
+                    // Zone task board (kanban). Static "board" segment out-scores
+                    // the dynamic `:section` at equal depth, so no section named
+                    // "board" is reachable — acceptable reserved word.
+                    <Route path=path!("/forums/:category/board") view=AuthGatedBoard />
                     <Route path=path!("/forums/:category/:section") view=AuthGatedSection />
                     <Route path=path!("/forums/:category/:section/:topic") view=AuthGatedThread />
                     <Route path=path!("/events") view=AuthGatedEvents />
@@ -868,6 +872,8 @@ pub fn App() -> impl IntoView {
                     // to `/:category` → CategoryPage, whose own "Zone Not Found"
                     // handles it (the desired behaviour, not a 404).
                     <Route path=path!("/:category") view=AuthGatedCategory />
+                    // Slug alias for the zone task board (mirrors /forums form).
+                    <Route path=path!("/:category/board") view=AuthGatedBoard />
                     <Route path=path!("/:category/:section") view=AuthGatedSection />
                     <Route path=path!("/:category/:section/:topic") view=AuthGatedThread />
                 </FlatRoutes>
@@ -1394,6 +1400,7 @@ macro_rules! auth_gated {
 
 auth_gated!(AuthGatedSetup, SetupPage);
 auth_gated!(AuthGatedForums, ForumsPage);
+auth_gated!(AuthGatedBoard, BoardPage);
 auth_gated!(AuthGatedCategory, CategoryPage);
 auth_gated!(AuthGatedSection, SectionPage);
 auth_gated!(AuthGatedThread, ThreadPage);

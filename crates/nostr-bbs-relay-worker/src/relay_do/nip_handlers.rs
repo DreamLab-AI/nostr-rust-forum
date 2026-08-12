@@ -65,6 +65,8 @@ pub fn is_ban_gated_kind(kind: u64) -> bool {
         || kind == nostr_bbs_core::KIND_CALENDAR_DATE_EVENT
         || kind == nostr_bbs_core::KIND_CALENDAR_EVENT
         || kind == KIND_CALENDAR_RSVP
+        || nostr_bbs_core::is_kanban_kind(kind)
+        || kind == nostr_bbs_core::KIND_AGENT_INTENT
 }
 
 /// Phase C (write side): whether an RSVP (kind 31925) is permitted to be written,
@@ -623,8 +625,15 @@ impl NostrRelayDO {
         // Human responses (kind 31403, approve/reject of agent action requests)
         // are exempt from the agent-registry gate but, per P1-6, MUST come from
         // an admin -- they are privileged decisions, not generic member actions.
+        //
+        // Kanban exception: a kanban approval request (31402 tagged `k=30302`)
+        // is a MEMBER-initiated ask — "may this card enter the approval-gated
+        // column?" — so it is admitted from any whitelisted author (whitelist
+        // admission already ran above). Decisions stay admin-only 31403; every
+        // other 31402 remains agent-registry-gated.
         if governance::is_governance_kind(event.kind)
             && event.kind != governance::KIND_ACTION_RESPONSE
+            && !nostr_bbs_core::is_kanban_approval_request(&event)
             && !self.is_registered_agent(&event.pubkey).await
         {
             Self::send_ok(
@@ -742,13 +751,17 @@ impl NostrRelayDO {
                 Self::send_ok(ws, &event.id, false, "blocked: rsvp not permitted");
                 return;
             }
-        } else if matches!(
+        } else if (matches!(
             event.kind,
             nostr_bbs_core::KIND_CALENDAR_DATE_EVENT | nostr_bbs_core::KIND_CALENDAR_EVENT
-        ) && !is_admin
+        ) || nostr_bbs_core::is_kanban_kind(event.kind))
+            && !is_admin
         {
-            // Only zone-tagged calendar events are write-gated; untagged events
-            // are unscoped and retain prior behaviour.
+            // Only zone-tagged calendar/kanban events are write-gated; untagged
+            // events are unscoped and retain prior behaviour. Kanban boards and
+            // cards (30301/30302) carry the same zone-binding tag as calendar
+            // events and follow the identical rule: writing into a zone requires
+            // that zone's effective write cohorts.
             let zone = nostr_bbs_core::read_zone_tag(&event);
             let has_write = match zone {
                 Some(z) => trust::has_zone_write_access(&event.pubkey, z, &self.env).await,
@@ -1301,6 +1314,29 @@ impl NostrRelayDO {
             {
                 Some(out) => ReadDecision::DeliverAs(out),
                 None => ReadDecision::Withhold,
+            };
+        }
+
+        // Kanban boards/cards (30301/30302): binary zone read gate — no
+        // free/busy tier. An untagged board is unscoped (served as-is, the
+        // calendar posture); a zone-tagged one is served only to the author,
+        // admins, and zone members (cohort match or public-read zone).
+        // Deny-by-default for unknown zones, exactly like the projector.
+        if nostr_bbs_core::is_kanban_kind(event.kind) {
+            let Some(zone) = nostr_bbs_core::read_zone_tag(event) else {
+                return ReadDecision::Deliver;
+            };
+            let is_owner = ctx
+                .access_pubkey
+                .as_deref()
+                .map(|pk| pk == event.pubkey)
+                .unwrap_or(false);
+            let is_member = zones.is_public_read(zone)
+                || zones.cohorts_can_read(zone, &ctx.viewer_cohorts);
+            return if ctx.viewer_is_admin || is_owner || is_member {
+                ReadDecision::Deliver
+            } else {
+                ReadDecision::Withhold
             };
         }
 
@@ -2746,6 +2782,48 @@ mod write_gate_tests {
         // No zone tag → unscoped → permitted regardless of zone-write resolution.
         assert!(calendar_write_permitted(None, false));
         assert!(calendar_write_permitted(None, true));
+    }
+
+    // ---- Kanban gates (kinds 30301/30302, kanban-scoped 31402) --------------
+
+    #[test]
+    fn kanban_kinds_are_ban_and_write_gated() {
+        // Kanban boards/cards and agent intents are content-bearing: a banned
+        // author must not publish them.
+        assert!(is_ban_gated_kind(nostr_bbs_core::KIND_KANBAN_BOARD));
+        assert!(is_ban_gated_kind(nostr_bbs_core::KIND_KANBAN_CARD));
+        assert!(is_ban_gated_kind(nostr_bbs_core::KIND_AGENT_INTENT));
+        // The write path reuses the calendar zone predicate: zone-tagged needs
+        // write access, untagged is unscoped.
+        assert!(!calendar_write_permitted(Some("family"), false));
+        assert!(calendar_write_permitted(Some("family"), true));
+        assert!(calendar_write_permitted(None, false));
+    }
+
+    #[test]
+    fn kanban_approval_request_exempt_from_agent_registry_gate() {
+        // A 31402 tagged `k=30302` is the member-initiated kanban approval ask
+        // — exempt from the agent-registry gate. Any other 31402 stays gated.
+        let kanban_req = mk_event(
+            31402,
+            vec![
+                vec!["d".into(), "x".into()],
+                vec!["k".into(), "30302".into()],
+            ],
+        );
+        assert!(nostr_bbs_core::is_kanban_approval_request(&kanban_req));
+
+        let plain_req = mk_event(31402, vec![vec!["d".into(), "x".into()]]);
+        assert!(!nostr_bbs_core::is_kanban_approval_request(&plain_req));
+        // Wrong k value is not kanban either.
+        let wrong_k = mk_event(
+            31402,
+            vec![vec!["d".into(), "x".into()], vec!["k".into(), "1".into()]],
+        );
+        assert!(!nostr_bbs_core::is_kanban_approval_request(&wrong_k));
+        // A 31403 response never matches (admin-only path unchanged).
+        let response = mk_event(31403, vec![vec!["k".into(), "30302".into()]]);
+        assert!(!nostr_bbs_core::is_kanban_approval_request(&response));
     }
 
     // ---- NIP-59 gift-wrap (kind 1059) recipient routing --------------------

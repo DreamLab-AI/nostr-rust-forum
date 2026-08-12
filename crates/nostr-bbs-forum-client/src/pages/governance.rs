@@ -433,6 +433,15 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
     // rejection re-shows the controls (retryable) rather than reading as sent.
     let response_rejected = RwSignal::new(false);
 
+    // Resolve the relay at component construction — calling expect_context()
+    // (or use_auth()) inside the click handler panics ("expected context of
+    // type AuthStore") because the reactive owner is gone by event time, and
+    // the panic kills the whole WASM runtime (same hazard RsvpButtons
+    // documents). `auth` is already resolved in the component body above; the
+    // Rc-based relay rides a local StoredValue so the closure captures a Copy
+    // handle.
+    let relay_stored = StoredValue::new_local(expect_context::<RelayConnection>());
+
     let send_response = {
         let event_id = event_id.clone();
         let d_tag = d_tag.clone();
@@ -443,7 +452,6 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
             loading_sig.set(true);
             response_rejected.set(false);
 
-            let auth = use_auth();
             let pubkey = match auth.pubkey().get_untracked() {
                 Some(pk) => pk,
                 None => {
@@ -471,7 +479,7 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
             };
 
             // Async sign so NIP-07 / extension users can respond.
-            let r = expect_context::<RelayConnection>();
+            let r = relay_stored.get_value();
             spawn_local(async move {
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {

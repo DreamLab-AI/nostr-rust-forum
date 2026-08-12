@@ -20,9 +20,13 @@ This guide walks through deploying nostr-rust-forum on Cloudflare Workers with a
    wrangler login
    ```
 
-4. **worker-build** (for Rust Workers):
+4. **worker-build** (for Rust Workers). Pin 0.8.4: 0.8.5 passes
+   `--force-enable-abort-handler` to wasm-bindgen and fails with
+   `error: failed to generate catch wrappers` against these worker crates
+   (abort-recovery is a tracked follow-up; 0.8.4 is the last release without
+   the abort-handler codegen):
    ```bash
-   cargo install worker-build
+   cargo install worker-build --version 0.8.4 --locked
    ```
 
 ## 1. Cloudflare Account Setup

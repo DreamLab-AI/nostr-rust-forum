@@ -347,6 +347,7 @@ mod tests {
             encrypted: false,
             accent_hex: None,
             section_order: Vec::new(),
+            kanban: false,
         }
     }
 
@@ -362,6 +363,7 @@ mod tests {
             encrypted: false,
             accent_hex: None,
             section_order: Vec::new(),
+            kanban: false,
         }
     }
 
