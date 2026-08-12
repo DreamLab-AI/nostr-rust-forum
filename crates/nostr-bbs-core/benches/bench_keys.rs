@@ -12,8 +12,9 @@ fn bench_generate_keypair(c: &mut Criterion) {
 
 fn bench_derive_from_prf(c: &mut Criterion) {
     let prf_output = [0xABu8; 32];
+    let salt = [0x0bu8; 32];
     c.bench_function("keys_derive_from_prf", |b| {
-        b.iter(|| keys::derive_from_prf(&prf_output).unwrap());
+        b.iter(|| keys::derive_from_prf(&prf_output, &salt).unwrap());
     });
 }
 

@@ -51,15 +51,19 @@ pub fn nip44_decrypt(
 
 // ── Key derivation ──────────────────────────────────────────────────────────
 
-/// Derive a Nostr keypair from WebAuthn PRF output using HKDF-SHA-256.
+/// Derive a Nostr keypair from WebAuthn PRF output using HKDF-SHA-256, per the
+/// Podkey Passkey Identity Specification §3.
 ///
+/// `derivation_salt` is the client-owned HKDF salt (Podkey stores a random
+/// 32-byte value; the forum reuses the server-bound prfSalt bytes).
 /// Returns a JS object `{ secretKey: Uint8Array(32), publicKey: string }`.
 #[wasm_bindgen]
-pub fn derive_keypair_from_prf(prf_output: &[u8]) -> Result<JsValue, JsValue> {
+pub fn derive_keypair_from_prf(prf_output: &[u8], derivation_salt: &[u8]) -> Result<JsValue, JsValue> {
     let prf: [u8; 32] = prf_output
         .try_into()
         .map_err(|_| JsValue::from_str("prf_output must be 32 bytes"))?;
-    let kp = keys::derive_from_prf(&prf).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let kp = keys::derive_from_prf(&prf, derivation_salt)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     let obj = js_sys::Object::new();
     let sk_array = js_sys::Uint8Array::from(kp.secret.as_bytes().as_slice());

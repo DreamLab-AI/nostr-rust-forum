@@ -147,7 +147,10 @@ pub async fn register_passkey(
     }
     prf_bytes.copy_from_slice(&prf_output[..32]);
 
-    let keypair = nostr_bbs_core::derive_from_prf(&prf_bytes)
+    // HKDF derivation salt per the Podkey spec §3. The server-bound prfSalt is a
+    // stable value available identically at register and login, so it doubles as
+    // the derivation salt without a second stored field.
+    let keypair = nostr_bbs_core::derive_from_prf(&prf_bytes, prf_salt_b64.as_bytes())
         .map_err(|e| PasskeyError::KeyDerivation(e.to_string()))?;
     prf_bytes.zeroize();
 
@@ -256,7 +259,9 @@ pub async fn authenticate_passkey(pubkey: Option<&str>) -> Result<PasskeyAuthRes
     }
     prf_bytes.copy_from_slice(&prf_output[..32]);
 
-    let keypair = nostr_bbs_core::derive_from_prf(&prf_bytes)
+    // Same derivation salt as register (the server-bound prfSalt) — this is what
+    // makes login reproduce the registered identity under the Podkey §3 scheme.
+    let keypair = nostr_bbs_core::derive_from_prf(&prf_bytes, prf_salt_b64.as_bytes())
         .map_err(|e| PasskeyError::KeyDerivation(e.to_string()))?;
     prf_bytes.zeroize();
 

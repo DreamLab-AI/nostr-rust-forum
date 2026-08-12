@@ -8,8 +8,11 @@ use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// HKDF info string — must match the JavaScript implementation in passkey.ts
-const HKDF_INFO: &[u8] = b"nostr-secp256k1-v1";
+/// HKDF info prefix for the derived-identity path — must match the Podkey
+/// Passkey Identity Specification §3 (`podkey/nostr-secret/v1`), which is the
+/// cross-implementation key-derivation contract. A single counter byte is
+/// appended to this prefix (see [`derive_from_prf`]).
+const HKDF_INFO: &[u8] = b"podkey/nostr-secret/v1";
 
 // ── Error ───────────────────────────────────────────────────────────────────
 
@@ -177,28 +180,40 @@ pub fn signing_key_from_bytes(secret_key: &[u8; 32]) -> Result<SigningKey, KeyEr
 
 // ── Key derivation ──────────────────────────────────────────────────────────
 
-/// Derive a Nostr keypair from WebAuthn PRF output using HKDF-SHA-256.
+/// Derive a Nostr keypair from a WebAuthn PRF output using HKDF-SHA-256, per the
+/// Podkey Passkey Identity Specification §3 (the cross-implementation contract).
 ///
-/// Matches the JavaScript implementation in `passkey.ts`:
-/// ```js
-/// crypto.subtle.deriveBits({
-///   name: 'HKDF', hash: 'SHA-256',
-///   salt: new Uint8Array(0),
-///   info: new TextEncoder().encode('nostr-secp256k1-v1'),
-/// }, keyMaterial, 256)
-/// ```
-pub fn derive_from_prf(prf_output: &[u8; 32]) -> Result<Keypair, KeyError> {
-    let hk = Hkdf::<Sha256>::new(Some(&[]), prf_output);
-    let mut okm = [0u8; 32];
-    hk.expand(HKDF_INFO, &mut okm)
-        .map_err(|_| KeyError::HkdfExpandFailed)?;
+/// `derivation_salt` is a client-generated, client-stored 32-byte value (the
+/// HKDF salt); it is not secret but is availability-critical, and it is owned by
+/// the client — the server never mints or stores it. For each `counter` in
+/// `0..=255` the candidate is `HKDF-SHA-256(ikm = prf_output, salt =
+/// derivation_salt, info = "podkey/nostr-secret/v1" || counter, length = 32)`;
+/// the first candidate that is a valid secp256k1 scalar is the secret key. The
+/// loop makes derivation total and deterministic across implementations.
+///
+/// Matches Podkey's `deriveNostrKey` byte-for-byte (see the spec's §3.1 vector,
+/// exercised by `derive_from_prf_matches_podkey_vector`).
+pub fn derive_from_prf(prf_output: &[u8; 32], derivation_salt: &[u8]) -> Result<Keypair, KeyError> {
+    let hk = Hkdf::<Sha256>::new(Some(derivation_salt), prf_output);
+    let mut info = [0u8; HKDF_INFO.len() + 1];
+    info[..HKDF_INFO.len()].copy_from_slice(HKDF_INFO);
 
-    let secret = SecretKey::from_bytes(okm)?;
-    let public = secret.public_key();
-    // Zeroize the intermediate buffer
-    okm.zeroize();
-
-    Ok(Keypair { secret, public })
+    for counter in 0u16..=255 {
+        info[HKDF_INFO.len()] = counter as u8;
+        let mut okm = [0u8; 32];
+        hk.expand(&info, &mut okm)
+            .map_err(|_| KeyError::HkdfExpandFailed)?;
+        match SecretKey::from_bytes(okm) {
+            Ok(secret) => {
+                okm.zeroize();
+                let public = secret.public_key();
+                return Ok(Keypair { secret, public });
+            }
+            // Negligible invalid-scalar case: advance the counter deterministically.
+            Err(_) => okm.zeroize(),
+        }
+    }
+    Err(KeyError::InvalidSecretKey)
 }
 
 /// Derive a deterministic, purpose-scoped child secret key from a root secret key.
@@ -274,39 +289,47 @@ mod tests {
     use super::*;
 
     /// Compute HKDF-SHA256(salt=empty, ikm, info="nostr-secp256k1-v1") in pure Rust
-    /// to create a known test vector.
-    fn hkdf_derive(ikm: &[u8; 32]) -> [u8; 32] {
-        let hk = Hkdf::<Sha256>::new(Some(&[]), ikm);
-        let mut out = [0u8; 32];
-        hk.expand(b"nostr-secp256k1-v1", &mut out).unwrap();
-        out
-    }
-
+    /// Podkey Passkey Identity Specification §3.1 test vector — the shared
+    /// cross-implementation contract. prf = 0x07*32, derivationSalt = 0x0b*32.
     #[test]
-    fn derive_from_prf_produces_expected_key() {
-        let prf_input = [0x01u8; 32];
-        let expected_secret = hkdf_derive(&prf_input);
-
-        let kp = derive_from_prf(&prf_input).unwrap();
-        assert_eq!(kp.secret.as_bytes(), &expected_secret);
-
-        let pk = kp.secret.public_key();
-        assert_eq!(pk, kp.public);
+    fn derive_from_prf_matches_podkey_vector() {
+        let prf = [0x07u8; 32];
+        let salt = [0x0bu8; 32];
+        let kp = derive_from_prf(&prf, &salt).unwrap();
+        assert_eq!(
+            hex::encode(kp.secret.as_bytes()),
+            "35b9688c42b950406cd91257e11a2f8a76c61ef7b59dcdbe85250e06896582b9"
+        );
+        assert_eq!(
+            kp.public.to_hex(),
+            "a71f3a2f075fdfe99d801dc0658a4bcf2acf8fdf832be28ee2c64dada773eda8"
+        );
     }
 
     #[test]
     fn derive_from_prf_deterministic() {
         let prf = [0xABu8; 32];
-        let kp1 = derive_from_prf(&prf).unwrap();
-        let kp2 = derive_from_prf(&prf).unwrap();
+        let salt = [0x11u8; 32];
+        let kp1 = derive_from_prf(&prf, &salt).unwrap();
+        let kp2 = derive_from_prf(&prf, &salt).unwrap();
         assert_eq!(kp1.secret.as_bytes(), kp2.secret.as_bytes());
         assert_eq!(kp1.public, kp2.public);
     }
 
     #[test]
+    fn derive_from_prf_salt_separates_identities() {
+        let prf = [0x07u8; 32];
+        let kp1 = derive_from_prf(&prf, &[0x01u8; 32]).unwrap();
+        let kp2 = derive_from_prf(&prf, &[0x02u8; 32]).unwrap();
+        assert_ne!(kp1.secret.as_bytes(), kp2.secret.as_bytes());
+        assert_ne!(kp1.public, kp2.public);
+    }
+
+    #[test]
     fn derive_from_prf_different_inputs_differ() {
-        let kp1 = derive_from_prf(&[0x01u8; 32]).unwrap();
-        let kp2 = derive_from_prf(&[0x02u8; 32]).unwrap();
+        let salt = [0x0bu8; 32];
+        let kp1 = derive_from_prf(&[0x01u8; 32], &salt).unwrap();
+        let kp2 = derive_from_prf(&[0x02u8; 32], &salt).unwrap();
         assert_ne!(kp1.secret.as_bytes(), kp2.secret.as_bytes());
         assert_ne!(kp1.public, kp2.public);
     }
@@ -324,7 +347,7 @@ mod tests {
 
     #[test]
     fn sign_verify_with_derived_keypair() {
-        let kp = derive_from_prf(&[0xFFu8; 32]).unwrap();
+        let kp = derive_from_prf(&[0xFFu8; 32], &[0x0bu8; 32]).unwrap();
         let msg = [0x42u8; 32];
         let sig = kp.secret.sign(&msg).unwrap();
         kp.public.verify(&msg, &sig).unwrap();

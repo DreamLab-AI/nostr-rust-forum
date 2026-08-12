@@ -170,10 +170,13 @@ pub(crate) fn require_prf_32(prf_output: &[u8]) -> Result<[u8; 32], PasskeyError
 /// identical to the forum's derivation (HKDF-SHA-256, info `"nostr-secp256k1-v1"`
 /// inside [`nostr_bbs_core::derive_from_prf`]). The transient 32-byte PRF buffer
 /// is zeroized before returning.
-pub(crate) fn derive_keypair_from_prf_output(prf_output: &[u8]) -> Result<Keypair, PasskeyError> {
+pub(crate) fn derive_keypair_from_prf_output(
+    prf_output: &[u8],
+    derivation_salt: &[u8],
+) -> Result<Keypair, PasskeyError> {
     use zeroize::Zeroize;
     let mut prf_bytes = require_prf_32(prf_output)?;
-    let keypair = nostr_bbs_core::derive_from_prf(&prf_bytes)
+    let keypair = nostr_bbs_core::derive_from_prf(&prf_bytes, derivation_salt)
         .map_err(|e| PasskeyError::KeyDerivation(e.to_string()));
     prf_bytes.zeroize();
     keypair
@@ -343,7 +346,7 @@ pub async fn passkey_register(display_name: &str) -> Result<PasskeyOutcome, Pass
     let credential = create_credential(&options, &prf_salt_b64).await?;
 
     let prf_output = extract_prf_output(&credential, true)?;
-    let keypair = derive_keypair_from_prf_output(&prf_output)?;
+    let keypair = derive_keypair_from_prf_output(&prf_output, prf_salt_b64.as_bytes())?;
     let pubkey = keypair.public.to_hex();
 
     let encoded = encode_attestation_response(&credential)?;
@@ -381,7 +384,7 @@ pub async fn passkey_authenticate(pubkey: &str) -> Result<PasskeyOutcome, Passke
     check_hybrid_transport(&assertion)?;
 
     let prf_output = extract_prf_output(&assertion, false)?;
-    let keypair = derive_keypair_from_prf_output(&prf_output)?;
+    let keypair = derive_keypair_from_prf_output(&prf_output, prf_salt_b64.as_bytes())?;
     let derived_pubkey = keypair.public.to_hex();
 
     let encoded = encode_assertion_response(&assertion)?;
@@ -1059,13 +1062,14 @@ mod tests {
 
     #[test]
     fn derive_keypair_is_deterministic() {
-        // Same PRF output → same identity (the whole point of PRF-derived keys).
+        // Same PRF output + salt → same identity (the whole point of PRF-derived keys).
         let prf = [7u8; 32];
-        let a = derive_keypair_from_prf_output(&prf).expect("derive a");
-        let b = derive_keypair_from_prf_output(&prf).expect("derive b");
+        let salt = b"salt-b64";
+        let a = derive_keypair_from_prf_output(&prf, salt).expect("derive a");
+        let b = derive_keypair_from_prf_output(&prf, salt).expect("derive b");
         assert_eq!(a.public.to_hex(), b.public.to_hex());
         // Different PRF output → different identity.
-        let c = derive_keypair_from_prf_output(&[9u8; 32]).expect("derive c");
+        let c = derive_keypair_from_prf_output(&[9u8; 32], salt).expect("derive c");
         assert_ne!(a.public.to_hex(), c.public.to_hex());
     }
 
@@ -1074,15 +1078,16 @@ mod tests {
         // Our wrapper must produce byte-identical output to the kit's canonical
         // derivation the forum client uses — same passkey ⇒ same key everywhere.
         let prf = [42u8; 32];
-        let ours = derive_keypair_from_prf_output(&prf).expect("ours");
-        let canonical = nostr_bbs_core::derive_from_prf(&prf).expect("core");
+        let salt = b"salt-b64";
+        let ours = derive_keypair_from_prf_output(&prf, salt).expect("ours");
+        let canonical = nostr_bbs_core::derive_from_prf(&prf, salt).expect("core");
         assert_eq!(ours.public.to_hex(), canonical.public.to_hex());
         assert_eq!(ours.secret.as_bytes(), canonical.secret.as_bytes());
     }
 
     #[test]
     fn derive_keypair_rejects_short_prf() {
-        assert!(derive_keypair_from_prf_output(&[0u8; 16]).is_err());
+        assert!(derive_keypair_from_prf_output(&[0u8; 16], b"salt").is_err());
     }
 
     #[test]
