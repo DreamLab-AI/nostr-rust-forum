@@ -483,6 +483,21 @@ pub fn BoardPage() -> impl IntoView {
                     <div class="flex items-center justify-between flex-wrap gap-3 mt-4 mb-6">
                         <h1 class="text-2xl sm:text-3xl font-bold candy-gradient">
                             {move || format!("{} — Task board", zone_label.get())}
+                            // The active board's name — otherwise a single
+                            // board's title is invisible (the picker only
+                            // mounts with two or more boards), and a board
+                            // created with a task-like name looks lost.
+                            {move || {
+                                active_board
+                                    .get()
+                                    .map(|b| {
+                                        view! {
+                                            <span class="block text-sm font-normal text-gray-400 mt-1">
+                                                {b.title}
+                                            </span>
+                                        }
+                                    })
+                            }}
                         </h1>
                         <div class="flex items-center gap-2">
                             <Show when=move || { boards.get().len() > 1 }>
@@ -677,6 +692,13 @@ pub fn BoardPage() -> impl IntoView {
                                             zone_id=zid
                                             on_close=Callback::new(move |()| {
                                                 show_create_board.set(false)
+                                            })
+                                            on_created=Callback::new(move |()| {
+                                                // Guide straight into card
+                                                // creation: the + Card form
+                                                // mounts as soon as the new
+                                                // board arrives from the relay.
+                                                show_create_card.set(true)
                                             })
                                         />
                                     }
@@ -1320,7 +1342,11 @@ fn CardView(
 // -- Create board form ---------------------------------------------------------------
 
 #[component]
-fn CreateBoardForm(zone_id: String, on_close: Callback<()>) -> impl IntoView {
+fn CreateBoardForm(
+    zone_id: String,
+    on_close: Callback<()>,
+    on_created: Callback<()>,
+) -> impl IntoView {
     let auth = use_auth();
     let toasts = use_toasts();
     let relay = expect_context::<RelayConnection>();
@@ -1367,6 +1393,7 @@ fn CreateBoardForm(zone_id: String, on_close: Callback<()>) -> impl IntoView {
             {
                 Ok(event) => {
                     publish_with_toast(&relay, toasts, &event, "Board created");
+                    on_created.run(());
                     // `on_close` unmounts this form and disposes its signals —
                     // do NOT touch `submitting` after this, even via try_set:
                     // the write re-notifies the disposed `disabled` effect and
@@ -1388,7 +1415,7 @@ fn CreateBoardForm(zone_id: String, on_close: Callback<()>) -> impl IntoView {
             <input
                 type="text"
                 maxlength="80"
-                placeholder="Board title"
+                placeholder="Board name (e.g. Sprint board) — you add task cards next"
                 prop:value=move || title.get()
                 on:input=move |ev| title.set(event_target_value(&ev))
                 class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 za-focus"
@@ -1402,7 +1429,7 @@ fn CreateBoardForm(zone_id: String, on_close: Callback<()>) -> impl IntoView {
                 "\"Done\" requires admin approval (decision broker)"
             </label>
             <p class="text-xs text-gray-500">
-                "Starts with To do / Doing / Done columns. Anyone with write access to this zone can add and move cards."
+                "This names the BOARD, not a task. It starts with To do / Doing / Done columns; the card form opens right after so you can add your first task."
             </p>
             <div class="flex gap-2">
                 <button
