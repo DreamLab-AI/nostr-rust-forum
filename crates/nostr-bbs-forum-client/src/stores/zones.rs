@@ -116,6 +116,11 @@ pub struct Zone {
     /// client rendering concern).
     #[serde(default)]
     pub section_order: Vec<String>,
+    /// Whether this zone offers the collaborative kanban task board
+    /// (`[[zones]] kanban = true`). Pure UX flag — the relay gates the board
+    /// kinds by zone tag regardless.
+    #[serde(default)]
+    pub kanban: bool,
 }
 
 impl Zone {
@@ -329,6 +334,7 @@ fn fallback_zones() -> Vec<Zone> {
             encrypted: false,
             accent_hex: None,
             section_order: Vec::new(),
+            kanban: false,
         },
         Zone {
             id: "friends".to_string(),
@@ -341,6 +347,7 @@ fn fallback_zones() -> Vec<Zone> {
             encrypted: false,
             accent_hex: None,
             section_order: Vec::new(),
+            kanban: false,
         },
         Zone {
             id: "family".to_string(),
@@ -353,6 +360,7 @@ fn fallback_zones() -> Vec<Zone> {
             encrypted: true,
             accent_hex: None,
             section_order: Vec::new(),
+            kanban: false,
         },
         Zone {
             id: "business".to_string(),
@@ -365,6 +373,7 @@ fn fallback_zones() -> Vec<Zone> {
             encrypted: false,
             accent_hex: None,
             section_order: Vec::new(),
+            kanban: false,
         },
     ]
 }
@@ -419,6 +428,7 @@ mod tests {
             encrypted: false,
             accent_hex: None,
             section_order: Vec::new(),
+            kanban: false,
         }
     }
 

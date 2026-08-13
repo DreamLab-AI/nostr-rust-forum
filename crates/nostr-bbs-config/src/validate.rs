@@ -701,6 +701,7 @@ operator = "tier-2"
             visibility: ZoneVisibility::Public,
             encrypted: false,
             auto_approve: false,
+            kanban: false,
         }];
         assert!(validate_config(&cfg).is_ok());
     }
@@ -719,6 +720,7 @@ operator = "tier-2"
             visibility: ZoneVisibility::Public,
             encrypted: false,
             auto_approve: false,
+            kanban: false,
         }];
         assert!(validate_config(&cfg).is_err());
     }
@@ -737,6 +739,7 @@ operator = "tier-2"
             visibility: ZoneVisibility::Public,
             encrypted: false,
             auto_approve: false,
+            kanban: false,
         }
     }
 

@@ -11,6 +11,7 @@ mod login;
 mod signup;
 
 // -- New pages (v3.0 feature parity) -----------------------------------------
+mod board;
 mod category;
 mod events;
 mod forums;
@@ -27,6 +28,7 @@ mod thread;
 
 // -- Re-exports ---------------------------------------------------------------
 pub use admin::AdminPage;
+pub use board::BoardPage;
 pub use category::CategoryPage;
 pub use channel::ChannelPage;
 pub use connect::ConnectPage;

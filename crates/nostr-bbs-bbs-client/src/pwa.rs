@@ -548,6 +548,7 @@ mod tests {
             visibility: Default::default(),
             encrypted: false,
             auto_approve: false,
+            kanban: false,
         }
     }
 

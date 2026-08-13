@@ -25,6 +25,7 @@
 //! tile rendered fine, and "New Topic" minted a *channel* instead of a thread.
 
 use leptos::prelude::*;
+use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 use std::rc::Rc;
 
@@ -284,6 +285,33 @@ pub fn CategoryPage() -> impl IntoView {
             // members (zone-first nav, ADR-107) — who never see the /forums index
             // — still meet it.
             {crate::components::bbs_sash::bbs_switch_sash()}
+
+            // Zone task board entry (kanban = true zones only). Rendered under
+            // the hero so it is discoverable from the zone landing itself.
+            {move || {
+                let slug = category_slug();
+                let zs = load_zones();
+                let has_board = crate::stores::zones::resolve_zone_param(&slug, &zs)
+                    .map(|z| z.kanban)
+                    .unwrap_or(false);
+                has_board.then(|| {
+                    view! {
+                        <div class="mb-4">
+                            <A
+                                href=base_href(&format!("/forums/{slug}/board"))
+                                attr:class="inline-flex items-center gap-2 text-sm font-semibold text-amber-400 hover:text-amber-300 bg-amber-500/10 hover:bg-amber-500/15 border border-amber-500/30 rounded-lg px-4 py-2 transition-colors"
+                            >
+                                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="3" y="3" width="5" height="18" rx="1"/>
+                                    <rect x="10" y="3" width="5" height="12" rx="1"/>
+                                    <rect x="17" y="3" width="5" height="8" rx="1"/>
+                                </svg>
+                                "Task board"
+                            </A>
+                        </div>
+                    }
+                })
+            }}
 
             // Zone-first breadcrumb (ADR-107): single-locked-zone members drop
             // the global "Forums" crumb (their landing IS the zone); everyone

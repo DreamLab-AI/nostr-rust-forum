@@ -119,6 +119,15 @@ struct RelayInner {
     /// Whether a delayed drain is already scheduled (avoids timer pile-up).
     drain_scheduled: bool,
     relay_url: String,
+    /// Per-subscription dedup of delivered events, keyed `"{sub_id}:{event_id}"`.
+    ///
+    /// The relay sends one EVENT frame per MATCHING SUBSCRIPTION, so the same
+    /// event legitimately arrives once per overlapping sub. Deduping on the
+    /// bare event id let whichever subscription's frame arrived first STARVE
+    /// every other subscription of that event (e.g. an app-level governance
+    /// subscription swallowing kind-31403 decisions a page-level board
+    /// subscription also needs). Scoping the key to the subscription keeps the
+    /// replay/reconnect dedup while delivering each event to every sub once.
     seen_events: HashSet<String>,
     auth_signer: Option<AuthSignCallback>,
     auth_signer_async: Option<AuthSignAsyncCallback>,
@@ -670,7 +679,7 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
 
             {
                 let mut inner = inner_rc.borrow_mut();
-                if !inner.seen_events.insert(event.id.clone()) {
+                if !inner.seen_events.insert(format!("{sub_id}:{}", event.id)) {
                     return;
                 }
                 if inner.seen_events.len() > 10_000 {
