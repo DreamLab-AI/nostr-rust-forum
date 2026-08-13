@@ -148,6 +148,79 @@ fn spawn_move(
     });
 }
 
+/// Render a card description with minimal bullet-list support: consecutive
+/// lines starting with `- ` or `* ` become a `<ul>`, everything else renders
+/// as paragraphs. Text-only (Leptos escapes by default) — no inline HTML.
+fn render_description(text: &str) -> impl IntoView {
+    enum Block {
+        Para(String),
+        List(Vec<String>),
+    }
+    let mut blocks: Vec<Block> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let bullet = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "));
+        match bullet {
+            Some(item) => match blocks.last_mut() {
+                Some(Block::List(items)) => items.push(item.to_string()),
+                _ => blocks.push(Block::List(vec![item.to_string()])),
+            },
+            None => {
+                if !line.trim().is_empty() {
+                    blocks.push(Block::Para(line.to_string()));
+                }
+            }
+        }
+    }
+    blocks
+        .into_iter()
+        .map(|b| match b {
+            Block::Para(t) => view! {
+                <p class="text-xs text-gray-300 whitespace-pre-wrap">{t}</p>
+            }
+            .into_any(),
+            Block::List(items) => view! {
+                <ul class="text-xs text-gray-300 list-disc pl-4 space-y-0.5">
+                    {items
+                        .into_iter()
+                        .map(|i| view! { <li>{i}</li> })
+                        .collect_view()}
+                </ul>
+            }
+            .into_any(),
+        })
+        .collect_view()
+}
+
+/// Unix seconds -> `datetime-local` input value (`YYYY-MM-DDTHH:MM`, local time).
+fn due_to_input_value(ts: u64) -> String {
+    let d = js_sys::Date::new_0();
+    d.set_time((ts as f64) * 1000.0);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}",
+        d.get_full_year(),
+        d.get_month() + 1,
+        d.get_date(),
+        d.get_hours(),
+        d.get_minutes()
+    )
+}
+
+/// `datetime-local` input value -> unix seconds (None when empty/invalid).
+fn input_value_to_due(raw: &str) -> Option<u64> {
+    if raw.is_empty() {
+        return None;
+    }
+    let ms = js_sys::Date::new(&wasm_bindgen::JsValue::from_str(raw)).get_time();
+    if ms.is_nan() {
+        None
+    } else {
+        Some((ms / 1000.0) as u64)
+    }
+}
+
 /// Rebuild a [`CardInput`] from an existing card version, preserving identity.
 fn input_from(card: &KanbanCard) -> CardInput {
     CardInput {
@@ -161,6 +234,7 @@ fn input_from(card: &KanbanCard) -> CardInput {
         due: card.due,
         zone: card.zone.clone(),
         pending_move: card.pending_move.clone(),
+        deleted: card.deleted,
     }
 }
 
@@ -358,12 +432,15 @@ pub fn BoardPage() -> impl IntoView {
             return Vec::new();
         };
         let coord = board.coord();
-        fold_cards(
+        let mut cards = fold_cards(
             card_versions
                 .get()
                 .into_iter()
                 .filter(|c| c.board == coord),
-        )
+        );
+        // Deletion tombstones win the fold (newest version), then hide here.
+        cards.retain(|c| !c.deleted);
+        cards
     });
 
     // -- View --------------------------------------------------------------------
@@ -649,6 +726,14 @@ fn CardView(
     let expanded = RwSignal::new(false);
     let show_dispatch = RwSignal::new(false);
     let agent_input = RwSignal::new(String::new());
+    // Inline edit form state, pre-filled from this card version.
+    let editing = RwSignal::new(false);
+    let edit_title = RwSignal::new(card.title.clone());
+    let edit_desc = RwSignal::new(card.description.clone());
+    let edit_due = RwSignal::new(card.due.map(due_to_input_value).unwrap_or_default());
+    // Two-step delete confirmation.
+    let del_confirm = RwSignal::new(false);
+    let assignee_input = RwSignal::new(String::new());
 
     let title = card.title.clone();
     let description = card.description.clone();
@@ -685,6 +770,11 @@ fn CardView(
             });
         }
     };
+
+    // Copy-able handle so nested Show children (edit form, delete confirm,
+    // assignee rows) capture an arena key instead of moving the closure.
+    let publish_card_sv = StoredValue::new_local(publish_card.clone());
+    let card_sv = StoredValue::new_local(card.clone());
 
     // Move: approval-gated targets raise a 31402 and mark the card pending
     // (admins move directly). Shared logic with column drag-and-drop.
@@ -912,13 +1002,69 @@ fn CardView(
             <Show when=move || expanded.get()>
                 <div class="mt-2 pt-2 border-t border-gray-700/50 space-y-2">
                     {(!description.is_empty())
-                        .then(|| {
-                            view! {
-                                <p class="text-xs text-gray-300 whitespace-pre-wrap">
-                                    {description.clone()}
-                                </p>
+                        .then(|| render_description(&description))}
+
+                    // Assignees: chips with remove, plus an add-by-pubkey row.
+                    <div class="flex items-center gap-1.5 flex-wrap">
+                        <span class="text-[11px] text-gray-500">"Assignees:"</span>
+                        {card
+                            .assignees
+                            .iter()
+                            .map(|pk| {
+                                let pk_full = pk.clone();
+                                let short = format!("{}…{}", &pk[..6], &pk[pk.len() - 4..]);
+                                view! {
+                                    <span class="inline-flex items-center gap-1 text-[11px] text-gray-300 bg-gray-800 rounded-full px-2 py-0.5">
+                                        {short}
+                                        <button
+                                            class="text-gray-500 hover:text-red-400"
+                                            title="Remove assignee"
+                                            on:click=move |_| {
+                                                let card = card_sv.get_value();
+                                                let mut input = input_from(&card);
+                                                input.assignees.retain(|a| *a != pk_full);
+                                                publish_card_sv
+                                                    .with_value(|p| p(input, "Assignee removed"));
+                                            }
+                                        >
+                                            {"\u{00d7}"}
+                                        </button>
+                                    </span>
+                                }
+                            })
+                            .collect_view()}
+                        <input
+                            type="text"
+                            placeholder="Add pubkey (hex)"
+                            prop:value=move || assignee_input.get()
+                            on:input=move |ev| assignee_input.set(event_target_value(&ev))
+                            class="w-36 bg-gray-900 border border-gray-600 rounded px-2 py-0.5 text-[11px] text-white placeholder-gray-500 za-focus"
+                        />
+                        <button
+                            class="text-[11px] text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 rounded px-2 py-0.5"
+                            on:click=move |_| {
+                                let pk = assignee_input.get_untracked().trim().to_string();
+                                if pk.len() != 64 || hex::decode(&pk).is_err() {
+                                    toasts.show(
+                                        "Assignee must be a 64-hex pubkey",
+                                        ToastVariant::Error,
+                                    );
+                                    return;
+                                }
+                                let card = card_sv.get_value();
+                                if card.assignees.contains(&pk) {
+                                    toasts.show("Already assigned", ToastVariant::Info);
+                                    return;
+                                }
+                                let mut input = input_from(&card);
+                                input.assignees.push(pk);
+                                publish_card_sv.with_value(|p| p(input, "Assignee added"));
+                                assignee_input.set(String::new());
                             }
-                        })}
+                        >
+                            "Add"
+                        </button>
+                    </div>
 
                     // Pending decision row
                     {match (pending_state, request_id.clone(), pending_target.clone()) {
@@ -1030,7 +1176,99 @@ fn CardView(
                         >
                             "Send to agent"
                         </button>
+                        <button
+                            class="text-[11px] text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 rounded px-2 py-1"
+                            on:click=move |_| editing.update(|e| *e = !*e)
+                        >
+                            "Edit"
+                        </button>
+                        {move || {
+                            if del_confirm.get() {
+                                view! {
+                                    <button
+                                        class="text-[11px] bg-red-600 hover:bg-red-500 text-white rounded px-2 py-1"
+                                        on:click=move |_| {
+                                            let card = card_sv.get_value();
+                                            let mut input = input_from(&card);
+                                            input.deleted = true;
+                                            input.pending_move = None;
+                                            publish_card_sv
+                                                .with_value(|p| p(input, "Card deleted"));
+                                        }
+                                    >
+                                        "Confirm delete"
+                                    </button>
+                                }
+                                    .into_any()
+                            } else {
+                                view! {
+                                    <button
+                                        class="text-[11px] text-red-400 hover:text-red-300 bg-gray-800 hover:bg-gray-700 rounded px-2 py-1"
+                                        on:click=move |_| del_confirm.set(true)
+                                    >
+                                        "Delete"
+                                    </button>
+                                }
+                                    .into_any()
+                            }
+                        }}
                     </div>
+
+                    // Inline edit form (title / description / due date).
+                    <Show when=move || editing.get()>
+                        <div class="space-y-1.5 bg-gray-900/60 border border-gray-700/60 rounded-lg p-2">
+                            <input
+                                type="text"
+                                maxlength="120"
+                                prop:value=move || edit_title.get()
+                                on:input=move |ev| edit_title.set(event_target_value(&ev))
+                                class="w-full bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-white za-focus"
+                            />
+                            <textarea
+                                placeholder="Description — lines starting with \"- \" render as bullets"
+                                prop:value=move || edit_desc.get()
+                                on:input=move |ev| edit_desc.set(event_target_value(&ev))
+                                class="w-full bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-white placeholder-gray-500 za-focus h-16"
+                            ></textarea>
+                            <input
+                                type="datetime-local"
+                                prop:value=move || edit_due.get()
+                                on:input=move |ev| edit_due.set(event_target_value(&ev))
+                                class="w-full bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-white za-focus"
+                            />
+                            <div class="flex gap-1.5">
+                                <button
+                                    class="text-[11px] bg-amber-500 hover:bg-amber-400 text-gray-900 font-semibold rounded px-2 py-1"
+                                    on:click=move |_| {
+                                        let t = edit_title.get_untracked().trim().to_string();
+                                        if t.is_empty() {
+                                            toasts.show(
+                                                "Card needs a title",
+                                                ToastVariant::Error,
+                                            );
+                                            return;
+                                        }
+                                        let card = card_sv.get_value();
+                                        let mut input = input_from(&card);
+                                        input.title = t;
+                                        input.description = edit_desc.get_untracked();
+                                        input.due =
+                                            input_value_to_due(&edit_due.get_untracked());
+                                        publish_card_sv.with_value(|p| p(input, "Card updated"));
+                                        editing.set(false);
+                                    }
+                                >
+                                    "Save"
+                                </button>
+                                <button
+                                    class="text-[11px] text-gray-400 hover:text-white px-2 py-1"
+                                    on:click=move |_| editing.set(false)
+                                >
+                                    "Cancel"
+                                </button>
+                            </div>
+                        </div>
+                    </Show>
 
                     // Agent dispatch inline row. Wrapped in an interpolation
                     // block so the nested Show's children closure captures a
@@ -1240,6 +1478,7 @@ fn CreateCardForm(board: KanbanBoard, on_close: Callback<()>) -> impl IntoView {
             due,
             zone: zone.clone(),
             pending_move: None,
+            deleted: false,
         };
         let relay = relay.clone();
         wasm_bindgen_futures::spawn_local(async move {

@@ -78,6 +78,12 @@ pub const RANK_TAG: &str = "rank";
 pub const DUE_TAG: &str = "due";
 /// Repo-local pending move: `["pending_move", "<target-col>", "<31402-event-id>"]`.
 pub const PENDING_MOVE_TAG: &str = "pending_move";
+/// Repo-local deletion tombstone: `["deleted", "1"]`. Under the multi-author
+/// fold a kind-5 deletion only removes ONE author's replaceable row (the key
+/// includes the pubkey), so an older sibling version would resurface; a
+/// tombstone republish IS the newest version for every viewer and hides the
+/// card everywhere while preserving the audit trail.
+pub const DELETED_TAG: &str = "deleted";
 
 // -- Errors ---------------------------------------------------------------------
 
@@ -286,6 +292,9 @@ pub struct KanbanCard {
     pub zone: Option<String>,
     /// Pending approval-gated move: `(target column, 31402 request event id)`.
     pub pending_move: Option<(String, String)>,
+    /// Deletion tombstone — the card is hidden from boards but the version
+    /// history remains foldable.
+    pub deleted: bool,
     /// Version timestamp.
     pub created_at: u64,
 }
@@ -335,6 +344,7 @@ impl KanbanCard {
             due: tag_value(event, DUE_TAG).and_then(|v| v.parse().ok()),
             zone: read_zone_tag(event).map(str::to_string),
             pending_move,
+            deleted: tag_value(event, DELETED_TAG).is_some(),
             created_at: event.created_at,
         })
     }
@@ -389,6 +399,8 @@ pub struct CardInput {
     pub zone: Option<String>,
     /// Pending approval-gated move `(target column, 31402 event id)`.
     pub pending_move: Option<(String, String)>,
+    /// Publish this version as a deletion tombstone.
+    pub deleted: bool,
 }
 
 fn board_tags(
@@ -531,6 +543,9 @@ fn card_tags(input: &CardInput, d_tag: String) -> Vec<Vec<String>> {
     }
     if let Some((col, req)) = &input.pending_move {
         tags.push(vec![PENDING_MOVE_TAG.to_string(), col.clone(), req.clone()]);
+    }
+    if input.deleted {
+        tags.push(vec![DELETED_TAG.to_string(), "1".to_string()]);
     }
     if let Some(z) = &input.zone {
         tags.push(vec![crate::calendar::ZONE_TAG.to_string(), z.clone()]);
@@ -941,6 +956,7 @@ mod tests {
                 due: Some(1_800_000_000),
                 zone: board.zone.clone(),
                 pending_move: None,
+                deleted: false,
             },
         )
         .unwrap()
@@ -1154,6 +1170,43 @@ mod tests {
             assert_eq!(body["title"], "Fix the gate");
             assert_eq!(body["instructions"], "please fix");
         });
+    }
+
+    #[test]
+    fn deletion_tombstone_roundtrip_and_fold() {
+        let board = KanbanBoard::from_event(&make_board()).unwrap();
+        let live = KanbanCard::from_event(&make_card(&board, None, "todo", 10)).unwrap();
+        assert!(!live.deleted);
+
+        // Republish as a tombstone (any zone member may, per the fold model).
+        let tomb_event = create_card(
+            &test_key(),
+            &CardInput {
+                d_tag: Some(live.d_tag.clone()),
+                board: live.board.clone(),
+                title: live.title.clone(),
+                description: live.description.clone(),
+                column: live.column.clone(),
+                rank: live.rank,
+                assignees: live.assignees.clone(),
+                due: live.due,
+                zone: live.zone.clone(),
+                pending_move: None,
+                deleted: true,
+            },
+        )
+        .unwrap();
+        let mut tomb = KanbanCard::from_event(&tomb_event).unwrap();
+        assert!(tomb.deleted);
+
+        // The tombstone is the NEWEST version, so the fold surfaces it (the
+        // client then hides deleted cards) — an older live sibling must not win.
+        tomb.created_at = live.created_at + 10;
+        let folded = fold_cards(vec![live.clone(), tomb.clone()]);
+        assert_eq!(folded.len(), 1);
+        assert!(folded[0].deleted);
+        let folded_rev = fold_cards(vec![tomb, live]);
+        assert!(folded_rev[0].deleted);
     }
 
     #[test]
