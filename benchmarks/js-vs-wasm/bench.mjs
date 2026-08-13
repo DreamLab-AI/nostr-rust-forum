@@ -174,7 +174,7 @@ async function runAll() {
   }, 1000);
 
   const wasmHkdf = benchmark(() => {
-    const kp = derive_keypair_from_prf(PRF_OUTPUT);
+    const kp = derive_keypair_from_prf(PRF_OUTPUT, new Uint8Array(32).fill(11));
     return kp.publicKey;
   }, 1000);
 
