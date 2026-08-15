@@ -163,13 +163,37 @@ kinds_lo = 30910
 kinds_hi = 30916
 
 
-# ─── Federation mesh ─────────────────────────────────────────────────────────
-# OPTIONAL. Cross-relay federation. `mode`:
+# ─── Federation mesh (PRD-010 DID:Nostr Mesh Federation) ─────────────────────
+# OPTIONAL. Cross-relay federation. Defaults preserve current behaviour
+# (standalone); flip `mode` to federate — no recompile. `mode`:
 #   "standalone" — no federation (default; recommended to start).
-#   "federated"  — relay exposed externally; accepts/peers with other relays.
+#   "federated"  — this relay is exposed externally and peers with the relays
+#                  listed in `peer_relays`; accepted events of a federated kind
+#                  by a federated pubkey are fanned out to peers.
+#   "client"     — this node runs no relay; it speaks to a single upstream
+#                  relay given by `client_relay` (or the first `peer_relays`).
 [mesh]
 mode        = "standalone"
 peer_relays = []                                       # e.g. ["wss://peer.example.org"]
+
+# Event kinds eligible for cross-relay fan-out (PRD-010 F11). Default below is
+# kind-14 rumor, kind-1059 gift-wrap, kind-30033 mesh service-list, and the
+# 30910–30916 moderation range. Bounds the federation blast radius.
+federated_kinds = [14, 1059, 30033, 30910, 30911, 30912, 30913, 30914, 30915, 30916]
+
+# Local actor pubkeys (hex) whose events federate. Empty = all local actors.
+federated_pubkeys = []
+
+# Trust-root DIDs whose ban/mute actions are honoured locally (opt-in per relay).
+honor_remote_moderation = []
+
+# Remote peer DIDs whose inbound events are accepted.
+allowed_remote_dids = []
+
+# Require a NIP-26 delegation on any cross-system re-attribution (recommended).
+delegation_required = true
+
+# client_relay = "wss://hub.example.org"   # required only when mode = "client"
 
 
 # ─── Rate limits (per-route) ─────────────────────────────────────────────────

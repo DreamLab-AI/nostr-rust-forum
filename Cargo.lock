@@ -2217,11 +2217,14 @@ name = "nostr-bbs-mesh"
 version = "1.0.0-beta.8"
 dependencies = [
  "async-trait",
+ "hex",
  "nostr-bbs-config",
  "nostr-bbs-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -2285,6 +2288,7 @@ dependencies = [
  "hex",
  "js-sys",
  "nostr-bbs-core",
+ "nostr-bbs-mesh",
  "nostr-bbs-rate-limit",
  "serde",
  "serde_json",

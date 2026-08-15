@@ -21,6 +21,9 @@ test-exports = []
 [dependencies]
 nostr-bbs-core = { workspace = true }
 nostr-bbs-rate-limit = { workspace = true }
+# PRD-010 mesh federation core: IS-Envelope, delegation verify, mesh config,
+# and the Nostr relay-backed MeshTransport. Wired via `src/mesh.rs`.
+nostr-bbs-mesh = { workspace = true }
 worker = { workspace = true, features = ["d1"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

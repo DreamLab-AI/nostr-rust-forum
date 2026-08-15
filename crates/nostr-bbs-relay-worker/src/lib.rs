@@ -20,6 +20,7 @@ mod agent_disclosure;
 mod audit;
 mod auth;
 mod cron;
+mod mesh;
 mod moderation;
 mod nip11;
 mod profiles;
