@@ -31,7 +31,8 @@
     "degradeOnWasmFailure": false
   },
   "evaluatorEntrypoints": {
-    "bench": "cargo test --workspace 2>&1 | tail -30"
+    "bench": "cargo test --workspace 2>&1 | tail -30",
+    "perf": "cargo bench -p nostr-bbs-core 2>&1 | grep -E 'time:|thrpt:|^bench|Benchmarking|regressed|improved' | tail -60"
   },
   "adrConvention": "3-digit",
   "extraDisciplines": [
