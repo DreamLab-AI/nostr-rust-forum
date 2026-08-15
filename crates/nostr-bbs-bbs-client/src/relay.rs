@@ -517,6 +517,31 @@ mod wasm {
         static SUBS: RefCell<HashMap<String, serde_json::Value>> = RefCell::new(HashMap::new());
         /// Publish acks awaiting the relay's `OK`, keyed by event id.
         static PENDING: RefCell<HashMap<String, PublishAck>> = RefCell::new(HashMap::new());
+        /// PRD-010 G4: whether THIS socket has completed NIP-42 AUTH. Reset on
+        /// every (re)connect, set once the AUTH response is sent. Gates whether a
+        /// write goes out immediately or is deferred.
+        static AUTHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// EVENT (write) frames deferred while connected-but-unauthenticated. In
+        /// `nip42` mode the relay rejects an unauthenticated write `auth-required`,
+        /// so they are buffered here and flushed the instant AUTH completes
+        /// (`flush_deferred_writes`). READ subscriptions are never deferred.
+        static DEFERRED_WRITES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Flush writes deferred until NIP-42 AUTH completed (PRD-010 G4). Called
+    /// right after the AUTH response is sent, on the SAME socket, so the relay
+    /// has processed AUTH before these writes arrive.
+    fn flush_deferred_writes() {
+        let pending = DEFERRED_WRITES.with(|d| std::mem::take(&mut *d.borrow_mut()));
+        let count = pending.len();
+        for msg in pending {
+            send_str(&msg);
+        }
+        if count > 0 {
+            web_sys::console::log_1(
+                &format!("[bbs-relay] flushed {count} deferred write(s) post-AUTH").into(),
+            );
+        }
     }
 
     /// Return the socket iff it is OPEN.
@@ -574,7 +599,14 @@ mod wasm {
 
     pub fn publish(event: &NostrEvent) {
         if let Ok(msg) = serde_json::to_string(&serde_json::json!(["EVENT", event])) {
-            send_str(&msg);
+            // PRD-010 G4: defer the write if the socket is open but not yet
+            // authenticated; flushed on AUTH completion. Otherwise send now
+            // (authenticated, or `send_str` drops it when the socket is closed).
+            if ws_open().is_some() && !AUTHED.with(|a| a.get()) {
+                DEFERRED_WRITES.with(|d| d.borrow_mut().push(msg));
+            } else {
+                send_str(&msg);
+            }
         }
     }
 
@@ -593,7 +625,14 @@ mod wasm {
                 if let Some(cb) = on_ok {
                     PENDING.with(|m| m.borrow_mut().insert(event.id.clone(), cb));
                 }
-                let _ = ws.send_with_str(&msg);
+                // PRD-010 G4: send now if authenticated, else defer until AUTH
+                // completes. The PENDING ack still fires when the relay OKs the
+                // flushed write, so the caller is never left hanging.
+                if AUTHED.with(|a| a.get()) {
+                    let _ = ws.send_with_str(&msg);
+                } else {
+                    DEFERRED_WRITES.with(|d| d.borrow_mut().push(msg));
+                }
             }
             None => {
                 if let Some(cb) = on_ok {
@@ -639,8 +678,12 @@ mod wasm {
                         send_str(&msg);
                         web_sys::console::log_1(&"[bbs-relay] NIP-42 AUTH response sent".into());
                     }
-                    // Replay subs so the relay re-evaluates them authenticated.
+                    // PRD-010 G4: the socket is now authenticated. Mark it, then
+                    // replay subs (gated zones re-evaluate) and flush any writes
+                    // deferred while unauthenticated.
+                    AUTHED.with(|a| a.set(true));
                     replay_subs();
+                    flush_deferred_writes();
                 }
                 Err(e) => {
                     web_sys::console::warn_1(
@@ -715,6 +758,8 @@ mod wasm {
             // Register the standing subscriptions (idempotent) then (re)send all
             // tracked subs — including a board sub opened before a reconnect.
             let gov: Vec<u64> = nostr_bbs_core::governance::GOVERNANCE_KIND_RANGE.collect();
+            // A fresh socket has not completed NIP-42 AUTH yet.
+            AUTHED.with(|a| a.set(false));
             SUBS.with(|m| {
                 let mut b = m.borrow_mut();
                 b.insert(

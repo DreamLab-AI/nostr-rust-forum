@@ -129,6 +129,13 @@ struct RelayInner {
     /// subscription also needs). Scoping the key to the subscription keeps the
     /// replay/reconnect dedup while delivering each event to every sub once.
     seen_events: HashSet<String>,
+    /// PRD-010 G4: EVENT (write) frames deferred because the socket is connected
+    /// but has not yet completed NIP-42 AUTH. In `nip42` mode the relay rejects
+    /// unauthenticated writes with `["OK", id, false, "auth-required: …"]`, so
+    /// rather than fire-and-lose them we hold writes here and flush them the
+    /// instant AUTH completes (see the AUTH handler's `replay_subs`). Public
+    /// READ subscriptions are never deferred — they stay non-blocking.
+    deferred_writes: Vec<String>,
     auth_signer: Option<AuthSignCallback>,
     auth_signer_async: Option<AuthSignAsyncCallback>,
     /// Reactive sink for relay NOTICE messages (cloned from the outer
@@ -265,6 +272,7 @@ impl RelayConnection {
             drain_scheduled: false,
             relay_url,
             seen_events: HashSet::new(),
+            deferred_writes: Vec::new(),
             auth_signer: None,
             auth_signer_async: None,
             notice_sink: None,
@@ -545,7 +553,36 @@ impl RelayConnection {
     pub fn publish(&self, event: &NostrEvent) {
         let msg = serde_json::json!(["EVENT", event]);
         let serialized = serde_json::to_string(&msg).unwrap_or_default();
-        self.send_raw(&serialized);
+        self.send_or_defer_write(&serialized);
+    }
+
+    /// Send an EVENT (write) frame, or DEFER it until NIP-42 AUTH completes.
+    ///
+    /// PRD-010 G4: while the socket is OPEN but not yet authenticated the relay
+    /// rejects writes `auth-required`, so rather than fire-and-lose them we
+    /// buffer the frame and flush it the instant AUTH completes (the AUTH
+    /// handler's `replay_subs`). When already authenticated it goes out
+    /// immediately; when disconnected `send_raw` buffers it in
+    /// `pending_messages` and flushes on (re)connect. READ subscriptions never
+    /// route through here, so public reads stay non-blocking.
+    fn send_or_defer_write(&self, msg: &str) {
+        let deferred = self.with_inner(|rc| {
+            let mut inner = rc.borrow_mut();
+            let is_open = matches!(&inner.ws, Some(ws) if ws.ready_state() == WebSocket::OPEN);
+            let is_authed = inner
+                .authed_sink
+                .map(|s| s.get_untracked())
+                .unwrap_or(false);
+            if is_open && !is_authed {
+                inner.deferred_writes.push(msg.to_string());
+                true
+            } else {
+                false
+            }
+        });
+        if !deferred {
+            self.send_raw(msg);
+        }
     }
 
     /// Publish a signed event and invoke `on_ok` when the relay responds with OK.
@@ -566,7 +603,7 @@ impl RelayConnection {
         let msg = serde_json::json!(["EVENT", event]);
         let serialized =
             serde_json::to_string(&msg).map_err(|e| format!("serialize error: {}", e))?;
-        self.send_raw(&serialized);
+        self.send_or_defer_write(&serialized);
         Ok(())
     }
 
@@ -820,8 +857,8 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                         // `inner.borrow_mut()`. Holding this borrow across the
                         // set would re-enter the same RefCell and panic
                         // ("already borrowed").
-                        let (frames, authed_sink) = {
-                            let inner = replay_rc.borrow();
+                        let (frames, deferred_writes, authed_sink) = {
+                            let mut inner = replay_rc.borrow_mut();
                             let mut frames = Vec::new();
                             if ws.is_some() {
                                 for (sub_id, sub) in inner.subscriptions.iter() {
@@ -839,7 +876,17 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                                     }
                                 }
                             }
-                            (frames, inner.authed_sink)
+                            // PRD-010 G4: drain writes deferred while this socket
+                            // was unauthenticated, to flush them now that AUTH
+                            // has completed on the SAME socket (the relay
+                            // processes the AUTH frame before these, so ordering
+                            // holds). Only when the socket is live.
+                            let deferred_writes = if ws.is_some() {
+                                std::mem::take(&mut inner.deferred_writes)
+                            } else {
+                                Vec::new()
+                            };
+                            (frames, deferred_writes, inner.authed_sink)
                         };
                         // Paced: the boot replay is exactly the burst that
                         // tripped the relay's per-IP limit and dropped the
@@ -850,6 +897,19 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                             }
                             web_sys::console::log_1(
                                 &"[Relay] replayed subscriptions post-AUTH (paced)".into(),
+                            );
+                        }
+                        // Flush writes deferred until authentication (paced too).
+                        let deferred_count = deferred_writes.len();
+                        for msg in deferred_writes {
+                            queue_paced(&replay_rc, msg);
+                        }
+                        if deferred_count > 0 {
+                            web_sys::console::log_1(
+                                &format!(
+                                    "[Relay] flushed {deferred_count} deferred write(s) post-AUTH"
+                                )
+                                .into(),
                             );
                         }
                         // Mark the session authenticated so AUTH-gated consumers

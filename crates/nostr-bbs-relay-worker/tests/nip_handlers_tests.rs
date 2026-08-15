@@ -733,3 +733,278 @@ fn ban_gate_excludes_gift_wraps_and_profiles() {
     assert!(!is_ban_gated_kind(22242));
     assert!(!is_ban_gated_kind(10002)); // relay list metadata
 }
+
+// ---------------------------------------------------------------------------
+// NIP-42 AUTH + PRD-010 G4 gating (relay_do::nip42)
+//
+// The AUTH-verdict cases build REAL Schnorr-signed kind-22242 events and drive
+// `evaluate_auth_event` end to end (signature, challenge, relay-URL, skew). The
+// gating cases exercise the pure write/read predicates. Together they cover the
+// PRD-010 G4 matrix: universal write gate, open public reads, protected-kind
+// read gate, and the allowlist-as-authorisation (`restricted:`) distinction.
+// ---------------------------------------------------------------------------
+mod nip42_auth {
+    use nostr_bbs_core::event::{sign_event, NostrEvent, UnsignedEvent};
+    use nostr_bbs_core::keys::{pubkey_hex, signing_key_from_bytes};
+    use nostr_bbs_relay_worker::test_exports::{
+        allowlist_denial_reason, evaluate_auth_event, protected_read_blocked, relay_urls_match,
+        write_auth_ok, AuthMode, AuthVerdict, NostrFilter, AUTH_MAX_SKEW_SECS,
+    };
+
+    const RELAY: &str = "wss://relay.example.com/";
+    const CHALLENGE: &str = "0123456789abcdef0123456789abcdef";
+    const NOW: u64 = 1_800_000_000;
+
+    /// Build a genuinely-signed kind-22242 AUTH event for `seed` with the given
+    /// tags/time. `seed` must be a non-zero byte (a zero secret key is invalid).
+    fn signed_auth(
+        seed: u8,
+        kind: u64,
+        relay: Option<&str>,
+        challenge: Option<&str>,
+        created_at: u64,
+    ) -> NostrEvent {
+        let sk_bytes = [seed; 32];
+        let sk = signing_key_from_bytes(&sk_bytes).expect("valid signing key");
+        let pubkey = pubkey_hex(&sk_bytes).expect("pubkey");
+        let mut tags: Vec<Vec<String>> = Vec::new();
+        if let Some(r) = relay {
+            tags.push(vec!["relay".into(), r.into()]);
+        }
+        if let Some(c) = challenge {
+            tags.push(vec!["challenge".into(), c.into()]);
+        }
+        let unsigned = UnsignedEvent {
+            pubkey,
+            created_at,
+            kind,
+            tags,
+            content: String::new(),
+        };
+        sign_event(unsigned, &sk).expect("sign")
+    }
+
+    fn filter_kinds(kinds: Vec<u64>) -> NostrFilter {
+        serde_json::from_value(serde_json::json!({ "kinds": kinds })).expect("filter")
+    }
+
+    // ----- AUTH verdict table (real signatures) --------------------------------
+
+    #[test]
+    fn happy_path_auth_succeeds_and_returns_pubkey() {
+        let ev = signed_auth(0x11, 22242, Some(RELAY), Some(CHALLENGE), NOW);
+        let expected_pubkey = ev.pubkey.clone();
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some(CHALLENGE),
+            Some("wss://relay.example.com"),
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
+        assert_eq!(verdict, AuthVerdict::Ok(expected_pubkey));
+    }
+
+    #[test]
+    fn wrong_challenge_rejected() {
+        let ev = signed_auth(0x12, 22242, Some(RELAY), Some(CHALLENGE), NOW);
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some("a-different-challenge"),
+            Some(RELAY),
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: challenge mismatch")
+        );
+    }
+
+    #[test]
+    fn missing_session_challenge_rejected() {
+        // The session is gone (None expected challenge) — nothing can match.
+        let ev = signed_auth(0x13, 22242, Some(RELAY), Some(CHALLENGE), NOW);
+        let verdict = evaluate_auth_event(&ev, None, Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: challenge mismatch")
+        );
+    }
+
+    #[test]
+    fn wrong_relay_url_rejected() {
+        let ev = signed_auth(
+            0x14,
+            22242,
+            Some("wss://evil.example.com"),
+            Some(CHALLENGE),
+            NOW,
+        );
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some(CHALLENGE),
+            Some("wss://relay.example.com"),
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: relay url mismatch")
+        );
+    }
+
+    #[test]
+    fn missing_relay_tag_rejected_when_own_url_known() {
+        let ev = signed_auth(0x15, 22242, None, Some(CHALLENGE), NOW);
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some(CHALLENGE),
+            Some("wss://relay.example.com"),
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
+        assert_eq!(verdict, AuthVerdict::Rejected("invalid: missing relay tag"));
+    }
+
+    #[test]
+    fn relay_tag_check_skipped_when_own_url_unset() {
+        // Fail-open on the relay-tag check only: an unconfigured RELAY_URL means
+        // even an evil relay tag passes (challenge + signature still enforced).
+        let ev = signed_auth(
+            0x16,
+            22242,
+            Some("wss://evil.example.com"),
+            Some(CHALLENGE),
+            NOW,
+        );
+        let verdict = evaluate_auth_event(&ev, Some(CHALLENGE), None, NOW, AUTH_MAX_SKEW_SECS);
+        assert!(matches!(verdict, AuthVerdict::Ok(_)));
+        // Canonicalisation is scheme/slash/case tolerant.
+        assert!(relay_urls_match(RELAY, "wss://relay.example.com"));
+    }
+
+    #[test]
+    fn stale_created_at_rejected() {
+        let created = NOW - (AUTH_MAX_SKEW_SECS + 5);
+        let ev = signed_auth(0x17, 22242, Some(RELAY), Some(CHALLENGE), created);
+        let verdict =
+            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: auth event too old")
+        );
+    }
+
+    #[test]
+    fn future_created_at_beyond_skew_rejected() {
+        let created = NOW + (AUTH_MAX_SKEW_SECS + 5);
+        let ev = signed_auth(0x18, 22242, Some(RELAY), Some(CHALLENGE), created);
+        let verdict =
+            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: auth event too old")
+        );
+    }
+
+    #[test]
+    fn bad_signature_rejected() {
+        let mut ev = signed_auth(0x19, 22242, Some(RELAY), Some(CHALLENGE), NOW);
+        // Corrupt the signature after signing — strict verification must fail.
+        ev.sig = "0".repeat(128);
+        let verdict =
+            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: signature verification failed")
+        );
+    }
+
+    #[test]
+    fn tampered_content_rejected() {
+        let mut ev = signed_auth(0x1a, 22242, Some(RELAY), Some(CHALLENGE), NOW);
+        // Mutating content breaks the id→content hash binding checked strictly.
+        ev.content = "injected".to_string();
+        let verdict =
+            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: signature verification failed")
+        );
+    }
+
+    #[test]
+    fn wrong_kind_rejected() {
+        // A validly-signed kind-1 note is not an AUTH event.
+        let ev = signed_auth(0x1b, 1, Some(RELAY), Some(CHALLENGE), NOW);
+        let verdict =
+            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: expected kind 22242")
+        );
+    }
+
+    // ----- Write gate (PRD-010 G4 universal write gate) ------------------------
+
+    #[test]
+    fn unauthenticated_write_rejected_in_nip42_mode() {
+        let denied = write_auth_ok(AuthMode::Nip42, false);
+        assert_eq!(
+            denied.unwrap_err(),
+            "auth-required: NIP-42 AUTH required to publish"
+        );
+        // Authenticated session may write.
+        assert!(write_auth_ok(AuthMode::Nip42, true).is_ok());
+        // Allowlist escape hatch: no AUTH round-trip forced (legacy behaviour).
+        assert!(write_auth_ok(AuthMode::Allowlist, false).is_ok());
+    }
+
+    // ----- Read gate (open public / gated protected) ---------------------------
+
+    #[test]
+    fn public_kind_read_allowed_unauthenticated() {
+        // Notes (1), reactions (7), profiles (0), contacts (3) stay open.
+        let public = [filter_kinds(vec![0, 1, 3, 7])];
+        assert!(!protected_read_blocked(&public, false, AuthMode::Nip42));
+        // Even a broad addressable read that names no protected kind is open.
+        let addressable = [filter_kinds(vec![30000, 39999])];
+        assert!(!protected_read_blocked(
+            &addressable,
+            false,
+            AuthMode::Nip42
+        ));
+    }
+
+    #[test]
+    fn protected_kind_read_gated_unauthenticated() {
+        for k in [4u64, 13, 14, 1059, 30910, 30916] {
+            let f = [filter_kinds(vec![k])];
+            assert!(
+                protected_read_blocked(&f, false, AuthMode::Nip42),
+                "kind {k} must require AUTH to read"
+            );
+            // The same read succeeds once authenticated.
+            assert!(!protected_read_blocked(&f, true, AuthMode::Nip42));
+        }
+    }
+
+    #[test]
+    fn mixed_filter_with_one_protected_kind_is_gated() {
+        // A REQ mixing a public and a protected kind is gated as a whole.
+        let mixed = [filter_kinds(vec![1, 4])];
+        assert!(protected_read_blocked(&mixed, false, AuthMode::Nip42));
+    }
+
+    // ----- Allowlist as authorisation (restricted: vs blocked:) ----------------
+
+    #[test]
+    fn allowlist_denied_but_authenticated_pubkey_gets_restricted_prefix() {
+        // A session that AUTHenticated but whose pubkey is not on the allowlist
+        // is rejected with NIP-42's `restricted:` reason, not `auth-required:`.
+        let reason = allowlist_denial_reason(AuthMode::Nip42, true);
+        assert!(reason.starts_with("restricted:"), "got: {reason}");
+        // Legacy allowlist mode keeps the historical blocked: message.
+        assert!(allowlist_denial_reason(AuthMode::Allowlist, true).starts_with("blocked:"));
+    }
+}

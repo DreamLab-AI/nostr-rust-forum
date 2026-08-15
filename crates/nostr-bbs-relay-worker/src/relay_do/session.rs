@@ -362,6 +362,19 @@ impl NostrRelayDO {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh federation seam: SessionAuthBoundary
+// ---------------------------------------------------------------------------
+//
+// `crate::mesh::SessionAuthBoundary` (the mesh fan-out seam) is implemented for
+// `NostrRelayDO` in `mesh.rs`, reading the `sessions` map's per-session
+// `authed_pubkey` this module owns and persists across hibernation. That impl
+// only became meaningful once the NIP-42 AUTH gate started populating
+// `authed_pubkey` (see `nip_handlers::handle_auth`): federated fan-out now never
+// relays on behalf of a peer pubkey that does not hold an authenticated session
+// here. The single source of `authed_pubkey` truth stays here; mesh.rs is a
+// read-only consumer, so there is no second impl to keep in sync.
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

@@ -20,6 +20,23 @@ ZONE_CONFIG = "[]"
 # Must match the auth-worker and the client window.__ENV__ to take effect.
 DEVICE_KEYS_ENABLED = "false"
 
+# NIP-42 AUTH enforcement mode (PRD-010 G4). The escape hatch:
+#   "nip42"     (default) — NIP-42 AUTH is the universal write gate: every EVENT
+#               requires a completed AUTH handshake, and reads of the protected
+#               kinds {4,13,14,1059,30910-39916} require AUTH. The pubkey
+#               allowlist becomes the authorisation layer on the authed identity.
+#   "allowlist" — legacy behaviour: writes gated on the allowlist alone, no AUTH
+#               round-trip forced. Recover the pre-G4 model here if needed.
+# Anything other than "allowlist" resolves to the secure default (nip42).
+AUTH_MODE = "nip42"
+# The relay's own canonical URL, used to verify the NIP-42 `["relay", <url>]`
+# tag on AUTH responses (defence-in-depth on top of the per-session challenge).
+# Set this to the wss:// URL clients connect to (the same value the client
+# reads from window.__ENV__.RELAY_URL). When BLANK the relay-tag check is
+# skipped (the challenge still fully protects the handshake) — so leaving it
+# unset is safe, and setting it enables strict relay scoping.
+RELAY_URL = ""
+
 # Escalation-default posture (REC-6 share / WP-9). The default authority
 # boundary the Agent Control Surface assumes, projected in the NIP-11
 # `nostr_bbs.escalation_defaults` block so a mesh agent can discover it.

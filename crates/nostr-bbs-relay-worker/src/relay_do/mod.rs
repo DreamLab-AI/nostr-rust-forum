@@ -22,6 +22,7 @@ mod broadcast;
 mod calendar_projection;
 mod filter;
 mod mod_cache;
+mod nip42;
 mod nip_handlers;
 mod session;
 mod storage;
@@ -35,6 +36,11 @@ pub mod test_exports {
     pub use super::broadcast::{event_treatment, EventTreatment};
     pub use super::filter::{d_tag_value, event_matches_filters, tag_value, NostrFilter};
     pub use super::mod_cache::{resolve_block, ActionRow, Block, ModCache};
+    pub use super::nip42::{
+        allowlist_denial_reason, canonical_relay_url, evaluate_auth_event, is_protected_read_kind,
+        parse_auth_mode, protected_read_blocked, relay_urls_match, write_auth_ok, AuthMode,
+        AuthVerdict, AUTH_MAX_SKEW_SECS, KIND_AUTH, PROTECTED_READ_KINDS,
+    };
     pub use super::nip_handlers::{governance_response_blocked, is_ban_gated_kind};
 }
 
@@ -45,6 +51,11 @@ use nostr_bbs_core::event::NostrEvent;
 use worker::*;
 
 use session::{generate_challenge, SessionInfo};
+
+// NIP-42 AUTH mode parsing is shared with the NIP-11 relay-info document
+// (`crate::nip11`) so the advertised `auth_required` can never drift from the
+// mode the handlers actually enforce.
+pub(crate) use nip42::{parse_auth_mode, AuthMode, PROTECTED_READ_KINDS};
 
 /// Maximum WebSocket connections per IP address.
 const MAX_CONNECTIONS_PER_IP: u32 = 20;
@@ -226,7 +237,7 @@ impl DurableObject for NostrRelayDO {
                         return Ok(());
                     }
                 };
-                self.handle_event(&ws, &ip, event).await;
+                self.handle_event(session_id, &ws, &ip, event).await;
             }
             "REQ" => {
                 let sub_id = match arr[1].as_str() {

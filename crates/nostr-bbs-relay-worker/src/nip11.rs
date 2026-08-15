@@ -152,6 +152,24 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         .map(|v| v.to_string())
         .unwrap_or_else(|_| DEFAULT_ESCALATION_POSTURE.to_string());
 
+    // PRD-010 G4: the advertised `auth_required` must reflect the mode the
+    // handlers actually enforce. Sourced from the SAME `parse_auth_mode` the
+    // Durable Object uses, so the NIP-11 claim can never drift from behaviour.
+    let auth_mode = crate::relay_do::parse_auth_mode(
+        env.var("AUTH_MODE").ok().map(|v| v.to_string()).as_deref(),
+    );
+    let nip42_enforced = auth_mode == crate::relay_do::AuthMode::Nip42;
+    let write_mode_label = if nip42_enforced { "nip42" } else { "allowlist" };
+    let (write_model, write_auth_method, write_rejection) = if nip42_enforced {
+        (
+            "nip42+allowlist",
+            "nip42",
+            "auth-required: NIP-42 AUTH required to publish",
+        )
+    } else {
+        ("whitelist", "whitelist", "blocked: pubkey not whitelisted")
+    };
+
     // Built from the shared `RETENTION_POLICY` so the advertised windows and the
     // cron sweep (`crate::cron::sweep_retention`) can never diverge.
     let retention: Vec<serde_json::Value> = RETENTION_POLICY
@@ -197,17 +215,16 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
             "max_filters": 10,
             "max_limit": 1000,
             "max_subid_length": 64,
-            // Gap 7 (truthful relay-info): the relay sends a NIP-42 AUTH
-            // challenge on connect and lists 42 in supported_nips, but writes
-            // are NOT gated on completing the AUTH handshake — the gate is on
-            // the *signed event's pubkey* being whitelisted (see
-            // nip_handlers::handle_event `is_whitelisted`). So `auth_required`
-            // is false in the strict NIP-42 sense (no AUTH round-trip is
-            // forced before EVENT), but writes are still trust-gated. The
-            // `restricted_writes` flag plus the `nostr_bbs.write_policy` block
-            // below describe the actual model so a standard client does not
-            // mistake this for an open relay.
-            "auth_required": false,
+            // PRD-010 G4 (truthful relay-info): in the default `nip42` mode the
+            // relay forces a NIP-42 AUTH round-trip before ANY write and gates
+            // the protected-read kinds {4,13,14,1059,30910-30916} — so
+            // `auth_required` is true. The pubkey allowlist still applies, but
+            // now as AUTHORISATION on the authenticated identity (a member who
+            // authenticates yet is not allowlisted is rejected `restricted:`).
+            // Under the `AUTH_MODE=allowlist` escape hatch the legacy model
+            // stands (challenge advertised but not write-forcing) and this is
+            // false. The `nostr_bbs.write_policy` block describes the exact model.
+            "auth_required": nip42_enforced,
             "payment_required": false,
             "restricted_writes": true,
         },
@@ -224,20 +241,21 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         // prevent drift. Namespaced under `nostr_bbs` so it never collides with
         // standard NIP-11 fields.
         "nostr_bbs": {
-            // Gap 7: make the whitelist-gated write model explicit. Standard
-            // NIP-11 only has the boolean `restricted_writes`; this block says
-            // *how* writes are restricted so a client knows a rejection is not
-            // a NIP-42 AUTH failure but a trust/whitelist decision keyed on the
-            // signed event's pubkey. `auth_method: "whitelist"` (not "nip42")
-            // is the truthful description: the EVENT itself proves identity,
-            // and admission is decided against the relay's whitelist + trust
-            // levels, not against a completed AUTH session.
+            // Make the write model explicit. Standard NIP-11 only has the
+            // boolean `restricted_writes`; this block says *how* writes are
+            // restricted. PRD-010 G4: in `nip42` mode a completed AUTH session
+            // is required BEFORE an EVENT is accepted (`nip42_required_for_write`
+            // true), and the allowlist is then the authorisation layer. In the
+            // `allowlist` escape-hatch mode the EVENT's own signed pubkey proves
+            // identity and admission is decided against the allowlist alone.
             "write_policy": {
-                "model": "whitelist",
-                "auth_method": "whitelist",
+                "mode": write_mode_label,
+                "model": write_model,
+                "auth_method": write_auth_method,
                 "nip42_challenge_sent": true,
-                "nip42_required_for_write": false,
-                "rejection_message": "blocked: pubkey not whitelisted",
+                "nip42_required_for_write": nip42_enforced,
+                "protected_read_kinds": crate::relay_do::PROTECTED_READ_KINDS,
+                "rejection_message": write_rejection,
             },
             "agent_control_surface": {
                 "enabled": true,

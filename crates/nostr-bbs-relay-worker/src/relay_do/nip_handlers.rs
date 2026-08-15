@@ -23,6 +23,7 @@ use crate::zone_config::ZoneConfig;
 use super::broadcast::{event_treatment, EventTreatment};
 use super::calendar_projection;
 use super::filter::{self, NostrFilter};
+use super::nip42::{self, AuthMode};
 use super::NostrRelayDO;
 
 use nostr_bbs_core::KIND_CALENDAR_RSVP;
@@ -417,7 +418,38 @@ pub fn effective_principal(pubkey: &str, device_owner: Option<&str>, enabled: bo
 // ---------------------------------------------------------------------------
 
 impl NostrRelayDO {
-    pub(crate) async fn handle_event(&self, ws: &WebSocket, ip: &str, event: NostrEvent) {
+    /// Resolve the configured NIP-42 enforcement mode (`AUTH_MODE`). Absent or
+    /// unrecognised ⇒ the secure default (`nip42`). Reads a JS-boundary env var,
+    /// so callers cache the result within a single handler invocation.
+    pub(crate) fn auth_mode(&self) -> AuthMode {
+        nip42::parse_auth_mode(
+            self.env
+                .var("AUTH_MODE")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+        )
+    }
+
+    /// The relay's own canonical URL (`RELAY_URL`), used to verify a client's
+    /// NIP-42 `["relay", …]` tag. Returns `None` when unset/blank, which makes
+    /// `evaluate_auth_event` skip the relay-tag check (fail-open on that
+    /// defence-in-depth check only; the per-session challenge still applies).
+    pub(crate) fn own_relay_url(&self) -> Option<String> {
+        self.env
+            .var("RELAY_URL")
+            .ok()
+            .map(|v| v.to_string())
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    pub(crate) async fn handle_event(
+        &self,
+        session_id: u64,
+        ws: &WebSocket,
+        ip: &str,
+        event: NostrEvent,
+    ) {
         // Rate limit
         if !self.check_rate_limit(ip) {
             Self::send_notice(ws, "rate limit exceeded");
@@ -452,6 +484,26 @@ impl NostrRelayDO {
             return;
         }
 
+        // PRD-010 G4: NIP-42 AUTH is the universal write gate. Resolve the mode
+        // and whether THIS session completed the AUTH handshake ONCE, then reuse
+        // both below (the mode read crosses the JS env boundary). In `nip42`
+        // mode an unauthenticated session may not publish ANY event — including
+        // gift wraps, which are still published over the sender's authenticated
+        // socket even though the wrap itself is signed by an ephemeral key. The
+        // allowlist check further down then applies as AUTHORISATION on the
+        // authenticated identity (see `allowlist_denial_reason`).
+        let auth_mode = self.auth_mode();
+        let session_authed = self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .map(|s| s.authed_pubkey.is_some())
+            .unwrap_or(false);
+        if let Err(reason) = nip42::write_auth_ok(auth_mode, session_authed) {
+            Self::send_ok(ws, &event.id, false, reason);
+            return;
+        }
+
         // NIP-59 gift wraps (kind-1059) are signed by a fresh ephemeral key per
         // message, so the author is intentionally NOT a member and the standard
         // author-membership check would always reject them. Instead, gate on the
@@ -482,7 +534,12 @@ impl NostrRelayDO {
             // device's own key; we only rebind WHO the allowlist is checked for.
             let allowlist_pubkey = self.effective_pubkey(&event.pubkey).await;
             if !self.is_whitelisted(&allowlist_pubkey).await {
-                Self::send_ok(ws, &event.id, false, "blocked: pubkey not whitelisted");
+                // NIP-42 semantics: a denial AFTER a completed AUTH is
+                // `restricted:` (authenticated but not authorised), distinct
+                // from `auth-required:`. Legacy `allowlist` mode keeps the
+                // historical `blocked:` message.
+                let reason = nip42::allowlist_denial_reason(auth_mode, session_authed);
+                Self::send_ok(ws, &event.id, false, reason);
                 return;
             }
         }
@@ -952,6 +1009,21 @@ impl NostrRelayDO {
                 .and_then(|s| s.authed_pubkey.clone())
         };
 
+        // PRD-010 G4: protected-kind reads ({4,13,14,1059,30910-30916}) require
+        // an authenticated session in nip42 mode. Reject the whole subscription
+        // with CLOSED (NIP-42 semantics) before any D1 query. Public kinds stay
+        // open to unauthenticated sockets. kind-1059's own gate + mandatory #p
+        // rewrite still runs below in BOTH modes, so DM privacy never depends on
+        // AUTH_MODE.
+        if nip42::protected_read_blocked(&filters, session_pubkey.is_some(), self.auth_mode()) {
+            Self::send_closed(
+                &ws,
+                sub_id,
+                "auth-required: authentication required to read protected kinds",
+            );
+            return;
+        }
+
         // NIP-59: kind-1059 (Sealed DM) read gate + mandatory #p rewrite. Shared
         // with the COUNT path so both reject unauthenticated kind-1059 reads and
         // bind results to the authed recipient identically.
@@ -1142,58 +1214,44 @@ impl NostrRelayDO {
 
 impl NostrRelayDO {
     /// Handle an AUTH response from a client (kind 22242 event).
+    ///
+    /// Verification (kind, Schnorr signature, challenge match, relay-URL match,
+    /// created_at skew) is delegated to the pure [`nip42::evaluate_auth_event`]
+    /// so the full verdict table is unit-testable without a DO; this method only
+    /// performs the side effects (mark session authed + persist for hibernation).
     pub(crate) async fn handle_auth(&self, session_id: u64, ws: &WebSocket, event: NostrEvent) {
-        // Must be kind 22242
-        if event.kind != 22242 {
-            Self::send_ok(ws, &event.id, false, "invalid: expected kind 22242");
-            return;
-        }
-
-        // Verify signature
-        if nostr_bbs_core::verify_event_strict(&event).is_err() {
-            Self::send_ok(
-                ws,
-                &event.id,
-                false,
-                "invalid: signature verification failed",
-            );
-            return;
-        }
-
-        // Verify challenge tag matches session challenge
-        let challenge_tag = filter::tag_value(&event, "challenge");
+        // The exact challenge THIS session was issued (None if the session is
+        // gone — which can never match, so verification rejects).
         let expected_challenge = {
             let sessions = self.sessions.borrow();
             sessions.get(&session_id).map(|s| s.challenge.clone())
         };
-
-        match (challenge_tag, expected_challenge) {
-            (Some(c), Some(expected)) if c == expected => {}
-            _ => {
-                Self::send_ok(ws, &event.id, false, "invalid: challenge mismatch");
-                return;
-            }
-        }
-
-        // Timestamp must be within 10 minutes
+        let own_relay_url = self.own_relay_url();
         let now = auth::js_now_secs();
-        if now.abs_diff(event.created_at) > 600 {
-            Self::send_ok(ws, &event.id, false, "invalid: auth event too old");
-            return;
-        }
 
-        // Mark session as authenticated
-        {
-            let mut sessions = self.sessions.borrow_mut();
-            if let Some(session) = sessions.get_mut(&session_id) {
-                session.authed_pubkey = Some(event.pubkey.clone());
+        match nip42::evaluate_auth_event(
+            &event,
+            expected_challenge.as_deref(),
+            own_relay_url.as_deref(),
+            now,
+            nip42::AUTH_MAX_SKEW_SECS,
+        ) {
+            nip42::AuthVerdict::Ok(pubkey) => {
+                // Mark session as authenticated.
+                {
+                    let mut sessions = self.sessions.borrow_mut();
+                    if let Some(session) = sessions.get_mut(&session_id) {
+                        session.authed_pubkey = Some(pubkey.clone());
+                    }
+                }
+                // Persist auth state to DO storage so it survives hibernation.
+                self.save_auth(session_id, &pubkey).await;
+                Self::send_ok(ws, &event.id, true, "");
+            }
+            nip42::AuthVerdict::Rejected(reason) => {
+                Self::send_ok(ws, &event.id, false, reason);
             }
         }
-
-        // Persist auth state to DO storage so it survives hibernation
-        self.save_auth(session_id, &event.pubkey).await;
-
-        Self::send_ok(ws, &event.id, true, "");
     }
 }
 
@@ -1331,8 +1389,8 @@ impl NostrRelayDO {
                 .as_deref()
                 .map(|pk| pk == event.pubkey)
                 .unwrap_or(false);
-            let is_member = zones.is_public_read(zone)
-                || zones.cohorts_can_read(zone, &ctx.viewer_cohorts);
+            let is_member =
+                zones.is_public_read(zone) || zones.cohorts_can_read(zone, &ctx.viewer_cohorts);
             return if ctx.viewer_is_admin || is_owner || is_member {
                 ReadDecision::Deliver
             } else {
@@ -1419,6 +1477,15 @@ impl NostrRelayDO {
                 .get(&session_id)
                 .and_then(|s| s.authed_pubkey.clone())
         };
+
+        // PRD-010 G4: protected-kind reads require auth (nip42 mode). A COUNT is
+        // an existence/count oracle, so an unauthenticated protected-kind COUNT
+        // returns 0 rather than a real tally — mirroring the REQ CLOSED
+        // rejection so the two read paths never diverge on what leaks.
+        if nip42::protected_read_blocked(&filters, session_pubkey.is_some(), self.auth_mode()) {
+            Self::send_count(ws, sub_id, 0);
+            return;
+        }
 
         // kind-1059 gate identical to REQ; deny-by-default → count 0 on reject.
         let filters = match Self::gate_kind_1059_filters(filters, &session_pubkey) {

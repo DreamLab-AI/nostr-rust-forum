@@ -226,6 +226,13 @@ impl NostrRelayDO {
         Self::send(ws, &serde_json::json!(["EOSE", sub_id]));
     }
 
+    /// NIP-42 / NIP-01e: terminate a subscription the relay refuses to serve,
+    /// carrying a machine-readable reason (`auth-required: …`, `restricted: …`).
+    /// Used when an unauthenticated session requests a protected-read kind.
+    pub(crate) fn send_closed(ws: &WebSocket, sub_id: &str, msg: &str) {
+        Self::send(ws, &serde_json::json!(["CLOSED", sub_id, msg]));
+    }
+
     pub(crate) fn send_auth(ws: &WebSocket, challenge: &str) {
         Self::send(ws, &serde_json::json!(["AUTH", challenge]));
     }
