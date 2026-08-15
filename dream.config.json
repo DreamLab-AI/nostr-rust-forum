@@ -1,0 +1,45 @@
+{
+  "repo": "DreamLab-AI/nostr-rust-forum",
+  "cron": "0 3 * * *",
+  "slots": [
+    {
+      "deep": "nip-compliance",
+      "scan": ["event-validation", "relay-protocol"]
+    },
+    {
+      "deep": "forum-thread-model",
+      "scan": ["moderation", "threading"]
+    },
+    {
+      "deep": "auth-and-identity",
+      "scan": ["nip42-auth", "delegation"]
+    },
+    {
+      "deep": "performance-scaling",
+      "scan": ["connection-handling", "subscription-filters"]
+    }
+  ],
+  "bonusModuli": {
+    "25": "security-adversarial",
+    "50": "api-surface-review"
+  },
+  "controlPlaneProbes": [
+    "cargo check --workspace 2>&1 | tail -5 || true"
+  ],
+  "buildStep": {
+    "cmd": "cargo build --workspace --release 2>&1 | tail -20",
+    "degradeOnWasmFailure": false
+  },
+  "evaluatorEntrypoints": {
+    "bench": "cargo test --workspace 2>&1 | tail -30"
+  },
+  "adrConvention": "3-digit",
+  "extraDisciplines": [
+    "evaluation-is-not-promotion",
+    "witness-every-quantitative-claim"
+  ],
+  "ledgerPath": "docs/dream-cycle/LEDGER.md",
+  "branchPrefix": "dream/",
+  "labels": ["dream-cycle", "research"],
+  "autoMerge": false
+}
