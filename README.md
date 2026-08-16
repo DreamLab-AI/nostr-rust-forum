@@ -193,6 +193,10 @@ that many production consumers exist yet — one does. See
 [docs/consumer-surface-map.md](docs/consumer-surface-map.md) and
 [docs/prd/prd-gap-close-forum.md](docs/prd/prd-gap-close-forum.md).
 
+**Self-improvement.** The forum's own rule — a human decision is the one that's signed — is
+exactly how the code evolves: a nightly [dream cycle](https://github.com/DreamLab-AI/dream-engine)
+proposes, a maintainer signs the merge. *Evaluation is not promotion.*
+
 ---
 
 ## Identity & keys
