@@ -496,7 +496,6 @@ pub fn ChannelPage() -> impl IntoView {
                     reply_to_id: reply_to,
                     reply_to_pubkey: reply_pk,
                     reply_to_content: None,
-                    reactions: RwSignal::new(Vec::new()),
                     is_hidden: false,
                     channel_id: cid.clone(),
                     thread_replies: RwSignal::new(Vec::<ThreadReply>::new()),

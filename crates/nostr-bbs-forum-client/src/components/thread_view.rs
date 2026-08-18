@@ -10,7 +10,7 @@ use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::mention_text::MentionText;
-use crate::components::reaction_bar::{Reaction, ReactionBar};
+use crate::components::reaction_bar::ReactionBar;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
@@ -23,7 +23,6 @@ pub struct ThreadReply {
     pub pubkey: String,
     pub content: String,
     pub created_at: u64,
-    pub reactions: RwSignal<Vec<Reaction>>,
 }
 
 /// Collapsible threaded reply view for a parent message.
@@ -195,7 +194,7 @@ pub fn ThreadView(
                             let time = format_relative_time(reply.created_at);
                             let content = reply.content.clone();
                             let eid = reply.id.clone();
-                            let reactions = reply.reactions;
+                            let author_pk = reply.pubkey.clone();
 
                             let display_name = use_display_name_memo(pk.clone());
 
@@ -215,7 +214,7 @@ pub fn ThreadView(
                                         <div class="text-xs text-gray-300 leading-relaxed">
                                             <MentionText content=content />
                                         </div>
-                                        <ReactionBar event_id=eid reactions=reactions />
+                                        <ReactionBar event_id=eid author_pubkey=author_pk />
                                     </div>
                                 </div>
                             }

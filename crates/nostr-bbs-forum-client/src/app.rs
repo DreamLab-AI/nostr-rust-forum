@@ -394,6 +394,7 @@ pub fn App() -> impl IntoView {
     let relay = RelayConnection::new();
     provide_context(relay.clone());
     provide_channel_store();
+    crate::stores::reactions::provide_reaction_store();
 
     let auth = use_auth();
     let is_authed = auth.is_authenticated();
@@ -765,6 +766,8 @@ pub fn App() -> impl IntoView {
         let store = use_channel_store();
         let r = expect_context::<RelayConnection>();
         store.start_sync(&r);
+        // NIP-25 reactions: one broad kind-7/kind-5 sub for the whole app.
+        crate::stores::reactions::use_reaction_store().start_sync(&r);
     });
 
     // Start message count sync after channel EOSE
@@ -786,6 +789,7 @@ pub fn App() -> impl IntoView {
         on_cleanup(move || {
             let store = use_channel_store();
             store.cleanup(&relay_cleanup);
+            crate::stores::reactions::use_reaction_store().cleanup(&relay_cleanup);
         });
     }
 

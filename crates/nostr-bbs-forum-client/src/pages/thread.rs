@@ -39,6 +39,7 @@ use crate::components::link_preview::LinkPreview;
 use crate::components::media_embed::MediaEmbed;
 use crate::components::mention_text::{normalise_mention_pubkey, MentionText};
 use crate::components::message_input::MessageInput;
+use crate::components::reaction_bar::ReactionBar;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
@@ -1152,6 +1153,9 @@ fn RootPost(
     let edited = post.edited;
     let post_id = post.id.clone();
     let post_pubkey = post.pubkey.clone();
+    // NIP-25 reaction bar targets: the topic-root event id + its author.
+    let react_id = post.id.clone();
+    let react_pk = post.pubkey.clone();
 
     let is_editing = {
         let pid = post_id.clone();
@@ -1230,6 +1234,8 @@ fn RootPost(
                             />
                         </div>
                     </Show>
+                    // NIP-25 emoji reactions on the topic root.
+                    <ReactionBar event_id=react_id author_pubkey=react_pk />
                 </div>
             </div>
         </article>
@@ -1266,6 +1272,9 @@ fn ReplyCard(
     let edited = reply.edited;
     let post_id = reply.id.clone();
     let post_pubkey = reply.pubkey.clone();
+    // NIP-25 reaction bar targets: this reply's event id + its author.
+    let react_id = reply.id.clone();
+    let react_pk = reply.pubkey.clone();
 
     let is_editing = {
         let pid = post_id.clone();
@@ -1348,6 +1357,8 @@ fn ReplyCard(
                             />
                         </div>
                     </Show>
+                    // NIP-25 emoji reactions on this reply.
+                    <ReactionBar event_id=react_id author_pubkey=react_pk />
                 </div>
             </div>
         </div>

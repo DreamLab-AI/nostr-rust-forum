@@ -40,6 +40,10 @@ pub struct ProfileEntry {
     pub display_name: Option<String>,
     pub picture: Option<String>,
     pub nip05: Option<String>,
+    /// Free-text "about"/bio from kind-0 metadata. Populated from live kind-0
+    /// events and the IndexedDB cache; the batch projection supplies it when
+    /// the relay-worker returns it.
+    pub about: Option<String>,
     /// Unix seconds when this entry was last fetched/refreshed.
     pub fetched_at: u64,
 }
@@ -59,6 +63,7 @@ impl ProfileEntry {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             nip05: obj.get("nip05").and_then(|v| v.as_str()).map(String::from),
+            about: obj.get("about").and_then(|v| v.as_str()).map(String::from),
             fetched_at: created_at,
         })
     }
@@ -191,6 +196,18 @@ impl ProfileCache {
             .filter(|p| p.starts_with("http://") || p.starts_with("https://"))
     }
 
+    /// Tracked read of a profile's `about`/bio text by pubkey.
+    ///
+    /// Subscribes to the entries signal and schedules the debounced batch fetch
+    /// on a miss (same contract as [`picture_reactive`](Self::picture_reactive)).
+    /// Returns the trimmed bio only when non-empty.
+    pub fn about_reactive(&self, pubkey: &str) -> Option<String> {
+        self.lookup_reactive(pubkey)
+            .and_then(|e| e.about)
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+    }
+
     /// Insert or update an entry from a kind-0 nostr event.
     pub fn upsert_from_kind0(&self, pubkey: &str, content_json: &str, created_at: u64) {
         if pubkey.is_empty() {
@@ -251,6 +268,7 @@ impl ProfileCache {
                             display_name: None,
                             picture: p.picture,
                             nip05: None,
+                            about: p.about,
                             fetched_at: p.updated_at,
                         };
                         map.entry(p.pubkey).or_insert(entry);
@@ -281,6 +299,7 @@ impl ProfileCache {
                     display_name: None,
                     picture: cached.picture,
                     nip05: None,
+                    about: cached.about,
                     fetched_at: cached.updated_at,
                 };
                 self.entries.update(|map| {
@@ -312,7 +331,7 @@ impl ProfileCache {
                 pubkey: entry.pubkey.clone(),
                 name: entry.display_name.clone().or_else(|| entry.name.clone()),
                 picture: entry.picture.clone(),
-                about: None,
+                about: entry.about.clone(),
                 updated_at: entry.fetched_at,
             })
             .collect();
@@ -453,7 +472,7 @@ fn persist_one(entry: &ProfileEntry) {
             pubkey: entry.pubkey.clone(),
             name: entry.display_name.clone().or_else(|| entry.name.clone()),
             picture: entry.picture.clone(),
-            about: None,
+            about: entry.about.clone(),
             updated_at: entry.fetched_at,
         };
         let _ = db.put_profile(&cached).await;
@@ -485,6 +504,8 @@ struct BatchResponseFlat {
     picture: Option<String>,
     #[serde(default)]
     nip05: Option<String>,
+    #[serde(default)]
+    about: Option<String>,
     #[serde(default)]
     last_kind0_at: Option<u64>,
     #[serde(default)]
@@ -636,6 +657,10 @@ fn parse_batch_response(text: &str) -> Vec<ProfileEntry> {
                         .get("nip05")
                         .and_then(|v| v.as_str())
                         .map(String::from),
+                    about: profile
+                        .get("about")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                     fetched_at: profile
                         .get("last_kind0_at")
                         .and_then(|v| v.as_u64())
@@ -653,6 +678,7 @@ fn parse_batch_response(text: &str) -> Vec<ProfileEntry> {
                 display_name: flat.display_name,
                 picture: flat.picture,
                 nip05: flat.nip05,
+                about: flat.about,
                 fetched_at: flat.last_kind0_at.or(flat.fetched_at).unwrap_or(now),
             };
             out.push(entry);
@@ -704,12 +730,13 @@ mod tests {
 
     #[test]
     fn parse_wrapped_response() {
-        let json = r#"[{"pubkey":"abc","profile":{"name":"alice","nip05":"alice@example.test"}}]"#;
+        let json = r#"[{"pubkey":"abc","profile":{"name":"alice","nip05":"alice@example.test","about":"hi there"}}]"#;
         let parsed = parse_batch_response(json);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].pubkey, "abc");
         assert_eq!(parsed[0].name.as_deref(), Some("alice"));
         assert_eq!(parsed[0].nip05.as_deref(), Some("alice@example.test"));
+        assert_eq!(parsed[0].about.as_deref(), Some("hi there"));
     }
 
     #[test]
@@ -743,6 +770,7 @@ mod tests {
             display_name: Some("Alice Wonderland".into()),
             picture: None,
             nip05: Some("alice@example.test".into()),
+            about: None,
             fetched_at: 1,
         };
         assert_eq!(e.best_label().as_deref(), Some("Alice Wonderland"));
@@ -757,11 +785,12 @@ mod tests {
 
     #[test]
     fn from_kind0_parses_metadata() {
-        let content = r#"{"name":"alice","display_name":"Alice","picture":"https://x/y.png","nip05":"alice@example.test"}"#;
+        let content = r#"{"name":"alice","display_name":"Alice","picture":"https://x/y.png","nip05":"alice@example.test","about":"builder of things"}"#;
         let entry = ProfileEntry::from_kind0_content("abc".into(), content, 1234).expect("valid");
         assert_eq!(entry.pubkey, "abc");
         assert_eq!(entry.name.as_deref(), Some("alice"));
         assert_eq!(entry.display_name.as_deref(), Some("Alice"));
+        assert_eq!(entry.about.as_deref(), Some("builder of things"));
         assert_eq!(entry.fetched_at, 1234);
     }
 

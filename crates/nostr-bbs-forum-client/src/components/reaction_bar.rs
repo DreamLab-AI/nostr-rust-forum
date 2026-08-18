@@ -1,10 +1,18 @@
-//! Emoji reaction bar for messages -- display, toggle, and publish kind 7 reactions.
+//! Emoji reaction bar for messages -- display, toggle, and publish NIP-25
+//! kind-7 reactions (and NIP-09 kind-5 un-reacts).
+//!
+//! The bar is stateless: aggregated counts live in the shared
+//! [`ReactionStore`](crate::stores::reactions::ReactionStore), which subscribes
+//! to kind-7/kind-5 once at app root. Clicking publishes and optimistically
+//! nudges the store, so the pill updates before the relay echo and converges
+//! with everyone else's reactions on load.
 
 use leptos::prelude::*;
 
 use crate::auth::use_auth;
 use crate::components::fx::reaction_burst::ReactionBurst;
 use crate::relay::RelayConnection;
+use crate::stores::reactions::use_reaction_store;
 
 /// Common reaction emojis offered in the picker.
 const REACTION_EMOJIS: &[&str] = &[
@@ -18,7 +26,7 @@ const REACTION_EMOJIS: &[&str] = &[
     "\u{1F64C}",
 ];
 
-/// A single emoji reaction on a message.
+/// A single emoji reaction on a message, aggregated across all reactors.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Reaction {
     pub emoji: String,
@@ -28,128 +36,101 @@ pub(crate) struct Reaction {
 
 /// Display and toggle emoji reactions on a message.
 ///
-/// Shows existing reactions as pills with count. Clicking a pill toggles
-/// the reaction (publishes a kind 7 event via the relay). A "+" button
-/// opens a compact picker for adding new reactions.
+/// Reads aggregated reactions from the [`ReactionStore`](crate::stores::reactions::ReactionStore)
+/// and renders each emoji as a pill with a count. Clicking a pill toggles the
+/// viewer's own reaction: adding publishes a kind-7 event; removing publishes a
+/// kind-5 deletion of the viewer's earlier kind-7. A "+" button opens a compact
+/// picker for adding new reactions.
 #[component]
 pub(crate) fn ReactionBar(
     /// The event ID of the message being reacted to.
     event_id: String,
-    /// Reactive list of reactions on this message.
-    reactions: RwSignal<Vec<Reaction>>,
+    /// The pubkey of the message's author — the NIP-25 `p` tag on the kind-7
+    /// reaction (notifies the author, per NIP-25). NOT the reactor's pubkey.
+    #[prop(into)]
+    author_pubkey: String,
 ) -> impl IntoView {
     let show_picker = RwSignal::new(false);
 
-    // Store event_id in StoredValue so closures that capture it are Copy.
-    let event_id_stored = StoredValue::new(event_id);
+    // Store ids in StoredValue so the closures that capture them are Copy.
+    let event_id_stored = StoredValue::new(event_id.clone());
+    let author_pk_stored = StoredValue::new(author_pubkey);
 
     // Resolve contexts at component construction. Calling expect_context() /
     // use_auth() inside a click handler or spawn_local panics ("expected
     // context of type RelayConnection") because the reactive owner is gone by
-    // event time, and that panic kills the whole WASM runtime. AuthStore is
-    // Copy; RelayConnection is only Clone, so park it in a StoredValue (Copy)
-    // and clone from there inside the handlers — keeps the closures Copy.
+    // event time, and that panic kills the whole WASM runtime. AuthStore and the
+    // ReactionStore are Copy; RelayConnection is only Clone, so park it in a
+    // StoredValue (Copy) and clone from there inside the handlers.
     let auth = use_auth();
     let relay_stored = StoredValue::new(expect_context::<RelayConnection>());
+    let store = use_reaction_store();
 
+    // Reactive, aggregated reactions for this event (all reactors, deduped).
+    let reactions = store.reactions_for(&event_id);
+
+    // Toggle the viewer's own `emoji` reaction on this message. Adding publishes
+    // a kind-7; removing publishes a kind-5 deleting the viewer's prior kind-7.
+    // Both paths update the store optimistically so the pill reacts instantly.
     let toggle_reaction = move |emoji: String| {
         let relay = relay_stored.get_value();
         let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
         if pubkey.is_empty() {
             return;
         }
+        let target = event_id_stored.get_value();
 
-        // Toggle local state
-        reactions.update(|list| {
-            if let Some(r) = list.iter_mut().find(|r| r.emoji == emoji) {
-                if r.reacted_by_me {
-                    r.count = r.count.saturating_sub(1);
-                    r.reacted_by_me = false;
-                } else {
-                    r.count += 1;
-                    r.reacted_by_me = true;
+        if store.has_my_reaction(&target, &emoji, &pubkey) {
+            // Un-react: NIP-09 kind-5 deletion of the viewer's own kind-7.
+            let Some(reaction_id) = store.my_reaction_id(&target, &emoji, &pubkey) else {
+                return;
+            };
+            store.remove_local(&reaction_id);
+            let now = (js_sys::Date::now() / 1000.0) as u64;
+            let unsigned = nostr_bbs_core::UnsignedEvent {
+                pubkey,
+                created_at: now,
+                kind: 5,
+                tags: vec![vec!["e".to_string(), reaction_id]],
+                content: String::new(),
+            };
+            wasm_bindgen_futures::spawn_local(async move {
+                match auth.sign_event_async(unsigned).await {
+                    Ok(signed) => relay.publish(&signed),
+                    Err(e) => web_sys::console::error_1(
+                        &format!("[ReactionBar] Un-react sign failed: {}", e).into(),
+                    ),
                 }
-                if r.count == 0 {
-                    list.retain(|r| r.count > 0);
-                }
-            } else {
-                list.push(Reaction {
-                    emoji: emoji.clone(),
-                    count: 1,
-                    reacted_by_me: true,
-                });
+            });
+        } else {
+            // React: NIP-25 kind-7. The `p` tag is the reacted-to AUTHOR.
+            let author = author_pk_stored.get_value();
+            let now = (js_sys::Date::now() / 1000.0) as u64;
+            let mut tags = vec![vec!["e".to_string(), target.clone()]];
+            if !author.is_empty() {
+                tags.push(vec!["p".to_string(), author]);
             }
-        });
-
-        // Publish kind 7 reaction event
-        let eid = event_id_stored.get_value();
-        let now = (js_sys::Date::now() / 1000.0) as u64;
-        let unsigned = nostr_bbs_core::UnsignedEvent {
-            pubkey: pubkey.clone(),
-            created_at: now,
-            kind: 7,
-            tags: vec![vec!["e".to_string(), eid], vec!["p".to_string(), pubkey]],
-            content: emoji,
-        };
-
-        let relay = relay.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            match auth.sign_event_async(unsigned).await {
-                Ok(signed) => {
-                    relay.publish(&signed);
+            let unsigned = nostr_bbs_core::UnsignedEvent {
+                pubkey: pubkey.clone(),
+                created_at: now,
+                kind: 7,
+                tags,
+                content: emoji.clone(),
+            };
+            wasm_bindgen_futures::spawn_local(async move {
+                match auth.sign_event_async(unsigned).await {
+                    Ok(signed) => {
+                        // Record with the real signed id so a later un-react can
+                        // address the kind-5; idempotent with the relay echo.
+                        store.add_local(&signed.id, &target, &emoji, &pubkey);
+                        relay.publish(&signed);
+                    }
+                    Err(e) => web_sys::console::error_1(
+                        &format!("[ReactionBar] React sign failed: {}", e).into(),
+                    ),
                 }
-                Err(e) => {
-                    web_sys::console::error_1(&format!("[ReactionBar] Sign failed: {}", e).into());
-                }
-            }
-        });
-    };
-
-    let add_from_picker = move |emoji: &'static str| {
-        show_picker.set(false);
-        let relay = relay_stored.get_value();
-        let pubkey = auth.pubkey().get_untracked().unwrap_or_default();
-        if pubkey.is_empty() {
-            return;
+            });
         }
-
-        // Update local state
-        reactions.update(|list| {
-            if let Some(r) = list.iter_mut().find(|r| r.emoji == emoji) {
-                if !r.reacted_by_me {
-                    r.count += 1;
-                    r.reacted_by_me = true;
-                }
-            } else {
-                list.push(Reaction {
-                    emoji: emoji.to_string(),
-                    count: 1,
-                    reacted_by_me: true,
-                });
-            }
-        });
-
-        // Publish kind 7
-        let eid = event_id_stored.get_value();
-        let now = (js_sys::Date::now() / 1000.0) as u64;
-        let unsigned = nostr_bbs_core::UnsignedEvent {
-            pubkey: pubkey.clone(),
-            created_at: now,
-            kind: 7,
-            tags: vec![vec!["e".to_string(), eid], vec!["p".to_string(), pubkey]],
-            content: emoji.to_string(),
-        };
-
-        wasm_bindgen_futures::spawn_local(async move {
-            match auth.sign_event_async(unsigned).await {
-                Ok(signed) => {
-                    relay.publish(&signed);
-                }
-                Err(e) => {
-                    web_sys::console::error_1(&format!("[ReactionBar] Sign failed: {}", e).into());
-                }
-            }
-        });
     };
 
     view! {
@@ -170,8 +151,11 @@ pub(crate) fn ReactionBar(
                         <div class="relative inline-flex">
                             <button
                                 class=move || {
-                                    let r = reactions.get().iter().find(|r| r.emoji == emoji).cloned();
-                                    let is_mine = r.as_ref().map(|r| r.reacted_by_me).unwrap_or(false);
+                                    let is_mine = reactions.get()
+                                        .iter()
+                                        .find(|r| r.emoji == emoji)
+                                        .map(|r| r.reacted_by_me)
+                                        .unwrap_or(false);
                                     if is_mine {
                                         "reaction-burst is-active inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-amber-500/15 border border-amber-500/30 hover:bg-amber-500/25 transition-colors cursor-pointer"
                                     } else {
@@ -182,6 +166,7 @@ pub(crate) fn ReactionBar(
                                     let emoji_c = emoji_for_click.clone();
                                     let toggle_c = toggle;
                                     move |_| {
+                                        // A burst plays only when ADDING a reaction.
                                         let adding = !reactions.get_untracked()
                                             .iter()
                                             .find(|r| r.emoji == emoji_c)
@@ -223,10 +208,14 @@ pub(crate) fn ReactionBar(
                         <div class="flex gap-1">
                             {REACTION_EMOJIS.iter().map(|&emoji| {
                                 let emoji_static = emoji;
+                                let toggle = toggle_reaction;
                                 view! {
                                     <button
                                         class="emoji-btn text-base"
-                                        on:click=move |_| add_from_picker(emoji_static)
+                                        on:click=move |_| {
+                                            show_picker.set(false);
+                                            toggle(emoji_static.to_string());
+                                        }
                                     >
                                         {emoji_static}
                                     </button>

@@ -38,6 +38,9 @@ pub mod reaction_bar;
 
 // -- Auth Flow + Profile (Stream 3) ------------------------------------------
 pub mod profile_modal;
+// Lightweight anchored profile preview (read-only) — the popover counterpart to
+// the full `profile_modal` overlay; wired into `UserDisplay`.
+pub mod profile_popover;
 pub mod user_display;
 
 // -- Navigation + Mobile (Stream 4) ------------------------------------------

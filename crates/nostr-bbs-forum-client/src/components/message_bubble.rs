@@ -12,8 +12,9 @@ use crate::components::link_preview::LinkPreview;
 use crate::components::media_embed::MediaEmbed;
 use crate::components::mention_text::MentionText;
 use crate::components::pinned_messages::PinButton;
+use crate::components::profile_popover::ProfilePopover;
 use crate::components::quoted_message::QuotedMessage;
-use crate::components::reaction_bar::{Reaction, ReactionBar};
+use crate::components::reaction_bar::ReactionBar;
 use crate::components::report_button::ReportButton;
 use crate::components::thread_view::{ThreadReply, ThreadView};
 use crate::components::toast::{use_toasts, ToastVariant};
@@ -34,8 +35,6 @@ pub struct MessageData {
     pub reply_to_pubkey: Option<String>,
     /// Reply-to content (cached for display).
     pub reply_to_content: Option<String>,
-    /// Reactive reactions list.
-    pub reactions: RwSignal<Vec<Reaction>>,
     /// Whether this message has been hidden by moderation.
     pub is_hidden: bool,
     /// Channel ID this message belongs to (for pin/thread context).
@@ -103,18 +102,15 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
         }
     };
 
-    // Profile modal trigger (avatar + name click)
-    let pk_modal = StoredValue::new(msg_pubkey.clone());
-    let on_avatar_click = move |_: leptos::ev::MouseEvent| {
-        if let Some(ctx) = use_context::<ProfileModalTarget>() {
-            ctx.0.set(Some(pk_modal.get_value()));
-        }
-    };
-    let on_name_click = move |_: leptos::ev::MouseEvent| {
-        if let Some(ctx) = use_context::<ProfileModalTarget>() {
-            ctx.0.set(Some(pk_modal.get_value()));
-        }
-    };
+    // Profile popover trigger (avatar + name click). A lightweight anchored
+    // preview (avatar zoom, name, NIP-05, bio, copy pubkey, Send DM) replaces
+    // the former full-screen ProfileModal on this click path. Both the avatar
+    // and the name toggle one shared open-state signal; the popover is anchored
+    // under the avatar (see the `relative` wrapper in the view).
+    let profile_open = RwSignal::new(false);
+    let pk_popover = StoredValue::new(msg_pubkey.clone());
+    let on_avatar_click = move |_: leptos::ev::MouseEvent| profile_open.update(|o| *o = !*o);
+    let on_name_click = move |_: leptos::ev::MouseEvent| profile_open.update(|o| *o = !*o);
 
     // Display name resolved through ProfileCache > NameCache > shortened pubkey.
     let display_name = use_display_name_memo(msg_pubkey.clone());
@@ -149,6 +145,7 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
 
     let event_id_attr = event_id.clone();
     let event_id_react = event_id.clone();
+    let pk_react = msg_pubkey.clone();
     let event_id_report = event_id.clone();
     let event_id_pin = event_id.clone();
     let event_id_delete = event_id.clone();
@@ -164,9 +161,13 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
             class="flex gap-3 py-2 px-2 hover:bg-gray-800/30 rounded-lg transition-colors group"
             data-event-id=event_id_attr
         >
-            // Avatar (clickable)
-            <div class="flex-shrink-0 mt-0.5 cursor-pointer" on:click=on_avatar_click>
+            // Avatar (clickable) — opens the anchored profile popover. The
+            // `relative` wrapper is the anchor for the popover's absolute card.
+            <div class="flex-shrink-0 mt-0.5 cursor-pointer relative" on:click=on_avatar_click>
                 <Avatar pubkey=pk_for_avatar size=AvatarSize::Md />
+                <Show when=move || profile_open.get()>
+                    <ProfilePopover pubkey=pk_popover.get_value() is_open=profile_open />
+                </Show>
             </div>
 
             // Content column
@@ -244,7 +245,7 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                 // Reaction bar
                 <ReactionBar
                     event_id=event_id_react
-                    reactions=message.reactions
+                    author_pubkey=pk_react
                 />
 
                 // Threaded replies (NIP-22 kind-1111). Threading is one level
