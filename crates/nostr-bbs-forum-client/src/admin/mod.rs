@@ -14,7 +14,6 @@ pub mod registrations;
 pub mod reports;
 pub mod section_requests;
 pub mod settings;
-pub mod stats;
 pub mod user_table;
 
 use leptos::prelude::*;
@@ -28,20 +27,36 @@ use nostr_bbs_core::signer::Signer;
 // -- Types --------------------------------------------------------------------
 
 /// Tabs in the admin panel.
+///
+/// Consolidated from the original 12-tab layout into 8 working surfaces.
+/// User management (whitelist, pending approvals, invites, section access
+/// requests) is unified under `Members` with an internal sub-view selector.
+/// The old `Settings` tab is renamed `Configuration` to avoid the naming
+/// collision with the per-user `/settings` route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdminTab {
     Overview,
+    Members,
     Channels,
-    Users,
-    Pending,
-    Invites,
-    Sections,
     Agents,
     Calendar,
-    Settings,
+    Configuration,
     Reports,
     AuditLog,
-    NativePods,
+}
+
+/// Sub-views within the consolidated Members tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MembersView {
+    /// Whitelisted users (cohort/admin management).
+    #[default]
+    Active,
+    /// Registrations awaiting approval.
+    Pending,
+    /// Zone-bound invite link generation.
+    Invites,
+    /// Section/zone join-request approvals.
+    Access,
 }
 
 /// A whitelisted user returned from the relay API.

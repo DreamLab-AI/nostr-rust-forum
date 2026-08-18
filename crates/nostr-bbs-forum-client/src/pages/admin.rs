@@ -21,7 +21,7 @@ use crate::admin::section_requests::SectionRequests;
 use crate::admin::settings::SettingsTab;
 use crate::admin::user_table::{AdminToggleCb, DeleteCb};
 use crate::admin::user_table::{UpdateCohortsCb, UserTable};
-use crate::admin::{provide_admin, use_admin, AdminTab};
+use crate::admin::{provide_admin, use_admin, AdminTab, MembersView};
 use crate::auth::use_auth;
 use crate::components::admin_checklist::AdminChecklist;
 use crate::components::toast::{use_toasts, ToastVariant};
@@ -157,7 +157,7 @@ fn AdminPanelInner() -> impl IntoView {
     let active_tab_for_focus = admin.state.active_tab;
     Effect::new(move |_| {
         let tab = active_tab_for_focus.get();
-        if matches!(tab, AdminTab::Overview | AdminTab::Pending) {
+        if matches!(tab, AdminTab::Overview | AdminTab::Members) {
             if let Some(signer) = auth_for_focus.get_signer() {
                 let admin_clone = admin_for_focus.clone();
                 spawn_local(async move {
@@ -273,36 +273,33 @@ fn AdminPanelInner() -> impl IntoView {
             }}
 
             // Tab navigation
-            <div class="flex gap-6 border-b border-gray-700 mb-6">
+            <div class="flex flex-wrap gap-4 sm:gap-6 border-b border-gray-700 mb-6">
                 <TabButton tab=AdminTab::Overview active=active_tab label="Overview" />
+                <MembersTabButton active=active_tab pending=admin.state.stats />
                 <TabButton tab=AdminTab::Channels active=active_tab label="Channels" />
-                <TabButton tab=AdminTab::Users active=active_tab label="Users" />
-                <PendingTabButton active=active_tab pending=admin.state.stats />
-                <TabButton tab=AdminTab::Invites active=active_tab label="Invites" />
-                <TabButton tab=AdminTab::Sections active=active_tab label="Sections" />
                 <TabButton tab=AdminTab::Agents active=active_tab label="Agents" />
                 <TabButton tab=AdminTab::Calendar active=active_tab label="Calendar" />
-                <TabButton tab=AdminTab::Settings active=active_tab label="Settings" />
+                <TabButton tab=AdminTab::Configuration active=active_tab label="Configuration" />
                 <TabButton tab=AdminTab::Reports active=active_tab label="Reports" />
                 <TabButton tab=AdminTab::AuditLog active=active_tab label="Audit Log" />
-                <TabButton tab=AdminTab::NativePods active=active_tab label="Native Pods" />
             </div>
 
             // Tab content
             {move || {
                 match active_tab.get() {
                     AdminTab::Overview => view! { <OverviewTab /> }.into_any(),
+                    AdminTab::Members => view! { <MembersTab /> }.into_any(),
                     AdminTab::Channels => view! { <ChannelsTab /> }.into_any(),
-                    AdminTab::Users => view! { <UsersTab /> }.into_any(),
-                    AdminTab::Pending => view! { <RegistrationsPanel /> }.into_any(),
-                    AdminTab::Invites => view! { <InvitesPanel /> }.into_any(),
-                    AdminTab::Sections => view! { <SectionRequests /> }.into_any(),
                     AdminTab::Agents => view! { <AgentsRoster /> }.into_any(),
                     AdminTab::Calendar => view! { <AdminCalendar /> }.into_any(),
-                    AdminTab::Settings => view! { <SettingsTab /> }.into_any(),
+                    AdminTab::Configuration => view! {
+                        <SettingsTab />
+                        <div class="mt-8 border-t border-gray-700 pt-6">
+                            <NativePodsTab />
+                        </div>
+                    }.into_any(),
                     AdminTab::Reports => view! { <ReportsTab /> }.into_any(),
                     AdminTab::AuditLog => view! { <AuditLogTab /> }.into_any(),
-                    AdminTab::NativePods => view! { <NativePodsTab /> }.into_any(),
                 }
             }}
 
@@ -326,17 +323,13 @@ fn initial_tab_from_query() -> Option<AdminTab> {
         }
         match value {
             "overview" => Some(AdminTab::Overview),
+            "members" | "users" | "pending" | "invites" | "sections" => Some(AdminTab::Members),
             "channels" => Some(AdminTab::Channels),
-            "users" => Some(AdminTab::Users),
-            "pending" => Some(AdminTab::Pending),
-            "invites" => Some(AdminTab::Invites),
-            "sections" => Some(AdminTab::Sections),
             "agents" => Some(AdminTab::Agents),
             "calendar" => Some(AdminTab::Calendar),
-            "settings" => Some(AdminTab::Settings),
+            "configuration" | "settings" | "pods" | "nativepods" => Some(AdminTab::Configuration),
             "reports" => Some(AdminTab::Reports),
             "audit" | "auditlog" => Some(AdminTab::AuditLog),
-            "pods" | "nativepods" => Some(AdminTab::NativePods),
             _ => None,
         }
     })
@@ -363,15 +356,14 @@ fn TabButton(tab: AdminTab, active: RwSignal<AdminTab>, label: &'static str) -> 
     }
 }
 
-/// Tab button for the Pending registrations tab, carrying a live count badge
-/// sourced from the same `pending_approvals` stat shown on the Overview card —
-/// so the icon and the number always agree and refresh together.
+/// Tab button for the consolidated Members tab, carrying a live pending-count
+/// badge sourced from `pending_approvals` in the admin stats signal.
 #[component]
-fn PendingTabButton(
+fn MembersTabButton(
     active: RwSignal<AdminTab>,
     pending: RwSignal<crate::admin::AdminStats>,
 ) -> impl IntoView {
-    let tab = AdminTab::Pending;
+    let tab = AdminTab::Members;
     let is_active = move || active.get() == tab;
     let class = move || {
         if is_active() {
@@ -384,13 +376,53 @@ fn PendingTabButton(
 
     view! {
         <button on:click=move |_| active.set(tab) class=class>
-            "Pending"
+            "Members"
             <Show when=move || { count() > 0 }>
                 <span class="bg-red-500/20 text-red-400 text-xs font-bold px-1.5 py-0.5 rounded-full border border-red-500/30 leading-none">
                     {move || count().to_string()}
                 </span>
             </Show>
         </button>
+    }
+}
+
+// -- Members tab (consolidated) -----------------------------------------------
+
+#[component]
+fn MembersTab() -> impl IntoView {
+    let sub_view = RwSignal::new(MembersView::Active);
+
+    let sub_btn_class = move |v: MembersView| {
+        if sub_view.get() == v {
+            "px-3 py-1.5 text-xs font-medium rounded-md bg-gray-700 text-white"
+        } else {
+            "px-3 py-1.5 text-xs font-medium rounded-md text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+        }
+    };
+
+    view! {
+        <div class="space-y-4">
+            <div class="flex gap-2 flex-wrap">
+                <button on:click=move |_| sub_view.set(MembersView::Active) class=move || sub_btn_class(MembersView::Active)>
+                    "Active Users"
+                </button>
+                <button on:click=move |_| sub_view.set(MembersView::Pending) class=move || sub_btn_class(MembersView::Pending)>
+                    "Pending"
+                </button>
+                <button on:click=move |_| sub_view.set(MembersView::Invites) class=move || sub_btn_class(MembersView::Invites)>
+                    "Invites"
+                </button>
+                <button on:click=move |_| sub_view.set(MembersView::Access) class=move || sub_btn_class(MembersView::Access)>
+                    "Section Access"
+                </button>
+            </div>
+            {move || match sub_view.get() {
+                MembersView::Active => view! { <UsersTab /> }.into_any(),
+                MembersView::Pending => view! { <RegistrationsPanel /> }.into_any(),
+                MembersView::Invites => view! { <InvitesPanel /> }.into_any(),
+                MembersView::Access => view! { <SectionRequests /> }.into_any(),
+            }}
+        </div>
     }
 }
 
