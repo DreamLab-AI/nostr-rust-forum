@@ -125,7 +125,34 @@ pub fn home_zone_for(zones: &[Zone], cohorts: &[String], is_admin: bool) -> Opti
     }
 }
 
+/// First accessible locked zone — for PWA bake (ADR-109 amendment).
+///
+/// Unlike [`home_zone_for`] this does NOT require exactly one locked zone: it
+/// returns the first match, allowing multi-zone members and admins to install.
+/// Admins bypass the cohort check (they have access to every zone); non-admins
+/// must satisfy the zone's cohort requirement.
+pub fn first_accessible_zone_for(zones: &[Zone], cohorts: &[String], is_admin: bool) -> Option<Zone> {
+    zones
+        .iter()
+        .find(|z| {
+            !z.required_cohorts.is_empty() && (is_admin || z.is_member(cohorts))
+        })
+        .cloned()
+}
+
 impl ZoneAccess {
+    /// First accessible locked zone (reactive). Used by PWA install to pick a
+    /// bake target when `home_zone()` returns `None` (admin / multi-zone).
+    pub fn first_accessible_zone(&self) -> Option<Zone> {
+        let loaded = self.loaded.get();
+        let is_admin = self.is_admin.get();
+        let cohorts = self.cohorts.get();
+        if !loaded {
+            return None;
+        }
+        first_accessible_zone_for(&load_zones(), &cohorts, is_admin)
+    }
+
     /// Check access for a zone by its string ID.
     #[allow(dead_code)]
     pub fn has_access(&self, zone_id: &str) -> bool {

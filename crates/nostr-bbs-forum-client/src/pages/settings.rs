@@ -244,7 +244,7 @@ pub fn SettingsPage() -> impl IntoView {
             return;
         }
         let zones = crate::stores::zones::load_zones();
-        let Some(zone) = crate::stores::zone_access::home_zone_for(
+        let Some(zone) = crate::stores::zone_access::first_accessible_zone_for(
             &zones,
             &za.cohorts.get_untracked(),
             za.is_admin.get_untracked(),
@@ -1370,7 +1370,7 @@ pub fn SettingsPage() -> impl IntoView {
                         <div class="border-t border-gray-700/50"></div>
 
                         <p class="text-sm text-gray-400">
-                            "Add this zone to your phone or computer and open it like an app — signed in, straight into your zone, with no password."
+                            "Add the forum to your phone or computer and open it like an app — signed in, with access to all your zones, no password needed."
                         </p>
 
                         // Consent warning (verbatim, ADR-109 §11.2 — do not alter).

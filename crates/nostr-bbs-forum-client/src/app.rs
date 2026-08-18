@@ -358,7 +358,7 @@ pub fn App() -> impl IntoView {
                 if rebaked.get_value() || !auth.is_authenticated().get() {
                     return;
                 }
-                let Some(zone) = zone_access.home_zone() else {
+                let Some(zone) = zone_access.home_zone().or_else(|| zone_access.first_accessible_zone()) else {
                     return;
                 };
                 rebaked.set_value(true);

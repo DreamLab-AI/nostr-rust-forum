@@ -1,9 +1,9 @@
-//! Zone-bound BBS PWA install orchestration (ADR-109, Decisions #1/#3/#4).
+//! PWA install orchestration (ADR-109, amended to remove single-zone gate).
 //!
 //! This module owns three concerns for the FORUM (write) side:
-//! 1. The **gating predicate** — reused verbatim from ADR-107
-//!    ([`crate::stores::zone_access::home_zone_for`]) so admins and multi/zero-zone
-//!    members never see the install affordance.
+//! 1. The **gating predicate** — any authenticated user with at least one
+//!    accessible locked zone can install; the PWA uses the full Nostr key so
+//!    the user retains access to every zone they are authorised for.
 //! 2. **Install orchestration** — after the bake (see [`crate::utils::bake`]) the
 //!    member is LINKED to the BBS (`/bbs/?pwa=1`) where installation actually
 //!    happens: `beforeinstallprompt` belongs to the BBS scope (`/community/bbs/`,
@@ -24,7 +24,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use crate::app::base_href;
-use crate::stores::zone_access::home_zone_for;
+use crate::stores::zone_access::first_accessible_zone_for;
 use crate::stores::zones::Zone;
 
 /// `window.__ENV__` key toggling the whole feature. Missing ⇒ DISABLED (the
@@ -36,14 +36,15 @@ const FEATURE_FLAG_KEY: &str = "BBS_PWA_ENABLED";
 // (a) Gating predicate
 // ---------------------------------------------------------------------------
 
-/// The exact ADR-107 predicate: the install option is visible only to a
-/// non-admin member whose cohorts resolve to exactly ONE locked zone.
+/// Show the install option to any authenticated user who can access at least
+/// one locked zone — admins, multi-zone members, and single-zone members
+/// alike. The installed PWA uses the full Nostr key so the user retains access
+/// to every zone they are authorised for.
 ///
-/// Pure and unit-tested (truth table below). The runtime `BBS_PWA_ENABLED`
-/// gate is a SEPARATE concern ([`feature_enabled`]); the caller ANDs them so
-/// this predicate stays a faithful mirror of `home_zone_for`.
+/// Pure and unit-tested. The runtime `BBS_PWA_ENABLED` gate is a SEPARATE
+/// concern ([`feature_enabled`]); the caller ANDs them.
 pub fn install_option_visible(zones: &[Zone], cohorts: &[String], is_admin: bool) -> bool {
-    !is_admin && home_zone_for(zones, cohorts, is_admin).is_some()
+    first_accessible_zone_for(zones, cohorts, is_admin).is_some()
 }
 
 /// Whether the operator has enabled the BBS-PWA feature for this deployment.
@@ -367,13 +368,13 @@ mod tests {
         }
     }
 
-    // ── install_option_visible: the exact ADR-107 truth table ───────────────
+    // ── install_option_visible: open to all with zone access ────────────────
 
     #[test]
-    fn admin_never_sees_install() {
+    fn admin_sees_install() {
         let zones = vec![locked_zone("business", "business")];
         let cohorts = vec!["business".to_string()];
-        assert!(!install_option_visible(&zones, &cohorts, true));
+        assert!(install_option_visible(&zones, &cohorts, true));
     }
 
     #[test]
@@ -384,18 +385,17 @@ mod tests {
     }
 
     #[test]
-    fn two_locked_zones_hide_install() {
+    fn multi_zone_member_sees_install() {
         let zones = vec![
             locked_zone("business", "business"),
             locked_zone("family", "family"),
         ];
         let cohorts = vec!["business".to_string(), "family".to_string()];
-        assert!(!install_option_visible(&zones, &cohorts, false));
+        assert!(install_option_visible(&zones, &cohorts, false));
     }
 
     #[test]
     fn zero_accessible_zones_hide_install() {
-        // A member with no cohorts can only read the public zone → no home zone.
         let zones = vec![public_zone("public"), locked_zone("business", "business")];
         let cohorts: Vec<String> = vec![];
         assert!(!install_option_visible(&zones, &cohorts, false));
