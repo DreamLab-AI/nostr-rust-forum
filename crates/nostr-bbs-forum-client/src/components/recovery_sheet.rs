@@ -52,6 +52,7 @@
 use leptos::prelude::*;
 use qrcode::render::svg;
 use qrcode::{EcLevel, QrCode};
+use wasm_bindgen::JsCast;
 
 use crate::app::base_href;
 use crate::components::info_term::InfoTerm;
@@ -72,6 +73,162 @@ fn qr_svg(data: &str) -> String {
             .light_color(svg::Color("#ffffff"))
             .build(),
         Err(_) => String::new(),
+    }
+}
+
+/// Trigger a browser download of a self-contained HTML recovery document.
+///
+/// Builds a standalone HTML page with all QR codes (inline SVG), the recovery
+/// key, relay address, and restore instructions — identical content to the
+/// printable sheet but delivered as a direct file download. On Android this
+/// prompts the download permission once and saves immediately, bypassing the
+/// `window.print()` dialog entirely.
+///
+/// The secret key never leaves the browser: the Blob is constructed in WASM,
+/// the object-URL is ephemeral, and the hidden `<a>` is removed after click.
+fn download_recovery_html(
+    display_name: &str,
+    created: &str,
+    nip05: Option<&str>,
+    connect_url: Option<&str>,
+    connect_qr: &str,
+    nsec: &str,
+    nsec_qr: &str,
+    relay_url: &str,
+    relay_qr: &str,
+    npub: &str,
+    npub_qr: &str,
+) {
+    let nip05_line = nip05
+        .filter(|h| !h.is_empty())
+        .map(|h| format!(" &middot; {h}"))
+        .unwrap_or_default();
+
+    let connect_section = connect_url
+        .map(|url| {
+            format!(
+                r#"<div style="border:2px solid #dc2626;border-radius:12px;padding:16px;background:#fef2f2">
+  <p style="font-size:14px;font-weight:bold;color:#b91c1c;text-transform:uppercase;letter-spacing:0.05em">📱 Sign in on your phone</p>
+  <p style="font-size:12px;color:#1f2937;margin:6px 0">Scan this code with your phone's camera — the forum opens and signs you in.</p>
+  <p style="font-size:11px;color:#b91c1c;font-weight:bold;margin-bottom:10px">⚠ Treat this code like a key to your account.</p>
+  <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+    <div style="flex-shrink:0">{connect_qr}</div>
+    <div style="min-width:0;flex:1"><p style="font-size:10px;color:#dc2626;text-transform:uppercase;margin-bottom:4px">your sign-in link</p><code style="font-size:10px;word-break:break-all">{url}</code></div>
+  </div>
+</div>"#
+            )
+        })
+        .unwrap_or_default();
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recovery Sheet – {display_name}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 700px; margin: 0 auto; padding: 20px; color: #111; background: #fff; }}
+  code {{ font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace; word-break: break-all; }}
+  svg {{ width: 180px; height: 180px; }}
+  .section {{ border: 1px solid #d1d5db; border-radius: 12px; padding: 16px; margin-bottom: 16px; }}
+  .secret {{ border: 2px solid #dc2626; background: #fef2f2; }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; }}
+  @media print {{ @page {{ margin: 12mm; }} }}
+</style>
+</head>
+<body>
+<div style="border-bottom:1px solid #d1d5db;padding-bottom:12px;margin-bottom:16px">
+  <h1>Your account &amp; sign-in sheet</h1>
+  <p style="font-size:12px;color:#4b5563">Save this file and keep it somewhere safe — it's how you get back into your account. Everything here is private to you; don't share it.</p>
+  <p style="font-size:11px;color:#6b7280;margin-top:4px">Account: {display_name}{nip05_line} &middot; Created {created}</p>
+</div>
+
+{connect_section}
+
+<div class="section secret">
+  <p style="font-size:14px;font-weight:bold;color:#b91c1c;text-transform:uppercase;letter-spacing:0.05em">🔑 Your recovery key</p>
+  <p style="font-size:12px;color:#1f2937;margin:6px 0">This is the master key to your account. Anyone who reads it can sign in as you.</p>
+  <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+    <div style="flex-shrink:0">{nsec_qr}</div>
+    <div style="min-width:0;flex:1"><p style="font-size:10px;color:#dc2626;text-transform:uppercase;margin-bottom:4px">recovery key (nsec)</p><code style="font-size:12px">{nsec}</code></div>
+  </div>
+</div>
+
+<div class="section">
+  <p style="font-size:14px;font-weight:bold;text-transform:uppercase;letter-spacing:0.05em">📡 Server address</p>
+  <p style="font-size:12px;color:#4b5563;margin:6px 0">Only needed if you connect a separate messaging app.</p>
+  <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+    <div style="flex-shrink:0">{relay_qr}</div>
+    <div style="min-width:0;flex:1"><p style="font-size:10px;color:#6b7280;text-transform:uppercase;margin-bottom:4px">address (relay)</p><code style="font-size:12px">{relay_url}</code></div>
+  </div>
+</div>
+
+<div class="section">
+  <p style="font-size:14px;font-weight:bold;text-transform:uppercase;letter-spacing:0.05em">🪪 Your public profile</p>
+  <p style="font-size:12px;color:#4b5563;margin:6px 0">Safe to share — it's how people find you.</p>
+  <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+    <div style="flex-shrink:0">{npub_qr}</div>
+    <div style="min-width:0;flex:1">
+      <p style="font-size:12px"><strong>Name:</strong> {display_name}</p>
+      <p style="font-size:10px;color:#6b7280;text-transform:uppercase;margin-top:6px">public ID (npub)</p>
+      <code style="font-size:12px">{npub}</code>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="background:#f9fafb">
+  <p style="font-size:14px;font-weight:bold;text-transform:uppercase;letter-spacing:0.05em">📖 How to restore</p>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px">
+    <div>
+      <p style="font-size:13px;font-weight:600;margin-bottom:4px">On your phone (easiest)</p>
+      <ol style="font-size:11px;color:#374151;padding-left:16px;margin:0">
+        <li>Point your phone's camera at the 📱 code.</li>
+        <li>The forum opens and signs you in automatically.</li>
+      </ol>
+    </div>
+    <div>
+      <p style="font-size:13px;font-weight:600;margin-bottom:4px">On a computer</p>
+      <ol style="font-size:11px;color:#374151;padding-left:16px;margin:0">
+        <li>Open the forum's sign-in page.</li>
+        <li>Paste your recovery key (the 🔑 key above).</li>
+        <li>You're back in — same account.</li>
+      </ol>
+    </div>
+  </div>
+</div>
+</body>
+</html>"##
+    );
+
+    let Some(window) = web_sys::window() else { return };
+    let Some(document) = window.document() else { return };
+
+    let parts = js_sys::Array::new();
+    parts.push(&html.into());
+
+    let opts = web_sys::BlobPropertyBag::new();
+    opts.set_type("text/html;charset=utf-8");
+
+    let Ok(blob) = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts) else {
+        return;
+    };
+    let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) else {
+        return;
+    };
+
+    if let Ok(a) = document.create_element("a") {
+        let _ = a.set_attribute("href", &url);
+        let _ = a.set_attribute("download", "dreamlab-recovery.html");
+        let _ = a.set_attribute("style", "display:none");
+        if let Some(body) = document.body() {
+            let _ = body.append_child(&a);
+            if let Some(el) = a.dyn_ref::<web_sys::HtmlElement>() {
+                el.click();
+            }
+            let _ = body.remove_child(&a);
+        }
+        let _ = web_sys::Url::revoke_object_url(&url);
     }
 }
 
@@ -129,6 +286,35 @@ pub(crate) fn RecoverySheet(
             on_ready.run(());
         }
     });
+
+    // Capture values for the download closure (cloned once; the closure is Fn).
+    let dl_display = display_name.clone();
+    let dl_created = created.clone();
+    let dl_nip05 = nip05.clone();
+    let dl_connect_url = connect_url.clone();
+    let dl_connect_qr = connect_qr.clone();
+    let dl_nsec = nsec.clone();
+    let dl_nsec_qr = nsec_qr.clone();
+    let dl_relay = relay_url.clone();
+    let dl_relay_qr = relay_qr.clone();
+    let dl_npub = npub.clone();
+    let dl_npub_qr = npub_qr.clone();
+    let on_download = move |_| {
+        download_recovery_html(
+            &dl_display,
+            &dl_created,
+            dl_nip05.as_deref(),
+            dl_connect_url.as_deref(),
+            &dl_connect_qr,
+            &dl_nsec,
+            &dl_nsec_qr,
+            &dl_relay,
+            &dl_relay_qr,
+            &dl_npub,
+            &dl_npub_qr,
+        );
+        printed.set(true);
+    };
 
     let on_print = move |_| {
         if let Some(window) = web_sys::window() {
@@ -521,18 +707,25 @@ pub(crate) fn RecoverySheet(
                     </div>
                 </Show>
 
-                // ── Print / gate controls (never printed) ─────────────────
+                // ── Download + print / gate controls (never printed) ────
                 <div class="rs-screen-controls border-t border-gray-300 pt-4 space-y-3">
                     <button
-                        on:click=on_print
+                        on:click=on_download
                         class="w-full bg-gray-900 hover:bg-gray-700 text-white font-semibold py-3 px-4 rounded-xl transition-colors text-sm"
-                        data-testid="recovery-print"
+                        data-testid="recovery-download"
                     >
-                        "Save as PDF (or print)"
+                        "Download recovery file"
                     </button>
                     <p class="text-xs text-gray-500">
-                        "In the dialog that opens, choose \u{201c}Save as PDF\u{201d} and keep the file somewhere safe — that one file keeps your access."
+                        "Downloads a file with your sign-in QR codes and recovery key. Keep it somewhere safe — that one file keeps your access."
                     </p>
+                    <button
+                        on:click=on_print
+                        class="w-full border border-gray-400 hover:bg-gray-100 text-gray-700 font-medium py-2 px-4 rounded-xl transition-colors text-xs"
+                        data-testid="recovery-print"
+                    >
+                        "Print a paper copy instead"
+                    </button>
                     <label class="flex items-center gap-2 cursor-pointer text-sm text-gray-800">
                         <input
                             type="checkbox"

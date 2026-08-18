@@ -288,7 +288,8 @@ fn AdminSetupCta(
             match auth.register_with_passkey(&name).await {
                 Ok(()) => {
                     needs_setup.set(Some(false));
-                    navigate.with_value(|nav| nav("/setup", NavigateOptions::default()));
+                    auth.complete_signup();
+                    navigate.with_value(|nav| nav("/forums", NavigateOptions::default()));
                 }
                 Err(e) => {
                     error.set(Some(e));
@@ -330,12 +331,15 @@ fn AdminSetupCta(
         }
     };
 
-    // After backup, navigate to profile setup
+    // After backup, skip directly to the forum (display name is already set
+    // from the registration form — the old redirect to /setup re-asked for a
+    // nickname, duplicating the capture).
     let on_backup_done = Callback::new(move |()| {
         auth.confirm_nsec_backup();
+        auth.complete_signup();
         setup_phase.set(SetupPhase::Done);
         needs_setup.set(Some(false));
-        navigate.with_value(|nav| nav("/setup", NavigateOptions::default()));
+        navigate.with_value(|nav| nav("/forums", NavigateOptions::default()));
     });
 
     view! {
