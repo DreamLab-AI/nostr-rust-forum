@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-preview-worker"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 publish = false           # deployable application (built from source at KIT_REF), not a crates.io dependency
 edition = "2021"
 description = "Link preview Worker: OG metadata + Twitter oEmbed + SSRF protection (nostr-bbs)"
@@ -19,6 +19,7 @@ crate-type = ["cdylib"]
 worker = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+futures-util = { workspace = true }
 js-sys = { workspace = true }
 nostr-bbs-rate-limit = { workspace = true }
 nostr-bbs-ascii = { workspace = true, features = ["decode"] }

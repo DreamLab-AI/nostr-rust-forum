@@ -24,7 +24,10 @@
 //! rebind-vulnerable by construction — operators handling untrusted preview
 //! targets should configure `PREVIEW_ALLOWED_HOSTS`.
 
-use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Response, Url};
+use futures_util::TryStreamExt;
+use worker::{
+    Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Response, ResponseBody, Url,
+};
 
 /// Maximum number of HTTP redirects we will follow per outbound request.
 pub const MAX_REDIRECTS: usize = 3;
@@ -216,14 +219,11 @@ pub async fn ssrf_fetch_with_redirects(
 }
 
 /// Read the response body as text, rejecting bodies that exceed
-/// [`MAX_BODY_BYTES`]. workers-rs `Response::text()` does not expose a
-/// streaming reader, so we read the bytes and check the size before UTF-8
-/// decoding.
+/// [`MAX_BODY_BYTES`]. Streaming responses are consumed incrementally and
+/// aborted as soon as the cap is crossed, so a hostile origin cannot force an
+/// unbounded allocation before rejection.
 pub async fn read_text_capped(mut response: Response) -> Result<String, SsrfFetchError> {
-    let bytes = response.bytes().await?;
-    if bytes.len() > MAX_BODY_BYTES {
-        return Err(SsrfFetchError::BodyTooLarge);
-    }
+    let bytes = read_response_capped(&mut response, MAX_BODY_BYTES).await?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -235,11 +235,43 @@ pub async fn read_bytes_capped(
     mut response: Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, SsrfFetchError> {
-    let bytes = response.bytes().await?;
-    if bytes.len() > max_bytes {
-        return Err(SsrfFetchError::BodyTooLarge);
+    read_response_capped(&mut response, max_bytes).await
+}
+
+async fn read_response_capped(
+    response: &mut Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SsrfFetchError> {
+    if let Some(content_length) = response
+        .headers()
+        .get("Content-Length")
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        if content_length > max_bytes {
+            return Err(SsrfFetchError::BodyTooLarge);
+        }
     }
-    Ok(bytes)
+
+    if matches!(response.body(), ResponseBody::Stream(_)) {
+        let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+        let mut stream = response.stream()?;
+        while let Some(chunk) = stream.try_next().await? {
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            if chunk.len() > remaining {
+                return Err(SsrfFetchError::BodyTooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    } else {
+        let bytes = response.bytes().await?;
+        if bytes.len() > max_bytes {
+            return Err(SsrfFetchError::BodyTooLarge);
+        }
+        Ok(bytes)
+    }
 }
 
 /// Returns `true` if the URL should be blocked: it fails the egress allowlist

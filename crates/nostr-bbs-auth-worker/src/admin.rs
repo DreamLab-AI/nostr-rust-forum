@@ -164,28 +164,28 @@ pub async fn require_authed(
     Ok(token.pubkey)
 }
 
-/// Build the absolute request URL that NIP-98 expects for verification.
+/// Build the exact absolute request URL that NIP-98 expects for verification.
 ///
-/// `origin` is the actual request origin (`scheme://host[:port]`), extracted
-/// from the incoming request URL at the top of the request handler. This
-/// ensures NIP-98 tokens signed for `.workers.dev` URLs verify correctly even
-/// when `EXPECTED_ORIGIN` points at a custom domain.
+/// `origin_or_url` carries whatever was extracted from the incoming request at
+/// the top of the request handler. It is one of two shapes:
+///   * a full request URL (`scheme://host[:port]/path?query`) — the common case,
+///     since the handler threads `url.to_string()`. It is returned verbatim so
+///     the query string is preserved: NIP-98 signs the exact URL, and paginated
+///     admin routes (`?limit=…&before=…`) must verify against it byte-for-byte.
+///   * a bare origin (`scheme://host[:port]`) — `path` is appended to it.
+///
+/// Threading the real request URL through (rather than a config value) ensures
+/// tokens signed for `.workers.dev` URLs verify correctly even when
+/// `EXPECTED_ORIGIN` points at a custom domain.
 ///
 /// Unlike the previous implementation, this function does NOT fall back to a
 /// hardcoded `"https://example.com"` default or read from a thread_local,
 /// eliminating the config-dependent auth bypass (P2-07) and the thread_local
-/// hack (P2-06). The origin is always available from the request URL.
-pub fn canonical_url(origin: &str, path: &str) -> String {
-    format!("{origin}{path}")
-}
-
-/// Extract the origin (`scheme://host[:port]`) from a parsed URL.
-pub fn request_origin(url: &worker::Url) -> String {
-    let scheme = url.scheme();
-    let host = url.host_str().unwrap_or("localhost");
-    match url.port() {
-        Some(port) => format!("{scheme}://{host}:{port}"),
-        None => format!("{scheme}://{host}"),
+/// hack (P2-06). The URL is always available from the request itself.
+pub fn canonical_url(origin_or_url: &str, path: &str) -> String {
+    match worker::Url::parse(origin_or_url) {
+        Ok(url) if url.path() != "/" || url.query().is_some() => url.to_string(),
+        _ => format!("{origin_or_url}{path}"),
     }
 }
 
@@ -217,5 +217,17 @@ mod tests {
     fn canonical_url_with_port() {
         let url = canonical_url("https://forum.example.com:8443", "/api/mod/ban");
         assert_eq!(url, "https://forum.example.com:8443/api/mod/ban");
+    }
+
+    #[test]
+    fn canonical_url_preserves_exact_query_bearing_request_url() {
+        let url = canonical_url(
+            "https://forum.example.com/api/mod/actions?limit=20&before=42",
+            "/api/mod/actions",
+        );
+        assert_eq!(
+            url,
+            "https://forum.example.com/api/mod/actions?limit=20&before=42"
+        );
     }
 }

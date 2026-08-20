@@ -224,6 +224,7 @@ fn merge_cohorts_json(existing: &str, add: &[String]) -> String {
 ///      merged into whatever is there. The UPDATE is idempotent and correct
 ///      whether we or the claim won step 1, so a concurrent bare-`members`
 ///      insert can no longer clobber the grant.
+///
 /// Best-effort: any D1 error is a non-fatal no-op (the redeem still succeeds; an
 /// admin can re-grant).
 async fn grant_zone_cohorts(env: &Env, pubkey: &str, zone_cohorts: &[String]) {

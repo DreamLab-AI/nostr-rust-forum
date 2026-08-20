@@ -82,7 +82,7 @@ struct AuditLogRow {
 pub async fn handle_audit_log_list(req: &Request, env: &Env) -> Result<Response> {
     // Authenticate admin via NIP-98
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
 
     match auth::require_nip98_admin(auth_header.as_deref(), &request_url, "GET", None, env).await {

@@ -141,7 +141,7 @@ pub async fn insert_report(
 /// Paginated report queue. NIP-98 admin-only.
 pub async fn handle_list_reports(req: &Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
 
     match auth::require_nip98_admin(auth_header.as_deref(), &request_url, "GET", None, env).await {
@@ -233,7 +233,7 @@ pub async fn handle_list_reports(req: &Request, env: &Env) -> Result<Response> {
 /// NIP-98 admin-only.
 pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
     let body_bytes = req.bytes().await?;
 

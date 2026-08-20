@@ -187,7 +187,7 @@ async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
     // tokens signed for .workers.dev URLs verify correctly even when
     // EXPECTED_ORIGIN points at a custom domain. The origin is threaded
     // through the route functions rather than stored in a thread_local (P2-06).
-    let origin = admin::request_origin(&url);
+    let origin = url.to_string();
 
     // Read body bytes BEFORE routing so they are available for both NIP-98
     // payload hash verification and route handler consumption.

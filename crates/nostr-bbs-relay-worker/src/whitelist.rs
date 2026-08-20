@@ -149,7 +149,7 @@ pub async fn handle_check_whitelist(req: &Request, env: &Env) -> Result<Response
 /// to extract `display_name` from the most recent kind-0 profile event.
 pub async fn handle_whitelist_list(req: &Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
     if let Err((body, status)) =
         auth::require_nip98_admin(auth_header.as_deref(), &request_url, "GET", None, env).await
@@ -280,7 +280,7 @@ pub async fn handle_whitelist_list(req: &Request, env: &Env) -> Result<Response>
 /// `{ "pubkey": "<hex>", "cohorts": ["approved"] }`
 pub async fn handle_whitelist_add(mut req: Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
     let body_bytes = req.bytes().await?;
 
@@ -349,7 +349,7 @@ pub async fn handle_whitelist_add(mut req: Request, env: &Env) -> Result<Respons
 /// Safety: prevents demoting yourself if you're the last admin.
 pub async fn handle_set_admin(mut req: Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
     let body_bytes = req.bytes().await?;
 
@@ -445,7 +445,7 @@ pub async fn handle_setup_status(_req: &Request, env: &Env) -> Result<Response> 
 /// After reset the first user to register will become admin.
 pub async fn handle_reset_db(mut req: Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
     let body_bytes = req.bytes().await?;
 
@@ -479,7 +479,7 @@ pub async fn handle_reset_db(mut req: Request, env: &Env) -> Result<Response> {
 /// `{ "pubkey": "<hex>", "cohorts": ["approved", "premium"] }`
 pub async fn handle_whitelist_update_cohorts(mut req: Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
     let body_bytes = req.bytes().await?;
 

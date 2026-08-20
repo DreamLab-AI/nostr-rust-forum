@@ -383,7 +383,7 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
 /// (Sprint v10). Returns `{ scanned, backfilled, skipped, truncated }`.
 async fn handle_profiles_backfill(mut req: Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
     let body_bytes = req.bytes().await.unwrap_or_default();
     // Treat empty body as no body for NIP-98 payload-hash semantics; non-empty
@@ -435,7 +435,7 @@ async fn handle_channel_zone_upsert(mut req: Request, env: &Env) -> Result<Respo
     use nostr_bbs_core::d1_helpers::{js_f64, js_str};
 
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization").ok().flatten();
     let body_bytes = req.bytes().await.unwrap_or_default();
     let body_for_auth: Option<&[u8]> = if body_bytes.is_empty() {

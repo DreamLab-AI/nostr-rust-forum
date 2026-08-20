@@ -113,10 +113,18 @@ fn default_k() -> usize {
     10
 }
 
+fn is_search_visible(public_labels: &std::collections::HashSet<u64>, label: u64) -> bool {
+    public_labels.contains(&label)
+}
+
 #[derive(Deserialize)]
 struct IngestEntry {
     id: String,
     embedding: Vec<f32>,
+    /// Whether this event is safe to expose through anonymous search. Missing
+    /// visibility fails closed for legacy callers.
+    #[serde(default)]
+    public: bool,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +212,7 @@ async fn persist_store(
     id_to_label: &std::collections::HashMap<String, u64>,
     next_label: u64,
     model: &str,
+    public_labels: &std::collections::HashSet<u64>,
     env: &Env,
 ) -> Result<()> {
     let store_key = env
@@ -223,6 +232,7 @@ async fn persist_store(
         "pairs": pairs,
         "next": next_label,
         "model": model,
+        "publicLabels": public_labels,
     });
     kv.put(
         &format!("{store_key}:mapping"),
@@ -242,6 +252,7 @@ async fn load_mapping(
     std::collections::HashMap<u64, String>,
     u64,
     String,
+    std::collections::HashSet<u64>,
 )> {
     let store_key = env
         .var("RVF_STORE_KEY")
@@ -259,6 +270,10 @@ async fn load_mapping(
             let model = val["model"].as_str().unwrap_or(MODEL_UNKNOWN).to_string();
             let mut id_to_label = std::collections::HashMap::new();
             let mut label_to_id = std::collections::HashMap::new();
+            let public_labels = val["publicLabels"]
+                .as_array()
+                .map(|labels| labels.iter().filter_map(|label| label.as_u64()).collect())
+                .unwrap_or_default();
 
             if let Some(pairs) = val["pairs"].as_array() {
                 for pair in pairs {
@@ -269,7 +284,7 @@ async fn load_mapping(
                 }
             }
 
-            return Ok((id_to_label, label_to_id, next, model));
+            return Ok((id_to_label, label_to_id, next, model, public_labels));
         }
     }
 
@@ -278,6 +293,7 @@ async fn load_mapping(
         std::collections::HashMap::new(),
         1,
         MODEL_UNKNOWN.to_string(),
+        std::collections::HashSet::new(),
     ))
 }
 
@@ -351,7 +367,7 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    let (_, label_to_id, _, indexed_model) = load_mapping(env).await?;
+    let (_, label_to_id, _, indexed_model, public_labels) = load_mapping(env).await?;
 
     // Fail loudly rather than returning numerically valid but semantically
     // meaningless cosine scores across mismatched embedding spaces.
@@ -366,6 +382,7 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
 
     let results_json: Vec<serde_json::Value> = results
         .iter()
+        .filter(|(label, _)| is_search_visible(&public_labels, *label))
         .map(|(label, score)| {
             let id = label_to_id
                 .get(label)
@@ -450,7 +467,7 @@ async fn handle_embed(req: &Request, env: &Env) -> Result<Response> {
 async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
     // NIP-98 admin auth
     let url = req.url()?;
-    let request_url = format!("{}{}", url.origin().ascii_serialization(), url.path());
+    let request_url = url.to_string();
     let auth_header = req.headers().get("Authorization")?;
     let mut req_clone = req.clone()?;
     let raw_body = req_clone.bytes().await?;
@@ -480,7 +497,8 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
     }
 
     let mut store = load_store(env).await?;
-    let (mut id_to_label, _, mut next_label, indexed_model) = load_mapping(env).await?;
+    let (mut id_to_label, _, mut next_label, indexed_model, mut public_labels) =
+        load_mapping(env).await?;
 
     // The caller-declared model for these entries' embeddings; falls back to
     // this worker's currently-active embedding model for older callers that
@@ -523,11 +541,24 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         });
 
         store.insert(label, &entry.embedding);
+        if entry.public {
+            public_labels.insert(label);
+        } else {
+            public_labels.remove(&label);
+        }
         accepted += 1;
     }
 
     // Persist to R2 + KV, recording the model identity used for this ingest.
-    persist_store(&store, &id_to_label, next_label, &ingest_model, env).await?;
+    persist_store(
+        &store,
+        &id_to_label,
+        next_label,
+        &ingest_model,
+        &public_labels,
+        env,
+    )
+    .await?;
 
     json_response(
         req,
@@ -716,5 +747,14 @@ mod model_match_tests {
     #[test]
     fn both_unknown_does_not_block() {
         assert!(check_model_match(MODEL_UNKNOWN, MODEL_UNKNOWN).is_ok());
+    }
+
+    #[test]
+    fn anonymous_results_fail_closed_without_explicit_public_visibility() {
+        let mut public = std::collections::HashSet::new();
+        assert!(!is_search_visible(&public, 7));
+        public.insert(7);
+        assert!(is_search_visible(&public, 7));
+        assert!(!is_search_visible(&public, 8));
     }
 }

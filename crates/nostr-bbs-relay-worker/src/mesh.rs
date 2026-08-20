@@ -153,7 +153,9 @@ pub struct FederationManager {
 impl FederationManager {
     /// Construct from a resolved [`MeshConfig`].
     pub fn new(config: MeshConfig) -> Self {
-        FederationManager { peers: PeerManager::from_config(config) }
+        FederationManager {
+            peers: PeerManager::from_config(config),
+        }
     }
 
     /// Construct directly from the environment reader.
@@ -204,8 +206,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn reader(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |name: &str| map.get(name).cloned()
     }
 

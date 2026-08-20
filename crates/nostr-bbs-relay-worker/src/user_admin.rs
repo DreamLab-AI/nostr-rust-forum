@@ -44,14 +44,10 @@ fn valid_pubkey(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Build the canonical request URL (origin + path) for NIP-98 verification.
+/// Build the exact absolute request URL, including its query string, for
+/// NIP-98 verification.
 fn request_url(req: &Request) -> Result<String> {
-    let url = req.url()?;
-    Ok(format!(
-        "{}{}",
-        url.origin().ascii_serialization(),
-        url.path()
-    ))
+    Ok(req.url()?.to_string())
 }
 
 // ---------------------------------------------------------------------------
