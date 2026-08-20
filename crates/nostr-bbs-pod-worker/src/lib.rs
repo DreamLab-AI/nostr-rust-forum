@@ -20,17 +20,9 @@ mod content_negotiation;
 mod contexts;
 mod did;
 mod git;
-// Native-only pod-git identity + gitmark/blocktrails anchoring (ADR-124 §5.4,
-// ADR-089). Structurally absent from the CF Workers (`wasm32-unknown-unknown`)
-// build: CF cannot spawn `git` subprocesses, so the trail anchors only on the
-// native/agentbox deployment of the externally-pullable forum pod. On CF the
-// `git` module above keeps returning the 501 / `X-Git-Unavailable: cf-workers`
-// stub.
 mod notifications;
 mod patch;
 mod payments;
-#[cfg(not(target_arch = "wasm32"))]
-mod pod_git_anchor;
 mod provision;
 mod quota;
 mod remote_storage;
@@ -614,7 +606,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
 
         let auth_header = req.headers().get("Authorization").ok().flatten();
-        let request_url = format!("{}{}", request_origin(&url), path);
+        let request_url = url.to_string();
         let requester_pubkey = match auth_header.as_deref() {
             Some(header) => {
                 auth::verify_nip98_replay(header, &request_url, "POST", Some(&body), &env)
@@ -668,7 +660,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             };
 
             let pay_nip98_origin = request_origin(&url);
-            let request_url = format!("{pay_nip98_origin}{path}");
+            let request_url = url.to_string();
             let requester_pubkey: Option<String> = if let Some(ref header) = pay_auth_header {
                 let method_name = method_str(&method);
                 let body_ref = pay_body.as_deref();
@@ -759,7 +751,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .var("EXPECTED_ORIGIN")
         .map(|v| v.to_string())
         .unwrap_or_else(|_| nip98_origin.clone());
-    let request_url = format!("{nip98_origin}{path}");
+    let request_url = url.to_string();
 
     let requester_pubkey: Option<String> = if let Some(ref header) = auth_header {
         let method_name = method_str(&method);
@@ -1313,8 +1305,18 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     );
                 }
 
-                if let Err(e) =
-                    quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await
+                let (quota_account, quota_limit) = quota::reservation_account(
+                    &owner_pubkey,
+                    requester_pubkey.as_deref(),
+                    &resource_path,
+                );
+                if let Err(e) = quota::check_and_reserve_with_limit_d1(
+                    &quota_db,
+                    &quota_account,
+                    data_len,
+                    quota_limit,
+                )
+                .await
                 {
                     return json_error(&env, &e.to_string(), 413);
                 }
@@ -1362,7 +1364,19 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 );
             }
 
-            if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await {
+            let (quota_account, quota_limit) = quota::reservation_account(
+                &owner_pubkey,
+                requester_pubkey.as_deref(),
+                &resource_path,
+            );
+            if let Err(e) = quota::check_and_reserve_with_limit_d1(
+                &quota_db,
+                &quota_account,
+                data_len,
+                quota_limit,
+            )
+            .await
+            {
                 return json_error(&env, &e.to_string(), 413);
             }
 
@@ -1441,9 +1455,19 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             // Atomic quota check for size increase
             let size_delta = updated_len as i64 - current_bytes.len() as i64;
+            let (quota_account, quota_limit) = quota::reservation_account(
+                &owner_pubkey,
+                requester_pubkey.as_deref(),
+                &resource_path,
+            );
             if size_delta > 0 {
-                if let Err(e) =
-                    quota::check_and_reserve_d1(&quota_db, &owner_pubkey, size_delta as u64).await
+                if let Err(e) = quota::check_and_reserve_with_limit_d1(
+                    &quota_db,
+                    &quota_account,
+                    size_delta as u64,
+                    quota_limit,
+                )
+                .await
                 {
                     return json_error(&env, &e.to_string(), 413);
                 }
@@ -1467,7 +1491,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             // Release quota for shrinkage
             if size_delta < 0 {
-                quota::update_usage_d1(&quota_db, &owner_pubkey, size_delta)
+                quota::update_usage_d1(&quota_db, &quota_account, size_delta)
                     .await
                     .ok();
             }
@@ -1497,7 +1521,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             bucket.delete(&r2_key).await?;
 
             // Release quota (negative delta, D1 atomic)
-            quota::update_usage_d1(&quota_db, &owner_pubkey, -(deleted_size as i64))
+            let (quota_account, _) = quota::reservation_account(
+                &owner_pubkey,
+                requester_pubkey.as_deref(),
+                &resource_path,
+            );
+            quota::update_usage_d1(&quota_db, &quota_account, -(deleted_size as i64))
                 .await
                 .ok();
 
@@ -1643,15 +1672,22 @@ async fn handle_acl_request(
                 };
             }
 
-            if content_length > MAX_BODY_SIZE {
+            if content_length > acl::MAX_ACL_DOC_BYTES as u64 {
                 return json_error(
                     env,
-                    &format!("Body exceeds {} byte limit", MAX_BODY_SIZE),
+                    &format!("ACL exceeds {} byte limit", acl::MAX_ACL_DOC_BYTES),
                     413,
                 );
             }
 
             let mut data = body_bytes.unwrap_or_default();
+            if data.len() > acl::MAX_ACL_DOC_BYTES {
+                return json_error(
+                    env,
+                    &format!("ACL exceeds {} byte limit", acl::MAX_ACL_DOC_BYTES),
+                    413,
+                );
+            }
 
             // ── Delegation shortcut (ADR-096) ──────────────────────────
             //
@@ -1720,13 +1756,21 @@ async fn handle_acl_request(
                 }
             }
 
-            // Validate that the body is a valid ACL document (parseable JSON-LD)
-            if serde_json::from_slice::<acl::AclDocument>(&data).is_err() {
+            // Parse through the same capped path used by authorization reads,
+            // then preserve the invariant that the owner can never be locked
+            // out by an accepted raw ACL replacement.
+            let Some(document) = acl::parse_acl_with_cap(&data) else {
                 return json_error(
                     env,
                     "Invalid ACL document: must be valid JSON-LD with @graph",
                     422,
                 );
+            };
+            let owner_did = did::NostrPubkey::from_hex(owner_pubkey)
+                .map(|pk| nostr_bbs_core::did_nostr_uri(&pk))
+                .unwrap_or_else(|_| format!("did:nostr:{owner_pubkey}"));
+            if !acl::preserves_owner_control(&document, &owner_did, parent_path) {
+                return json_error(env, "ACL must preserve owner acl:Control", 422);
             }
 
             bucket

@@ -17,6 +17,24 @@ use worker::*;
 /// Default per-pod quota: 50 MB.
 const DEFAULT_QUOTA: u64 = 50 * 1024 * 1024;
 
+/// Total capacity reserved for authenticated third-party appends to one pod's
+/// inbox. It is deliberately separate from the owner's general storage quota,
+/// so inbox spam cannot block the owner's own writes.
+pub const INBOX_QUOTA: u64 = 5 * 1024 * 1024;
+
+/// Select the quota account and limit for a write.
+pub fn reservation_account(
+    owner_pubkey: &str,
+    _requester_pubkey: Option<&str>,
+    resource_path: &str,
+) -> (String, u64) {
+    if resource_path.starts_with("/inbox/") {
+        (format!("inbox:{owner_pubkey}"), INBOX_QUOTA)
+    } else {
+        (owner_pubkey.to_string(), DEFAULT_QUOTA)
+    }
+}
+
 /// Quota information for a pod.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct QuotaInfo {
@@ -90,6 +108,16 @@ pub async fn update_usage_d1(db: &D1Database, pubkey: &str, delta: i64) -> Resul
 /// The WHERE clause `(used_bytes + ?2) <= limit_bytes` makes this atomic —
 /// concurrent writers cannot all pass the check before any records usage.
 pub async fn check_and_reserve_d1(db: &D1Database, pubkey: &str, bytes: u64) -> Result<()> {
+    check_and_reserve_with_limit_d1(db, pubkey, bytes, DEFAULT_QUOTA).await
+}
+
+/// Atomically reserve bytes against an explicitly bounded quota account.
+pub async fn check_and_reserve_with_limit_d1(
+    db: &D1Database,
+    pubkey: &str,
+    bytes: u64,
+    limit: u64,
+) -> Result<()> {
     let now = (js_sys::Date::now() / 1000.0) as i64;
 
     // First ensure the row exists (idempotent upsert with zero delta)
@@ -98,7 +126,7 @@ pub async fn check_and_reserve_d1(db: &D1Database, pubkey: &str, bytes: u64) -> 
          VALUES (?1, ?2, 0, ?3) \
          ON CONFLICT(pubkey) DO NOTHING",
     )
-    .bind(&[js_str(pubkey), js_i64(DEFAULT_QUOTA as i64), js_i64(now)])
+    .bind(&[js_str(pubkey), js_i64(limit as i64), js_i64(now)])
     .map_err(|e| Error::RustError(format!("d1 bind quota init: {e:?}")))?
     .run()
     .await
@@ -245,5 +273,22 @@ mod tests {
         let q2: QuotaInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(q2.limit, 100);
         assert_eq!(q2.used, 42);
+    }
+
+    #[test]
+    fn third_party_inbox_writes_use_an_isolated_bounded_account() {
+        let owner = "aa";
+        assert_eq!(
+            reservation_account(owner, Some("bb"), "/inbox/",),
+            ("inbox:aa".to_string(), INBOX_QUOTA)
+        );
+        assert_eq!(
+            reservation_account(owner, Some(owner), "/inbox/"),
+            ("inbox:aa".to_string(), INBOX_QUOTA)
+        );
+        assert_eq!(
+            reservation_account(owner, Some("bb"), "/private/note"),
+            (owner.to_string(), DEFAULT_QUOTA)
+        );
     }
 }

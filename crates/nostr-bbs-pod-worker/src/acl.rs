@@ -11,6 +11,10 @@
 //!   `MAX_ACL_BYTES` is 1 MiB; kit deliberately stricter per audit C3).
 //! - [`parse_acl_with_cap`] / [`parse_acl_text_with_cap`] — apply the
 //!   stricter cap before delegating to `serde_json::from_slice`.
+//! - [`preserves_owner_control`] — invariant check applied to raw JSON-LD
+//!   ACL replacements, so a `PUT` of a hand-authored document can never lock
+//!   the owner out; structured delegation grants already guarantee this by
+//!   construction via `build_delegation_acl`.
 //! - [`find_effective_acl`] — CF Workers R2 + KV walk-up resolver. Tied to
 //!   the worker-rs API; can't live in upstream which is runtime-agnostic.
 //!
@@ -104,11 +108,29 @@ pub const MAX_ACL_DOC_BYTES: usize = 64 * 1024;
 /// Parse an ACL document from raw bytes, enforcing [`MAX_ACL_DOC_BYTES`].
 ///
 /// Returns `Some(doc)` on success and `None` for any size or parse failure.
-fn parse_acl_with_cap(bytes: &[u8]) -> Option<AclDocument> {
+pub fn parse_acl_with_cap(bytes: &[u8]) -> Option<AclDocument> {
     if bytes.len() > MAX_ACL_DOC_BYTES {
         return None;
     }
     serde_json::from_slice::<AclDocument>(bytes).ok()
+}
+
+/// Return whether an ACL remains controllable by the pod owner.
+///
+/// Raw JSON-LD replacement is accepted only when the owner retains
+/// `acl:Control` on the protected resource. This is the same invariant the
+/// structured delegation builder enforces by construction.
+pub fn preserves_owner_control(
+    document: &AclDocument,
+    owner_did: &str,
+    protected_path: &str,
+) -> bool {
+    evaluate_access(
+        Some(document),
+        Some(owner_did),
+        protected_path,
+        AccessMode::Control,
+    )
 }
 
 /// Same as [`parse_acl_with_cap`] but operates on a `&str`.
@@ -488,6 +510,21 @@ mod tests {
             graph: Some(graph),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn raw_acl_must_preserve_owner_control() {
+        let owner = "did:nostr:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let safe = build_delegation_acl(
+            owner,
+            "did:nostr:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "/private/",
+            &[AccessMode::Read],
+        );
+        assert!(preserves_owner_control(&safe, owner, "/private/"));
+
+        let unsafe_doc = make_doc(vec![auth_read_public("/private/")]);
+        assert!(!preserves_owner_control(&unsafe_doc, owner, "/private/"));
     }
 
     fn auth_read_public(path: &str) -> AclAuthorization {

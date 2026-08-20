@@ -104,15 +104,10 @@ fn render_public_type_index_acl(owner_did: &str) -> Vec<u8> {
 /// forum-client surfaces a clone URL with an "available on git-init-
 /// enabled deployments" caveat to bridge the two tiers.
 ///
-/// **Native pod-git identity + trail (ADR-124 §5.4):** on the native build the
-/// clone-able pod root additionally carries the canonical `agent.did.json`
-/// (ADR-125 §2 Multikey), `git config nostr.privkey`, and the
-/// `gitmark.json`/`blocktrails.json` web-contract trail. That writer lives in
-/// [`crate::pod_git_anchor`] (gated `#[cfg(not(target_arch = "wasm32"))]`, so it
-/// is structurally absent here on CF). It anchors `states[]` onto **real
-/// forum-pod commit SHAs** — never the CF 501 stub. I1–I4 hold: the `agent_did`
-/// is the unchanged `did:nostr:<hex>` string and nothing in the trail is read by
-/// the NIP-98 auth path (ADR-124 §7).
+/// Native Git anchoring is intentionally not implemented in this Worker crate.
+/// Native deployments must use the separately maintained `solid-pod-rs` Git
+/// service and a platform secret store; this crate never persists signing keys
+/// in repository configuration.
 pub async fn provision_pod(
     bucket: &Bucket,
     kv: &kv::KvStore,
