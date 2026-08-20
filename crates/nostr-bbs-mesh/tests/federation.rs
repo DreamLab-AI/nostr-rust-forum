@@ -14,9 +14,7 @@ use nostr_bbs_mesh::config::{MeshConfig, MeshMode};
 use nostr_bbs_mesh::delegation::DelegationToken;
 use nostr_bbs_mesh::envelope::{Envelope, EnvelopeKind};
 use nostr_bbs_mesh::mock::MockRelay;
-use nostr_bbs_mesh::transport::{
-    decode_incoming_wrap, MeshError, ReceiveOptions, RelayTransport,
-};
+use nostr_bbs_mesh::transport::{decode_incoming_wrap, MeshError, ReceiveOptions, RelayTransport};
 
 // ── Minimal dependency-free async executor ───────────────────────────────────
 // The mock socket never truly suspends (all ops resolve immediately), so a
@@ -106,7 +104,11 @@ fn forged_from_without_delegation_is_rejected() {
 
     // Envelope claims Carol authored it, but Alice signs the seal and there is
     // no delegation token → attribution mismatch.
-    let env = Envelope::chat(&carol.public.to_hex(), &bob.public.to_hex(), "not from carol");
+    let env = Envelope::chat(
+        &carol.public.to_hex(),
+        &bob.public.to_hex(),
+        "not from carol",
+    );
     let wrap = gift_wrap(
         &sk(&alice),
         &alice.public.to_hex(),
@@ -121,7 +123,11 @@ fn forged_from_without_delegation_is_rejected() {
 
 // ── 3. NIP-26 delegation: agent A acts for user U ─────────────────────────────
 
-fn signed_delegation(delegator: &Keypair, delegatee_hex: &str, conditions: &str) -> DelegationToken {
+fn signed_delegation(
+    delegator: &Keypair,
+    delegatee_hex: &str,
+    conditions: &str,
+) -> DelegationToken {
     let token = DelegationToken::new(delegator.public.to_hex(), conditions, "00".repeat(64));
     let msg = token.signing_message(delegatee_hex);
     let sig = delegator.secret.sign(&msg).unwrap();
@@ -134,7 +140,11 @@ fn valid_delegation_accepts_reattributed_envelope() {
     let agent = kp(); // delegatee A (signs the seal)
     let peer = kp(); // recipient B
 
-    let token = signed_delegation(&user, &agent.public.to_hex(), "kind=14&created_at<9999999999");
+    let token = signed_delegation(
+        &user,
+        &agent.public.to_hex(),
+        "kind=14&created_at<9999999999",
+    );
     let mut env = Envelope::new(
         &user.public.to_hex(),
         &peer.public.to_hex(),
@@ -153,7 +163,10 @@ fn valid_delegation_accepts_reattributed_envelope() {
     .unwrap();
 
     let received = decode_incoming_wrap(&wrap, &sk(&peer), &ReceiveOptions::default()).unwrap();
-    assert_eq!(received.envelope.from, format!("did:nostr:{}", user.public.to_hex()));
+    assert_eq!(
+        received.envelope.from,
+        format!("did:nostr:{}", user.public.to_hex())
+    );
     assert_eq!(received.seal_pubkey, agent.public.to_hex()); // wire signed by agent
 }
 
@@ -165,7 +178,11 @@ fn delegation_for_wrong_delegatee_is_rejected() {
     let peer = kp();
 
     // Token authorises `impostor`, but the seal is signed by `agent`.
-    let token = signed_delegation(&user, &impostor.public.to_hex(), "kind=14&created_at<9999999999");
+    let token = signed_delegation(
+        &user,
+        &impostor.public.to_hex(),
+        "kind=14&created_at<9999999999",
+    );
     let mut env = Envelope::new(
         &user.public.to_hex(),
         &peer.public.to_hex(),
@@ -239,7 +256,10 @@ fn transport_loopback_send_and_receive() {
 
     block_on(async {
         // Bob subscribes to his gift-wrap inbox.
-        bob_t.subscribe_inbox("inbox", &bob.public.to_hex()).await.unwrap();
+        bob_t
+            .subscribe_inbox("inbox", &bob.public.to_hex())
+            .await
+            .unwrap();
 
         // Alice sends an IS-Envelope to Bob.
         let env = Envelope::chat(&alice.public.to_hex(), &bob.public.to_hex(), "hi bob");
@@ -255,7 +275,10 @@ fn transport_loopback_send_and_receive() {
         assert_eq!(received.event_id, sent_id);
         assert_eq!(received.seal_pubkey, alice.public.to_hex());
         assert_eq!(received.envelope.body, json!("hi bob"));
-        assert_eq!(received.envelope.from, format!("did:nostr:{}", alice.public.to_hex()));
+        assert_eq!(
+            received.envelope.from,
+            format!("did:nostr:{}", alice.public.to_hex())
+        );
     });
 
     // The relay stored exactly one event (the gift wrap).
@@ -274,8 +297,14 @@ fn transport_loopback_delivers_only_to_addressed_recipient() {
     let alice_t = RelayTransport::new(relay.connect(), "wss://mock");
 
     block_on(async {
-        eve_t.subscribe_inbox("e", &eve.public.to_hex()).await.unwrap();
-        bob_t.subscribe_inbox("b", &bob.public.to_hex()).await.unwrap();
+        eve_t
+            .subscribe_inbox("e", &eve.public.to_hex())
+            .await
+            .unwrap();
+        bob_t
+            .subscribe_inbox("b", &bob.public.to_hex())
+            .await
+            .unwrap();
 
         let env = Envelope::chat(&alice.public.to_hex(), &bob.public.to_hex(), "for bob only");
         alice_t.send_envelope(&sk(&alice), &env).await.unwrap();
@@ -299,27 +328,38 @@ fn transport_loopback_delivers_only_to_addressed_recipient() {
 
 #[test]
 fn all_three_topologies_resolve() {
-    let standalone = MeshConfig::from_toml_str(r#"[mesh]
+    let standalone = MeshConfig::from_toml_str(
+        r#"[mesh]
 mode = "standalone"
-"#)
+"#,
+    )
     .unwrap();
     assert_eq!(standalone.resolve().unwrap(), MeshMode::Standalone);
 
-    let federated = MeshConfig::from_toml_str(r#"[mesh]
+    let federated = MeshConfig::from_toml_str(
+        r#"[mesh]
 mode = "federated"
 peer_relays = ["wss://a.example", "wss://b.example"]
-"#)
+"#,
+    )
     .unwrap();
-    assert!(matches!(federated.resolve().unwrap(), MeshMode::Federated { .. }));
+    assert!(matches!(
+        federated.resolve().unwrap(),
+        MeshMode::Federated { .. }
+    ));
 
-    let client = MeshConfig::from_toml_str(r#"[mesh]
+    let client = MeshConfig::from_toml_str(
+        r#"[mesh]
 mode = "client"
 client_relay = "wss://hub.example"
-"#)
+"#,
+    )
     .unwrap();
     assert_eq!(
         client.resolve().unwrap(),
-        MeshMode::Client { relay: "wss://hub.example".into() }
+        MeshMode::Client {
+            relay: "wss://hub.example".into()
+        }
     );
 }
 

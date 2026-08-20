@@ -117,7 +117,7 @@ pub fn HomePage() -> impl IntoView {
                         "Fast oldschool forum tech"
                     </p>
                     <p class="text-lg text-gray-400 leading-relaxed">
-                        "A dreamlab, DreamLab AI Ltd, and Minimoomaa co-production"
+                        "Powered by the configurable nostr-bbs forum kit"
                     </p>
                 </div>
 

@@ -616,6 +616,7 @@ pub fn ChannelPage() -> impl IntoView {
                             &event_id,
                             &content_for_index,
                             Some(&channel_for_index),
+                            false,
                             &*signer,
                         )
                         .await;

@@ -75,7 +75,11 @@ pub enum DelegationError {
 
 impl DelegationToken {
     /// Construct a token from its three wire parts.
-    pub fn new(delegator: impl Into<String>, conditions: impl Into<String>, sig: impl Into<String>) -> Self {
+    pub fn new(
+        delegator: impl Into<String>,
+        conditions: impl Into<String>,
+        sig: impl Into<String>,
+    ) -> Self {
         DelegationToken {
             delegator: delegator.into(),
             conditions: conditions.into(),
@@ -115,7 +119,9 @@ impl DelegationToken {
     pub fn validate_structure(&self) -> Result<(), DelegationError> {
         let dh = self.delegator_hex();
         if dh.len() != 64 || !is_hex(&dh) {
-            return Err(DelegationError::Malformed("delegator must be 64-hex".into()));
+            return Err(DelegationError::Malformed(
+                "delegator must be 64-hex".into(),
+            ));
         }
         if self.conditions.trim().is_empty() {
             return Err(DelegationError::Malformed("empty conditions".into()));
@@ -157,7 +163,8 @@ impl DelegationToken {
         let sig = Signature::from_bytes(sig_arr);
 
         let msg = self.signing_message(delegatee_hex);
-        pk.verify(&msg, &sig).map_err(|_| DelegationError::BadSignature)?;
+        pk.verify(&msg, &sig)
+            .map_err(|_| DelegationError::BadSignature)?;
         Ok(conditions)
     }
 
@@ -192,22 +199,22 @@ impl Conditions {
         let mut c = Conditions::default();
         for clause in s.split('&').map(str::trim).filter(|c| !c.is_empty()) {
             if let Some(rest) = clause.strip_prefix("kind=") {
-                let k: u64 = rest
-                    .parse()
-                    .map_err(|_| DelegationError::Malformed(format!("bad kind clause: {clause}")))?;
+                let k: u64 = rest.parse().map_err(|_| {
+                    DelegationError::Malformed(format!("bad kind clause: {clause}"))
+                })?;
                 c.kinds.push(k);
             } else if let Some(rest) = clause.strip_prefix("created_at>") {
-                c.created_at_gt = Some(
-                    rest.parse()
-                        .map_err(|_| DelegationError::Malformed(format!("bad created_at>: {clause}")))?,
-                );
+                c.created_at_gt = Some(rest.parse().map_err(|_| {
+                    DelegationError::Malformed(format!("bad created_at>: {clause}"))
+                })?);
             } else if let Some(rest) = clause.strip_prefix("created_at<") {
-                c.created_at_lt = Some(
-                    rest.parse()
-                        .map_err(|_| DelegationError::Malformed(format!("bad created_at<: {clause}")))?,
-                );
+                c.created_at_lt = Some(rest.parse().map_err(|_| {
+                    DelegationError::Malformed(format!("bad created_at<: {clause}"))
+                })?);
             } else {
-                return Err(DelegationError::Malformed(format!("unknown clause: {clause}")));
+                return Err(DelegationError::Malformed(format!(
+                    "unknown clause: {clause}"
+                )));
             }
         }
         if c.kinds.is_empty() && c.created_at_gt.is_none() && c.created_at_lt.is_none() {
@@ -275,7 +282,10 @@ mod tests {
     fn tampered_conditions_fail_signature() {
         let (delegatee_hex, mut token) = make_token("kind=14");
         token.conditions = "kind=1059".to_string(); // sig no longer matches
-        assert_eq!(token.verify(&delegatee_hex), Err(DelegationError::BadSignature));
+        assert_eq!(
+            token.verify(&delegatee_hex),
+            Err(DelegationError::BadSignature)
+        );
     }
 
     #[test]

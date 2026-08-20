@@ -137,9 +137,7 @@ fn spawn_move(
                 publish_with_toast(&relay, toasts, &request, "Approval requested");
                 input.pending_move = Some((target_col, request_id));
                 match nostr_bbs_core::create_card_signer(signer.as_ref(), &input).await {
-                    Ok(event) => {
-                        publish_with_toast(&relay, toasts, &event, "Card marked pending")
-                    }
+                    Ok(event) => publish_with_toast(&relay, toasts, &event, "Card marked pending"),
                     Err(e) => toasts.show(format!("Card failed: {e}"), ToastVariant::Error),
                 }
             }
@@ -432,12 +430,7 @@ pub fn BoardPage() -> impl IntoView {
             return Vec::new();
         };
         let coord = board.coord();
-        let mut cards = fold_cards(
-            card_versions
-                .get()
-                .into_iter()
-                .filter(|c| c.board == coord),
-        );
+        let mut cards = fold_cards(card_versions.get().into_iter().filter(|c| c.board == coord));
         // Deletion tombstones win the fold (newest version), then hide here.
         cards.retain(|c| !c.deleted);
         cards
@@ -809,7 +802,7 @@ fn CardView(
                 toasts.show("Not authenticated", ToastVariant::Error);
                 return;
             };
-            let needs_approval = approval_columns.iter().any(|c| *c == target_col) && !is_admin;
+            let needs_approval = approval_columns.contains(&target_col) && !is_admin;
             spawn_move(
                 relay.clone(),
                 toasts,
@@ -1186,7 +1179,7 @@ fn CardView(
                                 view! {
                                     <button
                                         class="text-[11px] text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 rounded px-2 py-1"
-                                        on:click=move |ev| add_to_calendar(ev)
+                                            on:click=add_to_calendar
                                     >
                                         "Add to calendar"
                                     </button>

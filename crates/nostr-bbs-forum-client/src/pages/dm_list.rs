@@ -256,9 +256,8 @@ pub fn DmListPage() -> impl IntoView {
     // persistent banner on the capability directly so the limitation is always
     // surfaced. Re-probes when auth settles (the extension may inject `nip44`
     // slightly after load).
-    let show_nip07_dm_warning = Memo::new(move |_| {
-        auth.get().is_nip07 && !crate::auth::nip07::nip07_has_nip44()
-    });
+    let show_nip07_dm_warning =
+        Memo::new(move |_| auth.get().is_nip07 && !crate::auth::nip07::nip07_has_nip44());
 
     view! {
         <div class="max-w-2xl mx-auto p-4 sm:p-6">

@@ -213,7 +213,12 @@ impl Envelope {
 
     /// Convenience: a plain-text [`EnvelopeKind::Chat`] envelope.
     pub fn chat(from: &str, to: &str, text: &str) -> Self {
-        let mut e = Envelope::new(from, to, EnvelopeKind::Chat, Value::String(text.to_string()));
+        let mut e = Envelope::new(
+            from,
+            to,
+            EnvelopeKind::Chat,
+            Value::String(text.to_string()),
+        );
         e.lang = Some("text/plain".to_string());
         e
     }
@@ -292,9 +297,9 @@ impl Envelope {
     /// discriminant fields are checked; extra fields are ignored (forward-compat).
     fn validate_body_shape(&self) -> Result<(), EnvelopeError> {
         let obj = |name: &str| -> Result<&serde_json::Map<String, Value>, EnvelopeError> {
-            self.body
-                .as_object()
-                .ok_or_else(|| EnvelopeError::MalformedBody(format!("{name} body must be an object")))
+            self.body.as_object().ok_or_else(|| {
+                EnvelopeError::MalformedBody(format!("{name} body must be an object"))
+            })
         };
         match self.kind {
             EnvelopeKind::Chat => {
@@ -305,10 +310,14 @@ impl Envelope {
                     if map.get("text").map(Value::is_string).unwrap_or(false) {
                         Ok(())
                     } else {
-                        Err(EnvelopeError::MalformedBody("chat object requires string `text`".into()))
+                        Err(EnvelopeError::MalformedBody(
+                            "chat object requires string `text`".into(),
+                        ))
                     }
                 } else {
-                    Err(EnvelopeError::MalformedBody("chat body must be string or object".into()))
+                    Err(EnvelopeError::MalformedBody(
+                        "chat body must be string or object".into(),
+                    ))
                 }
             }
             EnvelopeKind::ToolInvoke => {
@@ -402,7 +411,10 @@ impl Envelope {
                 let (text, attachments) = match &self.body {
                     Value::String(s) => (s.clone(), Value::Null),
                     Value::Object(m) => (
-                        m.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        m.get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                         m.get("attachments").cloned().unwrap_or(Value::Null),
                     ),
                     _ => (String::new(), Value::Null),
@@ -456,7 +468,10 @@ fn validate_did(s: &str) -> Result<(), String> {
     if hex.len() != 64 {
         return Err(format!("expected 64 hex chars, got {}", hex.len()));
     }
-    if !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(format!("non-lowercase-hex in did: {s}"));
     }
     Ok(())
@@ -553,7 +568,10 @@ mod tests {
             EnvelopeKind::ToolInvoke,
             serde_json::json!({ "args": {} }),
         );
-        assert!(matches!(env.validate(), Err(EnvelopeError::MalformedBody(_))));
+        assert!(matches!(
+            env.validate(),
+            Err(EnvelopeError::MalformedBody(_))
+        ));
     }
 
     #[test]

@@ -165,7 +165,9 @@ pub fn UserDisplay(
 
     let name_cls = format!(
         "font-semibold text-sm truncate transition-colors {}",
-        name_class.as_deref().unwrap_or("text-amber-400 hover:text-amber-300"),
+        name_class
+            .as_deref()
+            .unwrap_or("text-amber-400 hover:text-amber-300"),
     );
 
     view! {

@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 /// gift-wrap, kind-30033 mesh service-list, and the 30910–30916 moderation
 /// range.
 pub fn default_federated_kinds() -> Vec<u64> {
-    vec![14, 1059, 30033, 30910, 30911, 30912, 30913, 30914, 30915, 30916]
+    vec![
+        14, 1059, 30033, 30910, 30911, 30912, 30913, 30914, 30915, 30916,
+    ]
 }
 
 fn default_delegation_required() -> bool {
@@ -177,17 +179,16 @@ impl MeshConfig {
     /// Whether a local actor `pubkey_hex` federates. An empty
     /// `federated_pubkeys` means "all local actors" (PRD-010 §F11).
     pub fn is_federated_pubkey(&self, pubkey_hex: &str) -> bool {
-        self.federated_pubkeys.is_empty()
-            || self.federated_pubkeys.iter().any(|p| p == pubkey_hex)
+        self.federated_pubkeys.is_empty() || self.federated_pubkeys.iter().any(|p| p == pubkey_hex)
     }
 
     /// Whether an inbound peer DID/pubkey is accepted (PRD-010 §F12
     /// `allowed_remote_dids`). Matches against the bare hex or a `did:nostr:`
     /// form.
     pub fn is_allowed_remote(&self, pubkey_hex: &str) -> bool {
-        self.allowed_remote_dids.iter().any(|d| {
-            d == pubkey_hex || d.strip_prefix("did:nostr:") == Some(pubkey_hex)
-        })
+        self.allowed_remote_dids
+            .iter()
+            .any(|d| d == pubkey_hex || d.strip_prefix("did:nostr:") == Some(pubkey_hex))
     }
 }
 
@@ -245,7 +246,9 @@ mod tests {
         let cfg = MeshConfig::from_toml_str(doc).unwrap();
         assert_eq!(
             cfg.resolve().unwrap(),
-            MeshMode::Client { relay: "wss://hub.example".into() }
+            MeshMode::Client {
+                relay: "wss://hub.example".into()
+            }
         );
     }
 
@@ -259,7 +262,9 @@ mod tests {
         let cfg = MeshConfig::from_toml_str(doc).unwrap();
         assert_eq!(
             cfg.resolve().unwrap(),
-            MeshMode::Client { relay: "wss://hub.example".into() }
+            MeshMode::Client {
+                relay: "wss://hub.example".into()
+            }
         );
     }
 
@@ -272,7 +277,10 @@ mod tests {
     #[test]
     fn unknown_mode_rejected() {
         let cfg = MeshConfig::from_toml_str("[mesh]\nmode='bogus'\n").unwrap();
-        assert_eq!(cfg.resolve(), Err(MeshConfigError::UnknownMode("bogus".into())));
+        assert_eq!(
+            cfg.resolve(),
+            Err(MeshConfigError::UnknownMode("bogus".into()))
+        );
     }
 
     #[test]

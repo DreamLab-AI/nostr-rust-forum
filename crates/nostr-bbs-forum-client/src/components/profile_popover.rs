@@ -5,7 +5,7 @@
 //! copyable shortened pubkey. Unlike [`ProfileModal`](crate::components::profile_modal::ProfileModal),
 //! which is a centred full overlay with DM/mute actions and a live relay fetch,
 //! this popover is purely a read-only preview driven off the shared
-//! [`ProfileCache`]. It is meant to be rendered inside a `position: relative`
+//! `ProfileCache`. It is meant to be rendered inside a `position: relative`
 //! wrapper (e.g. [`UserDisplay`](crate::components::user_display::UserDisplay))
 //! so it anchors just beneath the clicked avatar/name.
 //!

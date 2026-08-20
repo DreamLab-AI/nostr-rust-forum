@@ -253,8 +253,7 @@ pub fn parse_reaction(event: &NostrEvent) -> Option<ReactionRef> {
     let target = event
         .tags
         .iter()
-        .filter(|t| t.len() >= 2 && t[0] == "e")
-        .next_back()
+        .rfind(|t| t.len() >= 2 && t[0] == "e")
         .map(|t| t[1].to_lowercase())
         .filter(|id| !id.is_empty())?;
     Some(ReactionRef {
@@ -319,7 +318,10 @@ pub fn fold_remove(
 /// Build the display list for one target's emoji map, ordered most-reacted
 /// first (ties broken by emoji for stable rendering). `me` is the lowercased
 /// pubkey of the logged-in user, used to flag `reacted_by_me`.
-pub fn build_reactions(by_emoji: Option<&HashMap<String, HashSet<String>>>, me: &str) -> Vec<Reaction> {
+pub fn build_reactions(
+    by_emoji: Option<&HashMap<String, HashSet<String>>>,
+    me: &str,
+) -> Vec<Reaction> {
     let mut out: Vec<Reaction> = match by_emoji {
         Some(map) => map
             .iter()
@@ -359,7 +361,13 @@ mod tests {
 
     #[test]
     fn parse_reaction_extracts_target_emoji_reactor() {
-        let e = ev("r1", "ALICE", 7, "\u{1F44D}", &[&["e", "POST1"], &["p", "bob"]]);
+        let e = ev(
+            "r1",
+            "ALICE",
+            7,
+            "\u{1F44D}",
+            &[&["e", "POST1"], &["p", "bob"]],
+        );
         let r = parse_reaction(&e).unwrap();
         assert_eq!(r.target, "post1"); // lowercased
         assert_eq!(r.emoji, "\u{1F44D}");
@@ -369,7 +377,13 @@ mod tests {
     #[test]
     fn parse_reaction_prefers_last_e_tag() {
         // NIP-25: the reacted-to event is the last `e` tag.
-        let e = ev("r1", "alice", 7, "\u{2764}", &[&["e", "root"], &["e", "post2"]]);
+        let e = ev(
+            "r1",
+            "alice",
+            7,
+            "\u{2764}",
+            &[&["e", "root"], &["e", "post2"]],
+        );
         assert_eq!(parse_reaction(&e).unwrap().target, "post2");
     }
 
@@ -390,10 +404,28 @@ mod tests {
         let mut agg = Aggregate::new();
         let mut idx = ReactionIndex::new();
         let tomb = HashSet::new();
-        fold_add(&mut agg, &mut idx, &tomb, "r1".into(), ReactionRef {
-            target: "post1".into(), emoji: "\u{1F44D}".into(), pubkey: "alice".into() });
-        fold_add(&mut agg, &mut idx, &tomb, "r2".into(), ReactionRef {
-            target: "post1".into(), emoji: "\u{1F44D}".into(), pubkey: "bob".into() });
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r1".into(),
+            ReactionRef {
+                target: "post1".into(),
+                emoji: "\u{1F44D}".into(),
+                pubkey: "alice".into(),
+            },
+        );
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r2".into(),
+            ReactionRef {
+                target: "post1".into(),
+                emoji: "\u{1F44D}".into(),
+                pubkey: "bob".into(),
+            },
+        );
         let out = build_reactions(agg.get("post1"), "alice");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].count, 2);
@@ -405,7 +437,11 @@ mod tests {
         let mut agg = Aggregate::new();
         let mut idx = ReactionIndex::new();
         let tomb = HashSet::new();
-        let r = ReactionRef { target: "post1".into(), emoji: "\u{1F44D}".into(), pubkey: "alice".into() };
+        let r = ReactionRef {
+            target: "post1".into(),
+            emoji: "\u{1F44D}".into(),
+            pubkey: "alice".into(),
+        };
         fold_add(&mut agg, &mut idx, &tomb, "r1".into(), r.clone());
         fold_add(&mut agg, &mut idx, &tomb, "r1".into(), r);
         assert_eq!(build_reactions(agg.get("post1"), "")[0].count, 1);
@@ -416,8 +452,17 @@ mod tests {
         let mut agg = Aggregate::new();
         let mut idx = ReactionIndex::new();
         let mut tomb = HashSet::new();
-        fold_add(&mut agg, &mut idx, &tomb, "r1".into(), ReactionRef {
-            target: "post1".into(), emoji: "\u{2764}".into(), pubkey: "alice".into() });
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r1".into(),
+            ReactionRef {
+                target: "post1".into(),
+                emoji: "\u{2764}".into(),
+                pubkey: "alice".into(),
+            },
+        );
         // NIP-09 kind-5 targeting the kind-7 id.
         fold_remove(&mut agg, &mut idx, &mut tomb, &["r1".into()]);
         assert!(build_reactions(agg.get("post1"), "alice").is_empty());
@@ -431,8 +476,17 @@ mod tests {
         let mut idx = ReactionIndex::new();
         let mut tomb = HashSet::new();
         fold_remove(&mut agg, &mut idx, &mut tomb, &["r1".into()]);
-        fold_add(&mut agg, &mut idx, &tomb, "r1".into(), ReactionRef {
-            target: "post1".into(), emoji: "\u{1F44D}".into(), pubkey: "alice".into() });
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r1".into(),
+            ReactionRef {
+                target: "post1".into(),
+                emoji: "\u{1F44D}".into(),
+                pubkey: "alice".into(),
+            },
+        );
         assert!(build_reactions(agg.get("post1"), "").is_empty());
     }
 
@@ -441,10 +495,28 @@ mod tests {
         let mut agg = Aggregate::new();
         let mut idx = ReactionIndex::new();
         let mut tomb = HashSet::new();
-        fold_add(&mut agg, &mut idx, &tomb, "r1".into(), ReactionRef {
-            target: "post1".into(), emoji: "\u{1F44D}".into(), pubkey: "alice".into() });
-        fold_add(&mut agg, &mut idx, &tomb, "r2".into(), ReactionRef {
-            target: "post1".into(), emoji: "\u{1F44D}".into(), pubkey: "bob".into() });
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r1".into(),
+            ReactionRef {
+                target: "post1".into(),
+                emoji: "\u{1F44D}".into(),
+                pubkey: "alice".into(),
+            },
+        );
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r2".into(),
+            ReactionRef {
+                target: "post1".into(),
+                emoji: "\u{1F44D}".into(),
+                pubkey: "bob".into(),
+            },
+        );
         fold_remove(&mut agg, &mut idx, &mut tomb, &["r1".into()]);
         let out = build_reactions(agg.get("post1"), "alice");
         assert_eq!(out.len(), 1);
@@ -458,12 +530,39 @@ mod tests {
         let mut idx = ReactionIndex::new();
         let tomb = HashSet::new();
         // heart: 1, thumbs: 2
-        fold_add(&mut agg, &mut idx, &tomb, "r1".into(), ReactionRef {
-            target: "p".into(), emoji: "\u{2764}".into(), pubkey: "a".into() });
-        fold_add(&mut agg, &mut idx, &tomb, "r2".into(), ReactionRef {
-            target: "p".into(), emoji: "\u{1F44D}".into(), pubkey: "a".into() });
-        fold_add(&mut agg, &mut idx, &tomb, "r3".into(), ReactionRef {
-            target: "p".into(), emoji: "\u{1F44D}".into(), pubkey: "b".into() });
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r1".into(),
+            ReactionRef {
+                target: "p".into(),
+                emoji: "\u{2764}".into(),
+                pubkey: "a".into(),
+            },
+        );
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r2".into(),
+            ReactionRef {
+                target: "p".into(),
+                emoji: "\u{1F44D}".into(),
+                pubkey: "a".into(),
+            },
+        );
+        fold_add(
+            &mut agg,
+            &mut idx,
+            &tomb,
+            "r3".into(),
+            ReactionRef {
+                target: "p".into(),
+                emoji: "\u{1F44D}".into(),
+                pubkey: "b".into(),
+            },
+        );
         let out = build_reactions(agg.get("p"), "");
         assert_eq!(out[0].emoji, "\u{1F44D}"); // count 2 first
         assert_eq!(out[1].emoji, "\u{2764}"); // count 1 second

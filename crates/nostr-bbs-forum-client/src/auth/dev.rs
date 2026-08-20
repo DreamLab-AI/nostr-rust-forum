@@ -216,15 +216,6 @@ fn dev_identity_for_pubkey(pubkey: &str) -> Option<&'static DevIdentity> {
     None
 }
 
-/// Check if a pubkey belongs to the dev jarvis identity.
-pub fn is_dev_jarvis(pubkey: &str) -> bool {
-    if let Ok(kp) = build_keypair(&DEV_JARVIS) {
-        kp.public.to_hex() == pubkey
-    } else {
-        false
-    }
-}
-
 /// Get the dev jarvis pubkey hex.
 pub fn dev_jarvis_pubkey() -> String {
     build_keypair(&DEV_JARVIS)

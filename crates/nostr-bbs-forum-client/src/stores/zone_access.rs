@@ -8,7 +8,9 @@
 //! `access` object) from the relay's `/api/check-whitelist?pubkey=` endpoint.
 
 use leptos::prelude::*;
+#[cfg(not(feature = "dev-auth"))]
 use wasm_bindgen::JsCast;
+#[cfg(not(feature = "dev-auth"))]
 use wasm_bindgen_futures::JsFuture;
 
 use crate::auth::use_auth;
@@ -18,6 +20,7 @@ use crate::stores::zones::{load_zones, Zone};
 ///
 /// Raw `JsValue` / fetch errors are logged to the browser console for
 /// debugging; the user only ever sees this reassuring message.
+#[cfg(not(feature = "dev-auth"))]
 const ACCESS_LOAD_ERROR: &str =
     "Could not load your access details — check your connection and try again.";
 
@@ -131,12 +134,14 @@ pub fn home_zone_for(zones: &[Zone], cohorts: &[String], is_admin: bool) -> Opti
 /// returns the first match, allowing multi-zone members and admins to install.
 /// Admins bypass the cohort check (they have access to every zone); non-admins
 /// must satisfy the zone's cohort requirement.
-pub fn first_accessible_zone_for(zones: &[Zone], cohorts: &[String], is_admin: bool) -> Option<Zone> {
+pub fn first_accessible_zone_for(
+    zones: &[Zone],
+    cohorts: &[String],
+    is_admin: bool,
+) -> Option<Zone> {
     zones
         .iter()
-        .find(|z| {
-            !z.required_cohorts.is_empty() && (is_admin || z.is_member(cohorts))
-        })
+        .find(|z| !z.required_cohorts.is_empty() && (is_admin || z.is_member(cohorts)))
         .cloned()
 }
 
@@ -261,6 +266,7 @@ pub fn provide_zone_access() {
 }
 
 /// Resolve the relay HTTP base URL for whitelist API calls.
+#[cfg(not(feature = "dev-auth"))]
 fn relay_api_base() -> String {
     crate::utils::relay_url::relay_api_base()
 }
@@ -272,6 +278,7 @@ fn relay_api_base() -> String {
 /// the `cohorts` array for backwards compatibility with old relay versions.
 /// The raw `cohorts` array is always surfaced (when present) so config-driven
 /// zones can compute membership without the legacy 3-flag mapping.
+#[cfg(not(feature = "dev-auth"))]
 async fn fetch_user_access(pubkey: &str) -> Result<(bool, bool, bool, bool, Vec<String>), String> {
     let url = format!("{}/api/check-whitelist?pubkey={}", relay_api_base(), pubkey);
     let win = web_sys::window().ok_or_else(|| {

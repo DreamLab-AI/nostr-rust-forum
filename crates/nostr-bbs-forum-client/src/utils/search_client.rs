@@ -96,6 +96,7 @@ pub async fn ingest_message_signer(
     event_id: &str,
     content: &str,
     channel: Option<&str>,
+    public: bool,
     signer: &dyn nostr_bbs_core::signer::Signer,
 ) -> Result<bool, String> {
     let embedding = embed_query(content).await?;
@@ -107,6 +108,7 @@ pub async fn ingest_message_signer(
             "embedding": embedding,
             "channel": channel,
             "timestamp": (js_sys::Date::now() / 1000.0) as u64,
+            "public": public,
         }]
     });
     let body_str = body.to_string();

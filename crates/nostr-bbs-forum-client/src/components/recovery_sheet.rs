@@ -86,19 +86,34 @@ fn qr_svg(data: &str) -> String {
 ///
 /// The secret key never leaves the browser: the Blob is constructed in WASM,
 /// the object-URL is ephemeral, and the hidden `<a>` is removed after click.
-fn download_recovery_html(
-    display_name: &str,
-    created: &str,
-    nip05: Option<&str>,
-    connect_url: Option<&str>,
-    connect_qr: &str,
-    nsec: &str,
-    nsec_qr: &str,
-    relay_url: &str,
-    relay_qr: &str,
-    npub: &str,
-    npub_qr: &str,
-) {
+struct RecoveryDownload<'a> {
+    display_name: &'a str,
+    created: &'a str,
+    nip05: Option<&'a str>,
+    connect_url: Option<&'a str>,
+    connect_qr: &'a str,
+    nsec: &'a str,
+    nsec_qr: &'a str,
+    relay_url: &'a str,
+    relay_qr: &'a str,
+    npub: &'a str,
+    npub_qr: &'a str,
+}
+
+fn download_recovery_html(sheet: RecoveryDownload<'_>) {
+    let RecoveryDownload {
+        display_name,
+        created,
+        nip05,
+        connect_url,
+        connect_qr,
+        nsec,
+        nsec_qr,
+        relay_url,
+        relay_qr,
+        npub,
+        npub_qr,
+    } = sheet;
     let nip05_line = nip05
         .filter(|h| !h.is_empty())
         .map(|h| format!(" &middot; {h}"))
@@ -201,8 +216,12 @@ fn download_recovery_html(
 </html>"##
     );
 
-    let Some(window) = web_sys::window() else { return };
-    let Some(document) = window.document() else { return };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
 
     let parts = js_sys::Array::new();
     parts.push(&html.into());
@@ -219,7 +238,7 @@ fn download_recovery_html(
 
     if let Ok(a) = document.create_element("a") {
         let _ = a.set_attribute("href", &url);
-        let _ = a.set_attribute("download", "dreamlab-recovery.html");
+        let _ = a.set_attribute("download", "nostr-bbs-recovery.html");
         let _ = a.set_attribute("style", "display:none");
         if let Some(body) = document.body() {
             let _ = body.append_child(&a);
@@ -300,19 +319,19 @@ pub(crate) fn RecoverySheet(
     let dl_npub = npub.clone();
     let dl_npub_qr = npub_qr.clone();
     let on_download = move |_| {
-        download_recovery_html(
-            &dl_display,
-            &dl_created,
-            dl_nip05.as_deref(),
-            dl_connect_url.as_deref(),
-            &dl_connect_qr,
-            &dl_nsec,
-            &dl_nsec_qr,
-            &dl_relay,
-            &dl_relay_qr,
-            &dl_npub,
-            &dl_npub_qr,
-        );
+        download_recovery_html(RecoveryDownload {
+            display_name: &dl_display,
+            created: &dl_created,
+            nip05: dl_nip05.as_deref(),
+            connect_url: dl_connect_url.as_deref(),
+            connect_qr: &dl_connect_qr,
+            nsec: &dl_nsec,
+            nsec_qr: &dl_nsec_qr,
+            relay_url: &dl_relay,
+            relay_qr: &dl_relay_qr,
+            npub: &dl_npub,
+            npub_qr: &dl_npub_qr,
+        });
         printed.set(true);
     };
 

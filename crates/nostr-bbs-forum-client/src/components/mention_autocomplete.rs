@@ -55,7 +55,7 @@ use crate::utils::relay_url::relay_api_base;
 /// load) plus the hardcoded known-users seed, so a bare `@` showed nothing but
 /// the four "house agents". The fetch is debounced by the composer, and the
 /// relay's roster query is bounded + indexed, so hitting it on `@` is cheap.
-pub(crate) const NETWORK_SEARCH_MIN_LEN: usize = 0;
+pub(crate) const NETWORK_SEARCH_MIN_LEN: usize = 1;
 
 /// One autocomplete candidate. `pubkey` is the canonical 64-char hex pubkey
 /// used to build the `["p", pubkey]` tag; the optional metadata drives display.

@@ -155,8 +155,8 @@ pub enum RelayMessage {
 impl RelayMessage {
     /// Parse a relay message from a text frame.
     pub fn parse(text: &str) -> Result<Self, MeshError> {
-        let arr: Vec<Value> =
-            serde_json::from_str(text).map_err(|e| MeshError::Protocol(format!("not a JSON array: {e}")))?;
+        let arr: Vec<Value> = serde_json::from_str(text)
+            .map_err(|e| MeshError::Protocol(format!("not a JSON array: {e}")))?;
         let tag = arr
             .first()
             .and_then(Value::as_str)
@@ -170,28 +170,61 @@ impl RelayMessage {
                     .ok_or_else(|| MeshError::Protocol("EVENT missing sub_id".into()))?
                     .to_string();
                 let event: NostrEvent = serde_json::from_value(
-                    arr.get(2).cloned().ok_or_else(|| MeshError::Protocol("EVENT missing event".into()))?,
+                    arr.get(2)
+                        .cloned()
+                        .ok_or_else(|| MeshError::Protocol("EVENT missing event".into()))?,
                 )
                 .map_err(|e| MeshError::Serde(e.to_string()))?;
-                Ok(RelayMessage::Event { subscription_id, event })
+                Ok(RelayMessage::Event {
+                    subscription_id,
+                    event,
+                })
             }
             "OK" => Ok(RelayMessage::Ok {
-                event_id: arr.get(1).and_then(Value::as_str).unwrap_or_default().to_string(),
+                event_id: arr
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 accepted: arr.get(2).and_then(Value::as_bool).unwrap_or(false),
-                message: arr.get(3).and_then(Value::as_str).unwrap_or_default().to_string(),
+                message: arr
+                    .get(3)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             }),
             "EOSE" => Ok(RelayMessage::Eose {
-                subscription_id: arr.get(1).and_then(Value::as_str).unwrap_or_default().to_string(),
+                subscription_id: arr
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             }),
             "AUTH" => Ok(RelayMessage::Auth {
-                challenge: arr.get(1).and_then(Value::as_str).unwrap_or_default().to_string(),
+                challenge: arr
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             }),
             "NOTICE" => Ok(RelayMessage::Notice {
-                message: arr.get(1).and_then(Value::as_str).unwrap_or_default().to_string(),
+                message: arr
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             }),
             "CLOSED" => Ok(RelayMessage::Closed {
-                subscription_id: arr.get(1).and_then(Value::as_str).unwrap_or_default().to_string(),
-                message: arr.get(2).and_then(Value::as_str).unwrap_or_default().to_string(),
+                subscription_id: arr
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                message: arr
+                    .get(2)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             }),
             _ => Ok(RelayMessage::Other(Value::Array(arr))),
         }
@@ -226,7 +259,8 @@ pub trait MeshTransport {
     ) -> Result<(), MeshError>;
 
     /// Publish a raw event (JSON object) to the peer as `["EVENT", <event>]`.
-    async fn publish_event(&self, session: &PeerSession, event_json: &str) -> Result<(), MeshError>;
+    async fn publish_event(&self, session: &PeerSession, event_json: &str)
+        -> Result<(), MeshError>;
 
     /// Open a subscription: `["REQ", <sub_id>, <filter>]`.
     async fn subscribe(
@@ -273,7 +307,10 @@ pub struct ReceiveOptions {
 
 impl Default for ReceiveOptions {
     fn default() -> Self {
-        ReceiveOptions { now: None, delegation_required: true }
+        ReceiveOptions {
+            now: None,
+            delegation_required: true,
+        }
     }
 }
 
@@ -291,7 +328,10 @@ pub struct RelayTransport<S: MeshSocket> {
 impl<S: MeshSocket> RelayTransport<S> {
     /// Wrap an established socket connected to `peer_url`.
     pub fn new(socket: S, peer_url: impl Into<String>) -> Self {
-        RelayTransport { socket, peer_url: peer_url.into() }
+        RelayTransport {
+            socket,
+            peer_url: peer_url.into(),
+        }
     }
 
     /// Borrow the underlying socket (e.g. for the mock relay to drain it).
@@ -314,12 +354,18 @@ impl<S: MeshSocket> RelayTransport<S> {
     ) -> Result<(), MeshError> {
         let mut frame = vec![Value::String("REQ".into()), Value::String(sub_id.into())];
         frame.extend(filters);
-        self.socket.send_text(&Value::Array(frame).to_string()).await
+        self.socket
+            .send_text(&Value::Array(frame).to_string())
+            .await
     }
 
     /// Subscribe to the gift-wrapped inbox for `recipient_hex`
     /// (`{"#p":[hex],"kinds":[1059]}`).
-    pub async fn subscribe_inbox(&self, sub_id: &str, recipient_hex: &str) -> Result<(), MeshError> {
+    pub async fn subscribe_inbox(
+        &self,
+        sub_id: &str,
+        recipient_hex: &str,
+    ) -> Result<(), MeshError> {
         let filter = json!({ "#p": [recipient_hex], "kinds": [1059] });
         self.subscribe_filters(sub_id, vec![filter]).await
     }
@@ -433,7 +479,9 @@ pub fn decode_incoming_wrap(
     // TTL (ADR-075 §D7).
     if let Some(now) = opts.now {
         if envelope.is_expired_with_default(now, rumor.created_at) {
-            return Err(MeshError::Envelope(EnvelopeError::Json("envelope-expired".into())));
+            return Err(MeshError::Envelope(EnvelopeError::Json(
+                "envelope-expired".into(),
+            )));
         }
     }
 
@@ -490,7 +538,11 @@ impl<S: MeshSocket> MeshTransport for RelayTransport<S> {
         Ok(())
     }
 
-    async fn publish_event(&self, _session: &PeerSession, event_json: &str) -> Result<(), MeshError> {
+    async fn publish_event(
+        &self,
+        _session: &PeerSession,
+        event_json: &str,
+    ) -> Result<(), MeshError> {
         let frame = format!("[\"EVENT\",{event_json}]");
         self.socket.send_text(&frame).await
     }
@@ -505,7 +557,10 @@ impl<S: MeshSocket> MeshTransport for RelayTransport<S> {
         self.socket.send_text(&frame).await
     }
 
-    async fn next_message(&self, _session: &PeerSession) -> Result<Option<RelayMessage>, MeshError> {
+    async fn next_message(
+        &self,
+        _session: &PeerSession,
+    ) -> Result<Option<RelayMessage>, MeshError> {
         self.recv().await
     }
 
@@ -522,7 +577,7 @@ impl<S: MeshSocket> MeshTransport for RelayTransport<S> {
 // ── Peer management + fan-out dedup ──────────────────────────────────────────
 
 /// Capacity-bounded seen-event-id cache for fan-out loop prevention
-/// (ADR-075 §D12, PRD-010 §F21). Insertion-ordered eviction at [`Self::capacity`].
+/// (ADR-075 §D12, PRD-010 §F21). Insertion-ordered eviction at the configured capacity.
 #[derive(Debug)]
 pub struct SeenIds {
     capacity: usize,
@@ -584,7 +639,11 @@ impl PeerManager {
     /// Build a roster from config `peer_relays`.
     pub fn from_config(config: MeshConfig) -> Self {
         let peers = config.peer_relays.iter().map(PeerSession::new).collect();
-        PeerManager { config, peers, seen: SeenIds::default() }
+        PeerManager {
+            config,
+            peers,
+            seen: SeenIds::default(),
+        }
     }
 
     /// The configured peer sessions.
@@ -628,7 +687,10 @@ mod tests {
     fn parses_inbound_event_frame() {
         let text = r#"["EVENT","sub1",{"id":"aa","pubkey":"bb","created_at":1,"kind":1059,"tags":[],"content":"c","sig":"dd"}]"#;
         match RelayMessage::parse(text).unwrap() {
-            RelayMessage::Event { subscription_id, event } => {
+            RelayMessage::Event {
+                subscription_id,
+                event,
+            } => {
                 assert_eq!(subscription_id, "sub1");
                 assert_eq!(event.kind, 1059);
             }
@@ -649,7 +711,11 @@ mod tests {
     fn parses_ok_frame() {
         let text = r#"["OK","evid",false,"blocked: nope"]"#;
         match RelayMessage::parse(text).unwrap() {
-            RelayMessage::Ok { event_id, accepted, message } => {
+            RelayMessage::Ok {
+                event_id,
+                accepted,
+                message,
+            } => {
                 assert_eq!(event_id, "evid");
                 assert!(!accepted);
                 assert_eq!(message, "blocked: nope");

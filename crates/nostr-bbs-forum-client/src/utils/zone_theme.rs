@@ -13,7 +13,6 @@
 //! |---------------|-------------|------------------------------|
 //! | `public`      | Public      | amber / dawn (warm, open)    |
 //! | `friends`     | Friends     | rose / fuchsia (the social)  |
-//! | `minimoonoir` | Minimoonoir | blue / sky (cool, distinct)  |
 //! | `family`      | Family      | emerald / teal (warm, safe)  |
 //! | `business`    | Business    | purple (the brand accent)    |
 //!
@@ -84,13 +83,6 @@ pub fn zone_theme(zone_id: &str) -> ZoneTheme {
             border: "border-rose-500/25",
             accent_text: "text-rose-400",
             accent_hex: "#fb7185",
-        },
-        // minimoonoir — cool, distinct blue / sky.
-        "minimoonoir" => ZoneTheme {
-            gradient: "from-blue-500/20 via-sky-500/10 to-cyan-500/10",
-            border: "border-blue-500/25",
-            accent_text: "text-blue-400",
-            accent_hex: "#3b82f6",
         },
         // family — warm, safe emerald / teal.
         "family" => ZoneTheme {
@@ -228,10 +220,9 @@ mod tests {
     fn each_generic_zone_has_a_distinct_accent() {
         let public = zone_theme("public").accent_hex;
         let friends = zone_theme("friends").accent_hex;
-        let minimoonoir = zone_theme("minimoonoir").accent_hex;
         let family = zone_theme("family").accent_hex;
         let business = zone_theme("business").accent_hex;
-        let all = [public, friends, minimoonoir, family, business];
+        let all = [public, friends, family, business];
         for (i, a) in all.iter().enumerate() {
             for b in all.iter().skip(i + 1) {
                 assert_ne!(a, b, "zone accents must be distinct");
@@ -240,12 +231,10 @@ mod tests {
     }
 
     #[test]
-    fn minimoonoir_zone_is_blue() {
-        let t = zone_theme("minimoonoir");
-        assert_eq!(t.accent_hex, "#3b82f6");
-        assert!(t.gradient.contains("blue"));
-        assert!(t.accent_text.contains("blue"));
-        assert!(t.border.contains("blue"));
+    fn operator_zone_requires_configured_brand_colour() {
+        let t = zone_theme("operator-zone");
+        assert_eq!(t.accent_hex, "#94a3b8");
+        assert!(t.gradient.contains("slate"));
     }
 
     #[test]
@@ -346,7 +335,7 @@ mod tests {
     #[test]
     fn resolved_accent_falls_back_when_absent_or_invalid() {
         // Absent -> built-in; malformed/blank config never leaks, also -> built-in.
-        assert_eq!(resolved_accent_hex("minimoonoir", None), "#3b82f6");
+        assert_eq!(resolved_accent_hex("operator-zone", None), "#94a3b8");
         assert_eq!(resolved_accent_hex("business", Some("nope")), "#a855f7");
         assert_eq!(resolved_accent_hex("business", Some("   ")), "#a855f7");
     }

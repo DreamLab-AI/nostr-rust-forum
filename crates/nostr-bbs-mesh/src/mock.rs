@@ -40,16 +40,21 @@ impl Filter {
             .get("kinds")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_u64).collect());
-        let p_tags = v
-            .get("#p")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
+        let p_tags = v.get("#p").and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        });
         Filter { kinds, p_tags }
     }
 
     fn matches(&self, event: &Value) -> bool {
         if let Some(kinds) = &self.kinds {
-            let k = event.get("kind").and_then(Value::as_u64).unwrap_or(u64::MAX);
+            let k = event
+                .get("kind")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
             if !kinds.contains(&k) {
                 return false;
             }
@@ -91,7 +96,9 @@ pub struct MockRelay {
 impl MockRelay {
     /// A fresh, empty relay.
     pub fn new() -> Self {
-        MockRelay { state: Rc::new(RefCell::new(RelayState::default())) }
+        MockRelay {
+            state: Rc::new(RefCell::new(RelayState::default())),
+        }
     }
 
     /// Connect a new client, returning its socket.
@@ -100,7 +107,10 @@ impl MockRelay {
         let id = st.next_id;
         st.next_id += 1;
         st.clients.insert(id, ClientState::default());
-        MockSocket { client_id: id, state: Rc::clone(&self.state) }
+        MockSocket {
+            client_id: id,
+            state: Rc::clone(&self.state),
+        }
     }
 
     /// Number of events the relay currently stores (fan-out assertions).
@@ -115,7 +125,11 @@ impl MockRelay {
         match tag {
             "EVENT" => {
                 let event = arr.get(1).cloned().unwrap_or(Value::Null);
-                let event_id = event.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                let event_id = event
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 {
                     let mut st = self.state.borrow_mut();
                     st.events.push(event.clone());
@@ -235,7 +249,9 @@ impl MockSocket {
 impl MeshSocket for MockSocket {
     async fn send_text(&self, msg: &str) -> Result<(), MeshError> {
         // Reconstruct a temporary relay handle sharing the same state.
-        let relay = MockRelay { state: Rc::clone(&self.state) };
+        let relay = MockRelay {
+            state: Rc::clone(&self.state),
+        };
         relay.handle_frame(self.client_id, msg)
     }
 

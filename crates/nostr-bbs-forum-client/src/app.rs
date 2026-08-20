@@ -20,9 +20,10 @@ use crate::components::screen_reader::{provide_announcer, ScreenReaderAnnouncer}
 use crate::components::toast::{provide_toasts, use_toasts, ToastContainer, ToastVariant};
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
-    AdminPage, BoardPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage, EventsPage,
-    ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, LoginPage, NoteViewPage,
-    PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage, SignupPage, ThreadPage,
+    AdminPage, BoardPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage,
+    EventsPage, ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, LoginPage,
+    NoteViewPage, PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage, SignupPage,
+    ThreadPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
@@ -358,7 +359,10 @@ pub fn App() -> impl IntoView {
                 if rebaked.get_value() || !auth.is_authenticated().get() {
                     return;
                 }
-                let Some(zone) = zone_access.home_zone().or_else(|| zone_access.first_accessible_zone()) else {
+                let Some(zone) = zone_access
+                    .home_zone()
+                    .or_else(|| zone_access.first_accessible_zone())
+                else {
                     return;
                 };
                 rebaked.set_value(true);
