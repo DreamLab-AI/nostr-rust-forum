@@ -98,10 +98,9 @@ pub use kanban::{
     board_coord, card_coord, create_agent_intent_signer, create_board, create_board_signer,
     create_card, create_card_approval_request_signer, create_card_approval_response_signer,
     create_card_due_event_signer, create_card_signer, fold_cards, is_kanban_approval_request,
-    is_kanban_kind, parse_approval_decision,
-    parse_coord, ApprovalDecision, BoardColumn, CardInput, KanbanBoard, KanbanCard, KanbanError,
-    APPROVAL_COL_TAG, COL_TAG, DUE_TAG, KIND_AGENT_INTENT, KIND_KANBAN_BOARD, KIND_KANBAN_CARD,
-    PENDING_MOVE_TAG, RANK_TAG, STATUS_TAG,
+    is_kanban_kind, parse_approval_decision, parse_coord, ApprovalDecision, BoardColumn, CardInput,
+    KanbanBoard, KanbanCard, KanbanError, APPROVAL_COL_TAG, COL_TAG, DUE_TAG, KIND_AGENT_INTENT,
+    KIND_KANBAN_BOARD, KIND_KANBAN_CARD, PENDING_MOVE_TAG, RANK_TAG, STATUS_TAG,
 };
 
 pub use moderation_events::{

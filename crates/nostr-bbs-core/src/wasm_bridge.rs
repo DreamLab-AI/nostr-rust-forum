@@ -58,7 +58,10 @@ pub fn nip44_decrypt(
 /// 32-byte value; the forum reuses the server-bound prfSalt bytes).
 /// Returns a JS object `{ secretKey: Uint8Array(32), publicKey: string }`.
 #[wasm_bindgen]
-pub fn derive_keypair_from_prf(prf_output: &[u8], derivation_salt: &[u8]) -> Result<JsValue, JsValue> {
+pub fn derive_keypair_from_prf(
+    prf_output: &[u8],
+    derivation_salt: &[u8],
+) -> Result<JsValue, JsValue> {
     let prf: [u8; 32] = prf_output
         .try_into()
         .map_err(|_| JsValue::from_str("prf_output must be 32 bytes"))?;

@@ -117,6 +117,7 @@ fn map_upstream_err(e: UpstreamError) -> Nip44Error {
         UpstreamError::Key(_) => Nip44Error::InvalidPublicKey,
         UpstreamError::Base64Decode(_) => Nip44Error::InvalidBase64,
         UpstreamError::Utf8Encode => Nip44Error::InvalidPayload("invalid UTF-8 in plaintext"),
+        UpstreamError::MessageTooLong => Nip44Error::PlaintextTooLong,
         UpstreamError::UnknownVersion(v) => Nip44Error::UnsupportedVersion(v),
         UpstreamError::VersionNotFound => Nip44Error::InvalidPayload("missing version byte"),
         UpstreamError::NotFound(field) => {

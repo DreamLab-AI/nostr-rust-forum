@@ -145,9 +145,7 @@ fn map_upstream_err(e: UpstreamError) -> Nip04Error {
         // nostr 0.44.5+: unit variant, no observed length. Normally
         // unreachable — the kit's own wire pre-check returns
         // `InvalidIvLength(n)` with the real length before delegating.
-        UpstreamError::InvalidIVLen => {
-            Nip04Error::UpstreamCryptoError("invalid IV length".into())
-        }
+        UpstreamError::InvalidIVLen => Nip04Error::UpstreamCryptoError("invalid IV length".into()),
     }
 }
 

@@ -243,7 +243,9 @@ impl KanbanBoard {
             id: event.id.clone(),
             pubkey: event.pubkey.clone(),
             d_tag,
-            title: tag_value(event, "title").unwrap_or("Untitled board").to_string(),
+            title: tag_value(event, "title")
+                .unwrap_or("Untitled board")
+                .to_string(),
             description: event.content.clone(),
             columns,
             approval_columns: event
@@ -615,10 +617,7 @@ fn approval_request_tags(card: &KanbanCard, target_col: &str) -> Vec<Vec<String>
     let mut tags = vec![
         vec!["d".to_string(), random_d_tag()],
         vec!["k".to_string(), KIND_KANBAN_CARD.to_string()],
-        vec![
-            "a".to_string(),
-            card_coord(&card.pubkey, &card.d_tag),
-        ],
+        vec!["a".to_string(), card_coord(&card.pubkey, &card.d_tag)],
         vec!["board".to_string(), card.board.clone()],
         vec!["card_d".to_string(), card.d_tag.clone()],
         vec!["target_col".to_string(), target_col.to_string()],
@@ -742,13 +741,12 @@ pub fn parse_approval_decision(event: &NostrEvent) -> Option<ApprovalDecision> {
         return None;
     }
     let request_id = tag_value(event, "e")?.to_string();
-    let approved = match crate::governance::broker::DecisionOutcome::from_response_content(
-        &event.content,
-    )? {
-        crate::governance::broker::DecisionOutcome::Approve => true,
-        crate::governance::broker::DecisionOutcome::Reject => false,
-        _ => return None,
-    };
+    let approved =
+        match crate::governance::broker::DecisionOutcome::from_response_content(&event.content)? {
+            crate::governance::broker::DecisionOutcome::Approve => true,
+            crate::governance::broker::DecisionOutcome::Reject => false,
+            _ => return None,
+        };
     Some(ApprovalDecision {
         request_id,
         approved,
@@ -810,10 +808,7 @@ pub async fn create_agent_intent_signer(
 ) -> Result<NostrEvent, KanbanError> {
     let mut tags = vec![
         vec!["p".to_string(), agent_pubkey.to_string()],
-        vec![
-            "a".to_string(),
-            card_coord(&card.pubkey, &card.d_tag),
-        ],
+        vec!["a".to_string(), card_coord(&card.pubkey, &card.d_tag)],
         vec!["board".to_string(), card.board.clone()],
         vec!["card_d".to_string(), card.d_tag.clone()],
     ];
