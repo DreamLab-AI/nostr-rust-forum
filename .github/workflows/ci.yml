@@ -2,13 +2,13 @@
 #
 # Jobs:
 #   fmt       — cargo fmt --check (hard gate)
-#   clippy    — cargo clippy -D warnings (advisory, continue-on-error)
-#   test      — cargo test --workspace (native, advisory; ~1280 tests, pre-existing
-#               unrelated failures — NOT a merge gate; see test-security below)
+#   clippy    — cargo clippy -D warnings (hard gate)
+#   test      — cargo test --workspace --all-targets --all-features (hard gate)
 #   test-security — hard gate: security-critical crate suites (crypto, relay
 #               read-gating, WAC/ACL, NIP-98 replay, SSRF, config)
 #   wasm      — cargo check --target wasm32-unknown-unknown (portable crates, hard gate)
 #   doc       — cargo doc --no-deps (catch broken links)
+#   coverage  — measured workspace line/branch/function coverage (hard gate)
 #   deny      — cargo-deny licence/advisory/ban/source policy
 #   ci-pass   — single required status check aggregator
 #
@@ -25,6 +25,8 @@ on:
       - '**/Cargo.lock'
       - 'deny.toml'
       - 'rust-toolchain.toml'
+      - 'forum.toml'
+      - 'scripts/validate-forum-config.sh'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
@@ -34,6 +36,8 @@ on:
       - '**/Cargo.lock'
       - 'deny.toml'
       - 'rust-toolchain.toml'
+      - 'forum.toml'
+      - 'scripts/validate-forum-config.sh'
       - '.github/workflows/ci.yml'
   workflow_dispatch:
 
@@ -70,8 +74,6 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    # Advisory: -D warnings is too strict for the evolving kit. Visible, non-blocking.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -81,8 +83,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo clippy --workspace --all-targets -- -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   # ---------------------------------------------------------------------------
   # Test — run the full workspace test suite on native target
@@ -90,9 +92,6 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    # Advisory: full-workspace suite has pre-existing failures unrelated to deploy.
-    # Per-feature tests are run by the contributing change; wasm32 is the hard gate.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -100,14 +99,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      - name: cargo test --workspace --all-targets --all-features
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Validate configuration contract
+        run: |
+          bash scripts/validate-forum-config.sh forum.example.toml
+          if [[ -f forum.toml ]]; then
+            bash scripts/validate-forum-config.sh forum.toml
+          fi
 
   # ---------------------------------------------------------------------------
   # Test (security) — HARD GATE for the security-critical crates.
   #
-  # The full-workspace `test` job above is advisory (pre-existing unrelated
-  # failures). This job runs the test suites that cover the security controls
+  # The full-workspace `test` job above is required. This focused job also runs
+  # the test suites that cover the security controls
   # (crypto/signature verification, relay zone/COUNT read-gating, WAC/ACL,
   # NIP-98 replay, SSRF guard, config validation) and DOES gate merges, so a
   # regression in those controls fails CI instead of slipping through.
@@ -173,8 +179,6 @@ jobs:
   doc:
     name: doc
     runs-on: ubuntu-latest
-    # Advisory: -D warnings on rustdoc is too strict for the evolving kit.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -188,6 +192,30 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings -D rustdoc::broken-intra-doc-links"
         run: cargo doc --workspace --no-deps
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - name: Measure workspace coverage
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
 
   # ---------------------------------------------------------------------------
   # cargo-deny — licence policy, advisories, bans, sources
@@ -230,6 +258,7 @@ jobs:
       - test-security
       - wasm
       - doc
+      - coverage
       - deny
     steps:
       - name: Verify all jobs succeeded
@@ -240,19 +269,22 @@ jobs:
           echo "test-security: ${{ needs.test-security.result }}"
           echo "wasm:          ${{ needs.wasm.result }}"
           echo "doc:           ${{ needs.doc.result }}"
+          echo "coverage:      ${{ needs.coverage.result }}"
           echo "deny:          ${{ needs.deny.result }}"
 
-          # Hard gates: fmt, wasm32 (deploy-relevant), test-security (security
-          # control regressions), and deny (supply-chain policy). The broad
-          # `test`/`clippy`/`doc` jobs remain advisory (continue-on-error).
+          # Every listed quality and security job is a hard merge gate.
           for result in \
             "${{ needs.fmt.result }}" \
+            "${{ needs.clippy.result }}" \
+            "${{ needs.test.result }}" \
             "${{ needs.wasm.result }}" \
             "${{ needs.test-security.result }}" \
+            "${{ needs.doc.result }}" \
+            "${{ needs.coverage.result }}" \
             "${{ needs.deny.result }}"; do
             if [[ "$result" != "success" ]]; then
-              echo "A required job (fmt, wasm32, test-security, or deny) did not succeed."
+              echo "A required CI job did not succeed."
               exit 1
             fi
           done
-          echo "Required gates (fmt, wasm32, test-security, deny) passed."
+          echo "All required CI gates passed."

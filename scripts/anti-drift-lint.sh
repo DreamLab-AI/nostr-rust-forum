@@ -143,14 +143,21 @@ fi
 # Operators must inject branding via forum-config/, not hardcode it back into
 # the substrate crates. The kit-repo URL in NIP-11 is allowlisted.
 BRANDED_RES=$(
-  grep -RIn \
-    --include='*.rs' --include='*.toml' --include='*.html' --include='*.css' --include='*.js' \
-    -E '\bDreamLab\b|\bdreamlab\b|\bminimoonoir\b' \
-    crates 2>/dev/null \
-    | grep -v '/target/' \
-    | grep -v 'node_modules' \
-    | grep -v 'github\.com/DreamLab-AI/nostr-rust-forum' \
-    || true
+  while IFS= read -r source; do
+    # Rust unit-test modules are fixtures, not emitted substrate. Stop at the
+    # conventional trailing cfg(test) module, while continuing to scan all
+    # production code above it. Other asset types are scanned in full.
+    awk '
+      /#\[cfg\(test\)\]/ { if (FILENAME ~ /\.rs$/) exit }
+      /DreamLab|dreamlab|minimoonoir/ {
+        if ($0 !~ /^[[:space:]]*\/\// &&
+            $0 !~ /github\.com\/DreamLab-AI\/nostr-rust-forum/ &&
+            $0 !~ /w3id\.org\/dreamlab\/mesh/) {
+          printf "%s:%d:%s\n", FILENAME, FNR, $0
+        }
+      }
+    ' "$source"
+  done < <(find crates -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.html' -o -name '*.css' -o -name '*.js' \) -print)
 )
 
 if [ -n "$BRANDED_RES" ]; then
