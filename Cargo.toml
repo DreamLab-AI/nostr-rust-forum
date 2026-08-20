@@ -55,7 +55,7 @@ wasm-check-packages = ["nostr-bbs-config", "nostr-bbs-preview-worker"]
 # enables nip04 (legacy DM), nip44 (encrypted DM v2), nip59 (gift wrap),
 # nip90 (DVM), and nip98 (HTTP auth) — the rust-nostr modules that replace
 # hand-rolled crypto in `nostr-bbs-core`.
-nostr = { version = "0.44", features = ["nip04", "nip44", "nip59", "nip98"] }
+nostr = { version = "0.44.7", features = ["nip04", "nip44", "nip59", "nip98"] }
 
 # UI framework (0.7.x — stay on 0.7 track, 0.8 is breaking)
 leptos = { version = "0.7", features = ["csr"] }
@@ -96,6 +96,7 @@ url = "2"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+futures-util = "0.3"
 
 # WASM bindings
 wasm-bindgen = "0.2"
@@ -154,11 +155,11 @@ wasm-bindgen-test = "0.3"
 solid-pod-rs = { version = "=0.5.0-alpha.7", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.3).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.8" }
-nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.8" }
-nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.8" }
-nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.8" }
-nostr-bbs-ascii = { path = "crates/nostr-bbs-ascii", version = "1.0.0-beta.8" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.9" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.9" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.9" }
+nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.9" }
+nostr-bbs-ascii = { path = "crates/nostr-bbs-ascii", version = "1.0.0-beta.9" }
 
 # Image decoders for server-side ASCII rendering (nostr-bbs-ascii `decode`
 # feature, enabled by the preview/pod workers). default-features off so no
@@ -178,4 +179,3 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
-

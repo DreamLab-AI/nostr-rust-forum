@@ -7,6 +7,46 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.9] — 2026-08-20
+
+Feature-parity and security-hardening release; every kit crate moves to
+`1.0.0-beta.9`. The `nostr` dependency is pinned to an exact patch and the
+`nostr-bbs-core` crypto shims track the current upstream error surface.
+
+### Added
+
+- **Owner-control ACL invariant (pod-worker).** Raw JSON-LD ACL `PUT`s now go
+  through `preserves_owner_control`, guaranteeing the owner's `acl:Control`
+  grant survives a caller-supplied ACL document (owner cannot be locked out of
+  their own pod).
+- **`futures-util`** added to the workspace dependency set.
+- Security-audit tooling and records: `scripts/security-audit.sh`,
+  `scripts/validate-forum-config.sh`, a `validate-forum-config` config binary,
+  `docs/audit/2026-08-20-*`, and `docs/security/advisory-exceptions.md`.
+
+### Changed
+
+- **Pin `nostr` `0.44` → `0.44.7`** (exact patch) with the
+  `nip04`/`nip44`/`nip59`/`nip98` features. The `nostr-bbs-core` crypto modules
+  delegate to the rust-nostr NIP implementations.
+- **NIP-98 canonical URL is now exact (auth-worker).** `canonical_url` returns
+  the full request URL verbatim (query string preserved) when handed one,
+  falling back to `origin + path` only for a bare origin; the request handler
+  threads `url.to_string()` directly and the `request_origin` helper is removed.
+  This makes NIP-98 verification of query-bearing admin routes
+  (`?limit=…&before=…`) sign against the exact URL the client signed.
+- Workspace-wide `rustfmt` normalisation.
+
+### Fixed
+
+- **nip44:** upstream `MessageTooLong` / `ErrorV2::MessageTooLong` now map to
+  the kit's `Nip44Error::PlaintextTooLong` instead of a generic payload error.
+
+### Removed
+
+- **pod-worker: `pod_git_anchor.rs`.** Native Git anchoring is intentionally not
+  implemented in the Worker crate; the dead module (and its 654 lines) is gone.
+
 ## [1.0.0-beta.8] — 2026-07-26
 
 Hotfix release on top of `beta.7`, published the same day: moving off the
