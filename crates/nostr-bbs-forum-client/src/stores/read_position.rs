@@ -60,6 +60,38 @@ impl ReadPositionStore {
         self.persist();
     }
 
+    /// Mark many channels read in one update + one persist.
+    ///
+    /// Used by the notification centre's "Mark all read" / "Clear" actions so
+    /// they clear the per-channel unread badges durably, not just the visible
+    /// notification list (the badges are recomputed from read positions each
+    /// session — see module docs). Never moves a read position backwards, so a
+    /// stale caller cannot resurrect unread counts the user has already passed.
+    pub fn mark_many_read(&self, entries: &[(String, String, u64)]) {
+        if entries.is_empty() {
+            return;
+        }
+        self.inner.update(|rp| {
+            for (channel_id, event_id, timestamp) in entries {
+                let newer = rp
+                    .positions
+                    .get(channel_id)
+                    .map(|p| *timestamp > p.timestamp)
+                    .unwrap_or(true);
+                if newer {
+                    rp.positions.insert(
+                        channel_id.clone(),
+                        ReadPosition {
+                            last_event_id: event_id.clone(),
+                            timestamp: *timestamp,
+                        },
+                    );
+                }
+            }
+        });
+        self.persist();
+    }
+
     /// Return the last-read event ID for a channel (empty string if never read).
     pub fn last_read_event_id(&self, channel_id: &str) -> String {
         self.inner

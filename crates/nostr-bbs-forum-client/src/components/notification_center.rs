@@ -21,7 +21,9 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
 
+use crate::stores::channels::use_channel_store;
 use crate::stores::notifications::{use_notification_store, Notification, NotificationKind};
+use crate::stores::read_position::use_read_positions;
 use crate::utils::format_relative_time;
 
 /// Notification center panel, toggled by the notification bell.
@@ -33,11 +35,23 @@ pub fn NotificationCenter(
     let store = use_notification_store();
     let _navigate = StoredValue::new(use_navigate());
 
+    // "Mark all read" / "Clear" must also stamp per-channel READ POSITIONS, not
+    // just flip the visible notification list: the unread badges are recomputed
+    // from read positions against the live message set every session, so
+    // clearing only the list makes the badges resurrect on next login.
+    let channels = use_channel_store();
+    let read_positions = use_read_positions();
+    let stamp_all_read = move || {
+        read_positions.mark_many_read(&channels.latest_message_per_channel());
+    };
+
     let on_mark_all = move |_| {
+        stamp_all_read();
         store.mark_all_read();
     };
 
     let on_clear = move |_| {
+        stamp_all_read();
         store.clear_all();
         is_open.set(false);
     };

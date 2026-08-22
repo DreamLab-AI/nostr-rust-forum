@@ -139,6 +139,32 @@ impl ChannelStore {
             .with(|m| m.get(cid).map(|v| v.len() as u32).unwrap_or(0))
     }
 
+    /// Newest message per channel as `(channel_id, event_id, created_at)`.
+    ///
+    /// The read model is timestamp-based (see `stores::read_position`), so
+    /// "mark everything read" means stamping each channel's read position at
+    /// its newest message — this is the input for that bulk stamp. Channels
+    /// with no loaded messages fall back to `last_active` (with an empty
+    /// event id) so a badge computed from the cached activity map also clears.
+    pub fn latest_message_per_channel(&self) -> Vec<(String, String, u64)> {
+        let mut out: HashMap<String, (String, u64)> = HashMap::new();
+        self.channel_messages.with_untracked(|m| {
+            for (cid, events) in m.iter() {
+                if let Some(ev) = events.iter().max_by_key(|e| e.created_at) {
+                    out.insert(cid.clone(), (ev.id.clone(), ev.created_at));
+                }
+            }
+        });
+        self.last_active.with_untracked(|m| {
+            for (cid, ts) in m.iter() {
+                out.entry(cid.clone()).or_insert((String::new(), *ts));
+            }
+        });
+        out.into_iter()
+            .map(|(cid, (eid, ts))| (cid, eid, ts))
+            .collect()
+    }
+
     fn load_cache() -> CachedData {
         let json: Result<String, _> = LocalStorage::get(CACHE_KEY);
         json.ok()
