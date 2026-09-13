@@ -449,6 +449,8 @@ checksum = "2550f75b8cfac212855f6b1885455df8eaee8fe8e246b647d69146142e016084"
 [[package]]
 name = "colloquy-core"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31dbdc872e5a73502e3802154cd7eb398d9aea2ed530628e8dfc64f1a084968a"
 dependencies = [
  "hex",
  "serde",
@@ -460,6 +462,8 @@ dependencies = [
 [[package]]
 name = "colloquy-view"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11cb98abfe0f1e876c0a11a2163fb9cd5f0246027423e2414494b497dc72a409"
 dependencies = [
  "colloquy-core",
  "serde",
@@ -2439,7 +2443,7 @@ dependencies = [
  "oxilangtag",
  "oxiri",
  "rand 0.8.5",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3619,7 +3623,7 @@ dependencies = [
  "oxrdf",
  "peg",
  "rand 0.8.5",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
