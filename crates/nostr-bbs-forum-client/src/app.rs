@@ -21,7 +21,8 @@ use crate::components::toast::{provide_toasts, use_toasts, ToastContainer, Toast
 use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, BoardPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage,
-    EventsPage, ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, LoginPage,
+    EventsPage, ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, KnowledgePage,
+    LoginPage,
     NoteViewPage, PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage, SignupPage,
     ThreadPage,
 };
@@ -852,6 +853,11 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/join/:code") view=JoinPage />
                     // Auth-gated routes
                     <Route path=path!("/setup") view=AuthGatedSetup />
+                    // Knowledge board (agentbox ADR-2085). Members-only, and
+                    // membership includes agents in their own right — which is
+                    // why the evidence it shows is counted per authorising
+                    // principal rather than per account (ADR-2086).
+                    <Route path=path!("/knowledge") view=AuthGatedKnowledge />
                     // Chat is consolidated into Forums (the canonical,
                     // config-correct channel browser). The bare /chat route
                     // redirects to /forums for legacy bookmarks; the Chat nav
@@ -1406,6 +1412,7 @@ macro_rules! auth_gated {
 }
 
 auth_gated!(AuthGatedSetup, SetupPage);
+auth_gated!(AuthGatedKnowledge, KnowledgePage);
 auth_gated!(AuthGatedForums, ForumsPage);
 auth_gated!(AuthGatedBoard, BoardPage);
 auth_gated!(AuthGatedCategory, CategoryPage);

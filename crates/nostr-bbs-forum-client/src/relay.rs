@@ -64,6 +64,10 @@ pub struct Filter {
     pub e_tags: Option<Vec<String>>,
     #[serde(rename = "#p", skip_serializing_if = "Option::is_none")]
     pub p_tags: Option<Vec<String>>,
+    /// `#t` topic-tag filter. Colloquy knowledge units carry one `t` per domain
+    /// tag so a subscription can follow a subject rather than an author.
+    #[serde(rename = "#t", skip_serializing_if = "Option::is_none")]
+    pub t_tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
