@@ -1,6 +1,6 @@
 ---
 expectation_id: EXP-AC-006
-git_sha: c2e4ef7e54a0df9065c54a5784a433082d08c80d
+git_sha: 81aa0d9
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T15:42:05Z
 audited_by:

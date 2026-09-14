@@ -7,7 +7,7 @@ implementation_status: partial
 activation_status: inactive
 supersedes: []
 superseded_by: []
-verified_commit: c2e4ef7
+verified_commit: 81aa0d9
 owner: jjohare
 review_trigger: nostr-bbs-core publishing TaskProperties to crates.io, or a probe-blindness scheme that survives raw-event inspection
 repo: nostr-rust-forum
@@ -55,7 +55,8 @@ Established at `verified_commit` by executed commands, recorded with raw output 
 - `cargo test -p nostr-bbs-core --lib governance::calibration_tests governance::receipt_stage_tests` — the deterministic sampling band (80..=120 of 1,000 at rate 0.1) and every stage pair checked for regression.
 - `cargo test -p nostr-bbs-relay-worker --lib augmentation_boundary_tests ageing` — panel-tightened projection, advertised-default folding, delegation admission, the human-resolution guard, and the ageing predicate and its deadline ordering.
 - `cargo test -p nostr-bbs-auth-worker --lib augmentation_api_tests` — application-stage authority (including the case-ownership bind), the manual-continuation precondition, monotonicity and its 409s, probe redaction, and the reviewer read model.
-- `cargo test --workspace --exclude nostr-bbs-forum-client` — whole-workspace regression.
-- `scripts/deepsec-gate.sh --diff main` — security gate; receipt path recorded in the evidence.
+- `cargo test -p nostr-bbs-relay-worker --lib req_gate_ordering_tests protected_read_permitted_tests` — the two out-of-scope security fixes recorded under Consequences.
+- `cargo test --workspace --exclude nostr-bbs-forum-client` — whole-workspace regression: 1589 passed, 0 failed at `verified_commit`.
+- `scripts/deepsec-gate.sh --diff main` — security gate. **It does not pass.** The verdict is computed from `deepsec export --project-id`, an export of the persistent store under `.deepsec-gate/data/`, which accumulates and never retires a fixed finding; both blocking `HIGH` entries are fixed on this branch in commits predating the run that still reports them. The receipts record the exit code and the analysis, and claim nothing further. Pre-existing findings that were not fixed are owned in `docs/security/known-findings.md`.
 
 `activation_status` stays `inactive`: nothing here has been deployed and `nostr-bbs-core` 1.0.0-beta.11 has not been published. It moves to `staged` on publication and to `live` on edge deploy with the probe suite run (PRD milestone M4).
