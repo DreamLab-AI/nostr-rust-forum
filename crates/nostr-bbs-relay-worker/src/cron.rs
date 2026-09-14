@@ -603,16 +603,27 @@ pub async fn escalate_stale_cases(env: &Env) -> Result<AgeingSweepResult, String
         max_pending_hours: Option<f64>,
     }
 
-    // The deadline arithmetic stays in Rust (and therefore under test) rather
-    // than in SQL: the query selects pending cases oldest-first and the pure
-    // predicate decides. `state` and `created_at` are indexed together by 0006.
+    // Ordered and filtered by each case's OWN deadline, not by `created_at`.
+    // Panels declare different deadlines, so "oldest first" is not "most
+    // overdue first": a six-hour case raised this morning is overdue while a
+    // seventy-two-hour case raised yesterday is not. Ordering by
+    // `created_at + deadline` makes the page ceiling cut the *least* overdue
+    // cases, which is the only cut that leaves the sweep correct. The pure
+    // predicate below re-checks every fetched row — the SQL narrows, it does
+    // not decide.
     let rows = db
         .prepare(
             "SELECT id, created_at, max_pending_hours FROM broker_cases \
              WHERE state IN ('open', 'under_review', 'reopened') \
-             ORDER BY created_at ASC LIMIT ?1",
+               AND (created_at + COALESCE(NULLIF(max_pending_hours, 0), ?1) * 3600) < ?2 \
+             ORDER BY (created_at + COALESCE(NULLIF(max_pending_hours, 0), ?1) * 3600) ASC \
+             LIMIT ?3",
         )
-        .bind(&[JsValue::from_f64((AGEING_BATCH_SIZE + 1) as f64)])
+        .bind(&[
+            JsValue::from_f64(nostr_bbs_core::governance::DEFAULT_MAX_PENDING_HOURS as f64),
+            JsValue::from_f64(now as f64),
+            JsValue::from_f64((AGEING_BATCH_SIZE + 1) as f64),
+        ])
         .map_err(|e| format!("stale case bind: {e:?}"))?
         .all()
         .await
@@ -632,13 +643,14 @@ pub async fn escalate_stale_cases(env: &Env) -> Result<AgeingSweepResult, String
             .filter(|h| *h > 0.0)
             .map(|h| h as u32)
             .unwrap_or(nostr_bbs_core::governance::DEFAULT_MAX_PENDING_HOURS);
-        if !is_past_pending_deadline(created_at, now, deadline) {
-            // Oldest-first: the first case inside its deadline means every
-            // remaining case is too.
-            result.truncated = false;
-            break;
-        }
         result.scanned += 1;
+        if !is_past_pending_deadline(created_at, now, deadline) {
+            // The SQL already narrowed to overdue rows; this is the belt to its
+            // braces. There is deliberately NO early break here: the rows carry
+            // different deadlines, so a row inside its own deadline says nothing
+            // whatever about the rows after it.
+            continue;
+        }
 
         let age_hours = now.saturating_sub(created_at) / 3_600;
         let insert = db
@@ -1016,5 +1028,65 @@ mod ageing_tests {
     #[test]
     fn a_backwards_clock_escalates_nothing() {
         assert!(!is_past_pending_deadline(2_000_000, 1_000_000, 1));
+    }
+}
+
+#[cfg(test)]
+mod ageing_ordering_tests {
+    //! The defect this pins: the sweep once ordered candidates by `created_at`
+    //! and broke on the first case inside its own deadline. With per-panel
+    //! deadlines that is unsound — a six-hour case raised after a seventy-two
+    //! hour case is overdue while the older one is not, and the break skipped
+    //! it. The ordering is now by each case's own deadline and there is no
+    //! early break.
+    use super::*;
+
+    const HOUR: u64 = 3_600;
+
+    /// The deadline instant a case is ordered and filtered by, mirroring the
+    /// SQL expression so the two cannot drift apart unnoticed.
+    fn deadline_at(created_at: u64, max_pending_hours: u32) -> u64 {
+        let hours = if max_pending_hours == 0 {
+            nostr_bbs_core::governance::DEFAULT_MAX_PENDING_HOURS
+        } else {
+            max_pending_hours
+        };
+        created_at + hours as u64 * HOUR
+    }
+
+    /// The exact shape that used to be skipped: a younger case with a short
+    /// deadline is overdue while an older case with a long one is not.
+    #[test]
+    fn a_younger_short_deadline_case_is_overdue_before_an_older_long_one() {
+        let now = 1_000_000 + 80 * HOUR;
+        let old_slow = (1_000_000u64, 720u32); // raised first, 30-day deadline
+        let young_fast = (1_000_000 + 70 * HOUR, 1u32); // raised later, 1 hour
+
+        assert!(!is_past_pending_deadline(old_slow.0, now, old_slow.1));
+        assert!(is_past_pending_deadline(young_fast.0, now, young_fast.1));
+
+        // And the ordering the query uses puts the overdue one first, so a
+        // capped page cuts the least overdue rather than the most.
+        assert!(
+            deadline_at(young_fast.0, young_fast.1) < deadline_at(old_slow.0, old_slow.1),
+            "deadline ordering must not follow creation order here"
+        );
+    }
+
+    /// With equal deadlines the ordering degenerates to oldest-first, which is
+    /// the behaviour operators expect of a queue.
+    #[test]
+    fn equal_deadlines_order_oldest_first() {
+        assert!(deadline_at(1_000, 72) < deadline_at(2_000, 72));
+    }
+
+    /// A case with no declared deadline sorts as though it declared the
+    /// documented default, not as though it had none.
+    #[test]
+    fn an_undeclared_deadline_sorts_as_the_default() {
+        assert_eq!(
+            deadline_at(1_000, 0),
+            deadline_at(1_000, nostr_bbs_core::governance::DEFAULT_MAX_PENDING_HOURS)
+        );
     }
 }
