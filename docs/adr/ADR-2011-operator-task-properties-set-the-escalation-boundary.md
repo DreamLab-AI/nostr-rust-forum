@@ -7,7 +7,7 @@ implementation_status: partial
 activation_status: inactive
 supersedes: []
 superseded_by: []
-verified_commit: PLACEHOLDER_SHA
+verified_commit: c2e4ef7
 owner: jjohare
 review_trigger: nostr-bbs-core publishing TaskProperties to crates.io, or a probe-blindness scheme that survives raw-event inspection
 repo: nostr-rust-forum
