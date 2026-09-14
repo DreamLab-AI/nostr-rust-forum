@@ -2147,9 +2147,11 @@ impl NostrRelayDO {
             return false;
         };
         let Ok(stmt) = db
-            .prepare("SELECT role FROM broker_roles WHERE pubkey = ?1 AND role = ?2 LIMIT 1")
+            .prepare(
+                "SELECT role FROM broker_roles WHERE lower(pubkey) = ?1 AND role = ?2 LIMIT 1",
+            )
             .bind(&[
-                JsValue::from_str(pubkey),
+                JsValue::from_str(&pubkey.to_ascii_lowercase()),
                 JsValue::from_str(governance::ROLE_REVIEWER),
             ])
         else {
@@ -2173,9 +2175,12 @@ impl NostrRelayDO {
         let Ok(stmt) = db
             .prepare(
                 "SELECT case_id FROM case_delegations \
-                 WHERE case_id = ?1 AND delegate_pubkey = ?2 LIMIT 1",
+                 WHERE case_id = ?1 AND lower(delegate_pubkey) = ?2 LIMIT 1",
             )
-            .bind(&[JsValue::from_str(case_id), JsValue::from_str(pubkey)])
+            .bind(&[
+                JsValue::from_str(case_id),
+                JsValue::from_str(&pubkey.to_ascii_lowercase()),
+            ])
         else {
             return false;
         };
@@ -2210,7 +2215,10 @@ impl NostrRelayDO {
             )
             .bind(&[
                 JsValue::from_str(case_id),
-                JsValue::from_str(delegate_pubkey),
+                // Normalised on write as well as on read: the gate compares a
+                // lowercased form, so a delegation stored in another casing
+                // would silently never admit its delegatee.
+                JsValue::from_str(&delegate_pubkey.to_ascii_lowercase()),
                 JsValue::from_str(delegated_by),
                 JsValue::from_str(decision_id),
                 JsValue::from_f64(at as f64),

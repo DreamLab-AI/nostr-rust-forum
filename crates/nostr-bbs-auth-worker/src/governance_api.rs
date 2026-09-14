@@ -667,12 +667,17 @@ pub async fn handle_grant_role(
     let db = relay_db(env)?;
     let now = now_secs();
 
+    // FR6.2 made `reviewer` a privilege-granting role, so the stored pubkey is
+    // normalised: a role granted in one hex casing and revoked in another would
+    // leave a live privilege behind.
+    let pubkey = body.pubkey.to_ascii_lowercase();
+
     db.prepare(
         "INSERT OR REPLACE INTO broker_roles (pubkey, role, granted_by, granted_at) \
          VALUES (?1, ?2, ?3, ?4)",
     )
     .bind(&[
-        JsValue::from_str(&body.pubkey),
+        JsValue::from_str(&pubkey),
         JsValue::from_str(&body.role),
         JsValue::from_str(&admin_pk),
         JsValue::from_f64(now as f64),
@@ -725,18 +730,31 @@ pub async fn handle_revoke_role(
         Err(e) => return error_json(env, &format!("bad body: {e}"), 400),
     };
 
+    // Same reasoning as `handle_revoke_agent`: a revocation that matched no row
+    // must not report success. With `reviewer` now able to decide delegated
+    // cases (FR6.2), a stale role is a live privilege.
+    let pubkey = body.pubkey.to_ascii_lowercase();
+
     let db = relay_db(env)?;
-    db.prepare("DELETE FROM broker_roles WHERE pubkey = ?1 AND role = ?2")
-        .bind(&[
-            JsValue::from_str(&body.pubkey),
-            JsValue::from_str(&body.role),
-        ])?
+    let result = db
+        .prepare("DELETE FROM broker_roles WHERE lower(pubkey) = ?1 AND role = ?2")
+        .bind(&[JsValue::from_str(&pubkey), JsValue::from_str(&body.role)])?
         .run()
         .await?;
 
+    let changed = result
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.changes)
+        .unwrap_or(0);
+    if changed == 0 {
+        return error_json(env, "no such role assignment", 404);
+    }
+
     json_response(
         env,
-        &json!({ "ok": true, "pubkey": body.pubkey, "role": body.role, "revoked": true }),
+        &json!({ "ok": true, "pubkey": pubkey, "role": body.role, "revoked": true }),
         200,
     )
 }
