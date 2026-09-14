@@ -78,6 +78,32 @@ against the six conditions of arXiv 2609.12482. **Not published and not deployed
   delegations: hex is case-insensitive, so the same key could present as two
   principals.
 
+#### Relay read-authorisation (security, pre-existing)
+
+Both found by `deepsec-gate --diff` while scanning this change's blast radius.
+Neither was introduced here; both are fixed here because the gate blocked on
+them.
+
+- **REQ subscriptions were stored before they were authorised, and stored raw.**
+  `handle_req` inserted the client's un-gated filter into the session and
+  persisted it *before* `protected_read_blocked` and `gate_kind_1059_filters`
+  ran, keeping the gated filters in a shadowed local used only for the immediate
+  query. A subscription refused with `CLOSED` stayed in the session, and
+  `broadcast_event` matched every later event against the raw filter: the
+  historical read was refused and the live stream was delivered anyway. Both
+  gates now run before the insert, and the gated, `#p`-rewritten filter is what
+  is stored.
+- **A `kinds`-absent filter bypassed the protected-read gates entirely.** Both
+  gates decide from the kinds a filter *names*; a filter omitting `kinds` matches
+  every kind while naming none, so `REQ ["sub", {}]` returned sealed DMs,
+  encrypted DMs and moderation events to an anonymous socket. `authorize_event`
+  — which already guards the historical, COUNT and broadcast paths — now applies
+  `nip42::protected_read_permitted` per event. Correspondence (4/13/14/1059)
+  requires an authenticated author or `p`-tagged recipient and is
+  mode-independent; admin is not an exemption. Moderation kinds (30910-30916)
+  require only authentication, and only in `nip42` mode, so legacy `Allowlist`
+  deployments keep their current read behaviour.
+
 ### Known limitations
 
 - **Probe blindness is partial.** The `probe` tag is absent from the tag index and
