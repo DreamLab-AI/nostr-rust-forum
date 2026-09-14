@@ -36,16 +36,12 @@ use crate::components::agent_badge::{try_use_agent_disclosure, AgentBadge, Agent
 use crate::relay::{Filter, RelayConnection};
 use nostr_bbs_core::event::{NostrEvent, UnsignedEvent};
 
-/// Kinds, mirrored from `colloquy_nostr::kinds`.
-///
-/// Deliberately re-declared rather than imported: `colloquy-nostr` depends on
-/// `nostr-bbs-core`, and depending on it from here would close a repo-level
-/// cycle. Three integers are the whole of the duplication, and
-/// [`tests::kind_constants_match_the_registry`] pins them to the protocol
-/// registry so they cannot drift silently.
-const KIND_KNOWLEDGE_UNIT: u64 = 38100;
-const KIND_CONFIRMATION: u64 = 38101;
-const KIND_FLAG: u64 = 38102;
+// Kinds come from the crate that defines them. They used to be re-declared
+// here: colloquy-nostr depended on nostr-bbs-core, so importing it from this
+// repo would have closed a dependency cycle. That dependency is gone —
+// colloquy-nostr owns its NIP-01 structs and is published — so the duplication
+// is gone with it, and there is nothing left to drift.
+use colloquy_nostr::kinds::{KIND_CONFIRMATION, KIND_FLAG, KIND_KNOWLEDGE_UNIT};
 
 /// How many events to pull on first load.
 const PAGE_LIMIT: u64 = 500;
@@ -510,9 +506,9 @@ mod tests {
     }
 
     #[test]
-    fn kind_constants_match_the_registry() {
-        // Pinned against docs/PROTOCOL-registry.md — these three integers are
-        // the only thing this page duplicates from colloquy-nostr.
+    fn kind_constants_are_the_registry_values() {
+        // Imported, not copied — but still asserted here, because this page's
+        // subscription filter is only correct for these three numbers.
         assert_eq!(
             (KIND_KNOWLEDGE_UNIT, KIND_CONFIRMATION, KIND_FLAG),
             (38100, 38101, 38102)

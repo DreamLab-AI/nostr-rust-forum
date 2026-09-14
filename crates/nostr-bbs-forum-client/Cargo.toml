@@ -33,6 +33,7 @@ solid-pod-rs = { workspace = true }
 # are registry deps and this repo has NO path edge into agentbox — the forum
 # builds from a clean checkout with nothing beside it.
 colloquy-core = "0.1"
+colloquy-nostr = "0.1"
 colloquy-view = "0.1"
 leptos = { workspace = true }
 leptos_router = { workspace = true }

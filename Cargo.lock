@@ -460,6 +460,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "colloquy-nostr"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44a5bc7a9598cc9cbee24ab2473f978e721578e5159e7fe24ce606634b6dc000"
+dependencies = [
+ "colloquy-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "colloquy-view"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2211,6 +2223,7 @@ dependencies = [
  "base64",
  "bech32",
  "colloquy-core",
+ "colloquy-nostr",
  "colloquy-view",
  "comrak",
  "console_error_panic_hook",
