@@ -1270,19 +1270,6 @@ impl NostrRelayDO {
             }
         }
 
-        // Store subscription in memory
-        {
-            let mut sessions = self.sessions.borrow_mut();
-            if let Some(session) = sessions.get_mut(&session_id) {
-                session
-                    .subscriptions
-                    .insert(sub_id.to_string(), filters.clone());
-            }
-        }
-
-        // Persist subscriptions to DO storage so they survive hibernation
-        self.save_subscriptions(session_id).await;
-
         // Determine the requesting session's pubkey and zone access for filtering
         let session_pubkey = {
             let sessions = self.sessions.borrow();
@@ -1297,6 +1284,15 @@ impl NostrRelayDO {
         // open to unauthenticated sockets. kind-1059's own gate + mandatory #p
         // rewrite still runs below in BOTH modes, so DM privacy never depends on
         // AUTH_MODE.
+        //
+        // ORDERING IS LOAD-BEARING (auth-bypass, found by deepsec-gate). Both
+        // gates run BEFORE the subscription is stored, and what is stored is the
+        // GATED filter, never the client's raw one. The previous order stored
+        // `filters.clone()` first and shadowed the gated filters into a local
+        // used only for the immediate `query_events`: a rejected subscription
+        // stayed in `session.subscriptions`, and `broadcast_event` then matched
+        // live events against the un-gated filter. The historical read was
+        // refused and every subsequent matching event was delivered anyway.
         if nip42::protected_read_blocked(&filters, session_pubkey.is_some(), self.auth_mode()) {
             Self::send_closed(
                 &ws,
@@ -1319,6 +1315,21 @@ impl NostrRelayDO {
                 return;
             }
         };
+
+        // Store the AUTHORISED subscription — never the raw client filter — so
+        // the live broadcast path matches against exactly what the gates above
+        // permitted.
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session
+                    .subscriptions
+                    .insert(sub_id.to_string(), filters.clone());
+            }
+        }
+
+        // Persist subscriptions to DO storage so they survive hibernation
+        self.save_subscriptions(session_id).await;
 
         // Query D1 for matching events
         let events = self.query_events(&filters).await;
@@ -4103,5 +4114,62 @@ mod augmentation_boundary_tests {
             from_share_state: None,
             to_share_state: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod req_gate_ordering_tests {
+    //! The auth-bypass deepsec-gate found in `handle_req`: the subscription was
+    //! stored before the read gates ran, and what was stored was the client's
+    //! RAW filter while the gated one was a shadowed local used only for the
+    //! immediate `query_events`. A refused subscription therefore stayed in
+    //! `session.subscriptions`, and `broadcast_event` matched every later event
+    //! against the un-gated filter — the historical read was refused and the
+    //! live stream was delivered anyway.
+    //!
+    //! `handle_req` needs a live WebSocket and Durable Object, so the ordering
+    //! itself cannot be driven from a unit test. What is pinned here is the
+    //! property that makes the ordering matter: the gated filter is not the same
+    //! object as the raw one, so storing the wrong one is a real difference and
+    //! not a distinction without one.
+    use super::*;
+
+    fn dm_filter() -> Vec<NostrFilter> {
+        vec![serde_json::from_value(serde_json::json!({ "kinds": [1059] }))
+            .expect("valid filter")]
+    }
+
+    /// An unauthenticated session cannot subscribe to sealed DMs at all, so
+    /// there is nothing legitimate to store.
+    #[test]
+    fn an_unauthenticated_sealed_dm_subscription_yields_no_filter_to_store() {
+        assert!(NostrRelayDO::gate_kind_1059_filters(dm_filter(), &None).is_none());
+    }
+
+    /// An authenticated session's stored filter must be the REWRITTEN one: it
+    /// carries a `#p` binding the client never sent. Storing the raw filter
+    /// would leave the subscription unbound to any recipient, which is exactly
+    /// what the live broadcast path then honoured.
+    #[test]
+    fn the_gated_filter_differs_from_the_raw_one_and_binds_the_recipient() {
+        let pk = "a".repeat(64);
+        let raw = dm_filter();
+        assert!(
+            !raw[0].extra.contains_key("#p"),
+            "the client sent no recipient binding"
+        );
+
+        let gated = NostrRelayDO::gate_kind_1059_filters(raw.clone(), &Some(pk.clone()))
+            .expect("an authed session may read its own sealed DMs");
+        assert_eq!(
+            gated[0].extra.get("#p"),
+            Some(&serde_json::json!([pk])),
+            "the stored filter must bind to the authed recipient"
+        );
+        assert_ne!(
+            gated[0].extra.get("#p"),
+            raw[0].extra.get("#p"),
+            "raw and gated must not be interchangeable"
+        );
     }
 }
