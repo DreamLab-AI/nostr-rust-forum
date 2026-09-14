@@ -5,7 +5,11 @@ git_sha: ef0c9aa207ba16618cb4a09195546ef317823ba8
 branch: feat/augmentation-conditions-client
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T20:02:22Z
-audited_by:
+audited_by: agent:claude-sonnet-5 (degraded: same family as producer; codex GPT-6 Astra unavailable — bwrap sandbox refused in container)
+audited_at: 2026-09-14T21:40:00Z
+auditor_verdict: DISPUTED
+auditor_counter_examples_attempted: 4
+auditor_counter_examples_found: 1
 ---
 
 # Evidence — EXP-AC-004 (forum client)
@@ -160,3 +164,93 @@ Also fixed in this branch, from runs 1 and 2:
   twice, 64-bit decision ids). **Not this branch's code** — they belong to the
   backend half on `feat/augmentation-conditions` and are recorded here only so
   they are not lost.
+
+## Auditor adversarial probes
+
+Worktree `nostr-rust-forum-client-client`, HEAD `6b6f48a` (unchanged code from
+`ef0c9aa`). No implementation files edited; probe below was run as a temporary
+`#[cfg(test)]` block appended to `stores/receipts.rs` and reverted with `git
+checkout --` before this commit.
+
+```
+$ cargo test -p nostr-bbs-forum-client
+test result: ok. 393 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+1. **`reduce_case` with out-of-order stages: `applied` row arriving before a
+   `consumer-received` row.** Reproduces the evidence's own
+   `an_out_of_order_row_never_regresses_a_decision` — `applied` (ladder
+   position 5) correctly outranks `consumer-received` (position 4) and wins.
+   No counter-example on this pairing.
+
+2. **`reduce_case` with duplicate stages (two `applied` rows for the same
+   `event_id`, different `acknowledgement`).** `existing.stage >= row.stage`
+   is `true` for a tie, so the *first*-seen row's `acknowledgement`,
+   `applied_by` and `applied_at` are kept and the second is silently dropped.
+   Not obviously wrong (there is no documented tie-break rule), but worth
+   recording: whichever row an unstable relay-side ordering happens to return
+   first wins, not the most recent. Not counted as a counter-example — no
+   expectation specifies "most recent wins".
+
+3. **`reduce_case` with `applied` then `not-applied` for the same
+   `event_id`.** This is the finding. `ReceiptStage` derives `Ord` from
+   declaration order (`governance.rs:663`): `Signed < RelayAccepted <
+   ProjectionCommitted < ProjectionFailed < ConsumerReceived < Applied <
+   NotApplied < AppliedManually < EscalatedOnAge < Expired`. `reduce_case`'s
+   "furthest stage wins" (`stores/receipts.rs:106`) is exactly `row.stage >
+   existing.stage` on that same derived order — which is only a sound
+   "further along the ladder" measure for the *strictly sequential* prefix
+   (`Signed` → … → `ConsumerReceived`). `Applied`, `NotApplied` and
+   `AppliedManually` are not three further rungs of one ladder; they are three
+   **mutually exclusive terminal outcomes** at the same rung, and their
+   relative `Ord` is an accident of enum declaration order. Reproduced:
+
+   ```rust
+   let r = reduce_case(vec![
+       ReceiptView { event_id: "dec-1".into(), stage: ReceiptStage::Applied, .. },
+       ReceiptView { event_id: "dec-1".into(), stage: ReceiptStage::NotApplied, .. },
+   ]);
+   // r.by_decision["dec-1"].stage == ReceiptStage::NotApplied
+   ```
+
+   confirmed by running the block (then reverted) — the result is
+   `NotApplied`. A successfully applied action, once a `not-applied` row for
+   the same `event_id` is present, displays as failed. This is not a
+   theoretical edge of the ordering; it is the *specific* pair FR4.1 and both
+   evidence files single out by name: "a denied action and an approved action
+   whose write failed must never look the same"
+   (`the_application_stages_each_have_a_distinct_honest_label`,
+   `a_failed_application_reads_as_a_failure_not_as_progress`) — this reduction
+   can make them look like *the same thing in the wrong direction*: a
+   successful application reads as a failure.
+
+   **Reachability, stated honestly rather than overclaimed:** the relay's
+   `governance_receipts` table is a single row per `event_id`, written by
+   `UPDATE … WHERE event_id = ?` (`relay_do/receipts.rs:179,554`), never
+   `INSERT` on a later stage — so `GET /api/governance/receipts` today can
+   only ever return **one** row per `event_id`, and this exact two-row
+   scenario cannot currently be produced through the documented endpoint. The
+   defect is real in the code and in what the tests claim to guard
+   (`an_out_of_order_row_never_regresses_a_decision`'s name promises more than
+   its one tested pairing establishes), and it is exactly the class of thing
+   the store's own doc comment anticipates changing ("where several ladder
+   rows exist for one decision (a replayed projection, then an application)")
+   — but it is not live against the current server. Recorded as a
+   counter-example against the *code's* claimed guarantee, with the
+   reachability caveat attached rather than omitted.
+
+4. **Age label for `created_at` in the future.** Already covered by
+   `a_future_created_at_reads_as_just_now_not_as_a_negative_age`; re-verified
+   with `created_at` several days ahead of `now` (not just seconds) — still
+   `"just now"`, `saturating_sub` floors at 0 regardless of skew magnitude. No
+   counter-example.
+
+**Verdict: DISPUTED** for the display half, on item 3: `reduce_case`'s
+stage-ordering is unsound for the three terminal application outcomes, and can
+display a successful application as `NOT applied`. Not currently reachable via
+the relay's single-row-per-event_id write path, so it does not contradict the
+evidence's Scenario 1 PASS as tested — but the evidence's tests do not cover
+this pairing despite naming "out-of-order" and "distinct honest label" as the
+properties under test, and neither evidence file's "Honest limits" section
+discloses the ordering's scope. Item 2 is a minor, unspecified tie-break
+observation, not a counter-example. Items 1 and 4 held.

@@ -5,7 +5,11 @@ git_sha: ef0c9aa207ba16618cb4a09195546ef317823ba8
 branch: feat/augmentation-conditions-client
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T20:02:22Z
-audited_by:
+audited_by: agent:claude-sonnet-5 (degraded: same family as producer; codex GPT-6 Astra unavailable — bwrap sandbox refused in container)
+audited_at: 2026-09-14T21:40:00Z
+auditor_verdict: PASS
+auditor_counter_examples_attempted: 5
+auditor_counter_examples_found: 0
 ---
 
 # Evidence — EXP-AC-006 (forum client)
@@ -185,3 +189,58 @@ Also fixed in this branch, from runs 1 and 2:
   twice, 64-bit decision ids). **Not this branch's code** — they belong to the
   backend half on `feat/augmentation-conditions` and are recorded here only so
   they are not lost.
+
+## Auditor adversarial probes
+
+Worktree `nostr-rust-forum-client-client`, HEAD `6b6f48a`. No implementation
+files edited.
+
+```
+$ cargo test -p nostr-bbs-forum-client
+test result: ok. 393 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+1. **`is_decidable_by` for a reviewer with a delegation on a different
+   case.** Already the third assertion of `a_delegatee_may_decide_only_the_delegated_case`
+   (`governance_view.rs:1022`, empty chain for the other case). Confirmed by
+   reading, and by the boundary test's own comment: this is exactly the
+   counter-example the expectation names. No counter-example found.
+
+2. **Delegate pubkey uppercase hex / 63 chars / `0x` prefix** — as probed
+   under EXP-AC-002 item 8, same function (`normalise_delegate_pubkey`), same
+   result: all three rejected or normalised correctly. No counter-example.
+
+3. **`resolve_panel_for`'s `LatestFromAgent` fallback vs `panel_address`'s
+   keyed lookup — a mixed-case pubkey on the `a`/`panel` tag path.**
+   `panel_address` (`panel_registry.rs:29`) lowercases the agent pubkey before
+   building the map key on *both* insertion (`PanelEntry::address`) and lookup
+   (`resolve_panel_for`'s `Addressed`/`Named` arm), and the `LatestFromAgent`
+   arm separately compares case-insensitively
+   (`eq_ignore_ascii_case`). Fed an uppercase-hex pubkey through both paths by
+   hand-tracing the two call sites: they agree. No counter-example — this
+   looked like a plausible split-case bug before reading `panel_address`
+   closely, worth recording as attempted and cleared.
+
+4. **A decided case whose 31403 is a `Delegate` — is `visible_probe` still
+   hidden?** `chain_is_decided` (`governance_view.rs:362`) explicitly excludes
+   `outcome == "delegate"` from counting as a decision
+   (`a_delegation_is_not_itself_a_decision` already covers this), so a case
+   with only a `Delegate` step remains `chain_is_decided == false` and
+   `visible_probe` stays `None`. No counter-example.
+
+5. **A 31402 carrying the probe tag and a *spoofed* 31403 (non-admin,
+   non-delegated signer, forged `approve`).** As recorded under EXP-AC-002
+   item 9: the client's `chain_is_decided`/`visible_probe` path does not
+   itself check whether the signer of an `approve` step was authorised — that
+   authority check is the relay's, not this view's, and both this file and
+   EXP-AC-002's evidence already state the view is "a view gate mirroring the
+   relay's admission gate, not a replacement for it". Not a new
+   counter-example; already disclosed as this client's honest limit, and
+   `bind_to_request`'s hardening (this branch's own security-gate fix) closes
+   the *cross-case* forgery, which is the part actually in this client's
+   power to close.
+
+**Verdict: PASS**, confirmed. All five adversarial probes either reproduced
+behaviour the producer's own tests already establish, or landed on a limit
+both this file and EXP-AC-002's already disclose in writing. No new
+counter-example against EXP-AC-006 in the client half.

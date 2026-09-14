@@ -5,7 +5,11 @@ git_sha: ef0c9aa207ba16618cb4a09195546ef317823ba8
 branch: feat/augmentation-conditions-client
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T20:02:22Z
-audited_by:
+audited_by: agent:claude-sonnet-5 (degraded: same family as producer; codex GPT-6 Astra unavailable — bwrap sandbox refused in container)
+audited_at: 2026-09-14T21:40:00Z
+auditor_verdict: DISPUTED
+auditor_counter_examples_attempted: 9
+auditor_counter_examples_found: 1
 ---
 
 # Evidence — EXP-AC-002 (forum client)
@@ -205,3 +209,118 @@ Also fixed in this branch, from runs 1 and 2:
   twice, 64-bit decision ids). **Not this branch's code** — they belong to the
   backend half on `feat/augmentation-conditions` and are recorded here only so
   they are not lost.
+
+## Auditor adversarial probes
+
+Worktree `nostr-rust-forum-client-client` at HEAD `6b6f48a` (unchanged from
+`ef0c9aa` — the evidence-stamping commit touched only frontmatter). No
+implementation files edited; probes were run either as read-only greps or as a
+`#[cfg(test)] mod auditor_probes` block appended to and then reverted (`git
+checkout --`) from `stores/receipts.rs`.
+
+```
+$ cargo test -p nostr-bbs-forum-client
+test result: ok. 393 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Matches the evidence's own re-run count (391 at Scenario 3's git_sha, growing
+to 393 once the two `EXP-AC-006` probe-hardening tests are counted — see that
+file). No regression.
+
+1. **Rationale of exactly 20 chars, leading/trailing whitespace.**
+   `rationale_satisfied` trims before counting
+   (`utils/governance_view.rs:51`), so `"  " + "x"*20 + "  "` satisfies a
+   `critical` gate and 19 does not. Matches the producer's own boundary test.
+   No counter-example.
+
+2. **Rationale of 20 astral-plane chars (𝕏×20) vs 10.** `.trim().chars().count()`
+   counts Unicode *scalar values*: `𝕏` (U+1D54F, outside the BMP) is one
+   `char` in Rust regardless of its 2-code-unit UTF-16 / 4-byte UTF-8 width, so
+   20 of them satisfies the gate and 10 does not — internally consistent, no
+   divergence *within* this counting method.
+   **But the counter-example is elsewhere: there is no server-side counterpart
+   to count anything at all.** `grep -rn "MIN_RATIONALE\|rationale" crates/`
+   outside this client crate turns up nothing, and
+   `nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs::plan_action_response`
+   (the function that actually accepts a signed 31403) parses `reasoning` as a
+   plain string with `.unwrap_or_default()` and applies **no length check** —
+   its own test fixtures publish `{"action":"reject","reasoning":"x"}` (line
+   3308) and `{"action":"reject"}` with no `reasoning` field at all (line
+   3291) and both are accepted. So EXP-AC-002's "the publish action is
+   disabled until the rationale has at least 20 characters" holds only for
+   *this* Leptos build with JS enabled; a raw `nak` publish, a different
+   client, or a build with the disabled-attribute stripped can post a
+   `critical`-case 31403 with an empty `reasoning` and the relay takes it.
+   Neither evidence file's "Honest limits" section discloses this — the client
+   evidence frames the 20-char gate as though it were the enforcement point,
+   when it is UI-only.
+   **Counter-example: CONFIRMED** (against the expectation's plain-language
+   claim, not against any single test in the suite, which are all internally
+   consistent).
+
+3. **`decision_content` with `\n` and a run of spaces.** Byte-for-byte
+   preserved — this is exactly `published_reasoning_is_the_typed_text_byte_for_byte`
+   (`governance_view.rs:604`), which already asserts a string with leading
+   whitespace and an embedded `\n\n— jj`. Re-verified with a `\t` and doubled
+   spaces substituted in by hand at the REPL-equivalent (`serde_json` round
+   trip): unchanged. No counter-example.
+
+4. **`fields` at ~1 MB.** `pretty_fields` (`governance_view.rs:457`) is a
+   straight `serde_json::to_string_pretty`; nothing truncates or streams it,
+   consistent with the 200-element test already in the suite. No functional
+   counter-example found, though this is unverified beyond code reading — no
+   render-path (DOM) test exists at any size, which both evidence files
+   already disclose ("No browser run").
+
+5. **`fields` containing `"</script>"`.** Not independently verifiable
+   host-side: `pretty_fields` returns a plain `String`; whether it reaches the
+   DOM as text (Leptos's default `{expr}` interpolation escapes) or as raw
+   markup is a rendering-shell property outside this pure module and outside
+   what any host-target test exercises. No counter-example demonstrated, but
+   also not evidenced — flagged as an unverified gap, not a pass.
+
+6. **`effective` tier absent on a legacy request.** This is relay-side, not
+   client-side: `nip_handlers.rs`'s `human_resolution_required` gate is
+   skipped when `case_row.effective_tier` is `None` ("a case projected before
+   0006 … imposes nothing" — the code's own comment). The client always
+   computes *some* effective tier via `compute_boundary`'s fallback to
+   `advertised_default`, so the two halves disagree by construction on what
+   "absent" means, but this is pre-existing/documented legacy behaviour, not
+   new to this branch, and out of the client's control. Not a counter-example
+   against this branch.
+
+7. **`context_url = "javascript:alert(1)"` / `"data:text/html,..."`.** Both
+   already in the producer's own hostile-URL test
+   (`a_script_bearing_context_url_never_reaches_an_href`), and rejected.
+   Re-verified `"data:text/html,<script>1</script>"` (a bare, non-base64
+   `data:` URI, not the base64 one already tested) — also rejected, since
+   `safe_context_url` allows only an `http`/`https` prefix. No counter-example.
+
+8. **Delegate pubkey uppercase hex / 63 chars / `0x` prefix.** All three
+   already covered by `delegate_target_must_be_hex64`; `0x`-prefixed 64-char
+   input is additionally rejected because `x` is not `is_ascii_hexdigit`.
+   Re-verified `0X` (uppercase prefix) — same rejection, `X` is not hex. No
+   counter-example.
+
+9. **A 31402 with the probe tag AND a spoofed 31403 from a non-admin,
+   non-delegated pubkey.** `visible_probe` gates on `chain_is_decided`, which
+   in turn is driven by the chain the client itself resolves — but that chain
+   is bound to the request's event id by `bind_to_request`
+   (`panel_registry.rs:461`) and is **not** filtered by whether the signer was
+   authorised. A forged `approve` from an arbitrary pubkey, once it exists as
+   an event the client ingests, *would* satisfy `chain_is_decided` and reveal
+   the probe client-side — this is exactly the gap both evidence files already
+   name under "Left open" (the client can only enforce blindness for what it
+   renders; the relay's admission gate, not this view, is what actually stops
+   an unauthorised 31403 from mattering). No *new* counter-example: this is
+   already disclosed, and `is_decidable_by`/`chain_is_decided` are honestly
+   documented as "a view gate mirroring the relay's admission gate, not a
+   replacement for it".
+
+**Verdict: DISPUTED.** Every named test in the evidence passes as claimed and
+`cargo test -p nostr-bbs-forum-client` reproduces at 393/393. The dispute is
+with item 2: the expectation's mandatory-rationale-length claim is true only
+of the reference Leptos build, is unenforced at the only place that actually
+admits a 31403 to the relay, and neither evidence file states this. Everything
+else attempted (items 1, 3, 4, 6, 7, 8, 9) held or was already honestly
+disclosed; item 5 is an unverified gap, not a failure.
