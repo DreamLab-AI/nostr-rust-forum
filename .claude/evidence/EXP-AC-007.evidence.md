@@ -124,18 +124,32 @@ observations establish this:
 3. Both `HIGH` entries in the blocking set are findings **fixed on this branch**,
    in commits that predate the run that still reports them.
 
-### The two blocking HIGH findings, and their fixes
+### Triage of the two blocking HIGH findings
 
-| Finding | Fixed in | Verified |
+Both were attributed against the **feature-only** state of the branch
+(`main..71f6b26`, before either security fix landed). The feature diff has no
+hunk in `nip_handlers.rs` between old lines 202 and 1750; both findings live in
+that gap. Neither is in a line this branch changed for feature reasons — both
+are **purely pre-existing blast radius**.
+
+| | HIGH-1 | HIGH-2 |
 |---|---|---|
-| `auth-bypass` — REQ subscription stored, raw and un-gated, before the read gates ran | `a14b2b7` | `protected_read_blocked` and `gate_kind_1059_filters` now precede `subscriptions.insert` and `save_subscriptions`, and the stored value is the rebound (gated) `filters`. `req_gate_ordering_tests`. |
-| `auth-bypass` — a `kinds`-absent filter bypassed both protected-read gates | `12a10da` | `nip42::protected_read_permitted` is called from `authorize_event`, which guards the historical, COUNT and broadcast paths. `protected_read_permitted_tests`, 8 tests. |
+| Location | `nip_handlers.rs:1288-1331` (`handle_req`) | `nip42.rs:85-108`, called from `nip_handlers.rs:1655-1675` (`authorize_event`) |
+| In this branch's feature diff? | No — pre-existing | No — pre-existing |
+| Exploit path | Send `REQ sub1 {"kinds":[1059]}` on an unauthenticated socket in `nip42` mode. The raw filter is inserted into `session.subscriptions` and persisted *before* the gates run; the gate then refuses the historical read with `CLOSED` and returns — leaving the subscription in place. `broadcast.rs` matches every subsequently-published event against that stored raw filter, so the attacker receives the live stream of sealed DMs they were just refused. | Send `REQ sub1 {}` — a filter with no `kinds` field. It matches every kind while naming none, so `protected_read_blocked` (which inspects `filter.kinds`) sees no protected kind and `gate_kind_1059_filters` applies no `#p` rewrite. `build_filter_conditions` adds no `kind IN (...)` predicate, so `query_events` returns sealed DMs, encrypted DMs and moderation events to an anonymous socket. |
+| Contained? | Yes — a reorder | Yes — one predicate at an existing chokepoint |
+| Disposition | **Fixed** in `a14b2b7`. Gates precede the insert; the stored value is the rebound gated filter. | **Fixed** in `12a10da`. `authorize_event` already guarded all three read paths, so the gate applies per event and cannot be dodged by omitting the kind. |
+| Tests | `nip_handlers.rs:4144` `req_gate_ordering_tests` | `nip42.rs:383` `protected_read_permitted_tests`, 8 cases |
 
-Both were pre-existing and outside this expectation's scope; they were fixed
-because they blocked the gate. **This receipt does not claim the gate is green.**
-A truthful current-state verdict needs the project store reset or re-verified by
-whoever owns the gate — clearing a security ledger is not this agent's call, and
-an attempt to set the store aside was correctly denied by policy.
+Both are recorded in ADR-2011's Consequences as out-of-scope security fixes
+carried on this change, with file:line.
+
+Findings that are pre-existing and **not** contained enough to fix here are in
+`docs/security/known-findings.md` with an owner — including one `HIGH_BUG`
+(KF-1, the retention sweep's `CAST`-versus-parse divergence, which silently
+deletes events whose expiration tag is malformed). KF-1 is contained and worth
+doing; it is not one of the two gate-blocking `HIGH`s and is recommended as a
+standalone change rather than a third unrequested relay fix on this branch.
 
 ### Findings against this branch's own code — all fixed, each with a test
 

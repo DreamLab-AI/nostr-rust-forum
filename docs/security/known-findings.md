@@ -1,0 +1,40 @@
+# Known security findings — open, owned, untriaged-by-default is not allowed
+
+Findings raised by `deepsec-gate --diff` that are **pre-existing** and were not
+fixed by the branch that surfaced them. A finding reaches this table only with an
+owner and a disposition; "we saw it and moved on" is not a disposition.
+
+The gate scans the *blast radius* of a change, not only its lines, so a branch
+routinely surfaces defects it did not introduce. Fixing all of them inside a
+feature branch is how a feature branch becomes unreviewable. Recording them here
+with an owner is the alternative — the point is that the finding survives the
+branch that found it.
+
+**This table is not a suppression list.** Nothing here is waived, and no entry
+makes a gate green. `docs/security/advisory-exceptions.md` is the separate,
+narrower thing: accepted risk in third-party dependencies.
+
+Surfaced by `feat/augmentation-conditions` (ADR-2011), runs
+`.deepsec-gate/reports/20260914T1[45]*`.
+
+| # | Severity | Location | Finding | Why not fixed here | Owner |
+|---|---|---|---|---|---|
+| KF-1 | HIGH_BUG | `crates/nostr-bbs-relay-worker/src/cron.rs:417-420` | The NIP-40 expiry sweep matches on `CAST(value AS INTEGER) < ?1`. SQLite's `CAST` yields `0` for a non-numeric string, and `0 < now`, so an event whose `expiration` tag is malformed or negative is **silently deleted** on the next 5-minute tick — while the accept/serve path parses the same tag properly and treats it as "no expiration". The reap predicate and the serve predicate disagree, and the reap side wins. | Contained (a validity guard on the predicate) and worth doing, but it is data-loss in the retention sweep, not one of the two gate-blocking `HIGH`s this branch was asked to triage, and the branch already carries two unrequested relay fixes. Recommended as a standalone change: restrict the match to digit-only values before the `CAST`, with a test that a malformed tag survives a sweep. | relay maintainers |
+| KF-2 | MEDIUM | `crates/nostr-bbs-auth-worker/src/governance_api.rs` — `handle_list_agents`, `handle_list_cases`, `handle_get_case`, `handle_list_decisions`, `handle_list_roles` | These read endpoints are gated by `require_admin`-adjacent `require_authed`, which verifies a NIP-98 signature but performs **no membership check**; the crate has no `require_member`. Anyone can mint a keypair and sign a valid token, so "authenticated" is effectively "anonymous" for the agent registry, broker cases, decision reasoning and the role map. | A product decision, not a bug fix: whether forum governance data is member-only or public is the operator's call, and `require_member` does not exist yet. **Note:** ADR-2011 slightly widens what this gate exposes, adding `effective_tier`, `declared_tier` and the task-property triple to the case projection — low-sensitivity fields, but a real widening. | auth-worker maintainers / operator |
+| KF-3 | MEDIUM | `crates/nostr-bbs-relay-worker/src/lib.rs:160` calls `ensure_schema` (`:593`) | ~75 sequential D1 DDL statements run on **every** HTTP request, before the CORS short-circuit, the WebSocket upgrade branch and any authentication, with no rate limit on the HTTP surface. Unauthenticated D1 load and cost amplification. | Touching the schema bootstrap while this branch depends on it for migration 0006 is the wrong order of operations. The fix is a run-once latch per isolate, or moving DDL off the request path entirely. | relay maintainers |
+| KF-4 | MEDIUM | `crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs:795-845` | The write gate resolves a device key to its owner (`effective_pubkey`) for the whitelist check, but the moderation gates that follow key on the **raw signing pubkey**: `check_suspension`, `mod_cache.is_blocked`. A suspended or banned user can therefore keep writing through a registered device key. Gift-wrap (1059) senders escape the same gates. | ADR-099 device-key semantics; the fix is to resolve the effective principal once and feed it to every author-scoped gate. Out of this expectation's scope and it interacts with the device-key model. | relay maintainers |
+| KF-5 | BUG | `crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` — `plan_action_response` | `decision_id` is `dec-` plus a **16-hex (64-bit) truncation** of the event id. A projection key derived from a truncated identity invites collision between two distinct signed decisions. | Pre-existing and load-bearing: `broker_decisions.decision_id` is a primary key with rows already written under this scheme, so changing it is a migration, not an edit. | relay maintainers |
+| KF-6 | MEDIUM | `crates/nostr-bbs-core/src/governance.rs` — `BrokerCase::record_decision`, `claim`, `supersede_authority` | The self-review and original-signer guards compare pubkeys with case-sensitive `String` equality. NIP-98 accepts case-insensitive hex and returns `event.pubkey` verbatim, so the same key can present in two casings and slip a separate-of-duties check. | This branch normalised casing in every path it added (agent registry, broker roles, case delegations). Normalising the core aggregate's identity comparisons is a wider change to published crate behaviour and wants its own review. | core maintainers |
+
+## Probe blindness — a documented limitation, not an open finding
+
+`deepsec` raised probe blindness four times across these runs. It is not listed
+above because it is a **known, recorded design limitation** rather than an
+untriaged defect: the `probe` tag is kept out of `event_tags` and out of every
+D1/REST projection of an undecided case, but it remains on the raw signed 31402,
+because stripping it invalidates the signature both clients verify strictly and
+the probe would disappear rather than render blind. It is stated in
+`nostr-bbs-core/src/governance.rs` on `TAG_PROBE`, in migration `0006`, in
+ADR-2011 (`implementation_status: partial`, and its `review_trigger`), in the
+CHANGELOG, and in the EXP-AC-006 evidence, which records that scenario as
+PARTIAL. Closing it properly means keeping the digest off the signed event.
