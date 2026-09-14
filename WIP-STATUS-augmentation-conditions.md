@@ -21,7 +21,9 @@
 
 ## Not done
 
-1. **deepsec-gate is BLOCK, not PASS** (exit 1). Both blocking `HIGH` findings
+1. **deepsec-gate is BLOCK, not PASS.** Final run: exit `1`, 43 findings,
+   2 at/above HIGH, receipt `.deepsec-gate/reports/20260914T194052Z/`.
+   Both blocking `HIGH` findings
    are **triaged and fixed**: each is purely pre-existing blast radius (the
    feature diff has no hunk in `nip_handlers.rs` between old lines 202 and 1750,
    where both live), each is contained, and each is fixed with tests —

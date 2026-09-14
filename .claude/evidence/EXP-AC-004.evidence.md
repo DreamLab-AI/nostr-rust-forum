@@ -118,9 +118,9 @@ short-deadline cases the feature exists for. The query now filters and orders by
 
 ```
 $ /home/devuser/.claude/skills/build-with-quality/scripts/deepsec-gate.sh --diff main
-deepsec-gate: BLOCK - 32 finding(s) {CRITICAL: 0, HIGH: 2, MEDIUM: 20, HIGH_BUG: 1, BUG: 9}, 2 at/above HIGH
+deepsec-gate: BLOCK - 43 finding(s) {CRITICAL: 0, HIGH: 2, MEDIUM: 28, HIGH_BUG: 1, BUG: 12}, 2 at/above HIGH
 exit code: 1
-receipt: .deepsec-gate/reports/20260914T162917Z/receipt.json
+receipt: .deepsec-gate/reports/20260914T194052Z/receipt.json
 ```
 
 **Verdict: BLOCK.** Exit code `1` — not 78, so the gate ran rather than being
@@ -180,8 +180,19 @@ standalone change rather than a third unrequested relay fix on this branch.
 - `other-info-disclosure` — the `TAG_PROBE` doc comment claimed the relay strips
   the tag from every projection. It does not; the comment now states what is
   enforced and what is not (`c86f9cf`).
+- `other-oversight-evasion` — `is_calibration_sample` keyed on the request id,
+  which is the `d` tag the **requesting agent chooses**, checked against a rate
+  the panel publishes: an agent could grind `d` tags offline until it found one
+  sampling never selects, opting itself out of oversight. Selection is now
+  `HMAC-SHA256` under a Cloudflare secret (`67d0d71`), written TDD with three
+  tests red first.
 - `revocation-silent-failure` and pubkey case-normalisation across the agent
   registry, broker roles and case delegations (`df18a81`, `96566dc`).
+
+The final run added no new finding requiring work: its three net-new entries
+restate items already owned in `docs/security/known-findings.md` (KF-2a, KF-4)
+or the documented probe-blindness limitation. The store has converged on
+re-describing known items.
 
 ### Open, pre-existing, and routed rather than fixed
 
