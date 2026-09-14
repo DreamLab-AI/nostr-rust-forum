@@ -205,3 +205,63 @@ Also fixed in this branch, from runs 1 and 2:
   twice, 64-bit decision ids). **Not this branch's code** — they belong to the
   backend half on `feat/augmentation-conditions` and are recorded here only so
   they are not lost.
+
+## Gate after merge
+
+```
+$ /home/devuser/.claude/skills/build-with-quality/scripts/deepsec-gate.sh --diff main
+```
+
+Run at `afe863a`, tree clean. Receipt `.deepsec-gate/reports/20260914T211502Z/`.
+
+```
+deepsec-gate: BLOCK — 55 finding(s) {'CRITICAL': 0, 'HIGH': 2, 'MEDIUM': 33,
+'HIGH_BUG': 2, 'BUG': 18, 'LOW': 0}, 2 at/above HIGH; candidates=0
+5 new finding(s) — exiting 1
+```
+
+**Result: BLOCK, exit 1.** Not a pass. The scope widened from `--diff
+feat/augmentation-conditions` to `--diff main`, so this run scans the whole
+branch's blast radius rather than the client half's, which is why the totals
+jump rather than fall.
+
+The two `blocking` HIGHs are the same two relay read-auth bypasses recorded on
+every receipt since `20260914T194300Z`: *"subscription is stored before the gate"*
+and *"kinds-absent REQ/COUNT filter"*. Both were **fixed on this branch** and are
+documented in ADR-2011's *Out-of-scope security fixes carried on this change*
+with their tests (`req_gate_ordering_tests`, `protected_read_permitted_tests`).
+`findings.json` is a cumulative ledger — a finding stays in it once raised — so
+the blocking list is a history, not a live statement about the tree. That is a
+property of the tool, not evidence that the fixes landed; the evidence for those
+is the tests named in the ADR.
+
+### The five net-new findings, and their owners
+
+All five are pre-existing and already owned. None is in code this branch added.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| NIP-40 retention sweep deletes events with malformed/zero `expiration` (`cron.rs:417-420`) | HIGH_BUG | Already **KF-1** |
+| Governance read endpoints gate on any signature, not membership (`governance_api.rs`) | MEDIUM | Already **KF-2** / **KF-2a** |
+| Seeded-probe digest leaks via the raw signed 31402 (`core/governance.rs:343,365,596`) | MEDIUM | **ADR-2011's own `review_trigger`**, recorded as **KF-10** |
+| `ensure_schema` runs ~70 D1 statements per request before auth (`lib.rs:160`) | BUG | Already **KF-3** |
+| `decision_id` truncates a 256-bit event id to 64 bits (`nip_handlers.rs:440`) | BUG | Already **KF-5** |
+
+The probe-digest finding deserves naming rather than filing quietly: it is the
+exact limitation this branch has stated since its first receipt. The relay
+cannot strip a `probe` tag from a signed 31402 without invalidating the
+signature both clients verify strictly, so an agent reading its own subscription
+can tell a probe from a real request and answer it correctly. Client-side
+blindness (`visible_probe`) protects the *reviewer*, which is what the catch rate
+needs, and protects nothing against the *agent*. `implementation_status: partial`
+on ADR-2011 says so, and this is its `review_trigger`.
+
+### The previous run's seven
+
+Of the seven net-new at `20260914T204117Z`, four were fixed at `afe863a` (client
+NIP-33 replaceability, the 31402 duplicate, the inert probe-blinding trigger, and
+the agent-registration pubkey casing) and three recorded (KF-8, KF-9, and KF-3
+unchanged). **None of the four was re-raised** in this run, which re-scanned the
+same files under a wider diff. That is the strongest statement the tool supports
+— it is not proof of absence, and the direct evidence is the tests in
+`afe863a`.
