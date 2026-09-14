@@ -700,6 +700,179 @@ impl PanelPolicy {
     }
 }
 
+
+// ── Human rationale on a consequential decision (FR2.2) ─────────────────────
+
+/// The minimum length, in Unicode scalar values, of a human rationale on a
+/// decision whose effective tier is `High` or `Critical`.
+///
+/// Counted in **scalars**, not bytes and not UTF-16 units, so a reviewer
+/// writing in a script with multi-byte characters is not asked for more words
+/// than one writing in ASCII. Matches VisionClaw's `check_rationale`.
+pub const MIN_HUMAN_RATIONALE_CHARS: usize = 20;
+
+/// Why a 31403 was refused for want of a human rationale (FR2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RationaleError {
+    /// No rationale at all, or nothing but whitespace.
+    #[error("a rationale is required at this tier")]
+    Missing,
+    /// Present, but shorter than [`MIN_HUMAN_RATIONALE_CHARS`] after trimming.
+    #[error("rationale is {chars} characters; at least {min} are required", min = MIN_HUMAN_RATIONALE_CHARS)]
+    TooShort { chars: usize },
+}
+
+impl RationaleError {
+    /// The machine-readable token the relay returns in its `OK` false message.
+    ///
+    /// One token for both variants deliberately: the client needs to know that
+    /// a rationale is required, and telling an unauthorised caller *how close*
+    /// they were tells them nothing useful. The human-readable difference stays
+    /// in the `Display` text.
+    pub fn reason(self) -> &'static str {
+        "rationale_required"
+    }
+}
+
+/// Whether an outcome is a human decision on the requested act, and so needs
+/// the human's own words at a consequential tier (FR2.2).
+///
+/// `approve`, `reject`, `amend` and `delegate` resolve the case a human was
+/// asked about. `promote` and `precedent` are downstream bookkeeping on an
+/// already-decided case and are not gated.
+pub fn outcome_requires_rationale(action: &str) -> bool {
+    matches!(action, "approve" | "reject" | "amend" | "delegate")
+}
+
+/// Enforce the FR2.2 rationale rule for a 31403 (ADR-2011).
+///
+/// A decision whose **effective** tier is `High` or `Critical` must carry a
+/// rationale the human actually wrote: present, non-whitespace, and at least
+/// [`MIN_HUMAN_RATIONALE_CHARS`] scalars after trimming. Lower tiers, and
+/// legacy cases with no effective tier at all, are unchanged.
+///
+/// This exists as a **relay-side** rule and not only a UI one because a UI rule
+/// is a suggestion: the 31403 is a signed event that any client — or any
+/// script — can publish directly to the relay. FR2.2's purpose is that a
+/// signed decision represents a judgement a human actually formed, and a rule
+/// enforced only in the surface that happens to be convenient does not deliver
+/// that. Nothing here ever *fills in* a rationale: absence is refused, never
+/// papered over (PRD non-functional rule 1).
+pub fn check_rationale(
+    effective: RiskTier,
+    action: &str,
+    reasoning: Option<&str>,
+) -> Result<(), RationaleError> {
+    if !matches!(effective, RiskTier::High | RiskTier::Critical) {
+        return Ok(());
+    }
+    if !outcome_requires_rationale(action) {
+        return Ok(());
+    }
+    let trimmed = reasoning.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return Err(RationaleError::Missing);
+    }
+    let chars = trimmed.chars().count();
+    if chars < MIN_HUMAN_RATIONALE_CHARS {
+        return Err(RationaleError::TooShort { chars });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod rationale_tests {
+    use super::*;
+
+    /// A human rationale of exactly the minimum, built from ASTRAL scalars so
+    /// the test fails if anyone counts bytes (80) or UTF-16 units (40) instead
+    /// of Unicode scalar values (20).
+    fn twenty_astral() -> String {
+        "\u{1D11E}".repeat(MIN_HUMAN_RATIONALE_CHARS)
+    }
+
+    #[test]
+    fn nineteen_characters_padded_with_spaces_is_rejected() {
+        let nineteen = format!("   {}   ", "a".repeat(19));
+        assert_eq!(nineteen.trim().chars().count(), 19);
+        assert_eq!(
+            check_rationale(RiskTier::High, "approve", Some(&nineteen)),
+            Err(RationaleError::TooShort { chars: 19 }),
+            "padding must not buy length"
+        );
+    }
+
+    #[test]
+    fn twenty_astral_characters_are_accepted() {
+        let rationale = twenty_astral();
+        assert_eq!(rationale.chars().count(), 20);
+        assert_eq!(rationale.len(), 80, "astral scalars are 4 bytes each");
+        assert_eq!(
+            check_rationale(RiskTier::Critical, "approve", Some(&rationale)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_low_tier_case_accepts_an_empty_rationale() {
+        for tier in [RiskTier::Low, RiskTier::Medium] {
+            assert_eq!(check_rationale(tier, "approve", None), Ok(()));
+            assert_eq!(check_rationale(tier, "approve", Some("")), Ok(()));
+            assert_eq!(check_rationale(tier, "reject", Some("x")), Ok(()));
+        }
+    }
+
+    #[test]
+    fn delegate_on_a_critical_case_without_a_rationale_is_rejected() {
+        assert_eq!(
+            check_rationale(RiskTier::Critical, "delegate", None),
+            Err(RationaleError::Missing)
+        );
+    }
+
+    /// Every outcome that resolves a case for a human needs the human's words.
+    #[test]
+    fn all_four_gated_outcomes_are_gated_at_high_and_critical() {
+        for tier in [RiskTier::High, RiskTier::Critical] {
+            for action in ["approve", "reject", "amend", "delegate"] {
+                assert!(
+                    check_rationale(tier, action, Some("too short")).is_err(),
+                    "{action} at {tier:?} accepted a short rationale"
+                );
+                assert_eq!(check_rationale(tier, action, Some(&twenty_astral())), Ok(()));
+            }
+        }
+    }
+
+    /// `promote` and `precedent` are not human decisions on the requested act;
+    /// they are downstream bookkeeping, and FR2.2 does not name them.
+    #[test]
+    fn promote_and_precedent_are_not_gated() {
+        for action in ["promote", "precedent"] {
+            assert_eq!(check_rationale(RiskTier::Critical, action, None), Ok(()));
+        }
+    }
+
+    /// Whitespace-only is absence wearing a costume.
+    #[test]
+    fn whitespace_only_is_missing_not_short() {
+        assert_eq!(
+            check_rationale(RiskTier::High, "approve", Some("   \t \n ")),
+            Err(RationaleError::Missing)
+        );
+    }
+
+    /// The wire reason the relay sends back, pinned: the client matches on it.
+    #[test]
+    fn the_refusal_reason_is_the_documented_token() {
+        assert_eq!(RationaleError::Missing.reason(), "rationale_required");
+        assert_eq!(
+            RationaleError::TooShort { chars: 3 }.reason(),
+            "rationale_required"
+        );
+    }
+}
+
 // ── Receipt stage ladder (ADR-2010 + FR4) ───────────────────────────────────
 
 /// How far a governance decision has actually got — from the signature through

@@ -114,6 +114,85 @@ its own deadline, which with per-panel deadlines skipped exactly the
 short-deadline cases the feature exists for. The query now filters and orders by
 `created_at + deadline` and there is no early break.
 
+## Scenario 4 — FR2.2 is a relay rule, not a UI convention
+
+Added after the client auditor's counter-example (client evidence `53ca2e2`):
+the relay's 31403 admission enforced no rationale length, so a 31403 carrying
+`reasoning: "x"` — or no `reasoning` at all — was accepted and projected. FR2.2
+was therefore a property of the forum client, and a 31403 is a signed event any
+other client, or any script, can publish straight at the relay. A rule enforced
+only in the surface that happens to be convenient does not deliver "a human
+formed this judgement".
+
+The gate now runs in `handle_event` **before `save_event`**, so a refused
+decision is never stored and never projected, and answers `OK false` with the
+structured token `rationale_required`. It never fills a rationale in: absence is
+refused, not papered over (PRD non-functional rule 1).
+
+The rule: a 31403 whose outcome is `approve | reject | amend | delegate`, on a
+case whose **effective** tier is `high` or `critical`, must carry a rationale of
+at least 20 Unicode scalar values after trimming. Scalars — not bytes, not
+UTF-16 units — matching VisionClaw's `check_rationale`, so a reviewer writing in
+a multi-byte script is not asked for more words than one writing in ASCII.
+`low`, `medium` and legacy cases with no effective tier are unchanged.
+
+```
+$ cargo test -p nostr-bbs-core --lib rationale_tests
+```
+
+```
+test governance::rationale_tests::a_low_tier_case_accepts_an_empty_rationale ... ok
+test governance::rationale_tests::delegate_on_a_critical_case_without_a_rationale_is_rejected ... ok
+test governance::rationale_tests::all_four_gated_outcomes_are_gated_at_high_and_critical ... ok
+test governance::rationale_tests::nineteen_characters_padded_with_spaces_is_rejected ... ok
+test governance::rationale_tests::the_refusal_reason_is_the_documented_token ... ok
+test governance::rationale_tests::promote_and_precedent_are_not_gated ... ok
+test governance::rationale_tests::twenty_astral_characters_are_accepted ... ok
+test governance::rationale_tests::whitespace_only_is_missing_not_short ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 385 filtered out; finished in 0.00s
+```
+
+```
+$ cargo test -p nostr-bbs-relay-worker --lib rationale_gate
+```
+
+```
+test relay_do::nip_handlers::rationale_gate_tests::a_legacy_untiered_case_is_not_gated ... ok
+test relay_do::nip_handlers::rationale_gate_tests::a_low_tier_case_still_accepts_a_bare_decision ... ok
+test relay_do::nip_handlers::rationale_gate_tests::an_absent_reasoning_field_reads_as_absent ... ok
+test relay_do::nip_handlers::rationale_gate_tests::the_action_and_reasoning_are_read_off_the_signed_content ... ok
+test relay_do::nip_handlers::rationale_gate_tests::a_malformed_body_yields_no_action_and_so_no_rationale_refusal ... ok
+test relay_do::nip_handlers::rationale_gate_tests::delegate_on_a_critical_case_without_a_rationale_is_refused ... ok
+test relay_do::nip_handlers::rationale_gate_tests::the_auditor_counter_examples_are_now_refused ... ok
+test relay_do::nip_handlers::rationale_gate_tests::nineteen_characters_with_padding_is_refused ... ok
+test relay_do::nip_handlers::rationale_gate_tests::twenty_astral_characters_are_accepted_through_the_json_round_trip ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 282 filtered out; finished in 0.00s
+```
+
+**Verdict: PASS.** 17 tests, 0 failures, covering the four cases named in the
+request and the edges around them:
+
+| Case | Test | Result |
+|---|---|---|
+| 19 chars + surrounding spaces | `nineteen_characters_padded_with_spaces_is_rejected`, `nineteen_characters_with_padding_is_refused` | rejected, `TooShort { chars: 19 }` |
+| 20 astral chars (80 bytes) | `twenty_astral_characters_are_accepted`, `..._through_the_json_round_trip` | accepted; the test asserts `len() == 80` so it fails if anyone counts bytes |
+| low tier, empty rationale | `a_low_tier_case_accepts_an_empty_rationale`, `a_low_tier_case_still_accepts_a_bare_decision` | accepted |
+| delegate on critical, no rationale | `delegate_on_a_critical_case_without_a_rationale_is_rejected`, `..._is_refused` | rejected, `Missing` |
+| whitespace-only | `whitespace_only_is_missing_not_short` | rejected as `Missing`, not `TooShort` |
+| `promote` / `precedent` | `promote_and_precedent_are_not_gated` | not gated — downstream bookkeeping, not a human decision on the act |
+| malformed body | `a_malformed_body_yields_no_action_and_so_no_rationale_refusal` | not refused *here*; rejected downstream as malformed, so the publisher is told the true reason |
+| legacy untiered case | `a_legacy_untiered_case_is_not_gated` | unchanged |
+
+Both refusal variants return the same wire token (`the_refusal_reason_is_the_documented_token`): the client needs to know a rationale is required, and telling a caller how close they were tells them nothing useful.
+
+### Not covered by this scenario
+
+- **An executed WebSocket round trip.** The gate's env-bound half is one
+  `SELECT` of `broker_cases.effective_tier`; `handle_event` needs a live socket
+  and D1, so the pure seams are what is exercised here.
+- **The forum client's own FR2.2 rule.** Owned by the client agent; this is the
+  protocol-side floor beneath it, not a replacement for it.
+
 ## Security gate — BLOCK (exit 1), with the blocking set analysed
 
 ```
