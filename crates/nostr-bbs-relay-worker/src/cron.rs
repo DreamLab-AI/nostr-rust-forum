@@ -536,6 +536,154 @@ fn decide_demotion(
 // tests in `tests/` and through the existing live-ingest test suite.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// FR4.3 — escalation on age
+// ---------------------------------------------------------------------------
+
+/// How many stale cases one tick will escalate. A circuit breaker, not a
+/// target: the forum has far fewer pending cases than this, and a run that hits
+/// the ceiling reports `truncated` so the shortfall is visible rather than
+/// silently deferred.
+const AGEING_BATCH_SIZE: u32 = 200;
+
+/// What one ageing sweep did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AgeingSweepResult {
+    /// Cases past their deadline that this tick looked at.
+    pub scanned: u64,
+    /// Cases that received a fresh `escalated-on-age` receipt.
+    pub escalated: u64,
+    /// Cases already carrying one. Not an error — the idempotency working.
+    pub already_escalated: u64,
+    /// Writes that failed. Reported as loudly as successes: a sweep whose
+    /// writes all failed must not look like a quiet tick.
+    pub failed: u64,
+    /// The batch ceiling was reached and more stale cases remain.
+    pub truncated: bool,
+}
+
+/// Whether a case is past its ageing deadline (FR4.3).
+///
+/// Pure so the arithmetic is testable without a clock or a D1: `now` and
+/// `created_at` are seconds, `max_pending_hours` is the panel's declared
+/// deadline (or the documented default for a case that predates it). A case
+/// exactly *at* its deadline has not yet exceeded it.
+pub(crate) fn is_past_pending_deadline(
+    created_at: u64,
+    now: u64,
+    max_pending_hours: u32,
+) -> bool {
+    let hours = if max_pending_hours == 0 {
+        nostr_bbs_core::governance::DEFAULT_MAX_PENDING_HOURS
+    } else {
+        max_pending_hours
+    };
+    now.saturating_sub(created_at) > (hours as u64).saturating_mul(3_600)
+}
+
+/// Mark every still-pending case past its panel's `max_pending_hours` with an
+/// `escalated-on-age` side receipt (FR4.3, EXP-AC-004).
+///
+/// Exactly one receipt per case, guaranteed by the `(case_id, stage)` primary
+/// key on `case_side_receipts` rather than by a code path that has to remember:
+/// the `INSERT OR IGNORE` is the idempotency, and a second tick over the same
+/// stale case reports it as `already_escalated`.
+///
+/// A stalled case is the failure mode C2 exists to catch — a reviewer who never
+/// got to it, or a queue nobody is watching. The receipt is what makes that
+/// visible instead of leaving the case quietly pending forever.
+pub async fn escalate_stale_cases(env: &Env) -> Result<AgeingSweepResult, String> {
+    let db = env.d1("DB").map_err(|e| format!("D1 binding: {e:?}"))?;
+    let now = auth::js_now_secs();
+
+    #[derive(Deserialize)]
+    struct StaleCaseRow {
+        id: String,
+        created_at: f64,
+        max_pending_hours: Option<f64>,
+    }
+
+    // The deadline arithmetic stays in Rust (and therefore under test) rather
+    // than in SQL: the query selects pending cases oldest-first and the pure
+    // predicate decides. `state` and `created_at` are indexed together by 0006.
+    let rows = db
+        .prepare(
+            "SELECT id, created_at, max_pending_hours FROM broker_cases \
+             WHERE state IN ('open', 'under_review', 'reopened') \
+             ORDER BY created_at ASC LIMIT ?1",
+        )
+        .bind(&[JsValue::from_f64((AGEING_BATCH_SIZE + 1) as f64)])
+        .map_err(|e| format!("stale case bind: {e:?}"))?
+        .all()
+        .await
+        .map_err(|e| format!("stale case query: {e:?}"))?
+        .results::<StaleCaseRow>()
+        .map_err(|e| format!("stale case decode: {e:?}"))?;
+
+    let mut result = AgeingSweepResult {
+        truncated: rows.len() as u32 > AGEING_BATCH_SIZE,
+        ..Default::default()
+    };
+
+    for row in rows.iter().take(AGEING_BATCH_SIZE as usize) {
+        let created_at = row.created_at.max(0.0) as u64;
+        let deadline = row
+            .max_pending_hours
+            .filter(|h| *h > 0.0)
+            .map(|h| h as u32)
+            .unwrap_or(nostr_bbs_core::governance::DEFAULT_MAX_PENDING_HOURS);
+        if !is_past_pending_deadline(created_at, now, deadline) {
+            // Oldest-first: the first case inside its deadline means every
+            // remaining case is too.
+            result.truncated = false;
+            break;
+        }
+        result.scanned += 1;
+
+        let age_hours = now.saturating_sub(created_at) / 3_600;
+        let insert = db
+            .prepare(
+                "INSERT OR IGNORE INTO case_side_receipts (case_id, stage, recorded_at, detail) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(&[
+                JsValue::from_str(&row.id),
+                JsValue::from_str(
+                    nostr_bbs_core::governance::ReceiptStage::EscalatedOnAge.as_str(),
+                ),
+                JsValue::from_f64(now as f64),
+                JsValue::from_str(&format!("pending {age_hours}h against a {deadline}h deadline")),
+            ]);
+        match insert {
+            Ok(stmt) => match stmt.run().await {
+                Ok(meta) => {
+                    let changed = meta
+                        .meta()
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.changes)
+                        .unwrap_or(0);
+                    if changed > 0 {
+                        result.escalated += 1;
+                    } else {
+                        result.already_escalated += 1;
+                    }
+                }
+                Err(e) => {
+                    console_warn!("escalate-on-age write failed for {}: {:?}", row.id, e);
+                    result.failed += 1;
+                }
+            },
+            Err(e) => {
+                console_warn!("escalate-on-age bind failed for {}: {:?}", row.id, e);
+                result.failed += 1;
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,5 +968,53 @@ mod tests {
         assert!(json.contains("\"demoted\":3"));
         assert!(json.contains("\"held\":8"));
         assert!(json.contains("\"failed\":1"));
+    }
+}
+
+#[cfg(test)]
+mod ageing_tests {
+    //! FR4.3 / EXP-AC-004: the ageing predicate. The D1 shell around it is a
+    //! paged `SELECT` plus an `INSERT OR IGNORE` whose idempotency is a primary
+    //! key, so the only arithmetic worth testing is here.
+    use super::*;
+
+    const HOUR: u64 = 3_600;
+
+    #[test]
+    fn a_case_inside_its_deadline_is_not_escalated() {
+        let created = 1_000_000;
+        assert!(!is_past_pending_deadline(created, created + 71 * HOUR, 72));
+    }
+
+    /// A case exactly at its deadline has not yet *exceeded* it.
+    #[test]
+    fn the_deadline_boundary_is_exclusive() {
+        let created = 1_000_000;
+        assert!(!is_past_pending_deadline(created, created + 72 * HOUR, 72));
+        assert!(is_past_pending_deadline(created, created + 72 * HOUR + 1, 72));
+    }
+
+    #[test]
+    fn the_panel_deadline_is_honoured_over_the_default() {
+        let created = 1_000_000;
+        assert!(is_past_pending_deadline(created, created + 7 * HOUR, 6));
+        assert!(!is_past_pending_deadline(created, created + 7 * HOUR, 72));
+    }
+
+    /// A case that predates the column, or a panel that declared nothing, falls
+    /// back to the documented 72-hour default rather than escalating instantly.
+    #[test]
+    fn a_missing_deadline_falls_back_to_the_default() {
+        let created = 1_000_000;
+        assert!(!is_past_pending_deadline(created, created + HOUR, 0));
+        assert!(is_past_pending_deadline(created, created + 73 * HOUR, 0));
+        assert_eq!(nostr_bbs_core::governance::DEFAULT_MAX_PENDING_HOURS, 72);
+    }
+
+    /// A clock that has gone backwards must not escalate everything: the age is
+    /// a saturating difference, so a future `created_at` reads as age zero.
+    #[test]
+    fn a_backwards_clock_escalates_nothing() {
+        assert!(!is_past_pending_deadline(2_000_000, 1_000_000, 1));
     }
 }

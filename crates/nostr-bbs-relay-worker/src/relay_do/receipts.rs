@@ -66,64 +66,15 @@ use nostr_bbs_core::NostrEvent;
 // Stages
 // ---------------------------------------------------------------------------
 
-/// How far a governance response has actually got.
+/// The receipt stage ladder, owned by `nostr-bbs-core` (ADR-2010 + FR4).
 ///
-/// Ordering is deliberate and meaningful: a stage may only ever advance, never
-/// regress, which is what stops a late duplicate from downgrading a committed
-/// receipt back to "accepted".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReceiptStage {
-    /// The event carries a valid signature and correlates to a case. Recorded
-    /// for completeness; the relay only ever persists a receipt at or beyond
-    /// `RelayAccepted`.
-    Signed,
-    /// The signed envelope is durably stored by the relay. This is what a relay
-    /// `OK` actually certifies — and all it certifies.
-    RelayAccepted,
-    /// The decision row, the case state and this receipt committed together.
-    ProjectionCommitted,
-    /// Projection was attempted and did not commit. Terminal until a
-    /// reconciliation retry supersedes it.
-    ProjectionFailed,
-}
-
-impl ReceiptStage {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Signed => "signed",
-            Self::RelayAccepted => "relay-accepted",
-            Self::ProjectionCommitted => "projection-committed",
-            Self::ProjectionFailed => "projection-failed",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "signed" => Some(Self::Signed),
-            "relay-accepted" => Some(Self::RelayAccepted),
-            "projection-committed" => Some(Self::ProjectionCommitted),
-            "projection-failed" => Some(Self::ProjectionFailed),
-            _ => None,
-        }
-    }
-
-    /// Whether this stage represents a mutation that actually took effect.
-    ///
-    /// The distinction a downstream operator needs: a *denied* action and an
-    /// *approved* action whose write failed must never look the same.
-    pub fn is_applied(self) -> bool {
-        matches!(self, Self::ProjectionCommitted)
-    }
-
-    /// Whether a further projection attempt is warranted.
-    pub fn awaits_projection(self) -> bool {
-        matches!(
-            self,
-            Self::Signed | Self::RelayAccepted | Self::ProjectionFailed
-        )
-    }
-}
+/// It moved out of this module when FR4.1 added the **application** stages
+/// (`consumer-received`, `applied`, `not-applied`, `applied-manually`) and the
+/// `escalated-on-age` / `expired` side receipts: the auth worker's receipts
+/// endpoint and this projection path both have to agree on the ladder and its
+/// monotonicity rule, and they share no code but the core crate. Re-exported
+/// here so every existing `receipts::ReceiptStage` path keeps working.
+pub use nostr_bbs_core::governance::ReceiptStage;
 
 // ---------------------------------------------------------------------------
 // Correlation

@@ -13,7 +13,7 @@ use nostr_bbs_core::event::NostrEvent;
 use nostr_bbs_core::feature_gate::{
     device_keys_enabled as core_device_keys_enabled, DEVICE_KEYS_ENABLED_VAR,
 };
-use nostr_bbs_core::governance;
+use nostr_bbs_core::governance::{self, RiskTier, TaskProperties};
 use nostr_bbs_core::{KIND_BAN, KIND_MUTE, KIND_REPORT_NIP56, KIND_UNBAN, KIND_UNMUTE};
 use wasm_bindgen::JsValue;
 use worker::*;
@@ -121,14 +121,210 @@ pub fn gift_wrap_recipient(event: &NostrEvent) -> Option<String> {
     }
 }
 
-/// P1-6: whether an event must be rejected by the governance ActionResponse
-/// admin gate. Returns `true` when the event is kind-31403 (approve/reject of
-/// an agent action request) and the signer is NOT an admin.
+
+// ── ADR-2011: the effective escalation boundary ─────────────────────────────
+
+/// Who resolved a case — a human, or a system actor acting on its behalf.
 ///
-/// Extracted as a pure predicate so the gate decision is unit-testable without
-/// a `worker::Env` / `WebSocket`.
-pub fn governance_response_blocked(kind: u64, is_admin: bool) -> bool {
-    kind == governance::KIND_ACTION_RESPONSE && !is_admin
+/// DDD §6 invariant 8: `system:whelk-gate` and its kind are not humans, and an
+/// effective `High`/`Critical` case is not theirs to close (invariant 4). The
+/// distinction is carried on the 31403's optional `decided_by` field, which a
+/// reasoner stamps and a human client never does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolver {
+    /// A human `did:nostr`, identified by the signing pubkey.
+    Human(String),
+    /// A named non-human actor, e.g. `system:whelk-gate`.
+    System(String),
+}
+
+impl Resolver {
+    pub(crate) fn is_human(&self) -> bool {
+        matches!(self, Resolver::Human(_))
+    }
+}
+
+/// Read the resolver from a signed 31403's content.
+///
+/// A response with no `decided_by`, or one naming the signer, is a human
+/// decision — the overwhelmingly common case and the safe default, because the
+/// 31403 admission gate has already established that the signer is an admin or
+/// a delegated reviewer. A `decided_by` of the form `system:<actor>` marks the
+/// outcome as machine-produced.
+pub(crate) fn parse_resolver(content: &str, signer: &str) -> Resolver {
+    let declared = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("decided_by")
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
+        });
+    match declared {
+        Some(actor) if actor.starts_with("system:") => Resolver::System(actor),
+        _ => Resolver::Human(signer.to_string()),
+    }
+}
+
+/// DDD §6 invariant 4: an effective `High` or `Critical` case reaches `Decided`
+/// only through a human 31403.
+pub(crate) fn human_resolution_required(effective: RiskTier) -> bool {
+    matches!(effective, RiskTier::High | RiskTier::Critical)
+}
+
+/// The outcome of the 31403 admission gate (P1-6 extended by FR6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseAdmission {
+    /// The signer may decide this case.
+    Admit,
+    /// The signer is neither an admin nor a reviewer: decisions are not theirs.
+    BlockedNotAuthorised,
+    /// The signer holds the `reviewer` role but this case was never delegated
+    /// to them. Reviewers are read-only except on cases an admin hands them.
+    BlockedNotDelegated,
+}
+
+impl ResponseAdmission {
+    pub(crate) fn is_admitted(self) -> bool {
+        matches!(self, ResponseAdmission::Admit)
+    }
+
+    /// The relay `OK` message for a refusal.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            ResponseAdmission::Admit => "",
+            ResponseAdmission::BlockedNotAuthorised => {
+                "blocked: admin-only governance action response"
+            }
+            ResponseAdmission::BlockedNotDelegated => {
+                "blocked: case not delegated to this reviewer"
+            }
+        }
+    }
+}
+
+/// Decide whether a kind-31403 may be admitted (FR6.2, DDD §6 invariant 6).
+///
+/// An admin may decide any case, as before. A `reviewer`-role pubkey may decide
+/// **exactly** the cases an admin has delegated to it — the mechanism that lets
+/// a junior reviewer do substantive review work without being handed the whole
+/// surface. Everyone else is refused.
+///
+/// Pure so the gate is unit-testable without a `worker::Env`; the relay supplies
+/// the three booleans from `broker_roles`, its admin list, and `case_delegations`.
+pub(crate) fn response_admission(
+    is_admin: bool,
+    is_reviewer: bool,
+    delegated_for_this_case: bool,
+) -> ResponseAdmission {
+    if is_admin {
+        return ResponseAdmission::Admit;
+    }
+    if !is_reviewer {
+        return ResponseAdmission::BlockedNotAuthorised;
+    }
+    if delegated_for_this_case {
+        ResponseAdmission::Admit
+    } else {
+        ResponseAdmission::BlockedNotDelegated
+    }
+}
+
+/// Everything the relay derives about a 31402's escalation boundary at
+/// projection time (ADR-2011, FR6.3, FR6.4, FR4.3).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RequestBoundary {
+    /// The agent's own declaration. Telemetry: kept so declared-vs-effective
+    /// divergence is measurable per agent.
+    pub declared: Option<RiskTier>,
+    /// The tier that governs the case. The only tier a consumer reads.
+    pub effective: RiskTier,
+    /// The merged, panel-tightened triple the tier derives from.
+    pub props: Option<TaskProperties>,
+    /// Whether this otherwise-suppressible case is shown anyway (FR6.3).
+    pub calibration_sample: bool,
+    /// The seeded-probe digest, kept only when the panel's REGISTERED probe
+    /// agent published it.
+    pub probe_digest: Option<String>,
+    /// The panel's pending-case deadline, copied onto the case for the cron.
+    pub max_pending_hours: u32,
+}
+
+/// The agent's declared tier, read from the `risk-tier` tag first and the
+/// `ActionRequest` content second.
+///
+/// A tag is cheaper for the relay and is what agentbox stamps; the content
+/// field is what the forum client's own `ActionRequest` carries. Reading both
+/// means neither publisher has to change to be understood, and an absent
+/// declaration stays `None` rather than becoming an accidental `Medium`.
+fn declared_tier(tags: &[Vec<String>], content: &str) -> Option<RiskTier> {
+    if let Some(t) = governance::extract_tag(tags, "risk-tier") {
+        return Some(RiskTier::parse(t));
+    }
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("risk_tier")
+                .and_then(|t| t.as_str())
+                .map(RiskTier::parse)
+        })
+}
+
+/// Derive the whole boundary for one 31402 (ADR-2011).
+///
+/// `panel_tags` are the tags of the 31400 this request belongs to, where the
+/// relay could resolve one. A request whose panel cannot be resolved is not
+/// refused — it simply has no operator declaration to be tightened by, and
+/// falls back to its own declaration and the relay's advertised default.
+///
+/// Pure over its inputs so the whole boundary computation is unit-testable
+/// without a live D1; the env-bound shell in `project_action_request` only
+/// supplies the panel row.
+pub(crate) fn plan_request_boundary(
+    case_id: &str,
+    request_pubkey: &str,
+    request_tags: &[Vec<String>],
+    request_content: &str,
+    panel_tags: Option<&[Vec<String>]>,
+    advertised_default: RiskTier,
+) -> RequestBoundary {
+    let panel_props = panel_tags.and_then(TaskProperties::from_tags);
+    let request_props = TaskProperties::from_tags(request_tags);
+    let merged = TaskProperties::merge_opt(panel_props.as_ref(), request_props.as_ref());
+    let declared = declared_tier(request_tags, request_content);
+    let effective = governance::effective_tier(
+        panel_props.as_ref(),
+        request_props.as_ref(),
+        declared,
+        advertised_default,
+    );
+
+    let policy = panel_tags
+        .map(governance::PanelPolicy::from_tags)
+        .unwrap_or_default();
+
+    // Only a case the member surface would otherwise hide is worth sampling:
+    // sampling a case that is already shown changes nothing and would inflate
+    // the `calibration_shown` denominator with cases nobody chose to show.
+    let suppressible =
+        governance::is_member_suppressed_effective(merged.as_ref(), effective, false);
+    let calibration_sample = suppressible
+        && governance::is_calibration_sample(case_id, policy.calibration_sample_rate);
+
+    // A `probe` tag is honoured ONLY from the panel's registered probe agent
+    // (FR6.4). From anyone else it is noise that would corrupt the catch rate,
+    // so it is dropped rather than recorded.
+    let probe_digest = governance::extract_tag(request_tags, governance::TAG_PROBE)
+        .filter(|_| policy.is_probe_agent(request_pubkey))
+        .map(str::to_string);
+
+    RequestBoundary {
+        declared,
+        effective,
+        props: merged,
+        calibration_sample,
+        probe_digest,
+        max_pending_hours: policy.max_pending_hours,
+    }
 }
 
 /// The `broker_cases` columns the 31403 projection reads to hydrate a case
@@ -137,6 +333,11 @@ pub fn governance_response_blocked(kind: u64, is_admin: bool) -> bool {
 pub(crate) struct BrokerCaseRow {
     pub category: String,
     pub state: String,
+    /// The ADR-2011 effective tier, absent on cases projected before 0006.
+    /// An absent tier imposes no human-resolution requirement of its own —
+    /// the case predates the boundary rather than opting out of it.
+    #[serde(default)]
+    pub effective_tier: Option<String>,
     pub nostr_event_id: Option<String>,
     pub created_by: String,
     pub from_share_state: Option<String>,
@@ -170,6 +371,14 @@ pub(crate) struct ResponseProjection {
 /// instead of the former fixed `under_review` fallback. The `Env`/D1 read + write
 /// stay in [`NostrRelayDO::project_action_response`]; this pure seam is what makes
 /// the lifecycle unit-testable in the worker crate without a live D1.
+///
+/// ADR-2011 / DDD §6 invariants 4 and 8: a case whose **effective** tier is
+/// `High` or `Critical` reaches `Decided` only through a *human* 31403. The
+/// resolver is read from the response's own `decided_by` field, so a reasoner
+/// stamping `system:whelk-gate` cannot close a case the boundary reserves for a
+/// person. This is the assertion path EXP-AC-003 requires: the admission gate
+/// already establishes that the signer is an admin or a delegated reviewer, and
+/// this establishes that the *outcome* is a human's.
 pub(crate) fn plan_action_response(
     case_id: &str,
     case_row: Option<&BrokerCaseRow>,
@@ -199,6 +408,24 @@ pub(crate) fn plan_action_response(
         })
         .unwrap_or_default();
     let decision_id = format!("dec-{}", &event_id[..16.min(event_id.len())]);
+
+    // Invariant 4: only a human closes a high/critical case. An absent
+    // `effective_tier` is a case projected before 0006 and imposes nothing.
+    let effective = case_row
+        .and_then(|r| r.effective_tier.as_deref())
+        .map(RiskTier::parse);
+    if let Some(tier) = effective {
+        let resolver = parse_resolver(content, responder_pubkey);
+        if human_resolution_required(tier) && !resolver.is_human() {
+            return Err(
+                governance::broker::OrchestrationError::ShareTransitionRejected(format!(
+                    "effective tier {} requires a human 31403; {:?} may not resolve it",
+                    tier.as_str(),
+                    resolver
+                )),
+            );
+        }
+    }
 
     if let Some(row) = case_row {
         if !matches!(
@@ -735,16 +962,27 @@ impl NostrRelayDO {
             return;
         }
 
-        // P1-6: kind-31403 ActionResponse (approve/reject) is admin-only. Uses
-        // the same admin check as the moderation mirror. Reject non-admins.
-        if governance_response_blocked(event.kind, is_admin) {
-            Self::send_ok(
-                ws,
-                &event.id,
-                false,
-                "blocked: admin-only governance action response",
-            );
-            return;
+        // P1-6 + FR6.2: kind-31403 ActionResponse is admin-only, EXCEPT for a
+        // `reviewer`-role pubkey deciding a case an admin explicitly delegated
+        // to it. That exception is what lets a junior reviewer do substantive
+        // review work (C5) without being handed the whole governance surface:
+        // the delegation is scoped to one case and the delegating admin stays
+        // on the row. Everyone else is refused exactly as before.
+        if event.kind == governance::KIND_ACTION_RESPONSE {
+            let case_id = governance::extract_d_tag(&event.tags).unwrap_or_default();
+            let (is_reviewer, delegated) = if is_admin || case_id.is_empty() {
+                (false, false)
+            } else {
+                (
+                    self.is_reviewer(&event.pubkey).await,
+                    self.is_delegated_for_case(case_id, &event.pubkey).await,
+                )
+            };
+            let admission = response_admission(is_admin, is_reviewer, delegated);
+            if !admission.is_admitted() {
+                Self::send_ok(ws, &event.id, false, admission.reason());
+                return;
+            }
         }
 
         // F6 (DDD §7a.1): a *superseding* kind-31403 — one carrying an `e`-tag
@@ -1748,6 +1986,87 @@ impl NostrRelayDO {
         }
     }
 
+    /// The relay's advertised `ESCALATION_DEFAULT_TIER` (NIP-11), as a tier.
+    ///
+    /// ADR-2011 §3 makes the advertisement load-bearing rather than decorative:
+    /// an unlabelled 31402 folds to exactly this. Reading it here, from the same
+    /// var `nip11.rs` advertises, is what stops the claim and the behaviour
+    /// drifting apart.
+    pub(crate) fn advertised_default_tier(&self) -> RiskTier {
+        self.env
+            .var("ESCALATION_DEFAULT_TIER")
+            .map(|v| RiskTier::parse(&v.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// The tags of the 31400 panel a 31402 belongs to, where one can be resolved.
+    ///
+    /// Resolution order: the NIP-33 `a` tag (`31400:<pubkey>:<d>`), then a plain
+    /// `panel` tag naming the panel's `d`, then the most recent panel the same
+    /// agent published. A request whose panel cannot be resolved is not refused —
+    /// it simply has no operator declaration to be tightened by.
+    pub(crate) async fn resolve_panel_tags(&self, event: &NostrEvent) -> Option<Vec<Vec<String>>> {
+        let db = self.env.d1("DB").ok()?;
+
+        #[derive(serde::Deserialize)]
+        struct TagsRow {
+            tags: String,
+        }
+
+        // `a` is `<kind>:<pubkey>:<d>`; we only honour a 31400 address.
+        let addressed = governance::extract_tag(&event.tags, "a").and_then(|a| {
+            let mut parts = a.splitn(3, ':');
+            let kind = parts.next()?;
+            let pubkey = parts.next()?;
+            let d = parts.next()?;
+            (kind.parse::<u64>().ok() == Some(governance::KIND_PANEL_DEFINITION))
+                .then(|| (pubkey.to_string(), d.to_string()))
+        });
+        let named = governance::extract_tag(&event.tags, "panel")
+            .map(|d| (event.pubkey.clone(), d.to_string()));
+
+        let row = if let Some((pubkey, d)) = addressed.or(named) {
+            db.prepare(
+                "SELECT tags FROM events WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3 \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&[
+                JsValue::from_f64(governance::KIND_PANEL_DEFINITION as f64),
+                JsValue::from_str(&pubkey),
+                JsValue::from_str(&d),
+            ])
+            .ok()?
+            .first::<TagsRow>(None)
+            .await
+            .ok()
+            .flatten()
+        } else {
+            db.prepare(
+                "SELECT tags FROM events WHERE kind = ?1 AND pubkey = ?2 \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&[
+                JsValue::from_f64(governance::KIND_PANEL_DEFINITION as f64),
+                JsValue::from_str(&event.pubkey),
+            ])
+            .ok()?
+            .first::<TagsRow>(None)
+            .await
+            .ok()
+            .flatten()
+        }?;
+
+        serde_json::from_str::<Vec<Vec<String>>>(&row.tags).ok()
+    }
+
+    /// Project a 31402 ActionRequest into `broker_cases`, stamping the ADR-2011
+    /// effective tier, the triple it derives from, the calibration mark and the
+    /// panel's ageing deadline.
+    ///
+    /// The tier is computed here, once, at projection time — not read from the
+    /// request by each consumer. That is what makes the boundary the operator's
+    /// rather than the requesting agent's: every downstream surface reads
+    /// `broker_cases.effective_tier` and there is nowhere else to look.
     pub(crate) async fn project_action_request(&self, event: &NostrEvent) {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
@@ -1764,11 +2083,24 @@ impl NostrRelayDO {
             .and_then(|p| p.parse().ok())
             .unwrap_or(50);
 
+        let panel_tags = self.resolve_panel_tags(event).await;
+        let boundary = plan_request_boundary(
+            d_tag,
+            &event.pubkey,
+            &event.tags,
+            &event.content,
+            panel_tags.as_deref(),
+            self.advertised_default_tier(),
+        );
+
         let stmt = db.prepare(
             "INSERT OR IGNORE INTO broker_cases \
              (id, category, subject_kind, subject_id, title, summary, state, priority, \
-              created_by, nostr_event_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?10)",
+              created_by, nostr_event_id, created_at, updated_at, \
+              declared_tier, effective_tier, tp_verifiability, tp_reversibility, tp_stakes, \
+              calibration_sample, probe_digest, max_pending_hours) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?10, \
+                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         );
         if let Ok(bound) = stmt.bind(&[
             JsValue::from_str(d_tag),
@@ -1781,8 +2113,110 @@ impl NostrRelayDO {
             JsValue::from_str(&event.pubkey),
             JsValue::from_str(&event.id),
             JsValue::from_f64(event.created_at as f64),
+            match boundary.declared {
+                Some(t) => JsValue::from_str(t.as_str()),
+                None => JsValue::NULL,
+            },
+            JsValue::from_str(boundary.effective.as_str()),
+            match &boundary.props {
+                Some(p) => JsValue::from_str(p.verifiability.as_str()),
+                None => JsValue::NULL,
+            },
+            match &boundary.props {
+                Some(p) => JsValue::from_str(p.reversibility.as_str()),
+                None => JsValue::NULL,
+            },
+            match &boundary.props {
+                Some(p) => JsValue::from_str(p.stakes.as_str()),
+                None => JsValue::NULL,
+            },
+            JsValue::from_f64(u8::from(boundary.calibration_sample) as f64),
+            match &boundary.probe_digest {
+                Some(d) => JsValue::from_str(d),
+                None => JsValue::NULL,
+            },
+            JsValue::from_f64(boundary.max_pending_hours as f64),
         ]) {
             let _ = bound.run().await;
+        }
+    }
+
+    /// Whether `pubkey` holds the `reviewer` governance role (FR6.2).
+    pub(crate) async fn is_reviewer(&self, pubkey: &str) -> bool {
+        let Ok(db) = self.env.d1("DB") else {
+            return false;
+        };
+        let Ok(stmt) = db
+            .prepare("SELECT role FROM broker_roles WHERE pubkey = ?1 AND role = ?2 LIMIT 1")
+            .bind(&[
+                JsValue::from_str(pubkey),
+                JsValue::from_str(governance::ROLE_REVIEWER),
+            ])
+        else {
+            return false;
+        };
+        stmt.first::<serde_json::Value>(None)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Whether an admin has delegated `case_id` to `pubkey` (FR6.2).
+    ///
+    /// The delegation is scoped to exactly one case: this returns false for
+    /// every other case the same reviewer might try to decide.
+    pub(crate) async fn is_delegated_for_case(&self, case_id: &str, pubkey: &str) -> bool {
+        let Ok(db) = self.env.d1("DB") else {
+            return false;
+        };
+        let Ok(stmt) = db
+            .prepare(
+                "SELECT case_id FROM case_delegations \
+                 WHERE case_id = ?1 AND delegate_pubkey = ?2 LIMIT 1",
+            )
+            .bind(&[JsValue::from_str(case_id), JsValue::from_str(pubkey)])
+        else {
+            return false;
+        };
+        stmt.first::<serde_json::Value>(None)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Record an admin's `Delegate{to}` so the 31403 gate will admit the
+    /// delegatee for this one case (FR6.2, DDD §6 invariant 6).
+    ///
+    /// The delegating admin is kept on the row, so the delegation stays
+    /// attributable to them even though the decision will be the delegatee's.
+    pub(crate) async fn record_case_delegation(
+        &self,
+        case_id: &str,
+        delegate_pubkey: &str,
+        delegated_by: &str,
+        decision_id: &str,
+        at: u64,
+    ) {
+        let Ok(db) = self.env.d1("DB") else {
+            return;
+        };
+        if let Ok(stmt) = db
+            .prepare(
+                "INSERT OR IGNORE INTO case_delegations \
+                 (case_id, delegate_pubkey, delegated_by, decision_id, delegated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(&[
+                JsValue::from_str(case_id),
+                JsValue::from_str(delegate_pubkey),
+                JsValue::from_str(delegated_by),
+                JsValue::from_str(decision_id),
+                JsValue::from_f64(at as f64),
+            ])
+        {
+            let _ = stmt.run().await;
         }
     }
 
@@ -1871,7 +2305,8 @@ impl NostrRelayDO {
         // id links the provenance chain.
         let case_row = db
             .prepare(
-                "SELECT category, state, nostr_event_id, created_by, from_share_state, to_share_state \
+                "SELECT category, state, effective_tier, nostr_event_id, created_by, \
+                 from_share_state, to_share_state \
                  FROM broker_cases WHERE id = ?1 LIMIT 1",
             )
             .bind(&[JsValue::from_str(&case_id)])
@@ -1927,6 +2362,17 @@ impl NostrRelayDO {
             }
         };
 
+        // Captured before `proj` is consumed: an admin's `Delegate{to}` has to
+        // project a `case_delegations` row, which is what later admits the
+        // delegatee's own 31403 for this one case (FR6.2).
+        let delegate_target = if proj.outcome == "delegate" {
+            proj.outcome_detail.clone()
+        } else {
+            None
+        };
+        let delegating_decision_id = proj.decision_id.clone();
+        let delegated_case_id = case_id.clone();
+
         let commit = receipts::ProjectionCommit {
             event_id: event.id.clone(),
             case_id,
@@ -1951,6 +2397,22 @@ impl NostrRelayDO {
         let store = receipts::D1ReceiptStore::new(db);
         let outcome =
             receipts::apply_with_receipt(&store, &correlation, &commit, auth::js_now_secs()).await;
+
+        // FR6.2: only a delegation that actually COMMITTED opens the gate. A
+        // projection that failed leaves no delegation behind, so a reviewer can
+        // never be admitted on the strength of a decision that did not land.
+        if outcome.is_applied() {
+            if let Some(delegate) = delegate_target.as_deref().filter(|d| !d.trim().is_empty()) {
+                self.record_case_delegation(
+                    &delegated_case_id,
+                    delegate,
+                    &event.pubkey,
+                    &delegating_decision_id,
+                    event.created_at,
+                )
+                .await;
+            }
+        }
 
         match &outcome {
             ReceiptOutcome::ProjectionFailed { error } => {
@@ -2522,6 +2984,7 @@ mod governance_projection_tests {
         BrokerCaseRow {
             category: "manual_submission".into(),
             state: "open".into(),
+            effective_tier: None,
             nostr_event_id: Some("r".repeat(64)),
             created_by: "agent-alice".into(),
             from_share_state: None,
@@ -3221,5 +3684,416 @@ mod device_key_tests {
         let wl_empty: Vec<String> = vec![];
         assert!(!access_admitted(&author, None, true, &wl_empty));
         assert!(!access_admitted(&author, None, false, &wl_empty));
+    }
+}
+
+#[cfg(test)]
+mod augmentation_boundary_tests {
+    //! ADR-2011 / EXP-AC-003, EXP-AC-006: the relay's own share of the
+    //! augmentation-conditions work — the effective tier it stamps on a case,
+    //! the default it folds an unlabelled request to, the delegation admission
+    //! gate, and the human-resolution guard on a high/critical case. All of it
+    //! sits behind pure seams so it is exercised without a live D1, exactly as
+    //! `governance_projection_tests` does for the decision projection.
+    use super::*;
+    use nostr_bbs_core::governance::{Reversibility, Stakes, Verifiability};
+
+    fn tag(name: &str, value: &str) -> Vec<String> {
+        vec![name.to_string(), value.to_string()]
+    }
+
+    fn panel_tags(v: &str, r: &str, s: &str) -> Vec<Vec<String>> {
+        vec![
+            tag("d", "panel-1"),
+            tag(governance::TAG_TP_VERIFIABILITY, v),
+            tag(governance::TAG_TP_REVERSIBILITY, r),
+            tag(governance::TAG_TP_STAKES, s),
+        ]
+    }
+
+    // ── Effective tier at projection time ───────────────────────────────
+
+    /// EXP-AC-003: an unlabelled 31402 projects with the NIP-11 advertised
+    /// default tier, not with the accidental `Medium` of an absent tag.
+    #[test]
+    fn unlabelled_request_projects_with_the_advertised_default() {
+        for default in [RiskTier::Low, RiskTier::Medium, RiskTier::High] {
+            let boundary =
+                plan_request_boundary("case-1", "agent", &[tag("d", "case-1")], "{}", None, default);
+            assert_eq!(boundary.effective, default);
+            assert_eq!(boundary.declared, None);
+            assert_eq!(boundary.props, None);
+        }
+    }
+
+    /// The counter-example: a request claiming `reversible` against a panel
+    /// declaring `irreversible` does not lower the boundary.
+    #[test]
+    fn request_tag_cannot_loosen_the_panel_declaration() {
+        let panel = panel_tags("inspectable", "irreversible", "bounded");
+        let request = vec![
+            tag("d", "case-1"),
+            tag(governance::TAG_TP_REVERSIBILITY, "reversible"),
+            tag("risk-tier", "low"),
+        ];
+        let boundary = plan_request_boundary(
+            "case-1",
+            "agent",
+            &request,
+            "{}",
+            Some(&panel),
+            RiskTier::Medium,
+        );
+        assert_eq!(
+            boundary.props.unwrap().reversibility,
+            Reversibility::Irreversible
+        );
+        assert_eq!(boundary.effective, RiskTier::High);
+        assert_eq!(boundary.declared, Some(RiskTier::Low), "still telemetry");
+    }
+
+    /// A request may *tighten*: that is the whole point of allowing it to
+    /// declare at all.
+    #[test]
+    fn request_tag_may_tighten_the_panel_declaration() {
+        let panel = panel_tags("inspectable", "reversible", "bounded");
+        let request = vec![
+            tag("d", "case-1"),
+            tag(governance::TAG_TP_STAKES, "critical"),
+        ];
+        let boundary = plan_request_boundary(
+            "case-1",
+            "agent",
+            &request,
+            "{}",
+            Some(&panel),
+            RiskTier::Low,
+        );
+        assert_eq!(boundary.props.unwrap().stakes, Stakes::Critical);
+        assert_eq!(boundary.effective, RiskTier::High);
+    }
+
+    /// The declared tier is read from the `risk-tier` tag OR the request
+    /// content, so neither publisher has to change to be understood.
+    #[test]
+    fn declared_tier_reads_from_tag_or_content() {
+        let from_tag = plan_request_boundary(
+            "c",
+            "agent",
+            &[tag("risk-tier", "critical")],
+            "{}",
+            None,
+            RiskTier::Low,
+        );
+        assert_eq!(from_tag.declared, Some(RiskTier::Critical));
+        assert_eq!(from_tag.effective, RiskTier::Critical);
+
+        let from_content = plan_request_boundary(
+            "c",
+            "agent",
+            &[],
+            r#"{"fields":{},"risk_tier":"high"}"#,
+            None,
+            RiskTier::Low,
+        );
+        assert_eq!(from_content.declared, Some(RiskTier::High));
+        assert_eq!(from_content.effective, RiskTier::High);
+    }
+
+    /// `Opaque` work floors at `Medium` and is never member-suppressed.
+    #[test]
+    fn opaque_work_floors_at_medium_and_is_shown() {
+        let panel = panel_tags("opaque", "reversible", "bounded");
+        let boundary = plan_request_boundary(
+            "case-1",
+            "agent",
+            &[tag("risk-tier", "low")],
+            "{}",
+            Some(&panel),
+            RiskTier::Low,
+        );
+        assert_eq!(boundary.effective, RiskTier::Medium);
+        assert!(!governance::is_member_suppressed_effective(
+            boundary.props.as_ref(),
+            boundary.effective,
+            boundary.calibration_sample
+        ));
+        assert_eq!(
+            boundary.props.unwrap().verifiability,
+            Verifiability::Opaque
+        );
+    }
+
+    // ── Calibration sampling and probes ─────────────────────────────────
+
+    /// Sampling only ever applies to a case the member surface would otherwise
+    /// hide: marking a case that is already shown would inflate the
+    /// `calibration_shown` denominator with cases nobody chose to show.
+    #[test]
+    fn only_suppressible_cases_are_sampled() {
+        let panel = vec![
+            tag("d", "p"),
+            tag(governance::TAG_CALIBRATION_SAMPLE_RATE, "1.0"),
+        ];
+        let low = plan_request_boundary(
+            "case-low",
+            "agent",
+            &[tag("risk-tier", "low")],
+            "{}",
+            Some(&panel),
+            RiskTier::Low,
+        );
+        assert!(low.calibration_sample, "a low case is suppressible");
+
+        let high = plan_request_boundary(
+            "case-high",
+            "agent",
+            &[tag("risk-tier", "high")],
+            "{}",
+            Some(&panel),
+            RiskTier::Low,
+        );
+        assert!(!high.calibration_sample, "a high case is already shown");
+    }
+
+    /// A calibration sample is shown rather than suppressed — the mechanism
+    /// that keeps reviewers exposed to routine agent output (C5/C6).
+    #[test]
+    fn a_calibration_sample_is_not_suppressed() {
+        let panel = vec![
+            tag("d", "p"),
+            tag(governance::TAG_CALIBRATION_SAMPLE_RATE, "1.0"),
+        ];
+        let b = plan_request_boundary(
+            "case-low",
+            "agent",
+            &[tag("risk-tier", "low")],
+            "{}",
+            Some(&panel),
+            RiskTier::Low,
+        );
+        assert_eq!(b.effective, RiskTier::Low);
+        assert!(!governance::is_member_suppressed_effective(
+            b.props.as_ref(),
+            b.effective,
+            b.calibration_sample
+        ));
+    }
+
+    /// EXP-AC-006: a `probe` tag is honoured only from the panel's REGISTERED
+    /// probe agent. From anyone else it is noise that would corrupt the catch
+    /// rate, so it is dropped rather than recorded.
+    #[test]
+    fn probe_is_honoured_only_from_the_registered_probe_agent() {
+        let prober = "a".repeat(64);
+        let panel = vec![
+            tag("d", "p"),
+            tag(governance::TAG_PROBE_AGENT, &prober),
+        ];
+        let request = vec![tag(governance::TAG_PROBE, "deadbeef")];
+
+        let registered =
+            plan_request_boundary("c", &prober, &request, "{}", Some(&panel), RiskTier::Medium);
+        assert_eq!(registered.probe_digest.as_deref(), Some("deadbeef"));
+
+        let impostor = plan_request_boundary(
+            "c",
+            &"b".repeat(64),
+            &request,
+            "{}",
+            Some(&panel),
+            RiskTier::Medium,
+        );
+        assert_eq!(impostor.probe_digest, None);
+
+        // And a panel with no registered probe agent honours none at all.
+        let unregistered = plan_request_boundary(
+            "c",
+            &prober,
+            &request,
+            "{}",
+            Some(&[tag("d", "p")]),
+            RiskTier::Medium,
+        );
+        assert_eq!(unregistered.probe_digest, None);
+    }
+
+    /// The panel's ageing deadline travels onto the case so the cron is a
+    /// single indexed scan, and falls back to the documented default.
+    #[test]
+    fn max_pending_hours_comes_from_the_panel_or_the_default() {
+        let panel = vec![tag("d", "p"), tag(governance::TAG_MAX_PENDING_HOURS, "6")];
+        assert_eq!(
+            plan_request_boundary("c", "a", &[], "{}", Some(&panel), RiskTier::Medium)
+                .max_pending_hours,
+            6
+        );
+        assert_eq!(
+            plan_request_boundary("c", "a", &[], "{}", None, RiskTier::Medium).max_pending_hours,
+            governance::DEFAULT_MAX_PENDING_HOURS
+        );
+    }
+
+    // ── Delegation admission (FR6.2) ────────────────────────────────────
+
+    #[test]
+    fn admin_decides_any_case() {
+        assert_eq!(response_admission(true, false, false), ResponseAdmission::Admit);
+    }
+
+    /// EXP-AC-006 counter-example: a reviewer deciding a case not delegated to
+    /// them is refused.
+    #[test]
+    fn reviewer_without_a_delegation_is_refused() {
+        assert_eq!(
+            response_admission(false, true, false),
+            ResponseAdmission::BlockedNotDelegated
+        );
+    }
+
+    #[test]
+    fn reviewer_with_a_delegation_is_admitted() {
+        assert_eq!(
+            response_admission(false, true, true),
+            ResponseAdmission::Admit
+        );
+    }
+
+    /// A delegation row for a non-reviewer does not make them a decider: both
+    /// halves are required, so a stale row cannot promote an ordinary member.
+    #[test]
+    fn a_delegation_alone_does_not_admit_a_non_reviewer() {
+        assert_eq!(
+            response_admission(false, false, true),
+            ResponseAdmission::BlockedNotAuthorised
+        );
+        assert_eq!(
+            response_admission(false, false, false),
+            ResponseAdmission::BlockedNotAuthorised
+        );
+    }
+
+    // ── Human resolution of a high/critical case (invariants 4 and 8) ────
+
+    fn case_row_at_tier(tier: &str) -> BrokerCaseRow {
+        BrokerCaseRow {
+            category: "manual_submission".into(),
+            state: "open".into(),
+            effective_tier: Some(tier.into()),
+            nostr_event_id: Some("r".repeat(64)),
+            created_by: "agent-alice".into(),
+            from_share_state: None,
+            to_share_state: None,
+        }
+    }
+
+    #[test]
+    fn high_and_critical_require_a_human() {
+        assert!(human_resolution_required(RiskTier::High));
+        assert!(human_resolution_required(RiskTier::Critical));
+        assert!(!human_resolution_required(RiskTier::Medium));
+        assert!(!human_resolution_required(RiskTier::Low));
+    }
+
+    #[test]
+    fn resolver_defaults_to_the_human_signer() {
+        assert_eq!(
+            parse_resolver(r#"{"action":"approve"}"#, "human-bob"),
+            Resolver::Human("human-bob".into())
+        );
+        assert_eq!(
+            parse_resolver(
+                r#"{"action":"approve","decided_by":"system:whelk-gate"}"#,
+                "relay-key"
+            ),
+            Resolver::System("system:whelk-gate".into())
+        );
+    }
+
+    /// EXP-AC-003: a case with effective `High`/`Critical` cannot reach
+    /// `Decided` through any non-human path.
+    #[test]
+    fn a_system_actor_cannot_decide_a_high_or_critical_case() {
+        for tier in ["high", "critical"] {
+            let row = case_row_at_tier(tier);
+            let err = plan_action_response(
+                "case-1",
+                Some(&row),
+                &"e".repeat(64),
+                r#"{"action":"approve","decided_by":"system:whelk-gate"}"#,
+                "relay-key",
+                None,
+                2_000,
+            )
+            .expect_err("a system actor must not resolve a high/critical case");
+            let message = format!("{err:?}");
+            assert!(
+                message.contains("requires a human 31403"),
+                "unexpected refusal: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_human_decides_a_high_case_normally() {
+        let row = case_row_at_tier("high");
+        let proj = plan_action_response(
+            "case-1",
+            Some(&row),
+            &"e".repeat(64),
+            r#"{"action":"approve","reasoning":"checked the diff line by line"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("a human resolves a high case");
+        assert_eq!(proj.outcome, "approve");
+    }
+
+    /// A system actor may still resolve a case the boundary does not reserve —
+    /// the guard is about the tier, not about disliking automation.
+    #[test]
+    fn a_system_actor_may_decide_a_medium_case() {
+        let row = case_row_at_tier("medium");
+        assert!(plan_action_response(
+            "case-1",
+            Some(&row),
+            &"e".repeat(64),
+            r#"{"action":"approve","decided_by":"system:whelk-gate"}"#,
+            "relay-key",
+            None,
+            2_000,
+        )
+        .is_ok());
+    }
+
+    /// A case projected before migration 0006 has no effective tier. It keeps
+    /// its prior behaviour rather than being retro-gated on a tier nobody
+    /// computed.
+    #[test]
+    fn a_legacy_case_without_an_effective_tier_is_unaffected() {
+        let row = open_legacy_case_row();
+        assert!(plan_action_response(
+            "case-1",
+            Some(&row),
+            &"e".repeat(64),
+            r#"{"action":"approve","decided_by":"system:whelk-gate"}"#,
+            "relay-key",
+            None,
+            2_000,
+        )
+        .is_ok());
+    }
+
+    fn open_legacy_case_row() -> BrokerCaseRow {
+        BrokerCaseRow {
+            category: "manual_submission".into(),
+            state: "open".into(),
+            effective_tier: None,
+            nostr_event_id: Some("r".repeat(64)),
+            created_by: "agent-alice".into(),
+            from_share_state: None,
+            to_share_state: None,
+        }
     }
 }

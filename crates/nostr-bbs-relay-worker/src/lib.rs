@@ -897,4 +897,23 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         }
         Err(e) => console_error!("retention sweep failed: {e}"),
     }
+
+    // FR4.3: a case nobody got to must age visibly rather than sit quietly
+    // pending. One `escalated-on-age` receipt per case, ever — the idempotency
+    // is the `(case_id, stage)` primary key, not this tick's memory.
+    match cron::escalate_stale_cases(&env).await {
+        Ok(result) => {
+            if result.escalated > 0 || result.failed > 0 || result.truncated {
+                console_log!(
+                    "ageing sweep: scanned={} escalated={} already={} failed={} truncated={}",
+                    result.scanned,
+                    result.escalated,
+                    result.already_escalated,
+                    result.failed,
+                    result.truncated
+                );
+            }
+        }
+        Err(e) => console_error!("ageing sweep failed: {e}"),
+    }
 }
