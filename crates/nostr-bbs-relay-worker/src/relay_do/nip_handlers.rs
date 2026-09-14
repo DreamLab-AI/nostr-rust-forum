@@ -171,6 +171,26 @@ pub(crate) fn human_resolution_required(effective: RiskTier) -> bool {
     matches!(effective, RiskTier::High | RiskTier::Critical)
 }
 
+/// The action and human rationale carried by a signed 31403's content.
+///
+/// Parsed once, here, so the rationale gate and the projection cannot disagree
+/// about what the event said. A malformed body yields `None` for the action,
+/// which the gate treats as "not a gated outcome" — a body that does not parse
+/// is rejected further down by `plan_action_response`, and refusing it here for
+/// the wrong reason would tell the publisher something untrue.
+pub(crate) fn response_action_and_reasoning(content: &str) -> (Option<String>, Option<String>) {
+    let action = governance::broker::DecisionOutcome::from_response_content(content)
+        .map(|o| o.action_str().to_string());
+    let reasoning = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("reasoning")
+                .and_then(|r| r.as_str())
+                .map(str::to_string)
+        });
+    (action, reasoning)
+}
+
 /// The outcome of the 31403 admission gate (P1-6 extended by FR6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResponseAdmission {
@@ -992,6 +1012,29 @@ impl NostrRelayDO {
             if !admission.is_admitted() {
                 Self::send_ok(ws, &event.id, false, admission.reason());
                 return;
+            }
+
+            // FR2.2: a decision on a consequential case must carry the human's
+            // own words. Enforced HERE, before `save_event`, because a 31403 is
+            // a signed event any client or script can publish straight to the
+            // relay — a rule that lives only in the forum UI is a suggestion,
+            // and the point of FR2.2 is that a signed decision represents a
+            // judgement a human actually formed. A refusal never fills the
+            // rationale in; absence is refused, not papered over.
+            if !case_id.is_empty() {
+                if let Some(effective) = self.case_effective_tier(case_id).await {
+                    let (action, reasoning) = response_action_and_reasoning(&event.content);
+                    if let Some(action) = action {
+                        if let Err(e) = governance::check_rationale(
+                            effective,
+                            &action,
+                            reasoning.as_deref(),
+                        ) {
+                            Self::send_ok(ws, &event.id, false, e.reason());
+                            return;
+                        }
+                    }
+                }
             }
         }
 
@@ -2207,6 +2250,26 @@ impl NostrRelayDO {
         ]) {
             let _ = bound.run().await;
         }
+    }
+
+    /// The effective tier stored on a case, or `None` for a case projected
+    /// before migration 0006 (which is not retro-gated on a tier nobody
+    /// computed) or a case id the relay has never seen.
+    pub(crate) async fn case_effective_tier(&self, case_id: &str) -> Option<RiskTier> {
+        let db = self.env.d1("DB").ok()?;
+        #[derive(serde::Deserialize)]
+        struct TierRow {
+            effective_tier: Option<String>,
+        }
+        db.prepare("SELECT effective_tier FROM broker_cases WHERE id = ?1 LIMIT 1")
+            .bind(&[JsValue::from_str(case_id)])
+            .ok()?
+            .first::<TierRow>(None)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.effective_tier)
+            .map(|t| RiskTier::parse(&t))
     }
 
     /// Whether `pubkey` holds the `reviewer` governance role (FR6.2).
@@ -4287,5 +4350,137 @@ mod req_gate_ordering_tests {
             raw[0].extra.get("#p"),
             "raw and gated must not be interchangeable"
         );
+    }
+}
+
+#[cfg(test)]
+mod rationale_gate_tests {
+    //! FR2.2 relay-side: a 31403 on an effective high/critical case must carry
+    //! a human rationale of at least 20 Unicode scalars, refused before
+    //! `save_event` with the token `rationale_required`.
+    //!
+    //! The auditor's counter-example (client evidence `53ca2e2`) was that the
+    //! relay accepted `reasoning: "x"` and accepted no reasoning at all, which
+    //! made FR2.2 a forum-UI convention rather than a protocol rule — and a
+    //! 31403 is a signed event any script can publish straight at the relay.
+    //!
+    //! `handle_event` needs a live WebSocket and D1, so these exercise the two
+    //! pure seams the gate is built from: the content parse, and
+    //! `governance::check_rationale`. The env-bound half is one `SELECT` of
+    //! `broker_cases.effective_tier`.
+    use super::*;
+    use nostr_bbs_core::governance::{check_rationale, RationaleError};
+
+    fn approve(reasoning: &str) -> String {
+        serde_json::json!({ "action": "approve", "reasoning": reasoning }).to_string()
+    }
+
+    // ── The content parse ───────────────────────────────────────────────
+
+    #[test]
+    fn the_action_and_reasoning_are_read_off_the_signed_content() {
+        let (action, reasoning) = response_action_and_reasoning(&approve("checked the diff"));
+        assert_eq!(action.as_deref(), Some("approve"));
+        assert_eq!(reasoning.as_deref(), Some("checked the diff"));
+    }
+
+    #[test]
+    fn an_absent_reasoning_field_reads_as_absent() {
+        let (action, reasoning) =
+            response_action_and_reasoning(r#"{"action":"approve"}"#);
+        assert_eq!(action.as_deref(), Some("approve"));
+        assert_eq!(reasoning, None, "absence must not become an empty string");
+    }
+
+    /// A body that does not parse is not refused *for want of a rationale* —
+    /// it is rejected further down for being malformed. Refusing it here would
+    /// tell the publisher something untrue about why.
+    #[test]
+    fn a_malformed_body_yields_no_action_and_so_no_rationale_refusal() {
+        let (action, _) = response_action_and_reasoning("not json at all");
+        assert_eq!(action, None);
+    }
+
+    // ── The rule, over the parsed content ───────────────────────────────
+
+    /// The auditor's two fixtures, by name: `reasoning: "x"` and no reasoning.
+    #[test]
+    fn the_auditor_counter_examples_are_now_refused() {
+        for content in [approve("x"), r#"{"action":"approve"}"#.to_string()] {
+            let (action, reasoning) = response_action_and_reasoning(&content);
+            let err = check_rationale(
+                RiskTier::Critical,
+                action.as_deref().unwrap(),
+                reasoning.as_deref(),
+            )
+            .expect_err("a critical case must not accept this");
+            assert_eq!(err.reason(), "rationale_required");
+        }
+    }
+
+    /// 19 scalars padded with spaces is 19 scalars.
+    #[test]
+    fn nineteen_characters_with_padding_is_refused() {
+        let content = approve("                   abcdefghijklmnopqrs   ");
+        let (action, reasoning) = response_action_and_reasoning(&content);
+        assert_eq!(
+            check_rationale(RiskTier::High, action.as_deref().unwrap(), reasoning.as_deref()),
+            Err(RationaleError::TooShort { chars: 19 })
+        );
+    }
+
+    /// 20 astral scalars (80 bytes) is 20 characters and is accepted — the
+    /// test fails if anyone counts bytes.
+    #[test]
+    fn twenty_astral_characters_are_accepted_through_the_json_round_trip() {
+        let rationale = "\u{1D11E}".repeat(20);
+        let content = approve(&rationale);
+        let (action, reasoning) = response_action_and_reasoning(&content);
+        assert_eq!(reasoning.as_ref().unwrap().chars().count(), 20);
+        assert_eq!(reasoning.as_ref().unwrap().len(), 80);
+        assert_eq!(
+            check_rationale(RiskTier::High, action.as_deref().unwrap(), reasoning.as_deref()),
+            Ok(())
+        );
+    }
+
+    /// Low and medium tiers are untouched: the gate is about consequence.
+    #[test]
+    fn a_low_tier_case_still_accepts_a_bare_decision() {
+        let (action, reasoning) = response_action_and_reasoning(r#"{"action":"approve"}"#);
+        for tier in [RiskTier::Low, RiskTier::Medium] {
+            assert_eq!(
+                check_rationale(tier, action.as_deref().unwrap(), reasoning.as_deref()),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn delegate_on_a_critical_case_without_a_rationale_is_refused() {
+        let content =
+            serde_json::json!({ "action": "delegate", "delegate_to": "human-carol" }).to_string();
+        let (action, reasoning) = response_action_and_reasoning(&content);
+        assert_eq!(action.as_deref(), Some("delegate"));
+        assert_eq!(
+            check_rationale(
+                RiskTier::Critical,
+                action.as_deref().unwrap(),
+                reasoning.as_deref()
+            ),
+            Err(RationaleError::Missing)
+        );
+    }
+
+    /// A case projected before migration 0006 has no effective tier, so the
+    /// gate does not run at all — legacy behaviour, unchanged.
+    #[test]
+    fn a_legacy_untiered_case_is_not_gated() {
+        // `case_effective_tier` returns None for such a case, and the gate is
+        // inside `if let Some(effective)`. The parse still works, and nothing
+        // downstream refuses it.
+        let (action, reasoning) = response_action_and_reasoning(r#"{"action":"approve"}"#);
+        assert_eq!(action.as_deref(), Some("approve"));
+        assert_eq!(reasoning, None);
     }
 }
