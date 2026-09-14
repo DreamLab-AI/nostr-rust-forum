@@ -3,7 +3,11 @@ expectation_id: EXP-AC-004
 git_sha: 81aa0d9
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T15:42:05Z
-audited_by:
+audited_by: agent:claude-sonnet-5 (degraded: same family as producer; codex GPT-6 Astra unavailable — bwrap sandbox refused in container)
+audited_at: 2026-09-14T19:30:00Z
+auditor_verdict: CONFIRMED
+auditor_counter_examples_attempted: 6
+auditor_counter_examples_found: 0
 ---
 
 # Evidence — EXP-AC-004
@@ -188,6 +192,150 @@ projection — low-sensitivity fields, but a real widening); gift-wrap senders
 escaping suspension; the retention sweep's CAST-versus-parse divergence; and the
 16-hex truncation of `decision_id`. Each belongs to a surface this expectation
 does not own.
+
+## Auditor adversarial probes
+
+Cross-family audit degraded to same-family (see frontmatter). Whole-workspace
+regression re-run independently:
+
+```
+$ cargo test --workspace --exclude nostr-bbs-forum-client
+```
+
+Aggregate across 37 `test result:` blocks: **1589 passed, 0 failed** — exact
+match to the producer's stated total. (A first attempt at this command
+mid-audit failed to compile with escalating, non-deterministic errors —
+duplicate `k256`/`serde` type identities and a linker "duplicate symbol"
+failure that grew worse between consecutive runs on an unchanged tree. Traced
+to a concurrently-running producer process rewriting the working tree and
+racing this same `target/` and shared `CARGO_HOME` registry cache — confirmed
+by commits `68f0ef7`/`8576dfe` landing on this branch during the audit. Not a
+code defect; the re-run above, after the producer's writes settled, compiled
+and passed clean.)
+
+Receipt-ladder probes (`can_advance_stage`), run against the same temporary
+`tests/audit_scratch_probes.rs` as EXP-AC-003 (deleted after the run):
+
+- `Applied -> ConsumerReceived` (the exact regression EXP-AC-004 names): rejected.
+- `RelayAccepted -> AppliedManually` (manual continuation of a decision that
+  never committed): rejected — `applied-manually`'s consumer-received exemption
+  does not extend to skipping the projection precondition.
+
+Endpoint-authority scenarios (`plan_application_advance`, read directly rather
+than re-implemented, since it is already the pure seam the endpoint calls):
+confirmed by code reading that `applied-manually` from a registered
+(non-admin) agent returns `ApplicationRefusal::ManualRequiresAdmin` →
+`status() == 403` (already asserted by the producer's own
+`applied_manually_from_a_non_admin_is_403`), and that `applied-manually` for
+an `open` case state returns `ManualRequiresApprovedCase` →
+`status() == 409` (asserted by `applied_manually_requires_a_prior_approve`'s
+`open`/`none` row). No counter-example: the status-code mapping in
+`ApplicationRefusal::status()` matches EXP-AC-004's spec exactly, and no path
+reaches `Ok(())` for either scenario.
+
+Ageing idempotency: the "exactly once" guarantee is a `(case_id, stage)`
+PRIMARY KEY on `case_side_receipts` (migration 0006) with `INSERT OR IGNORE`
+as the write — verified by reading the migration and the cron write path, not
+re-derivable as a pure-function probe without a D1 mock. Re-running the sweep
+twice cannot double-insert given that schema; this is a structural guarantee
+the auditor could confirm by code reading but not independently execute
+outside a Workers/D1 runtime, same limitation the producer's own evidence
+notes for the D1 shells.
+
+**No counter-example found.** 6 attempted (2 executed as scratch tests, 2
+confirmed by direct code/test reading, 1 whole-workspace regression rerun, 1
+structural-guarantee code read for ageing idempotency).
+
+**Verdict: CONFIRMED.**
+
+## Auditor re-verification of deepsec HIGH fixes
+
+Independent re-verification of the two `HIGH` auth-bypass findings ADR-2011
+records as fixed-but-still-blocking-the-gate (`a14b2b7`, `12a10da`). Read
+directly against current `HEAD` (`8576dfe`, docs/chore-only since `81aa0d9`;
+no crate code changed underneath this audit).
+
+### Fix 1 — `a14b2b7`: REQ subscription gated before storage
+
+Read `crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs`, `handle_req`
+(current lines ~1280-1327):
+
+- `nip42::protected_read_blocked(&filters, ...)` runs at line 1296 and returns
+  early (`send_closed`) **before** any mutation of `session.subscriptions`.
+- `Self::gate_kind_1059_filters(filters, ...)` runs at line 1308, rebinding
+  `filters` to the gated value and returning early (`send_notice`) on refusal.
+- The block that inserts into `session.subscriptions` (line ~1319) and calls
+  `save_subscriptions` (line ~1329) both reference `filters` — the **rebound,
+  gated** value — and sit textually after both gates, with no path from either
+  gate's early return into the insert block.
+
+Confirmed by reading, not merely by comment: because both refusal branches
+`return` before the insert block, a refused subscription structurally never
+reaches `session.subscriptions`, so `broadcast.rs`'s live-match path (which
+reads only what is stored there) cannot later deliver against a raw,
+un-gated filter. This is a control-flow proof rather than a runtime
+observation — an executed scratch test exercising `broadcast_event` against a
+live `SessionsHandler` would need the Durable Object / `worker-rs` runtime,
+which is not available to `cargo test` outside `wrangler`; the producer's own
+evidence notes the same limitation for these D1/DO shells.
+
+```
+$ cargo test -p nostr-bbs-relay-worker --lib req_gate_ordering_tests
+```
+
+```
+test relay_do::nip_handlers::req_gate_ordering_tests::an_unauthenticated_sealed_dm_subscription_yields_no_filter_to_store ... ok
+test relay_do::nip_handlers::req_gate_ordering_tests::the_gated_filter_differs_from_the_raw_one_and_binds_the_recipient ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+**VERIFIED FIXED** — `crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs:1296` (protected_read_blocked gate), `:1308` (kind-1059 gate), `:1319-1331` (insert/save use the gated `filters`).
+
+### Fix 2 — `12a10da`: per-event protected-read gate on all three read paths
+
+Read `crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` and
+`nip42.rs`. `nip42::protected_read_permitted` is called from exactly one place,
+`authorize_event` (`nip_handlers.rs:1667`), which is itself called from three
+sites: the historical REQ delivery loop (`nip_handlers.rs:1350`), the COUNT
+delivery loop (`nip_handlers.rs:1821`), and the live broadcast path
+(`broadcast.rs:114`) — confirmed all three resolve to the same function, not
+three re-implementations that could drift.
+
+Added a temporary test to `nip42.rs`'s existing
+`protected_read_permitted_tests` module (reverted with `git checkout` after
+the run; `git status --short` clean afterwards) simulating `REQ ["s", {}]`
+(no `kinds`, so both filter-level gates pass it) reaching the per-event gate
+for kind 1059 (gift wrap), 4 (encrypted DM) and 30910 (moderation), from an
+unauthenticated session in `Nip42` mode:
+
+```
+$ cargo test -p nostr-bbs-relay-worker --lib protected_read_permitted_tests
+```
+
+```
+test relay_do::nip42::protected_read_permitted_tests::a_gift_wrap_with_several_recipients_serves_each_of_them ... ok
+test relay_do::nip42::protected_read_permitted_tests::a_stranger_receives_no_correspondence_in_either_mode ... ok
+test relay_do::nip42::protected_read_permitted_tests::auditor_probe_kinds_absent_filter_from_anon_socket_is_still_gated_per_event ... ok
+test relay_do::nip42::protected_read_permitted_tests::an_anonymous_viewer_receives_no_correspondence ... ok
+test relay_do::nip42::protected_read_permitted_tests::moderation_kinds_need_only_authentication_and_only_in_nip42 ... ok
+test relay_do::nip42::protected_read_permitted_tests::the_correspondence_set_is_exactly_the_dm_kinds ... ok
+test relay_do::nip42::protected_read_permitted_tests::recipient_matching_is_case_insensitive ... ok
+test relay_do::nip42::protected_read_permitted_tests::unprotected_kinds_are_untouched ... ok
+test relay_do::nip42::protected_read_permitted_tests::the_recipient_and_the_author_both_receive_their_correspondence ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+(The 8 pre-existing `protected_read_permitted_tests`, unmodified, also match
+the producer's evidence exactly, including the existing
+`an_anonymous_viewer_receives_no_correspondence` and
+`moderation_kinds_need_only_authentication_and_only_in_nip42`, which already
+cover this scenario for kinds 4/13/14/1059 and 30910-30916 respectively — the
+auditor's added test is a redundant, independently-authored confirmation of
+the same claim, not new ground.)
+
+**VERIFIED FIXED** — `crates/nostr-bbs-relay-worker/src/relay_do/nip42.rs:85-104` (`protected_read_permitted`), called from `nip_handlers.rs:1649-1675` (`authorize_event`), itself called at `nip_handlers.rs:1350` (historical REQ), `nip_handlers.rs:1821` (COUNT), `broadcast.rs:114` (live broadcast).
 
 ## Not covered by this receipt
 

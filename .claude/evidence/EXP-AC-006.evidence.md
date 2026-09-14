@@ -3,7 +3,11 @@ expectation_id: EXP-AC-006
 git_sha: 81aa0d9
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T15:42:05Z
-audited_by:
+audited_by: agent:claude-sonnet-5 (degraded: same family as producer; codex GPT-6 Astra unavailable — bwrap sandbox refused in container)
+audited_at: 2026-09-14T19:30:00Z
+auditor_verdict: CONFIRMED
+auditor_counter_examples_attempted: 3
+auditor_counter_examples_found: 0
 ---
 
 # Evidence — EXP-AC-006
@@ -220,6 +224,61 @@ projection — low-sensitivity fields, but a real widening); gift-wrap senders
 escaping suspension; the retention sweep's CAST-versus-parse divergence; and the
 16-hex truncation of `decision_id`. Each belongs to a surface this expectation
 does not own.
+
+## Auditor adversarial probes
+
+Cross-family audit degraded to same-family (see frontmatter). Sampling
+determinism and delegation-scoping probes run via the temporary
+`tests/audit_scratch_probes.rs` (nostr-bbs-core, deleted after the run):
+
+```
+test probe_calibration_sampling_determinism_same_id_same_result ... ok
+test probe_calibration_rate_zero_selects_none_rate_one_selects_all ... ok
+test probe_calibration_negative_and_nan_rate_sample_nothing ... ok
+```
+
+- Same request id, called 20 times at rate 0.1: identical answer every time —
+  `is_calibration_sample` reads no clock, confirming EXP-AC-006's named
+  counter-example does not occur.
+- Rate 0.0 selected none of 5 fixed ids; rate 1.0 selected all 5.
+
+**Delegation scoped to a different case (403), by reading rather than
+execution:** `is_delegated_for_case` (`crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs:2205-2226`)
+issues `SELECT case_id FROM case_delegations WHERE case_id = ?1 AND
+lower(delegate_pubkey) = ?2 LIMIT 1` — parameterised on the case in question,
+not merely on the pubkey. A delegatee decided a case delegated to them for
+case A and attempting case B would bind `case_id = B` and find no row,
+returning `false` from `is_delegated_for_case`, which feeds
+`response_admission`'s `has_delegation` boolean and yields
+`BlockedNotDelegated` (pinned by the producer's own
+`reviewer_without_a_delegation_is_refused`, which is exactly this state after
+the SQL resolves to no row). This is a code-read verification, not an
+executed probe: `response_admission` is a pure function that already takes
+`has_delegation: bool` as an abstracted input, so the producer's test suite
+cannot itself distinguish "no delegation exists" from "delegation exists for
+a different case" — both collapse to the same boolean before reaching the
+function under test. Exercising the SQL scoping itself would need a D1 mock,
+which is outside `cargo test`'s reach here (same limitation the producer's
+own evidence notes for every D1 shell in this branch).
+
+**Reviewers endpoint non-admin (403):** `handle_list_reviewers`
+(`crates/nostr-bbs-auth-worker/src/governance_api.rs:1382-1390`) calls
+`require_admin(auth_header, ...)` and returns its error response before ever
+touching the D1 read model. `require_admin` is shared plumbing used
+elsewhere in this worker (not augmentation-specific), so its own test
+coverage is outside this expectation's scope; verified by reading that the
+gate runs first and unconditionally.
+
+**No counter-example found** in the three probes attempted (sampling
+determinism/bounds executed; delegation scoping and reviewers-auth verified
+by code reading, both constrained by the same D1-mock gap the producer's own
+evidence discloses).
+
+**Verdict: CONFIRMED**, with the caveat that the delegation-scoping and
+reviewers-auth claims rest on code reading rather than an executed adversarial
+request, because the pure-function boundary the producer chose to test at
+(`response_admission`) is one level above the SQL that actually does the
+scoping, and no D1 test harness is available outside `wrangler`.
 
 ## Not covered by this receipt
 

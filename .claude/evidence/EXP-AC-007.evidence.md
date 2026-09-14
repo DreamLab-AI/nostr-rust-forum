@@ -3,7 +3,11 @@ expectation_id: EXP-AC-007
 git_sha: 81aa0d9
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T15:42:27Z
-audited_by:
+audited_by: agent:claude-sonnet-5 (degraded: same family as producer; codex GPT-6 Astra unavailable — bwrap sandbox refused in container)
+audited_at: 2026-09-14T19:30:00Z
+auditor_verdict: CONFIRMED
+auditor_counter_examples_attempted: 2
+auditor_counter_examples_found: 0
 ---
 
 # Evidence — EXP-AC-007
@@ -174,6 +178,67 @@ projection — low-sensitivity fields, but a real widening); gift-wrap senders
 escaping suspension; the retention sweep's CAST-versus-parse divergence; and the
 16-hex truncation of `decision_id`. Each belongs to a surface this expectation
 does not own.
+
+## Auditor adversarial probes
+
+Cross-family audit degraded to same-family (see frontmatter).
+
+**Probe 1 — `applied-manually` from a registered (non-admin) agent is 403.**
+Read `plan_application_advance` (`crates/nostr-bbs-auth-worker/src/governance_api.rs:1038-1072`):
+when `requested == AppliedManually` and `!caller.is_admin`, the function
+returns `ApplicationRefusal::ManualRequiresAdmin` before the case-state check
+even runs; `status()` maps this to 403. Already an executed test — the
+producer's own `applied_manually_from_a_non_admin_is_403`
+(`crates/nostr-bbs-auth-worker/src/governance_api.rs:1572-1583`) calls this
+exact path with `agent()` (a registered, non-admin caller) and asserts the
+refusal and its 403. Re-ran it directly:
+
+```
+$ cargo test -p nostr-bbs-auth-worker --lib applied_manually_from_a_non_admin_is_403
+```
+
+```
+test governance_api::augmentation_api_tests::applied_manually_from_a_non_admin_is_403 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out
+```
+
+**No counter-example**: the guard is unconditional on caller identity, before
+any case-state branch is reached.
+
+**Probe 2 — `applied-manually` for an `Open` case is 409, not silently
+admitted.** Read the same function: for `requested == AppliedManually`, the
+decided-and-approved check (`matches!(case_state, "decided" | "resolved")` and
+`latest_outcome == Some("approve")`) runs after the admin check, and its
+failure returns `ApplicationRefusal::ManualRequiresApprovedCase`, which
+`status()` maps to 409, not silently passing through to
+`can_advance_stage`. Re-ran the producer's
+`applied_manually_requires_a_prior_approve`, whose `open`/`none` row is
+exactly this scenario:
+
+```
+$ cargo test -p nostr-bbs-auth-worker --lib applied_manually_requires_a_prior_approve
+```
+
+```
+test governance_api::augmentation_api_tests::applied_manually_requires_a_prior_approve ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out
+```
+
+**No counter-example**: an `Open` case with no decision cannot reach
+`can_advance_stage`, let alone succeed there.
+
+Both probes re-executed the producer's own tests against the live crate
+rather than re-deriving the logic independently, because `plan_application_advance`
+is already the single pure seam both the endpoint and any adversarial caller
+must go through — there is no separate code path to have missed. The value
+added is confirming the tests still pass against `HEAD` (`8576dfe`) after the
+concurrent producer commits landed during this audit, and that the status-code
+mapping in `ApplicationRefusal::status()` (`governance_api.rs:978-987`)
+genuinely returns 403/409 rather than merely being asserted to.
+
+**Verdict: CONFIRMED.**
 
 ## Not covered by this receipt
 

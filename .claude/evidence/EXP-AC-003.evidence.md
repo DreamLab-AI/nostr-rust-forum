@@ -3,7 +3,11 @@ expectation_id: EXP-AC-003
 git_sha: 81aa0d9
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T15:42:05Z
-audited_by:
+audited_by: agent:claude-sonnet-5 (degraded: same family as producer; codex GPT-6 Astra unavailable — bwrap sandbox refused in container)
+audited_at: 2026-09-14T19:30:00Z
+auditor_verdict: CONFIRMED
+auditor_counter_examples_attempted: 4
+auditor_counter_examples_found: 0
 ---
 
 # Evidence — EXP-AC-003
@@ -170,6 +174,58 @@ projection — low-sensitivity fields, but a real widening); gift-wrap senders
 escaping suspension; the retention sweep's CAST-versus-parse divergence; and the
 16-hex truncation of `decision_id`. Each belongs to a surface this expectation
 does not own.
+
+## Auditor adversarial probes
+
+Cross-family audit degraded to same-family (see frontmatter). Probes run as a
+temporary `tests/audit_scratch_probes.rs` in `nostr-bbs-core`, deleted after
+the run (`git status --short` clean afterwards). All probes target
+`effective_tier`/`TaskProperties::merge` directly, calling the same pure
+functions the producer's own tests call, but with adversarial inputs the
+producer's test names do not name.
+
+```
+$ cargo test -p nostr-bbs-core --test audit_scratch_probes
+```
+
+```
+test probe_applied_manually_from_relay_accepted_is_not_projected ... ok
+test probe_calibration_negative_and_nan_rate_sample_nothing ... ok
+test probe_calibration_rate_zero_selects_none_rate_one_selects_all ... ok
+test probe_critical_stakes_plus_declared_low_is_at_least_high ... ok
+test probe_calibration_sampling_determinism_same_id_same_result ... ok
+test probe_irreversible_plus_declared_low_is_at_least_high ... ok
+test probe_merge_request_looser_than_panel_on_all_three_axes ... ok
+test probe_receipt_regression_applied_to_consumer_received_is_rejected ... ok
+test probe_opaque_plus_declared_low_is_at_least_medium_not_suppressed ... ok
+test probe_unlabelled_request_folds_to_env_absent_default ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+- `merge(panel=Opaque/Irreversible/Critical, request=Inspectable/Reversible/Bounded)`
+  did **not** loosen any leg — matches `merge_is_tightening_only_over_all_729_pairs`
+  but exercised as a single adversarial case rather than the enumeration.
+- `effective_tier` with `Opaque` verifiability and a *declared* `Low` tier
+  returned `≥ Medium` and `is_member_suppressed_effective` was `false` — the
+  declared tier cannot pull the floor back down.
+- `effective_tier` with `Irreversible` and declared `Low` returned `≥ High`;
+  same for `Critical` stakes and declared `Low`.
+- Fully unlabelled request (`None, None, None`) folded to exactly the
+  advertised default for all four `RiskTier` values, not to an accidental
+  `Medium`.
+- `can_advance_stage(Applied, ConsumerReceived)` and
+  `can_advance_stage(RelayAccepted, AppliedManually)` were both rejected, as
+  the ADR's ladder requires.
+- Calibration sampling was deterministic across 20 repeats of the same
+  request id, rate 0 selected none of 5 fixed ids, rate 1 selected all of
+  them, and a negative or NaN rate selected none.
+
+**No counter-example found.** All four attempted counter-examples (looser
+merge, Opaque-suppressed-by-declared-Low, Irreversible-suppressed-by-declared-Low,
+unlabelled-not-folding-to-default) failed to materialise; the code held.
+
+**Verdict: CONFIRMED.**
 
 ## Not covered by this receipt
 
