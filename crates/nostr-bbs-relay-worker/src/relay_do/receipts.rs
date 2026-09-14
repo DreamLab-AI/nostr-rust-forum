@@ -365,6 +365,14 @@ pub struct ReceiptRow {
     pub accepted_at: Option<i64>,
     pub projected_at: Option<i64>,
     pub replays: i64,
+    /// FR4.1 provenance: when the mutation owner reported an application stage,
+    /// who reported it, and in whose words. Absent until one is reported.
+    #[serde(default)]
+    pub applied_at: Option<i64>,
+    #[serde(default)]
+    pub applied_by: Option<String>,
+    #[serde(default)]
+    pub acknowledgement: Option<String>,
 }
 
 /// D1 implementation of [`ReceiptStore`].
@@ -589,6 +597,13 @@ fn receipt_json(row: &ReceiptRow) -> serde_json::Value {
         // either.
         "applied": stage.map(ReceiptStage::is_applied).unwrap_or(false),
         "awaitsProjection": stage.map(ReceiptStage::awaits_projection).unwrap_or(false),
+        // FR4.1: the stages past projection, and who claimed them. This is
+        // what the human who approved something reads to learn whether it
+        // actually happened — the loop ADR-2010 left open.
+        "isApplicationStage": stage.map(ReceiptStage::is_application_stage).unwrap_or(false),
+        "appliedAt": row.applied_at,
+        "appliedBy": row.applied_by,
+        "acknowledgement": row.acknowledgement,
         "signedAt": row.signed_at,
         "acceptedAt": row.accepted_at,
         "projectedAt": row.projected_at,
@@ -1161,6 +1176,9 @@ mod tests {
             accepted_at: Some(1_700_000_001),
             projected_at: None,
             replays: 0,
+            applied_at: None,
+            applied_by: None,
+            acknowledgement: None,
         }
     }
 
@@ -1225,5 +1243,80 @@ mod tests {
         assert!(correlate(&ev).is_none());
         let ev = event(vec![t(&["d", ""])], r#"{"action":"approve"}"#);
         assert!(correlate(&ev).is_none());
+    }
+}
+
+#[cfg(test)]
+mod application_stage_wire_tests {
+    //! FR4.1: the read API must speak the extended ladder, or the human who
+    //! approved something still cannot see whether it happened.
+    use super::*;
+
+    fn applied_row() -> ReceiptRow {
+        ReceiptRow {
+            event_id: "e".repeat(64),
+            kind: 31403,
+            case_id: "case-1".to_string(),
+            request_event_id: Some("r".repeat(64)),
+            signer_pubkey: "a".repeat(64),
+            decision_outcome: Some("approve".to_string()),
+            target_operation: Some("publish".to_string()),
+            supersedes_event_id: None,
+            stage: ReceiptStage::Applied.as_str().to_string(),
+            stage_error: None,
+            decision_id: Some("dec-eeeeeeeeeeeeeeee".to_string()),
+            signed_at: 1_700_000_000,
+            accepted_at: Some(1_700_000_001),
+            projected_at: Some(1_700_000_002),
+            replays: 0,
+            applied_at: Some(1_700_000_099),
+            applied_by: Some("b".repeat(64)),
+            acknowledgement: Some("published to the mesh, 3 records written".to_string()),
+        }
+    }
+
+    #[test]
+    fn an_applied_receipt_serialises_its_provenance() {
+        let json = receipt_json(&applied_row());
+        assert_eq!(json["stage"], "applied");
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["isApplicationStage"], true);
+        assert_eq!(json["appliedAt"], 1_700_000_099i64);
+        assert_eq!(json["appliedBy"], "b".repeat(64));
+        assert_eq!(
+            json["acknowledgement"],
+            "published to the mesh, 3 records written"
+        );
+    }
+
+    /// The distinction the whole receipt ladder exists for: a decision the
+    /// owner declined to apply is not applied, and is not a denial either.
+    #[test]
+    fn a_not_applied_receipt_is_not_applied() {
+        let mut row = applied_row();
+        row.stage = ReceiptStage::NotApplied.as_str().to_string();
+        row.acknowledgement = Some("target branch was deleted upstream".to_string());
+        let json = receipt_json(&row);
+        assert_eq!(json["applied"], false);
+        assert_eq!(json["isApplicationStage"], true);
+        assert_eq!(json["awaitsProjection"], false);
+    }
+
+    /// A receipt nobody has reported on yet says so by absence, not by a
+    /// fabricated default (PRD non-functional rule 1).
+    #[test]
+    fn an_unreported_receipt_carries_null_provenance() {
+        let mut row = applied_row();
+        row.stage = ReceiptStage::ProjectionCommitted.as_str().to_string();
+        row.applied_at = None;
+        row.applied_by = None;
+        row.acknowledgement = None;
+        let json = receipt_json(&row);
+        assert_eq!(json["isApplicationStage"], false);
+        assert!(json["appliedAt"].is_null());
+        assert!(json["appliedBy"].is_null());
+        assert!(json["acknowledgement"].is_null());
+        // Still applied in the relay's sense: the projection committed.
+        assert_eq!(json["applied"], true);
     }
 }
