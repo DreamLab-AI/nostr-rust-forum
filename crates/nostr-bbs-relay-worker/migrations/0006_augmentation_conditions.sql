@@ -11,6 +11,12 @@
 -- COLUMN`, which SQLite has no `IF NOT EXISTS` form for. It is applied once by
 -- `wrangler d1 migrations apply`, which records what it has run; re-running the
 -- file by hand will error on the first duplicate column and change nothing.
+--
+-- NOTE ON THE LIVE PATH: this file is the readable record. The schema a deployed
+-- relay actually gets comes from `ensure_schema()` in `src/lib.rs`, which the
+-- worker runs at startup and which discards the duplicate-column error. Every
+-- statement below is mirrored there. **The two move together** — a column added
+-- here and not there simply does not exist in production.
 
 -- ── Effective tier and the properties it derives from (ADR-2011) ────────────
 

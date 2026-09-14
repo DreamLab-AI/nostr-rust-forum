@@ -612,6 +612,28 @@ async fn ensure_schema(env: &Env) {
         // F6 (DDD §7a): supersession marker on the append-only decision trail.
         // Idempotent for already-deployed DBs whose broker_decisions predates F6.
         "ALTER TABLE broker_decisions ADD COLUMN superseded_by TEXT",
+        // ADR-2011 (migration 0006): the effective escalation boundary and the
+        // operator-declared triple it derives from, the calibration mark, the
+        // seeded-probe digest and the panel's ageing deadline. Mirrored here
+        // because THIS function is the live schema path — a deployed DB is
+        // provisioned from here, not from `wrangler d1 migrations apply`, so a
+        // column that exists only in migrations/ would never exist in
+        // production. SQLite has no `ADD COLUMN IF NOT EXISTS`; the error on a
+        // duplicate column is discarded below, which is how every ALTER above
+        // is already idempotent.
+        "ALTER TABLE broker_cases ADD COLUMN declared_tier TEXT",
+        "ALTER TABLE broker_cases ADD COLUMN effective_tier TEXT",
+        "ALTER TABLE broker_cases ADD COLUMN tp_verifiability TEXT",
+        "ALTER TABLE broker_cases ADD COLUMN tp_reversibility TEXT",
+        "ALTER TABLE broker_cases ADD COLUMN tp_stakes TEXT",
+        "ALTER TABLE broker_cases ADD COLUMN calibration_sample INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE broker_cases ADD COLUMN probe_digest TEXT",
+        "ALTER TABLE broker_cases ADD COLUMN max_pending_hours INTEGER",
+        // FR4.1: provenance of an application-stage advance — who claimed it,
+        // when, and in whose words.
+        "ALTER TABLE governance_receipts ADD COLUMN applied_at INTEGER",
+        "ALTER TABLE governance_receipts ADD COLUMN applied_by TEXT",
+        "ALTER TABLE governance_receipts ADD COLUMN acknowledgement TEXT",
     ];
     for stmt in alter_stmts {
         let _ = db.prepare(stmt).run().await;
@@ -779,6 +801,39 @@ async fn ensure_schema(env: &Env) {
             created_at INTEGER NOT NULL, \
             reason TEXT\
         )",
+        // FR4.3 / FR4.5 (migration 0006): `escalated-on-age` and `expired` are
+        // receipts about a CASE, not about a signed decision event, so they
+        // cannot live in `governance_receipts` — every row there is keyed by a
+        // full 64-hex signed event id. The (case_id, stage) primary key is what
+        // makes the ageing cron idempotent: "exactly once per case" is a
+        // constraint, not a code path that has to remember.
+        "CREATE TABLE IF NOT EXISTS case_side_receipts (\
+            case_id TEXT NOT NULL, \
+            stage TEXT NOT NULL, \
+            recorded_at INTEGER NOT NULL, \
+            detail TEXT, \
+            PRIMARY KEY (case_id, stage)\
+        )",
+        // FR6.2 (migration 0006): an admin's Delegate{to} projects one row
+        // here and the 31403 admission gate consults it. A `reviewer`-role
+        // pubkey is otherwise read-only; a row here admits it for EXACTLY the
+        // named case, and `delegated_by` keeps the delegation attributable to
+        // the admin who granted it.
+        "CREATE TABLE IF NOT EXISTS case_delegations (\
+            case_id TEXT NOT NULL, \
+            delegate_pubkey TEXT NOT NULL, \
+            delegated_by TEXT NOT NULL, \
+            decision_id TEXT, \
+            delegated_at INTEGER NOT NULL, \
+            PRIMARY KEY (case_id, delegate_pubkey)\
+        )",
+        // DDD §6 invariant 7 (migration 0006): `event_tags` backs every `#tag`
+        // REQ filter, so a `probe` row there would let any client enumerate the
+        // seeded probes by subscription and destroy the catch rate they exist
+        // to measure. This trigger removes those rows as they are written.
+        "CREATE TRIGGER IF NOT EXISTS trg_event_tags_probe_blind \
+         AFTER INSERT ON event_tags WHEN NEW.name = 'probe' \
+         BEGIN DELETE FROM event_tags WHERE event_id = NEW.event_id AND name = 'probe'; END",
     ];
     for stmt in create_stmts {
         let _ = db.prepare(stmt).run().await;
@@ -817,6 +872,14 @@ async fn ensure_schema(env: &Env) {
         // Task #7: reverse lookup old_pubkey -> new_pubkey for display/cohort
         // resolution (the forward new_pubkey lookup uses the PK).
         "CREATE INDEX IF NOT EXISTS idx_pubkey_aliases_old ON pubkey_aliases(old_pubkey)",
+        // ADR-2011 (migration 0006). `idx_broker_cases_pending_age` serves the
+        // ageing sweep's state filter; the sweep orders by a computed deadline
+        // expression, which SQLite cannot index, so this narrows rather than
+        // satisfies the ORDER BY.
+        "CREATE INDEX IF NOT EXISTS idx_broker_cases_effective_tier ON broker_cases(effective_tier)",
+        "CREATE INDEX IF NOT EXISTS idx_broker_cases_pending_age ON broker_cases(state, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_case_side_receipts_stage ON case_side_receipts(stage)",
+        "CREATE INDEX IF NOT EXISTS idx_case_delegations_delegate ON case_delegations(delegate_pubkey)",
     ];
     for stmt in index_stmts {
         let _ = db.prepare(stmt).run().await;
