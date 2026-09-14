@@ -6,6 +6,7 @@
 
 pub mod admin_alerts;
 pub mod badges;
+pub mod case_projection;
 pub mod channels;
 #[allow(dead_code)]
 pub mod indexed_db;
@@ -15,6 +16,7 @@ pub mod panel_registry;
 pub mod preferences;
 pub mod profile_cache;
 pub mod reactions;
+pub mod receipts;
 pub mod read_position;
 pub mod zone_access;
 pub mod zones;

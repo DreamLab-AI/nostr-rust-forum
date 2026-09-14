@@ -30,6 +30,8 @@ use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::channels::{provide_channel_store, use_channel_store};
 use crate::stores::mute::provide_mute_store;
 use crate::stores::panel_registry::provide_panel_registry;
+use crate::stores::case_projection::provide_case_projection_store;
+use crate::stores::receipts::provide_receipt_store;
 use crate::stores::preferences::provide_preferences;
 use crate::stores::profile_cache::{provide_profile_cache, try_use_profile_cache};
 use crate::stores::read_position::provide_read_positions;
@@ -402,6 +404,13 @@ pub fn App() -> impl IntoView {
     provide_announcer();
     crate::stores::badges::provide_badges();
     provide_panel_registry();
+    // FR4.1: the receipt ladder past projection — whether an approved act
+    // actually took effect. Provided beside the panel registry so every
+    // governance surface can read it.
+    provide_receipt_store();
+    // FR6.3: the relay-authoritative calibration flag (HMAC-selected under a
+    // secret this client neither has nor should have).
+    provide_case_projection_store();
     // Agent disclosure cache (COM-13/F2): one fetch of the active agent set for
     // the whole page; every AgentBadge reads it reactively.
     crate::components::agent_badge::provide_agent_disclosure();

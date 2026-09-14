@@ -4,6 +4,7 @@ pub mod bake;
 pub mod bootstrap;
 pub mod devices;
 pub mod freshness;
+pub mod governance_view;
 pub mod image_compress;
 pub mod paths;
 pub mod pod_client;
@@ -124,11 +125,47 @@ pub fn pubkey_color(pubkey: &str) -> String {
 }
 
 /// Shorten a hex pubkey to "abcd12...ef56" format for display.
+///
+/// Slices by CHARACTER, not by byte. The guard used to be a byte-length check
+/// followed by `&pubkey[..6]`, which panics whenever byte offset 6 or `len - 4`
+/// falls inside a multi-byte character — and a panic in WASM aborts the whole
+/// reactive render, blanking the client. Every current caller passes 64-char
+/// ASCII hex, but this is a public utility with no type-level guarantee of it,
+/// and a Nostr event field is only ever guaranteed to be a string.
 pub fn shorten_pubkey(pubkey: &str) -> String {
-    if pubkey.len() < 12 {
+    let chars: Vec<char> = pubkey.chars().collect();
+    if chars.len() < 12 {
         return pubkey.to_string();
     }
-    format!("{}...{}", &pubkey[..6], &pubkey[pubkey.len() - 4..])
+    let head: String = chars[..6].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}...{tail}")
+}
+
+#[cfg(test)]
+mod shorten_pubkey_tests {
+    use super::shorten_pubkey;
+
+    #[test]
+    fn shortens_a_hex_pubkey() {
+        let pk = "a".repeat(64);
+        assert_eq!(shorten_pubkey(&pk), "aaaaaa...aaaa");
+    }
+
+    #[test]
+    fn leaves_a_short_string_alone() {
+        assert_eq!(shorten_pubkey("abc"), "abc");
+        assert_eq!(shorten_pubkey(""), "");
+    }
+
+    #[test]
+    fn never_panics_on_multi_byte_input() {
+        // Byte offsets 6 and len-4 both fall mid-character here.
+        for s in ["日本語テキストの長い文字列", "😀😀😀😀😀😀😀😀😀😀😀😀"] {
+            let out = shorten_pubkey(s);
+            assert!(out.contains("..."));
+        }
+    }
 }
 
 /// Simple left arrow SVG icon for back navigation buttons.

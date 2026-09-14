@@ -17,7 +17,13 @@ use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
 use crate::relay::RelayConnection;
 use crate::stores::panel_registry::{use_panel_registry, ActionEntry, DecisionView, PanelEntry};
+use crate::stores::case_projection::use_case_projection_store;
+use crate::stores::receipts::{stage_class, stage_label, use_receipt_store};
 use crate::stores::zone_access::use_zone_access;
+use crate::utils::governance_view::{
+    self, CardSection, CaseBoundary, MIN_RATIONALE_LEN,
+};
+use nostr_bbs_core::governance::broker::DecisionOutcome;
 use wasm_bindgen_futures::spawn_local;
 
 // ── Governance page component ────────────────────────────────────────────────
@@ -33,10 +39,28 @@ use wasm_bindgen_futures::spawn_local;
 /// `/governance/admin` route behind `AdminGatedGovernance`, where [`PanelCard`]
 /// and [`ActionRow`] carry the Approve/Reject/action controls.
 ///
-/// `member_view` also drives the F7 approval-fatigue filter: the member surface
-/// suppresses `low` risk-tier action requests. Suppression is a **view filter** —
-/// the events remain in the store, stay visible on the admin surface, and are
+/// `member_view` also drives the F7 approval-fatigue filter, as ADR-2011
+/// rewrote it: the member surface suppresses requests whose **effective** tier
+/// is `low`, never the agent's own `risk_tier` (DDD §6 invariant 3), and never
+/// suppresses a calibration sample (FR6.3) or work the operator declared
+/// opaque, irreversible or critical. Suppression is a **view filter** — the
+/// events remain in the store, stay visible on the admin surface, and are
 /// readable through the decisions read API (ADR-106 Decision 4).
+///
+/// ## Amendment (FR6.2): the split is by *decidability*, not purely by route
+///
+/// ADR-106 Decision 2 split the surface so that an ordinary member's client
+/// never mounts a 31403 publish path. FR6.2 introduces the `reviewer` role: an
+/// admin publishes `Delegate { to }` on one case, and from then on that
+/// delegatee — who is not an admin — must be able to decide **that case**. So
+/// the member route now mounts [`ActionRow`] for exactly the cases
+/// [`governance_view::is_decidable_by`] admits the viewer for, and
+/// [`ReadOnlyActionRow`] for every other card. A member with no delegation
+/// still mounts no publish path anywhere on the surface, which is the property
+/// ADR-106 was protecting; what changed is that "who may decide" is now a
+/// per-case question the delegation chain answers, rather than a property of
+/// the URL. The relay enforces the same gate independently (scoped delegation
+/// admission) — this is the view agreeing with it, not replacing it.
 #[component]
 pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoView {
     let registry = use_panel_registry();
@@ -55,29 +79,92 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
         v
     });
 
-    let actions = Memo::new(move |_| {
+    // One pass over the store per render: resolve each request's panel, compute
+    // its ADR-2011 boundary, and decide — from the delegation chain — whether
+    // this viewer may act on it. Everything downstream (visibility, ordering,
+    // which row component mounts) reads this and recomputes nothing.
+    let auth = use_auth();
+    let viewer_pubkey = auth.pubkey();
+
+    // FR6.3: whether a case is a calibration sample is the RELAY's answer, not
+    // ours. Selection is HMAC'd under a secret only it holds, precisely so the
+    // requesting agent cannot grind its freely-chosen `d` tag out of being
+    // sampled; a key shipped to the browser would be a published key. Read over
+    // `GET /api/governance/cases`, which is member-readable (NIP-98, not admin)
+    // — which it must be, since calibration samples exist to be shown to
+    // members.
+    let cases = use_case_projection_store();
+    #[cfg(target_arch = "wasm32")]
+    Effect::new(move |_| {
+        if let Some(signer) = auth.get_signer() {
+            cases.load(signer);
+        }
+    });
+
+    let cards = Memo::new(move |_| {
+        let admin = zone_access.is_admin.get();
+        let case_state = cases.state.read();
+
+        let viewer = viewer_pubkey.get();
         let s = state.read();
-        let mut v: Vec<ActionEntry> = s
+        let mut v: Vec<ActionCardData> = s
             .actions
             .iter()
-            .filter(|a| !member_view || a.is_member_visible())
-            .cloned()
+            .map(|a| {
+                let panel = crate::stores::panel_registry::resolve_panel_for(
+                    &s.panels,
+                    &a.tags,
+                    &a.agent_pubkey,
+                )
+                .map(|p| p.context());
+                let boundary = a.boundary(
+                    panel.as_ref(),
+                    crate::stores::case_projection::is_calibration_sample_in(
+                        &case_state,
+                        &a.d_tag,
+                    ),
+                );
+                // Scoped to the decisions bound to THIS request's event id: a
+                // colliding `d` tag must not let another case's 31403 reveal
+                // this one's probe or hand a stranger the controls.
+                let steps = crate::stores::panel_registry::chain_steps(
+                    &s.decisions
+                        .get(&a.d_tag)
+                        .map(|e| {
+                            let bound: Vec<_> =
+                                crate::stores::panel_registry::bind_to_request(e, &a.event_id)
+                                    .into_iter()
+                                    .cloned()
+                                    .collect();
+                            crate::stores::panel_registry::resolve_decision_chain(&bound)
+                        })
+                        .unwrap_or_default(),
+                );
+                let decidable =
+                    governance_view::is_decidable_by(&steps, viewer.as_deref(), admin);
+                let decided = governance_view::chain_is_decided(&steps);
+                ActionCardData {
+                    item: a.clone(),
+                    boundary,
+                    decidable,
+                    decided,
+                }
+            })
+            // FR6.2: a case delegated to this viewer is shown to them even when
+            // the member surface would otherwise suppress it — being handed a
+            // case you cannot see is not delegation.
+            .filter(|c| !member_view || c.boundary.is_member_visible() || c.decidable)
             .collect();
-        v.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        // FR4.3 / EXP-AC-006: oldest first, so a stalled case rises rather than
+        // sinking out of sight under fresher work.
+        v.sort_by_key(|c| c.item.created_at);
         v
     });
 
     let panel_count = Memo::new(move |_| state.read().panels.len());
     // Count only the requests this surface renders, so the stat and the
-    // empty-state gate agree with the F7 member suppression.
-    let action_count = Memo::new(move |_| {
-        state
-            .read()
-            .actions
-            .iter()
-            .filter(|a| !member_view || a.is_member_visible())
-            .count()
-    });
+    // empty-state gate agree with the member suppression.
+    let action_count = Memo::new(move |_| cards.get().len());
 
     view! {
         <div class="governance-page max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -149,19 +236,22 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                 }
             >
                 <h2 class="text-xl font-semibold text-white mb-4">"Pending Actions"</h2>
+                <p class="text-gray-500 text-sm mb-4">"Oldest first — a case that has been waiting is the one that needs you."</p>
                 <div class="governance-inbox space-y-2 mb-8">
                     <For
-                        each=move || actions.get()
-                        key=|item| item.event_id.clone()
-                        let:item
+                        each=move || cards.get()
+                        key=|c| (c.item.event_id.clone(), c.decidable, c.decided)
+                        let:c
                     >
-                        // Route-split (ADR-106 Decision 2): the member surface
-                        // mounts a read-only row with no publish path; the admin
-                        // surface mounts the writable ActionRow.
-                        {if member_view {
-                            view! { <ReadOnlyActionRow item=item /> }.into_any()
+                        // Decidability split (ADR-106 Decision 2 as amended by
+                        // FR6.2): the writable row mounts only where this viewer
+                        // may actually publish a 31403 — an admin, or the
+                        // delegatee of this one case. Everyone else gets a row
+                        // that compiles in no signer and no publish path.
+                        {if c.decidable {
+                            view! { <ActionRow card=c /> }.into_any()
                         } else {
-                            view! { <ActionRow item=item /> }.into_any()
+                            view! { <ReadOnlyActionRow card=c /> }.into_any()
                         }}
                     </For>
                 </div>
@@ -210,7 +300,7 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                 <div class="governance-panels-grid grid grid-cols-1 md:grid-cols-2 gap-4">
                     <For
                         each=move || panels.get()
-                        key=|panel| panel.d_tag.clone()
+                        key=|panel| panel.address()
                         let:panel
                     >
                         // Route-split (ADR-106 Decision 2): read-only card for the
@@ -383,88 +473,319 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
     }
 }
 
-// ── Action row component ─────────────────────────────────────────────────────
+// ── Decision card (FR2, FR4.3, FR6.2/6.3/6.4) ───────────────────────────────
 
-#[component]
-fn ActionRow(item: ActionEntry) -> impl IntoView {
-    let auth = use_auth();
+/// One pending request, with everything the surfaces derived about it resolved
+/// once at the page level rather than per row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionCardData {
+    pub item: ActionEntry,
+    /// The ADR-2011 boundary: effective tier, merged task properties,
+    /// calibration flag, probe digest, ageing deadline.
+    pub boundary: CaseBoundary,
+    /// Whether THIS viewer may publish a 31403 on this case (admin, or the
+    /// delegatee an admin named — DDD §6 invariant 6).
+    pub decidable: bool,
+    /// Whether an effective, non-delegation decision already exists.
+    pub decided: bool,
+}
 
-    let priority_class = match item.priority.as_str() {
+/// Human-readable title for a request, from its `title` tag, else its `d`-tag.
+fn card_title(item: &ActionEntry) -> String {
+    nostr_bbs_core::governance::extract_tag(&item.tags, "title")
+        .map(str::to_string)
+        .unwrap_or_else(|| item.d_tag.clone())
+}
+
+fn tier_class(tier: &str) -> &'static str {
+    match tier {
         "critical" => "bg-red-500/20 text-red-400 border-red-500/30",
         "high" => "bg-orange-500/20 text-orange-400 border-orange-500/30",
         "medium" => "bg-blue-500/20 text-blue-400 border-blue-500/30",
-        "low" => "bg-gray-500/20 text-gray-400 border-gray-500/30",
         _ => "bg-gray-500/20 text-gray-400 border-gray-500/30",
-    };
+    }
+}
 
-    let title_tag = nostr_bbs_core::governance::extract_tag(
-        &item
-            .d_tag
-            .split('|')
-            .map(|s| vec![s.to_string()])
-            .collect::<Vec<_>>(),
-        "title",
-    )
-    .map(|s| s.to_string())
-    .unwrap_or_else(|| item.d_tag.clone());
+/// Build every section of a decision card except the reviewer's controls.
+///
+/// Returned as `(section, view)` pairs so the caller can order them by
+/// [`governance_view::card_sections`] — the ordering rule (FR2.1: the agent's
+/// tier and confidence never render above Approve) lives in that tested pure
+/// function, not in a `view!` macro nobody can assert against.
+fn card_body_parts(card: &ActionCardData) -> Vec<(CardSection, AnyView)> {
+    let item = &card.item;
+    let b = &card.boundary;
 
-    let reasoning = item.reasoning.clone().unwrap_or_default();
-    let priority = item.priority.clone();
-    let d_tag = item.d_tag.clone();
-    // F6: supersession history for this action's case (DDD §7a.3).
-    let history_d_tag = item.d_tag.clone();
-    let event_id = item.event_id.clone();
-    // F5: the agent's stated confidence + risk tier, shown at decision time so a
-    // human sees them before responding. Sourced from the 31402 ActionRequest.
-    let confidence = item.confidence;
-    let risk_tier = item.risk_tier.clone();
-    // Resolve the requesting agent's name reactively (display_name > name >
-    // NIP-05 > shortened pubkey). Re-renders when kind-0 metadata arrives.
-    let agent_name =
-        crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
-    // Disclosure badge (COM-13/F2): names the authorising principal when the
-    // requesting agent is active in the registry.
+    let title = card_title(item);
+    let agent_name = crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
     let agent_badge_pubkey = item.agent_pubkey.clone();
 
-    let approve_loading = RwSignal::new(false);
-    let reject_loading = RwSignal::new(false);
+    // FR4.3: age from `created_at`, differenced client-side. `now` is read once
+    // per render; the label itself is pure and tested.
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    let age_label = governance_view::relative_age_label(item.created_at, now);
+    let overdue = governance_view::is_overdue(item.created_at, now, b.max_pending_hours);
+    let max_hours = b.max_pending_hours;
+
+    // FR4.3: the relay's own `escalated-on-age` receipt, where this viewer can
+    // read receipts. Authoritative; the clock reading above is advisory and is
+    // labelled so.
+    let escalated_d_tag = item.d_tag.clone();
+    let receipts = use_receipt_store();
+    let escalated = Memo::new(move |_| {
+        receipts
+            .case(&escalated_d_tag)
+            .map(|c| c.escalated_on_age)
+            .unwrap_or(false)
+    });
+
+    let calibration = b.calibration_sample;
+    // DDD §6 invariant 7: this is the ONLY path by which a probe digest may
+    // reach the DOM, and it yields `None` for every undecided case. The raw
+    // 31402 still carries the tag — stripping it relay-side would invalidate
+    // the signature this client verifies — so the blindness is ours to keep.
+    let probe = governance_view::visible_probe(card.decided, b.probe_digest.as_deref())
+        .map(str::to_string);
+
+    let header = view! {
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+            <span class=format!(
+                "inline-block px-2 py-1 text-xs font-medium rounded border {}",
+                tier_class(b.effective.as_str()),
+            )>{b.effective.as_str()}</span>
+            <span class="text-white font-medium">{title}</span>
+            <span class="text-gray-500 text-xs">{move || agent_name.get()}</span>
+            <AgentBadge pubkey=agent_badge_pubkey compact=true />
+            <span
+                class=move || if overdue || escalated.get() {
+                    "text-xs px-2 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/30"
+                } else {
+                    "text-xs px-2 py-0.5 rounded border bg-gray-700/60 text-gray-400 border-gray-600/50"
+                }
+                title=format!("Pending deadline: {max_hours}h")
+            >{age_label}</span>
+            // The relay said so (a receipt), as against our own clock reading.
+            {move || escalated.get().then(|| view! {
+                <span
+                    class="text-xs px-2 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/30"
+                    title="The relay recorded an escalated-on-age receipt for this case"
+                >"escalated on age"</span>
+            })}
+            {(overdue && !calibration).then(|| view! {
+                <span
+                    class="text-xs px-2 py-0.5 rounded border bg-amber-500/10 text-amber-400/80 border-amber-500/20"
+                    title=format!("Past this panel's {max_hours}h pending deadline, by this browser's clock")
+                >"overdue"</span>
+            })}
+            // FR6.3: a calibration sample is shown rather than suppressed, and
+            // marked subtly — enough that the record is honest about why the
+            // case is here, not so much that it reads as a different kind of
+            // work. It is NOT a probe, and says nothing about the answer.
+            {calibration.then(|| view! {
+                <span
+                    class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-gray-600/50 text-gray-500"
+                    title="Shown as a routine calibration sample rather than suppressed by tier"
+                >"calibration"</span>
+            })}
+            // Only ever reachable once a 31403 exists (invariant 7).
+            {probe.map(|p| view! {
+                <span
+                    class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-purple-500/30 text-purple-400"
+                    title=format!("Seeded probe {p}")
+                >"probe"</span>
+            })}
+        </div>
+    }
+    .into_any();
+
+    let mut parts: Vec<(CardSection, AnyView)> = vec![(CardSection::Header, header)];
+
+    // The agent's own prose, verbatim. Absent where it wrote none.
+    if let Some(reasoning) = item.reasoning.clone().filter(|r| !r.trim().is_empty()) {
+        parts.push((
+            CardSection::AgentReasoning,
+            view! {
+                <p class="text-gray-400 text-sm whitespace-pre-wrap mb-2">{reasoning}</p>
+            }
+            .into_any(),
+        ));
+    }
+
+    // FR2.1: the proposed change itself, pretty-printed, in full, never
+    // truncated. The container scrolls; the text does not shorten.
+    if governance_view::has_proposal(&item.fields) {
+        let pretty = governance_view::pretty_fields(&item.fields);
+        parts.push((
+            CardSection::Proposal,
+            view! {
+                <div class="mb-2">
+                    <span class="text-xs uppercase tracking-wide text-gray-500 block mb-1">"Proposed change"</span>
+                    <pre class="governance-proposal text-xs text-gray-200 bg-gray-900/70 border border-gray-700/60 rounded p-3 max-h-96 overflow-auto whitespace-pre-wrap break-words">{pretty}</pre>
+                </div>
+            }
+            .into_any(),
+        ));
+    }
+
+    // Re-checked here even though the store validated on ingest: this is the
+    // DOM sink, and a sink that trusts its feed is one refactor from stored XSS.
+    if let Some(url) = item
+        .context_url
+        .as_deref()
+        .and_then(governance_view::safe_context_url)
+    {
+        let href = url.clone();
+        parts.push((
+            CardSection::ContextLink,
+            view! {
+                <a
+                    href=href
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="inline-block text-xs text-amber-400 hover:text-amber-300 underline mb-2 break-all"
+                >{url}</a>
+            }
+            .into_any(),
+        ));
+    }
+
+    // FR2.1: the agent's framing, BELOW the controls. Declared tier and
+    // effective tier are both shown — their divergence is exactly how a
+    // habitually under-tiering agent becomes visible (ADR-2011).
+    let declared = b.declared.map(|t| t.as_str().to_string());
+    let effective = b.effective.as_str().to_string();
+    let confidence = item.confidence;
+    let props = b.props;
+    parts.push((
+        CardSection::AgentFraming,
+        view! {
+            <div class="mt-3 pt-3 border-t border-gray-700/50 flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-500">
+                <span>"Agent declared: "{declared.unwrap_or_else(|| "—".into())}</span>
+                {confidence.map(|c| view! {
+                    <span>{format!("Agent confidence: {:.0}%", (c * 100.0).clamp(0.0, 100.0))}</span>
+                })}
+                <span class="text-amber-400/80">"Effective tier: "{effective}</span>
+                {props.map(|p| view! {
+                    <span title="Operator-declared task properties (ADR-2011)">
+                        {format!(
+                            "{} · {} · {}",
+                            p.verifiability.as_str(),
+                            p.reversibility.as_str(),
+                            p.stakes.as_str(),
+                        )}
+                    </span>
+                })}
+            </div>
+        }
+        .into_any(),
+    ));
+
+    parts.push((
+        CardSection::DecisionChain,
+        view! {
+            <SupersessionHistory
+                d_tag=item.d_tag.clone()
+                request_event_id=item.event_id.clone()
+            />
+        }
+        .into_any(),
+    ));
+
+    parts
+}
+
+/// Assemble a card from its parts in the order
+/// [`governance_view::card_sections`] dictates.
+fn assemble_card(
+    mut parts: Vec<(CardSection, AnyView)>,
+    controls: AnyView,
+    has_context_url: bool,
+    has_agent_reasoning: bool,
+) -> Vec<AnyView> {
+    parts.push((CardSection::ReviewerControls, controls));
+    governance_view::card_sections(has_context_url, has_agent_reasoning)
+        .into_iter()
+        .filter_map(|section| {
+            parts
+                .iter()
+                .position(|(k, _)| *k == section)
+                .map(|i| parts.remove(i).1)
+        })
+        .collect()
+}
+
+fn has_context_url(item: &ActionEntry) -> bool {
+    item.context_url
+        .as_deref()
+        .and_then(governance_view::safe_context_url)
+        .is_some()
+}
+
+fn has_agent_reasoning(item: &ActionEntry) -> bool {
+    item.reasoning
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty())
+}
+
+// ── Writable decision card ───────────────────────────────────────────────────
+
+/// The decision card for a viewer who may actually decide this case: an admin,
+/// or the delegatee an admin named on it (FR6.2).
+///
+/// It collects the human's rationale and publishes it **verbatim** as the
+/// 31403's `reasoning` ([`governance_view::decision_content`]). There is no
+/// template anywhere in this crate: where the reviewer typed nothing, the
+/// published `reasoning` is the empty string, which is the honest record.
+/// For an effective tier of `high` or `critical` every control stays disabled
+/// until the rationale has at least [`MIN_RATIONALE_LEN`] non-whitespace
+/// characters (FR2.2).
+#[component]
+fn ActionRow(card: ActionCardData) -> impl IntoView {
+    let auth = use_auth();
+    let zone_access = use_zone_access();
+    let is_admin = Memo::new(move |_| zone_access.is_admin.get());
+
+    let item = card.item.clone();
+    let effective = card.boundary.effective;
+    let d_tag = item.d_tag.clone();
+    let event_id = item.event_id.clone();
+    let ctx_url = has_context_url(&item);
+    let agent_reasoning = has_agent_reasoning(&item);
+
+    let rationale = RwSignal::new(String::new());
+    let amend_open = RwSignal::new(false);
+    let amend_diff = RwSignal::new(String::new());
+    let delegate_open = RwSignal::new(false);
+    let delegate_to = RwSignal::new(String::new());
+    let pending: RwSignal<Option<String>> = RwSignal::new(None);
     let response_sent = RwSignal::new(false);
-    // F4: relay-rejection state. `response_sent` advances only on a relay OK; a
-    // rejection re-shows the controls (retryable) rather than reading as sent.
+    // A relay rejection re-shows the controls (retryable) rather than reading
+    // as sent (F4).
     let response_rejected = RwSignal::new(false);
 
-    // Resolve the relay at component construction — calling expect_context()
-    // (or use_auth()) inside the click handler panics ("expected context of
-    // type AuthStore") because the reactive owner is gone by event time, and
-    // the panic kills the whole WASM runtime (same hazard RsvpButtons
-    // documents). `auth` is already resolved in the component body above; the
-    // Rc-based relay rides a local StoredValue so the closure captures a Copy
-    // handle.
+    // Resolve the relay at component construction: calling expect_context()
+    // inside a click handler panics once the reactive owner is gone, and the
+    // panic kills the whole WASM runtime.
     let relay_stored = StoredValue::new_local(expect_context::<RelayConnection>());
 
-    let send_response = {
+    let publish = {
         let event_id = event_id.clone();
         let d_tag = d_tag.clone();
-        move |action: &str, loading_sig: RwSignal<bool>| {
-            let action = action.to_string();
+        move |outcome: DecisionOutcome| {
+            let label = outcome.action_str().to_string();
             let event_id = event_id.clone();
             let d_tag = d_tag.clone();
-            loading_sig.set(true);
+            pending.set(Some(label));
             response_rejected.set(false);
 
-            let pubkey = match auth.pubkey().get_untracked() {
-                Some(pk) => pk,
-                None => {
-                    loading_sig.set(false);
-                    return;
-                }
+            let Some(pubkey) = auth.pubkey().get_untracked() else {
+                pending.set(None);
+                return;
             };
 
-            let content = serde_json::json!({
-                "action": action,
-                "reasoning": format!("Human {} via governance UI", action),
-            })
-            .to_string();
+            // FR2.2 / DDD §6 invariant 1: the reviewer's own bytes, untrimmed,
+            // and nothing else.
+            let content = governance_view::decision_content(&outcome, &rationale.get_untracked());
 
             let now = (js_sys::Date::now() / 1000.0) as u64;
             let unsigned = nostr_bbs_core::UnsignedEvent {
@@ -478,16 +799,13 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                 content,
             };
 
-            // Async sign so NIP-07 / extension users can respond.
             let r = relay_stored.get_value();
             spawn_local(async move {
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {
-                        // F4: advance to "Response sent" only when the relay
-                        // acknowledges with OK; a rejection surfaces as retryable.
-                        let ack: crate::relay::PublishCallback = Rc::new(
-                            move |accepted: bool, message: String| {
-                                loading_sig.set(false);
+                        let ack: crate::relay::PublishCallback =
+                            Rc::new(move |accepted: bool, message: String| {
+                                pending.set(None);
                                 if accepted {
                                     response_sent.set(true);
                                 } else {
@@ -496,14 +814,13 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                                         &format!("[governance] action response rejected by relay: {message}").into(),
                                     );
                                 }
-                            },
-                        );
+                            });
                         if let Err(e) = r.publish_with_ack(&signed, Some(ack)) {
                             web_sys::console::warn_1(
                                 &format!("[governance] Failed to publish action response: {e}")
                                     .into(),
                             );
-                            loading_sig.set(false);
+                            pending.set(None);
                             response_rejected.set(true);
                         }
                     }
@@ -511,72 +828,157 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
                         web_sys::console::warn_1(
                             &format!("[governance] Failed to sign action response: {e}").into(),
                         );
-                        loading_sig.set(false);
+                        pending.set(None);
                     }
                 }
             });
         }
     };
 
-    let on_approve = {
-        let send = send_response.clone();
-        move |_| send("approve", approve_loading)
-    };
-    let on_reject = {
-        let send = send_response;
-        move |_| send("reject", reject_loading)
-    };
-
     let is_authed = auth.is_authenticated();
+    // FR2.2: the gate. One predicate, tested in `governance_view`, applied to
+    // every control — approve, reject, amend and delegate alike, because a
+    // delegation on a critical case is as consequential as a decision on it.
+    let gate_ok = Memo::new(move |_| {
+        governance_view::rationale_satisfied(effective, &rationale.get())
+    });
+    let blocked = move || {
+        !is_authed.get() || pending.get().is_some() || response_sent.get() || !gate_ok.get()
+    };
+    let required = governance_view::rationale_required(effective);
 
-    view! {
-        <div class="action-row bg-gray-800 rounded-lg p-4 border border-gray-700/50 flex items-center gap-4">
-            <div class="flex-shrink-0">
-                <span class={format!("inline-block px-2 py-1 text-xs font-medium rounded border {priority_class}")}>{priority}</span>
-            </div>
-            <div class="flex-1 min-w-0">
-                <span class="text-white font-medium block truncate">{title_tag}</span>
-                <span class="text-gray-500 text-xs block truncate">
-                    {reasoning}" · "{move || agent_name.get()}
-                </span>
-                // F5: agent-declared risk tier + confidence, at decision time.
-                {move || {
-                    let mut parts: Vec<String> = Vec::new();
-                    if let Some(t) = risk_tier.clone() {
-                        parts.push(format!("risk: {t}"));
-                    }
-                    if let Some(c) = confidence {
-                        parts.push(format!("confidence: {:.0}%", (c * 100.0).clamp(0.0, 100.0)));
-                    }
-                    (!parts.is_empty()).then(|| view! {
-                        <span class="text-amber-400/80 text-xs block truncate">{parts.join(" · ")}</span>
-                    })
-                }}
-                <AgentBadge pubkey=agent_badge_pubkey compact=true />
-                <SupersessionHistory d_tag=history_d_tag />
-            </div>
+    // Park the publisher in a `StoredValue` so every handler captures a `Copy`
+    // handle. A `Show` fallback and its children are `Fn`, so a handler that
+    // captured the publisher by move would only be `FnOnce` and the whole
+    // control block would fail to compile.
+    let publish = StoredValue::new_local(Rc::new(publish) as Rc<dyn Fn(DecisionOutcome)>);
+
+    let on_approve = move |_| (publish.get_value())(DecisionOutcome::Approve);
+    let on_reject = move |_| (publish.get_value())(DecisionOutcome::Reject);
+    let on_amend = move |_| {
+        let diff = amend_diff.get_untracked();
+        if diff.trim().is_empty() {
+            return;
+        }
+        (publish.get_value())(DecisionOutcome::Amend { diff })
+    };
+    let on_delegate = move |_| {
+        // A mistyped target would mint a delegation to a pubkey nobody holds
+        // and park the case with no delegatee able to move it.
+        let Some(to) = governance_view::normalise_delegate_pubkey(&delegate_to.get_untracked())
+        else {
+            return;
+        };
+        (publish.get_value())(DecisionOutcome::Delegate { delegate_to: to })
+    };
+
+    let btn = "px-3 py-1.5 text-xs rounded border transition-colors disabled:opacity-40 disabled:cursor-not-allowed";
+
+    let controls = view! {
+        <div class="reviewer-controls mt-3">
             <Show
                 when=move || response_sent.get()
                 fallback=move || view! {
-                    <div class="flex flex-col items-end gap-1 flex-shrink-0">
-                        <div class="flex gap-2">
+                    <div class="flex flex-col gap-2">
+                        <label class="text-xs uppercase tracking-wide text-gray-500">
+                            {if required {
+                                format!("Your rationale (required, at least {MIN_RATIONALE_LEN} characters)")
+                            } else {
+                                "Your rationale (optional)".to_string()
+                            }}
+                        </label>
+                        <textarea
+                            class="w-full text-sm bg-gray-900/70 border border-gray-700/60 rounded p-2 text-gray-100 focus:outline-none focus:border-amber-500/60"
+                            rows="3"
+                            placeholder="Why you are deciding this, in your own words."
+                            prop:value=move || rationale.get()
+                            on:input=move |ev| rationale.set(event_target_value(&ev))
+                        ></textarea>
+                        {move || (required && !gate_ok.get()).then(|| {
+                            let left = governance_view::rationale_remaining(effective, &rationale.get());
+                            view! {
+                                <span class="text-amber-400/80 text-xs">
+                                    {format!(
+                                        "This case is {} — {left} more character(s) of rationale before you can decide it.",
+                                        effective.as_str(),
+                                    )}
+                                </span>
+                            }
+                        })}
+                        <div class="flex flex-wrap gap-2">
                             <button
-                                class="px-3 py-1.5 text-xs rounded bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20 transition-colors disabled:opacity-50"
-                                disabled=move || !is_authed.get() || approve_loading.get()
-                                on:click=on_approve.clone()
+                                class=format!("{btn} bg-green-500/10 text-green-400 border-green-500/20 hover:bg-green-500/20")
+                                disabled=blocked
+                                on:click=on_approve
                             >
-                                {move || if approve_loading.get() { "..." } else { "Approve" }}
+                                {move || if pending.get().as_deref() == Some("approve") { "…" } else { "Approve" }}
                             </button>
                             <button
-                                class="px-3 py-1.5 text-xs rounded bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-colors disabled:opacity-50"
-                                disabled=move || !is_authed.get() || reject_loading.get()
-                                on:click=on_reject.clone()
+                                class=format!("{btn} bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20")
+                                disabled=blocked
+                                on:click=on_reject
                             >
-                                {move || if reject_loading.get() { "..." } else { "Reject" }}
+                                {move || if pending.get().as_deref() == Some("reject") { "…" } else { "Reject" }}
                             </button>
+                            <button
+                                class=format!("{btn} bg-blue-500/10 text-blue-400 border-blue-500/20 hover:bg-blue-500/20")
+                                disabled=blocked
+                                on:click=move |_| amend_open.update(|o| *o = !*o)
+                            >"Amend…"</button>
+                            // FR6.2: delegation is an ADMIN act. A delegatee
+                            // deciding their own case cannot re-delegate it.
+                            {move || is_admin.get().then(|| view! {
+                                <button
+                                    class=format!("{btn} bg-purple-500/10 text-purple-400 border-purple-500/20 hover:bg-purple-500/20")
+                                    disabled=blocked
+                                    on:click=move |_| delegate_open.update(|o| *o = !*o)
+                                >"Delegate to…"</button>
+                            })}
                         </div>
-                        // F4: a relay-rejected response reads as rejected + retryable,
-                        // never as sent.
+                        <Show when=move || amend_open.get() fallback=|| ()>
+                            <div class="flex flex-col gap-1">
+                                <textarea
+                                    class="w-full text-xs font-mono bg-gray-900/70 border border-gray-700/60 rounded p-2 text-gray-100"
+                                    rows="4"
+                                    placeholder="The amendment, as a diff or a replacement payload."
+                                    prop:value=move || amend_diff.get()
+                                    on:input=move |ev| amend_diff.set(event_target_value(&ev))
+                                ></textarea>
+                                <button
+                                    class=format!("{btn} self-start bg-blue-500/10 text-blue-400 border-blue-500/20 hover:bg-blue-500/20")
+                                    disabled=move || blocked() || amend_diff.get().trim().is_empty()
+                                    on:click=on_amend
+                                >
+                                    {move || if pending.get().as_deref() == Some("amend") { "…" } else { "Publish amendment" }}
+                                </button>
+                            </div>
+                        </Show>
+                        <Show when=move || delegate_open.get() && is_admin.get() fallback=|| ()>
+                            <div class="flex flex-col gap-1">
+                                <input
+                                    class="w-full text-xs font-mono bg-gray-900/70 border border-gray-700/60 rounded p-2 text-gray-100"
+                                    placeholder="Reviewer pubkey (64 hex characters)"
+                                    prop:value=move || delegate_to.get()
+                                    on:input=move |ev| delegate_to.set(event_target_value(&ev))
+                                />
+                                {move || {
+                                    let raw = delegate_to.get();
+                                    (!raw.trim().is_empty()
+                                        && governance_view::normalise_delegate_pubkey(&raw).is_none())
+                                    .then(|| view! {
+                                        <span class="text-red-400 text-xs">"Not a 64-character hex pubkey."</span>
+                                    })
+                                }}
+                                <button
+                                    class=format!("{btn} self-start bg-purple-500/10 text-purple-400 border-purple-500/20 hover:bg-purple-500/20")
+                                    disabled=move || blocked()
+                                        || governance_view::normalise_delegate_pubkey(&delegate_to.get()).is_none()
+                                    on:click=on_delegate
+                                >
+                                    {move || if pending.get().as_deref() == Some("delegate") { "…" } else { "Delegate this case" }}
+                                </button>
+                            </div>
+                        </Show>
                         <Show when=move || response_rejected.get() fallback=|| ()>
                             <span class="text-red-400 text-xs font-medium">"⚠ Rejected by relay — retry"</span>
                         </Show>
@@ -587,17 +989,27 @@ fn ActionRow(item: ActionEntry) -> impl IntoView {
             </Show>
         </div>
     }
+    .into_any();
+
+    let sections = assemble_card(card_body_parts(&card), controls, ctx_url, agent_reasoning);
+
+    view! {
+        <div class="action-row bg-gray-800 rounded-lg p-4 border border-gray-700/50">
+            {sections}
+        </div>
+    }
 }
 
 // ── Read-only member components (F1, ADR-106 Decision 2) ─────────────────────
 //
-// These are the ONLY panel/action components the member route (`member_view =
-// true`) mounts. They render panels and their outcomes but compile in no relay
-// handle, no signer, and no 31403 publish path — the split-by-route invariant
-// (DDD Invariant 1: "the member read path publishes nothing"). A grep of this
-// region for `publish`/`sign_event`/`RelayConnection` returns nothing; the write
-// machinery lives only in [`PanelCard`] and [`ActionRow`] above, which the
-// member route never instantiates.
+// [`ReadOnlyPanelCard`] and [`ReadOnlyActionRow`] render panels, proposals and
+// their outcomes but compile in no relay handle, no signer, and no 31403
+// publish path. A grep of this region for `publish`/`sign_event`/
+// `RelayConnection` returns nothing; the write machinery lives only in
+// [`PanelCard`] and [`ActionRow`] above. Since FR6.2 the choice between the two
+// rows is per-case decidability rather than the route alone — see
+// [`GovernancePage`] — but the property ADR-106 protects is unchanged: a viewer
+// who may not decide a case mounts nothing that could.
 
 /// Read-only panel card for the member surface. Mirrors [`PanelCard`]'s
 /// presentation — title, schema, description, counts, agent name, disclosure
@@ -653,69 +1065,33 @@ fn ReadOnlyPanelCard(panel: PanelEntry) -> impl IntoView {
     }
 }
 
-/// Read-only action row for the member surface. Mirrors [`ActionRow`]'s decision
-/// context — priority, title, reasoning, agent, risk tier + confidence,
-/// disclosure badge — but replaces the Approve/Reject controls with a static
-/// "Awaiting administrator decision" status. No signer, no relay, no 31403.
+/// Read-only decision card. Renders exactly the same decision context as
+/// [`ActionRow`] — including the proposed change in full, the context link and
+/// the agent's framing below where the controls would be — and replaces the
+/// controls with a status line. No signer, no relay, no 31403.
+///
+/// It is what a member sees on every case, and what a delegated reviewer sees
+/// on every case except the one delegated to them.
 #[component]
-fn ReadOnlyActionRow(item: ActionEntry) -> impl IntoView {
-    let priority_class = match item.priority.as_str() {
-        "critical" => "bg-red-500/20 text-red-400 border-red-500/30",
-        "high" => "bg-orange-500/20 text-orange-400 border-orange-500/30",
-        "medium" => "bg-blue-500/20 text-blue-400 border-blue-500/30",
-        "low" => "bg-gray-500/20 text-gray-400 border-gray-500/30",
-        _ => "bg-gray-500/20 text-gray-400 border-gray-500/30",
-    };
+fn ReadOnlyActionRow(card: ActionCardData) -> impl IntoView {
+    let ctx_url = has_context_url(&card.item);
+    let agent_reasoning = has_agent_reasoning(&card.item);
+    let decided = card.decided;
 
-    let title_tag = nostr_bbs_core::governance::extract_tag(
-        &item
-            .d_tag
-            .split('|')
-            .map(|s| vec![s.to_string()])
-            .collect::<Vec<_>>(),
-        "title",
-    )
-    .map(|s| s.to_string())
-    .unwrap_or_else(|| item.d_tag.clone());
+    let status = view! {
+        <div class="reviewer-controls mt-3">
+            <span class="inline-block text-xs text-gray-500 border border-gray-600/60 rounded px-2.5 py-1">
+                {if decided { "Decided" } else { "Awaiting a decision" }}
+            </span>
+        </div>
+    }
+    .into_any();
 
-    let reasoning = item.reasoning.clone().unwrap_or_default();
-    let priority = item.priority.clone();
-    let confidence = item.confidence;
-    let risk_tier = item.risk_tier.clone();
-    let agent_name =
-        crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
-    let agent_badge_pubkey = item.agent_pubkey.clone();
-    // F6: supersession history for this action's case (DDD §7a.3).
-    let history_d_tag = item.d_tag.clone();
+    let sections = assemble_card(card_body_parts(&card), status, ctx_url, agent_reasoning);
 
     view! {
-        <div class="action-row bg-gray-800 rounded-lg p-4 border border-gray-700/50 flex items-center gap-4">
-            <div class="flex-shrink-0">
-                <span class={format!("inline-block px-2 py-1 text-xs font-medium rounded border {priority_class}")}>{priority}</span>
-            </div>
-            <div class="flex-1 min-w-0">
-                <span class="text-white font-medium block truncate">{title_tag}</span>
-                <span class="text-gray-500 text-xs block truncate">
-                    {reasoning}" · "{move || agent_name.get()}
-                </span>
-                {move || {
-                    let mut parts: Vec<String> = Vec::new();
-                    if let Some(t) = risk_tier.clone() {
-                        parts.push(format!("risk: {t}"));
-                    }
-                    if let Some(c) = confidence {
-                        parts.push(format!("confidence: {:.0}%", (c * 100.0).clamp(0.0, 100.0)));
-                    }
-                    (!parts.is_empty()).then(|| view! {
-                        <span class="text-amber-400/80 text-xs block truncate">{parts.join(" · ")}</span>
-                    })
-                }}
-                <AgentBadge pubkey=agent_badge_pubkey compact=true />
-                <SupersessionHistory d_tag=history_d_tag />
-            </div>
-            <span class="flex-shrink-0 text-xs text-gray-500 border border-gray-600/60 rounded px-2.5 py-1">
-                "Awaiting administrator decision"
-            </span>
+        <div class="action-row bg-gray-800 rounded-lg p-4 border border-gray-700/50">
+            {sections}
         </div>
     }
 }
@@ -733,9 +1109,49 @@ fn ReadOnlyActionRow(item: ActionEntry) -> impl IntoView {
 /// case with a single, un-superseded decision still shows its outcome. A case
 /// with no observed decisions renders nothing.
 #[component]
-fn SupersessionHistory(d_tag: String) -> impl IntoView {
+fn SupersessionHistory(
+    d_tag: String,
+    /// The request EVENT id, on a decision card. When given, the chain is
+    /// scoped to the decisions bound to that request, so a 31403 carrying a
+    /// colliding `d` tag cannot land here. `None` on a PANEL card, which has
+    /// no request to bind to.
+    #[prop(optional)]
+    request_event_id: Option<String>,
+) -> impl IntoView {
     let registry = use_panel_registry();
-    let chain = Memo::new(move |_| registry.decision_chain(&d_tag));
+    let receipts = use_receipt_store();
+    let auth = use_auth();
+    let chain_key = d_tag.clone();
+    let bind_key = request_event_id.clone();
+    let chain = Memo::new(move |_| match &bind_key {
+        Some(req) => registry.case_chain(&chain_key, req),
+        None => registry.decision_chain(&chain_key),
+    });
+
+    // FR4.1: pull the case's receipt trail so each decision can say how far it
+    // actually got. The read is NIP-98 admin (the relay scopes cross-case
+    // receipt reads to its administrative authority), so a member or a
+    // delegated reviewer sees the chain without stages — which the store
+    // records as "unavailable" and never as "not applied".
+    #[cfg(target_arch = "wasm32")]
+    {
+        let load_key = d_tag.clone();
+        Effect::new(move |_| {
+            if chain.get().is_empty() {
+                return;
+            }
+            let Some(signer) = auth.get_signer() else {
+                return;
+            };
+            receipts.load_case(&load_key, signer);
+        });
+    }
+    // The receipt read is a WASM-only path (it needs `window.fetch`); on the
+    // host target these two are constructed for parity and not used.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (&auth, &receipts);
+    }
 
     view! {
         <Show when=move || !chain.get().is_empty() fallback=|| ()>
@@ -759,17 +1175,33 @@ fn SupersessionHistory(d_tag: String) -> impl IntoView {
 
 #[component]
 fn DecisionChainRow(view: DecisionView) -> impl IntoView {
-    let signer = view.entry.signer_pubkey.clone();
-    let signer_short = if signer.len() > 12 {
-        format!("{}…{}", &signer[..8], &signer[signer.len() - 4..])
-    } else {
-        signer
-    };
+    // Character-safe: a hostile 31403 carries arbitrary strings, and a
+    // byte-slice at a fixed offset panics on a multi-byte boundary — which in
+    // WASM aborts the whole reactive render.
+    let signer_short = governance_view::short_id(&view.entry.signer_pubkey);
     let outcome = view.entry.outcome.clone();
     let reason = view.entry.reason.clone();
     let superseded = view.superseded;
     let effective = view.effective;
     let is_supersede = view.entry.supersedes.is_some();
+    // FR6.2: a delegation names its delegatee in the chain, and the admin who
+    // made it stays attributable (DDD §6 invariant 6 — "the delegation itself
+    // remains in the chain").
+    let delegate_to = view
+        .entry
+        .delegate_to
+        .as_deref()
+        .map(governance_view::short_id);
+
+    // FR4.1: how far this decision actually got.
+    let receipts = use_receipt_store();
+    let case_key = view.entry.d_tag.clone();
+    let event_key = view.entry.event_id.clone();
+    let receipt = Memo::new(move |_| {
+        receipts
+            .case(&case_key)
+            .and_then(|c| c.by_decision.get(&event_key).cloned())
+    });
 
     let outcome_class = if superseded {
         "line-through text-gray-500"
@@ -778,14 +1210,36 @@ fn DecisionChainRow(view: DecisionView) -> impl IntoView {
     };
 
     view! {
-        <li class="flex items-center gap-2 text-xs">
+        <li class="flex flex-wrap items-center gap-2 text-xs">
             {is_supersede.then(|| view! {
                 <span class="text-amber-400/70" title="supersedes a prior decision">"↳"</span>
             })}
             <span class=outcome_class>{outcome}</span>
+            {delegate_to.map(|d| view! {
+                <span class="text-purple-400/80" title="delegated to this reviewer">{format!("→ {d}")}</span>
+            })}
             <span class="text-gray-500 truncate">{signer_short}</span>
             {(!reason.is_empty()).then(|| view! {
                 <span class="text-gray-600 truncate italic">{reason}</span>
+            })}
+            // The receipt ladder: what the relay and the mutation owner each
+            // certified. Absence of a receipt shows nothing at all — it is not
+            // evidence that the act did not happen.
+            {move || receipt.get().map(|r| {
+                let label = stage_label(r.stage);
+                let class = stage_class(r.stage);
+                let detail = r
+                    .acknowledgement
+                    .clone()
+                    .or_else(|| r.stage_error.clone())
+                    .or_else(|| r.applied_by.clone().map(|by| format!("by {by}")))
+                    .unwrap_or_else(|| label.to_string());
+                view! {
+                    <span
+                        class=format!("px-1.5 py-0.5 rounded border {class}")
+                        title=detail
+                    >{label}</span>
+                }
             })}
             {superseded.then(|| view! {
                 <span class="ml-auto flex-shrink-0 px-1.5 py-0.5 rounded bg-gray-700/60 text-gray-400 border border-gray-600/50">
