@@ -501,15 +501,35 @@ pub async fn handle_revoke_agent(
         Err(e) => return error_json(env, &format!("bad body: {e}"), 400),
     };
 
+    // Revocation is a credential-disabling control, so it must not report
+    // success it did not achieve. `/provision` stores the pubkey lowercased and
+    // the registry lookup now normalises, so a revoke that did not normalise
+    // could silently miss the row and leave the agent live.
+    if body.pubkey.len() != 64 || !body.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return error_json(env, "invalid pubkey: must be 64 hex chars", 400);
+    }
+    let pubkey = body.pubkey.to_ascii_lowercase();
+
     let db = relay_db(env)?;
-    db.prepare("UPDATE agent_registry SET active = 0 WHERE pubkey = ?1")
-        .bind(&[JsValue::from_str(&body.pubkey)])?
+    let result = db
+        .prepare("UPDATE agent_registry SET active = 0 WHERE lower(pubkey) = ?1")
+        .bind(&[JsValue::from_str(&pubkey)])?
         .run()
         .await?;
 
+    let changed = result
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|m| m.changes)
+        .unwrap_or(0);
+    if changed == 0 {
+        return error_json(env, "no such agent", 404);
+    }
+
     json_response(
         env,
-        &json!({ "ok": true, "pubkey": body.pubkey, "active": false }),
+        &json!({ "ok": true, "pubkey": pubkey, "active": false }),
         200,
     )
 }
@@ -924,6 +944,10 @@ pub(crate) enum ApplicationRefusal {
     UnknownStage,
     /// The caller is neither a registered agent nor an admin.
     NotAuthorised,
+    /// The caller is a registered agent, but not the one whose case this is.
+    /// A receipt says what happened to *your* mutation; only its owner can
+    /// know, and only its owner may say.
+    NotTheCaseOwner,
     /// `applied-manually` is an admin-only act (FR7.2).
     ManualRequiresAdmin,
     /// `applied-manually` presupposes a prior `Approve` (DDD §6 invariant 4).
@@ -936,7 +960,7 @@ impl ApplicationRefusal {
     pub(crate) fn status(&self) -> u16 {
         match self {
             Self::UnknownStage => 400,
-            Self::NotAuthorised | Self::ManualRequiresAdmin => 403,
+            Self::NotAuthorised | Self::NotTheCaseOwner | Self::ManualRequiresAdmin => 403,
             // A regression and a not-yet-approved case are both conflicts with
             // durable state, not authentication problems: 409, so a retrying
             // client can tell "you may not" from "not in that order".
@@ -952,6 +976,10 @@ impl ApplicationRefusal {
             }
             Self::NotAuthorised => {
                 "only a registered agent or an admin may report an application stage".to_string()
+            }
+            Self::NotTheCaseOwner => {
+                "only the agent that raised this case, or an admin, may report its application stage"
+                    .to_string()
             }
             Self::ManualRequiresAdmin => {
                 "applied-manually may only be reported by an admin".to_string()
@@ -969,6 +997,10 @@ impl ApplicationRefusal {
 pub(crate) struct ApplicationCaller {
     pub is_admin: bool,
     pub is_registered_agent: bool,
+    /// Whether this caller is the agent that raised the case (its
+    /// `broker_cases.created_by`), and therefore the owner of the mutation the
+    /// receipt is about.
+    pub is_case_owner: bool,
 }
 
 /// Decide whether one application-stage advance is permitted (FR4.1, FR7.2).
@@ -995,8 +1027,17 @@ pub(crate) fn plan_application_advance(
     if !requested.is_application_stage() {
         return Err(ApplicationRefusal::UnknownStage);
     }
-    if !caller.is_admin && !caller.is_registered_agent {
-        return Err(ApplicationRefusal::NotAuthorised);
+    if !caller.is_admin {
+        if !caller.is_registered_agent {
+            return Err(ApplicationRefusal::NotAuthorised);
+        }
+        // Registration says "this pubkey may speak governance", not "this
+        // pubkey may speak for everyone". Without this, any active agent could
+        // mark another agent's applied mutation `not-applied` — a durable lie
+        // about someone else's work, written under its own valid NIP-98.
+        if !caller.is_case_owner {
+            return Err(ApplicationRefusal::NotTheCaseOwner);
+        }
     }
     if requested == ReceiptStage::AppliedManually {
         if !caller.is_admin {
@@ -1019,9 +1060,12 @@ async fn is_registered_agent(env: &Env, pubkey: &str) -> Result<bool> {
     struct ActiveRow {
         active: f64,
     }
+    // Hex is case-insensitive and the registry is written lowercased by
+    // `/provision`, so the lookup compares on a normalised form. A raw
+    // comparison would let the same key present as two different principals.
     let found = relay_db(env)?
-        .prepare("SELECT active FROM agent_registry WHERE pubkey = ?1 LIMIT 1")
-        .bind(&[JsValue::from_str(pubkey)])?
+        .prepare("SELECT active FROM agent_registry WHERE lower(pubkey) = ?1 LIMIT 1")
+        .bind(&[JsValue::from_str(&pubkey.to_ascii_lowercase())])?
         .first::<ActiveRow>(None)
         .await?;
     Ok(found.map(|r| r.active >= 1.0).unwrap_or(false))
@@ -1085,11 +1129,12 @@ pub async fn handle_receipt_application(
     #[derive(Deserialize)]
     struct CaseOutcomeRow {
         state: String,
+        created_by: String,
         outcome: Option<String>,
     }
     let case = db
         .prepare(
-            "SELECT c.state AS state, \
+            "SELECT c.state AS state, c.created_by AS created_by, \
              (SELECT d.outcome FROM broker_decisions d WHERE d.case_id = c.id \
               ORDER BY d.decided_at DESC, d.decision_id DESC LIMIT 1) AS outcome \
              FROM broker_cases c WHERE c.id = ?1 LIMIT 1",
@@ -1098,9 +1143,13 @@ pub async fn handle_receipt_application(
         .first::<CaseOutcomeRow>(None)
         .await?;
 
+    let caller_pubkey_lc = caller_pubkey.to_ascii_lowercase();
     let caller = ApplicationCaller {
         is_admin: crate::admin::is_admin(&caller_pubkey, env).await,
         is_registered_agent: is_registered_agent(env, &caller_pubkey).await.unwrap_or(false),
+        is_case_owner: case
+            .as_ref()
+            .is_some_and(|c| c.created_by.to_ascii_lowercase() == caller_pubkey_lc),
     };
 
     if let Err(refusal) = plan_application_advance(
@@ -1396,23 +1445,75 @@ mod augmentation_api_tests {
     //! every decision worth testing is in these two functions.
     use super::*;
 
+    /// The agent that raised the case: the owner of the mutation the receipt
+    /// is about.
     fn agent() -> ApplicationCaller {
         ApplicationCaller {
             is_admin: false,
             is_registered_agent: true,
+            is_case_owner: true,
+        }
+    }
+    /// A registered agent that has nothing to do with this case.
+    fn other_agent() -> ApplicationCaller {
+        ApplicationCaller {
+            is_admin: false,
+            is_registered_agent: true,
+            is_case_owner: false,
         }
     }
     fn admin() -> ApplicationCaller {
         ApplicationCaller {
             is_admin: true,
             is_registered_agent: false,
+            is_case_owner: false,
         }
     }
     fn stranger() -> ApplicationCaller {
         ApplicationCaller {
             is_admin: false,
             is_registered_agent: false,
+            is_case_owner: false,
         }
+    }
+
+    /// Registration says "this pubkey may speak governance", not "this pubkey
+    /// may speak for everyone". A second agent must not be able to write a
+    /// durable lie about the first agent's work.
+    #[test]
+    fn a_registered_agent_may_not_report_on_another_agents_case() {
+        for requested in [
+            ReceiptStage::ConsumerReceived,
+            ReceiptStage::Applied,
+            ReceiptStage::NotApplied,
+        ] {
+            let refusal = plan_application_advance(
+                ReceiptStage::ConsumerReceived,
+                requested,
+                other_agent(),
+                "decided",
+                Some("approve"),
+            )
+            .expect_err("a non-owner agent may not report this stage");
+            assert_eq!(refusal, ApplicationRefusal::NotTheCaseOwner);
+            assert_eq!(refusal.status(), 403);
+        }
+    }
+
+    /// An admin is the deliberate override: they are not the case owner and
+    /// still may act, which is what makes manual continuation possible at all.
+    #[test]
+    fn an_admin_needs_no_ownership() {
+        assert_eq!(
+            plan_application_advance(
+                ReceiptStage::ProjectionCommitted,
+                ReceiptStage::ConsumerReceived,
+                admin(),
+                "decided",
+                Some("approve"),
+            ),
+            Ok(())
+        );
     }
 
     // ── Authority ───────────────────────────────────────────────────────
