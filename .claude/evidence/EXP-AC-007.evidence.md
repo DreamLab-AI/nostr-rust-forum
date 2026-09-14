@@ -96,6 +96,35 @@ consumer by construction. The exemption is narrow —
 `can_advance_stage(RelayAccepted, AppliedManually)` is still `NotProjected`, so a
 manual continuation of a decision that never committed is refused.
 
+## Security gate — BLOCKED, not passed
+
+```
+$ /home/devuser/.claude/skills/build-with-quality/scripts/deepsec-gate.sh --diff main
+deepsec-gate: BLOCK - 32 finding(s) {CRITICAL: 0, HIGH: 2, MEDIUM: 20, HIGH_BUG: 1, BUG: 9}
+exit code: 1
+receipt: .deepsec-gate/reports/20260914T162917Z/receipt.json
+```
+
+**Verdict: BLOCK.** Exit code `1` — not 78, so the gate ran rather than being
+skipped, and it is recorded as blocked rather than passed.
+
+The gate scans the blast radius of a diff, not only its lines, so successive
+runs pulled neighbouring pre-existing code into scope. Findings raised against
+**this branch's own code** were fixed, each with a test: `cross-tenant-id` (any
+registered agent could advance any receipt) and the ageing sweep's unsound
+early break. Two pre-existing HIGH auth bypasses in the relay's REQ read path
+were also fixed because they blocked the gate (subscription stored before it was
+authorised, and a `kinds`-absent filter bypassing both protected-read gates).
+
+**The remaining findings are unresolved and this receipt does not claim
+otherwise.** Work was paused by the operator before they were triaged. They are
+pre-existing and outside this expectation's scope — `ensure_schema` running per
+request, `require_authed` being weaker than membership on the governance read
+endpoints, gift-wrap senders escaping suspension, the retention sweep's
+CAST-versus-parse divergence, and the 16-hex truncation of `decision_id` — but
+"outside scope" is an argument for routing them, not for calling the gate green.
+An auditor should treat the security-gate line of this expectation as NOT met.
+
 ## Not covered by this receipt
 
 - **`governance_manual_continue`** with its `case_id` / `executed_by` /
