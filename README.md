@@ -239,14 +239,51 @@ sequenceDiagram
 | 31400 | PanelDefinition | Agent | Declare a control panel (schema, fields, actions) |
 | 31401 | PanelState | Agent | Publish a current panel data snapshot |
 | 31402 | ActionRequest | Agent | Request a human decision |
-| 31403 | ActionResponse | Human | The signed decision (admin key only) |
+| 31403 | ActionResponse | Human | The signed decision (admin key, or a reviewer for a case delegated to them) |
 | 31404 | PanelUpdate | Agent | Incremental state diff |
 | 31405 | PanelRetired | Agent | Retire a control panel |
 
+**Governance tags** ([ADR-2011](docs/adr/ADR-2011-operator-task-properties-set-the-escalation-boundary.md)).
+The escalation boundary is declared by the operator on the panel, not by the
+requesting agent on its own request.
+
+| Tag | On | Values | Purpose |
+|-----|----|--------|---------|
+| `tp-verifiability` | 31400, 31402 | `inspectable` \| `partial` \| `opaque` | How far the outcome can be checked afterwards |
+| `tp-reversibility` | 31400, 31402 | `reversible` \| `compensable` \| `irreversible` | Whether the act can be undone |
+| `tp-stakes` | 31400, 31402 | `bounded` \| `significant` \| `critical` | What is at risk if it is wrong |
+| `calibration-sample-rate` | 31400 | `0.0`–`1.0` (default `0.1`) | Share of otherwise-suppressed requests shown to reviewers anyway |
+| `max-pending-hours` | 31400 | integer (default `72`) | Age at which a still-pending case is escalated |
+| `probe-agent` | 31400 | 64-hex pubkey | The only agent whose `probe` tags count as probes |
+| `probe` | 31402 | sha256 digest | Seeded known-bad request; withheld from every projection until the case is decided |
+
+On the panel the triple is the operator's declaration; on a request it may only
+**tighten** it, never loosen it. `irreversible` or `critical` floors the case at
+`high`; `opaque` floors it at `medium` and is never member-suppressed; a request
+declaring nothing at all folds to the relay's advertised `ESCALATION_DEFAULT_TIER`.
+The resulting *effective tier* is stored on `broker_cases.effective_tier` and is the
+only tier any consumer reads. The agent's own `risk_tier` remains as telemetry.
+
+**Receipt stages** ([ADR-2010](docs/adr/ADR-2010-durable-governance-outcome-receipts.md),
+extended by ADR-2011). Each stage certifies only itself.
+
+```
+signed → relay-accepted → projection-committed → consumer-received → applied | not-applied | applied-manually
+```
+
+The first three are the relay's and say nothing about whether the approved act took
+effect; the rest are the mutation owner's, reported through
+`POST /api/governance/receipts/{response_event_id}/application`. `escalated-on-age`
+and `expired` are *side* receipts: they record something that happened to a case
+without advancing it toward application.
+
 **Trust model.** Agent pubkeys must be registered in the `agent_registry` D1 table
-(admin-gated); governance events from unregistered agents are rejected at relay ingress;
-a Decision (kind 31403) is admitted only from an admin key. Nine NIP-98-gated REST
-endpoints on the auth-worker manage agents, broker cases, and roles.
+(admin-gated); governance events from unregistered agents are rejected at relay ingress.
+A Decision (kind 31403) is admitted from an admin key, or from a `reviewer`-role pubkey
+for exactly the cases an admin has `Delegate`d to it. A case whose effective tier is
+`high` or `critical` is resolved only by a human 31403. Eleven NIP-98-gated REST
+endpoints on the auth-worker manage agents, broker cases, roles, application receipts
+and reviewer telemetry.
 
 **Scope, stated plainly.** The protocol is general-purpose, but it has exactly **one live
 consumer today**: ontology-concept elevation in VisionClaw (a case queue capped at five

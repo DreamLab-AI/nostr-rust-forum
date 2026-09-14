@@ -7,6 +7,86 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.11] — 2026-09-14
+
+Augmentation-conditions release: `nostr-bbs-core` and `nostr-bbs-mesh` move to
+`1.0.0-beta.11`. The human–agent escalation boundary stops being the requesting
+agent's own opinion of its work, the receipt ladder extends past projection to
+whether the approved act actually happened, and the humans doing the reviewing
+become measurable. Implements PRD-augmentation-conditions FR3, FR4, FR6 and FR7.2
+against the six conditions of arXiv 2609.12482. **Not published and not deployed.**
+
+### Added
+
+- **Task-property triple (core).** `TaskProperties {verifiability, reversibility,
+  stakes}` on 31400 panels and 31402 requests as `tp-*` tags, with a
+  tightening-only `merge` and a pure, total `effective_tier()`
+  ([ADR-2011](docs/adr/ADR-2011-operator-task-properties-set-the-escalation-boundary.md)).
+  `irreversible`/`critical` floors a case at `high`; `opaque` floors it at
+  `medium` and is never member-suppressed; an unlabelled request folds to the
+  relay's advertised `ESCALATION_DEFAULT_TIER`, making the NIP-11 advertisement
+  load-bearing for the first time.
+- **Panel policy (core).** `calibration-sample-rate` (default `0.1`),
+  `max-pending-hours` (default `72`) and `probe-agent` tags, plus
+  `is_calibration_sample()`, which selects on `sha256(request_id)` and never on
+  the wall clock.
+- **Application receipt stages (core).** `ReceiptStage` moves from the relay into
+  core and gains `consumer-received`, `applied`, `not-applied`,
+  `applied-manually`, and the `escalated-on-age` / `expired` side receipts, with
+  `can_advance_stage()` enforcing monotonicity.
+- **Effective tier on cases (relay-worker).** Migration `0006` adds the effective
+  and declared tiers, the merged triple, the calibration mark, the probe digest
+  and the ageing deadline to `broker_cases`, plus `case_side_receipts`,
+  `case_delegations` and application-receipt provenance columns. The tier is
+  computed once, at 31402 projection time.
+- **Scoped delegation (relay-worker).** A `reviewer`-role pubkey may decide
+  exactly the cases an admin has `Delegate`d to it; the delegating admin stays
+  attributable on the row.
+- **Escalation on age (relay-worker).** A cron emits one `escalated-on-age`
+  receipt per case past its panel's `max_pending_hours`, idempotent by primary
+  key rather than by remembering.
+- **`POST /api/governance/receipts/{response_event_id}/application`
+  (auth-worker).** NIP-98. The mutation owner reports what became of a decision;
+  a registered agent may report on its own case, `applied-manually` is admin-only
+  and requires a case already decided `Approve`. A stage regression is `409`.
+- **`GET /api/governance/reviewers` (auth-worker).** Admin NIP-98. Per-reviewer
+  decisions, median and p90 time-to-decision, override rate, superseded count and
+  the calibration/probe columns.
+
+### Changed
+
+- **`broker_cases` REST responses** now expose the effective tier, the declared
+  tier and the triple, and route through `case_json()`, which withholds the probe
+  digest from any undecided case.
+- **A high or critical case is resolved only by a human 31403**: a response whose
+  `decided_by` names a `system:` actor is refused.
+- **`probe` tags are kept out of `event_tags`**, so no client can enumerate seeded
+  probes by subscription.
+
+### Fixed
+
+- **Cross-tenant receipt reporting (auth-worker).** Any active registered agent
+  could advance any receipt, and so mark another agent's applied mutation
+  `not-applied`. A non-admin caller must now be the case's `created_by`.
+- **Silent revocation (auth-worker).** `handle_revoke_agent` and
+  `handle_revoke_role` validated nothing, never read `changes()`, and reported
+  success for a pubkey that matched no row — leaving a live credential or role
+  behind. Both now normalise pubkey casing and return `404` when nothing was
+  revoked. With FR6.2 making `reviewer` privilege-granting, this stopped being
+  cosmetic.
+- **Pubkey case handling** in the agent registry, broker roles and case
+  delegations: hex is case-insensitive, so the same key could present as two
+  principals.
+
+### Known limitations
+
+- **Probe blindness is partial.** The `probe` tag is absent from the tag index and
+  from every D1 projection of an undecided case, but remains on the raw signed
+  31402 served over REQ: stripping it would invalidate the signature both clients
+  verify strictly, and the probe would vanish rather than render blind. Tracked as
+  ADR-2011's `review_trigger`.
+
+
 ## [1.0.0-beta.10] — 2026-09-06
 
 Governance-receipts and identity release; every kit crate moves to
