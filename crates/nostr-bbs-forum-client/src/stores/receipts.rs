@@ -43,12 +43,71 @@ pub struct ReceiptView {
     pub applied_at: Option<u64>,
 }
 
+/// What one decision's receipts amount to, for display.
+///
+/// The split exists because the stage ladder has two halves with different
+/// algebra. The rungs up to `consumer-received` are genuinely **ordered** —
+/// each implies the ones before it, so "furthest wins" is correct and reading
+/// them through `Ord` is right. The application outcomes are a **set of
+/// mutually exclusive claims**, where "largest wins" is meaningless: two of
+/// them is not progress, it is a contradiction, and resolving it by picking one
+/// invents an answer the receipts do not contain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageView {
+    /// The furthest ladder rung reached; no application outcome reported yet.
+    Ladder(ReceiptStage),
+    /// Exactly one application outcome. The loop FR4.1 exists to close.
+    Terminal(ReceiptStage),
+    /// Two or more DIFFERENT application outcomes for one decision, held as
+    /// what they are. Never resolved by choosing one: only the mutation owner
+    /// knows which is true, and a client that guessed would be fabricating the
+    /// very thing this whole context forbids.
+    Conflicting(Vec<ReceiptStage>),
+}
+
+impl StageView {
+    /// The human-facing label.
+    pub fn label(&self) -> String {
+        match self {
+            StageView::Ladder(s) | StageView::Terminal(s) => stage_label(*s).to_string(),
+            StageView::Conflicting(stages) => {
+                let names: Vec<&str> = stages.iter().map(|s| stage_label(*s)).collect();
+                format!("conflicting receipts: {}", names.join(" and "))
+            }
+        }
+    }
+
+    /// Badge classes. A conflict reads as a failure, because it is one: nobody
+    /// can say whether the approved act happened, which is exactly the state an
+    /// operator must act on.
+    pub fn class(&self) -> &'static str {
+        match self {
+            StageView::Ladder(s) | StageView::Terminal(s) => stage_class(*s),
+            StageView::Conflicting(_) => "bg-red-500/10 text-red-400 border-red-500/30",
+        }
+    }
+}
+
+/// One decision's reduced receipt: the stage view plus the row that carried the
+/// most informative claim (the terminal outcome where there is one, else the
+/// furthest rung).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionReceipt {
+    pub stage: StageView,
+    /// Who claimed an application stage.
+    pub applied_by: Option<String>,
+    /// The mutation owner's own words about what it did.
+    pub acknowledgement: Option<String>,
+    /// Set when projection failed; the human is told why, not just that.
+    pub stage_error: Option<String>,
+}
+
 /// What a case's receipts say, reduced for display.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CaseReceipts {
-    /// The furthest **ladder** stage per 31403 event id. Side receipts never
-    /// appear here (DDD §6 invariant 5).
-    pub by_decision: HashMap<String, ReceiptView>,
+    /// Per 31403 event id. Side receipts never appear here (DDD §6
+    /// invariant 5).
+    pub by_decision: HashMap<String, DecisionReceipt>,
     /// The case exceeded its panel's `max_pending_hours` (FR4.3). This is the
     /// authoritative statement, as against the client's own clock reading.
     pub escalated_on_age: bool,
@@ -98,13 +157,36 @@ pub fn parse_receipts(body: &str) -> Vec<ReceiptView> {
 
 /// Reduce a case's receipt rows for display.
 ///
-/// DDD §6 invariant 5 — receipts are monotonic, and `escalated-on-age` /
-/// `expired` are **side receipts that do not advance the ladder**. So a side
-/// receipt sets its own flag and never becomes a decision's stage, and where
-/// several ladder rows exist for one decision (a replayed projection, then an
-/// application) the furthest one wins.
+/// Three rules, each for its own reason:
+///
+/// 1. **Side receipts set flags, never stages.** DDD §6 invariant 5:
+///    `escalated-on-age` and `expired` record something that happened *to* a
+///    case without advancing it toward application.
+/// 2. **Ladder rungs reduce by `Ord`.** `signed → relay-accepted →
+///    projection-committed → consumer-received` each imply the ones before, so
+///    the furthest is the whole truth and rows may arrive in any order.
+/// 3. **Application outcomes reduce as a SET.** `applied`, `not-applied` and
+///    `applied-manually` are mutually exclusive claims about the world. One of
+///    them is the answer and outranks every rung; two *different* ones are a
+///    contradiction, held as [`StageView::Conflicting`] rather than resolved.
+///    Only the mutation owner knows which is true, and a client that picked the
+///    larger under a derived `Ord` would be displaying a successful application
+///    as a failure — which is precisely the counter-example FR4.1 names, in the
+///    opposite direction.
+///
+/// Known limit, stated: `projection-failed` is treated as a ladder rung, so a
+/// failure followed by a successful reconciliation retry still shows the
+/// failure (it outranks `projection-committed`). These rows carry no ordering
+/// this reducer reads, and showing a stale failure is the safe direction —
+/// an operator looks again, rather than being told all is well.
 pub fn reduce_case(rows: Vec<ReceiptView>) -> CaseReceipts {
     let mut out = CaseReceipts::default();
+    // Per decision: the furthest ladder rung, the DISTINCT terminal outcomes in
+    // arrival order, and the row worth quoting.
+    let mut ladder: HashMap<String, ReceiptStage> = HashMap::new();
+    let mut terminals: HashMap<String, Vec<ReceiptStage>> = HashMap::new();
+    let mut detail: HashMap<String, ReceiptView> = HashMap::new();
+
     for row in rows {
         if row.stage == ReceiptStage::EscalatedOnAge {
             out.escalated_on_age = true;
@@ -114,12 +196,56 @@ pub fn reduce_case(rows: Vec<ReceiptView>) -> CaseReceipts {
             out.expired = true;
             continue;
         }
-        match out.by_decision.get(&row.event_id) {
-            Some(existing) if existing.stage >= row.stage => {}
-            _ => {
-                out.by_decision.insert(row.event_id.clone(), row);
+
+        if row.stage.is_terminal_application() {
+            let seen = terminals.entry(row.event_id.clone()).or_default();
+            // A repeated claim — a replayed post — is one claim, not a conflict.
+            if !seen.contains(&row.stage) {
+                seen.push(row.stage);
+            }
+            // A terminal row always carries the most informative detail.
+            detail.insert(row.event_id.clone(), row);
+            continue;
+        }
+
+        let rung = ladder.entry(row.event_id.clone()).or_insert(row.stage);
+        if row.stage > *rung {
+            *rung = row.stage;
+        }
+        // Keep a ladder row's detail only while no terminal row has spoken.
+        if !terminals.contains_key(&row.event_id) {
+            match detail.get(&row.event_id) {
+                Some(existing) if existing.stage >= row.stage => {}
+                _ => {
+                    detail.insert(row.event_id.clone(), row);
+                }
             }
         }
+    }
+
+    let ids: std::collections::BTreeSet<String> =
+        ladder.keys().chain(terminals.keys()).cloned().collect();
+    for id in ids {
+        let stage = match terminals.get(&id).map(Vec::as_slice) {
+            Some([]) | None => match ladder.get(&id) {
+                Some(rung) => StageView::Ladder(*rung),
+                // Unreachable in practice: an id is here because it appeared in
+                // one map or the other.
+                None => continue,
+            },
+            Some([one]) => StageView::Terminal(*one),
+            Some(many) => StageView::Conflicting(many.to_vec()),
+        };
+        let row = detail.get(&id);
+        out.by_decision.insert(
+            id,
+            DecisionReceipt {
+                stage,
+                applied_by: row.and_then(|r| r.applied_by.clone()),
+                acknowledgement: row.and_then(|r| r.acknowledgement.clone()),
+                stage_error: row.and_then(|r| r.stage_error.clone()),
+            },
+        );
     }
     out
 }
@@ -306,13 +432,113 @@ mod tests {
     }
 
     #[test]
-    fn the_furthest_ladder_stage_wins_per_decision() {
+    fn two_terminal_outcomes_are_a_conflict_never_a_winner() {
+        // Auditor counter-example: `applied` and `not-applied` are mutually
+        // exclusive CLAIMS about the world, not rungs. Picking the larger under
+        // the derived `Ord` displayed a successful application as a failure.
+        for pair in [
+            [ReceiptStage::Applied, ReceiptStage::NotApplied],
+            [ReceiptStage::NotApplied, ReceiptStage::Applied],
+            [ReceiptStage::AppliedManually, ReceiptStage::Applied],
+            [ReceiptStage::Applied, ReceiptStage::AppliedManually],
+            [ReceiptStage::NotApplied, ReceiptStage::AppliedManually],
+        ] {
+            let r = reduce_case(vec![row("dec-1", pair[0]), row("dec-1", pair[1])]);
+            let view = &r.by_decision["dec-1"].stage;
+            match view {
+                StageView::Conflicting(stages) => {
+                    assert!(stages.contains(&pair[0]) && stages.contains(&pair[1]));
+                }
+                other => panic!("{pair:?} reduced to {other:?} instead of a conflict"),
+            }
+            assert!(view.label().contains("conflict"));
+            assert!(view.class().contains("red"), "a conflict is not progress");
+        }
+    }
+
+    #[test]
+    fn a_conflict_survives_an_intervening_ladder_row() {
+        let r = reduce_case(vec![
+            row("dec-1", ReceiptStage::Applied),
+            row("dec-1", ReceiptStage::ConsumerReceived),
+            row("dec-1", ReceiptStage::NotApplied),
+        ]);
+        assert!(matches!(
+            r.by_decision["dec-1"].stage,
+            StageView::Conflicting(_)
+        ));
+    }
+
+    #[test]
+    fn a_repeated_terminal_outcome_is_not_a_conflict() {
+        // The same claim twice — a replayed post — is one claim.
+        for stage in [
+            ReceiptStage::Applied,
+            ReceiptStage::NotApplied,
+            ReceiptStage::AppliedManually,
+        ] {
+            let r = reduce_case(vec![row("dec-1", stage), row("dec-1", stage)]);
+            assert_eq!(r.by_decision["dec-1"].stage, StageView::Terminal(stage));
+        }
+    }
+
+    #[test]
+    fn one_terminal_outcome_wins_over_every_ladder_rung() {
+        let r = reduce_case(vec![
+            row("dec-1", ReceiptStage::Signed),
+            row("dec-1", ReceiptStage::NotApplied),
+            row("dec-1", ReceiptStage::RelayAccepted),
+            row("dec-1", ReceiptStage::ConsumerReceived),
+        ]);
+        assert_eq!(
+            r.by_decision["dec-1"].stage,
+            StageView::Terminal(ReceiptStage::NotApplied)
+        );
+    }
+
+    #[test]
+    fn a_conflict_on_one_decision_does_not_infect_another() {
+        let r = reduce_case(vec![
+            row("dec-1", ReceiptStage::Applied),
+            row("dec-1", ReceiptStage::NotApplied),
+            row("dec-2", ReceiptStage::Applied),
+        ]);
+        assert!(matches!(
+            r.by_decision["dec-1"].stage,
+            StageView::Conflicting(_)
+        ));
+        assert_eq!(
+            r.by_decision["dec-2"].stage,
+            StageView::Terminal(ReceiptStage::Applied)
+        );
+    }
+
+    #[test]
+    fn out_of_order_ladder_rows_still_reduce_to_the_furthest_rung() {
+        // Ladder rungs ARE ordered, and keep using that order.
+        let r = reduce_case(vec![
+            row("dec-1", ReceiptStage::ConsumerReceived),
+            row("dec-1", ReceiptStage::Signed),
+            row("dec-1", ReceiptStage::ProjectionCommitted),
+            row("dec-1", ReceiptStage::RelayAccepted),
+        ]);
+        assert_eq!(
+            r.by_decision["dec-1"].stage,
+            StageView::Ladder(ReceiptStage::ConsumerReceived)
+        );
+    }
+
+    #[test]
+    fn the_terminal_outcome_wins_over_the_ladder_it_completes() {
         let r = reduce_case(vec![
             row("dec-1", ReceiptStage::ProjectionCommitted),
             row("dec-1", ReceiptStage::ConsumerReceived),
             row("dec-1", ReceiptStage::Applied),
         ]);
-        assert_eq!(r.by_decision["dec-1"].stage, ReceiptStage::Applied);
+        assert_eq!(
+            r.by_decision["dec-1"].stage,
+            StageView::Terminal(ReceiptStage::Applied)
+        );
     }
 
     #[test]
@@ -321,7 +547,10 @@ mod tests {
             row("dec-1", ReceiptStage::Applied),
             row("dec-1", ReceiptStage::ConsumerReceived),
         ]);
-        assert_eq!(r.by_decision["dec-1"].stage, ReceiptStage::Applied);
+        assert_eq!(
+            r.by_decision["dec-1"].stage,
+            StageView::Terminal(ReceiptStage::Applied)
+        );
     }
 
     #[test]
@@ -334,7 +563,10 @@ mod tests {
         ]);
         assert!(r.escalated_on_age);
         assert!(r.expired);
-        assert_eq!(r.by_decision["dec-1"].stage, ReceiptStage::ConsumerReceived);
+        assert_eq!(
+            r.by_decision["dec-1"].stage,
+            StageView::Ladder(ReceiptStage::ConsumerReceived)
+        );
     }
 
     #[test]

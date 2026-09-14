@@ -18,7 +18,7 @@ use crate::components::agent_badge::AgentBadge;
 use crate::relay::RelayConnection;
 use crate::stores::panel_registry::{use_panel_registry, ActionEntry, DecisionView, PanelEntry};
 use crate::stores::case_projection::use_case_projection_store;
-use crate::stores::receipts::{stage_class, stage_label, use_receipt_store};
+use crate::stores::receipts::use_receipt_store;
 use crate::stores::zone_access::use_zone_access;
 use crate::utils::governance_view::{
     self, CardSection, CaseBoundary, MIN_RATIONALE_LEN,
@@ -1226,14 +1226,14 @@ fn DecisionChainRow(view: DecisionView) -> impl IntoView {
             // certified. Absence of a receipt shows nothing at all — it is not
             // evidence that the act did not happen.
             {move || receipt.get().map(|r| {
-                let label = stage_label(r.stage);
-                let class = stage_class(r.stage);
+                let label = r.stage.label();
+                let class = r.stage.class();
                 let detail = r
                     .acknowledgement
                     .clone()
                     .or_else(|| r.stage_error.clone())
                     .or_else(|| r.applied_by.clone().map(|by| format!("by {by}")))
-                    .unwrap_or_else(|| label.to_string());
+                    .unwrap_or_else(|| label.clone());
                 view! {
                     <span
                         class=format!("px-1.5 py-0.5 rounded border {class}")

@@ -160,3 +160,76 @@ Also fixed in this branch, from runs 1 and 2:
   twice, 64-bit decision ids). **Not this branch's code** — they belong to the
   backend half on `feat/augmentation-conditions` and are recorded here only so
   they are not lost.
+
+## Iteration after merge — two terminal outcomes are a conflict, not a winner
+
+The client auditor (evidence `53ca2e2`) produced a counter-example Scenario 1
+missed. `reduce_case` picked the "furthest" stage for a decision using
+`ReceiptStage`'s **derived** `Ord`, which ranks variants by declaration order.
+That is right for the rungs up to `consumer-received` — each implies the ones
+before it — and wrong for `applied` / `not-applied` / `applied-manually`, which
+are not rungs at all. They are three mutually exclusive *claims about the world*,
+exactly one of which is true for any decision. Under the derived order
+`NotApplied > Applied`, so a decision whose receipts contained both reduced to
+`NotApplied` and **displayed a successful application as a failure** — FR4.1's
+own counter-example, in reverse.
+
+Fixed by giving the two halves the algebra they actually have
+(`stores/receipts.rs`). Ladder rungs still reduce by `Ord`. Application outcomes
+reduce as a **set**, using core's own `ReceiptStage::is_terminal_application()`
+rather than a comparison: one distinct outcome is `StageView::Terminal`, two or
+more is `StageView::Conflicting`, which is **never** resolved by picking one.
+Only the mutation owner knows which claim is true, and a client that chose would
+be fabricating the one thing this whole context forbids. A conflict renders as
+`conflicting receipts: applied and NOT applied` in the red failure style, because
+that is the state an operator has to act on: nobody can say whether the approved
+act happened.
+
+Core was **not** changed. `ReceiptStage` keeps its derived `Ord` — `can_advance_stage`
+and the monotonicity checks depend on it, and narrowing it would break every
+existing sort and `BTreeMap` key. A doc comment on the enum now says what the
+ordering does and does not mean, and points a reducing consumer at
+`is_application_stage` / `is_terminal_application`
+(`crates/nostr-bbs-core/src/governance.rs`, above the derive).
+
+```
+$ cargo test -p nostr-bbs-forum-client stores::receipts
+```
+
+```
+test stores::receipts::tests::two_terminal_outcomes_are_a_conflict_never_a_winner ... ok
+test stores::receipts::tests::a_repeated_terminal_outcome_is_not_a_conflict ... ok
+test stores::receipts::tests::a_conflict_survives_an_intervening_ladder_row ... ok
+test stores::receipts::tests::a_conflict_on_one_decision_does_not_infect_another ... ok
+test stores::receipts::tests::one_terminal_outcome_wins_over_every_ladder_rung ... ok
+test stores::receipts::tests::out_of_order_ladder_rows_still_reduce_to_the_furthest_rung ... ok
+test stores::receipts::tests::the_terminal_outcome_wins_over_the_ladder_it_completes ... ok
+test stores::receipts::tests::an_out_of_order_row_never_regresses_a_decision ... ok
+test stores::receipts::tests::side_receipts_flag_the_case_and_never_become_a_stage ... ok
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 389 filtered out; finished in 0.00s
+```
+
+Written before the fix and observed failing to compile against the old shape
+(`no method named 'label'`, `cannot find type 'StageView'`), then made to pass.
+`two_terminal_outcomes_are_a_conflict_never_a_winner` runs all five ordered
+pairs of distinct outcomes, so neither `[Applied, NotApplied]` nor
+`[AppliedManually, Applied]` can resolve to a winner in either arrival order.
+`a_repeated_terminal_outcome_is_not_a_conflict` keeps a replayed post — the same
+claim twice — as one claim.
+
+**Still not fixed, stated:** `projection-failed` remains a ladder rung, so a
+failure followed by a successful reconciliation retry still shows the failure
+(it outranks `projection-committed` under the same derived order). These rows
+carry no ordering this reducer reads. Showing a stale failure is the safe
+direction — an operator looks again rather than being told all is well — but it
+is the same class of defect one rung down, and it is recorded here rather than
+closed.
+
+```
+$ cargo test --workspace          # 2013 passed, 0 failed (404 forum-client)
+$ cd crates/nostr-bbs-forum-client && trunk build --release   # INFO success
+$ cargo clippy -p nostr-bbs-forum-client --target wasm32-unknown-unknown
+```
+
+Clippy: clean across every file this branch owns. The security gate has still
+not been re-run since `20260914T201424Z` (BLOCK, exit 1).

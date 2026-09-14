@@ -887,6 +887,27 @@ mod rationale_tests {
 /// Two stages are *side receipts* ([`Self::is_side_receipt`]): they record
 /// something that happened to a case without advancing it toward application,
 /// and so never overwrite a ladder stage.
+///
+/// # The derived `Ord` is declaration order, not a total ranking of outcomes
+///
+/// `Ord` here is derived, so it ranks variants in the order they are written.
+/// That is meaningful for the rungs up to [`Self::ConsumerReceived`], each of
+/// which implies the ones before it, and **not** meaningful for the three
+/// application outcomes: [`Self::Applied`], [`Self::NotApplied`] and
+/// [`Self::AppliedManually`] are mutually exclusive *claims about the world*,
+/// exactly one of which is true for any decision. `max()` over them is not
+/// "the furthest stage", it is an arbitrary pick — and a consumer that reduces
+/// `[Applied, NotApplied]` that way displays a successful application as a
+/// failure, which is the FR4.1 counter-example in reverse.
+///
+/// A consumer reducing several receipts for one decision should therefore
+/// compare rungs by order and treat outcomes as a **set**, surfacing more than
+/// one as the contradiction it is rather than resolving it. Use
+/// [`Self::is_application_stage`] to tell the two halves apart. The trait stays
+/// derived because [`can_advance_stage`] and the monotonicity checks depend on
+/// it, and because narrowing it would break every existing sort and `BTreeMap`
+/// key — the hazard is in reading it as a ranking of outcomes, not in the
+/// ordering itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReceiptStage {
