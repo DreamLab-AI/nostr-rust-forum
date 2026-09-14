@@ -37,6 +37,74 @@ A 31402 `ActionRequest` carried one boundary signal, `risk_tier`, declared by th
 - **Probe blindness is partial, and this is the reason `implementation_status` is `partial`.** The `probe` tag is removed from the tag index and never re-served in the D1 projection of an undecided case, so no client can query for probes and no governance API response reveals one. The tag nevertheless remains on the raw signed 31402 served over REQ, because removing it would invalidate the signature that both clients verify strictly (`verify_event_strict`) and the probe would vanish entirely rather than render blind. A scheme that survives raw-event inspection — committing to the probe out of band, or encrypting the marker to the relay — is follow-on work and is this ADR's `review_trigger`.
 - `reviewer` became a privilege-granting role, which made the pre-existing stale-privilege defect in role revocation material; role grant/revoke now normalise pubkey casing and a revocation that matched no row returns 404 instead of reporting success.
 
+## Implementation notes
+
+### Client (`nostr-bbs-forum-client`)
+
+The forum client is the surface the six conditions are actually experienced on,
+and it is where FR2, the FR4.1/FR4.3 display half, and the FR6.2/6.3/6.4 display
+half land. The rules live in pure functions with host-target tests rather than in
+`view!` macros, so what a reviewer is shown and when they may act is asserted by
+`cargo test`, not by reading markup.
+
+- **Pure view logic** — `crates/nostr-bbs-forum-client/src/utils/governance_view.rs`.
+  `compute_boundary` (:209) mirrors the relay's `plan_request_boundary`
+  field-for-field over the same `nostr-bbs-core` functions, so the client reads an
+  effective tier it computes identically rather than one it guesses;
+  `rationale_satisfied` (:50) is the FR2.2 gate; `decision_content` (:70) writes
+  the reviewer's bytes untrimmed and has no template branch; `visible_probe` (:282)
+  is the only path a probe digest can take to the DOM; `card_sections` (:435) makes
+  the FR2.1 ordering data; `is_decidable_by` (:389) is the scoped-delegation view
+  gate; `relative_age_label` (:294) and `is_overdue` (:318) are FR4.3.
+- **Decision card** — `src/pages/governance.rs`. `ActionCardData` (:446) resolves
+  each request's panel, boundary and decidability once per render; `card_body_parts`
+  (:480) builds every region *except* the controls and `assemble_card` (:652)
+  orders them by `card_sections`, which is how the agent's tier and confidence come
+  to sit **below** Approve. `ActionRow` (:695) carries the rationale textarea and
+  Approve / Reject / Amend / Delegate; `ReadOnlyActionRow` (:1028) renders the same
+  context with no signer, relay handle or publish path.
+- **Decidability replaces the pure route split.** ADR-106 Decision 2 split the
+  surface by route so an ordinary member mounted no publish path. FR6.2 makes "who
+  may decide" a per-case question, so `GovernancePage` (:87) mounts `ActionRow`
+  exactly where `is_decidable_by` admits the viewer — an admin, or the delegatee an
+  admin named on that one case — and `ReadOnlyActionRow` everywhere else. The
+  property ADR-106 protected is unchanged: a viewer who may not decide a case
+  mounts nothing that could. The relay's scoped-delegation admission enforces the
+  same gate independently.
+- **Receipt ladder** — `src/stores/receipts.rs`. `parse_receipts` (:62) and
+  `reduce_case` (:106) reduce `GET /api/governance/receipts`, keeping
+  `escalated-on-age` and `expired` as side receipts that never become a decision's
+  stage; `stage_label` (:132) gives each stage a distinct honest label so a denied
+  action and an approved action whose write failed never read alike.
+  `DecisionChainRow` (:1117) renders the stage beside its decision.
+- **Store** — `src/stores/panel_registry.rs` now carries the raw 31400 and 31402
+  tags (:28, :63) so the triple, the panel policy and a probe tag are readable,
+  `context_url` (:60) so the proposal's context can be linked, and `delegate_to`
+  (:121) so a delegation names its delegatee in the chain. `resolve_panel_for`
+  (:356) mirrors the relay's panel-resolution order.
+
+**Known limits, stated rather than papered over.**
+
+1. `GET /api/governance/receipts` is NIP-98 **admin**, so a member or a delegated
+   reviewer sees the decision chain without application stages. The store records
+   that as unavailable and never as `not-applied`; the ageing badge those viewers
+   do get is the client's own clock reading and is labelled as advisory against
+   the relay's `escalated-on-age` receipt.
+2. Receipts are fetched per case on demand, not subscribed; a stage that advances
+   after the fetch appears on the next load of the surface.
+3. **The client publishes no 31400.** There is no panel-authoring UI in this
+   crate, so there is no publish form in which to prompt for the task-property
+   triple. The triple is declared by whatever publishes the panel — today
+   agentbox — and the requirement is documented for those publishers in
+   `README.md` (governance tags) rather than implemented as a form that does not
+   exist. A panel-authoring UI, when one is built, must collect
+   `tp-verifiability` / `tp-reversibility` / `tp-stakes` at publish time.
+4. Probe blindness in the client is complete for *rendering* (`visible_probe` is
+   the only path, and it is tested against a fixture 31402 carrying the tag), but
+   the raw signed event still carries the tag over REQ, exactly as this ADR's
+   `Consequences` records. A reader of the browser's WebSocket frames can still
+   see it.
+
 ## Verification
 
 Established at `verified_commit` by executed commands, recorded with raw output in `.claude/evidence/EXP-AC-003.evidence.md`, `EXP-AC-004.evidence.md`, `EXP-AC-006.evidence.md` and `EXP-AC-007.evidence.md`:
@@ -47,5 +115,35 @@ Established at `verified_commit` by executed commands, recorded with raw output 
 - `cargo test -p nostr-bbs-auth-worker --lib augmentation_api_tests` — application-stage authority (including the case-ownership bind), the manual-continuation precondition, monotonicity and its 409s, probe redaction, and the reviewer read model.
 - `cargo test --workspace --exclude nostr-bbs-forum-client` — whole-workspace regression.
 - `scripts/deepsec-gate.sh --diff main` — security gate; receipt path recorded in the evidence.
+
+Client half, recorded in `.claude/evidence/EXP-AC-002.client.evidence.md`,
+`EXP-AC-004.client.evidence.md` and `EXP-AC-006.client.evidence.md`:
+
+- `cargo test -p nostr-bbs-forum-client` — 393 tests, of which 42 in
+  `utils::governance_view`, 9 in `stores::receipts`, 3 new in
+  `stores::panel_registry` and 3 in `utils` are new: the rationale gate
+  and its whitespace counter-example, byte-for-byte reasoning, the absence of any
+  rationale template (asserted over the sources that build a 31403), the
+  tightening-only boundary, deterministic clock-free sampling, probe blindness
+  against a fixture event carrying the tag, the ageing labels and deadline,
+  scoped delegation including withdrawal by supersession, control-before-framing
+  ordering, untruncated proposal rendering, the receipt-stage reduction with its
+  side-receipt rule, and the security fixes below.
+- `trunk build --release` in `crates/nostr-bbs-forum-client` — the WASM bundle the
+  forum actually ships.
+- `scripts/deepsec-gate.sh --diff feat/augmentation-conditions` over the client
+  worktree — **BLOCK, exit 1**, run three times as the branch changed. It found
+  and this branch fixed: stored XSS through an unvalidated `context_url` bound
+  into an `href` (the governance subscription carries no `authors` filter, so
+  that field is attacker-controlled); a byte-slicing panic on non-ASCII
+  identifiers, which in WASM blanks the whole client; panels keyed by `d` tag
+  alone, which let one registered agent replace another operator's panel and so
+  **lower their escalation boundary**; 31405 retirement with no ownership check;
+  and an unscoped decision chain, where a 31403 with a colliding `d` tag could
+  make a case read as decided (revealing its probe) or offer a stranger the
+  controls. The two HIGH entries on the final receipt are the first run's,
+  fixed and absent from runs 2 and 3; the gate's blocking list is cumulative.
+  Remaining findings and why they are open are triaged in
+  `.claude/evidence/EXP-AC-002.client.evidence.md`.
 
 `activation_status` stays `inactive`: nothing here has been deployed and `nostr-bbs-core` 1.0.0-beta.11 has not been published. It moves to `staged` on publication and to `live` on edge deploy with the probe suite run (PRD milestone M4).

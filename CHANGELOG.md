@@ -16,6 +16,67 @@ whether the approved act actually happened, and the humans doing the reviewing
 become measurable. Implements PRD-augmentation-conditions FR3, FR4, FR6 and FR7.2
 against the six conditions of arXiv 2609.12482. **Not published and not deployed.**
 
+### Forum client — the decision surface (PRD *Augmentation Conditions* FR2, FR4, FR6)
+
+- **The proposed change is now on the decision card.** `ActionRow` renders
+  `ActionRequest.fields` pretty-printed, in full and untruncated in a scrolling
+  pane, `context_url` as a link, and the agent's own `reasoning` verbatim. The
+  agent's declared tier, its confidence, the effective tier and the merged
+  task-property triple render **below** the reviewer's controls, so the reviewer
+  meets the proposal before they meet the agent's framing of it. The section order
+  is data (`governance_view::card_sections`) and the ordering rule is a test.
+- **The rationale is the human's.** A textarea collects it; for an effective tier of
+  `high` or `critical` every control — Approve, Reject, Amend, Delegate — stays
+  disabled until the trimmed text reaches 20 characters, and the published 31403
+  `reasoning` is the typed text byte-for-byte, untrimmed. On `low`/`medium` a
+  rationale is optional and an empty one publishes an empty `reasoning`. The
+  fabricated `"Human {action} via governance UI"` template is **removed**, and a
+  test asserts it has not grown back in any source that builds a 31403.
+- **Suppression reads the effective tier, never `risk_tier`.** The client computes
+  the ADR-2011 boundary with the same pure `nostr-bbs-core` functions the relay
+  uses, resolving each request's panel by the same order, so both sides agree. An
+  operator's `irreversible`/`critical`/`opaque` declaration now overrides an agent
+  that tiered its own work `low`.
+- **Calibration samples are shown, marked subtly.** A deterministically-sampled
+  otherwise-suppressible case renders with a small "calibration" marker rather than
+  being hidden (FR6.3).
+- **Probes stay blind.** A `probe` tag on an undecided 31402 is never rendered
+  anywhere; it may show in the chain once a 31403 exists. Tested against a fixture
+  event carrying the tag, which is how it arrives over REQ — the relay cannot strip
+  it without invalidating the signature.
+- **Delegation (FR6.2).** An admin can publish `Delegate { to }` from the card with
+  a validated 64-hex target; the delegatee — who is not an admin — then sees that
+  one case as decidable and every other case read-only. The chain names the
+  delegatee and keeps the delegating admin attributable. A delegation superseded by
+  a later one withdraws the first delegatee's authority.
+- **Ageing and receipts (FR4.1, FR4.3).** Every pending card shows its age from
+  `created_at`, an `overdue` badge past the panel's `max_pending_hours`, and the
+  relay's authoritative `escalated-on-age` badge where receipts are readable. The
+  decision chain shows each decision's receipt stage through the application
+  stages — `consumer-received`, `applied`, `not-applied`, `applied-manually` —
+  with `escalated-on-age` and `expired` kept as side receipts that never become a
+  stage. The pending list now sorts **oldest first**.
+- **Fixed under the security gate, in the client's governance path.** Stored XSS
+  through an unvalidated `ActionRequest.context_url` bound into an `href` — the
+  governance subscription carries no `authors` filter, so that field is
+  attacker-controlled; now scheme-validated at ingest *and* at render, with
+  control-character-bearing values rejected outright. Panels and panel states
+  are keyed by their NIP-33 address rather than by `d` tag alone, so one
+  registered agent can no longer replace another operator's panel — which since
+  ADR-2011 would have **lowered that operator's escalation boundary** — and a
+  31405 can only retire its author's own panel. A card's decision chain is
+  scoped to the decisions bound to that request's event id, so a 31403 with a
+  colliding `d` tag can no longer make a case read as decided (revealing its
+  probe) or offer a stranger the controls. `shorten_pubkey` and the chain's
+  identifier shortening slice by character, not byte: the old byte-slice
+  panicked on multi-byte input, and a panic in WASM blanks the whole client.
+- Known limits recorded in ADR-2011's implementation notes: the receipts read is
+  admin-only, so members and delegated reviewers see the chain without stages
+  (never rendered as "not applied"); receipts are fetched per case, not subscribed;
+  and the client publishes no 31400, so the task-property triple is documented for
+  panel publishers in `README.md` rather than prompted for in a form that does not
+  exist.
+
 ### Added
 
 - **Task-property triple (core).** `TaskProperties {verifiability, reversibility,

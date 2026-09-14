@@ -264,6 +264,16 @@ declaring nothing at all folds to the relay's advertised `ESCALATION_DEFAULT_TIE
 The resulting *effective tier* is stored on `broker_cases.effective_tier` and is the
 only tier any consumer reads. The agent's own `risk_tier` remains as telemetry.
 
+**Publishing a panel.** The forum web client publishes no 31400 — panels come from
+registered agents (today, agentbox). Whatever publishes one **must** stamp the
+task-property triple: a panel that declares nothing constrains nothing, and its
+unlabelled requests fold to the relay's advertised default rather than to anything
+the operator chose. Declare all three legs; a partial declaration takes the loosest
+value on the legs you leave out. The forum client reads the triple from the 31400's
+tags or, for publishers using the `PanelDefinition` body, from its `task_properties`
+field — tags win where both are present. If a panel-authoring UI is ever added to
+the client, it must collect the triple at publish time.
+
 **Receipt stages** ([ADR-2010](docs/adr/ADR-2010-durable-governance-outcome-receipts.md),
 extended by ADR-2011). Each stage certifies only itself.
 

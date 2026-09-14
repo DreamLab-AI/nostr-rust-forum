@@ -118,6 +118,16 @@ pub fn bbs_url_override() -> Option<String> {
 }
 
 /// Read a key from the `window.__ENV__` object (runtime config injected by index.html).
+/// A runtime `window.__ENV__.<key>` override, where the deployment set one.
+///
+/// Exposed so non-URL runtime settings (e.g. the relay's advertised
+/// `ESCALATION_DEFAULT_TIER`) resolve through the same single mechanism as the
+/// URLs rather than each growing their own lookup.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn env_override(key: &str) -> Option<String> {
+    window_env(key)
+}
+
 fn window_env(key: &str) -> Option<String> {
     let window = web_sys::window()?;
     let env = js_sys::Reflect::get(&window, &"__ENV__".into()).ok()?;
