@@ -342,8 +342,26 @@ pub const TAG_MAX_PENDING_HOURS: &str = "max-pending-hours";
 pub const TAG_PROBE_AGENT: &str = "probe-agent";
 /// Tag name carrying a seeded probe's digest on a 31402 request.
 ///
-/// Invariant 7 (DDD §6): this tag is never rendered before the case is decided.
-/// The relay strips it from every projection of an undecided case.
+/// Invariant 7 (DDD §6) asks that this tag never be rendered before the case is
+/// decided. **What the relay actually enforces is narrower than that, and this
+/// comment says so rather than restating the aspiration as fact:**
+///
+/// - the tag is deleted from the `event_tags` index, so no client can find a
+///   probe by subscribing to `#probe`;
+/// - `broker_cases.probe_digest` is withheld from every REST projection of an
+///   undecided case;
+/// - a `probe` tag from any pubkey other than the panel's registered probe
+///   agent is discarded rather than recorded, so it cannot corrupt the catch
+///   rate.
+///
+/// The tag nevertheless **remains on the raw signed 31402** served over REQ.
+/// Removing it would invalidate the signature that the forum and BBS clients
+/// both verify strictly (`verify_event_strict`), so the probe would disappear
+/// from the queue rather than render blind — the opposite of what the feature
+/// needs. Blindness on the rendered surface is therefore the client's
+/// responsibility, and the catch rate assumes reviewers read that surface
+/// rather than raw relay events. Closing this properly means keeping the digest
+/// off the signed event altogether; that is ADR-2011's `review_trigger`.
 pub const TAG_PROBE: &str = "probe";
 
 /// Default share of `Low`/`Reversible` requests shown rather than suppressed,
