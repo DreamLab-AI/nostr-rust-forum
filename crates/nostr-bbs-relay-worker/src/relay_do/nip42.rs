@@ -50,6 +50,59 @@ pub fn is_protected_read_kind(kind: u64) -> bool {
     PROTECTED_READ_KINDS.contains(&kind)
 }
 
+/// The protected kinds that are *correspondence*: readable only by the parties
+/// to them, never merely by anyone who has authenticated.
+///
+/// The distinction matters because the two halves of [`PROTECTED_READ_KINDS`]
+/// have different rules. A moderation event (30910-30916) is protected from
+/// anonymous readers but is legitimately readable by the membership. A DM is
+/// not: authenticating as *someone* does not make you a party to *this*
+/// conversation.
+pub fn is_correspondence_kind(kind: u64) -> bool {
+    matches!(kind, 4 | 13 | 14 | 1059)
+}
+
+/// Whether a protected-kind event may be delivered to this viewer.
+///
+/// This is the **per-event** gate, deliberately duplicating policy the
+/// filter-level gates already express, because those gates decide from what a
+/// filter *names*: `protected_read_blocked` and `gate_kind_1059_filters` both
+/// inspect `filter.kinds`, and a Nostr filter that omits `kinds` matches every
+/// kind while naming none. A `REQ ["sub", {}]` therefore sailed past both and
+/// `query_events` returned sealed DMs to anyone (deepsec-gate, auth-bypass,
+/// HIGH). A per-event decision cannot be dodged by declining to mention the
+/// kind, because by then the kind is a property of the event in hand.
+///
+/// - **Correspondence** (4, 13, 14, 1059): the viewer must be authenticated and
+///   be either the author or a `p`-tagged recipient. Mode-independent, matching
+///   the existing design note that "DM privacy never depends on `AUTH_MODE`".
+///   Admin is **not** an exemption: an operator role is not a party to someone
+///   else's conversation.
+/// - **Moderation** (30910-30916): the viewer must be authenticated when the
+///   relay is in `Nip42` mode, exactly mirroring `protected_read_blocked`, so
+///   legacy `Allowlist` deployments keep their current read behaviour.
+/// - Everything else is not protected and passes through untouched.
+pub fn protected_read_permitted(
+    kind: u64,
+    author: &str,
+    recipients: &[String],
+    session_pubkey: Option<&str>,
+    mode: AuthMode,
+) -> bool {
+    if !is_protected_read_kind(kind) {
+        return true;
+    }
+    if is_correspondence_kind(kind) {
+        let Some(viewer) = session_pubkey else {
+            return false;
+        };
+        return viewer.eq_ignore_ascii_case(author)
+            || recipients.iter().any(|r| r.eq_ignore_ascii_case(viewer));
+    }
+    // Moderation kinds: authentication is the whole rule, and only in nip42 mode.
+    mode != AuthMode::Nip42 || session_pubkey.is_some()
+}
+
 /// AUTH enforcement mode — the operator escape hatch (config `AUTH_MODE`),
 /// mirroring the repo's other env-driven toggles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -323,5 +376,161 @@ mod tests {
             allowlist_denial_reason(AuthMode::Allowlist, true),
             "blocked: pubkey not whitelisted"
         );
+    }
+}
+
+#[cfg(test)]
+mod protected_read_permitted_tests {
+    //! The auth-bypass deepsec-gate found at HIGH: a `REQ ["sub", {}]` names no
+    //! kinds, matches every kind, and so passed both filter-level gates —
+    //! `query_events` then returned sealed DMs to an anonymous socket. These
+    //! pin the per-event gate that closes it.
+    use super::*;
+
+    const VIEWER: &str = "aaaa";
+    const AUTHOR: &str = "bbbb";
+    const STRANGER: &str = "cccc";
+
+    fn to(pk: &str) -> Vec<String> {
+        vec![pk.to_string()]
+    }
+
+    /// The bypass itself: an anonymous viewer receives no correspondence,
+    /// whatever the filter did or did not say.
+    #[test]
+    fn an_anonymous_viewer_receives_no_correspondence() {
+        for kind in [4u64, 13, 14, 1059] {
+            for mode in [AuthMode::Nip42, AuthMode::Allowlist] {
+                assert!(
+                    !protected_read_permitted(kind, AUTHOR, &to(VIEWER), None, mode),
+                    "kind {kind} leaked to an anonymous viewer in {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// DM privacy does not depend on AUTH_MODE — the relay's own design note,
+    /// now true of the per-event gate as well as the filter gate.
+    #[test]
+    fn a_stranger_receives_no_correspondence_in_either_mode() {
+        for kind in [4u64, 13, 14, 1059] {
+            for mode in [AuthMode::Nip42, AuthMode::Allowlist] {
+                assert!(
+                    !protected_read_permitted(kind, AUTHOR, &to(VIEWER), Some(STRANGER), mode),
+                    "kind {kind} leaked to a stranger in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_recipient_and_the_author_both_receive_their_correspondence() {
+        for kind in [4u64, 13, 14, 1059] {
+            assert!(protected_read_permitted(
+                kind,
+                AUTHOR,
+                &to(VIEWER),
+                Some(VIEWER),
+                AuthMode::Nip42
+            ));
+            assert!(protected_read_permitted(
+                kind,
+                AUTHOR,
+                &to(VIEWER),
+                Some(AUTHOR),
+                AuthMode::Nip42
+            ));
+        }
+    }
+
+    /// Pubkeys are hex and hex is case-insensitive; a recipient must not be
+    /// locked out of their own mail by casing.
+    #[test]
+    fn recipient_matching_is_case_insensitive() {
+        assert!(protected_read_permitted(
+            1059,
+            AUTHOR,
+            &to("AAAA"),
+            Some("aaaa"),
+            AuthMode::Nip42
+        ));
+    }
+
+    /// An operator role is not a party to someone else's conversation.
+    /// Admin-ness is deliberately not an input to this function.
+    #[test]
+    fn a_gift_wrap_with_several_recipients_serves_each_of_them() {
+        let many = vec![VIEWER.to_string(), STRANGER.to_string()];
+        assert!(protected_read_permitted(
+            1059,
+            AUTHOR,
+            &many,
+            Some(STRANGER),
+            AuthMode::Nip42
+        ));
+        assert!(!protected_read_permitted(
+            1059,
+            AUTHOR,
+            &many,
+            Some("dddd"),
+            AuthMode::Nip42
+        ));
+    }
+
+    /// Moderation events are protected from anonymous readers but are
+    /// legitimately readable by the membership — a different rule from
+    /// correspondence, and one that must not change under legacy AUTH_MODE.
+    #[test]
+    fn moderation_kinds_need_only_authentication_and_only_in_nip42() {
+        for kind in 30910u64..=30916 {
+            assert!(!protected_read_permitted(
+                kind,
+                AUTHOR,
+                &[],
+                None,
+                AuthMode::Nip42
+            ));
+            assert!(protected_read_permitted(
+                kind,
+                AUTHOR,
+                &[],
+                Some(STRANGER),
+                AuthMode::Nip42
+            ));
+            // Legacy deployments keep their current read behaviour.
+            assert!(protected_read_permitted(
+                kind,
+                AUTHOR,
+                &[],
+                None,
+                AuthMode::Allowlist
+            ));
+        }
+    }
+
+    /// Everything outside the protected set passes through untouched: this gate
+    /// must not quietly become a general read filter.
+    #[test]
+    fn unprotected_kinds_are_untouched() {
+        for kind in [0u64, 1, 7, 42, 30023, 31402, 31403] {
+            assert!(protected_read_permitted(
+                kind,
+                AUTHOR,
+                &[],
+                None,
+                AuthMode::Nip42
+            ));
+        }
+    }
+
+    #[test]
+    fn the_correspondence_set_is_exactly_the_dm_kinds() {
+        for kind in PROTECTED_READ_KINDS {
+            assert_eq!(
+                is_correspondence_kind(*kind),
+                matches!(kind, 4 | 13 | 14 | 1059),
+                "kind {kind} is on the wrong side of the correspondence split"
+            );
+        }
     }
 }

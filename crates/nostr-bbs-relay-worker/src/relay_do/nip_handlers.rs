@@ -1652,6 +1652,29 @@ impl NostrRelayDO {
         ctx: &ViewerContext,
         zones: &ZoneConfig,
     ) -> ReadDecision {
+        // Protected kinds first, and per EVENT rather than per filter. The
+        // filter-level gates in `handle_req` decide from the kinds a filter
+        // NAMES; a filter that omits `kinds` matches every kind while naming
+        // none, and so passed both of them. This branch cannot be dodged that
+        // way — the kind is a property of the event in hand.
+        if nip42::is_protected_read_kind(event.kind) {
+            let recipients: Vec<String> = event
+                .tags
+                .iter()
+                .filter(|t| t.len() >= 2 && t[0] == "p")
+                .map(|t| t[1].clone())
+                .collect();
+            if !nip42::protected_read_permitted(
+                event.kind,
+                &event.pubkey,
+                &recipients,
+                ctx.session_pubkey.as_deref(),
+                self.auth_mode(),
+            ) {
+                return ReadDecision::Withhold;
+            }
+        }
+
         if calendar_projection::is_projected_calendar_kind(event.kind) {
             return match self
                 .project_calendar_for_viewer(
