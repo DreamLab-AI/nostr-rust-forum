@@ -1,7 +1,7 @@
 ---
 expectation_id: EXP-AC-002
 scope: nostr-bbs-forum-client (forum half; the VisionClaw half is another repo's)
-git_sha: aa438f3ea79ad9688c37119783b398d609680778
+git_sha: ef0c9aa207ba16618cb4a09195546ef317823ba8
 branch: feat/augmentation-conditions-client
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T20:02:22Z
@@ -11,10 +11,11 @@ audited_by:
 # Evidence — EXP-AC-002 (forum client)
 
 Executed in the worktree `nostr-rust-forum-client` on branch
-`feat/augmentation-conditions-client`, whose parent is `aa438f3ea79ad9688c37119783b398d609680778`
-(`feat/augmentation-conditions`). Every command below was run; the output is
-this run's, trimmed to the assertion lines. Uncommitted at capture time — the
-tree is the change under test.
+`feat/augmentation-conditions-client`, at `ef0c9aa` (parent
+`aa438f3`, the backend half). Every command below was run against that tree; the
+output is this run's, trimmed to the assertion lines. This receipt is committed
+immediately after the change it describes, so the tree it names is the tree the
+commands ran on.
 
 ## Scenario 1 — the rationale is the human's, and there is no template left
 

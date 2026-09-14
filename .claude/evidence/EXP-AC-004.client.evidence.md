@@ -1,7 +1,7 @@
 ---
 expectation_id: EXP-AC-004
 scope: nostr-bbs-forum-client (the UI half of FR4.1 and FR4.3 only)
-git_sha: aa438f3ea79ad9688c37119783b398d609680778
+git_sha: ef0c9aa207ba16618cb4a09195546ef317823ba8
 branch: feat/augmentation-conditions-client
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T20:02:22Z
