@@ -252,7 +252,7 @@ requesting agent on its own request.
 | `tp-verifiability` | 31400, 31402 | `inspectable` \| `partial` \| `opaque` | How far the outcome can be checked afterwards |
 | `tp-reversibility` | 31400, 31402 | `reversible` \| `compensable` \| `irreversible` | Whether the act can be undone |
 | `tp-stakes` | 31400, 31402 | `bounded` \| `significant` \| `critical` | What is at risk if it is wrong |
-| `calibration-sample-rate` | 31400 | `0.0`–`1.0` (default `0.1`) | Share of otherwise-suppressed requests shown to reviewers anyway |
+| `calibration-sample-rate` | 31400 | `0.0`–`1.0` (default `0.1`) | Share of otherwise-suppressed requests shown to reviewers anyway. Selection is `HMAC(CALIBRATION_SELECTION_KEY, request_id)` — keyed, because the agent chooses its own request id |
 | `max-pending-hours` | 31400 | integer (default `72`) | Age at which a still-pending case is escalated |
 | `probe-agent` | 31400 | 64-hex pubkey | The only agent whose `probe` tags count as probes |
 | `probe` | 31402 | sha256 digest | Seeded known-bad request; withheld from every projection until the case is decided |

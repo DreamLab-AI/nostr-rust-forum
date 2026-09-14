@@ -28,8 +28,14 @@ against the six conditions of arXiv 2609.12482. **Not published and not deployed
   load-bearing for the first time.
 - **Panel policy (core).** `calibration-sample-rate` (default `0.1`),
   `max-pending-hours` (default `72`) and `probe-agent` tags, plus
-  `is_calibration_sample()`, which selects on `sha256(request_id)` and never on
-  the wall clock.
+  `is_calibration_sample()`, which selects on
+  `HMAC-SHA256(CALIBRATION_SELECTION_KEY, request_id)` — deterministic, node-
+  independent, and never keyed on the wall clock. **The HMAC key is not
+  decoration:** the request id is the 31402's `d` tag, chosen freely by the
+  requesting agent, so an unkeyed hash against a published rate would let an
+  agent grind `d` tags until it found one sampling never selects. Set the key
+  with `wrangler secret put CALIBRATION_SELECTION_KEY`; unset, the relay still
+  samples and warns on every projection.
 - **Application receipt stages (core).** `ReceiptStage` moves from the relay into
   core and gains `consumer-received`, `applied`, `not-applied`,
   `applied-manually`, and the `escalated-on-age` / `expired` side receipts, with

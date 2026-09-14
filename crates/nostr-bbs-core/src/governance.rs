@@ -553,18 +553,47 @@ pub fn is_member_suppressed_effective(
     effective.is_member_suppressed()
 }
 
-/// Whether a request is a deterministically-selected calibration sample
-/// (FR6.3, DDD §3).
+/// Tag name carrying the relay's calibration selection key, never published.
 ///
-/// The first 8 bytes of `sha256(request_id)` read as a big-endian `u64`,
-/// divided by `u64::MAX`, compared against `rate`. Deterministic by
-/// construction: the same request id always gives the same answer on every
-/// node, and nothing about the wall clock enters — the counter-example
-/// EXP-AC-006 names explicitly.
+/// Not a tag at all, in fact — the constant names the environment variable the
+/// relay reads. It lives here so the one place that documents the selection
+/// mechanism also names the thing that secures it.
+pub const ENV_CALIBRATION_SELECTION_KEY: &str = "CALIBRATION_SELECTION_KEY";
+
+/// Whether a request is a calibration sample (FR6.3, DDD §3).
+///
+/// `HMAC-SHA256(selection_key, request_id)`, first 8 bytes read as a big-endian
+/// `u64`, divided by `u64::MAX`, compared against `rate`.
+///
+/// ## Why this is keyed
+///
+/// The obvious implementation — `sha256(request_id) < rate` — is deterministic
+/// and clock-free, which is what FR6.3 asks for, and **still broken**. The
+/// request id is the 31402's `d` tag, which on a NIP-33 parameterized-
+/// replaceable event the *requesting agent chooses freely*, and the rate is
+/// published on the panel for anyone to read. An agent can therefore grind `d`
+/// tags offline until it finds one that never lands below the rate, and opt out
+/// of oversight entirely. That is precisely the failure ADR-2011 exists to
+/// remove — the party with the incentive to escape scrutiny deciding whether it
+/// is scrutinised — reappearing one level down.
+///
+/// Keying the selection under a secret the agent does not hold makes membership
+/// unpredictable: the agent can still choose its `d` tag, but it cannot tell
+/// which choice escapes. Everything FR6.3 actually required is preserved —
+/// the result is deterministic for a given `(key, request_id)`, identical on
+/// every node holding the key, and no wall clock is involved.
+///
+/// ## Operator responsibility
+///
+/// The security property is the **secrecy of `selection_key`**. An empty or
+/// publicly-known key reduces this to the grindable form above. The relay reads
+/// it from [`ENV_CALIBRATION_SELECTION_KEY`]; an unset key is a misconfiguration
+/// that the relay reports rather than silently tolerating, and it deliberately
+/// still samples, because silently disabling oversight is the worse failure.
 ///
 /// A rate at or below zero samples nothing; a rate at or above one samples
 /// everything.
-pub fn is_calibration_sample(request_id: &str, rate: f32) -> bool {
+pub fn is_calibration_sample(selection_key: &[u8], request_id: &str, rate: f32) -> bool {
     // NaN is handled explicitly rather than by inverting `>`: a rate that is
     // not a number samples nothing, which is the conservative reading.
     if rate.is_nan() || rate <= 0.0 {
@@ -573,10 +602,17 @@ pub fn is_calibration_sample(request_id: &str, rate: f32) -> bool {
     if rate >= 1.0 {
         return true;
     }
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(request_id.as_bytes());
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    // `new_from_slice` on HMAC accepts a key of any length (it is hashed or
+    // zero-padded to the block size per RFC 2104), so this cannot fail for a
+    // variable-length operator secret.
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(selection_key)
+        .expect("HMAC accepts a key of any length");
+    mac.update(request_id.as_bytes());
+    let tag = mac.finalize().into_bytes();
     let mut head = [0u8; 8];
-    head.copy_from_slice(&digest[..8]);
+    head.copy_from_slice(&tag[..8]);
     let position = u64::from_be_bytes(head) as f64 / u64::MAX as f64;
     position < rate as f64
 }
@@ -3068,6 +3104,9 @@ mod task_property_tests {
 mod calibration_tests {
     use super::*;
 
+    /// Stands in for the relay operator's `CALIBRATION_SELECTION_KEY`.
+    const TEST_KEY: &[u8] = b"relay-selection-secret";
+
     /// EXP-AC-006: with a rate of 0.1, between 80 and 120 of 1,000 requests are
     /// sampled. The bound is on the hash's uniformity, not on luck: the ids are
     /// fixed, so this test is deterministic and will fail identically forever if
@@ -3075,7 +3114,7 @@ mod calibration_tests {
     #[test]
     fn sampling_rate_lands_within_the_expected_band() {
         let sampled = (0..1000)
-            .filter(|i| is_calibration_sample(&format!("req-{i:04}"), 0.1))
+            .filter(|i| is_calibration_sample(TEST_KEY, &format!("req-{i:04}"), 0.1))
             .count();
         assert!(
             (80..=120).contains(&sampled),
@@ -3090,19 +3129,69 @@ mod calibration_tests {
     fn sampling_is_deterministic_per_request_id() {
         for i in 0..200 {
             let id = format!("req-{i}");
-            let first = is_calibration_sample(&id, 0.1);
+            let first = is_calibration_sample(TEST_KEY, &id, 0.1);
             for _ in 0..5 {
-                assert_eq!(is_calibration_sample(&id, 0.1), first, "unstable for {id}");
+                assert_eq!(
+                    is_calibration_sample(TEST_KEY, &id, 0.1),
+                    first,
+                    "unstable for {id}"
+                );
             }
         }
     }
 
+    /// The defect: the selection key is the request's `d` tag, which the
+    /// **requesting agent chooses freely** on a NIP-33 replaceable event, and
+    /// the rate is published on the panel. An agent can therefore grind `d`
+    /// tags offline until it finds one that is never selected, and opt out of
+    /// the oversight FR6.3 exists to impose — the same failure ADR-2011 was
+    /// written to remove, one level down.
+    ///
+    /// The fix is to key the selection under a secret the agent does not hold,
+    /// so membership cannot be precomputed. This test pins the property that
+    /// makes grinding useless: the request id alone does not determine the
+    /// outcome.
+    #[test]
+    fn the_request_id_alone_does_not_determine_selection() {
+        let id = "agent-chosen-d-tag";
+        let mut outcomes = std::collections::HashSet::new();
+        for n in 0..64u32 {
+            let key = format!("relay-secret-{n}");
+            outcomes.insert(is_calibration_sample(key.as_bytes(), id, 0.5));
+        }
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "one fixed request id resolved the same way under every key: \
+             an agent could grind `d` tags to evade sampling"
+        );
+    }
+
+    /// Grinding is defeated in the direction that matters: an agent searching
+    /// for an id that escapes sampling under one key finds no guarantee under
+    /// the relay's actual key.
+    #[test]
+    fn an_id_that_evades_one_key_does_not_evade_another() {
+        let evader = (0..10_000)
+            .map(|i| format!("req-{i}"))
+            .find(|id| !is_calibration_sample(b"attacker-assumed-key", id, 0.5))
+            .expect("an unsampled id exists at rate 0.5");
+        assert!(
+            (0..64u32).any(|n| is_calibration_sample(
+                format!("relay-secret-{n}").as_bytes(),
+                &evader,
+                0.5
+            )),
+            "an id chosen to evade one key evaded all of them"
+        );
+    }
+
     #[test]
     fn degenerate_rates_are_total() {
-        assert!(!is_calibration_sample("anything", 0.0));
-        assert!(!is_calibration_sample("anything", -1.0));
-        assert!(is_calibration_sample("anything", 1.0));
-        assert!(is_calibration_sample("anything", 2.0));
+        assert!(!is_calibration_sample(TEST_KEY, "anything", 0.0));
+        assert!(!is_calibration_sample(TEST_KEY, "anything", -1.0));
+        assert!(is_calibration_sample(TEST_KEY, "anything", 1.0));
+        assert!(is_calibration_sample(TEST_KEY, "anything", 2.0));
     }
 
     /// A higher rate samples a superset: the selection is a threshold on one
@@ -3111,8 +3200,11 @@ mod calibration_tests {
     fn higher_rate_is_a_superset() {
         for i in 0..300 {
             let id = format!("req-{i}");
-            if is_calibration_sample(&id, 0.1) {
-                assert!(is_calibration_sample(&id, 0.5), "{id} dropped out at 0.5");
+            if is_calibration_sample(TEST_KEY, &id, 0.1) {
+                assert!(
+                    is_calibration_sample(TEST_KEY, &id, 0.5),
+                    "{id} dropped out at 0.5"
+                );
             }
         }
     }

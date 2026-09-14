@@ -48,6 +48,22 @@ RELAY_URL = ""
 ESCALATION_DEFAULT_TIER    = "medium"
 ESCALATION_DEFAULT_POSTURE = "escalate_to_human"
 
+# Calibration sampling (FR6.3 / ADR-2011). CALIBRATION_SELECTION_KEY is
+# deliberately NOT declared here as a plaintext var: it is a SECRET, set with
+#
+#     wrangler secret put CALIBRATION_SELECTION_KEY
+#
+# Sampling is HMAC(key, request_id), and the request id is the 31402's `d` tag,
+# which the requesting agent chooses freely. The key's secrecy is the only thing
+# stopping an agent grinding `d` tags against the panel's published rate until it
+# finds one that sampling never selects — i.e. opting itself out of oversight.
+# Committing the key to this file would hand it to every agent that can read the
+# repository and restore exactly that hole.
+#
+# Unset, the relay still samples (silently disabling oversight is the worse
+# failure) and logs a warning on every projection. Set it before relying on the
+# calibration or probe-catch numbers for anything.
+
 # Mesh federation (PRD-010 Phase 3 / ADR-073)
 MESH_MODE               = "standalone"
 MESH_PEER_RELAYS        = ""

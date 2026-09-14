@@ -279,6 +279,11 @@ fn declared_tier(tags: &[Vec<String>], content: &str) -> Option<RiskTier> {
 /// Pure over its inputs so the whole boundary computation is unit-testable
 /// without a live D1; the env-bound shell in `project_action_request` only
 /// supplies the panel row.
+///
+/// `calibration_key` is the relay's secret selection key. It is an input rather
+/// than a constant because the whole point is that the requesting agent cannot
+/// predict the sampling outcome: the agent chooses its own `d` tag, so an
+/// unkeyed hash of it would let the agent grind its way out of oversight.
 pub(crate) fn plan_request_boundary(
     case_id: &str,
     request_pubkey: &str,
@@ -286,6 +291,7 @@ pub(crate) fn plan_request_boundary(
     request_content: &str,
     panel_tags: Option<&[Vec<String>]>,
     advertised_default: RiskTier,
+    calibration_key: &[u8],
 ) -> RequestBoundary {
     let panel_props = panel_tags.and_then(TaskProperties::from_tags);
     let request_props = TaskProperties::from_tags(request_tags);
@@ -308,7 +314,11 @@ pub(crate) fn plan_request_boundary(
     let suppressible =
         governance::is_member_suppressed_effective(merged.as_ref(), effective, false);
     let calibration_sample = suppressible
-        && governance::is_calibration_sample(case_id, policy.calibration_sample_rate);
+        && governance::is_calibration_sample(
+            calibration_key,
+            case_id,
+            policy.calibration_sample_rate,
+        );
 
     // A `probe` tag is honoured ONLY from the panel's registered probe agent
     // (FR6.4). From anyone else it is noise that would corrupt the catch rate,
@@ -2033,6 +2043,18 @@ impl NostrRelayDO {
             .unwrap_or_default()
     }
 
+    /// The relay's calibration selection key (FR6.3).
+    ///
+    /// Secret, and never advertised in NIP-11: its secrecy is the only thing
+    /// stopping a requesting agent from grinding `d` tags until it finds one
+    /// that sampling never selects.
+    pub(crate) fn calibration_selection_key(&self) -> Vec<u8> {
+        self.env
+            .var(governance::ENV_CALIBRATION_SELECTION_KEY)
+            .map(|v| v.to_string().into_bytes())
+            .unwrap_or_default()
+    }
+
     /// The tags of the 31400 panel a 31402 belongs to, where one can be resolved.
     ///
     /// Resolution order: the NIP-33 `a` tag (`31400:<pubkey>:<d>`), then a plain
@@ -2118,6 +2140,17 @@ impl NostrRelayDO {
             .unwrap_or(50);
 
         let panel_tags = self.resolve_panel_tags(event).await;
+        let calibration_key = self.calibration_selection_key();
+        if calibration_key.is_empty() {
+            // Reported, not silently tolerated: without a key the selection is
+            // an unkeyed hash of an agent-chosen `d` tag, which the agent can
+            // grind to escape sampling. Sampling still runs, because silently
+            // disabling oversight is the worse of the two failures.
+            console_warn!(
+                "{} is unset: calibration sampling is predictable by the requesting agent",
+                governance::ENV_CALIBRATION_SELECTION_KEY
+            );
+        }
         let boundary = plan_request_boundary(
             d_tag,
             &event.pubkey,
@@ -2125,6 +2158,7 @@ impl NostrRelayDO {
             &event.content,
             panel_tags.as_deref(),
             self.advertised_default_tier(),
+            &calibration_key,
         );
 
         let stmt = db.prepare(
@@ -3740,6 +3774,11 @@ mod augmentation_boundary_tests {
     use super::*;
     use nostr_bbs_core::governance::{Reversibility, Stakes, Verifiability};
 
+    /// Stands in for the relay operator's `CALIBRATION_SELECTION_KEY`. Sampling
+    /// is keyed precisely so a requesting agent cannot predict it from the `d`
+    /// tag it chose.
+    const KEY: &[u8] = b"relay-selection-secret";
+
     fn tag(name: &str, value: &str) -> Vec<String> {
         vec![name.to_string(), value.to_string()]
     }
@@ -3761,7 +3800,7 @@ mod augmentation_boundary_tests {
     fn unlabelled_request_projects_with_the_advertised_default() {
         for default in [RiskTier::Low, RiskTier::Medium, RiskTier::High] {
             let boundary =
-                plan_request_boundary("case-1", "agent", &[tag("d", "case-1")], "{}", None, default);
+                plan_request_boundary("case-1", "agent", &[tag("d", "case-1")], "{}", None, default, KEY);
             assert_eq!(boundary.effective, default);
             assert_eq!(boundary.declared, None);
             assert_eq!(boundary.props, None);
@@ -3785,6 +3824,7 @@ mod augmentation_boundary_tests {
             "{}",
             Some(&panel),
             RiskTier::Medium,
+            KEY,
         );
         assert_eq!(
             boundary.props.unwrap().reversibility,
@@ -3810,6 +3850,7 @@ mod augmentation_boundary_tests {
             "{}",
             Some(&panel),
             RiskTier::Low,
+            KEY,
         );
         assert_eq!(boundary.props.unwrap().stakes, Stakes::Critical);
         assert_eq!(boundary.effective, RiskTier::High);
@@ -3826,6 +3867,7 @@ mod augmentation_boundary_tests {
             "{}",
             None,
             RiskTier::Low,
+            KEY,
         );
         assert_eq!(from_tag.declared, Some(RiskTier::Critical));
         assert_eq!(from_tag.effective, RiskTier::Critical);
@@ -3837,6 +3879,7 @@ mod augmentation_boundary_tests {
             r#"{"fields":{},"risk_tier":"high"}"#,
             None,
             RiskTier::Low,
+            KEY,
         );
         assert_eq!(from_content.declared, Some(RiskTier::High));
         assert_eq!(from_content.effective, RiskTier::High);
@@ -3853,6 +3896,7 @@ mod augmentation_boundary_tests {
             "{}",
             Some(&panel),
             RiskTier::Low,
+            KEY,
         );
         assert_eq!(boundary.effective, RiskTier::Medium);
         assert!(!governance::is_member_suppressed_effective(
@@ -3884,6 +3928,7 @@ mod augmentation_boundary_tests {
             "{}",
             Some(&panel),
             RiskTier::Low,
+            KEY,
         );
         assert!(low.calibration_sample, "a low case is suppressible");
 
@@ -3894,8 +3939,47 @@ mod augmentation_boundary_tests {
             "{}",
             Some(&panel),
             RiskTier::Low,
+            KEY,
         );
         assert!(!high.calibration_sample, "a high case is already shown");
+    }
+
+    /// The evasion this closes: the `d` tag IS the case id, and the requesting
+    /// agent chooses it. If sampling were an unkeyed hash of that, an agent
+    /// could grind `d` tags offline against the panel's published rate until it
+    /// found one that is never sampled. Keyed, the same id resolves differently
+    /// under different relay keys, so there is nothing to grind towards.
+    #[test]
+    fn an_agent_cannot_grind_its_case_id_out_of_sampling() {
+        let panel = vec![
+            tag("d", "p"),
+            tag(governance::TAG_CALIBRATION_SAMPLE_RATE, "0.5"),
+        ];
+        let sampled_under = |key: &[u8], case_id: &str| {
+            plan_request_boundary(
+                case_id,
+                "agent",
+                &[tag("risk-tier", "low")],
+                "{}",
+                Some(&panel),
+                RiskTier::Low,
+                key,
+            )
+            .calibration_sample
+        };
+
+        // An agent grinds offline and finds an id unsampled under the key it
+        // guessed at.
+        let evader = (0..10_000)
+            .map(|i| format!("agent-chosen-{i}"))
+            .find(|id| !sampled_under(b"guessed-key", id))
+            .expect("an unsampled id exists at rate 0.5");
+
+        // Against the relay's real key, the grinding bought nothing.
+        assert!(
+            (0..64u32).any(|n| sampled_under(format!("real-key-{n}").as_bytes(), &evader)),
+            "an id ground against one key evaded every key: sampling is predictable"
+        );
     }
 
     /// A calibration sample is shown rather than suppressed — the mechanism
@@ -3913,6 +3997,7 @@ mod augmentation_boundary_tests {
             "{}",
             Some(&panel),
             RiskTier::Low,
+            KEY,
         );
         assert_eq!(b.effective, RiskTier::Low);
         assert!(!governance::is_member_suppressed_effective(
@@ -3935,7 +4020,9 @@ mod augmentation_boundary_tests {
         let request = vec![tag(governance::TAG_PROBE, "deadbeef")];
 
         let registered =
-            plan_request_boundary("c", &prober, &request, "{}", Some(&panel), RiskTier::Medium);
+            plan_request_boundary("c", &prober, &request, "{}", Some(&panel), RiskTier::Medium,
+            KEY,
+        );
         assert_eq!(registered.probe_digest.as_deref(), Some("deadbeef"));
 
         let impostor = plan_request_boundary(
@@ -3945,6 +4032,7 @@ mod augmentation_boundary_tests {
             "{}",
             Some(&panel),
             RiskTier::Medium,
+            KEY,
         );
         assert_eq!(impostor.probe_digest, None);
 
@@ -3956,6 +4044,7 @@ mod augmentation_boundary_tests {
             "{}",
             Some(&[tag("d", "p")]),
             RiskTier::Medium,
+            KEY,
         );
         assert_eq!(unregistered.probe_digest, None);
     }
@@ -3966,12 +4055,16 @@ mod augmentation_boundary_tests {
     fn max_pending_hours_comes_from_the_panel_or_the_default() {
         let panel = vec![tag("d", "p"), tag(governance::TAG_MAX_PENDING_HOURS, "6")];
         assert_eq!(
-            plan_request_boundary("c", "a", &[], "{}", Some(&panel), RiskTier::Medium)
+            plan_request_boundary("c", "a", &[], "{}", Some(&panel), RiskTier::Medium,
+            KEY,
+        )
                 .max_pending_hours,
             6
         );
         assert_eq!(
-            plan_request_boundary("c", "a", &[], "{}", None, RiskTier::Medium).max_pending_hours,
+            plan_request_boundary("c", "a", &[], "{}", None, RiskTier::Medium,
+            KEY,
+        ).max_pending_hours,
             governance::DEFAULT_MAX_PENDING_HOURS
         );
     }
