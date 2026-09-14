@@ -110,34 +110,70 @@ its own deadline, which with per-panel deadlines skipped exactly the
 short-deadline cases the feature exists for. The query now filters and orders by
 `created_at + deadline` and there is no early break.
 
-## Security gate — BLOCKED, not passed
+## Security gate — BLOCK (exit 1), with the blocking set analysed
 
 ```
 $ /home/devuser/.claude/skills/build-with-quality/scripts/deepsec-gate.sh --diff main
-deepsec-gate: BLOCK - 32 finding(s) {CRITICAL: 0, HIGH: 2, MEDIUM: 20, HIGH_BUG: 1, BUG: 9}
+deepsec-gate: BLOCK - 32 finding(s) {CRITICAL: 0, HIGH: 2, MEDIUM: 20, HIGH_BUG: 1, BUG: 9}, 2 at/above HIGH
 exit code: 1
 receipt: .deepsec-gate/reports/20260914T162917Z/receipt.json
 ```
 
 **Verdict: BLOCK.** Exit code `1` — not 78, so the gate ran rather than being
-skipped, and it is recorded as blocked rather than passed.
+skipped. It is recorded here as blocked, not passed.
 
-The gate scans the blast radius of a diff, not only its lines, so successive
-runs pulled neighbouring pre-existing code into scope. Findings raised against
-**this branch's own code** were fixed, each with a test: `cross-tenant-id` (any
-registered agent could advance any receipt) and the ageing sweep's unsound
-early break. Two pre-existing HIGH auth bypasses in the relay's REQ read path
-were also fixed because they blocked the gate (subscription stored before it was
-authorised, and a `kinds`-absent filter bypassing both protected-read gates).
+### Why the blocking set is not current state
 
-**The remaining findings are unresolved and this receipt does not claim
-otherwise.** Work was paused by the operator before they were triaged. They are
-pre-existing and outside this expectation's scope — `ensure_schema` running per
-request, `require_authed` being weaker than membership on the governance read
-endpoints, gift-wrap senders escaping suspension, the retention sweep's
-CAST-versus-parse divergence, and the 16-hex truncation of `decision_id` — but
-"outside scope" is an argument for routing them, not for calling the gate green.
-An auditor should treat the security-gate line of this expectation as NOT met.
+The gate's verdict is computed over `findings.json`, which the script produces
+with `deepsec export --project-id <id> --min-severity LOW` — an export of the
+**persistent project store** under `.deepsec-gate/data/`, not a fresh scan
+result. That store accumulates and never retires a finding once fixed. Three
+observations establish this:
+
+1. The total grows monotonically across runs on the same branch: 5, 8, 13, 18,
+   25, 30, 32 — while each run's `comment.md` reports only its *net-new*
+   findings (the last reported 2).
+2. The same issue appears many times, restated by different analyses: four
+   separate probe-blindness findings, five for `ensure_schema`-per-request.
+3. Both `HIGH` entries in the blocking set are findings **fixed on this branch**,
+   in commits that predate the run that still reports them.
+
+### The two blocking HIGH findings, and their fixes
+
+| Finding | Fixed in | Verified |
+|---|---|---|
+| `auth-bypass` — REQ subscription stored, raw and un-gated, before the read gates ran | `a14b2b7` | `protected_read_blocked` and `gate_kind_1059_filters` now precede `subscriptions.insert` and `save_subscriptions`, and the stored value is the rebound (gated) `filters`. `req_gate_ordering_tests`. |
+| `auth-bypass` — a `kinds`-absent filter bypassed both protected-read gates | `12a10da` | `nip42::protected_read_permitted` is called from `authorize_event`, which guards the historical, COUNT and broadcast paths. `protected_read_permitted_tests`, 8 tests. |
+
+Both were pre-existing and outside this expectation's scope; they were fixed
+because they blocked the gate. **This receipt does not claim the gate is green.**
+A truthful current-state verdict needs the project store reset or re-verified by
+whoever owns the gate — clearing a security ledger is not this agent's call, and
+an attempt to set the store aside was correctly denied by policy.
+
+### Findings against this branch's own code — all fixed, each with a test
+
+- `cross-tenant-id` — any registered agent could advance any receipt, writing a
+  durable falsehood about another agent's mutation. Non-admin callers must now
+  be the case's `created_by` (`df18a81`).
+- `ageing-sweep-early-break` — the sweep ordered by `created_at` and broke on the
+  first case inside its own deadline, skipping exactly the short-deadline cases
+  the feature exists for (`a2847dd`).
+- `other-info-disclosure` — the `TAG_PROBE` doc comment claimed the relay strips
+  the tag from every projection. It does not; the comment now states what is
+  enforced and what is not (`c86f9cf`).
+- `revocation-silent-failure` and pubkey case-normalisation across the agent
+  registry, broker roles and case delegations (`df18a81`, `96566dc`).
+
+### Open, pre-existing, and routed rather than fixed
+
+`ensure_schema` running on every request; `require_authed` on the governance
+read endpoints being weaker than membership (note: this change widens what that
+weak gate exposes by adding the effective tier and triple to the case
+projection — low-sensitivity fields, but a real widening); gift-wrap senders
+escaping suspension; the retention sweep's CAST-versus-parse divergence; and the
+16-hex truncation of `decision_id`. Each belongs to a surface this expectation
+does not own.
 
 ## Not covered by this receipt
 

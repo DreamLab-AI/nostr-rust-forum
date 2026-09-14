@@ -22,8 +22,17 @@
 ## Not done
 
 1. **deepsec-gate is BLOCK, not PASS** (exit 1, receipt
-   `.deepsec-gate/reports/20260914T162917Z/`). 2 HIGH remain, both pre-existing
-   and outside this feature. Untriaged at pause. The evidence receipts say so.
+   `.deepsec-gate/reports/20260914T162917Z/`). Now triaged: both blocking HIGH
+   findings are pre-existing relay read-auth bypasses that **are fixed on this
+   branch** (`a14b2b7`, `12a10da`), each with tests. They still appear because
+   the gate's verdict is an export of the persistent project store under
+   `.deepsec-gate/data/`, which accumulates and never retires a fixed finding —
+   the total grew 5, 8, 13, 18, 25, 30, 32 across runs while each run's net-new
+   count stayed small, and the same issues recur verbatim.
+   **Needs a decision from the gate's owner:** reset or re-verify the store to
+   get a truthful current-state verdict. Clearing a security ledger is not this
+   agent's call; an attempt to set the store aside was denied by policy and not
+   worked around. Full analysis in each evidence receipt.
 2. **Probe blindness is PARTIAL.** The `probe` tag is absent from `event_tags`
    and from every D1/REST projection of an undecided case, but remains on the
    raw signed 31402 served over REQ: stripping it invalidates the signature both
