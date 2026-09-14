@@ -547,6 +547,27 @@ async fn route_sprint_api(
         let resp = governance_api::handle_revoke_role(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
+    // FR4.1: the mutation owner reports what actually became of a decision.
+    if let Some(rest) = path.strip_prefix("/api/governance/receipts/") {
+        if let Some(response_event_id) = rest.strip_suffix("/application") {
+            if *method == Method::Post {
+                let resp = governance_api::handle_receipt_application(
+                    response_event_id,
+                    body_bytes,
+                    auth_header,
+                    env,
+                    origin,
+                )
+                .await?;
+                return Ok(Some(resp));
+            }
+        }
+    }
+    // FR6.1: reviewer telemetry — the humans are measured, not only the agents.
+    if path == "/api/governance/reviewers" && *method == Method::Get {
+        let resp = governance_api::handle_list_reviewers(auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
     if path == "/api/governance/roles" && *method == Method::Get {
         let resp = governance_api::handle_list_roles(auth_header, env, origin).await?;
         return Ok(Some(resp));
