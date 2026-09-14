@@ -8,3 +8,7 @@
 | 2026-08-16 | nip-compliance | Given the official `perf` evaluator receipts for `nostr-bbs-core` at commit `ef5 | NONE | NONE | yes | INCONCLUSIVE |  | 1f8b2b2ae969 |  |
 | 2026-08-21 | forum-thread-model | Given the sanctioned `perf` evaluator (`cargo bench -p nostr-bbs-core`) and the  | NONE | NONE | yes | INCONCLUSIVE |  | 1a9490e1e4f4 |  |
 | 2026-09-07 | operator-handoff | OPERATOR: thread benches + thread-model evaluator added; deeps now measurable | NONE | NONE | n/a | OPERATOR |  | operator |  |
+| 2026-09-07 | performance-scaling | annexe tail rejects 'tail -N'; all evaluators abort <200 ms; fix: 'tail -n N' | NONE | NONE | yes | INCONCLUSIVE |  | 9ad389fa59a6 |  |
+| 2026-09-07 | performance-scaling | perf exit 127: fish wrapper mis-quotes grep pattern; no perf data, deep blocked | NONE | NONE | yes | INCONCLUSIVE |  | d70520986a43 |  |
+| 2026-09-07 | performance-scaling | A-baseline: thread 250.4/21.57/181.4 µs @360ev; veto: no thread-model receipt | NONE | NONE | yes | INCONCLUSIVE |  | b07ddd51c838 |  |
+| 2026-09-07 | performance-scaling | VETOED: A-baseline locked: thread 250.0/21.6/183.3µs ±1.1%; no conn/sub-filter b | NONE | NONE | yes | INCONCLUSIVE |  | d5f714546fb0 |  |

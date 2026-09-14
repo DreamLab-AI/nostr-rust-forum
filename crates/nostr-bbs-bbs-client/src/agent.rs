@@ -64,6 +64,14 @@ pub fn sample_panels() -> Vec<AgentPanel> {
                 layout: LayoutHint::InboxTable,
                 capabilities: vec![PanelCapability::Filter, PanelCapability::BulkAction],
                 refresh_secs: 30,
+                // ADR-2011: these demo panels declare no task-property triple
+                // and no calibration policy. Absence is the honest value — an
+                // operator declares the triple, and no operator declared one
+                // here; the sample must not invent a boundary.
+                task_properties: None,
+                calibration_sample_rate: None,
+                max_pending_hours: None,
+                probe_agent: None,
             },
         },
         AgentPanel {
@@ -82,6 +90,14 @@ pub fn sample_panels() -> Vec<AgentPanel> {
                 layout: LayoutHint::CardGrid,
                 capabilities: vec![PanelCapability::Sort],
                 refresh_secs: 10,
+                // ADR-2011: these demo panels declare no task-property triple
+                // and no calibration policy. Absence is the honest value — an
+                // operator declares the triple, and no operator declared one
+                // here; the sample must not invent a boundary.
+                task_properties: None,
+                calibration_sample_rate: None,
+                max_pending_hours: None,
+                probe_agent: None,
             },
         },
     ]

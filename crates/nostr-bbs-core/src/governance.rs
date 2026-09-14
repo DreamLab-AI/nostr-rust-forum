@@ -112,6 +112,41 @@ pub struct PanelDefinition {
     pub capabilities: Vec<PanelCapability>,
     #[serde(default = "default_refresh")]
     pub refresh_secs: u32,
+    /// Operator-declared task-property triple for every action this panel
+    /// raises (ADR-2011). Absent on legacy panels, which constrain nothing.
+    #[serde(default)]
+    pub task_properties: Option<TaskProperties>,
+    /// Share of otherwise-suppressible requests shown anyway (FR6.3). `None`
+    /// means [`DEFAULT_CALIBRATION_SAMPLE_RATE`].
+    #[serde(default)]
+    pub calibration_sample_rate: Option<f32>,
+    /// Age in hours past which a pending case is escalated (FR4.3). `None`
+    /// means [`DEFAULT_MAX_PENDING_HOURS`].
+    #[serde(default)]
+    pub max_pending_hours: Option<u32>,
+    /// The one agent pubkey whose `probe`-tagged requests count as probes
+    /// (FR6.4). `None` means this panel honours no probes.
+    #[serde(default)]
+    pub probe_agent: Option<String>,
+}
+
+impl PanelDefinition {
+    /// The panel's effective calibration/ageing/probe policy, with each field
+    /// falling back to its documented default independently.
+    pub fn policy(&self) -> PanelPolicy {
+        PanelPolicy {
+            calibration_sample_rate: self
+                .calibration_sample_rate
+                .filter(|r| r.is_finite())
+                .map(|r| r.clamp(0.0, 1.0))
+                .unwrap_or(DEFAULT_CALIBRATION_SAMPLE_RATE),
+            max_pending_hours: self
+                .max_pending_hours
+                .filter(|h| *h > 0)
+                .unwrap_or(DEFAULT_MAX_PENDING_HOURS),
+            probe_agent: self.probe_agent.clone(),
+        }
+    }
 }
 
 fn default_version() -> String {
@@ -142,7 +177,7 @@ pub enum ActionPriority {
 /// auditable through the admin surface and the decisions read API (ADR-106
 /// Decision 4). If REC-6 later supplies a relay-side default it overrides this
 /// agent-declared tier; until then the agent's declaration stands.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskTier {
     Low,
@@ -184,6 +219,613 @@ impl RiskTier {
     }
 }
 
+
+// ── Task properties: the operator-declared human–agent boundary (ADR-2011) ──
+
+/// How far an outcome can be checked after the fact.
+///
+/// The first leg of the task-property triple (arXiv 2609.12482, ADR-2011).
+/// Ordering is *tightness*: `Inspectable` is the loosest, `Opaque` the
+/// tightest. A request may move a property up this ordering and never down.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Verifiability {
+    /// The result can be read back and checked directly.
+    #[default]
+    Inspectable,
+    /// Some of the result is checkable; some is not.
+    Partial,
+    /// Nothing about the result can be checked from outside.
+    Opaque,
+}
+
+/// Whether the act can be undone.
+///
+/// Second leg of the triple. Tightness order: `Reversible` < `Compensable` <
+/// `Irreversible`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Reversibility {
+    /// The act can be undone, restoring the prior state exactly.
+    #[default]
+    Reversible,
+    /// The act cannot be undone but its harm can be paid back or repaired.
+    Compensable,
+    /// Once done, done.
+    Irreversible,
+}
+
+/// What is at risk if the act is wrong.
+///
+/// Third leg of the triple. Tightness order: `Bounded` < `Significant` <
+/// `Critical`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Stakes {
+    /// A loss the operator has already accepted as a cost of doing business.
+    #[default]
+    Bounded,
+    /// A loss that would need explaining.
+    Significant,
+    /// A loss the operator cannot absorb.
+    Critical,
+}
+
+impl Verifiability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inspectable => "inspectable",
+            Self::Partial => "partial",
+            Self::Opaque => "opaque",
+        }
+    }
+    /// Parse a tag value. An unrecognised value falls back to the **loosest**
+    /// variant, because an unrecognised string must never silently *lower* a
+    /// panel's declared property through the tightening-only merge: it is the
+    /// merge that raises, and a loose fallback simply defers to the other side.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "partial" => Self::Partial,
+            "opaque" => Self::Opaque,
+            _ => Self::Inspectable,
+        }
+    }
+}
+
+impl Reversibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reversible => "reversible",
+            Self::Compensable => "compensable",
+            Self::Irreversible => "irreversible",
+        }
+    }
+    /// See [`Verifiability::parse`] for why an unknown value is the loosest.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "compensable" => Self::Compensable,
+            "irreversible" => Self::Irreversible,
+            _ => Self::Reversible,
+        }
+    }
+}
+
+impl Stakes {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bounded => "bounded",
+            Self::Significant => "significant",
+            Self::Critical => "critical",
+        }
+    }
+    /// See [`Verifiability::parse`] for why an unknown value is the loosest.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "significant" => Self::Significant,
+            "critical" => Self::Critical,
+            _ => Self::Bounded,
+        }
+    }
+}
+
+/// Tag name carrying [`Verifiability`] on a 31400 panel or 31402 request.
+pub const TAG_TP_VERIFIABILITY: &str = "tp-verifiability";
+/// Tag name carrying [`Reversibility`].
+pub const TAG_TP_REVERSIBILITY: &str = "tp-reversibility";
+/// Tag name carrying [`Stakes`].
+pub const TAG_TP_STAKES: &str = "tp-stakes";
+/// Tag name carrying the panel's calibration sample rate (31400).
+pub const TAG_CALIBRATION_SAMPLE_RATE: &str = "calibration-sample-rate";
+/// Tag name carrying the panel's pending-case deadline in hours (31400).
+pub const TAG_MAX_PENDING_HOURS: &str = "max-pending-hours";
+/// Tag name carrying the panel's registered probe-agent pubkey (31400).
+pub const TAG_PROBE_AGENT: &str = "probe-agent";
+/// Tag name carrying a seeded probe's digest on a 31402 request.
+///
+/// Invariant 7 (DDD §6): this tag is never rendered before the case is decided.
+/// The relay strips it from every projection of an undecided case.
+pub const TAG_PROBE: &str = "probe";
+
+/// Default share of `Low`/`Reversible` requests shown rather than suppressed,
+/// so reviewers keep exposure to routine agent output (C5/C6, FR6.3).
+pub const DEFAULT_CALIBRATION_SAMPLE_RATE: f32 = 0.1;
+
+/// Default age at which a still-pending case is escalated (FR4.3).
+pub const DEFAULT_MAX_PENDING_HOURS: u32 = 72;
+
+/// The governance role that may decide a case only when an admin has delegated
+/// that specific case to it (FR6.2, DDD §6 invariant 6).
+pub const ROLE_REVIEWER: &str = "reviewer";
+
+/// The operator-declared properties of the *task*, which set the human–agent
+/// boundary (ADR-2011).
+///
+/// Declared on a [`PanelDefinition`] (31400) by the operator who publishes the
+/// panel, and optionally restated on an [`ActionRequest`] (31402) by the
+/// requesting agent — where it may only **tighten**, never loosen, the panel's
+/// declaration. This is the whole point: the party with the strongest incentive
+/// to under-tier its own work cannot lower the boundary.
+///
+/// `Default` is the loosest triple, which is the correct reading of *absence*:
+/// a panel that declared nothing constrains nothing, and the request's own
+/// declaration (or the relay's advertised default) decides.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskProperties {
+    #[serde(default)]
+    pub verifiability: Verifiability,
+    #[serde(default)]
+    pub reversibility: Reversibility,
+    #[serde(default)]
+    pub stakes: Stakes,
+}
+
+impl TaskProperties {
+    pub fn new(verifiability: Verifiability, reversibility: Reversibility, stakes: Stakes) -> Self {
+        Self {
+            verifiability,
+            reversibility,
+            stakes,
+        }
+    }
+
+    /// Read the triple from an event's tags.
+    ///
+    /// Returns `None` when **no** `tp-*` tag is present — the honest reading of
+    /// a legacy event that declared nothing, distinct from one that declared
+    /// the loosest triple. When at least one leg is present the missing legs
+    /// take their loosest value, which is safe under [`Self::merge`]: a loose
+    /// leg can only ever defer to the other side, never lower it.
+    pub fn from_tags(tags: &[Vec<String>]) -> Option<Self> {
+        let v = extract_tag(tags, TAG_TP_VERIFIABILITY);
+        let r = extract_tag(tags, TAG_TP_REVERSIBILITY);
+        let s = extract_tag(tags, TAG_TP_STAKES);
+        if v.is_none() && r.is_none() && s.is_none() {
+            return None;
+        }
+        Some(Self {
+            verifiability: v.map(Verifiability::parse).unwrap_or_default(),
+            reversibility: r.map(Reversibility::parse).unwrap_or_default(),
+            stakes: s.map(Stakes::parse).unwrap_or_default(),
+        })
+    }
+
+    /// The three tags a publisher stamps on a 31400/31402 to declare this triple.
+    pub fn to_tags(self) -> Vec<Vec<String>> {
+        vec![
+            vec![
+                TAG_TP_VERIFIABILITY.to_string(),
+                self.verifiability.as_str().to_string(),
+            ],
+            vec![
+                TAG_TP_REVERSIBILITY.to_string(),
+                self.reversibility.as_str().to_string(),
+            ],
+            vec![TAG_TP_STAKES.to_string(), self.stakes.as_str().to_string()],
+        ]
+    }
+
+    /// Combine the panel's declaration with the request's, taking the **tighter**
+    /// value on every leg independently.
+    ///
+    /// DDD §6 invariant 2 ("tightening only"): the result is never looser than
+    /// `panel` on any leg, whatever the request claims. A request declaring
+    /// `Reversible` against a panel declaring `Irreversible` does not lower the
+    /// boundary — it is simply ignored on that leg.
+    pub fn merge(panel: TaskProperties, request: TaskProperties) -> TaskProperties {
+        TaskProperties {
+            verifiability: panel.verifiability.max(request.verifiability),
+            reversibility: panel.reversibility.max(request.reversibility),
+            stakes: panel.stakes.max(request.stakes),
+        }
+    }
+
+    /// Merge where either side may be absent. `None` on both sides means
+    /// nothing was declared anywhere, which stays `None` rather than collapsing
+    /// to the loosest triple — the caller needs that distinction to decide
+    /// whether to fall back to the relay's advertised default.
+    pub fn merge_opt(
+        panel: Option<&TaskProperties>,
+        request: Option<&TaskProperties>,
+    ) -> Option<TaskProperties> {
+        match (panel, request) {
+            (None, None) => None,
+            (Some(p), None) => Some(*p),
+            (None, Some(r)) => Some(*r),
+            (Some(p), Some(r)) => Some(Self::merge(*p, *r)),
+        }
+    }
+
+    /// The lowest [`RiskTier`] this triple permits (ADR-2011 §2).
+    ///
+    /// `Irreversible` reversibility or `Critical` stakes floors the case at
+    /// `High`; `Opaque` verifiability floors it at `Medium`. Anything else
+    /// imposes no floor of its own (`Low`) and defers to the declared tier and
+    /// the relay's advertised default.
+    pub fn tier_floor(self) -> RiskTier {
+        if self.reversibility == Reversibility::Irreversible || self.stakes == Stakes::Critical {
+            RiskTier::High
+        } else if self.verifiability == Verifiability::Opaque {
+            RiskTier::Medium
+        } else {
+            RiskTier::Low
+        }
+    }
+
+    /// Whether this triple forbids member-surface suppression outright.
+    ///
+    /// `Opaque` work is the case the paper singles out: nobody downstream can
+    /// check it, so it is never hidden from the people who could.
+    pub fn forbids_suppression(self) -> bool {
+        self.verifiability == Verifiability::Opaque
+            || self.reversibility == Reversibility::Irreversible
+            || self.stakes == Stakes::Critical
+    }
+}
+
+/// The tier that actually governs a case (ADR-2011 §2) — the only tier stored,
+/// rendered, or used for suppression.
+///
+/// - `panel_props` — the operator's declaration on the 31400.
+/// - `request_props` — the agent's optional restatement on the 31402; merged
+///   tightening-only.
+/// - `declared` — the agent's own `risk_tier`. Telemetry from here on: it can
+///   raise the effective tier but never lower it below the properties' floor.
+/// - `advertised_default` — the relay's `ESCALATION_DEFAULT_TIER`, as advertised
+///   in NIP-11. An entirely unlabelled request folds to exactly this.
+///
+/// Total and pure: every combination of inputs yields a tier, and the same
+/// inputs always yield the same tier.
+pub fn effective_tier(
+    panel_props: Option<&TaskProperties>,
+    request_props: Option<&TaskProperties>,
+    declared: Option<RiskTier>,
+    advertised_default: RiskTier,
+) -> RiskTier {
+    let merged = TaskProperties::merge_opt(panel_props, request_props);
+    match (declared, merged) {
+        // Nothing declared anywhere: the relay's advertised posture applies,
+        // rather than the accidental `Medium` of an absent tag (ADR-2011 §3).
+        (None, None) => advertised_default,
+        // A tier but no properties: the agent's declaration stands on its own.
+        (Some(d), None) => d,
+        // Properties but no tier: the floor, but never below what the relay
+        // advertises it escalates at.
+        (None, Some(p)) => advertised_default.max(p.tier_floor()),
+        // Both: the tighter of the two.
+        (Some(d), Some(p)) => d.max(p.tier_floor()),
+    }
+}
+
+/// Whether the member surface may suppress this case (FR3.2, DDD §6).
+///
+/// Suppression is a view filter over the *effective* tier, with two overrides
+/// that the tier alone cannot express: a triple that forbids suppression
+/// outright, and a calibration sample, which exists precisely to be seen.
+pub fn is_member_suppressed_effective(
+    props: Option<&TaskProperties>,
+    effective: RiskTier,
+    calibration_sample: bool,
+) -> bool {
+    if calibration_sample {
+        return false;
+    }
+    if props.map(|p| p.forbids_suppression()).unwrap_or(false) {
+        return false;
+    }
+    effective.is_member_suppressed()
+}
+
+/// Whether a request is a deterministically-selected calibration sample
+/// (FR6.3, DDD §3).
+///
+/// The first 8 bytes of `sha256(request_id)` read as a big-endian `u64`,
+/// divided by `u64::MAX`, compared against `rate`. Deterministic by
+/// construction: the same request id always gives the same answer on every
+/// node, and nothing about the wall clock enters — the counter-example
+/// EXP-AC-006 names explicitly.
+///
+/// A rate at or below zero samples nothing; a rate at or above one samples
+/// everything.
+pub fn is_calibration_sample(request_id: &str, rate: f32) -> bool {
+    // NaN is handled explicitly rather than by inverting `>`: a rate that is
+    // not a number samples nothing, which is the conservative reading.
+    if rate.is_nan() || rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(request_id.as_bytes());
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    let position = u64::from_be_bytes(head) as f64 / u64::MAX as f64;
+    position < rate as f64
+}
+
+/// The calibration/ageing/probe policy an operator declares on a panel
+/// (FR6.3, FR6.4, FR4.3).
+///
+/// Read from 31400 tags so it travels with the panel rather than living in
+/// relay configuration: the operator who declares what the panel does also
+/// declares how its cases are sampled, when they go stale, and who is allowed
+/// to seed probes into them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PanelPolicy {
+    /// Share of otherwise-suppressible requests shown to reviewers anyway.
+    pub calibration_sample_rate: f32,
+    /// Age in hours past which a still-pending case is escalated.
+    pub max_pending_hours: u32,
+    /// The one pubkey whose `probe`-tagged requests are honoured as probes.
+    pub probe_agent: Option<String>,
+}
+
+impl Default for PanelPolicy {
+    fn default() -> Self {
+        Self {
+            calibration_sample_rate: DEFAULT_CALIBRATION_SAMPLE_RATE,
+            max_pending_hours: DEFAULT_MAX_PENDING_HOURS,
+            probe_agent: None,
+        }
+    }
+}
+
+impl PanelPolicy {
+    /// Read the policy from a 31400's tags, defaulting each field independently
+    /// so a panel that declares only one of them keeps the defaults for the
+    /// rest. An out-of-range rate is clamped to `0.0..=1.0` and a zero deadline
+    /// is rejected in favour of the default, because "escalate everything
+    /// immediately" is far more likely a typo than an intent.
+    pub fn from_tags(tags: &[Vec<String>]) -> Self {
+        let rate = extract_tag(tags, TAG_CALIBRATION_SAMPLE_RATE)
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(DEFAULT_CALIBRATION_SAMPLE_RATE);
+        let hours = extract_tag(tags, TAG_MAX_PENDING_HOURS)
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_PENDING_HOURS);
+        let probe_agent = extract_tag(tags, TAG_PROBE_AGENT)
+            .filter(|v| v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|v| v.to_ascii_lowercase());
+        Self {
+            calibration_sample_rate: rate,
+            max_pending_hours: hours,
+            probe_agent,
+        }
+    }
+
+    /// The tags a panel publisher stamps to declare this policy.
+    pub fn to_tags(&self) -> Vec<Vec<String>> {
+        let mut tags = vec![
+            vec![
+                TAG_CALIBRATION_SAMPLE_RATE.to_string(),
+                self.calibration_sample_rate.to_string(),
+            ],
+            vec![
+                TAG_MAX_PENDING_HOURS.to_string(),
+                self.max_pending_hours.to_string(),
+            ],
+        ];
+        if let Some(agent) = &self.probe_agent {
+            tags.push(vec![TAG_PROBE_AGENT.to_string(), agent.clone()]);
+        }
+        tags
+    }
+
+    /// Whether `pubkey` is this panel's registered probe agent (FR6.4).
+    ///
+    /// A panel with no registered probe agent honours no probes at all: a
+    /// `probe` tag from an arbitrary agent is not a probe, it is noise that
+    /// would corrupt the catch rate.
+    pub fn is_probe_agent(&self, pubkey: &str) -> bool {
+        self.probe_agent
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(pubkey))
+    }
+}
+
+// ── Receipt stage ladder (ADR-2010 + FR4) ───────────────────────────────────
+
+/// How far a governance decision has actually got — from the signature through
+/// to whether the approved act took effect in the world.
+///
+/// The first four stages are the relay's (ADR-2010): they certify storage and
+/// projection. The **application** stages are the mutation owner's (FR4.1):
+/// only the system that performed the act can say whether it happened, and it
+/// says so by advancing this ladder through the receipts endpoint. That is what
+/// closes the loop for the human who approved it.
+///
+/// Two stages are *side receipts* ([`Self::is_side_receipt`]): they record
+/// something that happened to a case without advancing it toward application,
+/// and so never overwrite a ladder stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReceiptStage {
+    /// The event carries a valid signature and correlates to a case.
+    Signed,
+    /// The signed envelope is durably stored by the relay. This is what a relay
+    /// `OK` actually certifies — and all it certifies.
+    RelayAccepted,
+    /// The decision row, the case state and this receipt committed together.
+    ProjectionCommitted,
+    /// Projection was attempted and did not commit. Terminal until a
+    /// reconciliation retry supersedes it.
+    ProjectionFailed,
+    /// The mutation owner has read the decision. It has not acted yet.
+    ConsumerReceived,
+    /// The mutation owner performed the approved act and it took effect.
+    Applied,
+    /// The mutation owner did not perform the act, and says so. A denied action
+    /// and an approved action whose write failed must never look the same.
+    NotApplied,
+    /// An operator executed the approved act by hand during an outage (FR7).
+    AppliedManually,
+    /// Side receipt: the case exceeded the panel's `max_pending_hours` while
+    /// still pending (FR4.3).
+    EscalatedOnAge,
+    /// Side receipt: the case passed its open-case TTL without a decision.
+    Expired,
+}
+
+impl ReceiptStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Signed => "signed",
+            Self::RelayAccepted => "relay-accepted",
+            Self::ProjectionCommitted => "projection-committed",
+            Self::ProjectionFailed => "projection-failed",
+            Self::ConsumerReceived => "consumer-received",
+            Self::Applied => "applied",
+            Self::NotApplied => "not-applied",
+            Self::AppliedManually => "applied-manually",
+            Self::EscalatedOnAge => "escalated-on-age",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "signed" => Some(Self::Signed),
+            "relay-accepted" => Some(Self::RelayAccepted),
+            "projection-committed" => Some(Self::ProjectionCommitted),
+            "projection-failed" => Some(Self::ProjectionFailed),
+            "consumer-received" => Some(Self::ConsumerReceived),
+            "applied" => Some(Self::Applied),
+            "not-applied" => Some(Self::NotApplied),
+            "applied-manually" => Some(Self::AppliedManually),
+            "escalated-on-age" => Some(Self::EscalatedOnAge),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+
+    /// Position on the monotonic ladder, or `None` for a stage that is not on
+    /// it (the two side receipts, and the `projection-failed` error state).
+    pub fn ladder_rank(self) -> Option<u8> {
+        match self {
+            Self::Signed => Some(0),
+            Self::RelayAccepted => Some(1),
+            Self::ProjectionCommitted => Some(2),
+            Self::ConsumerReceived => Some(3),
+            Self::Applied | Self::NotApplied | Self::AppliedManually => Some(4),
+            Self::ProjectionFailed | Self::EscalatedOnAge | Self::Expired => None,
+        }
+    }
+
+    /// A record about a case that does not advance it toward application
+    /// (DDD §6 invariant 5).
+    pub fn is_side_receipt(self) -> bool {
+        matches!(self, Self::EscalatedOnAge | Self::Expired)
+    }
+
+    /// One of the four stages the mutation owner reports through the receipts
+    /// endpoint (FR4.1).
+    pub fn is_application_stage(self) -> bool {
+        matches!(
+            self,
+            Self::ConsumerReceived | Self::Applied | Self::NotApplied | Self::AppliedManually
+        )
+    }
+
+    /// A terminal application stage: the mutation owner has said what happened.
+    pub fn is_terminal_application(self) -> bool {
+        matches!(self, Self::Applied | Self::NotApplied | Self::AppliedManually)
+    }
+
+    /// Whether this stage represents a mutation that actually took effect.
+    pub fn is_applied(self) -> bool {
+        matches!(
+            self,
+            Self::ProjectionCommitted | Self::Applied | Self::AppliedManually
+        )
+    }
+
+    /// Whether a further projection attempt is warranted.
+    pub fn awaits_projection(self) -> bool {
+        matches!(self, Self::Signed | Self::RelayAccepted | Self::ProjectionFailed)
+    }
+}
+
+/// Why an application-stage advance was refused (FR4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum StageAdvanceError {
+    /// The requested stage is not one the mutation owner may report.
+    #[error("stage is not an application stage")]
+    NotAnApplicationStage,
+    /// The receipt has not yet reached `projection-committed`, so there is no
+    /// committed decision for a consumer to have received.
+    #[error("receipt has not reached projection-committed")]
+    NotProjected,
+    /// The ladder would move backwards, or sideways within the same rank.
+    /// DDD §6 invariant 5: a stage never regresses.
+    #[error("stage would regress or repeat")]
+    Regression,
+    /// `applied | not-applied` must follow an explicit `consumer-received`:
+    /// the consumer says it has the decision before it says what it did with it.
+    #[error("terminal application stage requires consumer-received first")]
+    MissingConsumerReceived,
+}
+
+/// Whether a receipt at `current` may advance to `next` (DDD §6 invariant 5).
+///
+/// Monotonic: `next` must sit strictly higher on the ladder than `current`.
+/// `applied` and `not-applied` additionally require an explicit
+/// `consumer-received` beforehand, so "the consumer never saw it" and "the
+/// consumer saw it and declined" stay distinguishable.
+///
+/// `applied-manually` is deliberately exempt from that second rule: it is the
+/// outage path (FR7), where by construction no consumer received anything —
+/// an operator acted by hand on a decision that reached `projection-committed`.
+pub fn can_advance_stage(
+    current: ReceiptStage,
+    next: ReceiptStage,
+) -> Result<(), StageAdvanceError> {
+    if !next.is_application_stage() {
+        return Err(StageAdvanceError::NotAnApplicationStage);
+    }
+    let current_rank = match current.ladder_rank() {
+        // A side receipt or a failed projection is not a ladder position, so
+        // there is nothing to advance from.
+        None => return Err(StageAdvanceError::NotProjected),
+        Some(r) => r,
+    };
+    if current_rank < ReceiptStage::ProjectionCommitted.ladder_rank().unwrap_or(2) {
+        return Err(StageAdvanceError::NotProjected);
+    }
+    let next_rank = next.ladder_rank().unwrap_or(0);
+    if next_rank <= current_rank {
+        return Err(StageAdvanceError::Regression);
+    }
+    if matches!(next, ReceiptStage::Applied | ReceiptStage::NotApplied)
+        && current != ReceiptStage::ConsumerReceived
+    {
+        return Err(StageAdvanceError::MissingConsumerReceived);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionRequest {
     pub fields: serde_json::Value,
@@ -198,6 +840,16 @@ pub struct ActionRequest {
     /// before responding. Absent on legacy requests.
     #[serde(default)]
     pub confidence: Option<f32>,
+    /// The agent's optional restatement of the panel's task-property triple
+    /// (ADR-2011). Merged tightening-only: it can raise the boundary for this
+    /// one request and can never lower the panel's.
+    #[serde(default)]
+    pub task_properties: Option<TaskProperties>,
+    /// Seeded-probe digest (FR6.4). Honoured only from the panel's registered
+    /// probe agent, and never rendered before the case is decided (DDD §6
+    /// invariant 7).
+    #[serde(default)]
+    pub probe: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1195,6 +1847,14 @@ mod tests {
             layout: LayoutHint::InboxTable,
             capabilities: vec![PanelCapability::BulkAction, PanelCapability::Filter],
             refresh_secs: 30,
+            task_properties: Some(TaskProperties::new(
+                Verifiability::Partial,
+                Reversibility::Compensable,
+                Stakes::Significant,
+            )),
+            calibration_sample_rate: Some(0.2),
+            max_pending_hours: Some(24),
+            probe_agent: Some("f".repeat(64)),
         };
         let json = serde_json::to_string(&panel).unwrap();
         let parsed: PanelDefinition = serde_json::from_str(&json).unwrap();
@@ -2111,5 +2771,527 @@ mod tests {
             Some("reviewed-decision")
         );
         assert_eq!(extract_supersedes_target(&appeal_tags), None);
+    }
+}
+
+// ── ADR-2011 / EXP-AC-003: task properties and the effective tier ───────────
+
+#[cfg(test)]
+mod task_property_tests {
+    use super::*;
+
+    const VERIFIABILITIES: [Verifiability; 3] = [
+        Verifiability::Inspectable,
+        Verifiability::Partial,
+        Verifiability::Opaque,
+    ];
+    const REVERSIBILITIES: [Reversibility; 3] = [
+        Reversibility::Reversible,
+        Reversibility::Compensable,
+        Reversibility::Irreversible,
+    ];
+    const STAKES: [Stakes; 3] = [Stakes::Bounded, Stakes::Significant, Stakes::Critical];
+
+    /// All 27 triples, in a fixed order so a failure names a reproducible case.
+    fn all_triples() -> Vec<TaskProperties> {
+        let mut out = Vec::with_capacity(27);
+        for v in VERIFIABILITIES {
+            for r in REVERSIBILITIES {
+                for s in STAKES {
+                    out.push(TaskProperties::new(v, r, s));
+                }
+            }
+        }
+        out
+    }
+
+    /// DDD §6 invariant 2, exhaustively: over every one of the 27×27 =: 729
+    /// (panel, request) pairs the merge is never looser than the panel on any
+    /// leg. This is the property the whole ADR rests on — an agent cannot lower
+    /// the boundary its operator set — so it is checked by enumeration rather
+    /// than by sampling.
+    #[test]
+    fn merge_is_tightening_only_over_all_729_pairs() {
+        let triples = all_triples();
+        assert_eq!(triples.len(), 27, "the triple space is 3x3x3");
+        let mut checked = 0usize;
+        for panel in &triples {
+            for request in &triples {
+                let merged = TaskProperties::merge(*panel, *request);
+                assert!(
+                    merged.verifiability >= panel.verifiability,
+                    "verifiability loosened: panel={panel:?} request={request:?} merged={merged:?}"
+                );
+                assert!(
+                    merged.reversibility >= panel.reversibility,
+                    "reversibility loosened: panel={panel:?} request={request:?} merged={merged:?}"
+                );
+                assert!(
+                    merged.stakes >= panel.stakes,
+                    "stakes loosened: panel={panel:?} request={request:?} merged={merged:?}"
+                );
+                // Tightening only in the other direction too: the request's own
+                // declaration is honoured where it is the tighter of the two.
+                assert!(merged.verifiability >= request.verifiability);
+                assert!(merged.reversibility >= request.reversibility);
+                assert!(merged.stakes >= request.stakes);
+                // And the merge never invents tightness neither side declared.
+                assert_eq!(
+                    merged,
+                    TaskProperties::new(
+                        panel.verifiability.max(request.verifiability),
+                        panel.reversibility.max(request.reversibility),
+                        panel.stakes.max(request.stakes),
+                    )
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 729);
+    }
+
+    /// The counter-example EXP-AC-003 names: a request tag claiming
+    /// `Reversible` against an `Irreversible` panel.
+    #[test]
+    fn request_cannot_lower_irreversible_to_reversible() {
+        let panel = TaskProperties::new(
+            Verifiability::Inspectable,
+            Reversibility::Irreversible,
+            Stakes::Bounded,
+        );
+        let request = TaskProperties::default();
+        let merged = TaskProperties::merge(panel, request);
+        assert_eq!(merged.reversibility, Reversibility::Irreversible);
+        assert_eq!(
+            effective_tier(Some(&panel), Some(&request), Some(RiskTier::Low), RiskTier::Medium),
+            RiskTier::High,
+            "an irreversible panel floors the case at high whatever the request says"
+        );
+    }
+
+    /// The effective-tier table from PRD FR3.2 / ADR-2011 §2, over the whole
+    /// triple space crossed with every declared tier.
+    #[test]
+    fn effective_tier_table_holds_for_every_triple_and_tier() {
+        let tiers = [
+            None,
+            Some(RiskTier::Low),
+            Some(RiskTier::Medium),
+            Some(RiskTier::High),
+            Some(RiskTier::Critical),
+        ];
+        for props in all_triples() {
+            for declared in tiers {
+                let tier = effective_tier(Some(&props), None, declared, RiskTier::Medium);
+
+                if props.reversibility == Reversibility::Irreversible
+                    || props.stakes == Stakes::Critical
+                {
+                    assert!(
+                        tier >= RiskTier::High,
+                        "irreversible/critical must floor at high: {props:?} declared={declared:?} => {tier:?}"
+                    );
+                } else if props.verifiability == Verifiability::Opaque {
+                    assert!(
+                        tier >= RiskTier::Medium,
+                        "opaque must floor at medium: {props:?} declared={declared:?} => {tier:?}"
+                    );
+                    assert!(
+                        !is_member_suppressed_effective(Some(&props), tier, false),
+                        "opaque work is never member-suppressed: {props:?}"
+                    );
+                } else {
+                    // No floor of its own: the declared tier stands, and an
+                    // undeclared tier folds to the advertised default.
+                    assert_eq!(tier, declared.unwrap_or(RiskTier::Medium));
+                }
+
+                // The declared tier can only ever raise the result.
+                if let Some(d) = declared {
+                    assert!(tier >= d, "declared tier was lowered: {d:?} => {tier:?}");
+                }
+            }
+        }
+    }
+
+    /// FR3.3: an entirely unlabelled request folds to exactly the relay's
+    /// advertised default, not to the accidental `Medium` of an absent tag.
+    #[test]
+    fn unlabelled_request_folds_to_advertised_default() {
+        for default in [RiskTier::Low, RiskTier::Medium, RiskTier::High, RiskTier::Critical] {
+            assert_eq!(effective_tier(None, None, None, default), default);
+        }
+    }
+
+    /// A tier declared without any properties stands on its own — the
+    /// advertised default is what an *unlabelled* request folds to, not a floor
+    /// under every request (ADR-2011 §3).
+    #[test]
+    fn declared_tier_without_properties_stands_alone() {
+        assert_eq!(
+            effective_tier(None, None, Some(RiskTier::Low), RiskTier::Medium),
+            RiskTier::Low
+        );
+        assert_eq!(
+            effective_tier(None, None, Some(RiskTier::Critical), RiskTier::Low),
+            RiskTier::Critical
+        );
+    }
+
+    /// Properties without a declared tier still never sit below what the relay
+    /// advertises it escalates at.
+    #[test]
+    fn properties_without_tier_respect_advertised_default() {
+        let loose = TaskProperties::default();
+        assert_eq!(
+            effective_tier(Some(&loose), None, None, RiskTier::High),
+            RiskTier::High
+        );
+    }
+
+    /// The second counter-example: a `Critical`-stakes request is never
+    /// suppressed from the member surface.
+    #[test]
+    fn critical_stakes_is_never_member_suppressed() {
+        let props = TaskProperties::new(
+            Verifiability::Inspectable,
+            Reversibility::Reversible,
+            Stakes::Critical,
+        );
+        let tier = effective_tier(Some(&props), None, Some(RiskTier::Low), RiskTier::Medium);
+        assert_eq!(tier, RiskTier::High);
+        assert!(!is_member_suppressed_effective(Some(&props), tier, false));
+    }
+
+    /// A calibration sample is shown even when its effective tier is `Low` —
+    /// that is the entire mechanism (FR6.3).
+    #[test]
+    fn calibration_sample_overrides_suppression() {
+        let loose = TaskProperties::default();
+        assert!(is_member_suppressed_effective(
+            Some(&loose),
+            RiskTier::Low,
+            false
+        ));
+        assert!(!is_member_suppressed_effective(
+            Some(&loose),
+            RiskTier::Low,
+            true
+        ));
+    }
+
+    #[test]
+    fn tags_round_trip() {
+        let props = TaskProperties::new(
+            Verifiability::Opaque,
+            Reversibility::Compensable,
+            Stakes::Significant,
+        );
+        let tags = props.to_tags();
+        assert_eq!(TaskProperties::from_tags(&tags), Some(props));
+    }
+
+    /// Legacy events carry no `tp-*` tag at all; that must stay distinguishable
+    /// from a declared-loosest triple, because only the former falls back to the
+    /// advertised default.
+    #[test]
+    fn absent_tags_parse_to_none_not_loosest() {
+        let legacy = vec![vec!["d".to_string(), "case-1".to_string()]];
+        assert_eq!(TaskProperties::from_tags(&legacy), None);
+    }
+
+    /// A partially-tagged request keeps the loosest value on the legs it did
+    /// not declare, which under the tightening merge simply defers to the panel.
+    #[test]
+    fn partial_tags_default_the_missing_legs() {
+        let tags = vec![vec![TAG_TP_STAKES.to_string(), "critical".to_string()]];
+        let parsed = TaskProperties::from_tags(&tags).expect("one tp tag is enough");
+        assert_eq!(parsed.stakes, Stakes::Critical);
+        assert_eq!(parsed.verifiability, Verifiability::Inspectable);
+        assert_eq!(parsed.reversibility, Reversibility::Reversible);
+
+        let panel = TaskProperties::new(
+            Verifiability::Opaque,
+            Reversibility::Irreversible,
+            Stakes::Bounded,
+        );
+        let merged = TaskProperties::merge(panel, parsed);
+        assert_eq!(merged.verifiability, Verifiability::Opaque);
+        assert_eq!(merged.reversibility, Reversibility::Irreversible);
+        assert_eq!(merged.stakes, Stakes::Critical);
+    }
+
+    /// An unrecognised tag value must not loosen a declared property; it falls
+    /// back to the loosest value, which the merge then discards in favour of
+    /// whatever the other side declared.
+    #[test]
+    fn unknown_tag_value_cannot_loosen() {
+        let tags = vec![vec![
+            TAG_TP_REVERSIBILITY.to_string(),
+            "totally-fine-honest".to_string(),
+        ]];
+        let parsed = TaskProperties::from_tags(&tags).unwrap();
+        assert_eq!(parsed.reversibility, Reversibility::Reversible);
+        let panel = TaskProperties::new(
+            Verifiability::Inspectable,
+            Reversibility::Irreversible,
+            Stakes::Bounded,
+        );
+        assert_eq!(
+            TaskProperties::merge(panel, parsed).reversibility,
+            Reversibility::Irreversible
+        );
+    }
+}
+
+// ── EXP-AC-006: deterministic calibration sampling ──────────────────────────
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+
+    /// EXP-AC-006: with a rate of 0.1, between 80 and 120 of 1,000 requests are
+    /// sampled. The bound is on the hash's uniformity, not on luck: the ids are
+    /// fixed, so this test is deterministic and will fail identically forever if
+    /// the selection function changes.
+    #[test]
+    fn sampling_rate_lands_within_the_expected_band() {
+        let sampled = (0..1000)
+            .filter(|i| is_calibration_sample(&format!("req-{i:04}"), 0.1))
+            .count();
+        assert!(
+            (80..=120).contains(&sampled),
+            "expected 80..=120 of 1000 sampled at rate 0.1, got {sampled}"
+        );
+    }
+
+    /// The counter-example EXP-AC-006 names: sampling must not depend on the
+    /// wall clock. Determinism is the observable form of that — the same id
+    /// gives the same answer every time it is asked.
+    #[test]
+    fn sampling_is_deterministic_per_request_id() {
+        for i in 0..200 {
+            let id = format!("req-{i}");
+            let first = is_calibration_sample(&id, 0.1);
+            for _ in 0..5 {
+                assert_eq!(is_calibration_sample(&id, 0.1), first, "unstable for {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_rates_are_total() {
+        assert!(!is_calibration_sample("anything", 0.0));
+        assert!(!is_calibration_sample("anything", -1.0));
+        assert!(is_calibration_sample("anything", 1.0));
+        assert!(is_calibration_sample("anything", 2.0));
+    }
+
+    /// A higher rate samples a superset: the selection is a threshold on one
+    /// fixed per-id position, not a fresh draw.
+    #[test]
+    fn higher_rate_is_a_superset() {
+        for i in 0..300 {
+            let id = format!("req-{i}");
+            if is_calibration_sample(&id, 0.1) {
+                assert!(is_calibration_sample(&id, 0.5), "{id} dropped out at 0.5");
+            }
+        }
+    }
+
+    #[test]
+    fn panel_policy_defaults_and_overrides() {
+        assert_eq!(
+            PanelPolicy::from_tags(&[]),
+            PanelPolicy {
+                calibration_sample_rate: DEFAULT_CALIBRATION_SAMPLE_RATE,
+                max_pending_hours: DEFAULT_MAX_PENDING_HOURS,
+                probe_agent: None,
+            }
+        );
+        let probe = "b".repeat(64);
+        let tags = vec![
+            vec![TAG_CALIBRATION_SAMPLE_RATE.to_string(), "0.25".to_string()],
+            vec![TAG_MAX_PENDING_HOURS.to_string(), "12".to_string()],
+            vec![TAG_PROBE_AGENT.to_string(), probe.clone()],
+        ];
+        let policy = PanelPolicy::from_tags(&tags);
+        assert_eq!(policy.calibration_sample_rate, 0.25);
+        assert_eq!(policy.max_pending_hours, 12);
+        assert!(policy.is_probe_agent(&probe));
+        assert!(!policy.is_probe_agent(&"c".repeat(64)));
+    }
+
+    /// A nonsense rate or a zero deadline is far more likely a typo than an
+    /// intent, so the policy keeps its documented default rather than sampling
+    /// nothing or escalating everything.
+    #[test]
+    fn out_of_range_policy_values_fall_back() {
+        let tags = vec![
+            vec![TAG_CALIBRATION_SAMPLE_RATE.to_string(), "7".to_string()],
+            vec![TAG_MAX_PENDING_HOURS.to_string(), "0".to_string()],
+            vec![TAG_PROBE_AGENT.to_string(), "not-a-pubkey".to_string()],
+        ];
+        let policy = PanelPolicy::from_tags(&tags);
+        assert_eq!(policy.calibration_sample_rate, 1.0, "clamped, not discarded");
+        assert_eq!(policy.max_pending_hours, DEFAULT_MAX_PENDING_HOURS);
+        assert_eq!(policy.probe_agent, None);
+    }
+
+    /// A panel with no registered probe agent honours no probes: a `probe` tag
+    /// from an arbitrary agent is noise that would corrupt the catch rate.
+    #[test]
+    fn panel_without_probe_agent_honours_no_probe() {
+        assert!(!PanelPolicy::default().is_probe_agent(&"a".repeat(64)));
+    }
+}
+
+// ── EXP-AC-004: the receipt stage ladder ────────────────────────────────────
+
+#[cfg(test)]
+mod receipt_stage_tests {
+    use super::*;
+
+    const ALL: [ReceiptStage; 10] = [
+        ReceiptStage::Signed,
+        ReceiptStage::RelayAccepted,
+        ReceiptStage::ProjectionCommitted,
+        ReceiptStage::ProjectionFailed,
+        ReceiptStage::ConsumerReceived,
+        ReceiptStage::Applied,
+        ReceiptStage::NotApplied,
+        ReceiptStage::AppliedManually,
+        ReceiptStage::EscalatedOnAge,
+        ReceiptStage::Expired,
+    ];
+
+    #[test]
+    fn every_stage_round_trips_through_its_wire_string() {
+        for stage in ALL {
+            assert_eq!(ReceiptStage::parse(stage.as_str()), Some(stage));
+        }
+        assert_eq!(ReceiptStage::parse("not-a-stage"), None);
+    }
+
+    /// The happy path EXP-AC-004 specifies: `projection-committed` →
+    /// `consumer-received` → exactly one terminal stage.
+    #[test]
+    fn ladder_advances_committed_to_received_to_terminal() {
+        assert!(can_advance_stage(
+            ReceiptStage::ProjectionCommitted,
+            ReceiptStage::ConsumerReceived
+        )
+        .is_ok());
+        for terminal in [ReceiptStage::Applied, ReceiptStage::NotApplied] {
+            assert!(
+                can_advance_stage(ReceiptStage::ConsumerReceived, terminal).is_ok(),
+                "{terminal:?} must follow consumer-received"
+            );
+        }
+    }
+
+    /// DDD §6 invariant 5, exhaustively: no pair of stages permits a regression
+    /// or a sideways move at the same rank.
+    #[test]
+    fn no_stage_pair_permits_a_regression() {
+        for current in ALL {
+            for next in ALL {
+                let Ok(()) = can_advance_stage(current, next) else {
+                    continue;
+                };
+                let (c, n) = (
+                    current.ladder_rank().expect("advance from a ladder stage"),
+                    next.ladder_rank().expect("advance to a ladder stage"),
+                );
+                assert!(n > c, "{current:?} -> {next:?} is not an advance");
+                assert!(next.is_application_stage());
+            }
+        }
+    }
+
+    /// The EXP-AC-004 regression case, by name: `applied` then
+    /// `consumer-received` is refused.
+    #[test]
+    fn applied_then_consumer_received_is_a_regression() {
+        assert_eq!(
+            can_advance_stage(ReceiptStage::Applied, ReceiptStage::ConsumerReceived),
+            Err(StageAdvanceError::Regression)
+        );
+        assert_eq!(
+            can_advance_stage(ReceiptStage::Applied, ReceiptStage::Applied),
+            Err(StageAdvanceError::Regression)
+        );
+    }
+
+    /// A consumer cannot report an outcome for a decision that never committed.
+    #[test]
+    fn application_stages_require_a_committed_projection() {
+        for current in [
+            ReceiptStage::Signed,
+            ReceiptStage::RelayAccepted,
+            ReceiptStage::ProjectionFailed,
+            ReceiptStage::EscalatedOnAge,
+            ReceiptStage::Expired,
+        ] {
+            assert_eq!(
+                can_advance_stage(current, ReceiptStage::ConsumerReceived),
+                Err(StageAdvanceError::NotProjected),
+                "{current:?} is not a committed projection"
+            );
+        }
+    }
+
+    /// "The consumer never saw it" and "the consumer saw it and declined" must
+    /// stay distinguishable, so a terminal stage needs an explicit
+    /// `consumer-received` first.
+    #[test]
+    fn applied_requires_consumer_received_first() {
+        assert_eq!(
+            can_advance_stage(ReceiptStage::ProjectionCommitted, ReceiptStage::Applied),
+            Err(StageAdvanceError::MissingConsumerReceived)
+        );
+        assert_eq!(
+            can_advance_stage(ReceiptStage::ProjectionCommitted, ReceiptStage::NotApplied),
+            Err(StageAdvanceError::MissingConsumerReceived)
+        );
+    }
+
+    /// FR7: manual continuation is the outage path, where by construction no
+    /// consumer received anything — so it is exempt from that one rule and
+    /// nothing else.
+    #[test]
+    fn applied_manually_may_follow_a_committed_projection_directly() {
+        assert!(can_advance_stage(
+            ReceiptStage::ProjectionCommitted,
+            ReceiptStage::AppliedManually
+        )
+        .is_ok());
+        assert_eq!(
+            can_advance_stage(ReceiptStage::RelayAccepted, ReceiptStage::AppliedManually),
+            Err(StageAdvanceError::NotProjected)
+        );
+    }
+
+    /// Side receipts never advance the ladder and are never a target of it.
+    #[test]
+    fn side_receipts_are_off_the_ladder() {
+        for side in [ReceiptStage::EscalatedOnAge, ReceiptStage::Expired] {
+            assert!(side.is_side_receipt());
+            assert_eq!(side.ladder_rank(), None);
+            assert_eq!(
+                can_advance_stage(ReceiptStage::ConsumerReceived, side),
+                Err(StageAdvanceError::NotAnApplicationStage)
+            );
+        }
+    }
+
+    /// A denied action and an approved action whose write failed must never
+    /// look the same.
+    #[test]
+    fn not_applied_is_not_applied() {
+        assert!(!ReceiptStage::NotApplied.is_applied());
+        assert!(ReceiptStage::Applied.is_applied());
+        assert!(ReceiptStage::AppliedManually.is_applied());
+        assert!(!ReceiptStage::ConsumerReceived.is_applied());
     }
 }
