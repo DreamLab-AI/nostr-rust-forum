@@ -183,9 +183,28 @@ pub struct PanelRegistryState {
     pub actions: Vec<ActionEntry>,
     /// Keyed by [`panel_address`], for the same reason as `panels`.
     pub panel_states: HashMap<String, serde_json::Value>,
+    /// The `(created_at, event_id)` of the newest 31401/31404 applied to each
+    /// panel address, so a replayed older state snapshot or diff cannot undo a
+    /// newer one.
+    pub panel_state_seen: HashMap<String, (u64, String)>,
     /// Decision history per case `d`-tag, oldest-first. Feeds the supersession
     /// history surfaces (F6).
     pub decisions: HashMap<String, Vec<DecisionEntry>>,
+}
+
+impl PanelRegistryState {
+    /// Whether a 31401/31404 for `address` is newer than the last one applied,
+    /// recording it when it is. NIP-33 replaceability for panel state.
+    fn accept_panel_state(&mut self, address: &str, created_at: u64, event_id: &str) -> bool {
+        if let Some((held_at, held_id)) = self.panel_state_seen.get(address) {
+            if !supersedes_held(created_at, event_id, *held_at, held_id) {
+                return false;
+            }
+        }
+        self.panel_state_seen
+            .insert(address.to_string(), (created_at, event_id.to_string()));
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -219,6 +238,18 @@ impl PanelRegistry {
                 if let Ok(def) = serde_json::from_str::<PanelDefinition>(&event.content) {
                     let address = panel_address(&event.pubkey, &d_tag);
                     self.state.update(|s| {
+                        // NIP-33 replaceability: a replayed older 31400 must not
+                        // roll back the operator's declaration.
+                        if let Some(held) = s.panels.get(&address) {
+                            if !supersedes_held(
+                                event.created_at,
+                                &event.id,
+                                held.last_updated,
+                                &held.event_id,
+                            ) {
+                                return;
+                            }
+                        }
                         s.panels.insert(
                             address,
                             PanelEntry {
@@ -240,8 +271,24 @@ impl PanelRegistry {
 
                 if let Ok(req) = serde_json::from_str::<governance::ActionRequest>(&event.content) {
                     self.state.update(|s| {
-                        if s.actions.iter().any(|a| a.event_id == event.id) {
-                            return;
+                        // NIP-33 replaceability, per (pubkey, d): a republished
+                        // request REPLACES its earlier version rather than
+                        // sitting beside it, and a replayed older one is
+                        // ignored. Two agents sharing a `d` tag keep separate
+                        // cases, because the address includes the author.
+                        let held = s.actions.iter().position(|a| {
+                            a.d_tag == d_tag && a.agent_pubkey.eq_ignore_ascii_case(&event.pubkey)
+                        });
+                        if let Some(i) = held {
+                            if !supersedes_held(
+                                event.created_at,
+                                &event.id,
+                                s.actions[i].created_at,
+                                &s.actions[i].event_id,
+                            ) {
+                                return;
+                            }
+                            s.actions.remove(i);
                         }
                         s.actions.push(ActionEntry {
                             d_tag,
@@ -336,6 +383,9 @@ impl PanelRegistry {
                 let address = panel_address(&event.pubkey, &d_tag);
                 if let Ok(state_data) = serde_json::from_str::<serde_json::Value>(&event.content) {
                     self.state.update(|s| {
+                        if !s.accept_panel_state(&address, event.created_at, &event.id) {
+                            return;
+                        }
                         s.panel_states.insert(address.clone(), state_data);
                         if let Some(panel) = s.panels.get_mut(&address) {
                             panel.last_updated = event.created_at;
@@ -347,6 +397,9 @@ impl PanelRegistry {
                 let address = panel_address(&event.pubkey, &d_tag);
                 if let Ok(diff) = serde_json::from_str::<serde_json::Value>(&event.content) {
                     self.state.update(|s| {
+                        if !s.accept_panel_state(&address, event.created_at, &event.id) {
+                            return;
+                        }
                         let current = s
                             .panel_states
                             .entry(address.clone())
@@ -369,12 +422,48 @@ impl PanelRegistry {
                 // a 31405 naming another operator's `d` tag addresses nothing.
                 let address = panel_address(&event.pubkey, &d_tag);
                 self.state.update(|s| {
+                    // A retirement older than the panel it names is a replay,
+                    // not a retirement.
+                    if let Some(held) = s.panels.get(&address) {
+                        if held.last_updated > event.created_at {
+                            return;
+                        }
+                    }
                     s.panels.remove(&address);
                     s.panel_states.remove(&address);
+                    s.panel_state_seen.remove(&address);
                 });
             }
             _ => {}
         }
+    }
+}
+
+/// Whether an incoming replaceable event supersedes the one already held.
+///
+/// NIP-33: kinds 31400-31405 are parameterized-replaceable, and the newest
+/// `created_at` wins per `(kind, pubkey, d)` address, with the **lowest event
+/// id** breaking a tie (NIP-01). Without this rule an agent can simply REPLAY
+/// its own earlier 31400 to roll the operator's task-property declaration back
+/// to a looser one — ADR-2011's boundary defeated by a replayed envelope rather
+/// than a forged one — or republish a 31402 so that two versions of one case sit
+/// side by side, one of them carrying whichever tier it prefers.
+///
+/// Pure over the two (timestamp, id) pairs so the rule is testable and stated
+/// once rather than re-derived at each of the five ingest arms.
+pub fn supersedes_held(
+    incoming_at: u64,
+    incoming_id: &str,
+    held_at: u64,
+    held_id: &str,
+) -> bool {
+    match incoming_at.cmp(&held_at) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // Same second: NIP-01 breaks the tie on the lowest event id, which is
+        // arbitrary but identical on every client, so two clients never render
+        // different versions of the same case.
+        std::cmp::Ordering::Equal => incoming_id < held_id,
     }
 }
 
@@ -513,6 +602,7 @@ impl PanelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_bbs_core::NostrEvent;
 
     fn dec(event_id: &str, at: u64, outcome: &str, supersedes: Option<&str>) -> DecisionEntry {
         DecisionEntry {
@@ -629,6 +719,130 @@ mod tests {
         let bare = panel_map(vec![panel("p-1", "agent", 100, vec![tag("calibration-sample-rate", "0")])]);
         let ctx = resolve_panel_for(&bare, &item.tags, &item.agent_pubkey).map(|p| p.context());
         assert!(!item.boundary(ctx.as_ref(), false).is_member_visible());
+    }
+
+    fn panel_event(d_tag: &str, agent: &str, created_at: u64, stakes: &str) -> NostrEvent {
+        NostrEvent {
+            id: format!("ev-{d_tag}-{created_at}"),
+            pubkey: agent.into(),
+            created_at,
+            kind: governance::KIND_PANEL_DEFINITION,
+            tags: vec![tag("d", d_tag), tag("tp-stakes", stakes)],
+            content: serde_json::json!({
+                "title": "t", "description": "d", "version": "1.0.0",
+                "schema": "action-inbox", "fields": [], "actions": [],
+                "layout": "inbox-table"
+            })
+            .to_string(),
+            sig: String::new(),
+        }
+    }
+
+    fn request_event(d_tag: &str, agent: &str, created_at: u64, tier: &str) -> NostrEvent {
+        NostrEvent {
+            id: format!("req-{d_tag}-{created_at}"),
+            pubkey: agent.into(),
+            created_at,
+            kind: governance::KIND_ACTION_REQUEST,
+            tags: vec![tag("d", d_tag), tag("risk-tier", tier)],
+            content: serde_json::json!({ "fields": { "n": created_at } }).to_string(),
+            sig: String::new(),
+        }
+    }
+
+    fn fresh_registry() -> PanelRegistry {
+        PanelRegistry {
+            state: RwSignal::new(PanelRegistryState::default()),
+        }
+    }
+
+    #[test]
+    fn an_older_panel_never_rolls_back_a_newer_operator_declaration() {
+        // NIP-33: kinds 31400-31405 are parameterized-replaceable and
+        // newest-`created_at` wins per (kind, pubkey, d). Without that rule an
+        // agent could REPLAY its own earlier, looser 31400 and roll the
+        // operator's escalation boundary back down — ADR-2011 defeated by a
+        // replayed envelope rather than a forged one.
+        let r = fresh_registry();
+        r.ingest_event(&panel_event("p-1", "operator", 200, "critical"));
+        let addr = panel_address("operator", "p-1");
+        assert_eq!(
+            r.state.read_untracked().panels[&addr].definition.task_properties, None,
+            "the triple rides tags here, not content"
+        );
+        assert_eq!(r.state.read_untracked().panels[&addr].last_updated, 200);
+
+        // Replay of the older, looser declaration.
+        r.ingest_event(&panel_event("p-1", "operator", 100, "bounded"));
+        let s = r.state.read_untracked();
+        assert_eq!(s.panels[&addr].last_updated, 200, "older event replaced a newer one");
+        assert_eq!(
+            s.panels[&addr].context().task_properties.unwrap().stakes,
+            governance::Stakes::Critical,
+            "the operator's tighter declaration was rolled back"
+        );
+    }
+
+    #[test]
+    fn a_newer_panel_does_replace_an_older_one() {
+        let r = fresh_registry();
+        r.ingest_event(&panel_event("p-1", "operator", 100, "bounded"));
+        r.ingest_event(&panel_event("p-1", "operator", 200, "critical"));
+        let addr = panel_address("operator", "p-1");
+        let s = r.state.read_untracked();
+        assert_eq!(s.panels[&addr].last_updated, 200);
+        assert_eq!(
+            s.panels[&addr].context().task_properties.unwrap().stakes,
+            governance::Stakes::Critical
+        );
+    }
+
+    #[test]
+    fn a_republished_request_replaces_rather_than_duplicating() {
+        // 31402 is parameterized-replaceable too. Appending both versions
+        // showed one case twice — and let an agent publish a second, lower
+        // tier that sits alongside the first rather than superseding it.
+        let r = fresh_registry();
+        r.ingest_event(&request_event("case-1", "agent", 100, "critical"));
+        r.ingest_event(&request_event("case-1", "agent", 200, "low"));
+        let s = r.state.read_untracked();
+        assert_eq!(s.actions.len(), 1, "one case, one card");
+        assert_eq!(s.actions[0].created_at, 200);
+        assert_eq!(s.actions[0].risk_tier.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn an_older_republished_request_is_ignored() {
+        let r = fresh_registry();
+        r.ingest_event(&request_event("case-1", "agent", 200, "critical"));
+        r.ingest_event(&request_event("case-1", "agent", 100, "low"));
+        let s = r.state.read_untracked();
+        assert_eq!(s.actions.len(), 1);
+        assert_eq!(s.actions[0].created_at, 200);
+        assert_eq!(
+            s.actions[0].risk_tier.as_deref(),
+            Some("critical"),
+            "a replayed older request lowered the tier"
+        );
+    }
+
+    #[test]
+    fn two_agents_sharing_a_d_tag_keep_separate_cases() {
+        // Replaceability is per (pubkey, d), so one agent's republish must not
+        // displace another's case that happens to share a `d` tag.
+        let r = fresh_registry();
+        r.ingest_event(&request_event("case-1", "agent-a", 100, "critical"));
+        r.ingest_event(&request_event("case-1", "agent-b", 200, "low"));
+        assert_eq!(r.state.read_untracked().actions.len(), 2);
+    }
+
+    #[test]
+    fn a_duplicate_of_the_same_event_is_ingested_once() {
+        let r = fresh_registry();
+        let ev = request_event("case-1", "agent", 100, "low");
+        r.ingest_event(&ev);
+        r.ingest_event(&ev);
+        assert_eq!(r.state.read_untracked().actions.len(), 1);
     }
 
     #[test]

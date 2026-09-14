@@ -40,3 +40,20 @@ the probe would disappear rather than render blind. It is stated in
 ADR-2011 (`implementation_status: partial`, and its `review_trigger`), in the
 CHANGELOG, and in the EXP-AC-006 evidence, which records that scenario as
 PARTIAL. Closing it properly means keeping the digest off the signed event.
+| KF-8 | BUG | `crates/nostr-bbs-core/src/governance.rs:32, :1174` | `KIND_PANEL_RETIRED` and `KIND_GOVERNANCE_AUDIT_LOG` are **both 31405**. `validate_governance_event` applies its append-only audit rules to the kind, so a legitimate `PanelRetired` is validated as an audit-log entry and the two semantics are entangled on one wire kind. | Assigning the audit log a distinct kind is a **protocol change** to a published crate: it changes what a deployed relay accepts and what both clients emit, and `GOVERNANCE_KIND_RANGE`, the client dispatch and the relay projection all move with it. That is an ADR, not a line edit, and doing it inside a feature branch would make the branch unreviewable. Recommended shape: give the audit log a **non-replaceable** kind, so append-only is enforced by the kind's own semantics rather than by a validator. | core maintainers |
+| KF-9 | MEDIUM | `crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs:804-875` | Sharper restatement of KF-4 for **gift-wrap**: for a kind-1059 the `event.pubkey` is a fresh ephemeral key that is never whitelisted and never moderated, so `check_suspension`, `mod_cache.is_blocked` and the trust lookup all pass vacuously. A suspended or banned user can keep sending gift-wrapped DMs. | Same root cause and same fix as KF-4 — resolve the effective principal once and feed every author-scoped gate — but gift-wrap is the case where there *is* no author to resolve on the envelope, so it needs a decision about what moderation means for an unlinkable sender. Wider than KF-4 and wants its own review. | relay maintainers |
+
+### Re-raised by the merged-tree run `.deepsec-gate/reports/20260914T204117Z`
+
+That run reported seven net-new findings against `20260914T194052Z`. Four were
+fixed on the branch (client NIP-33 replaceability and the 31402 duplicate, the
+probe-blinding trigger, and the agent-registration pubkey casing — see the
+CHANGELOG). Of the remaining three, two are restatements of entries already in
+this table and one is new:
+
+- **`ensure_schema` runs ~50 DDL statements on every request, before auth** —
+  already **KF-3**, unchanged. The branch adds statements to that path rather
+  than fixing its shape, which is recorded there.
+- **Gift-wrap escapes the moderation gates** — the specific case of **KF-4**,
+  broken out as **KF-9** above because the fix is not the same one line.
+- **31405 defined twice** — new, **KF-8** above.

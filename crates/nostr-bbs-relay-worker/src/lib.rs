@@ -585,6 +585,43 @@ async fn handle_channel_zone_upsert(mut req: Request, env: &Env) -> Result<Respo
     )
 }
 
+/// The statements that keep seeded probes out of `event_tags` (DDD §6
+/// invariant 7, FR6.4), mirroring migration 0006.
+///
+/// `event_tags` backs every `#tag` REQ filter, so one `probe` row there lets any
+/// client enumerate the seeded probes by subscription and destroys the catch
+/// rate they exist to measure.
+///
+/// The blinding lives in the tag-WRITING trigger, not in a second trigger
+/// watching it. `event_tags` is written only by `trg_event_tags_ai` (0004), an
+/// `AFTER INSERT ON events`; in SQLite a trigger fired by a modification made
+/// inside another trigger runs only under `PRAGMA recursive_triggers = ON`,
+/// which defaults OFF and is set nowhere here. A watcher trigger therefore never
+/// fired for the only path that writes probe rows: the control read as
+/// enforcement and was inert. Filtering at the source needs no recursion.
+///
+/// Order matters: drop the old writer, create the filtering one, keep the
+/// watcher for any other writer, then purge rows written before any of this
+/// existed. The last statement is the one the original migration failed to
+/// mirror here, so a deployed relay kept every probe row it had already indexed.
+pub(crate) const PROBE_BLIND_STMTS: [&str; 4] = [
+    "DROP TRIGGER IF EXISTS trg_event_tags_ai",
+    "CREATE TRIGGER IF NOT EXISTS trg_event_tags_ai_v2 AFTER INSERT ON events \
+     BEGIN \
+       INSERT INTO event_tags (event_id, name, value) \
+       SELECT NEW.id, json_extract(je.value, '$[0]'), \
+              COALESCE(json_extract(je.value, '$[1]'), '') \
+       FROM json_each(NEW.tags) je \
+       WHERE json_type(je.value) = 'array' \
+         AND json_extract(je.value, '$[0]') IS NOT NULL \
+         AND json_extract(je.value, '$[0]') <> 'probe'; \
+     END",
+    "CREATE TRIGGER IF NOT EXISTS trg_event_tags_probe_blind \
+     AFTER INSERT ON event_tags WHEN NEW.name = 'probe' \
+     BEGIN DELETE FROM event_tags WHERE event_id = NEW.event_id AND name = 'probe'; END",
+    "DELETE FROM event_tags WHERE name = 'probe'",
+];
+
 /// Idempotent schema migrations.
 ///
 /// All statements use `IF NOT EXISTS` for tables or silently ignore errors
@@ -827,15 +864,14 @@ async fn ensure_schema(env: &Env) {
             delegated_at INTEGER NOT NULL, \
             PRIMARY KEY (case_id, delegate_pubkey)\
         )",
-        // DDD §6 invariant 7 (migration 0006): `event_tags` backs every `#tag`
-        // REQ filter, so a `probe` row there would let any client enumerate the
-        // seeded probes by subscription and destroy the catch rate they exist
-        // to measure. This trigger removes those rows as they are written.
-        "CREATE TRIGGER IF NOT EXISTS trg_event_tags_probe_blind \
-         AFTER INSERT ON event_tags WHEN NEW.name = 'probe' \
-         BEGIN DELETE FROM event_tags WHERE event_id = NEW.event_id AND name = 'probe'; END",
     ];
     for stmt in create_stmts {
+        let _ = db.prepare(stmt).run().await;
+    }
+
+    // DDD §6 invariant 7 — probe blinding. Ordered, so run as its own sequence
+    // rather than folded into the unordered `create_stmts` above.
+    for stmt in PROBE_BLIND_STMTS {
         let _ = db.prepare(stmt).run().await;
     }
 
@@ -978,5 +1014,95 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             }
         }
         Err(e) => console_error!("ageing sweep failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod probe_blinding_tests {
+    use super::PROBE_BLIND_STMTS;
+
+    const MIGRATION_0006: &str = include_str!("../migrations/0006_augmentation_conditions.sql");
+
+    /// Whitespace-insensitive containment, so a line-continued Rust string and a
+    /// formatted SQL file compare on content rather than on layout.
+    fn squash(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn the_tag_writing_trigger_itself_excludes_probe() {
+        // The defect this guards: blinding used to live in a SECOND trigger
+        // watching `event_tags`. `event_tags` is written only from inside
+        // another trigger, and SQLite runs trigger-inside-trigger only under
+        // `PRAGMA recursive_triggers = ON` — off by default, set nowhere here.
+        // The control read as enforcement and never fired. Filtering in the
+        // writer needs no recursion.
+        let writer = PROBE_BLIND_STMTS
+            .iter()
+            .find(|s| s.contains("trg_event_tags_ai_v2"))
+            .expect("a replacement tag-writing trigger exists");
+        let w = squash(writer);
+        assert!(w.contains("AFTER INSERT ON events"));
+        assert!(
+            w.contains("json_extract(je.value, '$[0]') <> 'probe'"),
+            "the writer must filter probe rows at the source"
+        );
+    }
+
+    #[test]
+    fn the_superseded_writer_trigger_is_dropped_first() {
+        // 0004 created `trg_event_tags_ai` with IF NOT EXISTS, so on a deployed
+        // relay it survives and would keep writing probe rows beside the new
+        // one. It must be dropped, and dropped BEFORE the replacement exists so
+        // the sequence never leaves the table unwritten.
+        assert_eq!(
+            PROBE_BLIND_STMTS[0], "DROP TRIGGER IF EXISTS trg_event_tags_ai",
+            "the old writer must be dropped first"
+        );
+        assert!(PROBE_BLIND_STMTS[1].contains("trg_event_tags_ai_v2"));
+    }
+
+    #[test]
+    fn existing_probe_rows_are_purged_on_the_live_path_too() {
+        // The original migration purged pre-existing rows and `ensure_schema`
+        // did not, contradicting the file's own "every statement below is
+        // mirrored there" — so a deployed relay kept every probe row it had
+        // already indexed and stayed enumerable.
+        assert!(
+            PROBE_BLIND_STMTS
+                .iter()
+                .any(|s| squash(s) == "DELETE FROM event_tags WHERE name = 'probe'"),
+            "the live path must purge rows written before the blinding existed"
+        );
+    }
+
+    #[test]
+    fn every_live_statement_is_mirrored_in_migration_0006() {
+        // The mirror claim is now checkable rather than asserted in a comment.
+        let migration = squash(MIGRATION_0006);
+        for stmt in PROBE_BLIND_STMTS {
+            assert!(
+                migration.contains(&squash(stmt)),
+                "migration 0006 does not carry: {}",
+                squash(stmt)
+            );
+        }
+    }
+
+    #[test]
+    fn the_watcher_trigger_is_kept_but_is_not_the_only_control() {
+        // Kept for any other writer of `event_tags`; it must not be the sole
+        // blinder, which is what made the control inert.
+        assert!(PROBE_BLIND_STMTS
+            .iter()
+            .any(|s| s.contains("trg_event_tags_probe_blind")));
+        assert!(
+            PROBE_BLIND_STMTS
+                .iter()
+                .filter(|s| s.contains("'probe'"))
+                .count()
+                >= 3,
+            "blinding must be enforced at the writer, the watcher and the purge"
+        );
     }
 }

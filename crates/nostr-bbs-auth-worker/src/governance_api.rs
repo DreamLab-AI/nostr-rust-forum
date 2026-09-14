@@ -92,6 +92,23 @@ fn validate_agent_fields(pubkey: &str, name: &str) -> std::result::Result<(), &'
     Ok(())
 }
 
+/// Validate an agent's fields and return the **canonical** pubkey.
+///
+/// NIP-98 accepts case-insensitive hex and returns `event.pubkey` verbatim, and
+/// a Nostr event id is recomputed over the serialised event including that
+/// string — so the same key can legitimately present in two casings and both
+/// verify. Every other `agent_registry` path already canonicalises to lowercase
+/// (`handle_provision_agent`, `is_registered_agent`'s `lower(pubkey)` lookup,
+/// `handle_revoke_agent`), and registration did not: an agent registered with
+/// uppercase hex was written verbatim and then never matched by the lookup that
+/// decides whether its governance events are admitted. That is the same
+/// stale-identity class this branch fixed for `broker_roles`, left behind in its
+/// sibling path.
+fn canonical_agent_pubkey(pubkey: &str, name: &str) -> std::result::Result<String, &'static str> {
+    validate_agent_fields(pubkey, name)?;
+    Ok(pubkey.to_ascii_lowercase())
+}
+
 /// Pure validation/normalisation for [`ProvisionAgentBody`].
 ///
 /// Rules:
@@ -351,9 +368,10 @@ pub async fn handle_register_agent(
         Err(e) => return error_json(env, &format!("bad body: {e}"), 400),
     };
 
-    if let Err(msg) = validate_agent_fields(&body.pubkey, &body.name) {
-        return error_json(env, msg, 400);
-    }
+    let pubkey = match canonical_agent_pubkey(&body.pubkey, &body.name) {
+        Ok(pk) => pk,
+        Err(msg) => return error_json(env, msg, 400),
+    };
 
     let db = relay_db(env)?;
     let now = now_secs();
@@ -364,7 +382,7 @@ pub async fn handle_register_agent(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
     )
     .bind(&[
-        JsValue::from_str(&body.pubkey),
+        JsValue::from_str(&pubkey),
         JsValue::from_str(&body.name),
         JsValue::from_str(&body.description),
         JsValue::from_str(&admin_pk),
@@ -374,9 +392,11 @@ pub async fn handle_register_agent(
     .run()
     .await?;
 
+    // Echo what was STORED, not what was sent: a caller that posted uppercase
+    // hex needs to see the identity its agent will actually be known by.
     json_response(
         env,
-        &json!({ "ok": true, "pubkey": body.pubkey, "name": body.name }),
+        &json!({ "ok": true, "pubkey": pubkey, "name": body.name }),
         201,
     )
 }
@@ -1454,6 +1474,48 @@ pub async fn handle_list_reviewers(
         }),
         200,
     )
+}
+
+#[cfg(test)]
+mod agent_registration_tests {
+    use super::canonical_agent_pubkey;
+
+    #[test]
+    fn registration_canonicalises_pubkey_case() {
+        // `is_registered_agent` looks up with `lower(pubkey)`, so a verbatim
+        // uppercase row is written and then never matched — the agent is
+        // "registered" and its governance events are refused.
+        let upper = "A".repeat(64);
+        assert_eq!(
+            canonical_agent_pubkey(&upper, "probe-agent").unwrap(),
+            "a".repeat(64)
+        );
+        // Mixed case, and an already-lowercase key, both land on the same value.
+        let mixed: String = (0..64)
+            .map(|i| if i % 2 == 0 { 'A' } else { 'b' })
+            .collect();
+        assert_eq!(
+            canonical_agent_pubkey(&mixed, "x").unwrap(),
+            mixed.to_ascii_lowercase()
+        );
+        let lower = "f".repeat(64);
+        assert_eq!(canonical_agent_pubkey(&lower, "x").unwrap(), lower);
+    }
+
+    #[test]
+    fn registration_still_rejects_what_it_always_rejected() {
+        assert!(canonical_agent_pubkey(&"a".repeat(63), "x").is_err());
+        assert!(canonical_agent_pubkey(&"a".repeat(65), "x").is_err());
+        assert!(canonical_agent_pubkey(&"z".repeat(64), "x").is_err());
+        assert!(canonical_agent_pubkey(&"a".repeat(64), "   ").is_err());
+    }
+
+    #[test]
+    fn canonicalisation_is_idempotent() {
+        let once = canonical_agent_pubkey(&"AbCd".repeat(16), "x").unwrap();
+        let twice = canonical_agent_pubkey(&once, "x").unwrap();
+        assert_eq!(once, twice);
+    }
 }
 
 #[cfg(test)]

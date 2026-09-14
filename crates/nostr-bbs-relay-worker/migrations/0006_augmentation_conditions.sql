@@ -108,10 +108,44 @@ CREATE INDEX IF NOT EXISTS idx_case_delegations_delegate ON case_delegations(del
 -- rendered surface is the client's own responsibility (FR6.4), and blindness in
 -- the relay's D1 projection is enforced in `broker_cases`, which never re-serves
 -- `probe_digest` for an undecided case.
+--
+-- The blinding is done in the tag-writing trigger ITSELF, not in a second
+-- trigger that watches it. `event_tags` is written only by
+-- `trg_event_tags_ai` (0004), an AFTER INSERT ON events; in SQLite a trigger
+-- fired by a modification made INSIDE another trigger runs only when
+-- `PRAGMA recursive_triggers = ON`, which defaults OFF and is set nowhere in
+-- this worker (and is not on by default in D1). A watcher trigger therefore
+-- never fired for the only path that writes probe rows, and the control was
+-- inert while reading as enforcement. Filtering at the source needs no
+-- recursion and cannot be switched off by a pragma.
+--
+-- 0004 created `trg_event_tags_ai` with IF NOT EXISTS, so it survives on a
+-- deployed relay and must be dropped rather than redefined. The replacement
+-- carries a new name so that the live `ensure_schema` path can drop the old
+-- one idempotently without ever dropping the trigger currently in force.
+DROP TRIGGER IF EXISTS trg_event_tags_ai;
+
+CREATE TRIGGER IF NOT EXISTS trg_event_tags_ai_v2 AFTER INSERT ON events
+BEGIN
+  INSERT INTO event_tags (event_id, name, value)
+  SELECT NEW.id,
+         json_extract(je.value, '$[0]'),
+         COALESCE(json_extract(je.value, '$[1]'), '')
+  FROM json_each(NEW.tags) je
+  WHERE json_type(je.value) = 'array'
+    AND json_extract(je.value, '$[0]') IS NOT NULL
+    AND json_extract(je.value, '$[0]') <> 'probe';
+END;
+
+-- Belt and braces: kept so that any other writer of `event_tags` (a backfill, a
+-- future ingest path) is still blinded. It is not the primary control.
 CREATE TRIGGER IF NOT EXISTS trg_event_tags_probe_blind AFTER INSERT ON event_tags
 WHEN NEW.name = 'probe'
 BEGIN
   DELETE FROM event_tags WHERE event_id = NEW.event_id AND name = 'probe';
 END;
 
+-- Purge rows written before the blinding existed. Mirrored in `ensure_schema`,
+-- unlike the original, which was not — so a deployed relay kept every probe row
+-- it had already indexed.
 DELETE FROM event_tags WHERE name = 'probe';

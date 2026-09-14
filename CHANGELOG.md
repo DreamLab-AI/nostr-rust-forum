@@ -62,6 +62,30 @@ against the six conditions of arXiv 2609.12482. **Not published and not deployed
   `broker_cases.calibration_sample` from `GET /api/governance/cases` —
   member-readable NIP-98, as FR6.3 requires — instead of computing it. A case
   the relay has said nothing about is not a sample.
+- **NIP-33 replaceability enforced on ingest.** Kinds 31400-31405 are
+  parameterized-replaceable, and the client did not enforce newest-`created_at`
+  wins per `(pubkey, d)`. An agent could **replay its own earlier 31400** to roll
+  the operator's task-property declaration back to a looser one — ADR-2011's
+  boundary defeated by a replayed envelope rather than a forged one — and a
+  republished 31402 accumulated beside its earlier version instead of replacing
+  it, so one case showed twice and an agent's second, lower tier sat alongside
+  its first. `supersedes_held` now gates panels, panel state, requests and
+  retirement, with NIP-01's lowest-event-id tie-break so two clients never render
+  different versions of one case.
+- **Probe blinding in `event_tags` actually fires now.** The blinding was a
+  second trigger watching `event_tags`, but `event_tags` is written only from
+  inside another trigger, and SQLite runs trigger-inside-trigger only under
+  `PRAGMA recursive_triggers = ON` — off by default and set nowhere here. The
+  control read as enforcement and was inert, leaving seeded probes enumerable by
+  a `{"#probe": [...]}` subscription. Filtering moved into the tag-writing
+  trigger itself, where no recursion is involved; the watcher is kept for any
+  other writer; and the one-time purge of already-indexed probe rows is now
+  mirrored into `ensure_schema`, which it never was.
+- **Agent registration canonicalises pubkey case.** `handle_register_agent` wrote
+  `body.pubkey` verbatim while `is_registered_agent` looks up with
+  `lower(pubkey)`, so an agent registered with uppercase hex was "registered" and
+  then never matched — its governance events refused. The same stale-identity
+  class this release fixed for `broker_roles`, left behind in its sibling path.
 - **Fixed under the security gate, in the client's governance path.** Stored XSS
   through an unvalidated `ActionRequest.context_url` bound into an `href` — the
   governance subscription carries no `authors` filter, so that field is
