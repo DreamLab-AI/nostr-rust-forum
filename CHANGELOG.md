@@ -7,6 +7,20 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed — forum member feedback, September 2026
+
+- **The installed PWA has its own icon.** `manifest.webmanifest` pointed at
+  `/community/bbs/icons/*` — the *retro BBS client's* black terminal mark — so
+  the installed forum was indistinguishable from the installed BBS, and from
+  every other dark tile on a home screen. It also 404'd outright on a deploy
+  without the `bbs/` sub-app. The forum now ships its own set generated from an
+  SVG source of record (`scripts/gen-pwa-icons.sh`, `--check` proves the
+  committed rasters match): a dark diamond with an amber tick on an amber field,
+  at 192/512 plus maskable variants sized for Android's adaptive-icon safe zone.
+  `index.html` gains the `apple-touch-icon` it never had, without which iOS
+  screenshots the page for the home-screen tile.
+
+
 ## [1.0.0-beta.11] — 2026-09-14
 
 Augmentation-conditions release: `nostr-bbs-core` and `nostr-bbs-mesh` move to

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Maskable variant. Android adaptive icons crop to an OS-chosen shape
+  (circle, squircle, teardrop) and only the central 80% diameter — a circle
+  of radius 205 on a 512 canvas — is guaranteed visible.
+
+  So: the amber field goes FULL-BLEED with no corner radius (the OS supplies
+  the corners), and the mark is scaled to ~72% about the centre so the tick's
+  extremities sit comfortably inside the safe circle. Scaling the whole mark
+  rather than re-drawing it keeps the two files in visual lockstep.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Forum">
+  <defs>
+    <linearGradient id="field" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fcd34d"/>
+      <stop offset="45%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#d97706"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1f2937"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#field)"/>
+
+  <!-- translate/scale about (256,256): 0.72 keeps the diamond's 164px
+       half-diagonal at ~118px, well inside the 205px safe radius. -->
+  <g transform="translate(256 256) scale(0.72) translate(-256 -256)">
+    <path d="M256 92 L420 256 L256 420 L92 256 Z" fill="url(#core)"/>
+    <path d="M182 258 L233 309 L332 210"
+          fill="none" stroke="#fbbf24" stroke-width="42"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
