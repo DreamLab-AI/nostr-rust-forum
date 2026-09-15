@@ -84,3 +84,50 @@ follow-on, with the gate's own recommendation recorded above.
 ## Run 2 — after remediation
 
 See the second receipt in `.deepsec-gate/reports/`.
+
+## Run 2 — `20260915210638-9106cd6785d81025` (after remediation)
+
+```
+deepsec-gate: PASS — 7 finding(s) cumulative
+  {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 2, 'HIGH_BUG': 3, 'BUG': 2, 'LOW': 0}
+  0 at/above HIGH; candidates=0
+  Findings: 2 new this run
+receipt: .deepsec-gate/reports/20260915T210635Z/receipt.json
+GATE_EXIT=0
+```
+
+All four remediated findings from run 1 are gone. Two **new** findings appeared,
+both in `crates/nostr-bbs-search-worker/src/lib.rs`, and neither is introduced by
+this branch — they are pre-existing worker code that entered the gate's scope
+because the diff touched that file. Both are recorded rather than fixed:
+
+### MEDIUM — `/embed` meters requests, not work
+
+`lib.rs:529-582`. The per-IP limiter counts 100 requests/60s, but each request may
+carry up to 100 texts with no per-text length cap, so one IP can drive ~10,000
+inferences/minute against a paid model. This is a sharper restatement of run 1's
+MEDIUM. The remedy — meter `texts.len()` and cap per-text length, or require auth
+for `/embed` — is an operator policy decision about whether `/embed` is public at
+all, not a defect in the search fix.
+
+### HIGH BUG — concurrent `/ingest` is an unsynchronised read-modify-write
+
+`lib.rs:616-693`. `handle_ingest` does `load_store()` + `load_mapping()`, mutates
+in memory, then `persist_store()` blind-overwrites both R2 and KV. Two
+overlapping ingests read the same base state and last-writer-wins, silently
+losing one batch; worse, `next_label` is derived from each reader's stale view,
+so concurrent batches can assign the **same label to different event ids**,
+corrupting the id↔label mapping and therefore the visibility filter.
+
+Genuinely serious, and genuinely **pre-existing**: this is the worker's
+persistence design, untouched by this branch. Fixing it means serialising ingest
+behind a Durable Object or making persistence a compare-and-swap — an
+architectural change well beyond a member-feedback pass. It is also latent today
+for a second reason: `/ingest` is admin-gated but called as the ordinary posting
+user, so in practice almost nothing reaches it (see EXP-FB-006's honest limits).
+That coincidence should not be mistaken for safety — the moment ingest is made to
+work for ordinary members, this becomes reachable and should be fixed first.
+
+**Recommended order for the follow-on**: fix the ingest concurrency, then unblock
+non-admin ingest, then backfill the vectors stranded by the old `public: false`.
+Doing them in the other order corrupts the mapping under real load.
