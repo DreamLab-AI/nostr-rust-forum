@@ -162,16 +162,68 @@ Edit the following files to point to your deployed worker URLs:
 - `crates/nostr-bbs-forum-client/src/relay.rs` -- `DEFAULT_RELAY_URL`
 - `crates/nostr-bbs-forum-client/src/utils/relay_url.rs` -- relay HTTP/WS URLs
 - `crates/nostr-bbs-forum-client/src/utils/pod_client.rs` -- pod API URL
-- `crates/nostr-bbs-forum-client/src/utils/search_client.rs` -- search API URL
-- `crates/nostr-bbs-forum-client/src/components/global_search.rs` -- search API URL
 - `crates/nostr-bbs-forum-client/src/components/link_preview.rs` -- preview API URL
+
+The **search** worker URL is no longer edited in source. Both the global-search
+overlay and `utils/search_client.rs` resolve it through the single resolver
+`utils::search_client::search_api_base()`, which prefers a runtime value.
 
 Alternatively, set environment variables at compile time:
 - `RELAY_URL` -- WebSocket relay URL
 - `RELAY_HTTP_URL` -- HTTP relay URL
 - `POD_API_URL` -- Pod worker URL
-- `SEARCH_API_URL` -- Search worker URL
+- `SEARCH_API_URL` (or `VITE_SEARCH_API_URL`) -- Search worker URL. **Both names
+  are accepted**; they are equivalent, with `VITE_SEARCH_API_URL` taking
+  precedence if you somehow set both.
 - `PREVIEW_API_URL` -- Preview worker URL
+
+### Search worker URL at runtime (preferred)
+
+A compile-time URL bakes one endpoint into the artefact. Prefer injecting it into
+`window.__ENV__` from the served `index.html`, so one build can be repointed
+without a rebuild:
+
+```html
+<script>
+window.__ENV__ = { SEARCH_API: "https://your-search-worker.workers.dev" };
+</script>
+```
+
+Any of `SEARCH_API`, `SEARCH_URL`, `SEARCH_BASE_URL`, `SEARCH_API_URL` or
+`VITE_SEARCH_API_URL` is read, in that order (the first three match the names the
+retro BBS client's `config.rs` already reads, so one injection serves both
+clients). A runtime value beats the compile-time one; if neither is set the
+client falls back to the kit's deployed search worker. A trailing slash is
+stripped, and a blank value is treated as absent.
+
+### Search visibility: messages must be ingested as `public`
+
+The search worker fails **closed**. A vector ingested with `public: false` is
+recorded outside the worker's `publicLabels` set and is filtered out of every
+`/search` response, so it is indexed but permanently unfindable. Callers indexing
+a message posted to an openly readable channel must pass `public: true`;
+`public: false` is correct only for private/gated channels.
+
+To make that failure loud rather than silent, `POST /ingest` now **rejects with
+400** a batch in which *no* entry is public. A deliberate private-only ingest (or
+a retraction that re-ingests known ids as private) opts in explicitly:
+
+```json
+{ "entries": [ ... ], "allowPrivate": true }
+```
+
+The `/ingest` success response also reports `"public": N` alongside `accepted` /
+`rejected`, so you can see how many of your entries are actually reachable.
+
+### Search request fields
+
+`POST /search` reads exactly `embedding` / `query` / `k` / `minScore` / `model`.
+The result count field is **`k`** -- serde silently discards any other key, so a
+plausible-looking `"limit"` is ignored and the worker's default of 10 applies.
+There is **no `channel` filter**: the index stores only `(label, vector)` with no
+per-vector channel metadata, so a `"channel"` key in the request body is
+discarded. Filter by channel after hydrating the returned event ids from the
+relay.
 
 ## 6. Build and Deploy Forum Client
 

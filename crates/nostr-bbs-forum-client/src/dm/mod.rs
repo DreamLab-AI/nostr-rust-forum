@@ -10,7 +10,7 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use nostr_bbs_core::gift_wrap::{unwrap_gift_with_signer, KIND_ENCRYPTED_DM, KIND_GIFT_WRAP};
 use nostr_bbs_core::signer::Signer;
-use nostr_bbs_core::{gift_wrap_with_signer, NostrEvent};
+use nostr_bbs_core::{gift_wrap_pair_with_signer, NostrEvent};
 
 use crate::components::user_display::use_display_name;
 use crate::relay::{EoseCallback, EventCallback, Filter, RelayConnection};
@@ -85,10 +85,42 @@ impl DMStore {
     }
 
     /// Messages for the currently selected conversation (chronological).
+    ///
+    /// The conversation filter is applied HERE rather than in the relay query,
+    /// and that is forced by NIP-59, not laziness: a gift wrap reveals nothing
+    /// about which conversation it belongs to until it has been unwrapped
+    /// locally, so the subscription necessarily pulls the whole wrap inbox
+    /// (see `gift_wrap_filters`).
+    ///
+    /// It previously returned `state.messages` wholesale. Because the realtime
+    /// subscription is inbox-wide, a DM arriving from a THIRD party while you
+    /// were reading a conversation was appended straight into it — someone
+    /// else's message rendered inside an unrelated thread. Scoping the memo to
+    /// `current_conversation` is what keeps the two concerns separate.
     pub fn messages(&self) -> Memo<Vec<DMMessage>> {
         let state = self.state;
         Memo::new(move |_| {
-            let mut msgs = state.get().messages.clone();
+            let inner = state.get();
+            let Some(current) = inner.current_conversation.as_deref() else {
+                // No conversation open: render nothing rather than the whole
+                // inbox flattened into one stream.
+                return Vec::new();
+            };
+            let mut msgs: Vec<DMMessage> = inner
+                .messages
+                .iter()
+                .filter(|m| {
+                    // The "other party" of a message is the recipient when we
+                    // sent it and the sender when we received it.
+                    let counterparty = if m.is_sent {
+                        &m.recipient_pubkey
+                    } else {
+                        &m.sender_pubkey
+                    };
+                    counterparty.eq_ignore_ascii_case(current)
+                })
+                .cloned()
+                .collect();
             msgs.sort_by_key(|m| m.timestamp);
             msgs
         })
@@ -149,16 +181,7 @@ impl DMStore {
         let my_pk = my_pubkey.to_string();
         let state = self.state;
 
-        let sent_filter = Filter {
-            kinds: Some(vec![4, 1059]),
-            authors: Some(vec![my_pk.clone()]),
-            ..Default::default()
-        };
-        let recv_filter = Filter {
-            kinds: Some(vec![4, 1059]),
-            p_tags: Some(vec![my_pk.clone()]),
-            ..Default::default()
-        };
+        let filters = inbox_filters(&my_pk);
 
         let my_pk_cb = my_pk.clone();
         let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
@@ -171,7 +194,7 @@ impl DMStore {
         subscribe_dm_with_auth_retry(
             *self,
             relay.clone(),
-            vec![sent_filter, recv_filter],
+            filters,
             on_event,
             Some(on_eose),
             "fetch_conversations",
@@ -222,12 +245,7 @@ impl DMStore {
         // history this widened window also re-streams.
         let since = now.saturating_sub(GIFT_WRAP_LOOKBACK_SECS);
 
-        let filter = Filter {
-            kinds: Some(vec![4, 1059]),
-            p_tags: Some(vec![my_pk.clone()]),
-            since: Some(since),
-            ..Default::default()
-        };
+        let filters = incoming_filters(&my_pk, since);
         let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
             spawn_process_dm_event(event, signer.clone(), my_pk.clone(), state);
         });
@@ -235,7 +253,7 @@ impl DMStore {
         subscribe_dm_with_auth_retry(
             *self,
             relay.clone(),
-            vec![filter],
+            filters,
             on_event,
             None,
             "subscribe_incoming",
@@ -297,18 +315,7 @@ impl DMStore {
             s.is_loading = true;
         });
 
-        let sent_filter = Filter {
-            kinds: Some(vec![4, 1059]),
-            authors: Some(vec![my_pk.clone()]),
-            p_tags: Some(vec![partner_pk.clone()]),
-            ..Default::default()
-        };
-        let recv_filter = Filter {
-            kinds: Some(vec![4, 1059]),
-            authors: Some(vec![partner_pk]),
-            p_tags: Some(vec![my_pk.clone()]),
-            ..Default::default()
-        };
+        let filters = conversation_filters(&my_pk, &partner_pk);
 
         let my_pk_cb = my_pk.clone();
         let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
@@ -321,7 +328,7 @@ impl DMStore {
         subscribe_dm_with_auth_retry(
             *self,
             relay.clone(),
-            vec![sent_filter, recv_filter],
+            filters,
             on_event,
             Some(on_eose),
             "load_conversation_messages",
@@ -371,7 +378,21 @@ impl DMStore {
         // Optimistic local update — keyed by a temporary local ID. When the real
         // gift-wrap event ID is known we re-key the dedup entry so the inbound
         // echo (if any) does not duplicate the bubble.
-        let local_id = format!("local-{}-{}", now, content.len());
+        // Collision-resistant optimistic key.
+        //
+        // This was `format!("local-{}-{}", now, content.len())`, with `now` in
+        // whole seconds — so two messages of equal byte length sent in the same
+        // second ("hey" and "yo!") produced the SAME key. The second one's
+        // `seen_ids.insert` then returned false, its bubble was never pushed,
+        // and the later re-key step operated on a shared key, corrupting the
+        // dedup index for both. Both messages still reached the relay; the
+        // sender just could not see one of them, which reads as a lost message.
+        let local_id = format!(
+            "local-{}-{}-{:08x}",
+            now,
+            content.len(),
+            (js_sys::Math::random() * (u32::MAX as f64)) as u32
+        );
         let msg = DMMessage {
             id: local_id.clone(),
             sender_pubkey: my_pubkey.to_string(),
@@ -413,19 +434,32 @@ impl DMStore {
             // Publish kind-10050 (preferred DM relay) once per pubkey per session.
             ensure_dm_relay_published(&relay, signer.as_ref(), &my_pk).await;
 
-            match gift_wrap_with_signer(signer.as_ref(), &recipient, &content_owned).await {
-                Ok(wrapped) => {
+            // NIP-17 requires TWO wraps: one encrypted to the recipient, one
+            // encrypted back to us. Without the self-copy a sent message is
+            // write-only for its author — the wrap is encrypted to the
+            // recipient's key and authored by a throwaway key, so we can
+            // neither decrypt nor even *find* it afterwards. The optimistic
+            // bubble below would then be the only copy in existence and would
+            // die with the page, which is why sent history kept vanishing.
+            match gift_wrap_pair_with_signer(signer.as_ref(), &recipient, &content_owned).await {
+                Ok((to_recipient, to_self)) => {
                     // Re-key the optimistic message to the real wrap event ID so
                     // the relay echo dedups against it instead of duplicating.
+                    //
+                    // We key on the SELF copy: that is the one that comes back
+                    // to us through our own `#p` subscription, so it is the one
+                    // that would otherwise render a second bubble. The
+                    // recipient copy is never delivered to us at all.
                     state.update(|s| {
                         if s.seen_ids.remove(&local_id) {
-                            s.seen_ids.insert(wrapped.id.clone());
+                            s.seen_ids.insert(to_self.id.clone());
                         }
                         if let Some(m) = s.messages.iter_mut().find(|m| m.id == local_id) {
-                            m.id = wrapped.id.clone();
+                            m.id = to_self.id.clone();
                         }
                     });
-                    relay.publish(&wrapped);
+                    relay.publish(&to_recipient);
+                    relay.publish(&to_self);
                 }
                 Err(e) => {
                     web_sys::console::error_1(&format!("[DM] Gift wrap failed: {e}").into());
@@ -484,6 +518,123 @@ impl DMStore {
 // -- Authenticated subscription with retry -------------------------------------
 
 /// How long to wait for the relay's EOSE before treating the REQ as dropped.
+// -- DM subscription filters (pure; unit-tested on the host target) -----------
+//
+// # Why these are separate functions
+//
+// Two independent relay-side facts make naive DM filters silently return
+// nothing, and both were live bugs:
+//
+// 1. **A gift wrap's `authors` is a throwaway key, never a person.** NIP-59
+//    signs the kind-1059 outer layer with a fresh keypair minted per message
+//    (`nostr_bbs_core::gift_wrap::wrap_seal`) precisely so an observer cannot
+//    tell who sent it. The relay translates `authors` to `pubkey IN (...)`, so
+//    ANY `authors` constraint on a kind-1059 filter matches zero rows — for
+//    both parties, forever. A conversation's history is therefore *not*
+//    selectable relay-side at all: the only usable handle is the `#p` tag, and
+//    which conversation a wrap belongs to is knowable only AFTER unwrapping it
+//    locally.
+//
+// 2. **The relay rewrites `#p` on any filter mentioning kind 1059.** The DM
+//    privacy gate (`relay_do/nip_handlers.rs::gate_kind_1059_filters`) forces
+//    `#p = <authenticated pubkey>` on every filter whose `kinds` contains 1059,
+//    so that nobody can fish for someone else's wraps. Correct — but the client
+//    used to bundle kinds 4 and 1059 into ONE filter, so the rewrite also
+//    clobbered the legacy kind-4 half of the query and destroyed outbound
+//    kind-4 history as collateral damage.
+//
+// Hence: gift wraps and legacy kind-4 DMs get **separate filters**, and the
+// gift-wrap filter carries `#p` only.
+//
+// These are free functions taking plain strings so they can be asserted
+// directly in host-target unit tests — the bug lived in filter *shape*, which
+// no amount of crypto testing would have caught.
+
+/// Filters for the gift-wrap (kind-1059) half of any DM query.
+///
+/// `#p` is the sole constraint by necessity (see the module note above).
+/// `since` is optional: `None` asks for all history, `Some(t)` narrows a
+/// realtime subscription.
+fn gift_wrap_filters(my_pubkey: &str, since: Option<u64>) -> Vec<Filter> {
+    vec![Filter {
+        kinds: Some(vec![KIND_GIFT_WRAP]),
+        p_tags: Some(vec![my_pubkey.to_string()]),
+        since,
+        ..Default::default()
+    }]
+}
+
+/// Filters for the legacy NIP-04 (kind-4) half of a *conversation* query.
+///
+/// Kind 4 predates gift-wrapping: its author IS the real sender and the `p` tag
+/// IS the real recipient, so both directions are precisely selectable — which
+/// is exactly why it must not share a filter with kind 1059 and inherit the
+/// relay's `#p` rewrite.
+fn legacy_dm_filters(my_pubkey: &str, partner_pubkey: Option<&str>) -> Vec<Filter> {
+    match partner_pubkey {
+        // One conversation: both directions, each precisely constrained.
+        Some(partner) => vec![
+            Filter {
+                kinds: Some(vec![KIND_ENCRYPTED_DM]),
+                authors: Some(vec![my_pubkey.to_string()]),
+                p_tags: Some(vec![partner.to_string()]),
+                ..Default::default()
+            },
+            Filter {
+                kinds: Some(vec![KIND_ENCRYPTED_DM]),
+                authors: Some(vec![partner.to_string()]),
+                p_tags: Some(vec![my_pubkey.to_string()]),
+                ..Default::default()
+            },
+        ],
+        // The whole inbox: everything we sent, plus everything addressed to us.
+        None => vec![
+            Filter {
+                kinds: Some(vec![KIND_ENCRYPTED_DM]),
+                authors: Some(vec![my_pubkey.to_string()]),
+                ..Default::default()
+            },
+            Filter {
+                kinds: Some(vec![KIND_ENCRYPTED_DM]),
+                p_tags: Some(vec![my_pubkey.to_string()]),
+                ..Default::default()
+            },
+        ],
+    }
+}
+
+/// Every filter needed to rebuild the DM inbox (all conversations).
+fn inbox_filters(my_pubkey: &str) -> Vec<Filter> {
+    let mut f = gift_wrap_filters(my_pubkey, None);
+    f.extend(legacy_dm_filters(my_pubkey, None));
+    f
+}
+
+/// Every filter needed to rebuild one conversation's history.
+///
+/// Note the asymmetry, and that it is deliberate: the gift-wrap half CANNOT be
+/// narrowed to `partner` relay-side, so it fetches the whole wrap inbox and the
+/// conversation is selected locally after unwrapping. That is more data over
+/// the wire than one would like, and it is the price NIP-59's sender anonymity
+/// charges. The alternative — an `authors` constraint — simply returns nothing.
+fn conversation_filters(my_pubkey: &str, partner_pubkey: &str) -> Vec<Filter> {
+    let mut f = gift_wrap_filters(my_pubkey, None);
+    f.extend(legacy_dm_filters(my_pubkey, Some(partner_pubkey)));
+    f
+}
+
+/// Every filter for the realtime inbound subscription.
+///
+/// The gift-wrap half is windowed by `since` because NIP-59 randomises the
+/// outer `created_at` up to ~2 days into the past; a `since = now` subscription
+/// would skip a message sent this second. Legacy kind-4 keeps a real timestamp
+/// but is left unwindowed — event-id dedup makes the overlap free.
+fn incoming_filters(my_pubkey: &str, since: u64) -> Vec<Filter> {
+    let mut f = gift_wrap_filters(my_pubkey, Some(since));
+    f.extend(legacy_dm_filters(my_pubkey, None));
+    f
+}
+
 const DM_SUB_CONFIRM_MS: i32 = 3_000;
 /// Maximum REQ attempts before surfacing an error.
 const DM_SUB_MAX_ATTEMPTS: u32 = 4;
@@ -708,8 +859,14 @@ async fn process_gift_wrap_event(
 
 /// Decrypt a legacy kind 4 DM event and insert into state.
 ///
-/// Decryption goes through the signer's `nip44_decrypt`, preserving the existing
-/// kind-4 decryption semantics while working for local-key and NIP-07 sessions.
+/// Decryption goes through the signer's `nip04_decrypt`, which works for
+/// local-key and NIP-07 sessions alike.
+///
+/// This previously called `nip44_decrypt`. Kind 4 is NIP-04 (AES-256-CBC);
+/// NIP-44 is ChaCha20-Poly1305 and a different key schedule, so the call could
+/// only ever fail. Every legacy DM was therefore dropped with a console warning
+/// and the conversation rendered empty — one of the several independent causes
+/// of "DM history isn't viewable".
 async fn process_kind4_event(
     event: &NostrEvent,
     signer: &dyn Signer,
@@ -734,7 +891,7 @@ async fn process_kind4_event(
 
     // NIP-44 conversation key is symmetric: decrypt with our key against the
     // counterparty pubkey, via the signer.
-    let plaintext = match signer.nip44_decrypt(&counterparty_pk, &event.content).await {
+    let plaintext = match signer.nip04_decrypt(&counterparty_pk, &event.content).await {
         Ok(pt) => pt,
         Err(e) => {
             web_sys::console::warn_1(
@@ -890,4 +1047,179 @@ pub fn provide_dm_store() {
 /// Get the DM store from context. Panics if `provide_dm_store()` was not called.
 pub fn use_dm_store() -> DMStore {
     expect_context::<DMStore>()
+}
+
+// -- Tests --------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ME: &str = "11111111111111111111111111111111111111111111111111111111111111aa";
+    const PARTNER: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
+
+    /// Every filter in `filters` that targets gift wraps.
+    fn wrap_filters(filters: &[Filter]) -> Vec<&Filter> {
+        filters
+            .iter()
+            .filter(|f| {
+                f.kinds
+                    .as_ref()
+                    .map(|k| k.contains(&KIND_GIFT_WRAP))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Every filter in `filters` that targets legacy kind-4 DMs.
+    fn legacy_filters(filters: &[Filter]) -> Vec<&Filter> {
+        filters
+            .iter()
+            .filter(|f| {
+                f.kinds
+                    .as_ref()
+                    .map(|k| k.contains(&KIND_ENCRYPTED_DM))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    // ── The regression that made DM history unviewable ──────────────────────
+
+    #[test]
+    fn no_gift_wrap_filter_constrains_authors() {
+        // THE bug. A kind-1059 event is signed by a per-message throwaway key,
+        // so `authors: [anyone_real]` matches zero rows at the relay. A history
+        // query built that way returns nothing — for both parties, always.
+        for filters in [
+            inbox_filters(ME),
+            conversation_filters(ME, PARTNER),
+            incoming_filters(ME, 1_700_000_000),
+        ] {
+            for f in wrap_filters(&filters) {
+                assert!(
+                    f.authors.is_none(),
+                    "gift-wrap filter must not constrain authors \
+                     (wraps are signed by throwaway keys): {f:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gift_wrap_and_legacy_kinds_never_share_a_filter() {
+        // The relay's DM privacy gate rewrites `#p` to the authenticated pubkey
+        // on ANY filter mentioning kind 1059. Bundling kind 4 into that filter
+        // let the rewrite clobber the legacy query too, which is what destroyed
+        // outbound kind-4 history.
+        for filters in [
+            inbox_filters(ME),
+            conversation_filters(ME, PARTNER),
+            incoming_filters(ME, 1_700_000_000),
+        ] {
+            for f in &filters {
+                let kinds = f.kinds.as_ref().expect("every DM filter pins its kinds");
+                let has_wrap = kinds.contains(&KIND_GIFT_WRAP);
+                let has_legacy = kinds.contains(&KIND_ENCRYPTED_DM);
+                assert!(
+                    !(has_wrap && has_legacy),
+                    "kinds 1059 and 4 must be queried separately: {f:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gift_wrap_filter_is_addressed_to_me() {
+        // `#p` is the only handle a wrap exposes, so it must be present and it
+        // must be us — anything else is either empty or someone else's mail.
+        for filters in [
+            inbox_filters(ME),
+            conversation_filters(ME, PARTNER),
+            incoming_filters(ME, 1_700_000_000),
+        ] {
+            let wraps = wrap_filters(&filters);
+            assert!(!wraps.is_empty(), "a DM query must ask for gift wraps");
+            for f in wraps {
+                assert_eq!(f.p_tags.as_deref(), Some(&[ME.to_string()][..]));
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_gift_wrap_filter_is_not_narrowed_to_the_partner() {
+        // Deliberate and worth pinning: a wrap carries no relay-visible hint of
+        // which conversation it belongs to, so the partner cannot be part of
+        // the query. Selection happens locally, after unwrapping. A future
+        // "optimisation" that adds the partner here would silently empty the
+        // page again.
+        let filters = conversation_filters(ME, PARTNER);
+        for f in wrap_filters(&filters) {
+            assert!(f.authors.is_none());
+            assert_eq!(f.p_tags.as_deref(), Some(&[ME.to_string()][..]));
+        }
+    }
+
+    // ── Legacy kind-4 halves ────────────────────────────────────────────────
+
+    #[test]
+    fn conversation_legacy_filters_cover_both_directions() {
+        let filters = conversation_filters(ME, PARTNER);
+        let legacy = legacy_filters(&filters);
+        assert_eq!(legacy.len(), 2, "sent and received");
+
+        let sent = legacy
+            .iter()
+            .find(|f| f.authors.as_deref() == Some(&[ME.to_string()][..]))
+            .expect("outbound kind-4 filter");
+        assert_eq!(sent.p_tags.as_deref(), Some(&[PARTNER.to_string()][..]));
+
+        let recv = legacy
+            .iter()
+            .find(|f| f.authors.as_deref() == Some(&[PARTNER.to_string()][..]))
+            .expect("inbound kind-4 filter");
+        assert_eq!(recv.p_tags.as_deref(), Some(&[ME.to_string()][..]));
+    }
+
+    #[test]
+    fn inbox_legacy_filters_cover_sent_and_received() {
+        let filters = inbox_filters(ME);
+        let legacy = legacy_filters(&filters);
+        assert_eq!(legacy.len(), 2);
+        assert!(legacy
+            .iter()
+            .any(|f| f.authors.as_deref() == Some(&[ME.to_string()][..]) && f.p_tags.is_none()));
+        assert!(legacy
+            .iter()
+            .any(|f| f.p_tags.as_deref() == Some(&[ME.to_string()][..]) && f.authors.is_none()));
+    }
+
+    // ── since-windowing ─────────────────────────────────────────────────────
+
+    #[test]
+    fn only_the_realtime_wrap_filter_is_windowed() {
+        // History queries must be unwindowed or they are not history.
+        for filters in [inbox_filters(ME), conversation_filters(ME, PARTNER)] {
+            for f in &filters {
+                assert!(f.since.is_none(), "history filter must not set since: {f:?}");
+            }
+        }
+
+        // The realtime wrap sub IS windowed, to cover NIP-59's backdating.
+        let since = 1_700_000_000;
+        let live = incoming_filters(ME, since);
+        for f in wrap_filters(&live) {
+            assert_eq!(f.since, Some(since));
+        }
+    }
+
+    #[test]
+    fn gift_wrap_lookback_covers_the_nip59_randomisation_window() {
+        // NIP-59 backdates the outer created_at by up to two days. A narrower
+        // window silently drops messages that were sent seconds ago.
+        assert!(
+            GIFT_WRAP_LOOKBACK_SECS >= 2 * 24 * 60 * 60,
+            "lookback must cover the full 2-day backdating window"
+        );
+    }
 }

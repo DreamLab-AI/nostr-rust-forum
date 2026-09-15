@@ -404,9 +404,48 @@ select:focus {
         display: flex;
     }
 
-    /* Account for bottom nav height on mobile */
+    /* Height of the fixed bottom nav, published as ONE custom property so every
+       mobile surface compensates from the same number instead of each
+       hand-copying a `4rem` that nothing keeps in sync (that drift is what let
+       the chat composer slide under the nav — see §31a).
+
+       3.5rem is the nav's real box: a 20px icon + a 2px gap + a 10px label at
+       the body line-height of 1.6, inside 0.5rem of vertical padding, plus the
+       1px top border = 55px. The home-indicator inset is the nav's OWN
+       padding-bottom, so it is always added alongside this token and never
+       folded into it — folding it in would double-count on iOS. */
+    :root {
+        --forum-mobile-nav-h: 3.5rem;
+    }
+
+    /* The nav renders only for signed-in readers (`<Show when=is_authed>` in
+       mobile_bottom_nav.rs). Reserving its band for a signed-out reader leaves
+       a dead 56px strip at the foot of every page, so zero the token when the
+       nav is genuinely absent from the DOM. Progressive enhancement: a browser
+       without `:has()` keeps the reserved band, which is the safe way to fail
+       (dead space, never covered content). */
+    :root:not(:has(.mobile-bottom-nav)) {
+        --forum-mobile-nav-h: 0px;
+    }
+
+    /* Account for bottom nav height on mobile. Now derived from the token
+       above, so it collapses to just the safe-area inset when signed out. */
     main {
-        padding-bottom: calc(4rem + env(safe-area-inset-bottom, 0px));
+        padding-bottom: calc(var(--forum-mobile-nav-h, 3.5rem) + env(safe-area-inset-bottom, 0px));
+    }
+
+    /* Anything scrolled into view (the thread composer's `scroll_into_view` in
+       thread.rs, in-page anchors) must stop above the nav rather than behind
+       it. */
+    html {
+        scroll-padding-bottom: calc(var(--forum-mobile-nav-h, 3.5rem) + env(safe-area-inset-bottom, 0px) + 0.5rem);
+    }
+
+    /* Tap-target floor. The nav item already computes to ~54px, so this is a
+       defensive minimum that keeps it at/above the 44px guideline if the label
+       font ever shrinks — it must never be traded away for compactness. */
+    .mobile-nav-item {
+        min-height: 44px;
     }
 }
 
@@ -897,4 +936,234 @@ select:focus {
     .bbs-sash .label::after { animation: none !important; }
     .bbs-sash .label::before,
     .bbs-sash .label::after { opacity: 0 !important; }
+}
+
+/* ---------------------------------------------------------------------------
+   31. Narrow-viewport thread reading pass          (user feedback, 2026-09)
+
+   Reported: "Lots of space and overlap making it hard to follow a thread" on
+   mobile. Two separate defects, fixed separately below:
+
+     (a) a genuine z-overlap — the fixed bottom nav sitting on top of the chat
+         composer and the last message; and
+     (b) vertical rhythm — the thread stack burning ~25-35% more height than it
+         needs, so a phone screen shows two or three posts instead of four.
+
+   Scope discipline: this section changes spacing and box geometry only. No
+   colours are introduced, so the runtime-injected `[data-theme="light"]`
+   palette in stores/preferences.rs stays authoritative and untouched. The
+   compact-density overrides injected from the same place are all `!important`
+   and target `.glass-card` / `.space-y-6` / `.space-y-4` / `.py-3`, none of
+   which this section touches, so the two passes compose rather than fight.
+
+   Selector note: several rules below have to reach Leptos markup that carries
+   only Tailwind utilities (the .rs files are owned elsewhere and were read but
+   not edited). Each such selector is qualified with a `:has()` or a multi-class
+   signature that was verified unique across `src/` — the qualifier is named in
+   the comment so a future rename fails loudly rather than silently widening the
+   rule. `style.css` is linked AFTER `tailwind.dist.css` in index.html, so
+   equal-specificity overrides of utilities win on order alone.
+
+   Breakpoint: `max-width: 639px` throughout, matching §19 and the underside of
+   Tailwind's `sm:` (min-width 640px). Using 640px here would double-apply in
+   the 1px overlap with every `sm:` utility on these surfaces.
+   --------------------------------------------------------------------------- */
+
+/* -- 31a. THE OVERLAP ------------------------------------------------------
+   Root cause: `src/pages/channel.rs:816` and `src/pages/dm_chat.rs:166` size
+   the chat column with `h-[calc(100vh-64px)]` — the viewport minus the 64px
+   sticky header. That reserves nothing for the *fixed* `.mobile-bottom-nav`,
+   so the compose bar pinned to the bottom of that flex column, its send
+   button, and the tail of the message list all sat underneath the nav.
+
+   §19's `main { padding-bottom }` cannot rescue this: the column's height is
+   absolute, not content-driven, so padding on the ancestor pushes the page
+   taller without moving the column's bottom edge off the nav.
+
+   Also re-based on `100dvh` (the *dynamic* viewport) so iOS Safari's
+   collapsing URL bar stops claiming the same band a second time — `100vh`
+   there is the *large* viewport and is always too tall.
+
+   Same specificity as Tailwind's arbitrary-value utility; wins on link order.
+   `100vh` is kept as a first declaration so a browser without `dvh` still gets
+   the nav compensation rather than dropping the whole rule. */
+@media (max-width: 639px) {
+    .h-\[calc\(100vh-64px\)\] {
+        height: calc(
+            100vh - 64px
+            - var(--forum-mobile-nav-h, 3.5rem)
+            - env(safe-area-inset-bottom, 0px)
+        );
+        height: calc(
+            100dvh - 64px
+            - var(--forum-mobile-nav-h, 3.5rem)
+            - env(safe-area-inset-bottom, 0px)
+        );
+    }
+
+    /* Same defect, same fix, different surface: the notification drawer
+       (notification_center.rs:114) is `fixed top-16` with
+       `h-[calc(100dvh-4rem)]`, so its bottom edge lands at the viewport floor
+       and the nav — which shares its `z-50` — covers the last notification row
+       and its tap target. Subtract the same band. */
+    .h-\[calc\(100dvh-4rem\)\] {
+        height: calc(
+            100dvh - 4rem
+            - var(--forum-mobile-nav-h, 3.5rem)
+            - env(safe-area-inset-bottom, 0px)
+        );
+    }
+}
+
+/* -- 31b. Composer keyboard / safe-area clearance --------------------------
+   The thread page's single bottom composer (`#thread-reply-composer`,
+   thread.rs:958) is scrolled into view by `el.scroll_into_view()` when the
+   reader taps Reply on a post (thread.rs:673-679). The default alignment can
+   land it flush with the viewport bottom, i.e. behind the nav. `scroll-margin`
+   is the correct lever — it changes where the scroll stops, not the layout.
+
+   Deliberately NOT inside the media query: on desktop the token is undeclared
+   and the fallback resolves to 0px, making this a no-op there. */
+#thread-reply-composer {
+    scroll-margin-bottom: calc(
+        var(--forum-mobile-nav-h, 0px) + env(safe-area-inset-bottom, 0px) + 0.5rem
+    );
+}
+
+@media (max-width: 639px) {
+    /* -- 31c. Thread page gutter -------------------------------------------
+       thread.rs:841 opens the page with `p-4 sm:p-6` (16px all round at this
+       width). On a 360px screen that is 32px — nearly a tenth of the width —
+       spent on empty margin before the post text starts. 12px still separates
+       the cards from the screen edge without the letterbox feel.
+
+       Qualified with `:has(article.rounded-xl.p-5)` because section.rs:357
+       shares the same `max-w-4xl mx-auto p-4 sm:p-6` root; the topic-root
+       `<article>` (thread.rs:1176-1177) exists only on the thread page. */
+    .max-w-4xl.mx-auto.p-4:has(article.rounded-xl.p-5) {
+        padding: 0.75rem;
+    }
+
+    /* -- 31d. Topic-root card ----------------------------------------------
+       `bg-gray-800/70 border rounded-xl p-5 mt-4` (thread.rs:1177): 20px of
+       padding and 16px of top margin. The root post is the one card that
+       deserves emphasis, so it stays the roomiest of the three — 14px padding
+       (-30%) and 12px top margin (-25%), which is still a visible step above
+       the reply cards below it. */
+    article.bg-gray-800\/70.rounded-xl.p-5 {
+        padding: 0.875rem;
+        margin-top: 0.75rem;
+    }
+
+    /* -- 31e. Reply cards --------------------------------------------------
+       `bg-gray-800/40 border border-gray-700/50 rounded-lg p-4`
+       (thread.rs:1292) — verified unique to the thread ReplyCard. 16px → 12px
+       vertical / 13px horizontal (-25%). Horizontal stays marginally larger
+       than vertical so the text column keeps a comfortable inset while the
+       stack tightens, which is where the reclaimed height actually matters. */
+    div.bg-gray-800\/40.border-gray-700\/50.rounded-lg.p-4 {
+        padding: 0.75rem 0.8125rem;
+    }
+
+    /* -- 31f. Gap between consecutive replies -------------------------------
+       `space-y-3` (thread.rs:936) puts 12px between reply cards. Combined with
+       31e that is 12 + 12 + 12 = 36px of dead band between one author's last
+       line and the next author's name. 8px (-33%) still reads as a separator
+       because each card carries its own border and fill.
+
+       Tailwind's `space-y-*` selector is `.space-y-3 > :not([hidden]) ~
+       :not([hidden])` (specificity 0,3,0), so the override is deliberately
+       qualified up past it rather than relying on order alone. The `:has()`
+       pins this to the thread reply stack; other `space-y-3` lists elsewhere
+       in the app keep their 12px. */
+    div.space-y-3:has(> div.bg-gray-800\/40.border-gray-700\/50.rounded-lg.p-4) > * + * {
+        margin-top: 0.5rem;
+    }
+
+    /* -- 31g. "N replies" heading ------------------------------------------
+       The replies section opens with `mt-6` (24px) and its heading carries
+       `mb-3` (12px) — 36px of chrome to announce a label that is already
+       obvious from the cards beneath it. 16px / 8px (-33%).
+
+       `h3.uppercase.tracking-wide.mb-3` is unique to thread.rs:924 (board.rs's
+       uppercase h3 is `text-white` with no `mb-3`). */
+    div.mt-6:has(> h3.uppercase.tracking-wide.mb-3) {
+        margin-top: 1rem;
+    }
+
+    h3.uppercase.tracking-wide.mb-3 {
+        margin-bottom: 0.5rem;
+    }
+
+    /* -- 31h. Composer offset ----------------------------------------------
+       `mt-6` (24px) between the last reply and the composer (thread.rs:958).
+       16px keeps the composer visibly detached from the stack without the gulf.
+       The composer's own `p-3` is already tight and is left alone. */
+    #thread-reply-composer {
+        margin-top: 1rem;
+    }
+
+    /* -- 31i. Avatar / meta row --------------------------------------------
+       Both thread cards lay out as `flex items-start gap-3` (thread.rs:1180,
+       1293) — a 12px channel between the avatar and the text column. At this
+       width the avatar is small enough that 10px reads identically while
+       returning width to the message body. Scoped to direct children of the
+       two thread cards so no other `gap-3` row in the app is touched. */
+    article.bg-gray-800\/70.rounded-xl.p-5 > div.gap-3,
+    div.bg-gray-800\/40.border-gray-700\/50.rounded-lg.p-4 > div.gap-3 {
+        gap: 0.625rem;
+    }
+
+    /* -- 31j. Nested-reply indentation -------------------------------------
+       thread_view.rs:187 and :228 indent a nested reply with
+       `ml-4 + border-l-2 + pl-3` = 16 + 2 + 12 = 30px. On a 360px screen with
+       the page gutter that is ~12% of the line width gone to whitespace, and
+       the 16px margin is pure void — the reader cannot see it, so it buys no
+       legibility.
+
+       Keep the 2px rule (that IS the "this is nested" signal), shrink the void
+       around it: 8 + 2 + 10 = 20px (-33%). The rule now sits close to the text
+       it brackets, which reads as nesting more clearly than a wide gap did.
+
+       Verified unique: only thread_view.rs carries this class trio. */
+    .ml-4.border-l-2.pl-3 {
+        margin-left: 0.5rem;
+        padding-left: 0.625rem;
+    }
+
+    /* Indentation cap. Reply threading is architecturally one level deep today
+       (thread_view.rs gates the second-level affordance behind `allow_reply`,
+       and thread.rs quote-and-appends rather than nesting), so this never
+       fires as written. It exists so that if nesting is ever deepened, the
+       second level and everything under it collapse to a 4+2+8 = 14px step
+       instead of compounding 20px at a time until the text column is a sliver. */
+    .ml-4.border-l-2.pl-3 .ml-4.border-l-2.pl-3 {
+        margin-left: 0.25rem;
+        padding-left: 0.5rem;
+    }
+
+    /* -- 31k. Send-button tap target ---------------------------------------
+       message_input.rs:969 renders the send button at `w-8 h-8` — a 32px box,
+       below the 44px guideline, and it is the single most-tapped control in a
+       thread. Compactness must not make this worse, so rather than shrink
+       anything nearby, expand the *hit area* to 44px with a transparent
+       pseudo-element centred on the button. The visible 32px amber circle is
+       unchanged, so the composer's density is untouched.
+
+       `bg-amber-500` + `rounded-full` + `w-8 h-8` is unique to the send button;
+       the sibling emoji/attach controls are `p-1.5 rounded-lg`. */
+    button.w-8.h-8.rounded-full.bg-amber-500 {
+        position: relative;
+    }
+
+    button.w-8.h-8.rounded-full.bg-amber-500::after {
+        content: '';
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 44px;
+        height: 44px;
+        transform: translate(-50%, -50%);
+        border-radius: 50%;
+    }
 }

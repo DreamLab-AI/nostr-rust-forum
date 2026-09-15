@@ -7,6 +7,117 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed — forum member feedback, September 2026
+
+- **Search can return a result at all, and is reachable on a phone.** The client
+  ingested every message with `public: false` hardcoded, and the worker
+  fail-closes on that flag — so every vector ever indexed was filtered out of
+  every response and `/search` could only ever return `[]`. `public` is now
+  derived from the owning zone's read policy (`required_cohorts.is_empty()`),
+  failing closed for any zone that cannot be resolved, because `/search` is
+  unauthenticated and gated content must not become searchable. The worker's
+  fail-closed default is kept, and `/ingest` now rejects an all-private batch
+  rather than silently writing unreachable vectors. Alongside that: results were
+  truncated to `k` *before* the visibility filter ran (now over-fetch then
+  filter); `search_client.rs` defaulted its API base to `search.example.com`, an
+  unresolvable reserved domain, and disagreed with `global_search.rs` (now one
+  runtime-resolved base, with `SETUP.md`'s documented variable name reconciled
+  with the code's); both clients sent `limit` where the worker reads `k`, locked
+  in by a test asserting the wrong field; and a whitespace-only query produced
+  an all-zero embedding that matched the entire index at score 0. Finally,
+  mobile had **no** reachable search entry point — the nav button is
+  desktop-only, the hamburger item is behind an auth gate, the bottom nav has
+  none and Ctrl/Cmd+K does not exist on touch — so a search button now sits
+  beside the hamburger, outside any auth gate.
+
+- **A reply addressed to you now reaches you, and cannot be silenced forever.**
+  Two defects, neither of them the obvious one (replies *do* carry the parent
+  author's p-tag). First, unread is gated on a *per-channel* read position that
+  render-time effects stamp to the channel's newest message — opening a
+  section's topic-title list marked every reply in every topic of that section
+  read, having shown the reader nothing but titles. A post that p-tags you now
+  bypasses that gate: being addressed by name and "this channel is marked read"
+  are different claims. Second, the producer wrote the event id into the
+  *persisted* dedup set **before** testing notifiability, so anything evaluated
+  during a transient bad state was burned in and could never notify again, on
+  any future reload. Verdicts are now classified by durability, and only
+  irreversible ones are recorded. Editing a reply also no longer drops the topic
+  author's routing p-tag.
+
+- **@-mentions render as links in posts.** The composer, the p-tag emission and
+  the NIP-27 renderer were all already present — but `PostBody` passed the post
+  text to `MentionText` *without its tags*, and tags are how a typed `@handle`
+  resolves to a pubkey. A mention of anyone not already cached in the session
+  degraded to plain grey text, which from a reader's seat is indistinguishable
+  from mentions not working.
+
+### Added — forum member feedback, September 2026
+
+- **Your own reaction emoji.** The picker's set was a compile-time const of
+  eight. A per-user list now persists to localStorage (capped, validated by
+  length and shape rather than by an emoji whitelist, so flags, ZWJ sequences
+  and skin-tone modifiers survive), with an add box and a per-entry remove
+  control in the picker.
+- **A conventional add-reaction affordance.** The literal `"+"` is replaced by
+  Slack's smiley-with-plus icon, with a tooltip and proper ARIA. It stays
+  permanently visible at low opacity rather than fading in on hover — a
+  hover-only affordance is unreachable on touch, which is the trap the original
+  was already close to.
+
+- **The mobile compose bar no longer sits under the bottom nav, and threads are
+  ~30% tighter.** The chat and DM columns sized themselves `100vh` minus the
+  header only, reserving nothing for the *fixed* bottom nav, so the composer and
+  the tail of the message list were covered by it. Ancestor padding could not
+  compensate — the column's height is absolute, not content-driven, which is why
+  the compensation *looked* present. A published `--forum-mobile-nav-h` token
+  re-derives those heights from `100dvh` minus header, nav and safe-area inset;
+  the notification drawer had the same defect and the same fix. Alongside it, a
+  measured density pass below 639px on card padding, reply-stack gaps, meta
+  gutters and composer margins, and nested-reply indentation reduced from 30px
+  to 20px while keeping the left rule as the nesting signal. No tap target
+  shrinks: the 32px send button gains a 44px hit expander.
+
+- **DM history is viewable again, and senders keep their own copy.** Four
+  independent defects, all of which had to be fixed for a conversation to load:
+  - Gift-wrap (kind-1059) filters constrained `authors`. A wrap is signed by a
+    throwaway key *by design*, so `authors: [anyone_real]` matched zero rows at
+    the relay and `load_conversation_messages` — the only history source for
+    `/dm/:pubkey` — returned nothing, for both parties, always. Gift-wrap
+    filters are now keyed on `#p` alone and the conversation is selected
+    client-side after unwrapping (a wrap exposes no relay-visible hint of which
+    conversation it belongs to; that is the point of it).
+  - Kinds 4 and 1059 shared a filter. The relay's DM privacy gate rewrites `#p`
+    on any filter mentioning 1059, which clobbered the legacy kind-4 half and
+    destroyed outbound kind-4 history as collateral damage. They are now
+    separate filters.
+  - Sending published only one wrap. NIP-17 requires two — one sealed to the
+    recipient, one to yourself — because a single wrap is *write-only for its
+    author*: encrypted to the recipient's key, authored by a throwaway key, so
+    the sender can neither decrypt nor find it. The optimistic bubble was the
+    only copy and died with the page. `gift_wrap_pair_with_signer` seals one
+    rumor twice so both sides reconstruct an identical message, while the two
+    wraps stay unlinkable on the wire.
+  - Kind-4 DMs were decrypted with NIP-44. Kind 4 is NIP-04 (AES-256-CBC), so
+    every legacy DM failed and was dropped with a console warning. Fixed at the
+    call site *and* in the NIP-07 bridge, which had hard-wired `nip04_decrypt`
+    to `window.nostr.nip44`.
+
+  The rendered message list is now scoped to the open conversation: the inbound
+  subscription is necessarily inbox-wide, so an unscoped view rendered a third
+  party's DM inside whatever thread happened to be open.
+
+- **The installed PWA has its own icon.** `manifest.webmanifest` pointed at
+  `/community/bbs/icons/*` — the *retro BBS client's* black terminal mark — so
+  the installed forum was indistinguishable from the installed BBS, and from
+  every other dark tile on a home screen. It also 404'd outright on a deploy
+  without the `bbs/` sub-app. The forum now ships its own set generated from an
+  SVG source of record (`scripts/gen-pwa-icons.sh`, `--check` proves the
+  committed rasters match): a dark diamond with an amber tick on an amber field,
+  at 192/512 plus maskable variants sized for Android's adaptive-icon safe zone.
+  `index.html` gains the `apple-touch-icon` it never had, without which iOS
+  screenshots the page for the home-screen tile.
+
+
 ## [1.0.0-beta.11] — 2026-09-14
 
 Augmentation-conditions release: `nostr-bbs-core` and `nostr-bbs-mesh` move to

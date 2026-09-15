@@ -70,6 +70,11 @@ struct ReplyView {
     /// the quoted parent's author + snippet for an inline quote block. `None`
     /// for a plain top-level reply to the topic.
     quote: Option<QuotedRef>,
+    /// The post's own event tags, carried so `MentionText` can resolve a typed
+    /// `@handle` against this post's `["p", pubkey]` tags. Without them a
+    /// mention only renders as a link if the author happens to be in this
+    /// session's NameCache already.
+    tags: Vec<Vec<String>>,
 }
 
 /// A quoted parent shown inline above a quote-reply.
@@ -476,6 +481,7 @@ pub fn ThreadPage() -> impl IntoView {
                         created_at,
                         edited,
                         quote,
+                        tags: e.tags.clone(),
                     }
                 })
                 .collect()
@@ -496,6 +502,7 @@ pub fn ThreadPage() -> impl IntoView {
             created_at,
             edited,
             quote: None,
+            tags: root.tags.clone(),
         })
     });
 
@@ -730,6 +737,21 @@ pub fn ThreadPage() -> impl IntoView {
                 String::new(),
                 EDIT_MARKER.to_string(),
             ]);
+            // Preserve the topic author's `p` tag across the edit.
+            //
+            // A reply carries `["p", root.pubkey]` unconditionally when first
+            // published, and that p-tag is what makes the reply reach its
+            // recipient: notification ingress treats "addressed to me by name"
+            // as the signal that a channel-wide read position does not cover
+            // this event. Rebuilding the tag list from scratch on edit dropped
+            // it, so an edited reply became invisible to the person it was a
+            // reply to — silently, and only for edited posts, which is why it
+            // was easy to miss.
+            if let Some(ref r) = root {
+                if !r.pubkey.is_empty() {
+                    tags.push(vec!["p".to_string(), r.pubkey.clone()]);
+                }
+            }
             // Preserve @-mention routing on the edited content.
             for hex in
                 crate::components::mention_autocomplete::resolve_content_mentions(&new_content)
@@ -1015,16 +1037,28 @@ fn is_media_url(url: &str) -> bool {
 /// Body of a post: mention-rendered text, inline media embeds for media URLs,
 /// and a link-preview card for the first non-media URL.
 #[component]
-fn PostBody(content: String) -> impl IntoView {
+fn PostBody(
+    content: String,
+    /// The post's own tags. `MentionText` resolves a typed `@handle` to a
+    /// pubkey by pairing it with the event's `["p", pubkey]` tags; without them
+    /// it falls back to the NameCache and, failing that, renders the mention as
+    /// plain text. Forum posts were rendered WITHOUT their tags, so a mention
+    /// of anyone not already cached in this session degraded to grey text
+    /// instead of a link — "can't @ other members in posts", from the reader's
+    /// side rather than the writer's.
+    #[prop(optional, into)]
+    tags: Option<Vec<Vec<String>>>,
+) -> impl IntoView {
     let urls = extract_urls(&content);
     let (media_urls, link_urls): (Vec<_>, Vec<_>) = urls.into_iter().partition(|u| is_media_url(u));
     let first_link = link_urls.into_iter().next();
     // Hide embedded media URLs from the visible text — the embed below (with its
     // own hover "open full" icon) is the representation.
     let text = crate::components::mention_text::strip_media_urls(&content, &media_urls);
+    let tags = tags.unwrap_or_default();
     view! {
         <>
-            {(!text.is_empty()).then(|| view! { <MentionText content=text /> })}
+            {(!text.is_empty()).then(|| view! { <MentionText content=text tags=tags /> })}
             {media_urls.into_iter().map(|u| view! { <MediaEmbed url=u /> }).collect_view()}
             {first_link.map(|u| view! { <LinkPreview url=u /> })}
         </>
@@ -1150,6 +1184,8 @@ fn RootPost(
     // Disclosure badge (COM-13/F2): marks the topic-root author as an agent.
     let author_badge_pubkey = post.pubkey.clone();
     let content = post.content.clone();
+    // Carried into PostBody so typed @handles resolve against this post's p-tags.
+    let tags = post.tags.clone();
     let edited = post.edited;
     let post_id = post.id.clone();
     let post_pubkey = post.pubkey.clone();
@@ -1216,9 +1252,10 @@ fn RootPost(
                         when=move || is_editing.get()
                         fallback={
                             let content = content.clone();
+                            let tags = tags.clone();
                             move || view! {
                                 <div class="text-gray-200 mt-2 leading-relaxed whitespace-pre-wrap break-words">
-                                    <PostBody content=content.clone() />
+                                    <PostBody content=content.clone() tags=tags.clone() />
                                 </div>
                             }
                         }
@@ -1269,6 +1306,8 @@ fn ReplyCard(
     // Disclosure badge (COM-13/F2): marks the reply author as an agent.
     let author_badge_pubkey = reply.pubkey.clone();
     let content = reply.content.clone();
+    // Carried into PostBody so typed @handles resolve against this reply's p-tags.
+    let tags = reply.tags.clone();
     let edited = reply.edited;
     let post_id = reply.id.clone();
     let post_pubkey = reply.pubkey.clone();
@@ -1339,9 +1378,10 @@ fn ReplyCard(
                         when=move || is_editing.get()
                         fallback={
                             let content = content.clone();
+                            let tags = tags.clone();
                             move || view! {
                                 <div class="text-sm text-gray-300 mt-1 leading-relaxed whitespace-pre-wrap break-words">
-                                    <PostBody content=content.clone() />
+                                    <PostBody content=content.clone() tags=tags.clone() />
                                 </div>
                             }
                         }

@@ -56,8 +56,21 @@ pub fn parse_results(json: &str) -> Result<Vec<RawHit>, String> {
 
 /// Build the JSON request body for the worker `/search` endpoint. Uses
 /// `serde_json` so the query is always correctly escaped.
-pub fn build_search_body(query: &str, limit: usize) -> String {
-    serde_json::json!({ "query": query.trim(), "limit": limit }).to_string()
+///
+/// The hit-count field MUST be `k`. The search worker's `SearchRequest`
+/// (`nostr-bbs-search-worker/src/lib.rs`) deserialises only
+/// `embedding` / `query` / `k` / `minScore` / `model`; serde drops every other
+/// key without complaint, so the `"limit"` this used to send was never read and
+/// the worker's `default_k()` silently decided the result count. The bug was
+/// masked because `default_k()` is also 10 — it would only have surfaced as
+/// "changing the limit does nothing".
+///
+/// The query is trimmed here as well as worker-side: a whitespace-only query
+/// embeds to an all-zero vector which scores `0.0` against every stored vector,
+/// and with the default `minScore` of `0.0` (compared with `>=`) that returns
+/// the entire index as "matches".
+pub fn build_search_body(query: &str, k: usize) -> String {
+    serde_json::json!({ "query": query.trim(), "k": k }).to_string()
 }
 
 /// Numeric sort key for a hit — an absent score ranks below any real score.
@@ -181,7 +194,24 @@ mod tests {
         let body = build_search_body("  a\"b  ", 10);
         // Trimmed and quote-escaped by serde_json.
         assert!(body.contains(r#""query":"a\"b""#), "body was {body}");
-        assert!(body.contains(r#""limit":10"#));
+    }
+
+    #[test]
+    fn build_search_body_uses_k_not_limit() {
+        // The worker only reads `k`; `limit` is silently dropped by serde and
+        // the worker's `default_k()` takes over. This test previously asserted
+        // the WRONG field name, so it locked the bug in place.
+        let body = build_search_body("hello", 25);
+        assert!(body.contains(r#""k":25"#), "body was {body}");
+        assert!(!body.contains("limit"), "stale `limit` key in {body}");
+    }
+
+    #[test]
+    fn build_search_body_trims_whitespace_only_query_to_empty() {
+        // The worker rejects an empty query with a 400; sending "   " unTRIMMED
+        // used to slip past that check and match the entire index at score 0.0.
+        let body = build_search_body("   \t \n ", 10);
+        assert!(body.contains(r#""query":"""#), "body was {body}");
     }
 
     #[test]

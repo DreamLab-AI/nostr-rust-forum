@@ -30,6 +30,29 @@ type RawHit = (String, Option<f64>, Option<String>, Option<String>);
 /// Shared open-state for the global search overlay. The app shell provides this
 /// via context so a visible nav button can open the very same panel that the
 /// Cmd/Ctrl+K shortcut toggles.
+
+/// Truncate `text` to at most `max_chars` characters, appending an ellipsis
+/// when it was shortened.
+///
+/// Counts and slices by CHARACTER, never by byte. The previous code did
+/// `&content[..77]` after checking `content.len() > 80` — `len()` is bytes, so
+/// any content whose 77th byte landed mid-codepoint panicked. In Rust a panic
+/// in WASM aborts the module: one message containing an emoji or any non-ASCII
+/// script at the wrong offset would take down the entire client for everyone
+/// who searched and matched it. Both call sites read fully attacker-controlled
+/// text (a message body, a channel description), so this was reachable by
+/// anyone who can post.
+fn ellipsise(text: &str, max_chars: usize) -> String {
+    // `chars().count()` is O(n) but these strings are short and the alternative
+    // (byte length) is exactly the bug.
+    if text.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub(3);
+        format!("{}...", text.chars().take(keep).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct SearchOpen(pub RwSignal<bool>);
 use std::rc::Rc;
@@ -37,10 +60,13 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-const SEARCH_API: &str = match option_env!("VITE_SEARCH_API_URL") {
-    Some(u) => u,
-    None => "https://members-search-api.solitary-paper-764d.workers.dev",
-};
+/// How many semantic hits to ask the worker for.
+///
+/// Sent as `k` — the ONLY field the worker's `SearchRequest` understands. This
+/// used to be sent as `"limit"`, which serde silently discarded, leaving the
+/// worker's `default_k()` in charge. That happened to also be 10, so the bug was
+/// invisible until someone changed this number and nothing moved.
+const SEMANTIC_K: u32 = 10;
 const RECENT_KEY: &str = "nostrbbs_recent_searches";
 const MAX_RECENT: usize = 5;
 
@@ -101,11 +127,7 @@ impl Hit {
         match self {
             Self::Channel { name, .. } => name.clone(),
             Self::Message { content, .. } | Self::SemanticMessage { content, .. } => {
-                if content.len() > 80 {
-                    format!("{}...", &content[..77])
-                } else {
-                    content.clone()
-                }
+                ellipsise(content, 80)
             }
             // Tracked: title()/subtitle() run inside the reactive results
             // closure, so the list re-renders when kind-0 metadata arrives.
@@ -292,7 +314,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
 
                 if is_semantic {
                     // RuVector semantic search, with legacy text fallback.
-                    match search_client::search_similar(&q, 10, 0.3, None).await {
+                    match search_client::search_similar(&q, SEMANTIC_K, 0.3).await {
                         Ok(hits) => {
                             for h in hits {
                                 let content = h.content.and_then(non_empty);
@@ -389,11 +411,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                         .cloned()
                         .unwrap_or_default();
                     if nm.to_lowercase().contains(&qs) {
-                        let d = if ev.content.len() > 100 {
-                            format!("{}...", &ev.content[..97])
-                        } else {
-                            ev.content.clone()
-                        };
+                        let d = ellipsise(&ev.content, 100);
                         found.update(|v| {
                             v.push(Hit::Channel {
                                 id: nm.clone(),
@@ -680,10 +698,16 @@ async fn hydrate_search_ids(
     found.get_untracked()
 }
 
+/// POST `query` to the worker's `/search` and return its raw hits.
+///
+/// Both the base URL and the request body come from `utils::search_client` so
+/// this overlay and the `search_client` API path cannot drift apart again — they
+/// previously defaulted to two *different* hosts (this one to the real worker,
+/// `search_client` to the unresolvable `search.example.com`) and sent two
+/// different field names for the same thing.
 async fn semantic_search(query: &str) -> Result<Vec<SHit>, String> {
-    let url = format!("{}/search", SEARCH_API);
-    let body_str = serde_json::to_string(&serde_json::json!({ "query": query, "limit": 10 }))
-        .map_err(|e| e.to_string())?;
+    let url = format!("{}/search", search_client::search_api_base());
+    let body_str = search_client::build_query_search_body(query, SEMANTIC_K);
     let window = web_sys::window().ok_or("No window")?;
     let init = web_sys::RequestInit::new();
     init.set_method("POST");
@@ -730,5 +754,69 @@ fn save_recent(q: &str) {
     r.truncate(MAX_RECENT);
     if let Ok(j) = serde_json::to_string(&r) {
         let _ = LocalStorage::set(RECENT_KEY, j);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    // ── UTF-8 truncation (WASM-abort regression) ────────────────────────────
+
+    #[test]
+    fn ellipsise_does_not_panic_on_a_multibyte_boundary() {
+        // The regression: `&content[..77]` after `content.len() > 80`. `len()`
+        // is bytes, so a codepoint straddling byte 77 panicked — and a panic in
+        // WASM aborts the whole module. Every one of these strings puts a
+        // multi-byte character at or across the old cut point.
+        for s in [
+            "a".repeat(76) + "\u{1F600}\u{1F600}\u{1F600}",
+            "\u{1F600}".repeat(40),
+            "e\u{0301}".repeat(60),
+            "\u{4F60}\u{597D}".repeat(50),
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}".repeat(10),
+        ] {
+            let out = ellipsise(&s, 80);
+            assert!(out.chars().count() <= 80);
+        }
+    }
+
+    #[test]
+    fn ellipsise_leaves_short_text_alone() {
+        assert_eq!(ellipsise("hello", 80), "hello");
+        // Counted in CHARS: 40 emoji are 160 bytes but only 40 characters, so
+        // this must NOT be truncated at a byte-based threshold of 80.
+        let forty = "\u{1F600}".repeat(40);
+        assert_eq!(ellipsise(&forty, 80), forty);
+    }
+
+    #[test]
+    fn ellipsise_marks_truncation_and_respects_the_budget() {
+        let long = "a".repeat(200);
+        let out = ellipsise(&long, 80);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 80);
+    }
+    use super::*;
+
+    // Pure tests only: the overlay itself is Leptos/wasm, but the wire contract
+    // it depends on is pure, so it is pinned here on the host target.
+
+    #[test]
+    fn overlay_semantic_body_uses_k_not_limit() {
+        // Regression guard for the original bug: the overlay POSTed
+        // `{"query":…,"limit":10}` while the worker's SearchRequest only has
+        // `k`, so the limit was silently discarded and `default_k()` applied.
+        let body = search_client::build_query_search_body("hello", SEMANTIC_K);
+        assert!(body.contains(r#""k":10"#), "body was {body}");
+        assert!(!body.contains("limit"), "stale `limit` key in {body}");
+    }
+
+    #[test]
+    fn overlay_and_search_client_share_one_base_url() {
+        // This module no longer owns a base-URL constant; if one is
+        // reintroduced the two call sites can diverge again (they once
+        // defaulted to two different hosts, one of them unresolvable).
+        let base = search_client::resolve_search_base(Some("https://s.example.org"), None);
+        assert_eq!(format!("{base}/search"), "https://s.example.org/search");
     }
 }

@@ -415,44 +415,74 @@ impl NotificationStoreV2 {
                     {
                         continue;
                     }
-                    store.seen_messages.update(|s| {
-                        // Bound the persisted dedup set; on overflow drop an
-                        // arbitrary oldest-ish entry. Re-notifying a long-evicted
-                        // post is far less bad than an unbounded set.
-                        if s.len() >= MAX_SEEN_IDS {
-                            if let Some(victim) = s.iter().next().cloned() {
-                                s.remove(&victim);
-                            }
-                        }
-                        s.insert(event.id.clone());
-                    });
-                    seen_changed = true;
 
-                    // Suppression model (the fix) — see `post_is_notifiable`.
-                    // Notify only on genuinely unread activity from someone else:
-                    // unread in-channel (`> read_ts`), past the persisted
-                    // first-sync floor (`> baseline`), and not the user's own.
-                    // De-dup against already-notified ids is the persisted
-                    // `seen_messages` check above.
-                    if !post_is_notifiable(
+                    // Suppression model — see `post_is_notifiable`. Notify only
+                    // on genuinely unread activity from someone else: unread
+                    // in-channel (`> read_ts`), past the persisted first-sync
+                    // floor (`> baseline`), and not the user's own.
+                    // Computed up front because it is now an INPUT to the
+                    // suppression decision, not merely a label: see
+                    // `classify_post`'s `directed_at_me` note.
+                    let mentions_me = me
+                        .as_deref()
+                        .map(|pk| event_mentions(event, pk))
+                        .unwrap_or(false);
+
+                    let verdict = classify_post(
                         &event.pubkey,
                         event.created_at,
                         me.as_deref(),
                         read_ts,
                         baseline,
-                    ) {
+                        mentions_me,
+                    );
+
+                    // ORDER MATTERS, and it used to be wrong.
+                    //
+                    // `seen_messages` is persisted (as `notified_ids`), so
+                    // writing an id into it is a PERMANENT statement that this
+                    // event has had its chance. The previous code inserted
+                    // BEFORE evaluating notifiability, which meant any event the
+                    // effect happened to observe during a transient bad state —
+                    // auth not yet resolved, a provisional `now` baseline, read
+                    // positions freshly clobbered — was burned in and could never
+                    // notify again, on this reload or any future one. That is
+                    // what turned a recoverable glitch into permanent silence,
+                    // and it is the "ingress isn't working" report.
+                    //
+                    // So we only burn the id when the answer cannot change:
+                    // either we are notifying now, or the event is rejected on a
+                    // ground that is immutable (it is the user's own post, or it
+                    // predates the sync floor, which only ever moves forward).
+                    // A read-position rejection is left unburned; re-checking it
+                    // on a later pass is cheap, and it means a corrected read
+                    // position can still surface the reply.
+                    if verdict.is_permanent() {
+                        store.seen_messages.update(|s| {
+                            // Bound the persisted dedup set; on overflow drop an
+                            // arbitrary oldest-ish entry. Re-notifying a
+                            // long-evicted post is far less bad than an
+                            // unbounded set.
+                            if s.len() >= MAX_SEEN_IDS {
+                                if let Some(victim) = s.iter().next().cloned() {
+                                    s.remove(&victim);
+                                }
+                            }
+                            s.insert(event.id.clone());
+                        });
+                        seen_changed = true;
+                    }
+
+                    if verdict != PostVerdict::Notify {
                         continue;
                     }
 
                     let author = author_display(&event.pubkey);
                     let preview = post_preview(&event.content);
-                    // Classify @-mentions of the current user as `Mention` so
-                    // they survive the MentionsOnly notification level; plain
-                    // channel posts stay `Message` and are gated out under it.
-                    let mentions_me = me
-                        .as_deref()
-                        .map(|pk| event_mentions(event, pk))
-                        .unwrap_or(false);
+                    // `mentions_me` (computed above) also classifies the
+                    // notification as `Mention` so it survives the MentionsOnly
+                    // notification level; plain channel posts stay `Message` and
+                    // are gated out under it.
                     let (kind, title) = if mentions_me {
                         (
                             NotificationKind::Mention,
@@ -736,6 +766,11 @@ fn load_sync_state(owner: &str) -> SyncState {
 ///
 /// De-dup against already-notified ids is handled by the caller's persisted
 /// `seen_messages` set, not here.
+/// Thin compatibility wrapper over [`classify_post`], kept because the
+/// suppression model's truth table is asserted against it. Production code
+/// calls `classify_post` directly, because it needs the verdict's DURABILITY
+/// (see `PostVerdict`), not merely a boolean.
+#[cfg(test)]
 fn post_is_notifiable(
     author: &str,
     created_at: u64,
@@ -743,12 +778,88 @@ fn post_is_notifiable(
     read_ts: u64,
     baseline: u64,
 ) -> bool {
+    classify_post(author, created_at, me, read_ts, baseline, false) == PostVerdict::Notify
+}
+
+/// Why a post was or was not turned into a notification.
+///
+/// The distinction that matters is not notify-vs-not, it is whether the answer
+/// can ever CHANGE. `seen_messages` is persisted, so recording an id there is a
+/// permanent statement; doing that for a rejection that might later be reversed
+/// silences the post forever. See the call site for the bug this prevents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostVerdict {
+    /// Raise a notification. Terminal: it has had its chance.
+    Notify,
+    /// The viewer wrote it. Immutable — authorship never changes.
+    OwnPost,
+    /// Older than the persisted first-sync floor. Immutable in practice: the
+    /// baseline only ever moves forward, so this can never become notifiable.
+    BeforeBaseline,
+    /// At or before the channel's read position. NOT recorded as seen: read
+    /// positions are written by render-time effects and can be wrong, so a
+    /// cheap re-check on a later pass is worth more than a permanent veto.
+    AlreadyRead,
+}
+
+impl PostVerdict {
+    /// Whether this verdict should be burned into the persisted dedup set.
+    fn is_permanent(self) -> bool {
+        matches!(
+            self,
+            PostVerdict::Notify | PostVerdict::OwnPost | PostVerdict::BeforeBaseline
+        )
+    }
+}
+
+/// Classify a post for notification purposes.
+///
+/// Order is deliberate: authorship first (cheapest and most absolute), then the
+/// sync floor, then the read position — so the most durable reason wins and a
+/// post is not filed under a reversible verdict when an irreversible one
+/// applies.
+fn classify_post(
+    author: &str,
+    created_at: u64,
+    me: Option<&str>,
+    read_ts: u64,
+    baseline: u64,
+    directed_at_me: bool,
+) -> PostVerdict {
     if let Some(pk) = me {
         if author == pk {
-            return false;
+            return PostVerdict::OwnPost;
         }
     }
-    created_at > read_ts && created_at > baseline
+    if created_at <= baseline {
+        return PostVerdict::BeforeBaseline;
+    }
+    // A post DIRECTED AT ME skips the read-position gate.
+    //
+    // This is the "ingress particularly" half of the reply/unread report. The
+    // read position is per CHANNEL, but a channel holds many topics, and it is
+    // stamped to the channel's newest message by render-time effects — opening a
+    // section's topic-title list (`pages/section.rs`) marks every reply in every
+    // topic of that section read, having shown the reader nothing but titles.
+    // A reply to your post in a topic you never opened was therefore
+    // `created_at <= read_ts` before you could ever see it, and silently
+    // suppressed.
+    //
+    // Channel-read and I-have-seen-this-reply are simply different claims. A
+    // p-tag means someone addressed this to you by name — a forum reply always
+    // p-tags the topic author, and the per-post Reply affordance additionally
+    // p-tags the immediate parent's author — so it is the strongest signal the
+    // client has that a channel-wide "read" does not cover this event.
+    //
+    // The baseline and own-post gates still apply: this widens ingress, it does
+    // not open a backfill floodgate, and it cannot notify you about yourself.
+    if directed_at_me {
+        return PostVerdict::Notify;
+    }
+    if created_at <= read_ts {
+        return PostVerdict::AlreadyRead;
+    }
+    PostVerdict::Notify
 }
 
 /// Whether a notification of `kind` is allowed under the persisted
@@ -880,6 +991,128 @@ fn parse_persisted_items(value: &serde_json::Value, now: u64) -> Vec<Notificatio
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── Verdict durability (the "ingress isn't working" regression) ─────────
+    //
+    // The bug was not in WHETHER a post notifies — `post_is_notifiable` was
+    // already correct and already tested. It was that the producer recorded the
+    // event in the PERSISTED dedup set before asking, so a rejection made under
+    // transient bad state became permanent. These tests pin the durability
+    // classification that fix depends on.
+
+
+    #[test]
+    fn a_read_position_rejection_is_not_permanent() {
+        // THE regression. Read positions are written by render-time effects and
+        // can be wrong (opening a section index used to stamp every topic in it
+        // as read). If such a rejection burned the id, the reply could never
+        // notify again — on this reload or any future one. It must stay
+        // re-checkable.
+        let v = classify_post(OTHER, 100, Some(ME), /* read_ts */ 200, /* baseline */ 0, false);
+        assert_eq!(v, PostVerdict::AlreadyRead);
+        assert!(
+            !v.is_permanent(),
+            "a read-position rejection must remain re-checkable"
+        );
+    }
+
+    #[test]
+    fn own_posts_and_pre_baseline_posts_are_permanent() {
+        // Both grounds are immutable — authorship never changes, and the sync
+        // floor only moves forward — so burning the id is safe and saves the
+        // producer from re-evaluating them on every pass.
+        let own = classify_post(ME, 500, Some(ME), 0, 0, false);
+        assert_eq!(own, PostVerdict::OwnPost);
+        assert!(own.is_permanent());
+
+        let old = classify_post(OTHER, 100, Some(ME), 0, /* baseline */ 200, false);
+        assert_eq!(old, PostVerdict::BeforeBaseline);
+        assert!(old.is_permanent());
+    }
+
+    #[test]
+    fn a_notified_post_is_permanent() {
+        let v = classify_post(OTHER, 500, Some(ME), 100, 100, false);
+        assert_eq!(v, PostVerdict::Notify);
+        assert!(v.is_permanent(), "we notified; it has had its chance");
+    }
+
+    #[test]
+    fn authorship_beats_a_reversible_rejection() {
+        // Ordering matters: an own post that is ALSO before the read position
+        // must be filed under the immutable reason, not the reversible one, or
+        // the producer re-evaluates the user's own posts forever.
+        let v = classify_post(ME, 100, Some(ME), 200, 0, false);
+        assert_eq!(v, PostVerdict::OwnPost);
+        assert!(v.is_permanent());
+    }
+
+    #[test]
+    fn baseline_beats_read_position() {
+        // Same principle one level down: pre-baseline is immutable, read
+        // position is not, so pre-baseline must win when both apply.
+        let v = classify_post(OTHER, 100, Some(ME), /* read */ 150, /* baseline */ 150, false);
+        assert_eq!(v, PostVerdict::BeforeBaseline);
+        assert!(v.is_permanent());
+    }
+
+    #[test]
+    fn a_reply_addressed_to_me_survives_a_channel_wide_read_position() {
+        // THE "ingress particularly" regression. Opening a section's
+        // topic-title list stamps the WHOLE channel read, so a reply to my post
+        // in a topic I never opened arrives already `created_at <= read_ts`.
+        // Being p-tagged means it was addressed to me by name, which a
+        // channel-wide read position does not speak to.
+        let suppressed = classify_post(OTHER, 100, Some(ME), /* read */ 900, 0, false);
+        assert_eq!(suppressed, PostVerdict::AlreadyRead);
+
+        let directed = classify_post(OTHER, 100, Some(ME), /* read */ 900, 0, true);
+        assert_eq!(
+            directed,
+            PostVerdict::Notify,
+            "a post addressed to me must not be suppressed by a channel-wide read position"
+        );
+    }
+
+    #[test]
+    fn being_addressed_does_not_defeat_the_immutable_gates() {
+        // The bypass widens ingress; it must not become a backfill floodgate,
+        // and it must never notify me about my own post.
+        assert_eq!(
+            classify_post(OTHER, 100, Some(ME), 0, /* baseline */ 500, true),
+            PostVerdict::BeforeBaseline,
+            "the first-sync floor still applies to a directed post"
+        );
+        assert_eq!(
+            classify_post(ME, 900, Some(ME), 0, 0, true),
+            PostVerdict::OwnPost,
+            "p-tagging yourself must not notify you about your own post"
+        );
+    }
+
+    #[test]
+    fn classify_post_agrees_with_the_legacy_predicate() {
+        // `post_is_notifiable` is now a thin wrapper. Pin the equivalence so the
+        // refactor cannot silently change the suppression model that the
+        // existing truth-table tests below assert.
+        for author in [ME, OTHER] {
+            for created_at in [0u64, 100, 200, 300] {
+                for read_ts in [0u64, 150, 300] {
+                    for baseline in [0u64, 150, 300] {
+                        let expected = {
+                            let not_mine = author != ME;
+                            not_mine && created_at > read_ts && created_at > baseline
+                        };
+                        assert_eq!(
+                            post_is_notifiable(author, created_at, Some(ME), read_ts, baseline),
+                            expected,
+                            "author={author} at={created_at} read={read_ts} base={baseline}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn lenient_parse_drops_corrupt_entry_keeps_valid() {

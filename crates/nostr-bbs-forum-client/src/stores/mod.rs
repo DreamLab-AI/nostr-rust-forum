@@ -8,6 +8,7 @@ pub mod admin_alerts;
 pub mod badges;
 pub mod case_projection;
 pub mod channels;
+pub mod custom_emoji;
 #[allow(dead_code)]
 pub mod indexed_db;
 pub mod mute;

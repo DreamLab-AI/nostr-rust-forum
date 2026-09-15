@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  nostr-rust-forum PWA mark — "the place a decision gets signed".
+
+  Silhouette brief (why it looks like this):
+    * FULL-BLEED AMBER. The previous manifest borrowed the retro BBS icon:
+      a near-black tile (#0a0a0a) with a small terminal glyph. On a dark
+      home screen that is a black square among black squares — the exact
+      "can't identify the PWA" complaint. A saturated amber field is the
+      single biggest legibility win at 48px.
+    * DIAMOND + TICK. The diamond is the existing brand cue (it is already
+      the browser favicon in index.html). The tick inside it is the forum's
+      actual proposition — a signed decision — and gives the mark an
+      asymmetric interior so it is not confused with a generic rhombus.
+    * NO TEXT. Lettering is unreadable below ~64px and localises badly.
+
+  This is the "any" purpose source. icon-maskable.svg is the same mark with
+  the safe-zone scaling Android's adaptive-icon mask requires.
+  Regenerate PNGs with: scripts/gen-pwa-icons.sh
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Forum">
+  <defs>
+    <linearGradient id="field" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fcd34d"/>
+      <stop offset="45%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#d97706"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1f2937"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Field. rx=112 ≈ 22% — iOS superellipse-ish without fighting the OS mask. -->
+  <rect width="512" height="512" rx="112" fill="url(#field)"/>
+
+  <!-- Dark diamond: the signing surface. -->
+  <path d="M256 92 L420 256 L256 420 L92 256 Z" fill="url(#core)"/>
+
+  <!-- Amber tick: the signature. Stroked, round caps, so it stays a
+       confident single gesture when the raster drops to 48px. -->
+  <path d="M182 258 L233 309 L332 210"
+        fill="none" stroke="#fbbf24" stroke-width="42"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
