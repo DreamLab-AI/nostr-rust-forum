@@ -56,7 +56,8 @@ pub use event::{
     NostrEvent, PubkeyMismatch, UnsignedEvent,
 };
 pub use gift_wrap::{
-    gift_wrap, gift_wrap_with_signer, unwrap_gift, unwrap_gift_with_signer, GiftWrapError,
+    gift_wrap, gift_wrap_pair_with_signer, gift_wrap_with_signer, unwrap_gift,
+    unwrap_gift_with_signer, GiftWrapError,
     SignerGiftWrapError, UnwrappedGift,
 };
 pub use keys::{

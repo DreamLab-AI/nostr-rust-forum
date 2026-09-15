@@ -9,6 +9,35 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ### Fixed — forum member feedback, September 2026
 
+- **DM history is viewable again, and senders keep their own copy.** Four
+  independent defects, all of which had to be fixed for a conversation to load:
+  - Gift-wrap (kind-1059) filters constrained `authors`. A wrap is signed by a
+    throwaway key *by design*, so `authors: [anyone_real]` matched zero rows at
+    the relay and `load_conversation_messages` — the only history source for
+    `/dm/:pubkey` — returned nothing, for both parties, always. Gift-wrap
+    filters are now keyed on `#p` alone and the conversation is selected
+    client-side after unwrapping (a wrap exposes no relay-visible hint of which
+    conversation it belongs to; that is the point of it).
+  - Kinds 4 and 1059 shared a filter. The relay's DM privacy gate rewrites `#p`
+    on any filter mentioning 1059, which clobbered the legacy kind-4 half and
+    destroyed outbound kind-4 history as collateral damage. They are now
+    separate filters.
+  - Sending published only one wrap. NIP-17 requires two — one sealed to the
+    recipient, one to yourself — because a single wrap is *write-only for its
+    author*: encrypted to the recipient's key, authored by a throwaway key, so
+    the sender can neither decrypt nor find it. The optimistic bubble was the
+    only copy and died with the page. `gift_wrap_pair_with_signer` seals one
+    rumor twice so both sides reconstruct an identical message, while the two
+    wraps stay unlinkable on the wire.
+  - Kind-4 DMs were decrypted with NIP-44. Kind 4 is NIP-04 (AES-256-CBC), so
+    every legacy DM failed and was dropped with a console warning. Fixed at the
+    call site *and* in the NIP-07 bridge, which had hard-wired `nip04_decrypt`
+    to `window.nostr.nip44`.
+
+  The rendered message list is now scoped to the open conversation: the inbound
+  subscription is necessarily inbox-wide, so an unscoped view rendered a third
+  party's DM inside whatever thread happened to be open.
+
 - **The installed PWA has its own icon.** `manifest.webmanifest` pointed at
   `/community/bbs/icons/*` — the *retro BBS client's* black terminal mark — so
   the installed forum was indistinguishable from the installed BBS, and from

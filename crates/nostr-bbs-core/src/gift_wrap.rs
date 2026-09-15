@@ -483,6 +483,69 @@ pub async fn gift_wrap_with_signer(
     wrap_seal(&seal, recipient_pubkey).map_err(|e| SignerGiftWrapError::KeyError(e.to_string()))
 }
 
+/// Create the **pair** of gift wraps NIP-17 requires for a direct message:
+/// one addressed to the recipient, one addressed back to the sender.
+///
+/// # Why a second wrap exists
+///
+/// A gift wrap is NIP-44-encrypted *to a single recipient* and signed by a
+/// throwaway key ([`wrap_seal`]). Those two properties are what make the
+/// transport private — and together they mean the SENDER cannot read, or even
+/// find, their own outbound message afterwards:
+///
+/// * it is encrypted to the recipient's key, so the sender cannot decrypt it;
+/// * its author is a throwaway key, so `{"authors": [sender]}` never matches it;
+/// * its only `p` tag is the recipient, so `{"#p": [sender]}` never matches it.
+///
+/// So with a single wrap, everything you send is write-only. The optimistic
+/// bubble the UI paints at send time is the *only* copy that ever exists, and it
+/// dies with the page. Reload a conversation and your own half of it is gone —
+/// which is precisely the "DM history isn't viewable" report this addresses.
+///
+/// NIP-17 solves this by sealing the same rumor twice — once encrypted to the
+/// recipient, once encrypted to yourself — and wrapping each seal separately.
+/// Both wraps carry the *same* rumor, so both sides reconstruct an identical
+/// message (same `created_at`, same content, same declared author); only the
+/// encryption target and the throwaway wrapping key differ.
+///
+/// # Returns
+///
+/// `(to_recipient, to_self)`. Publish **both**. They are independent events with
+/// distinct ids and distinct throwaway authors — by design, so an observer
+/// cannot link them to each other or to the sender.
+///
+/// # Note on the rumor
+///
+/// The rumor is created once and shared by both seals. This matters: calling
+/// [`gift_wrap_with_signer`] twice would mint two rumors with two different
+/// `created_at` values, and the sender's copy would drift from the recipient's.
+pub async fn gift_wrap_pair_with_signer(
+    signer: &dyn Signer,
+    recipient_pubkey: &str,
+    content: &str,
+) -> Result<(NostrEvent, NostrEvent), SignerGiftWrapError> {
+    let sender_pubkey = signer.public_key().to_string();
+
+    // ONE rumor, shared by both seals, so the two copies agree on timestamp
+    // and content. (`create_rumor` stamps a real `now`; only the seal and wrap
+    // layers randomise their timestamps.)
+    let rumor = create_rumor(&sender_pubkey, recipient_pubkey, content);
+
+    // Seal + wrap for the recipient.
+    let seal_to_recipient = seal_rumor_with_signer(&rumor, signer, recipient_pubkey).await?;
+    let wrap_to_recipient = wrap_seal(&seal_to_recipient, recipient_pubkey)
+        .map_err(|e| SignerGiftWrapError::KeyError(e.to_string()))?;
+
+    // Seal + wrap for ourselves. Encrypting to our own pubkey is a normal
+    // NIP-44 operation (the ECDH shared secret of a key with itself is
+    // well-defined), and works identically through a NIP-07 extension.
+    let seal_to_self = seal_rumor_with_signer(&rumor, signer, &sender_pubkey).await?;
+    let wrap_to_self = wrap_seal(&seal_to_self, &sender_pubkey)
+        .map_err(|e| SignerGiftWrapError::KeyError(e.to_string()))?;
+
+    Ok((wrap_to_recipient, wrap_to_self))
+}
+
 /// Unwrap a gift-wrapped (kind 1059) event using a [`Signer`] for decryption.
 ///
 /// Both NIP-44 layers (gift→seal and seal→rumor) are decrypted through the
@@ -928,6 +991,108 @@ mod tests {
         let unwrapped = block_on(unwrap_gift_with_signer(&wrapped, &recipient)).unwrap();
         assert_eq!(unwrapped.sender_pubkey, sender_pk);
         assert_eq!(unwrapped.rumor.content, content);
+    }
+
+    // ── NIP-17 wrap PAIR (sender keeps a readable copy) ─────────────────────
+
+    #[test]
+    fn wrap_pair_lets_the_sender_read_their_own_sent_message() {
+        // The regression this locks: with a single wrap, a sent DM is
+        // write-only for its author, so reloading a conversation loses your
+        // own half of it.
+        let (sender, sender_pk) = prf_signer();
+        let (recipient, recipient_pk) = prf_signer();
+
+        let content = "can I read this back? 🎁";
+        let (to_recipient, to_self) =
+            block_on(gift_wrap_pair_with_signer(&sender, &recipient_pk, content)).unwrap();
+
+        // The recipient reads their copy.
+        let theirs = block_on(unwrap_gift_with_signer(&to_recipient, &recipient)).unwrap();
+        assert_eq!(theirs.rumor.content, content);
+        assert_eq!(theirs.sender_pubkey, sender_pk);
+
+        // ...and the SENDER reads their own copy. This is the whole point.
+        let mine = block_on(unwrap_gift_with_signer(&to_self, &sender)).unwrap();
+        assert_eq!(mine.rumor.content, content);
+        assert_eq!(mine.sender_pubkey, sender_pk);
+    }
+
+    #[test]
+    fn wrap_pair_copies_agree_on_the_rumor() {
+        // Both copies must reconstruct an IDENTICAL message. If the two seals
+        // were built from separately-minted rumors, the sender's transcript
+        // would drift from the recipient's (different created_at → different
+        // sort order → the two people see a different conversation).
+        let (sender, _sender_pk) = prf_signer();
+        let (recipient, recipient_pk) = prf_signer();
+
+        let (to_recipient, to_self) =
+            block_on(gift_wrap_pair_with_signer(&sender, &recipient_pk, "same rumor")).unwrap();
+
+        let theirs = block_on(unwrap_gift_with_signer(&to_recipient, &recipient)).unwrap();
+        let mine = block_on(unwrap_gift_with_signer(&to_self, &sender)).unwrap();
+
+        assert_eq!(theirs.rumor.content, mine.rumor.content);
+        assert_eq!(theirs.rumor.created_at, mine.rumor.created_at);
+        assert_eq!(theirs.rumor.pubkey, mine.rumor.pubkey);
+        assert_eq!(theirs.rumor.tags, mine.rumor.tags);
+    }
+
+    #[test]
+    fn wrap_pair_copies_are_unlinkable_on_the_wire() {
+        // Each wrap must carry its own throwaway author and its own id, so an
+        // observer cannot tell the two copies belong to the same message (nor
+        // tie either to the sender). This is the privacy property that makes
+        // publishing a self-copy safe in the first place.
+        let (sender, sender_pk) = prf_signer();
+        let (_recipient, recipient_pk) = prf_signer();
+
+        let (to_recipient, to_self) =
+            block_on(gift_wrap_pair_with_signer(&sender, &recipient_pk, "unlinkable")).unwrap();
+
+        assert_eq!(to_recipient.kind, KIND_GIFT_WRAP);
+        assert_eq!(to_self.kind, KIND_GIFT_WRAP);
+        assert_ne!(to_recipient.id, to_self.id);
+        assert_ne!(to_recipient.pubkey, to_self.pubkey);
+        assert_ne!(to_recipient.pubkey, sender_pk);
+        assert_ne!(to_self.pubkey, sender_pk);
+    }
+
+    #[test]
+    fn wrap_pair_addresses_each_copy_to_exactly_one_party() {
+        // The p-tag is what a relay indexes and what the client filters on.
+        // The recipient copy must be addressed to them; the self copy to us.
+        let (sender, sender_pk) = prf_signer();
+        let (_recipient, recipient_pk) = prf_signer();
+
+        let (to_recipient, to_self) =
+            block_on(gift_wrap_pair_with_signer(&sender, &recipient_pk, "p tags")).unwrap();
+
+        let p_tags = |e: &NostrEvent| -> Vec<String> {
+            e.tags
+                .iter()
+                .filter(|t| t.first().map(|x| x == "p").unwrap_or(false))
+                .filter_map(|t| t.get(1).cloned())
+                .collect()
+        };
+
+        assert_eq!(p_tags(&to_recipient), vec![recipient_pk.clone()]);
+        assert_eq!(p_tags(&to_self), vec![sender_pk.clone()]);
+    }
+
+    #[test]
+    fn wrap_pair_self_copy_is_not_readable_by_the_recipient() {
+        // The self copy is encrypted to the sender only. The recipient getting
+        // hold of it (they cannot, via #p, but belt and braces) must not be
+        // able to open it.
+        let (sender, _sender_pk) = prf_signer();
+        let (recipient, recipient_pk) = prf_signer();
+
+        let (_to_recipient, to_self) =
+            block_on(gift_wrap_pair_with_signer(&sender, &recipient_pk, "private")).unwrap();
+
+        assert!(block_on(unwrap_gift_with_signer(&to_self, &recipient)).is_err());
     }
 
     #[test]

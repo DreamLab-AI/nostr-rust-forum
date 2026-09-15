@@ -221,7 +221,9 @@ impl Signer for Nip07Signer {
         sender_pubkey_hex: &str,
         ciphertext: &str,
     ) -> Result<String, SignerError> {
-        nip07_nip44_decrypt(sender_pubkey_hex, ciphertext)
+        // NIP-04 ciphertext needs the NIP-04 algorithm. See
+        // `nip07_nip04_decrypt` for why this is not simply NIP-44.
+        nip07_nip04_decrypt(sender_pubkey_hex, ciphertext)
             .await
             .map_err(SignerError::DecryptionFailed)
     }
@@ -272,7 +274,16 @@ async fn nip07_nip44_encrypt(
 }
 
 /// NIP-44 decrypt via `window.nostr.nip44.decrypt(pubkey, ciphertext)`.
-async fn nip07_nip44_decrypt(sender_pubkey_hex: &str, ciphertext: &str) -> Result<String, String> {
+/// Decrypt via `window.nostr.<ns>.decrypt(pubkey, ciphertext)`.
+///
+/// Generic over the namespace because NIP-04 and NIP-07's NIP-44 bridge have
+/// identical call shapes and differ only in which object hangs off
+/// `window.nostr`. Keeping one implementation means the two cannot drift.
+async fn nip07_decrypt_via(
+    namespace: &str,
+    sender_pubkey_hex: &str,
+    ciphertext: &str,
+) -> Result<String, String> {
     let window = web_sys::window().ok_or("No window object")?;
     let nostr =
         js_sys::Reflect::get(&window, &"nostr".into()).map_err(|_| "window.nostr not found")?;
@@ -280,34 +291,64 @@ async fn nip07_nip44_decrypt(sender_pubkey_hex: &str, ciphertext: &str) -> Resul
         return Err("NIP-07 extension not available".to_string());
     }
 
-    let nip44 = js_sys::Reflect::get(&nostr, &"nip44".into())
-        .map_err(|_| "window.nostr.nip44 not found")?;
-    if nip44.is_undefined() || nip44.is_null() {
-        return Err("window.nostr.nip44 not supported by this extension".to_string());
+    let ns = js_sys::Reflect::get(&nostr, &namespace.into())
+        .map_err(|_| format!("window.nostr.{namespace} not found"))?;
+    if ns.is_undefined() || ns.is_null() {
+        return Err(format!(
+            "window.nostr.{namespace} not supported by this extension"
+        ));
     }
 
-    let decrypt_fn = js_sys::Reflect::get(&nip44, &"decrypt".into())
-        .map_err(|_| "window.nostr.nip44.decrypt not found")?;
+    let decrypt_fn = js_sys::Reflect::get(&ns, &"decrypt".into())
+        .map_err(|_| format!("window.nostr.{namespace}.decrypt not found"))?;
     let decrypt_fn: js_sys::Function = decrypt_fn
         .dyn_into()
-        .map_err(|_| "nip44.decrypt is not a function")?;
+        .map_err(|_| format!("{namespace}.decrypt is not a function"))?;
 
     let promise = decrypt_fn
         .call2(
-            &nip44,
+            &ns,
             &JsValue::from_str(sender_pubkey_hex),
             &JsValue::from_str(ciphertext),
         )
-        .map_err(|e| format!("nip44.decrypt() call failed: {:?}", e))?;
+        .map_err(|e| format!("{namespace}.decrypt() call failed: {:?}", e))?;
     let promise: js_sys::Promise = promise
         .dyn_into()
-        .map_err(|_| "nip44.decrypt() did not return a Promise")?;
+        .map_err(|_| format!("{namespace}.decrypt() did not return a Promise"))?;
 
     let result = JsFuture::from(promise)
         .await
-        .map_err(|e| format!("nip44.decrypt() rejected: {:?}", e))?;
+        .map_err(|e| format!("{namespace}.decrypt() rejected: {:?}", e))?;
 
     result
         .as_string()
-        .ok_or_else(|| "nip44.decrypt() did not return a string".to_string())
+        .ok_or_else(|| format!("{namespace}.decrypt() did not return a string"))
+}
+
+/// NIP-44 decrypt via `window.nostr.nip44.decrypt(pubkey, ciphertext)`.
+async fn nip07_nip44_decrypt(sender_pubkey_hex: &str, ciphertext: &str) -> Result<String, String> {
+    nip07_decrypt_via("nip44", sender_pubkey_hex, ciphertext).await
+}
+
+/// NIP-04 decrypt via `window.nostr.nip04.decrypt(pubkey, ciphertext)`, falling
+/// back to NIP-44 only if the extension has no `nip04` namespace at all.
+///
+/// This used to call NIP-44 unconditionally, which is simply the wrong
+/// algorithm: kind-4 content is NIP-04 (AES-256-CBC), not NIP-44
+/// (ChaCha20-Poly1305). Every legacy DM therefore failed to decrypt and was
+/// dropped with a console warning — invisible to the user, who just saw an
+/// empty conversation. The fallback is retained because a small number of
+/// extensions expose only `nip44`, and for those a NIP-44 attempt is strictly
+/// better than refusing outright; it will fail on genuine NIP-04 ciphertext,
+/// which is the honest outcome.
+async fn nip07_nip04_decrypt(sender_pubkey_hex: &str, ciphertext: &str) -> Result<String, String> {
+    match nip07_decrypt_via("nip04", sender_pubkey_hex, ciphertext).await {
+        Ok(plaintext) => Ok(plaintext),
+        Err(nip04_err) => {
+            web_sys::console::warn_1(
+                &format!("[nip07] nip04.decrypt unavailable ({nip04_err}); trying nip44").into(),
+            );
+            nip07_nip44_decrypt(sender_pubkey_hex, ciphertext).await
+        }
+    }
 }
