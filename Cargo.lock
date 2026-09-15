@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-config"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "proptest",
  "schemars",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-rate-limit"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "hex",
