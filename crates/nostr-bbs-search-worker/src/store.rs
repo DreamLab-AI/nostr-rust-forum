@@ -51,6 +51,15 @@ impl VectorStore {
 
     /// Cosine similarity k-NN search. Returns (label, score) pairs sorted by
     /// descending score (1.0 = identical, 0.0 = orthogonal).
+    ///
+    /// # `k` is a raw candidate count, not a final result count
+    ///
+    /// This truncates to `k` with no knowledge of visibility, so any caller that
+    /// filters the output (as `/search` does, through the public-label set) must
+    /// pass an OVER-FETCHED `k` and cut to the real limit itself -- see
+    /// `overfetch_k` / `visible_top_k` in `lib.rs`. Passing the user-facing `k`
+    /// here and then filtering silently starves the result set whenever the top
+    /// neighbours happen to be non-public.
     pub fn search(&self, query: &[f32], k: usize, min_score: f32) -> Vec<(u64, f32)> {
         if self.entries.is_empty() || query.len() != DIM {
             return Vec::new();

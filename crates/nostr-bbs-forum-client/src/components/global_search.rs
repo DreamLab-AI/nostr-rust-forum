@@ -37,10 +37,13 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-const SEARCH_API: &str = match option_env!("VITE_SEARCH_API_URL") {
-    Some(u) => u,
-    None => "https://members-search-api.solitary-paper-764d.workers.dev",
-};
+/// How many semantic hits to ask the worker for.
+///
+/// Sent as `k` — the ONLY field the worker's `SearchRequest` understands. This
+/// used to be sent as `"limit"`, which serde silently discarded, leaving the
+/// worker's `default_k()` in charge. That happened to also be 10, so the bug was
+/// invisible until someone changed this number and nothing moved.
+const SEMANTIC_K: u32 = 10;
 const RECENT_KEY: &str = "nostrbbs_recent_searches";
 const MAX_RECENT: usize = 5;
 
@@ -292,7 +295,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
 
                 if is_semantic {
                     // RuVector semantic search, with legacy text fallback.
-                    match search_client::search_similar(&q, 10, 0.3, None).await {
+                    match search_client::search_similar(&q, SEMANTIC_K, 0.3).await {
                         Ok(hits) => {
                             for h in hits {
                                 let content = h.content.and_then(non_empty);
@@ -680,10 +683,16 @@ async fn hydrate_search_ids(
     found.get_untracked()
 }
 
+/// POST `query` to the worker's `/search` and return its raw hits.
+///
+/// Both the base URL and the request body come from `utils::search_client` so
+/// this overlay and the `search_client` API path cannot drift apart again — they
+/// previously defaulted to two *different* hosts (this one to the real worker,
+/// `search_client` to the unresolvable `search.example.com`) and sent two
+/// different field names for the same thing.
 async fn semantic_search(query: &str) -> Result<Vec<SHit>, String> {
-    let url = format!("{}/search", SEARCH_API);
-    let body_str = serde_json::to_string(&serde_json::json!({ "query": query, "limit": 10 }))
-        .map_err(|e| e.to_string())?;
+    let url = format!("{}/search", search_client::search_api_base());
+    let body_str = search_client::build_query_search_body(query, SEMANTIC_K);
     let window = web_sys::window().ok_or("No window")?;
     let init = web_sys::RequestInit::new();
     init.set_method("POST");
@@ -730,5 +739,32 @@ fn save_recent(q: &str) {
     r.truncate(MAX_RECENT);
     if let Ok(j) = serde_json::to_string(&r) {
         let _ = LocalStorage::set(RECENT_KEY, j);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure tests only: the overlay itself is Leptos/wasm, but the wire contract
+    // it depends on is pure, so it is pinned here on the host target.
+
+    #[test]
+    fn overlay_semantic_body_uses_k_not_limit() {
+        // Regression guard for the original bug: the overlay POSTed
+        // `{"query":…,"limit":10}` while the worker's SearchRequest only has
+        // `k`, so the limit was silently discarded and `default_k()` applied.
+        let body = search_client::build_query_search_body("hello", SEMANTIC_K);
+        assert!(body.contains(r#""k":10"#), "body was {body}");
+        assert!(!body.contains("limit"), "stale `limit` key in {body}");
+    }
+
+    #[test]
+    fn overlay_and_search_client_share_one_base_url() {
+        // This module no longer owns a base-URL constant; if one is
+        // reintroduced the two call sites can diverge again (they once
+        // defaulted to two different hosts, one of them unresolvable).
+        let base = search_client::resolve_search_base(Some("https://s.example.org"), None);
+        assert_eq!(format!("{base}/search"), "https://s.example.org/search");
     }
 }

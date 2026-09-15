@@ -32,6 +32,7 @@ use crate::stores::mute::provide_mute_store;
 use crate::stores::panel_registry::provide_panel_registry;
 use crate::stores::case_projection::provide_case_projection_store;
 use crate::stores::receipts::provide_receipt_store;
+use crate::stores::custom_emoji::provide_custom_emoji_store;
 use crate::stores::preferences::provide_preferences;
 use crate::stores::profile_cache::{provide_profile_cache, try_use_profile_cache};
 use crate::stores::read_position::provide_read_positions;
@@ -318,6 +319,10 @@ pub fn App() -> impl IntoView {
     provide_read_positions();
     provide_mute_store();
     provide_preferences();
+    // Per-user reaction emoji. Provided at the root so the picker's list stays
+    // in sync across tabs; `use_custom_emoji_store` self-provisions from
+    // localStorage without it, so this only adds the cross-tab listener.
+    provide_custom_emoji_store();
 
     // Admin alert producer: bell notifications for new members awaiting zone
     // access (no-op for non-admins). Mounted after the auth / zone-access /
@@ -1140,6 +1145,29 @@ fn Layout(children: Children) -> impl IntoView {
                             <LogoutButton />
                         </Show>
                     </div>
+
+                    // Mobile search.
+                    //
+                    // Search had NO reachable entry point on a phone. The nav
+                    // button below lives in the `hidden sm:flex` desktop block,
+                    // the hamburger's "Search" item sits inside
+                    // `<Show when=is_authed>`, MobileBottomNav has no search
+                    // entry, and Ctrl/Cmd+K obviously does not exist on touch —
+                    // so a signed-out mobile visitor could not open search at
+                    // all, and a signed-in one had to know to look in the
+                    // hamburger. That is most of "search seems completely
+                    // broken - unclear if just on mobile": for some users it
+                    // was not broken, it was absent.
+                    //
+                    // Sits beside the hamburger, outside any auth gate, so the
+                    // affordance is always one tap away.
+                    <button
+                        class="sm:hidden p-2 text-gray-400 hover:text-amber-400 rounded-lg hover:bg-gray-800 transition-colors"
+                        on:click=move |_| { search_open.set(true); mobile_open.set(false); }
+                        aria-label="Search"
+                    >
+                        {search_icon()}
+                    </button>
 
                     // Mobile hamburger
                     <button

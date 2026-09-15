@@ -224,6 +224,62 @@ pub fn ChannelPage() -> impl IntoView {
         })
     };
 
+    // Whether this channel's owning zone is readable WITHOUT authentication.
+    //
+    // This decides the `public` flag on the semantic-search index entry below,
+    // and it has to be derived rather than assumed in either direction:
+    //
+    //  * The search worker's `/search` endpoint is UNAUTHENTICATED. Indexing a
+    //    gated zone's message as public would expose its content to anyone who
+    //    can reach the worker, bypassing the zone ACL entirely.
+    //  * But the previous code hardcoded `public: false`, and the worker
+    //    fail-closes on exactly that flag — so every vector the client ever
+    //    ingested was unreachable and `/search` could only ever return `[]`.
+    //    That is the "search seems completely broken" report.
+    //
+    // `required_cohorts` empty is the kit's definition of unauthenticated read
+    // (see `stores::zones::Zone::required_cohorts`). Anything we cannot resolve
+    // — unknown channel, unknown zone, store not yet loaded — falls through to
+    // `false`, i.e. indexed but not searchable, which is the safe direction.
+    let zone_is_world_readable = {
+        let store = use_context::<ChannelStore>();
+        Signal::derive(move || {
+            let raw = channel_id();
+            let zones = load_zones();
+            let resolved_zone = store.and_then(|store| {
+                let needle_lower = raw.to_lowercase();
+                store.channels.with(|list| {
+                    list.iter()
+                        .find(|c| {
+                            c.id == raw
+                                || c.name.to_lowercase() == needle_lower
+                                || c.section.to_lowercase() == needle_lower
+                        })
+                        .and_then(|c| {
+                            let section = if c.section.is_empty() {
+                                raw.clone()
+                            } else {
+                                c.section.clone()
+                            };
+                            section_to_zone(&section, &zones)
+                        })
+                })
+            });
+            // NOTE: deliberately no `.unwrap_or_default()` fallback to the first
+            // zone here, unlike `zone_accent` above. An accent guessing wrong is
+            // cosmetic; a visibility flag guessing wrong is a disclosure. If the
+            // zone is unknown we return false.
+            match resolved_zone.or_else(|| section_to_zone(&raw, &zones)) {
+                Some(zone_id) => zones
+                    .iter()
+                    .find(|z| z.id == zone_id)
+                    .map(|z| z.required_cohorts.is_empty())
+                    .unwrap_or(false),
+                None => false,
+            }
+        })
+    };
+
     // Read-position store for mark-as-read
     let read_store = use_read_positions();
 
@@ -750,20 +806,32 @@ pub fn ChannelPage() -> impl IntoView {
         };
 
         let relay = relay_for_send.clone();
+        // Read the visibility decision on THIS side of the spawn: the signal is
+        // Copy but reading it inside the async block would sample it after an
+        // await point, where the reactive owner may already be gone.
+        let is_public_for_index = zone_is_world_readable.get_untracked();
         wasm_bindgen_futures::spawn_local(async move {
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
                     let event_id = signed.id.clone();
                     relay.publish(&signed);
 
-                    // Auto-index for semantic search in background
+                    // Auto-index for semantic search in background.
+                    //
+                    // `public` was hardcoded `false`, and the worker fail-closes
+                    // on that flag — so every vector this client ever ingested
+                    // was filtered out of every search response and `/search`
+                    // could only ever return `[]`. It is now derived from the
+                    // owning zone's read policy (see `zone_is_world_readable`),
+                    // because `/search` is unauthenticated and a gated zone's
+                    // content must not become searchable.
                     let channel_for_index = cid;
                     if let Some(signer) = auth.get_signer() {
                         let _ = crate::utils::search_client::ingest_message_signer(
                             &event_id,
                             &content_for_index,
                             Some(&channel_for_index),
-                            false,
+                            is_public_for_index,
                             &*signer,
                         )
                         .await;

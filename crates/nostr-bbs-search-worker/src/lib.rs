@@ -113,8 +113,112 @@ fn default_k() -> usize {
     10
 }
 
+/// Whether a stored vector may be returned to an anonymous `/search` caller.
+///
+/// **Fail-closed by design, and deliberately left that way.** Membership of
+/// `public_labels` is the only thing that makes a vector visible: a label that
+/// was never ingested with `public: true` — or whose visibility predates the
+/// `publicLabels` set entirely — is invisible. The alternative (default-visible)
+/// would turn any ingest bug, any legacy mapping, or any dropped field into a
+/// disclosure of private-channel content, which is a far worse failure than an
+/// empty result set. The correct place to fix "search returns nothing" is the
+/// ingest caller declaring `public: true`, never a relaxation here.
 fn is_search_visible(public_labels: &std::collections::HashSet<u64>, label: u64) -> bool {
     public_labels.contains(&label)
+}
+
+/// How many extra candidates to pull out of the k-NN store per requested hit.
+///
+/// `VectorStore::search` truncates to its `k` *before* this module applies the
+/// public-visibility filter, so asking for exactly `k` and then filtering can
+/// only ever shrink the result set — in an index where the top-`k` neighbours
+/// happen to be private, a perfectly good public match ranked `k+1` is never
+/// considered and search returns fewer hits (or none) for no visible reason.
+/// Over-fetching gives the filter something to consume.
+const OVERFETCH_FACTOR: usize = 4;
+
+/// Absolute ceiling on the over-fetch, so a large `k` cannot make the worker
+/// score-and-sort an unbounded slice on every request. `k` is already clamped to
+/// 100 by the handler, so this only ever binds at the top of that range.
+const OVERFETCH_CAP: usize = 400;
+
+/// Candidate count to request from the store for a caller-requested `k`.
+///
+/// Never returns less than `k` (a cap below `k` would reintroduce the starvation
+/// it exists to prevent) and saturates rather than overflowing.
+fn overfetch_k(k: usize) -> usize {
+    k.saturating_mul(OVERFETCH_FACTOR).min(OVERFETCH_CAP).max(k)
+}
+
+/// Apply the public-visibility filter to over-fetched candidates, then cut to
+/// the `k` the caller actually asked for.
+///
+/// Order matters and is the whole point: filter first, truncate second. The
+/// candidates arrive already sorted by descending score, and both operations
+/// preserve that order, so the result is the top `k` *visible* hits.
+fn visible_top_k(
+    candidates: &[(u64, f32)],
+    public_labels: &std::collections::HashSet<u64>,
+    k: usize,
+) -> Vec<(u64, f32)> {
+    candidates
+        .iter()
+        .filter(|(label, _)| is_search_visible(public_labels, *label))
+        .take(k)
+        .copied()
+        .collect()
+}
+
+/// Trim a caller-supplied query and reject it if nothing is left.
+///
+/// A whitespace-only query is not "a query with no results" — it is not a query
+/// at all. Without the trim it slips past the empty check, `embed_texts` yields
+/// an all-zero vector for it (see `embed.rs`), and cosine similarity against an
+/// all-zero query is `0.0` for every stored vector. Because `minScore` defaults
+/// to `0.0` and `VectorStore::search` compares with `>=`, that returns the
+/// ENTIRE index, ranked arbitrarily, as "matches". Rejecting here is the only
+/// place that costs nothing and cannot be bypassed by a stale client.
+fn normalise_query(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Reject an ingest batch in which no entry is publicly searchable.
+///
+/// Vectors ingested with `public: false` are filtered out of every `/search`
+/// response by [`is_search_visible`], so a batch that is entirely private
+/// consumes R2/KV storage and index scan time while being unreachable by
+/// construction. In practice this has always meant a caller bug (a hardcoded
+/// `public: false` at the call site), and the old behaviour — accept, persist,
+/// report `accepted: N` — made that bug indistinguishable from success.
+///
+/// Returns the caller-facing error body when the batch should be refused, or
+/// `None` when it may proceed. Deliberate un-publishing (re-ingesting known ids
+/// as private to retract them) is still supported: the caller opts in with
+/// `"allowPrivate": true`, which is an explicit statement of intent rather than
+/// an accident.
+fn all_private_ingest_rejection(
+    total_valid: u32,
+    public_count: u32,
+    allow_private: bool,
+) -> Option<serde_json::Value> {
+    if allow_private || total_valid == 0 || public_count > 0 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "error": "Every entry in this batch is non-public",
+        "detail": "Vectors ingested with `public: false` are filtered out of all /search \
+                   results, so this batch would index content that no search can ever \
+                   return. Set `public: true` on entries posted to publicly readable \
+                   channels. If you really intend to index (or retract) private-only \
+                   vectors, resend with `\"allowPrivate\": true`.",
+        "entries": total_valid,
+        "public": public_count,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -137,6 +241,12 @@ struct IngestRequest {
     /// omitted (back-compat with callers that pre-date this field).
     #[serde(default)]
     model: Option<String>,
+    /// Explicit opt-in to an all-private batch. Off by default so the common
+    /// case -- a caller that forgot to set `public` -- is caught rather than
+    /// silently indexing vectors that `/search` can never return. See
+    /// [`all_private_ingest_rejection`].
+    #[serde(default, rename = "allowPrivate")]
+    allow_private: bool,
 }
 
 /// Sentinel used when the model that produced a set of vectors is not known
@@ -324,18 +434,21 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
             body.embedding,
             body.model.unwrap_or_else(|| MODEL_UNKNOWN.to_string()),
         )
-    } else if let Some(ref text) = body.query {
-        if text.is_empty() {
+    } else if let Some(ref raw_text) = body.query {
+        // Trim BEFORE the empty check -- see `normalise_query` for why an
+        // untrimmed "   " would otherwise return the entire index.
+        let Some(text) = normalise_query(raw_text) else {
             return json_response(
                 req,
                 env,
                 &serde_json::json!({ "error": "Empty query string" }),
                 400,
             );
-        }
-        // Embed the query with the same model used at ingest time so the
-        // query vector lives in the same space as the stored vectors.
-        let (mut embs, model) = embed::embed_texts(env, std::slice::from_ref(text)).await;
+        };
+        // Embed the *trimmed* query with the same model used at ingest time so
+        // the query vector lives in the same space as the stored vectors.
+        let text = text.to_string();
+        let (mut embs, model) = embed::embed_texts(env, std::slice::from_ref(&text)).await;
         (embs.pop().unwrap_or_default(), model.to_string())
     } else {
         return json_response(
@@ -378,11 +491,15 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         return json_response(req, env, &err_body, 409);
     }
 
-    let results = store.search(&embedding, k, body.min_score);
+    // Over-fetch candidates, THEN apply the public-visibility filter, THEN cut
+    // to `k`. Filtering a set the store had already truncated to `k` could only
+    // shrink it -- an index whose top-`k` neighbours are private returned
+    // nothing at all while public matches sat just below the cut.
+    let candidates = store.search(&embedding, overfetch_k(k), body.min_score);
+    let results = visible_top_k(&candidates, &public_labels, k);
 
     let results_json: Vec<serde_json::Value> = results
         .iter()
-        .filter(|(label, _)| is_search_visible(&public_labels, *label))
         .map(|(label, score)| {
             let id = label_to_id
                 .get(label)
@@ -525,6 +642,29 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         }
     }
 
+    // Refuse a batch that could never be found before mutating anything. The
+    // check runs on the caller's declared flags (not on post-insert state) so
+    // nothing is written to R2/KV when it fails.
+    let valid_entries = body
+        .entries
+        .iter()
+        .filter(|e| !e.id.is_empty() && e.embedding.len() == DIM)
+        .count() as u32;
+    let public_entries = body
+        .entries
+        .iter()
+        .filter(|e| !e.id.is_empty() && e.embedding.len() == DIM && e.public)
+        .count() as u32;
+    if let Some(err_body) =
+        all_private_ingest_rejection(valid_entries, public_entries, body.allow_private)
+    {
+        console_warn!(
+            "Search worker: ingest rejected, all {valid_entries} entries non-public \
+             (they would be invisible to /search). Resend with allowPrivate:true if deliberate."
+        );
+        return json_response(req, env, &err_body, 400);
+    }
+
     let mut accepted = 0u32;
     let mut rejected = 0u32;
 
@@ -566,6 +706,9 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         &serde_json::json!({
             "accepted": accepted,
             "rejected": rejected,
+            // Surfaced so a caller can see at a glance how many of its entries
+            // are actually reachable by /search.
+            "public": public_entries,
             "totalVectors": store.count(),
             "engine": "rvf-rust",
             "model": ingest_model,
@@ -747,6 +890,92 @@ mod model_match_tests {
     #[test]
     fn both_unknown_does_not_block() {
         assert!(check_model_match(MODEL_UNKNOWN, MODEL_UNKNOWN).is_ok());
+    }
+
+    /// Build `n` descending-score candidates with labels `0..n`, the shape
+    /// `VectorStore::search` returns.
+    fn candidates(n: u64) -> Vec<(u64, f32)> {
+        (0..n).map(|i| (i, 1.0 - (i as f32) * 0.001)).collect()
+    }
+
+    #[test]
+    fn overfetch_pulls_more_candidates_than_requested() {
+        assert_eq!(overfetch_k(10), 40);
+        assert_eq!(overfetch_k(1), 4);
+        // Capped so a large k cannot make the worker sort an unbounded slice...
+        assert_eq!(overfetch_k(100), 400);
+        // ...but the cap can never drop below k itself.
+        assert!(overfetch_k(500) >= 500);
+        // And it must not overflow on an absurd input.
+        assert!(overfetch_k(usize::MAX) >= usize::MAX.min(OVERFETCH_CAP));
+    }
+
+    #[test]
+    fn overfetch_then_filter_returns_k_visible_hits() {
+        // 40 candidates, only every 4th public. Asking the store for exactly
+        // k=10 would have yielded 10 candidates of which just 2-3 survive the
+        // filter; over-fetching 4x gives the filter enough to return a full k.
+        let public: std::collections::HashSet<u64> = (0..40).filter(|l| l % 4 == 0).collect();
+        let all = candidates(overfetch_k(10) as u64);
+        let hits = visible_top_k(&all, &public, 10);
+        assert_eq!(hits.len(), 10, "public filter starved the result set");
+        assert!(hits.iter().all(|(l, _)| l % 4 == 0));
+        // Still ordered by descending score, and headed by the best public hit.
+        assert_eq!(hits[0].0, 0);
+        assert!(hits.windows(2).all(|w| w[0].1 >= w[1].1));
+    }
+
+    #[test]
+    fn visible_top_k_filters_before_truncating() {
+        // Labels 0..9 are all private, 10..19 public. A filter applied AFTER a
+        // truncate-to-10 would return nothing; filtering first returns 10.
+        let public: std::collections::HashSet<u64> = (10..20).collect();
+        let hits = visible_top_k(&candidates(20), &public, 10);
+        assert_eq!(hits.len(), 10);
+        assert_eq!(hits[0].0, 10);
+    }
+
+    #[test]
+    fn visible_top_k_returns_empty_when_nothing_is_public() {
+        let public = std::collections::HashSet::new();
+        assert!(visible_top_k(&candidates(40), &public, 10).is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_query_is_rejected() {
+        // The bug: only `""` was rejected, so "   " reached the embedder, became
+        // an all-zero vector, scored 0.0 against everything and -- with the
+        // default minScore of 0.0 and a `>=` comparison -- matched the whole index.
+        assert_eq!(normalise_query("   "), None);
+        assert_eq!(normalise_query("\t\n  \r"), None);
+        assert_eq!(normalise_query(""), None);
+    }
+
+    #[test]
+    fn non_empty_query_is_trimmed_not_rejected() {
+        assert_eq!(normalise_query("  hello world  "), Some("hello world"));
+        assert_eq!(normalise_query("a"), Some("a"));
+    }
+
+    #[test]
+    fn all_private_batch_is_rejected_with_a_warning_body() {
+        let err = all_private_ingest_rejection(3, 0, false)
+            .expect("an all-private batch must be refused");
+        assert_eq!(err["error"], "Every entry in this batch is non-public");
+        assert_eq!(err["entries"], 3);
+        assert_eq!(err["public"], 0);
+        assert!(err["detail"].as_str().unwrap().contains("allowPrivate"));
+    }
+
+    #[test]
+    fn mixed_and_opted_in_batches_are_accepted() {
+        // One public entry is enough -- the batch is not unreachable.
+        assert!(all_private_ingest_rejection(3, 1, false).is_none());
+        // Deliberate private-only ingest / retraction opts in explicitly.
+        assert!(all_private_ingest_rejection(3, 0, true).is_none());
+        // Nothing valid to judge: the existing "Missing entries" / per-entry
+        // rejection paths own that case.
+        assert!(all_private_ingest_rejection(0, 0, false).is_none());
     }
 
     #[test]
