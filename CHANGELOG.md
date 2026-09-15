@@ -9,6 +9,61 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ### Fixed — forum member feedback, September 2026
 
+- **Search can return a result at all, and is reachable on a phone.** The client
+  ingested every message with `public: false` hardcoded, and the worker
+  fail-closes on that flag — so every vector ever indexed was filtered out of
+  every response and `/search` could only ever return `[]`. `public` is now
+  derived from the owning zone's read policy (`required_cohorts.is_empty()`),
+  failing closed for any zone that cannot be resolved, because `/search` is
+  unauthenticated and gated content must not become searchable. The worker's
+  fail-closed default is kept, and `/ingest` now rejects an all-private batch
+  rather than silently writing unreachable vectors. Alongside that: results were
+  truncated to `k` *before* the visibility filter ran (now over-fetch then
+  filter); `search_client.rs` defaulted its API base to `search.example.com`, an
+  unresolvable reserved domain, and disagreed with `global_search.rs` (now one
+  runtime-resolved base, with `SETUP.md`'s documented variable name reconciled
+  with the code's); both clients sent `limit` where the worker reads `k`, locked
+  in by a test asserting the wrong field; and a whitespace-only query produced
+  an all-zero embedding that matched the entire index at score 0. Finally,
+  mobile had **no** reachable search entry point — the nav button is
+  desktop-only, the hamburger item is behind an auth gate, the bottom nav has
+  none and Ctrl/Cmd+K does not exist on touch — so a search button now sits
+  beside the hamburger, outside any auth gate.
+
+- **A reply addressed to you now reaches you, and cannot be silenced forever.**
+  Two defects, neither of them the obvious one (replies *do* carry the parent
+  author's p-tag). First, unread is gated on a *per-channel* read position that
+  render-time effects stamp to the channel's newest message — opening a
+  section's topic-title list marked every reply in every topic of that section
+  read, having shown the reader nothing but titles. A post that p-tags you now
+  bypasses that gate: being addressed by name and "this channel is marked read"
+  are different claims. Second, the producer wrote the event id into the
+  *persisted* dedup set **before** testing notifiability, so anything evaluated
+  during a transient bad state was burned in and could never notify again, on
+  any future reload. Verdicts are now classified by durability, and only
+  irreversible ones are recorded. Editing a reply also no longer drops the topic
+  author's routing p-tag.
+
+- **@-mentions render as links in posts.** The composer, the p-tag emission and
+  the NIP-27 renderer were all already present — but `PostBody` passed the post
+  text to `MentionText` *without its tags*, and tags are how a typed `@handle`
+  resolves to a pubkey. A mention of anyone not already cached in the session
+  degraded to plain grey text, which from a reader's seat is indistinguishable
+  from mentions not working.
+
+### Added — forum member feedback, September 2026
+
+- **Your own reaction emoji.** The picker's set was a compile-time const of
+  eight. A per-user list now persists to localStorage (capped, validated by
+  length and shape rather than by an emoji whitelist, so flags, ZWJ sequences
+  and skin-tone modifiers survive), with an add box and a per-entry remove
+  control in the picker.
+- **A conventional add-reaction affordance.** The literal `"+"` is replaced by
+  Slack's smiley-with-plus icon, with a tooltip and proper ARIA. It stays
+  permanently visible at low opacity rather than fading in on hover — a
+  hover-only affordance is unreachable on touch, which is the trap the original
+  was already close to.
+
 - **The mobile compose bar no longer sits under the bottom nav, and threads are
   ~30% tighter.** The chat and DM columns sized themselves `100vh` minus the
   header only, reserving nothing for the *fixed* bottom nav, so the composer and
