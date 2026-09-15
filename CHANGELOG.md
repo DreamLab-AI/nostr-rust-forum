@@ -9,6 +9,19 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ### Fixed — forum member feedback, September 2026
 
+- **The mobile compose bar no longer sits under the bottom nav, and threads are
+  ~30% tighter.** The chat and DM columns sized themselves `100vh` minus the
+  header only, reserving nothing for the *fixed* bottom nav, so the composer and
+  the tail of the message list were covered by it. Ancestor padding could not
+  compensate — the column's height is absolute, not content-driven, which is why
+  the compensation *looked* present. A published `--forum-mobile-nav-h` token
+  re-derives those heights from `100dvh` minus header, nav and safe-area inset;
+  the notification drawer had the same defect and the same fix. Alongside it, a
+  measured density pass below 639px on card padding, reply-stack gaps, meta
+  gutters and composer margins, and nested-reply indentation reduced from 30px
+  to 20px while keeping the left rule as the nesting signal. No tap target
+  shrinks: the 32px send button gains a 44px hit expander.
+
 - **DM history is viewable again, and senders keep their own copy.** Four
   independent defects, all of which had to be fixed for a conversation to load:
   - Gift-wrap (kind-1059) filters constrained `authors`. A wrap is signed by a
