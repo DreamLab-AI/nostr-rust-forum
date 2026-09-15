@@ -378,7 +378,21 @@ impl DMStore {
         // Optimistic local update — keyed by a temporary local ID. When the real
         // gift-wrap event ID is known we re-key the dedup entry so the inbound
         // echo (if any) does not duplicate the bubble.
-        let local_id = format!("local-{}-{}", now, content.len());
+        // Collision-resistant optimistic key.
+        //
+        // This was `format!("local-{}-{}", now, content.len())`, with `now` in
+        // whole seconds — so two messages of equal byte length sent in the same
+        // second ("hey" and "yo!") produced the SAME key. The second one's
+        // `seen_ids.insert` then returned false, its bubble was never pushed,
+        // and the later re-key step operated on a shared key, corrupting the
+        // dedup index for both. Both messages still reached the relay; the
+        // sender just could not see one of them, which reads as a lost message.
+        let local_id = format!(
+            "local-{}-{}-{:08x}",
+            now,
+            content.len(),
+            (js_sys::Math::random() * (u32::MAX as f64)) as u32
+        );
         let msg = DMMessage {
             id: local_id.clone(),
             sender_pubkey: my_pubkey.to_string(),

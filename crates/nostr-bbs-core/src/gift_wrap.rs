@@ -16,7 +16,7 @@ use crate::nip44;
 use k256::schnorr::SigningKey;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -132,13 +132,26 @@ fn randomized_timestamp() -> u64 {
     let offset_raw =
         u32::from_le_bytes([rand_bytes[0], rand_bytes[1], rand_bytes[2], rand_bytes[3]]);
     let offset = (offset_raw % TIMESTAMP_JITTER_SECS) as u64;
-    let add = rand_bytes[4] & 1 == 0;
 
-    if add {
-        now.saturating_add(offset)
-    } else {
-        now.saturating_sub(offset)
-    }
+    // PAST ONLY — never the future.
+    //
+    // This used to pick a direction from `rand_bytes[4] & 1`, jittering
+    // symmetrically about `now`. NIP-59 specifies backdating for a reason
+    // beyond metadata hygiene: the wrap's `created_at` is the ONLY timestamp a
+    // relay can see (the seal's is inside the ciphertext), and relays routinely
+    // refuse events dated more than a few minutes ahead — strfry's
+    // `max_created_at` being the common example. A coin-flip direction meant
+    // roughly HALF of all outbound DMs were stamped up to two days in the
+    // future and silently dropped at admission, with the sender seeing a
+    // perfectly normal optimistic bubble.
+    //
+    // Clients also assume backdating when they widen a realtime `since` window
+    // to catch live wraps (see the forum client's `GIFT_WRAP_LOOKBACK_SECS`);
+    // a future-stamped wrap defeats that too.
+    //
+    // `rand_bytes` stays 5 bytes wide so the draw is unchanged in shape; the
+    // fifth is simply no longer consulted.
+    now.saturating_sub(offset)
 }
 
 // ── Hex helpers ──────────────────────────────────────────────────────────────
@@ -245,7 +258,12 @@ pub fn wrap_seal(seal: &NostrEvent, recipient_pubkey: &str) -> Result<NostrEvent
     let throwaway = generate_keypair()
         .map_err(|e| GiftWrapError::KeyError(format!("throwaway keypair generation: {e}")))?;
 
-    let throwaway_sk_bytes = *throwaway.secret.as_bytes();
+    // `Zeroizing` scrubs on drop, including on the early `?` returns below.
+    // The previous code copied the array into a local and zeroized THAT copy,
+    // leaving the original binding (and the SigningKey built from it) holding
+    // live key bytes until ordinary stack teardown — i.e. the intended
+    // defence-in-depth scrub was a no-op.
+    let throwaway_sk_bytes = Zeroizing::new(*throwaway.secret.as_bytes());
     let throwaway_pubkey = throwaway.public.to_hex();
 
     // Serialize the seal to JSON
@@ -268,16 +286,15 @@ pub fn wrap_seal(seal: &NostrEvent, recipient_pubkey: &str) -> Result<NostrEvent
         content: encrypted,
     };
 
-    let throwaway_signing_key = SigningKey::from_bytes(&throwaway_sk_bytes)
+    let throwaway_signing_key = SigningKey::from_bytes(&*throwaway_sk_bytes)
         .map_err(|e| GiftWrapError::KeyError(format!("throwaway signing key: {e}")))?;
 
     let wrapped = sign_event(unsigned_wrap, &throwaway_signing_key)
         .map_err(|e| GiftWrapError::KeyError(format!("gift wrap signing failed: {e}")))?;
 
-    // Zeroize throwaway secret key material
-    let mut sk_to_zeroize = throwaway_sk_bytes;
-    sk_to_zeroize.zeroize();
-    // The Keypair's SecretKey also auto-zeroizes on drop via its Zeroize derive.
+    // `throwaway_sk_bytes` is `Zeroizing`, so it scrubs itself on drop here and
+    // on every early return above. The Keypair's SecretKey also auto-zeroizes
+    // on drop via its Zeroize derive.
 
     Ok(wrapped)
 }
@@ -991,6 +1008,35 @@ mod tests {
         let unwrapped = block_on(unwrap_gift_with_signer(&wrapped, &recipient)).unwrap();
         assert_eq!(unwrapped.sender_pubkey, sender_pk);
         assert_eq!(unwrapped.rumor.content, content);
+    }
+
+    #[test]
+    fn wrap_timestamps_are_never_in_the_future() {
+        // The wrap's created_at is the ONLY timestamp a relay can see, and
+        // relays routinely refuse events dated ahead of now. A symmetric jitter
+        // meant ~half of all outbound DMs were silently dropped at admission
+        // while the sender saw a normal optimistic bubble.
+        //
+        // 200 draws: at p=0.5 per draw, a regression to symmetric jitter fails
+        // this with probability 1 - 2^-200.
+        let (sender, _) = prf_signer();
+        let (_recipient, recipient_pk) = prf_signer();
+
+        for _ in 0..200 {
+            let now = now_secs();
+            let wrapped =
+                block_on(gift_wrap_with_signer(&sender, &recipient_pk, "backdate me")).unwrap();
+            assert!(
+                wrapped.created_at <= now + 1,
+                "wrap created_at {} is ahead of now {} — relays will reject it",
+                wrapped.created_at,
+                now
+            );
+            assert!(
+                wrapped.created_at + TIMESTAMP_JITTER_SECS as u64 >= now,
+                "wrap backdated further than the declared jitter window"
+            );
+        }
     }
 
     // ── NIP-17 wrap PAIR (sender keeps a readable copy) ─────────────────────

@@ -30,6 +30,29 @@ type RawHit = (String, Option<f64>, Option<String>, Option<String>);
 /// Shared open-state for the global search overlay. The app shell provides this
 /// via context so a visible nav button can open the very same panel that the
 /// Cmd/Ctrl+K shortcut toggles.
+
+/// Truncate `text` to at most `max_chars` characters, appending an ellipsis
+/// when it was shortened.
+///
+/// Counts and slices by CHARACTER, never by byte. The previous code did
+/// `&content[..77]` after checking `content.len() > 80` — `len()` is bytes, so
+/// any content whose 77th byte landed mid-codepoint panicked. In Rust a panic
+/// in WASM aborts the module: one message containing an emoji or any non-ASCII
+/// script at the wrong offset would take down the entire client for everyone
+/// who searched and matched it. Both call sites read fully attacker-controlled
+/// text (a message body, a channel description), so this was reachable by
+/// anyone who can post.
+fn ellipsise(text: &str, max_chars: usize) -> String {
+    // `chars().count()` is O(n) but these strings are short and the alternative
+    // (byte length) is exactly the bug.
+    if text.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub(3);
+        format!("{}...", text.chars().take(keep).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct SearchOpen(pub RwSignal<bool>);
 use std::rc::Rc;
@@ -104,11 +127,7 @@ impl Hit {
         match self {
             Self::Channel { name, .. } => name.clone(),
             Self::Message { content, .. } | Self::SemanticMessage { content, .. } => {
-                if content.len() > 80 {
-                    format!("{}...", &content[..77])
-                } else {
-                    content.clone()
-                }
+                ellipsise(content, 80)
             }
             // Tracked: title()/subtitle() run inside the reactive results
             // closure, so the list re-renders when kind-0 metadata arrives.
@@ -392,11 +411,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                         .cloned()
                         .unwrap_or_default();
                     if nm.to_lowercase().contains(&qs) {
-                        let d = if ev.content.len() > 100 {
-                            format!("{}...", &ev.content[..97])
-                        } else {
-                            ev.content.clone()
-                        };
+                        let d = ellipsise(&ev.content, 100);
                         found.update(|v| {
                             v.push(Hit::Channel {
                                 id: nm.clone(),
@@ -744,6 +759,43 @@ fn save_recent(q: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    // ── UTF-8 truncation (WASM-abort regression) ────────────────────────────
+
+    #[test]
+    fn ellipsise_does_not_panic_on_a_multibyte_boundary() {
+        // The regression: `&content[..77]` after `content.len() > 80`. `len()`
+        // is bytes, so a codepoint straddling byte 77 panicked — and a panic in
+        // WASM aborts the whole module. Every one of these strings puts a
+        // multi-byte character at or across the old cut point.
+        for s in [
+            "a".repeat(76) + "\u{1F600}\u{1F600}\u{1F600}",
+            "\u{1F600}".repeat(40),
+            "e\u{0301}".repeat(60),
+            "\u{4F60}\u{597D}".repeat(50),
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}".repeat(10),
+        ] {
+            let out = ellipsise(&s, 80);
+            assert!(out.chars().count() <= 80);
+        }
+    }
+
+    #[test]
+    fn ellipsise_leaves_short_text_alone() {
+        assert_eq!(ellipsise("hello", 80), "hello");
+        // Counted in CHARS: 40 emoji are 160 bytes but only 40 characters, so
+        // this must NOT be truncated at a byte-based threshold of 80.
+        let forty = "\u{1F600}".repeat(40);
+        assert_eq!(ellipsise(&forty, 80), forty);
+    }
+
+    #[test]
+    fn ellipsise_marks_truncation_and_respects_the_budget() {
+        let long = "a".repeat(200);
+        let out = ellipsise(&long, 80);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 80);
+    }
     use super::*;
 
     // Pure tests only: the overlay itself is Leptos/wasm, but the wire contract
