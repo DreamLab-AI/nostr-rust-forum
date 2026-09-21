@@ -1000,7 +1000,6 @@ mod tests {
     // transient bad state became permanent. These tests pin the durability
     // classification that fix depends on.
 
-
     #[test]
     fn a_read_position_rejection_is_not_permanent() {
         // THE regression. Read positions are written by render-time effects and
@@ -1008,7 +1007,14 @@ mod tests {
         // as read). If such a rejection burned the id, the reply could never
         // notify again — on this reload or any future one. It must stay
         // re-checkable.
-        let v = classify_post(OTHER, 100, Some(ME), /* read_ts */ 200, /* baseline */ 0, false);
+        let v = classify_post(
+            OTHER,
+            100,
+            Some(ME),
+            /* read_ts */ 200,
+            /* baseline */ 0,
+            false,
+        );
         assert_eq!(v, PostVerdict::AlreadyRead);
         assert!(
             !v.is_permanent(),
@@ -1051,7 +1057,14 @@ mod tests {
     fn baseline_beats_read_position() {
         // Same principle one level down: pre-baseline is immutable, read
         // position is not, so pre-baseline must win when both apply.
-        let v = classify_post(OTHER, 100, Some(ME), /* read */ 150, /* baseline */ 150, false);
+        let v = classify_post(
+            OTHER,
+            100,
+            Some(ME),
+            /* read */ 150,
+            /* baseline */ 150,
+            false,
+        );
         assert_eq!(v, PostVerdict::BeforeBaseline);
         assert!(v.is_permanent());
     }

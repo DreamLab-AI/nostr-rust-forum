@@ -10,9 +10,7 @@ use leptos::prelude::*;
 
 use nostr_bbs_core::governance::{self, PanelDefinition};
 
-use crate::utils::governance_view::{
-    self, CaseBoundary, ChainStep, PanelContext, PanelRef,
-};
+use crate::utils::governance_view::{self, CaseBoundary, ChainStep, PanelContext, PanelRef};
 
 /// The NIP-33 address of a replaceable governance event: the author plus its
 /// `d` tag.
@@ -99,8 +97,7 @@ impl ActionEntry {
             risk_tier: self.risk_tier.as_deref().map(governance::RiskTier::parse),
             confidence: self.confidence,
             task_properties: governance::TaskProperties::from_tags(&self.tags),
-            probe: governance::extract_tag(&self.tags, governance::TAG_PROBE)
-                .map(str::to_string),
+            probe: governance::extract_tag(&self.tags, governance::TAG_PROBE).map(str::to_string),
         }
     }
 
@@ -118,11 +115,7 @@ impl ActionEntry {
     /// has no key with which to recompute it and must not be given one. It
     /// comes from [`crate::stores::case_projection`], and `false` where the
     /// relay has said nothing.
-    pub fn boundary(
-        &self,
-        panel: Option<&PanelContext>,
-        calibration_sample: bool,
-    ) -> CaseBoundary {
+    pub fn boundary(&self, panel: Option<&PanelContext>, calibration_sample: bool) -> CaseBoundary {
         governance_view::compute_boundary(
             &self.agent_pubkey,
             &self.tags,
@@ -132,7 +125,6 @@ impl ActionEntry {
             calibration_sample,
         )
     }
-
 }
 
 /// A single human decision (kind-31403 `ActionResponse`) on a case, tracked so
@@ -299,13 +291,13 @@ impl PanelRegistry {
                             created_at: event.created_at,
                             event_id: event.id.clone(),
                             confidence: req.confidence,
-                            risk_tier: req
-                                .risk_tier
-                                .map(|t| t.as_str().to_string())
-                                .or_else(|| {
-                                    governance::extract_tag(&event.tags, "risk-tier")
-                                        .map(|t| governance::RiskTier::parse(t).as_str().to_string())
-                                }),
+                            risk_tier: req.risk_tier.map(|t| t.as_str().to_string()).or_else(
+                                || {
+                                    governance::extract_tag(&event.tags, "risk-tier").map(|t| {
+                                        governance::RiskTier::parse(t).as_str().to_string()
+                                    })
+                                },
+                            ),
                             // Scheme-validated at INGEST so a `javascript:`
                             // URI never enters the reactive store. The view
                             // re-checks before binding an href; either alone
@@ -451,12 +443,7 @@ impl PanelRegistry {
 ///
 /// Pure over the two (timestamp, id) pairs so the rule is testable and stated
 /// once rather than re-derived at each of the five ingest arms.
-pub fn supersedes_held(
-    incoming_at: u64,
-    incoming_id: &str,
-    held_at: u64,
-    held_id: &str,
-) -> bool {
+pub fn supersedes_held(incoming_at: u64, incoming_id: &str, held_at: u64, held_id: &str) -> bool {
     match incoming_at.cmp(&held_at) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
@@ -712,11 +699,19 @@ mod tests {
         let item = action("case-1", "agent", vec![tag("panel", "p-1")]);
         let ctx = resolve_panel_for(&panels, &item.tags, &item.agent_pubkey).map(|p| p.context());
         assert_eq!(item.risk_tier.as_deref(), Some("low"));
-        assert_eq!(item.boundary(ctx.as_ref(), false).effective, governance::RiskTier::High);
+        assert_eq!(
+            item.boundary(ctx.as_ref(), false).effective,
+            governance::RiskTier::High
+        );
         assert!(item.boundary(ctx.as_ref(), false).is_member_visible());
 
         // Without that operator declaration the same `low` request is hidden.
-        let bare = panel_map(vec![panel("p-1", "agent", 100, vec![tag("calibration-sample-rate", "0")])]);
+        let bare = panel_map(vec![panel(
+            "p-1",
+            "agent",
+            100,
+            vec![tag("calibration-sample-rate", "0")],
+        )]);
         let ctx = resolve_panel_for(&bare, &item.tags, &item.agent_pubkey).map(|p| p.context());
         assert!(!item.boundary(ctx.as_ref(), false).is_member_visible());
     }
@@ -767,7 +762,10 @@ mod tests {
         r.ingest_event(&panel_event("p-1", "operator", 200, "critical"));
         let addr = panel_address("operator", "p-1");
         assert_eq!(
-            r.state.read_untracked().panels[&addr].definition.task_properties, None,
+            r.state.read_untracked().panels[&addr]
+                .definition
+                .task_properties,
+            None,
             "the triple rides tags here, not content"
         );
         assert_eq!(r.state.read_untracked().panels[&addr].last_updated, 200);
@@ -775,7 +773,10 @@ mod tests {
         // Replay of the older, looser declaration.
         r.ingest_event(&panel_event("p-1", "operator", 100, "bounded"));
         let s = r.state.read_untracked();
-        assert_eq!(s.panels[&addr].last_updated, 200, "older event replaced a newer one");
+        assert_eq!(
+            s.panels[&addr].last_updated, 200,
+            "older event replaced a newer one"
+        );
         assert_eq!(
             s.panels[&addr].context().task_properties.unwrap().stakes,
             governance::Stakes::Critical,
@@ -855,7 +856,11 @@ mod tests {
         let mut panels = HashMap::new();
         panels.insert(honest.address(), honest);
         panels.insert(hostile.address(), hostile);
-        assert_eq!(panels.len(), 2, "the hostile panel did not replace the honest one");
+        assert_eq!(
+            panels.len(),
+            2,
+            "the hostile panel did not replace the honest one"
+        );
 
         // A request against the operator's panel still resolves the operator's
         // declaration, and so still floors at `high`.

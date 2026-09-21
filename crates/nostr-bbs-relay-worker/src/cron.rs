@@ -568,11 +568,7 @@ pub struct AgeingSweepResult {
 /// `created_at` are seconds, `max_pending_hours` is the panel's declared
 /// deadline (or the documented default for a case that predates it). A case
 /// exactly *at* its deadline has not yet exceeded it.
-pub(crate) fn is_past_pending_deadline(
-    created_at: u64,
-    now: u64,
-    max_pending_hours: u32,
-) -> bool {
+pub(crate) fn is_past_pending_deadline(created_at: u64, now: u64, max_pending_hours: u32) -> bool {
     let hours = if max_pending_hours == 0 {
         nostr_bbs_core::governance::DEFAULT_MAX_PENDING_HOURS
     } else {
@@ -664,7 +660,9 @@ pub async fn escalate_stale_cases(env: &Env) -> Result<AgeingSweepResult, String
                     nostr_bbs_core::governance::ReceiptStage::EscalatedOnAge.as_str(),
                 ),
                 JsValue::from_f64(now as f64),
-                JsValue::from_str(&format!("pending {age_hours}h against a {deadline}h deadline")),
+                JsValue::from_str(&format!(
+                    "pending {age_hours}h against a {deadline}h deadline"
+                )),
             ]);
         match insert {
             Ok(stmt) => match stmt.run().await {
@@ -1003,7 +1001,11 @@ mod ageing_tests {
     fn the_deadline_boundary_is_exclusive() {
         let created = 1_000_000;
         assert!(!is_past_pending_deadline(created, created + 72 * HOUR, 72));
-        assert!(is_past_pending_deadline(created, created + 72 * HOUR + 1, 72));
+        assert!(is_past_pending_deadline(
+            created,
+            created + 72 * HOUR + 1,
+            72
+        ));
     }
 
     #[test]

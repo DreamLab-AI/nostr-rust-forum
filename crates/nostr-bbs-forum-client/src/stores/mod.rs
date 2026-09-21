@@ -17,7 +17,7 @@ pub mod panel_registry;
 pub mod preferences;
 pub mod profile_cache;
 pub mod reactions;
-pub mod receipts;
 pub mod read_position;
+pub mod receipts;
 pub mod zone_access;
 pub mod zones;

@@ -1184,7 +1184,9 @@ pub async fn handle_receipt_application(
     let caller_pubkey_lc = caller_pubkey.to_ascii_lowercase();
     let caller = ApplicationCaller {
         is_admin: crate::admin::is_admin(&caller_pubkey, env).await,
-        is_registered_agent: is_registered_agent(env, &caller_pubkey).await.unwrap_or(false),
+        is_registered_agent: is_registered_agent(env, &caller_pubkey)
+            .await
+            .unwrap_or(false),
         is_case_owner: case
             .as_ref()
             .is_some_and(|c| c.created_by.to_ascii_lowercase() == caller_pubkey_lc),
@@ -1601,7 +1603,10 @@ mod augmentation_api_tests {
     #[test]
     fn a_registered_agent_may_report_the_ordinary_stages() {
         for (current, requested) in [
-            (ReceiptStage::ProjectionCommitted, ReceiptStage::ConsumerReceived),
+            (
+                ReceiptStage::ProjectionCommitted,
+                ReceiptStage::ConsumerReceived,
+            ),
             (ReceiptStage::ConsumerReceived, ReceiptStage::Applied),
             (ReceiptStage::ConsumerReceived, ReceiptStage::NotApplied),
         ] {
@@ -1841,10 +1846,10 @@ mod augmentation_api_tests {
     #[test]
     fn calibration_and_probe_columns() {
         let rows = vec![
-            row("alice", "reject", 10, false, true),   // probe caught
-            row("alice", "approve", 10, false, true),  // probe missed
-            row("alice", "approve", 10, true, false),  // calibration decided
-            row("bob", "approve", 10, true, false),    // calibration decided
+            row("alice", "reject", 10, false, true),  // probe caught
+            row("alice", "approve", 10, false, true), // probe missed
+            row("alice", "approve", 10, true, false), // calibration decided
+            row("bob", "approve", 10, true, false),   // calibration decided
         ];
         let stats = aggregate_reviewers(&rows);
         let alice = &stats[0];
@@ -1891,7 +1896,11 @@ mod augmentation_api_tests {
     #[test]
     fn a_probe_is_revealed_once_the_case_is_decided() {
         for state in ["decided", "resolved", "rejected", "superseded", "closed"] {
-            assert_eq!(redact_probe(state, Some("deadbeef")), Some("deadbeef"), "{state}");
+            assert_eq!(
+                redact_probe(state, Some("deadbeef")),
+                Some("deadbeef"),
+                "{state}"
+            );
         }
     }
 

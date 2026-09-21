@@ -107,10 +107,7 @@ fn runtime_search_base() -> Option<String> {
 /// Resolved on every call (not cached in a `const`) precisely so the runtime
 /// `window.__ENV__` value wins over anything baked in at build time.
 pub fn search_api_base() -> String {
-    resolve_search_base(
-        runtime_search_base().as_deref(),
-        SEARCH_API_COMPILE_TIME,
-    )
+    resolve_search_base(runtime_search_base().as_deref(), SEARCH_API_COMPILE_TIME)
 }
 
 // ── Wire-body builders (pure, host-testable) ──
@@ -469,7 +466,10 @@ mod tests {
         let body = build_embedding_search_body(&[0.5, -0.25], 7, 0.3);
         assert!(body.contains(r#""k":7"#), "body was {body}");
         assert!(body.contains(r#""minScore":0.3"#), "body was {body}");
-        assert!(body.contains(r#""embedding":[0.5,-0.25]"#), "body was {body}");
+        assert!(
+            body.contains(r#""embedding":[0.5,-0.25]"#),
+            "body was {body}"
+        );
         assert!(!body.contains("limit"), "stale `limit` key in {body}");
     }
 
@@ -479,7 +479,10 @@ mod tests {
         assert!(body.contains(r#""k":10"#), "body was {body}");
         // Trimmed (a whitespace-only query would otherwise embed to an all-zero
         // vector and match the entire index at score 0.0) and quote-escaped.
-        assert!(body.contains(r#""query":"hello \"world\"""#), "body was {body}");
+        assert!(
+            body.contains(r#""query":"hello \"world\"""#),
+            "body was {body}"
+        );
         assert!(!body.contains("limit"), "stale `limit` key in {body}");
     }
 
@@ -495,8 +498,8 @@ mod tests {
     fn search_result_parses_without_a_score_field() {
         // A response row missing `score` used to fail the WHOLE parse, so one
         // cosmetic gap read to the user as "search is broken".
-        let parsed: SearchResult = serde_json::from_str(r#"{"id":"abc"}"#)
-            .expect("a score-less row must still parse");
+        let parsed: SearchResult =
+            serde_json::from_str(r#"{"id":"abc"}"#).expect("a score-less row must still parse");
         assert_eq!(parsed.id, "abc");
         assert_eq!(parsed.score, 0.0);
         assert_eq!(parsed.distance, 0.0);

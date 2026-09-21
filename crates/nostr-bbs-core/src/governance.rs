@@ -219,7 +219,6 @@ impl RiskTier {
     }
 }
 
-
 // ── Task properties: the operator-declared human–agent boundary (ADR-2011) ──
 
 /// How far an outcome can be checked after the fact.
@@ -700,7 +699,6 @@ impl PanelPolicy {
     }
 }
 
-
 // ── Human rationale on a consequential decision (FR2.2) ─────────────────────
 
 /// The minimum length, in Unicode scalar values, of a human rationale on a
@@ -839,7 +837,10 @@ mod rationale_tests {
                     check_rationale(tier, action, Some("too short")).is_err(),
                     "{action} at {tier:?} accepted a short rationale"
                 );
-                assert_eq!(check_rationale(tier, action, Some(&twenty_astral())), Ok(()));
+                assert_eq!(
+                    check_rationale(tier, action, Some(&twenty_astral())),
+                    Ok(())
+                );
             }
         }
     }
@@ -999,7 +1000,10 @@ impl ReceiptStage {
 
     /// A terminal application stage: the mutation owner has said what happened.
     pub fn is_terminal_application(self) -> bool {
-        matches!(self, Self::Applied | Self::NotApplied | Self::AppliedManually)
+        matches!(
+            self,
+            Self::Applied | Self::NotApplied | Self::AppliedManually
+        )
     }
 
     /// Whether this stage represents a mutation that actually took effect.
@@ -1012,7 +1016,10 @@ impl ReceiptStage {
 
     /// Whether a further projection attempt is warranted.
     pub fn awaits_projection(self) -> bool {
-        matches!(self, Self::Signed | Self::RelayAccepted | Self::ProjectionFailed)
+        matches!(
+            self,
+            Self::Signed | Self::RelayAccepted | Self::ProjectionFailed
+        )
     }
 }
 
@@ -3111,7 +3118,12 @@ mod task_property_tests {
         let merged = TaskProperties::merge(panel, request);
         assert_eq!(merged.reversibility, Reversibility::Irreversible);
         assert_eq!(
-            effective_tier(Some(&panel), Some(&request), Some(RiskTier::Low), RiskTier::Medium),
+            effective_tier(
+                Some(&panel),
+                Some(&request),
+                Some(RiskTier::Low),
+                RiskTier::Medium
+            ),
             RiskTier::High,
             "an irreversible panel floors the case at high whatever the request says"
         );
@@ -3166,7 +3178,12 @@ mod task_property_tests {
     /// advertised default, not to the accidental `Medium` of an absent tag.
     #[test]
     fn unlabelled_request_folds_to_advertised_default() {
-        for default in [RiskTier::Low, RiskTier::Medium, RiskTier::High, RiskTier::Critical] {
+        for default in [
+            RiskTier::Low,
+            RiskTier::Medium,
+            RiskTier::High,
+            RiskTier::Critical,
+        ] {
             assert_eq!(effective_tier(None, None, None, default), default);
         }
     }
@@ -3437,7 +3454,10 @@ mod calibration_tests {
             vec![TAG_PROBE_AGENT.to_string(), "not-a-pubkey".to_string()],
         ];
         let policy = PanelPolicy::from_tags(&tags);
-        assert_eq!(policy.calibration_sample_rate, 1.0, "clamped, not discarded");
+        assert_eq!(
+            policy.calibration_sample_rate, 1.0,
+            "clamped, not discarded"
+        );
         assert_eq!(policy.max_pending_hours, DEFAULT_MAX_PENDING_HOURS);
         assert_eq!(policy.probe_agent, None);
     }

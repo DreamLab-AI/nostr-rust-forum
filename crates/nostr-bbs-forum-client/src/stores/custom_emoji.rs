@@ -73,10 +73,7 @@ pub fn normalise_custom_emoji(raw: &str) -> Option<String> {
     // Interior whitespace or control chars means someone pasted text (or a
     // newline snuck in from a copy). Reject rather than persist a "reaction"
     // that renders as a line break in every client on the relay.
-    if trimmed
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control())
-    {
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     if trimmed.chars().count() > MAX_EMOJI_CHARS {
@@ -245,9 +242,7 @@ fn load_custom_emojis() -> Vec<String> {
 fn sanitise_list(list: Vec<String>) -> Vec<String> {
     list.into_iter()
         .filter_map(|e| normalise_custom_emoji(&e))
-        .fold(Vec::new(), |acc, e| {
-            insert_capped(acc, e, MAX_CUSTOM_EMOJI)
-        })
+        .fold(Vec::new(), |acc, e| insert_capped(acc, e, MAX_CUSTOM_EMOJI))
 }
 
 // -- Tests --------------------------------------------------------------------
@@ -351,11 +346,11 @@ mod tests {
     fn sanitise_list_drops_junk_dedupes_and_caps() {
         let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
         let mut raw = vec![
-            "  \u{1F44D} ".to_string(),   // trimmed
-            "\u{1F44D}".to_string(),      // duplicate of the above post-trim
-            "".to_string(),               // dropped
-            "a b".to_string(),            // dropped (interior whitespace)
-            family.to_string(),           // multi-codepoint survives
+            "  \u{1F44D} ".to_string(),      // trimmed
+            "\u{1F44D}".to_string(),         // duplicate of the above post-trim
+            "".to_string(),                  // dropped
+            "a b".to_string(),               // dropped (interior whitespace)
+            family.to_string(),              // multi-codepoint survives
             "x".repeat(MAX_EMOJI_CHARS + 1), // dropped (too long)
         ];
         raw.extend((0..MAX_CUSTOM_EMOJI).map(|i| format!("e{i}")));

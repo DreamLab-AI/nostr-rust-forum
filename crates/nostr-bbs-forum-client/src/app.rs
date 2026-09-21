@@ -22,20 +22,19 @@ use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, BoardPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage,
     EventsPage, ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, KnowledgePage,
-    LoginPage,
-    NoteViewPage, PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage, SignupPage,
-    ThreadPage,
+    LoginPage, NoteViewPage, PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage,
+    SignupPage, ThreadPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
+use crate::stores::case_projection::provide_case_projection_store;
 use crate::stores::channels::{provide_channel_store, use_channel_store};
+use crate::stores::custom_emoji::provide_custom_emoji_store;
 use crate::stores::mute::provide_mute_store;
 use crate::stores::panel_registry::provide_panel_registry;
-use crate::stores::case_projection::provide_case_projection_store;
-use crate::stores::receipts::provide_receipt_store;
-use crate::stores::custom_emoji::provide_custom_emoji_store;
 use crate::stores::preferences::provide_preferences;
 use crate::stores::profile_cache::{provide_profile_cache, try_use_profile_cache};
 use crate::stores::read_position::provide_read_positions;
+use crate::stores::receipts::provide_receipt_store;
 use crate::stores::zone_access::{provide_zone_access, use_zone_access};
 
 // -- Base path for sub-directory deployment -----------------------------------

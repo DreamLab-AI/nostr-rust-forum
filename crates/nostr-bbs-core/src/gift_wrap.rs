@@ -1073,8 +1073,12 @@ mod tests {
         let (sender, _sender_pk) = prf_signer();
         let (recipient, recipient_pk) = prf_signer();
 
-        let (to_recipient, to_self) =
-            block_on(gift_wrap_pair_with_signer(&sender, &recipient_pk, "same rumor")).unwrap();
+        let (to_recipient, to_self) = block_on(gift_wrap_pair_with_signer(
+            &sender,
+            &recipient_pk,
+            "same rumor",
+        ))
+        .unwrap();
 
         let theirs = block_on(unwrap_gift_with_signer(&to_recipient, &recipient)).unwrap();
         let mine = block_on(unwrap_gift_with_signer(&to_self, &sender)).unwrap();
@@ -1094,8 +1098,12 @@ mod tests {
         let (sender, sender_pk) = prf_signer();
         let (_recipient, recipient_pk) = prf_signer();
 
-        let (to_recipient, to_self) =
-            block_on(gift_wrap_pair_with_signer(&sender, &recipient_pk, "unlinkable")).unwrap();
+        let (to_recipient, to_self) = block_on(gift_wrap_pair_with_signer(
+            &sender,
+            &recipient_pk,
+            "unlinkable",
+        ))
+        .unwrap();
 
         assert_eq!(to_recipient.kind, KIND_GIFT_WRAP);
         assert_eq!(to_self.kind, KIND_GIFT_WRAP);
@@ -1135,8 +1143,12 @@ mod tests {
         let (sender, _sender_pk) = prf_signer();
         let (recipient, recipient_pk) = prf_signer();
 
-        let (_to_recipient, to_self) =
-            block_on(gift_wrap_pair_with_signer(&sender, &recipient_pk, "private")).unwrap();
+        let (_to_recipient, to_self) = block_on(gift_wrap_pair_with_signer(
+            &sender,
+            &recipient_pk,
+            "private",
+        ))
+        .unwrap();
 
         assert!(block_on(unwrap_gift_with_signer(&to_self, &recipient)).is_err());
     }

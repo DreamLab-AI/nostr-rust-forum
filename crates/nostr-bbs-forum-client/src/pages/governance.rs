@@ -16,13 +16,11 @@ use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
 use crate::relay::RelayConnection;
-use crate::stores::panel_registry::{use_panel_registry, ActionEntry, DecisionView, PanelEntry};
 use crate::stores::case_projection::use_case_projection_store;
+use crate::stores::panel_registry::{use_panel_registry, ActionEntry, DecisionView, PanelEntry};
 use crate::stores::receipts::use_receipt_store;
 use crate::stores::zone_access::use_zone_access;
-use crate::utils::governance_view::{
-    self, CardSection, CaseBoundary, MIN_RATIONALE_LEN,
-};
+use crate::utils::governance_view::{self, CardSection, CaseBoundary, MIN_RATIONALE_LEN};
 use nostr_bbs_core::governance::broker::DecisionOutcome;
 use wasm_bindgen_futures::spawn_local;
 
@@ -119,10 +117,7 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                 .map(|p| p.context());
                 let boundary = a.boundary(
                     panel.as_ref(),
-                    crate::stores::case_projection::is_calibration_sample_in(
-                        &case_state,
-                        &a.d_tag,
-                    ),
+                    crate::stores::case_projection::is_calibration_sample_in(&case_state, &a.d_tag),
                 );
                 // Scoped to the decisions bound to THIS request's event id: a
                 // colliding `d` tag must not let another case's 31403 reveal
@@ -140,8 +135,7 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                         })
                         .unwrap_or_default(),
                 );
-                let decidable =
-                    governance_view::is_decidable_by(&steps, viewer.as_deref(), admin);
+                let decidable = governance_view::is_decidable_by(&steps, viewer.as_deref(), admin);
                 let decided = governance_view::chain_is_decided(&steps);
                 ActionCardData {
                     item: a.clone(),
@@ -517,7 +511,8 @@ fn card_body_parts(card: &ActionCardData) -> Vec<(CardSection, AnyView)> {
     let b = &card.boundary;
 
     let title = card_title(item);
-    let agent_name = crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
+    let agent_name =
+        crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
     let agent_badge_pubkey = item.agent_pubkey.clone();
 
     // FR4.3: age from `created_at`, differenced client-side. `now` is read once
@@ -544,8 +539,8 @@ fn card_body_parts(card: &ActionCardData) -> Vec<(CardSection, AnyView)> {
     // reach the DOM, and it yields `None` for every undecided case. The raw
     // 31402 still carries the tag — stripping it relay-side would invalidate
     // the signature this client verifies — so the blindness is ours to keep.
-    let probe = governance_view::visible_probe(card.decided, b.probe_digest.as_deref())
-        .map(str::to_string);
+    let probe =
+        governance_view::visible_probe(card.decided, b.probe_digest.as_deref()).map(str::to_string);
 
     let header = view! {
         <div class="flex flex-wrap items-center gap-2 mb-1">
@@ -803,8 +798,8 @@ fn ActionRow(card: ActionCardData) -> impl IntoView {
             spawn_local(async move {
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {
-                        let ack: crate::relay::PublishCallback =
-                            Rc::new(move |accepted: bool, message: String| {
+                        let ack: crate::relay::PublishCallback = Rc::new(
+                            move |accepted: bool, message: String| {
                                 pending.set(None);
                                 if accepted {
                                     response_sent.set(true);
@@ -814,7 +809,8 @@ fn ActionRow(card: ActionCardData) -> impl IntoView {
                                         &format!("[governance] action response rejected by relay: {message}").into(),
                                     );
                                 }
-                            });
+                            },
+                        );
                         if let Err(e) = r.publish_with_ack(&signed, Some(ack)) {
                             web_sys::console::warn_1(
                                 &format!("[governance] Failed to publish action response: {e}")
@@ -839,9 +835,8 @@ fn ActionRow(card: ActionCardData) -> impl IntoView {
     // FR2.2: the gate. One predicate, tested in `governance_view`, applied to
     // every control — approve, reject, amend and delegate alike, because a
     // delegation on a critical case is as consequential as a decision on it.
-    let gate_ok = Memo::new(move |_| {
-        governance_view::rationale_satisfied(effective, &rationale.get())
-    });
+    let gate_ok =
+        Memo::new(move |_| governance_view::rationale_satisfied(effective, &rationale.get()));
     let blocked = move || {
         !is_authed.get() || pending.get().is_some() || response_sent.get() || !gate_ok.get()
     };
