@@ -121,7 +121,6 @@ pub fn gift_wrap_recipient(event: &NostrEvent) -> Option<String> {
     }
 }
 
-
 // ── ADR-2011: the effective escalation boundary ─────────────────────────────
 
 /// Who resolved a case — a human, or a system actor acting on its behalf.
@@ -193,7 +192,7 @@ pub(crate) fn response_action_and_reasoning(content: &str) -> (Option<String>, O
 
 /// The outcome of the 31403 admission gate (P1-6 extended by FR6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResponseAdmission {
+pub enum ResponseAdmission {
     /// The signer may decide this case.
     Admit,
     /// The signer is neither an admin nor a reviewer: decisions are not theirs.
@@ -204,12 +203,12 @@ pub(crate) enum ResponseAdmission {
 }
 
 impl ResponseAdmission {
-    pub(crate) fn is_admitted(self) -> bool {
+    pub fn is_admitted(self) -> bool {
         matches!(self, ResponseAdmission::Admit)
     }
 
     /// The relay `OK` message for a refusal.
-    pub(crate) fn reason(self) -> &'static str {
+    pub fn reason(self) -> &'static str {
         match self {
             ResponseAdmission::Admit => "",
             ResponseAdmission::BlockedNotAuthorised => {
@@ -231,7 +230,7 @@ impl ResponseAdmission {
 ///
 /// Pure so the gate is unit-testable without a `worker::Env`; the relay supplies
 /// the three booleans from `broker_roles`, its admin list, and `case_delegations`.
-pub(crate) fn response_admission(
+pub fn response_admission(
     is_admin: bool,
     is_reviewer: bool,
     delegated_for_this_case: bool,
@@ -1025,11 +1024,9 @@ impl NostrRelayDO {
                 if let Some(effective) = self.case_effective_tier(case_id).await {
                     let (action, reasoning) = response_action_and_reasoning(&event.content);
                     if let Some(action) = action {
-                        if let Err(e) = governance::check_rationale(
-                            effective,
-                            &action,
-                            reasoning.as_deref(),
-                        ) {
+                        if let Err(e) =
+                            governance::check_rationale(effective, &action, reasoning.as_deref())
+                        {
                             Self::send_ok(ws, &event.id, false, e.reason());
                             return;
                         }
@@ -2278,9 +2275,7 @@ impl NostrRelayDO {
             return false;
         };
         let Ok(stmt) = db
-            .prepare(
-                "SELECT role FROM broker_roles WHERE lower(pubkey) = ?1 AND role = ?2 LIMIT 1",
-            )
+            .prepare("SELECT role FROM broker_roles WHERE lower(pubkey) = ?1 AND role = ?2 LIMIT 1")
             .bind(&[
                 JsValue::from_str(&pubkey.to_ascii_lowercase()),
                 JsValue::from_str(governance::ROLE_REVIEWER),
@@ -3862,8 +3857,15 @@ mod augmentation_boundary_tests {
     #[test]
     fn unlabelled_request_projects_with_the_advertised_default() {
         for default in [RiskTier::Low, RiskTier::Medium, RiskTier::High] {
-            let boundary =
-                plan_request_boundary("case-1", "agent", &[tag("d", "case-1")], "{}", None, default, KEY);
+            let boundary = plan_request_boundary(
+                "case-1",
+                "agent",
+                &[tag("d", "case-1")],
+                "{}",
+                None,
+                default,
+                KEY,
+            );
             assert_eq!(boundary.effective, default);
             assert_eq!(boundary.declared, None);
             assert_eq!(boundary.props, None);
@@ -3967,10 +3969,7 @@ mod augmentation_boundary_tests {
             boundary.effective,
             boundary.calibration_sample
         ));
-        assert_eq!(
-            boundary.props.unwrap().verifiability,
-            Verifiability::Opaque
-        );
+        assert_eq!(boundary.props.unwrap().verifiability, Verifiability::Opaque);
     }
 
     // ── Calibration sampling and probes ─────────────────────────────────
@@ -4076,14 +4075,16 @@ mod augmentation_boundary_tests {
     #[test]
     fn probe_is_honoured_only_from_the_registered_probe_agent() {
         let prober = "a".repeat(64);
-        let panel = vec![
-            tag("d", "p"),
-            tag(governance::TAG_PROBE_AGENT, &prober),
-        ];
+        let panel = vec![tag("d", "p"), tag(governance::TAG_PROBE_AGENT, &prober)];
         let request = vec![tag(governance::TAG_PROBE, "deadbeef")];
 
-        let registered =
-            plan_request_boundary("c", &prober, &request, "{}", Some(&panel), RiskTier::Medium,
+        let registered = plan_request_boundary(
+            "c",
+            &prober,
+            &request,
+            "{}",
+            Some(&panel),
+            RiskTier::Medium,
             KEY,
         );
         assert_eq!(registered.probe_digest.as_deref(), Some("deadbeef"));
@@ -4118,16 +4119,13 @@ mod augmentation_boundary_tests {
     fn max_pending_hours_comes_from_the_panel_or_the_default() {
         let panel = vec![tag("d", "p"), tag(governance::TAG_MAX_PENDING_HOURS, "6")];
         assert_eq!(
-            plan_request_boundary("c", "a", &[], "{}", Some(&panel), RiskTier::Medium,
-            KEY,
-        )
+            plan_request_boundary("c", "a", &[], "{}", Some(&panel), RiskTier::Medium, KEY,)
                 .max_pending_hours,
             6
         );
         assert_eq!(
-            plan_request_boundary("c", "a", &[], "{}", None, RiskTier::Medium,
-            KEY,
-        ).max_pending_hours,
+            plan_request_boundary("c", "a", &[], "{}", None, RiskTier::Medium, KEY,)
+                .max_pending_hours,
             governance::DEFAULT_MAX_PENDING_HOURS
         );
     }
@@ -4136,7 +4134,10 @@ mod augmentation_boundary_tests {
 
     #[test]
     fn admin_decides_any_case() {
-        assert_eq!(response_admission(true, false, false), ResponseAdmission::Admit);
+        assert_eq!(
+            response_admission(true, false, false),
+            ResponseAdmission::Admit
+        );
     }
 
     /// EXP-AC-006 counter-example: a reviewer deciding a case not delegated to
@@ -4314,8 +4315,7 @@ mod req_gate_ordering_tests {
     use super::*;
 
     fn dm_filter() -> Vec<NostrFilter> {
-        vec![serde_json::from_value(serde_json::json!({ "kinds": [1059] }))
-            .expect("valid filter")]
+        vec![serde_json::from_value(serde_json::json!({ "kinds": [1059] })).expect("valid filter")]
     }
 
     /// An unauthenticated session cannot subscribe to sealed DMs at all, so
@@ -4386,8 +4386,7 @@ mod rationale_gate_tests {
 
     #[test]
     fn an_absent_reasoning_field_reads_as_absent() {
-        let (action, reasoning) =
-            response_action_and_reasoning(r#"{"action":"approve"}"#);
+        let (action, reasoning) = response_action_and_reasoning(r#"{"action":"approve"}"#);
         assert_eq!(action.as_deref(), Some("approve"));
         assert_eq!(reasoning, None, "absence must not become an empty string");
     }
@@ -4424,7 +4423,11 @@ mod rationale_gate_tests {
         let content = approve("                   abcdefghijklmnopqrs   ");
         let (action, reasoning) = response_action_and_reasoning(&content);
         assert_eq!(
-            check_rationale(RiskTier::High, action.as_deref().unwrap(), reasoning.as_deref()),
+            check_rationale(
+                RiskTier::High,
+                action.as_deref().unwrap(),
+                reasoning.as_deref()
+            ),
             Err(RationaleError::TooShort { chars: 19 })
         );
     }
@@ -4439,7 +4442,11 @@ mod rationale_gate_tests {
         assert_eq!(reasoning.as_ref().unwrap().chars().count(), 20);
         assert_eq!(reasoning.as_ref().unwrap().len(), 80);
         assert_eq!(
-            check_rationale(RiskTier::High, action.as_deref().unwrap(), reasoning.as_deref()),
+            check_rationale(
+                RiskTier::High,
+                action.as_deref().unwrap(),
+                reasoning.as_deref()
+            ),
             Ok(())
         );
     }

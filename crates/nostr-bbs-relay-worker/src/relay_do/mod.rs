@@ -43,8 +43,8 @@ pub mod test_exports {
         AuthVerdict, AUTH_MAX_SKEW_SECS, KIND_AUTH, PROTECTED_READ_KINDS,
     };
     pub use super::nip_handlers::{
-        device_keys_enabled_var, effective_principal, governance_response_blocked,
-        is_ban_gated_kind,
+        device_keys_enabled_var, effective_principal, is_ban_gated_kind, response_admission,
+        ResponseAdmission,
     };
 }
 

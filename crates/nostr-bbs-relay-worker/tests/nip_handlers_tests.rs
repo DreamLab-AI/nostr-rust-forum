@@ -15,8 +15,8 @@
 
 use nostr_bbs_core::event::NostrEvent;
 use nostr_bbs_relay_worker::test_exports::{
-    d_tag_value, event_matches_filters, event_treatment, governance_response_blocked,
-    is_ban_gated_kind, tag_value, EventTreatment, NostrFilter,
+    d_tag_value, event_matches_filters, event_treatment, is_ban_gated_kind, response_admission,
+    tag_value, EventTreatment, NostrFilter, ResponseAdmission,
 };
 
 // ---------------------------------------------------------------------------
@@ -655,39 +655,71 @@ fn governance_event_matches_kind_filter() {
 }
 
 // ---------------------------------------------------------------------------
-// P1-6: kind-31403 ActionResponse (approve/reject) is admin-only.
+// P1-6 + FR6.2: kind-31403 ActionResponse admission.
+//
+// The gate is admin-only, with one scoped exception: a `reviewer`-role pubkey
+// may decide exactly the cases an admin delegated to it. The kind check itself
+// now lives at the call site in `handle_event`, so these tests cover the pure
+// authorisation decision that the call site delegates to.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn non_admin_action_response_is_blocked() {
-    // A whitelisted but non-admin signer must NOT be able to approve/reject.
-    assert!(governance_response_blocked(
-        nostr_bbs_core::governance::KIND_ACTION_RESPONSE,
-        /* is_admin */ false
-    ));
+fn non_admin_non_reviewer_action_response_is_blocked() {
+    // A whitelisted but otherwise unprivileged signer must NOT be able to
+    // approve/reject, delegation flag notwithstanding.
+    assert_eq!(
+        response_admission(
+            /* is_admin */ false, /* is_reviewer */ false,
+            /* delegated_for_this_case */ false
+        ),
+        ResponseAdmission::BlockedNotAuthorised
+    );
+    assert_eq!(
+        response_admission(false, false, true),
+        ResponseAdmission::BlockedNotAuthorised
+    );
 }
 
 #[test]
 fn admin_action_response_is_accepted() {
-    // An admin signer is permitted to approve/reject.
-    assert!(!governance_response_blocked(
-        nostr_bbs_core::governance::KIND_ACTION_RESPONSE,
-        /* is_admin */ true
-    ));
+    // An admin signer is permitted to decide any case.
+    assert_eq!(
+        response_admission(
+            /* is_admin */ true, /* is_reviewer */ false,
+            /* delegated_for_this_case */ false
+        ),
+        ResponseAdmission::Admit
+    );
+    assert!(response_admission(true, false, false).is_admitted());
 }
 
 #[test]
-fn action_response_gate_only_targets_31403() {
-    // Other governance kinds are not affected by the admin-only response gate
-    // (they go through the agent-registry gate instead).
-    assert!(!governance_response_blocked(
-        nostr_bbs_core::governance::KIND_ACTION_REQUEST,
-        false
-    ));
-    assert!(!governance_response_blocked(
-        nostr_bbs_core::governance::KIND_PANEL_DEFINITION,
-        false
-    ));
+fn reviewer_is_admitted_only_on_a_delegated_case() {
+    // The scoped exception: delegated case admitted, everything else refused,
+    // so holding the `reviewer` role never generalises to the whole surface.
+    assert_eq!(
+        response_admission(false, true, true),
+        ResponseAdmission::Admit
+    );
+    assert_eq!(
+        response_admission(false, true, false),
+        ResponseAdmission::BlockedNotDelegated
+    );
+    assert!(!response_admission(false, true, false).is_admitted());
+}
+
+#[test]
+fn refusal_reasons_distinguish_the_two_blocked_cases() {
+    // The relay OK message must tell a reviewer that the case was not
+    // delegated, rather than implying they lack the role entirely.
+    assert_eq!(
+        response_admission(false, false, false).reason(),
+        "blocked: admin-only governance action response"
+    );
+    assert_eq!(
+        response_admission(false, true, false).reason(),
+        "blocked: case not delegated to this reviewer"
+    );
 }
 
 // ---------------------------------------------------------------------------
