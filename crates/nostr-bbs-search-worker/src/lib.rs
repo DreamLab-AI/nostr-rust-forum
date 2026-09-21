@@ -906,8 +906,9 @@ mod model_match_tests {
         assert_eq!(overfetch_k(100), 400);
         // ...but the cap can never drop below k itself.
         assert!(overfetch_k(500) >= 500);
-        // And it must not overflow on an absurd input.
-        assert!(overfetch_k(usize::MAX) >= usize::MAX.min(OVERFETCH_CAP));
+        // And it must not overflow on an absurd input: the multiply saturates,
+        // the cap clamps to OVERFETCH_CAP, and the final `.max(k)` restores k.
+        assert_eq!(overfetch_k(usize::MAX), usize::MAX);
     }
 
     #[test]

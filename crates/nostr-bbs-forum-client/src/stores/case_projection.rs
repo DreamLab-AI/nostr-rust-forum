@@ -42,6 +42,10 @@ pub struct CaseProjection {
 
 /// Parse `GET /api/governance/cases` into a map keyed by case id (the 31402's
 /// `d` tag). Malformed rows are skipped rather than failing the whole read.
+// Unwired: the pure, unit-tested half of a governance surface that is not yet
+// rendered. Kept because the tests assert a documented invariant; the `allow`
+// is scoped to the item so new dead code in this module is still reported.
+#[allow(dead_code)]
 pub fn parse_cases(body: &str) -> HashMap<String, CaseProjection> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return HashMap::new();
@@ -74,11 +78,12 @@ pub fn parse_cases(body: &str) -> HashMap<String, CaseProjection> {
 
 /// Whether the relay's projection marks `case_id` a calibration sample.
 ///
-/// Free function over the state so a caller holding a read guard (the
-/// governance page reads every card in one pass) uses the same rule as
-/// [`CaseProjectionStore::is_calibration_sample`] without taking a second
-/// borrow. `false` for an unknown case: the marker is a claim about the
-/// relay's HMAC selection, and the client makes no such claim on its own.
+/// A free function over the state rather than a [`CaseProjectionStore`] method,
+/// so the governance page can read every card in one pass while already holding
+/// a read guard instead of taking a fresh borrow per card. It is the **only**
+/// place the rule lives, so there is no second implementation to drift from.
+/// `false` for an unknown case: the marker is a claim about the relay's HMAC
+/// selection, and the client makes no such claim on its own.
 pub fn is_calibration_sample_in(state: &CaseProjectionState, case_id: &str) -> bool {
     state
         .cases

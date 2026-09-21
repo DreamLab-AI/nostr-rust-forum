@@ -5,8 +5,8 @@
 //! touches `web_sys`, `js_sys` or a Leptos signal, so the rules that decide
 //! **what a reviewer is shown and when they are allowed to act** are unit-tested
 //! on the host target rather than asserted by eye in a WASM bundle. The Leptos
-//! components in [`crate::pages::governance`] are a rendering shell over these
-//! functions: they choose no ordering, no gate and no label of their own.
+//! components behind [`crate::pages::GovernancePage`] are a rendering shell over
+//! these functions: they choose no ordering, no gate and no label of their own.
 //!
 //! The rules, and the invariants they discharge (DDD §6):
 //!
@@ -75,9 +75,8 @@ pub fn rationale_remaining(effective: RiskTier, typed: &str) -> usize {
 /// template and no default — if the reviewer typed nothing, `reasoning` is the
 /// empty string, which is the honest record of "they gave no reason".
 pub fn decision_content(outcome: &DecisionOutcome, typed_rationale: &str) -> String {
-    let mut value = serde_json::to_value(outcome).unwrap_or_else(|_| {
-        serde_json::json!({ "action": outcome.action_str() })
-    });
+    let mut value = serde_json::to_value(outcome)
+        .unwrap_or_else(|_| serde_json::json!({ "action": outcome.action_str() }));
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
             "reasoning".to_string(),
@@ -666,7 +665,10 @@ mod tests {
         // This module is excluded by construction: it names the removed
         // template in prose so the next reader knows what was removed and why.
         for (name, src) in [
-            ("pages/governance.rs", include_str!("../pages/governance.rs")),
+            (
+                "pages/governance.rs",
+                include_str!("../pages/governance.rs"),
+            ),
             (
                 "stores/panel_registry.rs",
                 include_str!("../stores/panel_registry.rs"),
@@ -726,7 +728,14 @@ mod tests {
 
     #[test]
     fn an_unlabelled_request_folds_to_the_advertised_default() {
-        let b = compute_boundary("agent", &[], &request(serde_json::json!({})), None, RiskTier::Medium, false);
+        let b = compute_boundary(
+            "agent",
+            &[],
+            &request(serde_json::json!({})),
+            None,
+            RiskTier::Medium,
+            false,
+        );
         assert_eq!(b.declared, None);
         assert_eq!(b.effective, RiskTier::Medium);
         assert_eq!(b.props, None);
@@ -884,12 +893,18 @@ mod tests {
         // assertion does not match itself.
         let needle = format!("{}{}", "governance::is_calibration", "_sample(");
         for (name, src) in [
-            ("utils/governance_view.rs", include_str!("./governance_view.rs")),
+            (
+                "utils/governance_view.rs",
+                include_str!("./governance_view.rs"),
+            ),
             (
                 "stores/panel_registry.rs",
                 include_str!("../stores/panel_registry.rs"),
             ),
-            ("pages/governance.rs", include_str!("../pages/governance.rs")),
+            (
+                "pages/governance.rs",
+                include_str!("../pages/governance.rs"),
+            ),
             (
                 "stores/case_projection.rs",
                 include_str!("../stores/case_projection.rs"),
@@ -920,7 +935,10 @@ mod tests {
         // No tags at all: the policy is the documented default.
         let bare = PanelContext::from_panel(&[], None);
         assert!(bare.task_properties.is_none());
-        assert_eq!(bare.policy.max_pending_hours, governance::DEFAULT_MAX_PENDING_HOURS);
+        assert_eq!(
+            bare.policy.max_pending_hours,
+            governance::DEFAULT_MAX_PENDING_HOURS
+        );
     }
 
     // ── Probe blindness (invariant 7) ───────────────────────────────────
@@ -1034,7 +1052,10 @@ mod tests {
 
     #[test]
     fn delegate_target_must_be_hex64() {
-        assert_eq!(normalise_delegate_pubkey(&"A".repeat(64)), Some("a".repeat(64)));
+        assert_eq!(
+            normalise_delegate_pubkey(&"A".repeat(64)),
+            Some("a".repeat(64))
+        );
         assert_eq!(
             normalise_delegate_pubkey(&format!("  {}  ", "b".repeat(64))),
             Some("b".repeat(64))

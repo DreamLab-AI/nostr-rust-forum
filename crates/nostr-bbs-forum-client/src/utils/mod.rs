@@ -142,32 +142,6 @@ pub fn shorten_pubkey(pubkey: &str) -> String {
     format!("{head}...{tail}")
 }
 
-#[cfg(test)]
-mod shorten_pubkey_tests {
-    use super::shorten_pubkey;
-
-    #[test]
-    fn shortens_a_hex_pubkey() {
-        let pk = "a".repeat(64);
-        assert_eq!(shorten_pubkey(&pk), "aaaaaa...aaaa");
-    }
-
-    #[test]
-    fn leaves_a_short_string_alone() {
-        assert_eq!(shorten_pubkey("abc"), "abc");
-        assert_eq!(shorten_pubkey(""), "");
-    }
-
-    #[test]
-    fn never_panics_on_multi_byte_input() {
-        // Byte offsets 6 and len-4 both fall mid-character here.
-        for s in ["日本語テキストの長い文字列", "😀😀😀😀😀😀😀😀😀😀😀😀"] {
-            let out = shorten_pubkey(s);
-            assert!(out.contains("..."));
-        }
-    }
-}
-
 /// Simple left arrow SVG icon for back navigation buttons.
 pub fn arrow_left_svg() -> impl IntoView {
     view! {
@@ -241,4 +215,31 @@ pub async fn check_storage_quota() -> Option<(f64, f64)> {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
     Some((usage, quota))
+}
+
+#[cfg(test)]
+mod shorten_pubkey_tests {
+    use super::shorten_pubkey;
+
+    #[test]
+    fn shortens_a_hex_pubkey() {
+        let pk = "a".repeat(64);
+        assert_eq!(shorten_pubkey(&pk), "aaaaaa...aaaa");
+    }
+
+    #[test]
+    fn leaves_a_short_string_alone() {
+        assert_eq!(shorten_pubkey("abc"), "abc");
+        assert_eq!(shorten_pubkey(""), "");
+    }
+
+    #[test]
+    fn never_panics_on_multi_byte_input() {
+        // Byte offsets 6 and len-4 both fall mid-character here.
+        for s in ["日本語テキストの長い文字列", "😀😀😀😀😀😀😀😀😀😀😀😀"]
+        {
+            let out = shorten_pubkey(s);
+            assert!(out.contains("..."));
+        }
+    }
 }

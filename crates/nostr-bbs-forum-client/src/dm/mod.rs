@@ -517,7 +517,6 @@ impl DMStore {
 
 // -- Authenticated subscription with retry -------------------------------------
 
-/// How long to wait for the relay's EOSE before treating the REQ as dropped.
 // -- DM subscription filters (pure; unit-tested on the host target) -----------
 //
 // # Why these are separate functions
@@ -635,6 +634,7 @@ fn incoming_filters(my_pubkey: &str, since: u64) -> Vec<Filter> {
     f
 }
 
+/// How long to wait for the relay's EOSE before treating the REQ as dropped.
 const DM_SUB_CONFIRM_MS: i32 = 3_000;
 /// Maximum REQ attempts before surfacing an error.
 const DM_SUB_MAX_ATTEMPTS: u32 = 4;
@@ -644,6 +644,15 @@ const DM_SUB_MAX_ATTEMPTS: u32 = 4;
 /// into the past, so the live subscription must look back at least that far or
 /// it silently drops freshly-sent DMs. Two days plus a small margin.
 const GIFT_WRAP_LOOKBACK_SECS: u64 = 2 * 24 * 60 * 60 + 3600;
+
+/// NIP-59 backdates a gift wrap's outer `created_at` by up to two days, so a
+/// narrower lookback silently drops messages that were sent seconds ago. The
+/// bound is a property of the constant alone, so it is asserted at compile time
+/// rather than in a test that only the host target ever runs.
+const _: () = assert!(
+    GIFT_WRAP_LOOKBACK_SECS >= 2 * 24 * 60 * 60,
+    "lookback must cover the full 2-day backdating window"
+);
 
 /// Subscribe to DM filters, re-issuing the REQ if the relay never confirms it.
 ///
@@ -1201,7 +1210,10 @@ mod tests {
         // History queries must be unwindowed or they are not history.
         for filters in [inbox_filters(ME), conversation_filters(ME, PARTNER)] {
             for f in &filters {
-                assert!(f.since.is_none(), "history filter must not set since: {f:?}");
+                assert!(
+                    f.since.is_none(),
+                    "history filter must not set since: {f:?}"
+                );
             }
         }
 
@@ -1211,15 +1223,5 @@ mod tests {
         for f in wrap_filters(&live) {
             assert_eq!(f.since, Some(since));
         }
-    }
-
-    #[test]
-    fn gift_wrap_lookback_covers_the_nip59_randomisation_window() {
-        // NIP-59 backdates the outer created_at by up to two days. A narrower
-        // window silently drops messages that were sent seconds ago.
-        assert!(
-            GIFT_WRAP_LOOKBACK_SECS >= 2 * 24 * 60 * 60,
-            "lookback must cover the full 2-day backdating window"
-        );
     }
 }

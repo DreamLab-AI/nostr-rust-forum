@@ -19,7 +19,8 @@
 //!    advances after the fetch shows on the next load of the surface.
 //!
 //! The parsing and reduction below are pure and unit-tested; only
-//! [`ReceiptStore::load_case`] touches the network.
+//! `ReceiptStore::load_case` touches the network (WASM-only, so it does not
+//! appear in host-target rustdoc).
 
 use std::collections::HashMap;
 
@@ -27,6 +28,10 @@ use leptos::prelude::*;
 use nostr_bbs_core::governance::ReceiptStage;
 
 /// One `governance_receipts` row, reduced to what the decision chain renders.
+// Unwired: the pure, unit-tested half of a governance surface that is not yet
+// rendered. Kept because the tests assert a documented invariant; the `allow`
+// is scoped to the item so new dead code in this module is still reported.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptView {
     /// The 31403 event this receipt tracks.
@@ -52,6 +57,10 @@ pub struct ReceiptView {
 /// mutually exclusive claims**, where "largest wins" is meaningless: two of
 /// them is not progress, it is a contradiction, and resolving it by picking one
 /// invents an answer the receipts do not contain.
+// Unwired: the pure, unit-tested half of a governance surface that is not yet
+// rendered. Kept because the tests assert a documented invariant; the `allow`
+// is scoped to the item so new dead code in this module is still reported.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageView {
     /// The furthest ladder rung reached; no application outcome reported yet.
@@ -118,6 +127,10 @@ pub struct CaseReceipts {
 /// Parse `GET /api/governance/receipts` into rows, ignoring anything malformed
 /// rather than failing the whole read: a receipt trail with one unreadable row
 /// is still worth showing.
+// Unwired: the pure, unit-tested half of a governance surface that is not yet
+// rendered. Kept because the tests assert a documented invariant; the `allow`
+// is scoped to the item so new dead code in this module is still reported.
+#[allow(dead_code)]
 pub fn parse_receipts(body: &str) -> Vec<ReceiptView> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
@@ -179,6 +192,10 @@ pub fn parse_receipts(body: &str) -> Vec<ReceiptView> {
 /// failure (it outranks `projection-committed`). These rows carry no ordering
 /// this reducer reads, and showing a stale failure is the safe direction —
 /// an operator looks again, rather than being told all is well.
+// Unwired: the pure, unit-tested half of a governance surface that is not yet
+// rendered. Kept because the tests assert a documented invariant; the `allow`
+// is scoped to the item so new dead code in this module is still reported.
+#[allow(dead_code)]
 pub fn reduce_case(rows: Vec<ReceiptView>) -> CaseReceipts {
     let mut out = CaseReceipts::default();
     // Per decision: the furthest ladder rung, the DISTINCT terminal outcomes in
@@ -325,7 +342,7 @@ impl ReceiptStore {
     }
 
     /// Whether this case still needs a fetch. Read only by the WASM-only
-    /// [`Self::load_case`].
+    /// `load_case`, which is `cfg`-gated out of host-target rustdoc.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn needs_load(&self, d_tag: &str) -> bool {
         let s = self.state.read();
@@ -410,7 +427,10 @@ mod tests {
         let rows = parse_receipts(body);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].stage, ReceiptStage::Applied);
-        assert_eq!(rows[0].acknowledgement.as_deref(), Some("migration 0007 ran"));
+        assert_eq!(
+            rows[0].acknowledgement.as_deref(),
+            Some("migration 0007 ran")
+        );
         assert_eq!(rows[0].applied_by.as_deref(), Some("agent-x"));
         assert_eq!(rows[1].stage, ReceiptStage::ProjectionCommitted);
     }
@@ -582,9 +602,18 @@ mod tests {
         // must never look the same".
         assert_eq!(stage_label(ReceiptStage::Applied), "applied");
         assert_eq!(stage_label(ReceiptStage::NotApplied), "NOT applied");
-        assert_eq!(stage_label(ReceiptStage::AppliedManually), "applied manually");
-        assert_eq!(stage_label(ReceiptStage::ConsumerReceived), "read by the agent");
-        assert_eq!(stage_label(ReceiptStage::EscalatedOnAge), "escalated on age");
+        assert_eq!(
+            stage_label(ReceiptStage::AppliedManually),
+            "applied manually"
+        );
+        assert_eq!(
+            stage_label(ReceiptStage::ConsumerReceived),
+            "read by the agent"
+        );
+        assert_eq!(
+            stage_label(ReceiptStage::EscalatedOnAge),
+            "escalated on age"
+        );
         let labels = [
             ReceiptStage::Signed,
             ReceiptStage::RelayAccepted,

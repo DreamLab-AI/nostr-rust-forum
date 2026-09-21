@@ -156,8 +156,9 @@ impl Board {
             })
             .map(|(event_id, unit)| {
                 let ledger = self.ledgers.get(event_id).cloned().unwrap_or_default();
-                let view = ThreadView::build(unit, &ledger, &Default::default(), &Default::default(), now)
-                    .with_texts(&self.texts);
+                let view =
+                    ThreadView::build(unit, &ledger, &Default::default(), &Default::default(), now)
+                        .with_texts(&self.texts);
                 (event_id.clone(), view)
             })
             .collect();
@@ -193,12 +194,12 @@ pub fn KnowledgePage() -> impl IntoView {
     // returning nothing.
     {
         let relay = relay.clone();
-        let disclosure_for_sub = disclosure.clone();
+        let disclosure_for_sub = disclosure;
         Effect::new(move |_| {
             if sub_id.get_untracked().is_some() {
                 return;
             }
-            let disclosure = disclosure_for_sub.clone();
+            let disclosure = disclosure_for_sub;
             let id = relay.subscribe(
                 vec![Filter {
                     kinds: Some(vec![KIND_KNOWLEDGE_UNIT, KIND_CONFIRMATION, KIND_FLAG]),
@@ -208,7 +209,12 @@ pub fn KnowledgePage() -> impl IntoView {
                 Rc::new(move |ev: NostrEvent| {
                     let loaded = disclosure
                         .as_ref()
-                        .map(|d| !matches!(d.status(), crate::components::agent_badge::DisclosureStatus::Loading))
+                        .map(|d| {
+                            !matches!(
+                                d.status(),
+                                crate::components::agent_badge::DisclosureStatus::Loading
+                            )
+                        })
                         .unwrap_or(false);
                     board.update(|b| b.absorb(&ev, disclosure.as_ref(), loaded));
                 }),
@@ -233,7 +239,13 @@ pub fn KnowledgePage() -> impl IntoView {
     // than none.
     let attest = {
         let relay = relay.clone();
-        move |(event_id, unit_author, unit_hex, is_flag, text): (String, String, String, bool, String)| {
+        move |(event_id, unit_author, unit_hex, is_flag, text): (
+            String,
+            String,
+            String,
+            bool,
+            String,
+        )| {
             let Some(me) = auth.pubkey().get_untracked() else {
                 error.set(Some("Sign in to confirm or flag.".into()));
                 return;
@@ -245,10 +257,17 @@ pub fn KnowledgePage() -> impl IntoView {
             let unsigned = UnsignedEvent {
                 pubkey: me,
                 created_at: (js_sys::Date::now() / 1000.0) as u64,
-                kind: if is_flag { KIND_FLAG } else { KIND_CONFIRMATION },
+                kind: if is_flag {
+                    KIND_FLAG
+                } else {
+                    KIND_CONFIRMATION
+                },
                 tags: vec![
                     vec!["e".into(), event_id],
-                    vec!["a".into(), format!("{KIND_KNOWLEDGE_UNIT}:{unit_author}:{unit_hex}")],
+                    vec![
+                        "a".into(),
+                        format!("{KIND_KNOWLEDGE_UNIT}:{unit_author}:{unit_hex}"),
+                    ],
                     vec!["p".into(), unit_author],
                 ],
                 content: text,
@@ -522,7 +541,17 @@ mod tests {
         tampered["insight"]["action"] = serde_json::json!("something else");
 
         let mut b = Board::default();
-        b.absorb(&ev(KIND_KNOWLEDGE_UNIT, "e1", "author", vec![], &tampered.to_string()), None, true);
+        b.absorb(
+            &ev(
+                KIND_KNOWLEDGE_UNIT,
+                "e1",
+                "author",
+                vec![],
+                &tampered.to_string(),
+            ),
+            None,
+            true,
+        );
         assert!(b.units.is_empty(), "a tampered unit must never render");
     }
 
@@ -530,7 +559,11 @@ mod tests {
     fn a_well_formed_unit_is_kept_with_its_author() {
         let (u, json) = unit_json();
         let mut b = Board::default();
-        b.absorb(&ev(KIND_KNOWLEDGE_UNIT, "e1", "author-pk", vec![], &json), None, true);
+        b.absorb(
+            &ev(KIND_KNOWLEDGE_UNIT, "e1", "author-pk", vec![], &json),
+            None,
+            true,
+        );
         assert_eq!(b.units.get("e1"), Some(&u));
         assert_eq!(b.authors.get("e1").map(String::as_str), Some("author-pk"));
     }
@@ -539,11 +572,21 @@ mod tests {
     fn attestations_from_unknown_members_are_counted_as_unresolved_not_as_evidence() {
         let (_, json) = unit_json();
         let mut b = Board::default();
-        b.absorb(&ev(KIND_KNOWLEDGE_UNIT, "e1", "author", vec![], &json), None, true);
+        b.absorb(
+            &ev(KIND_KNOWLEDGE_UNIT, "e1", "author", vec![], &json),
+            None,
+            true,
+        );
         // `disclosure` is None — the fetch has not answered, so nothing can be
         // classified and nothing may be counted.
         b.absorb(
-            &ev(KIND_CONFIRMATION, "c1", "someone", vec![vec!["e".into(), "e1".into()]], ""),
+            &ev(
+                KIND_CONFIRMATION,
+                "c1",
+                "someone",
+                vec![vec!["e".into(), "e1".into()]],
+                "",
+            ),
             None,
             true,
         );
@@ -558,15 +601,33 @@ mod tests {
         gap.lifecycle.kind = UnitKind::ToolGapSignal;
 
         let mut b = Board::default();
-        b.absorb(&ev(KIND_KNOWLEDGE_UNIT, "e1", "a", vec![], &json), None, true);
         b.absorb(
-            &ev(KIND_KNOWLEDGE_UNIT, "e2", "a", vec![], &serde_json::to_string(&gap).unwrap()),
+            &ev(KIND_KNOWLEDGE_UNIT, "e1", "a", vec![], &json),
+            None,
+            true,
+        );
+        b.absorb(
+            &ev(
+                KIND_KNOWLEDGE_UNIT,
+                "e2",
+                "a",
+                vec![],
+                &serde_json::to_string(&gap).unwrap(),
+            ),
             None,
             true,
         );
 
         let now = Timestamp::from_secs(0);
-        assert_eq!(b.threads(now, false).len(), 1, "units tab excludes gap signals");
-        assert_eq!(b.threads(now, true).len(), 1, "gap tab has only gap signals");
+        assert_eq!(
+            b.threads(now, false).len(),
+            1,
+            "units tab excludes gap signals"
+        );
+        assert_eq!(
+            b.threads(now, true).len(),
+            1,
+            "gap tab has only gap signals"
+        );
     }
 }

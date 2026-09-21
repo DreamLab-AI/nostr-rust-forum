@@ -27,10 +27,6 @@ use std::collections::HashMap;
 /// Bodies are absent until the id→event hydration pass fills them in.
 type RawHit = (String, Option<f64>, Option<String>, Option<String>);
 
-/// Shared open-state for the global search overlay. The app shell provides this
-/// via context so a visible nav button can open the very same panel that the
-/// Cmd/Ctrl+K shortcut toggles.
-
 /// Truncate `text` to at most `max_chars` characters, appending an ellipsis
 /// when it was shortened.
 ///
@@ -53,6 +49,9 @@ fn ellipsise(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Shared open-state for the global search overlay. The app shell provides this
+/// via context so a visible nav button can open the very same panel that the
+/// Cmd/Ctrl+K shortcut toggles.
 #[derive(Clone, Copy)]
 pub struct SearchOpen(pub RwSignal<bool>);
 use std::rc::Rc;
