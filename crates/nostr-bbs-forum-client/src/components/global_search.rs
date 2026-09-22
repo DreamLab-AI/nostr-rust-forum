@@ -311,8 +311,31 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                     }
                 };
 
-                if is_semantic {
-                    // RuVector semantic search, with legacy text fallback.
+                // Text search goes to the RELAY (NIP-50 `search` on kind-42),
+                // not to the vector worker. The worker's index is fed only by
+                // the posting client's `/ingest` call, which is admin-gated —
+                // so for every non-admin member their own posts were never
+                // indexed and "search" could not find them ("I did a post
+                // called Glastonbury. Searched for it and couldn't find it").
+                // The relay already holds every post and matches `content`
+                // as a case-insensitive substring, for members and admins
+                // alike, so it is the authoritative text path. The vector
+                // worker stays as the *semantic* layer on top.
+                let relay_hits = relay_text_search(&relay, &q).await;
+                let mut seen: std::collections::HashSet<String> =
+                    relay_hits.iter().map(|ev| ev.id.clone()).collect();
+                for ev in &relay_hits {
+                    out.push(Hit::Message {
+                        content: ev.content.clone(),
+                        author: ev.pubkey.clone(),
+                        channel_id: channel_id_of(ev).unwrap_or_else(|| ev.id.clone()),
+                    });
+                }
+
+                // The worker is consulted in semantic mode, or when the relay
+                // returned nothing (a deployment whose relay predates NIP-50
+                // still gets whatever the index knows).
+                if is_semantic || relay_hits.is_empty() {
                     match search_client::search_similar(&q, SEMANTIC_K, 0.3).await {
                         Ok(hits) => {
                             for h in hits {
@@ -331,19 +354,13 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                             }
                         },
                     }
-                } else {
-                    // Legacy text search via /search
-                    match semantic_search(&q).await {
-                        Ok(hits) => {
-                            for h in hits {
-                                raw.push((h.id, None, non_empty(h.content), h.label));
-                            }
-                        }
-                        Err(e) => fetch_err = Some(e),
-                    }
                 }
+                raw = drop_seen_hits(raw, &mut seen);
 
-                if let Some(e) = fetch_err {
+                // A worker failure is only worth surfacing when the relay
+                // found nothing either — otherwise the member has their
+                // results and a warning about the optional layer is noise.
+                if let (Some(e), true) = (fetch_err, relay_hits.is_empty()) {
                     errors.push(format!("Message search failed: {e}"));
                 }
 
@@ -659,6 +676,59 @@ fn channel_id_of(ev: &nostr_bbs_core::NostrEvent) -> Option<String> {
         .map(|t| t[1].clone())
 }
 
+/// How many kind-42 events one NIP-50 text query asks the relay for.
+const RELAY_TEXT_LIMIT: u64 = 50;
+
+/// Drop worker hits whose event id the relay text search already returned, so
+/// a post is listed once even when both layers match it, and record every
+/// remaining id in `seen` for the same reason.
+fn drop_seen_hits(raw: Vec<RawHit>, seen: &mut std::collections::HashSet<String>) -> Vec<RawHit> {
+    raw.into_iter()
+        .filter(|(id, _, _, _)| seen.insert(id.clone()))
+        .collect()
+}
+
+/// NIP-50 text search over kind-42 messages on the relay.
+///
+/// Waits up to 1.2s for the relay to answer, then unsubscribes. Newest first.
+/// An empty result is indistinguishable from "relay has no NIP-50" — callers
+/// treat it as a reason to consult the vector worker, never as an error.
+async fn relay_text_search(
+    relay: &RelayConnection,
+    query: &str,
+) -> Vec<nostr_bbs_core::NostrEvent> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let found: RwSignal<Vec<nostr_bbs_core::NostrEvent>> = RwSignal::new(Vec::new());
+    let cb = Rc::new(move |ev: nostr_bbs_core::NostrEvent| {
+        if ev.kind == 42 && !ev.content.trim().is_empty() {
+            found.update(|v| v.push(ev));
+        }
+    });
+    let sid = relay.subscribe(
+        vec![Filter {
+            kinds: Some(vec![42]),
+            search: Some(q.to_string()),
+            limit: Some(RELAY_TEXT_LIMIT),
+            ..Default::default()
+        }],
+        cb,
+        None,
+    );
+    let delay = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1_200);
+    });
+    let _ = JsFuture::from(delay).await;
+    relay.unsubscribe(&sid);
+    let mut events = found.get_untracked();
+    events.sort_by_key(|ev| std::cmp::Reverse(ev.created_at));
+    events
+}
+
 /// Hydrate search-result event ids into full events via a relay `ids` REQ.
 ///
 /// The search API only returns `{id, score}` pairs; the event body, author,
@@ -808,6 +878,42 @@ mod tests {
         let body = search_client::build_query_search_body("hello", SEMANTIC_K);
         assert!(body.contains(r#""k":10"#), "body was {body}");
         assert!(!body.contains("limit"), "stale `limit` key in {body}");
+    }
+
+    #[test]
+    fn relay_text_filter_serialises_the_nip50_search_key() {
+        // The relay-worker reads `search` (relay_do/filter.rs); a differently
+        // spelled key would be silently ignored and the REQ would return the
+        // newest 50 kind-42 events regardless of the query.
+        let f = Filter {
+            kinds: Some(vec![42]),
+            search: Some("Glastonbury".to_string()),
+            limit: Some(RELAY_TEXT_LIMIT),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""search":"Glastonbury""#), "was {json}");
+        assert!(json.contains(r#""kinds":[42]"#), "was {json}");
+        assert!(json.contains(r#""limit":50"#), "was {json}");
+        // Absent by default, so existing filters are byte-identical.
+        let plain = serde_json::to_string(&Filter::default()).unwrap();
+        assert!(!plain.contains("search"), "was {plain}");
+    }
+
+    #[test]
+    fn worker_hits_already_found_by_the_relay_are_dropped() {
+        let mut seen: std::collections::HashSet<String> =
+            ["a".to_string(), "b".to_string()].into_iter().collect();
+        let raw: Vec<RawHit> = vec![
+            ("a".into(), Some(0.9), None, None),
+            ("c".into(), Some(0.8), None, None),
+            ("c".into(), Some(0.7), None, None),
+            ("b".into(), None, Some("x".into()), None),
+        ];
+        let kept = drop_seen_hits(raw, &mut seen);
+        let ids: Vec<&str> = kept.iter().map(|(id, _, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["c"]);
+        assert!(seen.contains("c"));
     }
 
     #[test]
