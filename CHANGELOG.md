@@ -7,6 +7,31 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed — forum member feedback, 2026-09-22
+
+- **Text search finds a member's own post.** *"I did a post called Glastonbury.
+  Searched for it and couldn't find it."* The 2026-09-15 search fix made the
+  vector index *returnable*, but the index is only ever fed by the posting
+  client's `/ingest` call, and `/ingest` is admin-gated (`search-worker/src/auth.rs`).
+  For every non-admin member that call 403s silently (`let _ =`), so their posts
+  never reach the index — the live index held 12 vectors, all from admins — and
+  *both* search modes in the overlay queried that index. Message search now goes
+  to the relay first, as a NIP-50 `search` REQ on kind-42 (`Filter.search` in
+  `relay.rs`; the relay-worker has matched `content` case-insensitively since
+  `a754468`), which holds every post regardless of who wrote it. The vector
+  worker remains the semantic layer: consulted in semantic mode, or when the
+  relay returns nothing, with hits the relay already returned de-duplicated by
+  event id. Verified read-only against the live relay: the three Glastonbury
+  posts come back on `{"kinds":[42],"search":"Glastonbury"}`.
+- **Who reacted.** *"Long press to see a list of who left what emoji response."*
+  A reaction pill now opens a small popover naming its reactors (profile-cache
+  display name, else a shortened pubkey; the viewer as "You"): long press on
+  touch, settled hover on a hover-capable pointer, and a visually-hidden "who"
+  button after each pill for the keyboard (Enter/Space; Escape closes). Tap
+  still toggles the reaction; a long press that opened the popover swallows the
+  click that follows it on some browsers. `ReactionStore::reactors_for` exposes
+  the attribution the store already held.
+
 ### Fixed — forum member feedback, September 2026
 
 - **Search can return a result at all, and is reachable on a phone.** The client
