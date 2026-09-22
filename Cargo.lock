@@ -461,9 +461,9 @@ dependencies = [
 
 [[package]]
 name = "colloquy-nostr"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44a5bc7a9598cc9cbee24ab2473f978e721578e5159e7fe24ce606634b6dc000"
+checksum = "28b678caba1b7cbf3269a53eef3b4886cc6cc218c39cefda8c6200695b310ac3"
 dependencies = [
  "colloquy-core",
  "serde",

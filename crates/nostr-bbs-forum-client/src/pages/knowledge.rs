@@ -530,7 +530,7 @@ mod tests {
         // subscription filter is only correct for these three numbers.
         assert_eq!(
             (KIND_KNOWLEDGE_UNIT, KIND_CONFIRMATION, KIND_FLAG),
-            (38100, 38101, 38102)
+            (38410, 38411, 38412)
         );
     }
 
