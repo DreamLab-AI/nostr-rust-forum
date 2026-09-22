@@ -33,6 +33,7 @@ pub mod nip04;
 pub mod nip19;
 pub mod nip44;
 pub mod nip98;
+pub mod ontology_governance;
 pub mod signer;
 pub mod thread;
 pub mod types;

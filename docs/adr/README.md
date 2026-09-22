@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_12 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_13 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -44,3 +44,4 @@ _12 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) | Track governance decisions through durable projection and application receipts | 2026-09-04 | proposed | partial | inactive | — | — | nostr-rust-forum maintainers (DreamLab AI) | nostr-rust-forum |
 | [ADR-2011](ADR-2011-operator-task-properties-set-the-escalation-boundary.md) | Operator-declared task properties set the escalation boundary, not the requesting agent's self-tier | 2026-09-14 | accepted | partial | inactive | — | — | jjohare | nostr-rust-forum |
 | [ADR-2012](ADR-2012-d1-ledger-becomes-a-chain-view.md) | The pod-worker D1 ledger becomes a derived view over the sidestr chain, and solid-pod-rs moves in lockstep with the host | 2026-09-21 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
+| [ADR-2013](ADR-2013-ontology-governance-panel-promote-demote-expiry.md) | The ontology-governance panel activates Promote, adds Demote, and expires proposals rather than re-surfacing them forever | 2026-09-22 | accepted | partial | staged | — | — | jjohare | nostr-rust-forum |

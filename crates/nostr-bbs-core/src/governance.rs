@@ -1441,15 +1441,48 @@ pub mod broker {
         }
     }
 
+    /// What a human decided about a case, as carried in a signed kind-31403.
+    ///
+    /// # `Promote`/`Demote` carry an IRI, not a pattern id
+    ///
+    /// `Promote` was specified with a `pattern_id` field and shipped with no
+    /// producer and no consumer — the projection published only
+    /// `{action, reasoning}`, so nothing ever wrote a `pattern_id` and nothing
+    /// ever read one (`docs/prd/prd-gap-close-forum.md`). Its first real
+    /// consumer is ontology promotion (ADR-2013), where the thing being
+    /// promoted is a corpus page addressed by its OKF `resource` IRI. The field
+    /// is therefore `iri`, not a rename of a value anyone held: there was no
+    /// such value. `Demote` is its inverse and is new.
+    ///
+    /// Both carry the IRI **redundantly** with the 31402's `context_url` tag.
+    /// That is deliberate: the signed human decision must name the subject it
+    /// decided on in its own signed bytes, so the apply path can never be
+    /// pointed at a different page by a later edit to the request.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(tag = "action", rename_all = "snake_case")]
     pub enum DecisionOutcome {
         Approve,
         Reject,
-        Amend { diff: String },
-        Delegate { delegate_to: String },
-        Promote { pattern_id: String },
-        Precedent { scope: String },
+        Amend {
+            diff: String,
+        },
+        Delegate {
+            delegate_to: String,
+        },
+        /// Raise the named subject to `status: stable`, stamping the signer as
+        /// a `verified` actor (ADR-2013).
+        Promote {
+            iri: String,
+        },
+        /// Lower the named subject to `status: deprecated` (ADR-2013). The
+        /// inverse of [`Self::Promote`], and the only decision that may be
+        /// raised about an already-stable subject.
+        Demote {
+            iri: String,
+        },
+        Precedent {
+            scope: String,
+        },
     }
 
     impl DecisionOutcome {
@@ -1460,6 +1493,7 @@ pub mod broker {
                 DecisionOutcome::Amend { .. } => "amend",
                 DecisionOutcome::Delegate { .. } => "delegate",
                 DecisionOutcome::Promote { .. } => "promote",
+                DecisionOutcome::Demote { .. } => "demote",
                 DecisionOutcome::Precedent { .. } => "precedent",
             }
         }
@@ -1471,7 +1505,7 @@ pub mod broker {
         /// `{"action":"delegate","delegate_to":"<pubkey>", ...}`. The binary
         /// forms carry no detail (`{"action":"approve"}`); the non-binary forms
         /// carry the typed detail field their variant requires (`delegate_to`,
-        /// `pattern_id`, `scope`, `diff`). Extra fields — notably the human's
+        /// `iri`, `scope`, `diff`). Extra fields — notably the human's
         /// free-text `reasoning` — are ignored. Returns `None` when the action is
         /// unrecognised or a required detail field is missing, so a malformed
         /// response is rejected rather than silently parked.
@@ -1487,7 +1521,9 @@ pub mod broker {
                 DecisionOutcome::Approve | DecisionOutcome::Reject => None,
                 DecisionOutcome::Amend { diff } => Some(diff.as_str()),
                 DecisionOutcome::Delegate { delegate_to } => Some(delegate_to.as_str()),
-                DecisionOutcome::Promote { pattern_id } => Some(pattern_id.as_str()),
+                DecisionOutcome::Promote { iri } | DecisionOutcome::Demote { iri } => {
+                    Some(iri.as_str())
+                }
                 DecisionOutcome::Precedent { scope } => Some(scope.as_str()),
             }
         }
@@ -1707,7 +1743,13 @@ pub mod broker {
             self.state = match outcome {
                 DecisionOutcome::Approve
                 | DecisionOutcome::Reject
-                | DecisionOutcome::Amend { .. } => CaseState::Decided,
+                | DecisionOutcome::Amend { .. }
+                // A demotion is a resolved decision like any other; it gets no
+                // `Demoted` state of its own because nothing branches on one.
+                // `Promoted` exists only because it predates this enum's first
+                // consumer — the outcome, not the state, is what the apply path
+                // reads, and that is recorded in `broker_decisions.outcome`.
+                | DecisionOutcome::Demote { .. } => CaseState::Decided,
                 DecisionOutcome::Delegate { .. } => CaseState::Delegated,
                 DecisionOutcome::Promote { .. } => CaseState::Promoted,
                 DecisionOutcome::Precedent { .. } => CaseState::Precedent,
@@ -2505,11 +2547,12 @@ mod tests {
             "delegate"
         );
         assert_eq!(
-            DecisionOutcome::Promote {
-                pattern_id: "x".into()
-            }
-            .action_str(),
+            DecisionOutcome::Promote { iri: "x".into() }.action_str(),
             "promote"
+        );
+        assert_eq!(
+            DecisionOutcome::Demote { iri: "x".into() }.action_str(),
+            "demote"
         );
         assert_eq!(
             DecisionOutcome::Precedent { scope: "x".into() }.action_str(),
@@ -2575,10 +2618,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(del.detail(), Some("carol"));
-        let prom =
-            DecisionOutcome::from_response_content(r#"{"action":"promote","pattern_id":"pat-9"}"#)
-                .unwrap();
-        assert_eq!(prom.detail(), Some("pat-9"));
+        let prom = DecisionOutcome::from_response_content(
+            r#"{"action":"promote","iri":"urn:ngm:class:knowledge-graph"}"#,
+        )
+        .unwrap();
+        assert_eq!(prom.detail(), Some("urn:ngm:class:knowledge-graph"));
         let prec =
             DecisionOutcome::from_response_content(r#"{"action":"precedent","scope":"org-wide"}"#)
                 .unwrap();
@@ -2665,13 +2709,13 @@ mod tests {
         let (_, detail, state, _) = decide(
             &snapshot(CaseState::Open),
             &"a".repeat(64),
-            r#"{"action":"promote","pattern_id":"pat-9"}"#,
+            r#"{"action":"promote","iri":"urn:ngm:class:knowledge-graph"}"#,
             "human-bob",
             2000,
         )
         .unwrap();
         assert_eq!(state, CaseState::Promoted);
-        assert_eq!(detail.as_deref(), Some("pat-9"));
+        assert_eq!(detail.as_deref(), Some("urn:ngm:class:knowledge-graph"));
 
         let (_, detail, state, _) = decide(
             &snapshot(CaseState::Open),

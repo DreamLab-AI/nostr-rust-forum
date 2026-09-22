@@ -694,6 +694,175 @@ pub async fn escalate_stale_cases(env: &Env) -> Result<AgeingSweepResult, String
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// ADR-2013 — proposal expiry
+// ---------------------------------------------------------------------------
+
+/// What one expiry sweep did.
+///
+/// Deliberately the same shape as [`AgeingSweepResult`] and deliberately NOT
+/// the same type: the two sweeps answer different questions about the same
+/// case, and collapsing them would hide a case that was escalated for age and
+/// then expired — which is the ordinary sequence, not an anomaly.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExpirySweepResult {
+    /// Cases past their `stale_after` that this tick looked at.
+    pub scanned: u64,
+    /// Cases that received a fresh `expired` receipt AND were closed.
+    pub expired: u64,
+    /// Cases already carrying one. Not an error — the idempotency working.
+    pub already_expired: u64,
+    /// Writes that failed. Reported as loudly as successes.
+    pub failed: u64,
+    /// The batch ceiling was reached and more expired proposals remain.
+    pub truncated: bool,
+}
+
+/// Close every still-pending ontology proposal past its `stale_after`
+/// (ADR-2013, PRD-sovereign-corpus §3.3).
+///
+/// # Why this is not the ageing sweep
+///
+/// `escalate_stale_cases` answers "nobody has looked at this yet" and leaves
+/// the case open so somebody still can. Expiry answers "this proposal is no
+/// longer safe to apply": the corpus has moved on since the diff was computed,
+/// the digest no longer describes the page, and applying it would write a stale
+/// frontmatter over a newer one. So expiry **closes** the case
+/// (`CaseState::Closed` — closed *without a decision*, which is why no
+/// `broker_decisions` row is written) rather than merely re-surfacing it. The
+/// page is untouched and the proposer regenerates from the current generation.
+///
+/// Both receipts can and routinely do land on the same case: a 14-day proposal
+/// whose panel escalates at 14 days is escalated and then expires. They are
+/// separate rows in `case_side_receipts` keyed by `(case_id, stage)`, so the
+/// history reads "surfaced, then expired unattended", which is the true story.
+///
+/// # Ordering
+///
+/// The receipt is written **before** the close. If the close then fails, the
+/// case stays pending and carries an `expired` receipt — visibly wrong, and
+/// retried next tick (the receipt insert reports `already_expired`, the close
+/// is re-attempted). The other order would close a case with no receipt saying
+/// why, which is silently wrong and never retried.
+pub async fn expire_stale_proposals(env: &Env) -> Result<ExpirySweepResult, String> {
+    let db = env.d1("DB").map_err(|e| format!("D1 binding: {e:?}"))?;
+    let now = auth::js_now_secs() as i64;
+
+    #[derive(Deserialize)]
+    struct ExpiredCaseRow {
+        id: String,
+        stale_after: f64,
+    }
+
+    // `stale_after IS NOT NULL` is what confines this sweep to ontology
+    // proposals: no other 31402 declares one, so no other case can be closed
+    // by it. Ordered by expiry so the batch ceiling cuts the least overdue.
+    let rows = db
+        .prepare(
+            "SELECT id, stale_after FROM broker_cases \
+             WHERE state IN ('open', 'under_review', 'reopened') \
+               AND stale_after IS NOT NULL AND stale_after < ?1 \
+             ORDER BY stale_after ASC LIMIT ?2",
+        )
+        .bind(&[
+            JsValue::from_f64(now as f64),
+            JsValue::from_f64((AGEING_BATCH_SIZE + 1) as f64),
+        ])
+        .map_err(|e| format!("expired case bind: {e:?}"))?
+        .all()
+        .await
+        .map_err(|e| format!("expired case query: {e:?}"))?
+        .results::<ExpiredCaseRow>()
+        .map_err(|e| format!("expired case decode: {e:?}"))?;
+
+    let mut result = ExpirySweepResult {
+        truncated: rows.len() as u32 > AGEING_BATCH_SIZE,
+        ..Default::default()
+    };
+
+    for row in rows.iter().take(AGEING_BATCH_SIZE as usize) {
+        let stale_after = row.stale_after as i64;
+        result.scanned += 1;
+        // Belt to the SQL's braces, and the one place the boundary rule lives.
+        if !nostr_bbs_core::ontology_governance::is_expired(stale_after, now) {
+            continue;
+        }
+
+        let overdue_hours = (now - stale_after).max(0) / 3_600;
+        let receipt = db
+            .prepare(
+                "INSERT OR IGNORE INTO case_side_receipts (case_id, stage, recorded_at, detail) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(&[
+                JsValue::from_str(&row.id),
+                JsValue::from_str(nostr_bbs_core::governance::ReceiptStage::Expired.as_str()),
+                JsValue::from_f64(now as f64),
+                JsValue::from_str(&format!(
+                    "proposal stale_after passed {overdue_hours}h ago; closed without a decision"
+                )),
+            ]);
+        let fresh = match receipt {
+            Ok(stmt) => match stmt.run().await {
+                Ok(meta) => {
+                    meta.meta()
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.changes)
+                        .unwrap_or(0)
+                        > 0
+                }
+                Err(e) => {
+                    console_warn!("expiry receipt write failed for {}: {:?}", row.id, e);
+                    result.failed += 1;
+                    continue;
+                }
+            },
+            Err(e) => {
+                console_warn!("expiry receipt bind failed for {}: {:?}", row.id, e);
+                result.failed += 1;
+                continue;
+            }
+        };
+
+        // Closed WITHOUT a decision: no `broker_decisions` row is written,
+        // because nobody decided anything. The `expired` receipt is the whole
+        // record of what happened, and the `state` guard in the WHERE clause
+        // means a case decided between the SELECT and here is left alone.
+        let close = db
+            .prepare(
+                "UPDATE broker_cases SET state = ?1, updated_at = ?2 \
+                 WHERE id = ?3 AND state IN ('open', 'under_review', 'reopened')",
+            )
+            .bind(&[
+                JsValue::from_str(nostr_bbs_core::governance::broker::CaseState::Closed.as_str()),
+                JsValue::from_f64(now as f64),
+                JsValue::from_str(&row.id),
+            ]);
+        match close {
+            Ok(stmt) => match stmt.run().await {
+                Ok(_) => {
+                    if fresh {
+                        result.expired += 1;
+                    } else {
+                        result.already_expired += 1;
+                    }
+                }
+                Err(e) => {
+                    console_warn!("expiry close failed for {}: {:?}", row.id, e);
+                    result.failed += 1;
+                }
+            },
+            Err(e) => {
+                console_warn!("expiry close bind failed for {}: {:?}", row.id, e);
+                result.failed += 1;
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

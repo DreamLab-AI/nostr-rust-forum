@@ -14,6 +14,7 @@ use nostr_bbs_core::feature_gate::{
     device_keys_enabled as core_device_keys_enabled, DEVICE_KEYS_ENABLED_VAR,
 };
 use nostr_bbs_core::governance::{self, RiskTier, TaskProperties};
+use nostr_bbs_core::ontology_governance;
 use nostr_bbs_core::{KIND_BAN, KIND_MUTE, KIND_REPORT_NIP56, KIND_UNBAN, KIND_UNMUTE};
 use wasm_bindgen::JsValue;
 use worker::*;
@@ -266,6 +267,10 @@ pub(crate) struct RequestBoundary {
     pub probe_digest: Option<String>,
     /// The panel's pending-case deadline, copied onto the case for the cron.
     pub max_pending_hours: u32,
+    /// The proposal's own expiry instant, read out of the `PatchProposal` body
+    /// (ADR-2013). `None` for every request that is not an ontology proposal,
+    /// and for one whose `stale_after` this relay will not vouch for.
+    pub stale_after: Option<i64>,
 }
 
 /// The agent's declared tier, read from the `risk-tier` tag first and the
@@ -313,7 +318,17 @@ pub(crate) fn plan_request_boundary(
     calibration_key: &[u8],
 ) -> RequestBoundary {
     let panel_props = panel_tags.and_then(TaskProperties::from_tags);
-    let request_props = TaskProperties::from_tags(request_tags);
+    // ADR-2013: an ontology proposal's `level` tag contributes a property floor
+    // of its own — `schema` and `demotion` carry `stakes: critical`, whose
+    // tier floor is `High`. It is folded in on the REQUEST side, where the
+    // tightening-only merge can only ever raise the boundary: a proposer that
+    // omits or misspells `level` loses the floor rather than escaping the
+    // panel's. Expressing the rule as a property rather than a tier is what
+    // puts the reason in `broker_cases.tp_stakes` for the reviewer to read.
+    let request_props = TaskProperties::merge_opt(
+        TaskProperties::from_tags(request_tags).as_ref(),
+        ontology_governance::level_property_floor(request_tags).as_ref(),
+    );
     let merged = TaskProperties::merge_opt(panel_props.as_ref(), request_props.as_ref());
     let declared = declared_tier(request_tags, request_content);
     let effective = governance::effective_tier(
@@ -353,6 +368,12 @@ pub(crate) fn plan_request_boundary(
         calibration_sample,
         probe_digest,
         max_pending_hours: policy.max_pending_hours,
+        // Only an ontology proposal has an expiry, and only one that declared a
+        // `level` is an ontology proposal: reading `stale_after` off any 31402
+        // would let an unrelated agent give its own case a self-serving
+        // deadline.
+        stale_after: ontology_governance::ProposalLevel::from_tags(request_tags)
+            .and_then(|_| ontology_governance::stale_after_from_content(request_content)),
     }
 }
 
@@ -2206,9 +2227,9 @@ impl NostrRelayDO {
              (id, category, subject_kind, subject_id, title, summary, state, priority, \
               created_by, nostr_event_id, created_at, updated_at, \
               declared_tier, effective_tier, tp_verifiability, tp_reversibility, tp_stakes, \
-              calibration_sample, probe_digest, max_pending_hours) \
+              calibration_sample, probe_digest, max_pending_hours, stale_after) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?10, \
-                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         );
         if let Ok(bound) = stmt.bind(&[
             JsValue::from_str(d_tag),
@@ -2244,6 +2265,10 @@ impl NostrRelayDO {
                 None => JsValue::NULL,
             },
             JsValue::from_f64(boundary.max_pending_hours as f64),
+            match boundary.stale_after {
+                Some(t) => JsValue::from_f64(t as f64),
+                None => JsValue::NULL,
+            },
         ]) {
             let _ = bound.run().await;
         }
@@ -3153,7 +3178,7 @@ mod governance_projection_tests {
             "case-1",
             Some(&row),
             &"a".repeat(64),
-            r#"{"action":"promote","pattern_id":"pat-9"}"#,
+            r#"{"action":"promote","iri":"urn:ngm:class:knowledge-graph"}"#,
             "human-bob",
             None,
             2_000,
@@ -4293,6 +4318,260 @@ mod augmentation_boundary_tests {
             created_by: "agent-alice".into(),
             from_share_state: None,
             to_share_state: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod ontology_governance_boundary_tests {
+    //! ADR-2013: the `ontology-governance` profile's share of the boundary —
+    //! the `level` tag's tier floor and the proposal expiry the relay copies
+    //! onto the case. Pure seams, no live D1, as `augmentation_boundary_tests`.
+    use super::*;
+    use nostr_bbs_core::governance::broker::CaseState;
+    use nostr_bbs_core::governance::Stakes;
+    use nostr_bbs_core::ontology_governance::{self as og, ProposalLevel};
+
+    const KEY: &[u8] = b"relay-selection-secret";
+
+    fn tag(name: &str, value: &str) -> Vec<String> {
+        vec![name.to_string(), value.to_string()]
+    }
+
+    /// The panel an operator actually publishes, rendered to the tags a 31400
+    /// carries. Tests run against the real thing so a change to the panel's
+    /// declaration is caught here rather than in production.
+    fn ontology_panel_tags() -> Vec<Vec<String>> {
+        let panel = og::ontology_governance_panel();
+        let mut tags = vec![tag("d", og::PANEL_ONTOLOGY_GOVERNANCE)];
+        tags.extend(panel.task_properties.unwrap().to_tags());
+        tags.extend(panel.policy().to_tags());
+        tags
+    }
+
+    fn proposal(level: &str, stale_after: &str) -> (Vec<Vec<String>>, String) {
+        let tags = vec![
+            tag("d", "case-onto-1"),
+            tag(og::TAG_CONTEXT_URL, "urn:ngm:class:knowledge-graph"),
+            tag(og::TAG_LEVEL, level),
+            tag("risk-tier", "low"),
+        ];
+        let content = format!(
+            r#"{{"level":"{level}","iri":"urn:ngm:class:knowledge-graph",
+                 "page":"Knowledge Graph","hypothesis":"h","diff":"d",
+                 "digest":"sha256:abc","blockers":[],
+                 "proposer":"process:vault/1.0","generation":"visionGraph@deadbee",
+                 "stale_after":"{stale_after}"}}"#
+        );
+        (tags, content)
+    }
+
+    fn boundary_for(level: &str, stale_after: &str) -> RequestBoundary {
+        let (tags, content) = proposal(level, stale_after);
+        plan_request_boundary(
+            "case-onto-1",
+            "agent",
+            &tags,
+            &content,
+            Some(&ontology_panel_tags()),
+            RiskTier::Medium,
+            KEY,
+        )
+    }
+
+    // ── The `level` tier floor (PRD §2 Q7) ──────────────────────────────
+
+    /// The headline rule: a schema-level proposal is `High` even though the
+    /// proposing agent declared `low` and the panel declares only
+    /// `significant` stakes.
+    #[test]
+    fn a_schema_proposal_is_floored_at_high() {
+        let boundary = boundary_for("schema", "2026-10-06T00:00:00Z");
+        assert_eq!(boundary.effective, RiskTier::High);
+        assert_eq!(boundary.props.unwrap().stakes, Stakes::Critical);
+        assert_eq!(
+            boundary.declared,
+            Some(RiskTier::Low),
+            "the agent's own claim survives as telemetry, not as the boundary"
+        );
+    }
+
+    /// A demotion reaches as far as a schema change, so it is tiered the same.
+    #[test]
+    fn a_demotion_proposal_is_floored_at_high() {
+        assert_eq!(
+            boundary_for("demotion", "2026-10-06T00:00:00Z").effective,
+            RiskTier::High
+        );
+    }
+
+    /// The falsification target: if every ontology case were `High`, the rule
+    /// above would be testing nothing. A content proposal is not floored.
+    #[test]
+    fn a_content_proposal_is_not_floored_at_high() {
+        let boundary = boundary_for("content", "2026-10-06T00:00:00Z");
+        assert_ne!(boundary.effective, RiskTier::High);
+        assert_eq!(boundary.props.unwrap().stakes, Stakes::Significant);
+    }
+
+    /// A non-ontology 31402 on some other panel is untouched by this profile.
+    #[test]
+    fn a_request_without_a_level_tag_gains_no_floor_and_no_expiry() {
+        let boundary = plan_request_boundary(
+            "case-1",
+            "agent",
+            &[tag("d", "case-1")],
+            r#"{"stale_after":"2020-01-01T00:00:00Z"}"#,
+            None,
+            RiskTier::Medium,
+            KEY,
+        );
+        assert_eq!(boundary.effective, RiskTier::Medium);
+        assert_eq!(
+            boundary.stale_after, None,
+            "a `stale_after` on a request that is not an ontology proposal is \
+             not this relay's business to honour"
+        );
+    }
+
+    // ── Expiry carried onto the case ────────────────────────────────────
+
+    #[test]
+    fn the_proposal_expiry_is_copied_onto_the_case() {
+        let boundary = boundary_for("content", "2026-10-06T00:00:00Z");
+        assert_eq!(boundary.stale_after, Some(1_791_244_800));
+        assert!(og::is_expired(1_791_244_800, 1_791_244_801));
+        assert!(!og::is_expired(1_791_244_800, 1_791_244_800));
+    }
+
+    #[test]
+    fn an_unreadable_expiry_leaves_the_case_out_of_the_sweep() {
+        let (tags, _) = proposal("content", "");
+        let boundary = plan_request_boundary(
+            "case-onto-1",
+            "agent",
+            &tags,
+            r#"{"level":"content","stale_after":"whenever"}"#,
+            Some(&ontology_panel_tags()),
+            RiskTier::Medium,
+            KEY,
+        );
+        assert_eq!(boundary.stale_after, None);
+        // …but the case is still tiered and still ages, so it is not lost.
+        assert_eq!(boundary.max_pending_hours, og::STALE_AFTER_DEFAULT_HOURS);
+    }
+
+    // ── Promote / Demote parsing off the signed 31403 ───────────────────
+
+    /// A schema-level ontology case as the relay projected it: `high`, because
+    /// that is what [`a_schema_proposal_is_floored_at_high`] proves it becomes.
+    fn schema_case_row() -> BrokerCaseRow {
+        BrokerCaseRow {
+            category: "knowledge_enrichment".into(),
+            state: "open".into(),
+            effective_tier: Some(RiskTier::High.as_str().to_string()),
+            nostr_event_id: Some("r".repeat(64)),
+            created_by: "agent-vault".into(),
+            from_share_state: None,
+            to_share_state: None,
+        }
+    }
+
+    #[test]
+    fn promote_and_demote_project_with_the_iri_they_signed() {
+        let row = schema_case_row();
+        let promote = plan_action_response(
+            "case-onto-1",
+            Some(&row),
+            &"a".repeat(64),
+            r#"{"action":"promote","iri":"urn:ngm:class:knowledge-graph"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("promote projects");
+        assert_eq!(promote.outcome, "promote");
+        assert_eq!(
+            promote.outcome_detail.as_deref(),
+            Some("urn:ngm:class:knowledge-graph")
+        );
+        assert_eq!(promote.new_state, CaseState::Promoted);
+
+        let demote = plan_action_response(
+            "case-onto-1",
+            Some(&schema_case_row()),
+            &"b".repeat(64),
+            r#"{"action":"demote","iri":"urn:ngm:class:knowledge-graph"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .expect("demote projects");
+        assert_eq!(demote.outcome, "demote");
+        assert_eq!(
+            demote.outcome_detail.as_deref(),
+            Some("urn:ngm:class:knowledge-graph")
+        );
+        // A demotion is a resolved decision; it gets no state of its own.
+        assert_eq!(demote.new_state, CaseState::Decided);
+    }
+
+    /// A `promote`/`demote` with no `iri` is refused rather than parked: the
+    /// apply path has nothing to act on, and inventing a subject for it is the
+    /// one mistake that writes to the wrong page.
+    #[test]
+    fn a_subjectless_promote_or_demote_is_refused() {
+        for content in [r#"{"action":"promote"}"#, r#"{"action":"demote"}"#] {
+            assert!(
+                nostr_bbs_core::governance::broker::DecisionOutcome::from_response_content(content)
+                    .is_none(),
+                "{content} must not parse"
+            );
+        }
+    }
+
+    /// The point of flooring a schema proposal at `High`: the corpus write is
+    /// then reserved for a person. A reasoner stamping `system:whelk-gate`
+    /// cannot promote a page, however well its gate ran.
+    #[test]
+    fn a_reasoner_may_not_promote_a_schema_level_page() {
+        let refused = plan_action_response(
+            "case-onto-1",
+            Some(&schema_case_row()),
+            &"c".repeat(64),
+            r#"{"action":"promote","iri":"urn:ngm:class:knowledge-graph",
+                "decided_by":"system:whelk-gate"}"#,
+            "agent-vault",
+            None,
+            2_000,
+        );
+        assert!(
+            refused.is_err(),
+            "a system resolver must not close a High case"
+        );
+
+        // The same body from a human signer, with no `decided_by`, projects.
+        assert!(plan_action_response(
+            "case-onto-1",
+            Some(&schema_case_row()),
+            &"d".repeat(64),
+            r#"{"action":"promote","iri":"urn:ngm:class:knowledge-graph"}"#,
+            "human-bob",
+            None,
+            2_000,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_level_a_proposal_declares_round_trips() {
+        for (s, level) in [
+            ("content", ProposalLevel::Content),
+            ("schema", ProposalLevel::Schema),
+            ("demotion", ProposalLevel::Demotion),
+        ] {
+            assert_eq!(ProposalLevel::parse(s), level);
+            assert_eq!(level.as_str(), s);
         }
     }
 }

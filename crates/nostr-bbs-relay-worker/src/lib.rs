@@ -666,6 +666,10 @@ async fn ensure_schema(env: &Env) {
         "ALTER TABLE broker_cases ADD COLUMN calibration_sample INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE broker_cases ADD COLUMN probe_digest TEXT",
         "ALTER TABLE broker_cases ADD COLUMN max_pending_hours INTEGER",
+        // ADR-2013 (migration 0007): the ontology proposal's own expiry, copied
+        // off the `PatchProposal` body at projection time so the expiry sweep
+        // is an indexed scan rather than a JSON parse per pending row.
+        "ALTER TABLE broker_cases ADD COLUMN stale_after INTEGER",
         // FR4.1: provenance of an application-stage advance — who claimed it,
         // when, and in whose words.
         "ALTER TABLE governance_receipts ADD COLUMN applied_at INTEGER",
@@ -1014,6 +1018,27 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             }
         }
         Err(e) => console_error!("ageing sweep failed: {e}"),
+    }
+
+    // ADR-2013: an ontology proposal past its `stale_after` is no longer safe
+    // to apply — the corpus has moved on and its digest no longer describes the
+    // page. It is closed WITHOUT a decision and receipted `expired`. This runs
+    // after the ageing sweep so a case that is both overdue and expired accrues
+    // the honest pair of receipts, in the order they became true.
+    match cron::expire_stale_proposals(&env).await {
+        Ok(result) => {
+            if result.expired > 0 || result.failed > 0 || result.truncated {
+                console_log!(
+                    "expiry sweep: scanned={} expired={} already={} failed={} truncated={}",
+                    result.scanned,
+                    result.expired,
+                    result.already_expired,
+                    result.failed,
+                    result.truncated
+                );
+            }
+        }
+        Err(e) => console_error!("expiry sweep failed: {e}"),
     }
 }
 
