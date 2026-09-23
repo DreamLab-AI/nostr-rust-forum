@@ -33,8 +33,8 @@ machine-confirmed          verified: [process:vault/<ver>]
       ├─ you sign 31403 Reject ────────► receipt `rejected`. Nothing is written.
       ├─ you sign 31403 Demote{iri} ───► status: deprecated. Case → decided.
       │
-      ├─ 72 h unattended (panel default) ─► `escalated-on-age` receipt. STILL OPEN.
-      └─ stale_after (14 d) passes ──────► `expired` receipt, case CLOSED without
+      └─ 14 d unattended ─────────────► `escalated-on-age` receipt, then
+         (panel deadline = stale_after)     `expired` receipt: case CLOSED without
                                             a decision. Page untouched.
 stable ──► a conflict or a passed stale_after proposes its own demotion, which
            comes back to you as a `level: demotion` case, floored HIGH.
@@ -115,19 +115,24 @@ the only decision that may be raised about an already-stable page.
 
 ### Do nothing
 
-Two different things happen, in this order, and they are **not** the same:
+Two different things happen, and they are **not** the same, though on this
+panel they fall due together:
 
-1. **72 hours** (the panel's `max_pending_hours`): an `escalated-on-age` side
-   receipt. The case stays **open**. This says "nobody has looked at this yet"
-   and is a prompt, not a verdict.
+1. **336 hours** (the panel's `max_pending_hours`, 14 days): an
+   `escalated-on-age` side receipt. On its own it leaves the case **open**: it
+   says "nobody has looked at this yet" and is a prompt, not a verdict.
 2. **14 days** (`stale_after`): an `expired` side receipt and the case is
    **closed without a decision** — no `broker_decisions` row, because nobody
    decided anything. The page is untouched. This says "this diff no longer
    describes the page": the corpus has moved on, the digest no longer matches,
    and applying it would write stale frontmatter over newer.
 
-Both receipts land on the same case, in that order, and that is the honest
-history: *surfaced, then expired unattended*. An expired proposal is not a
+The panel deadline is set to match `stale_after` on purpose (forum ADR-2013), so
+both sweeps land on the same five-minute cron tick rather than a day either side
+of each other. Both receipts land on the same case, and that is the honest
+history: *surfaced, then expired unattended*. If you want an earlier nudge than
+fourteen days, it has to come from outside the panel: shortening
+`max_pending_hours` alone would re-open the gap ADR-2013 closed. An expired proposal is not a
 rejection — nothing was judged. The proposer regenerates from the current
 generation.
 
