@@ -155,8 +155,7 @@ fn tier_of(request_tags: &[Vec<String>]) -> RiskTier {
 
 /// `--from-request`: verify a real 31402 and sign the human's decisions on it.
 fn decide_real_request(path: &str) {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     let doc: serde_json::Value = serde_json::from_str(&text).expect("request file is JSON");
     // `vault propose --json` wraps the event beside the proposal; accept both.
     let event_json = doc.get("event").cloned().unwrap_or(doc);
@@ -204,7 +203,10 @@ fn decide_real_request(path: &str) {
         "demote": demote,
         "reject": reject,
     });
-    println!("{}", serde_json::to_string_pretty(&out).expect("serialisable"));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).expect("serialisable")
+    );
 }
 
 fn main() {
