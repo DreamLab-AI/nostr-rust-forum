@@ -149,6 +149,16 @@ impl ReactionStore {
         })
     }
 
+    /// A reactive, stably-ordered list of everyone who reacted with `emoji`
+    /// on `event_id` — the attribution behind a reaction pill ("long press to
+    /// see a list of who left what emoji response").
+    pub fn reactors_for(&self, event_id: &str, emoji: &str) -> Signal<Vec<String>> {
+        let target = event_id.to_lowercase();
+        let emoji = emoji.to_string();
+        let aggregate = self.aggregate;
+        Signal::derive(move || aggregate.with(|agg| reactor_list(agg.get(&target), &emoji)))
+    }
+
     /// Whether `pubkey` has an active `emoji` reaction on `target`.
     pub fn has_my_reaction(&self, target: &str, emoji: &str, pubkey: &str) -> bool {
         let target = target.to_lowercase();
@@ -335,6 +345,20 @@ pub fn build_reactions(
         None => Vec::new(),
     };
     out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.emoji.cmp(&b.emoji)));
+    out
+}
+
+/// The reactor pubkeys behind one emoji on one target, sorted so the list is
+/// stable across re-renders (a `HashSet` iterates in arbitrary order).
+pub fn reactor_list(
+    by_emoji: Option<&HashMap<String, HashSet<String>>>,
+    emoji: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = by_emoji
+        .and_then(|m| m.get(emoji))
+        .map(|pks| pks.iter().cloned().collect())
+        .unwrap_or_default();
+    out.sort();
     out
 }
 
@@ -566,5 +590,26 @@ mod tests {
         let out = build_reactions(agg.get("p"), "");
         assert_eq!(out[0].emoji, "\u{1F44D}"); // count 2 first
         assert_eq!(out[1].emoji, "\u{2764}"); // count 1 second
+    }
+
+    #[test]
+    fn reactor_list_is_sorted_and_scoped_to_one_emoji() {
+        let mut by_emoji: HashMap<String, HashSet<String>> = HashMap::new();
+        by_emoji.entry("\u{1F44D}".into()).or_default().extend([
+            "carol".to_string(),
+            "alice".to_string(),
+            "bob".to_string(),
+        ]);
+        by_emoji
+            .entry("\u{1F525}".into())
+            .or_default()
+            .insert("dave".to_string());
+        assert_eq!(
+            reactor_list(Some(&by_emoji), "\u{1F44D}"),
+            vec!["alice", "bob", "carol"]
+        );
+        assert_eq!(reactor_list(Some(&by_emoji), "\u{1F525}"), vec!["dave"]);
+        assert!(reactor_list(Some(&by_emoji), "\u{1F602}").is_empty());
+        assert!(reactor_list(None, "\u{1F44D}").is_empty());
     }
 }

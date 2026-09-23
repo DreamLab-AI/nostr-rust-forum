@@ -74,6 +74,12 @@ pub struct Filter {
     pub until: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+    /// NIP-50 full-text query. The relay-worker matches it as a
+    /// case-insensitive substring of `content` (`relay_do/filter.rs`), so a
+    /// member can find their own post by a word in it without that post ever
+    /// having reached the vector index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
 }
 
 /// Callback type for received events on a subscription.

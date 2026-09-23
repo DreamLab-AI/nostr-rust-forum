@@ -25,13 +25,102 @@
 //!    ordinary NIP-25 kind-7 content strings, so they go through
 //!    `toggle_reaction` unchanged.
 
+//!
+//! ## Attribution popover (user feedback, 2026-09-22)
+//!
+//! *"Long press to see a list of who left what emoji response"* -- a pill
+//! showed a count but never who was behind it. Each pill now opens a small
+//! popover naming the reactors (display name from the profile cache, else a
+//! shortened pubkey; the viewer as "You"). It opens on a long press on touch,
+//! on a settled hover on a pointer that can hover, and from the keyboard via
+//! a visually-hidden "who" button after each pill that appears on focus. The
+//! tap-to-toggle behaviour of the pill is untouched: a long press that opened
+//! the popover swallows the click that follows it, so it never also toggles.
+
 use leptos::prelude::*;
+use wasm_bindgen::prelude::Closure;
+use wasm_bindgen::JsCast;
 
 use crate::auth::use_auth;
 use crate::components::fx::reaction_burst::ReactionBurst;
+use crate::components::user_display::use_display_name_tracked;
 use crate::relay::RelayConnection;
 use crate::stores::custom_emoji::{use_custom_emoji_store, MAX_EMOJI_CHARS};
 use crate::stores::reactions::use_reaction_store;
+
+/// How long a touch must be held on a pill before it counts as a long press.
+const LONG_PRESS_MS: i32 = 500;
+/// How long a pointer must rest on a pill before the popover opens on hover.
+const HOVER_OPEN_MS: i32 = 400;
+/// Most names the popover lists before collapsing the rest to "+N more".
+const MAX_LISTED_REACTORS: usize = 30;
+
+/// Whether the primary pointer can hover (a mouse or trackpad). A phone's tap
+/// synthesises `mouseenter` before `click`, so the hover-to-open path must be
+/// off there or every tap would also open the popover.
+fn hover_capable() -> bool {
+    web_sys::window()
+        .and_then(|w| w.match_media("(hover: hover)").ok().flatten())
+        .map(|m| m.matches())
+        .unwrap_or(false)
+}
+
+/// The kept-alive `setTimeout` callback of a [`HoldTimer`].
+type HeldClosure = StoredValue<Option<send_wrapper::SendWrapper<Closure<dyn FnMut()>>>>;
+
+/// A cancellable one-shot timer held per pill: one for the long press, one
+/// for the hover delay. The `Closure` is kept alive in a `StoredValue` and
+/// dropped on cancel or replacement rather than leaked via `.forget()`.
+#[derive(Clone, Copy)]
+struct HoldTimer {
+    handle: RwSignal<Option<i32>>,
+    closure: HeldClosure,
+}
+
+impl HoldTimer {
+    fn new() -> Self {
+        Self {
+            handle: RwSignal::new(None),
+            closure: StoredValue::new(None),
+        }
+    }
+
+    fn start<F: Fn() + 'static>(&self, delay_ms: i32, f: F) {
+        self.cancel();
+        let Some(w) = web_sys::window() else {
+            return;
+        };
+        let cb = Closure::wrap(Box::new(f) as Box<dyn FnMut()>);
+        if let Ok(h) = w.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            delay_ms,
+        ) {
+            self.handle.set(Some(h));
+        }
+        self.closure
+            .set_value(Some(send_wrapper::SendWrapper::new(cb)));
+    }
+
+    fn cancel(&self) {
+        if let Some(h) = self.handle.get_untracked() {
+            if let Some(w) = web_sys::window() {
+                w.clear_timeout_with_handle(h);
+            }
+            self.handle.set(None);
+        }
+        self.closure.set_value(None);
+    }
+}
+
+/// Label one reactor for the popover: "You" for the viewer, else the display
+/// name the rest of the UI uses (profile cache, falling back to a short npub).
+fn reactor_label(pubkey: &str, me: &str) -> String {
+    if !me.is_empty() && pubkey.eq_ignore_ascii_case(me) {
+        "You".to_string()
+    } else {
+        use_display_name_tracked(pubkey)
+    }
+}
 
 /// Common reaction emojis offered in the picker.
 const REACTION_EMOJIS: &[&str] = &[
@@ -185,11 +274,56 @@ pub(crate) fn ReactionBar(
                     let emoji = reaction.emoji.clone();
                     let emoji_for_click = emoji.clone();
                     let emoji_for_burst = emoji.clone();
+                    let emoji_for_who = emoji.clone();
+                    let emoji_for_dialog = emoji.clone();
+                    // Copy handles: the `<Show>` body below must be `Fn`, so
+                    // nothing owned may be moved into it.
+                    let emoji_in_popover = StoredValue::new(emoji.clone());
                     let toggle = toggle_reaction;
                     let burst_trigger = RwSignal::new(false);
+                    // Attribution popover state, per pill.
+                    let who_open = RwSignal::new(false);
+                    let press_fired = RwSignal::new(false);
+                    let press_timer = HoldTimer::new();
+                    let hover_timer = HoldTimer::new();
+                    let reactors = store.reactors_for(&event_id_stored.get_value(), &emoji);
+                    let close_who = move || {
+                        press_timer.cancel();
+                        hover_timer.cancel();
+                        who_open.set(false);
+                    };
                     view! {
-                        <div class="relative inline-flex">
+                        <div
+                            class="relative inline-flex"
+                            on:mouseleave=move |_| close_who()
+                            on:keydown=move |ev| {
+                                if ev.key() == "Escape" && who_open.get_untracked() {
+                                    ev.stop_propagation();
+                                    close_who();
+                                }
+                            }
+                        >
                             <button
+                                // No iOS callout / Android context menu on the
+                                // long press; the popover is the long-press action.
+                                style="-webkit-touch-callout:none;-webkit-user-select:none;user-select:none"
+                                on:contextmenu=move |ev| ev.prevent_default()
+                                on:touchstart=move |_| {
+                                    press_fired.set(false);
+                                    press_timer.start(LONG_PRESS_MS, move || {
+                                        press_fired.set(true);
+                                        who_open.set(true);
+                                    });
+                                }
+                                on:touchend=move |_| press_timer.cancel()
+                                on:touchcancel=move |_| press_timer.cancel()
+                                on:touchmove=move |_| press_timer.cancel()
+                                on:mouseenter=move |_| {
+                                    if hover_capable() {
+                                        hover_timer.start(HOVER_OPEN_MS, move || who_open.set(true));
+                                    }
+                                }
+                                aria-describedby=move || if who_open.get() { Some(format!("who-{}", emoji_for_who)) } else { None }
                                 class=move || {
                                     let is_mine = reactions.get()
                                         .iter()
@@ -206,6 +340,13 @@ pub(crate) fn ReactionBar(
                                     let emoji_c = emoji_for_click.clone();
                                     let toggle_c = toggle;
                                     move |_| {
+                                        // A long press that opened the popover
+                                        // ends in a synthesised click on some
+                                        // browsers; that click is not a toggle.
+                                        if press_fired.get_untracked() {
+                                            press_fired.set(false);
+                                            return;
+                                        }
                                         // A burst plays only when ADDING a reaction.
                                         let adding = !reactions.get_untracked()
                                             .iter()
@@ -228,6 +369,61 @@ pub(crate) fn ReactionBar(
                                 particle_count=12
                                 emoji=emoji_for_burst
                             />
+                            // Keyboard route to the same popover: hidden until
+                            // focused (Tab lands on it right after the pill),
+                            // Enter/Space toggles. Screen readers get the emoji
+                            // in the label rather than a bare "who".
+                            <button
+                                class="sr-only focus:not-sr-only focus:absolute focus:-top-1 focus:right-0 focus:z-50 focus:px-1.5 focus:py-0.5 focus:rounded-md focus:text-[10px] focus:bg-gray-800 focus:text-amber-300 focus:outline-none focus:ring-1 focus:ring-amber-400/60"
+                                on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    who_open.update(|v| *v = !*v);
+                                }
+                                aria-label=move || format!("Who reacted with {}", emoji_for_dialog)
+                                aria-haspopup="dialog"
+                                aria-expanded=move || if who_open.get() { "true" } else { "false" }
+                            >
+                                "who"
+                            </button>
+                            <Show when=move || who_open.get()>
+                                <div
+                                    id=move || format!("who-{}", emoji_in_popover.get_value())
+                                    class="absolute bottom-full left-0 mb-1 glass-card px-2 py-1.5 rounded-xl shadow-lg z-50 w-max max-w-[14rem] text-xs"
+                                    role="dialog"
+                                    aria-label=move || format!("Reacted with {}", emoji_in_popover.get_value())
+                                    on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        close_who();
+                                    }
+                                >
+                                    <div class="text-gray-400 mb-0.5 whitespace-nowrap">
+                                        <span>{move || emoji_in_popover.get_value()}</span>
+                                        " "
+                                        <span>{move || reactors.get().len()}</span>
+                                    </div>
+                                    <ul class="max-h-40 overflow-y-auto">
+                                        {move || {
+                                            let me = auth.pubkey().get().unwrap_or_default();
+                                            let all = reactors.get();
+                                            let extra = all.len().saturating_sub(MAX_LISTED_REACTORS);
+                                            let mut rows: Vec<AnyView> = all
+                                                .iter()
+                                                .take(MAX_LISTED_REACTORS)
+                                                .map(|pk| {
+                                                    let label = reactor_label(pk, &me);
+                                                    view! { <li class="text-gray-200 truncate">{label}</li> }.into_any()
+                                                })
+                                                .collect();
+                                            if extra > 0 {
+                                                rows.push(
+                                                    view! { <li class="text-gray-500">{format!("+{extra} more")}</li> }.into_any(),
+                                                );
+                                            }
+                                            rows
+                                        }}
+                                    </ul>
+                                </div>
+                            </Show>
                         </div>
                     }
                 }
