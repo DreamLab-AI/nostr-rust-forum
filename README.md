@@ -28,7 +28,7 @@ and deployment values — no forking, no code changes.
 
 ## Where this sits in the ecosystem
 
-VisionFlow is a seven-repo mesh built on one premise: hierarchy was an information-routing
+VisionFlow is an eight-repo mesh built on one premise: hierarchy was an information-routing
 protocol bounded by human bandwidth, AI collapses the cost of that routing to near zero,
 and so the human role is promoted from router to **judgment broker** — the person who
 signs the decisions that matter. This repo is the surface where that signature lands.
@@ -51,6 +51,9 @@ its own are signed here, by a person, with a key.
 - **[solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs)** — the personal-data
   sovereignty layer. This forum's per-user Solid pods are that server's kit; the identity
   spine (`did:nostr` Multikey) is shared verbatim.
+- **[sidestr-rs](https://github.com/DreamLab-AI/sidestr-rs)** — Rust port of Melvin Carvalho's sidestr sidechains,
+  AGPL-3.0-only: the economic engine for `did:nostr` agents. A `did:nostr` key is a
+  sidechain wallet.
 - **[narrativegoldmine](https://github.com/DreamLab-AI/knowledgeGraph)** — the published,
   browsable rendering of the knowledge corpus VisionClaw reasons over, served at
   [narrativegoldmine.com](https://narrativegoldmine.com). Since July 2026 it also releases
@@ -99,6 +102,14 @@ Each sibling in its own words:
 <br/>
 
 > **Your data's exit right should sit in the floor, not be granted at the door — solid-pod-rs gives every human and agent a self-owned RDF pod under their own key.** A Rust-native Solid Protocol server with WAC access control and `did:nostr` identity; every write is a git-mark commit and high-value writes anchor to Bitcoin. Standards-based sovereignty: leave at any time, and take everything with you.
+
+</details>
+
+<details>
+<summary><b>sidestr-rs</b> — <em>economic engine for did:nostr agents — a did:nostr key is a sidechain wallet</em></summary>
+<br/>
+
+> **Rust port of Melvin Carvalho's sidestr sidechains, AGPL-3.0-only: the economic engine for `did:nostr` agents. A `did:nostr` key is a sidechain wallet.**
 
 </details>
 
