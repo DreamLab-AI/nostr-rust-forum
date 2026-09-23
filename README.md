@@ -28,7 +28,7 @@ and deployment values — no forking, no code changes.
 
 ## Where this sits in the ecosystem
 
-VisionFlow is an eight-repo mesh built on one premise: hierarchy was an information-routing
+VisionFlow is a nine-repo mesh built on one premise: hierarchy was an information-routing
 protocol bounded by human bandwidth, AI collapses the cost of that routing to near zero,
 and so the human role is promoted from router to **judgment broker** — the person who
 signs the decisions that matter. This repo is the surface where that signature lands.
@@ -69,7 +69,7 @@ Each sibling in its own words:
 <summary><b>VisionFlow</b> — <em>ecosystem canon and honest status ledger</em></summary>
 <br/>
 
-> **Six honest systems can still assemble one collective lie — VisionFlow is the canon that stops that.** It holds the ADRs, PRDs, compatibility matrix and honest status ledger for a seven-repo human–AI mesh built on one wager: AI collapses the cost of routing information, so the human is promoted from router to judgment broker. This repo ships words, not runtime — and it is graded on their accuracy.
+> **Six honest systems can still assemble one collective lie — VisionFlow is the canon that stops that.** It holds the ADRs, PRDs, compatibility matrix and honest status ledger for a nine-repo human–AI mesh built on one wager: AI collapses the cost of routing information, so the human is promoted from router to judgment broker. This repo ships words, not runtime — and it is graded on their accuracy.
 
 </details>
 
