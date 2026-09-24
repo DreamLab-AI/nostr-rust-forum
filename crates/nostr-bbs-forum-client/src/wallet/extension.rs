@@ -47,13 +47,20 @@ pub fn available() -> bool {
     provider().is_some()
 }
 
-/// What to call the signer in a sentence: the name the extension gives
-/// itself (`window.nostr.name`, e.g. "Podkey"), else "Your extension".
+/// What to call the signer in a sentence: the name it gives itself
+/// (`window.nostr.sidestr.name`, e.g. "Podkey"; `window.nostr.name` for
+/// others), else "Your extension".
 pub fn name() -> String {
-    web_sys::window()
-        .and_then(|w| js_sys::Reflect::get(&w, &"nostr".into()).ok())
-        .and_then(|n| js_sys::Reflect::get(&n, &"name".into()).ok())
-        .and_then(|v| v.as_string())
+    let nostr = web_sys::window().and_then(|w| js_sys::Reflect::get(&w, &"nostr".into()).ok());
+    let text = |v: wasm_bindgen::JsValue| v.as_string();
+    provider()
+        .and_then(|s| js_sys::Reflect::get(&s, &"name".into()).ok())
+        .and_then(text)
+        .or_else(|| {
+            nostr
+                .and_then(|n| js_sys::Reflect::get(&n, &"name".into()).ok())
+                .and_then(text)
+        })
         .map(|s| s.trim().chars().take(32).collect::<String>())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Your extension".into())
