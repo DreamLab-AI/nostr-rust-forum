@@ -9,6 +9,7 @@ pub mod audit_log;
 pub mod calendar;
 pub mod channel_form;
 pub mod invites;
+pub(crate) mod membership;
 pub mod overview;
 pub mod registrations;
 pub mod reports;
@@ -188,14 +189,12 @@ impl AdminStore {
         self.state.error.set(None);
 
         match fetch_whitelist_rows(signer).await {
-            Ok(rows) => {
-                let parsed = WhitelistResponse { users: rows };
-                if parsed.users.is_empty() {
+            Ok(mut users) => {
+                if users.is_empty() {
                     self.state.error.set(Some(
                         "Whitelist is empty. No users have been approved yet.".to_string(),
                     ));
                 }
-                let mut users = parsed.users;
                 // Enrich with admin-only real names from the auth-worker. The
                 // relay never sees real names, so they are joined here by pubkey.
                 Self::enrich_real_names(&mut users, signer).await;
@@ -332,22 +331,10 @@ impl AdminStore {
     /// Derived from the two stored lists so it always reflects the live state
     /// after an approval. Sorted newest-first by reservation time.
     pub fn pending_registrations(&self) -> Vec<Registration> {
-        let whitelisted: std::collections::HashSet<String> = self
-            .state
-            .users
-            .get_untracked()
-            .into_iter()
-            .map(|u| u.pubkey)
-            .collect();
-        let mut pending: Vec<Registration> = self
-            .state
-            .registrations
-            .get_untracked()
-            .into_iter()
-            .filter(|r| !whitelisted.contains(&r.pubkey))
-            .collect();
-        pending.sort_by_key(|r| std::cmp::Reverse(r.created_at));
-        pending
+        membership::pending_registrations(
+            &self.state.registrations.get_untracked(),
+            &self.state.users.get_untracked(),
+        )
     }
 
     /// Recompute the Overview "Pending" stat from the current registrations and
@@ -876,13 +863,11 @@ pub fn use_admin() -> AdminStore {
 
 // -- Internal helpers ---------------------------------------------------------
 
-/// API response shape for GET /api/whitelist/list.
-#[derive(Deserialize)]
-struct WhitelistResponse {
-    users: Vec<WhitelistUser>,
-}
-
-/// Fetch the raw whitelist rows (NIP-98 signed GET, admin-gated server-side).
+/// Fetch every whitelist row (NIP-98 signed GETs, admin-gated server-side).
+///
+/// Walks all pages: the relay defaults `limit` to 20, and a single-page read
+/// turned every older member into a phantom "pending" registration that no
+/// approval could clear (see [`membership::WhitelistPager`]).
 ///
 /// Standalone so non-panel consumers — the admin new-joiner alert producer in
 /// [`crate::stores::admin_alerts`] — can read the whitelist without an
@@ -891,16 +876,18 @@ struct WhitelistResponse {
 pub(crate) async fn fetch_whitelist_rows(
     signer: &dyn Signer,
 ) -> Result<Vec<WhitelistUser>, String> {
-    let url = format!(
+    let base = format!(
         "{}/api/whitelist/list",
         crate::utils::relay_url::relay_api_base()
     );
-    let body = fetch_with_nip98_get_signer(&url, signer)
-        .await
-        .map_err(|e| format!("Failed to fetch whitelist: {e}"))?;
-    let parsed: WhitelistResponse =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse whitelist: {e}"))?;
-    Ok(parsed.users)
+    let mut pager = membership::WhitelistPager::new();
+    while let Some(query) = pager.next_query() {
+        let body = fetch_with_nip98_get_signer(&format!("{base}{query}"), signer)
+            .await
+            .map_err(|e| format!("Failed to fetch whitelist: {e}"))?;
+        pager.absorb(&body)?;
+    }
+    Ok(pager.into_users())
 }
 
 /// Infer a legacy section ID from a channel name for channels that lack a

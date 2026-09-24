@@ -70,16 +70,10 @@ pub fn RegistrationsPanel() -> impl IntoView {
     }
 
     // Derived pending set: registrations whose pubkey is not on the whitelist.
+    // One derivation shared with the Overview stat, so the badge and the list
+    // cannot disagree.
     let pending = Signal::derive(move || {
-        let wl: std::collections::HashSet<String> =
-            users.get().into_iter().map(|u| u.pubkey).collect();
-        let mut list: Vec<super::Registration> = registrations
-            .get()
-            .into_iter()
-            .filter(|r| !wl.contains(&r.pubkey))
-            .collect();
-        list.sort_by_key(|r| std::cmp::Reverse(r.created_at));
-        list
+        super::membership::pending_registrations(&registrations.get(), &users.get())
     });
 
     let pending_count = Memo::new(move |_| pending.get().len());
