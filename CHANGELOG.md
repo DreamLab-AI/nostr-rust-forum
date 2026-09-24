@@ -7,6 +7,18 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added — wallet spends signed in the browser extension, 2026-09-24
+
+- **Members signed in with an extension can send and tip without pasting a key.** When the
+  extension offers `window.nostr.sidestr.signTransaction` (sidestr spec
+  `proposals/browser-signer.md`; Podkey is the reference signer), the wallet builds the spend
+  unsigned, the extension shows it and asks the member, and the forum takes the answer back only
+  if it is the same transaction with every input validly signed (ADR-2015 D8, sidestr-wallet
+  0.4.1). The review step and the tip popover say where to confirm. The nsec unlock is now only
+  the fallback for extensions without the method.
+- **Transaction events come from a throwaway key** on every path (SPEC 11: the transaction
+  authorises itself), so a member is asked once, for the spend.
+
 ### Fixed — forum member feedback, 2026-09-22
 
 - **Text search finds a member's own post.** *"I did a post called Glastonbury.

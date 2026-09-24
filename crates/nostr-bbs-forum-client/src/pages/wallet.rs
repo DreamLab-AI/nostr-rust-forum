@@ -20,7 +20,7 @@ use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::utils::format_relative_time;
 use crate::wallet::chain::{self, Balances, Snapshot};
-use crate::wallet::{use_wallet, LoadStatus, Pending, PendingKind, WalletStore};
+use crate::wallet::{use_wallet, LoadStatus, Pending, PendingKind, SpendPath, WalletStore};
 
 /// What the give form sends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +115,7 @@ pub fn WalletPage() -> impl IntoView {
     let pack_sats = RwSignal::new(PACK_SATS.to_string());
     let review = RwSignal::new(false);
     let sending = RwSignal::new(false);
+    let signer_name = StoredValue::new(crate::wallet::extension::name());
     let search_seq = StoredValue::new(0u32);
 
     let recipient = Memo::new(
@@ -298,7 +299,7 @@ pub fn WalletPage() -> impl IntoView {
                 <section class=card aria-labelledby="unlock-h">
                     <h2 id="unlock-h" class="text-sm font-semibold text-gray-100">"Unlock to send"</h2>
                     <p class="mt-1 text-sm text-gray-400">
-                        "You signed in with a browser extension, which can receive DREAM but can't sign DreamLab transfers yet. Paste your nsec to send from this tab. It stays in this tab's memory and is forgotten when you close it or sign out; it is never sent anywhere."
+                        "You signed in with a browser extension, which can receive DREAM but can't sign DreamLab transfers. Podkey can: it shows you each transfer and asks you to confirm, and your key never leaves it. Or paste your nsec to send from this tab. It stays in this tab's memory and is forgotten when you close it or sign out; it is never sent anywhere."
                     </p>
                     <form class="mt-3 flex gap-2" on:submit=move |ev| {
                         ev.prevent_default();
@@ -327,6 +328,11 @@ pub fn WalletPage() -> impl IntoView {
                 <p class="text-xs text-gray-500 -mt-2">
                     "Unlocked for this tab. "
                     <button class="text-amber-400 hover:text-amber-300" on:click=move |_| wallet.lock()>"Lock now"</button>
+                </p>
+            </Show>
+            <Show when=move || me.get().is_some() && wallet.spend_path(&auth) == SpendPath::Extension>
+                <p class="text-xs text-gray-500 -mt-2">
+                    {move || format!("Transfers are signed in {}: it shows you each one and asks you to confirm. Your key never reaches this page.", signer_name.get_value())}
                 </p>
             </Show>
 
@@ -453,6 +459,7 @@ pub fn WalletPage() -> impl IntoView {
                 // review → confirm
                 {move || {
                     let can = wallet.can_spend(&auth);
+                    let via_extension = wallet.spend_path(&auth) == SpendPath::Extension;
                     let rec = recipient.get();
                     let m = mode.get();
                     let (d, s) = match m {
@@ -508,13 +515,27 @@ pub fn WalletPage() -> impl IntoView {
                                 <dd class="text-gray-300">{after}</dd>
                             </dl>
                             <p class="mt-3 text-xs text-gray-500">"Transfers can't be undone. They confirm in a minute or two."</p>
+                            {via_extension.then(|| view! {
+                                <p class="mt-2 text-xs text-amber-200/80" role="status">
+                                    {move || if sending.get() {
+                                        format!("{} is showing you this spend. Confirm it there.", signer_name.get_value())
+                                    } else {
+                                        format!("{} will show you this spend and ask you to confirm.", signer_name.get_value())
+                                    }}
+                                </p>
+                            })}
                             <div class="mt-3 flex gap-2">
                                 <button
                                     class="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-40"
                                     disabled=move || sending.get()
                                     on:click=submit
                                 >
-                                    {move || if sending.get() { "Sending…" } else { "Confirm and send" }}
+                                    {move || match (sending.get(), via_extension) {
+                                        (true, true) => format!("Waiting for {}…", signer_name.get_value()),
+                                        (true, false) => "Sending…".to_string(),
+                                        (false, true) => format!("Continue in {}", signer_name.get_value()),
+                                        (false, false) => "Confirm and send".to_string(),
+                                    }}
                                 </button>
                                 <button class="px-4 py-2 rounded-lg text-sm text-gray-300 hover:bg-gray-700/50" on:click=move |_| review.set(false)>"Back"</button>
                             </div>

@@ -3672,9 +3672,9 @@ dependencies = [
 
 [[package]]
 name = "sidestr-wallet"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f5e45d552b98f83175a66f15cc33d13214e935e7cc31b23479165ce050110c3"
+checksum = "a2baa803ec98ad09b1211a996a52a5155049cc82153c5e614dd008171ab5774a"
 dependencies = [
  "bitcoin",
  "hex",

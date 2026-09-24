@@ -18,7 +18,7 @@ use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
-use crate::wallet::{chain, use_wallet, LoadStatus};
+use crate::wallet::{chain, use_wallet, LoadStatus, SpendPath};
 
 const PRESETS: [u64; 4] = [10, 25, 50, 100];
 
@@ -70,6 +70,7 @@ pub(crate) fn TipControl(
     let open = RwSignal::new(false);
     let custom = RwSignal::new(String::new());
     let sending = RwSignal::new(false);
+    let signer_name = StoredValue::new(crate::wallet::extension::name());
 
     let is_own = Memo::new(move |_| {
         auth.pubkey()
@@ -184,11 +185,12 @@ pub(crate) fn TipControl(
                         if !wallet.can_spend(&auth) {
                             return view! {
                                 <p class="text-xs text-gray-400">
-                                    "Your key lives in your browser extension, which can't sign DreamLab transfers yet. Unlock your wallet for this tab to tip."
+                                    "Your key lives in your browser extension, which can't sign DreamLab transfers. Podkey can, and asks you to confirm each one; or unlock your wallet for this tab to tip."
                                 </p>
                                 <a href=base_href("/wallet") class="mt-2 inline-block text-xs text-amber-400 hover:text-amber-300">"Open wallet →"</a>
                             }.into_any();
                         }
+                        let via_extension = wallet.spend_path(&auth) == SpendPath::Extension;
                         let bal = my_dream.get().unwrap_or_default();
                         if bal.dream == 0 {
                             return view! {
@@ -232,9 +234,22 @@ pub(crate) fn TipControl(
                                     class="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-xs font-semibold disabled:opacity-40"
                                     disabled=move || sending.get()
                                 >
-                                    {move || if sending.get() { "Sending…" } else { "Tip" }}
+                                    {move || match (sending.get(), via_extension) {
+                                        (true, true) => "Confirm…",
+                                        (true, false) => "Sending…",
+                                        _ => "Tip",
+                                    }}
                                 </button>
                             </form>
+                            {via_extension.then(|| view! {
+                                <p class="mt-2 text-[11px] leading-snug text-amber-200/80" role="status">
+                                    {move || if sending.get() {
+                                        format!("{} is showing you this tip. Confirm it there.", signer_name.get_value())
+                                    } else {
+                                        format!("{} will show you each tip and ask you to confirm.", signer_name.get_value())
+                                    }}
+                                </p>
+                            })}
                             <p class="mt-2 text-[11px] leading-snug text-gray-500">
                                 "You have " {grouped(bal.dream)} " DREAM · each tip uses about 200 sats in fees. DREAM is a test token with no cash value."
                             </p>

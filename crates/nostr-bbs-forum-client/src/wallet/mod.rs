@@ -6,13 +6,17 @@
 //! browser half: it downloads the chain from a mirror, validates every block
 //! against the pinned document ([`chain`]), reads DREAM under the SPEC 12
 //! assets rule, and signs spends with the member's key in memory, never
-//! sending it anywhere. Transactions travel as kind-23500 events to the
-//! public relays the producer follows ([`relays`]).
+//! sending it anywhere — or, for a member signed in with an extension that
+//! offers `window.nostr.sidestr`, has the extension sign ([`extension`]).
+//! Transactions travel as kind-23500 events, signed by a throwaway key (a
+//! transaction authorises itself, SPEC 11), to the public relays the
+//! producer follows ([`relays`]).
 //!
 //! Off unless the deployment sets `window.__ENV__.SIDESTR_WALLET = "on"`, so
 //! an instance that has not opted in renders exactly as before.
 
 pub mod chain;
+pub mod extension;
 pub mod relays;
 
 use std::rc::Rc;
@@ -25,8 +29,10 @@ use sidestr_agent::AgentKey;
 use sidestr_nostr::event::SecretKeySigner;
 use sidestr_nostr::tx::{sign_faucet_request, sign_transaction_event};
 use sidestr_wallet::asset::{build_transfer, sort_coins, TransferRequest};
+use sidestr_wallet::coins::Coin;
+use sidestr_wallet::external::{accept_signed, unsigned_hex, ExternalSigner};
 use sidestr_wallet::spend::{build_spend, Spend, SpendRequest};
-use sidestr_wallet::Permissive;
+use sidestr_wallet::{Permissive, SpendSigner};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
@@ -124,6 +130,40 @@ pub struct Pending {
     pub tip_event: Option<String>,
     /// When it was sent, unix seconds.
     pub at: u64,
+}
+
+/// How this session can spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendPath {
+    /// With a key in this tab: the forum session's own, or a session unlock.
+    Key,
+    /// Through the browser extension, which asks the member every time.
+    Extension,
+    /// Not at all yet: signed in with an extension that cannot sign spends,
+    /// and not unlocked.
+    None,
+}
+
+/// Who signs a spend being built.
+enum Spender {
+    Key(AgentKey),
+    Extension(ExternalSigner),
+}
+
+impl Spender {
+    fn script(&self) -> ScriptBuf {
+        match self {
+            Spender::Key(k) => k.script(),
+            Spender::Extension(e) => e.script(),
+        }
+    }
+    /// Run a builder with this spender's [`SpendSigner`].
+    fn build<R>(&self, f: impl FnOnce(&dyn SpendSigner) -> R) -> R {
+        match self {
+            Spender::Key(k) => f(&k.spend_signer()),
+            Spender::Extension(e) => f(e),
+        }
+    }
 }
 
 /// A pending transaction older than this whose coins are still unspent is
@@ -359,10 +399,10 @@ impl WalletStore {
         t
     }
 
-    /// Unlock spending for this session with a pasted nsec (or hex): for a
-    /// member signed in through an extension, whose key the forum never
-    /// holds. The key must be the signed-in member's; it stays in memory
-    /// for this tab only.
+    /// Unlock spending for this session with a pasted nsec (or hex): the
+    /// fallback for a member signed in through an extension that cannot sign
+    /// spends, whose key the forum never holds. The key must be the
+    /// signed-in member's; it stays in memory for this tab only.
     pub fn unlock(&self, text: &str, expected_pubkey: &str) -> Result<(), String> {
         let k = AgentKey::parse(text)
             .map_err(|_| "That is not an nsec or a 64-hex key.".to_string())?;
@@ -403,20 +443,67 @@ impl WalletStore {
             .with_value(|k| k.as_ref().and_then(|b| AgentKey::from_secret_bytes(b).ok()))
     }
 
-    /// Whether this session can spend.
-    pub fn can_spend(&self, auth: &AuthStore) -> bool {
+    /// How this session can spend: a key in the tab first, then the
+    /// extension, when it offers `window.nostr.sidestr`.
+    pub fn spend_path(&self, auth: &AuthStore) -> SpendPath {
         self.unlocked.get();
-        auth.get_privkey_bytes().is_some() || self.session_key.with_value(|k| k.is_some())
+        let signed_in = auth.get().pubkey;
+        if auth.get_privkey_bytes().is_some() || self.session_key.with_value(|k| k.is_some()) {
+            SpendPath::Key
+        } else if signed_in.is_some() && extension::available() {
+            SpendPath::Extension
+        } else {
+            SpendPath::None
+        }
     }
 
-    async fn deliver(
+    /// Whether this session can spend.
+    pub fn can_spend(&self, auth: &AuthStore) -> bool {
+        self.spend_path(auth) != SpendPath::None
+    }
+
+    fn spender(&self, auth: &AuthStore) -> Option<Spender> {
+        if let Some(k) = self.signing_key(auth) {
+            return Some(Spender::Key(k));
+        }
+        let pk = auth.get().pubkey?;
+        if !extension::available() {
+            return None;
+        }
+        let key = sidestr_agent::parse_pubkey(&pk).ok()?;
+        Some(Spender::Extension(ExternalSigner::new(key)))
+    }
+
+    /// A spend built for the extension goes to it now; one built with a key
+    /// is already signed. The extension's answer is taken only if it is the
+    /// same transaction with every input validly signed against the coins
+    /// this tab built from.
+    async fn signed(
         &self,
-        key: &AgentKey,
+        spender: &Spender,
         spend: Spend,
-        mut pending: Pending,
-    ) -> Result<String, String> {
+        coins: &[Coin],
+        me: &ScriptBuf,
+    ) -> Result<Spend, String> {
+        let Spender::Extension(_) = spender else {
+            return Ok(spend);
+        };
+        let prevouts = chain::prevouts_for(&spend.tx, coins, me)?;
+        let answer = extension::sign(chain::CHAIN_ID, &unsigned_hex(&spend.tx))
+            .await
+            .map_err(|r| extension::explain(&r))?;
+        accept_signed(&spend, &answer, &prevouts, &chain::document()?).map_err(|e| {
+            format!("Your extension's answer was not a valid signature for this transfer, so nothing was sent ({e}).")
+        })
+    }
+
+    async fn deliver(&self, spend: Spend, mut pending: Pending) -> Result<String, String> {
         let doc = chain::document()?;
-        let event = sign_transaction_event(&key.event_signer(), &doc.id, &spend.hex, now_secs())
+        // the transaction authorises itself (SPEC 11): the event that carries
+        // it comes from a throwaway key, so the member is asked once, for the spend
+        let secret = random_32().ok_or("This browser has no secure random source.")?;
+        let carrier = SecretKeySigner::from_bytes(&secret).map_err(|e| e.to_string())?;
+        let event = sign_transaction_event(&carrier, &doc.id, &spend.hex, now_secs())
             .map_err(|e| format!("could not sign the event: {e}"))?;
         let json = serde_json::to_string(&event).map_err(|e| e.to_string())?;
         let (ok, _) = relays::publish_all(&relay_urls(), &json, &event.id).await;
@@ -439,15 +526,13 @@ impl WalletStore {
         Ok(txid)
     }
 
-    fn ready(&self, auth: &AuthStore) -> Result<(Rc<Snapshot>, AgentKey, ScriptBuf), String> {
+    fn ready(&self, auth: &AuthStore) -> Result<(Rc<Snapshot>, Spender, ScriptBuf), String> {
         let snap = self
             .snapshot_untracked()
             .ok_or("The chain has not loaded yet.")?;
-        let key = self
-            .signing_key(auth)
-            .ok_or("Unlock your wallet to send.")?;
-        let me = key.script();
-        Ok((snap, key, me))
+        let spender = self.spender(auth).ok_or("Unlock your wallet to send.")?;
+        let me = spender.script();
+        Ok((snap, spender, me))
     }
 
     /// Send DREAM, optionally as a tip on a post.
@@ -458,7 +543,7 @@ impl WalletStore {
         amount: u64,
         tip_event: Option<String>,
     ) -> Result<String, String> {
-        let (snap, key, me) = self.ready(auth)?;
+        let (snap, spender, me) = self.ready(auth)?;
         if to == me {
             return Err("That is your own wallet.".into());
         }
@@ -467,30 +552,33 @@ impl WalletStore {
             .iter()
             .map(|e| format!("{}{e}", chain::TIP_PREFIX))
             .collect();
-        let t = build_transfer(
-            &TransferRequest {
-                chain: snap.view.state.document(),
-                coins: &coins,
-                view: &snap.view.assets,
-                tip_height: snap.height(),
-                asset: chain::dream_id(),
-                to: &to.to_hex_string(),
-                amount,
-                memos: &memos,
-                fee: None,
-            },
-            &key.spend_signer(),
-            &Permissive,
-        )
-        .map_err(explain)?;
+        let t = spender
+            .build(|signer| {
+                build_transfer(
+                    &TransferRequest {
+                        chain: snap.view.state.document(),
+                        coins: &coins,
+                        view: &snap.view.assets,
+                        tip_height: snap.height(),
+                        asset: chain::dream_id(),
+                        to: &to.to_hex_string(),
+                        amount,
+                        memos: &memos,
+                        fee: None,
+                    },
+                    signer,
+                    &Permissive,
+                )
+            })
+            .map_err(explain)?;
+        let spend = self.signed(&spender, t.spend, &coins, &me).await?;
         let kind = if tip_event.is_some() {
             PendingKind::Tip
         } else {
             PendingKind::Dream
         };
         self.deliver(
-            &key,
-            t.spend,
+            spend,
             Pending {
                 txid: String::new(),
                 kind,
@@ -513,27 +601,30 @@ impl WalletStore {
         to: ScriptBuf,
         sats: u64,
     ) -> Result<String, String> {
-        let (snap, key, me) = self.ready(auth)?;
+        let (snap, spender, me) = self.ready(auth)?;
         if to == me {
             return Err("That is your own wallet.".into());
         }
         let coins = snap.coins(&me, &self.held());
         let plain = sort_coins(&coins, &snap.view.assets, None).plain;
-        let spend = build_spend(
-            &SpendRequest {
-                chain: snap.view.state.document(),
-                coins: &plain,
-                tip_height: snap.height(),
-                to: &to.to_hex_string(),
-                amount: sats,
-                fee: None,
-            },
-            &key.spend_signer(),
-            &Permissive,
-        )
-        .map_err(explain)?;
+        let spend = spender
+            .build(|signer| {
+                build_spend(
+                    &SpendRequest {
+                        chain: snap.view.state.document(),
+                        coins: &plain,
+                        tip_height: snap.height(),
+                        to: &to.to_hex_string(),
+                        amount: sats,
+                        fee: None,
+                    },
+                    signer,
+                    &Permissive,
+                )
+            })
+            .map_err(explain)?;
+        let spend = self.signed(&spender, spend, &coins, &me).await?;
         self.deliver(
-            &key,
             spend,
             Pending {
                 txid: String::new(),
@@ -559,18 +650,19 @@ impl WalletStore {
         dream: u64,
         sats: u64,
     ) -> Result<String, String> {
-        let (snap, key, me) = self.ready(auth)?;
+        let (snap, spender, me) = self.ready(auth)?;
         if to == me {
             return Err("That is your own wallet.".into());
         }
         let coins = snap.coins(&me, &self.held());
-        let spend =
-            chain::build_provision(&snap, &coins, &key, &to, dream, sats).map_err(|e| match e {
+        let spend = spender
+            .build(|signer| chain::build_provision(&snap, &coins, signer, &to, dream, sats))
+            .map_err(|e| match e {
                 chain::ProvisionError::Wallet(w) => explain(w),
                 chain::ProvisionError::Plain(m) => m,
             })?;
+        let spend = self.signed(&spender, spend, &coins, &me).await?;
         self.deliver(
-            &key,
             spend,
             Pending {
                 txid: String::new(),
