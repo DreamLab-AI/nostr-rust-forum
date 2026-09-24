@@ -50,7 +50,8 @@ the clients that read it, not by the producer.
    is a passkey or local key, or, for a member signed in through a NIP-07 extension, a key unlocked
    for this tab only. An unlocked key must match the signed-in pubkey, lives in memory, and is
    cleared on sign-out. Transactions travel as kind-23500 events to the public relays the producer
-   follows.
+   follows, signed by a throwaway key: a transaction authorises itself (SPEC 11), as in the
+   reference wallet, so the member's key signs only the spend.
 5. **Tips are chain records, not forum events.** A tip is a DREAM transfer to the author's script,
    carrying a `tip:nostr:<event id>` record beside its tally. A post's total is what the chain says,
    so it is the same for everyone who replays it. This repo adds no event kind (ADR-2012 D3 holds).
@@ -61,6 +62,17 @@ the clients that read it, not by the producer.
 7. **Coins that carry DREAM are never spent as plain sats.** Plain payments select only coins the
    view reads as carrying nothing. Every built transfer is checked against the view before it is
    signed.
+8. **An extension that signs spends is used before a pasted key** (added 2026-09-24). When the
+   member has no key in the tab and `window.nostr.sidestr` offers `version >= 1` (sidestr spec
+   `proposals/browser-signer.md`; reference signer Podkey), the spend is built unsigned from the
+   member's public key (`sidestr_wallet::external::ExternalSigner`, sidestr-wallet 0.4.1), the bare
+   transaction goes to `signTransaction({ chain, tx })`, and the answer is taken only when its txid
+   is the one built and every input verifies under the parent family's sighash against the coins
+   this tab built from (`external::accept_signed`, prevouts from `chain::prevouts_for`). The
+   extension resolves and validates the chain itself and asks the member every time; the page
+   never sees the key. The extension's error codes read as plain sentences
+   (`wallet::extension::explain`). The nsec unlock remains only as the fallback for an extension
+   without the method.
 
 ## Consequences
 
@@ -78,6 +90,13 @@ after 30 minutes. When JSS gains sidestr support, the wallet should move upstrea
 should follow it.
 
 ## Verification
+
+- Browser-signer path (D8, branch `browser-signer`): `cargo test -p nostr-bbs-forum-client`: 475
+  pass. `wallet::chain::tests::browser_signer` builds the treasury's DREAM pack from its public key
+  alone on the live fixture, accepts a validly signed answer (same txid, same vsize as the
+  placeholder sized it), and refuses swapped signatures, another key's signatures, a different
+  transaction signed validly, an answer still unsigned, and a coin that is not the member's.
+  sidestr-rs `9f9efff5` publishes sidestr-wallet 0.4.1 with `external` and 7 unit tests of its own.
 
 - `cargo test -p nostr-bbs-forum-client`: 462 pass. `wallet::chain` replays the live chain fixture
   (`src/wallet/testdata/blocks.dat`) and finds DREAM's supply at the treasury, with no transaction

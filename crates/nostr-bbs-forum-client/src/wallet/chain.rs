@@ -424,14 +424,14 @@ pub enum ProvisionError {
 pub fn build_provision(
     snap: &Snapshot,
     coins: &[Coin],
-    key: &sidestr_agent::AgentKey,
+    signer: &dyn sidestr_wallet::SpendSigner,
     to: &ScriptBuf,
     dream: u64,
     sats: u64,
 ) -> Result<sidestr_wallet::spend::Spend, ProvisionError> {
     use sidestr_wallet::asset::{sort_coins, CARRIER};
     use sidestr_wallet::compose::{build_outputs, OutputsRequest};
-    let me = key.script();
+    let me = signer.script();
     let id = dream_id();
     let sorted = sort_coins(coins, &snap.view.assets, Some(&id));
     let mut required = Vec::new();
@@ -484,7 +484,7 @@ pub fn build_provision(
             records: &records,
             fee: None,
         },
-        &key.spend_signer(),
+        signer,
         &sidestr_wallet::Permissive,
     )
     .map_err(ProvisionError::Wallet)?;
@@ -494,6 +494,35 @@ pub fn build_provision(
         .check(&spend.tx, &mut carried_in)
         .map_err(|e| ProvisionError::Plain(format!("the pack would break the DREAM rule: {e}")))?;
     Ok(spend)
+}
+
+/// The outputs `tx` spends, in input order, read from the member's own
+/// coins (every coin pays `me`): the prevouts a browser signer's answer is
+/// verified against. A spend of a coin not in `coins` is refused, since
+/// the page did not build it.
+pub fn prevouts_for(
+    tx: &bitcoin::Transaction,
+    coins: &[Coin],
+    me: &ScriptBuf,
+) -> Result<Vec<bitcoin::TxOut>, String> {
+    tx.input
+        .iter()
+        .map(|i| {
+            coins
+                .iter()
+                .find(|c| c.outpoint == i.previous_output)
+                .map(|c| bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(c.value),
+                    script_pubkey: me.clone(),
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "the transfer spends {}, which is not one of your coins",
+                        i.previous_output
+                    )
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -553,6 +582,138 @@ mod tests {
         let issue = hist.iter().find(|t| t.txid == DREAM_ASSET_ID).unwrap();
         assert_eq!(issue.movement(&treasury.to_hex_string()).dream, 1_000_000);
         assert!(snap.txs.iter().all(|t| t.broken.is_none()));
+    }
+
+    mod browser_signer {
+        use super::super::*;
+        use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
+        use bitcoin::hashes::Hash;
+        use bitcoin::secp256k1::{Keypair, Message, SecretKey};
+        use bitcoin::{Transaction, Witness};
+        use sidestr_core::block::secp;
+        use sidestr_core::sighash::{key_path_sighash, SighashRules};
+        use sidestr_wallet::external::{accept_signed, unsigned_hex, ExternalSigner};
+        use sidestr_wallet::SpendSigner;
+
+        fn snap() -> Snapshot {
+            replay(include_bytes!("testdata/blocks.dat"), None).unwrap()
+        }
+        fn kp() -> Keypair {
+            Keypair::from_secret_key(secp(), &SecretKey::from_slice(&[0x42; 32]).unwrap())
+        }
+        /// Two plain coins of the test key, so a pack spends both.
+        fn coins() -> Vec<Coin> {
+            (1..=2u8)
+                .map(|i| Coin {
+                    outpoint: OutPoint {
+                        txid: Txid::from_byte_array([i; 32]),
+                        vout: 0,
+                    },
+                    value: 1_500,
+                    height: 1,
+                    coinbase: false,
+                })
+                .collect()
+        }
+        fn them() -> ScriptBuf {
+            script_of("11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c").unwrap()
+        }
+        /// What the extension does: its own sighash, its own key.
+        fn sign(tx: &Transaction, prevouts: &[bitcoin::TxOut], k: &Keypair) -> Transaction {
+            let mut t = tx.clone();
+            for i in 0..t.input.len() {
+                let (m, ht) = key_path_sighash(&t, i, prevouts, SighashRules::Bip341).unwrap();
+                let sig = secp().sign_schnorr_with_aux_rand(&Message::from_digest(m), k, &[0; 32]);
+                t.input[i].witness =
+                    Witness::from_slice(&[[sig.serialize().as_slice(), &[ht]].concat()]);
+            }
+            t
+        }
+        fn built() -> (Snapshot, ExternalSigner, sidestr_wallet::spend::Spend) {
+            let s = snap();
+            let ext = ExternalSigner::new(kp().x_only_public_key().0);
+            let spend = build_provision(&s, &coins(), &ext, &them(), 0, 2_000)
+                .unwrap_or_else(|_| panic!("the pack builds"));
+            (s, ext, spend)
+        }
+
+        /// The treasury's own DREAM pack, from its public key alone: the
+        /// carriers are found and laid out, and nothing is signed.
+        #[test]
+        fn a_dream_pack_builds_unsigned_from_a_public_key() {
+            let s = snap();
+            let treasury = sidestr_agent::parse_pubkey(
+                "f6b84686a2323a233e99c60ed79a59d3ec45289fec58a4c359997e551b0326b0",
+            )
+            .unwrap();
+            let ext = ExternalSigner::new(treasury);
+            let coins = s.coins(&ext.script(), &[]);
+            let spend = build_provision(&s, &coins, &ext, &them(), 100, 1_000)
+                .unwrap_or_else(|_| panic!("the treasury pack builds"));
+            let bare: Transaction = deserialize_hex(&unsigned_hex(&spend.tx)).unwrap();
+            assert!(bare.input.iter().all(|i| i.witness.is_empty()));
+            assert_eq!(bare.compute_txid(), spend.txid);
+            let prevouts = prevouts_for(&spend.tx, &coins, &ext.script()).unwrap();
+            assert_eq!(prevouts.len(), spend.tx.input.len());
+            let doc = document().unwrap();
+            // an answer that is still unsigned is refused
+            assert!(accept_signed(&spend, &unsigned_hex(&spend.tx), &prevouts, &doc).is_err());
+        }
+
+        #[test]
+        fn a_validly_signed_answer_is_accepted() {
+            let (_, ext, spend) = built();
+            assert_eq!(spend.tx.input.len(), 2);
+            let prevouts = prevouts_for(&spend.tx, &coins(), &ext.script()).unwrap();
+            let answer = serialize_hex(&sign(&spend.tx, &prevouts, &kp()));
+            let signed = accept_signed(&spend, &answer, &prevouts, &document().unwrap()).unwrap();
+            assert_eq!(signed.txid, spend.txid);
+            assert_eq!(
+                signed.vsize, spend.vsize,
+                "the placeholder sized it exactly"
+            );
+        }
+
+        #[test]
+        fn swapped_signatures_are_refused() {
+            let (_, ext, spend) = built();
+            let prevouts = prevouts_for(&spend.tx, &coins(), &ext.script()).unwrap();
+            let mut t = sign(&spend.tx, &prevouts, &kp());
+            // same inputs in the same order, each carrying the other's signature
+            let w0 = t.input[0].witness.clone();
+            t.input[0].witness = t.input[1].witness.clone();
+            t.input[1].witness = w0;
+            assert!(
+                accept_signed(&spend, &serialize_hex(&t), &prevouts, &document().unwrap()).is_err()
+            );
+        }
+
+        #[test]
+        fn another_keys_signature_is_refused() {
+            let (_, ext, spend) = built();
+            let prevouts = prevouts_for(&spend.tx, &coins(), &ext.script()).unwrap();
+            let other =
+                Keypair::from_secret_key(secp(), &SecretKey::from_slice(&[0x43; 32]).unwrap());
+            let answer = serialize_hex(&sign(&spend.tx, &prevouts, &other));
+            assert!(accept_signed(&spend, &answer, &prevouts, &document().unwrap()).is_err());
+        }
+
+        #[test]
+        fn a_different_transaction_is_refused_even_if_signed() {
+            let (_, ext, spend) = built();
+            let prevouts = prevouts_for(&spend.tx, &coins(), &ext.script()).unwrap();
+            let mut other = spend.tx.clone();
+            other.output[0].script_pubkey = ext.script(); // pays itself instead
+            let answer = serialize_hex(&sign(&other, &prevouts, &kp()));
+            let e = accept_signed(&spend, &answer, &prevouts, &document().unwrap()).unwrap_err();
+            assert!(e.to_string().contains("different transaction"), "{e}");
+        }
+
+        #[test]
+        fn a_coin_that_is_not_mine_has_no_prevout() {
+            let (_, ext, spend) = built();
+            assert!(prevouts_for(&spend.tx, &coins()[..1], &ext.script()).is_err());
+        }
     }
 
     #[test]

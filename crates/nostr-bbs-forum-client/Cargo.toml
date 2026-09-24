@@ -159,7 +159,7 @@ uuid = { version = "1", features = ["js"] }
 # clang for wasm32 (the CI runners carry it).
 sidestr-agent = { version = "0.3", default-features = false }
 sidestr-core = "0.3.1"
-sidestr-wallet = "0.4"
+sidestr-wallet = "0.4.1"
 sidestr-nostr = "0.3"
 # `secp-lowmemory`: libsecp256k1 with small precomputed tables. Signing a
 # tip is one Schnorr signature and a replay verifies a few hundred, so the
