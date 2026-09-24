@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_14 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_15 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -46,3 +46,4 @@ _14 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2012](ADR-2012-d1-ledger-becomes-a-chain-view.md) | The pod-worker D1 ledger becomes a derived view over the sidestr chain, and solid-pod-rs moves in lockstep with the host | 2026-09-21 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
 | [ADR-2013](ADR-2013-ontology-governance-panel-promote-demote-expiry.md) | The ontology-governance panel activates Promote, adds Demote, and expires proposals rather than re-surfacing them forever | 2026-09-22 | accepted | partial | staged | — | — | jjohare | nostr-rust-forum |
 | [ADR-2014](ADR-2014-member-lifecycle-one-source-of-truth.md) | One member lifecycle, one authoritative store, one admin surface | 2026-09-24 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
+| [ADR-2015](ADR-2015-member-wallets-on-sidestr-dreamlab-and-dream-tips.md) | Every member's key is a wallet on sidestr:dreamlab (testnet4 only), DREAM is the one asset, and tips are chain records | 2026-09-24 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |

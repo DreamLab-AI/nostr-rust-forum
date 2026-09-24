@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit:
+verified_commit: b2d9e14407b5d3d768596fa970a709815602d424
 owner: jjohare
 review_trigger: any proposal to add a chain or asset to the lock; a chain with value (a mainnet parent); ADR-2101's derived spend key being implemented; DREAM moving to a chain whose document names the assets rule; JavaScriptSolidServer gaining sidestr support (then the wallet moves upstream)
 repo: nostr-rust-forum
