@@ -38,6 +38,9 @@ allow = [
     "MPL-2.0",
     "OpenSSL",
     "CDLA-Permissive-2.0",
+    # MIT plus a no-false-attribution clause: `hex_lit`, a rust-bitcoin 0.32
+    # dependency reached through the member wallet (ADR-2015).
+    "MITNFA",
 ]
 
 # Ring uses a custom licence that is functionally ISC.

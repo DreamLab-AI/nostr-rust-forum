@@ -52,7 +52,7 @@ pub fn mirror() -> String {
 }
 
 /// The relays transactions and faucet requests go to.
-pub fn relays() -> Vec<String> {
+pub fn relay_urls() -> Vec<String> {
     let from_env: Vec<String> = env_override("SIDESTR_RELAYS")
         .map(|s| {
             s.split(',')
@@ -419,7 +419,7 @@ impl WalletStore {
         let event = sign_transaction_event(&key.event_signer(), &doc.id, &spend.hex, now_secs())
             .map_err(|e| format!("could not sign the event: {e}"))?;
         let json = serde_json::to_string(&event).map_err(|e| e.to_string())?;
-        let (ok, _) = relays::publish_all(&relays(), &json, &event.id).await;
+        let (ok, _) = relays::publish_all(&relay_urls(), &json, &event.id).await;
         if ok == 0 {
             return Err("No relay took the transaction. Nothing was sent; try again.".into());
         }
@@ -596,7 +596,7 @@ impl WalletStore {
         let ev = sign_faucet_request(&signer, chain::CHAIN_ID, &address, now_secs())
             .map_err(|e| e.to_string())?;
         let json = serde_json::to_string(&ev).map_err(|e| e.to_string())?;
-        let (ok, _) = relays::publish_all(&relays(), &json, &ev.id).await;
+        let (ok, _) = relays::publish_all(&relay_urls(), &json, &ev.id).await;
         if ok == 0 {
             return Err("No relay took the request. Try again in a moment.".into());
         }
