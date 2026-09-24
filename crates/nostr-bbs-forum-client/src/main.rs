@@ -9,6 +9,7 @@ mod pages;
 mod relay;
 pub(crate) mod stores;
 pub(crate) mod utils;
+pub(crate) mod wallet;
 
 use app::App;
 

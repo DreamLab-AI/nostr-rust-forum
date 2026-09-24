@@ -127,6 +127,9 @@ time (`Cargo.toml`).
   ADR-091); deep-link entry self-bootstraps its own state (legacy ADR-092).
   Zone-first landing scopes navigation to the operator's `[[zones]]` config
   projected into `window.__ENV__.ZONE_CONFIG` (legacy ADR-107).
+  Member wallets and DREAM tips (ADR-2015) are gated on
+  `window.__ENV__.SIDESTR_WALLET` in `crates/nostr-bbs-forum-client/src/wallet/mod.rs`;
+  unset, the client renders as before.
 - **Retro BBS client** (`nostr-bbs-bbs-client`, served at `/community/bbs/`) — the
   M2 write-path is implemented via an in-client signer (`BbsSigner`) that adopts
   the forum session key when same-origin (`crates/nostr-bbs-bbs-client/src/app.rs:20-26`,
@@ -214,3 +217,8 @@ See the [forum review](../../VisionFlow/docs/estate-review/forum-decisions.md) f
 The ADR-2010 receipt ladder extends past `projection-committed` with the application stages `consumer-received`, `applied`, `not-applied` and `applied-manually`, plus `escalated-on-age` and `expired` as side receipts; `ReceiptStage` moved into `nostr-bbs-core` because the auth worker's receipts endpoint and the relay's projection must agree on the ladder and share no other code. The auth worker gains `POST /api/governance/receipts/{id}/application` (the mutation owner reports what happened; admin-only for `applied-manually`, and only on a case already decided `Approve`) and `GET /api/governance/reviewers` (per-reviewer decisions, time-to-decision, override rate, calibration and probe columns). A relay cron emits one `escalated-on-age` receipt per case past its panel's `max_pending_hours`.
 
 Implementation is **partial and inactive**: probe blindness holds in the tag index and the D1 projection but not on the raw signed 31402 served over REQ, where stripping the tag would break the signature clients verify. Nothing is deployed and `nostr-bbs-core` 1.0.0-beta.11 is unpublished.
+
+## Member wallets on sidestr:dreamlab and DREAM tips — ADR-2015
+
+[ADR-2015](adr/ADR-2015-member-wallets-on-sidestr-dreamlab-and-dream-tips.md) gives every member a wallet without a sign-up step: on a sidestr chain a Nostr key's coins pay `OP_1 <x-only key>`, so a member's npub is their address. The forum client (`src/wallet/`) pins exactly one chain, `sidestr:dreamlab` beside Bitcoin testnet4, and one asset, DREAM (issued at block 372). It downloads the mirror's `blocks.dat` and validates every block in the browser with the published `sidestr-core` 0.3.1, and reads DREAM under the SPEC 12 assets rule as a view. It signs transfers with the session key through `sidestr-wallet` 0.4 and `sidestr-agent` 0.3 (`default-features = false`), and delivers them as kind-23500 events to the producer's public relays. No worker holds a balance and no event kind is added (ADR-2012 D3 holds). A tip is a DREAM transfer that carries a `tip:nostr:<event id>` record, rendered by `components/tip_button.rs` inside the reaction row. `/wallet` offers give (DREAM, sats, or a one-transaction starter pack for members and agents), receive, agents, activity, and a tab-only unlock for NIP-07 members. The whole feature is off unless `SIDESTR_WALLET` is set; the identity-key-as-wallet choice is a testnet-scoped departure from agentbox ADR-2101 D3 that the chain lock enforces.
+

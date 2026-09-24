@@ -35,6 +35,7 @@ pub mod mention_text;
 pub mod message_input;
 pub mod quoted_message;
 pub mod reaction_bar;
+pub mod tip_button;
 
 // -- Auth Flow + Profile (Stream 3) ------------------------------------------
 pub mod profile_modal;

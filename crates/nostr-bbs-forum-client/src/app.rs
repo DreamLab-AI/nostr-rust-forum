@@ -23,7 +23,7 @@ use crate::pages::{
     AdminPage, BoardPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage,
     EventsPage, ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, KnowledgePage,
     LoginPage, NoteViewPage, PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage,
-    SignupPage, ThreadPage,
+    SignupPage, ThreadPage, WalletPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::case_projection::provide_case_projection_store;
@@ -264,6 +264,10 @@ fn pod_icon() -> impl IntoView {
     }
 }
 
+fn wallet_icon() -> impl IntoView {
+    crate::components::tip_button::dream_icon("w-4 h-4")
+}
+
 fn settings_icon() -> impl IntoView {
     view! {
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -308,6 +312,8 @@ pub fn App() -> impl IntoView {
 
     // Provide global context stores
     provide_toasts();
+    // Member wallets on sidestr:dreamlab (ADR-2015); inert unless SIDESTR_WALLET is on.
+    crate::wallet::provide_wallet();
     provide_notifications();
     crate::stores::notifications::provide_notification_store();
     provide_bookmarks();
@@ -899,6 +905,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/governance") view=MemberGatedGovernance />
                     <Route path=path!("/governance/admin") view=AdminGatedGovernance />
                     <Route path=path!("/pod") view=AuthGatedPod />
+                    <Route path=path!("/wallet") view=AuthGatedWallet />
                     // Zone URL slugs (issue #45): top-level aliases so a zone
                     // reads as `/<slug>` (e.g. `/welcome`, `/dreamlab`) with no
                     // `/forums` segment. They render the SAME gated views as the
@@ -1104,6 +1111,14 @@ fn Layout(children: Children) -> impl IntoView {
                                 {pod_icon()}
                                 "Pod"
                             </A>
+                            // Member wallet (ADR-2015): only where the deployment
+                            // switched it on, so other instances' nav is unchanged.
+                            {crate::wallet::enabled().then(|| view! {
+                                <A href=base_href("/wallet") attr:class=nav_link_class("/wallet")>
+                                    {wallet_icon()}
+                                    "Wallet"
+                                </A>
+                            })}
                             // About: the marketing landing, reachable in-app
                             // (issue #42). Last among the text items so it
                             // stays low-key.
@@ -1213,6 +1228,12 @@ fn Layout(children: Children) -> impl IntoView {
                                 {pod_icon()}
                                 "Pod"
                             </A>
+                            {crate::wallet::enabled().then(|| view! {
+                                <A href=base_href("/wallet") attr:class=mobile_link_class("/wallet") on:click=close_mobile>
+                                    {wallet_icon()}
+                                    "Wallet"
+                                </A>
+                            })}
                             // About: the marketing landing, reachable in-app
                             // (issue #42). Last among the text items.
                             <A href=base_href("/about") attr:class=mobile_link_class("/about") on:click=close_mobile>
@@ -1458,6 +1479,7 @@ auth_gated!(AuthGatedEvents, EventsPage);
 auth_gated!(AuthGatedProfile, ProfilePage);
 auth_gated!(AuthGatedSettings, SettingsPage);
 auth_gated!(AuthGatedPod, PodBrowserPage);
+auth_gated!(AuthGatedWallet, WalletPage);
 
 /// Root route (`/`): authed members skip the marketing landing and are
 /// redirected straight to their forums (issue #42 — reduce clicks to entry);

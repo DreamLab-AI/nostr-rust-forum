@@ -208,6 +208,24 @@ pub fn ProfilePage() -> impl IntoView {
         navigate.with_value(|nav| nav(&href, NavigateOptions::default()));
     };
 
+    // DREAM (ADR-2015): open the wallet's give form addressed to this member.
+    let on_send_dream = move |_| {
+        let pk = pubkey.get();
+        let to = sidestr_agent::parse_pubkey(&pk)
+            .map(|k| sidestr_agent::npub(&k))
+            .unwrap_or(pk);
+        let href = format!("/wallet?to={to}");
+        navigate.with_value(|nav| nav(&href, NavigateOptions::default()));
+    };
+    let show_send_dream = Memo::new(move |_| {
+        crate::wallet::enabled()
+            && is_valid_pubkey.get()
+            && crate::auth::use_auth()
+                .pubkey()
+                .get()
+                .is_some_and(|me| !me.eq_ignore_ascii_case(&pubkey.get()))
+    });
+
     let on_copy = move |_| {
         let pk = pubkey.get();
         if let Some(window) = web_sys::window() {
@@ -350,6 +368,16 @@ pub fn ProfilePage() -> impl IntoView {
                     </svg>
                     "Send DM"
                 </button>
+
+                <Show when=move || show_send_dream.get()>
+                    <button
+                        on:click=on_send_dream
+                        class="flex-1 bg-gray-800 hover:bg-gray-700 text-amber-300 py-2.5 px-4 rounded-xl transition-colors flex items-center justify-center gap-2 text-sm border border-amber-500/30"
+                    >
+                        {crate::components::tip_button::dream_icon("w-4 h-4")}
+                        "Send DREAM"
+                    </button>
+                </Show>
 
                 <button
                     on:click=on_copy

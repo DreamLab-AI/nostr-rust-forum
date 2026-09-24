@@ -77,6 +77,8 @@ web-sys = { workspace = true, features = [
     "HtmlDocument",
     "Headers",
     "RequestInit",
+    # The wallet fetches the mirror's block file with the cache bypassed.
+    "RequestCache",
     "Request",
     "Response",
     "PageTransitionEvent",
@@ -150,3 +152,16 @@ bech32 = { workspace = true }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["js"] }
+# Member wallets on sidestr:dreamlab (testnet4) and DREAM tips (ADR-2015).
+# The published sidestr-rs crates, pure halves only: the agent library
+# without its CLI builds for wasm32, so the browser validates the chain and
+# signs spends with the same code an agent runs. secp256k1's C builds with
+# clang for wasm32 (the CI runners carry it).
+sidestr-agent = { version = "0.3", default-features = false }
+sidestr-core = "0.3.1"
+sidestr-wallet = "0.4"
+sidestr-nostr = "0.3"
+# `secp-lowmemory`: libsecp256k1 with small precomputed tables. Signing a
+# tip is one Schnorr signature and a replay verifies a few hundred, so the
+# speed the full tables buy is not worth their ~1 MB in every page load.
+bitcoin = { version = "0.32", features = ["secp-lowmemory"] }

@@ -26,6 +26,7 @@ mod section;
 mod settings;
 mod setup;
 mod thread;
+mod wallet;
 
 // -- Re-exports ---------------------------------------------------------------
 pub use admin::AdminPage;
@@ -51,3 +52,4 @@ pub use settings::SettingsPage;
 pub use setup::SetupPage;
 pub use signup::SignupPage;
 pub use thread::ThreadPage;
+pub use wallet::WalletPage;

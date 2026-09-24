@@ -124,7 +124,7 @@ fn register_body(pubkey: &str, name: &str, description: &str, rate_limit_per_min
 }
 
 /// GET the roster with a NIP-98 signature and parse it.
-async fn load_roster(auth: AuthStore) -> Result<Vec<AgentRosterEntry>, String> {
+pub(crate) async fn load_roster(auth: AuthStore) -> Result<Vec<AgentRosterEntry>, String> {
     let signer = auth
         .get_signer()
         .ok_or_else(|| "No signing key available — log in first".to_string())?;
