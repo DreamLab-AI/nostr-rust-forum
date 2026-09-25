@@ -47,6 +47,17 @@ pub fn available() -> bool {
     provider().is_some()
 }
 
+/// Whether the signer says sidechain spends are turned on
+/// (`window.nostr.sidestr.enabled`). A signer that predates the field is
+/// taken as on. When off, a spend still works: the signer's first request
+/// asks the member to turn spends on, in its own window.
+pub fn enabled() -> bool {
+    provider()
+        .and_then(|s| js_sys::Reflect::get(&s, &"enabled".into()).ok())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
 /// What to call the signer in a sentence: the name it gives itself
 /// (`window.nostr.sidestr.name`, e.g. "Podkey"; `window.nostr.name` for
 /// others), else "Your extension".
@@ -108,13 +119,29 @@ fn refusal_of(e: wasm_bindgen::JsValue) -> Refusal {
     }
 }
 
+/// What the member will see next, before they continue in the extension:
+/// with spends off, the extension first asks to turn them on.
+pub fn review_hint(signer: &str, what: &str) -> String {
+    hint_for(signer, what, enabled())
+}
+
+fn hint_for(signer: &str, what: &str, enabled: bool) -> String {
+    if enabled {
+        format!("{signer} will show you {what} and ask you to confirm.")
+    } else {
+        format!(
+            "{signer} will ask you to turn on sidechain spends, then show you {what} to confirm."
+        )
+    }
+}
+
 /// The extension's refusal in words a member can act on. `rejected` is the
 /// member saying no, so it reads as that rather than as a failure.
 pub fn explain(r: &Refusal) -> String {
     match r.code.as_deref() {
         Some("rejected") => "You declined the spend in your extension. Nothing was sent.".into(),
         Some("not-yours") => "Your extension will only spend coins it can see are its own, and it could not find these under its key. Check that the extension holds the key you signed in with here, and wait for recent transfers to confirm.".into(),
-        Some("unsupported") => "Your extension does not support this chain yet. Nothing was sent.".into(),
+        Some("unsupported") => "Your extension did not take this spend: sidechain spends may be turned off there. In Podkey, turn them on when it asks, or in its settings. Nothing was sent.".into(),
         Some("invalid") => "Your extension could not read this transfer. Nothing was sent; try again.".into(),
         Some("unavailable") => {
             "Your extension is locked or could not read the chain. Unlock it and try again.".into()
@@ -149,6 +176,17 @@ mod tests {
             assert!(text.ends_with('.'), "{code}: {text}");
         }
         assert!(explain(&r(Some("rejected"), "")).starts_with("You declined"));
+    }
+
+    #[test]
+    fn the_hint_says_when_spends_must_be_turned_on_first() {
+        assert_eq!(
+            hint_for("Podkey", "this spend", true),
+            "Podkey will show you this spend and ask you to confirm."
+        );
+        assert!(hint_for("Podkey", "each tip", false)
+            .starts_with("Podkey will ask you to turn on sidechain spends"));
+        assert!(explain(&r(Some("unsupported"), "")).contains("turn them on"));
     }
 
     #[test]

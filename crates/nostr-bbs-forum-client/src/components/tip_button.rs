@@ -246,7 +246,7 @@ pub(crate) fn TipControl(
                                     {move || if sending.get() {
                                         format!("{} is showing you this tip. Confirm it there.", signer_name.get_value())
                                     } else {
-                                        format!("{} will show you each tip and ask you to confirm.", signer_name.get_value())
+                                        crate::wallet::extension::review_hint(&signer_name.get_value(), "each tip")
                                     }}
                                 </p>
                             })}

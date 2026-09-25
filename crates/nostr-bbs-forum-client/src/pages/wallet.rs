@@ -520,7 +520,7 @@ pub fn WalletPage() -> impl IntoView {
                                     {move || if sending.get() {
                                         format!("{} is showing you this spend. Confirm it there.", signer_name.get_value())
                                     } else {
-                                        format!("{} will show you this spend and ask you to confirm.", signer_name.get_value())
+                                        crate::wallet::extension::review_hint(&signer_name.get_value(), "this spend")
                                     }}
                                 </p>
                             })}
