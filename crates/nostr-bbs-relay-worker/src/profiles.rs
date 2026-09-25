@@ -8,6 +8,8 @@
 //! |--------|------------------------------|-----------------------------|-------|
 //! | POST   | /api/profiles/batch          | `{ "pubkeys": [hex, ...] }` | 200   |
 //! | GET    | /api/profiles/search         | `?q=<prefix>&limit=20`      | 50    |
+//!
+//! Search omits keys that `pubkey_aliases` marks as replaced.
 
 use serde::Deserialize;
 use serde_json::json;
@@ -274,6 +276,10 @@ pub async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         Err(_) => return cors_json_response(env, &json!({ "error": "Database unavailable" }), 500),
     };
 
+    // Keys replaced via `pubkey_aliases` are excluded from both shapes: the
+    // successor is the one to mention or DM, and listing both produced two
+    // indistinguishable entries for the same person.
+    //
     // Two query shapes:
     //
     //   * **Roster mode** (empty `q`): the composer opens the @mention dropdown on
@@ -298,6 +304,7 @@ pub async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
     let (sql, binds): (&str, Vec<JsValue>) = if q.is_empty() {
         (
             "SELECT pubkey, name, display_name, picture, nip05 FROM profiles \
+             WHERE pubkey NOT IN (SELECT old_pubkey FROM pubkey_aliases) \
              ORDER BY last_kind0_at DESC LIMIT ?1",
             vec![JsValue::from_f64(limit as f64)],
         )
@@ -305,9 +312,10 @@ pub async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         let pattern = search_like_pattern(&q);
         (
             "SELECT pubkey, name, display_name, picture, nip05 FROM profiles \
-             WHERE LOWER(name) LIKE ?1 \
+             WHERE (LOWER(name) LIKE ?1 \
                 OR LOWER(display_name) LIKE ?1 \
-                OR LOWER(nip05) LIKE ?1 \
+                OR LOWER(nip05) LIKE ?1) \
+               AND pubkey NOT IN (SELECT old_pubkey FROM pubkey_aliases) \
              ORDER BY last_kind0_at DESC LIMIT ?2",
             vec![JsValue::from_str(&pattern), JsValue::from_f64(limit as f64)],
         )

@@ -38,6 +38,7 @@ pub mod reaction_bar;
 pub mod tip_button;
 
 // -- Auth Flow + Profile (Stream 3) ------------------------------------------
+pub mod profile_activity;
 pub mod profile_modal;
 // Lightweight anchored profile preview (read-only) — the popover counterpart to
 // the full `profile_modal` overlay; wired into `UserDisplay`.

@@ -14,6 +14,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::badge_display::BadgeGrid;
+use crate::components::profile_activity::ProfileActivity;
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::badges::{use_badges, BadgeFetchState, EarnedBadge};
@@ -312,6 +313,13 @@ pub fn ProfilePage() -> impl IntoView {
                     </p>
                 </div>
             </Show>
+
+            // Activity — viewer-scoped counts, most active channels, linked keys.
+            // Keyed on the route param so navigating between profiles refetches.
+            <div class="bg-gray-800/50 border border-gray-700/30 rounded-xl p-4">
+                <h2 class="text-xs text-gray-500 font-medium">"Activity"</h2>
+                {move || view! { <ProfileActivity pubkey=pubkey.get() /> }}
+            </div>
 
             // Badges
             <div class="bg-gray-800/50 border border-gray-700/30 rounded-xl p-4">

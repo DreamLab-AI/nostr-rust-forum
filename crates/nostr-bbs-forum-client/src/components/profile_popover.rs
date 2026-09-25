@@ -19,6 +19,7 @@ use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
+use crate::components::profile_activity::ProfileActivity;
 use crate::components::user_display::use_display_name_tracked;
 use crate::stores::profile_cache::{format_nip05_handle, try_use_profile_cache};
 use crate::utils::{set_timeout_once, shorten_pubkey};
@@ -107,6 +108,8 @@ pub(crate) fn ProfilePopover(
     };
 
     let pk_avatar = pubkey.clone();
+    let pk_activity = pubkey.clone();
+    let profile_href = crate::app::base_href(&format!("/profile/{}", pubkey));
 
     view! {
         // Transparent click-catcher: dismiss on any outside click. Sits below
@@ -161,6 +164,9 @@ pub(crate) fn ProfilePopover(
                 </p>
             })}
 
+            // Posting since / count / most active in / linked keys.
+            <ProfileActivity pubkey=pk_activity compact=true />
+
             // Shortened pubkey + copy affordance.
             <button
                 class="mt-3 w-full flex items-center justify-between gap-2 rounded-lg \
@@ -191,6 +197,13 @@ pub(crate) fn ProfilePopover(
                 </svg>
                 "Send DM"
             </button>
+            <a
+                href=profile_href
+                class="mt-2 block text-center text-xs text-gray-400 hover:text-gray-200"
+                on:click=move |_| is_open.set(false)
+            >
+                "View full profile"
+            </a>
         </div>
     }
 }

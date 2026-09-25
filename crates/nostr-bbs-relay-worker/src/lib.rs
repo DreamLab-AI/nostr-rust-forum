@@ -23,6 +23,7 @@ mod cron;
 mod mesh;
 mod moderation;
 mod nip11;
+mod profile_stats;
 mod profiles;
 mod relay_do;
 mod trust;
@@ -331,6 +332,18 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
 
     if path == "/api/profiles/search" && method == Method::Get {
         return profiles::handle_search(&req, env).await;
+    }
+
+    // Public old->new pubkey map (admin-set aliases), so clients can fold a
+    // replaced key into its successor in pickers and DM routing.
+    if path == "/api/profiles/successors" && method == Method::Get {
+        return profile_stats::handle_successors(env).await;
+    }
+
+    // User-card activity stats, scoped to what the (optional NIP-98) viewer
+    // may read — see profile_stats.rs.
+    if path == "/api/profile-stats" && method == Method::Get {
+        return profile_stats::handle_profile_stats(&req, env).await;
     }
 
     // --- Sprint v11: profiles backfill (NIP-98 admin only, one-shot) ---

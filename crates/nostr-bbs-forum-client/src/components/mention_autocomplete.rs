@@ -202,11 +202,17 @@ pub(crate) fn local_candidates(query: &str, limit: usize) -> Vec<MentionCandidat
     let q_lower = query.to_lowercase();
 
     // 1. ProfileCache (read-only): anyone we've seen post in this session.
+    //    Keys replaced by a successor (`pubkey_aliases`) are skipped — the
+    //    successor is the person to mention or DM.
     let mut from_cache: Vec<MentionCandidate> = Vec::new();
     if let Some(cache) = try_use_profile_cache() {
         // Reactive read — re-runs when kind-0 metadata arrives.
         let entries = cache.entries.get();
+        let successors = cache.successors.get();
         for entry in entries.values() {
+            if successors.contains_key(&entry.pubkey) {
+                continue;
+            }
             let cand = MentionCandidate::from_entry(entry);
             if cand.matches(&q_lower) {
                 from_cache.push(cand);
@@ -360,7 +366,28 @@ pub(crate) fn merge_candidates(
     local: Vec<MentionCandidate>,
     limit: usize,
 ) -> Vec<MentionCandidate> {
-    dedup_by_pubkey(network.into_iter().chain(local), limit)
+    let successors = try_use_profile_cache()
+        .map(|c| c.successors.get_untracked())
+        .unwrap_or_default();
+    merge_candidates_with(network, local, &successors, limit)
+}
+
+/// [`merge_candidates`] with an explicit replaced-key map, dropping any
+/// candidate whose key has a successor (a stale relay, or an older client
+/// cache, can still surface one).
+fn merge_candidates_with(
+    network: Vec<MentionCandidate>,
+    local: Vec<MentionCandidate>,
+    successors: &HashMap<String, String>,
+    limit: usize,
+) -> Vec<MentionCandidate> {
+    dedup_by_pubkey(
+        network
+            .into_iter()
+            .chain(local)
+            .filter(|c| !successors.contains_key(&c.pubkey)),
+        limit,
+    )
 }
 
 // -- Network search -----------------------------------------------------------
@@ -555,6 +582,24 @@ mod tests {
             nip05: None,
             picture: None,
         }
+    }
+
+    #[test]
+    fn merge_drops_replaced_keys_from_both_sources() {
+        let old = "cd".repeat(32);
+        let new = "b4".repeat(32);
+        let successors = HashMap::from([(old.clone(), new.clone())]);
+        let out = merge_candidates_with(
+            vec![cand(&old, Some("beema"), None)],
+            vec![
+                cand(&new, Some("beema"), None),
+                cand(&old, Some("beema"), None),
+            ],
+            &successors,
+            10,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pubkey, new);
     }
 
     #[test]

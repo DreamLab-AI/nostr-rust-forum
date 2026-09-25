@@ -39,6 +39,26 @@ pub fn DmChatPage() -> impl IntoView {
     let params = use_params_map();
     let recipient_pubkey = move || params.read().get("pubkey").unwrap_or_default();
 
+    // A key replaced via `pubkey_aliases` is no longer read by its owner:
+    // redirect to the successor so the DM reaches the live identity. Tracks the
+    // successor map, which loads asynchronously at startup.
+    let navigate = leptos_router::hooks::use_navigate();
+    Effect::new(move |_| {
+        let rpk = recipient_pubkey();
+        let Some(cache) = crate::stores::profile_cache::try_use_profile_cache() else {
+            return;
+        };
+        if let Some(next) = cache.successor_tracked(&rpk) {
+            navigate(
+                &format!("/dm/{next}"),
+                leptos_router::NavigateOptions {
+                    replace: true,
+                    ..Default::default()
+                },
+            );
+        }
+    });
+
     // State
     let message_input = RwSignal::new(String::new());
     let sending = RwSignal::new(false);

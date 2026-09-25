@@ -141,6 +141,10 @@ pub struct ProfileCache {
     in_flight: RwSignal<HashSet<String>>,
     /// Whether a debounce flush is already scheduled.
     flush_scheduled: RwSignal<bool>,
+    /// Replaced key -> successor key, from the relay's public alias map
+    /// (`/api/profiles/successors`). Lookups for a replaced key resolve to the
+    /// successor's profile, and pickers drop replaced keys.
+    pub successors: RwSignal<HashMap<String, String>>,
 }
 
 impl Default for ProfileCache {
@@ -156,13 +160,38 @@ impl ProfileCache {
             pending: RwSignal::new(Vec::new()),
             in_flight: RwSignal::new(HashSet::new()),
             flush_scheduled: RwSignal::new(false),
+            successors: RwSignal::new(HashMap::new()),
         }
+    }
+
+    /// Successor of a replaced key (untracked read).
+    pub fn successor_of(&self, pubkey: &str) -> Option<String> {
+        self.successors.with_untracked(|m| m.get(pubkey).cloned())
+    }
+
+    /// Successor of a replaced key (tracked: re-runs the enclosing reactive
+    /// scope once the successor map loads).
+    pub fn successor_tracked(&self, pubkey: &str) -> Option<String> {
+        self.successors.with(|m| m.get(pubkey).cloned())
+    }
+
+    /// The key whose profile should represent `pubkey`: its successor when it
+    /// has been replaced, otherwise itself.
+    fn canonical(&self, pubkey: &str, tracked: bool) -> String {
+        let succ = if tracked {
+            self.successor_tracked(pubkey)
+        } else {
+            self.successor_of(pubkey)
+        };
+        succ.unwrap_or_else(|| pubkey.to_string())
     }
 
     /// Look up a profile entry. Returns immediately. If the entry is missing,
     /// schedules a debounced batch fetch and the cache will populate
     /// reactively once the response arrives.
     pub fn lookup(&self, pubkey: &str) -> Option<ProfileEntry> {
+        let key = self.canonical(pubkey, false);
+        let pubkey = key.as_str();
         let entries = self.entries.get_untracked();
         if let Some(entry) = entries.get(pubkey) {
             return Some(entry.clone());
@@ -174,6 +203,8 @@ impl ProfileCache {
 
     /// Reactive lookup — re-evaluates whenever the underlying entries change.
     pub fn lookup_reactive(&self, pubkey: &str) -> Option<ProfileEntry> {
+        let key = self.canonical(pubkey, true);
+        let pubkey = key.as_str();
         let entries = self.entries.get();
         if let Some(entry) = entries.get(pubkey) {
             return Some(entry.clone());
@@ -447,6 +478,13 @@ impl ProfileCache {
 pub fn provide_profile_cache() {
     let cache = ProfileCache::new();
     provide_context(cache);
+    // Successor map — small and rarely changing; one fetch per session.
+    spawn_local(async move {
+        let map = fetch_successors().await;
+        if !map.is_empty() {
+            cache.successors.set(map);
+        }
+    });
     // Hydrate from IDB in the background — non-blocking.
     spawn_local(async move {
         cache.hydrate().await;
@@ -477,6 +515,61 @@ fn persist_one(entry: &ProfileEntry) {
         };
         let _ = db.put_profile(&cached).await;
     });
+}
+
+// --- Successor map ------------------------------------------------------------
+
+/// Fetch the relay's public replaced-key map. Empty on any failure: without
+/// it every key simply renders as itself, which is the pre-alias behaviour.
+async fn fetch_successors() -> HashMap<String, String> {
+    let url = format!(
+        "{}/api/profiles/successors",
+        crate::utils::relay_url::relay_api_base()
+    );
+    let Some(win) = web_sys::window() else {
+        return HashMap::new();
+    };
+    let Ok(resp_val) = JsFuture::from(win.fetch_with_str(&url)).await else {
+        return HashMap::new();
+    };
+    let Ok(resp) = resp_val.dyn_into::<web_sys::Response>() else {
+        return HashMap::new();
+    };
+    if !resp.ok() {
+        return HashMap::new();
+    }
+    let Ok(promise) = resp.text() else {
+        return HashMap::new();
+    };
+    match JsFuture::from(promise)
+        .await
+        .ok()
+        .and_then(|v| v.as_string())
+    {
+        Some(text) => parse_successors(&text),
+        None => HashMap::new(),
+    }
+}
+
+/// Parse `{ "successors": { old: new } }`, keeping only well-formed,
+/// non-self-referential 64-hex pairs.
+pub(crate) fn parse_successors(text: &str) -> HashMap<String, String> {
+    fn hex64(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return HashMap::new();
+    };
+    let Some(obj) = value.get("successors").and_then(|v| v.as_object()) else {
+        return HashMap::new();
+    };
+    obj.iter()
+        .filter_map(|(old, new)| {
+            let new = new.as_str()?.to_lowercase();
+            let old = old.to_lowercase();
+            (hex64(&old) && hex64(&new) && old != new).then_some((old, new))
+        })
+        .collect()
 }
 
 // --- HTTP batch fetch --------------------------------------------------------
@@ -693,6 +786,21 @@ fn parse_batch_response(text: &str) -> Vec<ProfileEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_successors_keeps_valid_pairs_only() {
+        let old = "cd".repeat(32);
+        let new = "b4".repeat(32);
+        let text = format!(
+            r#"{{"successors":{{"{old}":"{new}","{new}":"{new}","short":"{new}","{old2}":42}}}}"#,
+            old2 = "ab".repeat(32)
+        );
+        let map = parse_successors(&text);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&old), Some(&new));
+        assert!(parse_successors("nope").is_empty());
+        assert!(parse_successors(r#"{"successors":[]}"#).is_empty());
+    }
 
     #[test]
     fn nip05_local_domain_is_short() {
