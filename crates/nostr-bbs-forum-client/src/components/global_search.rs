@@ -105,12 +105,17 @@ enum Hit {
         desc: String,
     },
     Message {
+        /// The matching event itself — the link target.
+        event_id: String,
         content: String,
         author: String,
         channel_id: String,
     },
     /// Semantic search result with similarity score.
     SemanticMessage {
+        /// The matching event itself — the link target.
+        event_id: String,
+        /// Containing channel (fallback link when the event id is unknown).
         id: String,
         content: String,
         label: String,
@@ -165,9 +170,13 @@ impl Hit {
     fn href(&self) -> String {
         match self {
             Self::Channel { id, .. } => base_href(&format!("/chat/{}", id)),
-            Self::Message { channel_id, .. } => base_href(&format!("/chat/{}", channel_id)),
-            Self::SemanticMessage { id, .. } => base_href(&format!("/chat/{}", id)),
-            Self::User { .. } => base_href("/chat"),
+            // Messages open AT the message: `/go/:id` resolves the topic it
+            // lives in and lands on it (pages/message_jump.rs), rather than
+            // dropping the reader one level up in the channel.
+            Self::Message { event_id, .. } | Self::SemanticMessage { event_id, .. } => {
+                base_href(&format!("/go/{}", event_id))
+            }
+            Self::User { pubkey, .. } => base_href(&format!("/profile/{}", pubkey)),
         }
     }
     fn score(&self) -> Option<f64> {
@@ -326,6 +335,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                     relay_hits.iter().map(|ev| ev.id.clone()).collect();
                 for ev in &relay_hits {
                     out.push(Hit::Message {
+                        event_id: ev.id.clone(),
                         content: ev.content.clone(),
                         author: ev.pubkey.clone(),
                         channel_id: channel_id_of(ev).unwrap_or_else(|| ev.id.clone()),
@@ -394,12 +404,14 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                     let channel = event.and_then(channel_id_of).unwrap_or_else(|| id.clone());
                     match score {
                         Some(s) => out.push(Hit::SemanticMessage {
+                            event_id: id.clone(),
                             id: channel,
                             content,
                             label: author,
                             score: s,
                         }),
                         None => out.push(Hit::Message {
+                            event_id: id.clone(),
                             content,
                             author,
                             channel_id: channel,

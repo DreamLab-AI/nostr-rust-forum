@@ -22,8 +22,8 @@ use crate::components::user_display::provide_name_cache;
 use crate::pages::{
     AdminPage, BoardPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage,
     EventsPage, ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, KnowledgePage,
-    LoginPage, NoteViewPage, PodBrowserPage, ProfilePage, SectionPage, SettingsPage, SetupPage,
-    SignupPage, ThreadPage, WalletPage,
+    LoginPage, MessageJumpPage, NoteViewPage, PodBrowserPage, ProfilePage, SectionPage,
+    SettingsPage, SetupPage, SignupPage, ThreadPage, WalletPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::case_projection::provide_case_projection_store;
@@ -865,6 +865,7 @@ pub fn App() -> impl IntoView {
                     // here via /glossary#<slug>.
                     <Route path=path!("/glossary") view=GlossaryPage />
                     <Route path=path!("/view/:note_id") view=NoteViewPage />
+                    <Route path=path!("/go/:event_id") view=MessageJumpPage />
                     // Zone-bound invite landing (PUBLIC — branches on auth). A
                     // static "join" segment out-scores the `/:category` dynamic
                     // aliases declared last, so `/join/<code>` never resolves to a

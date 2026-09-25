@@ -24,8 +24,9 @@ use std::rc::Rc;
 
 use leptos::prelude::*;
 use leptos_router::components::A;
-use leptos_router::hooks::use_params_map;
+use leptos_router::hooks::{use_params_map, use_query_map};
 use nostr_bbs_core::NostrEvent;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::app::base_href;
@@ -195,6 +196,36 @@ fn edit_chain_ids(original: &NostrEvent, events: &[NostrEvent]) -> Vec<String> {
         frontier = next_frontier;
     }
     ids
+}
+
+/// How long after first paint the "land on newest" scroll keeps re-applying
+/// while replies stream in.
+const LANDING_SETTLE_MS: f64 = 2_500.0;
+
+/// DOM id of a rendered post, for deep-link scrolling.
+fn post_anchor_id(event_id: &str) -> String {
+    format!("post-{}", event_id.to_lowercase())
+}
+
+/// Where a freshly opened topic should land: the `focus` post when it is the
+/// root or one of the replies (`true` = focused), otherwise the newest reply.
+/// `None` when there is nothing below the root to scroll to.
+fn landing_target(
+    focus: Option<&str>,
+    root_id: &str,
+    reply_ids: &[String],
+) -> Option<(String, bool)> {
+    if let Some(f) = focus.map(str::trim).filter(|f| !f.is_empty()) {
+        if root_id.eq_ignore_ascii_case(f) {
+            return Some((root_id.to_string(), true));
+        }
+        if let Some(id) = reply_ids.iter().find(|id| id.eq_ignore_ascii_case(f)) {
+            return Some((id.clone(), true));
+        }
+        // Focus target not loaded (yet): fall through to the newest reply; the
+        // effect re-runs as replies arrive and will pick the focus up.
+    }
+    reply_ids.last().map(|id| (id.clone(), false))
 }
 
 /// Root e-tag value of a kind-42 (prefer the "root" marker, else first `e`).
@@ -511,6 +542,80 @@ pub fn ThreadPage() -> impl IntoView {
     // the channel or the root post yet.
     let loading = Memo::new(move |_| {
         store_loading.get() && (resolved_channel.get().is_none() || topic_root.get().is_none())
+    });
+
+    // -- Landing position ---------------------------------------------------
+    //
+    // Opening a topic lands on its newest post; a `?focus=<event id>` deep link
+    // (search results, notifications via `/go/:id`) lands on that post and
+    // flashes it. Replies stream in from the store after first paint, so the
+    // bottom landing re-applies as the list grows until the reader scrolls or
+    // a short settle window passes — then it never moves under them again.
+    let query = use_query_map();
+    let focus_param = move || query.read().get("focus");
+    let landing_done = StoredValue::new(false);
+    let landing_started_at = StoredValue::new(0.0f64);
+    Effect::new(move |_| {
+        if landing_done.get_value() || loading.get() {
+            return;
+        }
+        let Some(root) = topic_root.get() else { return };
+        let reply_ids: Vec<String> = replies.get().iter().map(|r| r.id.clone()).collect();
+        let focus = focus_param();
+        let Some((target, is_focus)) = landing_target(focus.as_deref(), &root.id, &reply_ids)
+        else {
+            return;
+        };
+        let now = js_sys::Date::now();
+        if landing_started_at.get_value() == 0.0 {
+            landing_started_at.set_value(now);
+            // Any deliberate scroll by the reader ends the landing phase.
+            if let Some(w) = web_sys::window() {
+                let cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    if js_sys::Date::now() - landing_started_at.get_value() > 400.0 {
+                        landing_done.set_value(true);
+                    }
+                });
+                let _ = w.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref());
+                let _ =
+                    w.add_event_listener_with_callback("touchmove", cb.as_ref().unchecked_ref());
+                cb.forget();
+            }
+        } else if now - landing_started_at.get_value() > LANDING_SETTLE_MS {
+            landing_done.set_value(true);
+            return;
+        }
+        if is_focus {
+            landing_done.set_value(true);
+        }
+        crate::utils::set_timeout_once(
+            move || {
+                let Some(el) = web_sys::window()
+                    .and_then(|w| w.document())
+                    .and_then(|d| d.get_element_by_id(&post_anchor_id(&target)))
+                else {
+                    return;
+                };
+                let opts = web_sys::ScrollIntoViewOptions::new();
+                opts.set_block(if is_focus {
+                    web_sys::ScrollLogicalPosition::Center
+                } else {
+                    web_sys::ScrollLogicalPosition::End
+                });
+                el.scroll_into_view_with_scroll_into_view_options(&opts);
+                if is_focus {
+                    let cl = el.class_list();
+                    let _ = cl.add_2("ring-2", "ring-amber-400/70");
+                    crate::utils::set_timeout_once(
+                        move || {
+                            let _ = cl.remove_2("ring-2", "ring-amber-400/70");
+                        },
+                        2_500,
+                    );
+                }
+            },
+            60,
+        );
     });
 
     // Topic-not-found: store finished, channel resolved, but no matching root.
@@ -1210,7 +1315,8 @@ fn RootPost(
         // page, so it wears the zone colour (#29) via the inherited
         // `--zone-accent` custom property set on the page root.
         <article
-            class="bg-gray-800/70 border rounded-xl p-5 mt-4"
+            id=post_anchor_id(&post.id)
+            class="bg-gray-800/70 border rounded-xl p-5 mt-4 scroll-mt-20 transition-shadow"
             style="border-color:color-mix(in srgb, var(--zone-accent) 25%, transparent)"
         >
             <div class="flex items-start gap-3">
@@ -1328,7 +1434,10 @@ fn ReplyCard(
     let noop = Callback::new(|_: String| {});
 
     view! {
-        <div class="bg-gray-800/40 border border-gray-700/50 rounded-lg p-4">
+        <div
+            id=post_anchor_id(&post_id)
+            class="bg-gray-800/40 border border-gray-700/50 rounded-lg p-4 scroll-mt-20 transition-shadow"
+        >
             <div class="flex items-start gap-3">
                 <Avatar pubkey=pk size=AvatarSize::Sm />
                 <div class="flex-1 min-w-0">
@@ -1430,6 +1539,34 @@ fn first_line(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn landing_prefers_focus_then_newest_reply() {
+        let replies = vec!["aa".to_string(), "bb".to_string(), "cc".to_string()];
+        assert_eq!(
+            landing_target(None, "root", &replies),
+            Some(("cc".into(), false))
+        );
+        assert_eq!(
+            landing_target(Some("BB"), "root", &replies),
+            Some(("bb".into(), true))
+        );
+        assert_eq!(
+            landing_target(Some("root"), "root", &replies),
+            Some(("root".into(), true))
+        );
+        assert_eq!(
+            landing_target(Some("zz"), "root", &replies),
+            Some(("cc".into(), false))
+        );
+        assert_eq!(landing_target(Some(" "), "root", &[]), None);
+        assert_eq!(landing_target(None, "root", &[]), None);
+    }
+
+    #[test]
+    fn post_anchor_is_lowercase_and_prefixed() {
+        assert_eq!(post_anchor_id("ABC"), "post-abc");
+    }
 
     fn ev(
         id: &str,
