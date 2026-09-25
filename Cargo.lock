@@ -3642,9 +3642,9 @@ dependencies = [
 
 [[package]]
 name = "sidestr-core"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17cbe592ea9ab5bb32b2eed68d79947d8316dcef11db5a3c8cb2b275659fc47d"
+checksum = "2bdc002239f3238f1ae723277b3c100d01febd2d13391491de0fd2f335e5837b"
 dependencies = [
  "bech32",
  "bitcoin",
