@@ -220,7 +220,8 @@ pub struct Zone {
     /// Visibility policy for non-members. See [`ZoneVisibility`].
     #[serde(default)]
     pub visibility: ZoneVisibility,
-    /// End-to-end encrypt this zone's channel messages (ADR-2016): message text
+    /// End-to-end encrypt this zone's channel messages
+    /// (`docs/adr/ADR-2016-end-to-end-encrypted-zones.md`): message text
     /// is NIP-44 encrypted to a per-epoch zone key held only by members, and the
     /// relay refuses plaintext posts into the zone. Effective only when the
     /// deployment gate [`Encryption::enabled`] is on. Not allowed on a
