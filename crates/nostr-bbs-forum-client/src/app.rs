@@ -781,7 +781,11 @@ pub fn App() -> impl IntoView {
         let auth_for_keys = use_auth();
         let relay_for_keys = relay.clone();
         Effect::new(move |_| {
-            if !relay_authed.get() {
+            // Dormant with the deployment gate off: keys already held keep
+            // decrypting, but no member's gift wraps are re-opened (which
+            // would prompt NIP-07 signers for every DM) until encryption is
+            // switched on.
+            if !crate::zone_crypto::encryption_enabled() || !relay_authed.get() {
                 return;
             }
             let (Some(store), Some(me), Some(signer)) = (
