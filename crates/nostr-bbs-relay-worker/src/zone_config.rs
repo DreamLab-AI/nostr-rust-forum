@@ -72,6 +72,9 @@ impl Zone {
 #[derive(Debug, Clone, Default)]
 pub struct ZoneConfig {
     zones: Vec<Zone>,
+    /// Deployment master gate (`ENCRYPTION_ENABLED`). With the gate off no
+    /// zone is treated as encrypted, whatever its `encrypted` flag says.
+    encryption_enabled: bool,
 }
 
 impl ZoneConfig {
@@ -79,6 +82,10 @@ impl ZoneConfig {
     /// absent or malformed value yields an empty config (deny-by-default for
     /// non-admins). This is the single source of zone truth in the worker.
     pub fn load(env: &Env) -> Self {
+        let enabled = env
+            .var("ENCRYPTION_ENABLED")
+            .map(|v| encryption_flag(&v.to_string()))
+            .unwrap_or(false);
         let raw = match env.var("ZONE_CONFIG") {
             Ok(v) => v.to_string(),
             Err(_) => return Self::default(),
@@ -87,14 +94,23 @@ impl ZoneConfig {
         if trimmed.is_empty() {
             return Self::default();
         }
-        Self::from_json(trimmed)
+        Self::from_json(trimmed).with_encryption(enabled)
+    }
+
+    /// Set the deployment encryption gate (`ENCRYPTION_ENABLED`).
+    pub fn with_encryption(mut self, enabled: bool) -> Self {
+        self.encryption_enabled = enabled;
+        self
     }
 
     /// Parse a `ZONE_CONFIG` JSON array from a string. Malformed input yields an
     /// empty config (deny-by-default). Shared by [`Self::load`] and unit tests.
     pub fn from_json(raw: &str) -> Self {
         match serde_json::from_str::<Vec<Zone>>(raw.trim()) {
-            Ok(zones) => Self { zones },
+            Ok(zones) => Self {
+                zones,
+                encryption_enabled: false,
+            },
             Err(_) => Self::default(),
         }
     }
@@ -104,9 +120,16 @@ impl ZoneConfig {
         self.zones.iter().find(|z| z.id == id)
     }
 
-    /// Whether the zone's content must be end-to-end encrypted.
+    /// Whether the zone's content must be end-to-end encrypted: the
+    /// deployment gate is on, the zone is flagged `encrypted`, and the zone is
+    /// not public (anonymous readers can never hold a zone key, so a public
+    /// zone is never enforced even if misconfigured).
     pub fn is_encrypted(&self, id: &str) -> bool {
-        self.get(id).map(|z| z.encrypted).unwrap_or(false)
+        self.encryption_enabled
+            && self
+                .get(id)
+                .map(|z| z.encrypted && !self.is_public_read(id))
+                .unwrap_or(false)
     }
 
     /// Whether the zone is readable with no auth and no cohort membership.
@@ -158,6 +181,12 @@ impl ZoneConfig {
             }
         }
     }
+}
+
+/// Parse the `ENCRYPTION_ENABLED` var: only the exact string `"true"`
+/// (surrounding whitespace ignored) turns the gate on.
+pub fn encryption_flag(raw: &str) -> bool {
+    raw.trim() == "true"
 }
 
 /// Whether a kind-42 bound for an encrypted `zone` carries a zone-key
@@ -253,10 +282,38 @@ mod tests {
         let zc = ZoneConfig::from_json(
             r#"[{"id":"zone3","required_cohorts":["family"],"visibility":"locked","encrypted":true},
                 {"id":"zone2","required_cohorts":["friends"],"visibility":"locked"}]"#,
-        );
+        )
+        .with_encryption(true);
         assert!(zc.is_encrypted("zone3"));
         assert!(!zc.is_encrypted("zone2"));
         assert!(!zc.is_encrypted("nope"));
+    }
+
+    #[test]
+    fn master_gate_off_disables_every_zone() {
+        let zc = ZoneConfig::from_json(
+            r#"[{"id":"zone3","required_cohorts":["family"],"visibility":"locked","encrypted":true}]"#,
+        );
+        assert!(!zc.is_encrypted("zone3"));
+        assert!(!zc.with_encryption(false).is_encrypted("zone3"));
+    }
+
+    #[test]
+    fn public_zone_is_never_enforced_as_encrypted() {
+        let zc = ZoneConfig::from_json(
+            r#"[{"id":"zone1","required_cohorts":[],"visibility":"public","encrypted":true}]"#,
+        )
+        .with_encryption(true);
+        assert!(!zc.is_encrypted("zone1"));
+    }
+
+    #[test]
+    fn encryption_flag_accepts_only_exact_true() {
+        assert!(encryption_flag("true"));
+        assert!(encryption_flag(" true\n"));
+        for off in ["", "false", "TRUE", "1", "yes", "on"] {
+            assert!(!encryption_flag(off), "{off:?}");
+        }
     }
 
     fn cfg() -> ZoneConfig {
@@ -268,6 +325,7 @@ mod tests {
         ]"#;
         ZoneConfig {
             zones: serde_json::from_str(json).unwrap(),
+            encryption_enabled: false,
         }
     }
 
