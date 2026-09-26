@@ -62,19 +62,51 @@ fn allowed_origins(env: &Env) -> Vec<String> {
         .collect()
 }
 
+/// The `Access-Control-Allow-Origin` value for a request from `origin`: the
+/// origin itself when it is allowed, else the first allowed origin (which a
+/// browser then rejects, as it should).
+fn select_origin(allowed: &[String], origin: &str) -> String {
+    if allowed.iter().any(|o| o == origin) {
+        origin.to_string()
+    } else {
+        allowed.first().cloned().unwrap_or_default()
+    }
+}
+
 fn cors_origin(req: &Request, env: &Env) -> String {
-    let origins = allowed_origins(env);
     let origin = req
         .headers()
         .get("Origin")
         .ok()
         .flatten()
         .unwrap_or_default();
-    if origins.iter().any(|o| o == &origin) {
-        origin
-    } else {
-        origins.into_iter().next().unwrap_or_default()
+    select_origin(&allowed_origins(env), &origin)
+}
+
+/// Rewrite a response's `Access-Control-Allow-Origin` to the request's own
+/// allowed origin.
+///
+/// Many handlers build their response through [`cors::json_response`], which
+/// has no request and so can only name the first allowed origin; with more
+/// than one allowed origin every other one was refused by the browser. The
+/// entry point resolves the origin once and corrects the header here. A
+/// response without the header (none was intended) is left alone.
+fn with_request_origin(resp: Response, origin: &str) -> Response {
+    if origin.is_empty()
+        || !resp
+            .headers()
+            .has("Access-Control-Allow-Origin")
+            .unwrap_or(false)
+    {
+        return resp;
     }
+    let headers = Headers::new();
+    for (k, v) in resp.headers().entries() {
+        headers.append(&k, &v).ok();
+    }
+    headers.set("Access-Control-Allow-Origin", origin).ok();
+    headers.set("Vary", "Origin").ok();
+    resp.with_headers(headers)
 }
 
 fn cors_headers(req: &Request, env: &Env) -> Headers {
@@ -190,14 +222,16 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Ok(Response::ok(json_str)?.with_headers(headers));
     }
 
-    // Route to handlers with error wrapping
+    // Route to handlers with error wrapping. The origin is resolved before
+    // `req` moves into the router, then applied to whatever comes back.
+    let request_origin = cors_origin(&req, &env);
     let result = route(req, &env, path).await;
     match result {
-        Ok(resp) => Ok(resp),
+        Ok(resp) => Ok(with_request_origin(resp, &request_origin)),
         Err(e) => {
             console_error!("Relay worker error: {e}");
             let msg = e.to_string();
-            let fallback_origin = default_origin(&env);
+            let fallback_origin = request_origin;
             if msg.contains("JSON") || msg.contains("json") || msg.contains("Syntax") {
                 let headers = Headers::new();
                 headers.set("Content-Type", "application/json").ok();
@@ -1056,7 +1090,37 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 }
 
 #[cfg(test)]
+mod cors_tests {
+    #[test]
+    fn cors_allows_every_configured_origin_not_just_the_first() {
+        let allowed = vec![
+            "https://dreamlab-ai.com".to_string(),
+            "http://agentbox:8083".to_string(),
+        ];
+        assert_eq!(
+            super::select_origin(&allowed, "https://dreamlab-ai.com"),
+            "https://dreamlab-ai.com"
+        );
+        assert_eq!(
+            super::select_origin(&allowed, "http://agentbox:8083"),
+            "http://agentbox:8083"
+        );
+        // A foreign origin gets the first allowed one, which the browser refuses.
+        assert_eq!(
+            super::select_origin(&allowed, "https://evil.example"),
+            "https://dreamlab-ai.com"
+        );
+        assert_eq!(
+            super::select_origin(&allowed, ""),
+            "https://dreamlab-ai.com"
+        );
+        assert_eq!(super::select_origin(&[], "https://dreamlab-ai.com"), "");
+    }
+}
+
+#[cfg(test)]
 mod probe_blinding_tests {
+
     use super::PROBE_BLIND_STMTS;
 
     const MIGRATION_0006: &str = include_str!("../migrations/0006_augmentation_conditions.sql");
