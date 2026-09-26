@@ -49,6 +49,13 @@ pub struct Zone {
     /// Visibility policy for non-members.
     #[serde(default)]
     pub visibility: ZoneVisibility,
+    /// Content in this zone is end-to-end encrypted by clients (the zone-key
+    /// scheme in the forum client). The relay cannot decrypt; it only refuses
+    /// kind-42 content that is not a zone-key ciphertext (see
+    /// [`is_zone_ciphertext`]), so no client can downgrade the zone to
+    /// plaintext.
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 impl Zone {
@@ -95,6 +102,11 @@ impl ZoneConfig {
     /// Look up a zone definition by id.
     pub fn get(&self, id: &str) -> Option<&Zone> {
         self.zones.iter().find(|z| z.id == id)
+    }
+
+    /// Whether the zone's content must be end-to-end encrypted.
+    pub fn is_encrypted(&self, id: &str) -> bool {
+        self.get(id).map(|z| z.encrypted).unwrap_or(false)
     }
 
     /// Whether the zone is readable with no auth and no cohort membership.
@@ -148,9 +160,104 @@ impl ZoneConfig {
     }
 }
 
+/// Whether a kind-42 bound for an encrypted `zone` carries a zone-key
+/// ciphertext: a `["zk", <zone>, <epoch ≥ 1>, <64-hex zone pubkey>]` tag and
+/// content shaped like a NIP-44 v2 payload (base64 of version byte `0x02`,
+/// 32-byte nonce, ≥ 34-byte padded ciphertext and 32-byte MAC, so ≥ 99 bytes,
+/// and no more than NIP-44's 65 535-byte plaintext ceiling allows).
+///
+/// Shape only — the relay holds no key and cannot tell a real ciphertext from
+/// random bytes. What it guarantees is that nothing *readable* is stored in an
+/// encrypted zone: a plaintext post, from any client or any author (admins
+/// included), is refused.
+pub fn is_zone_ciphertext(zone: &str, tags: &[Vec<String>], content: &str) -> bool {
+    use base64::Engine as _;
+    let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let tag_ok = tags.iter().any(|t| {
+        t.len() >= 4
+            && t[0] == "zk"
+            && t[1] == zone
+            && t[2].parse::<u32>().map(|e| e >= 1).unwrap_or(false)
+            && hex64(&t[3])
+    });
+    if !tag_ok || content.len() < 132 || content.len() > 87_472 {
+        return false;
+    }
+    match base64::engine::general_purpose::STANDARD.decode(content) {
+        Ok(bytes) => bytes.len() >= 99 && bytes[0] == 0x02,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zk_payload() -> (Vec<Vec<String>>, String) {
+        // A real NIP-44 v2 ciphertext from core (rust-nostr), author → zone key.
+        let author = nostr_bbs_core::keys::generate_keypair().unwrap();
+        let zone = nostr_bbs_core::keys::generate_keypair().unwrap();
+        let zone_pk = *zone.public.as_bytes();
+        let ct = nostr_bbs_core::nip44::encrypt(author.secret.as_bytes(), &zone_pk, "hi family")
+            .unwrap();
+        let tags = vec![
+            vec!["e".into(), "chan".into(), "".into(), "root".into()],
+            vec![
+                "zk".into(),
+                "zone3".into(),
+                "1".into(),
+                hex::encode(zone_pk),
+            ],
+        ];
+        (tags, ct)
+    }
+
+    #[test]
+    fn real_zone_ciphertext_is_accepted() {
+        let (tags, ct) = zk_payload();
+        assert!(is_zone_ciphertext("zone3", &tags, &ct));
+    }
+
+    #[test]
+    fn plaintext_and_malformed_zk_are_refused() {
+        let (tags, ct) = zk_payload();
+        // Plaintext with a valid zk tag.
+        assert!(!is_zone_ciphertext(
+            "zone3",
+            &tags,
+            "hello everyone, dinner at 7?"
+        ));
+        // Ciphertext without a zk tag.
+        let no_zk = vec![vec!["e".to_string(), "chan".into()]];
+        assert!(!is_zone_ciphertext("zone3", &no_zk, &ct));
+        // zk tag for a different zone, epoch 0, short pubkey.
+        let bad = |zone: &str, epoch: &str, pk: &str| {
+            vec![vec!["zk".to_string(), zone.into(), epoch.into(), pk.into()]]
+        };
+        let pk = "ab".repeat(32);
+        assert!(!is_zone_ciphertext("zone3", &bad("zone2", "1", &pk), &ct));
+        assert!(!is_zone_ciphertext("zone3", &bad("zone3", "0", &pk), &ct));
+        assert!(!is_zone_ciphertext(
+            "zone3",
+            &bad("zone3", "1", "abcd"),
+            &ct
+        ));
+        // Base64 of text that is long enough but not a v2 payload.
+        use base64::Engine as _;
+        let fake = base64::engine::general_purpose::STANDARD.encode("x".repeat(120));
+        assert!(!is_zone_ciphertext("zone3", &tags, &fake));
+    }
+
+    #[test]
+    fn encrypted_flag_parses_from_zone_config() {
+        let zc = ZoneConfig::from_json(
+            r#"[{"id":"zone3","required_cohorts":["family"],"visibility":"locked","encrypted":true},
+                {"id":"zone2","required_cohorts":["friends"],"visibility":"locked"}]"#,
+        );
+        assert!(zc.is_encrypted("zone3"));
+        assert!(!zc.is_encrypted("zone2"));
+        assert!(!zc.is_encrypted("nope"));
+    }
 
     fn cfg() -> ZoneConfig {
         let json = r#"[

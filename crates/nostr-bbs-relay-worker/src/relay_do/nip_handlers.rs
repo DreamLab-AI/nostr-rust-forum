@@ -1103,6 +1103,19 @@ impl NostrRelayDO {
                     Self::send_ok(ws, &event.id, false, "zone access denied");
                     return;
                 }
+                // Encrypted zones store no readable text — for anyone, admins
+                // included. Shape check only; the relay holds no zone key.
+                if crate::zone_config::ZoneConfig::load(&self.env).is_encrypted(&zone)
+                    && !crate::zone_config::is_zone_ciphertext(&zone, &event.tags, &event.content)
+                {
+                    Self::send_ok(
+                        ws,
+                        &event.id,
+                        false,
+                        "blocked: encrypted zone requires zone-key ciphertext",
+                    );
+                    return;
+                }
             }
         }
 
