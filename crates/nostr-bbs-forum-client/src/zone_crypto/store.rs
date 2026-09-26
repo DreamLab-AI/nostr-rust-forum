@@ -74,6 +74,15 @@ impl ZoneKeyStore {
         self.keys.with_untracked(|m| latest_in(m, zone))
     }
 
+    /// Every key held for `zone`, oldest epoch first, untracked.
+    pub fn all_for_zone(&self, zone: &str) -> Vec<ZoneKey> {
+        let mut v: Vec<ZoneKey> = self
+            .keys
+            .with_untracked(|m| m.values().filter(|k| k.zone == zone).cloned().collect());
+        v.sort_by_key(|k| k.epoch);
+        v
+    }
+
     /// Highest-epoch key held for `zone`, tracked.
     pub fn latest_tracked(&self, zone: &str) -> Option<ZoneKey> {
         self.keys.with(|m| latest_in(m, zone))

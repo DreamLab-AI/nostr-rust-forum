@@ -339,6 +339,45 @@ pub fn grant_targets(
     out
 }
 
+/// The grants to send when an admin grants a zone's key to `recipients`.
+///
+/// `held` is every key this admin holds for the zone, in any order. The
+/// newest epoch always goes to every recipient. With `include_history`, each
+/// earlier epoch also goes to the recipients not already recorded for it
+/// (`already_sent(epoch)`), so a member who joins after a rotation can read
+/// the zone's older messages. Without it they read only what is posted from
+/// the newest epoch on. Returns `(key, recipients)` pairs, newest first, with
+/// empty pairs dropped.
+pub fn grant_plan(
+    held: &[ZoneKey],
+    recipients: &[String],
+    include_history: bool,
+    already_sent: impl Fn(u32) -> std::collections::HashSet<String>,
+) -> Vec<(ZoneKey, Vec<String>)> {
+    let mut keys: Vec<&ZoneKey> = held.iter().collect();
+    keys.sort_by_key(|k| std::cmp::Reverse(k.epoch));
+    let mut out = Vec::new();
+    for (i, key) in keys.into_iter().enumerate() {
+        if i > 0 && !include_history {
+            break;
+        }
+        let sent = if i == 0 {
+            Default::default()
+        } else {
+            already_sent(key.epoch)
+        };
+        let recs: Vec<String> = recipients
+            .iter()
+            .filter(|pk| !sent.contains(*pk))
+            .cloned()
+            .collect();
+        if !recs.is_empty() {
+            out.push((key.clone(), recs));
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Read path
 // ---------------------------------------------------------------------------
@@ -560,6 +599,50 @@ pub async fn unwrap_any(
 
 #[cfg(test)]
 mod tests {
+    fn key_at(epoch: u32) -> ZoneKey {
+        generate_zone_key("zone3", epoch, &"a".repeat(64), 0).expect("key")
+    }
+
+    #[test]
+    fn grant_plan_newest_only_without_history() {
+        let held = vec![key_at(1), key_at(3), key_at(2)];
+        let recs = vec!["b".repeat(64)];
+        let plan = grant_plan(&held, &recs, false, |_| Default::default());
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].0.epoch, 3);
+        assert_eq!(plan[0].1, recs);
+    }
+
+    #[test]
+    fn grant_plan_history_sends_earlier_epochs_newest_first_skipping_holders() {
+        let held = vec![key_at(1), key_at(2), key_at(3)];
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let recs = vec![b.clone(), c.clone()];
+        // c already got epoch 2 from this device; nobody got epoch 1.
+        let plan = grant_plan(&held, &recs, true, |epoch| {
+            if epoch == 2 {
+                std::iter::once(c.clone()).collect()
+            } else {
+                Default::default()
+            }
+        });
+        let epochs: Vec<u32> = plan.iter().map(|(k, _)| k.epoch).collect();
+        assert_eq!(epochs, vec![3, 2, 1]);
+        assert_eq!(
+            plan[0].1, recs,
+            "newest epoch always goes to everyone asked"
+        );
+        assert_eq!(plan[1].1, vec![b.clone()]);
+        assert_eq!(plan[2].1, recs);
+    }
+
+    #[test]
+    fn grant_plan_empty_inputs() {
+        assert!(grant_plan(&[], &["b".repeat(64)], true, |_| Default::default()).is_empty());
+        assert!(grant_plan(&[key_at(1)], &[], true, |_| Default::default()).is_empty());
+    }
+
     use super::*;
     use nostr_bbs_core::keys::generate_keypair;
     use nostr_bbs_core::signer::PrfSigner;

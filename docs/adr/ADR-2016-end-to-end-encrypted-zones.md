@@ -73,6 +73,11 @@ an agent admin included — unless the zone sets `agent_keys = true`.
 
 **Membership changes.** Removing a member means rotating to a new epoch and
 granting it to everyone who remains (admin > Encryption > Rotate key).
+A grant carries one epoch, so a member added after a rotation would read only
+from the newest epoch on. "Grant to members missing it" therefore also sends
+the earlier epochs the admin holds (skipping recipients already recorded for
+each), behind an on-by-default "Also send earlier keys" option that the admin
+can clear to give a newcomer the current key only (`zone_crypto::grant_plan`).
 
 **History.** Existing plaintext messages are left as they are. Re-publishing
 them as encrypted "sealed originals" (the full signed original event inside a

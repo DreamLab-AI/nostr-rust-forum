@@ -4,7 +4,10 @@
 //! create the first key, grant it to members who are missing it, or rotate to
 //! a new epoch. Grants are NIP-59 gift wraps sealed by this admin; which
 //! members hold a key can only be known for grants sent from this device, so
-//! the card says exactly that. Agents (cohort `agent`) never receive a key.
+//! the card says exactly that. Agents (cohort `agent`) receive a key only in a
+//! zone configured with `agent_keys`. Granting to a member who is missing the
+//! current key can also send the earlier keys this admin holds, so someone
+//! who joins after a rotation can read the zone's history.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -19,7 +22,7 @@ use crate::stores::zones::{load_zones, Zone};
 use crate::utils::shorten_pubkey;
 use crate::zone_crypto::store::{try_use_zone_key_store, ZoneKeyStore};
 use crate::zone_crypto::{
-    build_grant_wrap, generate_zone_key, grant_targets, ZoneKey, AGENT_COHORT,
+    build_grant_wrap, generate_zone_key, grant_plan, grant_targets, ZoneKey, AGENT_COHORT,
 };
 
 fn now_secs() -> u64 {
@@ -100,6 +103,9 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
     let busy = RwSignal::new(false);
     let status: RwSignal<Option<String>> = RwSignal::new(None);
     let sent: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+    // Also send earlier epochs to members being granted the current key, so a
+    // late joiner can read older messages. On by default; the admin can opt out.
+    let include_history = RwSignal::new(true);
 
     let latest = move || zone.with_value(|z| keys.latest_tracked(&z.id));
 
@@ -163,53 +169,61 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             .collect::<Vec<_>>()
     };
 
-    // Grant `key` to `recipients`: one gift wrap each, recorded once the relay
-    // accepts it.
+    // Send each `(key, recipients)` pair: one gift wrap per recipient, recorded
+    // once the relay accepts it.
     let grant = {
         let relay = relay.clone();
-        move |key: ZoneKey, recipients: Vec<String>| {
+        move |plan: Vec<(ZoneKey, Vec<String>)>| {
             let Some(signer) = auth.get_signer() else {
                 status.set(Some("Sign in again to grant keys.".into()));
                 return;
             };
-            if recipients.is_empty() {
+            if plan.iter().all(|(_, r)| r.is_empty()) {
                 status.set(Some("Everyone eligible already has this key.".into()));
                 return;
             }
+            let members: HashSet<&String> = plan.iter().flat_map(|(_, r)| r.iter()).collect();
+            let epochs = plan.len();
             busy.set(true);
-            status.set(Some(format!("Granting to {} member(s)…", recipients.len())));
+            status.set(Some(format!(
+                "Granting {} key(s) to {} member(s)…",
+                epochs,
+                members.len()
+            )));
             let relay = relay.clone();
             spawn_local(async move {
-                let total = recipients.len();
+                let total: usize = plan.iter().map(|(_, r)| r.len()).sum();
                 let mut failed = 0usize;
-                for pk in recipients {
-                    match build_grant_wrap(&*signer, &pk, &key, now_secs()).await {
-                        Ok(wrap) => {
-                            let key_for_ack = key.clone();
-                            let pk_for_ack = pk.clone();
-                            let on_ok = Rc::new(move |ok: bool, _msg: String| {
-                                if ok {
-                                    let key = key_for_ack.clone();
-                                    let pk = pk_for_ack.clone();
-                                    spawn_local(async move {
-                                        keys.record_grants(
-                                            &key.zone,
-                                            key.epoch,
-                                            std::slice::from_ref(&pk),
-                                        )
-                                        .await;
-                                        // The tab may be closed by now.
-                                        let _ = sent.try_update(|s| {
-                                            s.insert(pk);
+                for (key, recipients) in plan {
+                    for pk in recipients {
+                        match build_grant_wrap(&*signer, &pk, &key, now_secs()).await {
+                            Ok(wrap) => {
+                                let key_for_ack = key.clone();
+                                let pk_for_ack = pk.clone();
+                                let on_ok = Rc::new(move |ok: bool, _msg: String| {
+                                    if ok {
+                                        let key = key_for_ack.clone();
+                                        let pk = pk_for_ack.clone();
+                                        spawn_local(async move {
+                                            keys.record_grants(
+                                                &key.zone,
+                                                key.epoch,
+                                                std::slice::from_ref(&pk),
+                                            )
+                                            .await;
+                                            // The tab may be closed by now.
+                                            let _ = sent.try_update(|s| {
+                                                s.insert(pk);
+                                            });
                                         });
-                                    });
+                                    }
+                                });
+                                if relay.publish_with_ack(&wrap, Some(on_ok)).is_err() {
+                                    failed += 1;
                                 }
-                            });
-                            if relay.publish_with_ack(&wrap, Some(on_ok)).is_err() {
-                                failed += 1;
                             }
+                            Err(_) => failed += 1,
                         }
-                        Err(_) => failed += 1,
                     }
                 }
                 let _ = busy.try_set(false);
@@ -246,7 +260,9 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             match generate_zone_key(&zone_id, next_epoch, &me, now_secs()) {
                 Ok(key) => {
                     keys.insert(key.clone());
-                    grant(key, targets());
+                    // A new key goes to everyone eligible; they already hold
+                    // (or were already offered) the earlier ones.
+                    grant(vec![(key, targets())]);
                 }
                 Err(e) => status.set(Some(format!("Could not create a key: {e}"))),
             }
@@ -283,15 +299,28 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                             on:click=move |_| create_or_rotate.with_value(|f| f(false))
                         >"Create key (epoch 1)"</button>
                     })}
-                    {move || latest().map(|key| {
-                        let key_for_grant = key.clone();
+                    {move || latest().map(|_| {
                         view! {
                             <button
                                 class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-50"
                                 disabled=move || busy.get() || !members_ready.get() || missing().is_empty()
                                 on:click=move |_| {
-                                    let k = key_for_grant.clone();
-                                    grant.with_value(|g| g(k, missing()));
+                                    let recipients = missing();
+                                    let history = include_history.get_untracked();
+                                    let zone_id = zone.with_value(|z| z.id.clone());
+                                    let held = keys.all_for_zone(&zone_id);
+                                    spawn_local(async move {
+                                        let mut earlier = std::collections::HashMap::new();
+                                        if history {
+                                            for k in &held {
+                                                earlier.insert(k.epoch, keys.grants_sent(&k.zone, k.epoch).await);
+                                            }
+                                        }
+                                        let plan = grant_plan(&held, &recipients, history, |e| {
+                                            earlier.get(&e).cloned().unwrap_or_default()
+                                        });
+                                        grant.with_value(|g| g(plan));
+                                    });
                                 }
                             >{move || format!("Grant to members missing it ({})", missing().len())}</button>
                             <button
@@ -303,6 +332,17 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                     })}
                 </div>
             </header>
+
+            {move || (latest().map(|k| k.epoch).unwrap_or(0) > 1).then(|| view! {
+                <label class="flex items-center gap-2 text-sm text-gray-300">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || include_history.get()
+                        on:change=move |ev| include_history.set(event_target_checked(&ev))
+                    />
+                    "Also send earlier keys, so new members can read older messages"
+                </label>
+            })}
 
             {move || status.get().map(|s| view! {
                 <p class="text-sm text-amber-300" role="status">{s}</p>
