@@ -903,6 +903,21 @@ fn board_composer(
             }
             .into_any();
         }
+        // An encrypted zone's boards are read and written in the forum, which
+        // holds the zone key (ADR-2016); this client never posts plaintext there.
+        let (gate_on, zones) = use_context::<StoredValue<BbsConfig>>()
+            .map(|c| c.with_value(|c| (c.encryption_enabled, c.zones.clone())))
+            .unwrap_or_default();
+        if relay::board_is_encrypted(gate_on, &store.channels.get(), &channel_id, &zones) {
+            return view! {
+                <div class="bbs-panel bbs-dim">
+                    "  \u{1F512} This board is end-to-end encrypted. Read and post in the forum at "
+                    <span class="accent">"/community/"</span>
+                    ", which holds your zone key."
+                </div>
+            }
+            .into_any();
+        }
         let cid = channel_id.clone();
         let default_clear = default_reply.clone();
         // Local clone moved into the send closure — the outer view closure is

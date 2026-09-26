@@ -39,8 +39,11 @@ impl RelayStore {
         }
     }
 
-    /// Route a verified event into the matching bucket.
+    /// Route a verified event into the matching bucket. A zone-encrypted
+    /// kind-42 is stored with its text replaced by
+    /// [`ENCRYPTED_PLACEHOLDER`]: this client holds no zone keys.
     pub fn ingest(&self, ev: NostrEvent) {
+        let ev = mask_encrypted(ev);
         let bucket = match ev.kind {
             0 => self.profiles,
             40 => self.channels,
@@ -56,6 +59,48 @@ impl Default for RelayStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Shown in place of a zone-encrypted post. The retro client holds no zone
+/// keys; the forum at `/community/` decrypts (ADR-2016).
+pub const ENCRYPTED_PLACEHOLDER: &str = "\u{1F512} encrypted \u{2014} open in the forum to read";
+
+/// Whether `ev` is a zone-encrypted kind-42 (carries a `["zk", …]` tag).
+pub fn is_zone_encrypted(ev: &NostrEvent) -> bool {
+    ev.kind == 42
+        && ev
+            .tags
+            .iter()
+            .any(|t| t.first().map(String::as_str) == Some("zk"))
+}
+
+/// Replace a zone-encrypted post's ciphertext with [`ENCRYPTED_PLACEHOLDER`];
+/// every other event passes through untouched.
+pub fn mask_encrypted(mut ev: NostrEvent) -> NostrEvent {
+    if is_zone_encrypted(&ev) {
+        ev.content = ENCRYPTED_PLACEHOLDER.to_string();
+    }
+    ev
+}
+
+/// Whether board `channel_id` sits in a zone configured `encrypted = true`,
+/// with the deployment gate (`ENCRYPTION_ENABLED`) on.
+pub fn board_is_encrypted(
+    gate_on: bool,
+    channels: &[NostrEvent],
+    channel_id: &str,
+    zones: &[nostr_bbs_config::schema::Zone],
+) -> bool {
+    if !gate_on {
+        return false;
+    }
+    let Some(ch) = channels.iter().find(|c| c.id == channel_id) else {
+        return false;
+    };
+    let ids: Vec<String> = zones.iter().map(|z| z.id.clone()).collect();
+    channel_zone_index(ch, &ids)
+        .and_then(|i| zones.get(i))
+        .is_some_and(|z| z.encrypted)
 }
 
 /// Insert an event newest-first, de-duplicated by id, capped at `BUCKET_CAP`.
@@ -643,6 +688,53 @@ mod wasm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev42(tags: Vec<Vec<&str>>, content: &str) -> NostrEvent {
+        NostrEvent {
+            id: "m".into(),
+            pubkey: "p".into(),
+            created_at: 1,
+            kind: 42,
+            tags: tags
+                .into_iter()
+                .map(|t| t.into_iter().map(String::from).collect())
+                .collect(),
+            content: content.into(),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn zone_encrypted_posts_are_masked_and_plaintext_is_not() {
+        let enc = ev42(
+            vec![vec!["e", "c"], vec!["zk", "zone3", "1", "ab"]],
+            "Ag0ciphertext",
+        );
+        let masked = mask_encrypted(enc);
+        assert_eq!(masked.content, ENCRYPTED_PLACEHOLDER);
+        assert_eq!(masked.tags.len(), 2, "tags kept");
+        let plain = mask_encrypted(ev42(vec![vec!["e", "c"]], "hello"));
+        assert_eq!(plain.content, "hello");
+    }
+
+    #[test]
+    fn board_in_encrypted_zone_is_detected() {
+        let mut ch = ev42(vec![vec!["section", "zone3-chat"]], "{}");
+        ch.kind = 40;
+        ch.id = "fam".into();
+        let zones: Vec<nostr_bbs_config::schema::Zone> =
+            serde_json::from_value(serde_json::json!([
+                {"id": "zone2", "display_name": "Friends", "encrypted": false},
+                {"id": "zone3", "display_name": "Family", "encrypted": true}
+            ]))
+            .unwrap();
+        assert!(board_is_encrypted(true, &[ch.clone()], "fam", &zones));
+        assert!(
+            !board_is_encrypted(false, &[ch.clone()], "fam", &zones),
+            "gate off"
+        );
+        assert!(!board_is_encrypted(true, &[ch], "other", &zones));
+    }
     use nostr_bbs_core::event::NostrEvent;
 
     fn ev(id: &str, kind: u64, created_at: u64, content: &str, tags: Vec<Vec<&str>>) -> NostrEvent {

@@ -547,6 +547,7 @@ mod tests {
             accent_hex: None,
             visibility: Default::default(),
             encrypted: false,
+            agent_keys: false,
             auto_approve: false,
             kanban: false,
         }

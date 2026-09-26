@@ -63,6 +63,9 @@ pub struct BbsConfig {
     /// and valid — names the bound zone the installed app pins to. Read only in
     /// the wasm [`Self::load`]; `None` in [`Self::from_env_value`].
     pub boot_profile: Option<BootProfile>,
+    /// Zone end-to-end encryption master gate (ADR-2016): `__ENV__.ENCRYPTION_ENABLED`
+    /// is exactly `"true"`. With it off no board is treated as encrypted.
+    pub encryption_enabled: bool,
 }
 
 impl Default for BbsConfig {
@@ -83,6 +86,7 @@ impl Default for BbsConfig {
             pwa_enabled: false,
             pwa_mode: false,
             boot_profile: None,
+            encryption_enabled: false,
         }
     }
 }
@@ -154,6 +158,8 @@ impl BbsConfig {
             pwa_enabled: env_flag(env, "BBS_PWA_ENABLED"),
             pwa_mode: false,
             boot_profile: None,
+            // Only the exact string "true" turns the gate on.
+            encryption_enabled: str_key(env, "ENCRYPTION_ENABLED").as_deref() == Some("true"),
         }
     }
 
