@@ -65,6 +65,25 @@ pub struct ForumConfig {
     /// Shared calendar / venue configuration (NIP-52 events).
     #[serde(default)]
     pub calendar: Calendar,
+    /// Zone end-to-end encryption master gate (ADR-2016).
+    #[serde(default)]
+    pub encryption: Encryption,
+}
+
+/// Zone end-to-end encryption master gate (ADR-2016).
+///
+/// Encryption is dormant unless the operator enables it: a zone is treated as
+/// encrypted only when `encryption.enabled && zone.encrypted`. Projected as the
+/// plain string env var `ENCRYPTION_ENABLED` (`"true"` / `"false"`) into both the
+/// relay worker's `[vars]` and the forum client's `window.__ENV__`; anything
+/// other than the exact string `"true"` means off. Turning the gate off stops
+/// new messages being encrypted but never makes history unreadable: clients
+/// still decrypt `zk`-tagged messages with any key they hold.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Encryption {
+    /// Master switch. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Deployment metadata.
@@ -201,10 +220,19 @@ pub struct Zone {
     /// Visibility policy for non-members. See [`ZoneVisibility`].
     #[serde(default)]
     pub visibility: ZoneVisibility,
-    /// Whether content in this zone is client-side encrypted (NIP-44). The relay
-    /// only records the flag; encryption/decryption is a client concern.
+    /// End-to-end encrypt this zone's channel messages (ADR-2016): message text
+    /// is NIP-44 encrypted to a per-epoch zone key held only by members, and the
+    /// relay refuses plaintext posts into the zone. Effective only when the
+    /// deployment gate [`Encryption::enabled`] is on. Not allowed on a
+    /// `visibility = "public"` zone — anonymous readers can never hold a key.
     #[serde(default)]
     pub encrypted: bool,
+    /// Whether members with the `agent` cohort may be granted this zone's key
+    /// (ADR-2016). Default `false`: agents are excluded from key grants. Setting
+    /// it means the zone's plaintext reaches the agent stack and whatever model
+    /// the agent calls — an operator trade-off, made per zone.
+    #[serde(default)]
+    pub agent_keys: bool,
     /// Auto-approve new joiners into this zone. When `true`, a brand-new user
     /// (first kind-0 auto-whitelist) is automatically granted this zone's
     /// `required_cohorts`, so they land in it without an admin approving them.

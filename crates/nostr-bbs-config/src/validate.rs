@@ -239,6 +239,16 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
                     zone.id
                 ));
             }
+            // ADR-2016: a public zone is readable by anonymous visitors, who can
+            // never hold a zone key, so it cannot be end-to-end encrypted.
+            if zone.encrypted && zone.visibility == crate::schema::ZoneVisibility::Public {
+                return Err(format!(
+                    "zone '{}' has encrypted = true but visibility = \"public\" — a public \
+                     zone cannot be end-to-end encrypted (anonymous readers can never hold \
+                     a key); make it locked or hidden, or set encrypted = false",
+                    zone.id
+                ));
+            }
             if let Some(accent) = zone.accent_hex.as_deref() {
                 if !is_valid_hex_colour(accent) {
                     return Err(format!(
@@ -349,6 +359,7 @@ mod tests {
             governance: Governance::default(),
             payments: Payments::default(),
             calendar: Calendar::default(),
+            encryption: Encryption::default(),
         }
     }
 
@@ -687,6 +698,49 @@ operator = "tier-2"
         assert!(validate_config(&cfg).is_err());
     }
 
+    fn zone_for_encryption(visibility: ZoneVisibility, encrypted: bool) -> Zone {
+        Zone {
+            id: "family".into(),
+            slug: None,
+            display_name: "Family".into(),
+            required_cohorts: vec!["family".into()],
+            write_cohorts: None,
+            banner_image_url: None,
+            accent_hex: None,
+            visibility,
+            encrypted,
+            agent_keys: false,
+            auto_approve: false,
+            kanban: false,
+        }
+    }
+
+    #[test]
+    fn encrypted_public_zone_is_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![zone_for_encryption(ZoneVisibility::Public, true)];
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.contains("cannot be end-to-end encrypted"), "{err}");
+    }
+
+    #[test]
+    fn encrypted_locked_or_hidden_zone_is_accepted() {
+        for vis in [ZoneVisibility::Locked, ZoneVisibility::Hidden] {
+            let mut cfg = baseline_cfg();
+            cfg.zones = vec![zone_for_encryption(vis, true)];
+            assert!(validate_config(&cfg).is_ok());
+        }
+        let mut cfg = baseline_cfg();
+        cfg.zones = vec![zone_for_encryption(ZoneVisibility::Public, false)];
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn encryption_gate_defaults_off() {
+        let e: Encryption = serde_json::from_str("{}").unwrap();
+        assert!(!e.enabled);
+    }
+
     #[test]
     fn zone_valid_accent_hex_accepted() {
         let mut cfg = baseline_cfg();
@@ -700,6 +754,7 @@ operator = "tier-2"
             accent_hex: Some("#3b82f6".into()),
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            agent_keys: false,
             auto_approve: false,
             kanban: false,
         }];
@@ -719,6 +774,7 @@ operator = "tier-2"
             accent_hex: Some("blue".into()),
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            agent_keys: false,
             auto_approve: false,
             kanban: false,
         }];
@@ -738,6 +794,7 @@ operator = "tier-2"
             accent_hex: None,
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            agent_keys: false,
             auto_approve: false,
             kanban: false,
         }
