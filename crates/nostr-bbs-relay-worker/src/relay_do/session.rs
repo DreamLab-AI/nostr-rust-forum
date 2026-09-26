@@ -73,18 +73,7 @@ impl NostrRelayDO {
     /// load while unborrowed, then re-borrow (re-checking) to apply it.
     #[allow(clippy::map_entry)]
     pub(crate) async fn recover_session(&self, ws: &WebSocket) -> u64 {
-        let tags = self.state.get_tags(ws);
-
-        let mut recovered_id: Option<u64> = None;
-        let mut recovered_ip = "unknown".to_string();
-
-        for tag in &tags {
-            if let Some(id_str) = tag.strip_prefix("sid:") {
-                recovered_id = id_str.parse().ok();
-            } else if let Some(ip_str) = tag.strip_prefix("ip:") {
-                recovered_ip = ip_str.to_string();
-            }
-        }
+        let (recovered_id, recovered_ip) = session_tags(&self.state.get_tags(ws));
 
         let session_id = recovered_id.unwrap_or_else(|| {
             let mut next = self.next_session_id.borrow_mut();
@@ -96,9 +85,7 @@ impl NostrRelayDO {
         // Ensure next_session_id stays ahead of recovered IDs
         {
             let mut next = self.next_session_id.borrow_mut();
-            if session_id >= *next {
-                *next = session_id + 1;
-            }
+            *next = next_session_id_after(*next, session_id);
         }
 
         let storage = self.state.storage();
@@ -119,19 +106,73 @@ impl NostrRelayDO {
         }
 
         // Also recover any other connected WebSockets we've lost track of.
+        self.recover_untracked_sessions().await;
+
+        // If the current WS wasn't covered by the get_websockets loop
+        // (shouldn't happen, but be safe), insert it.
+        let current_tracked = self.sessions.borrow().contains_key(&session_id);
+        if !current_tracked {
+            let subscriptions = Self::load_subscriptions(&storage, session_id).await;
+            let authed_pubkey = Self::load_auth(&storage, session_id).await;
+
+            let mut sessions = self.sessions.borrow_mut();
+            if !sessions.contains_key(&session_id) {
+                sessions.insert(
+                    session_id,
+                    SessionInfo {
+                        ws: ws.clone(),
+                        ip: recovered_ip,
+                        subscriptions,
+                        authed_pubkey,
+                        challenge,
+                    },
+                );
+            }
+        }
+
+        let (total, sub_count, auth_count) = {
+            let sessions = self.sessions.borrow();
+            let sub_count: usize = sessions.values().map(|s| s.subscriptions.len()).sum();
+            let auth_count = sessions
+                .values()
+                .filter(|s| s.authed_pubkey.is_some())
+                .count();
+            (sessions.len(), sub_count, auth_count)
+        };
+        console_log!(
+            "[RelayDO] Recovered {} session(s) from hibernation (active: #{}, {} subs, {} authed)",
+            total,
+            session_id,
+            sub_count,
+            auth_count,
+        );
+
+        session_id
+    }
+
+    /// Bring every hibernated WebSocket this DO still holds back into the
+    /// in-memory `sessions` map, restoring its subscriptions, AUTH state and
+    /// NIP-42 challenge from DO storage.
+    ///
+    /// A DO that wakes from hibernation starts with an empty `sessions` map and
+    /// `next_session_id` back at 1, while its live sockets keep their `sid:`
+    /// tags. This must run before anything relies on that map, on EVERY wake
+    /// path: a message on an old socket (via [`Self::recover_session`]) and a
+    /// NEW connection (in `fetch`). Without it a new connection (a) is handed a
+    /// session id a live socket already carries, so the two share persisted
+    /// subscriptions and AUTH (the old socket can be recovered authenticated as
+    /// the newcomer), and (b) publishes to an empty map, so its events are never
+    /// pushed to the sleeping subscribers, zone-key grants included.
+    ///
+    /// `map_entry` is allowed for the same reason as on `recover_session`: the
+    /// insert depends on storage loads awaited between the check and the insert.
+    #[allow(clippy::map_entry)]
+    pub(crate) async fn recover_untracked_sessions(&self) {
+        let storage = self.state.storage();
         let all_ws = self.state.get_websockets();
 
         for other_ws in all_ws {
-            let other_tags = self.state.get_tags(&other_ws);
-            let mut other_sid: Option<u64> = None;
-            let mut other_ip = "unknown".to_string();
-            for tag in &other_tags {
-                if let Some(id_str) = tag.strip_prefix("sid:") {
-                    other_sid = id_str.parse().ok();
-                } else if let Some(ip_str) = tag.strip_prefix("ip:") {
-                    other_ip = ip_str.to_string();
-                }
-            }
+            let (other_sid, other_ip) = session_tags(&self.state.get_tags(&other_ws));
             let Some(sid) = other_sid else {
                 continue;
             };
@@ -176,51 +217,8 @@ impl NostrRelayDO {
             }
 
             let mut next = self.next_session_id.borrow_mut();
-            if sid >= *next {
-                *next = sid + 1;
-            }
+            *next = next_session_id_after(*next, sid);
         }
-
-        // If the current WS wasn't covered by the get_websockets loop
-        // (shouldn't happen, but be safe), insert it.
-        let current_tracked = self.sessions.borrow().contains_key(&session_id);
-        if !current_tracked {
-            let subscriptions = Self::load_subscriptions(&storage, session_id).await;
-            let authed_pubkey = Self::load_auth(&storage, session_id).await;
-
-            let mut sessions = self.sessions.borrow_mut();
-            if !sessions.contains_key(&session_id) {
-                sessions.insert(
-                    session_id,
-                    SessionInfo {
-                        ws: ws.clone(),
-                        ip: recovered_ip,
-                        subscriptions,
-                        authed_pubkey,
-                        challenge,
-                    },
-                );
-            }
-        }
-
-        let (total, sub_count, auth_count) = {
-            let sessions = self.sessions.borrow();
-            let sub_count: usize = sessions.values().map(|s| s.subscriptions.len()).sum();
-            let auth_count = sessions
-                .values()
-                .filter(|s| s.authed_pubkey.is_some())
-                .count();
-            (sessions.len(), sub_count, auth_count)
-        };
-        console_log!(
-            "[RelayDO] Recovered {} session(s) from hibernation (active: #{}, {} subs, {} authed)",
-            total,
-            session_id,
-            sub_count,
-            auth_count,
-        );
-
-        session_id
     }
 
     /// Load persisted subscriptions for a session from DO transactional storage.
@@ -378,6 +376,27 @@ impl NostrRelayDO {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The `(sid, ip)` a WebSocket was tagged with at accept time
+/// (`sid:<n>`, `ip:<addr>`). Pure over the tag list.
+pub(crate) fn session_tags(tags: &[String]) -> (Option<u64>, String) {
+    let mut sid = None;
+    let mut ip = "unknown".to_string();
+    for tag in tags {
+        if let Some(id) = tag.strip_prefix("sid:") {
+            sid = id.parse().ok();
+        } else if let Some(addr) = tag.strip_prefix("ip:") {
+            ip = addr.to_string();
+        }
+    }
+    (sid, ip)
+}
+
+/// The next session id to hand out once `seen` is known to be in use: always
+/// strictly greater than every live socket's id, never lower than `next`.
+pub(crate) fn next_session_id_after(next: u64, seen: u64) -> u64 {
+    next.max(seen.saturating_add(1))
+}
+
 /// Decide the NIP-42 challenge for a session recovered from hibernation.
 ///
 /// Returns `(challenge, reissue)`:
@@ -454,5 +473,27 @@ mod tests {
         let b = generate_challenge(1);
         assert_eq!(a.len(), 32);
         assert_ne!(a, b, "CSPRNG-backed challenges must differ");
+    }
+    #[test]
+    fn session_tags_reads_sid_and_ip() {
+        let tags = vec!["sid:17".to_string(), "ip:203.0.113.9".to_string()];
+        assert_eq!(session_tags(&tags), (Some(17), "203.0.113.9".to_string()));
+        assert_eq!(session_tags(&[]), (None, "unknown".to_string()));
+        assert_eq!(session_tags(&["sid:x".to_string()]).0, None);
+    }
+
+    /// Regression: a DO woken by a NEW connection restarted ids at 1 and handed
+    /// out an id a hibernated socket still carried, so both shared persisted
+    /// subscriptions and AUTH. After recovery the next id clears every live one.
+    #[test]
+    fn next_session_id_clears_every_recovered_socket() {
+        let mut next = 1; // a fresh (just woken) DO
+        for live in [1u64, 5, 3] {
+            next = next_session_id_after(next, live);
+        }
+        assert_eq!(next, 6);
+        // Never moves backwards.
+        assert_eq!(next_session_id_after(9, 2), 9);
+        assert_eq!(next_session_id_after(u64::MAX, u64::MAX), u64::MAX);
     }
 }

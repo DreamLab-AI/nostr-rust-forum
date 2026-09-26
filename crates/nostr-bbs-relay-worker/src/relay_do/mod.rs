@@ -127,6 +127,13 @@ impl DurableObject for NostrRelayDO {
             }
         }
 
+        // A DO woken from hibernation by this connection has lost its
+        // in-memory sessions but still holds their sockets. Recover them
+        // before allocating an id (so it cannot collide with a live socket's)
+        // and before this connection publishes anything (so broadcasts reach
+        // them). No-op when nothing hibernated.
+        self.recover_untracked_sessions().await;
+
         let pair = WebSocketPair::new()?;
         let server = pair.server;
         let client = pair.client;
