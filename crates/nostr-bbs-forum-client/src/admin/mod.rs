@@ -16,6 +16,7 @@ pub mod reports;
 pub mod section_requests;
 pub mod settings;
 pub mod user_table;
+pub mod zone_encryption;
 
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,8 @@ pub enum AdminTab {
     Configuration,
     Reports,
     AuditLog,
+    /// Zone end-to-end encryption keys (ADR-2016).
+    Encryption,
 }
 
 /// Sub-views within the consolidated Members tab.

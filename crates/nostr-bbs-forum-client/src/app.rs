@@ -434,6 +434,9 @@ pub fn App() -> impl IntoView {
     let relay = RelayConnection::new();
     provide_context(relay.clone());
     provide_channel_store();
+    // Zone end-to-end encryption (ADR-2016): keys load from IndexedDB now,
+    // before channel sync, so held keys decrypt the first messages to arrive.
+    crate::zone_crypto::store::provide_zone_key_store(use_channel_store());
     crate::stores::reactions::provide_reaction_store();
 
     let auth = use_auth();
@@ -766,6 +769,29 @@ pub fn App() -> impl IntoView {
                 });
             r.subscribe(vec![filter], on_event, None);
             kind0_sub_started.set(true);
+        });
+    }
+
+    // Zone-key grants (ADR-2016): once the relay session is NIP-42
+    // authenticated (kind-1059 REQs are AUTH-gated), pull grants out of the
+    // member's gift wraps. Idempotent; starts once per page load.
+    {
+        let relay_authed = relay.authenticated();
+        let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
+        let auth_for_keys = use_auth();
+        let relay_for_keys = relay.clone();
+        Effect::new(move |_| {
+            if !relay_authed.get() {
+                return;
+            }
+            let (Some(store), Some(me), Some(signer)) = (
+                zone_keys,
+                auth_for_keys.pubkey().get(),
+                auth_for_keys.get_signer(),
+            ) else {
+                return;
+            };
+            store.start_grant_sync(&relay_for_keys, signer, me);
         });
     }
 

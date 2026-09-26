@@ -10,6 +10,9 @@
 //! - `profiles`  — key `pubkey`, index `updated` on `updated_at`
 //! - `deletions` — key `event_id`, index `target` on `target_id`
 //! - `outbox`    — autoIncrement key, index `created` on `created_at`
+//! - `zone_keys` — key `id` (`"<zone>:<epoch>"`), zone end-to-end encryption keys (ADR-2016)
+//! - `zone_kv`   — key `id`, small JSON values for zone encryption bookkeeping
+//!   (processed gift-wrap ids, grants this admin has sent)
 
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -20,13 +23,16 @@ use web_sys::{
 };
 
 const DB_NAME: &str = "members-forum";
-const DB_VERSION: u32 = 1;
+/// v2 adds `zone_keys` and `zone_kv` (ADR-2016). Upgrades only ADD stores.
+const DB_VERSION: u32 = 2;
 
 const STORE_MESSAGES: &str = "messages";
 const STORE_CHANNELS: &str = "channels";
 const STORE_PROFILES: &str = "profiles";
 const STORE_DELETIONS: &str = "deletions";
 const STORE_OUTBOX: &str = "outbox";
+const STORE_ZONE_KEYS: &str = "zone_keys";
+const STORE_ZONE_KV: &str = "zone_kv";
 
 // ---------------------------------------------------------------------------
 // Public data types
@@ -49,6 +55,21 @@ pub struct CachedProfile {
     pub picture: Option<String>,
     pub about: Option<String>,
     pub updated_at: u64,
+}
+
+/// A zone key at rest: the key plus its storage id (`"<zone>:<epoch>"`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredZoneKey {
+    pub id: String,
+    #[serde(flatten)]
+    pub key: crate::zone_crypto::ZoneKey,
+}
+
+/// A small JSON value in `zone_kv`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZoneKvRecord {
+    id: String,
+    value: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -252,10 +273,83 @@ impl ForumDb {
                     );
                 }
             }
+
+            // --- zone_keys / zone_kv (v2, ADR-2016) ---
+            for name in [STORE_ZONE_KEYS, STORE_ZONE_KV] {
+                if !db.object_store_names().contains(name) {
+                    let params = IdbObjectStoreParameters::new();
+                    params.set_key_path(&JsValue::from_str("id"));
+                    try_idb!(
+                        db.create_object_store_with_optional_parameters(name, &params),
+                        "failed to create zone store"
+                    );
+                }
+            }
         })
         .await?;
 
         Ok(Self { db })
+    }
+
+    // -- Zone keys (ADR-2016) ------------------------------------------------
+
+    /// Store (or replace) a zone key.
+    pub async fn put_zone_key(&self, key: &crate::zone_crypto::ZoneKey) -> Result<(), JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store(STORE_ZONE_KEYS)?;
+        let rec = StoredZoneKey {
+            id: key.id(),
+            key: key.clone(),
+        };
+        let req = store.put(&to_js(&rec)?)?;
+        idb_request_result(&req).await?;
+        Ok(())
+    }
+
+    /// Every zone key held on this device.
+    pub async fn get_all_zone_keys(&self) -> Result<Vec<crate::zone_crypto::ZoneKey>, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readonly)?;
+        let store = tx.object_store(STORE_ZONE_KEYS)?;
+        let req = store.get_all()?;
+        let result = idb_request_result(&req).await?;
+        let arr: js_sys::Array = result.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
+        Ok((0..arr.length())
+            .filter_map(|i| from_js::<StoredZoneKey>(arr.get(i)).ok())
+            .map(|r| r.key)
+            .collect())
+    }
+
+    /// Write a small JSON value to `zone_kv`.
+    pub async fn put_zone_kv(&self, id: &str, value: &str) -> Result<(), JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KV, IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store(STORE_ZONE_KV)?;
+        let rec = ZoneKvRecord {
+            id: id.to_string(),
+            value: value.to_string(),
+        };
+        let req = store.put(&to_js(&rec)?)?;
+        idb_request_result(&req).await?;
+        Ok(())
+    }
+
+    /// Read a `zone_kv` value.
+    pub async fn get_zone_kv(&self, id: &str) -> Result<Option<String>, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KV, IdbTransactionMode::Readonly)?;
+        let store = tx.object_store(STORE_ZONE_KV)?;
+        let req = store.get(&JsValue::from_str(id))?;
+        let result = idb_request_result(&req).await?;
+        if result.is_undefined() || result.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(from_js::<ZoneKvRecord>(result)?.value))
     }
 
     // -- Messages -----------------------------------------------------------

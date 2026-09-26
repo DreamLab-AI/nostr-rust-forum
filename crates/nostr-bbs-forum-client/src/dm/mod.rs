@@ -795,6 +795,14 @@ async fn process_gift_wrap_event(
 ) {
     let unwrapped = match unwrap_gift_with_signer(event, signer).await {
         Ok(u) => u,
+        // A zone-key grant (ADR-2016) rides the same gift-wrap transport but
+        // is not a DM: core refuses its rumor kind, and the zone-key store
+        // picks it up instead. Not an error, so nothing to log.
+        Err(nostr_bbs_core::gift_wrap::SignerGiftWrapError::InvalidKind { actual, .. })
+            if actual == crate::zone_crypto::KIND_ZONE_KEY_GRANT =>
+        {
+            return;
+        }
         Err(e) => {
             let msg = e.to_string();
             web_sys::console::warn_1(

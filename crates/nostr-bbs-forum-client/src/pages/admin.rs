@@ -21,6 +21,7 @@ use crate::admin::section_requests::SectionRequests;
 use crate::admin::settings::SettingsTab;
 use crate::admin::user_table::{AdminToggleCb, DeleteCb};
 use crate::admin::user_table::{UpdateCohortsCb, UserTable};
+use crate::admin::zone_encryption::ZoneEncryptionTab;
 use crate::admin::{provide_admin, use_admin, AdminTab, MembersView};
 use crate::auth::use_auth;
 use crate::components::admin_checklist::AdminChecklist;
@@ -282,6 +283,9 @@ fn AdminPanelInner() -> impl IntoView {
                 <TabButton tab=AdminTab::Configuration active=active_tab label="Configuration" />
                 <TabButton tab=AdminTab::Reports active=active_tab label="Reports" />
                 <TabButton tab=AdminTab::AuditLog active=active_tab label="Audit Log" />
+                {crate::zone_crypto::encryption_enabled().then(|| view! {
+                    <TabButton tab=AdminTab::Encryption active=active_tab label="Encryption" />
+                })}
             </div>
 
             // Tab content
@@ -300,6 +304,7 @@ fn AdminPanelInner() -> impl IntoView {
                     }.into_any(),
                     AdminTab::Reports => view! { <ReportsTab /> }.into_any(),
                     AdminTab::AuditLog => view! { <AuditLogTab /> }.into_any(),
+                    AdminTab::Encryption => view! { <ZoneEncryptionTab /> }.into_any(),
                 }
             }}
 
@@ -330,6 +335,7 @@ fn initial_tab_from_query() -> Option<AdminTab> {
             "configuration" | "settings" | "pods" | "nativepods" => Some(AdminTab::Configuration),
             "reports" => Some(AdminTab::Reports),
             "audit" | "auditlog" => Some(AdminTab::AuditLog),
+            "encryption" | "keys" => Some(AdminTab::Encryption),
             _ => None,
         }
     })

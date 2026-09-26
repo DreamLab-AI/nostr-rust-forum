@@ -80,7 +80,17 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
     let urls = extract_urls(&content);
     let (media_urls, link_urls): (Vec<_>, Vec<_>) =
         urls.into_iter().partition(|url| is_media_url(url));
-    let first_link_url = link_urls.into_iter().next();
+    // No link preview for a zone-encrypted message (ADR-2016): fetching one
+    // would hand the URL to the preview worker, outside the zone.
+    let zone_encrypted = crate::zone_crypto::store::try_use_zone_key_store().is_some_and(|s| {
+        s.encrypted_ids
+            .with_untracked(|ids| ids.contains(&event_id))
+    });
+    let first_link_url = if zone_encrypted {
+        None
+    } else {
+        link_urls.into_iter().next()
+    };
     // Hide embedded media URLs from the visible text — the embed below carries
     // its own hover "open full" affordance, so the bare URL is just noise.
     let body_text = crate::components::mention_text::strip_media_urls(&content, &media_urls);

@@ -335,6 +335,7 @@ pub fn ChannelPage() -> impl IntoView {
     // Clone relay for each closure that needs it
     let relay_for_sub = relay.clone();
     let relay_for_send = relay.clone();
+    let zone_writer_for_send = crate::zone_crypto::store::ZoneWriter::capture();
     let relay_for_cleanup = relay;
 
     // Reactive header fallback (ADR-092): re-run whenever `store.channels`
@@ -422,6 +423,9 @@ pub fn ChannelPage() -> impl IntoView {
 
         let channel_info_sig = channel_info;
         let store_for_kind40 = use_context::<ChannelStore>();
+        // Captured here, inside the effect's owner: the relay callbacks below
+        // run without one (ADR-2016 decryption at ingest).
+        let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
         let relay_for_retry = relay_for_sub.clone();
         let on_channel_event = Rc::new(move |event: NostrEvent| {
             if event.kind == 40 {
@@ -467,6 +471,7 @@ pub fn ChannelPage() -> impl IntoView {
                     let channels_sig = store.channels;
                     let cid_for_replay = event.id.clone();
                     let store_for_replay = *store;
+                    let zone_keys_for_replay = zone_keys;
                     let on_replay = Rc::new(move |ev: NostrEvent| {
                         if ev.kind != 42 {
                             return;
@@ -501,6 +506,8 @@ pub fn ChannelPage() -> impl IntoView {
                                 .map(|c| c.id.clone())
                         });
                         let cid_match = resolved.unwrap_or_else(|| cid_for_replay.clone());
+                        let ev =
+                            crate::zone_crypto::store::prepare_incoming(zone_keys_for_replay, ev);
                         let mut newly_added = false;
                         let event_ts = ev.created_at;
                         channel_msgs.update(|m| {
@@ -607,7 +614,7 @@ pub fn ChannelPage() -> impl IntoView {
         // `update` notifies subscribers even when the list is unchanged, which
         // re-runs the auto-scroll effect and pulls the viewport to the bottom
         // while the reader is scrolled up.
-        let (has_stale, to_add) = messages.with_untracked(|list| {
+        let (has_stale, to_add, recontent) = messages.with_untracked(|list| {
             let present = id_set(&channel_events, |e| e.id.as_str());
             let stale = list.iter().any(|m| !present.contains(m.id.as_str()));
             let rendered = id_set(&list[..], |m| m.id.as_str());
@@ -616,13 +623,28 @@ pub fn ChannelPage() -> impl IntoView {
                     .into_iter()
                     .cloned()
                     .collect();
-            (stale, to_add)
+            // A survivor whose text changed in the store: a zone key arrived
+            // and its message decrypted (ADR-2016). Patched in place below.
+            let by_id: std::collections::HashMap<&str, &str> = channel_events
+                .iter()
+                .map(|e| (e.id.as_str(), e.content.as_str()))
+                .collect();
+            let recontent: Vec<(String, String)> = list
+                .iter()
+                .filter_map(|m| {
+                    by_id
+                        .get(m.id.as_str())
+                        .filter(|c| **c != m.content)
+                        .map(|c| (m.id.clone(), c.to_string()))
+                })
+                .collect();
+            (stale, to_add, recontent)
         });
         let outcome = Reconciliation {
             removed: usize::from(has_stale),
             added: to_add.len(),
         };
-        if !outcome.changed() {
+        if !outcome.changed() && recontent.is_empty() {
             return;
         }
 
@@ -633,6 +655,11 @@ pub fn ChannelPage() -> impl IntoView {
             //    counts can only ever go up.
             let present = id_set(&channel_events, |e| e.id.as_str());
             retain_present(list, &present, |m| m.id.as_str());
+            for (id, content) in &recontent {
+                if let Some(m) = list.iter_mut().find(|m| &m.id == id) {
+                    m.content = content.clone();
+                }
+            }
 
             // 2. Append what is new. Survivors are NOT rebuilt, so their
             //    per-message reactive state (thread replies) and the scroll
@@ -756,6 +783,10 @@ pub fn ChannelPage() -> impl IntoView {
         }
     });
 
+    // Draft restore: a post refused before sending (encrypted zone without a
+    // key, ADR-2016) goes back into the composer instead of being lost.
+    let restore_failed = RwSignal::new(None::<String>);
+
     // Send message handler
     let do_send_text = move |(content, mention_pubkeys): (String, Vec<String>)| {
         let cid = channel_id();
@@ -806,11 +837,25 @@ pub fn ChannelPage() -> impl IntoView {
         };
 
         let relay = relay_for_send.clone();
+        let zone_writer = zone_writer_for_send;
         // Read the visibility decision on THIS side of the spawn: the signal is
         // Copy but reading it inside the async block would sample it after an
         // await point, where the reactive owner may already be gone.
         let is_public_for_index = zone_is_world_readable.get_untracked();
         wasm_bindgen_futures::spawn_local(async move {
+            // Encrypted zone (ADR-2016): encrypt to the zone key, or refuse
+            // without one — the draft is kept, nothing is sent in plaintext.
+            let unsigned = match zone_writer.prepare(&cid, auth.get_signer(), unsigned).await {
+                Ok(u) => u,
+                Err(e) => {
+                    error_msg.set(Some(e));
+                    restore_failed.set(Some(content_for_index));
+                    return;
+                }
+            };
+            // Encrypted text must never reach the (unauthenticated) search
+            // worker as plaintext.
+            let zone_encrypted = crate::zone_crypto::has_zk_tag(&unsigned.tags);
             match auth.sign_event_async(unsigned).await {
                 Ok(signed) => {
                     let event_id = signed.id.clone();
@@ -826,6 +871,9 @@ pub fn ChannelPage() -> impl IntoView {
                     // because `/search` is unauthenticated and a gated zone's
                     // content must not become searchable.
                     let channel_for_index = cid;
+                    if zone_encrypted {
+                        return;
+                    }
                     if let Some(signer) = auth.get_signer() {
                         let _ = crate::utils::search_client::ingest_message_signer(
                             &event_id,
@@ -1135,6 +1183,7 @@ pub fn ChannelPage() -> impl IntoView {
                             on_send_with_mentions=send_callback
                             enable_image_upload=true
                             channel_id=channel_id()
+                            restore_failed=restore_failed
                         />
                     </div>
                 </div>

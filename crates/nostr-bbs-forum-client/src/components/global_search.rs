@@ -388,6 +388,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                     let content = match content {
                         Some(c) => c,
                         None => match event {
+                            Some(ev) if crate::zone_crypto::has_zk_tag(&ev.tags) => continue,
                             Some(ev) if !ev.content.trim().is_empty() => ev.content.clone(),
                             _ => {
                                 missing += 1;
@@ -715,7 +716,12 @@ async fn relay_text_search(
     }
     let found: RwSignal<Vec<nostr_bbs_core::NostrEvent>> = RwSignal::new(Vec::new());
     let cb = Rc::new(move |ev: nostr_bbs_core::NostrEvent| {
-        if ev.kind == 42 && !ev.content.trim().is_empty() {
+        // Zone-encrypted posts (ADR-2016) are never search results: the relay
+        // matched their ciphertext, which is meaningless to the reader.
+        if ev.kind == 42
+            && !ev.content.trim().is_empty()
+            && !crate::zone_crypto::has_zk_tag(&ev.tags)
+        {
             found.update(|v| v.push(ev));
         }
     });

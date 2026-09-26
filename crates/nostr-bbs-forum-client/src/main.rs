@@ -10,6 +10,7 @@ mod relay;
 pub(crate) mod stores;
 pub(crate) mod utils;
 pub(crate) mod wallet;
+pub(crate) mod zone_crypto;
 
 use app::App;
 

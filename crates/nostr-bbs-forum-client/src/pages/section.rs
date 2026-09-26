@@ -175,6 +175,7 @@ fn resolve_section(
 pub fn SectionPage() -> impl IntoView {
     let relay = expect_context::<RelayConnection>();
     let auth = use_auth();
+    let zone_writer = crate::zone_crypto::store::ZoneWriter::capture();
     let store = use_channel_store();
     let read_store = use_read_positions();
     let zone_access = use_zone_access();
@@ -491,7 +492,7 @@ pub fn SectionPage() -> impl IntoView {
                             let relay = composer_relay.get_value();
                             let body_for_restore = body.clone();
                             spawn_local(async move {
-                                match publish_topic_root(&auth, &relay, &cid, &body, mentions, toasts).await {
+                                match publish_topic_root(&auth, zone_writer, &relay, &cid, &body, mentions, toasts).await {
                                     Ok(()) => {
                                         show_new_topic.set(false);
                                         toasts.show("Topic created".to_string(), ToastVariant::Success);
@@ -560,6 +561,7 @@ pub fn SectionPage() -> impl IntoView {
 /// shape and the topic appears in this list on relay echo.
 async fn publish_topic_root(
     auth: &crate::auth::AuthStore,
+    zone_writer: crate::zone_crypto::store::ZoneWriter,
     relay: &RelayConnection,
     section_channel_id: &str,
     body: &str,
@@ -608,11 +610,17 @@ async fn publish_topic_root(
         tags,
         content: body.trim().to_string(),
     };
+    // Encrypted zone (ADR-2016): encrypt to the zone key, or refuse without one.
+    let unsigned = zone_writer
+        .prepare(section_channel_id, auth.get_signer(), unsigned)
+        .await?;
     let signed = auth.sign_event_async(unsigned).await?;
 
     let on_ok = Rc::new(move |accepted: bool, msg: String| {
         if !accepted {
-            let display = if msg.contains("whitelist") {
+            let display = if let Some(why) = crate::zone_crypto::explain_relay_rejection(&msg) {
+                why
+            } else if msg.contains("whitelist") {
                 "Your account isn't active yet — try refreshing the page.".to_string()
             } else if msg.trim().is_empty() {
                 "Topic rejected by relay".to_string()

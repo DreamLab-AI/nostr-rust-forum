@@ -662,6 +662,8 @@ pub fn ThreadPage() -> impl IntoView {
     // Admin gate for the delete affordance (author-or-admin; the relay is the
     // real boundary — see the kind-5 gate). `ZoneAccess::is_admin` is a signal.
     let is_admin = Signal::derive(move || zone_access.is_admin.get());
+    // Captured during setup: the publish tasks below have no reactive owner.
+    let zone_writer = crate::zone_crypto::store::ZoneWriter::capture();
     let do_send_reply = {
         let relay = relay_for_send;
         move |(content, mention_pubkeys): (String, Vec<String>)| {
@@ -694,7 +696,12 @@ pub fn ThreadPage() -> impl IntoView {
             // (so the topic list folds it and the reply list matches it), notify
             // the topic-root author, then mentions.
             let mut tags = vec![
-                vec!["e".to_string(), cid, String::new(), "root".to_string()],
+                vec![
+                    "e".to_string(),
+                    cid.clone(),
+                    String::new(),
+                    "root".to_string(),
+                ],
                 vec![
                     "e".to_string(),
                     root.id.clone(),
@@ -749,12 +756,26 @@ pub fn ThreadPage() -> impl IntoView {
 
             let relay = relay.clone();
             spawn_local(async move {
+                // Encrypted zone (ADR-2016): encrypt to the zone key, or refuse
+                // without one and hand the draft back.
+                let unsigned = match zone_writer.prepare(&cid, auth.get_signer(), unsigned).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        toasts.show(e, ToastVariant::Error);
+                        restore_failed.set(Some(original.clone()));
+                        return;
+                    }
+                };
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {
                         let original_for_ack = original.clone();
                         let on_ok = Rc::new(move |accepted: bool, message: String| {
                             if !accepted {
-                                let reason = if message.trim().is_empty() {
+                                let reason = if let Some(why) =
+                                    crate::zone_crypto::explain_relay_rejection(&message)
+                                {
+                                    why
+                                } else if message.trim().is_empty() {
                                     "Reply rejected by relay".to_string()
                                 } else {
                                     format!("Reply rejected: {message}")
@@ -817,6 +838,7 @@ pub fn ThreadPage() -> impl IntoView {
                 return;
             }
             let now = (js_sys::Date::now() / 1000.0) as u64;
+            let cid_for_zone = cid.clone();
             // Channel root anchor (NIP-10), then the edit pointer. When editing a
             // reply we also keep the topic root as the reply parent so the edit
             // re-enters the same thread query; editing the root omits that.
@@ -877,11 +899,27 @@ pub fn ThreadPage() -> impl IntoView {
             };
             let relay = relay.clone();
             spawn_local(async move {
+                // An edit in an encrypted zone is itself encrypted (ADR-2016):
+                // the relay refuses a plaintext kind-42 there, edits included.
+                let unsigned = match zone_writer
+                    .prepare(&cid_for_zone, auth.get_signer(), unsigned)
+                    .await
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        toasts.show(e, ToastVariant::Error);
+                        return;
+                    }
+                };
                 match auth.sign_event_async(unsigned).await {
                     Ok(signed) => {
                         let on_ok = Rc::new(move |accepted: bool, message: String| {
                             if !accepted {
-                                let reason = if message.trim().is_empty() {
+                                let reason = if let Some(why) =
+                                    crate::zone_crypto::explain_relay_rejection(&message)
+                                {
+                                    why
+                                } else if message.trim().is_empty() {
                                     "Edit rejected by relay".to_string()
                                 } else {
                                     format!("Edit rejected: {message}")
@@ -1156,7 +1194,15 @@ fn PostBody(
 ) -> impl IntoView {
     let urls = extract_urls(&content);
     let (media_urls, link_urls): (Vec<_>, Vec<_>) = urls.into_iter().partition(|u| is_media_url(u));
-    let first_link = link_urls.into_iter().next();
+    // No link preview for a zone-encrypted post (ADR-2016): fetching one would
+    // hand the URL to the preview worker, outside the zone. The `zk` tag
+    // survives decryption, so the post's own tags say whether it was sealed.
+    let zone_encrypted = tags.as_deref().is_some_and(crate::zone_crypto::has_zk_tag);
+    let first_link = if zone_encrypted {
+        None
+    } else {
+        link_urls.into_iter().next()
+    };
     // Hide embedded media URLs from the visible text — the embed below (with its
     // own hover "open full" icon) is the representation.
     let text = crate::components::mention_text::strip_media_urls(&content, &media_urls);

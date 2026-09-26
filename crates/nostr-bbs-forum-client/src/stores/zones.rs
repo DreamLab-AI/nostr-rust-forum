@@ -97,10 +97,15 @@ pub struct Zone {
     /// Visibility policy for non-members.
     #[serde(default)]
     pub visibility: ZoneVisibility,
-    /// Client-side NIP-44 encryption flag (UX hint only).
+    /// End-to-end encrypt this zone's messages (ADR-2016). Effective only when
+    /// the deployment gate `ENCRYPTION_ENABLED` is `"true"`; see
+    /// [`crate::zone_crypto::encryption_enabled`].
     #[serde(default)]
-    #[allow(dead_code)]
     pub encrypted: bool,
+    /// Whether `agent`-cohort members may be granted this zone's key
+    /// (ADR-2016). Default `false`.
+    #[serde(default)]
+    pub agent_keys: bool,
     /// Operator-configured accent colour override (issue #34), e.g. `"#22c55e"`.
     /// Validated upstream as a CSS hex colour by `nostr_bbs_config::validate`.
     /// When absent, rendering falls back to the built-in
@@ -332,6 +337,7 @@ fn fallback_zones() -> Vec<Zone> {
             banner_image_url: Some("/images/heroes/public-hero.webp".to_string()),
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            agent_keys: false,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
@@ -345,6 +351,7 @@ fn fallback_zones() -> Vec<Zone> {
             banner_image_url: Some("/images/heroes/friends-hero.webp".to_string()),
             visibility: ZoneVisibility::Locked,
             encrypted: false,
+            agent_keys: false,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
@@ -358,6 +365,7 @@ fn fallback_zones() -> Vec<Zone> {
             banner_image_url: Some("/images/heroes/family-hero.webp".to_string()),
             visibility: ZoneVisibility::Locked,
             encrypted: true,
+            agent_keys: false,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
@@ -371,6 +379,7 @@ fn fallback_zones() -> Vec<Zone> {
             banner_image_url: Some("/images/heroes/business-hero.webp".to_string()),
             visibility: ZoneVisibility::Locked,
             encrypted: false,
+            agent_keys: false,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
@@ -426,6 +435,7 @@ mod tests {
             banner_image_url: None,
             visibility: ZoneVisibility::Public,
             encrypted: false,
+            agent_keys: false,
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,

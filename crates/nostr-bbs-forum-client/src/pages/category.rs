@@ -348,6 +348,7 @@ pub fn CategoryPage() -> impl IntoView {
                         fallback=move || {
                             let relay_create = expect_context::<RelayConnection>();
                             let auth_create = use_auth();
+                            let zone_writer = crate::zone_crypto::store::ZoneWriter::capture();
                             let toasts = toasts;
                             view! {
                                 <div class="bg-gray-800 border border-gray-700 rounded-lg p-5 space-y-3">
@@ -407,6 +408,7 @@ pub fn CategoryPage() -> impl IntoView {
                                                 spawn_local(async move {
                                                     match publish_topic_root(
                                                         &auth_create,
+                                                        zone_writer,
                                                         &relay,
                                                         &section_cid,
                                                         &title,
@@ -637,6 +639,7 @@ fn SectionSkeleton() -> impl IntoView {
 /// topic appears in the section's message list immediately on relay echo.
 async fn publish_topic_root(
     auth: &crate::auth::AuthStore,
+    zone_writer: crate::zone_crypto::store::ZoneWriter,
     relay: &RelayConnection,
     section_channel_id: &str,
     title: &str,
@@ -678,13 +681,19 @@ async fn publish_topic_root(
         tags,
         content: title.trim().to_string(),
     };
+    // Encrypted zone (ADR-2016): encrypt to the zone key, or refuse without one.
+    let unsigned = zone_writer
+        .prepare(section_channel_id, auth.get_signer(), unsigned)
+        .await?;
 
     let signed = auth.sign_event_async(unsigned).await?;
 
     // Publish with ack so relay rejections (e.g. not-yet-whitelisted) surface.
     let on_ok = Rc::new(move |accepted: bool, msg: String| {
         if !accepted {
-            let display = if msg.contains("whitelist") {
+            let display = if let Some(why) = crate::zone_crypto::explain_relay_rejection(&msg) {
+                why
+            } else if msg.contains("whitelist") {
                 "Your account isn't active yet — try refreshing the page.".to_string()
             } else if msg.trim().is_empty() {
                 "Topic rejected by relay".to_string()

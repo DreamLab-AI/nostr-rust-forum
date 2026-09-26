@@ -396,6 +396,7 @@ impl ChannelStore {
         let channel_msgs = self.channel_messages;
         let tombstones = self.tombstones;
         let store = *self;
+        let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
 
         let on_msg = Rc::new(move |event: NostrEvent| {
             // Suppress a message that was already deleted — a kind-5 can land
@@ -434,6 +435,9 @@ impl ChannelStore {
             });
 
             if let Some(cid) = resolved {
+                // Zone-encrypted messages become readable text (or a
+                // placeholder) here, once, for every view (ADR-2016).
+                let event = crate::zone_crypto::store::prepare_incoming(zone_keys, event);
                 // Store raw event for channel page consumption. Dedup by
                 // event id is the ONLY counter — ADR-091. Last-active only
                 // advances when a genuinely new event is appended.
@@ -518,6 +522,7 @@ impl ChannelStore {
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
         let tombstones = self.tombstones;
+        let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
 
         let on_event = Rc::new(move |event: NostrEvent| {
             if event.kind != 42 {
@@ -539,6 +544,7 @@ impl ChannelStore {
                 Some(v) => v,
                 None => return,
             };
+            let event = crate::zone_crypto::store::prepare_incoming(zone_keys, event);
             let mut newly_added = false;
             let event_ts = event.created_at;
             channel_msgs.update(|m| {
