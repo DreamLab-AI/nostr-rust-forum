@@ -57,12 +57,49 @@ pub struct CachedProfile {
     pub updated_at: u64,
 }
 
-/// A zone key at rest: the key plus its storage id (`"<zone>:<epoch>"`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A zone key at rest: the key's fields plus its storage id
+/// (`"<zone>:<epoch>"`), the store's key path.
+///
+/// The fields are spelled out rather than `#[serde(flatten)]`ed from
+/// [`ZoneKey`](crate::zone_crypto::ZoneKey): `serde_wasm_bindgen` serialises a
+/// flattened struct as a JS `Map`, which has no `id` property, so IndexedDB
+/// rejects the `put` ("key path did not yield a value") and the key is lost.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredZoneKey {
     pub id: String,
-    #[serde(flatten)]
-    pub key: crate::zone_crypto::ZoneKey,
+    pub zone: String,
+    pub epoch: u32,
+    pub secret: String,
+    pub pubkey: String,
+    pub granted_by: String,
+    pub received_at: u64,
+}
+
+impl From<&crate::zone_crypto::ZoneKey> for StoredZoneKey {
+    fn from(k: &crate::zone_crypto::ZoneKey) -> Self {
+        Self {
+            id: k.id(),
+            zone: k.zone.clone(),
+            epoch: k.epoch,
+            secret: k.secret.clone(),
+            pubkey: k.pubkey.clone(),
+            granted_by: k.granted_by.clone(),
+            received_at: k.received_at,
+        }
+    }
+}
+
+impl From<StoredZoneKey> for crate::zone_crypto::ZoneKey {
+    fn from(r: StoredZoneKey) -> Self {
+        Self {
+            zone: r.zone,
+            epoch: r.epoch,
+            secret: r.secret,
+            pubkey: r.pubkey,
+            granted_by: r.granted_by,
+            received_at: r.received_at,
+        }
+    }
 }
 
 /// A small JSON value in `zone_kv`.
@@ -299,10 +336,7 @@ impl ForumDb {
             .db
             .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
         let store = tx.object_store(STORE_ZONE_KEYS)?;
-        let rec = StoredZoneKey {
-            id: key.id(),
-            key: key.clone(),
-        };
+        let rec = StoredZoneKey::from(key);
         let req = store.put(&to_js(&rec)?)?;
         idb_request_result(&req).await?;
         Ok(())
@@ -319,7 +353,7 @@ impl ForumDb {
         let arr: js_sys::Array = result.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
         Ok((0..arr.length())
             .filter_map(|i| from_js::<StoredZoneKey>(arr.get(i)).ok())
-            .map(|r| r.key)
+            .map(crate::zone_crypto::ZoneKey::from)
             .collect())
     }
 
@@ -574,5 +608,173 @@ impl ForumDb {
         }
 
         Ok(evicted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zone_crypto::ZoneKey;
+    use serde::ser::{self, Impossible, Serializer};
+
+    /// Reports how a value serialises at the top level: `serde_wasm_bindgen`
+    /// turns a struct into a plain JS object but a map (which is what
+    /// `#[serde(flatten)]` produces) into a JS `Map`, and IndexedDB's key path
+    /// only sees object properties.
+    struct TopLevelShape;
+
+    #[derive(Debug)]
+    struct Shape(&'static str);
+    impl std::fmt::Display for Shape {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Shape {}
+    impl ser::Error for Shape {
+        fn custom<T: std::fmt::Display>(_: T) -> Self {
+            Shape("other")
+        }
+    }
+
+    struct Fields;
+    impl ser::SerializeStruct for Fields {
+        type Ok = &'static str;
+        type Error = Shape;
+        fn serialize_field<T: ?Sized + Serialize>(
+            &mut self,
+            _: &'static str,
+            _: &T,
+        ) -> Result<(), Shape> {
+            Ok(())
+        }
+        fn end(self) -> Result<&'static str, Shape> {
+            Ok("struct")
+        }
+    }
+
+    macro_rules! not_struct {
+        ($($m:ident($($t:ty),*)),*) => {$(
+            fn $m(self, $(_: $t),*) -> Result<&'static str, Shape> { Err(Shape("not a struct")) }
+        )*};
+    }
+
+    impl Serializer for TopLevelShape {
+        type Ok = &'static str;
+        type Error = Shape;
+        type SerializeSeq = Impossible<&'static str, Shape>;
+        type SerializeTuple = Impossible<&'static str, Shape>;
+        type SerializeTupleStruct = Impossible<&'static str, Shape>;
+        type SerializeTupleVariant = Impossible<&'static str, Shape>;
+        type SerializeMap = Impossible<&'static str, Shape>;
+        type SerializeStruct = Fields;
+        type SerializeStructVariant = Impossible<&'static str, Shape>;
+
+        fn serialize_struct(self, _: &'static str, _: usize) -> Result<Fields, Shape> {
+            Ok(Fields)
+        }
+        fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Shape> {
+            Err(Shape("map"))
+        }
+        not_struct!(
+            serialize_bool(bool),
+            serialize_i8(i8),
+            serialize_i16(i16),
+            serialize_i32(i32),
+            serialize_i64(i64),
+            serialize_u8(u8),
+            serialize_u16(u16),
+            serialize_u32(u32),
+            serialize_u64(u64),
+            serialize_f32(f32),
+            serialize_f64(f64),
+            serialize_char(char),
+            serialize_str(&str),
+            serialize_bytes(&[u8]),
+            serialize_none(),
+            serialize_unit(),
+            serialize_unit_struct(&'static str),
+            serialize_unit_variant(&'static str, u32, &'static str)
+        );
+        fn serialize_some<T: ?Sized + Serialize>(self, _: &T) -> Result<&'static str, Shape> {
+            Err(Shape("not a struct"))
+        }
+        fn serialize_newtype_struct<T: ?Sized + Serialize>(
+            self,
+            _: &'static str,
+            _: &T,
+        ) -> Result<&'static str, Shape> {
+            Err(Shape("not a struct"))
+        }
+        fn serialize_newtype_variant<T: ?Sized + Serialize>(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: &T,
+        ) -> Result<&'static str, Shape> {
+            Err(Shape("not a struct"))
+        }
+        fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Shape> {
+            Err(Shape("not a struct"))
+        }
+        fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Shape> {
+            Err(Shape("not a struct"))
+        }
+        fn serialize_tuple_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleStruct, Shape> {
+            Err(Shape("not a struct"))
+        }
+        fn serialize_tuple_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleVariant, Shape> {
+            Err(Shape("not a struct"))
+        }
+        fn serialize_struct_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStructVariant, Shape> {
+            Err(Shape("not a struct"))
+        }
+    }
+
+    fn key() -> ZoneKey {
+        ZoneKey {
+            zone: "zone3".into(),
+            epoch: 2,
+            secret: "11".repeat(32),
+            pubkey: "22".repeat(32),
+            granted_by: "33".repeat(32),
+            received_at: 1_790_000_000,
+        }
+    }
+
+    /// Regression: a flattened record serialised as a JS `Map`, so the
+    /// `zone_keys` put failed and every zone key was lost on reload.
+    #[test]
+    fn stored_zone_key_serialises_as_a_plain_struct() {
+        let rec = StoredZoneKey::from(&key());
+        assert_eq!(rec.serialize(TopLevelShape).map_err(|e| e.0), Ok("struct"));
+    }
+
+    #[test]
+    fn stored_zone_key_has_its_id_at_the_top_level_and_round_trips() {
+        let k = key();
+        let rec = StoredZoneKey::from(&k);
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["id"], "zone3:2");
+        assert_eq!(v["secret"], k.secret);
+        let back: StoredZoneKey = serde_json::from_value(v).unwrap();
+        assert_eq!(ZoneKey::from(back), k);
     }
 }

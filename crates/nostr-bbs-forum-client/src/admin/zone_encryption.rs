@@ -38,13 +38,18 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
         .collect();
 
     // The member list drives grant targeting; load it if the Members tab has
-    // not been visited this session.
-    if admin.state.users.with_untracked(|u| u.is_empty()) {
+    // not been visited this session. Key actions stay disabled until it has
+    // arrived, or a quick click would grant (or rotate) to the admin alone.
+    let members_ready = RwSignal::new(!admin.state.users.with_untracked(|u| u.is_empty()));
+    if !members_ready.get_untracked() {
         if let Some(signer) = auth.get_signer() {
             let admin = admin.clone();
             spawn_local(async move {
                 let _ = admin.fetch_whitelist_signer(&*signer).await;
+                let _ = members_ready.try_set(true);
             });
+        } else {
+            members_ready.set(true);
         }
     }
 
@@ -69,10 +74,10 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
             <p class="text-sm text-gray-400 max-w-3xl">
                 "Members of an encrypted zone read and write its messages with a shared zone key. \
                  The relay only ever stores ciphertext. Grant the key to each member once; rotate it \
-                 when someone leaves so they cannot read anything posted afterwards. Agents are \
-                 never given a key."
+                 when someone leaves so they cannot read anything posted afterwards. Agents get \
+                 a key only in zones the operator configured with agent_keys."
             </p>
-            {zones.into_iter().map(|z| view! { <ZoneKeyCard zone=z keys=keys /> }).collect_view()}
+            {zones.into_iter().map(|z| view! { <ZoneKeyCard zone=z keys=keys members_ready=members_ready /> }).collect_view()}
         </div>
     }
     .into_any()
@@ -86,7 +91,7 @@ struct MemberRow {
 }
 
 #[component]
-fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore) -> impl IntoView {
+fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) -> impl IntoView {
     let admin = use_admin();
     let auth = use_auth();
     let relay = expect_context::<RelayConnection>();
@@ -274,7 +279,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore) -> impl IntoView {
                     {move || latest().is_none().then(|| view! {
                         <button
                             class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-50"
-                            disabled=move || busy.get()
+                            disabled=move || busy.get() || !members_ready.get()
                             on:click=move |_| create_or_rotate.with_value(|f| f(false))
                         >"Create key (epoch 1)"</button>
                     })}
@@ -283,7 +288,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore) -> impl IntoView {
                         view! {
                             <button
                                 class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-50"
-                                disabled=move || busy.get() || missing().is_empty()
+                                disabled=move || busy.get() || !members_ready.get() || missing().is_empty()
                                 on:click=move |_| {
                                     let k = key_for_grant.clone();
                                     grant.with_value(|g| g(k, missing()));
@@ -291,7 +296,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore) -> impl IntoView {
                             >{move || format!("Grant to members missing it ({})", missing().len())}</button>
                             <button
                                 class="px-3 py-1.5 rounded-lg border border-gray-600 text-gray-200 hover:bg-gray-700 text-sm disabled:opacity-50"
-                                disabled=move || busy.get()
+                                disabled=move || busy.get() || !members_ready.get()
                                 on:click=move |_| create_or_rotate.with_value(|f| f(true))
                             >"Rotate key"</button>
                         }

@@ -258,6 +258,21 @@ pub enum GrantError {
     NotAdmin(String),
 }
 
+/// Whether a zone-key grant wrap is settled and can be skipped from now on.
+///
+/// `admin` is the sealer's admin status (`None` when the relay could not be
+/// asked), `valid` whether [`validate_grant`] accepted it, and `persisted`
+/// whether the accepted key reached IndexedDB. A refused grant is final; a
+/// grant whose admin check or storage failed is retried next session, so a
+/// transient failure never loses a key.
+pub fn grant_settled(admin: Option<bool>, valid: bool, persisted: bool) -> bool {
+    match admin {
+        None => false,
+        Some(_) if valid => persisted,
+        Some(_) => true,
+    }
+}
+
 /// Validate a decrypted grant rumor sealed by `sealer`.
 ///
 /// `is_admin` is injected so the check is testable; production passes the
@@ -840,5 +855,21 @@ mod tests {
                 .is_some()
         );
         assert!(explain_relay_rejection("rate limited").is_none());
+    }
+
+    /// Regression: a grant wrap was marked processed before its key was
+    /// stored, so a failed IndexedDB write (or an unreachable admin check)
+    /// lost the key permanently. Only a final outcome settles a wrap.
+    #[test]
+    fn grant_wrap_settles_only_on_a_final_outcome() {
+        // Admin status unknown (relay unreachable): retry next session.
+        assert!(!grant_settled(None, false, false));
+        // Accepted but not persisted: retry, or the key is gone on reload.
+        assert!(!grant_settled(Some(true), true, false));
+        // Accepted and persisted: done.
+        assert!(grant_settled(Some(true), true, true));
+        // Refused (not an admin, bad secret, malformed): final.
+        assert!(grant_settled(Some(false), false, false));
+        assert!(grant_settled(Some(true), false, false));
     }
 }

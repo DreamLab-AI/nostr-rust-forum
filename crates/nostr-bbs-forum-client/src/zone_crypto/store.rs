@@ -209,19 +209,51 @@ impl ZoneKeyStore {
             // unmarked so a later session with a capable signer retries.
             Err(_) => return,
         };
-        self.mark_processed(&wrap.id).await;
         if rumor.kind != KIND_ZONE_KEY_GRANT {
+            self.mark_processed(&wrap.id).await;
             return;
         }
-        let is_admin = self.sealer_is_admin(&sealer).await;
-        match validate_grant(&rumor, &sealer, is_admin, now_secs()) {
-            Ok(key) => {
-                self.insert(key);
-            }
-            Err(e) => {
-                web_sys::console::warn_1(&format!("[zone-key] grant refused: {e}").into());
-            }
+        // A grant is marked processed only once its outcome is final. An
+        // unreachable admin check or a key that did not reach IndexedDB leaves
+        // the wrap unmarked, so the next session retries instead of losing the
+        // key for good.
+        let admin = self.sealer_is_admin(&sealer).await;
+        let (valid, persisted) = match admin {
+            None => (false, false),
+            Some(is_admin) => match validate_grant(&rumor, &sealer, is_admin, now_secs()) {
+                Ok(key) => (true, self.insert_persisted(key).await),
+                Err(e) => {
+                    web_sys::console::warn_1(&format!("[zone-key] grant refused: {e}").into());
+                    (false, false)
+                }
+            },
+        };
+        if super::grant_settled(admin, valid, persisted) {
+            self.mark_processed(&wrap.id).await;
         }
+    }
+
+    /// Add a key and wait for it to reach IndexedDB. The key is usable this
+    /// session either way; returns whether it was persisted.
+    async fn insert_persisted(&self, key: ZoneKey) -> bool {
+        let persisted = match ForumDb::open().await {
+            Ok(db) => match db.put_zone_key(&key).await {
+                Ok(()) => true,
+                Err(e) => {
+                    web_sys::console::warn_1(&format!("[zone-key] persist failed: {e:?}").into());
+                    false
+                }
+            },
+            Err(_) => false,
+        };
+        let id = key.id();
+        if self.keys.with_untracked(|m| m.get(&id) != Some(&key)) {
+            self.keys.update(|m| {
+                m.insert(id, key);
+            });
+            self.redecrypt();
+        }
+        persisted
     }
 
     async fn mark_processed(&self, wrap_id: &str) {
@@ -234,16 +266,17 @@ impl ZoneKeyStore {
         }
     }
 
-    /// Whether `pubkey` is a relay admin (cached per session).
-    pub async fn sealer_is_admin(&self, pubkey: &str) -> bool {
+    /// Whether `pubkey` is a relay admin, or `None` when the relay could not
+    /// be asked. Only definite answers are cached (per session).
+    pub async fn sealer_is_admin(&self, pubkey: &str) -> Option<bool> {
         if let Some(v) = self.admin_cache.with_value(|m| m.get(pubkey).copied()) {
-            return v;
+            return Some(v);
         }
-        let v = fetch_is_admin(pubkey).await.unwrap_or(false);
+        let v = fetch_is_admin(pubkey).await?;
         self.admin_cache.update_value(|m| {
             m.insert(pubkey.to_string(), v);
         });
-        v
+        Some(v)
     }
 
     /// Pubkeys this admin has granted `(zone, epoch)` to, on this device.
