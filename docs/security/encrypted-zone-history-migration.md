@@ -50,7 +50,8 @@ envelopes, readable only with the zone key. Back up first.
    ```
 
    `--print-channels` lists the relay's kind-40 channels with their section tag
-   to help write it.
+   to help write it (it needs `--relay` and the admin key, because the relay
+   withholds zone channels from non-members).
 6. **The key in the environment**, never on the command line:
 
    ```sh
@@ -92,7 +93,10 @@ $M seal                # then the rest
 For each original: builds the envelope, publishes it, waits for the relay's
 `OK true`, fetches the envelope back by id, opens it with the zone key and
 checks the inner event equals the original byte-for-byte. Resumable: re-running
-skips entries already done. Nothing is deleted.
+skips entries already done, and retries entries that failed at `seal` or
+`verify`. If an envelope for an original is already on the relay (for example,
+the state file was lost after a run) and it opens to exactly that original, it
+is *adopted* rather than published again. Nothing is deleted.
 
 ### 3. `verify` — re-check every envelope
 
@@ -109,13 +113,22 @@ after `seal`, and again just before `purge` if time has passed.
 $M purge --yes
 ```
 
-Refuses unless **every** entry in the state file is `verified`. Deletes the
-original plaintext rows through `POST /api/admin/events/delete` in chunks of at
+Refuses unless **every** entry in the state file is `verified` (entries already
+`purged` by an interrupted earlier run are allowed, so purge resumes). Just
+before each chunk is deleted, its envelopes are fetched and opened once more.
+If any fails, that chunk is not deleted, its entries are marked `failed`, and
+purge stops. It deletes the original plaintext rows through `POST /api/admin/events/delete` in chunks of at
 most 200, authenticated with NIP-98. No kind-5 is published and nothing is
 broadcast, so clients do not tombstone the ids the envelopes restore. Each call
 is recorded in the relay's admin audit log as `events.delete`.
 
-`status` prints the state file's counts at any point.
+`status` prints the state file's counts and failed entries at any point. It
+needs only `--state`, with no relay or key.
+
+Exit codes: `0` success; `1` error or refusal (nothing further was changed);
+`2` the step finished but some entries are `failed`. The state file holds ids,
+zones, epochs and a SHA-256 of each sealed event. It holds no secrets and no
+message text, and it is rewritten atomically after every change.
 
 ## Entry states
 
@@ -125,7 +138,7 @@ is recorded in the relay's admin audit log as `events.delete`.
 | `sealed` | Envelope accepted by the relay, read back and opened; inner event matched the original. | `verify` |
 | `verified` | `verify` fetched the envelope again and it opened and matched. The only state `purge` accepts. | `purge --yes` |
 | `purged` | Plaintext row deleted from the relay. | none |
-| `failed(reason)` | That step failed; the reason says which. The plaintext is untouched. | fix, then re-run the step |
+| `failed(reason)` | A step failed. The state file records it as `"status":"failed","step":"seal"\|"verify"\|"purge","reason":…`. At `seal` or `verify` the plaintext is untouched; at `purge` the relay kept the row because it is not kind 42. | fix, then `seal` (retries `seal` and `verify` failures) and `verify`; investigate a `purge` failure by hand |
 
 A single `failed` or unverified entry blocks `purge` for the whole run, by design.
 
