@@ -6,6 +6,8 @@
 //! - **NIP-01** event creation, signing, and verification
 //! - **NIP-44** encrypted direct messages (ChaCha20-Poly1305)
 //! - **NIP-98** HTTP auth token creation and verification
+//! - **Sealed originals** ([`sealed`]) — zone-encrypted envelopes carrying a
+//!   complete signed plaintext event, for migrating encrypted-zone history (ADR-2017)
 //! - **DID:nostr** document generation (delegates to `solid_pod_rs::did_nostr_types`)
 //! - **Key management** including HKDF derivation from WebAuthn PRF output
 //! - **Value types** (`EventId`, `Timestamp`, `Tag`, etc.)
@@ -34,6 +36,7 @@ pub mod nip19;
 pub mod nip44;
 pub mod nip98;
 pub mod ontology_governance;
+pub mod sealed;
 pub mod signer;
 pub mod thread;
 pub mod types;
@@ -122,6 +125,10 @@ pub use nip19::{
     decode_naddr, decode_nevent, decode_note, decode_nprofile, decode_npub, decode_nsec,
     encode_naddr, encode_nevent, encode_note, encode_nprofile, encode_npub, encode_nsec, NAddr,
     NEvent, NProfile, Nip19Error,
+};
+pub use sealed::{
+    channel_of, has_sealed_tag, open_sealed, parse_sealed, seal_original, SealError, SealedRef,
+    SEALED_TAG, SEALED_VERSION,
 };
 pub use signer::{PrfSigner, Signer, SignerError};
 
