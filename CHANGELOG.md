@@ -7,6 +7,20 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed — zone-key grant record and resumed PWAs, 2026-09-27
+
+- **Admin > Encryption no longer shows members who got the key as missing.** Relay acks for a
+  batch of grants arrive together, and each was recorded with its own IndexedDB read → add one →
+  write, so concurrent records overwrote each other and a random subset of accepted grants was
+  never recorded; "Grant to members missing it" then kept offering them. The record is now an
+  in-memory set that persists by rewriting the whole set until storage matches
+  (`zone_crypto::grant_ledger`, ADR-2016), with a test that reproduces the old loss.
+- **An installed app picks up a new deploy when it comes back to the foreground.** Phones resume a
+  PWA rather than relaunch it, so neither the network-first page load nor the load-time
+  `registration.update()` ran and a member could keep an old build for days. The client now calls
+  `registration.update()` on `visibilitychange` (at most once a minute); a new deploy's worker then
+  takes over and the existing `controllerchange` handler reloads the page once.
+
 ### Added — wallet spends signed in the browser extension, 2026-09-24
 
 - **Members signed in with an extension can send and tip without pasting a key.** When the

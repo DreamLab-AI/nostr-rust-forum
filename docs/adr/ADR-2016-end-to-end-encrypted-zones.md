@@ -78,6 +78,11 @@ from the newest epoch on. "Grant to members missing it" therefore also sends
 the earlier epochs the admin holds (skipping recipients already recorded for
 each), behind an on-by-default "Also send earlier keys" option that the admin
 can clear to give a newcomer the current key only (`zone_crypto::grant_plan`).
+"Recorded" means the relay accepted that member's grant, kept per device in
+IndexedDB; the relay cannot say who holds a key. A batch's acks arrive
+together, so the record is an in-memory set persisted by whole-set rewrites
+(`zone_crypto::grant_ledger`), never a per-ack read-modify-write, which lost a
+random subset of accepted grants and showed those members as missing.
 
 **History.** Existing plaintext messages are left as they are. Re-publishing
 them as encrypted "sealed originals" (the full signed original event inside a

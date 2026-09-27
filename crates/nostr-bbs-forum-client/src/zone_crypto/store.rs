@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use leptos::prelude::*;
 use nostr_bbs_core::signer::Signer;
@@ -14,14 +15,13 @@ use nostr_bbs_core::NostrEvent;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
+use super::grant_ledger::{GrantKv, GrantLedger};
 use super::{display_text, has_zk_tag, read_outcome, validate_grant, ZoneKey, KIND_ZONE_KEY_GRANT};
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::indexed_db::ForumDb;
 
 /// `zone_kv` id holding the ids of gift wraps already unwrapped here.
 const KV_PROCESSED: &str = "processed_wraps";
-/// `zone_kv` id prefix for "grants this admin sent": `grants_sent:<zone>:<epoch>`.
-const KV_GRANTS_SENT: &str = "grants_sent";
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
@@ -43,6 +43,8 @@ pub struct ZoneKeyStore {
     ciphertexts: StoredValue<HashMap<String, String>>,
     processed: StoredValue<HashSet<String>>,
     admin_cache: StoredValue<HashMap<String, bool>>,
+    /// "Granted from this device", shared by every Encryption-tab card.
+    grants: StoredValue<Arc<GrantLedger>>,
     sync_started: StoredValue<bool>,
     /// Captured at construction: relay callbacks and spawned tasks run
     /// without a reactive owner, so `use_context` is not available there.
@@ -59,6 +61,7 @@ impl ZoneKeyStore {
             ciphertexts: StoredValue::new(HashMap::new()),
             processed: StoredValue::new(HashSet::new()),
             admin_cache: StoredValue::new(HashMap::new()),
+            grants: StoredValue::new(Arc::new(GrantLedger::default())),
             sync_started: StoredValue::new(false),
         }
     }
@@ -290,29 +293,36 @@ impl ZoneKeyStore {
 
     /// Pubkeys this admin has granted `(zone, epoch)` to, on this device.
     pub async fn grants_sent(&self, zone: &str, epoch: u32) -> HashSet<String> {
-        let id = format!("{KV_GRANTS_SENT}:{zone}:{epoch}");
-        match ForumDb::open().await {
-            Ok(db) => db
-                .get_zone_kv(&id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
-                .map(|v| v.into_iter().collect())
-                .unwrap_or_default(),
-            Err(_) => HashSet::new(),
-        }
+        let ledger = self.grants.get_value();
+        ledger.sent(&IdbGrantKv, zone, epoch).await
     }
 
-    /// Record that `(zone, epoch)` was granted to `recipients`.
+    /// Record that `(zone, epoch)` was granted to `recipients`. Safe to call
+    /// concurrently: acks for one batch arrive together (see [`GrantLedger`]).
     pub async fn record_grants(&self, zone: &str, epoch: u32, recipients: &[String]) {
-        let mut all = self.grants_sent(zone, epoch).await;
-        all.extend(recipients.iter().cloned());
-        let mut v: Vec<String> = all.into_iter().collect();
-        v.sort();
-        let id = format!("{KV_GRANTS_SENT}:{zone}:{epoch}");
-        if let (Ok(db), Ok(json)) = (ForumDb::open().await, serde_json::to_string(&v)) {
-            let _ = db.put_zone_kv(&id, &json).await;
+        let ledger = self.grants.get_value();
+        ledger.record(&IdbGrantKv, zone, epoch, recipients).await;
+    }
+}
+
+/// The grant ledger's storage: the `zone_kv` IndexedDB store.
+struct IdbGrantKv;
+
+impl GrantKv for IdbGrantKv {
+    async fn get(&self, id: &str) -> Option<String> {
+        ForumDb::open()
+            .await
+            .ok()?
+            .get_zone_kv(id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn put(&self, id: &str, json: &str) -> bool {
+        match ForumDb::open().await {
+            Ok(db) => db.put_zone_kv(id, json).await.is_ok(),
+            Err(_) => false,
         }
     }
 }

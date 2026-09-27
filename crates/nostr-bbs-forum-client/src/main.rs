@@ -79,6 +79,7 @@ fn register_service_worker() {
                 // Force an immediate update check on load so a new deploy's
                 // worker is discovered now, not on the browser's own schedule.
                 trigger_registration_update(&reg);
+                install_foreground_update_check(reg);
             }
             Err(e) => web_sys::console::warn_1(
                 &format!("[PWA] Service worker registration failed: {:?}", e).into(),
@@ -102,6 +103,51 @@ fn trigger_registration_update(reg: &wasm_bindgen::JsValue) {
         // `update()` returns a promise; we don't need to await it.
         let _ = func.call0(reg);
     }
+}
+
+/// Minimum gap between foreground update checks.
+const FOREGROUND_UPDATE_MIN_MS: f64 = 60_000.0;
+
+/// Whether a foreground update check is due: the first one always is, later
+/// ones once `min_ms` has passed. A clock that went backwards counts as due.
+fn foreground_update_due(now_ms: f64, last_ms: Option<f64>, min_ms: f64) -> bool {
+    match last_ms {
+        None => true,
+        Some(last) => now_ms < last || now_ms - last >= min_ms,
+    }
+}
+
+/// Check for a new build whenever the app returns to the foreground.
+///
+/// An installed PWA is usually resumed from the background rather than
+/// relaunched, and a resume makes no navigation request, so neither the
+/// network-first `index.html` in `sw.js` nor the load-time `update()` above
+/// runs: a phone can keep the old WASM for days. On `visibilitychange` to
+/// visible this calls `registration.update()`; a new deploy's `sw.js` differs
+/// (its build token), so the new worker installs, claims the page, and
+/// `install_controllerchange_reload` reloads it once onto the new build.
+fn install_foreground_update_check(reg: wasm_bindgen::JsValue) {
+    use wasm_bindgen::JsCast;
+
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let last: std::cell::Cell<Option<f64>> = std::cell::Cell::new(Some(js_sys::Date::now()));
+    let doc = document.clone();
+    let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+        if doc.hidden() {
+            return;
+        }
+        let now = js_sys::Date::now();
+        if foreground_update_due(now, last.get(), FOREGROUND_UPDATE_MIN_MS) {
+            last.set(Some(now));
+            trigger_registration_update(&reg);
+        }
+    });
+    let _ = document
+        .add_event_listener_with_callback("visibilitychange", closure.as_ref().unchecked_ref());
+    // Leak the closure: it must outlive this fn for the lifetime of the page.
+    closure.forget();
 }
 
 /// Reload the page once when a new service worker takes control, so an open tab
@@ -181,4 +227,19 @@ fn run_offline_startup() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::foreground_update_due;
+
+    #[test]
+    fn foreground_update_is_throttled() {
+        assert!(foreground_update_due(0.0, None, 60_000.0));
+        assert!(!foreground_update_due(1_000.0, Some(0.0), 60_000.0));
+        assert!(!foreground_update_due(59_999.0, Some(0.0), 60_000.0));
+        assert!(foreground_update_due(60_000.0, Some(0.0), 60_000.0));
+        // A clock that jumped backwards never suppresses the check for good.
+        assert!(foreground_update_due(5.0, Some(10_000.0), 60_000.0));
+    }
 }

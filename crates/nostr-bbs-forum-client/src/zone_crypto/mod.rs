@@ -49,6 +49,7 @@
 //! — a per-zone operator trade-off, since an agent holding the key means the
 //! zone's plaintext reaches the agent stack and whatever model it calls.
 
+pub mod grant_ledger;
 pub mod store;
 
 use nostr_bbs_core::signer::Signer;

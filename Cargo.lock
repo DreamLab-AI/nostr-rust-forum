@@ -2304,6 +2304,7 @@ dependencies = [
  "colloquy-view",
  "comrak",
  "console_error_panic_hook",
+ "futures",
  "gloo",
  "hex",
  "js-sys",

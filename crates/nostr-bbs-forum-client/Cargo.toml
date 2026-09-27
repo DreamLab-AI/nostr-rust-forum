@@ -167,3 +167,7 @@ sidestr-nostr = "0.3"
 # tip is one Schnorr signature and a replay verifies a few hundred, so the
 # speed the full tables buy is not worth their ~1 MB in every page load.
 bitcoin = { version = "0.32", features = ["secp-lowmemory"] }
+
+[dev-dependencies]
+# Single-threaded executor for the grant-ledger concurrency tests.
+futures = "0.3"
