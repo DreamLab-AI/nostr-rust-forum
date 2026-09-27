@@ -441,15 +441,16 @@ impl ChannelStore {
                 // Store raw event for channel page consumption. Dedup by
                 // event id is the ONLY counter — ADR-091. Last-active only
                 // advances when a genuinely new event is appended.
+                // A restored sealed original carries the original id, which
+                // a kind-5 may have tombstoned (ADR-2017).
+                if tombstones.with_untracked(|t| !admits_message(t, &event.id)) {
+                    return;
+                }
                 let mut newly_added = false;
                 let event_ts = event.created_at;
                 channel_msgs.update(|m| {
                     let events = m.entry(cid.clone()).or_insert_with(Vec::new);
-                    if !events.iter().any(|e| e.id == event.id) {
-                        events.push(event);
-                        events.sort_by_key(|e| e.created_at);
-                        newly_added = true;
-                    }
+                    newly_added = insert_message(events, event);
                 });
                 if newly_added {
                     last_active.update(|m| {
@@ -545,15 +546,15 @@ impl ChannelStore {
                 None => return,
             };
             let event = crate::zone_crypto::store::prepare_incoming(zone_keys, event);
+            // A restored sealed original carries the original id (ADR-2017).
+            if tombstones.with_untracked(|t| !admits_message(t, &event.id)) {
+                return;
+            }
             let mut newly_added = false;
             let event_ts = event.created_at;
             channel_msgs.update(|m| {
                 let events = m.entry(cid.clone()).or_insert_with(Vec::new);
-                if !events.iter().any(|e| e.id == event.id) {
-                    events.push(event);
-                    events.sort_by_key(|e| e.created_at);
-                    newly_added = true;
-                }
+                newly_added = insert_message(events, event);
             });
             if newly_added {
                 last_active.update(|m| {
@@ -600,6 +601,21 @@ pub fn use_channel_store() -> ChannelStore {
 }
 
 // -- Helpers ------------------------------------------------------------------
+
+/// Insert a prepared kind-42 into a channel's list: dedupe by event id (the
+/// only counter, ADR-091), then keep the list sorted by `created_at`. Returns
+/// whether the event was new.
+///
+/// Callers pass the event *after* `zone_crypto::store::prepare_incoming`, so a
+/// restored sealed original (ADR-2017) is deduped by the original's id.
+pub fn insert_message(events: &mut Vec<NostrEvent>, event: NostrEvent) -> bool {
+    if events.iter().any(|e| e.id == event.id) {
+        return false;
+    }
+    events.push(event);
+    events.sort_by_key(|e| e.created_at);
+    true
+}
 
 /// Parse kind-40 channel content JSON into (name, description, picture).
 pub fn parse_channel_content(content: &str) -> (String, String, String) {

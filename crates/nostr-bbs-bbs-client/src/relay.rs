@@ -717,6 +717,55 @@ mod tests {
         assert_eq!(plain.content, "hello");
     }
 
+    /// A sealed original (ADR-2017) is a zone-encrypted kind-42 like any
+    /// other: this keyless client masks it and never shows its ciphertext.
+    #[test]
+    fn sealed_original_envelope_is_masked() {
+        use nostr_bbs_core::keys::SecretKey;
+        use nostr_bbs_core::sealed::{has_sealed_tag, seal_original};
+
+        let author = SecretKey::from_bytes([0x11; 32]).unwrap();
+        let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+        let zone = SecretKey::from_bytes([0x33; 32]).unwrap();
+        let unsigned = nostr_bbs_core::UnsignedEvent {
+            pubkey: author.public_key().to_hex(),
+            created_at: 1_700_000_000,
+            kind: 42,
+            tags: vec![vec![
+                "e".into(),
+                "c".repeat(64),
+                String::new(),
+                "root".into(),
+            ]],
+            content: "plaintext from before encryption".into(),
+        };
+        let id = nostr_bbs_core::compute_event_id(&unsigned);
+        let original = NostrEvent {
+            id: hex::encode(id),
+            pubkey: unsigned.pubkey,
+            created_at: unsigned.created_at,
+            kind: unsigned.kind,
+            tags: unsigned.tags,
+            content: unsigned.content,
+            sig: author.sign(&id).unwrap().to_hex(),
+        };
+        let envelope = seal_original(
+            &original,
+            "zone3",
+            1,
+            &zone.public_key().to_hex(),
+            &migrator,
+        )
+        .unwrap();
+        assert!(has_sealed_tag(&envelope.tags));
+
+        let tags = envelope.tags.clone();
+        let masked = mask_encrypted(envelope);
+        assert_eq!(masked.content, ENCRYPTED_PLACEHOLDER);
+        assert_eq!(masked.tags, tags, "tags kept");
+        assert_eq!(masked.pubkey, migrator.public_key().to_hex());
+    }
+
     #[test]
     fn board_in_encrypted_zone_is_detected() {
         let mut ch = ev42(vec![vec!["section", "zone3-chat"]], "{}");

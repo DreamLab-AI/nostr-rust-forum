@@ -508,15 +508,16 @@ pub fn ChannelPage() -> impl IntoView {
                         let cid_match = resolved.unwrap_or_else(|| cid_for_replay.clone());
                         let ev =
                             crate::zone_crypto::store::prepare_incoming(zone_keys_for_replay, ev);
+                        // A restored sealed original carries the original id,
+                        // which a kind-5 may have tombstoned (ADR-2017).
+                        if store_for_replay.is_message_deleted(&ev.id) {
+                            return;
+                        }
                         let mut newly_added = false;
                         let event_ts = ev.created_at;
                         channel_msgs.update(|m| {
                             let events = m.entry(cid_match.clone()).or_insert_with(Vec::new);
-                            if !events.iter().any(|e| e.id == ev.id) {
-                                events.push(ev);
-                                events.sort_by_key(|e| e.created_at);
-                                newly_added = true;
-                            }
+                            newly_added = crate::stores::channels::insert_message(events, ev);
                         });
                         if newly_added {
                             last_active.update(|m| {

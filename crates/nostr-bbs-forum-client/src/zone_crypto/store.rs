@@ -16,7 +16,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use super::grant_ledger::{GrantKv, GrantLedger};
-use super::{display_text, has_zk_tag, read_outcome, validate_grant, ZoneKey, KIND_ZONE_KEY_GRANT};
+use super::read_cache::ReadCache;
+use super::{
+    is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKey, KIND_ZONE_KEY_GRANT,
+};
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::indexed_db::ForumDb;
 
@@ -34,13 +37,15 @@ pub struct ZoneKeyStore {
     pub keys: RwSignal<HashMap<String, ZoneKey>>,
     /// Bumped whenever keys change or messages are re-decrypted.
     pub revision: RwSignal<u64>,
-    /// Ids of zone-encrypted kind-42s (decrypted or not). Views use this to
+    /// Ids of zone-encrypted kind-42s (decrypted or not), as shown: a
+    /// restored sealed original is listed under its own id. Views use this to
     /// keep link previews off: a preview would send the URL to the preview
     /// worker, outside the zone.
     pub encrypted_ids: RwSignal<HashSet<String>>,
-    /// Original ciphertext of each zone-encrypted kind-42 seen, by event id,
-    /// so a key that arrives later can decrypt what is already on screen.
-    ciphertexts: StoredValue<HashMap<String, String>>,
+    /// Ciphertexts and sealed-original envelopes seen, so a key that arrives
+    /// later can decrypt what is already on screen, swapping an envelope's
+    /// placeholder for the original event in place (ADR-2017).
+    cache: StoredValue<ReadCache>,
     processed: StoredValue<HashSet<String>>,
     admin_cache: StoredValue<HashMap<String, bool>>,
     /// "Granted from this device", shared by every Encryption-tab card.
@@ -58,7 +63,7 @@ impl ZoneKeyStore {
             keys: RwSignal::new(HashMap::new()),
             revision: RwSignal::new(0),
             encrypted_ids: RwSignal::new(HashSet::new()),
-            ciphertexts: StoredValue::new(HashMap::new()),
+            cache: StoredValue::new(ReadCache::default()),
             processed: StoredValue::new(HashSet::new()),
             admin_cache: StoredValue::new(HashMap::new()),
             grants: StoredValue::new(Arc::new(GrantLedger::default())),
@@ -113,19 +118,20 @@ impl ZoneKeyStore {
     }
 
     /// Turn an incoming kind-42 into what the reader should see. Events
-    /// without a `zk` tag pass through untouched; zone-encrypted ones get
-    /// their decrypted text or a placeholder, with the original event id,
-    /// tags and signature kept.
-    pub fn prepare_incoming(&self, mut ev: NostrEvent) -> NostrEvent {
-        if ev.kind != 42 || !has_zk_tag(&ev.tags) {
+    /// without a `zk` or `sealed` tag pass through untouched; zone-encrypted
+    /// ones get their decrypted text or a placeholder, with the original event
+    /// id, tags and signature kept. A sealed original that opens is replaced
+    /// by the whole original event (its own id), so call this before any
+    /// id-based dedupe or tombstone check that must see that id.
+    pub fn prepare_incoming(&self, ev: NostrEvent) -> NostrEvent {
+        if !is_zone_message(&ev) {
             return ev;
         }
+        let ev = self
+            .cache
+            .try_update_value(|c| c.prepare(&ev, |z, e| self.lookup(z, e)))
+            .unwrap_or_else(|| without_keys(&ev));
         let id = ev.id.clone();
-        self.ciphertexts.update_value(|m| {
-            m.entry(id.clone()).or_insert_with(|| ev.content.clone());
-        });
-        let outcome = read_outcome(&ev, |z, e| self.lookup(z, e));
-        ev.content = display_text(&outcome, &ev.content);
         if !self.encrypted_ids.with_untracked(|s| s.contains(&id)) {
             self.encrypted_ids.update(|s| {
                 s.insert(id);
@@ -135,27 +141,41 @@ impl ZoneKeyStore {
     }
 
     /// Re-run decryption over every zone-encrypted message already in the
-    /// channel store (a key just arrived).
+    /// channel store (a key just arrived). Sealed-original placeholders that
+    /// now open become the original event in place; see
+    /// [`ReadCache::redecrypt`].
     pub fn redecrypt(&self) {
         let channels = self.channels;
-        let cts = self.ciphertexts.get_value();
-        if cts.is_empty() {
+        if self.cache.with_value(ReadCache::is_empty) {
             self.revision.update(|r| *r += 1);
             return;
         }
         let store = *self;
+        let mut restored_ids: Vec<String> = Vec::new();
         channels.channel_messages.update(|m| {
-            for events in m.values_mut() {
-                for ev in events.iter_mut() {
-                    if let Some(ct) = cts.get(&ev.id) {
-                        let mut original = ev.clone();
-                        original.content = ct.clone();
-                        let outcome = read_outcome(&original, |z, e| store.lookup(z, e));
-                        ev.content = display_text(&outcome, ct);
-                    }
-                }
-            }
+            store.cache.update_value(|c| {
+                c.redecrypt(
+                    m,
+                    |z, e| store.lookup(z, e),
+                    |id| !channels.is_message_deleted(id),
+                );
+                restored_ids = m
+                    .values()
+                    .flatten()
+                    .filter(|ev| c.envelope_of(&ev.id).is_some())
+                    .map(|ev| ev.id.clone())
+                    .collect();
+            });
         });
+        let missing: Vec<String> = self.encrypted_ids.with_untracked(|s| {
+            restored_ids
+                .into_iter()
+                .filter(|id| !s.contains(id))
+                .collect()
+        });
+        if !missing.is_empty() {
+            self.encrypted_ids.update(|s| s.extend(missing));
+        }
         self.revision.update(|r| *r += 1);
     }
 
@@ -379,17 +399,15 @@ pub fn try_use_zone_key_store() -> Option<ZoneKeyStore> {
 pub fn prepare_incoming(store: Option<ZoneKeyStore>, ev: NostrEvent) -> NostrEvent {
     match store {
         Some(store) => store.prepare_incoming(ev),
-        None => {
-            if ev.kind == 42 && has_zk_tag(&ev.tags) {
-                let mut ev = ev;
-                let outcome = read_outcome(&ev, |_, _| None);
-                ev.content = display_text(&outcome, &ev.content);
-                ev
-            } else {
-                ev
-            }
-        }
+        None if is_zone_message(&ev) => without_keys(&ev),
+        None => ev,
     }
+}
+
+/// The read path with no keys at all: a zone-encrypted message or sealed
+/// envelope shows the missing-key placeholder under its own id.
+fn without_keys(ev: &NostrEvent) -> NostrEvent {
+    resolve_event(ev, read_outcome(ev, |_, _| None))
 }
 
 /// Encrypted-zone lookup for a channel: `(zone id, display name, encrypted)`,

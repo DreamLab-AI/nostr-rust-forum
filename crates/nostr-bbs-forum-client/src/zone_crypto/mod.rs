@@ -33,6 +33,29 @@
 //! live in this unpublished client crate on purpose, never in the published
 //! `nostr-bbs-core`.
 //!
+//! ## Read path
+//!
+//! [`read_outcome`] classifies every incoming kind-42 and
+//! [`store::ZoneKeyStore::prepare_incoming`] turns it into what the reader
+//! sees before the channel store's id-dedupe runs: the decrypted text, or a
+//! placeholder under the original id, tags and signature. The store caches
+//! each ciphertext by event id ([`read_cache::ReadCache`]) so a key that
+//! arrives later re-decrypts what is already on screen.
+//!
+//! A **sealed original** (ADR-2017, `nostr_bbs_core::sealed`) is a kind-42
+//! envelope, authored by an admin migrator, that carries a complete older
+//! plaintext message encrypted to the zone key. It is recognised by its
+//! `sealed` tag alone, never by the shape of its plaintext. When it opens and
+//! passes every core check the reader gets [`ReadOutcome::Sealed`], and the
+//! whole original event (its own id, author, timestamp and reply tags) is
+//! substituted for the envelope, so reactions, replies and deletions that
+//! name the original id attach to it as before. Without the key the envelope
+//! shows the missing-key placeholder under its own id; when the key arrives
+//! the placeholder is replaced in place by the original, and dropped instead
+//! if a copy with the original id is already on screen. An envelope that
+//! fails any check shows [`PLACEHOLDER_UNDECRYPTABLE`] and is never partly
+//! trusted.
+//!
 //! ## Deployment gate
 //!
 //! Encryption is dormant unless the operator enables it: a zone is treated as
@@ -50,8 +73,10 @@
 //! zone's plaintext reaches the agent stack and whatever model it calls.
 
 pub mod grant_ledger;
+pub mod read_cache;
 pub mod store;
 
+use nostr_bbs_core::sealed::{has_sealed_tag, open_sealed};
 use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{verify_event_strict, NostrEvent, UnsignedEvent};
 use serde::{Deserialize, Serialize};
@@ -384,16 +409,55 @@ pub fn grant_plan(
 // ---------------------------------------------------------------------------
 
 /// What the reader sees for one kind-42.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum ReadOutcome {
     /// No `zk` tag: legacy/plaintext, render as-is.
     Plain,
     /// Decrypted text.
     Decrypted(String),
+    /// A sealed original (ADR-2017) that opened and passed every
+    /// `nostr_bbs_core::sealed::open_sealed` check: the complete original
+    /// signed event, with its own id, author, timestamp and reply tags.
+    /// Readers substitute the whole event for the envelope
+    /// ([`resolve_event`]); its text alone must never be shown under the
+    /// migrator's name.
+    Sealed(NostrEvent),
     /// Encrypted to an epoch the reader has no key for.
     MissingKey,
-    /// A key was held but decryption failed (or the tag is malformed).
+    /// A key was held but decryption failed (or the tag is malformed). A
+    /// sealed envelope that fails any open check lands here too.
     Failed,
+}
+
+// `NostrEvent` has no `PartialEq`; a sealed outcome compares field by field.
+impl PartialEq for ReadOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Plain, Self::Plain)
+            | (Self::MissingKey, Self::MissingKey)
+            | (Self::Failed, Self::Failed) => true,
+            (Self::Decrypted(a), Self::Decrypted(b)) => a == b,
+            (Self::Sealed(a), Self::Sealed(b)) => {
+                a.id == b.id
+                    && a.pubkey == b.pubkey
+                    && a.created_at == b.created_at
+                    && a.kind == b.kind
+                    && a.tags == b.tags
+                    && a.content == b.content
+                    && a.sig == b.sig
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ReadOutcome {}
+
+/// Whether `ev` is a kind-42 the zone read path must handle: it carries a
+/// `zk` tag or a `sealed` tag. Everything else is plaintext and passes
+/// through untouched.
+pub fn is_zone_message(ev: &NostrEvent) -> bool {
+    ev.kind == 42 && (has_zk_tag(&ev.tags) || has_sealed_tag(&ev.tags))
 }
 
 /// Decrypt `ev` with `key` (zone secret × event author).
@@ -404,8 +468,14 @@ pub fn decrypt_with(ev: &NostrEvent, key: &ZoneKey) -> Result<String, String> {
 }
 
 /// Classify `ev` for display, looking keys up by `(zone, epoch)`.
+///
+/// An event with a `sealed` tag is a sealed original (ADR-2017) and is only
+/// ever [`ReadOutcome::Sealed`], [`ReadOutcome::MissingKey`] or
+/// [`ReadOutcome::Failed`]: it never yields [`ReadOutcome::Decrypted`], so the
+/// envelope's JSON is never rendered as a message from the migrator.
 pub fn read_outcome(ev: &NostrEvent, lookup: impl Fn(&str, u32) -> Option<ZoneKey>) -> ReadOutcome {
-    if !has_zk_tag(&ev.tags) {
+    let sealed = has_sealed_tag(&ev.tags);
+    if !sealed && !has_zk_tag(&ev.tags) {
         return ReadOutcome::Plain;
     }
     let Some(zk) = parse_zk(&ev.tags) else {
@@ -417,6 +487,15 @@ pub fn read_outcome(ev: &NostrEvent, lookup: impl Fn(&str, u32) -> Option<ZoneKe
     if !key.pubkey.eq_ignore_ascii_case(&zk.pubkey) {
         return ReadOutcome::Failed;
     }
+    if sealed {
+        let Some(sk) = key.secret_bytes() else {
+            return ReadOutcome::Failed;
+        };
+        return match open_sealed(ev, &sk) {
+            Ok(inner) => ReadOutcome::Sealed(inner),
+            Err(_) => ReadOutcome::Failed,
+        };
+    }
     match decrypt_with(ev, &key) {
         Ok(text) => ReadOutcome::Decrypted(text),
         Err(_) => ReadOutcome::Failed,
@@ -424,12 +503,31 @@ pub fn read_outcome(ev: &NostrEvent, lookup: impl Fn(&str, u32) -> Option<ZoneKe
 }
 
 /// The content to render for `outcome` (`original` is the event's content).
+///
+/// For [`ReadOutcome::Sealed`] this is the original's text, which belongs to
+/// the original's author: use [`resolve_event`] to render it, never this text
+/// on the envelope.
 pub fn display_text(outcome: &ReadOutcome, original: &str) -> String {
     match outcome {
         ReadOutcome::Plain => original.to_string(),
         ReadOutcome::Decrypted(t) => t.clone(),
+        ReadOutcome::Sealed(inner) => inner.content.clone(),
         ReadOutcome::MissingKey => PLACEHOLDER_MISSING_KEY.to_string(),
         ReadOutcome::Failed => PLACEHOLDER_UNDECRYPTABLE.to_string(),
+    }
+}
+
+/// The event to render for `ev` given its `outcome`: the restored original
+/// for a sealed envelope, otherwise `ev` with its content replaced by
+/// [`display_text`] (id, author, tags and signature kept).
+pub fn resolve_event(ev: &NostrEvent, outcome: ReadOutcome) -> NostrEvent {
+    match outcome {
+        ReadOutcome::Sealed(inner) => inner,
+        other => {
+            let mut out = ev.clone();
+            out.content = display_text(&other, &ev.content);
+            out
+        }
     }
 }
 
