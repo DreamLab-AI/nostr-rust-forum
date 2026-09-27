@@ -3,11 +3,11 @@ id: ADR-2017
 title: Migrate plaintext history into encrypted zones as sealed originals, then purge the plaintext silently
 date: 2026-09-27
 decision_status: accepted
-implementation_status: none
-activation_status: inactive
+implementation_status: complete
+activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: dd97fce
+verified_commit: 0144411
 owner: jjohare
 review_trigger: a second sealed-original format version; NIP-EE / MLS replacing zone keys (ADR-2016); a relay change to MAX_TIMESTAMP_DRIFT or to kind-5 handling; search-index purge of encrypted-zone embeddings landing
 repo: nostr-rust-forum
@@ -156,8 +156,56 @@ channel with neither a `zk` nor a `sealed` tag; an original that fails
   only while the admin-only and encrypted-zone rules sit behind it. A change to
   either rule, to `MAX_TIMESTAMP_DRIFT`, or to kind-5 handling re-opens this ADR.
 - A future format change takes a new `sealed` version value and a successor
-  ADR; version 1 as fixed here does not change in place.
+  ADR; version 1 as fixed here does not change in place. Every reader (core
+  `open_sealed`, the forum client, agentbox `zone-keys.js`) treats a `sealed`
+  tag with any version other than `1`, or a malformed tag, as undecryptable:
+  it is never rendered as a normal decrypted message and never falls back to
+  plain zone decryption.
+- Lookups by the **original** id no longer reach the relay after `purge`: only
+  the envelope id is stored. Channel reading is unaffected (the client restores
+  the inner event in place), but two by-id paths are follow-ons: the forum
+  client's single-note permalink (`pages/note_view.rs` loads one note by id)
+  and the agentbox nightly suggestions job (`scripts/dream-forum-suggestions.mjs`
+  finds its thread with `#e:[rootId]` / `ids:[rootId]`). Both need to fetch by
+  channel and match on the inner event's id and tags.
 
 ## Verification
 
-_To be filled at verification: test counts and CI output._
+Verified at kit `0144411` (core `194aba4`, relay `c7b8437`, forum client
+`991e47f`, migrator `0144411`, docs `ad8ce50`) on 2026-09-27 with the full
+workspace gate run from a clean `target/`:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 |
+| `cargo test --workspace --all-targets` | 35 test binaries, **2280 passed, 0 failed** |
+| `cargo check --workspace --target wasm32-unknown-unknown` | exit 0 |
+| `cargo deny check` | advisories, bans, licenses, sources ok |
+| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps` | exit 0 |
+
+Feature-specific coverage within that total:
+
+- `nostr-bbs-core::sealed`: round trip; each of the six open checks failing on
+  its own; extra/duplicate/missing inner fields; tampered content; wrong zone
+  key; proptest identity.
+- `nostr-bbs-relay-worker`: 24 new tests — the drift exemption and both write
+  rules (asserting the exact reject strings above, and that a real
+  `seal_original` envelope passes all three gates), and 14 for
+  `POST /api/admin/events/delete` (body limits, hex validation, `notFound` /
+  `skipped` reporting, audit row).
+- `nostr-bbs-forum-client`: 10 tests in `zone_crypto::read_cache` (round trip,
+  placeholder replaced in place, dedupe against cached plaintext and against a
+  second envelope, tampered envelope → placeholder, tombstoned original stays
+  hidden, reactions and replies attach to the restored id) plus the bbs-client
+  masking assertion.
+- `nostr-bbs-zone-migrate`: 44 tests — planner, state resume, key-file and
+  grant validation, 200-id chunking, refusal paths, and 12 end-to-end runs over
+  an in-memory relay (seal → verify → purge, resume, envelope adoption after
+  lost state, relay rejection, tampered or vanished read-back before `verify`
+  and before `purge`).
+- agentbox `management-api/lib/zone-keys.js` (separate repo, `e0e331afd`): 39
+  tests, each of the six checks shown to be load-bearing by disabling it.
+
+`activation_status: staged` — the code is deployed but no envelope exists until
+an operator runs the migrator; it becomes `live` at the first `purge`.
