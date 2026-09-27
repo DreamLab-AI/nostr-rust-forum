@@ -7,6 +7,36 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added — sealed-original history migration, 2026-09-27
+
+- **Plaintext history in an encrypted zone can be sealed, keeping who wrote it.** Turning on zone
+  encryption (ADR-2016) left older messages as plaintext in D1 and backups, and re-posting them as
+  an admin would have forged their authorship. A *sealed original* (ADR-2017,
+  `nostr_bbs_core::sealed`) is a zone-encrypted kind-42 from an admin with a
+  `["sealed", <original id>, "1"]` tag whose ciphertext is the whole original signed event. A
+  reader with the zone key opens it, checks six things — kind 42, the original's own signature,
+  the id matches the tag, no nested `zk`, same channel, same `created_at` — and shows the original
+  in place: same id, author, time and replies, so reactions and threads still attach. Anything that
+  fails a check shows as undecryptable, never as partly trusted.
+- **Relay.** A sealed kind-42 is exempt from the seven-day timestamp drift check, so it keeps the
+  original's time, and is accepted only from an admin (`blocked: sealed originals are admin-only`)
+  into a channel of an encrypted zone (`blocked: sealed originals belong to encrypted zones`); the
+  existing zone-key ciphertext rule still applies. New `POST /api/admin/events/delete` (NIP-98
+  admin, 1–200 ids, kind 42 only, audited as `events.delete`) removes rows **without** a kind-5:
+  the forum client tombstones every kind-5 target, and those ids are the ones the envelopes
+  restore.
+- **Forum client and agentbox reader** substitute the opened original for the envelope; a
+  placeholder shown before the key arrived turns into the original when it does, and a member's
+  cached plaintext copy is deduplicated rather than shown twice. The retro BBS client shows the
+  envelope as the encrypted placeholder, attributed to the migrating admin.
+- **`nostr-bbs-zone-migrate`**, a new workspace crate and CLI: `plan` (dry run), `seal` (publish,
+  read back, open, compare byte-for-byte), `verify`, `purge --yes` (only once every entry is
+  verified) and `status`, over a resumable state file. The key comes only from
+  `NOSTR_BBS_MIGRATE_KEY`, zone keys from a key file or the admin's own grants, and the
+  channel-to-zone map only from an explicit file. Runbook:
+  `docs/security/encrypted-zone-history-migration.md`. Pre-purge backups, members' caches and any
+  search-index embeddings of zone messages are not touched; rotate the zone keys after the run.
+
 ### Fixed — zone-key grant record and resumed PWAs, 2026-09-27
 
 - **Admin > Encryption no longer shows members who got the key as missing.** Relay acks for a

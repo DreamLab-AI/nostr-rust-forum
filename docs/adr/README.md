@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_16 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_17 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -48,3 +48,4 @@ _16 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2014](ADR-2014-member-lifecycle-one-source-of-truth.md) | One member lifecycle, one authoritative store, one admin surface | 2026-09-24 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
 | [ADR-2015](ADR-2015-member-wallets-on-sidestr-dreamlab-and-dream-tips.md) | Every member's key is a wallet on sidestr:dreamlab (testnet4 only), DREAM is the one asset, and tips are chain records | 2026-09-24 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
 | [ADR-2016](ADR-2016-end-to-end-encrypted-zones.md) | A zone can be end-to-end encrypted with per-epoch zone keys granted by gift wrap, behind a deployment gate | 2026-09-26 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
+| [ADR-2017](ADR-2017-sealed-original-history-migration.md) | Migrate plaintext history into encrypted zones as sealed originals, then purge the plaintext silently | 2026-09-27 | accepted | none | inactive | — | — | jjohare | nostr-rust-forum |

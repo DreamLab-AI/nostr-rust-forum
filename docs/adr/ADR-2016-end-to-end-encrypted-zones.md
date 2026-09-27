@@ -9,7 +9,7 @@ supersedes: []
 superseded_by: []
 verified_commit: cb86790
 owner: jjohare
-review_trigger: the first member removal that needs a rotation; an operator setting agent_keys = true; a proposal to migrate plaintext history ("sealed originals"); NIP-EE / MLS reaching a stable Nostr mapping
+review_trigger: the first member removal that needs a rotation; an operator setting agent_keys = true; NIP-EE / MLS reaching a stable Nostr mapping
 repo: nostr-rust-forum
 domain: BASELINE-architecture.md
 ---
@@ -87,7 +87,8 @@ random subset of accepted grants and showed those members as missing.
 **History.** Existing plaintext messages are left as they are. Re-publishing
 them as encrypted "sealed originals" (the full signed original event inside a
 zone-encrypted envelope, so ids, authorship and reply threading survive) is a
-separate, future decision.
+separate decision, taken in
+[ADR-2017](ADR-2017-sealed-original-history-migration.md).
 
 ### What it protects
 
@@ -126,7 +127,7 @@ leaves room to migrate.
   member needs a grant on approval.
 - Which members hold a key is known only for grants sent from the granting
   admin's device.
-- Follow-on: sealed-original history migration; encrypting reactions if
+- Follow-on: sealed-original history migration (ADR-2017); encrypting reactions if
   wanted; key backup/recovery for a member who loses every device.
 
 ## Verification
