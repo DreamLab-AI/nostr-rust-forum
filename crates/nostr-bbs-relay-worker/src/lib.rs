@@ -16,6 +16,7 @@
 //! - `whitelist.rs` -- Whitelist management HTTP handlers
 //! - `auth.rs` -- NIP-98 admin verification wrapper
 
+mod admin_events;
 mod agent_disclosure;
 mod audit;
 mod auth;
@@ -336,6 +337,13 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
     // in config (ZONE_CONFIG), this binds a channel to one of them.
     if path == "/api/admin/channel-zone" && method == Method::Post {
         return handle_channel_zone_upsert(req, env).await;
+    }
+
+    // ADR-2017: silent delete of kind-42 rows by id (NIP-98 admin only). No
+    // kind-5 and no broadcast: a kind-5 would tombstone the id that a sealed
+    // original restores on every forum client. See `admin_events`.
+    if path == "/api/admin/events/delete" && method == Method::Post {
+        return admin_events::handle_delete_events(req, env).await;
     }
 
     // --- Moderation endpoints (NIP-98 admin only) ---

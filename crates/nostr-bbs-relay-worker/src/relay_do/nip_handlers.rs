@@ -1097,7 +1097,22 @@ impl NostrRelayDO {
             // own new channel. Writes route through the write gate
             // (write_cohorts ?? required_cohorts) so a public zone can still be
             // read-by-all yet write-restricted.
-            if let Some(zone) = trust::get_channel_zone(&channel_id, &self.env).await {
+            let zone = trust::get_channel_zone(&channel_id, &self.env).await;
+            // ADR-2017: sealed originals are admin-only and belong to encrypted
+            // zones. They are exempt from the drift check in `validate_event`,
+            // so this gate must reject every other shape, including a sealed
+            // envelope into an unscoped channel from an admin.
+            let sealed = nostr_bbs_core::sealed::has_sealed_tag(&event.tags);
+            if sealed {
+                let zone_encrypted = zone
+                    .as_deref()
+                    .map(|z| ZoneConfig::load(&self.env).is_encrypted(z));
+                if let Some(reason) = sealed_write_rejection(sealed, is_admin, zone_encrypted) {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+            }
+            if let Some(zone) = zone {
                 if !is_admin && !trust::has_zone_write_access(&event.pubkey, &zone, &self.env).await
                 {
                     Self::send_ok(ws, &event.id, false, "zone access denied");
@@ -1306,14 +1321,81 @@ impl NostrRelayDO {
             }
         }
 
-        let now = auth::js_now_secs();
-        let drift = now.abs_diff(event.created_at);
-        if drift > MAX_TIMESTAMP_DRIFT {
-            return false;
-        }
-
-        true
+        timestamp_drift_ok(event, auth::js_now_secs())
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-2017: sealed originals — pure relay decisions
+// ---------------------------------------------------------------------------
+
+/// Reject text for a sealed original from a non-admin author (ADR-2017).
+pub(crate) const SEALED_ADMIN_ONLY: &str = "blocked: sealed originals are admin-only";
+
+/// Reject text for a sealed original outside an encrypted zone (ADR-2017).
+pub(crate) const SEALED_ENCRYPTED_ZONES_ONLY: &str =
+    "blocked: sealed originals belong to encrypted zones";
+
+/// Whether `event` is exempt from the [`MAX_TIMESTAMP_DRIFT`] check because it
+/// is a sealed-original envelope (ADR-2017).
+///
+/// An envelope keeps its original's `created_at` so relay pagination and
+/// ordering and clients' unread logic stay correct; migrated history is
+/// usually far older than seven days. `validate_event` runs before admin
+/// status is known, so the exemption is keyed on the tag alone and is safe
+/// only because [`sealed_write_rejection`] then refuses the event unless the
+/// author is an admin writing into an encrypted zone.
+///
+/// The exemption needs a **well-formed** marker
+/// ([`nostr_bbs_core::sealed::parse_sealed`]) while the write gate fires on
+/// **any** `sealed` tag ([`nostr_bbs_core::sealed::has_sealed_tag`]), so a
+/// malformed marker can never buy the exemption without also hitting the gate.
+pub(crate) fn sealed_drift_exempt(event: &NostrEvent) -> bool {
+    event.kind == 42 && nostr_bbs_core::sealed::parse_sealed(&event.tags).is_some()
+}
+
+/// The `created_at` bound of `validate_event`, at wall-clock time `now`.
+///
+/// Every event must lie within [`MAX_TIMESTAMP_DRIFT`] of `now`. A sealed
+/// original ([`sealed_drift_exempt`]) is exempt only from the *past* bound:
+/// it re-publishes an event the relay once accepted, so its `created_at` can
+/// be old but never further in the future than a live post's.
+pub(crate) fn timestamp_drift_ok(event: &NostrEvent, now: u64) -> bool {
+    if event.created_at <= now && sealed_drift_exempt(event) {
+        return true;
+    }
+    now.abs_diff(event.created_at) <= MAX_TIMESTAMP_DRIFT
+}
+
+/// The ADR-2017 write rule for a kind-42 into a channel, or `None` to fall
+/// through to the ordinary zone gate.
+///
+/// - `sealed`: the event carries any `sealed` tag, well formed or not
+///   ([`nostr_bbs_core::sealed::has_sealed_tag`]).
+/// - `is_admin`: the author is a relay admin.
+/// - `zone_encrypted`: `None` when the channel is unscoped (no
+///   `channel_zones` row), else whether its zone is encrypted.
+///
+/// Order matters: an unscoped channel otherwise lets any member post, so the
+/// encrypted-zone rule must reject a sealed envelope there even from an
+/// admin. The ADR-2016 ciphertext rule (`zone_config::is_zone_ciphertext`)
+/// still applies afterwards, so an accepted envelope always carries a
+/// well-formed `zk` tag and NIP-44 v2-shaped content.
+pub(crate) fn sealed_write_rejection(
+    sealed: bool,
+    is_admin: bool,
+    zone_encrypted: Option<bool>,
+) -> Option<&'static str> {
+    if !sealed {
+        return None;
+    }
+    if !is_admin {
+        return Some(SEALED_ADMIN_ONLY);
+    }
+    if zone_encrypted != Some(true) {
+        return Some(SEALED_ENCRYPTED_ZONES_ONLY);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -4781,5 +4863,200 @@ mod rationale_gate_tests {
         let (action, reasoning) = response_action_and_reasoning(r#"{"action":"approve"}"#);
         assert_eq!(action.as_deref(), Some("approve"));
         assert_eq!(reasoning, None);
+    }
+}
+
+#[cfg(test)]
+mod sealed_original_tests {
+    //! ADR-2017: the drift exemption and the write rule for sealed originals.
+    //! The handler feeds these pure decisions from `validate_event` and from
+    //! the kind-42 channel/zone gate; the D1 lookups behind `is_admin` and the
+    //! channel's zone are exercised elsewhere.
+    use super::*;
+
+    const NOW: u64 = 1_800_000_000;
+    const OLD: u64 = NOW - 400 * 24 * 60 * 60;
+
+    fn event(kind: u64, created_at: u64, tags: Vec<Vec<String>>) -> NostrEvent {
+        NostrEvent {
+            id: "1".repeat(64),
+            pubkey: "2".repeat(64),
+            created_at,
+            kind,
+            tags,
+            content: String::new(),
+            sig: "3".repeat(128),
+        }
+    }
+
+    fn tag(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn envelope_tags(sealed: Vec<String>) -> Vec<Vec<String>> {
+        let chan = "c".repeat(64);
+        vec![
+            tag(&["e", &chan, "", "root"]),
+            tag(&["zk", "zone3", "1", &"d".repeat(64)]),
+            sealed,
+        ]
+    }
+
+    fn well_formed() -> Vec<String> {
+        tag(&["sealed", &"a".repeat(64), "1"])
+    }
+
+    #[test]
+    fn reject_strings_match_adr_2017_verbatim() {
+        assert_eq!(
+            SEALED_ADMIN_ONLY,
+            "blocked: sealed originals are admin-only"
+        );
+        assert_eq!(
+            SEALED_ENCRYPTED_ZONES_ONLY,
+            "blocked: sealed originals belong to encrypted zones"
+        );
+    }
+
+    #[test]
+    fn well_formed_sealed_kind_42_is_drift_exempt() {
+        let ev = event(42, OLD, envelope_tags(well_formed()));
+        assert!(sealed_drift_exempt(&ev));
+        assert!(timestamp_drift_ok(&ev, NOW));
+    }
+
+    #[test]
+    fn exemption_is_kind_42_only() {
+        for kind in [1, 7, 40, 41, 1059] {
+            let ev = event(kind, OLD, envelope_tags(well_formed()));
+            assert!(!sealed_drift_exempt(&ev), "kind {kind}");
+            assert!(!timestamp_drift_ok(&ev, NOW), "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn malformed_marker_buys_no_exemption() {
+        for bad in [
+            tag(&["sealed"]),
+            tag(&["sealed", &"a".repeat(64)]),
+            tag(&["sealed", "not-hex", "1"]),
+            tag(&["sealed", &"a".repeat(63), "1"]),
+            tag(&["sealed", &"a".repeat(64), "v1"]),
+        ] {
+            let ev = event(42, OLD, envelope_tags(bad.clone()));
+            assert!(!sealed_drift_exempt(&ev), "{bad:?}");
+            assert!(!timestamp_drift_ok(&ev, NOW), "{bad:?}");
+            // ...but the write gate still sees it and refuses a non-admin.
+            assert!(nostr_bbs_core::sealed::has_sealed_tag(&ev.tags));
+            assert_eq!(
+                sealed_write_rejection(true, false, Some(true)),
+                Some(SEALED_ADMIN_ONLY)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_kind_42_keeps_the_drift_check() {
+        let chan = "c".repeat(64);
+        let tags = vec![tag(&["e", &chan, "", "root"])];
+        assert!(!timestamp_drift_ok(&event(42, OLD, tags.clone()), NOW));
+        assert!(timestamp_drift_ok(&event(42, NOW - 60, tags.clone()), NOW));
+        assert!(timestamp_drift_ok(
+            &event(42, NOW - MAX_TIMESTAMP_DRIFT, tags.clone()),
+            NOW
+        ));
+        assert!(!timestamp_drift_ok(
+            &event(42, NOW - MAX_TIMESTAMP_DRIFT - 1, tags),
+            NOW
+        ));
+    }
+
+    #[test]
+    fn sealed_envelope_is_not_exempt_into_the_future() {
+        let tags = envelope_tags(well_formed());
+        assert!(timestamp_drift_ok(
+            &event(42, NOW + MAX_TIMESTAMP_DRIFT, tags.clone()),
+            NOW
+        ));
+        assert!(!timestamp_drift_ok(
+            &event(42, NOW + MAX_TIMESTAMP_DRIFT + 1, tags),
+            NOW
+        ));
+    }
+
+    #[test]
+    fn unsealed_events_fall_through_to_the_zone_gate() {
+        for is_admin in [false, true] {
+            for zone in [None, Some(false), Some(true)] {
+                assert_eq!(sealed_write_rejection(false, is_admin, zone), None);
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_from_non_admin_is_refused_everywhere() {
+        for zone in [None, Some(false), Some(true)] {
+            assert_eq!(
+                sealed_write_rejection(true, false, zone),
+                Some(SEALED_ADMIN_ONLY)
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_from_admin_needs_an_encrypted_zone() {
+        // Unscoped channel: members may post there, so the envelope must be
+        // refused even though the author is an admin.
+        assert_eq!(
+            sealed_write_rejection(true, true, None),
+            Some(SEALED_ENCRYPTED_ZONES_ONLY)
+        );
+        assert_eq!(
+            sealed_write_rejection(true, true, Some(false)),
+            Some(SEALED_ENCRYPTED_ZONES_ONLY)
+        );
+        assert_eq!(sealed_write_rejection(true, true, Some(true)), None);
+    }
+
+    #[test]
+    fn real_envelope_passes_the_ciphertext_rule() {
+        use nostr_bbs_core::keys::SecretKey;
+        use nostr_bbs_core::sealed::seal_original;
+        use nostr_bbs_core::{sign_event, UnsignedEvent};
+
+        let author = SecretKey::from_bytes([0x11; 32]).unwrap();
+        let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+        let zone = SecretKey::from_bytes([0x33; 32]).unwrap();
+        let chan = "c".repeat(64);
+        let signing_key = nostr_bbs_core::keys::signing_key_from_bytes(author.as_bytes()).unwrap();
+        let original = sign_event(
+            UnsignedEvent {
+                pubkey: author.public_key().to_hex(),
+                created_at: OLD,
+                kind: 42,
+                tags: vec![tag(&["e", &chan, "", "root"])],
+                content: "from before encryption".into(),
+            },
+            &signing_key,
+        )
+        .unwrap();
+        let env = seal_original(
+            &original,
+            "zone3",
+            1,
+            &zone.public_key().to_hex(),
+            &migrator,
+        )
+        .unwrap();
+
+        assert!(timestamp_drift_ok(&env, NOW));
+        assert_eq!(sealed_write_rejection(true, true, Some(true)), None);
+        assert!(crate::zone_config::is_zone_ciphertext(
+            "zone3",
+            &env.tags,
+            &env.content
+        ));
+        // The gate keys on the channel `e` tag, which is the envelope's first.
+        assert_eq!(filter::tag_value(&env, "e").as_deref(), Some(chan.as_str()));
     }
 }
