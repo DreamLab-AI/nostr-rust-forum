@@ -4,7 +4,7 @@ title: Migrate plaintext history into encrypted zones as sealed originals, then 
 date: 2026-09-27
 decision_status: accepted
 implementation_status: complete
-activation_status: staged
+activation_status: live
 supersedes: []
 superseded_by: []
 verified_commit: 0144411
@@ -207,5 +207,28 @@ Feature-specific coverage within that total:
 - agentbox `management-api/lib/zone-keys.js` (separate repo, `e0e331afd`): 39
   tests, each of the six checks shown to be load-bearing by disabling it.
 
-`activation_status: staged` — the code is deployed but no envelope exists until
-an operator runs the migrator; it becomes `live` at the first `purge`.
+### First production run (DreamLab, 2026-09-27/28)
+
+`activation_status: live` since the first `purge`. Run with the deployed kit at
+`2f437bc` against `wss://dreamlab-nostr-relay.solitary-paper-764d.workers.dev`,
+migrator = the house admin key, keys obtained with `--fetch-grants`:
+
+| Zone | Channels | Sealed | Verified | Purged | Failed |
+|---|---|---|---|---|---|
+| zone4 (dreamlab) | 4 | 236 | 236 | 236 | 0 |
+| zone2 + zone3 (minimoonoir, family) | 6 | 194 | 194 | 194 | 0 |
+
+Independent read-back, separate from the migrator: agentbox's
+`management-api/lib/zone-keys.js` reader, NIP-42 authenticated, opened
+236 / 236 zone4 envelopes with JunkieJarvis's own key store and 194 / 194
+zone2/3 envelopes with keys unwrapped from the migrator's grants. After the
+purge a logged-out reader received 0 events across all ten channels, D1 held
+430 `sealed` rows and 0 plaintext kind-42 in the private zones, and
+`admin_log` carried three `events.delete` rows (200 + 36 + 194 ids). A full
+backup containing every plaintext original was taken before the first purge.
+
+Observed: an admin migrator keeps read access to the sealed history for as
+long as its zone-key grants exist on the relay, and admins bypass cohort
+gating; rotating the zone key protects new posts only. Operators who want the
+migrator excluded afterwards must use a dedicated, revocable admin key (see
+the runbook).

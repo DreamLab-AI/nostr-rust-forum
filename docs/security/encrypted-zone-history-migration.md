@@ -166,6 +166,12 @@ A single `failed` or unverified entry blocks `purge` for the whole run, by desig
 - **Backups:** D1 backups and exports from before the purge still hold the
   plaintext. They leave your estate only when your retention policy rotates them
   out; shorten it for this window if that matters.
+- **The migrator keeps reading:** whichever admin key ran `seal` holds the
+  epoch key used for the envelopes, and its grant stays on the relay for it to
+  fetch again; admins also bypass cohort gating. Rotation does not take that
+  away. If the migrator must not be able to read the zone afterwards, run it
+  with a dedicated admin key created for the migration, then remove that key
+  from the whitelist and delete its grants.
 - **Member caches:** members' devices that already showed the plaintext keep
   their cached copy until the cache is cleared. The forum client shows one
   message, not two.
