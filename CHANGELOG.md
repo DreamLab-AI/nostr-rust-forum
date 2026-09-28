@@ -7,6 +7,16 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed — key grants and rotation use a fresh member roster, 2026-09-28
+
+- **Admin › Encryption** re-reads the whitelist from the relay immediately
+  before "Grant to members missing it" and "Rotate key". The panel previously
+  used the roster loaded when the tab opened, so an admin tab left open across
+  a cohort change could grant — or rotate — to a stale list, including handing
+  the new epoch to an identity excluded since (seen in production: a key
+  re-marked `agent` still received the rotated key). The buttons show busy
+  while the roster refreshes and report if the refresh fails.
+
 ### Added — sealed-original history migration, 2026-09-27
 
 - **Plaintext history in an encrypted zone can be sealed, keeping who wrote it.** Turning on zone

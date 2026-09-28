@@ -8,6 +8,8 @@
 //! zone configured with `agent_keys`. Granting to a member who is missing the
 //! current key can also send the earlier keys this admin holds, so someone
 //! who joins after a rotation can read the zone's history.
+//! Both actions re-read the member roster from the relay first, so a tab left
+//! open across a cohort change never grants or rotates to a stale list.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -122,6 +124,30 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
     });
 
     let me = move || auth.pubkey().get().unwrap_or_default();
+
+    // Grants and rotations go to whoever the roster says is in the zone, so
+    // re-read it from the relay right before sending. An admin tab left open
+    // across a cohort change would otherwise act on a stale list — and hand
+    // the new key to someone excluded since the tab was opened.
+    let fresh_roster = {
+        let admin = admin.clone();
+        move |then: Box<dyn FnOnce()>| {
+            let admin = admin.clone();
+            let signer = auth.get_signer();
+            busy.set(true);
+            spawn_local(async move {
+                if let Some(signer) = signer {
+                    if let Err(e) = admin.fetch_whitelist_signer(&*signer).await {
+                        busy.set(false);
+                        status.set(Some(format!("Could not refresh the member list: {e}")));
+                        return;
+                    }
+                }
+                busy.set(false);
+                then();
+            });
+        }
+    };
 
     let rows = move || {
         let required = zone.with_value(|z| z.required_cohorts.clone());
@@ -238,6 +264,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
 
     let create_or_rotate = {
         let grant = grant.clone();
+        let fresh_roster = fresh_roster.clone();
         move |rotate: bool| {
             let next_epoch = latest().map(|k| k.epoch + 1).unwrap_or(1);
             if rotate {
@@ -255,21 +282,25 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                     return;
                 }
             }
-            let me = me();
-            let zone_id = zone.with_value(|z| z.id.clone());
-            match generate_zone_key(&zone_id, next_epoch, &me, now_secs()) {
-                Ok(key) => {
-                    keys.insert(key.clone());
-                    // A new key goes to everyone eligible; they already hold
-                    // (or were already offered) the earlier ones.
-                    grant(vec![(key, targets())]);
+            let grant = grant.clone();
+            fresh_roster(Box::new(move || {
+                let me = me();
+                let zone_id = zone.with_value(|z| z.id.clone());
+                match generate_zone_key(&zone_id, next_epoch, &me, now_secs()) {
+                    Ok(key) => {
+                        keys.insert(key.clone());
+                        // A new key goes to everyone eligible; they already hold
+                        // (or were already offered) the earlier ones.
+                        grant(vec![(key, targets())]);
+                    }
+                    Err(e) => status.set(Some(format!("Could not create a key: {e}"))),
                 }
-                Err(e) => status.set(Some(format!("Could not create a key: {e}"))),
-            }
+            }));
         }
     };
     let create_or_rotate = StoredValue::new_local(create_or_rotate);
     let grant = StoredValue::new_local(grant);
+    let fresh_roster = StoredValue::new_local(fresh_roster);
 
     let title = zone.with_value(|z| {
         if z.display_name.is_empty() {
@@ -304,7 +335,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                             <button
                                 class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-50"
                                 disabled=move || busy.get() || !members_ready.get() || missing().is_empty()
-                                on:click=move |_| {
+                                on:click=move |_| fresh_roster.with_value(|f| f(Box::new(move || {
                                     let recipients = missing();
                                     let history = include_history.get_untracked();
                                     let zone_id = zone.with_value(|z| z.id.clone());
@@ -321,7 +352,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                                         });
                                         grant.with_value(|g| g(plan));
                                     });
-                                }
+                                })))
                             >{move || format!("Grant to members missing it ({})", missing().len())}</button>
                             <button
                                 class="px-3 py-1.5 rounded-lg border border-gray-600 text-gray-200 hover:bg-gray-700 text-sm disabled:opacity-50"
