@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: live
 supersedes: []
 superseded_by: []
-verified_commit: HEAD
+verified_commit: 7be7871
 owner: jjohare
 review_trigger: a change to LOOKUP_TTL_SECS or ACTIVITY_FLUSH_SECS; a new per-event D1 lookup on any read path; moving off the D1 free tier; a relay feature that needs cohort or zone changes honoured in under a minute
 repo: nostr-rust-forum
