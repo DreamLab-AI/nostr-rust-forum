@@ -24,12 +24,14 @@ mod filter;
 mod mod_cache;
 mod nip42;
 mod nip_handlers;
+mod read_cache;
 pub(crate) mod receipts;
 mod session;
 mod storage;
 
 use crate::auth::AdminCache;
 pub(crate) use mod_cache::ModCache;
+use read_cache::{ActivityLedger, TtlCache, LOOKUP_TTL_SECS};
 
 #[cfg(feature = "test-exports")]
 #[doc(hidden)]
@@ -91,6 +93,14 @@ pub struct NostrRelayDO {
     /// P2-03: 5-minute TTL cache for admin status, eliminating redundant D1
     /// queries on the EVENT hot path.
     pub(crate) admin_cache: AdminCache,
+    /// ADR-2018: 60s-TTL memo of channel → zone (positive results only).
+    pub(crate) channel_zone_cache: TtlCache<String>,
+    /// ADR-2018: 60s-TTL memo of pubkey → (cohorts, whitelist is_admin).
+    pub(crate) cohort_cache: TtlCache<(Vec<String>, bool)>,
+    /// ADR-2018: 60s-TTL memo of device pubkey → owner (None = not a device key).
+    pub(crate) device_owner_cache: TtlCache<Option<String>>,
+    /// ADR-2018: per-pubkey throttle for the trust-ledger activity writes.
+    pub(crate) activity: ActivityLedger,
 }
 
 impl DurableObject for NostrRelayDO {
@@ -105,6 +115,10 @@ impl DurableObject for NostrRelayDO {
             connection_counts: RefCell::new(HashMap::new()),
             mod_cache: ModCache::new(),
             admin_cache: AdminCache::new(),
+            channel_zone_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            cohort_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            device_owner_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            activity: ActivityLedger::new(),
         }
     }
 

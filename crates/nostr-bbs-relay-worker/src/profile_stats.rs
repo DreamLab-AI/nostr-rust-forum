@@ -143,7 +143,7 @@ where
     out
 }
 
-/// Viewer read predicate over zones, mirroring `trust::has_zone_access`.
+/// Viewer read predicate over zones, mirroring `relay_do::nip_handlers::zone_read_permitted`.
 pub fn viewer_can_read(zones: &ZoneConfig, zone: &str, cohorts: &[String], is_admin: bool) -> bool {
     is_admin || zones.is_public_read(zone) || zones.cohorts_can_read(zone, cohorts)
 }

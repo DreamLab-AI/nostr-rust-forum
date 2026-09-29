@@ -7,6 +7,20 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed — relay read cost no longer scales with delivered events, 2026-09-29
+
+- The relay's Durable Object now memoises channel → zone, viewer cohorts and
+  device-owner lookups for 60 s and decides zone membership from the viewer
+  context it already holds, instead of two D1 queries per delivered event and
+  three per REQ. The trust-ledger writes (`posts_read`, `last_active_at`,
+  promotion check) are coalesced to one flush per pubkey per five minutes.
+  On one instance the old shape consumed ~70% of D1's free-tier daily row
+  reads with no humans present and exhausted it in one evening, after which
+  the relay served nothing until midnight UTC. [ADR-2018](docs/adr/ADR-2018-relay-read-caches-and-activity-throttle.md).
+- Operators: the relay restores subscriptions from DO storage after
+  hibernation, so a client that re-sends its REQ every few seconds as a
+  "keep-warm" is only spending D1; send WebSocket pings instead.
+
 ### Fixed — key grants and rotation use a fresh member roster, 2026-09-28
 
 - **Admin › Encryption** re-reads the whitelist from the relay immediately

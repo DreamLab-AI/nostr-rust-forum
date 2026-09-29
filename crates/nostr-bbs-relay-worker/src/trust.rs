@@ -637,24 +637,9 @@ pub async fn get_viewer_cohorts(pubkey: &str, env: &Env) -> (Vec<String>, bool) 
     whitelist_cohorts(pubkey, env).await
 }
 
-/// Check whether a pubkey may READ a given zone.
-///
-/// Config-driven (no hardcoded zone names): the zone's `required_cohorts` come
-/// from `ZONE_CONFIG` ([`ZoneConfig`]). Admins always pass. A `public` zone with
-/// empty `required_cohorts` is readable by everyone; every other zone requires
-/// the reader to hold one of its `required_cohorts`. Unknown zones deny.
-pub async fn has_zone_access(pubkey: &str, zone: &str, env: &Env) -> bool {
-    let zones = ZoneConfig::load(env);
-    // Public zones are readable regardless of membership.
-    if zones.is_public_read(zone) {
-        return true;
-    }
-    let (cohorts, is_admin) = whitelist_cohorts(pubkey, env).await;
-    if is_admin {
-        return true;
-    }
-    zones.cohorts_can_read(zone, &cohorts)
-}
+// The READ counterpart (`has_zone_access`) was removed in ADR-2018: read
+// paths decide from the viewer context's cached cohorts via
+// `relay_do::nip_handlers::zone_read_permitted`, with no per-event D1 read.
 
 /// Check whether a pubkey may WRITE to a given zone.
 ///

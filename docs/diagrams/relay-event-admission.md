@@ -372,7 +372,7 @@ sequenceDiagram
             end
         else channel kind 40 or 42
             DO->>D1: get_channel_zone(channel_id) (trust.rs:586-602)
-            DO->>DO: is_member = has_zone_access(access_pubkey, zone)\nor is_public_read (zone_config.rs:110-114)
+            DO->>DO: is_member = zone_read_permitted(zones, zone, ctx)\n(cached cohorts, no D1 — ADR-2018)
             alt admin or is_member
                 DO-->>C: ["EVENT", sub_id, event]
             else non-member

@@ -1097,7 +1097,7 @@ impl NostrRelayDO {
             // own new channel. Writes route through the write gate
             // (write_cohorts ?? required_cohorts) so a public zone can still be
             // read-by-all yet write-restricted.
-            let zone = trust::get_channel_zone(&channel_id, &self.env).await;
+            let zone = self.cached_channel_zone(&channel_id).await;
             // ADR-2017: sealed originals are admin-only and belong to encrypted
             // zones. They are exempt from the drift check in `validate_event`,
             // so this gate must reject every other shape, including a sealed
@@ -1160,7 +1160,7 @@ impl NostrRelayDO {
                     // `project_tier` short-circuits admins/owners to Full anyway;
                     // here we ask the author's own tier for the TARGET's real zone.
                     let (author_cohorts, author_cohort_admin) =
-                        trust::get_viewer_cohorts(&event.pubkey, &self.env).await;
+                        self.cached_viewer_cohorts(&event.pubkey).await;
                     let tier = calendar_projection::project_tier(
                         &author_cohorts,
                         &zone,
@@ -1220,10 +1220,10 @@ impl NostrRelayDO {
             if matches!(event.kind, 1 | 7 | 40 | 42 | KIND_REPORT_NIP56) {
                 trust::increment_posts_created(&event.pubkey, &self.env).await;
             }
-            trust::update_last_active(&event.pubkey, &self.env).await;
-
-            // After activity update, check for trust promotion
-            let _ = trust::check_promotion(&event.pubkey, &self.env).await;
+            // ADR-2018: the `last_active_at` stamp and promotion check are
+            // coalesced to one flush per pubkey per window; `posts_created`
+            // above stays exact because it is the promotion counter itself.
+            self.note_write_activity(&event.pubkey).await;
 
             // NIP-09: Process deletion events. Same-author targets always
             // delete; admins and TL3+ (Trusted) may delete anyone's events —
@@ -1535,18 +1535,16 @@ impl NostrRelayDO {
         // device→owner `access_pubkey` rebinding used for zone reads. After the
         // batched increment, run the same `check_promotion` the EVENT path uses
         // so a reader can cross the threshold without needing to also write.
+        //
+        // ADR-2018: the increment, the `last_active_at` stamp (ADR-102: a
+        // delivered read is activity, so a read-only member's inactivity clock
+        // resets) and the promotion check are coalesced by `ActivityLedger`
+        // into one flush per pubkey per window instead of three D1 writes per
+        // frame. The UPDATEs are whitelist-scoped, so a non-member authed
+        // pubkey is a harmless no-op.
         if delivered > 0 {
             if let Some(pk) = &session_pubkey {
-                trust::increment_posts_read_by(pk, delivered, &self.env).await;
-                // ADR-102: a delivered read is activity. Stamp `last_active_at`
-                // so a read-only member's inactivity clock resets, mirroring
-                // the EVENT path's `update_last_active`. Without this, an active
-                // lurker who never writes would drift past the ~6-month
-                // inactivity gate and be demoted by the cron sweep despite
-                // reading daily. The UPDATE is whitelist-scoped, so a non-member
-                // authed pubkey is a harmless no-op.
-                trust::update_last_active(pk, &self.env).await;
-                let _ = trust::check_promotion(pk, &self.env).await;
+                self.note_read_activity(pk, delivered).await;
             }
         }
     }
@@ -1739,6 +1737,18 @@ pub(crate) enum ReadDecision {
     Withhold,
 }
 
+/// Zone read rule shared by the REQ, COUNT and broadcast gates (ADR-2018).
+///
+/// Mirrors `trust::has_zone_access` without the D1 read: a public-read zone is
+/// open to everyone (including an unauthenticated viewer, whose cohorts are
+/// empty); otherwise the viewer needs the whitelist admin flag or one of the
+/// zone's required cohorts. Unknown zones deny, as `cohorts_can_read` does.
+pub(crate) fn zone_read_permitted(zones: &ZoneConfig, zone: &str, ctx: &ViewerContext) -> bool {
+    zones.is_public_read(zone)
+        || ctx.viewer_is_admin
+        || zones.cohorts_can_read(zone, &ctx.viewer_cohorts)
+}
+
 impl NostrRelayDO {
     /// NIP-59 kind-1059 (Sealed DM) read gate + mandatory `#p` rewrite.
     ///
@@ -1788,7 +1798,7 @@ impl NostrRelayDO {
             None => false,
         };
         let (viewer_cohorts, cohort_admin) = match &access_pubkey {
-            Some(pk) => trust::get_viewer_cohorts(pk, &self.env).await,
+            Some(pk) => self.cached_viewer_cohorts(pk).await,
             None => (Vec::new(), false),
         };
         let viewer_is_admin = is_admin || cohort_admin;
@@ -1799,6 +1809,75 @@ impl NostrRelayDO {
             viewer_cohorts,
             viewer_is_admin,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-2018: memoised lookups and coalesced activity writes
+    // -----------------------------------------------------------------------
+
+    /// `channel_zones` lookup through the 60s per-DO memo. Only a bound zone is
+    /// remembered: an unbound channel goes back to D1 every time, so a channel
+    /// bound moments after its first read is never served as unscoped.
+    pub(crate) async fn cached_channel_zone(&self, channel_id: &str) -> Option<String> {
+        let now = auth::js_now_secs();
+        if let Some(zone) = self.channel_zone_cache.get(channel_id, now) {
+            return Some(zone);
+        }
+        let zone = trust::get_channel_zone(channel_id, &self.env).await?;
+        self.channel_zone_cache
+            .insert(channel_id, zone.clone(), now);
+        Some(zone)
+    }
+
+    /// Whitelist `(cohorts, is_admin)` through the 60s per-DO memo. A missing
+    /// row is cached as `(vec![], false)` exactly as the D1 path reports it,
+    /// so a non-member costs one read a minute rather than one per frame.
+    pub(crate) async fn cached_viewer_cohorts(&self, pubkey: &str) -> (Vec<String>, bool) {
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.cohort_cache.get(pubkey, now) {
+            return hit;
+        }
+        let fresh = trust::get_viewer_cohorts(pubkey, &self.env).await;
+        self.cohort_cache.insert(pubkey, fresh.clone(), now);
+        fresh
+    }
+
+    /// `device_keys` owner lookup through the 60s per-DO memo. Both outcomes
+    /// are cached: a non-device pubkey is the common case and must not cost a
+    /// read per frame.
+    pub(crate) async fn cached_device_owner(&self, pubkey: &str) -> Option<String> {
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.device_owner_cache.get(pubkey, now) {
+            return hit;
+        }
+        let fresh = self.device_owner(pubkey).await;
+        self.device_owner_cache.insert(pubkey, fresh.clone(), now);
+        fresh
+    }
+
+    /// Record `delivered` reads for an authed reader and flush the trust ledger
+    /// when the [`ActivityLedger`] says the window is due.
+    pub(crate) async fn note_read_activity(&self, pubkey: &str, delivered: i32) {
+        let now = auth::js_now_secs();
+        if let Some(flush) = self.activity.record_read(pubkey, delivered, now) {
+            self.flush_activity(pubkey, flush.reads).await;
+        }
+    }
+
+    /// Record an accepted EVENT from `pubkey` and flush the trust ledger when
+    /// the window is due. `posts_created` is incremented by the caller
+    /// unconditionally; only the stamp and promotion check are throttled.
+    pub(crate) async fn note_write_activity(&self, pubkey: &str) {
+        let now = auth::js_now_secs();
+        if let Some(flush) = self.activity.record_write(pubkey, now) {
+            self.flush_activity(pubkey, flush.reads).await;
+        }
+    }
+
+    async fn flush_activity(&self, pubkey: &str, reads: i32) {
+        trust::increment_posts_read_by(pubkey, reads, &self.env).await;
+        trust::update_last_active(pubkey, &self.env).await;
+        let _ = trust::check_promotion(pubkey, &self.env).await;
     }
 
     /// Apply the zone / cohort / NIP-52-calendar read gate to a single event for
@@ -1897,12 +1976,16 @@ impl NostrRelayDO {
             // new channel's tile AND messages from all non-admins, including the
             // channel's own author, since "home" is not a configured zone and an
             // unknown zone denies by default.
-            if let Some(zone) = trust::get_channel_zone(&cid, &self.env).await {
+            //
+            // ADR-2018: the zone comes from the per-DO memo and membership is
+            // decided from the cohorts already resolved into `ctx` — no D1
+            // round-trips per event. `zone_read_permitted` is the same rule
+            // `trust::has_zone_access` applies (public read, or whitelist
+            // admin, or a required cohort); `ctx.viewer_is_admin` carries the
+            // whitelist admin flag that function used to re-read.
+            if let Some(zone) = self.cached_channel_zone(&cid).await {
                 if !ctx.is_admin {
-                    let is_member = match &ctx.access_pubkey {
-                        Some(pk) => trust::has_zone_access(pk, &zone, &self.env).await,
-                        None => zones.is_public_read(&zone),
-                    };
+                    let is_member = zone_read_permitted(zones, &zone, ctx);
                     if !is_member {
                         if event.kind == 40 {
                             // Channel definition: served only if the zone is not
@@ -2161,7 +2244,7 @@ impl NostrRelayDO {
         if !self.device_keys_enabled() {
             return pubkey.to_string();
         }
-        let owner = self.device_owner(pubkey).await;
+        let owner = self.cached_device_owner(pubkey).await;
         effective_principal(pubkey, owner.as_deref(), true)
     }
 
@@ -5058,5 +5141,72 @@ mod sealed_original_tests {
         ));
         // The gate keys on the channel `e` tag, which is the envelope's first.
         assert_eq!(filter::tag_value(&env, "e").as_deref(), Some(chan.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod zone_read_rule_tests {
+    //! ADR-2018: the D1-free zone read rule must match `trust::has_zone_access`
+    //! (public read, or whitelist admin, or a required cohort; unknown denies).
+    use super::{zone_read_permitted, ViewerContext};
+    use crate::zone_config::ZoneConfig;
+
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(
+            r#"[{"id":"public","required_cohorts":[],"visibility":"public"},
+                {"id":"zone2","required_cohorts":["friends"],"visibility":"locked"}]"#,
+        )
+    }
+
+    fn ctx(cohorts: &[&str], admin: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: Some("s".into()),
+            access_pubkey: Some("s".into()),
+            is_admin: false,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: admin,
+        }
+    }
+
+    #[test]
+    fn public_zone_is_readable_by_anyone_including_unauthenticated() {
+        let anon = ViewerContext {
+            session_pubkey: None,
+            access_pubkey: None,
+            is_admin: false,
+            viewer_cohorts: vec![],
+            viewer_is_admin: false,
+        };
+        assert!(zone_read_permitted(&zones(), "public", &anon));
+        assert!(zone_read_permitted(&zones(), "public", &ctx(&[], false)));
+    }
+
+    #[test]
+    fn locked_zone_needs_a_required_cohort_or_the_whitelist_admin_flag() {
+        assert!(!zone_read_permitted(&zones(), "zone2", &ctx(&[], false)));
+        assert!(!zone_read_permitted(
+            &zones(),
+            "zone2",
+            &ctx(&["family"], false)
+        ));
+        assert!(zone_read_permitted(
+            &zones(),
+            "zone2",
+            &ctx(&["friends"], false)
+        ));
+        assert!(zone_read_permitted(&zones(), "zone2", &ctx(&[], true)));
+    }
+
+    #[test]
+    fn unknown_zone_denies_even_with_cohorts() {
+        assert!(!zone_read_permitted(
+            &zones(),
+            "zone9",
+            &ctx(&["friends"], false)
+        ));
+        assert!(
+            zone_read_permitted(&zones(), "zone9", &ctx(&[], true)),
+            "admins bypass"
+        );
     }
 }
