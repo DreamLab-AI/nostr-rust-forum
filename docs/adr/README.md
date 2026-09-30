@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_18 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_19 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -50,3 +50,4 @@ _18 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2016](ADR-2016-end-to-end-encrypted-zones.md) | A zone can be end-to-end encrypted with per-epoch zone keys granted by gift wrap, behind a deployment gate | 2026-09-26 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
 | [ADR-2017](ADR-2017-sealed-original-history-migration.md) | Migrate plaintext history into encrypted zones as sealed originals, then purge the plaintext silently | 2026-09-27 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
 | [ADR-2018](ADR-2018-relay-read-caches-and-activity-throttle.md) | Make relay read cost scale with requests, not delivered events — per-DO lookup caches and a coalesced trust ledger | 2026-09-29 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
+| [ADR-2019](ADR-2019-member-wallet-shows-blake2b-testnet4-coins-read-only.md) | The member wallet shows the identity key's BLAKE2b testnet4 coins read-only, beside the one sidestr chain | 2026-09-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |

@@ -74,6 +74,8 @@ the clients that read it, not by the producer.
    (`wallet::extension::explain`). The nsec unlock remains only as the fallback for an extension
    without the method.
 
+**Review 2026-09-30.** A request for a BLAKE testnet token fired this record's first review trigger. D1 stands: no chain or asset joins the lock. The parent coin the identity key already holds on BLAKE2b testnet4 is proposed as a read-only view outside the lock in [ADR-2019](ADR-2019-member-wallet-shows-blake2b-testnet4-coins-read-only.md).
+
 ## Consequences
 
 Members get a wallet with no sign-up step, and a deployment that does not set `SIDESTR_WALLET` sees
