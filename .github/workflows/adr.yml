@@ -1,0 +1,47 @@
+# ADR ledger gate: frontmatter validity (the repository's own checker) and the
+# planning cycle's ratchet (scripts/adr-ratchet.sh: a new decision record must
+# close a proposed one). Runs on push as well as pull requests because most of
+# this repository's commits land on main directly, and a red run is what the
+# nightly estate-health snapshot reports.
+name: ADR ledger
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/adr/**'
+      - 'scripts/adr-index-gen.js'
+      - 'scripts/adr-ratchet.sh'
+      - '.github/workflows/adr.yml'
+  pull_request:
+    paths:
+      - 'docs/adr/**'
+      - 'scripts/adr-index-gen.js'
+      - 'scripts/adr-ratchet.sh'
+      - '.github/workflows/adr.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  adr-ledger:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the ratchet diffs the push's or PR's base against HEAD.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+
+      - name: Validate ADR frontmatter
+        run: node scripts/adr-index-gen.js docs/adr --check
+
+      - name: adr-ratchet (planning cycle 2026-09-21 — a new ADR must close a proposed one)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/adr-ratchet.sh docs/adr "${BASE:-0}" "${{ github.sha }}"
