@@ -22,8 +22,9 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
   `/.well-known/did/nostr/<hex>.json` route has only the identifier from D1,
   so it keeps emitting `0x02`, which is what the spec requires there.
 - `NostrPubkey::from_public_key` / `to_even_public_key` convert between the
-  identifier and points (the `0x02` point is the one to tweak when only the
-  identifier is known).
+  identifier and points (an identifier denotes the `0x02` point). This agrees
+  with `basePoint()` / `multikey()` in sidestr/spec PR #28; no key-arithmetic
+  (tweak) API is added until that PR merges.
 - Tests pin upstream `decode_even_parity` / `decode_odd_parity`
   (nostrcg/did-nostr@4ea80d8) and odd-y encode cases.
 - Kit set moves to `1.0.0-beta.12` (core changed; config, mesh and

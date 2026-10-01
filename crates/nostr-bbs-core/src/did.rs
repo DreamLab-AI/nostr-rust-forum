@@ -18,10 +18,10 @@
 //! [`render_did_document_tier1`]. A controller that publishes its own
 //! document from the full key may carry `fe70103…` when y is odd
 //! ([`render_did_document_published`]). Decoders accept both and return the
-//! same x ([`parse_multibase_schnorr`]); key arithmetic on a published
-//! document starts from the point it carries ([`parse_multibase_sec1`]), and
-//! with only the identifier from the `0x02` point
-//! ([`NostrPubkey::to_even_public_key`]).
+//! same x ([`parse_multibase_schnorr`]). Read as points, a Multikey keeps
+//! its own parity ([`parse_multibase_sec1`]) and an identifier denotes the
+//! `0x02` point ([`NostrPubkey::to_even_public_key`]), matching `basePoint()`
+//! in sidestr/spec PR #28. Key arithmetic (tweaks) is not provided here.
 
 use serde_json::{json, Value};
 use solid_pod_rs::did_nostr_types as upstream;
@@ -66,8 +66,7 @@ impl NostrPubkey {
 
     /// The `0x02` (even-y) point for this identifier — BIP-340 `lift_x`.
     ///
-    /// The point to tweak when only the identifier is known; a holder whose
-    /// secret gives the odd-y point uses `n − d` once so this point is theirs.
+    /// An identifier carries no parity, so it denotes the even-y point.
     ///
     /// # Errors
     ///
@@ -114,8 +113,7 @@ pub fn parse_multibase_schnorr(s: &str) -> Result<NostrPubkey, String> {
 }
 
 /// Decode a `publicKeyMultibase` to the full point it carries, keeping its
-/// parity — the point to tweak when doing key arithmetic on a published
-/// document.
+/// parity (`fe70103…` yields the odd-y point, not the even-y lift).
 ///
 /// # Errors
 ///
@@ -559,6 +557,35 @@ mod tests {
         assert_eq!(
             render_did_document_published(&pk),
             render_did_document_tier1(&id)
+        );
+    }
+
+    /// sidestr/spec PR #28 (`siding/test/keys-vectors.json` at head
+    /// bd1d692, unmerged), `oddSecret` encoding fields only: `multikey(P)` is
+    /// `fe701` + compressed hex and `basePoint(did)` is the 02 point.
+    #[test]
+    fn agrees_with_keys_mjs_multikey_and_base_point() {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let mut d = [0u8; 32];
+        d[31] = 6;
+        let pk = k256::SecretKey::from_slice(&d).unwrap().public_key();
+        let multikey = "fe70103fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556";
+        assert_eq!(format_multibase_public_key(&pk), multikey);
+        let from_mk = parse_multibase_sec1(multikey).unwrap();
+        assert_eq!(from_mk, pk);
+        let id = NostrPubkey::from_public_key(&pk);
+        assert_eq!(
+            did_nostr_uri(&id),
+            "did:nostr:fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556"
+        );
+        assert_eq!(
+            hex::encode(
+                id.to_even_public_key()
+                    .unwrap()
+                    .to_encoded_point(true)
+                    .as_bytes()
+            ),
+            "02fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556"
         );
     }
 
