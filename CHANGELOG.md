@@ -7,6 +7,29 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Changed — did:nostr parity model tracks nostrcg/did-nostr#145, 2026-10-01
+
+- `nostr-bbs-core::did` now decodes Multikeys: `parse_multibase_schnorr`
+  accepts both `fe70102…` and `fe70103…` and returns the same x-only key, as
+  the reconciled spec requires of every verifier
+  ([did-nostr#145](https://github.com/nostrcg/did-nostr/pull/145), closing
+  [#144](https://github.com/nostrcg/did-nostr/issues/144)); the forum
+  previously had no decoder of its own. `parse_multibase_sec1` returns the
+  full point a document carries.
+- New controller-published encoding: `render_did_document_published`,
+  `format_multibase_public_key` and `format_multibase_sec1` take the full
+  key and emit `0x03` for odd y. No forum route uses them yet — every
+  `/.well-known/did/nostr/<hex>.json` route has only the identifier from D1,
+  so it keeps emitting `0x02`, which is what the spec requires there.
+- `NostrPubkey::from_public_key` / `to_even_public_key` convert between the
+  identifier and points (the `0x02` point is the one to tweak when only the
+  identifier is known).
+- Tests pin upstream `decode_even_parity` / `decode_odd_parity`
+  (nostrcg/did-nostr@4ea80d8) and odd-y encode cases.
+- Kit set moves to `1.0.0-beta.12` (core changed; config, mesh and
+  rate-limit are version-only so the set stays coherent). `solid-pod-rs` pin
+  moves to `=0.5.0-alpha.10`, which must be published first.
+
 ### Fixed — relay read cost no longer scales with delivered events, 2026-09-29
 
 - The relay's Durable Object now memoises channel → zone, viewer cohorts and

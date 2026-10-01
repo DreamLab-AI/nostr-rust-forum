@@ -8,12 +8,29 @@
 //!
 //! Both auth-worker and pod-worker import from here so there is exactly
 //! one document schema per tier in the forum codebase.
+//!
+//! ## Parity model
+//!
+//! Follows nostrcg/did-nostr#145 (closing #144). The `did:nostr` identifier
+//! is the x-only key. A resolver that has only the identifier — every
+//! `/.well-known/did/nostr/<hex>.json` route in the forum, which reads the
+//! pubkey from D1 — emits `publicKeyMultibase: fe70102…` via
+//! [`render_did_document_tier1`]. A controller that publishes its own
+//! document from the full key may carry `fe70103…` when y is odd
+//! ([`render_did_document_published`]). Decoders accept both and return the
+//! same x ([`parse_multibase_schnorr`]); key arithmetic on a published
+//! document starts from the point it carries ([`parse_multibase_sec1`]), and
+//! with only the identifier from the `0x02` point
+//! ([`NostrPubkey::to_even_public_key`]).
 
 use serde_json::{json, Value};
 use solid_pod_rs::did_nostr_types as upstream;
 
-// Re-export upstream types that don't depend on NostrPubkey.
-pub use upstream::{format_multibase_schnorr, ServiceEntry};
+// Re-export upstream items that don't depend on NostrPubkey.
+pub use upstream::{
+    format_multibase_public_key, format_multibase_schnorr, render_did_document_published,
+    ServiceEntry, MULTIKEY_LEN, MULTIKEY_PREFIX, MULTIKEY_PREFIX_ODD,
+};
 
 // ---------------------------------------------------------------------------
 // NostrPubkey — wraps upstream with String error for backward compat
@@ -35,9 +52,87 @@ impl NostrPubkey {
         hex::encode(self.0)
     }
 
+    /// The x-only identifier of a full secp256k1 public key (parity dropped).
+    ///
+    /// ```
+    /// use nostr_bbs_core::did::NostrPubkey;
+    ///
+    /// let sk = k256::SecretKey::from_slice(&[0x11; 32]).unwrap();
+    /// assert_eq!(NostrPubkey::from_public_key(&sk.public_key()).to_hex().len(), 64);
+    /// ```
+    pub fn from_public_key(pk: &k256::PublicKey) -> Self {
+        Self(upstream::NostrPubkey::from_public_key(pk).0)
+    }
+
+    /// The `0x02` (even-y) point for this identifier — BIP-340 `lift_x`.
+    ///
+    /// The point to tweak when only the identifier is known; a holder whose
+    /// secret gives the odd-y point uses `n − d` once so this point is theirs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if `x` is not on secp256k1.
+    pub fn to_even_public_key(&self) -> Result<k256::PublicKey, String> {
+        self.to_upstream()
+            .to_even_public_key()
+            .map_err(|e| e.to_string())
+    }
+
     fn to_upstream(self) -> upstream::NostrPubkey {
         upstream::NostrPubkey(self.0)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multikey decoding / full-key encoding
+// ---------------------------------------------------------------------------
+
+/// Decode a `publicKeyMultibase` (`fe70102…` or `fe70103…`) to the x-only
+/// `did:nostr` key.
+///
+/// Both parity prefixes are accepted and yield the same key — verifiers MUST
+/// accept both (nostrcg/did-nostr#145; vectors `decode_even_parity` /
+/// `decode_odd_parity`). Delegates to `solid_pod_rs`.
+///
+/// # Errors
+///
+/// Returns a message for a wrong prefix or multicodec, a length other than
+/// [`MULTIKEY_LEN`], or uppercase / non-hex characters.
+///
+/// ```
+/// use nostr_bbs_core::did::parse_multibase_schnorr;
+///
+/// let x = "124c0fa99407182ece5a24fad9b7f6674902fc422843d3128d38a0afbee0fdd2";
+/// let even = parse_multibase_schnorr(&format!("fe70102{x}")).unwrap();
+/// let odd = parse_multibase_schnorr(&format!("fe70103{x}")).unwrap();
+/// assert_eq!(even, odd);
+/// ```
+pub fn parse_multibase_schnorr(s: &str) -> Result<NostrPubkey, String> {
+    upstream::parse_multibase_schnorr(s)
+        .map(|pk| NostrPubkey(pk.0))
+        .map_err(|e| e.to_string())
+}
+
+/// Decode a `publicKeyMultibase` to the full point it carries, keeping its
+/// parity — the point to tweak when doing key arithmetic on a published
+/// document.
+///
+/// # Errors
+///
+/// Every error of [`parse_multibase_schnorr`], plus x not on secp256k1.
+pub fn parse_multibase_sec1(s: &str) -> Result<k256::PublicKey, String> {
+    upstream::parse_multibase_sec1(s).map_err(|e| e.to_string())
+}
+
+/// Build `publicKeyMultibase` from a controller's 33-byte SEC1-compressed
+/// point, keeping its parity byte (`fe70102…` / `fe70103…`).
+///
+/// # Errors
+///
+/// Returns a message if `compressed` is not a valid 33-byte compressed
+/// secp256k1 point.
+pub fn format_multibase_sec1(compressed: &[u8]) -> Result<String, String> {
+    upstream::format_multibase_sec1(compressed).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +474,92 @@ mod tests {
         assert_eq!(&a[7..], PK_HEX);
         // Missing-parity (fe701 + 64 hex, 67 chars) is the ship-bug form — must NOT match.
         assert_ne!(a.len(), 67);
+    }
+
+    // ── Parity model (nostrcg/did-nostr#145) ──────────────────────────
+
+    /// Upstream nostrcg/did-nostr@4ea80d8,
+    /// `test-vectors/test-vectors-generated.json` → `key_decoding`.
+    const SPEC_X: &str = "124c0fa99407182ece5a24fad9b7f6674902fc422843d3128d38a0afbee0fdd2";
+    const DECODE_EVEN_PARITY: &str =
+        "fe70102124c0fa99407182ece5a24fad9b7f6674902fc422843d3128d38a0afbee0fdd2";
+    const DECODE_ODD_PARITY: &str =
+        "fe70103124c0fa99407182ece5a24fad9b7f6674902fc422843d3128d38a0afbee0fdd2";
+
+    fn public_key_with_parity(tag: u8) -> k256::PublicKey {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        (1u8..=255)
+            .map(|b| k256::SecretKey::from_slice(&[b; 32]).unwrap().public_key())
+            .find(|pk| pk.to_encoded_point(true).as_bytes()[0] == tag)
+            .unwrap()
+    }
+
+    #[test]
+    fn decode_even_and_odd_parity_vectors() {
+        for (input, parity) in [(DECODE_EVEN_PARITY, 0x02u8), (DECODE_ODD_PARITY, 0x03)] {
+            assert_eq!(parse_multibase_schnorr(input).unwrap().to_hex(), SPEC_X);
+            let point = parse_multibase_sec1(input).unwrap();
+            use k256::elliptic_curve::sec1::ToEncodedPoint;
+            assert_eq!(point.to_encoded_point(true).as_bytes()[0], parity);
+            assert_eq!(format_multibase_public_key(&point), input);
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_malformed_multikeys() {
+        for bad in [
+            "fe70104124c0fa99407182ece5a24fad9b7f6674902fc422843d3128d38a0afbee0fdd2",
+            "f000102124c0fa99407182ece5a24fad9b7f6674902fc422843d3128d38a0afbee0fdd2",
+            "FE70102124C0FA99407182ECE5A24FAD9B7F6674902FC422843D3128D38A0AFBEE0FDD2",
+            "fe70102",
+            "abc123",
+        ] {
+            assert!(parse_multibase_schnorr(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn identifier_only_document_emits_0x02_even_for_odd_key() {
+        let pk = public_key_with_parity(0x03);
+        let id = NostrPubkey::from_public_key(&pk);
+        let doc = render_did_document_tier1(&id);
+        let mb = doc["verificationMethod"][0]["publicKeyMultibase"]
+            .as_str()
+            .unwrap();
+        assert_eq!(mb, format!("fe70102{}", id.to_hex()));
+        assert_eq!(
+            *id.to_even_public_key().unwrap().as_affine(),
+            -*pk.as_affine()
+        );
+    }
+
+    #[test]
+    fn controller_published_document_carries_0x03_for_odd_key() {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let pk = public_key_with_parity(0x03);
+        let id = NostrPubkey::from_public_key(&pk);
+        let doc = render_did_document_published(&pk);
+        assert_eq!(doc["id"], did_nostr_uri(&id));
+        let mb = doc["verificationMethod"][0]["publicKeyMultibase"]
+            .as_str()
+            .unwrap();
+        assert_eq!(mb, format!("fe70103{}", id.to_hex()));
+        assert_eq!(mb.len(), MULTIKEY_LEN);
+        assert_eq!(
+            format_multibase_sec1(pk.to_encoded_point(true).as_bytes()).unwrap(),
+            mb
+        );
+        assert_eq!(parse_multibase_schnorr(mb).unwrap(), id);
+    }
+
+    #[test]
+    fn controller_published_document_matches_tier1_for_even_key() {
+        let pk = public_key_with_parity(0x02);
+        let id = NostrPubkey::from_public_key(&pk);
+        assert_eq!(
+            render_did_document_published(&pk),
+            render_did_document_tier1(&id)
+        );
     }
 
     // ── Upstream parity ───────────────────────────────────────────────

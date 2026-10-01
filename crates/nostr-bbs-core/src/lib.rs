@@ -117,8 +117,10 @@ pub use moderation_events::{
 };
 
 pub use did::{
-    did_nostr_uri, format_multibase_schnorr, is_valid_hex_pubkey, render_did_document_tier1,
-    render_did_document_tier3, verify_webid_tag, well_known_path, NostrPubkey,
+    did_nostr_uri, format_multibase_public_key, format_multibase_schnorr, format_multibase_sec1,
+    is_valid_hex_pubkey, parse_multibase_schnorr, parse_multibase_sec1,
+    render_did_document_published, render_did_document_tier1, render_did_document_tier3,
+    verify_webid_tag, well_known_path, NostrPubkey,
 };
 pub use nip04::{nip04_decrypt, nip04_encrypt, nip04_shared_secret, Nip04Error};
 pub use nip19::{

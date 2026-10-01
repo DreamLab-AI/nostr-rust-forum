@@ -15,7 +15,10 @@ use worker::*;
 /// 1. Validates the pubkey (64-char lowercase hex).
 /// 2. Checks the `webauthn_credentials` D1 table to confirm the pubkey is
 ///    registered (returns 404 for unknown pubkeys).
-/// 3. Builds a Tier-1 DID document via core's canonical renderer.
+/// 3. Builds a Tier-1 DID document via core's canonical renderer. The route
+///    holds only the identifier (from D1), so `publicKeyMultibase` is the
+///    `fe70102…` even-y form — what a resolver without the full key emits
+///    under the did:nostr parity model (nostrcg/did-nostr#145).
 /// 4. Returns `application/did+json` with 5-minute cache.
 pub async fn handle_did_document(pubkey: &str, env: &Env) -> Result<Response> {
     let pubkey_lower = pubkey.to_ascii_lowercase();

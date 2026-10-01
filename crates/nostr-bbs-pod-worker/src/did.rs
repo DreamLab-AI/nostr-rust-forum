@@ -3,6 +3,10 @@
 //! All document rendering and pubkey types live in `nostr_bbs_core::did`.
 //! This module re-exports the public API so existing pod-worker call sites
 //! (`use crate::did::*`) continue to compile unchanged.
+//!
+//! Pod-worker renders from the hex identifier only, so its documents carry
+//! the `fe70102…` (`0x02`) Multikey; decoding of either parity goes through
+//! `nostr_bbs_core::did::parse_multibase_schnorr` (nostrcg/did-nostr#145).
 
 pub use nostr_bbs_core::did::{render_did_document_tier3, verify_webid_tag, NostrPubkey};
 
