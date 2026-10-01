@@ -272,6 +272,7 @@ dependencies = [
  "hex-conservative 0.2.2",
  "hex_lit",
  "secp256k1",
+ "serde",
 ]
 
 [[package]]
@@ -304,6 +305,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9cb95693f371d089a4b5b6fc41c6f3ea6e01ee8c15388335dfac8ea685173b51"
 dependencies = [
  "bitcoin-consensus-encoding",
+ "serde",
 ]
 
 [[package]]
@@ -3720,9 +3722,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sidestr-agent"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b4b0757c810c25b007a89f6b5772dd4b4d1ecd2f63eef265a36e9ff4d4dbed4"
+checksum = "27934844bce3576e6d1246e20e08e4afba9352352f41a3fcd487a613032203b7"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -3738,9 +3740,9 @@ dependencies = [
 
 [[package]]
 name = "sidestr-core"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bdc002239f3238f1ae723277b3c100d01febd2d13391491de0fd2f335e5837b"
+checksum = "524d8caa031e41756513fa178799d0e9d211696f742ffb0901a23377a0ff9b3f"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -3753,9 +3755,9 @@ dependencies = [
 
 [[package]]
 name = "sidestr-nostr"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbe41b6aac4333e4f9f54408fcba1d5f7ff9538bbb78ecef49c59d0fb25d672b"
+checksum = "b02ed5ac1f29e80c145d06dcf2244052ff9d739981a1aa3c3f3fdac3c3891161"
 dependencies = [
  "bitcoin",
  "hex",
@@ -3768,9 +3770,9 @@ dependencies = [
 
 [[package]]
 name = "sidestr-wallet"
-version = "0.4.1"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2baa803ec98ad09b1211a996a52a5155049cc82153c5e614dd008171ab5774a"
+checksum = "6f9a2645b5725e3bcad07ae21c6494dbeca414e4173eb75b3a21aaf55e10468d"
 dependencies = [
  "bitcoin",
  "hex",
