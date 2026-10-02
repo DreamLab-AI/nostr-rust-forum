@@ -429,14 +429,6 @@ pub(crate) fn ReactionBar(
                 }
             </For>
 
-            // DREAM tips (ADR-2015): the post's tip total and, on other
-            // members' posts, a tip button. Renders nothing unless the
-            // deployment switched the wallet on.
-            <crate::components::tip_button::TipControl
-                event_id=event_id_stored.get_value()
-                author_pubkey=author_pk_stored.get_value()
-            />
-
             // Add-reaction affordance. The icon is the cross-app convention
             // (Slack/Discord/GitHub): a smiley with a small plus at its top-right
             // corner. Inline SVG rather than an icon font so it inherits
@@ -602,6 +594,18 @@ pub(crate) fn ReactionBar(
                         </div>
                     </div>
                 </Show>
+            </div>
+
+            // DREAM tips (ADR-2015): the post's tip total and, on other
+            // members' posts, a tip button. Renders nothing unless the
+            // deployment switched the wallet on. Pushed to the right edge
+            // (`ml-auto`) so money sits apart from the emoji reactions on the
+            // left; the gap keeps a wrapped bar from touching the picker.
+            <div class="ml-auto pl-2">
+                <crate::components::tip_button::TipControl
+                    event_id=event_id_stored.get_value()
+                    author_pubkey=author_pk_stored.get_value()
+                />
             </div>
         </div>
     }

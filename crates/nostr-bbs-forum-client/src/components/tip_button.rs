@@ -159,7 +159,7 @@ pub(crate) fn TipControl(
 
             <Show when=move || open.get()>
                 <div
-                    class="absolute bottom-full left-0 mb-1 glass-card p-3 rounded-xl shadow-lg z-50 w-64 text-sm"
+                    class="absolute bottom-full right-0 mb-1 glass-card p-3 rounded-xl shadow-lg z-50 w-64 text-sm"
                     role="dialog"
                     aria-label="Tip in DREAM"
                     on:keydown=move |ev| if ev.key() == "Escape" { open.set(false) }
