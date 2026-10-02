@@ -332,6 +332,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3792,9 +3801,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sidestr-agent"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4163cbca921e46205182e09e208128870c284a15d0fb476071370c74aac70dac"
+checksum = "df8ed4601336b99749f55c1fd702bd857f6f4e87756263197985cee5cef7d6b5"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -3803,6 +3812,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sidestr-core",
+ "sidestr-header",
+ "sidestr-hitch",
  "sidestr-nostr",
  "sidestr-wallet",
  "thiserror 2.0.18",
@@ -3810,9 +3821,9 @@ dependencies = [
 
 [[package]]
 name = "sidestr-core"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e37df2ecb89f16d09c9564a218a3369561b83579891f33c6f265df513150a66a"
+checksum = "653cae67acf8295790e2cf6535380fdffb95696216a57ef70a7e588d292cea4a"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -3824,10 +3835,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "sidestr-nostr"
-version = "0.5.0"
+name = "sidestr-header"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4feeccc98fe458511b40bd36b55938f73155e8dc6b2c4ca63cb387c18d5a6d9e"
+checksum = "5fe40fca697dde1a9c69d08731dbd8d705bd33ddfe65a8dcf3e4c95560576fe9"
+dependencies = [
+ "bitcoin",
+ "blake2",
+ "sha2",
+ "sidestr-core",
+]
+
+[[package]]
+name = "sidestr-hitch"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d7bd76e37e4d266f79195bc0d6f9bb351558cdb5db8150ca1a894259c62bc82"
+dependencies = [
+ "bitcoin",
+ "serde",
+ "sidestr-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sidestr-nostr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "595e56c74b7bd5fbf17a4fd0c1c945086c122c64bc7433bba8693869d5a1478a"
 dependencies = [
  "bitcoin",
  "hex",
@@ -3840,9 +3875,9 @@ dependencies = [
 
 [[package]]
 name = "sidestr-wallet"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1eb767659eb929f636bb99142e574c574edcf7a1539d32d4cce967a70f947ac"
+checksum = "467c2966c2a0953061e8b8c785d05c52a7422892e2170ed5d6903ca5e49f4f79"
 dependencies = [
  "bitcoin",
  "hex",
@@ -3913,9 +3948,9 @@ dependencies = [
 
 [[package]]
 name = "solid-pod-rs"
-version = "0.5.0-alpha.11"
+version = "0.5.0-alpha.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e185dd6138dc2b36f877b3d7f1560b2f0b7855abbbad511338e29d897baec1bf"
+checksum = "4f1d9628ede063b8b657df1d67e6805059ee9a2caceeb513a8a5de9b30a1b4cd"
 dependencies = [
  "async-trait",
  "base64",

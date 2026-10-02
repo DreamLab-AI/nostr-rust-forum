@@ -161,10 +161,10 @@ uuid = { version = "1", features = ["js"] }
 # without its CLI builds for wasm32, so the browser validates the chain and
 # signs spends with the same code an agent runs. secp256k1's C builds with
 # clang for wasm32 (the CI runners carry it).
-sidestr-agent = { version = "0.5", default-features = false }
-sidestr-core = "0.4.1"
-sidestr-wallet = "0.5.2"
-sidestr-nostr = "0.5"
+sidestr-agent = { version = "0.6", default-features = false }
+sidestr-core = "0.4.2"
+sidestr-wallet = "0.5.3"
+sidestr-nostr = "0.6"
 # `secp-lowmemory`: libsecp256k1 with small precomputed tables. Signing a
 # tip is one Schnorr signature and a replay verifies a few hundred, so the
 # speed the full tables buy is not worth their ~1 MB in every page load.
