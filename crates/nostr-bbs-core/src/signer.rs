@@ -71,6 +71,9 @@ impl From<PubkeyMismatch> for SignerError {
 /// Implementations can be synchronous wrappers (PRF-derived key) or async
 /// bridges to browser extensions (NIP-07). The `async_trait` macro erases the
 /// difference so callers can always `await` the sign call.
+// rustc 1.99 clippy flags the `#[must_use]` that `async_trait` itself emits on the
+// boxed future (clippy::double_must_use); the expansion is not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait(?Send)]
 pub trait Signer {
     /// Return the x-only public key (64-char hex) this signer controls.

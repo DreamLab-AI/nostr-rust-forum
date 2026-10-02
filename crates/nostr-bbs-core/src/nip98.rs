@@ -86,6 +86,9 @@ const NOSTR_PREFIX: &str = "Nostr ";
 /// caller's point of view — it returns `Ok(true)` on first observation and
 /// records the id, returning `Ok(false)` on subsequent observations within
 /// the TTL. A storage error is surfaced as `Err`.
+// rustc 1.99 clippy flags the `#[must_use]` that `async_trait` itself emits on the
+// boxed future (clippy::double_must_use); the expansion is not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait(?Send)]
 pub trait Nip98ReplayStore {
     /// Record `event_id` if absent and return `true` on first observation.
