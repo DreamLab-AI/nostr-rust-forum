@@ -33,6 +33,22 @@ cargo test -p nostr-bbs-core governance
 cargo check --target wasm32-unknown-unknown -p nostr-bbs-forum-client
 ```
 
+### A stale `target/` can fake a total build failure
+
+If `cargo test --workspace --exclude nostr-bbs-forum-client` suddenly fails on a
+clean tree with ~150 `the trait bound …: serde::Serialize is not satisfied`
+errors, read the note on the first error: `there are multiple different versions
+of crate serde_core in the dependency graph`. `Cargo.lock` pins one version; the
+duplicate is two incompatible rlibs of the *same* version left in `target/` by
+builds under different `-p` selections and feature unification, so a derive from
+one copy does not satisfy a bound from the other. It is not a code defect.
+Repair, then re-run:
+
+```bash
+cargo clean -p serde_core -p serde -p serde_json
+cargo test --workspace --exclude nostr-bbs-forum-client
+```
+
 ## Linting and Drift Detection
 
 Before submitting a PR, run both lint scripts:

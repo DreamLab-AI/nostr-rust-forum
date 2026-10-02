@@ -8,9 +8,13 @@
 //! ```
 //!
 //! The signing key is read from the named environment variable and never
-//! printed. The signer must be a registered agent on the relay and must NOT be
-//! an admin: several probes assert that an agent is refused. Exit status is 0
-//! only when every probe passed; any failure or not-run probe exits 1.
+//! printed. The signer must be a registered agent on the relay; it may or may
+//! not be an admin. P02 records which (`signer_is_admin`) rather than assuming
+//! it, and no verdict depends on the role: a non-admin is refused at admission,
+//! an admin is admitted and must then be stopped by the rationale gate (P08)
+//! and the human-resolution guard (P09/P10). The live M4 signer was an admin.
+//! Exit status is 0 only when every probe passed; any failure or not-run probe
+//! exits 1.
 //!
 //! The binary is native-only; on wasm32 it compiles to an empty `main`.
 
