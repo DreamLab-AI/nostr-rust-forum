@@ -118,11 +118,16 @@ pub fn correlate(event: &NostrEvent) -> Option<ReceiptCorrelation> {
         return None;
     }
 
-    // The `e` tag marked `request` cites the originating 31402; an unmarked
-    // `e` tag on a response is treated the same way, which matches how the
-    // existing projection resolves its request linkage.
+    // The `e` tag marked `request` cites the originating 31402; failing that an
+    // appeal's target; failing that the first UNMARKED `e` tag, which is the
+    // shape every 31403 producer in the estate actually emits (the forum
+    // client signs `["e", <request id>]`). A tag with any other marker —
+    // `supersedes`, `appeal` — is never read as the request. Reading the
+    // unmarked tag cannot bind a decision to the wrong case: the projection
+    // still requires this id to equal the case's own `nostr_event_id`.
     let request_event_id = tag_with_marker(event, "e", "request")
-        .or_else(|| governance::extract_appeal_target(&event.tags).map(str::to_string));
+        .or_else(|| governance::extract_appeal_target(&event.tags).map(str::to_string))
+        .or_else(|| unmarked_tag(event, "e"));
 
     Some(ReceiptCorrelation {
         event_id: event.id.clone(),
@@ -146,6 +151,16 @@ fn tag_value(event: &NostrEvent, name: &str) -> Option<String> {
         .tags
         .iter()
         .find(|t| t.len() >= 2 && t[0] == name)
+        .map(|t| t[1].clone())
+}
+
+/// First value of a `name` tag that carries no NIP-01 marker (fewer than four
+/// elements, or an empty marker).
+fn unmarked_tag(event: &NostrEvent, name: &str) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == name && t.get(3).is_none_or(|m| m.is_empty()))
         .map(|t| t[1].clone())
 }
 
@@ -1156,6 +1171,86 @@ mod tests {
         assert_eq!(c.request_event_id.as_deref(), Some(req.as_str()));
         assert_eq!(c.supersedes_event_id.as_deref(), Some(sup.as_str()));
         assert_eq!(c.target_operation.as_deref(), Some("publish-vault"));
+    }
+
+    /// The forum client signs a 31403 as `[["d", case], ["e", request]]` with
+    /// no marker. Before this was read, every decision taken in the forum UI
+    /// correlated with no request, `apply_with_receipt` returned
+    /// `Uncorrelated`, and the decision never reached `broker_decisions` while
+    /// the relay's OK said it was accepted.
+    #[test]
+    fn the_forum_clients_unmarked_request_tag_correlates() {
+        let req = "b".repeat(64);
+        let ev = event(
+            vec![t(&["d", "case-9"]), t(&["e", &req])],
+            r#"{"action":"approve","reasoning":"I have read the diff and it is right."}"#,
+        );
+        let c = correlate(&ev).expect("correlates");
+        assert_eq!(c.request_event_id.as_deref(), Some(req.as_str()));
+        // An explicitly empty marker is still unmarked.
+        let ev = event(vec![t(&["d", "case-9"]), t(&["e", &req, "", ""])], "{}");
+        assert_eq!(
+            correlate(&ev).unwrap().request_event_id.as_deref(),
+            Some(req.as_str())
+        );
+    }
+
+    #[test]
+    fn a_marked_request_wins_and_other_markers_are_never_the_request() {
+        let req = "b".repeat(64);
+        let other = "d".repeat(64);
+        let sup = "c".repeat(64);
+        let ev = event(
+            vec![
+                t(&["d", "case-9"]),
+                t(&["e", &other]),
+                t(&["e", &req, "", "request"]),
+            ],
+            "{}",
+        );
+        assert_eq!(
+            correlate(&ev).unwrap().request_event_id.as_deref(),
+            Some(req.as_str())
+        );
+        let ev = event(
+            vec![t(&["d", "case-9"]), t(&["e", &sup, "", "supersedes"])],
+            "{}",
+        );
+        let c = correlate(&ev).unwrap();
+        assert_eq!(c.request_event_id, None);
+        assert_eq!(c.supersedes_event_id.as_deref(), Some(sup.as_str()));
+    }
+
+    /// End to end through the receipt store: a response in the client's
+    /// shape now reaches `projection-committed` and writes its decision.
+    #[test]
+    fn an_unmarked_response_now_commits_its_projection() {
+        let ev = event(
+            vec![t(&["d", "case-1"]), t(&["e", &"r".repeat(64)])],
+            r#"{"action":"approve"}"#,
+        );
+        let c = correlate(&ev).unwrap();
+        let store = FakeStore::new();
+        let out = block_on(apply_with_receipt(&store, &c, &commit_plan(), 1));
+        assert_eq!(
+            out,
+            ReceiptOutcome::Committed {
+                stage: ReceiptStage::ProjectionCommitted
+            }
+        );
+        assert_eq!(store.decision_count(), 1);
+
+        // The same response with the request tag pointing elsewhere still
+        // cannot commit against this case.
+        let ev = event(
+            vec![t(&["d", "case-1"]), t(&["e", &"x".repeat(64)])],
+            r#"{"action":"approve"}"#,
+        );
+        let c = correlate(&ev).unwrap();
+        let store = FakeStore::new();
+        let out = block_on(apply_with_receipt(&store, &c, &commit_plan(), 1));
+        assert_eq!(out, ReceiptOutcome::Uncorrelated);
+        assert_eq!(store.decision_count(), 0);
     }
 
     // -- Wire projection ---------------------------------------------------
