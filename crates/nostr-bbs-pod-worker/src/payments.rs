@@ -1902,6 +1902,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Known-answer vectors for the LIVE deposit-address derivation.
+    //
+    // Captured from the k256 implementation before the rust-bitcoin port and
+    // never regenerated: addresses already handed to users must keep paying
+    // the same script. Pair 1 and pair 3 give an odd-y internal key Q (where
+    // this raw construction parts company with BIP 341), pair 2 an even-y Q;
+    // pair 3 also has an odd-y master point P.
+    // -----------------------------------------------------------------------
+
+    /// `(MASTER_SECRET hex, user x-only pubkey hex, address, Q parity byte)`.
+    const DEPOSIT_KAT: [(&str, &str, &str, u8); 3] = [
+        (
+            "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef",
+            "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659",
+            "bc1p0z7ve4ph6v4tfumrffgzmm5lhwzca2gq3gyl38yagyfdsuuddudsap2q2h",
+            0x03,
+        ),
+        (
+            "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef",
+            "dd308afec5777e13121fa72b9cc1b7cc0139715309b086c960e18fd969774eb8",
+            "bc1pc2ugfcac2yl9atk7u6s65tmp072jutcn7k7emywmkr0ah40sm5zqnlac5v",
+            0x02,
+        ),
+        (
+            "0b432b2677937381aef05bb02a66ecd012773062cf3fa2549e44f58ed2401710",
+            "25d1dff95105f5253c4022f628a996ad3a0d95fbf21d468a1b33f8c160d8f517",
+            "bc1pyesjlxgnvpawzr7w7e9na27pvyn49a3y5glxzvpnjkw2z2hvau6szcxa7v",
+            0x03,
+        ),
+    ];
+
+    fn kat_secret(hex_secret: &str) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&hex::decode(hex_secret).expect("valid hex"));
+        s
+    }
+
+    #[test]
+    fn deposit_address_known_answers_are_frozen() {
+        for (secret, user, expected, _) in DEPOSIT_KAT {
+            let got = derive_deposit_address(&kat_secret(secret), user).expect("derivation");
+            assert_eq!(got, expected, "live deposit address drifted for {user}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Agent job CRUD tests (pure logic — no D1 dependency)
     // -----------------------------------------------------------------------
 
