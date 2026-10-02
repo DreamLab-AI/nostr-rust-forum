@@ -55,12 +55,14 @@ mod cli {
         run_id: Option<String>,
         keep_open: bool,
         list_cases: bool,
+        get: Option<String>,
     }
 
     const USAGE: &str =
         "usage: nostr-bbs-governance-probe --relay <wss-url> --auth-api <https-url> \
         --out <dir> [--key-var <ENV>] [--run-id <id>] [--keep-open]\n       \
-        nostr-bbs-governance-probe --auth-api <https-url> --list-cases [--key-var <ENV>]";
+        nostr-bbs-governance-probe --auth-api <https-url> --list-cases [--key-var <ENV>]\n       \
+        nostr-bbs-governance-probe --get <https-url> [--key-var <ENV>]";
 
     fn parse_args() -> Result<Args, String> {
         let mut relay = None;
@@ -70,6 +72,7 @@ mod cli {
         let mut run_id = None;
         let mut keep_open = false;
         let mut list_cases = false;
+        let mut get = None;
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             let mut val = || it.next().ok_or(format!("{a} needs a value"));
@@ -81,19 +84,25 @@ mod cli {
                 "--run-id" => run_id = Some(val()?),
                 "--keep-open" => keep_open = true,
                 "--list-cases" => list_cases = true,
+                "--get" => get = Some(val()?),
                 "-h" | "--help" => return Err(USAGE.into()),
                 other => return Err(format!("unknown argument {other}\n{USAGE}")),
             }
         }
-        if list_cases {
+        if list_cases || get.is_some() {
             return Ok(Args {
                 relay: relay.unwrap_or_default(),
-                auth_api: auth_api.ok_or(USAGE)?,
+                auth_api: if get.is_some() {
+                    auth_api.unwrap_or_default()
+                } else {
+                    auth_api.ok_or(USAGE)?
+                },
                 out: out.unwrap_or_default(),
                 key_var,
                 run_id,
                 keep_open,
                 list_cases,
+                get,
             });
         }
         Ok(Args {
@@ -104,6 +113,7 @@ mod cli {
             run_id,
             keep_open,
             list_cases,
+            get,
         })
     }
 
@@ -222,6 +232,28 @@ mod cli {
                 return ExitCode::from(2);
             }
         };
+        if let Some(url) = &args.get {
+            // Read-only: one NIP-98-signed GET, printed as {status, body}.
+            return match Http::new() {
+                Ok(http) => match http.get_signed(&identity, url).await {
+                    Ok(a) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&a.to_json()).unwrap_or_default()
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{url}: {e}");
+                        ExitCode::from(1)
+                    }
+                },
+                Err(e) => {
+                    eprintln!("http client: {e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
         if args.list_cases {
             return match Http::new() {
                 Ok(http) => list_cases(&args, &identity, &http).await,
