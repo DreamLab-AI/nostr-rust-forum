@@ -282,6 +282,9 @@ impl Stmt {
 }
 
 /// The ledger's view of a SQL database (D1 in the worker, SQLite in tests).
+// rustc 1.99 clippy flags the `#[must_use]` that `async_trait` itself emits on the
+// boxed future (clippy::double_must_use); the expansion is not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait(?Send)]
 pub trait LedgerDb {
     /// Run the statements as one transaction (D1 `batch`); return the number
@@ -294,6 +297,9 @@ pub trait LedgerDb {
 }
 
 /// The explorer's view of a transaction (mempool.space / esplora JSON).
+// rustc 1.99 clippy flags the `#[must_use]` that `async_trait` itself emits on the
+// boxed future (clippy::double_must_use); the expansion is not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait(?Send)]
 pub trait TxSource {
     /// `GET {explorer_api}/tx/{txid}` as JSON.
