@@ -17,6 +17,7 @@
 
 pub mod chain;
 pub mod extension;
+pub mod parent;
 pub mod relays;
 
 use std::rc::Rc;

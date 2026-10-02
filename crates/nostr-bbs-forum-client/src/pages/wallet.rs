@@ -20,6 +20,7 @@ use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::utils::format_relative_time;
 use crate::wallet::chain::{self, Balances, Snapshot};
+use crate::wallet::parent::{self, ParentView};
 use crate::wallet::{use_wallet, LoadStatus, Pending, PendingKind, SpendPath, WalletStore};
 
 /// What the give form sends.
@@ -203,6 +204,23 @@ pub fn WalletPage() -> impl IntoView {
             });
         }
     });
+
+    // ── BLAKE2b testnet4, read-only (ADR-2019) ───────────────────────────
+    // Off, with no request made, unless the deployment names a backend.
+    let parent_api = parent::api_base();
+    let parent_view: RwSignal<Option<Result<ParentView, String>>> = RwSignal::new(None);
+    if let Some(base) = parent_api.clone() {
+        Effect::new(move |_| {
+            let Some(addr) = me.get().and_then(|pk| parent::address_of(&pk)) else {
+                return;
+            };
+            let base = base.clone();
+            parent_view.set(None);
+            spawn_local(async move {
+                parent_view.set(Some(parent::load(&base, &addr).await));
+            });
+        });
+    }
 
     // ── unlock ───────────────────────────────────────────────────────────
     let unlock_text = RwSignal::new(String::new());
@@ -590,6 +608,48 @@ pub fn WalletPage() -> impl IntoView {
                     </section>
                 })
             })}
+
+            // ── BLAKE2b testnet4, read-only (ADR-2019) ───────────────────
+            {move || {
+                let base = parent_api.clone()?;
+                let addr = me.get().and_then(|pk| parent::address_of(&pk))?;
+                let addr_c = addr.clone();
+                let link = parent::blaketest_link(&base);
+                Some(view! {
+                    <section class=card aria-labelledby="parent-h">
+                        <h2 id="parent-h" class="text-sm font-semibold text-gray-100">{parent::LABEL}</h2>
+                        <p class="mt-1 text-sm text-gray-400">"Your key is also an address on BLAKE2b testnet4. The figure is what this forum's backend reports; it is not checked here, and this page never moves these coins."</p>
+                        <div class="mt-3">
+                            <div class=label>"Address"</div>
+                            <div class="flex items-center gap-2 mt-1">
+                                <code class="text-xs text-gray-200 break-all">{addr.clone()}</code>
+                                <button class="text-xs text-amber-400 hover:text-amber-300 shrink-0" on:click=move |_| { copy(addr_c.clone()); toasts.show("Address copied", ToastVariant::Success); }>"Copy"</button>
+                            </div>
+                        </div>
+                        {move || match parent_view.get() {
+                            None => view! { <p class="mt-3 text-sm text-gray-500">"Asking the backend…"</p> }.into_any(),
+                            Some(Err(e)) => view! { <p class="mt-3 text-sm text-red-400">{e}</p> }.into_any(),
+                            Some(Ok(v)) => view! {
+                                <div class="mt-3 space-y-1 text-sm text-gray-200">
+                                    <p>{grouped(v.balance.confirmed)} " sats confirmed"
+                                        {(v.balance.unconfirmed != 0).then(|| {
+                                            let sign = if v.balance.unconfirmed > 0 { "+" } else { "−" };
+                                            format!(" ({sign}{} unconfirmed)", grouped(v.balance.unconfirmed.unsigned_abs()))
+                                        })}
+                                    </p>
+                                    {v.pair.map(|p| view! {
+                                        <p class="text-xs text-gray-400">
+                                            "Only on BLAKE2b: " {grouped(p.only_blake)} " · only on stock testnet4: " {grouped(p.only_stock)}
+                                            " · on both, spendable on either: " {grouped(p.both)} " sats"
+                                        </p>
+                                    })}
+                                </div>
+                            }.into_any(),
+                        }}
+                        <a class="mt-3 inline-block text-xs text-amber-400 hover:text-amber-300" href=link target="_blank" rel="noopener noreferrer">"Move these coins in blaketest ↗"</a>
+                    </section>
+                })
+            }}
 
             // ── agents ───────────────────────────────────────────────────
             {move || {
