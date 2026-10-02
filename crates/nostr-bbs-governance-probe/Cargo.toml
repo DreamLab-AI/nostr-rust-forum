@@ -1,0 +1,34 @@
+[package]
+name = "nostr-bbs-governance-probe"
+version = "1.0.0-beta.12"
+edition = "2021"
+description = "ADR-2011 / PRD-augmentation-conditions M4 probe suite: drives the escalation boundary on a live nostr-bbs relay and auth API and writes one receipt per probe"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+rust-version = "1.85"
+# Project-specific verification tool for a kit deployment; not a reusable library.
+publish = false
+
+[lib]
+# Event builders, identities and verdict evaluators are pure and portable.
+path = "src/lib.rs"
+
+[[bin]]
+name = "nostr-bbs-governance-probe"
+path = "src/main.rs"
+
+[dependencies]
+nostr-bbs-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+
+# Network client and CLI: native only, so a wasm32 check sees a pure library.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+zeroize = { workspace = true }

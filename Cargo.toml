@@ -36,6 +36,10 @@ members = [
     # Pure library + native-only binary, so it still passes the wasm32 check.
     "crates/nostr-bbs-zone-migrate",
 
+    # ADR-2011 M4 probe suite: drives the escalation boundary on a live relay
+    # and auth API and writes one receipt per probe. Pure library + native bin.
+    "crates/nostr-bbs-governance-probe",
+
     # F26 / ADR-076 D5 — upstream `nostr` crate WASM/CF Workers compatibility
     # canary. Validates that the absorption path (Shape A) is viable on the
     # forum's specific build matrix before any nostr-core module deletion.

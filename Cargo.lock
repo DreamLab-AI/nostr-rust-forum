@@ -2406,6 +2406,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr-bbs-governance-probe"
+version = "1.0.0-beta.12"
+dependencies = [
+ "futures-util",
+ "hex",
+ "nostr-bbs-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-tungstenite",
+ "zeroize",
+]
+
+[[package]]
 name = "nostr-bbs-mesh"
 version = "1.0.0-beta.12"
 dependencies = [
