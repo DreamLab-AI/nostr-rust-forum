@@ -1,5 +1,5 @@
 # ADR ledger gate: frontmatter validity (the repository's own checker) and the
-# planning cycle's ratchet (scripts/adr-ratchet.sh: a new decision record must
+# planning cycle's ratchet (scripts/adr-ratchet.sh: a new proposal must
 # close a proposed one). Runs on push as well as pull requests because most of
 # this repository's commits land on main directly, and a red run is what the
 # nightly estate-health snapshot reports.
@@ -41,7 +41,7 @@ jobs:
       - name: Validate ADR frontmatter
         run: node scripts/adr-index-gen.js docs/adr --check
 
-      - name: adr-ratchet (planning cycle 2026-09-21 — a new ADR must close a proposed one)
+      - name: adr-ratchet (planning cycle 2026-09-21 — a new proposal must close a proposed one)
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: bash scripts/adr-ratchet.sh docs/adr "${BASE:-0}" "${{ github.sha }}"
