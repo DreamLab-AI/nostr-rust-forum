@@ -19,6 +19,15 @@
 //! ordinary logged-in member gets it, which is what FR6.3 needs: calibration
 //! samples exist to be shown to the member surface.
 //!
+//! A projection row answers only for the card its author published. The map is
+//! keyed by the `d` tag, which the requesting agent chooses and which collides
+//! across authors; the relay stores the first claimant's row (`INSERT OR
+//! IGNORE`), so a second agent reusing that `d` would otherwise inherit the
+//! first one's tier and calibration flag, and `with_relay_tier` adopts a stored
+//! tier downward as well as upward. Each lookup therefore takes the card's
+//! author and answers only when the row's `created_by` matches it; a row with no
+//! `created_by` (an older relay) answers nothing.
+//!
 //! An unknown case is **not** a calibration sample (`false`): a legacy case
 //! projected before migration 0006, a logged-out viewer, or a projection not yet
 //! fetched all fall back to plain effective-tier suppression rather than being
@@ -38,6 +47,18 @@ pub struct CaseProjection {
     /// migration 0006. Carried for cross-checking the client's own computation;
     /// it is not yet what the surfaces gate on.
     pub effective_tier: Option<String>,
+    /// `broker_cases.created_by`, lower-cased: the pubkey of the 31402 the row
+    /// was projected from. `None` when the relay did not say.
+    pub created_by: Option<String>,
+}
+
+impl CaseProjection {
+    /// Whether this row was projected from a 31402 signed by `author`.
+    fn is_by(&self, author: &str) -> bool {
+        self.created_by
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(author))
+    }
 }
 
 /// Parse `GET /api/governance/cases` into a map keyed by case id (the 31402's
@@ -70,33 +91,47 @@ pub fn parse_cases(body: &str) -> HashMap<String, CaseProjection> {
                         .get("effective_tier")
                         .and_then(|t| t.as_str())
                         .map(str::to_string),
+                    created_by: r
+                        .get("created_by")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_ascii_lowercase),
                 },
             ))
         })
         .collect()
 }
 
-/// Whether the relay's projection marks `case_id` a calibration sample.
+/// Whether the relay's projection marks `case_id`, as published by `author`, a
+/// calibration sample.
 ///
 /// A free function over the state rather than a [`CaseProjectionStore`] method,
 /// so the governance page can read every card in one pass while already holding
 /// a read guard instead of taking a fresh borrow per card. It is the **only**
 /// place the rule lives, so there is no second implementation to drift from.
 /// `false` for an unknown case: the marker is a claim about the relay's HMAC
-/// selection, and the client makes no such claim on its own.
-pub fn is_calibration_sample_in(state: &CaseProjectionState, case_id: &str) -> bool {
+/// selection, and the client makes no such claim on its own. `false` too when the
+/// row belongs to another author (see the module doc on `d`-tag collisions).
+pub fn is_calibration_sample_in(state: &CaseProjectionState, author: &str, case_id: &str) -> bool {
     state
         .cases
         .get(case_id)
+        .filter(|c| c.is_by(author))
         .map(|c| c.calibration_sample)
         .unwrap_or(false)
 }
 
-/// The relay's stored effective tier for `case_id`, if the projection has it.
-pub fn effective_tier_in<'a>(state: &'a CaseProjectionState, case_id: &str) -> Option<&'a str> {
+/// The relay's stored effective tier for `case_id` as published by `author`, if
+/// the projection has it. `None` when the row belongs to another author, so the
+/// card keeps the tier it computed itself rather than a stranger's.
+pub fn effective_tier_in<'a>(
+    state: &'a CaseProjectionState,
+    author: &str,
+    case_id: &str,
+) -> Option<&'a str> {
     state
         .cases
         .get(case_id)
+        .filter(|c| c.is_by(author))
         .and_then(|c| c.effective_tier.as_deref())
 }
 
@@ -181,7 +216,7 @@ mod tests {
     #[test]
     fn parses_the_case_projection_envelope() {
         let body = r#"{"cases":[
-            {"id":"case-1","calibration_sample":true,"effective_tier":"low"},
+            {"id":"case-1","calibration_sample":true,"effective_tier":"low","created_by":"AA"},
             {"id":"case-2","calibration_sample":false,"effective_tier":"high"}
         ]}"#;
         let cases = parse_cases(body);
@@ -189,6 +224,8 @@ mod tests {
         assert!(cases["case-1"].calibration_sample);
         assert!(!cases["case-2"].calibration_sample);
         assert_eq!(cases["case-2"].effective_tier.as_deref(), Some("high"));
+        assert_eq!(cases["case-1"].created_by.as_deref(), Some("aa"));
+        assert_eq!(cases["case-2"].created_by, None);
     }
 
     #[test]
@@ -213,13 +250,14 @@ mod tests {
     #[test]
     fn an_unknown_case_is_never_reported_as_a_calibration_sample() {
         let mut state = CaseProjectionState::default();
-        assert!(!is_calibration_sample_in(&state, "never-seen"));
+        assert!(!is_calibration_sample_in(&state, "aa", "never-seen"));
 
         state.cases.insert(
             "case-1".into(),
             CaseProjection {
                 calibration_sample: true,
                 effective_tier: None,
+                created_by: Some("aa".into()),
             },
         );
         state.cases.insert(
@@ -227,26 +265,61 @@ mod tests {
             CaseProjection {
                 calibration_sample: false,
                 effective_tier: None,
+                created_by: Some("aa".into()),
             },
         );
         state.loaded = true;
 
-        assert!(is_calibration_sample_in(&state, "case-1"));
+        assert!(is_calibration_sample_in(&state, "aa", "case-1"));
         // Told about, and told it is not one.
-        assert!(!is_calibration_sample_in(&state, "case-2"));
+        assert!(!is_calibration_sample_in(&state, "aa", "case-2"));
         // Not told about at all — still not one.
-        assert!(!is_calibration_sample_in(&state, "case-3"));
+        assert!(!is_calibration_sample_in(&state, "aa", "case-3"));
     }
 
     #[test]
     fn effective_tier_lookup_is_per_case_and_absent_when_unknown() {
         let state = CaseProjectionState {
-            cases: parse_cases(r#"{"cases":[{"id":"c1","effective_tier":"high"},{"id":"c2"}]}"#),
+            cases: parse_cases(
+                r#"{"cases":[{"id":"c1","effective_tier":"high","created_by":"aa"},{"id":"c2","created_by":"aa"}]}"#,
+            ),
             loaded: true,
             ..Default::default()
         };
-        assert_eq!(effective_tier_in(&state, "c1"), Some("high"));
-        assert_eq!(effective_tier_in(&state, "c2"), None);
-        assert_eq!(effective_tier_in(&state, "missing"), None);
+        assert_eq!(effective_tier_in(&state, "aa", "c1"), Some("high"));
+        assert_eq!(effective_tier_in(&state, "aa", "c2"), None);
+        assert_eq!(effective_tier_in(&state, "aa", "missing"), None);
+    }
+
+    #[test]
+    fn a_colliding_d_tag_never_lends_one_authors_row_to_another() {
+        // deepsec finding_d4dc5fdca9f6c089: agent BB reuses the `d` of AA's
+        // low-tier case; the relay keeps AA's row. BB's card must not inherit
+        // AA's tier (which would drag a high case below the member surface) or
+        // AA's calibration flag.
+        let state = CaseProjectionState {
+            cases: parse_cases(
+                r#"{"cases":[{"id":"x","effective_tier":"low","calibration_sample":true,"created_by":"aa"}]}"#,
+            ),
+            loaded: true,
+            ..Default::default()
+        };
+        assert_eq!(effective_tier_in(&state, "AA", "x"), Some("low"));
+        assert!(is_calibration_sample_in(&state, "AA", "x"));
+        assert_eq!(effective_tier_in(&state, "bb", "x"), None);
+        assert!(!is_calibration_sample_in(&state, "bb", "x"));
+    }
+
+    #[test]
+    fn a_row_without_created_by_answers_for_nobody() {
+        let state = CaseProjectionState {
+            cases: parse_cases(
+                r#"{"cases":[{"id":"x","effective_tier":"low","calibration_sample":true}]}"#,
+            ),
+            loaded: true,
+            ..Default::default()
+        };
+        assert_eq!(effective_tier_in(&state, "aa", "x"), None);
+        assert!(!is_calibration_sample_in(&state, "aa", "x"));
     }
 }
