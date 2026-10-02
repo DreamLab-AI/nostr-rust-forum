@@ -1,0 +1,97 @@
+{
+  "auth_api": "https://dreamlab-auth-api.solitary-paper-764d.workers.dev",
+  "finished_at": "2026-10-02T13:19:07Z",
+  "passed": false,
+  "probe_agent": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+  "probe_case": "m4-probe-20261002t131900z",
+  "probe_panel": "31400:2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9:adr-2011-m4-probe",
+  "relay": "wss://dreamlab-nostr-relay.solitary-paper-764d.workers.dev",
+  "run_id": "20261002t131900z",
+  "started_at": "2026-10-02T13:19:00Z",
+  "suite": "ADR-2011 M4 probe suite (PRD-augmentation-conditions M4)",
+  "tool": "nostr-bbs-governance-probe 1.0.0-beta.12",
+  "verdicts": [
+    {
+      "event_ids": [],
+      "id": "P01",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [],
+      "id": "P02",
+      "verdict": {
+        "verdict": "fail",
+        "why": "a non-admin agent read reviewer telemetry"
+      }
+    },
+    {
+      "event_ids": [],
+      "id": "P03",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "4373f574362e61dbecef47f283439029a8ddc52d73dedaf14614b1825a48b3c4"
+      ],
+      "id": "P04",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "0ec931ede3e196bfb4d93e7cb44c3e501d4516bebed5ebcd5f31d7763ca73107"
+      ],
+      "id": "P05",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "0ec931ede3e196bfb4d93e7cb44c3e501d4516bebed5ebcd5f31d7763ca73107"
+      ],
+      "id": "P06",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "0ec931ede3e196bfb4d93e7cb44c3e501d4516bebed5ebcd5f31d7763ca73107"
+      ],
+      "id": "P07",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [],
+      "id": "P08",
+      "verdict": {
+        "verdict": "not-run",
+        "why": "signer holds admin (P02 answered 200); refusing to sign a decision"
+      }
+    },
+    {
+      "event_ids": [],
+      "id": "P09",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "11812da551b41e256c420bed7ac426b6bb406c37ca94cda3484490cbecba151c"
+      ],
+      "id": "P10",
+      "verdict": {
+        "verdict": "pass"
+      }
+    }
+  ]
+}

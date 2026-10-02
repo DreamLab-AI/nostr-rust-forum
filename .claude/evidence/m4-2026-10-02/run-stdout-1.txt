@@ -1,0 +1,13 @@
+M4 probe run 20261002t131900z as agent 2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9 against wss://dreamlab-nostr-relay.solitary-paper-764d.workers.dev / https://dreamlab-auth-api.solitary-paper-764d.workers.dev
+P01 NIP-11 advertises the escalation default: PASS
+P02 reviewers route deployed and admin-gated: FAIL — a non-admin agent read reviewer telemetry
+P03 application-receipt route deployed with the stage ladder: PASS
+relay session open (NIP-42 authenticated: true)
+P04 probe panel published: PASS
+P05 probe request published: PASS
+P06 effective tier stamped by the operator's triple: PASS
+P07 probe tag withheld from the tag index: PASS
+P08 agent cannot resolve a high case: NOT RUN — signer holds admin (P02 answered 200); refusing to sign a decision
+P09 refused response changed nothing: PASS
+P10 probe request withdrawn: PASS
+M4 NOT PASSED — receipts in .claude/evidence/m4-2026-10-02/run-20261002t131900z

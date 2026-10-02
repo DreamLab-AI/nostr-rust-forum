@@ -7,6 +7,30 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### ADR-2011 live; the forum UI's decisions now project — 2026-10-02
+
+- **ADR-2011 is `live`.** New `nostr-bbs-governance-probe` (not published): the
+  PRD-augmentation-conditions M4 probe suite. Eleven probes drive the live
+  relay and auth API as a registered agent, never the owner, on a panel of
+  their own, and write one receipt per probe. Run `20261002t132144z` passed
+  11/11 against the deployed kit `49904f4`, including the stored effective tier
+  (`high` over a declared `low`), the probe withheld from the projection and
+  the tag index, `rationale_required` before storage, and the projection
+  refusing a `system:` decider (receipt `projection-failed`). An earlier run
+  that did not pass is kept. Receipts: `.claude/evidence/m4-2026-10-02/`.
+- **Fixed: a 31403 from the forum UI never reached `broker_decisions`.** The
+  relay correlated a response only by an `e` tag marked `request`, which no
+  producer emits, so every UI decision came back `Uncorrelated` while the
+  relay's OK said "accepted". It now falls back to the unmarked `e` tag; the
+  projection still requires that id to be the case's own request
+  (ADR-2010). Needs a kit-pin to reach the edge.
+- The decision card adopts the relay's stored `broker_cases.effective_tier`
+  where the case projection carries one (PRD FR3.2), so rules only the relay
+  applies (the ADR-2013 ontology floor) reach the card.
+- Found and recorded, not changed: the agent that raises dream-machine cases
+  holds the admin flag, so it could decide its own case under ADR-2011's
+  human test. Owner action, see ADR-2011's activation section.
+
 ### Changed — did:nostr parity model tracks nostrcg/did-nostr#145, 2026-10-01
 
 - `nostr-bbs-core::did` now decodes Multikeys: `parse_multibase_schnorr`

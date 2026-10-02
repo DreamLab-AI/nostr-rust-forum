@@ -1,0 +1,108 @@
+{
+  "auth_api": "https://dreamlab-auth-api.solitary-paper-764d.workers.dev",
+  "finished_at": "2026-10-02T13:21:56Z",
+  "passed": true,
+  "probe_agent": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+  "probe_case": "m4-probe-20261002t132144z",
+  "probe_panel": "31400:2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9:adr-2011-m4-probe",
+  "relay": "wss://dreamlab-nostr-relay.solitary-paper-764d.workers.dev",
+  "run_id": "20261002t132144z",
+  "started_at": "2026-10-02T13:21:44Z",
+  "suite": "ADR-2011 M4 probe suite (PRD-augmentation-conditions M4)",
+  "tool": "nostr-bbs-governance-probe 1.0.0-beta.12",
+  "verdicts": [
+    {
+      "event_ids": [],
+      "id": "P01",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [],
+      "id": "P02",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [],
+      "id": "P03",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "1a353e9845f32daaece94eb14400ee7cd85fc1e0262a47cdffbdc01312f11528"
+      ],
+      "id": "P04",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9"
+      ],
+      "id": "P05",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9"
+      ],
+      "id": "P06",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9"
+      ],
+      "id": "P07",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "055db1df060993fa38a37eb33ba18aac35d9a3a16eac0b7237ff5c5d500a8801"
+      ],
+      "id": "P08",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "b46238b26fd409bc8f6aeba4cfbea437f617015318908d07d8bfb62989291d2b"
+      ],
+      "id": "P09",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "b46238b26fd409bc8f6aeba4cfbea437f617015318908d07d8bfb62989291d2b"
+      ],
+      "id": "P10",
+      "verdict": {
+        "verdict": "pass"
+      }
+    },
+    {
+      "event_ids": [
+        "76a3fd33e6128cc930de7695cd7fdcf851994fd5f2f09ee193f5229e39fe3d56"
+      ],
+      "id": "P11",
+      "verdict": {
+        "verdict": "pass"
+      }
+    }
+  ]
+}

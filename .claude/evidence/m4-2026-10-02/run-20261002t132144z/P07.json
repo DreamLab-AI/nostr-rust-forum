@@ -1,0 +1,41 @@
+{
+  "id": "P07",
+  "title": "probe tag withheld from the tag index",
+  "clause": "ADR-2011 §6",
+  "at": "2026-10-02T13:21:50Z",
+  "request": {
+    "req_control": {
+      "#d": [
+        "m4-probe-20261002t132144z"
+      ],
+      "authors": [
+        "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9"
+      ],
+      "kinds": [
+        31402
+      ],
+      "limit": 10
+    },
+    "req_probe": {
+      "#probe": [
+        "03f79a0dcd3df7f80975ddbf2a258919eed19a46824e7edfc7a690fe853bc824"
+      ],
+      "kinds": [
+        31402
+      ],
+      "limit": 10
+    }
+  },
+  "response": {
+    "control_matches": [
+      "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9"
+    ],
+    "probe_matches": []
+  },
+  "event_ids": [
+    "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9"
+  ],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

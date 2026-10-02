@@ -1,0 +1,25 @@
+{
+  "id": "P03",
+  "title": "application-receipt route deployed with the stage ladder",
+  "clause": "ADR-2011 §5 / FR4.1",
+  "at": "2026-10-02T13:21:47Z",
+  "request": {
+    "auth": "NIP-98 (agent)",
+    "body": {
+      "acknowledgement": "ADR-2011 M4 probe",
+      "stage": "m4-probe-not-a-stage"
+    },
+    "method": "POST",
+    "url": "https://dreamlab-auth-api.solitary-paper-764d.workers.dev/api/governance/receipts/0000000000000000000000000000000000000000000000000000000000000000/application"
+  },
+  "response": {
+    "body": {
+      "error": "stage must be one of consumer-received, applied, not-applied, applied-manually"
+    },
+    "status": 400
+  },
+  "event_ids": [],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

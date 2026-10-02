@@ -1,0 +1,60 @@
+{
+  "id": "P04",
+  "title": "probe panel published",
+  "clause": "ADR-2011 §1 / §6",
+  "at": "2026-10-02T13:21:49Z",
+  "request": {
+    "event": {
+      "content": "{\"title\":\"M4 PROBE · ADR-2011 escalation boundary\",\"description\":\"Automated ADR-2011 M4 probe panel. Every case here is a probe that verifies the relay's escalation boundary; none is a real decision. Cases are withdrawn by the suite when it finishes.\",\"version\":\"1.0.0\",\"schema\":\"action-inbox\",\"fields\":[],\"actions\":[],\"layout\":\"inbox-table\",\"capabilities\":[\"filter\"],\"refresh_secs\":300,\"task_properties\":{\"verifiability\":\"inspectable\",\"reversibility\":\"irreversible\",\"stakes\":\"significant\"},\"calibration_sample_rate\":null,\"max_pending_hours\":24,\"probe_agent\":\"2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9\"}",
+      "created_at": 1790947309,
+      "id": "1a353e9845f32daaece94eb14400ee7cd85fc1e0262a47cdffbdc01312f11528",
+      "kind": 31400,
+      "pubkey": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+      "sig": "94267c5b059b8717579dcf3ec95b15411d94398516ab78aafc810623b9dbf66f56e84e41fcaa800dc50c402cdcd20656b6ad05fb15e448d84daf6fe90762633c",
+      "tags": [
+        [
+          "d",
+          "adr-2011-m4-probe"
+        ],
+        [
+          "tp-verifiability",
+          "inspectable"
+        ],
+        [
+          "tp-reversibility",
+          "irreversible"
+        ],
+        [
+          "tp-stakes",
+          "significant"
+        ],
+        [
+          "calibration-sample-rate",
+          "0.1"
+        ],
+        [
+          "max-pending-hours",
+          "24"
+        ],
+        [
+          "probe-agent",
+          "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9"
+        ],
+        [
+          "t",
+          "adr-2011-m4-probe"
+        ]
+      ]
+    }
+  },
+  "response": {
+    "message": "",
+    "ok": true
+  },
+  "event_ids": [
+    "1a353e9845f32daaece94eb14400ee7cd85fc1e0262a47cdffbdc01312f11528"
+  ],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

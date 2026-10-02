@@ -4,10 +4,10 @@ title: Track governance decisions through durable projection and application rec
 date: 2026-09-04
 decision_status: proposed
 implementation_status: partial
-activation_status: inactive
+activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: f18b471e499b029d93cb14152edb6fb966abd274
+verified_commit: a5b809e
 owner: nostr-rust-forum maintainers (DreamLab AI)
 review_trigger: adoption of the receipt contract or changes to projection, retention, authority consumers or signing UI
 repo: nostr-rust-forum
@@ -147,3 +147,25 @@ The working-tree relay now rejects a missing request case and unknown persisted 
 Still incomplete: operation payload binding to the originating signed request, cross-repo authority-consumer/mutation-owner receipt agreement, and live D1/restart/external application evidence. Supersession/appeal projection paths remain separate and are not certified by the ordinary-response transaction tests. A relay projection is not an external applied-operation receipt. Proposed/partial/inactive remains appropriate.
 
 Evidence: [federation execution receipt](../../../VisionFlow/docs/estate-review/closeout/2026-09-07-execution-federation.md).
+
+## Live signed journey and acceptance criterion — 2026-10-02
+
+**The relay half is on the edge and was driven signed.** The forum kit deployed today (`49904f4`) carries the receipt store. The ADR-2011 M4 probe suite signed a 31402 and two 31403s against the live relay as a registered agent ([ADR-2011](ADR-2011-operator-task-properties-set-the-escalation-boundary.md), `.claude/evidence/EXP-AC-M4.live.evidence.md`). One 31403 was refused before storage (`rationale_required`). The other, `b46238b26fd409bc8f6aeba4cfbea437f617015318908d07d8bfb62989291d2b`, was stored and its projection refused. The relay's own receipt read back as `stage: projection-failed`, `applied: false`, with the refusal in `stageError` — a failed write recorded as distinct from an applied one, on the edge. That closes the 2026-09-05 gap "a signed governance journey was not driven" for the refusal path, not for the commit path. Hence `activation_status: staged`: the relay half runs live, but the contract this record proposes, which spans consumers, is not adopted.
+
+**A defect that would have hidden the owner's decision, fixed in `a5b809e`.** `receipts::correlate` read the request id only from an `e` tag marked `request`. Every 31403 producer in the estate signs an unmarked `["e", <request id>]`; the dream engine and the client's decision chain both bind to the unmarked tag. Every decision taken in the forum UI therefore came back `Uncorrelated`: no receipt, no `broker_decisions` row, case still open, while the relay's OK said "accepted". The live table held three receipts, none of them a per-case UI decision. `correlate` now falls back to the first unmarked `e` tag. The projection SQL still requires that id to equal the case's `nostr_event_id`, so a wrong tag cannot commit. **The fix is not on the edge until the website's kit pin moves past `a5b809e`.** Until then the owner's decision would be stored but never projected.
+
+**What closes this record (moves `decision_status` to `accepted`).** Both of:
+
+1. A kind-31403 signed by the owner's pubkey on a case whose `broker_cases.effective_tier` is `high` or `critical`, with a `reasoning` the owner typed (at least 20 Unicode scalars after trimming, no template).
+2. That event's `governance_receipts` row at `projection-committed`, with `requestEventId` equal to the case's `nostr_event_id` and a `decisionId`, plus the matching `broker_decisions` row (`GET /api/governance/decisions?case_id=<case>`).
+
+The event id, the case id, both reads and the commit the edge ran are recorded in a new section here and in ADR-2011's activation section. An application receipt from the mutation owner (`consumer-received` → `applied` / `not-applied`, or FR7's `applied-manually`) is not required to accept the decision. It is what moves `implementation_status` towards `complete`.
+
+**Owner procedure — the one live high-tier 31403.**
+
+0. *Prerequisites (not the owner's typing).* (a) The edge runs a kit at or after `a5b809e` (website kit-pin bump, then "Deploy Cloudflare Workers"). (b) A **real** high-tier case exists. None does today: the only `high` cases are the two M4 probe cases, which must not be used. Every other open case is a dream-machine `low`/`medium` case or predates migration 0006. A real one is raised by an agent declaring a genuinely irreversible or critical task, e.g. agentbox `governance_request_action` with `action_class` of a `zero-tolerance` class or `task_properties.reversibility: irreversible`. A live candidate is the outstanding release decision "Publish solid-pod-rs 1.0.0-beta.1 and yank legacy alphas" (case `agentbox-release-ops`, raised before 0006 and so untiered; crates.io still tops out at `0.5.0-alpha.10`). A crates.io publish cannot be undone. Confirm with `nostr-bbs-governance-probe --auth-api https://dreamlab-auth-api.solitary-paper-764d.workers.dev --list-cases`, which must show the case at `high`.
+1. Sign in with the owner key and open `https://dreamlab-ai.com/community/governance/admin`.
+2. Open the card whose tier reads **High**. The proposal is at the top; the agent's declared tier and confidence sit below the controls. Read the proposal, not the agent's framing.
+3. In the box labelled "Why you are deciding this, in your own words." type your own reasons: what you checked and why you decide as you do, at least 20 characters. Do not paste the agent's text or a template. Then press **Approve**, **Reject** or **Amend**. The relay refuses an empty or shorter rationale with `rationale_required`.
+4. *Recording.* Any admin signer reads `https://dreamlab-nostr-relay.solitary-paper-764d.workers.dev/api/governance/receipts?case=<case id>`, e.g. `nostr-bbs-governance-probe --get '<that URL>'`. The row with `kind: 31403`, the owner's `signerPubkey` and `stage: projection-committed` carries the `eventId`. Record it here, in ADR-2011, and as exit item 4 of the cycle (`dreamlab-cumbria/docs/planning/audit-2026-09-21/evidence/J3-vision-coherence.md`).
+

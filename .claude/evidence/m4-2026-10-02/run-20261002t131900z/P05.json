@@ -1,0 +1,72 @@
+{
+  "id": "P05",
+  "title": "probe request published",
+  "clause": "ADR-2011 §1",
+  "at": "2026-10-02T13:19:05Z",
+  "request": {
+    "event": {
+      "content": "{\"fields\":{\"note\":\"Automated ADR-2011 M4 probe. Not a real decision; do not act on it.\",\"probe_run\":\"20261002t131900z\"},\"reasoning\":\"M4 probe: declares risk tier low on a panel whose operator declared the task irreversible. The relay must stamp effective tier high and refuse any non-human resolution.\",\"context_url\":null,\"risk_tier\":\"low\",\"confidence\":null,\"task_properties\":null,\"probe\":null}",
+      "created_at": 1790947145,
+      "id": "0ec931ede3e196bfb4d93e7cb44c3e501d4516bebed5ebcd5f31d7763ca73107",
+      "kind": 31402,
+      "pubkey": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+      "sig": "e194efb5b0be9d6703fba877c47b6c9a045b61198ee0c51aadb657e9f1c720408a38e43ed159b174159cb9786b923d3c6b98a27dce095ed54fc625917fd3e962",
+      "tags": [
+        [
+          "d",
+          "m4-probe-20261002t131900z"
+        ],
+        [
+          "a",
+          "31400:2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9:adr-2011-m4-probe"
+        ],
+        [
+          "panel",
+          "adr-2011-m4-probe"
+        ],
+        [
+          "priority",
+          "low"
+        ],
+        [
+          "risk-tier",
+          "low"
+        ],
+        [
+          "category",
+          "workflow_review"
+        ],
+        [
+          "subject-kind",
+          "m4-probe"
+        ],
+        [
+          "subject-id",
+          "20261002t131900z"
+        ],
+        [
+          "title",
+          "M4 PROBE · boundary probe 20261002t131900z · not a real decision"
+        ],
+        [
+          "t",
+          "adr-2011-m4-probe"
+        ],
+        [
+          "probe",
+          "17f288bc122a8d8471d487a31fa1c63b5898a9303ca74387c974549f638f15c2"
+        ]
+      ]
+    }
+  },
+  "response": {
+    "message": "",
+    "ok": true
+  },
+  "event_ids": [
+    "0ec931ede3e196bfb4d93e7cb44c3e501d4516bebed5ebcd5f31d7763ca73107"
+  ],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

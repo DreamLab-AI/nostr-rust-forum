@@ -1,0 +1,47 @@
+{
+  "id": "P10",
+  "title": "neither response changed the case",
+  "clause": "ADR-2011 §4",
+  "at": "2026-10-02T13:21:54Z",
+  "request": {
+    "auth": "NIP-98 (probe agent)",
+    "method": "GET",
+    "url": "https://dreamlab-auth-api.solitary-paper-764d.workers.dev/api/governance/cases/m4-probe-20261002t132144z"
+  },
+  "response": {
+    "body": {
+      "case": {
+        "assigned_to": null,
+        "calibration_sample": false,
+        "category": "workflow_review",
+        "created_at": 1790947309.0,
+        "created_by": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+        "declared_tier": "low",
+        "effective_tier": "high",
+        "id": "m4-probe-20261002t132144z",
+        "max_pending_hours": 24.0,
+        "nostr_event_id": "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9",
+        "priority": 50.0,
+        "probe": null,
+        "state": "open",
+        "subject_id": "20261002t132144z",
+        "subject_kind": "m4-probe",
+        "summary": "{\"fields\":{\"note\":\"Automated ADR-2011 M4 probe. Not a real decision; do not act on it.\",\"probe_run\":\"20261002t132144z\"},\"reasoning\":\"M4 probe: declares risk tier low on a panel whose operator declared the task irreversible. The relay must stamp effective tier high and refuse any non-human resolution.\",\"context_url\":null,\"risk_tier\":\"low\",\"confidence\":null,\"task_properties\":null,\"probe\":null}",
+        "task_properties": {
+          "reversibility": "irreversible",
+          "stakes": "significant",
+          "verifiability": "inspectable"
+        },
+        "title": "M4 PROBE · boundary probe 20261002t132144z · not a real decision",
+        "updated_at": 1790947309.0
+      }
+    },
+    "status": 200
+  },
+  "event_ids": [
+    "b46238b26fd409bc8f6aeba4cfbea437f617015318908d07d8bfb62989291d2b"
+  ],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

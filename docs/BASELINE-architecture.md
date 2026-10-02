@@ -208,7 +208,7 @@ See the [forum review](../../VisionFlow/docs/estate-review/forum-decisions.md) f
 
 ## Proposed durable governance receipts — ADR-2010
 
-[ADR-2010](adr/ADR-2010-durable-governance-outcome-receipts.md) proposes distinct signed, relay-accepted, projection-committed, consumer-received and applied/rejected states. Current relay OK establishes acceptance only. The complete receipt contract remains proposed and inactive; adoption requires agreement with the authority consumer and mutation owner, plus failure/restart evidence. Historical ADR-106 supplies rationale, not proof of this contract.
+[ADR-2010](adr/ADR-2010-durable-governance-outcome-receipts.md) proposes distinct signed, relay-accepted, projection-committed, consumer-received and applied/rejected states. Current relay OK establishes acceptance only. The complete receipt contract remains proposed; its relay half is deployed and was observed live on a signed journey on 2026-10-02 (a refused projection recorded as `projection-failed`), so its activation is `staged`. Adoption requires agreement with the authority consumer and mutation owner, plus failure/restart evidence; acceptance waits on the owner's first high-tier 31403 reaching `projection-committed` (procedure in ADR-2010). Historical ADR-106 supplies rationale, not proof of this contract.
 
 ## Operator task properties set the escalation boundary — ADR-2011
 
@@ -216,7 +216,7 @@ See the [forum review](../../VisionFlow/docs/estate-review/forum-decisions.md) f
 
 The ADR-2010 receipt ladder extends past `projection-committed` with the application stages `consumer-received`, `applied`, `not-applied` and `applied-manually`, plus `escalated-on-age` and `expired` as side receipts; `ReceiptStage` moved into `nostr-bbs-core` because the auth worker's receipts endpoint and the relay's projection must agree on the ladder and share no other code. The auth worker gains `POST /api/governance/receipts/{id}/application` (the mutation owner reports what happened; admin-only for `applied-manually`, and only on a case already decided `Approve`) and `GET /api/governance/reviewers` (per-reviewer decisions, time-to-decision, override rate, calibration and probe columns). A relay cron emits one `escalated-on-age` receipt per case past its panel's `max_pending_hours`.
 
-Implementation is **partial and inactive**: probe blindness holds in the tag index and the D1 projection but not on the raw signed 31402 served over REQ, where stripping the tag would break the signature clients verify. Nothing is deployed and `nostr-bbs-core` 1.0.0-beta.11 is unpublished.
+Implementation is **partial and live**: probe blindness holds in the tag index and the D1 projection but not on the raw signed 31402 served over REQ, where stripping the tag would break the signature clients verify. `nostr-bbs-core` is published (`1.0.0-beta.11` 2026-09-15, `1.0.0-beta.12` 2026-10-01); the edge runs kit `49904f4`, and the M4 probe suite (`crates/nostr-bbs-governance-probe`) passed 11/11 against it on 2026-10-02. The boundary is only as strong as the admin list: the agent that raises dream-machine cases holds the admin flag (ADR-2011, activation section).
 
 ## Member wallets on sidestr:dreamlab and DREAM tips — ADR-2015
 

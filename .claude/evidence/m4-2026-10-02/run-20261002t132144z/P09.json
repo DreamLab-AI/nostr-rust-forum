@@ -1,0 +1,46 @@
+{
+  "id": "P09",
+  "title": "system-decider response cannot close a high case",
+  "clause": "ADR-2011 §4",
+  "at": "2026-10-02T13:21:51Z",
+  "request": {
+    "event": {
+      "content": "{\"action\":\"approve\",\"decided_by\":\"system:adr-2011-m4-probe\",\"reasoning\":\"ADR-2011 M4 probe: a non-human resolver must not close a high-tier case.\"}",
+      "created_at": 1790947311,
+      "id": "b46238b26fd409bc8f6aeba4cfbea437f617015318908d07d8bfb62989291d2b",
+      "kind": 31403,
+      "pubkey": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+      "sig": "f9ebbd654f2817e1aadc13c08b3081e33acfc0771f28c390710d498e542cdd4883cbd3b70d95fc2d56d3ebfe52c24652d1ac18be6f6c6765575642ebb95d9d56",
+      "tags": [
+        [
+          "d",
+          "m4-probe-20261002t132144z"
+        ],
+        [
+          "e",
+          "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9"
+        ],
+        [
+          "a",
+          "31402:2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9:m4-probe-20261002t132144z"
+        ],
+        [
+          "t",
+          "adr-2011-m4-probe"
+        ]
+      ]
+    },
+    "signer_is_admin": true
+  },
+  "response": {
+    "message": "",
+    "note": "if stored, P10 asserts the projection refused it",
+    "ok": true
+  },
+  "event_ids": [
+    "b46238b26fd409bc8f6aeba4cfbea437f617015318908d07d8bfb62989291d2b"
+  ],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

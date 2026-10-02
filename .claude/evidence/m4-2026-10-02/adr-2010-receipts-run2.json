@@ -1,0 +1,32 @@
+{
+  "body": {
+    "limit": 50,
+    "offset": 0,
+    "receipts": [
+      {
+        "acceptedAt": 1790947311,
+        "acknowledgement": null,
+        "applied": false,
+        "appliedAt": null,
+        "appliedBy": null,
+        "awaitsProjection": true,
+        "caseId": "m4-probe-20261002t132144z",
+        "decisionId": null,
+        "decisionOutcome": "approve",
+        "eventId": "b46238b26fd409bc8f6aeba4cfbea437f617015318908d07d8bfb62989291d2b",
+        "isApplicationStage": false,
+        "kind": 31403,
+        "projectedAt": null,
+        "replays": 0,
+        "requestEventId": null,
+        "signedAt": 1790947311,
+        "signerPubkey": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+        "stage": "projection-failed",
+        "stageError": "ShareTransitionRejected(\"effective tier high requires a human 31403; System(\\\"system:adr-2011-m4-probe\\\") may not resolve it\")",
+        "supersedesEventId": null,
+        "targetOperation": null
+      }
+    ]
+  },
+  "status": 200
+}

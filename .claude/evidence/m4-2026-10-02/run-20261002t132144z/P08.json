@@ -1,0 +1,45 @@
+{
+  "id": "P08",
+  "title": "rationale-less response refused before storage",
+  "clause": "ADR-2011 §4 / FR2.2",
+  "at": "2026-10-02T13:21:50Z",
+  "request": {
+    "event": {
+      "content": "{\"action\":\"approve\",\"decided_by\":\"system:adr-2011-m4-probe\",\"reasoning\":\"\"}",
+      "created_at": 1790947310,
+      "id": "055db1df060993fa38a37eb33ba18aac35d9a3a16eac0b7237ff5c5d500a8801",
+      "kind": 31403,
+      "pubkey": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+      "sig": "eb71fcaab2ffd003792927d97d6c86a24b205b6ff2406bc0120cce194ce302dd8c926f561932df1449a120708fbbb66bf54ded14c79ff5cce5bb003a853d9e4a",
+      "tags": [
+        [
+          "d",
+          "m4-probe-20261002t132144z"
+        ],
+        [
+          "e",
+          "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9"
+        ],
+        [
+          "a",
+          "31402:2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9:m4-probe-20261002t132144z"
+        ],
+        [
+          "t",
+          "adr-2011-m4-probe"
+        ]
+      ]
+    },
+    "signer_is_admin": true
+  },
+  "response": {
+    "message": "rationale_required",
+    "ok": false
+  },
+  "event_ids": [
+    "055db1df060993fa38a37eb33ba18aac35d9a3a16eac0b7237ff5c5d500a8801"
+  ],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": "P08",
+  "title": "agent cannot resolve a high case",
+  "clause": "ADR-2011 §4",
+  "at": "2026-10-02T13:19:06Z",
+  "request": null,
+  "response": null,
+  "event_ids": [],
+  "verdict": {
+    "verdict": "not-run",
+    "why": "signer holds admin (P02 answered 200); refusing to sign a decision"
+  }
+}

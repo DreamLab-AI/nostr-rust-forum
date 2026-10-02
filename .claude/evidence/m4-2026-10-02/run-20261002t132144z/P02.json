@@ -1,0 +1,49 @@
+{
+  "id": "P02",
+  "title": "reviewers route deployed and gated",
+  "clause": "ADR-2011 FR6.1",
+  "at": "2026-10-02T13:21:46Z",
+  "request": {
+    "signed": {
+      "auth": "NIP-98 (probe agent)",
+      "method": "GET",
+      "url": "https://dreamlab-auth-api.solitary-paper-764d.workers.dev/api/governance/reviewers"
+    },
+    "unsigned": {
+      "method": "GET",
+      "url": "https://dreamlab-auth-api.solitary-paper-764d.workers.dev/api/governance/reviewers"
+    }
+  },
+  "response": {
+    "signed": {
+      "body": {
+        "decisions_considered": 1,
+        "reviewers": [
+          {
+            "calibration_decided": 0,
+            "calibration_shown": 0,
+            "decisions": 1,
+            "median_ttd_ms": 176133000,
+            "override_rate": 0.0,
+            "p90_ttd_ms": 176133000,
+            "probes_caught": 0,
+            "probes_seen": 0,
+            "pubkey": "b41654017f6850b13857d19d8ae0e3f88f1365600cab0321e8101c9e92682f7a",
+            "superseded": 0
+          }
+        ]
+      },
+      "status": 200
+    },
+    "unsigned": {
+      "body": {
+        "error": "NIP-98 authentication required"
+      },
+      "status": 401
+    }
+  },
+  "event_ids": [],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

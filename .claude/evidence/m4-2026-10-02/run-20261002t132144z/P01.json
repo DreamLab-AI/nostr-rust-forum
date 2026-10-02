@@ -1,0 +1,154 @@
+{
+  "id": "P01",
+  "title": "NIP-11 advertises the escalation default",
+  "clause": "ADR-2011 §3",
+  "at": "2026-10-02T13:21:44Z",
+  "request": {
+    "accept": "application/nostr+json",
+    "method": "GET",
+    "url": "https://dreamlab-nostr-relay.solitary-paper-764d.workers.dev"
+  },
+  "response": {
+    "body": {
+      "contact": "",
+      "description": "Private whitelist-only Nostr relay (nostr-bbs).",
+      "limitation": {
+        "auth_required": true,
+        "max_content_length": 65536,
+        "max_event_tags": 2000,
+        "max_filters": 10,
+        "max_limit": 1000,
+        "max_message_length": 65536,
+        "max_subid_length": 64,
+        "max_subscriptions": 20,
+        "payment_required": false,
+        "restricted_writes": true
+      },
+      "name": "DreamLab Nostr Relay",
+      "nostr_bbs": {
+        "agent_control_surface": {
+          "action_request_kind": 31402,
+          "action_response_kind": 31403,
+          "agent_auth": "nip98",
+          "agent_identity": "did:nostr",
+          "enabled": true,
+          "panel_definition_kind": 31400,
+          "panel_retired_kind": 31405,
+          "panel_state_kind": 31401,
+          "panel_update_kind": 31404,
+          "registry_gated": true
+        },
+        "escalation_defaults": {
+          "autonomous_below_default": true,
+          "default_escalation_tier": "medium",
+          "default_posture": "escalate_to_human",
+          "note": "Forum-side reflection of the agent authority-boundary default. The authoritative escalation-default schema is owned by agentbox (REC-6); until it lands this projects the shipped forum default (escalate at or above the default tier; only 'low' acts autonomously). When REC-6 promotes this to a governance event kind it is gated identically to kinds 31400-31405 via the agent_registry.",
+          "registry_gated": true,
+          "risk_tiers": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "schema_owner": "agentbox:REC-6",
+          "status": "scaffolded"
+        },
+        "write_policy": {
+          "auth_method": "nip42",
+          "mode": "nip42",
+          "model": "nip42+allowlist",
+          "nip42_challenge_sent": true,
+          "nip42_required_for_write": true,
+          "protected_read_kinds": [
+            4,
+            13,
+            14,
+            1059,
+            30910,
+            30911,
+            30912,
+            30913,
+            30914,
+            30915,
+            30916
+          ],
+          "rejection_message": "auth-required: NIP-42 AUTH required to publish"
+        }
+      },
+      "pubkey": "",
+      "retention": [
+        {
+          "kinds": [
+            0
+          ],
+          "time": null
+        },
+        {
+          "kinds": [
+            3
+          ],
+          "time": null
+        },
+        {
+          "kinds": [
+            1
+          ],
+          "time": 7776000
+        },
+        {
+          "kinds": [
+            7
+          ],
+          "time": 2592000
+        },
+        {
+          "kinds": [
+            9024
+          ],
+          "time": 86400
+        },
+        {
+          "kinds": [
+            [
+              10000,
+              19999
+            ]
+          ],
+          "time": null
+        },
+        {
+          "kinds": [
+            [
+              30000,
+              39999
+            ]
+          ],
+          "time": null
+        }
+      ],
+      "software": "https://github.com/DreamLab-AI/nostr-rust-forum",
+      "supported_nips": [
+        1,
+        9,
+        11,
+        16,
+        29,
+        33,
+        40,
+        42,
+        45,
+        50,
+        56,
+        59,
+        65,
+        98
+      ],
+      "version": "1.0.0-beta.10"
+    },
+    "status": 200
+  },
+  "event_ids": [],
+  "verdict": {
+    "verdict": "pass"
+  }
+}

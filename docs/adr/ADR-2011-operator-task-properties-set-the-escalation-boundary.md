@@ -4,12 +4,12 @@ title: Operator-declared task properties set the escalation boundary, not the re
 date: 2026-09-14
 decision_status: accepted
 implementation_status: partial
-activation_status: inactive
+activation_status: live
 supersedes: []
 superseded_by: []
-verified_commit: 81aa0d9
+verified_commit: 98b99a4
 owner: jjohare
-review_trigger: nostr-bbs-core publishing TaskProperties to crates.io, or a probe-blindness scheme that survives raw-event inspection
+review_trigger: a probe-blindness scheme that survives raw-event inspection, a change to who holds the admin flag (an admin-flagged requesting agent can decide its own case), or a failing run of the M4 probe suite
 repo: nostr-rust-forum
 ---
 
@@ -175,4 +175,27 @@ Client half, recorded in `.claude/evidence/EXP-AC-002.client.evidence.md`,
   Remaining findings and why they are open are triaged in
   `.claude/evidence/EXP-AC-002.client.evidence.md`.
 
-`activation_status` stays `inactive`: nothing here has been deployed and `nostr-bbs-core` 1.0.0-beta.11 has not been published. It moves to `staged` on publication and to `live` on edge deploy with the probe suite run (PRD milestone M4).
+`activation_status` was `inactive` at `81aa0d9`: nothing was deployed and `nostr-bbs-core` 1.0.0-beta.11 was unpublished. The activation rule was `staged` on publication and `live` on edge deploy with the probe suite run (PRD milestone M4). Both conditions are now met; see below.
+
+## Activation — 2026-10-02
+
+**Staged.** `nostr-bbs-core` and `nostr-bbs-mesh` `1.0.0-beta.11` were published to crates.io on 2026-09-15 (20:22Z / 20:23Z) and `1.0.0-beta.12` on 2026-10-01 (12:26Z / 12:27Z), none yanked; both versions' `governance.rs` export `TaskProperties`, `effective_tier` and `ReceiptStage`. This was true from 2026-09-15; the record was not moved then.
+
+**Live.** The edge runs forum kit `49904f4` (dreamlab-ai-website `6ae4576` sets `KIT_REF`; "Deploy Cloudflare Workers" run `37003273172`, 2026-10-02T11:50:58Z, success), and `81aa0d9` is its ancestor. The M4 probe suite — `crates/nostr-bbs-governance-probe`, built for this because none existed — ran against the live relay and auth API, signed by a registered agent and never by the owner:
+
+- Run `20261002t131900z`: **not passed**. P02's verdict assumed a non-admin signer and the signer turned out to be an admin; the runner's guard then refused to sign P08. Kept as the record. The instrument was corrected so no verdict depends on the signer's role — a change made after seeing a result, and said so.
+- Run `20261002t132144z`: **11/11 passed**. The relay stamped `effective_tier: high` over a declared `low` from the probe panel's `irreversible` triple (§1–§3); the probe digest was absent from the case projection and from a `#probe` REQ while a `#d` control matched (§6); a rationale-less 31403 was refused `rationale_required` before storage (FR2.2); a `system:`-decider 31403 with a valid rationale was stored and its projection refused — the relay's own receipt reads `projection-failed`, `effective tier high requires a human 31403` (§4); the case stayed `open`. Request `03afc126…0fd9`, refused responses `055db1df…8801` and `b46238b2…1d2b`, withdrawal `76a3fd33…3d56`.
+
+Receipts: `.claude/evidence/m4-2026-10-02/` (one JSON per probe, summaries, stdout, the read-only pre-probe and the receipts read), read in `.claude/evidence/EXP-AC-M4.live.evidence.md`.
+
+`verified_commit` is `98b99a4`: the tree carrying the suite and the FR3.2 client read below. The live claims were verified against the deployed `49904f4`; `98b99a4` adds no relay or auth-worker change.
+
+**What "live" does not establish.**
+
+- **The requesting agent is an admin.** The probe signer, JunkieJarvis — which raises every dream-machine case — holds the admin flag on the relay and the auth worker. §4 tells a human from a system by the 31403's own `decided_by`, so an admin agent writing 20+ characters of rationale under a `did:nostr` (or no) `decided_by` would pass as the owner. Not exercised live, on purpose: it would mint a decision this ADR accepts as human. Until the flag is dropped or a no-self-resolution rule exists, the boundary is as strong as the admin list. This is the new `review_trigger`.
+- **`CALIBRATION_SELECTION_KEY` presence is unverified** on the edge (a Worker secret; checking it needs Cloudflare credentials). Unset, the relay warns and samples on an unkeyed hash.
+- **No human has yet decided a high-tier case, and on the deployed kit one would not project.** The only high cases on the edge are the two probe cases; real cases are dream-machine `low`/`medium` or pre-0006. Separately, the deployed relay correlated a 31403 only by an `e` tag marked `request`, which no producer emits, so a decision taken in the forum UI was stored but never reached `broker_decisions`; fixed in `a5b809e`, pending a kit-pin. The owner's first high-tier 31403 is the evidence that closes [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md); its procedure and prerequisites are recorded there.
+- **Probe rows persist.** Withdrawal removes the events, not the `broker_cases` rows; the two probe cases stay `open`, identifiable by `created_by` and `subject_kind = m4-probe`.
+- **Probe blindness remains partial** for the reason under Consequences; `implementation_status` stays `partial`.
+
+**FR3.2 client read (`98b99a4`, not yet on the edge).** The decision card computed its tier from the signed events, which misses rules only the relay applies (the ADR-2013 ontology floor). `CaseBoundary::with_relay_tier` now adopts the stored `broker_cases.effective_tier` wherever the authenticated case projection carries one, and keeps the computed tier otherwise; an unrecognised value is ignored rather than parsed to `Medium`. It reaches the edge on the next website kit-pin.

@@ -1,0 +1,48 @@
+{
+  "id": "P11",
+  "title": "probe request withdrawn",
+  "clause": "clean-up",
+  "at": "2026-10-02T13:21:54Z",
+  "request": {
+    "event": {
+      "content": "withdrawn: ADR-2011 M4 probe run 20261002t132144z complete",
+      "created_at": 1790947314,
+      "id": "76a3fd33e6128cc930de7695cd7fdcf851994fd5f2f09ee193f5229e39fe3d56",
+      "kind": 5,
+      "pubkey": "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9",
+      "sig": "3200a4a0c29901166a20c51d4df3323b98f6ed78382dcb5af1c0aa43b822bb43d7777f2c9faa05d34ca00194e4cddd2916d9aeaff0687b23236990f615018829",
+      "tags": [
+        [
+          "e",
+          "03afc126494248c64246188be5b5519a82e7b4fa39c7529eb0b0139fe1640fd9"
+        ],
+        [
+          "e",
+          "b46238b26fd409bc8f6aeba4cfbea437f617015318908d07d8bfb62989291d2b"
+        ],
+        [
+          "a",
+          "31402:2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9:m4-probe-20261002t132144z"
+        ],
+        [
+          "k",
+          "31402"
+        ],
+        [
+          "k",
+          "31403"
+        ]
+      ]
+    }
+  },
+  "response": {
+    "message": "",
+    "ok": true
+  },
+  "event_ids": [
+    "76a3fd33e6128cc930de7695cd7fdcf851994fd5f2f09ee193f5229e39fe3d56"
+  ],
+  "verdict": {
+    "verdict": "pass"
+  }
+}
