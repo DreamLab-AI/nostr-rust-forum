@@ -210,6 +210,7 @@ marketplace = false
 calendar    = true
 dms         = true
 governance  = false
+poker       = false   # poker tables; parameters live in [poker]
 
 
 # ─── NIP-05 resolution ───────────────────────────────────────────────────────
@@ -301,6 +302,19 @@ issuer = ""                                            # set your issuer pubkey 
 # fits your community (rooms, channels, physical spaces, ...).
 [calendar]
 shared_venues = ["primary", "secondary"]
+
+
+# ─── Poker tables ────────────────────────────────────────────────────────────
+# OPTIONAL. Table parameters for the poker UI (shown only when
+# [features] poker = true). Stakes and buy-in are in BIG BLINDS so one table
+# list serves every settlement asset. Projected to the client as the JSON
+# object window.__ENV__.POKER_CONFIG (see `Poker::to_env_json`).
+[poker]
+stakes_bb   = [2, 10, 20, 100, 200]                    # big-blind sizes, lobby order
+buyin_bb    = 100                                      # buy-in in big blinds
+assets      = ["sats", "dream"]                        # settlement assets, lobby order
+bot_profile = "tag"                                    # house-bot style (tight-aggressive)
+# citizen_pubkey = "<64-char lowercase hex>"           # house agent; omit until provisioned
 
 
 # ─── Operator custody tier ───────────────────────────────────────────────────

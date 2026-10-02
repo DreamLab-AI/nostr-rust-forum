@@ -161,6 +161,10 @@ pub struct Preferences {
     /// Whitespace density for lists, cards, and message rows.
     #[serde(default)]
     pub density: Density,
+    /// Show the practice poker table (Settings → Games). Off by default, and
+    /// only offered where the operator and the member wallet both enable it.
+    #[serde(default)]
+    pub poker_table: bool,
 }
 
 /// Visual theme selection.
@@ -293,6 +297,7 @@ impl Default for Preferences {
             show_technical_details: false,
             font_size: FontSize::Medium,
             density: Density::Comfortable,
+            poker_table: false,
         }
     }
 }

@@ -23,7 +23,7 @@ use crate::pages::{
     AdminPage, BoardPage, CategoryPage, ChannelPage, ConnectPage, DmChatPage, DmListPage,
     EventsPage, ForumsPage, GlossaryPage, GovernancePage, HomePage, JoinPage, KnowledgePage,
     LoginPage, MessageJumpPage, NoteViewPage, PodBrowserPage, ProfilePage, SectionPage,
-    SettingsPage, SetupPage, SignupPage, ThreadPage, WalletPage,
+    SettingsPage, SetupPage, SignupPage, TablePage, ThreadPage, WalletPage,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::case_projection::provide_case_projection_store;
@@ -266,6 +266,16 @@ fn pod_icon() -> impl IntoView {
 
 fn wallet_icon() -> impl IntoView {
     crate::components::tip_button::dream_icon("w-4 h-4")
+}
+
+/// Two overlapping playing cards, for the practice poker table.
+fn table_icon() -> impl IntoView {
+    view! {
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="7" width="10" height="14" rx="2" transform="rotate(-12 8 14)"/>
+            <rect x="11" y="3" width="10" height="14" rx="2" transform="rotate(12 16 10)"/>
+        </svg>
+    }
 }
 
 fn settings_icon() -> impl IntoView {
@@ -937,6 +947,9 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/governance/admin") view=AdminGatedGovernance />
                     <Route path=path!("/pod") view=AuthGatedPod />
                     <Route path=path!("/wallet") view=AuthGatedWallet />
+                    // Practice poker table: renders a notice unless POKER, the
+                    // wallet and the member's own preference are all on.
+                    <Route path=path!("/table") view=AuthGatedTable />
                     // Zone URL slugs (issue #45): top-level aliases so a zone
                     // reads as `/<slug>` (e.g. `/welcome`, `/dreamlab`) with no
                     // `/forums` segment. They render the SAME gated views as the
@@ -973,6 +986,9 @@ fn Layout(children: Children) -> impl IntoView {
     let pubkey = auth.pubkey();
     let mobile_open = RwSignal::new(false);
     let bookmarks_open = RwSignal::new(false);
+    // Practice poker table nav item: reactive on the member's preference, so
+    // ticking Settings → Games shows it without a reload.
+    let table_on = crate::poker::use_table_enabled();
     let profile_target_pk = RwSignal::new(String::new());
     let profile_open = RwSignal::new(false);
 
@@ -1150,6 +1166,14 @@ fn Layout(children: Children) -> impl IntoView {
                                     "Wallet"
                                 </A>
                             })}
+                            // Practice poker table: operator flag, wallet, and
+                            // the member's Settings → Games preference.
+                            {move || table_on.get().then(|| view! {
+                                <A href=base_href("/table") attr:class=nav_link_class("/table")>
+                                    {table_icon()}
+                                    "Table"
+                                </A>
+                            })}
                             // About: the marketing landing, reachable in-app
                             // (issue #42). Last among the text items so it
                             // stays low-key.
@@ -1263,6 +1287,12 @@ fn Layout(children: Children) -> impl IntoView {
                                 <A href=base_href("/wallet") attr:class=mobile_link_class("/wallet") on:click=close_mobile>
                                     {wallet_icon()}
                                     "Wallet"
+                                </A>
+                            })}
+                            {move || table_on.get().then(|| view! {
+                                <A href=base_href("/table") attr:class=mobile_link_class("/table") on:click=close_mobile>
+                                    {table_icon()}
+                                    "Table"
                                 </A>
                             })}
                             // About: the marketing landing, reachable in-app
@@ -1511,6 +1541,7 @@ auth_gated!(AuthGatedProfile, ProfilePage);
 auth_gated!(AuthGatedSettings, SettingsPage);
 auth_gated!(AuthGatedPod, PodBrowserPage);
 auth_gated!(AuthGatedWallet, WalletPage);
+auth_gated!(AuthGatedTable, TablePage);
 
 /// Root route (`/`): authed members skip the marketing landing and are
 /// redirected straight to their forums (issue #42 — reduce clicks to entry);

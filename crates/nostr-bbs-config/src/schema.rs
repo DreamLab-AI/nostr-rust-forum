@@ -65,6 +65,9 @@ pub struct ForumConfig {
     /// Shared calendar / venue configuration (NIP-52 events).
     #[serde(default)]
     pub calendar: Calendar,
+    /// Poker table configuration (stakes, buy-in, assets, house bot).
+    #[serde(default)]
+    pub poker: Poker,
     /// Zone end-to-end encryption master gate (ADR-2016).
     #[serde(default)]
     pub encryption: Encryption,
@@ -334,6 +337,10 @@ pub struct Features {
     /// the governance route is hidden even if [`Governance::enabled`] is set.
     #[serde(default)]
     pub governance: bool,
+    /// Poker table UI. When `false` the poker route is hidden; the table
+    /// parameters themselves live in [`Poker`].
+    #[serde(default)]
+    pub poker: bool,
 }
 
 /// Operator custody tier (per ADR-079 §4).
@@ -662,4 +669,286 @@ impl Default for Calendar {
 
 fn default_shared_venues() -> Vec<String> {
     vec!["primary".into(), "secondary".into()]
+}
+
+/// `[poker]` — poker table parameters.
+///
+/// Stakes and the buy-in are expressed in **big blinds** so a single table
+/// definition works across every settlement asset. The UI is gated separately
+/// by [`Features::poker`]; this section only describes the tables offered.
+/// Projected to the forum client as the JSON object produced by
+/// [`to_env_json`](Self::to_env_json) (`window.__ENV__.POKER_CONFIG`).
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_config::schema::Poker;
+///
+/// let poker = Poker::default();
+/// assert_eq!(poker.buyin_bb, 100);
+/// assert_eq!(
+///     poker.to_env_json(),
+///     r#"{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null}"#,
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Poker {
+    /// Big-blind sizes (in the asset's smallest unit) of the tables offered,
+    /// in the order the lobby lists them. Defaults to `[2, 10, 20, 100, 200]`.
+    #[serde(default = "default_poker_stakes_bb")]
+    pub stakes_bb: Vec<u64>,
+    /// Buy-in, measured in big blinds of the chosen table. Defaults to `100`.
+    #[serde(default = "default_poker_buyin_bb")]
+    pub buyin_bb: u64,
+    /// Settlement assets a table may be played in, in lobby order. Defaults to
+    /// `["sats", "dream"]`.
+    #[serde(default = "default_poker_assets")]
+    pub assets: Vec<String>,
+    /// Playing style of the house bot that fills empty seats (e.g. `"tag"` —
+    /// tight-aggressive). Defaults to `"tag"`.
+    #[serde(default = "default_poker_bot_profile")]
+    pub bot_profile: String,
+    /// Optional 64-character lowercase hex pubkey of the citizen (house) agent
+    /// that seats bots and settles hands. `None` until the operator provisions
+    /// one; the client then runs without a house agent.
+    #[serde(default)]
+    pub citizen_pubkey: Option<String>,
+}
+
+impl Default for Poker {
+    fn default() -> Self {
+        Self {
+            stakes_bb: default_poker_stakes_bb(),
+            buyin_bb: default_poker_buyin_bb(),
+            assets: default_poker_assets(),
+            bot_profile: default_poker_bot_profile(),
+            citizen_pubkey: None,
+        }
+    }
+}
+
+impl Poker {
+    /// Render the compact JSON object the forum client reads from
+    /// `window.__ENV__.POKER_CONFIG`:
+    ///
+    /// `{"stakes_bb":[..],"buyin_bb":N,"assets":[..],"bot_profile":"..","citizen_pubkey":null|".."}`
+    ///
+    /// Every key is always present (`citizen_pubkey` is `null` when unset), in
+    /// declaration order, so the deploy pipeline's hand-synced mirror can be
+    /// diffed against this output byte-for-byte.
+    pub fn to_env_json(&self) -> String {
+        // Serialising plain strings, integers and an `Option<String>` cannot
+        // fail; there are no maps with non-string keys.
+        serde_json::to_string(self).expect("Poker serialises to JSON")
+    }
+
+    /// Semantic checks beyond serde: at least one non-zero, unique stake; a
+    /// non-zero buy-in; at least one non-empty, unique asset; a non-empty bot
+    /// profile; and, when present, a 64-character lowercase hex
+    /// `citizen_pubkey`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message naming the offending `poker.*` key.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.stakes_bb.is_empty() {
+            return Err("poker.stakes_bb must list at least one stake".into());
+        }
+        let mut seen_stakes = std::collections::HashSet::new();
+        for &bb in &self.stakes_bb {
+            if bb == 0 {
+                return Err("poker.stakes_bb entries must be greater than zero".into());
+            }
+            if !seen_stakes.insert(bb) {
+                return Err(format!("poker.stakes_bb contains a duplicate stake: {bb}"));
+            }
+        }
+        if self.buyin_bb == 0 {
+            return Err("poker.buyin_bb must be greater than zero".into());
+        }
+        if self.assets.is_empty() {
+            return Err("poker.assets must list at least one asset".into());
+        }
+        let mut seen_assets = std::collections::HashSet::new();
+        for asset in &self.assets {
+            if asset.trim().is_empty() {
+                return Err("poker.assets entries must not be empty".into());
+            }
+            if !seen_assets.insert(asset.as_str()) {
+                return Err(format!("poker.assets contains a duplicate asset: {asset}"));
+            }
+        }
+        if self.bot_profile.trim().is_empty() {
+            return Err("poker.bot_profile must not be empty".into());
+        }
+        if let Some(pk) = self.citizen_pubkey.as_deref() {
+            let lower_hex = pk
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if pk.len() != 64 || !lower_hex {
+                return Err(format!(
+                    "poker.citizen_pubkey must be 64-char lowercase hex (got {pk})"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_poker_stakes_bb() -> Vec<u64> {
+    vec![2, 10, 20, 100, 200]
+}
+
+fn default_poker_buyin_bb() -> u64 {
+    100
+}
+
+fn default_poker_assets() -> Vec<String> {
+    vec!["sats".into(), "dream".into()]
+}
+
+fn default_poker_bot_profile() -> String {
+    "tag".into()
+}
+
+#[cfg(test)]
+mod poker_tests {
+    use super::*;
+
+    const DEFAULT_JSON: &str = r#"{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null}"#;
+
+    #[test]
+    fn defaults_match_documented_values() {
+        let p = Poker::default();
+        assert_eq!(p.stakes_bb, vec![2, 10, 20, 100, 200]);
+        assert_eq!(p.buyin_bb, 100);
+        assert_eq!(p.assets, vec!["sats", "dream"]);
+        assert_eq!(p.bot_profile, "tag");
+        assert!(p.citizen_pubkey.is_none());
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_section_takes_defaults() {
+        let p: Poker = toml::from_str("").expect("parse empty [poker]");
+        assert_eq!(p, Poker::default());
+    }
+
+    #[test]
+    fn feature_flag_defaults_off() {
+        let f: Features = toml::from_str("marketplace = true").expect("parse");
+        assert!(!f.poker);
+        let f: Features = toml::from_str("poker = true").expect("parse");
+        assert!(f.poker);
+    }
+
+    #[test]
+    fn env_json_shape_is_stable() {
+        assert_eq!(Poker::default().to_env_json(), DEFAULT_JSON);
+        let with_citizen = Poker {
+            citizen_pubkey: Some("ab".repeat(32)),
+            ..Poker::default()
+        };
+        let v: serde_json::Value = serde_json::from_str(&with_citizen.to_env_json()).unwrap();
+        assert_eq!(v["citizen_pubkey"], serde_json::json!("ab".repeat(32)));
+    }
+
+    #[test]
+    fn json_and_toml_round_trip() {
+        let p = Poker {
+            stakes_bb: vec![1, 5],
+            buyin_bb: 40,
+            assets: vec!["sats".into()],
+            bot_profile: "lag".into(),
+            citizen_pubkey: Some("0f".repeat(32)),
+        };
+        let back: Poker = serde_json::from_str(&p.to_env_json()).unwrap();
+        assert_eq!(back, p);
+        let back: Poker = toml::from_str(&toml::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+        // `None` is omitted by TOML and restored by the serde default.
+        let back: Poker = toml::from_str(&toml::to_string(&Poker::default()).unwrap()).unwrap();
+        assert_eq!(back, Poker::default());
+    }
+
+    #[test]
+    fn toml_sample_parses() {
+        let src = r#"
+stakes_bb = [2, 10, 20, 100, 200]
+buyin_bb = 100
+assets = ["sats", "dream"]
+bot_profile = "tag"
+citizen_pubkey = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c"
+"#;
+        let p: Poker = toml::from_str(src).expect("parse");
+        assert!(p.validate().is_ok());
+        assert_eq!(p.citizen_pubkey.as_deref().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn citizen_pubkey_must_be_64_lowercase_hex() {
+        let with = |pk: String| Poker {
+            citizen_pubkey: Some(pk),
+            ..Poker::default()
+        };
+        assert!(with("a".repeat(64)).validate().is_ok());
+        assert!(with("A".repeat(64)).validate().is_err(), "uppercase");
+        assert!(with("a".repeat(63)).validate().is_err(), "short");
+        assert!(with("a".repeat(65)).validate().is_err(), "long");
+        assert!(with("g".repeat(64)).validate().is_err(), "non-hex");
+        assert!(with(String::new()).validate().is_err(), "empty");
+    }
+
+    #[test]
+    fn degenerate_tables_rejected() {
+        let base = Poker::default;
+        assert!(Poker {
+            stakes_bb: vec![],
+            ..base()
+        }
+        .validate()
+        .is_err());
+        assert!(Poker {
+            stakes_bb: vec![0, 2],
+            ..base()
+        }
+        .validate()
+        .is_err());
+        assert!(Poker {
+            stakes_bb: vec![2, 2],
+            ..base()
+        }
+        .validate()
+        .is_err());
+        assert!(Poker {
+            buyin_bb: 0,
+            ..base()
+        }
+        .validate()
+        .is_err());
+        assert!(Poker {
+            assets: vec![],
+            ..base()
+        }
+        .validate()
+        .is_err());
+        assert!(Poker {
+            assets: vec![" ".into()],
+            ..base()
+        }
+        .validate()
+        .is_err());
+        assert!(Poker {
+            assets: vec!["sats".into(), "sats".into()],
+            ..base()
+        }
+        .validate()
+        .is_err());
+        assert!(Poker {
+            bot_profile: " ".into(),
+            ..base()
+        }
+        .validate()
+        .is_err());
+    }
 }

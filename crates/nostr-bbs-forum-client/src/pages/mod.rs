@@ -26,6 +26,7 @@ mod profile;
 mod section;
 mod settings;
 mod setup;
+mod table;
 mod thread;
 mod wallet;
 
@@ -53,5 +54,6 @@ pub use section::SectionPage;
 pub use settings::SettingsPage;
 pub use setup::SetupPage;
 pub use signup::SignupPage;
+pub use table::TablePage;
 pub use thread::ThreadPage;
 pub use wallet::WalletPage;

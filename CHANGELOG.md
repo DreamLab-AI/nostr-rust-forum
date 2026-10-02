@@ -7,6 +7,27 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: a practice poker table behind three gates — 2026-10-02
+
+Heads-up limit hold'em against a house bot at `/table`, in practice chips:
+no funds move. The operator switches it on with `[features] poker = true`
+and a `[poker]` section (stakes, buy-in, bot profile; projected to the client
+as `window.__ENV__.POKER` and `POKER_CONFIG`); the member wallet must be on;
+and each member opts in under Settings → Games, off by default. Nothing about
+poker is visible until all three hold. The deal is a committed shuffle (the
+seed's SHA-256 shown before the hand, the seed after), the bot's play replays
+from the seed, and the page renders only the hero's seat view.
+
+- The Libre Poker engine (`libre-poker/engine` 564d4c3, AGPL-3.0) is vendored
+  byte-for-byte under `crates/nostr-bbs-forum-client/js/librepoker/` behind a
+  JSON-string shim; see `VENDORED.md` there.
+- `wallet::poker` carries the pure settlement rules for the money phase
+  (ported from `libre-poker/sats`), a hand root over RFC 8785 canonical JSON
+  with the RFC's own vectors, and the `hand:<root>` memo. Not yet wired:
+  money against a bot the browser drives is unsound; it waits for a citizen
+  that holds its own key.
+- No new event kinds (ADR-2012 holds).
+
 ### Security: `/pay/` credits only on chain evidence (ADR-2012 D6) — 2026-10-02
 
 The pod-worker's pay routes are live in production (`PAY_ENABLED = "true"`),

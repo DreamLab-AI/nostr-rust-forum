@@ -1199,6 +1199,37 @@ pub fn SettingsPage() -> impl IntoView {
                     </div>
                 </div>
 
+                // -- Section 4c-ii: Games (practice poker table) --
+                // Offered only where the operator switched POKER on and the
+                // member wallet is on; the preference is the third gate.
+                {crate::poker::site_enabled().then(|| view! {
+                    <div class="glass-card p-6 space-y-4">
+                        <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                            {games_icon()}
+                            "Games"
+                        </h2>
+                        <div class="border-t border-gray-700/50"></div>
+
+                        <div class="space-y-1">
+                            <label class="flex items-center justify-between cursor-pointer">
+                                <span class="text-sm text-gray-300">"Poker table (practice chips, no money)"</span>
+                                <input
+                                    type="checkbox"
+                                    prop:checked=move || prefs.get().poker_table
+                                    on:change=move |_| {
+                                        prefs.update(|p| p.poker_table = !p.poker_table);
+                                        save_preferences(&prefs.get_untracked());
+                                    }
+                                    class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
+                                />
+                            </label>
+                            <p class="text-xs text-gray-500">
+                                "Heads-up limit hold'em against a house bot; no funds move."
+                            </p>
+                        </div>
+                    </div>
+                })}
+
                 // -- Section 4d: Pod git repository (ADR-089) --
                 <div class="glass-card p-6 space-y-4">
                     <h2 class="text-lg font-semibold text-white flex items-center gap-2">
@@ -1822,6 +1853,10 @@ fn handle_icon() -> impl IntoView {
 }
 fn mute_icon() -> impl IntoView {
     section_icon("M1 1l22 22M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2c0 .38-.03.75-.08 1.12M12 19v4M8 23h8")
+}
+fn games_icon() -> impl IntoView {
+    // A poker chip: rim, inner ring, and four edge marks.
+    section_icon("M12 2a10 10 0 100 20 10 10 0 000-20zM12 7a5 5 0 100 10 5 5 0 000-10zM12 2v5M12 17v5M2 12h5M17 12h5")
 }
 fn device_icon() -> impl IntoView {
     // Smartphone outline.

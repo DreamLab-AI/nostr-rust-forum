@@ -219,6 +219,9 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
         }
     }
 
+    // poker: coherent tables and a well-formed citizen pubkey.
+    cfg.poker.validate()?;
+
     // Zone ids must be unique. `ZoneConfig::get` resolves by FIRST match, so a
     // duplicate `[[zones]]` id with weaker required_cohorts/visibility could
     // silently shadow the intended access rule — an operator typo must fail
@@ -359,6 +362,7 @@ mod tests {
             governance: Governance::default(),
             payments: Payments::default(),
             calendar: Calendar::default(),
+            poker: Poker::default(),
             encryption: Encryption::default(),
         }
     }
@@ -560,6 +564,17 @@ operator = "tier-2"
         assert_eq!(cfg.governance.kinds_hi, 31405);
         assert!(!cfg.payments.enabled);
         assert_eq!(cfg.calendar.shared_venues, vec!["primary", "secondary"]);
+        assert!(!cfg.features.poker);
+        assert_eq!(cfg.poker, Poker::default());
+    }
+
+    #[test]
+    fn poker_bad_citizen_pubkey_rejected() {
+        let mut cfg = baseline_cfg();
+        cfg.poker.citizen_pubkey = Some("B".repeat(64));
+        assert!(validate_config(&cfg).is_err());
+        cfg.poker.citizen_pubkey = Some("b".repeat(64));
+        assert!(validate_config(&cfg).is_ok());
     }
 
     #[test]
@@ -926,6 +941,15 @@ supply = 1000000
 
 [calendar]
 shared_venues = ["primary", "secondary"]
+
+[features]
+poker = true
+
+[poker]
+stakes_bb = [2, 10, 20, 100, 200]
+buyin_bb = 100
+assets = ["sats", "dream"]
+bot_profile = "tag"
 "##;
         let cfg: ForumConfig = toml::from_str(toml_src).expect("parse");
         validate_config(&cfg).expect("validate");
@@ -938,5 +962,7 @@ shared_venues = ["primary", "secondary"]
         assert_eq!(cfg.payments.token.as_ref().unwrap().ticker, "COIN");
         assert_eq!(cfg.calendar.shared_venues, vec!["primary", "secondary"]);
         assert_eq!(cfg.zones[0].accent_hex.as_deref(), Some("#3b82f6"));
+        assert!(cfg.features.poker);
+        assert_eq!(cfg.poker, Poker::default());
     }
 }

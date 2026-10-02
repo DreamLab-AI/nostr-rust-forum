@@ -6,6 +6,7 @@ mod auth;
 mod components;
 mod dm;
 mod pages;
+pub(crate) mod poker;
 mod relay;
 pub(crate) mod stores;
 pub(crate) mod utils;
