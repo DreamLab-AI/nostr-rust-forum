@@ -10,7 +10,9 @@ use leptos::prelude::*;
 
 use nostr_bbs_core::governance::{self, PanelDefinition};
 
-use crate::utils::governance_view::{self, CaseBoundary, ChainStep, PanelContext, PanelRef};
+use crate::utils::governance_view::{
+    self, CaseBoundary, ChainStep, PanelAck, PanelContext, PanelDecision, PanelRef, PanelTarget,
+};
 
 /// The NIP-33 address of a replaceable governance event: the author plus its
 /// `d` tag.
@@ -137,6 +139,10 @@ pub struct DecisionEntry {
     pub signer_pubkey: String,
     /// The decision action string (`approve`/`reject`/…).
     pub outcome: String,
+    /// The content's raw `action` string. Differs from `outcome` for a panel
+    /// action (e.g. `acknowledge-alerts`), which is not a `DecisionOutcome`
+    /// and so parses to the generic `decision`.
+    pub action: String,
     pub reason: String,
     pub created_at: u64,
     /// When this is a *superseding* decision (§7a.2), the prior decision EVENT id
@@ -151,6 +157,9 @@ pub struct DecisionEntry {
     /// `approve` would read as decided (revealing a probe, DDD §6 invariant 7)
     /// and a forged `delegate` would offer a stranger the controls.
     pub request_event_id: Option<String>,
+    /// The `a` tag (`31400:<pubkey>:<d>`), which a panel-level decision uses
+    /// to name the panel it was made on independently of its event id.
+    pub panel_address: Option<String>,
     /// For a `Delegate` outcome, the pubkey the admin delegated the case to
     /// (FR6.2). Carried so the surfaces can tell a delegated reviewer that this
     /// one case is theirs to decide (DDD §6 invariant 6).
@@ -331,14 +340,18 @@ impl PanelRegistry {
                     }
                     _ => None,
                 };
-                let reason = serde_json::from_str::<serde_json::Value>(&event.content)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("reasoning")
-                            .and_then(|r| r.as_str())
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_default();
+                let content = serde_json::from_str::<serde_json::Value>(&event.content).ok();
+                let content_str = |key: &str| {
+                    content
+                        .as_ref()
+                        .and_then(|v| v.get(key))
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_default()
+                };
+                let reason = content_str("reasoning");
+                let action = content_str("action");
+                let panel_address = governance::extract_tag(&event.tags, "a").map(str::to_string);
                 let supersedes =
                     governance::extract_supersedes_target(&event.tags).map(str::to_string);
                 // The plain `e` tag (no marker) names the request being decided;
@@ -362,10 +375,12 @@ impl PanelRegistry {
                         event_id: event.id.clone(),
                         signer_pubkey: event.pubkey.clone(),
                         outcome,
+                        action,
                         reason,
                         created_at: event.created_at,
                         supersedes,
                         request_event_id,
+                        panel_address,
                         delegate_to,
                     });
                     chain.sort_by_key(|e| e.created_at);
@@ -555,6 +570,61 @@ pub fn bind_to_request<'a>(
         .collect()
 }
 
+/// The panel-level `acknowledge-alerts` decision that acknowledges this card,
+/// if one does (see [`governance_view::panel_acknowledgement`] for the rule).
+///
+/// The panel is resolved exactly as the boundary resolves it, and only the
+/// decisions filed under THAT panel's `d` are offered, so the rule sees the
+/// card's own panel and nothing a colliding `d` from another author filed.
+/// `is_admin` answers for a signer; an unknown signer must answer `false`.
+pub fn panel_acknowledgement_for(
+    state: &PanelRegistryState,
+    action: &ActionEntry,
+    is_admin: impl Fn(&str) -> bool,
+) -> Option<PanelAck> {
+    let is_alert = governance_view::is_alert_request(&action.fields);
+    if !is_alert {
+        return None;
+    }
+    let panel = resolve_panel_for(&state.panels, &action.tags, &action.agent_pubkey)?;
+    let target = PanelTarget {
+        agent_pubkey: &panel.agent_pubkey,
+        d_tag: &panel.d_tag,
+        event_id: &panel.event_id,
+    };
+    let decisions: Vec<PanelDecision> = panel_decisions(state, &panel.d_tag);
+    governance_view::panel_acknowledgement(
+        &action.agent_pubkey,
+        action.created_at,
+        is_alert,
+        Some(&target),
+        &decisions,
+        is_admin,
+    )
+}
+
+/// Every 31403 filed under a panel `d`, reduced for the acknowledgement rule.
+pub fn panel_decisions(state: &PanelRegistryState, panel_d_tag: &str) -> Vec<PanelDecision> {
+    state
+        .decisions
+        .get(panel_d_tag)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| PanelDecision {
+                    d_tag: e.d_tag.clone(),
+                    event_id: e.event_id.clone(),
+                    signer_pubkey: e.signer_pubkey.clone(),
+                    action: e.action.clone(),
+                    created_at: e.created_at,
+                    bound_event_id: e.request_event_id.clone(),
+                    bound_address: e.panel_address.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl PanelRegistry {
     /// The rendered supersession chain for a `d`-tag (F6). Empty when no
     /// decisions have been observed for it.
@@ -597,10 +667,12 @@ mod tests {
             event_id: event_id.into(),
             signer_pubkey: "signer".into(),
             outcome: outcome.into(),
+            action: outcome.into(),
             reason: "r".into(),
             created_at: at,
             supersedes: supersedes.map(str::to_string),
             request_event_id: Some("req-1".into()),
+            panel_address: None,
             delegate_to: None,
         }
     }
@@ -940,5 +1012,116 @@ mod tests {
         assert!(chain[0].superseded && !chain[0].effective);
         assert!(chain[1].superseded && !chain[1].effective);
         assert!(!chain[2].superseded && chain[2].effective);
+    }
+
+    // ── Panel-level acknowledgement, end to end through ingest ──────────
+
+    fn engine_request(d_tag: &str, agent: &str, created_at: u64, kind: &str) -> NostrEvent {
+        // Shaped like the dream engine's `request_event`: addressed to its
+        // panel, the item kind carried in `fields.kind`.
+        NostrEvent {
+            id: format!("req-{d_tag}"),
+            pubkey: agent.into(),
+            created_at,
+            kind: governance::KIND_ACTION_REQUEST,
+            tags: vec![
+                tag("d", d_tag),
+                tag(
+                    "a",
+                    &format!(
+                        "{}:{agent}:dream-machine",
+                        governance::KIND_PANEL_DEFINITION
+                    ),
+                ),
+                tag("panel", "dream-machine"),
+                tag("risk-tier", "low"),
+            ],
+            content: serde_json::json!({ "fields": { "kind": kind, "repo": "r" } }).to_string(),
+            sig: String::new(),
+        }
+    }
+
+    fn panel_ack_event(id: &str, signer: &str, at: u64, panel_event_id: &str) -> NostrEvent {
+        // Exactly what `PanelCard`'s button publishes.
+        NostrEvent {
+            id: id.into(),
+            pubkey: signer.into(),
+            created_at: at,
+            kind: governance::KIND_ACTION_RESPONSE,
+            tags: vec![tag("d", "dream-machine"), tag("e", panel_event_id)],
+            content: serde_json::json!({
+                "action": "acknowledge-alerts",
+                "reasoning": "Human selected 'acknowledge-alerts' on this panel via the governance UI",
+            })
+            .to_string(),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_panel_ack_acknowledges_the_agents_earlier_alerts_and_nothing_else() {
+        let r = fresh_registry();
+        r.ingest_event(&panel_event("dream-machine", "agent", 100, "bounded"));
+        r.ingest_event(&engine_request("alert-old", "agent", 200, "alert"));
+        r.ingest_event(&engine_request("question-old", "agent", 200, "question"));
+        r.ingest_event(&engine_request("alert-new", "agent", 400, "alert"));
+        r.ingest_event(&panel_ack_event(
+            "ack-1",
+            "admin",
+            300,
+            "ev-dream-machine-100",
+        ));
+
+        let s = r.state.read_untracked();
+        let held = &s.decisions["dream-machine"][0];
+        assert_eq!(held.action, "acknowledge-alerts");
+        assert_eq!(
+            held.outcome, "decision",
+            "a panel action is not a DecisionOutcome"
+        );
+        let by_d = |d: &str| s.actions.iter().find(|a| a.d_tag == d).unwrap();
+        let admin = |pk: &str| pk == "admin";
+
+        let got = panel_acknowledgement_for(&s, by_d("alert-old"), admin).unwrap();
+        assert_eq!((got.event_id.as_str(), got.created_at), ("ack-1", 300));
+        assert_eq!(
+            panel_acknowledgement_for(&s, by_d("question-old"), admin),
+            None
+        );
+        assert_eq!(
+            panel_acknowledgement_for(&s, by_d("alert-new"), admin),
+            None
+        );
+        // Unknown admin status fails closed.
+        assert_eq!(
+            panel_acknowledgement_for(&s, by_d("alert-old"), |_| false),
+            None
+        );
+        // The ack is not a decision ON the case: its own chain stays empty, so
+        // nothing about the case (its probe included) is revealed by it.
+        assert!(!s.decisions.contains_key("alert-old"));
+    }
+
+    #[test]
+    fn a_strangers_colliding_panel_neither_lends_nor_borrows_an_ack() {
+        let r = fresh_registry();
+        r.ingest_event(&panel_event("dream-machine", "agent", 100, "bounded"));
+        // The stranger's 31400 reuses our `d`; it is a distinct panel event.
+        r.ingest_event(&panel_event("dream-machine", "stranger", 110, "bounded"));
+        r.ingest_event(&engine_request("ours", "agent", 200, "alert"));
+        r.ingest_event(&engine_request("theirs", "stranger", 200, "alert"));
+        // An admin presses "Acknowledge all alerts" on the STRANGER's panel.
+        r.ingest_event(&panel_ack_event(
+            "ack-x",
+            "admin",
+            300,
+            "ev-dream-machine-110",
+        ));
+
+        let s = r.state.read_untracked();
+        let by_d = |d: &str| s.actions.iter().find(|a| a.d_tag == d).unwrap();
+        let admin = |pk: &str| pk == "admin";
+        assert_eq!(panel_acknowledgement_for(&s, by_d("ours"), admin), None);
+        assert!(panel_acknowledgement_for(&s, by_d("theirs"), admin).is_some());
     }
 }

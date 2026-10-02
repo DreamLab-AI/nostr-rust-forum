@@ -408,6 +408,115 @@ pub fn is_decidable_by(chain: &[ChainStep], viewer_pubkey: Option<&str>, is_admi
     delegated_to(chain).is_some_and(|d| d.eq_ignore_ascii_case(viewer))
 }
 
+// ── Panel-level acknowledgement ─────────────────────────────────────────────
+
+/// The panel action that acknowledges every open alert at once. Mirrors the
+/// dream engine's `ACK_ALERTS_ACTION`; its planner dismisses each open alert
+/// published at or before the acknowledging 31403's `created_at`.
+pub const ACK_ALERTS_ACTION: &str = "acknowledge-alerts";
+
+/// Whether a request is an alert, read from the engine's `fields.kind`.
+pub fn is_alert_request(fields: &serde_json::Value) -> bool {
+    fields.get("kind").and_then(|k| k.as_str()) == Some("alert")
+}
+
+/// The panel a card resolved to, reduced to what binds a panel-level 31403.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelTarget<'a> {
+    pub agent_pubkey: &'a str,
+    pub d_tag: &'a str,
+    /// The 31400 event currently held for that panel address.
+    pub event_id: &'a str,
+}
+
+/// One 31403 filed under a panel's `d` tag, reduced to what the rule needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelDecision {
+    pub d_tag: String,
+    pub event_id: String,
+    pub signer_pubkey: String,
+    /// The raw `action` string from the content (panel actions are not
+    /// `DecisionOutcome`s, so the parsed outcome cannot carry them).
+    pub action: String,
+    pub created_at: u64,
+    /// Its plain `e` tag: the panel definition event the button was on.
+    pub bound_event_id: Option<String>,
+    /// Its `a` tag, `31400:<pubkey>:<d>`, which survives a panel republish.
+    pub bound_address: Option<String>,
+}
+
+/// The panel-level decision that acknowledged a card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelAck {
+    pub event_id: String,
+    pub signer_pubkey: String,
+    pub created_at: u64,
+}
+
+/// Whether a panel-level 31403 acknowledges this alert card, and by whom.
+///
+/// Every condition must hold:
+/// - the card is an alert;
+/// - the card resolved to a panel owned by the card's own agent;
+/// - the decision is filed under that panel's `d` **and bound to that panel**
+///   — its `e` names the panel event held, or its `a` names the panel's
+///   address. `d` alone is chosen by the publisher, so a stranger's 31400 on
+///   a colliding `d` would otherwise borrow (or lend) the acknowledgement;
+/// - the content's action is [`ACK_ALERTS_ACTION`];
+/// - the signer is an admin by `is_admin` and is **never** the agent (no
+///   self-review, whatever the agent's own role);
+/// - the card was published at or before the decision.
+///
+/// Where several qualify, the earliest is returned: it is the one that
+/// dismissed the alert in the engine.
+///
+/// This does not make the case *decided* in the chain sense, so it reveals no
+/// probe ([`visible_probe`] still reads only the case's own chain) and it
+/// grants nobody the controls: it only withdraws them.
+pub fn panel_acknowledgement(
+    card_agent_pubkey: &str,
+    card_created_at: u64,
+    card_is_alert: bool,
+    panel: Option<&PanelTarget<'_>>,
+    decisions: &[PanelDecision],
+    is_admin: impl Fn(&str) -> bool,
+) -> Option<PanelAck> {
+    if !card_is_alert {
+        return None;
+    }
+    let panel = panel?;
+    if !panel.agent_pubkey.eq_ignore_ascii_case(card_agent_pubkey) {
+        return None;
+    }
+    let bound_to_panel = |d: &PanelDecision| {
+        d.bound_event_id.as_deref() == Some(panel.event_id)
+            || d.bound_address.as_deref().is_some_and(|a| {
+                let mut parts = a.splitn(3, ':');
+                matches!(
+                    (parts.next(), parts.next(), parts.next()),
+                    (Some(kind), Some(pk), Some(dt))
+                        if kind.parse::<u64>().ok() == Some(governance::KIND_PANEL_DEFINITION)
+                            && pk.eq_ignore_ascii_case(panel.agent_pubkey)
+                            && dt == panel.d_tag
+                )
+            })
+    };
+    decisions
+        .iter()
+        .filter(|d| d.d_tag == panel.d_tag)
+        .filter(|d| d.action == ACK_ALERTS_ACTION)
+        .filter(|d| !d.signer_pubkey.eq_ignore_ascii_case(card_agent_pubkey))
+        .filter(|d| card_created_at <= d.created_at)
+        .filter(|d| bound_to_panel(d))
+        .filter(|d| is_admin(&d.signer_pubkey))
+        .min_by(|a, b| (a.created_at, &a.event_id).cmp(&(b.created_at, &b.event_id)))
+        .map(|d| PanelAck {
+            event_id: d.event_id.clone(),
+            signer_pubkey: d.signer_pubkey.clone(),
+            created_at: d.created_at,
+        })
+}
+
 // ── Card section order (FR2.1, EXP-AC-002) ──────────────────────────────────
 
 /// One rendered region of a decision card, in the order it appears.
@@ -1236,5 +1345,209 @@ mod tests {
         assert_eq!(pretty_fields(&serde_json::Value::Null), "");
         assert!(!has_proposal(&serde_json::Value::Null));
         assert!(has_proposal(&serde_json::json!({"a": 1})));
+    }
+
+    // ── Panel-level acknowledgement (dream-machine `acknowledge-alerts`) ──
+
+    const AGENT: &str = "2de44d5622eef7952de44d5622eef7952de44d5622eef7952de44d5622eef795";
+    const ADMIN: &str = "b41654017f6850b13857d19d8ae0e3f88f1365600cab0321e8101c9e92682f7a";
+    const MEMBER: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const STRANGER: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const PANEL_EVENT: &str = "f24a7e5870093863472fd57dbc69e56752a32399ab9941e0216fb2c8df0b0a85";
+    const STRANGER_PANEL_EVENT: &str =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    fn our_panel() -> PanelTarget<'static> {
+        PanelTarget {
+            agent_pubkey: AGENT,
+            d_tag: "dream-machine",
+            event_id: PANEL_EVENT,
+        }
+    }
+
+    /// A panel-level 31403 as the forum's own panel button publishes it: `d` =
+    /// the panel's d-tag, plain `e` = the panel definition's event id.
+    fn ack(id: &str, signer: &str, at: u64, bound_to: &str) -> PanelDecision {
+        PanelDecision {
+            d_tag: "dream-machine".into(),
+            event_id: id.into(),
+            signer_pubkey: signer.into(),
+            action: ACK_ALERTS_ACTION.into(),
+            created_at: at,
+            bound_event_id: Some(bound_to.into()),
+            bound_address: None,
+        }
+    }
+
+    fn only_admin(pk: &str) -> bool {
+        pk == ADMIN
+    }
+
+    fn alert_ack(card_at: u64, decisions: &[PanelDecision]) -> Option<PanelAck> {
+        panel_acknowledgement(
+            AGENT,
+            card_at,
+            true,
+            Some(&our_panel()),
+            decisions,
+            only_admin,
+        )
+    }
+
+    #[test]
+    fn an_alert_is_recognised_from_the_engines_kind_field() {
+        assert!(is_alert_request(
+            &serde_json::json!({"kind": "alert", "repo": "r"})
+        ));
+        assert!(!is_alert_request(&serde_json::json!({"kind": "question"})));
+        assert!(!is_alert_request(&serde_json::json!({"repo": "r"})));
+        assert!(!is_alert_request(&serde_json::json!("alert")));
+    }
+
+    #[test]
+    fn an_admin_ack_after_the_alert_acknowledges_it() {
+        let got = alert_ack(1_000, &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)]);
+        assert_eq!(
+            got,
+            Some(PanelAck {
+                event_id: "ack-1".into(),
+                signer_pubkey: ADMIN.into(),
+                created_at: 2_000,
+            })
+        );
+        // The engine's rule is `published <= ack.created_at`: same second counts.
+        assert!(alert_ack(2_000, &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)]).is_some());
+    }
+
+    #[test]
+    fn an_ack_bound_by_panel_address_counts_across_a_panel_republish() {
+        let mut d = ack("ack-1", ADMIN, 2_000, "an-older-panel-event");
+        assert_eq!(alert_ack(1_000, &[d.clone()]), None);
+        d.bound_address = Some(format!("31400:{AGENT}:dream-machine"));
+        assert!(alert_ack(1_000, &[d.clone()]).is_some());
+        // An address naming someone else's panel binds to nothing of ours.
+        d.bound_address = Some(format!("31400:{STRANGER}:dream-machine"));
+        assert_eq!(alert_ack(1_000, &[d]), None);
+    }
+
+    #[test]
+    fn an_ack_before_the_alert_does_not_acknowledge_it() {
+        assert_eq!(
+            alert_ack(3_000, &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)]),
+            None
+        );
+    }
+
+    #[test]
+    fn the_earliest_qualifying_ack_is_the_one_shown() {
+        let got = alert_ack(
+            1_000,
+            &[
+                ack("ack-late", ADMIN, 5_000, PANEL_EVENT),
+                ack("ack-early", ADMIN, 2_000, PANEL_EVENT),
+                ack("ack-stale", ADMIN, 500, PANEL_EVENT),
+            ],
+        );
+        assert_eq!(got.map(|a| a.event_id), Some("ack-early".to_string()));
+    }
+
+    #[test]
+    fn a_non_admin_ack_does_not_count() {
+        assert_eq!(
+            alert_ack(1_000, &[ack("ack-1", MEMBER, 2_000, PANEL_EVENT)]),
+            None
+        );
+    }
+
+    #[test]
+    fn the_agent_cannot_acknowledge_its_own_alerts() {
+        // Even if the agent's key were (mis)configured as an admin: no
+        // self-review, the same rule the engine's planner applies.
+        let agent_is_admin = |pk: &str| pk == AGENT || pk == ADMIN;
+        let upper = AGENT.to_ascii_uppercase();
+        for signer in [AGENT, upper.as_str()] {
+            let got = panel_acknowledgement(
+                AGENT,
+                1_000,
+                true,
+                Some(&our_panel()),
+                &[ack("ack-self", signer, 2_000, PANEL_EVENT)],
+                agent_is_admin,
+            );
+            assert_eq!(got, None, "signer {signer}");
+        }
+    }
+
+    #[test]
+    fn a_non_alert_card_is_unaffected_by_an_ack() {
+        let got = panel_acknowledgement(
+            AGENT,
+            1_000,
+            false,
+            Some(&our_panel()),
+            &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)],
+            only_admin,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn some_other_panel_action_is_not_an_ack() {
+        let mut d = ack("act-1", ADMIN, 2_000, PANEL_EVENT);
+        d.action = "approve".into();
+        assert_eq!(alert_ack(1_000, &[d]), None);
+    }
+
+    #[test]
+    fn an_ack_on_a_strangers_colliding_panel_does_not_count() {
+        // A stranger publishes their own 31400 with our d-tag; an admin
+        // pressing "Acknowledge all alerts" on THAT panel binds to its event.
+        assert_eq!(
+            alert_ack(1_000, &[ack("ack-x", ADMIN, 2_000, STRANGER_PANEL_EVENT)]),
+            None
+        );
+        // And a stranger's alert, resolving to the stranger's panel, is not
+        // acknowledged by an ack on ours.
+        let theirs = PanelTarget {
+            agent_pubkey: STRANGER,
+            d_tag: "dream-machine",
+            event_id: STRANGER_PANEL_EVENT,
+        };
+        let got = panel_acknowledgement(
+            STRANGER,
+            1_000,
+            true,
+            Some(&theirs),
+            &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)],
+            only_admin,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn a_card_whose_panel_is_someone_elses_or_unresolved_is_never_acknowledged() {
+        // The card's agent must own the panel it resolved to.
+        let got = panel_acknowledgement(
+            STRANGER,
+            1_000,
+            true,
+            Some(&our_panel()),
+            &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)],
+            only_admin,
+        );
+        assert_eq!(got, None);
+        let got = panel_acknowledgement(
+            AGENT,
+            1_000,
+            true,
+            None,
+            &[ack("ack-1", ADMIN, 2_000, PANEL_EVENT)],
+            only_admin,
+        );
+        assert_eq!(got, None);
+        // A decision filed under a different d-tag is not this panel's.
+        let mut d = ack("ack-1", ADMIN, 2_000, PANEL_EVENT);
+        d.d_tag = "other-panel".into();
+        assert_eq!(alert_ack(1_000, &[d]), None);
     }
 }

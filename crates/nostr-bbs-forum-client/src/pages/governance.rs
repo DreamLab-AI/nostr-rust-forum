@@ -19,8 +19,11 @@ use crate::relay::RelayConnection;
 use crate::stores::case_projection::use_case_projection_store;
 use crate::stores::panel_registry::{use_panel_registry, ActionEntry, DecisionView, PanelEntry};
 use crate::stores::receipts::use_receipt_store;
+use crate::stores::signer_admin::SignerAdminCache;
 use crate::stores::zone_access::use_zone_access;
-use crate::utils::governance_view::{self, CardSection, CaseBoundary, MIN_RATIONALE_LEN};
+use crate::utils::governance_view::{
+    self, CardSection, CaseBoundary, PanelAck, ACK_ALERTS_ACTION, MIN_RATIONALE_LEN,
+};
 use nostr_bbs_core::governance::broker::DecisionOutcome;
 use wasm_bindgen_futures::spawn_local;
 
@@ -99,6 +102,21 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
         }
     });
 
+    // Panel-level `acknowledge-alerts` counts only from an admin signer. The
+    // viewer's own flag cannot answer for someone else, so ask the relay about
+    // each signer of such a decision; unanswered reads as "not an admin".
+    let signer_admin = SignerAdminCache::new();
+    Effect::new(move |_| {
+        let s = state.read();
+        signer_admin.request(
+            s.decisions
+                .values()
+                .flatten()
+                .filter(|e| e.action == ACK_ALERTS_ACTION)
+                .map(|e| e.signer_pubkey.as_str()),
+        );
+    });
+
     let cards = Memo::new(move |_| {
         let admin = zone_access.is_admin.get();
         let case_state = cases.state.read();
@@ -135,13 +153,26 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                         })
                         .unwrap_or_default(),
                 );
-                let decidable = governance_view::is_decidable_by(&steps, viewer.as_deref(), admin);
                 let decided = governance_view::chain_is_decided(&steps);
+                // An alert the panel's "Acknowledge all alerts" has dismissed.
+                // Not a decision on this case: it reveals no probe (the probe
+                // gate reads `decided`, from this case's own chain) and only
+                // ever withdraws controls, never grants them.
+                let acknowledged = (!decided)
+                    .then(|| {
+                        crate::stores::panel_registry::panel_acknowledgement_for(&s, a, |pk| {
+                            signer_admin.is_admin(pk)
+                        })
+                    })
+                    .flatten();
+                let decidable = acknowledged.is_none()
+                    && governance_view::is_decidable_by(&steps, viewer.as_deref(), admin);
                 ActionCardData {
                     item: a.clone(),
                     boundary,
                     decidable,
                     decided,
+                    acknowledged,
                 }
             })
             // FR6.2: a case delegated to this viewer is shown to them even when
@@ -234,7 +265,12 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                 <div class="governance-inbox space-y-2 mb-8">
                     <For
                         each=move || cards.get()
-                        key=|c| (c.item.event_id.clone(), c.decidable, c.decided)
+                        key=|c| (
+                            c.item.event_id.clone(),
+                            c.decidable,
+                            c.decided,
+                            c.acknowledged.as_ref().map(|a| a.event_id.clone()),
+                        )
                         let:c
                     >
                         // Decidability split (ADR-106 Decision 2 as amended by
@@ -348,6 +384,14 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
     let relay = expect_context::<RelayConnection>();
     let panel_d_tag = panel.d_tag.clone();
     let panel_event_id = panel.event_id.clone();
+    // The `a` tag binds a panel-level decision to THIS author's panel even
+    // after the definition is republished under a new event id.
+    let panel_a_tag = format!(
+        "{}:{}:{}",
+        nostr_bbs_core::governance::KIND_PANEL_DEFINITION,
+        panel.agent_pubkey,
+        panel.d_tag
+    );
     // F6: supersession history for this panel's case (DDD §7a.3).
     let history_d_tag = panel.d_tag.clone();
 
@@ -383,6 +427,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                         let action_id = action_id.clone();
                         let d_tag = panel_d_tag.clone();
                         let event_id = panel_event_id.clone();
+                        let a_tag = panel_a_tag.clone();
                         let relay = relay.clone();
                         move |_: web_sys::MouseEvent| {
                             if loading.get_untracked() || sent.get_untracked() {
@@ -407,6 +452,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                                 tags: vec![
                                     vec!["d".to_string(), d_tag.clone()],
                                     vec!["e".to_string(), event_id.clone()],
+                                    vec!["a".to_string(), a_tag.clone()],
                                 ],
                                 content,
                             };
@@ -482,6 +528,9 @@ pub struct ActionCardData {
     pub decidable: bool,
     /// Whether an effective, non-delegation decision already exists.
     pub decided: bool,
+    /// The panel-level `acknowledge-alerts` that dismissed this alert, when no
+    /// decision on the case itself has. Never set alongside `decided`.
+    pub acknowledged: Option<PanelAck>,
 }
 
 /// Human-readable title for a request, from its `title` tag, else its `d`-tag.
@@ -1072,12 +1121,32 @@ fn ReadOnlyActionRow(card: ActionCardData) -> impl IntoView {
     let ctx_url = has_context_url(&card.item);
     let agent_reasoning = has_agent_reasoning(&card.item);
     let decided = card.decided;
+    let acknowledged = card.acknowledged.clone();
 
     let status = view! {
-        <div class="reviewer-controls mt-3">
-            <span class="inline-block text-xs text-gray-500 border border-gray-600/60 rounded px-2.5 py-1">
-                {if decided { "Decided" } else { "Awaiting a decision" }}
+        <div class="reviewer-controls mt-3 flex flex-wrap items-center gap-2 text-xs">
+            <span class="inline-block text-gray-500 border border-gray-600/60 rounded px-2.5 py-1">
+                {if decided {
+                    "Decided"
+                } else if acknowledged.is_some() {
+                    "Acknowledged"
+                } else {
+                    "Awaiting a decision"
+                }}
             </span>
+            {acknowledged.map(|ack| {
+                let by = governance_view::short_id(&ack.signer_pubkey);
+                let when = crate::utils::format_relative_time(ack.created_at);
+                let exact = js_sys::Date::new(&((ack.created_at as f64) * 1000.0).into())
+                    .to_iso_string()
+                    .as_string()
+                    .unwrap_or_default();
+                view! {
+                    <span class="text-gray-500" title=exact>
+                        {format!("by {by} · {when} · \u{201c}Acknowledge all alerts\u{201d} on the panel")}
+                    </span>
+                }
+            })}
         </div>
     }
     .into_any();
