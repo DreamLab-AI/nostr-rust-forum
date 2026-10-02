@@ -188,6 +188,7 @@ impl DemotionSweepResult {
 ///
 /// `?Send` because the Workers runtime is single-threaded and its futures are
 /// not `Send`.
+#[allow(clippy::double_must_use)] // async_trait's own must_use; see nostr-bbs-core signer.rs
 #[async_trait(?Send)]
 pub trait DemotionStore {
     /// Fetch the next page of candidates strictly after `after`, ordered by

@@ -138,6 +138,7 @@ impl SessionAuthBoundary for crate::relay_do::NostrRelayDO {
 /// publish `["EVENT", <wrap>]` frames to a peer relay. Defined here as the
 /// documented join point; the DO accept path calls it once the session API
 /// stabilises.
+#[allow(clippy::double_must_use)] // async_trait's own must_use; see nostr-bbs-core signer.rs
 #[async_trait(?Send)]
 pub trait PeerConnector {
     /// Publish a pre-built wire frame to `peer_url`.

@@ -68,6 +68,7 @@ pub struct ProvisionedResource {
 }
 
 /// Abstract setup provider — one impl per custody tier.
+#[allow(clippy::double_must_use)] // async_trait's own must_use; see nostr-bbs-core signer.rs
 #[async_trait(?Send)]
 pub trait Provider {
     /// Provider tier identifier (`"tier-1"` .. `"tier-4"` or custom).

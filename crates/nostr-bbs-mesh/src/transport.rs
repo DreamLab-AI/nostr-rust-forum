@@ -233,6 +233,7 @@ impl RelayMessage {
 
 /// The byte-level transport seam. Implemented over `worker::WebSocket` in the
 /// CF relay-worker and over an in-memory channel in tests ([`crate::mock`]).
+#[allow(clippy::double_must_use)] // async_trait's own must_use; see nostr-bbs-core signer.rs
 #[async_trait(?Send)]
 pub trait MeshSocket {
     /// Send a text frame to the peer.
@@ -245,6 +246,7 @@ pub trait MeshSocket {
 /// Abstract transport for connecting to a peer relay (evolved from the original
 /// scaffold trait). Concrete transports (Nostr-over-WebSocket, libp2p, HTTP/3)
 /// implement this; the mesh state machine on top is transport-agnostic.
+#[allow(clippy::double_must_use)] // async_trait's own must_use; see nostr-bbs-core signer.rs
 #[async_trait(?Send)]
 pub trait MeshTransport {
     /// Establish (or describe) a session for `url`.

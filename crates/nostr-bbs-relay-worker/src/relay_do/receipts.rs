@@ -249,6 +249,7 @@ impl ReceiptOutcome {
 
 /// The receipt operations the flow needs, abstracted so the stage machine can
 /// be exercised — including under injected failure — without a live D1.
+#[allow(clippy::double_must_use)] // async_trait's own must_use; see nostr-bbs-core signer.rs
 #[async_trait(?Send)]
 pub trait ReceiptStore {
     /// Record the accepted envelope at `relay-accepted`, or report that this
