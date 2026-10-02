@@ -629,12 +629,12 @@ fn UsersTab() -> impl IntoView {
     };
 
     let admin_for_update = admin.clone();
-    let on_update_cohorts = move |pubkey: String, cohorts: Vec<String>| {
+    let on_update_cohorts = move |pubkey: String, add: Vec<String>, remove: Vec<String>| {
         if let Some(signer) = auth.get_signer() {
             let admin_clone = admin_for_update.clone();
             spawn_local(async move {
                 let _ = admin_clone
-                    .update_cohorts_signer(&pubkey, &cohorts, &*signer)
+                    .update_cohorts_signer(&pubkey, &add, &remove, &*signer)
                     .await;
             });
         }

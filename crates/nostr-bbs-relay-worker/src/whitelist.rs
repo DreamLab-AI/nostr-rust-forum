@@ -4,6 +4,7 @@
 //! updating whitelist entries in the D1 `whitelist` table.
 
 use nostr_bbs_core::d1_helpers::{js_f64, js_str};
+use nostr_bbs_core::whitelist_sql::{WHITELIST_GRANT_COHORTS_SQL, WHITELIST_REVOKE_COHORTS_SQL};
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::JsValue;
@@ -51,7 +52,54 @@ struct WhitelistAddBody {
 #[derive(Deserialize)]
 struct WhitelistUpdateCohortsBody {
     pubkey: Option<String>,
+    /// Cohorts to grant (merged into the member's set).
+    add: Option<Vec<String>>,
+    /// Cohorts to revoke by name.
+    remove: Option<Vec<String>>,
+    /// Pre-ADR-2014 field. Read as a grant, never as the replacement set, so a
+    /// client built before the delta contract cannot wipe a member's cohorts.
     cohorts: Option<Vec<String>>,
+}
+
+/// A validated cohort delta for one member: what to grant and what to revoke.
+#[derive(Debug, PartialEq, Eq)]
+struct CohortChange {
+    add: Vec<String>,
+    remove: Vec<String>,
+}
+
+/// Turn an update-cohorts body into a delta.
+///
+/// `add` and the legacy `cohorts` are both grants and are unioned. At least one
+/// cohort must be named, and a cohort may not be both granted and revoked in
+/// one request: the intent is ambiguous, so it is refused rather than guessed.
+fn cohort_change(
+    add: Option<Vec<String>>,
+    remove: Option<Vec<String>>,
+    legacy_cohorts: Option<Vec<String>>,
+) -> std::result::Result<CohortChange, &'static str> {
+    let mut grant: Vec<String> = Vec::new();
+    for c in add.into_iter().chain(legacy_cohorts).flatten() {
+        if !grant.contains(&c) {
+            grant.push(c);
+        }
+    }
+    let mut revoke: Vec<String> = Vec::new();
+    for c in remove.into_iter().flatten() {
+        if !revoke.contains(&c) {
+            revoke.push(c);
+        }
+    }
+    if grant.is_empty() && revoke.is_empty() {
+        return Err("Name at least one cohort in `add` or `remove`");
+    }
+    if grant.iter().any(|c| revoke.contains(c)) {
+        return Err("A cohort cannot be in both `add` and `remove`");
+    }
+    Ok(CohortChange {
+        add: grant,
+        remove: revoke,
+    })
 }
 
 #[derive(Deserialize)]
@@ -276,8 +324,12 @@ pub async fn handle_whitelist_list(req: &Request, env: &Env) -> Result<Response>
 
 /// `POST /api/whitelist/add` (NIP-98 admin only)
 ///
-/// Adds or updates a pubkey in the whitelist. Request body:
-/// `{ "pubkey": "<hex>", "cohorts": ["approved"] }`
+/// Adds a pubkey to the whitelist, or grants cohorts to one already on it.
+/// Request body: `{ "pubkey": "<hex>", "cohorts": ["approved"] }`
+///
+/// The cohorts are **merged** into the member's existing set (ADR-2014 D2):
+/// approving a member into one zone never revokes another. To remove a cohort
+/// use `/api/whitelist/update-cohorts` with `remove`.
 pub async fn handle_whitelist_add(mut req: Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
     let request_url = url.to_string();
@@ -311,21 +363,17 @@ pub async fn handle_whitelist_add(mut req: Request, env: &Env) -> Result<Respons
     let now = auth::js_now_secs();
 
     let db = env.d1("DB")?;
-    db.prepare(
-        "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by) \
-         VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT (pubkey) DO UPDATE SET cohorts = excluded.cohorts, added_by = excluded.added_by",
-    )
-    .bind(&[
-        js_str(&pubkey),
-        js_str(&cohorts_json),
-        js_f64(now as f64),
-        js_str(&admin_pubkey),
-    ])?
-    .run()
-    .await?;
+    db.prepare(WHITELIST_GRANT_COHORTS_SQL)
+        .bind(&[
+            js_str(&pubkey),
+            js_str(&cohorts_json),
+            js_f64(now as f64),
+            js_str(&admin_pubkey),
+        ])?
+        .run()
+        .await?;
 
-    // Audit trail
+    // Audit trail: `new_value` is the cohorts granted, not the resulting set.
     let _ = audit::log_admin_action(
         env,
         &admin_pubkey,
@@ -475,8 +523,17 @@ pub async fn handle_reset_db(mut req: Request, env: &Env) -> Result<Response> {
 
 /// `POST /api/whitelist/update-cohorts` (NIP-98 admin only)
 ///
-/// Updates the cohorts for an existing pubkey. Request body:
-/// `{ "pubkey": "<hex>", "cohorts": ["approved", "premium"] }`
+/// Grants and revokes named cohorts for one member. Request body:
+/// `{ "pubkey": "<hex>", "add": ["zone2"], "remove": ["zone3"] }`
+///
+/// Cohorts in `add` are merged into the member's set and those in `remove` are
+/// revoked; any other cohort the member holds is untouched, so an editor working
+/// from a stale list cannot undo a grant made since it loaded (ADR-2014 D2). A
+/// grant to a pubkey with no row creates one, as before; a revoke alone never
+/// does. Both statements run in one D1 batch.
+///
+/// The pre-ADR-2014 body `{ "pubkey", "cohorts": [...] }` is still accepted, but
+/// `cohorts` is read as a grant, not as the replacement set.
 pub async fn handle_whitelist_update_cohorts(mut req: Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
     let request_url = url.to_string();
@@ -509,31 +566,37 @@ pub async fn handle_whitelist_update_cohorts(mut req: Request, env: &Env) -> Res
             )
         }
     };
-    let cohorts = match &body.cohorts {
-        Some(c) => c.clone(),
-        None => return json_response(env, &json!({ "error": "Missing pubkey or cohorts" }), 400),
+    let change = match cohort_change(body.add, body.remove, body.cohorts) {
+        Ok(c) => c,
+        Err(msg) => return json_response(env, &json!({ "error": msg }), 400),
     };
 
-    let cohorts_json =
-        serde_json::to_string(&cohorts).map_err(|e| worker::Error::RustError(e.to_string()))?;
+    let add_json =
+        serde_json::to_string(&change.add).map_err(|e| worker::Error::RustError(e.to_string()))?;
+    let remove_json = serde_json::to_string(&change.remove)
+        .map_err(|e| worker::Error::RustError(e.to_string()))?;
     let now = auth::js_now_secs();
 
     let db = env.d1("DB")?;
-    db.prepare(
-        "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by) \
-         VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT (pubkey) DO UPDATE SET cohorts = excluded.cohorts, added_by = excluded.added_by",
-    )
-    .bind(&[
-        js_str(&pubkey),
-        js_str(&cohorts_json),
-        js_f64(now as f64),
-        js_str(&admin_pubkey),
-    ])?
-    .run()
-    .await?;
+    let mut stmts = Vec::with_capacity(2);
+    if !change.add.is_empty() {
+        stmts.push(db.prepare(WHITELIST_GRANT_COHORTS_SQL).bind(&[
+            js_str(&pubkey),
+            js_str(&add_json),
+            js_f64(now as f64),
+            js_str(&admin_pubkey),
+        ])?);
+    }
+    if !change.remove.is_empty() {
+        stmts.push(
+            db.prepare(WHITELIST_REVOKE_COHORTS_SQL)
+                .bind(&[js_str(&pubkey), js_str(&remove_json)])?,
+        );
+    }
+    db.batch(stmts).await?;
 
-    // Audit trail
+    // Audit trail: the delta, which is what the admin asked for.
+    let delta = json!({ "add": change.add, "remove": change.remove }).to_string();
     let _ = audit::log_admin_action(
         env,
         &admin_pubkey,
@@ -541,10 +604,58 @@ pub async fn handle_whitelist_update_cohorts(mut req: Request, env: &Env) -> Res
         Some(&pubkey),
         None,
         None,
-        Some(&cohorts_json),
+        Some(&delta),
         None,
     )
     .await;
 
     json_response(env, &json!({ "success": true }), 200)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Option<Vec<String>> {
+        Some(items.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn delta_carries_add_and_remove() {
+        let c = cohort_change(v(&["zone2"]), v(&["zone3"]), None).unwrap();
+        assert_eq!(c.add, ["zone2"]);
+        assert_eq!(c.remove, ["zone3"]);
+    }
+
+    #[test]
+    fn legacy_cohorts_field_is_a_grant_not_a_replacement() {
+        let c = cohort_change(None, None, v(&["home", "zone2"])).unwrap();
+        assert_eq!(c.add, ["home", "zone2"]);
+        assert!(c.remove.is_empty());
+    }
+
+    #[test]
+    fn add_and_legacy_cohorts_are_unioned_without_duplicates() {
+        let c = cohort_change(v(&["home"]), None, v(&["home", "zone2"])).unwrap();
+        assert_eq!(c.add, ["home", "zone2"]);
+    }
+
+    #[test]
+    fn empty_change_is_refused() {
+        assert!(cohort_change(None, None, None).is_err());
+        assert!(cohort_change(v(&[]), v(&[]), v(&[])).is_err());
+    }
+
+    #[test]
+    fn a_cohort_in_both_add_and_remove_is_refused() {
+        assert!(cohort_change(v(&["zone2"]), v(&["zone2"]), None).is_err());
+        assert!(cohort_change(None, v(&["zone2"]), v(&["zone2"])).is_err());
+    }
+
+    #[test]
+    fn remove_only_is_allowed() {
+        let c = cohort_change(None, v(&["zone3", "zone3"]), None).unwrap();
+        assert!(c.add.is_empty());
+        assert_eq!(c.remove, ["zone3"]);
+    }
 }

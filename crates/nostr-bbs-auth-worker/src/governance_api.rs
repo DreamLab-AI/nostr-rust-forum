@@ -15,6 +15,7 @@
 //! | POST   | /api/governance/roles/revoke    | admin | Revoke a broker role from a pubkey   |
 //! | GET    | /api/governance/roles           | any   | List broker role assignments         |
 
+use nostr_bbs_core::whitelist_sql::WHITELIST_GRANT_COHORTS_SQL;
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::JsValue;
@@ -408,10 +409,11 @@ pub async fn handle_register_agent(
 /// D1 (`RELAY_DB` — the same database that holds both `whitelist` and
 /// `agent_registry`):
 ///
-/// 1. Allowlist upsert — adds/updates the pubkey in the `whitelist` cohort
-///    table with the supplied cohorts. Mirrors the relay worker's
-///    `/api/whitelist/add` SQL contract (`INSERT … ON CONFLICT … DO UPDATE`),
-///    so the two paths converge on identical row shapes.
+/// 1. Allowlist grant — adds the pubkey to the `whitelist` table, or merges
+///    the supplied cohorts into its existing set (ADR-2014 D2: a grant never
+///    removes a cohort). Binds the same statement as the relay worker's
+///    `/api/whitelist/add` ([`WHITELIST_GRANT_COHORTS_SQL`]), so the two paths
+///    converge on identical row shapes.
 /// 2. Registry upsert — `INSERT OR REPLACE` into `agent_registry`, reusing the
 ///    exact column set written by [`handle_register_agent`].
 ///
@@ -425,7 +427,8 @@ pub async fn handle_register_agent(
 /// derived keys) and ADR-096 pod delegation.
 ///
 /// Idempotent: provisioning the same pubkey twice converges to the same end
-/// state (cohorts replaced, registry row replaced & re-activated).
+/// state (cohorts merged, registry row replaced & re-activated). A cohort the
+/// pubkey already held, from a human admin or an earlier provision, is kept.
 ///
 /// Returns `{ pubkey, cohorts, registered: true }`.
 pub async fn handle_provision_agent(
@@ -458,20 +461,14 @@ pub async fn handle_provision_agent(
     let db = relay_db(env)?;
     let now = now_secs();
 
-    // Allowlist write — same SQL contract as the relay worker's
-    // `/api/whitelist/add` (INSERT … ON CONFLICT DO UPDATE on cohorts/added_by).
-    let whitelist_stmt = db
-        .prepare(
-            "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (pubkey) DO UPDATE SET cohorts = excluded.cohorts, added_by = excluded.added_by",
-        )
-        .bind(&[
-            JsValue::from_str(&p.pubkey),
-            JsValue::from_str(&cohorts_json),
-            JsValue::from_f64(now as f64),
-            JsValue::from_str(&admin_pk),
-        ])?;
+    // Allowlist grant — the relay worker's `/api/whitelist/add` statement:
+    // merge the agent's cohorts into any existing row, never replace them.
+    let whitelist_stmt = db.prepare(WHITELIST_GRANT_COHORTS_SQL).bind(&[
+        JsValue::from_str(&p.pubkey),
+        JsValue::from_str(&cohorts_json),
+        JsValue::from_f64(now as f64),
+        JsValue::from_str(&admin_pk),
+    ])?;
 
     // Registry write — identical column set to handle_register_agent.
     let registry_stmt = db

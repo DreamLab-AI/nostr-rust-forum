@@ -51,6 +51,7 @@ pub mod governance;
 pub mod kanban;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_bridge;
+pub mod whitelist_sql;
 
 // ── Re-exports for ergonomic top-level use ─────────────────────────────────
 

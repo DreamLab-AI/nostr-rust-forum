@@ -78,14 +78,15 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_pubkey ON events(pubkey);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+```
 
-CREATE TABLE IF NOT EXISTS whitelist (
-    pubkey TEXT PRIMARY KEY,
-    cohorts TEXT NOT NULL DEFAULT '["members"]',
-    added_at INTEGER NOT NULL,
-    added_by TEXT NOT NULL DEFAULT 'auto-registration',
-    is_admin INTEGER NOT NULL DEFAULT 0
-);
+The membership table `whitelist` is checked in as a migration (ADR-2014
+phase 1). The relay worker also creates it, and adds any missing column, at
+startup, so this step only matters if you want the table before the first
+request:
+
+```bash
+wrangler d1 execute nostr-bbs-relay --file crates/nostr-bbs-relay-worker/migrations/0008_whitelist.sql
 ```
 
 Apply the governance migration (Agent Control Surface Protocol):

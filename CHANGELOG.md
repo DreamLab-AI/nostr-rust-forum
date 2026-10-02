@@ -7,6 +7,29 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### ADR-2014 phase 1 (slice): cohort grants merge; `whitelist` DDL checked in — 2026-10-02
+
+- **Fixed: granting a cohort revoked every other.** Four writers replaced a
+  member's cohort list wholesale: `/api/whitelist/add`,
+  `/api/whitelist/update-cohorts`, `/api/admin/alias` with inherit, and
+  `/api/governance/agents/provision`. Approving someone into one zone dropped
+  them from the rest. All four now bind one statement,
+  `nostr_bbs_core::whitelist_sql::WHITELIST_GRANT_COHORTS_SQL`, which merges
+  inside D1, so concurrent grants cannot lose each other either.
+- **`/api/whitelist/update-cohorts` takes a delta:** `{pubkey, add, remove}`.
+  Removal names its cohorts (`WHITELIST_REVOKE_COHORTS_SQL`); a cohort in both
+  lists is refused with 400. The old `cohorts` field is still accepted and read
+  as a grant, never as the replacement set. The admin cohort editor sends only
+  what the admin changed, so a grant made since the list loaded survives a save.
+- **The `whitelist` table has checked-in DDL:** relay migration
+  `0008_whitelist.sql`, which `ensure_schema()` mirrors. That function now
+  creates the table on a fresh D1 and adds `expires_at`, which admission read
+  but no DDL created. No manual D1 migration is needed: the worker applies both
+  at startup.
+- Tests run the grant and revoke SQL against a real SQLite (`rusqlite`,
+  dev-only), and a tree-wide guard fails the build if any writer reintroduces a
+  cohort-replacing upsert. Needs a kit-pin to reach the edge.
+
 ### ADR-2011 live; the forum UI's decisions now project — 2026-10-02
 
 - **ADR-2011 is `live`.** New `nostr-bbs-governance-probe` (not published): the

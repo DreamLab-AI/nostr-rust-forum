@@ -64,7 +64,8 @@ fn available_cohorts() -> Vec<(String, String)> {
 }
 
 /// Callback type for cohort updates: (pubkey, new_cohorts).
-type UpdateCallback = Rc<dyn Fn(String, Vec<String>)>;
+/// Callback type for a cohort edit: (pubkey, cohorts to add, cohorts to remove).
+type UpdateCallback = Rc<dyn Fn(String, Vec<String>, Vec<String>)>;
 
 /// Callback type for admin toggle: (pubkey, is_admin).
 type AdminToggleCallback = Rc<dyn Fn(String, bool)>;
@@ -73,7 +74,8 @@ type AdminToggleCallback = Rc<dyn Fn(String, bool)>;
 type DeleteCallback = Rc<dyn Fn(String, bool)>;
 
 /// Whitelist user table. Shows username, cohorts, and an edit button for each user.
-/// Calls `on_update_cohorts` when cohorts are changed for a user.
+/// Calls `on_update_cohorts` with the cohorts added and removed when a user's
+/// cohorts are changed.
 /// Calls `on_toggle_admin` when admin status is toggled for a user.
 #[component]
 pub fn UserTable(
@@ -141,7 +143,7 @@ pub fn UserTable(
 pub struct UpdateCohortsCb(SendWrapper<UpdateCallback>);
 
 impl UpdateCohortsCb {
-    pub fn new(f: impl Fn(String, Vec<String>) + 'static) -> Self {
+    pub fn new(f: impl Fn(String, Vec<String>, Vec<String>) + 'static) -> Self {
         Self(SendWrapper::new(Rc::new(f)))
     }
 }
@@ -151,7 +153,7 @@ unsafe impl Send for UpdateCohortsCb {}
 #[cfg(target_arch = "wasm32")]
 unsafe impl Sync for UpdateCohortsCb {}
 
-impl<F: Fn(String, Vec<String>) + 'static> From<F> for UpdateCohortsCb {
+impl<F: Fn(String, Vec<String>, Vec<String>) + 'static> From<F> for UpdateCohortsCb {
     fn from(f: F) -> Self {
         Self::new(f)
     }
@@ -647,9 +649,15 @@ fn UserRow(
 
     let save_cb = on_save.0;
     let pk_save = pk_for_save.clone();
+    let cohorts_before_edit = cohorts.clone();
     let on_save_click = move |_| {
         let updated = editing_cohorts.get_untracked();
-        save_cb(pk_save.clone(), updated);
+        // Send what changed, not the final set: a grant made elsewhere since
+        // this list loaded must survive the save (ADR-2014 D2).
+        let (add, remove) = super::membership::cohort_delta(&cohorts_before_edit, &updated);
+        if !add.is_empty() || !remove.is_empty() {
+            save_cb(pk_save.clone(), add, remove);
+        }
         editing_pubkey.set(None);
     };
 

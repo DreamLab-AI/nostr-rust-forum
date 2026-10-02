@@ -19,13 +19,15 @@
 //!
 //! Nostr events are bound to the signing key; an admin can never re-sign another
 //! key's events. The realistic model is a `pubkey_aliases` map. When a newly
-//! joining `new_pubkey` is linked to a prior `old_pubkey`, we (a) copy the old
-//! pubkey's `cohorts` onto the new whitelist row (cohort inheritance), and (b)
+//! joining `new_pubkey` is linked to a prior `old_pubkey`, we (a) merge the old
+//! pubkey's `cohorts` into the new whitelist row (cohort inheritance; cohorts
+//! the new key already holds are kept, ADR-2014 D2), and (b)
 //! persist the alias so the *display* layer can attribute the new pubkey's posts
 //! under the prior handle. Authorship of historic events is unchanged — only how
 //! we render/resolve it.
 
 use nostr_bbs_core::d1_helpers::{js_f64, js_str};
+use nostr_bbs_core::whitelist_sql::WHITELIST_GRANT_COHORTS_SQL;
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::JsValue;
@@ -597,28 +599,25 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
     .run()
     .await?;
 
-    // Cohort inheritance: copy the old pubkey's cohorts onto the new pubkey's
+    // Cohort inheritance: merge the old pubkey's cohorts into the new pubkey's
     // whitelist row (creating it if absent). Access (which zones the new key can
     // read/write) is cohort-driven, so this is the realistic "inherit access".
+    // A merge, not a copy: anything the new key was already granted survives.
     let mut inherited_cohorts: Option<String> = None;
     if body.inherit_cohorts {
         let stmt = db.prepare("SELECT cohorts FROM whitelist WHERE pubkey = ?1");
         let bound = stmt.bind(&[js_str(&old_pk)])?;
         if let Ok(Some(row)) = bound.first::<CohortsRow>(None).await {
             let cohorts_json = row.cohorts;
-            db.prepare(
-                "INSERT INTO whitelist (pubkey, cohorts, added_at, added_by) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT (pubkey) DO UPDATE SET cohorts = excluded.cohorts",
-            )
-            .bind(&[
-                js_str(&new_pk),
-                js_str(&cohorts_json),
-                js_f64(now as f64),
-                js_str(&admin_pubkey),
-            ])?
-            .run()
-            .await?;
+            db.prepare(WHITELIST_GRANT_COHORTS_SQL)
+                .bind(&[
+                    js_str(&new_pk),
+                    js_str(&cohorts_json),
+                    js_f64(now as f64),
+                    js_str(&admin_pubkey),
+                ])?
+                .run()
+                .await?;
             inherited_cohorts = Some(cohorts_json);
         }
     }

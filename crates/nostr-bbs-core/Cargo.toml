@@ -53,6 +53,7 @@ wasm-bindgen-test = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
+rusqlite = { workspace = true }
 
 [[bench]]
 name = "bench_nip44"

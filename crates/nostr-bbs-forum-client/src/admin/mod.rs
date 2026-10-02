@@ -381,17 +381,20 @@ impl AdminStore {
         }
     }
 
+    /// Grant `add` and revoke `remove` for one member via
+    /// `/api/whitelist/update-cohorts`. Cohorts named in neither are untouched.
     pub async fn update_cohorts_signer(
         &self,
         pubkey: &str,
-        cohorts: &[String],
+        add: &[String],
+        remove: &[String],
         signer: &dyn Signer,
     ) -> Result<(), String> {
         self.state.is_loading.set(true);
         self.state.error.set(None);
         self.state.success.set(None);
 
-        let body = serde_json::json!({ "pubkey": pubkey, "cohorts": cohorts });
+        let body = serde_json::json!({ "pubkey": pubkey, "add": add, "remove": remove });
         let body_json =
             serde_json::to_string(&body).map_err(|e| format!("JSON serialization failed: {e}"))?;
         let url = format!("{}/api/whitelist/update-cohorts", Self::api_base());

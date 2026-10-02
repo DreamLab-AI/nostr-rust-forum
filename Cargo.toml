@@ -58,6 +58,10 @@ rust-version = "1.85"
 wasm-check-packages = ["nostr-bbs-config", "nostr-bbs-preview-worker"]
 
 [workspace.dependencies]
+# Test-only: runs the shared whitelist SQL (nostr-bbs-core::whitelist_sql)
+# against a real SQLite, the engine D1 is built on. `bundled` so CI needs no
+# system libsqlite3.
+rusqlite = { version = "0.37", features = ["bundled"] }
 # Nostr protocol (0.44.x — alpha, pinned to minor).
 # Phase 5 Stage 2B (ADR-076/078): activate the NIP feature flags for the
 # absorption targets. `std` is on by default; the explicit feature list here

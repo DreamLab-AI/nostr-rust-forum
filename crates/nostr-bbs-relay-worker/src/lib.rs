@@ -44,6 +44,7 @@ pub mod test_exports {
     pub use crate::trust::{compute_trust_level, TrustLevel, TrustThresholds};
 }
 
+use nostr_bbs_core::whitelist_sql::WHITELIST_CREATE_SQL;
 use worker::*;
 
 // ---------------------------------------------------------------------------
@@ -688,6 +689,13 @@ async fn ensure_schema(env: &Env) {
         Err(_) => return,
     };
 
+    // --- Whitelist table (ADR-2014 phase 1, migration 0008) ---
+    // Must precede the ALTERs below: on a fresh D1 there is otherwise no table
+    // for them to alter, and admission and every whitelist write fail.
+    if let Err(e) = db.prepare(WHITELIST_CREATE_SQL).run().await {
+        console_error!("ensure_schema: whitelist create failed: {e}");
+    }
+
     // --- Whitelist columns (idempotent: errors ignored if column exists) ---
     let alter_stmts = [
         "ALTER TABLE whitelist ADD COLUMN is_admin INTEGER DEFAULT 0",
@@ -701,6 +709,9 @@ async fn ensure_schema(env: &Env) {
         "ALTER TABLE whitelist ADD COLUMN suspended_until INTEGER",
         "ALTER TABLE whitelist ADD COLUMN silenced INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE whitelist ADD COLUMN user_notes TEXT",
+        // Read by admission (`expires_at IS NULL OR expires_at > now`) but, until
+        // ADR-2014 phase 1, created by no DDL in the repository.
+        "ALTER TABLE whitelist ADD COLUMN expires_at INTEGER",
         // F6 (DDD §7a): supersession marker on the append-only decision trail.
         // Idempotent for already-deployed DBs whose broker_decisions predates F6.
         "ALTER TABLE broker_decisions ADD COLUMN superseded_by TEXT",

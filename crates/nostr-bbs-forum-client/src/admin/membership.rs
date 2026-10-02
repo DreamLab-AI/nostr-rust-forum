@@ -119,6 +119,30 @@ pub(crate) fn pending_registrations(
     pending
 }
 
+/// The change an admin made in the cohort editor, as the delta
+/// `/api/whitelist/update-cohorts` takes: `(add, remove)`.
+///
+/// The editor starts from the member's cohorts as the list showed them and
+/// ends with the ticked set. Sending the difference rather than the final set
+/// means a cohort granted elsewhere since the list loaded (an invite, an agent
+/// provision, another admin) is not revoked by this save (ADR-2014 D2). Order
+/// follows the inputs; duplicates are dropped.
+pub(crate) fn cohort_delta(original: &[String], edited: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut add: Vec<String> = Vec::new();
+    for c in edited {
+        if !original.contains(c) && !add.contains(c) {
+            add.push(c.clone());
+        }
+    }
+    let mut remove: Vec<String> = Vec::new();
+    for c in original {
+        if !edited.contains(c) && !remove.contains(c) {
+            remove.push(c.clone());
+        }
+    }
+    (add, remove)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,9 +152,9 @@ mod tests {
     ///
     /// - `GET /api/whitelist/list`: `limit` defaults to 20 and is capped at
     ///   100; `offset` defaults to 0; rows are `ORDER BY added_at DESC`.
-    /// - `POST /api/whitelist/add`: `INSERT … ON CONFLICT (pubkey) DO UPDATE SET
-    ///   cohorts = excluded.cohorts, added_by = excluded.added_by` — an existing
-    ///   row keeps its original `added_at`.
+    /// - `POST /api/whitelist/add`: `nostr_bbs_core::whitelist_sql::
+    ///   WHITELIST_GRANT_COHORTS_SQL` — granted cohorts are merged into an
+    ///   existing row's set (ADR-2014 D2), which keeps its original `added_at`.
     struct FakeRelay {
         /// (pubkey, cohorts, added_at)
         rows: Vec<(String, Vec<String>, u64)>,
@@ -149,7 +173,12 @@ mod tests {
             self.clock += 1;
             let cohorts: Vec<String> = cohorts.iter().map(|c| c.to_string()).collect();
             if let Some(row) = self.rows.iter_mut().find(|r| r.0 == pubkey) {
-                row.1 = cohorts; // added_at deliberately untouched
+                // Merge, as the relay does; added_at deliberately untouched.
+                for c in cohorts {
+                    if !row.1.contains(&c) {
+                        row.1.push(c);
+                    }
+                }
             } else {
                 self.rows.push((pubkey.to_string(), cohorts, self.clock));
             }
@@ -281,5 +310,43 @@ mod tests {
         relay.add(&reg.pubkey.to_uppercase(), &["members"]);
         reg.pubkey = reg.pubkey.to_lowercase();
         assert!(pending_registrations(&[reg], &fetch_all(&relay)).is_empty());
+    }
+
+    fn owned(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cohort_delta_reports_only_what_the_editor_changed() {
+        let (add, remove) = cohort_delta(
+            &owned(&["home", "zone2", "agent"]),
+            &owned(&["home", "agent", "zone3"]),
+        );
+        assert_eq!(add, ["zone3"]);
+        assert_eq!(remove, ["zone2"]);
+    }
+
+    #[test]
+    fn unchanged_editor_yields_an_empty_delta() {
+        let (add, remove) = cohort_delta(&owned(&["home", "zone2"]), &owned(&["zone2", "home"]));
+        assert!(add.is_empty() && remove.is_empty());
+    }
+
+    #[test]
+    fn unticking_a_zone_group_removes_every_equivalent_name() {
+        // The editor drops every name in a zone's equivalence group at once.
+        let (add, remove) = cohort_delta(&owned(&["members", "zone2", "home"]), &owned(&["home"]));
+        assert!(add.is_empty());
+        assert_eq!(remove, ["members", "zone2"]);
+    }
+
+    #[test]
+    fn approve_merges_into_cohorts_already_held() {
+        let mut relay = FakeRelay::new();
+        relay.add(&pk(1), &["zone2"]);
+        relay.add(&pk(1), &["home"]);
+        let users = fetch_all(&relay);
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].cohorts, ["zone2", "home"]);
     }
 }
