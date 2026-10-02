@@ -3,11 +3,11 @@ id: ADR-2014
 title: One member lifecycle, one authoritative store, one admin surface
 date: 2026-09-24
 decision_status: proposed
-implementation_status: none
-activation_status: inactive
+implementation_status: partial
+activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: 56e8c4f
+verified_commit: 1a26e51
 owner: jjohare
 review_trigger: phase 1 (the relay `members` projection) merging; any new writer to `whitelist`, auth `members` or `username_reservations`; any new admin tab or sub-view that lists people
 repo: nostr-rust-forum
@@ -32,7 +32,9 @@ and four writers that replace a member's cohorts rather than merge them.
 
 ### D1. Today's duplication (the map this decision replaces)
 
-Paths are relative to `crates/`; lines verified at `56e8c4f`.
+Paths are relative to `crates/`; lines verified at `56e8c4f`, which reached `main` as `b2b30d0`
+(identical `git patch-id`). This is the map of the tree **before** phase 1, kept as the record of
+what was replaced; rows changed since name the commit that changed them.
 
 **Stores.**
 
@@ -40,7 +42,7 @@ Paths are relative to `crates/`; lines verified at `56e8c4f`.
 |---|---|---|
 | Sign-up / handle / real name / dismissed | auth `username_reservations` (`status` `active`/`dismissed`) | `nostr-bbs-auth-worker/src/schema.rs:208`, `:232` |
 | "Member" with admin flag and invite provenance | auth `members` | `nostr-bbs-auth-worker/src/schema.rs:116` |
-| Access, cohorts, admin flag, trust, suspension, silence, notes | relay `whitelist` | **none in code**: base table only in `SETUP.md:82`; columns added at `nostr-bbs-relay-worker/src/lib.rs:638-648`; `expires_at` is read (`whitelist.rs:87,190,194,208,212`, `relay_do/storage.rs:353`) but defined nowhere |
+| Access, cohorts, admin flag, trust, suspension, silence, notes | relay `whitelist` | **none in code**: base table only in `SETUP.md:82`; columns added at `nostr-bbs-relay-worker/src/lib.rs:638-648`; `expires_at` is read (`whitelist.rs:87,190,194,208,212`, `relay_do/storage.rs:353`) but defined nowhere. *Since `1a26e51`:* `nostr-bbs-relay-worker/migrations/0008_whitelist.sql`, mirrored by `ensure_schema()` |
 | Invites | auth `invitations`, `invitation_redemptions` | `schema.rs:123`, `:136`, `zone_id` ALTER `:158` |
 | WoT admission | auth `wot_entries` | `schema.rs:103` |
 | Ban / mute | auth `moderation_actions` **and** relay mirror | `schema.rs:70`; `nostr-bbs-relay-worker/src/lib.rs:731` |
@@ -57,12 +59,12 @@ Paths are relative to `crates/`; lines verified at `56e8c4f`.
 | `nostr-bbs-auth-worker/src/username.rs:307` | username claim (auto-whitelist) | `DO NOTHING` |
 | `nostr-bbs-auth-worker/src/invites.rs:245`, `:271` | zone-bound invite redeem | insert then **merge** (the only merge) |
 | `nostr-bbs-auth-worker/src/admins.rs:187` | `/api/admins/add` | `DO UPDATE is_admin=1` |
-| `nostr-bbs-auth-worker/src/governance_api.rs:465` | `/api/governance/agents/provision` | **replace cohorts** |
-| `nostr-bbs-relay-worker/src/whitelist.rs:315` | `/api/whitelist/add` | **replace cohorts**, keep `added_at` |
-| `nostr-bbs-relay-worker/src/whitelist.rs:523` | `/api/whitelist/update-cohorts` | **replace** (and creates rows) |
+| `nostr-bbs-auth-worker/src/governance_api.rs:465` | `/api/governance/agents/provision` | **replace cohorts**; merge since `1a26e51` |
+| `nostr-bbs-relay-worker/src/whitelist.rs:315` | `/api/whitelist/add` | **replace cohorts**, keep `added_at`; merge since `1a26e51` |
+| `nostr-bbs-relay-worker/src/whitelist.rs:523` | `/api/whitelist/update-cohorts` | **replace** (and creates rows); since `1a26e51` a `{add, remove}` delta: merge, then revoke by name |
 | `nostr-bbs-relay-worker/src/whitelist.rs:395` | `/api/whitelist/set-admin` | update only |
 | `nostr-bbs-relay-worker/src/user_admin.rs:197`, `:300`, `:363`, `:458` | delete, suspend, silence, notes | delete / update |
-| `nostr-bbs-relay-worker/src/user_admin.rs:610` | `/api/admin/alias` with inherit | **replace cohorts** |
+| `nostr-bbs-relay-worker/src/user_admin.rs:610` | `/api/admin/alias` with inherit | **replace cohorts**; merge since `1a26e51` |
 | `nostr-bbs-relay-worker/src/trust.rs:238`, `trust_sweep.rs:417` | activity, cron | trust level |
 | `nostr-bbs-relay-worker/src/whitelist.rs:467` | `/api/admin/reset-db` | delete all |
 
@@ -183,8 +185,8 @@ cut-over, and step 1 is a pure copy.
 
 | Phase | Scope | Acceptance tests |
 |---|---|---|
-| 0 (done, `56e8c4f`) | Client reads every whitelist page; one Pending derivation | `admin::membership::tests` (5 tests), including 28 members with 8 beyond page 1 |
-| 1 | Checked-in DDL for `whitelist` including `expires_at`; merge-not-replace on the four replacing writers; lowercase pubkeys on write; invite revoke by code; list returns trust, suspension and silence | For each writer, a pure SQL-builder test that a grant never removes an existing cohort. Revoke-by-code test. Admin-list JSON includes the trust fields |
+| 0 (done, `56e8c4f` = `b2b30d0` on `main`) | Client reads every whitelist page; one Pending derivation | `admin::membership::tests` (5 tests), including 28 members with 8 beyond page 1 |
+| 1 (partial: DDL and merge done, `1a26e51`) | Checked-in DDL for `whitelist` including `expires_at`; merge-not-replace on the four replacing writers; lowercase pubkeys on write; invite revoke by code; list returns trust, suspension and silence | For each writer, a pure SQL-builder test that a grant never removes an existing cohort. Revoke-by-code test. Admin-list JSON includes the trust fields |
 | 2 | Relay `members` table, migration D5 steps 1–3, `membership.rs` module and transition endpoint with audit | Migration fixture: N whitelist + M reservations (including case collisions and past `expires_at`) gives exactly N active and M' requested, with identical cohorts and admin flags. Every transition writes one `admin_log` row. Invalid transitions (e.g. `removed → active`) are refused |
 | 3 | Dual-write, admission fallback, reconciliation cron | The reconciliation reports zero differences on the fixture. Admission is identical for every fixture pubkey under both stores. Suspension is enforced on a device key whose owner is suspended |
 | 4 | Single Members table with filters and bulk transitions; delete Pending/Access sub-views and client set arithmetic | Bulk approve of 50 requested members leaves 0 in `state=requested` after refetch. A `wasm32` check. An e2e journey: sign up → appears under Requested → approve → can post |
@@ -220,7 +222,7 @@ Forbidden after acceptance:
 
 ## Verification
 
-Proposed; phases 1–5 are not built. The duplication map in D1 was taken by `grep -n` and
+Phase 0 is built. Phase 1 is half built (below); phases 2–5 are not. The duplication map in D1 was taken by `grep -n` and
 `sed -n` over the tree at `56e8c4f`. Nothing in this record was checked against a deployed D1.
 In particular, whether production `whitelist` has an `expires_at` column is unverified: the
 code reads it, but no DDL in the repository creates it.
@@ -229,9 +231,51 @@ Phase 0 evidence: `cargo test -p nostr-bbs-forum-client membership` fails at the
 commit `a623ba8`'s single-page read ("8 members still pending after approval"; pager returned
 20 of 250 rows) and passes at `56e8c4f` (5/5; full crate 460/460).
 
+Phase 1 evidence, at `1a26e51` (the slice the disposition below names, taken on the owner's
+decision of 2026-10-02, Q5, to land it before the 3 Nov residential):
+
+- **Merge, not replace.** The four writers bind one statement,
+  `nostr_bbs_core::whitelist_sql::WHITELIST_GRANT_COHORTS_SQL`, which merges inside SQLite.
+  `/api/whitelist/update-cohorts` takes `{pubkey, add, remove}`; removal is by name
+  (`WHITELIST_REVOKE_COHORTS_SQL`) in the same D1 batch, a cohort in both lists is refused,
+  and the legacy `cohorts` field is read as a grant. The admin cohort editor sends only its
+  delta. The acceptance test the D6 row asks for is stronger than a SQL-builder test:
+  `cargo test -p nostr-bbs-core whitelist_sql` runs the statements against a real SQLite
+  (`rusqlite`, bundled, dev-only), 12 tests. Seeded with the pre-phase-1 replace SQL, three
+  fail (`grant_never_removes_an_existing_cohort`, `grant_does_not_duplicate_a_held_cohort`,
+  `empty_grant_leaves_cohorts_unchanged`); with the merge, 12/12.
+  `tests/whitelist_cohort_writers.rs` in the relay worker fails the build if any source outside
+  that module carries the replace idiom (`cohorts = excluded.cohorts`, present in exactly the
+  four writers at `b13101f`) or a new `UPDATE whitelist SET cohorts`.
+- **Checked-in DDL.** `migrations/0008_whitelist.sql` creates the whole table including
+  `expires_at`. `ensure_schema()` runs the same statement before its `ALTER` list, which now
+  adds `expires_at`. A test holds the migration and the constant equal and the create ahead
+  of the alters. No manual D1 migration is needed on the edge: the worker applies both at
+  start-up, and on an existing table the create is a no-op and the alter either adds the
+  column or fails harmlessly as a duplicate.
+- Suites at `1a26e51`: core 456 + 128 integration, relay worker 366 + 218 integration, auth
+  worker 239, forum client 540, all passing; `cargo clippy --workspace --all-targets
+  --all-features -D warnings`, `cargo fmt --check` and `cargo check --target
+  wasm32-unknown-unknown` clean.
+
+Not done in phase 1, and still owed before the D6 row closes: lowercase pubkeys on write,
+invite revoke by code, and trust, suspension and silence in the admin list. The invite
+zone grant (`invites.rs:245`, `:271`) already merged and is unchanged; it merges in the
+worker rather than in SQL, so two grants racing on one member can still lose one. Whether
+production `whitelist` already had `expires_at` is still unchecked against the deployed D1;
+phase 1 makes the answer not matter.
+
 ## Disposition — 2026-10-02
 
 - **Suitability:** fits, needs revision
 - **Priority:** P2 — next cycle (reopens at the start of the next cycle, or earlier if a residential deployment onboards members to a fresh forum instance and hits a cohort or pending defect)
 - **Why:** The defect class this record names is still present on `main` at `341c5d2`. `/api/whitelist/add` and `/api/whitelist/update-cohorts` still replace cohorts (`crates/nostr-bbs-relay-worker/src/whitelist.rs:317`, `:525`). No relay `members` table or `membership.rs` exists, and migrations stop at `0007_ontology_governance.sql`. No plan track (planning-cycle §2, §10) names membership, so phases 1–5 are not this cycle's work. The text needs revision on one point: `verified_commit` and every line reference cite `56e8c4f`, which is not on `main`. The same patch landed as `b2b30d0` (identical `git patch-id`), and ADR-2014 itself as `9be9c67`. The branch `fix/pending-approve` is therefore fully merged in substance.
 - **Next:** Re-anchor `verified_commit` to `b2b30d0` and re-check the D1 line references at the current HEAD. Then take phase 1 (merge-not-replace on the four replacing writers, plus checked-in `whitelist` DDL) as the first slice next cycle.
+
+### Update — 2026-10-02
+
+The owner brought the phase 1 slice above forward (decision of 2026-10-02, Q5: land before the
+3 Nov residential). It is on `main` at `1a26e51`: the four writers merge, and the `whitelist`
+DDL is checked in. `verified_commit` is re-anchored there; the D1 map stays the pre-phase-1
+record, with changed rows marked. It reaches the edge when the website's kit pin is bumped
+past `1a26e51`. The rest of phase 1 and phases 2–5 keep the P2 priority above.
