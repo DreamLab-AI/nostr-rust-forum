@@ -7,7 +7,7 @@ implementation_status: partial
 activation_status: inactive
 supersedes: []
 superseded_by: []
-verified_commit: 5f361e8f77c1b76b85aa9c36c2a9eeffc33ed190
+verified_commit: e43fbbc5420671ecb157591c3a49f259bcd14317
 owner: jjohare
 review_trigger: the three-ledger equality test first passing; any change to `derive_deposit_address` or its known-answer vectors; any new route that credits a `/pay/` balance; the solid-pod-rs post-port version publishing to crates.io; any proposal to add a forum-owned event kind for value or settlement
 repo: nostr-rust-forum
@@ -106,6 +106,15 @@ script it paid, keyed without its chain and with the txid's case preserved.
    sidestr/spec `keys.mjs` (full points, tweaks added to the point as it is) and the teller's
    tagged, ledger-scoped tweak `tagged("webledgers/deposit", ledgerHash ‖ account ‖ nonce)`
    under a **new route**; it never changes the addresses this route has issued.
+   *Amended 2026-10-02 (S6):* the credit-without-proof pattern is guarded structurally, not
+   only by route tests. `crates/nostr-bbs-pod-worker/tests/pay_credit_guard.rs` scans every
+   workspace source that can reach the shared D1 and fails unless the one statement that
+   creates or raises a `webledger_accounts` balance is `SQL_APPLY_CREDIT`, reading account
+   and amount from an unapplied `pay_credits` row, and no statement sets or adds
+   `balance_sats` from a bound parameter. A new credit path therefore has to go through the
+   journal and its evidence CHECK. This is the forum's half of the estate rule that
+   solid-pod-rs ADR-2008 D6 (e62d028) states for the pod: no reachable credit on the caller's
+   word, default-off or not.
 
 ## Consequences
 
@@ -125,7 +134,7 @@ outpoint pruned before this change could be claimed once more, by its own addres
 
 ## Verification
 
-D6 and the D1 journal are built at `5f361e8` and verified by
+D6 and the D1 journal are built at `b72dbe6` (rebased from `5f361e8`) and verified by
 `cargo test -p nostr-bbs-pod-worker`: `deposit_address_known_answers_are_frozen`,
 `known_answers_cover_both_parities_of_q` and `live_construction_is_not_bip341_for_odd_q`
 (`deposit_address.rs`); and handler fixtures that run the production dispatcher and SQL on
@@ -134,7 +143,9 @@ SQLite (`pay_ledger/tests.rs`): `deposit_with_amount_sats_is_refused_and_credits
 `teller_credit_once_by_outpoint_at_the_derived_address`,
 `the_same_outpoint_on_two_chains_is_two_receipts`,
 `dream_withdraw_on_zero_balance_is_refused_and_credits_nothing`,
-`every_credit_row_names_its_evidence`. Not deployed: activation stays inactive until the
+`every_credit_row_names_its_evidence`; and, since `e43fbbc`, the source guard
+`cargo test -p nostr-bbs-pod-worker --test pay_credit_guard` (three tests; they fail against
+`b72dbe6^`). Not deployed: activation stays inactive until the
 pod-worker ships this commit. The rest of the record is proposed; nothing else built.
 Ratification evidence will be:
 
