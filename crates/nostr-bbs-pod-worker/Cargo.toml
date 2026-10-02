@@ -37,8 +37,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-k256 = { workspace = true }
-bech32 = { workspace = true }
+# Deposit-address derivation (src/deposit_address.rs): secp256k1 point
+# tweaks, the TapTweak tagged hash, and segwit v1 address/script encoding.
+# secp256k1 0.29 is already in this crate's graph through nostr.
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 base64 = { workspace = true }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
@@ -62,3 +64,11 @@ uuid = { version = "1", features = ["js"] }
 # `cargo check --target wasm32-unknown-unknown`.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 proptest = { workspace = true }
+# The /pay/ ledger tests run the production SQL against a real SQLite, the
+# engine D1 is built on (`bundled`: no system libsqlite3).
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+# Cross-checks the deposit derivation's mod-n reduction against k256, the
+# implementation it was ported from.
+k256 = { workspace = true }

@@ -18,10 +18,12 @@ mod conditional;
 mod container;
 mod content_negotiation;
 mod contexts;
+mod deposit_address;
 mod did;
 mod git;
 mod notifications;
 mod patch;
+mod pay_ledger;
 mod payments;
 mod provision;
 mod quota;
@@ -661,16 +663,21 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             let pay_nip98_origin = request_origin(&url);
             let request_url = url.to_string();
-            let requester_pubkey: Option<String> = if let Some(ref header) = pay_auth_header {
+            // The verified signer and the signed request's event id: the id
+            // is the receipt for any credit this request causes (ADR-2012 D6).
+            let requester: Option<(String, String)> = if let Some(ref header) = pay_auth_header {
                 let method_name = method_str(&method);
                 let body_ref = pay_body.as_deref();
                 auth::verify_nip98_replay(header, &request_url, method_name, body_ref, &env)
                     .await
                     .ok()
-                    .map(|t| t.pubkey)
+                    .map(|t| (t.pubkey, t.event_id))
             } else {
                 None
             };
+            let caller = requester
+                .as_ref()
+                .map(|(pubkey, request_id)| pay_ledger::Caller { pubkey, request_id });
 
             let pay_cors_origin = env
                 .var("EXPECTED_ORIGIN")
@@ -682,7 +689,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if let Some(result) = payments::handle_pay_route(
                 path,
                 &method,
-                requester_pubkey.as_deref(),
+                caller,
                 pay_body.as_deref(),
                 &pay_db,
                 &env,

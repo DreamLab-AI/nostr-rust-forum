@@ -7,6 +7,53 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Security: `/pay/` credits only on chain evidence (ADR-2012 D6) — 2026-10-02
+
+The pod-worker's pay routes are live in production (`PAY_ENABLED = "true"`),
+and three of them moved sats without evidence. All three are closed; no
+existing balance, receipt or issued deposit address is touched.
+
+- **Removed: the `amount_sats` deposit.** `POST /pay/.deposit` with
+  `{"amount_sats": n}` credited `n` sats to the caller on their say-so. It now
+  answers 400. A deposit is credited only from a confirmed output whose
+  scriptPubKey is the caller's own derived deposit script (`GET /pay/.address`);
+  an output paying any other script answers 403. This is the teller's rule
+  (solidpayorg/teller 7c00cea `credit`): a deposit credits its account once and
+  the outpoint is the receipt.
+- **Removed: `/pay/.withdraw` and `/pay/.buy`.** D1 holds no DREAM (or any
+  token) balance, so `.withdraw` credited sats against a token nothing debited
+  and `.buy` debited sats for a token nothing recorded. Both answer 410 and
+  touch nothing; `/pay/.info` no longer advertises them, nor the unserved
+  `/pay/.pool`. DREAM lives on its chain (ADR-2015), read-only here.
+- **Receipts keep the chain.** The replay key is `txo:<chain>:<txid>:<vout>`
+  with the txid lower-cased (a txid in capitals was a second key for the same
+  outpoint), so one outpoint on two chains is two receipts. Deposits on a chain
+  whose unit is not `sat` (testnet4, signet) are refused rather than credited
+  as sats. Legacy chain-less `txo_deposits` rows still block a second credit,
+  and the 90-day prune of that table, which reopened every pruned outpoint to
+  a second credit, is gone. An unconfirmed output, or one with no status, is
+  not credited.
+- **Every credit names its evidence.** New table `pay_credits` (auth-worker
+  migration `0004_pay_credits.sql`, mirrored by `ensure_payment_schema`;
+  additive, existing rows untouched): a deposit row carries its chain and
+  outpoint, a job-hold release row the NIP-98 event id of the request that
+  released it, and a CHECK refuses a row with neither. The balance moves in the
+  same D1 batch (one transaction) that writes the row, reading the account and
+  amount back from it, so a credit without a row cannot happen and a row is
+  applied once. Job settle, cancel and expiry release each hold once
+  (`agent_jobs.release_ref`, additive column); job creation inserts the job and
+  debits its hold in one transaction. `D1PaymentStore` and its evidence-free
+  `write_ledger` / `credit_atomic` are removed.
+- **`derive_deposit_address` frozen and ported.** Known answers for three
+  `(MASTER_SECRET, user)` pairs (odd-y and even-y internal key) were captured
+  from the k256 code before the port (`ce9cdda`) and pass unchanged on the
+  rust-bitcoin / libsecp256k1 port in `deposit_address.rs`. The doc now says
+  what it is: a raw additive tweak plus TapTweak on the unlifted key, not
+  BIP 341 (a test shows the two differ for odd-y `Q`).
+- The `/pay/` rules moved to `pay_ledger.rs` behind a `LedgerDb` seam; the
+  tests drive the production dispatcher and SQL against a real SQLite
+  (`rusqlite`, dev-only) with explorer fixtures.
+
 ### ADR-2014 phase 1 (slice): cohort grants merge; `whitelist` DDL checked in — 2026-10-02
 
 - **Fixed: granting a cohort revoked every other.** Four writers replaced a

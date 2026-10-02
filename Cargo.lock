@@ -2475,7 +2475,7 @@ version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "base64",
- "bech32",
+ "bitcoin",
  "getrandom 0.2.17",
  "hex",
  "js-sys",
@@ -2484,6 +2484,7 @@ dependencies = [
  "nostr-bbs-core",
  "nostr-bbs-rate-limit",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
