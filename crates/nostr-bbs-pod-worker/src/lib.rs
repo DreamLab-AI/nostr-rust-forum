@@ -1930,6 +1930,9 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
             rate,
             supply,
             issuer,
+            // Only the pod's own issuer: the pod-worker credits no MRC20
+            // deposits (ADR-2012 D6), so no foreign trail is accepted.
+            accepted_issuers: Vec::new(),
         }
     });
 

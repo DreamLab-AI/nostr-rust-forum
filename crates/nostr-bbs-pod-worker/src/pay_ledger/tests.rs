@@ -139,6 +139,7 @@ fn live_config() -> PayConfig {
             rate: 10,
             supply: 1_000_000,
             issuer: String::new(),
+            accepted_issuers: Vec::new(),
         }),
         chains: vec![
             ChainConfig::bitcoin_mainnet(),
