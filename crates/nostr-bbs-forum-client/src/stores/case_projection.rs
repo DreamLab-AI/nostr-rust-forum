@@ -92,6 +92,14 @@ pub fn is_calibration_sample_in(state: &CaseProjectionState, case_id: &str) -> b
         .unwrap_or(false)
 }
 
+/// The relay's stored effective tier for `case_id`, if the projection has it.
+pub fn effective_tier_in<'a>(state: &'a CaseProjectionState, case_id: &str) -> Option<&'a str> {
+    state
+        .cases
+        .get(case_id)
+        .and_then(|c| c.effective_tier.as_deref())
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CaseProjectionState {
     pub cases: HashMap<String, CaseProjection>,
@@ -228,5 +236,17 @@ mod tests {
         assert!(!is_calibration_sample_in(&state, "case-2"));
         // Not told about at all — still not one.
         assert!(!is_calibration_sample_in(&state, "case-3"));
+    }
+
+    #[test]
+    fn effective_tier_lookup_is_per_case_and_absent_when_unknown() {
+        let state = CaseProjectionState {
+            cases: parse_cases(r#"{"cases":[{"id":"c1","effective_tier":"high"},{"id":"c2"}]}"#),
+            loaded: true,
+            ..Default::default()
+        };
+        assert_eq!(effective_tier_in(&state, "c1"), Some("high"));
+        assert_eq!(effective_tier_in(&state, "c2"), None);
+        assert_eq!(effective_tier_in(&state, "missing"), None);
     }
 }

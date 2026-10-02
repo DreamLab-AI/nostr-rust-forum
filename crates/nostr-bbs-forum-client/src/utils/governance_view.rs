@@ -186,10 +186,12 @@ fn tags_declare_policy(tags: &[Vec<String>]) -> bool {
 
 /// The whole boundary for one 31402, as the client sees it.
 ///
-/// Field-for-field the relay's `RequestBoundary`. The client computes it rather
-/// than reading it back because the member surface has no authenticated read
-/// API — and because `nostr-bbs-core::effective_tier` is pure, both sides
-/// necessarily agree on the same inputs.
+/// Field-for-field the relay's `RequestBoundary`. The client computes it from
+/// the signed events with the same pure `nostr-bbs-core::effective_tier`, then
+/// [`CaseBoundary::with_relay_tier`] replaces the tier with the relay's stored
+/// `broker_cases.effective_tier` wherever the authenticated case projection
+/// carries one, because the relay folds in rules (the ADR-2013 ontology floor)
+/// that the client does not compute.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaseBoundary {
     /// The agent's own declaration. Telemetry only — never used for gating.
@@ -263,6 +265,27 @@ pub fn compute_boundary(
 }
 
 impl CaseBoundary {
+    /// Adopt the relay's stored `broker_cases.effective_tier` (ADR-2011 §3,
+    /// PRD FR3.2: "the client reads only the effective tier").
+    ///
+    /// The relay computes the boundary once, at projection, and folds in rules
+    /// this client does not see — the ADR-2013 ontology `level` floor among
+    /// them — so where the relay has spoken its tier governs the card. Where it
+    /// has not (a logged-out viewer, a case outside the projection page, a
+    /// case projected before migration 0006) the client keeps the tier it
+    /// computed from the same signed events. An unrecognised value is ignored
+    /// rather than parsed, because `RiskTier::parse` maps anything unknown to
+    /// `Medium` and a garbled column must not loosen a high case.
+    pub fn with_relay_tier(mut self, relay_tier: Option<&str>) -> Self {
+        if let Some(tier) = relay_tier
+            .map(RiskTier::parse)
+            .filter(|t| Some(t.as_str()) == relay_tier)
+        {
+            self.effective = tier;
+        }
+        self
+    }
+
     /// Whether the member surface shows this case (FR3.2, FR6.3).
     ///
     /// Reads the **effective** tier, never `declared`. A calibration sample is
@@ -1549,5 +1572,46 @@ mod tests {
         let mut d = ack("ack-1", ADMIN, 2_000, PANEL_EVENT);
         d.d_tag = "other-panel".into();
         assert_eq!(alert_ack(1_000, &[d]), None);
+    }
+
+    #[test]
+    fn relay_tier_governs_the_card_where_the_relay_has_spoken() {
+        let b = compute_boundary(
+            "a",
+            &[tag("risk-tier", "low")],
+            &request(serde_json::json!({})),
+            None,
+            RiskTier::Medium,
+            false,
+        );
+        assert_eq!(b.effective, RiskTier::Low);
+        // e.g. an ADR-2013 ontology floor the client does not compute.
+        assert_eq!(
+            b.clone().with_relay_tier(Some("high")).effective,
+            RiskTier::High
+        );
+        // The relay is authoritative in both directions.
+        let hi = CaseBoundary {
+            effective: RiskTier::High,
+            ..b.clone()
+        };
+        assert_eq!(hi.with_relay_tier(Some("low")).effective, RiskTier::Low);
+        // Silence keeps the client's own computation.
+        assert_eq!(b.clone().with_relay_tier(None).effective, RiskTier::Low);
+        // A garbled column never parses to `Medium` by accident.
+        let hi = CaseBoundary {
+            effective: RiskTier::High,
+            ..b.clone()
+        };
+        assert_eq!(
+            hi.clone().with_relay_tier(Some("HIGH ")).effective,
+            RiskTier::High
+        );
+        assert_eq!(hi.with_relay_tier(Some("")).effective, RiskTier::High);
+        // The declaration is untouched: it stays telemetry.
+        assert_eq!(
+            b.with_relay_tier(Some("high")).declared,
+            Some(RiskTier::Low)
+        );
     }
 }

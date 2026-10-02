@@ -133,10 +133,17 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                     &a.agent_pubkey,
                 )
                 .map(|p| p.context());
-                let boundary = a.boundary(
-                    panel.as_ref(),
-                    crate::stores::case_projection::is_calibration_sample_in(&case_state, &a.d_tag),
-                );
+                let boundary =
+                    a.boundary(
+                        panel.as_ref(),
+                        crate::stores::case_projection::is_calibration_sample_in(
+                            &case_state,
+                            &a.d_tag,
+                        ),
+                    )
+                    .with_relay_tier(
+                        crate::stores::case_projection::effective_tier_in(&case_state, &a.d_tag),
+                    );
                 // Scoped to the decisions bound to THIS request's event id: a
                 // colliding `d` tag must not let another case's 31403 reveal
                 // this one's probe or hand a stranger the controls.
