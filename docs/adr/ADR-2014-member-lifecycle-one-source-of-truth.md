@@ -228,3 +228,10 @@ code reads it, but no DDL in the repository creates it.
 Phase 0 evidence: `cargo test -p nostr-bbs-forum-client membership` fails at the parent
 commit `a623ba8`'s single-page read ("8 members still pending after approval"; pager returned
 20 of 250 rows) and passes at `56e8c4f` (5/5; full crate 460/460).
+
+## Disposition — 2026-10-02
+
+- **Suitability:** fits, needs revision
+- **Priority:** P2 — next cycle (reopens at the start of the next cycle, or earlier if a residential deployment onboards members to a fresh forum instance and hits a cohort or pending defect)
+- **Why:** The defect class this record names is still present on `main` at `341c5d2`. `/api/whitelist/add` and `/api/whitelist/update-cohorts` still replace cohorts (`crates/nostr-bbs-relay-worker/src/whitelist.rs:317`, `:525`). No relay `members` table or `membership.rs` exists, and migrations stop at `0007_ontology_governance.sql`. No plan track (planning-cycle §2, §10) names membership, so phases 1–5 are not this cycle's work. The text needs revision on one point: `verified_commit` and every line reference cite `56e8c4f`, which is not on `main`. The same patch landed as `b2b30d0` (identical `git patch-id`), and ADR-2014 itself as `9be9c67`. The branch `fix/pending-approve` is therefore fully merged in substance.
+- **Next:** Re-anchor `verified_commit` to `b2b30d0` and re-check the D1 line references at the current HEAD. Then take phase 1 (merge-not-replace on the four replacing writers, plus checked-in `whitelist` DDL) as the first slice next cycle.
