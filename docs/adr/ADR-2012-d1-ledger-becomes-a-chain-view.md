@@ -85,3 +85,10 @@ Proposed; nothing built. Ratification evidence will be:
   version at the same commit.
 - The `derive_subkey` JS-parity vector green at that commit, plus a known-answer test that the
   `sidestr/spend/` and `sidestr/sign/` tags derive distinct keys from the same root.
+
+## Disposition — 2026-10-02
+
+- **Suitability:** fits, needs revision
+- **Priority:** P3 — parked (review trigger: agentbox ADR-2099 reopens, or the solid-pod-rs post-port version publishes)
+- **Why:** D1 to D3 follow agentbox ADR-2099 and park with it: §9 scopes the next sidechain work to a valueless demo chain, and that chain does not need the D1 view. D5 conflicts with agentbox ADR-2101. This record derives `k_sign` from `k_id` with `derive_subkey`. ADR-2101's amended D3 and its adversarial review require signer and bridge roots to be independent seeds, never derived from `k_id`, and the live `sidestr:dreamlab` signer key is not derived from identity (agentbox ADR-2103 first seal). ADR-2101 survives. D4's facts are stale: the forum pin is now `=0.5.0-alpha.10` at `Cargo.toml:166`, not `=0.5.0-alpha.7` at `:155`, and the host is still `0.4.0-alpha.15`. Code otherwise as described at `14b9fa4` (`crates/nostr-bbs-pod-worker/src/payments.rs:148,161,183`; `crates/nostr-bbs-core/src/keys.rs:251`).
+- **Next:** On reopening, restate D5 so that `derive_subkey` covers principal spend keys only, as in agentbox ADR-2101 D3, and refresh D4's pin facts.
