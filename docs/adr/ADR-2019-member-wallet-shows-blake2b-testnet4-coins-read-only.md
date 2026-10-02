@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: 7def3e4e74e92fdf2f29416ce08ae6dadc878c8d
+verified_commit: eca8db6a834a5611692f88bbeeb128a032cd394b
 owner: jjohare
 review_trigger: a BLAKE2b testnet4 address backend the operator runs (Knots-blake2b node plus electrs and the blaketest shim, or an address index in bitcoin-blake/blaketestnode) answering from the forum's origin; blaketestnode running in the browser with an address index; a sidestr chain for this estate sealed beside txbt4 (agentbox ADR-2103); any proposal to sign a parent-chain spend in the forum; a BLAKE2b parent with value
 repo: nostr-rust-forum
@@ -78,9 +78,18 @@ ADR-2015 D1.
 standing as the wallet key is ADR-2015 D2's testnet-scoped departure from agentbox ADR-2101 D3 (signer
 and identity keys independent), unchanged in scope here because nothing is signed.
 
+## Acceptance — 2026-10-02
+
+Accepted on the owner's ruling (R4, 2026-10-02): "pull it in if it's canonical feature, we have no
+users, there's no money and no legal risk". The review triggers above stand; none has fired.
+
+Axes: `implementation_status: complete` (the read-only view and its parser ship at `eca8db6`);
+`activation_status: staged` (the view is off until a deployment sets `SIDESTR_WALLET` and
+`BLAKE_TESTNET_API` and the website kit pin moves past this merge; live figures further need a
+conforming backend, which the estate does not run yet).
+
 ## Verification
 
-Accepted 2026-10-02 on the owner's ruling (a canonical feature; no users, no money, no legal risk).
 Built and staged: the view is in the client and off until a deployment sets both `SIDESTR_WALLET`
 and `BLAKE_TESTNET_API`, and it reaches members when the website kit pin moves past the merge.
 Live activation further needs a conforming backend, which the estate does not run yet.
