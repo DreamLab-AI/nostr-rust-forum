@@ -14,9 +14,9 @@ use sidestr_core::document::ChainDocument;
 use tokio::time::{sleep, Instant};
 use zeroize::Zeroizing;
 
-use crate::net::{now_secs, publish_once, Frame, Relay};
 use nostr_bbs_poker_citizen::chain::{self, Facts};
 use nostr_bbs_poker_citizen::ledger::Ledger;
+use nostr_bbs_poker_citizen::net::{now_secs, publish_once, Frame, Relay};
 use nostr_bbs_poker_citizen::table::{Balances, Citizen, Config, Effect, House};
 
 /// The house seat of the nostr-bbs poker table.

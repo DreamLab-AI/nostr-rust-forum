@@ -1,10 +1,11 @@
-//! `nostr-bbs-poker-citizen` binary. See the library docs.
+//! `nostr-bbs-poker-coach` binary: the practice table's coach. See
+//! [`nostr_bbs_poker_citizen::coach`] for the pure half.
 //!
-//! The binary is native-only; on wasm32 it compiles to an empty `main` so
-//! the workspace-wide wasm32 check still covers the library.
+//! Native-only; on wasm32 it compiles to an empty `main` so the
+//! workspace-wide wasm32 check still covers the library.
 
 #[cfg(not(target_arch = "wasm32"))]
-mod run;
+mod coach_run;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> std::process::ExitCode {
@@ -18,10 +19,10 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match rt.block_on(run::main()) {
+    match rt.block_on(coach_run::main()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("nostr-bbs-poker-citizen: {e}");
+            eprintln!("nostr-bbs-poker-coach: {e}");
             std::process::ExitCode::FAILURE
         }
     }

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use nostr_bbs_core::gift_wrap::{unwrap_gift_with_signer, KIND_ENCRYPTED_DM, KIND_GIFT_WRAP};
 use nostr_bbs_core::signer::Signer;
-use nostr_bbs_core::{gift_wrap_pair_with_signer, NostrEvent};
+use nostr_bbs_core::{gift_wrap_pair_with_signer, gift_wrap_with_signer, NostrEvent};
 
 use crate::components::user_display::try_display_name;
 use crate::poker::coach::is_coach_content;
@@ -445,6 +445,24 @@ impl DMStore {
             // neither decrypt nor even *find* it afterwards. The optimistic
             // bubble below would then be the only copy in existence and would
             // die with the page, which is why sent history kept vanishing.
+            // A coach request is table traffic, not mail: the table keeps its
+            // own ledger of what it asked, so no self-copy is made. One matters
+            // beyond tidiness: every wrap to our own key is read by whatever
+            // else holds it (a phone client, an operator's control gateway),
+            // which would otherwise see each request as a message we typed.
+            if coach {
+                match gift_wrap_with_signer(signer.as_ref(), &recipient, &content_owned).await {
+                    Ok(to_recipient) => relay.publish(&to_recipient),
+                    Err(e) => {
+                        web_sys::console::error_1(&format!("[DM] Coach wrap failed: {e}").into());
+                        state.update(|s| {
+                            s.seen_ids.remove(&local_id);
+                            s.messages.retain(|m| m.id != local_id);
+                        });
+                    }
+                }
+                return;
+            }
             match gift_wrap_pair_with_signer(signer.as_ref(), &recipient, &content_owned).await {
                 Ok((to_recipient, to_self)) => {
                     // Re-key the optimistic message to the real wrap event ID so

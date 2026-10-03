@@ -19,9 +19,13 @@
 //! | [`table`] | The state machine: messages in, messages and effects out; every money rule |
 //! | [`ledger`] | What members owe, what the house owes, what it paid today; saved as JSON |
 //! | [`chain`] | The two chain locks; replay the producer's blocks, read asset balances and `hand:` payments, build payouts |
+//! | [`coach`] | The practice table's coach: the request, the question to the model, the reply (binary `nostr-bbs-poker-coach`) |
+//! | [`net`] | One authenticated connection to the forum relay (native only), shared by both binaries |
 //!
 //! The binary (native only) joins them to a relay, a producer and a clock.
-//! Run it with `--help`; the key file is never a flag's value.
+//! Run it with `--help`; the key file is never a flag's value. A second
+//! binary, `nostr-bbs-poker-coach`, serves the practice table's coach from
+//! its own key: it holds no funds and deals nothing.
 //!
 //! The house refuses to deal while the member owes for a hand the chain has
 //! not shown paid (a member's own report of a transfer buys a grace
@@ -32,5 +36,8 @@
 #![warn(missing_docs)]
 
 pub mod chain;
+pub mod coach;
 pub mod ledger;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod net;
 pub mod table;

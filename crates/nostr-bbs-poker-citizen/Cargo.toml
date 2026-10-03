@@ -24,6 +24,12 @@ path = "src/lib.rs"
 name = "nostr-bbs-poker-citizen"
 path = "src/main.rs"
 
+[[bin]]
+# The practice table's coach: a second service on its own key (see
+# `coach`), built and shipped with the house seat.
+name = "nostr-bbs-poker-coach"
+path = "src/coach_main.rs"
+
 [dependencies]
 nostr-bbs-core = { workspace = true }
 nostr-bbs-poker = { workspace = true }
