@@ -201,7 +201,7 @@ pub fn PokerCoach(
                     class="animate-spin inline-block w-4 h-4 border-2 border-amber-400 border-t-transparent rounded-full"
                     aria-hidden="true"
                 ></span>
-                "Asking JunkieJarvis…"
+                "Asking the coach…"
             </p>
         }
         .into_any(),
