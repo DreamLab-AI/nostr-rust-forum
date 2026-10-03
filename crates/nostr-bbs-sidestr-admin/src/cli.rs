@@ -1,5 +1,7 @@
 //! The command line: flags, the producer round trip, and what is printed.
 
+mod faucet_run;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -75,6 +77,36 @@ pub enum Command {
         sats: u64,
         #[command(flatten)]
         mode: Mode,
+    },
+    /// Answer kind-23501 faucet requests on the relays with plain sats and,
+    /// optionally, units of an asset; one grant per script per window. Runs
+    /// until stopped; grants are posted, never only printed.
+    Faucet {
+        /// Plain sats per grant.
+        #[arg(long, default_value_t = 2_000)]
+        sats: u64,
+        /// An asset to grant too (id or ticker).
+        #[arg(long)]
+        asset: Option<String>,
+        /// Units of the asset per grant.
+        #[arg(long, default_value_t = 100, requires = "asset")]
+        units: u64,
+        /// Hours before one script may be paid again.
+        #[arg(long, default_value_t = 24)]
+        per_address_hours: u64,
+        /// Grants per hour, all scripts together.
+        #[arg(long, default_value_t = 20)]
+        per_hour: usize,
+        /// Where grants are remembered across restarts (sidestr-agent faucet's format).
+        #[arg(long)]
+        state: PathBuf,
+        /// Relays to follow and publish to, comma-separated.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net,wss://nostr.mom,wss://nostr.oxtr.dev"
+        )]
+        relays: Vec<String>,
     },
 }
 
@@ -216,6 +248,31 @@ async fn run(cli: Cli) -> Result<(), String> {
         .ok_or("--key-file is required (64 hex or nsec1…)")?;
     let key = read_key(key_file)?;
     let producer = Producer::new(&cli.url)?;
+    if let Command::Faucet {
+        sats,
+        asset,
+        units,
+        per_address_hours,
+        per_hour,
+        state,
+        relays,
+    } = cli.command
+    {
+        return faucet_run::run(
+            &producer,
+            &key,
+            faucet_run::Settings {
+                chain_id: cli.chain_id,
+                asset: asset.map(|a| (a, units)),
+                sats,
+                per_address_hours,
+                per_hour,
+                state,
+                relays,
+            },
+        )
+        .await;
+    }
     let r = producer.replayed(&cli.chain_id).await?;
     let me = key.pubkey().to_string();
     let doc = r.state.document();
@@ -299,6 +356,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("send      {sats} sats to {to}");
             finish(&producer, &spend, mode).await
         }
+        Command::Faucet { .. } => unreachable!("answered above"),
     }
 }
 
@@ -439,6 +497,53 @@ mod tests {
         // there is no flag that takes a key's value
         assert!(parse(&["--key", "abc", "assets"]).is_err());
         assert!(parse(&["--nsec", "abc", "assets"]).is_err());
+    }
+
+    #[test]
+    fn faucet_parses_with_defaults_and_an_asset() {
+        let c = parse(&["--key-file", "k", "faucet", "--state", "f.json"]).unwrap();
+        match c.command {
+            Command::Faucet {
+                sats,
+                asset,
+                units,
+                per_address_hours,
+                per_hour,
+                state,
+                relays,
+            } => {
+                assert_eq!(
+                    (sats, units, per_address_hours, per_hour),
+                    (2_000, 100, 24, 20)
+                );
+                assert_eq!(asset, None);
+                assert_eq!(state, PathBuf::from("f.json"));
+                assert_eq!(relays.len(), 5);
+            }
+            other => panic!("{other:?}"),
+        }
+        let c = parse(&[
+            "faucet",
+            "--state",
+            "f.json",
+            "--asset",
+            "BLAKES7",
+            "--units",
+            "50",
+            "--sats",
+            "1000",
+            "--relays",
+            "wss://a,wss://b",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c.command,
+            Command::Faucet { sats: 1_000, units: 50, ref asset, ref relays, .. }
+                if asset.as_deref() == Some("BLAKES7") && relays.len() == 2
+        ));
+        // the ledger is required; units without an asset is refused
+        assert!(parse(&["faucet"]).is_err());
+        assert!(parse(&["faucet", "--state", "f", "--units", "5"]).is_err());
     }
 
     #[test]

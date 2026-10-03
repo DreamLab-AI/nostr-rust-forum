@@ -20,6 +20,7 @@
 //! | [`build_issue`] | SPEC 12 issue: the whole supply on one carrier to the issuer |
 //! | [`build_asset_transfer`] | Move units of an asset, fee from plain coins |
 //! | [`build_send`] | Pay plain sats, spending only coins that carry nothing |
+//! | [`faucet`] | The faucet: its grant ledger and the grant, for `faucet` in the binary |
 //!
 //! The builders take the coins to spend explicitly (the binary passes the
 //! key's coins at the tip, [`Replayed`]'s `state.coins`), sign with the key
@@ -27,8 +28,9 @@
 //! re-check the result against the assets view before returning it.
 //!
 //! The binary (native only) fetches `/chain.json` and `/blocks.dat` from the
-//! producer, holds the document to the pin, and prints or posts. Run it with
-//! `--help`. Coins on these chains carry no value.
+//! producer, holds the document to the pin, and prints or posts; its
+//! `faucet` subcommand answers members' kind-23501 requests on the relays.
+//! Run it with `--help`. Coins on these chains carry no value.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -42,6 +44,8 @@ use sidestr_wallet::spend::{build_spend, Spend, SpendRequest};
 use sidestr_wallet::Permissive;
 
 pub use nostr_bbs_poker_citizen::chain::{check_document, pin, replay, Pin, PINS};
+
+pub mod faucet;
 
 /// A signing key from a key file's text: 64 hex characters or a NIP-19
 /// `nsec1…`, surrounding whitespace ignored. The error never echoes the

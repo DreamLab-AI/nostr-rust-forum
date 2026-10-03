@@ -29,6 +29,9 @@ nostr-bbs-core = { workspace = true }
 nostr-bbs-poker-citizen = { path = "../nostr-bbs-poker-citizen", version = "1.0.0-beta.13" }
 hex = { workspace = true }
 zeroize = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sidestr-nostr = "0.6"
 sidestr-agent = { version = "0.6", default-features = false }
 sidestr-core = "0.4.2"
 sidestr-wallet = "0.5.3"
@@ -37,5 +40,8 @@ bitcoin = { version = "0.32", features = ["secp-lowmemory"] }
 # HTTP and the CLI: native only, so the wasm32 check sees a pure library.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net", "sync"] }
+# The faucet follows kind-23501 requests on the public relays.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
