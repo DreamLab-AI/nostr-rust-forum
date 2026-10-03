@@ -18,7 +18,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::app::base_href;
 use crate::auth::use_auth;
-use crate::components::copy_key::CopyKey;
+use crate::components::copy_key::{CopyKey, KeyGlyph};
 use crate::components::user_display::use_display_name_tracked;
 use crate::utils::{format_relative_time, relay_url::relay_api_base};
 
@@ -158,10 +158,13 @@ pub(crate) fn ProfileActivity(pubkey: String, #[prop(optional)] compact: bool) -
                         let href = base_href(&format!("/profile/{next}"));
                         let next_name = next.clone();
                         view! {
-                            <a href=href class="block rounded-lg border border-amber-500/40 bg-amber-500/10 \
-                                              px-2.5 py-1.5 text-amber-300 hover:bg-amber-500/20">
-                                "Now posts as " {move || use_display_name_tracked(&next_name)} " →"
-                            </a>
+                            <div class="flex items-center gap-1">
+                                <a href=href class="flex-1 block rounded-lg border border-amber-500/40 bg-amber-500/10 \
+                                                  px-2.5 py-1.5 text-amber-300 hover:bg-amber-500/20">
+                                    "Now posts as " {move || use_display_name_tracked(&next_name)} " →"
+                                </a>
+                                <KeyGlyph pubkey=next.clone() />
+                            </div>
                         }
                     })}
                     <div class="flex flex-wrap gap-x-3 gap-y-1 text-gray-400">

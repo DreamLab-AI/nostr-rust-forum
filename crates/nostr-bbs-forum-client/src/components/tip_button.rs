@@ -27,6 +27,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::components::copy_key::KeyName;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::wallet::chain::{self, Mark, TipTotal};
@@ -442,7 +443,7 @@ pub(crate) fn TipControl(
                 >
                     <div class="flex items-center justify-between mb-2">
                         <span class="text-gray-200 font-medium truncate">
-                            "Tip " {move || author_name.get()}
+                            "Tip " <KeyName pubkey=author_pubkey.clone() key_class="font-mono" />
                             {move || chosen.get().and_then(store_at).map(|w| format!(" in {}", w.ticker()))}
                         </span>
                         <button class="text-gray-500 hover:text-gray-300 text-xs" on:click=move |_| open.set(false) aria-label="Close">"✕"</button>

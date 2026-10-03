@@ -9,7 +9,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::auth::nip98::fetch_with_nip98_get_signer;
 use crate::auth::use_auth;
-use crate::components::user_display::use_display_name_memo;
+use crate::components::copy_key::KeyName;
 
 // -- Types --------------------------------------------------------------------
 
@@ -184,24 +184,19 @@ fn AuditRow(entry: AuditEntry) -> impl IntoView {
     // (reactive — the row fills in nicknames when kind-0 metadata arrives,
     // falling back to the shortened hex pubkey in the interim).
     let actor_name = entry.actor_name.clone();
-    let actor_resolved = use_display_name_memo(entry.actor_pubkey.clone());
-    let actor = move || {
-        actor_name
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| actor_resolved.get())
+    let actor = match actor_name.filter(|n| !n.trim().is_empty()) {
+        Some(n) => n.into_any(),
+        None => {
+            view! { <KeyName pubkey=entry.actor_pubkey.clone() key_class="font-mono" /> }.into_any()
+        }
     };
-    let target_name = entry.target_name.clone();
-    let target_resolved = use_display_name_memo(entry.target_pubkey.clone().unwrap_or_default());
-    let target = move || {
-        target_name
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .or_else(|| {
-                let t = target_resolved.get();
-                (!t.is_empty()).then_some(t)
-            })
-            .unwrap_or_else(|| "-".to_string())
+    let target = match (
+        entry.target_name.clone().filter(|n| !n.trim().is_empty()),
+        entry.target_pubkey.clone().filter(|t| !t.is_empty()),
+    ) {
+        (Some(n), _) => n.into_any(),
+        (None, Some(pk)) => view! { <KeyName pubkey=pk /> }.into_any(),
+        (None, None) => "-".into_any(),
     };
     let details_raw = entry.details.clone().unwrap_or_default();
     let details = details_raw.clone();

@@ -195,6 +195,11 @@ pub fn abbreviate(s: &str, head: usize, tail: usize, sep: &str) -> String {
     out
 }
 
+/// Whether `s` is a 64-character hex string — the shape of a Nostr pubkey.
+pub fn is_hex_pubkey(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Shorten a hex pubkey to "abcd12...ef56" format for display
 /// ([`Abbrev::Pubkey`]). Character-safe; see [`abbreviate`].
 pub fn shorten_pubkey(pubkey: &str) -> String {
@@ -336,6 +341,16 @@ mod abbrev_tests {
         assert_eq!(Abbrev::Long.apply(NPUB), "npub1z8k...dy6l");
         assert_eq!(Abbrev::Pubkey.apply(NPUB), "npub1z...dy6l");
         assert_eq!(Abbrev::Wallet.apply(NPUB), "npub1z8kkggj\u{2026}gjdy6l");
+    }
+
+    #[test]
+    fn hex_pubkey_shape() {
+        assert!(super::is_hex_pubkey(&"aB".repeat(32)));
+        assert!(!super::is_hex_pubkey(&"a".repeat(63)));
+        assert!(!super::is_hex_pubkey(&"g".repeat(64)));
+        assert!(!super::is_hex_pubkey("npub1xyz"));
+        // 64 bytes but not 64 hex characters
+        assert!(!super::is_hex_pubkey(&"é".repeat(32)));
     }
 
     #[test]

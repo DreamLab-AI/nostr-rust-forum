@@ -15,7 +15,7 @@ use std::rc::Rc;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
-use crate::components::copy_key::CopyKey;
+use crate::components::copy_key::{CopyKey, KeyName};
 use crate::relay::RelayConnection;
 use crate::stores::case_projection::use_case_projection_store;
 use crate::stores::panel_registry::{use_panel_registry, ActionEntry, DecisionView, PanelEntry};
@@ -376,8 +376,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
     // Resolve the publishing agent's name reactively through the shared profile
     // cache (display_name > name > NIP-05 > shortened pubkey). Fills in when the
     // agent's kind-0 metadata arrives instead of showing a raw hex pubkey.
-    let agent_name =
-        crate::components::user_display::use_display_name_memo(panel.agent_pubkey.clone());
+    let agent_pk = panel.agent_pubkey.clone();
     // Disclosure badge (COM-13/F2): names the authorising principal when this
     // panel's publisher is an active registered agent.
     let agent_badge_pubkey = panel.agent_pubkey.clone();
@@ -416,7 +415,7 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
             <div class="flex items-center gap-4 text-xs text-gray-500 mb-3">
                 <span>{format!("{field_count} fields")}</span>
                 <span>{format!("{action_count} actions")}</span>
-                <span>{move || agent_name.get()}</span>
+                <span><KeyName pubkey=agent_pk.clone() key_class="font-mono" /></span>
                 <AgentBadge pubkey=agent_badge_pubkey compact=true />
             </div>
             <div class="flex gap-2">
@@ -571,8 +570,7 @@ fn card_body_parts(card: &ActionCardData) -> Vec<(CardSection, AnyView)> {
     let b = &card.boundary;
 
     let title = card_title(item);
-    let agent_name =
-        crate::components::user_display::use_display_name_memo(item.agent_pubkey.clone());
+    let agent_pk = item.agent_pubkey.clone();
     let agent_badge_pubkey = item.agent_pubkey.clone();
 
     // FR4.3: age from `created_at`, differenced client-side. `now` is read once
@@ -609,7 +607,7 @@ fn card_body_parts(card: &ActionCardData) -> Vec<(CardSection, AnyView)> {
                 tier_class(b.effective.as_str()),
             )>{b.effective.as_str()}</span>
             <span class="text-white font-medium">{title}</span>
-            <span class="text-gray-500 text-xs">{move || agent_name.get()}</span>
+            <span class="text-gray-500 text-xs"><KeyName pubkey=agent_pk.clone() key_class="font-mono" /></span>
             <AgentBadge pubkey=agent_badge_pubkey compact=true />
             <span
                 class=move || if overdue || escalated.get() {
@@ -1084,8 +1082,7 @@ fn ReadOnlyPanelCard(panel: PanelEntry) -> impl IntoView {
     };
     let title = panel.definition.title.clone();
     let description = panel.definition.description.clone();
-    let agent_name =
-        crate::components::user_display::use_display_name_memo(panel.agent_pubkey.clone());
+    let agent_pk = panel.agent_pubkey.clone();
     let agent_badge_pubkey = panel.agent_pubkey.clone();
     let field_count = panel.definition.fields.len();
     let action_count = panel.definition.actions.len();
@@ -1102,7 +1099,7 @@ fn ReadOnlyPanelCard(panel: PanelEntry) -> impl IntoView {
             <div class="flex items-center gap-4 text-xs text-gray-500 mb-3">
                 <span>{format!("{field_count} fields")}</span>
                 <span>{format!("{action_count} actions")}</span>
-                <span>{move || agent_name.get()}</span>
+                <span><KeyName pubkey=agent_pk.clone() key_class="font-mono" /></span>
                 <AgentBadge pubkey=agent_badge_pubkey compact=true />
             </div>
             <div class="flex flex-wrap gap-2">

@@ -13,9 +13,8 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 
 use crate::components::avatar::{Avatar, AvatarSize};
-use crate::components::copy_key::CopyKey;
+use crate::components::copy_key::{CopyKey, KeyName};
 use crate::components::modal::Modal;
-use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::mute::use_mute_store;
 use crate::utils::shorten_pubkey;
@@ -122,13 +121,13 @@ pub(crate) fn ProfileModal(
         });
     };
 
-    let display_name = Memo::new(move |_| {
-        let pk = pk_stored.get_value();
-        // Tracked fallback: the Memo re-runs when the shared cache fills.
-        meta.get()
-            .name
-            .unwrap_or_else(|| use_display_name_tracked(&pk))
-    });
+    // The modal's own kind-0 name, else the profile-cache name or the
+    // copyable abridged key ([`KeyName`]).
+    let meta_name = Memo::new(move |_| meta.get().name);
+    let heading = move || match meta_name.get() {
+        Some(name) => name.into_any(),
+        None => view! { <KeyName pubkey=pk_stored.get_value() key_class="font-mono" /> }.into_any(),
+    };
 
     view! {
         <Modal is_open=is_open title=String::new()>
@@ -145,7 +144,7 @@ pub(crate) fn ProfileModal(
                                 when=move || is_loading.get()
                                 fallback=move || view! {
                                     <h2 class="text-xl font-bold text-white">
-                                        {move || display_name.get()}
+                                        {heading}
                                     </h2>
                                 }
                             >

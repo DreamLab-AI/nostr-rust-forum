@@ -11,8 +11,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::admin::use_admin;
 use crate::auth::use_auth;
+use crate::components::copy_key::KeyName;
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::use_display_name_memo;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::utils::format_relative_time;
 
@@ -230,7 +230,7 @@ where
 {
     let time_display = format_relative_time(req.created_at);
     // Reactive: fills in the requester's nickname when kind-0 arrives.
-    let pk_short = use_display_name_memo(req.requester.clone());
+    let requester_pk = req.requester.clone();
 
     view! {
         <div class="grid grid-cols-12 gap-2 px-4 py-3 border-b border-gray-700/50 hover:bg-gray-750 items-center text-sm">
@@ -243,7 +243,7 @@ where
                     </svg>
                 </div>
                 <span class="text-gray-300 truncate font-mono text-xs" title=req.requester.clone()>
-                    {move || pk_short.get()}
+                    <KeyName pubkey=requester_pk />
                 </span>
             </div>
 

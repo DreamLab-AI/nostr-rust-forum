@@ -21,7 +21,7 @@ use nostr_bbs_core::NostrEvent;
 use crate::app::base_href;
 use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
-use crate::components::user_display::use_display_name_memo;
+use crate::components::copy_key::KeyName;
 use crate::utils::format_relative_time;
 use crate::utils::slug_hash::{section_slug, topic_slug};
 
@@ -233,8 +233,8 @@ pub fn TopicList(
 /// A single topic row: title line, author, reply count, last-activity.
 #[component]
 fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
-    let author_name = use_display_name_memo(topic.pubkey.clone());
-    let last_name = use_display_name_memo(topic.last_pubkey.clone());
+    let author_pk = topic.pubkey.clone();
+    let last_pk = topic.last_pubkey.clone();
     // Disclosure badges (COM-13/F2): mark the topic's root author and the
     // most-recent participant as agents, naming their authorising principals.
     let root_badge_pubkey = topic.pubkey.clone();
@@ -250,19 +250,25 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
     let has_replies = reply_count > 0;
     let pk = topic.pubkey.clone();
 
+    // "Stretched link" card: the title link's `::after` covers the whole card,
+    // so the card stays one click target, while an author's abridged key (no
+    // profile name) sits above that overlay as its own click-to-copy button —
+    // never a button nested inside a link.
     view! {
-        <A href=href attr:class="block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 hover:border-amber-500/30 rounded-lg p-4 no-underline text-inherit transition-colors group">
+        <div class="relative block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 hover:border-amber-500/30 rounded-lg p-4 text-inherit transition-colors group">
             <div class="flex items-start gap-3">
                 <div class="flex-shrink-0 mt-0.5">
                     <Avatar pubkey=pk size=AvatarSize::Md />
                 </div>
                 <div class="flex-1 min-w-0">
                     <h3 class="font-semibold text-white group-hover:text-amber-400 transition-colors line-clamp-1">
-                        {title}
+                        <A href=href attr:class="no-underline text-inherit after:absolute after:inset-0 after:rounded-lg">
+                            {title}
+                        </A>
                     </h3>
                     <div class="flex items-center gap-2 mt-1 text-xs text-gray-500 flex-wrap">
                         <span>"by "</span>
-                        <span class="text-gray-400">{move || author_name.get()}</span>
+                        <span class="text-gray-400"><KeyName pubkey=author_pk key_class="relative z-10 font-mono" /></span>
                         <AgentBadge pubkey=root_badge_pubkey compact=true />
                         <span class="text-gray-700">"\u{2022}"</span>
                         <span class="flex items-center gap-1">
@@ -283,13 +289,13 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
                     </div>
                     {has_replies.then(|| view! {
                         <div class="mt-1 text-gray-600 flex items-center gap-1 justify-end">
-                            "last: "<span class="text-gray-400">{move || last_name.get()}</span>
+                            "last: "<span class="text-gray-400"><KeyName pubkey=last_pk key_class="relative z-10 font-mono" /></span>
                             <AgentBadge pubkey=last_badge_pubkey compact=true />
                         </div>
                     })}
                 </div>
             </div>
-        </A>
+        </div>
     }
 }
 

@@ -292,7 +292,7 @@ fn card_slot() -> AnyView {
 fn seat_panel(
     v: &SeatView,
     seat: u32,
-    label: String,
+    label: AnyView,
     blurb: Option<String>,
     unit: &str,
 ) -> AnyView {
@@ -999,7 +999,7 @@ fn PracticeTable() -> impl IntoView {
                                 let bot_label = bot_label.clone();
                                 let bot_blurb = bot_blurb.clone();
                                 move || match seat_view.get() {
-                                    Some(v) => seat_panel(&v, BOT, bot_label.clone(), Some(bot_blurb.clone()), "chips"),
+                                    Some(v) => seat_panel(&v, BOT, bot_label.clone().into_any(), Some(bot_blurb.clone()), "chips"),
                                     None => view! {
                                         <div class="rounded-xl bg-gray-900/60 p-4 ring-1 ring-gray-700/50">
                                             <p class="font-semibold text-white">{bot_label.clone()}</p>
@@ -1019,7 +1019,7 @@ fn PracticeTable() -> impl IntoView {
                                 </p>
                             </div>
 
-                            {move || seat_view.get().map(|v| seat_panel(&v, HERO, "You".to_string(), None, "chips"))}
+                            {move || seat_view.get().map(|v| seat_panel(&v, HERO, "You".into_any(), None, "chips"))}
                         </TableSurface>
 
                         {move || outcome.get().map(|o| {
@@ -1486,10 +1486,11 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                             match view_now {
                                 Some(v) => {
                                     let other = 1 - seat;
+                                    // a member's pubkey: their name, or the copyable key
                                     let label_view = if label.len() == 64 {
-                                        crate::components::user_display::use_display_name(&label)
+                                        view! { <KeyName pubkey=label.clone() key_class="font-mono" /> }.into_any()
                                     } else {
-                                        label.clone()
+                                        label.clone().into_any()
                                     };
                                     view! {
                                         {seat_panel(&v, other, label_view, blurb, unit)}
@@ -1500,7 +1501,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                                                 <span class="text-gray-500">" · "{v.street.clone()}</span>
                                             </p>
                                         </div>
-                                        {seat_panel(&v, seat, "You".to_string(), None, unit)}
+                                        {seat_panel(&v, seat, "You".into_any(), None, unit)}
                                     }.into_any()
                                 }
                                 None => view! {

@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::base_href;
 use crate::components::agent_badge::AgentBadge;
+use crate::components::copy_key::KeyName;
 use crate::components::modal::Modal;
-use crate::components::user_display::use_display_name_tracked;
 use crate::utils::format_relative_time;
 
 /// localStorage key for bookmarks.
@@ -203,7 +203,7 @@ pub(crate) fn BookmarksModal(
                                     let avatar_text = bm.author_pubkey[..2].to_uppercase();
                                     // Tracked: the enclosing closure re-runs
                                     // when kind-0 metadata fills the cache.
-                                    let author_short = use_display_name_tracked(&bm.author_pubkey);
+                                    let author_pk = bm.author_pubkey.clone();
                                     // Disclosure badge (COM-13/F2): marks the
                                     // bookmarked message's author as an agent.
                                     let author_badge_pubkey = bm.author_pubkey.clone();
@@ -225,7 +225,7 @@ pub(crate) fn BookmarksModal(
                                                 // Content
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2 text-xs text-gray-500 mb-1">
-                                                        <span class="font-medium text-gray-400">{author_short}</span>
+                                                        <span class="font-medium text-gray-400"><KeyName pubkey=author_pk key_class="font-mono" /></span>
                                                         <AgentBadge pubkey=author_badge_pubkey compact=true />
                                                         <span>{"\u{00B7}"}</span>
                                                         <span>{time_str}</span>

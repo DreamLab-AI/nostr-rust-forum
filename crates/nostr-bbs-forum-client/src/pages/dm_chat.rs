@@ -13,9 +13,9 @@ use crate::app::base_href;
 use wasm_bindgen::JsCast;
 
 use crate::auth::use_auth;
+use crate::components::copy_key::KeyName;
 use crate::components::image_upload::ImageUpload;
 use crate::components::info_term::InfoTerm;
-use crate::components::user_display::use_display_name_memo;
 use crate::dm::{provide_dm_store, use_dm_store, DMMessage};
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::utils::{arrow_left_svg, format_relative_time, pubkey_color, set_timeout_once};
@@ -177,10 +177,6 @@ pub fn DmChatPage() -> impl IntoView {
     let my_pubkey = auth.pubkey();
 
     // Short display name for recipient (resolved from NameCache)
-    let recipient_display_memo = {
-        let rpk = recipient_pubkey();
-        use_display_name_memo(rpk)
-    };
 
     view! {
         <div class="flex flex-col h-[calc(100vh-64px)]">
@@ -208,7 +204,7 @@ pub fn DmChatPage() -> impl IntoView {
 
                         <div class="flex-1 min-w-0">
                             <h1 class="text-lg font-bold text-white truncate">
-                                {move || recipient_display_memo.get()}
+                                {move || view! { <KeyName pubkey=recipient_pubkey() key_class="font-mono" /> }}
                             </h1>
                             <p class="text-[10px] font-mono text-gray-500 truncate -mt-0.5 mb-0.5">
                                 {move || {

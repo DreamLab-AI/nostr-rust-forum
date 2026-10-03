@@ -42,8 +42,8 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::auth::use_auth;
+use crate::components::copy_key::KeyName;
 use crate::components::fx::reaction_burst::ReactionBurst;
-use crate::components::user_display::use_display_name_tracked;
 use crate::relay::RelayConnection;
 use crate::stores::custom_emoji::{use_custom_emoji_store, MAX_EMOJI_CHARS};
 use crate::stores::reactions::use_reaction_store;
@@ -112,14 +112,10 @@ impl HoldTimer {
     }
 }
 
-/// Label one reactor for the popover: "You" for the viewer, else the display
-/// name the rest of the UI uses (profile cache, falling back to a short npub).
-fn reactor_label(pubkey: &str, me: &str) -> String {
-    if !me.is_empty() && pubkey.eq_ignore_ascii_case(me) {
-        "You".to_string()
-    } else {
-        use_display_name_tracked(pubkey)
-    }
+/// Whether a reactor is the viewer (labelled "You" in the popover; everyone
+/// else shows their display name, or their copyable abridged key).
+fn reactor_is_me(pubkey: &str, me: &str) -> bool {
+    !me.is_empty() && pubkey.eq_ignore_ascii_case(me)
 }
 
 /// Common reaction emojis offered in the picker.
@@ -410,7 +406,11 @@ pub(crate) fn ReactionBar(
                                                 .iter()
                                                 .take(MAX_LISTED_REACTORS)
                                                 .map(|pk| {
-                                                    let label = reactor_label(pk, &me);
+                                                    let label = if reactor_is_me(pk, &me) {
+                                                        "You".into_any()
+                                                    } else {
+                                                        view! { <KeyName pubkey=pk.clone() key_class="font-mono" /> }.into_any()
+                                                    };
                                                     view! { <li class="text-gray-200 truncate">{label}</li> }.into_any()
                                                 })
                                                 .collect();

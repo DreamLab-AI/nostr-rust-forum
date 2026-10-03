@@ -12,7 +12,7 @@ use nostr_bbs_core::gift_wrap::{unwrap_gift_with_signer, KIND_ENCRYPTED_DM, KIND
 use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{gift_wrap_pair_with_signer, NostrEvent};
 
-use crate::components::user_display::use_display_name;
+use crate::components::user_display::try_display_name;
 use crate::relay::{EoseCallback, EventCallback, Filter, RelayConnection};
 
 /// A single decrypted direct message.
@@ -31,6 +31,9 @@ pub struct DMMessage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DMConversation {
     pub pubkey: String,
+    /// The counterparty's profile name when one was known as the conversation
+    /// opened; empty otherwise (the list then shows the live name or the
+    /// copyable abridged key).
     pub name: String,
     pub last_message: String,
     pub last_timestamp: u64,
@@ -414,7 +417,7 @@ impl DMStore {
                 .entry(recipient_pk_hex.to_string())
                 .or_insert_with(|| DMConversation {
                     pubkey: recipient_pk_hex.to_string(),
-                    name: use_display_name(recipient_pk_hex),
+                    name: try_display_name(recipient_pk_hex).unwrap_or_default(),
                     last_message: String::new(),
                     last_timestamp: 0,
                     unread_count: 0,
@@ -487,7 +490,7 @@ impl DMStore {
                     .entry(msg.sender_pubkey.clone())
                     .or_insert_with(|| DMConversation {
                         pubkey: msg.sender_pubkey.clone(),
-                        name: crate::components::user_display::use_display_name(&msg.sender_pubkey),
+                        name: try_display_name(&msg.sender_pubkey).unwrap_or_default(),
                         last_message: String::new(),
                         last_timestamp: 0,
                         unread_count: 0,
@@ -965,7 +968,7 @@ fn insert_dm_message(
             .entry(counterparty_pk.to_string())
             .or_insert_with(|| DMConversation {
                 pubkey: counterparty_pk.to_string(),
-                name: use_display_name(counterparty_pk),
+                name: try_display_name(counterparty_pk).unwrap_or_default(),
                 last_message: String::new(),
                 last_timestamp: 0,
                 unread_count: 0,

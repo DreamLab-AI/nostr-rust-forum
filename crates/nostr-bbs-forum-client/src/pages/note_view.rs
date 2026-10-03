@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use crate::app::base_href;
 use crate::components::agent_badge::AgentBadge;
+use crate::components::copy_key::KeyName;
 use crate::components::mention_text::MentionText;
-use crate::components::user_display::use_display_name_memo;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::utils::{format_relative_time, pubkey_color, set_timeout_once};
 
@@ -226,7 +226,7 @@ pub fn NoteViewPage() -> impl IntoView {
                     let avatar_bg = pubkey_color(&n.pubkey);
                     // Resolve author name reactively (display_name > name > NIP-05 >
                     // shortened pubkey). Re-renders when kind-0 metadata arrives.
-                    let author_name = use_display_name_memo(n.pubkey.clone());
+                    let author_pk = n.pubkey.clone();
                     // Disclosure badge (COM-13/F2): marks the note author as an
                     // agent and names its authorising principal from the registry.
                     let author_badge_pubkey = n.pubkey.clone();
@@ -248,7 +248,7 @@ pub fn NoteViewPage() -> impl IntoView {
                                 </div>
                                 <div>
                                     <div class="flex items-center gap-2">
-                                        <span class="font-semibold text-white text-sm">{move || author_name.get()}</span>
+                                        <span class="font-semibold text-white text-sm"><KeyName pubkey=author_pk key_class="font-mono" /></span>
                                         <AgentBadge pubkey=author_badge_pubkey compact=true />
                                     </div>
                                     <div class="text-xs text-gray-500">{time_str}</div>

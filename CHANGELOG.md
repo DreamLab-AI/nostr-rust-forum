@@ -32,6 +32,17 @@ clicking it copies the FULL key: hex as hex, npub as npub.
   acknowledger, poker table names, settings (account, devices), setup,
   signup, the header identity chip, and admin-alert/join/post notifications.
   The DM list card is now a stretched link so the key can sit above it.
+- Every rendered display-name fallback too: a member with no profile name
+  shows `<KeyName>` (the copyable key) in post/reply/quote authors, note,
+  pinned, thread-view, bookmark, event-card, calendar, birthday, report,
+  audit-log, section-request, governance-agent, tip-popover, reactor-list,
+  poker-seat, muted-user and profile headings (page, modal, popover). Where
+  the name sits inside a link or a profile-opening control (message author,
+  search results, `@username` mentions, "Now posts as", the agent pill's
+  principal, `UserDisplay`) a `<KeyGlyph>` copy glyph is its sibling, shown
+  only while the name is still the abridged key. The topic-list card is now
+  a stretched link like the DM card. DM conversations store a name only when
+  one resolved (`user_display::try_display_name`), never an abridged key.
 - One clipboard writer, `utils/clipboard.rs`: the async Clipboard API reached
   through `Reflect` and awaited (a rejection is a failure, not assumed a
   success), falling back to a hidden-textarea `execCommand("copy")`. Replaces

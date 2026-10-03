@@ -13,9 +13,8 @@ use leptos_router::NavigateOptions;
 
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::badge_display::BadgeGrid;
-use crate::components::copy_key::CopyKey;
+use crate::components::copy_key::{CopyKey, KeyName};
 use crate::components::profile_activity::ProfileActivity;
-use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::badges::{use_badges, BadgeFetchState, EarnedBadge};
 
@@ -182,25 +181,25 @@ pub fn ProfilePage() -> impl IntoView {
     }
     let badges_signal = Signal::derive(move || profile_badges.get());
 
-    let display_name = Memo::new(move |_| {
-        let pk = pubkey.get();
+    // The name this page's own kind-0 fetch carries, if any.
+    let meta_name = Memo::new(move |_| {
         let m = meta.get();
-        let candidate = m.display_name.or(m.name);
-        if let Some(name) = candidate.filter(|s| !s.trim().is_empty()) {
-            return name;
-        }
-        // Fallback chain: profile-cache → short hex → npub short form.
-        // Empty h1 was an a11y defect; SR users landed on a nameless page.
-        // Tracked: this Memo re-runs when the cache fills.
-        let lookup = use_display_name_tracked(&pk);
-        if !lookup.trim().is_empty() {
-            return lookup;
-        }
-        if !pk.is_empty() {
-            return crate::utils::shorten_pubkey(&pk);
-        }
-        "Profile".to_string()
+        m.display_name.or(m.name).filter(|s| !s.trim().is_empty())
     });
+    // Heading fallback chain: this page's kind-0 → profile cache → the
+    // copyable abridged key ([`KeyName`]) → "Profile". Never empty: an empty
+    // h1 was an a11y defect (SR users landed on a nameless page).
+    let heading = move || match meta_name.get() {
+        Some(name) => name.into_any(),
+        None => {
+            let pk = pubkey.get();
+            if pk.is_empty() {
+                "Profile".into_any()
+            } else {
+                view! { <KeyName pubkey=pk key_class="font-mono" /> }.into_any()
+            }
+        }
+    };
 
     let on_dm = move |_| {
         let pk = pubkey.get();
@@ -279,7 +278,7 @@ pub fn ProfilePage() -> impl IntoView {
                             <div class="skeleton w-40 h-7 mx-auto"></div>
                         }
                     >
-                        <h1 class="text-2xl font-bold text-white">{move || display_name.get()}</h1>
+                        <h1 class="text-2xl font-bold text-white">{heading}</h1>
                     </Show>
 
                     {move || meta.get().nip05.map(|nip| view! {

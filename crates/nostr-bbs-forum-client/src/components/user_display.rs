@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use leptos::prelude::*;
 
 use crate::components::avatar::{Avatar, AvatarSize};
+use crate::components::copy_key::KeyGlyph;
 use crate::components::profile_popover::ProfilePopover;
 use crate::stores::profile_cache::{try_use_profile_cache, ProfileCache};
 use crate::utils::shorten_pubkey;
@@ -50,21 +51,32 @@ pub fn use_display_name(pubkey: &str) -> String {
     if pubkey.is_empty() {
         return String::new();
     }
+    try_display_name(pubkey).unwrap_or_else(|| shorten_pubkey(pubkey))
+}
+
+/// Untracked layered lookup: `Some(label)` when a cache layer resolves a
+/// human label now, `None` otherwise (the caller decides the fallback — a
+/// store keeps it empty, a view renders the copyable key). Schedules the
+/// debounced batch fetch on a miss.
+pub fn try_display_name(pubkey: &str) -> Option<String> {
+    if pubkey.is_empty() {
+        return None;
+    }
     // Profile cache is the canonical source — display_name > name > NIP-05.
     if let Some(cache) = try_use_profile_cache() {
         if let Some(entry) = cache.lookup(pubkey) {
             if let Some(label) = entry.best_label() {
-                return label;
+                return Some(label);
             }
         }
     }
     // Legacy NameCache overrides (e.g. from prior NIP-05 lookups).
     if let Some(cache) = try_use_name_cache() {
         if let Some(name) = cache.0.get_untracked().get(pubkey).cloned() {
-            return name;
+            return Some(name);
         }
     }
-    shorten_pubkey(pubkey)
+    None
 }
 
 /// Tracked (subscribing) layered lookup that returns `Some(label)` only when
@@ -181,6 +193,9 @@ pub fn UserDisplay(
                 <Avatar pubkey=pk_avatar size=size />
                 <span class=name_cls>{move || display_name.get()}</span>
             </button>
+            // The trigger opens the popover; while the name is still the
+            // abridged key, a copy glyph sits beside it.
+            <KeyGlyph pubkey=pubkey.clone() />
 
             <Show when=move || open.get()>
                 <ProfilePopover pubkey=pk_popover.clone() is_open=open />

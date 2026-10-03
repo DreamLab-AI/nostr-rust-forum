@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::components::agent_badge::AgentBadge;
-use crate::components::user_display::use_display_name_memo;
+use crate::components::copy_key::KeyName;
 use crate::utils::pubkey_color;
 
 /// Display a quoted/replied-to message with a left amber border.
@@ -22,7 +22,7 @@ pub(crate) fn QuotedMessage(
     reply_to_content: String,
 ) -> impl IntoView {
     // Reactive: fills in the original author's nickname when kind-0 arrives.
-    let short_pk = use_display_name_memo(reply_to_pubkey.clone());
+    let quoted_pk = reply_to_pubkey.clone();
     // Disclosure badge (COM-13/F2): marks the quoted author as an agent and
     // names the authorising principal when the pubkey is active in the registry.
     let pk_for_agent_badge = reply_to_pubkey.clone();
@@ -93,7 +93,7 @@ pub(crate) fn QuotedMessage(
 
             <div class="flex-1 min-w-0">
                 <span class="text-xs font-medium text-amber-400/80 font-mono">
-                    {move || short_pk.get()}
+                    <KeyName pubkey=quoted_pk />
                 </span>
                 <AgentBadge pubkey=pk_for_agent_badge compact=true />
                 <p class="text-xs text-gray-400 truncate leading-snug mt-0.5">

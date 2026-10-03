@@ -9,8 +9,8 @@ use leptos::prelude::*;
 use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
+use crate::components::copy_key::KeyName;
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
 use crate::stores::zone_access::ZoneAccess;
 use crate::utils::format_relative_time;
@@ -175,7 +175,7 @@ pub fn PinnedMessages(
                                 let content_preview = truncate_content(&msg.content, 120);
                                 let time = format_relative_time(msg.created_at);
 
-                                let display_name = use_display_name_memo(pk.clone());
+                                let author_pk = pk.clone();
 
                                 let on_click = move |_| {
                                     scroll_to_event(&eid);
@@ -234,7 +234,7 @@ pub fn PinnedMessages(
                                         <Avatar pubkey=pk size=AvatarSize::Sm />
                                         <div class="flex-1 min-w-0">
                                             <div class="flex items-baseline gap-2">
-                                                <span class="text-xs font-medium text-amber-400">{move || display_name.get()}</span>
+                                                <span class="text-xs font-medium text-amber-400"><KeyName pubkey=author_pk key_class="font-mono" /></span>
                                                 <AgentBadge pubkey=pk_for_agent_badge compact=true />
                                                 <span class="text-xs text-gray-600">{time.clone()}</span>
                                             </div>

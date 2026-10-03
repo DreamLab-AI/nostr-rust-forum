@@ -9,11 +9,11 @@ use leptos::prelude::*;
 use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
+use crate::components::copy_key::KeyName;
 use crate::components::mention_text::MentionText;
 use crate::components::reaction_bar::ReactionBar;
 use crate::components::tip_button::TipControl;
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
 use crate::utils::format_relative_time;
 
@@ -203,7 +203,7 @@ pub fn ThreadView(
                             let eid = reply.id.clone();
                             let author_pk = reply.pubkey.clone();
 
-                            let display_name = use_display_name_memo(pk.clone());
+                            let name_pk = pk.clone();
 
                             view! {
                                 <div class="flex gap-2 py-1.5 hover:bg-gray-800/20 rounded-lg px-1 transition-colors group">
@@ -213,7 +213,7 @@ pub fn ThreadView(
                                     <div class="flex-1 min-w-0">
                                         <div class="flex items-baseline gap-2">
                                             <span class="font-semibold text-xs text-amber-400">
-                                                {move || display_name.get()}
+                                                <KeyName pubkey=name_pk key_class="font-mono" />
                                             </span>
                                             <AgentBadge pubkey=pk_for_agent_badge compact=true />
                                             <span class="text-xs text-gray-600">{time.clone()}</span>

@@ -14,13 +14,12 @@ use wasm_bindgen_futures::JsFuture;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::confirm_dialog::{ConfirmDialog, ConfirmVariant};
-use crate::components::copy_key::CopyKey;
+use crate::components::copy_key::{CopyKey, KeyName};
 use crate::components::onboarding_modal::{
     cache_claimed_username, claimed_username_cached, release_username, use_claimed_username,
     username_from_nip05,
 };
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::preferences::{
     save_preferences, use_preferences, Density, FontSize, NotificationLevel, Theme,
@@ -954,11 +953,10 @@ pub fn SettingsPage() -> impl IntoView {
                                         // Tracked resolver — the enclosing `move ||` closure
                                         // re-runs when kind-0 metadata fills the cache, so
                                         // muted users show nicknames as soon as available.
-                                        let pk_display = use_display_name_tracked(&pk);
                                         let pk_for_unmute = pk.clone();
                                         view! {
                                             <div class="flex items-center justify-between bg-gray-800 rounded-lg px-3 py-2">
-                                                <code class="text-xs text-gray-300 font-mono">{pk_display}</code>
+                                                <code class="text-xs text-gray-300 font-mono"><KeyName pubkey=pk.clone() /></code>
                                                 <button
                                                     on:click=move |_| on_unmute(pk_for_unmute.clone())
                                                     class="text-xs text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded px-2 py-1 transition-colors"

@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::components::copy_key::KeyName;
 use crate::components::create_event_modal::CreateEventModal;
 use crate::components::event_card::{BusyCard, EventCard};
 use crate::components::mini_calendar::MiniCalendar;
@@ -562,7 +563,11 @@ pub fn EventsPage() -> impl IntoView {
 /// A birthday entry derived from user profile metadata (kind 0).
 #[derive(Clone, Debug)]
 struct BirthdayEntry {
-    name: String,
+    /// The member's hex pubkey.
+    pubkey: String,
+    /// The name their kind-0 carries, when it carries one; otherwise the row
+    /// shows the profile-cache name or the copyable abridged key.
+    name: Option<String>,
     month: u32,
     day: u32,
 }
@@ -647,17 +652,20 @@ fn BirthdayList() -> impl IntoView {
                             .or_else(|| meta.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
+                            .trim()
                             .to_string();
-                        let name = if name.is_empty() {
-                            crate::components::user_display::use_display_name(&event.pubkey)
-                        } else {
-                            name
-                        };
+                        let name = (!name.is_empty()).then_some(name);
+                        let pubkey = event.pubkey.clone();
 
                         bdays.update(|list| {
                             // Deduplicate by pubkey — keep latest profile
-                            list.retain(|b| b.name != name);
-                            list.push(BirthdayEntry { name, month, day });
+                            list.retain(|b| b.pubkey != pubkey);
+                            list.push(BirthdayEntry {
+                                pubkey,
+                                name,
+                                month,
+                                day,
+                            });
                         });
                     }
                 }
@@ -738,7 +746,12 @@ fn BirthdayList() -> impl IntoView {
                                             </svg>
                                         </div>
                                         <div class="flex-1 min-w-0">
-                                            <span class="font-medium text-white">{b.name}</span>
+                                            <span class="font-medium text-white">
+                                                {match b.name {
+                                                    Some(n) => n.into_any(),
+                                                    None => view! { <KeyName pubkey=b.pubkey key_class="font-mono" /> }.into_any(),
+                                                }}
+                                            </span>
                                             {is_today.then(|| view! {
                                                 <span class="ml-2 text-xs bg-amber-500/20 text-amber-400 rounded-full px-2 py-0.5">"Today!"</span>
                                             })}

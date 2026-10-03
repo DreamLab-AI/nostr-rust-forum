@@ -15,6 +15,7 @@
 //! itself.
 
 use crate::app::base_href;
+use crate::components::copy_key::KeyGlyph;
 use crate::relay::{Filter, RelayConnection};
 use crate::utils::search_client;
 use gloo::events::EventListener;
@@ -127,6 +128,18 @@ enum Hit {
     },
 }
 impl Hit {
+    /// The member whose name this hit shows (title or "by …" subtitle). While
+    /// that name is still the abridged key the row gets a copy glyph beside it.
+    fn person(&self) -> Option<&str> {
+        match self {
+            Self::Message { author, .. } => Some(author),
+            Self::SemanticMessage { label, .. } if crate::utils::is_hex_pubkey(label) => {
+                Some(label)
+            }
+            Self::User { pubkey, .. } => Some(pubkey),
+            _ => None,
+        }
+    }
     fn title(&self) -> String {
         match self {
             Self::Channel { name, .. } => name.clone(),
@@ -619,7 +632,8 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                                 let (il, ic) = h.icon(); let cls = format!("w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold {}", ic);
                                 let ti = h.title(); let su = h.subtitle();
                                 let score_badge = h.score();
-                                view! { <button class=move || if sel.get() == i { "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg bg-gray-800 text-left" } else { "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-gray-800/50 text-left transition-colors" } on:click=move |_| nav_result(i) on:mouseenter=move |_| sel.set(i)>
+                                let person = h.person().map(str::to_string);
+                                view! { <div class="flex items-center gap-1"><button class=move || if sel.get() == i { "flex-1 min-w-0 flex items-center gap-3 px-3 py-2.5 rounded-lg bg-gray-800 text-left" } else { "flex-1 min-w-0 flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-gray-800/50 text-left transition-colors" } on:click=move |_| nav_result(i) on:mouseenter=move |_| sel.set(i)>
                                     <div class=cls.clone()>{il}</div>
                                     <div class="flex-1 min-w-0">
                                         <div class="flex items-center gap-2">
@@ -633,7 +647,9 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                                         <p class="text-xs text-gray-500 truncate">{su.clone()}</p>
                                     </div>
                                     <svg class="w-4 h-4 text-gray-600 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
-                                </button> }
+                                </button>
+                                {person.map(|pk| view! { <KeyGlyph pubkey=pk class="px-1" /> })}
+                                </div> }
                             }).collect_view() }}</div>
                         </Show>
                         <Show when=move || !loading.get() && results.get().is_empty() && !query.get().trim().is_empty()>

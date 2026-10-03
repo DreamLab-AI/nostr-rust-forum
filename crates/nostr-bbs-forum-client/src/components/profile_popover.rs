@@ -18,6 +18,7 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 
 use crate::components::avatar::{Avatar, AvatarSize};
+use crate::components::copy_key::KeyName;
 use crate::components::profile_activity::ProfileActivity;
 use crate::components::user_display::use_display_name_tracked;
 use crate::stores::profile_cache::{format_nip05_handle, try_use_profile_cache};
@@ -43,7 +44,6 @@ pub(crate) fn ProfilePopover(
     // tooltip — since a closure isn't `Copy` and each attribute/child consumes
     // its own.
     let pk_name = pubkey.clone();
-    let display_name = move || use_display_name_tracked(&pk_name);
     let pk_name_title = pubkey.clone();
     let display_name_title = move || use_display_name_tracked(&pk_name_title);
 
@@ -132,7 +132,7 @@ pub(crate) fn ProfilePopover(
                 </div>
                 <div class="min-w-0 flex-1">
                     <div class="font-bold text-white text-sm truncate" title=display_name_title>
-                        {display_name}
+                        <KeyName pubkey=pk_name key_class="font-mono" />
                     </div>
                     {move || nip05().map(|handle| view! {
                         <div class="text-xs text-green-400 truncate mt-0.5">

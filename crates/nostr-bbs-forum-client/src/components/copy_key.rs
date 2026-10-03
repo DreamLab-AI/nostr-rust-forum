@@ -10,6 +10,9 @@
 //!   confirmation announced through `aria-live`.
 //! - [`KeyName`] renders a member's resolved name, falling back to a
 //!   [`CopyKey`] while (or because) no profile name exists.
+//! - [`KeyGlyph`] is the sibling form for a name rendered inside a link or
+//!   button: a copy glyph beside the control, shown only while the name is
+//!   still the abridged key.
 //! - [`KeyedText`] + [`KeyedTextView`] carry a sentence that mentions a key
 //!   (an admin action banner, a notification body) from the store that builds
 //!   it to the view that renders it, so the key inside stays copyable.
@@ -199,7 +202,36 @@ pub fn KeyName(
     let key_class = key_class.unwrap_or_default();
     move || match name.get() {
         Some(n) => n.into_any(),
+        None if pubkey.is_empty() => ().into_any(),
         None => view! { <CopyKey full=pubkey.clone() class=key_class.clone() /> }.into_any(),
+    }
+}
+
+/// The copy affordance for a member's name that sits INSIDE a link or button
+/// (a profile trigger, a row link): render the name inside the control as
+/// before and put this beside it, as the control's sibling. While no profile
+/// name resolves — so the control shows the abridged key — it is a compact
+/// copy glyph ([`CopyKey`] with `icon`); once a name resolves it renders
+/// nothing. The control's own action is untouched and the copy stays one click.
+#[component]
+pub fn KeyGlyph(
+    /// Hex pubkey of the member.
+    #[prop(into)]
+    pubkey: String,
+    /// Extra classes for the glyph button.
+    #[prop(optional, into)]
+    class: Option<String>,
+) -> impl IntoView {
+    let pk = pubkey.clone();
+    let unnamed = Memo::new(move |_| !pk.is_empty() && try_display_name_tracked(&pk).is_none());
+    let class = format!(
+        "ml-1 text-gray-500 hover:text-amber-300 {}",
+        class.unwrap_or_default()
+    );
+    move || {
+        unnamed.get().then(|| {
+            view! { <CopyKey full=pubkey.clone() icon=true class=class.clone() /> }
+        })
     }
 }
 

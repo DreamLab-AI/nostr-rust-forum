@@ -10,7 +10,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::auth::nip98::{fetch_with_nip98_get_signer, fetch_with_nip98_post_signer};
 use crate::auth::use_auth;
-use crate::components::user_display::use_display_name_memo;
+use crate::components::copy_key::KeyName;
 
 // -- Types --------------------------------------------------------------------
 
@@ -221,12 +221,10 @@ fn ReportCard(
     // (reactive — fills in the nickname when kind-0 metadata arrives, with a
     // shortened-hex fallback in the interim).
     let reporter_name = report.reporter_name.clone();
-    let reporter_resolved = use_display_name_memo(report.reporter_pubkey.clone());
-    let reporter_display = move || {
-        reporter_name
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| reporter_resolved.get())
+    let reporter_pk = report.reporter_pubkey.clone();
+    let reporter_display = match reporter_name.filter(|n| !n.trim().is_empty()) {
+        Some(n) => n.into_any(),
+        None => view! { <KeyName pubkey=reporter_pk /> }.into_any(),
     };
     let timestamp = format_timestamp(report.created_at);
     let report_count = report.report_count;

@@ -8,7 +8,7 @@ use leptos::prelude::*;
 
 use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
-use crate::components::user_display::use_display_name_memo;
+use crate::components::copy_key::KeyName;
 
 /// Month abbreviations for date badge display.
 const MONTHS: [&str; 12] = [
@@ -144,7 +144,7 @@ pub(crate) fn EventCard(
     let (month, day) = extract_date_parts(start_time);
     let time_range = format!("{} - {}", format_time(start_time), format_time(end_time));
     // Reactive: fills in the host's nickname when the kind-0 metadata lands.
-    let host_display = use_display_name_memo(host_pubkey.clone());
+    let host_pk = host_pubkey.clone();
     // Disclosure badge (COM-13/F2): marks the event host as an agent and names
     // its authorising principal when the host pubkey is active in the registry.
     let host_badge_pubkey = host_pubkey.clone();
@@ -201,7 +201,7 @@ pub(crate) fn EventCard(
                     <div class="flex items-center justify-between pt-1">
                         <div class="flex items-center gap-2">
                             <Avatar pubkey=host_pubkey size=AvatarSize::Sm />
-                            <span class="text-xs text-gray-500">{move || host_display.get()}</span>
+                            <span class="text-xs text-gray-500"><KeyName pubkey=host_pk key_class="font-mono" /></span>
                             <AgentBadge pubkey=host_badge_pubkey compact=true />
                         </div>
 

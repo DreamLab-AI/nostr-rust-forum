@@ -9,7 +9,7 @@
 
 use leptos::prelude::*;
 
-use crate::components::copy_key::{CopyKey, KeyName};
+use crate::components::copy_key::{CopyKey, KeyGlyph, KeyName};
 use crate::components::user_display::{
     try_display_name_tracked, use_display_name, use_display_name_memo,
 };
@@ -140,10 +140,6 @@ pub(crate) fn MentionText(
                             Some(pk) => {
                                 // Reactive: fills in when kind-0 arrives.
                                 let display = use_display_name_memo(pk.clone());
-                                let name = {
-                                    let pk = pk.clone();
-                                    Memo::new(move |_| try_display_name_tracked(&pk))
-                                };
                                 let href = format!("/community/profile/{}", pk);
                                 // While the link text is the abridged key, a
                                 // sibling copy button sits beside it — never a
@@ -157,9 +153,7 @@ pub(crate) fn MentionText(
                                     >
                                         {"@"}{move || display.get()}
                                     </a>
-                                    {move || name.get().is_none().then(|| view! {
-                                        <CopyKey full=pk_copy.clone() icon=true class="ml-0.5 text-gray-500 hover:text-amber-300" />
-                                    })}
+                                    <KeyGlyph pubkey=pk_copy class="ml-0.5" />
                                 }.into_any()
                             }
                             None => {

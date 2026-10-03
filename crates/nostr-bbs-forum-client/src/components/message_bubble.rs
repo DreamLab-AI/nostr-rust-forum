@@ -8,6 +8,7 @@ use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::badge_display::BadgeBar;
 use crate::components::bookmarks_modal::use_bookmarks;
 use crate::components::confirm_dialog::ConfirmDialog;
+use crate::components::copy_key::KeyGlyph;
 use crate::components::link_preview::LinkPreview;
 use crate::components::media_embed::MediaEmbed;
 use crate::components::mention_text::MentionText;
@@ -190,6 +191,9 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                     >
                         {move || display_name.get()}
                     </span>
+                    // The name opens the profile; while it is still the
+                    // abridged key, a copy glyph sits beside it.
+                    <KeyGlyph pubkey=msg_pubkey.clone() />
                     <BadgeBar badge_ids=author_badge_ids max=3 />
                     <AgentBadge pubkey=pk_for_agent_badge compact=true />
                     <span class="text-xs text-gray-600 opacity-0 group-hover:opacity-100 transition-opacity">

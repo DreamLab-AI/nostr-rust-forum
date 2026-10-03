@@ -51,6 +51,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::components::badge::{Badge, BadgeSize, BadgeVariant};
+use crate::components::copy_key::KeyGlyph;
 
 /// How long a successful disclosure snapshot is treated as authoritative.
 /// Past this the badge reports its agent answers as possibly out of date and
@@ -411,7 +412,8 @@ pub fn AgentBadge(
             match current {
                 // Fresh register, author not listed: the only honest silence.
                 BadgeState::NotAnAgent => ().into_any(),
-                BadgeState::Agent { freshness, .. } => {
+                BadgeState::Agent { freshness, ref registered_by, .. } => {
+                    let principal_pk = registered_by.clone();
                     let principal = principal_label
                         .get()
                         .unwrap_or_else(|| "an administrator".to_string());
@@ -422,10 +424,14 @@ pub fn AgentBadge(
                         // Same pill, explicitly marked as possibly out of date.
                         format!("AGENT \u{b7} {principal} \u{b7}?")
                     };
+                    // While the principal has no profile name the pill shows
+                    // its abridged key: a copy glyph beside the pill copies
+                    // the full key (raised above any stretched-link overlay).
                     view! {
                         <span title=title>
                             <Badge text=text variant=BadgeVariant::Info size=size />
                         </span>
+                        <KeyGlyph pubkey=principal_pk class="relative z-10" />
                     }
                     .into_any()
                 }

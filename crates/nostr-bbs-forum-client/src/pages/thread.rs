@@ -36,6 +36,7 @@ use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
 use crate::components::confirm_dialog::ConfirmDialog;
+use crate::components::copy_key::KeyName;
 use crate::components::link_preview::LinkPreview;
 use crate::components::media_embed::MediaEmbed;
 use crate::components::mention_text::{normalise_mention_pubkey, MentionText};
@@ -1323,6 +1324,8 @@ fn RootPost(
     is_admin: Signal<bool>,
     on_delete: Callback<String>,
 ) -> impl IntoView {
+    let author_pk = post.pubkey.clone();
+    // The name as a string, for the composer's quote line.
     let author = use_display_name_memo(post.pubkey.clone());
     // Quote-and-append: tapping Reply focuses the bottom composer. A StoredValue
     // keeps the target Copy so the inline on:click handler stays `Fn`.
@@ -1370,7 +1373,7 @@ fn RootPost(
                 <Avatar pubkey=pk size=AvatarSize::Lg />
                 <div class="flex-1 min-w-0">
                     <div class="flex items-baseline gap-2 flex-wrap">
-                        <span class="font-semibold text-[color:var(--zone-accent)]">{move || author.get()}</span>
+                        <span class="font-semibold text-[color:var(--zone-accent)]"><KeyName pubkey=author_pk key_class="font-mono" /></span>
                         <AgentBadge pubkey=author_badge_pubkey compact=true />
                         <span class="text-xs text-gray-500">{time}</span>
                         {edited.then(|| view! {
@@ -1449,6 +1452,8 @@ fn ReplyCard(
     is_admin: Signal<bool>,
     on_delete: Callback<String>,
 ) -> impl IntoView {
+    let author_pk = reply.pubkey.clone();
+    // The name as a string, for the composer's quote line.
     let author = use_display_name_memo(reply.pubkey.clone());
     // Quote-and-append: tapping Reply quotes THIS post and focuses the composer.
     // StoredValue keeps the target Copy so the inline on:click handler stays `Fn`.
@@ -1494,7 +1499,7 @@ fn ReplyCard(
                 <Avatar pubkey=pk size=AvatarSize::Sm />
                 <div class="flex-1 min-w-0">
                     <div class="flex items-baseline gap-2 flex-wrap">
-                        <span class="font-semibold text-sm text-[color:var(--zone-accent)]">{move || author.get()}</span>
+                        <span class="font-semibold text-sm text-[color:var(--zone-accent)]"><KeyName pubkey=author_pk key_class="font-mono" /></span>
                         <AgentBadge pubkey=author_badge_pubkey compact=true />
                         <span class="text-xs text-gray-600">{time}</span>
                         {edited.then(|| view! {
@@ -1531,10 +1536,9 @@ fn ReplyCard(
                         </div>
                     </div>
                     {quote.map(|q| {
-                        let qn = use_display_name_memo(q.pubkey.clone());
                         view! {
                             <div class="mt-1 mb-0.5 pl-2 border-l-2 border-gray-600 text-xs text-gray-500 truncate">
-                                <span class="text-[color:var(--zone-accent)] opacity-80">{move || qn.get()}</span>
+                                <span class="text-[color:var(--zone-accent)] opacity-80"><KeyName pubkey=q.pubkey.clone() key_class="font-mono" /></span>
                                 ": "
                                 <span class="italic">{q.snippet.clone()}</span>
                             </div>
