@@ -165,6 +165,15 @@ pub struct Preferences {
     /// only offered where the operator and the member wallet both enable it.
     #[serde(default)]
     pub poker_table: bool,
+    /// Show the poker table in 3D (the table page's own toggle). Off by
+    /// default; where the browser has no WebGPU or WebGL 2, or the render tier
+    /// is CSS-only, the flat table shows whatever this says.
+    #[serde(default)]
+    pub poker_table_3d: bool,
+    /// Deal the 3D table's cards from a four-colour deck (green clubs, blue
+    /// diamonds), so suits are told apart by colour as well as shape.
+    #[serde(default)]
+    pub poker_four_colour: bool,
 }
 
 /// Visual theme selection.
@@ -298,6 +307,8 @@ impl Default for Preferences {
             font_size: FontSize::Medium,
             density: Density::Comfortable,
             poker_table: false,
+            poker_table_3d: false,
+            poker_four_colour: false,
         }
     }
 }

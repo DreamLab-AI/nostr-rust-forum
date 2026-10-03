@@ -92,6 +92,15 @@
          served from. -->
     <link data-trunk rel="copy-dir" href="assets/icons" data-target-path="icons" />
 
+    <!-- The 3D poker table (src/components/table3d.rs), copied verbatim and
+         loaded only when a member switches the 3D table on: the wasm-bindgen
+         snippet js/table3d.js dynamic-imports <public-url>/table3d/index.js,
+         which imports three.js from <public-url>/vendor/three-<version>/ by
+         relative path. No <base href> is involved, so both resolve from the
+         modules' own URLs on every route. See js/table3d/README.md. -->
+    <link data-trunk rel="copy-dir" href="js/table3d" data-target-path="table3d" />
+    <link data-trunk rel="copy-dir" href="assets/vendor" data-target-path="vendor" />
+
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="Forum" />
     <!-- iOS ignores the manifest's icons entirely and ignores SVG touch icons;

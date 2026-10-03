@@ -9,6 +9,13 @@
 //! the forum's house seat, or against another member the house deals for,
 //! and settles each hand on `sidestr:dreamlab`; it is offered only where the
 //! operator runs a house seat ([`poker::money_enabled`]).
+//!
+//! Either table can be shown in 3D ([`crate::components::table3d`]), a
+//! member's choice kept in the preferences store. The scene renders the same
+//! seat view and log the flat table does; the flat table stays in the page as
+//! the accessible text layer (visually hidden while the scene draws) and as
+//! the fallback wherever the scene cannot start. While the scene is still
+//! showing what just happened, the action buttons wait for it.
 
 use leptos::ev;
 use leptos::prelude::*;
@@ -17,7 +24,9 @@ use wasm_bindgen::JsCast;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::components::fx::use_render_tier;
 use crate::components::poker_schedule::ScheduleGameModal;
+use crate::components::table3d::{self, Pick, PickTarget, Table3d, Table3dStatus};
 use crate::components::user_display::use_display_name_memo;
 use crate::poker::live::{LiveStore, Pay};
 use crate::poker::{
@@ -25,6 +34,7 @@ use crate::poker::{
     SeatView, Stake,
 };
 use crate::relay::{ConnectionState, RelayConnection};
+use crate::stores::preferences::{save_preferences, use_preferences};
 use crate::utils::set_timeout_once;
 use crate::wallet::{chain, use_wallet};
 
@@ -93,6 +103,10 @@ fn Tables() -> impl IntoView {
     let zone_access = crate::stores::zone_access::use_zone_access();
     let can_schedule = Memo::new(move |_| zone_access.is_admin.get());
     let stakes = config.stakes();
+    let prefs = use_preferences();
+    let tier = use_render_tier();
+    let backend = Memo::new(move |_| table3d::available_backend(tier.get()));
+    let three_d = Memo::new(move |_| prefs.with(|p| p.poker_table_3d) && backend.get().is_some());
     let tab = move |m: Mode, label: &'static str| {
         let active = move || mode.get() == m;
         view! {
@@ -113,6 +127,42 @@ fn Tables() -> impl IntoView {
             <div class="flex gap-2">
                 {money.then(|| tab(Mode::Dream, "DREAM table"))}
                 {tab(Mode::Practice, "Practice chips")}
+            </div>
+            <div class="flex items-center gap-4 flex-wrap">
+                <label
+                    class="text-sm text-gray-300 flex items-center gap-2 cursor-pointer"
+                    title=move || if backend.get().is_none() {
+                        "The 3D table needs WebGPU or WebGL 2, with reduced motion off; this browser shows the flat table."
+                    } else {
+                        "Show the table in 3D. The flat table stays available to screen readers."
+                    }
+                >
+                    <input
+                        type="checkbox"
+                        class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500 disabled:opacity-40"
+                        prop:checked=move || three_d.get()
+                        prop:disabled=move || backend.get().is_none()
+                        on:change=move |_| {
+                            prefs.update(|p| p.poker_table_3d = !p.poker_table_3d);
+                            save_preferences(&prefs.get_untracked());
+                        }
+                    />
+                    "3D table"
+                </label>
+                <Show when=move || three_d.get()>
+                    <label class="text-sm text-gray-300 flex items-center gap-2 cursor-pointer" title="Green clubs and blue diamonds, so every suit has its own colour">
+                        <input
+                            type="checkbox"
+                            class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
+                            prop:checked=move || prefs.with(|p| p.poker_four_colour)
+                            on:change=move |_| {
+                                prefs.update(|p| p.poker_four_colour = !p.poker_four_colour);
+                                save_preferences(&prefs.get_untracked());
+                            }
+                        />
+                        "Four-colour deck"
+                    </label>
+                </Show>
             </div>
             <Show when=move || can_schedule.get()>
                 <button
@@ -266,6 +316,7 @@ fn board_of(cards: &[u8]) -> AnyView {
 fn action_bar(
     l: Option<Legal>,
     waiting: bool,
+    busy: bool,
     on_act: impl Fn(Choice) + Copy + 'static,
 ) -> AnyView {
     let Some(l) = l else {
@@ -280,7 +331,8 @@ fn action_bar(
         poker::choice_label(&l, choice).map(|label| {
             view! {
                 <button
-                    class=format!("flex-1 min-w-[6rem] px-4 py-3 rounded-lg font-semibold text-sm transition-colors {style}")
+                    class=format!("flex-1 min-w-[6rem] px-4 py-3 rounded-lg font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-wait {style}")
+                    prop:disabled=busy
                     on:click=move |_| on_act(choice)
                 >
                     {label}
@@ -359,6 +411,192 @@ fn session_card(hands: RwSignal<u32>, net: RwSignal<i64>, unit: &'static str) ->
     .into_any()
 }
 
+// ── The table surface: 3D or flat ─────────────────────────────────────────────
+
+/// Whether the device's main pointer is a finger, so the 3D table offers
+/// "free look" (touch dragging the camera instead of scrolling the page).
+fn coarse_pointer() -> bool {
+    web_sys::window()
+        .and_then(|w| w.match_media("(pointer: coarse)").ok().flatten())
+        .is_some_and(|mq| mq.matches())
+}
+
+/// The newest thing that happened at the table, in words: the outcome once
+/// the hand is over, else the latest log entry the narration tells.
+fn latest_line(log: &[poker::LogEntry], names: &[String], hero: u32) -> String {
+    log.iter()
+        .rev()
+        .find_map(|e| poker::describe(e, names, hero))
+        .unwrap_or_default()
+}
+
+/// What a tap on the 3D table shows, read from the seat view.
+fn pick_text(p: Pick, v: &SeatView, names: &[String], unit: &str) -> String {
+    let hero = v.seat as usize;
+    let other = if hero == 0 { 1 } else { 0 };
+    match p.target {
+        PickTarget::Pot => {
+            if v.phase == "done" {
+                return format!("This hand's pot was {} {unit}.", v.pot);
+            }
+            let bets: u64 = v.seats.iter().map(|s| s.street_commit).sum();
+            format!(
+                "Pot {} {unit}: {} in the middle, {bets} bet this street.",
+                v.pot,
+                v.pot.saturating_sub(bets)
+            )
+        }
+        PickTarget::Stack => v
+            .seats
+            .get(hero)
+            .map(|s| {
+                format!(
+                    "Your stack: {} {unit} ({}).",
+                    s.stack,
+                    poker::bb_count(s.stack, v.bb)
+                )
+            })
+            .unwrap_or_default(),
+        PickTarget::HeroCards => {
+            let Some(hole) = v.hole.clone() else {
+                return String::new();
+            };
+            let shown: Vec<String> = hole.iter().map(|&c| poker::card_name(c)).collect();
+            let mut all = hole;
+            all.extend_from_slice(&v.board);
+            if v.board.len() >= 3 {
+                format!(
+                    "Your cards: {} — {}.",
+                    shown.join(" "),
+                    poker::hand_name(&all)
+                )
+            } else {
+                format!("Your cards: {}.", shown.join(" "))
+            }
+        }
+        PickTarget::Seat => {
+            let seat = p.seat.map(|s| s as usize).unwrap_or(other);
+            let Some(s) = v.seats.get(seat) else {
+                return String::new();
+            };
+            let name = names.get(seat).cloned().unwrap_or_default();
+            let state = if s.folded {
+                " — folded"
+            } else if s.all_in {
+                " — all in"
+            } else {
+                ""
+            };
+            format!(
+                "{name}: {} {unit} ({}){state}.",
+                s.stack,
+                poker::bb_count(s.stack, v.bb)
+            )
+        }
+    }
+}
+
+/// The table itself. With the member's 3D toggle on and a GPU backend to
+/// draw with, the scene shows over the flat table, which then stays in the
+/// page only for screen readers; while the scene is loading, or if it fails,
+/// the flat table shows as before. `children` is the flat table.
+#[component]
+fn TableSurface(
+    /// The frame for the scene (`table3d::frame_json`).
+    #[prop(into)]
+    frame: Signal<Option<String>>,
+    /// The hero's label.
+    #[prop(into)]
+    near_name: Signal<String>,
+    /// The other seat's label.
+    #[prop(into)]
+    far_name: Signal<String>,
+    /// The chip unit: `chips` or `DREAM`.
+    unit: &'static str,
+    /// Set while the scene is still showing what happened.
+    busy: RwSignal<bool>,
+    /// The newest event in words, announced politely while the scene draws.
+    #[prop(into)]
+    narration: Signal<String>,
+    /// What a tap on the scene shows.
+    inspect: RwSignal<Option<String>>,
+    /// Turns a tap into the `inspect` text.
+    on_pick: Callback<Pick>,
+    children: ChildrenFn,
+) -> impl IntoView {
+    let prefs = use_preferences();
+    let tier = use_render_tier();
+    let backend = Memo::new(move |_| table3d::available_backend(tier.get()));
+    let status = RwSignal::new(Table3dStatus::Loading);
+    let on = Memo::new(move |_| prefs.with(|p| p.poker_table_3d) && backend.get().is_some());
+    let show = Memo::new(move |_| on.get() && !status.with(Table3dStatus::is_failed));
+    let ready = Memo::new(move |_| on.get() && status.with(Table3dStatus::is_ready));
+    let four_colour = Signal::derive(move || prefs.with(|p| p.poker_four_colour));
+    let free_look = RwSignal::new(false);
+    let touch = coarse_pointer();
+
+    // Switching the scene off releases the buttons and lets a later switch-on
+    // try again after a failure.
+    Effect::new(move |_| {
+        if !on.get() {
+            busy.set(false);
+            status.set(Table3dStatus::Loading);
+            inspect.set(None);
+        }
+    });
+
+    view! {
+        <Show when=move || show.get()>
+            {move || backend.get_untracked().map(|b| view! {
+                <Table3d
+                    frame=frame
+                    backend=b
+                    busy=busy
+                    status=status
+                    near_name=near_name
+                    far_name=far_name
+                    unit=unit
+                    four_colour=four_colour
+                    free_look=free_look
+                    on_pick=on_pick
+                />
+            })}
+            <div class="flex items-center justify-between gap-3 text-xs text-gray-500 min-h-[1.25rem]">
+                <p class="text-gray-300" aria-live="polite">{move || inspect.get().unwrap_or_default()}</p>
+                <div class="flex items-center gap-3 shrink-0">
+                    {touch.then(|| view! {
+                        <label class="flex items-center gap-1.5 cursor-pointer">
+                            <input
+                                type="checkbox"
+                                class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
+                                prop:checked=move || free_look.get()
+                                on:change=move |_| free_look.update(|v| *v = !*v)
+                            />
+                            "Free look"
+                        </label>
+                    })}
+                    <span>{move || match status.get() {
+                        Table3dStatus::Ready(b) => b.label().to_string(),
+                        _ => String::new(),
+                    }}</span>
+                </div>
+            </div>
+            <p class="sr-only" aria-live="polite">{move || narration.get()}</p>
+        </Show>
+        {move || match status.get() {
+            Table3dStatus::Failed(why) if on.get() => Some(view! {
+                <p class="text-xs text-amber-300">
+                    "The 3D table could not start (" {why} "), so the flat table is shown."
+                </p>
+            }),
+            _ => None,
+        }}
+        <div class=move || if ready.get() { "sr-only" } else { "space-y-4" }>
+            {children()}
+        </div>
+    }
+}
+
 // ── The practice table ────────────────────────────────────────────────────────
 
 /// The practice table, mounted only behind every gate.
@@ -389,6 +627,16 @@ fn PracticeTable() -> impl IntoView {
         Memo::new(move |_| hand.with(|h| h.as_ref().and_then(|h| poker::legal(h).ok().flatten())));
     let in_play = Memo::new(move |_| hand.with(|h| h.as_ref().is_some_and(|h| h.hand.in_play())));
     let hero_turn = Memo::new(move |_| legal.get().is_some_and(|l| l.seat == HERO));
+    // The 3D table is still showing what just happened: the buttons wait.
+    let table_busy = RwSignal::new(false);
+    let inspect: RwSignal<Option<String>> = RwSignal::new(None);
+    let frame3d = Memo::new(move |_| {
+        let v = seat_view.get()?;
+        hand.with(|h| {
+            h.as_ref()
+                .map(|h| table3d::frame_json(&h.hand.seed_hex, &v, &h.hand.log))
+        })
+    });
 
     // Take a new engine state: count a finished hand, prepare the next commit.
     let settle = move |next: HandState| {
@@ -417,7 +665,7 @@ fn PracticeTable() -> impl IntoView {
     };
 
     let deal = move || {
-        if in_play.get_untracked() {
+        if in_play.get_untracked() || table_busy.get_untracked() {
             return;
         }
         let Some(seed) = next_seed.get_untracked() else {
@@ -461,7 +709,7 @@ fn PracticeTable() -> impl IntoView {
     };
 
     let hero_act = move |choice: Choice| {
-        if !hero_turn.get_untracked() {
+        if !hero_turn.get_untracked() || table_busy.get_untracked() {
             return;
         }
         let Some(l) = legal.get_untracked() else {
@@ -571,8 +819,33 @@ fn PracticeTable() -> impl IntoView {
 
     let bar = move || {
         let l = legal.get().filter(|l| l.seat == HERO);
-        action_bar(l, in_play.get(), hero_act)
+        action_bar(l, in_play.get(), table_busy.get(), hero_act)
     };
+
+    // the seats' display names, for the narration and the tap read-outs
+    let names = move || -> Vec<String> {
+        vec![
+            "You".to_string(),
+            bot.with_value(|b| format!("{} {}", b.emoji, b.name)),
+        ]
+    };
+    let told = Signal::derive(move || {
+        if let Some(o) = outcome.get() {
+            return o.text;
+        }
+        hand.with(|h| {
+            h.as_ref()
+                .map(|h| latest_line(&h.hand.log, &names(), HERO))
+                .unwrap_or_default()
+        })
+    });
+    let on_pick = Callback::new(move |p: Pick| {
+        inspect.set(
+            seat_view
+                .get_untracked()
+                .map(|v| pick_text(p, &v, &names(), "chips")),
+        );
+    });
 
     let story = move || {
         let names = hand.with(|h| {
@@ -669,27 +942,42 @@ fn PracticeTable() -> impl IntoView {
             <div class="grid gap-4 lg:grid-cols-3">
                 <div class="lg:col-span-2 space-y-4">
                     <div class="glass-card p-4 sm:p-6 space-y-4">
-                        {move || match seat_view.get() {
-                            Some(v) => seat_panel(&v, BOT, bot_label.clone(), Some(bot_blurb.clone()), "chips"),
-                            None => view! {
-                                <div class="rounded-xl bg-gray-900/60 p-4 ring-1 ring-gray-700/50">
-                                    <p class="font-semibold text-white">{bot_label.clone()}</p>
-                                    <p class="text-xs text-gray-500 italic">{bot_blurb.clone()}</p>
-                                </div>
-                            }.into_any(),
-                        }}
+                        <TableSurface
+                            frame=frame3d
+                            near_name=Signal::derive(|| "You".to_string())
+                            far_name=Signal::derive(move || bot.with_value(|b| b.name.clone()))
+                            unit="chips"
+                            busy=table_busy
+                            narration=told
+                            inspect=inspect
+                            on_pick=on_pick
+                        >
+                            {
+                                let bot_label = bot_label.clone();
+                                let bot_blurb = bot_blurb.clone();
+                                move || match seat_view.get() {
+                                    Some(v) => seat_panel(&v, BOT, bot_label.clone(), Some(bot_blurb.clone()), "chips"),
+                                    None => view! {
+                                        <div class="rounded-xl bg-gray-900/60 p-4 ring-1 ring-gray-700/50">
+                                            <p class="font-semibold text-white">{bot_label.clone()}</p>
+                                            <p class="text-xs text-gray-500 italic">{bot_blurb.clone()}</p>
+                                        </div>
+                                    }.into_any(),
+                                }
+                            }
 
-                        <div class="flex flex-col items-center gap-2 py-2">
-                            <div class="flex gap-1.5 sm:gap-2">{board}</div>
-                            <p class="text-sm text-gray-300">
-                                {move || seat_view.get().map(|v| view! {
-                                    "Pot "<span class="font-mono text-amber-300">{v.pot}</span>
-                                    <span class="text-gray-500">" · "{v.street.clone()}</span>
-                                })}
-                            </p>
-                        </div>
+                            <div class="flex flex-col items-center gap-2 py-2">
+                                <div class="flex gap-1.5 sm:gap-2">{board}</div>
+                                <p class="text-sm text-gray-300">
+                                    {move || seat_view.get().map(|v| view! {
+                                        "Pot "<span class="font-mono text-amber-300">{v.pot}</span>
+                                        <span class="text-gray-500">" · "{v.street.clone()}</span>
+                                    })}
+                                </p>
+                            </div>
 
-                        {move || seat_view.get().map(|v| seat_panel(&v, HERO, "You".to_string(), None, "chips"))}
+                            {move || seat_view.get().map(|v| seat_panel(&v, HERO, "You".to_string(), None, "chips"))}
+                        </TableSurface>
 
                         {move || outcome.get().map(|o| {
                             let tone = net_tone(o.hero_net);
@@ -705,7 +993,8 @@ fn PracticeTable() -> impl IntoView {
 
                         <Show when=move || !in_play.get()>
                             <button
-                                class="w-full px-4 py-3 rounded-lg font-semibold text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 transition-colors"
+                                class="w-full px-4 py-3 rounded-lg font-semibold text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 transition-colors disabled:opacity-50 disabled:cursor-wait"
+                                prop:disabled=move || table_busy.get()
                                 on:click=move |_| deal()
                             >
                                 {move || if hand.with(Option::is_some) { "Next hand" } else { "Deal" }}
@@ -827,8 +1116,11 @@ fn DreamTable(citizen: String) -> impl IntoView {
             .get()
             .is_some_and(|h| h.view.phase == "act" && h.view.to_act == h.seat as i32)
     });
+    // The 3D table is still showing what just happened: the buttons wait.
+    let table_busy = RwSignal::new(false);
+    let inspect: RwSignal<Option<String>> = RwSignal::new(None);
     let hero_act = move |choice: Choice| {
-        if my_turn.get_untracked() && !live.busy.get_untracked() {
+        if my_turn.get_untracked() && !live.busy.get_untracked() && !table_busy.get_untracked() {
             live.act(choice);
         }
     };
@@ -841,6 +1133,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
             if (key == "Enter" || key == "1")
                 && live.offer.get_untracked().is_some()
                 && !live.busy.get_untracked()
+                && !table_busy.get_untracked()
                 && live.waiting.get_untracked().is_none()
             {
                 e.prevent_default();
@@ -880,6 +1173,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
     let can_sit = Memo::new(move |_| {
         !in_play.get()
             && !live.busy.get()
+            && !table_busy.get()
             && live.offer.get().is_some()
             && live.waiting.get().is_none()
             && dream.get().is_some_and(|d| d >= chosen_buyin.get())
@@ -914,8 +1208,64 @@ fn DreamTable(citizen: String) -> impl IntoView {
 
     let bar = move || {
         let l = live.hand.get().and_then(|h| legal_of_view_live(&h));
-        action_bar(l, in_play.get() && !my_turn.get(), hero_act)
+        action_bar(
+            l,
+            in_play.get() && !my_turn.get(),
+            table_busy.get(),
+            hero_act,
+        )
     };
+
+    // The 3D table's frame: the hand in play, else the one just finished,
+    // keyed by its commitment so each hand starts from a fresh deal.
+    let frame3d = Memo::new(move |_| match (live.hand.get(), live.finished.get()) {
+        (Some(h), _) => Some(table3d::frame_json(&h.commit, &h.view, &h.log)),
+        (None, Some(f)) => Some(table3d::frame_json(&f.commit, &f.view, &f.log)),
+        _ => None,
+    });
+    // a pubkey shown as the member's display name; a house name as it is
+    let display = |label: String| {
+        if label.len() == 64 {
+            crate::components::user_display::use_display_name(&label)
+        } else {
+            label
+        }
+    };
+    let house_name = move || {
+        live.offer
+            .get()
+            .map(|o| o.name)
+            .unwrap_or_else(|| "House".into())
+    };
+    let far_name = Signal::derive(move || match (live.hand.get(), live.finished.get()) {
+        (Some(h), _) => display(opponent_label(&h).0),
+        (None, Some(f)) if f.house => house_name(),
+        (None, Some(f)) => display(f.opponent),
+        _ => house_name(),
+    });
+    let told = Signal::derive(move || match (live.hand.get(), live.finished.get()) {
+        (Some(h), _) => latest_line(
+            &h.log,
+            &seat_names(h.seat, &h.opponent, h.house, live),
+            h.seat,
+        ),
+        (None, Some(f)) => f.text,
+        _ => String::new(),
+    });
+    let on_pick = Callback::new(move |p: Pick| {
+        let text = match (live.hand.get_untracked(), live.finished.get_untracked()) {
+            (Some(h), _) => {
+                let names = seat_names(h.seat, &h.opponent, h.house, live);
+                Some(pick_text(p, &h.view, &names, "DREAM"))
+            }
+            (None, Some(f)) => {
+                let names = seat_names(f.seat, &f.opponent, f.house, live);
+                Some(pick_text(p, &f.view, &names, "DREAM"))
+            }
+            _ => None,
+        };
+        inspect.set(text);
+    });
 
     let story = move || {
         let (log, seat, names) = match (live.hand.get(), live.finished.get()) {
@@ -1059,6 +1409,16 @@ fn DreamTable(citizen: String) -> impl IntoView {
             <div class="grid gap-4 lg:grid-cols-3">
                 <div class="lg:col-span-2 space-y-4">
                     <div class="glass-card p-4 sm:p-6 space-y-4">
+                        <TableSurface
+                            frame=frame3d
+                            near_name=Signal::derive(|| "You".to_string())
+                            far_name=far_name
+                            unit="DREAM"
+                            busy=table_busy
+                            narration=told
+                            inspect=inspect
+                            on_pick=on_pick
+                        >
                         {move || {
                             let (view_now, seat, label, blurb) = match (live.hand.get(), live.finished.get()) {
                                 (Some(h), _) => {
@@ -1105,6 +1465,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
                                 }.into_any(),
                             }
                         }}
+                        </TableSurface>
 
                         {settlement}
                         {bar}

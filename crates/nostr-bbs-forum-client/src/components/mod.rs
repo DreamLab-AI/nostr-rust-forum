@@ -63,6 +63,7 @@ pub mod mini_calendar;
 pub mod notification_center;
 pub mod poker_schedule;
 pub mod rsvp_buttons;
+pub mod table3d;
 
 // -- Search + DM Enhancement (Stream 8) --------------------------------------
 pub mod bookmarks_modal;

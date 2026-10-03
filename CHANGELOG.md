@@ -7,6 +7,43 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: the 3D poker table — 2026-10-03
+
+The practice and DREAM tables can now be shown in 3D: a Three.js scene of the
+same seat view and log the flat table renders, switched on per member with the
+**3D table** toggle on the table page (`poker_table_3d` in the preferences
+store, off by default). See `crates/nostr-bbs-forum-client/js/table3d/README.md`.
+
+- Rendering: three.js 0.186.1 `WebGPURenderer`, on WebGPU where the app's render
+  tier found it and on its WebGL 2 backend otherwise; the backend actually used
+  is reported back and shown. Physically based felt (procedural, never tiles),
+  lacquered racetrack and padded rail (Poly Haven CC0 maps), clear-coated cards
+  from a 15-slot canvas atlas with Dmitry Fomin's CC0 English-pattern courts,
+  instanced chips in casino denominations, a dealer button, a lamp with soft
+  shadows (blob shadows on phones), studio reflections from RoomEnvironment.
+- Animation: a pure director turns the log entries not yet shown into beats —
+  deal, blinds, bets, folds to the muck, streets dealt down and turned, all-in
+  run-outs with both hands shown first, the winning five lit, the pot pushed
+  to the winner — and reconciles to the seat view after every batch. Reduced
+  motion (app preference or OS) turns every beat into a short crossfade.
+- The page waits for the scene: while it is still showing what happened, the
+  action buttons, the deal/sit button and the keyboard shortcuts are held.
+- Render on demand, adaptive pixel ratio (capped at 2, 1.5 on touch), pause on
+  a hidden tab or a table scrolled away (queued beats fast-forward), device
+  loss and init failure fall back to the flat table, which always stays in the
+  page as the accessible text layer. Four-colour deck toggle; tap the pot, a
+  stack, your cards or the other seat for a read-out; free look on touch.
+- Nothing loads until the toggle is on: the wasm-bindgen snippet
+  `js/table3d.js` dynamic-imports `<public-url>/table3d/index.js` relative to
+  its own URL, which imports the vendored three.js
+  (`assets/vendor/three-0.186.1/`, produced by `scripts/vendor-three.sh`, with
+  the npm integrity and per-file SHA-256 in `VENDORED.md`).
+- Tests: `node crates/nostr-bbs-forum-client/tools/table3d-test.mjs` drives the
+  director with the engine's 160 recorded hands from both seats (and with two of
+  every three frames dropped) and requires zero drift; it also covers the
+  choreography, timeline, chip breakdown, card atlas, painter and picking. The
+  CI test job runs it.
+
 ### Added: the DREAM table — a house seat that holds its own key, hands between members, scheduled games — 2026-10-03
 
 ADR-2020. The poker table now plays for DREAM on `sidestr:dreamlab`, against a
