@@ -25,6 +25,13 @@ members = [
     "crates/nostr-bbs-relay-worker",
     "crates/nostr-bbs-search-worker",
 
+    # Heads-up poker: engine, bots, fair deal, settlement, record, protocol,
+    # replay verification. Pure, wasm32 and native.
+    "crates/nostr-bbs-poker",
+
+    # The poker table's house seat: pure table state machine + native service.
+    "crates/nostr-bbs-poker-citizen",
+
     # Leptos CSR forum client.
     "crates/nostr-bbs-forum-client",
 
@@ -175,6 +182,7 @@ nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.13"
 nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.13" }
 nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.13" }
 nostr-bbs-ascii = { path = "crates/nostr-bbs-ascii", version = "1.0.0-beta.10" }
+nostr-bbs-poker = { path = "crates/nostr-bbs-poker", version = "1.0.0-beta.13" }
 
 # Image decoders for server-side ASCII rendering (nostr-bbs-ascii `decode`
 # feature, enabled by the preview/pod workers). default-features off so no

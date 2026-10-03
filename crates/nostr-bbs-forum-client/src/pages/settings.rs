@@ -1212,7 +1212,7 @@ pub fn SettingsPage() -> impl IntoView {
 
                         <div class="space-y-1">
                             <label class="flex items-center justify-between cursor-pointer">
-                                <span class="text-sm text-gray-300">"Poker table (practice chips, no money)"</span>
+                                <span class="text-sm text-gray-300">"Poker table"</span>
                                 <input
                                     type="checkbox"
                                     prop:checked=move || prefs.get().poker_table
@@ -1224,7 +1224,7 @@ pub fn SettingsPage() -> impl IntoView {
                                 />
                             </label>
                             <p class="text-xs text-gray-500">
-                                "Heads-up limit hold'em against a house bot; no funds move."
+                                "Heads-up limit hold'em: practice chips against the house bot, and where the forum runs a house seat, DREAM hands against the house or another member."
                             </p>
                         </div>
                     </div>

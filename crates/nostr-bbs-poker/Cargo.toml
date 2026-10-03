@@ -1,0 +1,25 @@
+[package]
+name = "nostr-bbs-poker"
+version = "1.0.0-beta.13"
+edition = "2021"
+description = "nostr-bbs community forum — heads-up poker: the Libre Poker engine and bots in Rust, the fair-deal and settlement rules, the hand record, and the member↔house table protocol"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-poker"
+keywords = ["nostr", "poker", "bbs", "sidestr", "forum"]
+categories = ["game-engines", "cryptography"]
+readme = "README.md"
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+# `float_roundtrip`: exact float parsing, so a hand root (RFC 8785 over the
+# parsed record) matches the one a JavaScript peer computes.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

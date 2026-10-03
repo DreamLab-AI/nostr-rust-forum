@@ -1,0 +1,52 @@
+[package]
+name = "nostr-bbs-poker-citizen"
+version = "1.0.0-beta.13"
+edition = "2021"
+description = "The house seat of the nostr-bbs poker table: deals committed hands to members over gift-wrapped relay messages, plays the house bot, and settles each hand with one DREAM transfer on sidestr:dreamlab"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-poker-citizen"
+keywords = ["nostr", "poker", "sidestr", "bbs", "agent"]
+categories = ["command-line-utilities", "games"]
+readme = "README.md"
+rust-version = "1.85"
+# A deployment's service, built from source at the kit pin; not a library
+# other crates depend on.
+publish = false
+
+[lib]
+# The table state machine, the ledger and the chain scan are pure and
+# compile to wasm32 (kit CI checks every member for wasm32).
+path = "src/lib.rs"
+
+[[bin]]
+name = "nostr-bbs-poker-citizen"
+path = "src/main.rs"
+
+[dependencies]
+nostr-bbs-core = { workspace = true }
+nostr-bbs-poker = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+hex = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+# The chain: replay, the assets view, DREAM transfers, the kind-23500 event.
+# Pure halves only, the same the forum client builds for wasm32.
+sidestr-agent = { version = "0.6", default-features = false }
+sidestr-core = "0.4.2"
+sidestr-wallet = "0.5.3"
+sidestr-nostr = "0.6"
+bitcoin = { version = "0.32", features = ["secp-lowmemory"] }
+
+# The relay client, HTTP and the CLI: native only, so the wasm32 check sees
+# a pure library.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net", "sync"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

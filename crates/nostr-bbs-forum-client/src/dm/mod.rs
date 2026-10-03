@@ -798,8 +798,11 @@ async fn process_gift_wrap_event(
         // A zone-key grant (ADR-2016) rides the same gift-wrap transport but
         // is not a DM: core refuses its rumor kind, and the zone-key store
         // picks it up instead. Not an error, so nothing to log.
+        // The poker table's messages (ADR-2020) ride the same transport too;
+        // the table's own subscription reads them.
         Err(nostr_bbs_core::gift_wrap::SignerGiftWrapError::InvalidKind { actual, .. })
-            if actual == crate::zone_crypto::KIND_ZONE_KEY_GRANT =>
+            if actual == crate::zone_crypto::KIND_ZONE_KEY_GRANT
+                || actual == nostr_bbs_poker::protocol::RUMOR_KIND =>
         {
             return;
         }

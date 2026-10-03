@@ -22,6 +22,9 @@ dev-auth = []
 
 [dependencies]
 nostr-bbs-core = { workspace = true }
+# The poker table's engine types, rules, protocol and replay verifier,
+# shared with the house seat (nostr-bbs-poker-citizen).
+nostr-bbs-poker = { workspace = true }
 # `solid-pod-rs` core feature — wasm32-safe pure-logic surface. Exposes
 # `did_nostr_types::{NostrPubkey, did_nostr_uri}` plus the `webid` and
 # `interop` modules. Used by signup wizard + pod-browser + settings to

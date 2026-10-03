@@ -2428,6 +2428,7 @@ dependencies = [
  "leptos_meta",
  "leptos_router",
  "nostr-bbs-core",
+ "nostr-bbs-poker",
  "qrcode",
  "send_wrapper",
  "serde",
@@ -2501,6 +2502,42 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "worker",
+ "zeroize",
+]
+
+[[package]]
+name = "nostr-bbs-poker"
+version = "1.0.0-beta.13"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nostr-bbs-poker-citizen"
+version = "1.0.0-beta.13"
+dependencies = [
+ "bitcoin",
+ "clap",
+ "futures-util",
+ "getrandom 0.2.17",
+ "hex",
+ "nostr-bbs-core",
+ "nostr-bbs-poker",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sidestr-agent",
+ "sidestr-core",
+ "sidestr-nostr",
+ "sidestr-wallet",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
  "zeroize",
 ]
 

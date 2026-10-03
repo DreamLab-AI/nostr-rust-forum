@@ -1,29 +1,34 @@
-//! The practice poker table: its gates, its configuration, and the typed seam
-//! to the vendored Libre Poker engine (`js/librepoker`, AGPL-3.0).
+//! The poker table: its gates, its configuration, the typed seam to the
+//! vendored Libre Poker engine (`js/librepoker`, AGPL-3.0) for the practice
+//! table, and the live session with the forum's house seat ([`live`]).
 //!
 //! Three things must all hold before the table shows anywhere, nav item or
 //! route: the operator set `window.__ENV__.POKER = "on"`, the member wallet is
 //! on (`window.__ENV__.SIDESTR_WALLET`), and the member ticked "Poker table" in
-//! Settings → Games. The table plays practice chips only; nothing here reads
-//! the wallet store or sends anything anywhere.
+//! Settings → Games. The practice table plays chips that are worth nothing;
+//! the DREAM table ([`money_enabled`]) needs the operator to name a house seat
+//! (`POKER_CONFIG.citizen_pubkey`) and settles each hand on the chain.
 //!
-//! The engine runs in JS behind `js/poker-table.js`, whose exports take and
-//! return JSON strings. The hand state lives here between calls as
-//! [`HandState`]: the engine's own JSON (passed back verbatim on the next call,
-//! so no engine field is ever lost) beside a typed [`Hand`] parsed from it.
-//! What the page draws comes from [`SeatView`] — the engine's view for the
-//! hero's seat — so the bot's hole cards stay hidden until a showdown.
-
-use std::collections::BTreeMap;
+//! The engine types are [`nostr_bbs_poker::engine`]'s, shared with the house
+//! seat; they serialise to the JavaScript engine's JSON, so the practice table
+//! passes the engine's own state back verbatim ([`HandState`]) and the live
+//! table reads the house's seat views unchanged.
 
 use leptos::prelude::*;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
 use crate::stores::preferences::use_preferences;
 use crate::utils::relay_url::env_override;
+
+pub mod live;
+
+pub use nostr_bbs_poker::bots::RosterEntry;
+pub use nostr_bbs_poker::engine::{
+    Action, Hand, HandConfig, Legal, LogEntry, Seat as HandSeat, SeatConfig, SeatView,
+};
+pub use nostr_bbs_poker::fair::{bot_seed, commit as seed_commit};
 
 // -- JS interop with the engine ----------------------------------------------
 //
@@ -125,6 +130,9 @@ pub struct PokerConfig {
     pub buyin_bb: u64,
     /// The house bot's profile name (`rock`, `tag`, `lag`, `station`, `maniac`).
     pub bot_profile: String,
+    /// The house seat's pubkey (64 lowercase hex), once the operator runs one;
+    /// `None` leaves only the practice table.
+    pub citizen_pubkey: Option<String>,
 }
 
 impl Default for PokerConfig {
@@ -133,6 +141,7 @@ impl Default for PokerConfig {
             stakes_bb: DEFAULT_STAKES_BB.to_vec(),
             buyin_bb: DEFAULT_BUYIN_BB,
             bot_profile: DEFAULT_BOT_PROFILE.to_string(),
+            citizen_pubkey: None,
         }
     }
 }
@@ -163,6 +172,15 @@ impl PokerConfig {
             .unwrap_or_default()
     }
 
+    /// The house seat's pubkey, when it is a well-formed one.
+    pub fn citizen(&self) -> Option<String> {
+        self.citizen_pubkey
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .filter(|pk| nostr_bbs_poker::fair::is_hex64(pk))
+    }
+
     /// The tables on offer: every distinct big blind of at least 2 (so the
     /// small blind is a whole chip), in the operator's order. Falls back to the
     /// default list when none survive.
@@ -191,6 +209,11 @@ impl PokerConfig {
     }
 }
 
+/// Whether this deployment runs a house seat: the DREAM table is offered.
+pub fn money_enabled() -> bool {
+    PokerConfig::load().citizen().is_some()
+}
+
 /// A `window.__ENV__` value as JSON text, whether the deployment injected a
 /// string or an object.
 fn env_json(key: &str) -> Option<String> {
@@ -209,148 +232,7 @@ fn env_json(key: &str) -> Option<String> {
     None
 }
 
-// -- Engine types -------------------------------------------------------------
-
-/// Whether a hand is still being played.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Phase {
-    /// A seat is to act.
-    Act,
-    /// The hand is over and `result` is set. Also the reading of a hand whose
-    /// phase is missing, so a malformed state never offers actions.
-    #[default]
-    Done,
-}
-
-/// A seat in the engine's full hand state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct HandSeat {
-    /// Display name.
-    pub name: String,
-    /// Stack at the start of the hand.
-    pub start_stack: u64,
-    /// Chips behind.
-    pub stack: u64,
-    /// The two hole cards (card indices 0–51).
-    pub hole: Option<Vec<u8>>,
-    /// Folded this hand.
-    pub folded: bool,
-    /// All chips committed.
-    pub all_in: bool,
-    /// Sitting out (no chips).
-    pub out: bool,
-    /// Committed on the current street.
-    pub street_commit: u64,
-    /// Committed over the whole hand.
-    pub hand_commit: u64,
-}
-
-/// One entry of the engine's hand log (`ev` names the event).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct LogEntry {
-    /// Event kind: `sb`, `bb`, `deal`, `fold`, `check`, `call`, `bet`,
-    /// `raise`, `street`, `runout`, `refund`, `win`, `showdown`.
-    pub ev: String,
-    /// The seat the event concerns, where there is one.
-    pub seat: Option<u32>,
-    /// Chips moved (blinds, calls, refunds, wins).
-    pub amount: Option<u64>,
-    /// The total a bet or raise went to.
-    pub to: Option<u64>,
-    /// The street dealt (`flop`, `turn`, `river`).
-    pub street: Option<String>,
-}
-
-/// A pot and who could win it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct Pot {
-    /// Chips in the pot.
-    pub amount: u64,
-    /// Seats eligible for it.
-    pub contenders: Vec<u32>,
-    /// Seats that won it.
-    pub winners: Vec<u32>,
-}
-
-/// A seat's shown hand at showdown.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct Eval {
-    /// Category, 0 (high card) to 8 (straight flush).
-    pub cat: u8,
-    /// Tie-break ranks, high to low.
-    pub kick: Vec<u8>,
-    /// Comparable score: higher wins.
-    pub score: u64,
-    /// Spoken name, e.g. "two pair, kings and nines".
-    pub name: String,
-}
-
-/// Chips a seat collected.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct Winner {
-    /// The seat.
-    pub seat: u32,
-    /// Chips collected (its own commitment included).
-    pub amount: u64,
-}
-
-/// How a finished hand came out.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct HandResult {
-    /// Cards were shown (false when everyone else folded).
-    pub showdown: bool,
-    /// The pots, after side-pot slicing.
-    pub pots: Vec<Pot>,
-    /// Shown hands by seat number (as a string key, the engine's JSON shape);
-    /// empty when there was no showdown.
-    pub evals: BTreeMap<String, Eval>,
-    /// Who collected what.
-    pub winners: Vec<Winner>,
-}
-
-/// The engine's full hand state (`newHand`/`act` in `poker.js`). Fields the
-/// table does not read, such as the deck, are left in the raw JSON.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Hand {
-    /// Number of seats.
-    pub n: u32,
-    /// The dealer button's seat (heads-up it posts the small blind).
-    pub button: u32,
-    /// Small blind.
-    pub sb: u64,
-    /// Big blind.
-    pub bb: u64,
-    /// The 64-hex shuffle seed.
-    pub seed_hex: String,
-    /// Community cards dealt so far.
-    pub board: Vec<u8>,
-    /// 0 preflop, 1 flop, 2 turn, 3 river.
-    pub street: u8,
-    /// The seats.
-    pub seats: Vec<HandSeat>,
-    /// The bet to match on this street.
-    pub current_bet: u64,
-    /// The seat to act, or -1 when nobody is.
-    pub to_act: i32,
-    /// Still playing or finished.
-    pub phase: Phase,
-    /// Everything that happened, in order.
-    pub log: Vec<LogEntry>,
-    /// Set once the hand is over.
-    pub result: Option<HandResult>,
-    /// Small-blind seat.
-    pub sb_seat: u32,
-    /// Big-blind seat.
-    pub bb_seat: u32,
-}
+// -- Engine state -------------------------------------------------------------
 
 /// A hand in play: the engine's JSON, passed back verbatim on every call, and
 /// the typed reading of it.
@@ -368,138 +250,6 @@ impl HandState {
         let hand = decode::<Hand>(&raw)?;
         Ok(Self { raw, hand })
     }
-}
-
-/// A seat as another seat sees it: hole cards only when they may be seen.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ViewSeat {
-    /// Display name.
-    pub name: String,
-    /// Chips behind.
-    pub stack: u64,
-    /// Folded this hand.
-    pub folded: bool,
-    /// All chips committed.
-    pub all_in: bool,
-    /// Sitting out.
-    pub out: bool,
-    /// Committed on the current street.
-    pub street_commit: u64,
-    /// Committed over the whole hand.
-    pub hand_commit: u64,
-    /// Hole cards, present for the viewer's own seat and for hands shown down.
-    pub hole: Option<Vec<u8>>,
-}
-
-/// What one seat may see of the hand (`seatView` in `poker.js`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SeatView {
-    /// The viewing seat.
-    pub seat: u32,
-    /// `preflop`, `flop`, `turn` or `river`.
-    pub street: String,
-    /// Community cards dealt so far.
-    pub board: Vec<u8>,
-    /// Still playing or finished.
-    pub phase: Phase,
-    /// The seat to act, or -1.
-    pub to_act: i32,
-    /// The bet to match on this street.
-    pub current_bet: u64,
-    /// The dealer button's seat.
-    pub button: u32,
-    /// Small blind.
-    pub sb: u64,
-    /// Big blind.
-    pub bb: u64,
-    /// The viewer's hole cards.
-    pub hole: Option<Vec<u8>>,
-    /// Every chip committed this hand.
-    pub pot: u64,
-    /// All seats, masked for the viewer.
-    pub seats: Vec<ViewSeat>,
-    /// Set once the hand is over.
-    pub result: Option<HandResult>,
-}
-
-/// The actions open to the seat to act (`legal` in `poker.js`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Legal {
-    /// The seat to act.
-    pub seat: u32,
-    /// Some of `fold`, `check`, `call`, `bet`, `raise`.
-    pub actions: Vec<String>,
-    /// Chips needed to call.
-    pub call_amount: u64,
-    /// The smallest total a bet or raise may go to (in limit, the only one).
-    pub min_raise_to: u64,
-    /// The largest total a bet or raise may go to.
-    pub max_raise_to: u64,
-    /// The bet to match on this street.
-    pub current_bet: u64,
-}
-
-impl Legal {
-    /// Whether `action` is open.
-    pub fn allows(&self, action: &str) -> bool {
-        self.actions.iter().any(|a| a == action)
-    }
-}
-
-/// An action message for the engine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Action {
-    /// The acting seat.
-    pub seat: u32,
-    /// `fold`, `check`, `call`, `bet` or `raise`.
-    pub action: String,
-    /// The total a bet or raise goes to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amount: Option<u64>,
-}
-
-/// One of the engine's bot characters.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
-pub struct RosterEntry {
-    /// Display name.
-    pub name: String,
-    /// The profile it plays (`rock`, `tag`, …).
-    pub profile: String,
-    /// A glyph for the seat.
-    pub emoji: String,
-    /// One line of character.
-    pub blurb: String,
-}
-
-/// A seat in a new hand's configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SeatConfig {
-    /// Display name.
-    pub name: String,
-    /// Starting stack.
-    pub stack: u64,
-}
-
-/// Everything `newHand` needs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HandConfig {
-    /// The seats, in seat order.
-    pub seats: Vec<SeatConfig>,
-    /// The dealer button's seat.
-    pub button: u32,
-    /// Small blind.
-    pub sb: u64,
-    /// Big blind.
-    pub bb: u64,
-    /// The committed 64-hex shuffle seed.
-    pub seed_hex: String,
-    /// Fixed-limit betting.
-    pub limit: bool,
 }
 
 /// Parse an engine reply, surfacing an `{"error": …}` reply as `Err`.
@@ -564,7 +314,8 @@ pub fn hand_name(cards: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-/// 32 bytes from the browser's CSPRNG as 64 lowercase hex: a shuffle seed.
+/// 32 bytes from the browser's CSPRNG as 64 lowercase hex: a shuffle seed or
+/// a nonce.
 pub fn fresh_seed() -> Option<String> {
     let crypto = web_sys::window()?.crypto().ok()?;
     let mut buf = [0u8; 32];
@@ -572,19 +323,50 @@ pub fn fresh_seed() -> Option<String> {
     Some(hex::encode(buf))
 }
 
+/// The JavaScript engine behind [`nostr_bbs_poker::verify::Engine`], so a
+/// finished DREAM hand is replayed in the browser with the same engine the
+/// practice table plays.
+pub struct JsEngine;
+
+impl nostr_bbs_poker::verify::Engine for JsEngine {
+    fn new_hand(&self, cfg: &HandConfig) -> Result<Hand, String> {
+        new_hand(cfg).map(|h| h.hand)
+    }
+
+    fn legal(&self, h: &Hand) -> Result<Option<Legal>, String> {
+        legal(&raw_of(h)?)
+    }
+
+    fn act(&self, h: &Hand, action: &Action) -> Result<Hand, String> {
+        act(&raw_of(h)?, action).map(|h| h.hand)
+    }
+
+    fn seat_view(&self, h: &Hand, seat: u32) -> Result<SeatView, String> {
+        seat_view(&raw_of(h)?, seat)
+    }
+
+    fn bot_decide(
+        &self,
+        h: &Hand,
+        seat: u32,
+        profile: &str,
+        seed_hex: &str,
+    ) -> Result<Action, String> {
+        bot_decide(&raw_of(h)?, seat, profile, seed_hex)
+    }
+}
+
+/// The engine's JSON for a typed hand: the types serialise to the engine's
+/// own shape, so a replayed hand goes back to JavaScript whole.
+fn raw_of(h: &Hand) -> Result<HandState, String> {
+    let raw = serde_json::to_string(h).map_err(|e| e.to_string())?;
+    Ok(HandState {
+        raw,
+        hand: h.clone(),
+    })
+}
+
 // -- Pure helpers -------------------------------------------------------------
-
-/// The commitment published before a deal: SHA-256 of the seed's 64-character
-/// hex text, so `printf %s <seed> | sha256sum` checks it.
-pub fn seed_commit(seed_hex: &str) -> String {
-    hex::encode(Sha256::digest(seed_hex.as_bytes()))
-}
-
-/// The bot's per-decision randomness, derived from the hand's seed and how far
-/// the hand has gone, so a revealed seed replays the bot's play exactly.
-pub fn bot_seed(seed_hex: &str, step: usize) -> String {
-    hex::encode(Sha256::digest(format!("{seed_hex}:bot:{step}").as_bytes()))
-}
 
 /// The house bot for a profile: the first roster character playing it, else
 /// the default profile's character, else the first character.
@@ -640,6 +422,34 @@ pub fn choice_label(legal: &Legal, choice: Choice) -> Option<String> {
         "call" => format!("CALL {}", legal.call_amount),
         "bet" => format!("BET {}", a.amount.unwrap_or_default()),
         _ => format!("RAISE TO {}", a.amount.unwrap_or_default()),
+    })
+}
+
+/// The legal envelope a seat view implies for its own seat, when it is to
+/// act: what the house's view lets the member choose from. Fixed-limit: the
+/// raise total is the view's `min_raise_to`.
+pub fn legal_of_view(v: &SeatView) -> Option<Legal> {
+    if v.phase != "act" || v.to_act != v.seat as i32 {
+        return None;
+    }
+    let me = v.seats.get(v.seat as usize)?;
+    let call = v.current_bet.saturating_sub(me.street_commit).min(me.stack);
+    let mut actions = vec!["fold".to_string()];
+    actions.push(if call == 0 { "check" } else { "call" }.to_string());
+    let (min_to, max_to) = match v.min_raise_to {
+        Some(to) if to > v.current_bet => {
+            actions.push(if v.current_bet == 0 { "bet" } else { "raise" }.to_string());
+            (to, to)
+        }
+        _ => (v.current_bet, me.street_commit + me.stack),
+    };
+    Some(Legal {
+        seat: v.seat,
+        actions,
+        call_amount: call,
+        min_raise_to: min_to,
+        max_raise_to: max_to,
+        current_bet: v.current_bet,
     })
 }
 
@@ -704,20 +514,27 @@ fn net_of(seat: &HandSeat) -> i64 {
 
 /// Tell a finished hand from `hero`'s side. `name_hand` names the best hand in
 /// a set of cards (the engine's evaluator in the browser); `None` while the
-/// hand is still in play.
+/// hand is still in play. `names` replaces the seats' names for display.
 pub fn summarise(
     hand: &Hand,
     hero: usize,
     name_hand: impl Fn(&[u8]) -> String,
 ) -> Option<HandOutcome> {
+    let names: Vec<String> = hand.seats.iter().map(|s| s.name.clone()).collect();
+    summarise_named(hand, hero, &names, name_hand)
+}
+
+/// [`summarise`] with display names for the seats.
+pub fn summarise_named(
+    hand: &Hand,
+    hero: usize,
+    names: &[String],
+    name_hand: impl Fn(&[u8]) -> String,
+) -> Option<HandOutcome> {
     let result = hand.result.as_ref()?;
     let hero_net = net_of(hand.seats.get(hero)?);
     let who = |i: usize| -> (String, &'static str) {
-        let name = hand
-            .seats
-            .get(i)
-            .map(|s| s.name.clone())
-            .unwrap_or_default();
+        let name = names.get(i).cloned().unwrap_or_default();
         if i == hero {
             ("You".to_string(), "win")
         } else {
@@ -737,7 +554,8 @@ pub fn summarise(
         if named.is_empty() {
             result
                 .evals
-                .get(&i.to_string())
+                .as_ref()
+                .and_then(|e| e.get(&i.to_string()))
                 .map(|e| e.name.clone())
                 .unwrap_or_default()
         } else {
@@ -842,6 +660,7 @@ pub fn describe(entry: &LogEntry, names: &[String], hero: u32) -> Option<String>
 mod tests {
     use super::*;
     use crate::stores::preferences::Preferences;
+    use nostr_bbs_poker::engine::Winner;
 
     const HAND_NEW: &str = include_str!("testdata/hand_new.json");
     const HAND_SHOWDOWN: &str = include_str!("testdata/hand_showdown.json");
@@ -859,7 +678,7 @@ mod tests {
             hand.seats
                 .iter()
                 .position(|s| s.hole.as_deref().is_some_and(|h| cards.starts_with(h)))
-                .and_then(|i| hand.result.as_ref()?.evals.get(&i.to_string()))
+                .and_then(|i| hand.result.as_ref()?.evals.as_ref()?.get(&i.to_string()))
                 .map(|e| e.name.clone())
                 .unwrap_or_default()
         }
@@ -906,11 +725,12 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_and_stakes() {
+    fn config_defaults_stakes_and_the_house_seat() {
         let c = PokerConfig::from_json(
             r#"{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null}"#,
         );
         assert_eq!(c, PokerConfig::default());
+        assert_eq!(c.citizen(), None);
         let s = c.stakes();
         assert_eq!(s.len(), 5);
         assert_eq!(
@@ -943,13 +763,20 @@ mod tests {
             PokerConfig::from_json(r#"{"stakes_bb":[]}"#).stakes().len(),
             DEFAULT_STAKES_BB.len()
         );
+        let housed =
+            PokerConfig::from_json(&format!(r#"{{"citizen_pubkey":" {} "}}"#, "AB".repeat(32)));
+        assert_eq!(housed.citizen().as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(
+            PokerConfig::from_json(r#"{"citizen_pubkey":"nope"}"#).citizen(),
+            None
+        );
     }
 
     #[test]
     fn new_hand_fixture_deserialises() {
         let h = HandState::from_json(HAND_NEW.trim().to_string()).unwrap();
         let hand = &h.hand;
-        assert_eq!(hand.phase, Phase::Act);
+        assert!(hand.in_play());
         assert_eq!((hand.n, hand.button, hand.sb, hand.bb), (2, 0, 1, 2));
         assert_eq!(hand.seed_hex, "a".repeat(64));
         assert_eq!(hand.to_act, 0);
@@ -961,19 +788,23 @@ mod tests {
         assert!(hand.result.is_none());
         assert_eq!(hand.log.len(), 3);
         assert_eq!(h.raw, HAND_NEW.trim());
+        // the typed hand serialises back to the engine's shape
+        let back: serde_json::Value = serde_json::from_str(&raw_of(hand).unwrap().raw).unwrap();
+        let orig: serde_json::Value = serde_json::from_str(HAND_NEW).unwrap();
+        assert_eq!(back, orig);
     }
 
     #[test]
     fn showdown_fixture_deserialises_and_summarises() {
         let h = HandState::from_json(HAND_SHOWDOWN.trim().to_string()).unwrap();
         let hand = &h.hand;
-        assert_eq!(hand.phase, Phase::Done);
+        assert!(!hand.in_play());
         assert_eq!(hand.to_act, -1);
         assert_eq!(hand.board.len(), 5);
         let r = hand.result.as_ref().unwrap();
         assert!(r.showdown);
         assert_eq!(r.winners, vec![Winner { seat: 1, amount: 4 }]);
-        assert_eq!(r.evals["0"].name, "a pair of aces");
+        assert_eq!(r.evals.as_ref().unwrap()["0"].name, "a pair of aces");
         assert_eq!(r.pots[0].contenders, vec![0, 1]);
 
         let o = summarise(hand, 0, eval_names(hand)).unwrap();
@@ -988,6 +819,9 @@ mod tests {
             |_| String::new()
         )
         .is_none());
+        let named =
+            summarise_named(hand, 0, &["You".into(), "Alice".into()], eval_names(hand)).unwrap();
+        assert!(named.text.starts_with("Alice wins"));
     }
 
     #[test]
@@ -998,159 +832,73 @@ mod tests {
         let o = summarise(&hand, 0, |_| String::new()).unwrap();
         assert_eq!(o.hero_net, -1);
         assert_eq!(o.text, "First Mate Wren wins 1 chip — you folded.");
-        let names = ["You".to_string(), "First Mate Wren".to_string()];
-        let said: Vec<String> = hand
-            .log
-            .iter()
-            .filter_map(|e| describe(e, &names, 0))
-            .collect();
-        assert_eq!(
-            said,
-            vec![
-                "You post the small blind (1)",
-                "First Mate Wren posts the big blind (2)",
-                "You fold",
-                "1 chip uncalled returned to First Mate Wren",
-            ]
-        );
+        assert!(hand.result.as_ref().unwrap().evals.is_none());
     }
 
     #[test]
-    fn legal_and_views_deserialise() {
-        let l: Option<Legal> = decode(LEGAL_NEW).unwrap();
-        let l = l.unwrap();
-        assert_eq!(l.actions, vec!["fold", "call", "raise"]);
-        assert_eq!((l.call_amount, l.min_raise_to, l.max_raise_to), (1, 4, 4));
-        assert_eq!(decode::<Option<Legal>>(LEGAL_DONE).unwrap(), None);
-
-        let v: SeatView = decode(VIEW_NEW).unwrap();
-        assert_eq!(v.street, "preflop");
-        assert_eq!(v.pot, 3);
-        assert_eq!(v.hole.as_deref(), Some(&[8u8, 26][..]));
-        assert!(v.seats[1].hole.is_none(), "bot cards hidden mid-hand");
-
-        let v: SeatView = decode(VIEW_SHOWDOWN).unwrap();
-        assert_eq!(v.phase, Phase::Done);
-        assert_eq!(
-            v.seats[1].hole.as_deref(),
-            Some(&[6u8, 9][..]),
-            "shown at showdown"
-        );
-        assert!(v.result.is_some());
-    }
-
-    #[test]
-    fn engine_error_is_an_err() {
-        assert_eq!(
-            HandState::from_json(ERROR.trim().to_string()).unwrap_err(),
-            "not seat 1's turn"
-        );
-        assert!(decode::<Legal>("{").is_err());
-    }
-
-    #[test]
-    fn roster_and_bot_choice() {
-        let roster: Vec<RosterEntry> = decode(ROSTER).unwrap();
-        assert_eq!(roster.len(), 5);
-        assert_eq!(pick_bot(&roster, "tag").name, "First Mate Wren");
-        assert_eq!(pick_bot(&roster, "maniac").emoji, "🐧");
-        assert_eq!(pick_bot(&roster, "nobody").profile, "tag");
-        assert_eq!(pick_bot(&[], "tag").name, "House");
-    }
-
-    #[test]
-    fn action_bar() {
-        let l: Legal = decode::<Option<Legal>>(LEGAL_NEW).unwrap().unwrap();
-        assert_eq!(choice_label(&l, Choice::Fold).as_deref(), Some("FOLD"));
+    fn legal_and_view_fixtures_and_the_action_bar() {
+        let l: Legal = decode(LEGAL_NEW).unwrap();
+        assert_eq!(l.seat, 0);
+        assert!(l.allows("call") && l.allows("raise") && !l.allows("check"));
+        assert_eq!(action_for(&l, Choice::Passive).unwrap().action, "call");
         assert_eq!(choice_label(&l, Choice::Passive).as_deref(), Some("CALL 1"));
         assert_eq!(
             choice_label(&l, Choice::Aggressive).as_deref(),
             Some("RAISE TO 4")
         );
-        assert_eq!(
-            action_for(&l, Choice::Aggressive),
-            Some(Action {
-                seat: 0,
-                action: "raise".into(),
-                amount: Some(4)
-            })
-        );
-        assert_eq!(
-            serde_json::to_string(&action_for(&l, Choice::Passive).unwrap()).unwrap(),
-            r#"{"seat":0,"action":"call"}"#
-        );
+        assert_eq!(choice_label(&l, Choice::Fold).as_deref(), Some("FOLD"));
+        let done: Option<Legal> = decode(LEGAL_DONE).unwrap();
+        assert!(done.is_none());
 
-        let open = Legal {
-            seat: 1,
-            actions: vec!["fold".into(), "check".into(), "bet".into()],
-            min_raise_to: 2,
-            max_raise_to: 2,
-            ..Legal::default()
-        };
-        assert_eq!(
-            choice_label(&open, Choice::Passive).as_deref(),
-            Some("CHECK")
-        );
-        assert_eq!(
-            choice_label(&open, Choice::Aggressive).as_deref(),
-            Some("BET 2")
-        );
+        let v: SeatView = decode(VIEW_NEW).unwrap();
+        assert_eq!(v.seat, 0);
+        assert!(v.seats[1].hole.is_none());
+        assert!(v.hole.is_some());
+        // the view implies the same envelope the engine gave
+        let implied = legal_of_view(&v).unwrap();
+        assert_eq!(implied.actions, l.actions);
+        assert_eq!(implied.call_amount, l.call_amount);
+        assert_eq!(implied.min_raise_to, l.min_raise_to);
+        let sv: SeatView = decode(VIEW_SHOWDOWN).unwrap();
+        assert!(sv.seats[1].hole.is_some());
+        assert!(legal_of_view(&sv).is_none());
 
-        let capped = Legal {
-            actions: vec!["fold".into(), "call".into()],
-            call_amount: 4,
-            ..Legal::default()
-        };
-        assert_eq!(choice_label(&capped, Choice::Aggressive), None);
+        let roster: Vec<RosterEntry> = serde_json::from_str(ROSTER).unwrap();
+        assert_eq!(pick_bot(&roster, "maniac").name, "Ensign Puffin");
+        assert_eq!(pick_bot(&roster, "nope").profile, "tag");
+        assert_eq!(pick_bot(&[], "tag").name, "House");
+        assert_eq!(decode::<Legal>(ERROR).unwrap_err(), "not seat 1's turn");
     }
 
     #[test]
-    fn hand_config_serialises_for_the_shim() {
-        let cfg = HandConfig {
-            seats: vec![SeatConfig {
-                name: "You".into(),
-                stack: 200,
-            }],
-            button: 0,
-            sb: 1,
-            bb: 2,
-            seed_hex: "ab".into(),
-            limit: true,
-        };
-        assert_eq!(
-            serde_json::to_string(&cfg).unwrap(),
-            r#"{"seats":[{"name":"You","stack":200}],"button":0,"sb":1,"bb":2,"seedHex":"ab","limit":true}"#
-        );
-    }
-
-    #[test]
-    fn commit_and_bot_seed() {
-        // SHA-256("abc"), FIPS 180-2 appendix B.1.
-        assert_eq!(
-            seed_commit("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        let s = bot_seed(&"a".repeat(64), 3);
-        assert_eq!(s.len(), 64);
-        assert!(s
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-        assert_ne!(s, bot_seed(&"a".repeat(64), 4));
-    }
-
-    #[test]
-    fn display_helpers() {
-        assert_eq!(card_parts("A♠"), ("A".into(), "♠".into(), false));
+    fn helpers() {
         assert_eq!(card_parts("T♥"), ("10".into(), "♥".into(), true));
-        assert_eq!(card_parts("2♦"), ("2".into(), "♦".into(), true));
-        assert_eq!(card_parts(""), (String::new(), String::new(), false));
-        assert_eq!(bb_count(200, 2), "100 BB");
+        assert_eq!(card_parts("A♠"), ("A".into(), "♠".into(), false));
         assert_eq!(bb_count(199, 2), "99.5 BB");
+        assert_eq!(bb_count(200, 2), "100 BB");
         assert_eq!(bb_count(5, 0), "");
         assert_eq!(signed(4), "+4");
         assert_eq!(signed(-2), "\u{2212}2");
         assert_eq!(signed(0), "0");
         assert_eq!(chips(1), "1 chip");
-        assert_eq!(chips(0), "0 chips");
+        let names = vec!["You".to_string(), "Wren".to_string()];
+        let e = |ev: &str, seat: u32, amount: Option<u64>, to: Option<u64>| LogEntry {
+            ev: ev.into(),
+            seat: Some(seat),
+            amount,
+            to,
+            ..LogEntry::default()
+        };
+        assert_eq!(
+            describe(&e("raise", 1, None, Some(4)), &names, 0).as_deref(),
+            Some("Wren raises to 4")
+        );
+        assert_eq!(
+            describe(&e("call", 0, Some(1), None), &names, 0).as_deref(),
+            Some("You call 1")
+        );
+        assert_eq!(describe(&e("deal", 0, None, None), &names, 0), None);
+        assert_eq!(seed_commit(&"ab".repeat(32)).len(), 64);
+        assert_ne!(bot_seed("s", 1), bot_seed("s", 2));
     }
 }

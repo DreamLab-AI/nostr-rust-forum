@@ -739,6 +739,7 @@ pub fn WalletPage() -> impl IntoView {
                                     PendingKind::Dream => "Sent",
                                     PendingKind::Sats => "Sent",
                                     PendingKind::Provision => "Starter pack",
+                                    PendingKind::Hand => "Poker",
                                 };
                                 view! {
                                     <li class="py-2.5 flex items-center gap-3 text-sm">

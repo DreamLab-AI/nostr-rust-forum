@@ -419,6 +419,30 @@ pub fn create_rsvp(
 
 // -- Signer-based constructors ------------------------------------------------
 
+/// Everything a time-based calendar event may carry, for
+/// [`create_calendar_event_signer_spec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CalendarEventSpec {
+    /// Event title (required, non-empty).
+    pub title: String,
+    /// Unix seconds for the start.
+    pub start: u64,
+    /// Unix seconds for the end, if any.
+    pub end: Option<u64>,
+    /// Location text.
+    pub location: Option<String>,
+    /// Description (the content).
+    pub description: Option<String>,
+    /// Maximum number of attendees.
+    pub max_attendees: Option<u32>,
+    /// Invited participants as `(pubkey, role)` (NIP-52 `p` tags with a
+    /// role, e.g. `"player"`); an empty role is written as an empty string.
+    pub participants: Vec<(String, String)>,
+    /// Further `t` hashtags beside `calendar-event` (e.g. `"poker"`), so a
+    /// reader can tell a game night from a lecture.
+    pub hashtags: Vec<String>,
+}
+
 /// Create a time-based calendar event (kind 31923) using a [`Signer`].
 ///
 /// Async variant of [`create_calendar_event`] that delegates signing to the
@@ -432,6 +456,35 @@ pub async fn create_calendar_event_signer(
     description: Option<&str>,
     max_attendees: Option<u32>,
 ) -> Result<NostrEvent, CalendarError> {
+    create_calendar_event_signer_spec(
+        signer,
+        &CalendarEventSpec {
+            title: title.to_string(),
+            start: start_timestamp,
+            end: end_timestamp,
+            location: location.map(str::to_string),
+            description: description.map(str::to_string),
+            max_attendees,
+            participants: Vec::new(),
+            hashtags: Vec::new(),
+        },
+    )
+    .await
+}
+
+/// [`create_calendar_event_signer`] from a [`CalendarEventSpec`]: the same
+/// event with, in addition, a `["p", <pubkey>, "", <role>]` tag per
+/// participant and a `["t", <tag>]` per hashtag.
+pub async fn create_calendar_event_signer_spec(
+    signer: &dyn Signer,
+    spec: &CalendarEventSpec,
+) -> Result<NostrEvent, CalendarError> {
+    let title = spec.title.as_str();
+    let start_timestamp = spec.start;
+    let end_timestamp = spec.end;
+    let location = spec.location.as_deref();
+    let description = spec.description.as_deref();
+    let max_attendees = spec.max_attendees;
     if title.is_empty() {
         return Err(CalendarError::EmptyTitle);
     }
@@ -467,7 +520,21 @@ pub async fn create_calendar_event_signer(
         tags.push(vec!["max_attendees".to_string(), max.to_string()]);
     }
 
+    for (pk, role) in &spec.participants {
+        tags.push(vec![
+            "p".to_string(),
+            pk.clone(),
+            String::new(),
+            role.clone(),
+        ]);
+    }
+
     tags.push(vec!["t".to_string(), "calendar-event".to_string()]);
+    for t in &spec.hashtags {
+        if t != "calendar-event" && !t.is_empty() {
+            tags.push(vec!["t".to_string(), t.clone()]);
+        }
+    }
 
     let unsigned = UnsignedEvent {
         pubkey,

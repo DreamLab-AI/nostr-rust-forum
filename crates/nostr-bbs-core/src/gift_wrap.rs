@@ -183,10 +183,24 @@ fn hex_to_32(hex_str: &str) -> Result<[u8; 32], GiftWrapError> {
 /// * `recipient_pubkey` - 64-char hex recipient pubkey (used in `p` tag)
 /// * `content` - The plaintext message
 pub fn create_rumor(sender_pubkey: &str, recipient_pubkey: &str, content: &str) -> UnsignedEvent {
+    create_rumor_kind(sender_pubkey, recipient_pubkey, KIND_RUMOR, content)
+}
+
+/// Create an unsigned rumor of any kind: the same envelope as
+/// [`create_rumor`] with the caller's kind in place of the DM kind. An
+/// application protocol carried over gift wraps (the poker table's kind
+/// 20779, for one) uses this so a DM inbox, which accepts only kind 14,
+/// never shows its traffic.
+pub fn create_rumor_kind(
+    sender_pubkey: &str,
+    recipient_pubkey: &str,
+    kind: u64,
+    content: &str,
+) -> UnsignedEvent {
     UnsignedEvent {
         pubkey: sender_pubkey.to_string(),
         created_at: now_secs(),
-        kind: KIND_RUMOR,
+        kind,
         tags: vec![vec!["p".to_string(), recipient_pubkey.to_string()]],
         content: content.to_string(),
     }
@@ -317,9 +331,26 @@ pub fn gift_wrap(
     recipient_pubkey: &str,
     content: &str,
 ) -> Result<NostrEvent, GiftWrapError> {
+    gift_wrap_kind(
+        sender_sk,
+        sender_pubkey,
+        recipient_pubkey,
+        KIND_RUMOR,
+        content,
+    )
+}
+
+/// [`gift_wrap`] with a rumor of any kind (see [`create_rumor_kind`]).
+pub fn gift_wrap_kind(
+    sender_sk: &[u8; 32],
+    sender_pubkey: &str,
+    recipient_pubkey: &str,
+    kind: u64,
+    content: &str,
+) -> Result<NostrEvent, GiftWrapError> {
     let recipient_pk_bytes = hex_to_32(recipient_pubkey)?;
 
-    let rumor = create_rumor(sender_pubkey, recipient_pubkey, content);
+    let rumor = create_rumor_kind(sender_pubkey, recipient_pubkey, kind, content);
     let seal = seal_rumor(&rumor, sender_sk, &recipient_pk_bytes)?;
     wrap_seal(&seal, recipient_pubkey)
 }
@@ -341,6 +372,16 @@ pub fn gift_wrap(
 pub fn unwrap_gift(
     gift: &NostrEvent,
     recipient_sk: &[u8; 32],
+) -> Result<UnwrappedGift, GiftWrapError> {
+    unwrap_gift_kind(gift, recipient_sk, KIND_RUMOR)
+}
+
+/// [`unwrap_gift`] for a rumor of `expected_kind` (see [`create_rumor_kind`]);
+/// a rumor of any other kind is refused as [`GiftWrapError::InvalidKind`].
+pub fn unwrap_gift_kind(
+    gift: &NostrEvent,
+    recipient_sk: &[u8; 32],
+    expected_kind: u64,
 ) -> Result<UnwrappedGift, GiftWrapError> {
     // Validate outer kind
     if gift.kind != KIND_GIFT_WRAP {
@@ -383,9 +424,9 @@ pub fn unwrap_gift(
         .map_err(|e| GiftWrapError::ParseError(format!("rumor JSON parse: {e}")))?;
 
     // Validate rumor kind
-    if rumor.kind != KIND_RUMOR {
+    if rumor.kind != expected_kind {
         return Err(GiftWrapError::InvalidKind {
-            expected: KIND_RUMOR,
+            expected: expected_kind,
             actual: rumor.kind,
         });
     }
@@ -494,8 +535,19 @@ pub async fn gift_wrap_with_signer(
     recipient_pubkey: &str,
     content: &str,
 ) -> Result<NostrEvent, SignerGiftWrapError> {
+    gift_wrap_with_signer_kind(signer, recipient_pubkey, KIND_RUMOR, content).await
+}
+
+/// [`gift_wrap_with_signer`] with a rumor of any kind (see
+/// [`create_rumor_kind`]).
+pub async fn gift_wrap_with_signer_kind(
+    signer: &dyn Signer,
+    recipient_pubkey: &str,
+    kind: u64,
+    content: &str,
+) -> Result<NostrEvent, SignerGiftWrapError> {
     let sender_pubkey = signer.public_key();
-    let rumor = create_rumor(sender_pubkey, recipient_pubkey, content);
+    let rumor = create_rumor_kind(sender_pubkey, recipient_pubkey, kind, content);
     let seal = seal_rumor_with_signer(&rumor, signer, recipient_pubkey).await?;
     wrap_seal(&seal, recipient_pubkey).map_err(|e| SignerGiftWrapError::KeyError(e.to_string()))
 }
@@ -573,6 +625,16 @@ pub async fn unwrap_gift_with_signer(
     gift: &NostrEvent,
     signer: &dyn Signer,
 ) -> Result<UnwrappedGift, SignerGiftWrapError> {
+    unwrap_gift_with_signer_kind(gift, signer, KIND_RUMOR).await
+}
+
+/// [`unwrap_gift_with_signer`] for a rumor of `expected_kind` (see
+/// [`create_rumor_kind`]); any other kind is refused.
+pub async fn unwrap_gift_with_signer_kind(
+    gift: &NostrEvent,
+    signer: &dyn Signer,
+    expected_kind: u64,
+) -> Result<UnwrappedGift, SignerGiftWrapError> {
     if gift.kind != KIND_GIFT_WRAP {
         return Err(SignerGiftWrapError::InvalidKind {
             expected: KIND_GIFT_WRAP,
@@ -602,9 +664,9 @@ pub async fn unwrap_gift_with_signer(
     let rumor: UnsignedEvent = serde_json::from_str(&rumor_json)
         .map_err(|e| SignerGiftWrapError::Serialization(format!("rumor JSON parse: {e}")))?;
 
-    if rumor.kind != KIND_RUMOR {
+    if rumor.kind != expected_kind {
         return Err(SignerGiftWrapError::InvalidKind {
-            expected: KIND_RUMOR,
+            expected: expected_kind,
             actual: rumor.kind,
         });
     }
@@ -756,6 +818,46 @@ mod tests {
         assert_eq!(unwrapped.rumor.content, content);
         assert_eq!(unwrapped.rumor.kind, KIND_RUMOR);
         assert_eq!(unwrapped.seal.kind, KIND_SEAL);
+    }
+
+    #[test]
+    fn gift_wrap_of_another_kind_round_trips_and_is_not_a_dm() {
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let wrapped = gift_wrap_kind(
+            &sender_sk,
+            &sender_pk,
+            &recipient_pk,
+            20779,
+            "{\"t\":\"hello\"}",
+        )
+        .unwrap();
+        assert_eq!(wrapped.kind, KIND_GIFT_WRAP);
+        // the DM unwrap refuses it: a DM inbox never shows it
+        assert!(matches!(
+            unwrap_gift(&wrapped, &recipient_sk),
+            Err(GiftWrapError::InvalidKind {
+                expected: KIND_RUMOR,
+                actual: 20779
+            })
+        ));
+        let unwrapped = unwrap_gift_kind(&wrapped, &recipient_sk, 20779).unwrap();
+        assert_eq!(unwrapped.sender_pubkey, sender_pk);
+        assert_eq!(unwrapped.rumor.kind, 20779);
+        assert_eq!(unwrapped.rumor.content, "{\"t\":\"hello\"}");
+        assert_eq!(
+            unwrapped.rumor.tags,
+            vec![vec!["p".to_string(), recipient_pk.clone()]]
+        );
+        // and a DM is refused by the other-kind unwrap
+        let dm = gift_wrap(&sender_sk, &sender_pk, &recipient_pk, "hi").unwrap();
+        assert!(matches!(
+            unwrap_gift_kind(&dm, &recipient_sk, 20779),
+            Err(GiftWrapError::InvalidKind {
+                expected: 20779,
+                actual: KIND_RUMOR
+            })
+        ));
     }
 
     #[test]

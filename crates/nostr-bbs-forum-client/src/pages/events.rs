@@ -34,6 +34,10 @@ struct CalendarEvent {
     is_busy: bool,
     /// Venue slug (e.g. `fairfield`) when present on a busy block.
     venue: String,
+    /// A poker game (`t: poker`): the card links to the table.
+    poker: bool,
+    /// Invited players (`p` tags with a role), for a poker game.
+    players: Vec<String>,
 }
 
 /// RSVP data for an event.
@@ -471,6 +475,20 @@ pub fn EventsPage() -> impl IntoView {
                                             let eid_rsvp = evt.id.clone();
                                             let max = evt.max_attendees;
                                             let rsvps_sig = rsvps;
+                                            let poker_line = evt.poker.then(|| {
+                                                let n = evt.players.len();
+                                                let players = if n == 0 {
+                                                    "open table".to_string()
+                                                } else {
+                                                    format!("{n} player{} invited", if n == 1 { "" } else { "s" })
+                                                };
+                                                view! {
+                                                    <div class="mt-2 ml-[72px] text-xs text-amber-300 flex items-center gap-2">
+                                                        <span>"♠ Poker · "{players}</span>
+                                                        <a href=crate::app::base_href("/table") class="underline hover:text-amber-200">"Go to the table"</a>
+                                                    </div>
+                                                }
+                                            });
 
                                             let current_rsvp = Signal::derive(move || {
                                                 rsvps_sig.get().get(&eid_rsvp).and_then(|d| d.my_status)
@@ -494,6 +512,7 @@ pub fn EventsPage() -> impl IntoView {
                                                         host_pubkey=evt.host_pubkey
                                                         featured=evt.featured
                                                     />
+                                                    {poker_line}
                                                     <div class="mt-2 ml-[72px]">
                                                         <RsvpButtons
                                                             event_id=eid
@@ -780,6 +799,8 @@ fn parse_calendar_event(event: &NostrEvent) -> CalendarEvent {
             featured: false,
             is_busy: true,
             venue: tag("venue").unwrap_or_default(),
+            poker: false,
+            players: Vec::new(),
         };
     }
 
@@ -824,5 +845,15 @@ fn parse_calendar_event(event: &NostrEvent) -> CalendarEvent {
         featured: false,
         is_busy: false,
         venue: tag("venue").unwrap_or_default(),
+        poker: event
+            .tags
+            .iter()
+            .any(|t| t.len() >= 2 && t[0] == "t" && t[1] == "poker"),
+        players: event
+            .tags
+            .iter()
+            .filter(|t| t.len() >= 2 && t[0] == "p" && t[1].len() == 64)
+            .map(|t| t[1].clone())
+            .collect(),
     }
 }

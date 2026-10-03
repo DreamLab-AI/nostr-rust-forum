@@ -61,8 +61,10 @@ pub use event::{
     NostrEvent, PubkeyMismatch, UnsignedEvent,
 };
 pub use gift_wrap::{
-    gift_wrap, gift_wrap_pair_with_signer, gift_wrap_with_signer, unwrap_gift,
-    unwrap_gift_with_signer, GiftWrapError, SignerGiftWrapError, UnwrappedGift,
+    create_rumor_kind, gift_wrap, gift_wrap_kind, gift_wrap_pair_with_signer,
+    gift_wrap_with_signer, gift_wrap_with_signer_kind, unwrap_gift, unwrap_gift_kind,
+    unwrap_gift_with_signer, unwrap_gift_with_signer_kind, GiftWrapError, SignerGiftWrapError,
+    UnwrappedGift,
 };
 pub use keys::{
     derive_from_prf, derive_subkey, generate_keypair, Keypair, PublicKey, SecretKey, Signature,
@@ -95,10 +97,11 @@ pub use boot_profile::{
 };
 
 pub use calendar::{
-    create_calendar_event, create_calendar_event_signer, create_date_calendar_event, create_rsvp,
-    create_rsvp_signer, is_known_venue, read_venue_tag, read_zone_tag, set_venue_tag, set_zone_tag,
-    to_free_busy, CalendarError, RsvpStatus, KIND_CALENDAR_DATE_EVENT, KIND_CALENDAR_EVENT,
-    KIND_CALENDAR_RSVP, VENUE_PRIMARY, VENUE_SECONDARY, VENUE_TAG, ZONE_TAG,
+    create_calendar_event, create_calendar_event_signer, create_calendar_event_signer_spec,
+    create_date_calendar_event, create_rsvp, create_rsvp_signer, is_known_venue, read_venue_tag,
+    read_zone_tag, set_venue_tag, set_zone_tag, to_free_busy, CalendarError, CalendarEventSpec,
+    RsvpStatus, KIND_CALENDAR_DATE_EVENT, KIND_CALENDAR_EVENT, KIND_CALENDAR_RSVP, VENUE_PRIMARY,
+    VENUE_SECONDARY, VENUE_TAG, ZONE_TAG,
 };
 
 pub use kanban::{

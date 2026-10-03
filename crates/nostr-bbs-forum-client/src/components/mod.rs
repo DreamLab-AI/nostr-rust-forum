@@ -61,6 +61,7 @@ pub mod create_event_modal;
 pub mod event_card;
 pub mod mini_calendar;
 pub mod notification_center;
+pub mod poker_schedule;
 pub mod rsvp_buttons;
 
 // -- Search + DM Enhancement (Stream 8) --------------------------------------

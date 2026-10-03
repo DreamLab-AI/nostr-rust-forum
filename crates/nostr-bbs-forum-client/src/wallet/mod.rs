@@ -108,6 +108,8 @@ pub enum PendingKind {
     Sats,
     /// DREAM and sats together: a starter pack for a member or an agent.
     Provision,
+    /// DREAM settling a poker hand (`hand:<root>` beside the tally).
+    Hand,
 }
 
 /// A transaction this browser sent that the mirror has not shown yet.
@@ -130,6 +132,9 @@ pub struct Pending {
     /// The post, for a tip.
     #[serde(default)]
     pub tip_event: Option<String>,
+    /// The hand's root, for a settlement.
+    #[serde(default)]
+    pub hand_root: Option<String>,
     /// When it was sent, unix seconds.
     pub at: u64,
 }
@@ -377,7 +382,7 @@ impl WalletStore {
     }
 
     /// Coins a pending transaction spends.
-    fn held(&self) -> Vec<OutPoint> {
+    pub fn held(&self) -> Vec<OutPoint> {
         self.pending
             .get_untracked()
             .iter()
@@ -545,15 +550,57 @@ impl WalletStore {
         amount: u64,
         tip_event: Option<String>,
     ) -> Result<String, String> {
+        let memos: Vec<String> = tip_event
+            .iter()
+            .map(|e| format!("{}{e}", chain::TIP_PREFIX))
+            .collect();
+        let kind = if tip_event.is_some() {
+            PendingKind::Tip
+        } else {
+            PendingKind::Dream
+        };
+        self.send_dream_with(auth, to, amount, memos, kind, tip_event, None)
+            .await
+    }
+
+    /// Settle a poker hand: DREAM to the winner with `hand:<root>` beside
+    /// the tally, so the chain says which hand it paid for.
+    pub async fn send_dream_for_hand(
+        &self,
+        auth: &AuthStore,
+        to: ScriptBuf,
+        amount: u64,
+        root: &str,
+    ) -> Result<String, String> {
+        let memos = vec![nostr_bbs_poker::rules::hand_memo(root)];
+        self.send_dream_with(
+            auth,
+            to,
+            amount,
+            memos,
+            PendingKind::Hand,
+            None,
+            Some(root.to_string()),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_dream_with(
+        &self,
+        auth: &AuthStore,
+        to: ScriptBuf,
+        amount: u64,
+        memos: Vec<String>,
+        kind: PendingKind,
+        tip_event: Option<String>,
+        hand_root: Option<String>,
+    ) -> Result<String, String> {
         let (snap, spender, me) = self.ready(auth)?;
         if to == me {
             return Err("That is your own wallet.".into());
         }
         let coins = snap.coins(&me, &self.held());
-        let memos: Vec<String> = tip_event
-            .iter()
-            .map(|e| format!("{}{e}", chain::TIP_PREFIX))
-            .collect();
         let t = spender
             .build(|signer| {
                 build_transfer(
@@ -574,11 +621,6 @@ impl WalletStore {
             })
             .map_err(explain)?;
         let spend = self.signed(&spender, t.spend, &coins, &me).await?;
-        let kind = if tip_event.is_some() {
-            PendingKind::Tip
-        } else {
-            PendingKind::Dream
-        };
         self.deliver(
             spend,
             Pending {
@@ -590,6 +632,7 @@ impl WalletStore {
                 fee: 0,
                 spent: vec![],
                 tip_event,
+                hand_root,
                 at: 0,
             },
         )
@@ -637,6 +680,7 @@ impl WalletStore {
                 fee: 0,
                 spent: vec![],
                 tip_event: None,
+                hand_root: None,
                 at: 0,
             },
         )
@@ -675,6 +719,7 @@ impl WalletStore {
                 fee: 0,
                 spent: vec![],
                 tip_event: None,
+                hand_root: None,
                 at: 0,
             },
         )

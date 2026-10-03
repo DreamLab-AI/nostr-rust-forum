@@ -114,6 +114,8 @@ pub struct TxSummary {
     pub outs: Vec<Leg>,
     /// The post a tip names, when it carries `tip:nostr:<event id>`.
     pub tip_event: Option<String>,
+    /// The poker hand it settles, when it carries `hand:<root>`.
+    pub hand_root: Option<String>,
     /// Set when the assets rule reads it as broken: DREAM it touched is gone.
     pub broken: Option<String>,
     /// A block's coinbase: a peg-in claim or the producer's fees.
@@ -244,11 +246,15 @@ pub fn replay(dat: &[u8], now: Option<u32>) -> Result<Snapshot, String> {
                         .unwrap_or(0),
                 })
                 .collect();
-            let tip_event = records_of(tx).into_iter().find_map(|(_, t)| {
+            let records = records_of(tx);
+            let tip_event = records.iter().find_map(|(_, t)| {
                 t.strip_prefix(TIP_PREFIX)
                     .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
                     .map(str::to_ascii_lowercase)
             });
+            let hand_root = records
+                .iter()
+                .find_map(|(_, t)| nostr_bbs_poker::rules::parse_hand_memo(t).map(str::to_string));
             // a tip counts what output 0 carries of DREAM, when the rule held
             if let (Some(ev), None) = (&tip_event, &broken) {
                 let n = outs.first().map(|l| l.dream).unwrap_or(0);
@@ -265,6 +271,7 @@ pub fn replay(dat: &[u8], now: Option<u32>) -> Result<Snapshot, String> {
                 ins: spent[i].clone(),
                 outs,
                 tip_event,
+                hand_root,
                 broken,
                 coinbase,
             });
@@ -747,6 +754,7 @@ mod tests {
                 },
             ],
             tip_event: None,
+            hand_root: None,
             broken: None,
             coinbase: false,
         };

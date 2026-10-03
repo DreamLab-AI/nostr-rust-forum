@@ -1,13 +1,14 @@
-//! `/table`: a practice table — heads-up fixed-limit hold'em against a house
-//! bot, for chips that are worth nothing.
+//! `/table`: the poker table — heads-up fixed-limit hold'em.
 //!
-//! Each hand both stacks reset to the buy-in, the button alternates, and the
-//! shuffle is committed before the deal: the page shows SHA-256 of a fresh
-//! 32-byte seed, deals from that seed, and reveals it when the hand ends so
-//! anyone can check the deck was fixed in advance. The bot decides from its
-//! own seat's view only, with randomness derived from the same seed, so a
-//! revealed seed replays the whole hand. Nothing here touches the wallet or
-//! sends anything; the engine runs locally (see [`crate::poker`]).
+//! Two tables share the page. The **practice table** runs entirely in the
+//! browser for chips that are worth nothing: each hand both stacks reset to
+//! the buy-in, the shuffle is committed before the deal (the page shows
+//! SHA-256 of a fresh seed, deals from it, reveals it when the hand ends),
+//! and the bot decides from its own seat's view with randomness derived from
+//! the seed. The **DREAM table** ([`crate::poker::live`]) is played against
+//! the forum's house seat, or against another member the house deals for,
+//! and settles each hand on `sidestr:dreamlab`; it is offered only where the
+//! operator runs a house seat ([`poker::money_enabled`]).
 
 use leptos::ev;
 use leptos::prelude::*;
@@ -15,20 +16,35 @@ use leptos_router::components::A;
 use wasm_bindgen::JsCast;
 
 use crate::app::base_href;
+use crate::auth::use_auth;
+use crate::components::poker_schedule::ScheduleGameModal;
+use crate::components::user_display::use_display_name_memo;
+use crate::poker::live::{LiveStore, Pay};
 use crate::poker::{
-    self, Choice, HandConfig, HandOutcome, HandState, HistoryRow, Legal, Phase, RosterEntry,
-    SeatConfig, SeatView, Stake,
+    self, Choice, HandConfig, HandOutcome, HandState, HistoryRow, Legal, RosterEntry, SeatConfig,
+    SeatView, Stake,
 };
+use crate::relay::{ConnectionState, RelayConnection};
 use crate::utils::set_timeout_once;
+use crate::wallet::{chain, use_wallet};
 
-/// The member's seat.
+/// The member's seat at the practice table.
 const HERO: u32 = 0;
-/// The house bot's seat.
+/// The house bot's seat at the practice table.
 const BOT: u32 = 1;
 /// How long the bot "thinks", so each turn can be read.
 const BOT_DELAY_MS: i32 = 500;
 /// Hands kept in the history card.
 const HISTORY_LEN: usize = 20;
+
+/// Which table is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Chips that are worth nothing, in the browser.
+    Practice,
+    /// DREAM, with the house seat.
+    Dream,
+}
 
 /// The `/table` route: the table where every gate holds, a notice otherwise.
 #[component]
@@ -58,10 +74,69 @@ pub fn TablePage() -> impl IntoView {
                 </div>
             }
         >
-            <Table />
+            <Tables />
         </Show>
     }
     .into_any()
+}
+
+/// The mode switch over the two tables.
+#[component]
+fn Tables() -> impl IntoView {
+    // the schedule modal's invitations are DMs
+    crate::dm::provide_dm_store();
+    let config = poker::PokerConfig::load();
+    let citizen = config.citizen();
+    let money = poker::money_enabled();
+    let mode = RwSignal::new(if money { Mode::Dream } else { Mode::Practice });
+    let show_schedule = RwSignal::new(false);
+    let zone_access = crate::stores::zone_access::use_zone_access();
+    let can_schedule = Memo::new(move |_| zone_access.is_admin.get());
+    let stakes = config.stakes();
+    let tab = move |m: Mode, label: &'static str| {
+        let active = move || mode.get() == m;
+        view! {
+            <button
+                class=move || if active() {
+                    "px-3 py-1.5 rounded-lg text-sm font-semibold bg-amber-500 text-gray-900"
+                } else {
+                    "px-3 py-1.5 rounded-lg text-sm font-semibold bg-gray-800 text-gray-300 hover:bg-gray-700"
+                }
+                on:click=move |_| mode.set(m)
+            >
+                {label}
+            </button>
+        }
+    };
+    view! {
+        <div class="max-w-5xl mx-auto px-4 pt-6 flex items-center justify-between gap-3 flex-wrap">
+            <div class="flex gap-2">
+                {money.then(|| tab(Mode::Dream, "DREAM table"))}
+                {tab(Mode::Practice, "Practice chips")}
+            </div>
+            <Show when=move || can_schedule.get()>
+                <button
+                    class="px-3 py-1.5 rounded-lg text-sm font-semibold bg-gray-800 text-amber-300 hover:bg-gray-700 border border-amber-500/40"
+                    on:click=move |_| show_schedule.set(true)
+                >
+                    "Schedule a game"
+                </button>
+            </Show>
+        </div>
+        {move || match mode.get() {
+            Mode::Practice => view! { <PracticeTable /> }.into_any(),
+            Mode::Dream => {
+                let citizen = citizen.clone().unwrap_or_default();
+                view! { <DreamTable citizen=citizen /> }.into_any()
+            }
+        }}
+        <Show when=move || show_schedule.get()>
+            <ScheduleGameModal
+                stakes=stakes.clone()
+                on_close=Callback::new(move |()| show_schedule.set(false))
+            />
+        </Show>
+    }
 }
 
 /// Whether a key press is aimed at a text field, which the table's shortcuts
@@ -121,13 +196,19 @@ fn card_slot() -> AnyView {
 }
 
 /// One seat: name, stack, position, street bet, and cards.
-fn seat_panel(v: &SeatView, seat: u32, label: String, blurb: Option<String>) -> AnyView {
+fn seat_panel(
+    v: &SeatView,
+    seat: u32,
+    label: String,
+    blurb: Option<String>,
+    unit: &str,
+) -> AnyView {
     let Some(s) = v.seats.get(seat as usize).cloned() else {
         return ().into_any();
     };
     let position = if seat == v.button { "SB" } else { "BB" };
     let dealer = seat == v.button;
-    let to_act = v.phase == Phase::Act && v.to_act == seat as i32;
+    let to_act = v.phase == "act" && v.to_act == seat as i32;
     let ring = if to_act {
         "ring-2 ring-amber-400"
     } else {
@@ -141,6 +222,7 @@ fn seat_panel(v: &SeatView, seat: u32, label: String, blurb: Option<String>) -> 
         None => view! { {card_back()} {card_back()} }.into_any(),
     };
     let bb = v.bb;
+    let unit = unit.to_string();
     view! {
         <div class=format!("rounded-xl bg-gray-900/60 p-3 sm:p-4 flex items-center justify-between gap-3 {ring}")>
             <div class="min-w-0 space-y-1">
@@ -154,7 +236,7 @@ fn seat_panel(v: &SeatView, seat: u32, label: String, blurb: Option<String>) -> 
                 </div>
                 {blurb.map(|b| view! { <p class="text-xs text-gray-500 italic">{b}</p> })}
                 <p class="text-sm text-gray-300">
-                    <span class="font-mono">{s.stack}</span>" chips "
+                    <span class="font-mono">{s.stack}</span>" "{unit}" "
                     <span class="text-gray-500">"· "{poker::bb_count(s.stack, bb)}</span>
                 </p>
                 {(s.street_commit > 0).then(|| view! {
@@ -167,9 +249,121 @@ fn seat_panel(v: &SeatView, seat: u32, label: String, blurb: Option<String>) -> 
     .into_any()
 }
 
-/// The table itself, mounted only behind every gate.
+fn board_of(cards: &[u8]) -> AnyView {
+    (0..5)
+        .map(|i| {
+            cards
+                .get(i)
+                .copied()
+                .map(card_face)
+                .unwrap_or_else(card_slot)
+        })
+        .collect_view()
+        .into_any()
+}
+
+/// The three-button action bar for a legal envelope.
+fn action_bar(
+    l: Option<Legal>,
+    waiting: bool,
+    on_act: impl Fn(Choice) + Copy + 'static,
+) -> AnyView {
+    let Some(l) = l else {
+        return view! {
+            <p class="text-sm text-gray-500 text-center py-2">
+                {if waiting { "Waiting for the other seat…" } else { "" }}
+            </p>
+        }
+        .into_any();
+    };
+    let button = move |choice: Choice, key: &'static str, style: &'static str| {
+        poker::choice_label(&l, choice).map(|label| {
+            view! {
+                <button
+                    class=format!("flex-1 min-w-[6rem] px-4 py-3 rounded-lg font-semibold text-sm transition-colors {style}")
+                    on:click=move |_| on_act(choice)
+                >
+                    {label}
+                    <span class="ml-2 text-[10px] opacity-60 font-mono">{key}</span>
+                </button>
+            }
+        })
+    };
+    view! {
+        <div class="flex flex-wrap gap-2">
+            {button(Choice::Fold, "1", "bg-gray-700 hover:bg-gray-600 text-gray-100")}
+            {button(Choice::Passive, "2", "bg-gray-600 hover:bg-gray-500 text-white")}
+            {button(Choice::Aggressive, "3", "bg-amber-500 hover:bg-amber-400 text-gray-900")}
+        </div>
+    }
+    .into_any()
+}
+
+fn narration(log: &[poker::LogEntry], names: &[String], hero: u32) -> AnyView {
+    let lines: Vec<String> = log
+        .iter()
+        .filter_map(|e| poker::describe(e, names, hero))
+        .collect();
+    let skip = lines.len().saturating_sub(8);
+    lines
+        .into_iter()
+        .skip(skip)
+        .map(|l| view! { <li>{l}</li> })
+        .collect_view()
+        .into_any()
+}
+
+fn history_card(history: RwSignal<Vec<HistoryRow>>, unit: &'static str) -> AnyView {
+    view! {
+        <div class="glass-card p-4 space-y-2">
+            <h2 class="text-sm font-semibold text-white">"Hand history"</h2>
+            <Show
+                when=move || history.with(|h| !h.is_empty())
+                fallback=|| view! { <p class="text-xs text-gray-500">"No hands yet."</p> }
+            >
+                <ul class="space-y-2">
+                    <For
+                        each=move || history.get()
+                        key=|row| row.number
+                        let:row
+                    >
+                        <li class="text-xs flex gap-2">
+                            <span class="font-mono text-gray-500 shrink-0">{format!("#{}", row.number)}</span>
+                            <span class="text-gray-300 flex-1">{row.text.clone()}</span>
+                            <span class=format!("font-mono shrink-0 {}", net_tone(row.net))>
+                                {poker::signed(row.net)}" "{unit}
+                            </span>
+                        </li>
+                    </For>
+                </ul>
+            </Show>
+        </div>
+    }
+    .into_any()
+}
+
+fn session_card(hands: RwSignal<u32>, net: RwSignal<i64>, unit: &'static str) -> AnyView {
+    view! {
+        <div class="glass-card p-4 space-y-2">
+            <h2 class="text-sm font-semibold text-white">"Session"</h2>
+            <p class="text-sm text-gray-300">{move || format!("Hands played: {}", hands.get())}</p>
+            <p class="text-sm text-gray-300">
+                "Net: "
+                <span class=move || format!("font-mono {}", net_tone(net.get()))>
+                    {move || poker::signed(net.get())}
+                </span>
+                " "{unit}
+            </p>
+        </div>
+    }
+    .into_any()
+}
+
+// ── The practice table ────────────────────────────────────────────────────────
+
+/// The practice table, mounted only behind every gate.
 #[component]
-fn Table() -> impl IntoView {
+fn PracticeTable() -> impl IntoView {
     let config = poker::PokerConfig::load();
     let stakes = StoredValue::new(config.stakes());
     let bot: StoredValue<RosterEntry> =
@@ -193,14 +387,13 @@ fn Table() -> impl IntoView {
         Memo::new(move |_| hand.with(|h| h.as_ref().and_then(|h| poker::seat_view(h, HERO).ok())));
     let legal: Memo<Option<Legal>> =
         Memo::new(move |_| hand.with(|h| h.as_ref().and_then(|h| poker::legal(h).ok().flatten())));
-    let in_play =
-        Memo::new(move |_| hand.with(|h| h.as_ref().is_some_and(|h| h.hand.phase == Phase::Act)));
+    let in_play = Memo::new(move |_| hand.with(|h| h.as_ref().is_some_and(|h| h.hand.in_play())));
     let hero_turn = Memo::new(move |_| legal.get().is_some_and(|l| l.seat == HERO));
 
     // Take a new engine state: count a finished hand, prepare the next commit.
     let settle = move |next: HandState| {
         turn.update_value(|t| *t += 1);
-        if next.hand.phase == Phase::Done {
+        if !next.hand.in_play() {
             if let Some(o) = poker::summarise(&next.hand, HERO as usize, poker::hand_name) {
                 let n = hands_played.get_untracked() + 1;
                 hands_played.set(n);
@@ -250,6 +443,7 @@ fn Table() -> impl IntoView {
             button,
             sb: stake.sb,
             bb: stake.bb,
+            ante: 0,
             seed_hex: seed.clone(),
             limit: true,
         };
@@ -290,7 +484,7 @@ fn Table() -> impl IntoView {
     Effect::new(move |_| {
         let bot_to_act = hand.with(|h| {
             h.as_ref()
-                .is_some_and(|h| h.hand.phase == Phase::Act && h.hand.to_act == BOT as i32)
+                .is_some_and(|h| h.hand.in_play() && h.hand.to_act == BOT as i32)
         });
         if !bot_to_act {
             return;
@@ -372,51 +566,15 @@ fn Table() -> impl IntoView {
 
     let board = move || {
         let cards = seat_view.with(|v| v.as_ref().map(|v| v.board.clone()).unwrap_or_default());
-        (0..5)
-            .map(|i| {
-                cards
-                    .get(i)
-                    .copied()
-                    .map(card_face)
-                    .unwrap_or_else(card_slot)
-            })
-            .collect_view()
+        board_of(&cards)
     };
 
-    let action_bar = move || {
-        let Some(l) = legal.get().filter(|l| l.seat == HERO) else {
-            let waiting = in_play.get();
-            return view! {
-                <p class="text-sm text-gray-500 text-center py-2">
-                    {if waiting { "The bot is thinking…" } else { "" }}
-                </p>
-            }
-            .into_any();
-        };
-        let button = move |choice: Choice, key: &'static str, style: &'static str| {
-            poker::choice_label(&l, choice).map(|label| {
-                view! {
-                    <button
-                        class=format!("flex-1 min-w-[6rem] px-4 py-3 rounded-lg font-semibold text-sm transition-colors {style}")
-                        on:click=move |_| hero_act(choice)
-                    >
-                        {label}
-                        <span class="ml-2 text-[10px] opacity-60 font-mono">{key}</span>
-                    </button>
-                }
-            })
-        };
-        view! {
-            <div class="flex flex-wrap gap-2">
-                {button(Choice::Fold, "1", "bg-gray-700 hover:bg-gray-600 text-gray-100")}
-                {button(Choice::Passive, "2", "bg-gray-600 hover:bg-gray-500 text-white")}
-                {button(Choice::Aggressive, "3", "bg-amber-500 hover:bg-amber-400 text-gray-900")}
-            </div>
-        }
-        .into_any()
+    let bar = move || {
+        let l = legal.get().filter(|l| l.seat == HERO);
+        action_bar(l, in_play.get(), hero_act)
     };
 
-    let narration = move || {
+    let story = move || {
         let names = hand.with(|h| {
             h.as_ref()
                 .map(|h| {
@@ -428,29 +586,17 @@ fn Table() -> impl IntoView {
                 })
                 .unwrap_or_default()
         });
-        let lines: Vec<String> = hand.with(|h| {
+        hand.with(|h| {
             h.as_ref()
-                .map(|h| {
-                    h.hand
-                        .log
-                        .iter()
-                        .filter_map(|e| poker::describe(e, &names, HERO))
-                        .collect()
-                })
-                .unwrap_or_default()
-        });
-        let skip = lines.len().saturating_sub(8);
-        lines
-            .into_iter()
-            .skip(skip)
-            .map(|l| view! { <li>{l}</li> })
-            .collect_view()
+                .map(|h| narration(&h.hand.log, &names, HERO))
+                .unwrap_or_else(|| ().into_any())
+        })
     };
 
     let fairness = move || {
         let finished = hand.with(|h| {
             h.as_ref()
-                .filter(|h| h.hand.phase == Phase::Done)
+                .filter(|h| !h.hand.in_play())
                 .map(|h| h.hand.seed_hex.clone())
         });
         let revealed = finished.map(|seed| {
@@ -524,7 +670,7 @@ fn Table() -> impl IntoView {
                 <div class="lg:col-span-2 space-y-4">
                     <div class="glass-card p-4 sm:p-6 space-y-4">
                         {move || match seat_view.get() {
-                            Some(v) => seat_panel(&v, BOT, bot_label.clone(), Some(bot_blurb.clone())),
+                            Some(v) => seat_panel(&v, BOT, bot_label.clone(), Some(bot_blurb.clone()), "chips"),
                             None => view! {
                                 <div class="rounded-xl bg-gray-900/60 p-4 ring-1 ring-gray-700/50">
                                     <p class="font-semibold text-white">{bot_label.clone()}</p>
@@ -543,7 +689,7 @@ fn Table() -> impl IntoView {
                             </p>
                         </div>
 
-                        {move || seat_view.get().map(|v| seat_panel(&v, HERO, "You".to_string(), None))}
+                        {move || seat_view.get().map(|v| seat_panel(&v, HERO, "You".to_string(), None, "chips"))}
 
                         {move || outcome.get().map(|o| {
                             let tone = net_tone(o.hero_net);
@@ -555,7 +701,7 @@ fn Table() -> impl IntoView {
                             }
                         })}
 
-                        {action_bar}
+                        {bar}
 
                         <Show when=move || !in_play.get()>
                             <button
@@ -583,50 +729,489 @@ fn Table() -> impl IntoView {
                 </div>
 
                 <div class="space-y-4">
-                    <div class="glass-card p-4 space-y-2">
-                        <h2 class="text-sm font-semibold text-white">"Session"</h2>
-                        <p class="text-sm text-gray-300">
-                            {move || format!("Hands played: {}", hands_played.get())}
-                        </p>
-                        <p class="text-sm text-gray-300">
-                            "Net: "
-                            <span class=move || format!("font-mono {}", net_tone(session_net.get()))>
-                                {move || poker::signed(session_net.get())}
-                            </span>
-                            " chips"
-                        </p>
-                    </div>
-
+                    {session_card(hands_played, session_net, "chips")}
                     <div class="glass-card p-4 space-y-2">
                         <h2 class="text-sm font-semibold text-white">"This hand"</h2>
-                        <ul class="text-xs text-gray-400 space-y-0.5">{narration}</ul>
+                        <ul class="text-xs text-gray-400 space-y-0.5">{story}</ul>
                     </div>
-
-                    <div class="glass-card p-4 space-y-2">
-                        <h2 class="text-sm font-semibold text-white">"Hand history"</h2>
-                        <Show
-                            when=move || history.with(|h| !h.is_empty())
-                            fallback=|| view! { <p class="text-xs text-gray-500">"No hands yet."</p> }
-                        >
-                            <ul class="space-y-2">
-                                <For
-                                    each=move || history.get()
-                                    key=|row| row.number
-                                    let:row
-                                >
-                                    <li class="text-xs flex gap-2">
-                                        <span class="font-mono text-gray-500 shrink-0">{format!("#{}", row.number)}</span>
-                                        <span class="text-gray-300 flex-1">{row.text.clone()}</span>
-                                        <span class=format!("font-mono shrink-0 {}", net_tone(row.net))>
-                                            {poker::signed(row.net)}
-                                        </span>
-                                    </li>
-                                </For>
-                            </ul>
-                        </Show>
-                    </div>
+                    {history_card(history, "chips")}
                 </div>
             </div>
         </div>
     }
+}
+
+// ── The DREAM table ───────────────────────────────────────────────────────────
+
+/// A member's name, reactively.
+#[component]
+fn Name(#[prop(into)] pubkey: String) -> impl IntoView {
+    let name = use_display_name_memo(pubkey);
+    view! { <span>{move || name.get()}</span> }
+}
+
+/// The DREAM table: hands against the house seat or another member, settled
+/// on the chain.
+#[component]
+fn DreamTable(citizen: String) -> impl IntoView {
+    let auth = use_auth();
+    let relay = expect_context::<RelayConnection>();
+    let conn_state = relay.connection_state();
+    let relay_authed = relay.authenticated();
+    let wallet = use_wallet();
+    let me = auth.pubkey().get_untracked().unwrap_or_default();
+    let Some(signer) = auth.get_signer() else {
+        return view! {
+            <div class="max-w-2xl mx-auto px-4 py-16 text-center text-gray-400">
+                <p>"Sign in with a key that can sign to play for DREAM."</p>
+            </div>
+        }
+        .into_any();
+    };
+    let live = LiveStore::new(relay.clone(), signer, auth, wallet, &me, &citizen);
+    let citizen_pk = StoredValue::new(citizen.clone());
+
+    // Join once the relay session is NIP-42 authenticated: the inbox REQ is
+    // gated on it.
+    let started = RwSignal::new(false);
+    Effect::new(move |_| {
+        if conn_state.get() != ConnectionState::Connected || !relay_authed.get() {
+            return;
+        }
+        if started.get_untracked() {
+            return;
+        }
+        started.set(true);
+        live.start();
+    });
+    on_cleanup(move || live.stop());
+    if let Some(w) = wallet {
+        w.ensure_loaded();
+    }
+
+    // Our DREAM, and the chain's word on the last hand's payment to us.
+    let my_script = chain::script_of(&me);
+    let my_script_hex = my_script
+        .as_ref()
+        .map(|s| s.to_hex_string())
+        .unwrap_or_default();
+    let dream = Memo::new(move |_| {
+        let (Some(w), Some(script)) = (wallet, my_script.as_ref()) else {
+            return None;
+        };
+        let snap = w.snapshot()?;
+        let held = w.held();
+        Some(snap.balances(script, &held).dream)
+    });
+    Effect::new(move |_| {
+        let Some(w) = wallet else { return };
+        let Some(snap) = w.snapshot() else { return };
+        let Some(f) = live.finished.get() else { return };
+        if !matches!(f.pay, Pay::Awaiting { .. }) {
+            return;
+        }
+        let paid = snap.txs.iter().rev().find(|t| {
+            t.hand_root.as_deref() == Some(f.root.as_str())
+                && t.outs
+                    .iter()
+                    .any(|o| o.script == my_script_hex && o.dream > 0)
+        });
+        if let Some(t) = paid {
+            live.received(&f.root, &t.txid);
+        }
+    });
+
+    let in_play = Memo::new(move |_| live.hand.get().is_some_and(|h| h.view.phase == "act"));
+    let my_turn = Memo::new(move |_| {
+        live.hand
+            .get()
+            .is_some_and(|h| h.view.phase == "act" && h.view.to_act == h.seat as i32)
+    });
+    let hero_act = move |choice: Choice| {
+        if my_turn.get_untracked() && !live.busy.get_untracked() {
+            live.act(choice);
+        }
+    };
+    let keys = window_event_listener(ev::keydown, move |e: web_sys::KeyboardEvent| {
+        if e.ctrl_key() || e.meta_key() || e.alt_key() || e.repeat() || typing_into_field(&e) {
+            return;
+        }
+        let key = e.key();
+        if !in_play.get_untracked() {
+            if (key == "Enter" || key == "1")
+                && live.offer.get_untracked().is_some()
+                && !live.busy.get_untracked()
+                && live.waiting.get_untracked().is_none()
+            {
+                e.prevent_default();
+                live.sit();
+            }
+            return;
+        }
+        let choice = match key.as_str() {
+            "1" | "f" | "F" => Choice::Fold,
+            "2" | "c" | "C" => Choice::Passive,
+            "3" | "r" | "R" => Choice::Aggressive,
+            _ => return,
+        };
+        e.prevent_default();
+        hero_act(choice);
+    });
+    on_cleanup(move || keys.remove());
+
+    let stake_select = move || {
+        let tables = live.offer.get().map(|o| o.tables).unwrap_or_default();
+        let chosen = live.stake_bb.get();
+        tables
+            .into_iter()
+            .map(|t| {
+                let label = format!("{} — buy-in {} DREAM", t.label, t.buyin);
+                view! { <option value=t.bb.to_string() selected=move || chosen == t.bb>{label}</option> }
+            })
+            .collect_view()
+    };
+    let chosen_buyin = Memo::new(move |_| {
+        let bb = live.stake_bb.get();
+        live.offer
+            .get()
+            .and_then(|o| o.tables.into_iter().find(|t| t.bb == bb).map(|t| t.buyin))
+            .unwrap_or(0)
+    });
+    let can_sit = Memo::new(move |_| {
+        !in_play.get()
+            && !live.busy.get()
+            && live.offer.get().is_some()
+            && live.waiting.get().is_none()
+            && dream.get().is_some_and(|d| d >= chosen_buyin.get())
+    });
+
+    let opponent_label = move |h: &crate::poker::live::LiveHand| -> (String, Option<String>) {
+        if h.house {
+            let o = live.offer.get_untracked();
+            (
+                o.as_ref()
+                    .map(|o| o.name.clone())
+                    .unwrap_or_else(|| "House".into()),
+                o.map(|o| format!("the house · plays {}", o.profile)),
+            )
+        } else {
+            (
+                h.opponent.clone(),
+                Some("a member · the house deals".into()),
+            )
+        }
+    };
+
+    let board = move || {
+        let cards = live
+            .hand
+            .get()
+            .map(|h| h.view.board.clone())
+            .or_else(|| live.finished.get().map(|f| f.view.board.clone()))
+            .unwrap_or_default();
+        board_of(&cards)
+    };
+
+    let bar = move || {
+        let l = live.hand.get().and_then(|h| legal_of_view_live(&h));
+        action_bar(l, in_play.get() && !my_turn.get(), hero_act)
+    };
+
+    let story = move || {
+        let (log, seat, names) = match (live.hand.get(), live.finished.get()) {
+            (Some(h), _) => {
+                let names = seat_names(h.seat, &h.opponent, h.house, live);
+                (h.log, h.seat, names)
+            }
+            (None, Some(f)) => {
+                let names = seat_names(f.seat, &f.opponent, f.house, live);
+                (f.log, f.seat, names)
+            }
+            _ => return ().into_any(),
+        };
+        narration(&log, &names, seat)
+    };
+
+    let settlement = move || {
+        let Some(f) = live.finished.get() else {
+            return ().into_any();
+        };
+        let tone = net_tone(f.net);
+        let verified = match &f.verified {
+            Ok(()) => view! { <p class="text-xs text-green-400">"Replay verified: committed shuffle, your nonce, the record, and the house's play ✓"</p> }.into_any(),
+            Err(e) => view! { <p class="text-xs text-red-400">"Replay did not verify: "{e.clone()}</p> }.into_any(),
+        };
+        let pay = match &f.pay {
+            Pay::Split => view! { <p class="text-xs text-gray-400">"Split pot: nothing moves."</p> }.into_any(),
+            Pay::Sent(txid) => view! { <p class="text-xs text-gray-300">"You paid "<span class="font-mono">{f.net.unsigned_abs()}</span>" DREAM — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
+            Pay::Received(txid) => view! { <p class="text-xs text-green-300">"Paid to you — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
+            Pay::Awaiting { amount } => view! { <p class="text-xs text-amber-300">"You are owed "{*amount}" DREAM; waiting for the chain to show it."</p> }.into_any(),
+            Pay::Owed { amount, error, .. } => {
+                let amount = *amount;
+                view! {
+                    <div class="flex items-center gap-3 flex-wrap">
+                        <p class="text-xs text-amber-300">"You owe "{amount}" DREAM for this hand."</p>
+                        <button
+                            class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-gray-900"
+                            on:click=move |_| live.pay_now()
+                        >
+                            "Pay now"
+                        </button>
+                        {error.clone().map(|e| view! { <p class="text-xs text-red-400">{e}</p> })}
+                    </div>
+                }.into_any()
+            }
+        };
+        view! {
+            <div class="rounded-lg bg-gray-800/70 p-3 text-sm space-y-1">
+                <p class="text-gray-100">{f.text.clone()}</p>
+                <p class=format!("font-mono {tone}")>{poker::signed(f.net)}" DREAM this hand"</p>
+                {verified}
+                {pay}
+                <p class="font-mono text-[10px] text-gray-500 break-all">"hand:"{f.root.clone()}</p>
+            </div>
+        }
+        .into_any()
+    };
+
+    let present_list = move || {
+        let Some(o) = live.offer.get() else {
+            return ().into_any();
+        };
+        if o.present.is_empty() {
+            return view! { <p class="text-xs text-gray-500">"No other members at the table right now. Invite someone: schedule a game, or send them the link."</p> }.into_any();
+        }
+        o.present
+            .into_iter()
+            .map(|pk| {
+                let pk2 = pk.clone();
+                view! {
+                    <li class="flex items-center justify-between gap-2 text-sm">
+                        <span class="text-gray-200 truncate"><Name pubkey=pk.clone() /></span>
+                        <button
+                            class="px-2 py-1 rounded text-xs font-semibold bg-gray-700 hover:bg-gray-600 text-amber-300 disabled:opacity-50"
+                            prop:disabled=move || !can_sit.get()
+                            on:click=move |_| live.challenge(&pk2)
+                        >
+                            "Challenge"
+                        </button>
+                    </li>
+                }
+            })
+            .collect_view()
+            .into_any()
+    };
+
+    let challenges = move || {
+        live.challenges
+            .get()
+            .into_iter()
+            .map(|c| {
+                let accept = c.commit.clone();
+                let decline = c.commit.clone();
+                view! {
+                    <div class="rounded-lg bg-amber-900/30 border border-amber-500/40 p-3 text-sm space-y-2">
+                        <p class="text-gray-100"><Name pubkey=c.from.clone() />" challenges you: "{c.bb / 2}"/"{c.bb}", buy-in "{c.buyin}" DREAM."</p>
+                        <div class="flex gap-2">
+                            <button
+                                class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-gray-900 disabled:opacity-50"
+                                prop:disabled=move || dream.get().is_none_or(|d| d < c.buyin)
+                                on:click=move |_| live.accept(&accept)
+                            >
+                                "Accept"
+                            </button>
+                            <button
+                                class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-gray-700 hover:bg-gray-600 text-gray-100"
+                                on:click=move |_| live.decline(&decline)
+                            >
+                                "Decline"
+                            </button>
+                        </div>
+                    </div>
+                }
+            })
+            .collect_view()
+    };
+
+    view! {
+        <div class="max-w-5xl mx-auto px-4 py-6 space-y-4">
+            <div class="flex items-start justify-between gap-4 flex-wrap">
+                <div>
+                    <h1 class="text-2xl font-bold text-white">"DREAM table"</h1>
+                    <p class="text-sm text-gray-400">
+                        "Heads-up limit hold'em for DREAM on sidestr:dreamlab (testnet, no value). The house deals every hand; the loser pays the winner one transfer."
+                    </p>
+                </div>
+                <div class="text-right text-sm text-gray-300">
+                    <p>"Your DREAM: "<span class="font-mono text-amber-300">{move || dream.get().map(|d| d.to_string()).unwrap_or_else(|| "…".into())}</span></p>
+                    <A href=base_href("/wallet") attr:class="text-xs text-amber-400 hover:text-amber-300 underline">"Wallet"</A>
+                </div>
+            </div>
+
+            {move || live.error.get().map(|e| view! {
+                <p class="text-sm text-red-400" role="alert">{e}</p>
+            })}
+            {move || live.notice.get().map(|n| view! {
+                <p class="text-sm text-gray-300">{n}</p>
+            })}
+            {challenges}
+
+            <div class="grid gap-4 lg:grid-cols-3">
+                <div class="lg:col-span-2 space-y-4">
+                    <div class="glass-card p-4 sm:p-6 space-y-4">
+                        {move || {
+                            let (view_now, seat, label, blurb) = match (live.hand.get(), live.finished.get()) {
+                                (Some(h), _) => {
+                                    let (label, blurb) = opponent_label(&h);
+                                    (Some(h.view), h.seat, label, blurb)
+                                }
+                                (None, Some(f)) => {
+                                    let label = if f.house {
+                                        live.offer.get_untracked().map(|o| o.name).unwrap_or_else(|| "House".into())
+                                    } else {
+                                        f.opponent.clone()
+                                    };
+                                    (Some(f.view), f.seat, label, None)
+                                }
+                                _ => (None, 0, String::new(), None),
+                            };
+                            match view_now {
+                                Some(v) => {
+                                    let other = 1 - seat;
+                                    let label_view = if label.len() == 64 {
+                                        crate::components::user_display::use_display_name(&label)
+                                    } else {
+                                        label.clone()
+                                    };
+                                    view! {
+                                        {seat_panel(&v, other, label_view, blurb, "DREAM")}
+                                        <div class="flex flex-col items-center gap-2 py-2">
+                                            <div class="flex gap-1.5 sm:gap-2">{board()}</div>
+                                            <p class="text-sm text-gray-300">
+                                                "Pot "<span class="font-mono text-amber-300">{v.pot}</span>
+                                                <span class="text-gray-500">" · "{v.street.clone()}</span>
+                                            </p>
+                                        </div>
+                                        {seat_panel(&v, seat, "You".to_string(), None, "DREAM")}
+                                    }.into_any()
+                                }
+                                None => view! {
+                                    <div class="rounded-xl bg-gray-900/60 p-4 ring-1 ring-gray-700/50 text-sm text-gray-400">
+                                        {move || match live.offer.get() {
+                                            Some(o) => format!("{} deals. Tables: {}.", o.name, o.tables.iter().map(|t| t.label.clone()).collect::<Vec<_>>().join(", ")),
+                                            None => "Reaching the house…".to_string(),
+                                        }}
+                                    </div>
+                                }.into_any(),
+                            }
+                        }}
+
+                        {settlement}
+                        {bar}
+
+                        <Show when=move || !in_play.get()>
+                            <div class="flex items-center gap-3 flex-wrap">
+                                <label class="text-sm text-gray-300 flex items-center gap-2">
+                                    "Stakes"
+                                    <select
+                                        class="bg-gray-800 border border-gray-600 focus:border-amber-500 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:ring-1 focus:ring-amber-500"
+                                        on:change=move |ev| {
+                                            if let Ok(bb) = event_target_value(&ev).parse::<u64>() {
+                                                live.stake_bb.set(bb);
+                                            }
+                                        }
+                                        aria-label="Stakes"
+                                    >
+                                        {stake_select}
+                                    </select>
+                                </label>
+                                <button
+                                    class="flex-1 min-w-[10rem] px-4 py-3 rounded-lg font-semibold text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 transition-colors disabled:opacity-50"
+                                    prop:disabled=move || !can_sit.get()
+                                    on:click=move |_| live.sit()
+                                >
+                                    {move || if live.busy.get() { "Dealing…" } else if live.finished.get().is_some() { "Next hand against the house" } else { "Sit against the house" }}
+                                    <span class="ml-2 text-[10px] opacity-60 font-mono">"Enter"</span>
+                                </button>
+                            </div>
+                            {move || live.waiting.get().map(|w| view! {
+                                <p class="text-sm text-amber-300">"Waiting for "<Name pubkey=w.opponent.clone() />" to accept your challenge…"</p>
+                            })}
+                            {move || (dream.get().is_some_and(|d| d < chosen_buyin.get())).then(|| view! {
+                                <p class="text-xs text-amber-300">"This table's buy-in is "{chosen_buyin.get()}" DREAM; ask the faucet from your wallet."</p>
+                            })}
+                        </Show>
+                        <Show when=move || in_play.get()>
+                            <button
+                                class="text-xs text-gray-500 hover:text-red-300 underline"
+                                on:click=move |_| live.leave_hand()
+                            >
+                                "Fold and leave the hand"
+                            </button>
+                        </Show>
+
+                        <p class="text-xs text-gray-500">
+                            "Keys: 1 / F fold · 2 / C check or call · 3 / R bet or raise · Enter sit"
+                        </p>
+                    </div>
+
+                    <div class="glass-card p-4 text-xs space-y-2">
+                        <h2 class="text-sm font-semibold text-white">"Fair deal"</h2>
+                        <p class="text-gray-400">"The house commits to a secret before you sit; your browser adds a nonce; the deck is sha256(secret ‖ nonces). When the hand ends the secret is revealed and this page replays the whole hand with its own engine, checks every house action against the bot's book, and only then settles."</p>
+                        {move || live.finished.get().map(|f| view! {
+                            <p class="font-mono text-gray-500 break-all">"seed "{f.seed.clone()}</p>
+                        })}
+                    </div>
+                </div>
+
+                <div class="space-y-4">
+                    {session_card(live.hands_played, live.session_net, "DREAM")}
+                    <div class="glass-card p-4 space-y-2">
+                        <h2 class="text-sm font-semibold text-white">"At the table"</h2>
+                        <ul class="space-y-1">{present_list}</ul>
+                        <p class="text-[10px] text-gray-500">"House: "<span class="font-mono break-all">{citizen_pk.get_value()}</span></p>
+                    </div>
+                    <div class="glass-card p-4 space-y-2">
+                        <h2 class="text-sm font-semibold text-white">"This hand"</h2>
+                        <ul class="text-xs text-gray-400 space-y-0.5">{story}</ul>
+                    </div>
+                    {history_card(live.history, "DREAM")}
+                    {move || live.offer.get().filter(|o| !o.owed.is_empty() || !o.owing.is_empty()).map(|o| view! {
+                        <div class="glass-card p-4 space-y-1 text-xs">
+                            <h2 class="text-sm font-semibold text-white">"Open settlements"</h2>
+                            {o.owed.iter().map(|d| view! { <p class="text-amber-300">"You owe "{d.amount}" DREAM for hand "{d.root[..12].to_string()}"…"</p> }).collect_view()}
+                            {o.owing.iter().map(|d| view! { <p class="text-gray-300">"The house owes you "{d.amount}" DREAM for hand "{d.root[..12].to_string()}"…"</p> }).collect_view()}
+                        </div>
+                    })}
+                </div>
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
+/// The display names for a live hand's two seats: "You" and the opponent
+/// (the house character's name for the house).
+fn seat_names(seat: u32, opponent: &str, house: bool, live: LiveStore) -> Vec<String> {
+    let other = if house {
+        live.offer
+            .get_untracked()
+            .map(|o| o.name)
+            .unwrap_or_else(|| "House".into())
+    } else {
+        opponent.to_string()
+    };
+    (0..2)
+        .map(|i| {
+            if i == seat {
+                "You".to_string()
+            } else {
+                other.clone()
+            }
+        })
+        .collect()
+}
+
+fn legal_of_view_live(h: &crate::poker::live::LiveHand) -> Option<Legal> {
+    poker::legal_of_view(&h.view)
 }

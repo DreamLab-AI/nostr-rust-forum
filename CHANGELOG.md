@@ -7,6 +7,34 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: the DREAM table — a house seat that holds its own key, hands between members, scheduled games — 2026-10-03
+
+ADR-2020. The poker table now plays for DREAM on `sidestr:dreamlab`, against a
+house seat or against another member with the house dealing, and settles each
+hand with one chain transfer carrying `hand:<root>`. Scheduled games are NIP-52
+calendar events tagged `poker` with invited players, each invitee DM'd the time
+and the table's link.
+
+- `nostr-bbs-poker` (new, pure, wasm32 and native): the Libre Poker engine and
+  bots ported to Rust and held byte-for-byte to the JavaScript on 160 recorded
+  hands; the two-party committed shuffle; the settlement rules (moved from the
+  client's `wallet::poker`); the HAND.md record; the member↔house protocol
+  (gift-wrapped rumors of kind 20779); replay verification over an abstract
+  engine.
+- `nostr-bbs-poker-citizen` (new): the house seat. Pure table state machine
+  and JSON ledger; a native service joining the forum relay (NIP-42), the
+  chain's producer, and the clock. Presence, challenges between members, a
+  daily payout cap, debts cleared only by the chain.
+- Forum client: a DREAM table beside the practice one, offered where
+  `POKER_CONFIG.citizen_pubkey` names a house; replay verification with the
+  browser's own engine before any settlement; the wallet pays a lost hand at
+  once; a "Schedule a game" modal (admins and moderators, as calendar events
+  are) with member invitations; poker events on the events page link to the
+  table. The client's engine types are now the shared crate's.
+- `nostr-bbs-core`: gift wrap takes the rumor kind (`gift_wrap_kind`,
+  `unwrap_gift_kind`, signer variants); `CalendarEventSpec` with participants
+  and hashtags.
+
 ### Added: a practice poker table behind three gates — 2026-10-02
 
 Heads-up limit hold'em against a house bot at `/table`, in practice chips:
