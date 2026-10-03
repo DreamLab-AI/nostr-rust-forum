@@ -6,13 +6,16 @@
 //! route: the operator set `window.__ENV__.POKER = "on"`, the member wallet is
 //! on (`window.__ENV__.SIDESTR_WALLET`), and the member ticked "Poker table" in
 //! Settings → Games. The practice table plays chips that are worth nothing;
-//! the DREAM table ([`money_enabled`]) needs the operator to name a house seat
-//! (`POKER_CONFIG.citizen_pubkey`) and settles each hand on the chain.
+//! an asset table ([`asset_tables`]) — the DREAM table, the BLAKES7 table —
+//! is offered for each wallet chain that has an asset named and a house seat
+//! (`POKER_CONFIG.citizens`, ADR-2021), and settles each hand on that chain.
 //!
 //! The engine types are [`nostr_bbs_poker::engine`]'s, shared with the house
 //! seat; they serialise to the JavaScript engine's JSON, so the practice table
 //! passes the engine's own state back verbatim ([`HandState`]) and the live
 //! table reads the house's seat views unchanged.
+
+use std::collections::BTreeMap;
 
 use leptos::prelude::*;
 use serde::de::DeserializeOwned;
@@ -21,6 +24,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::stores::preferences::use_preferences;
 use crate::utils::relay_url::env_override;
+use crate::wallet::chain;
+use crate::wallet::profile::{self, ChainProfile};
 
 pub mod live;
 
@@ -130,9 +135,11 @@ pub struct PokerConfig {
     pub buyin_bb: u64,
     /// The house bot's profile name (`rock`, `tag`, `lag`, `station`, `maniac`).
     pub bot_profile: String,
-    /// The house seat's pubkey (64 lowercase hex), once the operator runs one;
-    /// `None` leaves only the practice table.
+    /// The house seat of `sidestr:dreamlab` (64 lowercase hex): the key the
+    /// operator named before there were two chains, still honoured there.
     pub citizen_pubkey: Option<String>,
+    /// The house seat of each chain, by chain id (`[poker] citizens`).
+    pub citizens: BTreeMap<String, String>,
 }
 
 impl Default for PokerConfig {
@@ -142,6 +149,7 @@ impl Default for PokerConfig {
             buyin_bb: DEFAULT_BUYIN_BB,
             bot_profile: DEFAULT_BOT_PROFILE.to_string(),
             citizen_pubkey: None,
+            citizens: BTreeMap::new(),
         }
     }
 }
@@ -167,18 +175,31 @@ impl PokerConfig {
     /// Read `window.__ENV__.POKER_CONFIG`, supplied either as a JSON string or
     /// as an already-parsed object.
     pub fn load() -> Self {
-        env_json("POKER_CONFIG")
+        crate::utils::relay_url::env_override_json("POKER_CONFIG")
             .map(|j| Self::from_json(&j))
             .unwrap_or_default()
     }
 
-    /// The house seat's pubkey, when it is a well-formed one.
-    pub fn citizen(&self) -> Option<String> {
-        self.citizen_pubkey
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .filter(|pk| nostr_bbs_poker::fair::is_hex64(pk))
+    /// The house seat of `chain_id`, when a well-formed one is named: its
+    /// `citizens` entry first, then `entry` (the chain's `SIDESTR_CHAINS`
+    /// `citizen_pubkey`), then, for `sidestr:dreamlab` only, the scalar
+    /// `citizen_pubkey`.
+    pub fn citizen_for(&self, chain_id: &str, entry: Option<&str>) -> Option<String> {
+        let well_formed = |pk: &str| {
+            let pk = pk.trim().to_ascii_lowercase();
+            nostr_bbs_poker::fair::is_hex64(&pk).then_some(pk)
+        };
+        let legacy = (chain_id == chain::CHAIN_ID)
+            .then_some(self.citizen_pubkey.as_deref())
+            .flatten();
+        [
+            self.citizens.get(chain_id).map(String::as_str),
+            entry,
+            legacy,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(well_formed)
     }
 
     /// The tables on offer: every distinct big blind of at least 2 (so the
@@ -209,27 +230,43 @@ impl PokerConfig {
     }
 }
 
-/// Whether this deployment runs a house seat: the DREAM table is offered.
-pub fn money_enabled() -> bool {
-    PokerConfig::load().citizen().is_some()
+/// One asset table: a wallet chain with an asset named, and its house seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetTable {
+    /// The chain the table settles on.
+    pub profile: &'static ChainProfile,
+    /// The house seat's pubkey.
+    pub citizen: String,
 }
 
-/// A `window.__ENV__` value as JSON text, whether the deployment injected a
-/// string or an object.
-fn env_json(key: &str) -> Option<String> {
-    let window = web_sys::window()?;
-    let env = js_sys::Reflect::get(&window, &"__ENV__".into()).ok()?;
-    if env.is_undefined() || env.is_null() {
-        return None;
+impl AssetTable {
+    /// The table's heading: "DREAM table", "BLAKES7 table".
+    pub fn title(&self) -> String {
+        format!("{} table", self.profile.label)
     }
-    let val = js_sys::Reflect::get(&env, &key.into()).ok()?;
-    if let Some(s) = val.as_string() {
-        return (!s.trim().is_empty()).then_some(s);
-    }
-    if val.is_object() {
-        return js_sys::JSON::stringify(&val).ok()?.as_string();
-    }
-    None
+}
+
+/// The asset tables `config` offers over the wallet's chains, in the
+/// wallet's order: one for each chain that has an asset named and a house
+/// seat. A chain without an asset (BLAKES7 before its issue is named) has
+/// no table.
+pub fn asset_tables_of(config: &PokerConfig, profiles: &'static [ChainProfile]) -> Vec<AssetTable> {
+    profiles
+        .iter()
+        .filter(|p| p.asset().is_some())
+        .filter_map(|p| {
+            let citizen = config.citizen_for(p.id, p.citizen_pubkey.as_deref())?;
+            Some(AssetTable {
+                profile: p,
+                citizen,
+            })
+        })
+        .collect()
+}
+
+/// The asset tables this deployment offers.
+pub fn asset_tables() -> Vec<AssetTable> {
+    asset_tables_of(&PokerConfig::load(), profile::profiles())
 }
 
 // -- Engine state -------------------------------------------------------------
@@ -730,7 +767,7 @@ mod tests {
             r#"{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null}"#,
         );
         assert_eq!(c, PokerConfig::default());
-        assert_eq!(c.citizen(), None);
+        assert_eq!(c.citizen_for(chain::CHAIN_ID, None), None);
         let s = c.stakes();
         assert_eq!(s.len(), 5);
         assert_eq!(
@@ -765,11 +802,82 @@ mod tests {
         );
         let housed =
             PokerConfig::from_json(&format!(r#"{{"citizen_pubkey":" {} "}}"#, "AB".repeat(32)));
-        assert_eq!(housed.citizen().as_deref(), Some("ab".repeat(32).as_str()));
         assert_eq!(
-            PokerConfig::from_json(r#"{"citizen_pubkey":"nope"}"#).citizen(),
+            housed.citizen_for(chain::CHAIN_ID, None).as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        // the scalar is sidestr:dreamlab's house seat, never another chain's
+        assert_eq!(housed.citizen_for(chain::TXBT4_CHAIN_ID, None), None);
+        assert_eq!(
+            PokerConfig::from_json(r#"{"citizen_pubkey":"nope"}"#)
+                .citizen_for(chain::CHAIN_ID, None),
             None
         );
+    }
+
+    /// The `POKER_CONFIG` the config crate projects: `citizens` first, the
+    /// chain's `SIDESTR_CHAINS` entry next, the scalar last (dreamlab only).
+    #[test]
+    fn each_chain_has_its_own_house_seat() {
+        let (a, b, c) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        let cfg = PokerConfig::from_json(&format!(
+            r#"{{"citizen_pubkey":"{a}","citizens":{{"sidestr:dreamlab":"{a}","sidestr:dreamlab-txbt4":"{b}"}}}}"#
+        ));
+        assert_eq!(cfg.citizen_for(chain::CHAIN_ID, Some(&c)), Some(a.clone()));
+        assert_eq!(
+            cfg.citizen_for(chain::TXBT4_CHAIN_ID, Some(&c)),
+            Some(b.clone())
+        );
+        let bare = PokerConfig::default();
+        assert_eq!(
+            bare.citizen_for(chain::TXBT4_CHAIN_ID, Some(&c)),
+            Some(c.clone())
+        );
+        assert_eq!(bare.citizen_for(chain::TXBT4_CHAIN_ID, Some("nope")), None);
+        // a malformed map entry falls through to the next source
+        let bad = PokerConfig::from_json(&format!(
+            r#"{{"citizen_pubkey":"{a}","citizens":{{"sidestr:dreamlab":"nope"}}}}"#
+        ));
+        assert_eq!(bad.citizen_for(chain::CHAIN_ID, None), Some(a));
+    }
+
+    /// One table per chain with an asset and a house seat, in the wallet's
+    /// order; the BLAKES7 chain has none until its asset is named.
+    #[test]
+    fn asset_tables_need_an_asset_and_a_house_seat() {
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let profiles = |json: &str| -> &'static [ChainProfile] {
+            let (list, _) = profile::resolve(Some(json), profile::Legacy::default());
+            Box::leak(list.into_boxed_slice())
+        };
+        let cfg = PokerConfig::from_json(&format!(
+            r#"{{"citizens":{{"sidestr:dreamlab":"{a}","sidestr:dreamlab-txbt4":"{b}"}}}}"#
+        ));
+        let unissued = profiles(r#"[{"id":"sidestr:dreamlab"},{"id":"sidestr:dreamlab-txbt4"}]"#);
+        let t = asset_tables_of(&cfg, unissued);
+        assert_eq!(t.len(), 1);
+        assert_eq!(
+            (t[0].profile.id, t[0].citizen.as_str()),
+            (chain::CHAIN_ID, a.as_str())
+        );
+        assert_eq!(t[0].title(), "DREAM table");
+        let issued = profiles(&format!(
+            r#"[{{"id":"sidestr:dreamlab-txbt4","asset_id":"{}"}},{{"id":"sidestr:dreamlab"}}]"#,
+            "07".repeat(32)
+        ));
+        let t = asset_tables_of(&cfg, issued);
+        assert_eq!(
+            t.iter()
+                .map(|t| (t.profile.id, t.title()))
+                .collect::<Vec<_>>(),
+            [
+                (chain::TXBT4_CHAIN_ID, "BLAKES7 table".to_string()),
+                (chain::CHAIN_ID, "DREAM table".to_string())
+            ]
+        );
+        assert_eq!(t[0].citizen, b);
+        // no house seat named: no table
+        assert!(asset_tables_of(&PokerConfig::default(), issued).is_empty());
     }
 
     #[test]

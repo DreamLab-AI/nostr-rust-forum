@@ -38,6 +38,9 @@ zeroize = { workspace = true }
 # Pure halves only, the same the forum client builds for wasm32.
 sidestr-agent = { version = "0.6", default-features = false }
 sidestr-core = "0.4.2"
+# The BLAKE2b header family (Knots v2 headers), for sidestr:dreamlab-txbt4:
+# already compiled in through sidestr-agent, named here to replay with it.
+sidestr-header = "0.3.1"
 sidestr-wallet = "0.5.3"
 sidestr-nostr = "0.6"
 bitcoin = { version = "0.32", features = ["secp-lowmemory"] }

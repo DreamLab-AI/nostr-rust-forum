@@ -426,7 +426,7 @@ impl LiveStore {
         let outcome = match (self.wallet.get_value(), chain::script_of_hex(to_script)) {
             (Some(w), Some(to)) => {
                 let auth = self.auth.get_value();
-                w.send_dream_for_hand(&auth, to, amount, root).await
+                w.send_asset_for_hand(&auth, to, amount, root).await
             }
             (None, _) => Err("The wallet is switched off.".into()),
             (_, None) => Err("The winner's script is not readable.".into()),

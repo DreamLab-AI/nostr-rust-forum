@@ -322,8 +322,6 @@ pub fn App() -> impl IntoView {
 
     // Provide global context stores
     provide_toasts();
-    // Member wallets on sidestr:dreamlab (ADR-2015); inert unless SIDESTR_WALLET is on.
-    crate::wallet::provide_wallet();
     provide_notifications();
     crate::stores::notifications::provide_notification_store();
     provide_bookmarks();
@@ -334,6 +332,10 @@ pub fn App() -> impl IntoView {
     provide_read_positions();
     provide_mute_store();
     provide_preferences();
+    // Member wallets, one per configured sidestr chain (ADR-2015, ADR-2021);
+    // inert unless SIDESTR_WALLET is on. After the auth store (each wallet
+    // binds to the signed-in member) and the preferences (the chain chosen).
+    crate::wallet::provide_wallet();
     // Per-user reaction emoji. Provided at the root so the picker's list stays
     // in sync across tabs; `use_custom_emoji_store` self-provisions from
     // localStorage without it, so this only adds the cross-tab listener.

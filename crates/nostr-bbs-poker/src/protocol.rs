@@ -51,10 +51,17 @@ pub const RUMOR_KIND: u64 = 20779;
 pub const VERSION: u32 = 1;
 
 /// The asset a table settles in.
+///
+/// A house seat serves one chain, so the asset is always that chain's issued
+/// asset, and protocol 1 names it with the one tag it shipped with: `dream`
+/// is DREAM to the `sidestr:dreamlab` house seat and BLAKES7 to the
+/// `sidestr:dreamlab-txbt4` one (kit ADR-2021). The member's browser sends
+/// it to the house seat of the table it sat at, so the two never meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Asset {
-    /// DREAM, the issued asset on `sidestr:dreamlab`.
+    /// The house seat's chain asset: DREAM on `sidestr:dreamlab`, BLAKES7 on
+    /// `sidestr:dreamlab-txbt4` (wire tag `dream`).
     Dream,
 }
 

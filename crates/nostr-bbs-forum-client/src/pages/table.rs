@@ -5,10 +5,15 @@
 //! the buy-in, the shuffle is committed before the deal (the page shows
 //! SHA-256 of a fresh seed, deals from it, reveals it when the hand ends),
 //! and the bot decides from its own seat's view with randomness derived from
-//! the seed. The **DREAM table** ([`crate::poker::live`]) is played against
-//! the forum's house seat, or against another member the house deals for,
-//! and settles each hand on `sidestr:dreamlab`; it is offered only where the
-//! operator runs a house seat ([`poker::money_enabled`]).
+//! the seed. The **asset tables** ([`crate::poker::live`]) — the DREAM table
+//! on `sidestr:dreamlab`, the BLAKES7 table on `sidestr:dreamlab-txbt4` — are
+//! played against that chain's house seat, or against another member the
+//! house deals for, and settle each hand on their own chain from the
+//! member's wallet on it; one is offered for each chain with an asset and a
+//! house seat ([`poker::asset_tables`], ADR-2021). Each has its own tab and
+//! its own `#<chain>` fragment (`#sidestr-dreamlab-txbt4`), which a
+//! scheduled game links to; one table is open at a time, so one inbox and
+//! one set of keyboard shortcuts are live.
 //!
 //! Either table can be shown in 3D ([`crate::components::table3d`]), a
 //! member's choice kept in the preferences store. The scene renders the same
@@ -30,13 +35,13 @@ use crate::components::table3d::{self, Pick, PickTarget, Table3d, Table3dStatus}
 use crate::components::user_display::use_display_name_memo;
 use crate::poker::live::{LiveStore, Pay};
 use crate::poker::{
-    self, Choice, HandConfig, HandOutcome, HandState, HistoryRow, Legal, RosterEntry, SeatConfig,
-    SeatView, Stake,
+    self, AssetTable, Choice, HandConfig, HandOutcome, HandState, HistoryRow, Legal, RosterEntry,
+    SeatConfig, SeatView, Stake,
 };
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::preferences::{save_preferences, use_preferences};
 use crate::utils::set_timeout_once;
-use crate::wallet::{chain, use_wallet};
+use crate::wallet::{chain, use_wallets};
 
 /// The member's seat at the practice table.
 const HERO: u32 = 0;
@@ -52,8 +57,30 @@ const HISTORY_LEN: usize = 20;
 enum Mode {
     /// Chips that are worth nothing, in the browser.
     Practice,
-    /// DREAM, with the house seat.
-    Dream,
+    /// A chain's asset, with that chain's house seat (the chain id).
+    Chain(&'static str),
+}
+
+/// The fragment that names a table's section of the page.
+fn fragment_of(m: Mode) -> String {
+    match m {
+        Mode::Practice => "practice".to_string(),
+        Mode::Chain(id) => crate::wallet::profile::anchor_of(id),
+    }
+}
+
+/// The table a page fragment names (`#sidestr-dreamlab-txbt4`), else the
+/// first asset table, else the practice table.
+fn opening_mode(tables: &[AssetTable], fragment: &str) -> Mode {
+    let fragment = fragment.trim_start_matches('#');
+    if fragment == "practice" {
+        return Mode::Practice;
+    }
+    tables
+        .iter()
+        .find(|t| t.profile.anchor() == fragment)
+        .or_else(|| tables.first())
+        .map_or(Mode::Practice, |t| Mode::Chain(t.profile.id))
 }
 
 /// The `/table` route: the table where every gate holds, a notice otherwise.
@@ -96,9 +123,22 @@ fn Tables() -> impl IntoView {
     // the schedule modal's invitations are DMs
     crate::dm::provide_dm_store();
     let config = poker::PokerConfig::load();
-    let citizen = config.citizen();
-    let money = poker::money_enabled();
-    let mode = RwSignal::new(if money { Mode::Dream } else { Mode::Practice });
+    let tables = poker::asset_tables();
+    let fragment = web_sys::window()
+        .and_then(|w| w.location().hash().ok())
+        .unwrap_or_default();
+    let mode = RwSignal::new(opening_mode(&tables, &fragment));
+    // the fragment follows the open table, so the address can be shared
+    Effect::new(move |_| {
+        let frag = fragment_of(mode.get());
+        if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
+            let _ = h.replace_state_with_url(
+                &wasm_bindgen::JsValue::NULL,
+                "",
+                Some(&format!("#{frag}")),
+            );
+        }
+    });
     let show_schedule = RwSignal::new(false);
     let zone_access = crate::stores::zone_access::use_zone_access();
     let can_schedule = Memo::new(move |_| zone_access.is_admin.get());
@@ -107,7 +147,7 @@ fn Tables() -> impl IntoView {
     let tier = use_render_tier();
     let backend = Memo::new(move |_| table3d::available_backend(tier.get()));
     let three_d = Memo::new(move |_| prefs.with(|p| p.poker_table_3d) && backend.get().is_some());
-    let tab = move |m: Mode, label: &'static str| {
+    let tab = move |m: Mode, label: String| {
         let active = move || mode.get() == m;
         view! {
             <button
@@ -122,11 +162,12 @@ fn Tables() -> impl IntoView {
             </button>
         }
     };
+    let tables_c = tables.clone();
     view! {
         <div class="max-w-5xl mx-auto px-4 pt-6 flex items-center justify-between gap-3 flex-wrap">
-            <div class="flex gap-2">
-                {money.then(|| tab(Mode::Dream, "DREAM table"))}
-                {tab(Mode::Practice, "Practice chips")}
+            <div class="flex gap-2 flex-wrap">
+                {tables.iter().map(|t| tab(Mode::Chain(t.profile.id), t.title())).collect_view()}
+                {tab(Mode::Practice, "Practice chips".to_string())}
             </div>
             <div class="flex items-center gap-4 flex-wrap">
                 <label
@@ -175,14 +216,16 @@ fn Tables() -> impl IntoView {
         </div>
         {move || match mode.get() {
             Mode::Practice => view! { <PracticeTable /> }.into_any(),
-            Mode::Dream => {
-                let citizen = citizen.clone().unwrap_or_default();
-                view! { <DreamTable citizen=citizen /> }.into_any()
-            }
+            Mode::Chain(id) => match tables_c.iter().find(|t| t.profile.id == id) {
+                Some(t) => view! { <ChainTable table=t.clone() /> }.into_any(),
+                None => view! { <PracticeTable /> }.into_any(),
+            },
         }}
         <Show when=move || show_schedule.get()>
             <ScheduleGameModal
                 stakes=stakes.clone()
+                tables=tables.clone()
+                chosen=match mode.get_untracked() { Mode::Chain(id) => Some(id), Mode::Practice => None }
                 on_close=Callback::new(move |()| show_schedule.set(false))
             />
         </Show>
@@ -511,7 +554,7 @@ fn TableSurface(
     /// The other seat's label.
     #[prop(into)]
     far_name: Signal<String>,
-    /// The chip unit: `chips` or `DREAM`.
+    /// The chip unit: `chips`, or the table's ticker (`DREAM`, `BLAKES7`).
     unit: &'static str,
     /// Set while the scene is still showing what happened.
     busy: RwSignal<bool>,
@@ -1030,7 +1073,7 @@ fn PracticeTable() -> impl IntoView {
     }
 }
 
-// ── The DREAM table ───────────────────────────────────────────────────────────
+// ── The asset tables ──────────────────────────────────────────────────────────
 
 /// A member's name, reactively.
 #[component]
@@ -1039,20 +1082,24 @@ fn Name(#[prop(into)] pubkey: String) -> impl IntoView {
     view! { <span>{move || name.get()}</span> }
 }
 
-/// The DREAM table: hands against the house seat or another member, settled
-/// on the chain.
+/// An asset table: hands against one chain's house seat or another member,
+/// settled on that chain from the member's wallet on it.
 #[component]
-fn DreamTable(citizen: String) -> impl IntoView {
+fn ChainTable(table: AssetTable) -> impl IntoView {
     let auth = use_auth();
     let relay = expect_context::<RelayConnection>();
     let conn_state = relay.connection_state();
     let relay_authed = relay.authenticated();
-    let wallet = use_wallet();
+    let profile = table.profile;
+    let unit: &'static str = &profile.ticker;
+    let citizen = table.citizen.clone();
+    // this chain's wallet, whichever chain the wallet page is showing
+    let wallet = use_wallets().and_then(|w| w.get(profile.id));
     let me = auth.pubkey().get_untracked().unwrap_or_default();
     let Some(signer) = auth.get_signer() else {
         return view! {
             <div class="max-w-2xl mx-auto px-4 py-16 text-center text-gray-400">
-                <p>"Sign in with a key that can sign to play for DREAM."</p>
+                <p>{format!("Sign in with a key that can sign to play for {unit}.")}</p>
             </div>
         }
         .into_any();
@@ -1078,19 +1125,20 @@ fn DreamTable(citizen: String) -> impl IntoView {
         w.ensure_loaded();
     }
 
-    // Our DREAM, and the chain's word on the last hand's payment to us.
+    // Our balance of the asset, and the chain's word on the last hand's
+    // payment to us.
     let my_script = chain::script_of(&me);
     let my_script_hex = my_script
         .as_ref()
         .map(|s| s.to_hex_string())
         .unwrap_or_default();
-    let dream = Memo::new(move |_| {
+    let balance = Memo::new(move |_| {
         let (Some(w), Some(script)) = (wallet, my_script.as_ref()) else {
             return None;
         };
         let snap = w.snapshot()?;
         let held = w.held();
-        Some(snap.balances(script, &held).dream)
+        Some(snap.balances(script, &held).asset)
     });
     Effect::new(move |_| {
         let Some(w) = wallet else { return };
@@ -1103,7 +1151,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
             t.hand_root.as_deref() == Some(f.root.as_str())
                 && t.outs
                     .iter()
-                    .any(|o| o.script == my_script_hex && o.dream > 0)
+                    .any(|o| o.script == my_script_hex && o.asset > 0)
         });
         if let Some(t) = paid {
             live.received(&f.root, &t.txid);
@@ -1158,7 +1206,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
         tables
             .into_iter()
             .map(|t| {
-                let label = format!("{} — buy-in {} DREAM", t.label, t.buyin);
+                let label = format!("{} — buy-in {} {unit}", t.label, t.buyin);
                 view! { <option value=t.bb.to_string() selected=move || chosen == t.bb>{label}</option> }
             })
             .collect_view()
@@ -1176,7 +1224,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
             && !table_busy.get()
             && live.offer.get().is_some()
             && live.waiting.get().is_none()
-            && dream.get().is_some_and(|d| d >= chosen_buyin.get())
+            && balance.get().is_some_and(|d| d >= chosen_buyin.get())
     });
 
     let opponent_label = move |h: &crate::poker::live::LiveHand| -> (String, Option<String>) {
@@ -1256,11 +1304,11 @@ fn DreamTable(citizen: String) -> impl IntoView {
         let text = match (live.hand.get_untracked(), live.finished.get_untracked()) {
             (Some(h), _) => {
                 let names = seat_names(h.seat, &h.opponent, h.house, live);
-                Some(pick_text(p, &h.view, &names, "DREAM"))
+                Some(pick_text(p, &h.view, &names, unit))
             }
             (None, Some(f)) => {
                 let names = seat_names(f.seat, &f.opponent, f.house, live);
-                Some(pick_text(p, &f.view, &names, "DREAM"))
+                Some(pick_text(p, &f.view, &names, unit))
             }
             _ => None,
         };
@@ -1293,14 +1341,14 @@ fn DreamTable(citizen: String) -> impl IntoView {
         };
         let pay = match &f.pay {
             Pay::Split => view! { <p class="text-xs text-gray-400">"Split pot: nothing moves."</p> }.into_any(),
-            Pay::Sent(txid) => view! { <p class="text-xs text-gray-300">"You paid "<span class="font-mono">{f.net.unsigned_abs()}</span>" DREAM — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
+            Pay::Sent(txid) => view! { <p class="text-xs text-gray-300">"You paid "<span class="font-mono">{f.net.unsigned_abs()}</span>" "{unit}" — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
             Pay::Received(txid) => view! { <p class="text-xs text-green-300">"Paid to you — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
-            Pay::Awaiting { amount } => view! { <p class="text-xs text-amber-300">"You are owed "{*amount}" DREAM; waiting for the chain to show it."</p> }.into_any(),
+            Pay::Awaiting { amount } => view! { <p class="text-xs text-amber-300">"You are owed "{*amount}" "{unit}"; waiting for the chain to show it."</p> }.into_any(),
             Pay::Owed { amount, error, .. } => {
                 let amount = *amount;
                 view! {
                     <div class="flex items-center gap-3 flex-wrap">
-                        <p class="text-xs text-amber-300">"You owe "{amount}" DREAM for this hand."</p>
+                        <p class="text-xs text-amber-300">"You owe "{amount}" "{unit}" for this hand."</p>
                         <button
                             class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-gray-900"
                             on:click=move |_| live.pay_now()
@@ -1315,7 +1363,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
         view! {
             <div class="rounded-lg bg-gray-800/70 p-3 text-sm space-y-1">
                 <p class="text-gray-100">{f.text.clone()}</p>
-                <p class=format!("font-mono {tone}")>{poker::signed(f.net)}" DREAM this hand"</p>
+                <p class=format!("font-mono {tone}")>{poker::signed(f.net)}" "{unit}" this hand"</p>
                 {verified}
                 {pay}
                 <p class="font-mono text-[10px] text-gray-500 break-all">"hand:"{f.root.clone()}</p>
@@ -1361,11 +1409,11 @@ fn DreamTable(citizen: String) -> impl IntoView {
                 let decline = c.commit.clone();
                 view! {
                     <div class="rounded-lg bg-amber-900/30 border border-amber-500/40 p-3 text-sm space-y-2">
-                        <p class="text-gray-100"><Name pubkey=c.from.clone() />" challenges you: "{c.bb / 2}"/"{c.bb}", buy-in "{c.buyin}" DREAM."</p>
+                        <p class="text-gray-100"><Name pubkey=c.from.clone() />" challenges you: "{c.bb / 2}"/"{c.bb}", buy-in "{c.buyin}" "{unit}"."</p>
                         <div class="flex gap-2">
                             <button
                                 class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-gray-900 disabled:opacity-50"
-                                prop:disabled=move || dream.get().is_none_or(|d| d < c.buyin)
+                                prop:disabled=move || balance.get().is_none_or(|d| d < c.buyin)
                                 on:click=move |_| live.accept(&accept)
                             >
                                 "Accept"
@@ -1387,13 +1435,13 @@ fn DreamTable(citizen: String) -> impl IntoView {
         <div class="max-w-5xl mx-auto px-4 py-6 space-y-4">
             <div class="flex items-start justify-between gap-4 flex-wrap">
                 <div>
-                    <h1 class="text-2xl font-bold text-white">"DREAM table"</h1>
+                    <h1 class="text-2xl font-bold text-white">{table.title()}</h1>
                     <p class="text-sm text-gray-400">
-                        "Heads-up limit hold'em for DREAM on sidestr:dreamlab (testnet, no value). The house deals every hand; the loser pays the winner one transfer."
+                        {format!("Heads-up limit hold'em for {unit} on {} (testnet, no value). The house deals every hand; the loser pays the winner one transfer.", profile.id)}
                     </p>
                 </div>
                 <div class="text-right text-sm text-gray-300">
-                    <p>"Your DREAM: "<span class="font-mono text-amber-300">{move || dream.get().map(|d| d.to_string()).unwrap_or_else(|| "…".into())}</span></p>
+                    <p>{format!("Your {unit}: ")}<span class="font-mono text-amber-300">{move || balance.get().map(|d| d.to_string()).unwrap_or_else(|| "…".into())}</span></p>
                     <A href=base_href("/wallet") attr:class="text-xs text-amber-400 hover:text-amber-300 underline">"Wallet"</A>
                 </div>
             </div>
@@ -1413,7 +1461,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
                             frame=frame3d
                             near_name=Signal::derive(|| "You".to_string())
                             far_name=far_name
-                            unit="DREAM"
+                            unit=unit
                             busy=table_busy
                             narration=told
                             inspect=inspect
@@ -1444,7 +1492,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
                                         label.clone()
                                     };
                                     view! {
-                                        {seat_panel(&v, other, label_view, blurb, "DREAM")}
+                                        {seat_panel(&v, other, label_view, blurb, unit)}
                                         <div class="flex flex-col items-center gap-2 py-2">
                                             <div class="flex gap-1.5 sm:gap-2">{board()}</div>
                                             <p class="text-sm text-gray-300">
@@ -1452,7 +1500,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
                                                 <span class="text-gray-500">" · "{v.street.clone()}</span>
                                             </p>
                                         </div>
-                                        {seat_panel(&v, seat, "You".to_string(), None, "DREAM")}
+                                        {seat_panel(&v, seat, "You".to_string(), None, unit)}
                                     }.into_any()
                                 }
                                 None => view! {
@@ -1498,8 +1546,8 @@ fn DreamTable(citizen: String) -> impl IntoView {
                             {move || live.waiting.get().map(|w| view! {
                                 <p class="text-sm text-amber-300">"Waiting for "<Name pubkey=w.opponent.clone() />" to accept your challenge…"</p>
                             })}
-                            {move || (dream.get().is_some_and(|d| d < chosen_buyin.get())).then(|| view! {
-                                <p class="text-xs text-amber-300">"This table's buy-in is "{chosen_buyin.get()}" DREAM; ask the faucet from your wallet."</p>
+                            {move || (balance.get().is_some_and(|d| d < chosen_buyin.get())).then(|| view! {
+                                <p class="text-xs text-amber-300">"This table's buy-in is "{chosen_buyin.get()}" "{unit}"; ask the faucet from your wallet."</p>
                             })}
                         </Show>
                         <Show when=move || in_play.get()>
@@ -1526,7 +1574,7 @@ fn DreamTable(citizen: String) -> impl IntoView {
                 </div>
 
                 <div class="space-y-4">
-                    {session_card(live.hands_played, live.session_net, "DREAM")}
+                    {session_card(live.hands_played, live.session_net, unit)}
                     <div class="glass-card p-4 space-y-2">
                         <h2 class="text-sm font-semibold text-white">"At the table"</h2>
                         <ul class="space-y-1">{present_list}</ul>
@@ -1536,12 +1584,12 @@ fn DreamTable(citizen: String) -> impl IntoView {
                         <h2 class="text-sm font-semibold text-white">"This hand"</h2>
                         <ul class="text-xs text-gray-400 space-y-0.5">{story}</ul>
                     </div>
-                    {history_card(live.history, "DREAM")}
+                    {history_card(live.history, unit)}
                     {move || live.offer.get().filter(|o| !o.owed.is_empty() || !o.owing.is_empty()).map(|o| view! {
                         <div class="glass-card p-4 space-y-1 text-xs">
                             <h2 class="text-sm font-semibold text-white">"Open settlements"</h2>
-                            {o.owed.iter().map(|d| view! { <p class="text-amber-300">"You owe "{d.amount}" DREAM for hand "{d.root[..12].to_string()}"…"</p> }).collect_view()}
-                            {o.owing.iter().map(|d| view! { <p class="text-gray-300">"The house owes you "{d.amount}" DREAM for hand "{d.root[..12].to_string()}"…"</p> }).collect_view()}
+                            {o.owed.iter().map(|d| view! { <p class="text-amber-300">"You owe "{d.amount}" "{unit}" for hand "{d.root[..12].to_string()}"…"</p> }).collect_view()}
+                            {o.owing.iter().map(|d| view! { <p class="text-gray-300">"The house owes you "{d.amount}" "{unit}" for hand "{d.root[..12].to_string()}"…"</p> }).collect_view()}
                         </div>
                     })}
                 </div>
@@ -1575,4 +1623,51 @@ fn seat_names(seat: u32, opponent: &str, house: bool, live: LiveStore) -> Vec<St
 
 fn legal_of_view_live(h: &crate::poker::live::LiveHand) -> Option<Legal> {
     poker::legal_of_view(&h.view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::profile;
+
+    fn tables() -> Vec<AssetTable> {
+        let json = format!(
+            r#"[{{"id":"sidestr:dreamlab"}},{{"id":"sidestr:dreamlab-txbt4","asset_id":"{}"}}]"#,
+            "07".repeat(32)
+        );
+        let (list, _) = profile::resolve(Some(&json), profile::Legacy::default());
+        let list: &'static [profile::ChainProfile] = Box::leak(list.into_boxed_slice());
+        list.iter()
+            .map(|p| AssetTable {
+                profile: p,
+                citizen: "aa".repeat(32),
+            })
+            .collect()
+    }
+
+    /// A scheduled game's link opens its chain's table; anything else opens
+    /// the first asset table, and with none the practice table.
+    #[test]
+    fn the_fragment_opens_its_chains_table() {
+        let t = tables();
+        assert_eq!(
+            opening_mode(&t, "#sidestr-dreamlab-txbt4"),
+            Mode::Chain(chain::TXBT4_CHAIN_ID)
+        );
+        assert_eq!(
+            opening_mode(&t, "sidestr-dreamlab"),
+            Mode::Chain(chain::CHAIN_ID)
+        );
+        assert_eq!(opening_mode(&t, ""), Mode::Chain(chain::CHAIN_ID));
+        assert_eq!(opening_mode(&t, "#nonsense"), Mode::Chain(chain::CHAIN_ID));
+        assert_eq!(opening_mode(&t, "#practice"), Mode::Practice);
+        assert_eq!(opening_mode(&[], "#sidestr-dreamlab"), Mode::Practice);
+        for m in [
+            Mode::Practice,
+            Mode::Chain(chain::CHAIN_ID),
+            Mode::Chain(chain::TXBT4_CHAIN_ID),
+        ] {
+            assert_eq!(opening_mode(&t, &fragment_of(m)), m, "round trip");
+        }
+    }
 }

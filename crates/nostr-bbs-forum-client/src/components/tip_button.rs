@@ -1,5 +1,9 @@
-//! DREAM tips on a post (ADR-2015): a chip showing what a post has been
-//! tipped, and, on other members' posts, a tip button with a small popover.
+//! Tips on a post (ADR-2015): a chip showing what a post has been tipped, and,
+//! on other members' posts, a tip button with a small popover. A tip is paid
+//! in the asset of the chain the member chose in their wallet (DREAM on
+//! `sidestr:dreamlab`, BLAKES7 on `sidestr:dreamlab-txbt4`, ADR-2021), and the
+//! chip shows what that chain holds for the post; on a chain with no asset
+//! named it renders nothing.
 //!
 //! Rendered inside the reaction row, so every surface that shows reactions
 //! (channel messages, forum threads, replies) offers tips too. It renders
@@ -7,7 +11,7 @@
 //! loads lazily on first render and is shared across every post, so a page
 //! of fifty posts downloads and validates it once.
 //!
-//! A tip is an ordinary DREAM transfer to the author's npub carrying a
+//! A tip is an ordinary asset transfer to the author's npub carrying a
 //! `tip:nostr:<event id>` record: the chain, not the forum, is where tips
 //! live, so a total is the same for everyone who replays it.
 
@@ -35,7 +39,7 @@ pub(crate) fn grouped(n: u64) -> String {
     out
 }
 
-/// The DREAM mark: a four-point spark.
+/// The wallet's mark, beside every asset figure: a four-point spark.
 pub(crate) fn dream_icon(class: &'static str) -> impl IntoView {
     view! {
         <svg class=class viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" focusable="false">
@@ -54,9 +58,10 @@ pub(crate) fn TipControl(
     #[prop(into)]
     author_pubkey: String,
 ) -> impl IntoView {
-    let Some(wallet) = use_wallet() else {
+    let Some(wallet) = use_wallet().filter(|w| w.has_asset()) else {
         return ().into_any();
     };
+    let ticker = wallet.ticker();
     let author_ok = chain::script_of(&author_pubkey).is_some();
     if !author_ok {
         return ().into_any();
@@ -78,7 +83,7 @@ pub(crate) fn TipControl(
             .is_some_and(|me| me.eq_ignore_ascii_case(&author.get_value()))
     });
     let total = Memo::new(move |_| wallet.tip_total(&eid.get_value()));
-    let my_dream = Memo::new(move |_| {
+    let my_balance = Memo::new(move |_| {
         let me = auth.pubkey().get()?;
         let snap = wallet.snapshot()?;
         let script = chain::script_of(&me)?;
@@ -101,7 +106,7 @@ pub(crate) fn TipControl(
         sending.set(true);
         let event = eid.get_value();
         spawn_local(async move {
-            match wallet.send_dream(&auth, to, amount, Some(event)).await {
+            match wallet.send_asset(&auth, to, amount, Some(event)).await {
                 Ok(_) => {
                     open.set(false);
                     custom.set(String::new());
@@ -109,7 +114,7 @@ pub(crate) fn TipControl(
                         format!(
                             "Tipped {} {} to {}. It confirms in a minute or two.",
                             grouped(amount),
-                            chain::DREAM,
+                            ticker,
                             author_name.get_untracked()
                         ),
                         ToastVariant::Success,
@@ -124,22 +129,22 @@ pub(crate) fn TipControl(
     view! {
         <div class="relative inline-flex items-center gap-1">
             // What the post has been tipped: shown to everyone, own posts included.
-            <Show when=move || { total.get().dream > 0 }>
+            <Show when=move || { total.get().asset > 0 }>
                 <span
                     class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-amber-500/10 border border-amber-500/30 text-amber-300"
                     title=move || {
                         let t = total.get();
                         format!(
                             "{} {} tipped in {} tip{}",
-                            grouped(t.dream),
-                            chain::DREAM,
+                            grouped(t.asset),
+                            ticker,
                             t.count,
                             if t.count == 1 { "" } else { "s" }
                         )
                     }
                 >
                     {dream_icon("w-3 h-3")}
-                    <span class="font-medium">{move || grouped(total.get().dream)}</span>
+                    <span class="font-medium">{move || grouped(total.get().asset)}</span>
                 </span>
             </Show>
 
@@ -148,10 +153,10 @@ pub(crate) fn TipControl(
                 <button
                     class="inline-flex items-center justify-center w-6 h-6 rounded-full text-gray-500 opacity-70 hover:opacity-100 hover:text-amber-400 hover:bg-gray-700/50 focus-visible:opacity-100 focus-visible:text-amber-400 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-400/60 transition-all"
                     on:click=move |_| open.update(|v| *v = !*v)
-                    aria-label=move || format!("Tip {} in DREAM", author_name.get())
+                    aria-label=move || format!("Tip {} in {ticker}", author_name.get())
                     aria-haspopup="dialog"
                     aria-expanded=move || if open.get() { "true" } else { "false" }
-                    title="Tip in DREAM"
+                    title=format!("Tip in {ticker}")
                 >
                     {dream_icon("w-3.5 h-3.5")}
                 </button>
@@ -161,7 +166,7 @@ pub(crate) fn TipControl(
                 <div
                     class="absolute bottom-full right-0 mb-1 glass-card p-3 rounded-xl shadow-lg z-50 w-64 text-sm"
                     role="dialog"
-                    aria-label="Tip in DREAM"
+                    aria-label=format!("Tip in {ticker}")
                     on:keydown=move |ev| if ev.key() == "Escape" { open.set(false) }
                 >
                     <div class="flex items-center justify-between mb-2">
@@ -176,7 +181,7 @@ pub(crate) fn TipControl(
                         if !loaded {
                             return match status {
                                 LoadStatus::Failed(e) => view! {
-                                    <p class="text-xs text-red-300">"The DreamLab chain could not be read: " {e}</p>
+                                    <p class="text-xs text-red-300">{format!("The {} chain could not be read: ", wallet.profile.id)} {e}</p>
                                     <button class="mt-2 text-xs text-amber-400 hover:text-amber-300" on:click=move |_| wallet.reload()>"Try again"</button>
                                 }.into_any(),
                                 _ => view! { <p class="text-xs text-gray-400">"Checking your wallet…"</p> }.into_any(),
@@ -191,10 +196,10 @@ pub(crate) fn TipControl(
                             }.into_any();
                         }
                         let via_extension = wallet.spend_path(&auth) == SpendPath::Extension;
-                        let bal = my_dream.get().unwrap_or_default();
-                        if bal.dream == 0 {
+                        let bal = my_balance.get().unwrap_or_default();
+                        if bal.asset == 0 {
                             return view! {
-                                <p class="text-xs text-gray-400">"You have no DREAM yet. Members can send you some, or ask the faucet from your wallet."</p>
+                                <p class="text-xs text-gray-400">{format!("You have no {ticker} yet. Members can send you some, or ask the faucet from your wallet.")}</p>
                                 <a href=base_href("/wallet") class="mt-2 inline-block text-xs text-amber-400 hover:text-amber-300">"Open wallet →"</a>
                             }.into_any();
                         }
@@ -203,7 +208,7 @@ pub(crate) fn TipControl(
                                 {PRESETS.iter().map(|&n| view! {
                                     <button
                                         class="px-2 py-1.5 rounded-lg bg-gray-700/60 hover:bg-amber-500/20 hover:text-amber-200 text-gray-200 text-xs font-medium transition-colors disabled:opacity-40"
-                                        disabled=move || sending.get() || bal.dream < n
+                                        disabled=move || sending.get() || bal.asset < n
                                         on:click=move |_| send(n)
                                     >
                                         {n}
@@ -227,7 +232,7 @@ pub(crate) fn TipControl(
                                     class="flex-1 min-w-0 bg-gray-800/80 border border-gray-600/60 rounded-lg px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-amber-500/60"
                                     prop:value=move || custom.get()
                                     on:input=move |ev| custom.set(event_target_value(&ev))
-                                    aria-label="Other amount of DREAM"
+                                    aria-label=format!("Other amount of {ticker}")
                                 />
                                 <button
                                     type="submit"
@@ -251,7 +256,7 @@ pub(crate) fn TipControl(
                                 </p>
                             })}
                             <p class="mt-2 text-[11px] leading-snug text-gray-500">
-                                "You have " {grouped(bal.dream)} " DREAM · each tip uses about 200 sats in fees. DREAM is a test token with no cash value."
+                                {format!("You have {} {ticker} · each tip uses about 200 sats in fees. {ticker} is a test token with no cash value.", grouped(bal.asset))}
                             </p>
                         }.into_any()
                     }}

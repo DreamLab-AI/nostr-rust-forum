@@ -166,6 +166,9 @@ uuid = { version = "1", features = ["js"] }
 # clang for wasm32 (the CI runners carry it).
 sidestr-agent = { version = "0.6", default-features = false }
 sidestr-core = "0.4.2"
+# The BLAKE2b header family (Knots v2 headers), for sidestr:dreamlab-txbt4:
+# already compiled in through sidestr-agent, named here to replay with it.
+sidestr-header = "0.3.1"
 sidestr-wallet = "0.5.3"
 sidestr-nostr = "0.6"
 # `secp-lowmemory`: libsecp256k1 with small precomputed tables. Signing a

@@ -174,6 +174,11 @@ pub struct Preferences {
     /// diamonds), so suits are told apart by colour as well as shape.
     #[serde(default)]
     pub poker_four_colour: bool,
+    /// The sidestr chain the wallet shows and spends on, by id, when the
+    /// deployment offers more than one (ADR-2021). `None`, or a chain no
+    /// longer offered, is the deployment's first.
+    #[serde(default)]
+    pub wallet_chain: Option<String>,
 }
 
 /// Visual theme selection.
@@ -309,6 +314,7 @@ impl Default for Preferences {
             poker_table: false,
             poker_table_3d: false,
             poker_four_colour: false,
+            wallet_chain: None,
         }
     }
 }

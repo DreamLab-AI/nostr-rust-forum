@@ -1,6 +1,9 @@
 //! Schedule a poker game: a NIP-52 calendar event (kind 31923) tagged
-//! `poker`, with the invited members as `p` participants, and a direct
-//! message to each of them with the time and the table's link.
+//! `poker`, with the invited members as `p` participants, a `chain` tag
+//! naming the chain whose asset table it is played at (ADR-2021), and a
+//! direct message to each of them with the time and that table's link.
+//! Where more than one asset table is offered the organiser picks the chain;
+//! the table open when the modal was opened is chosen first.
 //!
 //! The event goes to the relay like any other calendar event (the relay
 //! admits calendar events from admins and moderators, ADR-022); the invites
@@ -16,7 +19,7 @@ use crate::components::mention_autocomplete::{
 use crate::components::modal::Modal;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::dm::use_dm_store;
-use crate::poker::Stake;
+use crate::poker::{AssetTable, Stake};
 use crate::relay::RelayConnection;
 
 /// The modal.
@@ -24,6 +27,11 @@ use crate::relay::RelayConnection;
 pub fn ScheduleGameModal(
     /// The tables on offer, for the stakes picker.
     stakes: Vec<Stake>,
+    /// The asset tables on offer, for the chain picker; empty where only the
+    /// practice table runs.
+    tables: Vec<AssetTable>,
+    /// The chain whose table was open, chosen first.
+    chosen: Option<&'static str>,
     /// Called when the modal should close.
     on_close: Callback<()>,
 ) -> impl IntoView {
@@ -40,6 +48,24 @@ pub fn ScheduleGameModal(
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let submitting = RwSignal::new(false);
     let stakes = StoredValue::new(stakes);
+    let several = tables.len() > 1;
+    let chain: RwSignal<Option<&'static str>> = RwSignal::new(
+        chosen
+            .filter(|id| tables.iter().any(|t| t.profile.id == *id))
+            .or_else(|| tables.first().map(|t| t.profile.id)),
+    );
+    let tables = StoredValue::new(tables);
+    // the chosen table's ticker; chips where no asset table runs
+    let unit = move || -> &'static str {
+        let id = chain.get();
+        tables
+            .with_value(|l| {
+                l.iter()
+                    .find(|t| Some(t.profile.id) == id)
+                    .map(|t| t.profile.ticker.as_str())
+            })
+            .unwrap_or("chips")
+    };
 
     let toasts = use_toasts();
     let auth = use_auth();
@@ -87,11 +113,13 @@ pub fn ScheduleGameModal(
             .clamp(15, 24 * 60);
         let end = start + mins * 60;
         let bb = stake_bb.get_untracked();
+        let on_chain = chain.get_untracked();
+        let unit = untrack(unit);
         let stake = stakes.with_value(|s| s.iter().find(|s| s.bb == bb).copied());
         let stakes_line = stake
             .map(|s| {
                 format!(
-                    "Stakes {}/{} DREAM, buy-in {} DREAM per hand.",
+                    "Stakes {}/{} {unit}, buy-in {} {unit} per hand.",
                     s.sb, s.bb, s.buyin
                 )
             })
@@ -114,7 +142,7 @@ pub fn ScheduleGameModal(
         };
         submitting.set(true);
         let relay = relay.clone();
-        let table_link = table_url();
+        let table_link = table_url(on_chain);
         let when = when_text(start);
         wasm_bindgen_futures::spawn_local(async move {
             let spec = nostr_bbs_core::CalendarEventSpec {
@@ -129,7 +157,9 @@ pub fn ScheduleGameModal(
                     .map(|p| (p.pubkey.clone(), "player".to_string()))
                     .collect(),
                 hashtags: vec!["poker".to_string()],
-                extra_tags: Vec::new(),
+                extra_tags: on_chain
+                    .map(|id| vec![("chain".to_string(), id.to_string())])
+                    .unwrap_or_default(),
             };
             let event =
                 match nostr_bbs_core::create_calendar_event_signer_spec(signer.as_ref(), &spec)
@@ -221,6 +251,26 @@ pub fn ScheduleGameModal(
                             <input type="number" min="15" max="1440" class="mt-1 w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm" prop:value=move || minutes.get() on:input=move |ev| minutes.set(event_target_value(&ev)) />
                         </label>
                     </div>
+                    {several.then(|| view! {
+                        <label class="block text-sm text-gray-300">
+                            "Table"
+                            <select
+                                class="mt-1 w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm"
+                                on:change=move |ev| {
+                                    let v = event_target_value(&ev);
+                                    let id = tables.with_value(|l| l.iter().find(|t| t.profile.id == v).map(|t| t.profile.id));
+                                    if id.is_some() {
+                                        chain.set(id);
+                                    }
+                                }
+                            >
+                                {tables.with_value(|list| list.iter().map(|t| {
+                                    let id = t.profile.id;
+                                    view! { <option value=id selected=move || chain.get() == Some(id)>{format!("{} — {}", t.title(), id)}</option> }
+                                }).collect_view())}
+                            </select>
+                        </label>
+                    })}
                     <label class="block text-sm text-gray-300">
                         "Stakes"
                         <select
@@ -232,8 +282,8 @@ pub fn ScheduleGameModal(
                             }
                         >
                             {stakes.with_value(|list| list.iter().map(|s| {
-                                let bb = s.bb;
-                                let label = format!("{}/{} DREAM — buy-in {}", s.sb, s.bb, s.buyin);
+                                let (sb, bb, buyin) = (s.sb, s.bb, s.buyin);
+                                let label = move || format!("{sb}/{bb} {} — buy-in {buyin}", unit());
                                 view! { <option value=bb.to_string() selected=move || stake_bb.get() == bb>{label}</option> }
                             }).collect_view())}
                         </select>
@@ -325,12 +375,16 @@ fn parse_datetime(date: &str, time: &str) -> Option<u64> {
     }
 }
 
-/// The table's absolute URL, for an invitation.
-fn table_url() -> String {
+/// The table's absolute URL, for an invitation: the chosen chain's section
+/// when the game is played at an asset table.
+fn table_url(chain: Option<&str>) -> String {
     let origin = web_sys::window()
         .and_then(|w| w.location().origin().ok())
         .unwrap_or_default();
-    format!("{origin}{}", crate::app::base_href("/table"))
+    let fragment = chain
+        .map(|id| format!("#{}", crate::wallet::profile::anchor_of(id)))
+        .unwrap_or_default();
+    format!("{origin}{}{fragment}", crate::app::base_href("/table"))
 }
 
 /// A time in words for an invitation, in the browser's locale.

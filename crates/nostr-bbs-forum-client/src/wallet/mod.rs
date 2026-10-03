@@ -1,16 +1,24 @@
-//! Member wallets on `sidestr:dreamlab` (testnet4) and DREAM tips (ADR-2015).
+//! Member wallets on the DreamLab sidestr chains, and tips (ADR-2015,
+//! ADR-2021).
 //!
 //! Every member already has a wallet: on a sidestr chain a Nostr key's coins
-//! pay `OP_1 <x-only key>`, so a member's npub *is* their address and anyone
-//! can pay them without the member doing anything first. This module is the
-//! browser half: it downloads the chain from a mirror, validates every block
-//! against the pinned document ([`chain`]), reads DREAM under the SPEC 12
+//! pay `OP_1 <x-only key>`, so a member's npub *is* their address, on every
+//! chain at once, and anyone can pay them without the member doing anything
+//! first. This module is the browser half: it downloads each chain from a
+//! mirror, validates every block against that chain's pinned document
+//! ([`chain`]), reads the chain's asset (DREAM, BLAKES7) under the SPEC 12
 //! assets rule, and signs spends with the member's key in memory, never
 //! sending it anywhere — or, for a member signed in with an extension that
 //! offers `window.nostr.sidestr`, has the extension sign ([`extension`]).
 //! Transactions travel as kind-23500 events, signed by a throwaway key (a
 //! transaction authorises itself, SPEC 11), to the public relays the
-//! producer follows ([`relays`]).
+//! chain's producer follows ([`relays`]).
+//!
+//! There is one [`WalletStore`] per chain the deployment offers
+//! ([`profile`]), each with its own snapshot, pending list, held coins and
+//! persisted state, so the chains never mix; [`Wallets`] holds them all and
+//! the member's choice of chain, which every surface that spends follows
+//! ([`use_wallet`]).
 //!
 //! Off unless the deployment sets `window.__ENV__.SIDESTR_WALLET = "on"`, so
 //! an instance that has not opted in renders exactly as before.
@@ -19,11 +27,12 @@ pub mod chain;
 pub mod extension;
 pub mod parent;
 pub mod poker;
+pub mod profile;
 pub mod relays;
 
 use std::rc::Rc;
 
-use bitcoin::{OutPoint, ScriptBuf};
+use bitcoin::{OutPoint, ScriptBuf, Txid};
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 use serde::{Deserialize, Serialize};
@@ -39,8 +48,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::auth::AuthStore;
+use crate::stores::preferences::{save_preferences, Preferences};
 use crate::utils::relay_url::env_override;
-use chain::{Snapshot, TipTotal};
+use chain::{Pin, Snapshot, TipTotal};
+pub use profile::ChainProfile;
 
 /// Whether the deployment switched the wallet on.
 pub fn enabled() -> bool {
@@ -48,35 +59,6 @@ pub fn enabled() -> bool {
         env_override("SIDESTR_WALLET").as_deref().map(str::trim),
         Some("on" | "true" | "1")
     )
-}
-
-/// The mirror base URL (no trailing slash).
-pub fn mirror() -> String {
-    env_override("SIDESTR_MIRROR")
-        .filter(|m| m.starts_with("https://"))
-        .unwrap_or_else(|| chain::DEFAULT_MIRROR.to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-/// The relays transactions and faucet requests go to.
-pub fn relay_urls() -> Vec<String> {
-    let from_env: Vec<String> = env_override("SIDESTR_RELAYS")
-        .map(|s| {
-            s.split(',')
-                .map(|r| r.trim().to_string())
-                .filter(|r| r.starts_with("wss://"))
-                .collect()
-        })
-        .unwrap_or_default();
-    if from_env.is_empty() {
-        chain::DEFAULT_RELAYS
-            .iter()
-            .map(|r| r.to_string())
-            .collect()
-    } else {
-        from_env
-    }
 }
 
 fn now_secs() -> u64 {
@@ -100,15 +82,16 @@ pub enum LoadStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PendingKind {
-    /// DREAM to someone.
-    Dream,
-    /// DREAM on a post.
+    /// The chain's asset to someone (stored as `dream` before ADR-2021).
+    #[serde(alias = "dream")]
+    Asset,
+    /// The asset on a post.
     Tip,
     /// Sats to someone.
     Sats,
-    /// DREAM and sats together: a starter pack for a member or an agent.
+    /// The asset and sats together: a starter pack for a member or an agent.
     Provision,
-    /// DREAM settling a poker hand (`hand:<root>` beside the tally).
+    /// The asset settling a poker hand (`hand:<root>` beside the tally).
     Hand,
 }
 
@@ -121,8 +104,9 @@ pub struct Pending {
     pub kind: PendingKind,
     /// The recipient's script, hex.
     pub to: String,
-    /// DREAM sent.
-    pub dream: u64,
+    /// Units of the chain's asset sent (stored as `dream` before ADR-2021).
+    #[serde(alias = "dream")]
+    pub asset: u64,
     /// Sats sent (not counting the fee).
     pub sats: u64,
     /// The fee.
@@ -177,9 +161,12 @@ impl Spender {
 /// taken to have been dropped, and its coins are released.
 const PENDING_TTL: u64 = 30 * 60;
 
-/// The wallet's reactive state, provided once at the app root.
+/// One chain's wallet: its reactive state, created once per offered chain
+/// at the app root.
 #[derive(Clone, Copy)]
 pub struct WalletStore {
+    /// The chain this wallet reads and spends on.
+    pub profile: &'static ChainProfile,
     /// Load state.
     pub status: RwSignal<LoadStatus>,
     /// Bumped on each successful load, so views that read the snapshot re-run.
@@ -196,36 +183,104 @@ pub struct WalletStore {
     refresh_armed: StoredValue<bool>,
 }
 
-/// Provide the wallet store; call once, at the app root.
+/// Every chain's wallet, and which one the member is looking at.
+#[derive(Clone, Copy)]
+pub struct Wallets {
+    stores: StoredValue<Vec<WalletStore>>,
+    /// The chosen chain's id.
+    pub selected: RwSignal<&'static str>,
+    prefs: Option<RwSignal<Preferences>>,
+}
+
+impl Wallets {
+    /// Every wallet, in the order the deployment offers the chains.
+    pub fn all(&self) -> Vec<WalletStore> {
+        self.stores.get_value()
+    }
+
+    /// The wallet of `chain_id`, when the deployment offers that chain.
+    pub fn get(&self, chain_id: &str) -> Option<WalletStore> {
+        self.stores
+            .with_value(|l| l.iter().find(|w| w.profile.id == chain_id).copied())
+    }
+
+    /// The chosen chain's wallet, reactively.
+    pub fn current(&self) -> WalletStore {
+        let id = self.selected.get();
+        self.get(id).unwrap_or_else(|| self.first())
+    }
+
+    /// The chosen chain's wallet, without subscribing to the choice.
+    pub fn current_untracked(&self) -> WalletStore {
+        let id = self.selected.get_untracked();
+        self.get(id).unwrap_or_else(|| self.first())
+    }
+
+    fn first(&self) -> WalletStore {
+        // provide_wallet makes one store per profile and profiles() is never empty
+        self.stores.with_value(|l| l[0])
+    }
+
+    /// Whether the member has more than one chain to choose from.
+    pub fn several(&self) -> bool {
+        self.stores.with_value(|l| l.len() > 1)
+    }
+
+    /// Choose a chain, and remember the choice in the preferences.
+    pub fn select(&self, chain_id: &str) {
+        let Some(w) = self.get(chain_id) else {
+            return;
+        };
+        self.selected.set(w.profile.id);
+        if let Some(prefs) = self.prefs {
+            prefs.update(|p| p.wallet_chain = Some(w.profile.id.to_string()));
+            save_preferences(&prefs.get_untracked());
+        }
+    }
+}
+
+/// Provide every chain's wallet; call once, at the app root, after the auth
+/// store and the preferences.
 pub fn provide_wallet() {
-    let store = WalletStore {
-        status: RwSignal::new(LoadStatus::Idle),
-        version: RwSignal::new(0),
-        pending: RwSignal::new(Vec::new()),
-        unlocked: RwSignal::new(false),
-        loaded_at: RwSignal::new(0.0),
-        snapshot: StoredValue::new(None),
-        session_key: StoredValue::new(None),
-        pending_owner: StoredValue::new(String::new()),
-        refresh_armed: StoredValue::new(false),
+    let stores: Vec<WalletStore> = profile::profiles().iter().map(WalletStore::new).collect();
+    let prefs = use_context::<RwSignal<Preferences>>();
+    let remembered = prefs.and_then(|p| p.with_untracked(|p| p.wallet_chain.clone()));
+    let selected = remembered
+        .and_then(|id| stores.iter().find(|w| w.profile.id == id))
+        .unwrap_or(&stores[0])
+        .profile
+        .id;
+    let wallets = Wallets {
+        stores: StoredValue::new(stores.clone()),
+        selected: RwSignal::new(selected),
+        prefs,
     };
-    provide_context(store);
-    // The pending list and any session unlock belong to the signed-in member:
-    // rebind on every sign-in, and forget both on sign-out.
+    provide_context(wallets);
+    // Each pending list and any session unlock belong to the signed-in
+    // member: rebind on every sign-in, and forget both on sign-out.
     if let Some(auth) = use_context::<AuthStore>() {
         Effect::new(move |_| {
             let pk = auth.pubkey().get().unwrap_or_default();
-            store.bind_owner(&pk);
+            for store in &stores {
+                store.bind_owner(&pk);
+            }
         });
     }
 }
 
-/// The wallet store, when the wallet is switched on and provided.
-pub fn use_wallet() -> Option<WalletStore> {
+/// Every chain's wallet, when the wallet is switched on and provided.
+pub fn use_wallets() -> Option<Wallets> {
     if !enabled() {
         return None;
     }
-    use_context::<WalletStore>()
+    use_context::<Wallets>()
+}
+
+/// The wallet of the chain the member chose, when the wallet is switched on
+/// and provided. Read once, where the component is built: a surface that
+/// must follow a change of chain while it is open reads [`use_wallets`].
+pub fn use_wallet() -> Option<WalletStore> {
+    use_wallets().map(|w| w.current_untracked())
 }
 
 /// Fetch `url` as bytes.
@@ -260,11 +315,60 @@ fn random_32() -> Option<[u8; 32]> {
     Some(b)
 }
 
-fn pending_key(owner: &str) -> String {
-    format!("sidestr.pending.{owner}")
+/// Where a member's pending transactions on a chain are kept: namespaced by
+/// chain, so the two chains' lists never mix.
+fn pending_key(chain_id: &str, owner: &str) -> String {
+    format!("sidestr.pending.{chain_id}.{owner}")
+}
+
+/// Where `sidestr:dreamlab`'s list was kept before there were two chains:
+/// read once, moved to [`pending_key`], and removed.
+fn legacy_pending_key(chain_id: &str, owner: &str) -> Option<String> {
+    (chain_id == chain::CHAIN_ID).then(|| format!("sidestr.pending.{owner}"))
 }
 
 impl WalletStore {
+    fn new(profile: &'static ChainProfile) -> Self {
+        Self {
+            profile,
+            status: RwSignal::new(LoadStatus::Idle),
+            version: RwSignal::new(0),
+            pending: RwSignal::new(Vec::new()),
+            unlocked: RwSignal::new(false),
+            loaded_at: RwSignal::new(0.0),
+            snapshot: StoredValue::new(None),
+            session_key: StoredValue::new(None),
+            pending_owner: StoredValue::new(String::new()),
+            refresh_armed: StoredValue::new(false),
+        }
+    }
+
+    /// The chain's lock.
+    pub fn pin(&self) -> &'static Pin {
+        self.profile.pin()
+    }
+
+    /// The asset's ticker.
+    pub fn ticker(&self) -> &'static str {
+        &self.profile.ticker
+    }
+
+    /// Whether this chain has an asset named: without one it shows and sends
+    /// sats only.
+    pub fn has_asset(&self) -> bool {
+        self.profile.asset().is_some()
+    }
+
+    fn asset(&self) -> Result<Txid, String> {
+        self.profile.asset().ok_or_else(|| {
+            format!(
+                "{} has no {} yet; only sats move on it.",
+                self.profile.id,
+                self.ticker()
+            )
+        })
+    }
+
     /// The snapshot, reactively (re-read when a load lands).
     pub fn snapshot(&self) -> Option<Rc<Snapshot>> {
         self.version.track();
@@ -293,9 +397,15 @@ impl WalletStore {
         spawn_local(async move {
             // a query string defeats the CDN's ten-minute cache; the mirror
             // serves the same bytes for any query
-            let url = format!("{}/blocks.dat?t={}", mirror(), now_secs() / 15);
+            let profile = store.profile;
+            let url = format!("{}/blocks.dat?t={}", profile.mirror, now_secs() / 15);
             let result = match fetch_bytes(&url).await {
-                Ok(dat) => chain::replay(&dat, Some(now_secs() as u32)),
+                Ok(dat) => chain::replay(
+                    profile.pin(),
+                    profile.asset(),
+                    &dat,
+                    Some(now_secs() as u32),
+                ),
                 Err(e) => Err(e),
             };
             match result {
@@ -358,12 +468,26 @@ impl WalletStore {
             return;
         }
         self.pending_owner.set_value(pubkey.to_string());
-        let restored: Vec<Pending> = web_sys::window()
-            .and_then(|w| w.local_storage().ok().flatten())
-            .and_then(|s| s.get_item(&pending_key(pubkey)).ok().flatten())
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+        let read = |key: &str| {
+            storage
+                .as_ref()
+                .and_then(|s| s.get_item(key).ok().flatten())
+                .and_then(|t| serde_json::from_str::<Vec<Pending>>(&t).ok())
+        };
+        let id = self.profile.id;
+        let legacy = legacy_pending_key(id, pubkey);
+        let restored = match read(&pending_key(id, pubkey)) {
+            Some(list) => list,
+            None => legacy.as_deref().and_then(read).unwrap_or_default(),
+        };
         self.pending.set(restored);
+        if let (Some(s), Some(old)) = (storage.as_ref(), legacy) {
+            if !pubkey.is_empty() && s.get_item(&old).ok().flatten().is_some() {
+                self.save_pending();
+                let _ = s.remove_item(&old);
+            }
+        }
         self.session_key.set_value(None);
         self.unlocked.set(false);
     }
@@ -377,7 +501,7 @@ impl WalletStore {
             web_sys::window().and_then(|w| w.local_storage().ok().flatten()),
             serde_json::to_string(&self.pending.get_untracked()),
         ) {
-            let _ = s.set_item(&pending_key(&owner), &t);
+            let _ = s.set_item(&pending_key(self.profile.id, &owner), &t);
         }
     }
 
@@ -390,8 +514,8 @@ impl WalletStore {
             .collect()
     }
 
-    /// DREAM tipped on a post, the mirror's count plus this browser's
-    /// pending tips.
+    /// The asset tipped on a post on this chain, the mirror's count plus this
+    /// browser's pending tips.
     pub fn tip_total(&self, event_id: &str) -> TipTotal {
         let mut t = self
             .snapshot()
@@ -399,7 +523,7 @@ impl WalletStore {
             .unwrap_or_default();
         for p in self.pending.get().iter() {
             if p.tip_event.as_deref() == Some(event_id) {
-                t.dream += p.dream;
+                t.asset += p.asset;
                 t.count += 1;
             }
         }
@@ -496,16 +620,16 @@ impl WalletStore {
             return Ok(spend);
         };
         let prevouts = chain::prevouts_for(&spend.tx, coins, me)?;
-        let answer = extension::sign(chain::CHAIN_ID, &unsigned_hex(&spend.tx))
+        let answer = extension::sign(self.profile.id, &unsigned_hex(&spend.tx))
             .await
             .map_err(|r| extension::explain(&r))?;
-        accept_signed(&spend, &answer, &prevouts, &chain::document()?).map_err(|e| {
+        accept_signed(&spend, &answer, &prevouts, &self.pin().document()?).map_err(|e| {
             format!("Your extension's answer was not a valid signature for this transfer, so nothing was sent ({e}).")
         })
     }
 
     async fn deliver(&self, spend: Spend, mut pending: Pending) -> Result<String, String> {
-        let doc = chain::document()?;
+        let doc = self.pin().document()?;
         // the transaction authorises itself (SPEC 11): the event that carries
         // it comes from a throwaway key, so the member is asked once, for the spend
         let secret = random_32().ok_or("This browser has no secure random source.")?;
@@ -513,7 +637,7 @@ impl WalletStore {
         let event = sign_transaction_event(&carrier, &doc.id, &spend.hex, now_secs())
             .map_err(|e| format!("could not sign the event: {e}"))?;
         let json = serde_json::to_string(&event).map_err(|e| e.to_string())?;
-        let (ok, _) = relays::publish_all(&relay_urls(), &json, &event.id).await;
+        let (ok, _) = relays::publish_all(&self.profile.relays, &json, &event.id).await;
         if ok == 0 {
             return Err("No relay took the transaction. Nothing was sent; try again.".into());
         }
@@ -542,8 +666,8 @@ impl WalletStore {
         Ok((snap, spender, me))
     }
 
-    /// Send DREAM, optionally as a tip on a post.
-    pub async fn send_dream(
+    /// Send the chain's asset, optionally as a tip on a post.
+    pub async fn send_asset(
         &self,
         auth: &AuthStore,
         to: ScriptBuf,
@@ -557,15 +681,16 @@ impl WalletStore {
         let kind = if tip_event.is_some() {
             PendingKind::Tip
         } else {
-            PendingKind::Dream
+            PendingKind::Asset
         };
-        self.send_dream_with(auth, to, amount, memos, kind, tip_event, None)
+        self.send_asset_with(auth, to, amount, memos, kind, tip_event, None)
             .await
     }
 
-    /// Settle a poker hand: DREAM to the winner with `hand:<root>` beside
-    /// the tally, so the chain says which hand it paid for.
-    pub async fn send_dream_for_hand(
+    /// Settle a poker hand: the chain's asset to the winner with
+    /// `hand:<root>` beside the tally, so the chain says which hand it paid
+    /// for.
+    pub async fn send_asset_for_hand(
         &self,
         auth: &AuthStore,
         to: ScriptBuf,
@@ -573,7 +698,7 @@ impl WalletStore {
         root: &str,
     ) -> Result<String, String> {
         let memos = vec![nostr_bbs_poker::rules::hand_memo(root)];
-        self.send_dream_with(
+        self.send_asset_with(
             auth,
             to,
             amount,
@@ -586,7 +711,7 @@ impl WalletStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn send_dream_with(
+    async fn send_asset_with(
         &self,
         auth: &AuthStore,
         to: ScriptBuf,
@@ -596,6 +721,7 @@ impl WalletStore {
         tip_event: Option<String>,
         hand_root: Option<String>,
     ) -> Result<String, String> {
+        let asset = self.asset()?;
         let (snap, spender, me) = self.ready(auth)?;
         if to == me {
             return Err("That is your own wallet.".into());
@@ -605,11 +731,11 @@ impl WalletStore {
             .build(|signer| {
                 build_transfer(
                     &TransferRequest {
-                        chain: snap.view.state.document(),
+                        chain: snap.state.document(),
                         coins: &coins,
-                        view: &snap.view.assets,
+                        view: &snap.assets,
                         tip_height: snap.height(),
-                        asset: chain::dream_id(),
+                        asset,
                         to: &to.to_hex_string(),
                         amount,
                         memos: &memos,
@@ -619,7 +745,7 @@ impl WalletStore {
                     &Permissive,
                 )
             })
-            .map_err(explain)?;
+            .map_err(|e| explain(e, self.ticker()))?;
         let spend = self.signed(&spender, t.spend, &coins, &me).await?;
         self.deliver(
             spend,
@@ -627,7 +753,7 @@ impl WalletStore {
                 txid: String::new(),
                 kind,
                 to: to.to_hex_string(),
-                dream: amount,
+                asset: amount,
                 sats: 0,
                 fee: 0,
                 spent: vec![],
@@ -639,7 +765,7 @@ impl WalletStore {
         .await
     }
 
-    /// Send plain sats (never from a DREAM carrier).
+    /// Send plain sats (never from an asset carrier).
     pub async fn send_sats(
         &self,
         auth: &AuthStore,
@@ -651,12 +777,12 @@ impl WalletStore {
             return Err("That is your own wallet.".into());
         }
         let coins = snap.coins(&me, &self.held());
-        let plain = sort_coins(&coins, &snap.view.assets, None).plain;
+        let plain = sort_coins(&coins, &snap.assets, None).plain;
         let spend = spender
             .build(|signer| {
                 build_spend(
                     &SpendRequest {
-                        chain: snap.view.state.document(),
+                        chain: snap.state.document(),
                         coins: &plain,
                         tip_height: snap.height(),
                         to: &to.to_hex_string(),
@@ -667,7 +793,7 @@ impl WalletStore {
                     &Permissive,
                 )
             })
-            .map_err(explain)?;
+            .map_err(|e| explain(e, self.ticker()))?;
         let spend = self.signed(&spender, spend, &coins, &me).await?;
         self.deliver(
             spend,
@@ -675,7 +801,7 @@ impl WalletStore {
                 txid: String::new(),
                 kind: PendingKind::Sats,
                 to: to.to_hex_string(),
-                dream: 0,
+                asset: 0,
                 sats,
                 fee: 0,
                 spent: vec![],
@@ -687,13 +813,13 @@ impl WalletStore {
         .await
     }
 
-    /// Provision a member or an agent: DREAM on a carrier and sats for their
-    /// fees, in one transaction.
+    /// Provision a member or an agent: the chain's asset on a carrier and
+    /// sats for their fees, in one transaction.
     pub async fn provision(
         &self,
         auth: &AuthStore,
         to: ScriptBuf,
-        dream: u64,
+        units: u64,
         sats: u64,
     ) -> Result<String, String> {
         let (snap, spender, me) = self.ready(auth)?;
@@ -702,9 +828,11 @@ impl WalletStore {
         }
         let coins = snap.coins(&me, &self.held());
         let spend = spender
-            .build(|signer| chain::build_provision(&snap, &coins, signer, &to, dream, sats))
+            .build(|signer| {
+                chain::build_provision(&snap, &coins, signer, &to, units, sats, self.ticker())
+            })
             .map_err(|e| match e {
-                chain::ProvisionError::Wallet(w) => explain(w),
+                chain::ProvisionError::Wallet(w) => explain(w, self.ticker()),
                 chain::ProvisionError::Plain(m) => m,
             })?;
         let spend = self.signed(&spender, spend, &coins, &me).await?;
@@ -714,7 +842,7 @@ impl WalletStore {
                 txid: String::new(),
                 kind: PendingKind::Provision,
                 to: to.to_hex_string(),
-                dream,
+                asset: units,
                 sats,
                 fee: 0,
                 spent: vec![],
@@ -726,16 +854,17 @@ impl WalletStore {
         .await
     }
 
-    /// Ask the DreamLab faucet for a starter pack (kind 23501). Signed with a
-    /// throwaway key: the request names only the address to pay.
+    /// Ask this chain's faucet for a starter pack (kind 23501). Signed with a
+    /// throwaway key: the request names only the chain and the address to pay.
     pub async fn request_faucet(&self, pubkey_hex: &str) -> Result<usize, String> {
-        let address = chain::address_of(pubkey_hex).ok_or("No wallet address for this key.")?;
+        let address =
+            chain::address_of(self.pin(), pubkey_hex).ok_or("No wallet address for this key.")?;
         let secret = random_32().ok_or("This browser has no secure random source.")?;
         let signer = SecretKeySigner::from_bytes(&secret).map_err(|e| e.to_string())?;
-        let ev = sign_faucet_request(&signer, chain::CHAIN_ID, &address, now_secs())
+        let ev = sign_faucet_request(&signer, self.profile.id, &address, now_secs())
             .map_err(|e| e.to_string())?;
         let json = serde_json::to_string(&ev).map_err(|e| e.to_string())?;
-        let (ok, _) = relays::publish_all(&relay_urls(), &json, &ev.id).await;
+        let (ok, _) = relays::publish_all(&self.profile.relays, &json, &ev.id).await;
         if ok == 0 {
             return Err("No relay took the request. Try again in a moment.".into());
         }
@@ -751,8 +880,8 @@ impl WalletStore {
     }
 }
 
-/// Wallet errors in words a member can act on.
-pub fn explain(e: sidestr_wallet::Error) -> String {
+/// Wallet errors in words a member can act on; `ticker` names the asset.
+pub fn explain(e: sidestr_wallet::Error, ticker: &str) -> String {
     use sidestr_wallet::Error as E;
     match e {
         E::Insufficient { have, need } => format!(
@@ -761,12 +890,55 @@ pub fn explain(e: sidestr_wallet::Error) -> String {
         E::InsufficientForFee { fee, .. } => {
             format!("Not enough sats left for the fee ({fee} sats).")
         }
-        E::Asset(m) if m.starts_with("holds ") => {
-            format!("Not enough DREAM: you {}.", m.replace("of the asset,", "DREAM,"))
-        }
+        E::Asset(m) if m.starts_with("holds ") => format!(
+            "Not enough {ticker}: you hold {}.",
+            m["holds ".len()..].replace("of the asset,", &format!("{ticker},"))
+        ),
         E::Dust { min, .. } => format!("The smallest payment is {min} sats."),
         E::BadDestination(_) => "That is not a wallet address.".into(),
         E::BadAmount => "Enter an amount above zero.".into(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_lists_are_kept_per_chain() {
+        let me = "ab".repeat(32);
+        let a = pending_key(chain::CHAIN_ID, &me);
+        let b = pending_key(chain::TXBT4_CHAIN_ID, &me);
+        assert_ne!(a, b);
+        assert!(a.contains("sidestr:dreamlab.") && b.contains("sidestr:dreamlab-txbt4."));
+        // only dreamlab inherits the list kept before there were two chains
+        assert_eq!(
+            legacy_pending_key(chain::CHAIN_ID, &me),
+            Some(format!("sidestr.pending.{me}"))
+        );
+        assert_eq!(legacy_pending_key(chain::TXBT4_CHAIN_ID, &me), None);
+        assert_ne!(legacy_pending_key(chain::CHAIN_ID, &me), Some(a));
+    }
+
+    /// A pending list saved before ADR-2021 still reads.
+    #[test]
+    fn a_pending_list_from_before_two_chains_still_reads() {
+        let old = r#"[{"txid":"t","kind":"dream","to":"5120","dream":40,"sats":0,"fee":200,"spent":[],"at":1}]"#;
+        let list: Vec<Pending> = serde_json::from_str(old).unwrap();
+        assert_eq!(list[0].kind, PendingKind::Asset);
+        assert_eq!(list[0].asset, 40);
+        let again = serde_json::to_string(&list).unwrap();
+        assert!(again.contains(r#""kind":"asset""#) && again.contains(r#""asset":40"#));
+    }
+
+    #[test]
+    fn errors_name_the_chains_asset() {
+        let e = explain(
+            // sidestr-wallet 0.5.3 asset.rs: "holds {have} of the asset, {n} asked"
+            sidestr_wallet::Error::Asset("holds 3 of the asset, 5 asked".into()),
+            "BLAKES7",
+        );
+        assert_eq!(e, "Not enough BLAKES7: you hold 3 BLAKES7, 5 asked.");
     }
 }

@@ -1,10 +1,17 @@
-//! `/wallet`: a member's DREAM wallet on the DreamLab test chain (ADR-2015).
+//! `/wallet`: a member's wallet on the DreamLab test chains (ADR-2015,
+//! ADR-2021).
+//!
+//! Where the deployment offers more than one chain, a switcher at the top
+//! chooses which chain's wallet the page shows (DREAM on `sidestr:dreamlab`,
+//! BLAKES7 on `sidestr:dreamlab-txbt4`), remembered in the preferences; the
+//! page below is the same for each, bound to that chain's store.
 //!
 //! One page, top to bottom in the order a member needs it: what I have,
-//! (unlock, if my key lives in an extension), give (DREAM, sats, or a starter
-//! pack that provisions a member or an agent in one transaction), receive,
-//! my agents, what happened, and what this is. Every figure comes from the
-//! chain the browser has just validated; nothing is taken from a server.
+//! (unlock, if my key lives in an extension), give (the chain's asset, sats,
+//! or a starter pack that provisions a member or an agent in one
+//! transaction), receive, my agents, what happened, and what this is. Every
+//! figure comes from the chain the browser has just validated; nothing is
+//! taken from a server.
 
 use bitcoin::OutPoint;
 use leptos::prelude::*;
@@ -21,18 +28,20 @@ use crate::components::user_display::use_display_name_memo;
 use crate::utils::format_relative_time;
 use crate::wallet::chain::{self, Balances, Snapshot};
 use crate::wallet::parent::{self, Maturity, ParentView};
-use crate::wallet::{use_wallet, LoadStatus, Pending, PendingKind, SpendPath, WalletStore};
+use crate::wallet::{
+    use_wallets, LoadStatus, Pending, PendingKind, SpendPath, WalletStore, Wallets,
+};
 
 /// What the give form sends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
-    Dream,
+    Asset,
     Sats,
     Pack,
 }
 
-/// The starter pack: enough DREAM to tip with, enough sats for its fees.
-const PACK_DREAM: u64 = 100;
+/// The starter pack: enough of the asset to tip with, enough sats for its fees.
+const PACK_UNITS: u64 = 100;
 const PACK_SATS: u64 = 2_000;
 /// What a transfer typically costs: shown before review, not charged by it.
 const FEE_HINT: u64 = 250;
@@ -75,7 +84,7 @@ fn Party(#[prop(into)] script: String) -> impl IntoView {
 
 #[component]
 pub fn WalletPage() -> impl IntoView {
-    let Some(wallet) = use_wallet() else {
+    let Some(wallets) = use_wallets() else {
         return view! {
             <div class="max-w-2xl mx-auto px-4 py-16 text-center text-gray-400">
                 <p>"This forum has not switched on member wallets."</p>
@@ -83,7 +92,50 @@ pub fn WalletPage() -> impl IntoView {
         }
         .into_any();
     };
+    // the whole page is one chain's: rebuilt when the member switches chain
+    (move || {
+        let wallet = wallets.current();
+        view! { <ChainWallet wallet=wallet wallets=wallets /> }
+    })
+    .into_any()
+}
+
+/// The chain switcher: one tab per offered chain, its ticker and its parent.
+fn chain_tabs(wallets: Wallets, current: WalletStore) -> impl IntoView {
+    let chip = "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors text-left";
+    view! {
+        <div class="flex gap-1.5 flex-wrap" role="tablist" aria-label="Which chain">
+            {wallets.all().into_iter().map(|w| {
+                let on = w.profile.id == current.profile.id;
+                let id = w.profile.id;
+                view! {
+                    <button
+                        role="tab"
+                        aria-selected=if on { "true" } else { "false" }
+                        class=if on {
+                            format!("{chip} bg-amber-500/20 text-amber-200 border border-amber-500/40")
+                        } else {
+                            format!("{chip} bg-gray-700/40 text-gray-300 border border-transparent hover:bg-gray-700/70")
+                        }
+                        on:click=move |_| wallets.select(id)
+                    >
+                        <span class="block font-semibold">{w.profile.label.clone()}</span>
+                        <span class="block text-[10px] text-gray-400">{format!("{} · beside {}", w.profile.id, w.profile.parent_name)}</span>
+                    </button>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
+/// One chain's wallet.
+#[component]
+fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
     wallet.ensure_loaded();
+    let pin = wallet.pin();
+    let profile = wallet.profile;
+    let ticker = wallet.ticker();
+    let has_asset = wallet.has_asset();
     let auth = use_auth();
     let toasts = use_toasts();
 
@@ -98,21 +150,22 @@ pub fn WalletPage() -> impl IntoView {
             .pending
             .get()
             .iter()
-            .fold((0u64, 0u64), |(d, s), p| (d + p.dream, s + p.sats + p.fee))
+            .fold((0u64, 0u64), |(d, s), p| (d + p.asset, s + p.sats + p.fee))
     });
 
     // ── give form ────────────────────────────────────────────────────────
     let query = use_query_map();
     let mode = RwSignal::new(match query.get_untracked().get("mode").as_deref() {
+        _ if !has_asset => Mode::Sats,
         Some("pack") => Mode::Pack,
         Some("sats") => Mode::Sats,
-        _ => Mode::Dream,
+        _ => Mode::Asset,
     });
     let to_text = RwSignal::new(query.get_untracked().get("to").unwrap_or_default());
     let picked: RwSignal<Option<(String, String)>> = RwSignal::new(None);
     let suggestions: RwSignal<Vec<MentionCandidate>> = RwSignal::new(Vec::new());
     let amount = RwSignal::new(String::new());
-    let pack_dream = RwSignal::new(PACK_DREAM.to_string());
+    let pack_units = RwSignal::new(PACK_UNITS.to_string());
     let pack_sats = RwSignal::new(PACK_SATS.to_string());
     let review = RwSignal::new(false);
     let sending = RwSignal::new(false);
@@ -130,7 +183,7 @@ pub fn WalletPage() -> impl IntoView {
             if t.trim().is_empty() {
                 return Err("Choose who to send to.".into());
             }
-            let s = chain::destination_script(&t)?;
+            let s = chain::destination_script(pin, &t)?;
             let pk = chain::pubkey_of_script(&s);
             Ok((s, pk))
         },
@@ -142,7 +195,11 @@ pub fn WalletPage() -> impl IntoView {
         picked.set(None);
         review.set(false);
         let q = text.trim().to_string();
-        if q.len() < 2 || q.starts_with("npub1") || q.starts_with("drm1") || q.starts_with("did:") {
+        if q.len() < 2
+            || q.starts_with("npub1")
+            || q.starts_with(&format!("{}1", pin.address_prefix))
+            || q.starts_with("did:")
+        {
             suggestions.set(Vec::new());
             return;
         }
@@ -162,17 +219,17 @@ pub fn WalletPage() -> impl IntoView {
         };
         let m = mode.get_untracked();
         let (d, s) = match m {
-            Mode::Dream => (parse(&amount.get_untracked()), 0),
+            Mode::Asset => (parse(&amount.get_untracked()), 0),
             Mode::Sats => (0, parse(&amount.get_untracked())),
             Mode::Pack => (
-                parse(&pack_dream.get_untracked()),
+                parse(&pack_units.get_untracked()),
                 parse(&pack_sats.get_untracked()),
             ),
         };
         sending.set(true);
         spawn_local(async move {
             let r = match m {
-                Mode::Dream => wallet.send_dream(&auth, to, d, None).await,
+                Mode::Asset => wallet.send_asset(&auth, to, d, None).await,
                 Mode::Sats => wallet.send_sats(&auth, to, s).await,
                 Mode::Pack => wallet.provision(&auth, to, d, s).await,
             };
@@ -233,7 +290,7 @@ pub fn WalletPage() -> impl IntoView {
         spawn_local(async move {
             match wallet.request_faucet(&pk).await {
                 Ok(n) => toasts.show(
-                    format!("Asked the DreamLab faucet on {n} relays. A starter pack arrives within a few minutes when it is running; once a day per member."),
+                    format!("Asked the {} faucet on {n} relays. A starter pack arrives within a few minutes when it is running; once a day per member.", profile.id),
                     ToastVariant::Info,
                 ),
                 Err(e) => toasts.show(e, ToastVariant::Error),
@@ -255,41 +312,50 @@ pub fn WalletPage() -> impl IntoView {
                         {dream_icon("w-6 h-6 text-amber-400")}
                         "Wallet"
                     </h1>
-                    <p class="text-sm text-gray-400 mt-1">"DREAM, the community's tipping token, on the DreamLab test chain."</p>
+                    <p class="text-sm text-gray-400 mt-1">
+                        {if has_asset {
+                            format!("{ticker}, the community's tipping token, on the {} test chain.", profile.id)
+                        } else {
+                            format!("Sats on the {} test chain. {ticker} has not been issued here yet.", profile.id)
+                        }}
+                    </p>
                 </div>
             </header>
+            {wallets.several().then(|| chain_tabs(wallets, wallet))}
 
             <div class="rounded-xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-200">
-                "Test tokens on a sidechain of Bitcoin's testnet4. They have no cash value and can't be bought or sold. Use them to thank people, and to give new members and agents what they need to get started."
+                {format!("Test tokens on a sidechain of Bitcoin's {}. They have no cash value and can't be bought or sold. Use them to thank people, and to give new members and agents what they need to get started.", profile.parent_name)}
             </div>
 
             // ── balance ──────────────────────────────────────────────────
             <section class=card aria-labelledby="bal-h">
-                <h2 id="bal-h" class=label>"Your balance"</h2>
+                <h2 id="bal-h" class=label>{format!("Your balance on {}", profile.id)}</h2>
                 {move || match (balances.get(), wallet.status.get()) {
                     (Some(b), _) => view! {
-                        <div class="mt-2 flex items-baseline gap-2">
-                            <span class="text-4xl font-bold text-amber-300 tabular-nums">{grouped(b.dream)}</span>
-                            <span class="text-lg text-amber-200/80">"DREAM"</span>
-                        </div>
+                        {has_asset.then(|| view! {
+                            <div class="mt-2 flex items-baseline gap-2">
+                                <span class="text-4xl font-bold text-amber-300 tabular-nums">{grouped(b.asset)}</span>
+                                <span class="text-lg text-amber-200/80">{ticker}</span>
+                            </div>
+                        })}
                         <p class="mt-1 text-sm text-gray-400">
                             <span class="tabular-nums text-gray-300">{grouped(b.plain)}</span>
                             " sats for fees"
                             {(b.carrier_sats > 0).then(|| view! {
-                                <span class="text-gray-500">" · " {grouped(b.carrier_sats)} " sats travel with your DREAM"</span>
+                                <span class="text-gray-500">" · " {grouped(b.carrier_sats)} {if has_asset { format!(" sats travel with your {ticker}") } else { " sats travel with tokens".to_string() }}</span>
                             })}
                         </p>
                         {move || {
                             let (d, s) = pending_out.get();
                             (d > 0 || s > 0).then(|| view! {
                                 <p class="mt-2 text-xs text-amber-200/80">
-                                    "On its way: " {grouped(d)} " DREAM and " {grouped(s)} " sats, confirming in a minute or two."
+                                    "On its way: " {grouped(d)} " " {ticker} " and " {grouped(s)} " sats, confirming in a minute or two."
                                 </p>
                             })
                         }}
                     }.into_any(),
                     (None, LoadStatus::Failed(e)) => view! {
-                        <p class="mt-2 text-sm text-red-300">"The DreamLab chain could not be read: " {e}</p>
+                        <p class="mt-2 text-sm text-red-300">{format!("The {} chain could not be read: ", profile.id)} {e}</p>
                     }.into_any(),
                     (None, _) => view! {
                         <p class="mt-2 text-sm text-gray-400">"Downloading and checking the chain…"</p>
@@ -317,7 +383,7 @@ pub fn WalletPage() -> impl IntoView {
                 <section class=card aria-labelledby="unlock-h">
                     <h2 id="unlock-h" class="text-sm font-semibold text-gray-100">"Unlock to send"</h2>
                     <p class="mt-1 text-sm text-gray-400">
-                        "You signed in with a browser extension, which can receive DREAM but can't sign DreamLab transfers. Podkey can: it shows you each transfer and asks you to confirm, and your key never leaves it. Or paste your nsec to send from this tab. It stays in this tab's memory and is forgotten when you close it or sign out; it is never sent anywhere."
+                        "You signed in with a browser extension, which can receive tokens but can't sign DreamLab transfers. Podkey can: it shows you each transfer and asks you to confirm, and your key never leaves it. Or paste your nsec to send from this tab. It stays in this tab's memory and is forgotten when you close it or sign out; it is never sent anywhere."
                     </p>
                     <form class="mt-3 flex gap-2" on:submit=move |ev| {
                         ev.prevent_default();
@@ -358,7 +424,7 @@ pub fn WalletPage() -> impl IntoView {
             <section class=card aria-labelledby="give-h">
                 <h2 id="give-h" class="text-sm font-semibold text-gray-100">"Give"</h2>
                 <div class="mt-3 flex gap-1.5" role="tablist" aria-label="What to give">
-                    {[(Mode::Dream, "DREAM"), (Mode::Pack, "Starter pack"), (Mode::Sats, "Sats")].into_iter().map(|(m, text)| view! {
+                    {[(Mode::Asset, ticker), (Mode::Pack, "Starter pack"), (Mode::Sats, "Sats")].into_iter().filter(|(m, _)| has_asset || *m == Mode::Sats).map(|(m, text)| view! {
                         <button
                             role="tab"
                             aria-selected=move || if mode.get() == m { "true" } else { "false" }
@@ -375,9 +441,10 @@ pub fn WalletPage() -> impl IntoView {
                 </div>
                 <p class="mt-2 text-xs text-gray-500">
                     {move || match mode.get() {
-                        Mode::Dream => "Send DREAM to a member or an agent.",
-                        Mode::Pack => "Provision a new member or an agent: DREAM to tip with and sats for their fees, in one transfer.",
-                        Mode::Sats => "Send sats for fees. Sats never come out of your DREAM.",
+                        Mode::Asset => format!("Send {ticker} to a member or an agent."),
+                        Mode::Pack => format!("Provision a new member or an agent: {ticker} to tip with and sats for their fees, in one transfer."),
+                        Mode::Sats if has_asset => format!("Send sats for fees. Sats never come out of your {ticker}."),
+                        Mode::Sats => "Send sats to a member or an agent.".to_string(),
                     }}
                 </p>
 
@@ -395,7 +462,7 @@ pub fn WalletPage() -> impl IntoView {
                             <input
                                 id="give-to"
                                 class=input
-                                placeholder="A member's name, an npub, or a drm1… address"
+                                placeholder=format!("A member's name, an npub, or a {}1… address", pin.address_prefix)
                                 autocomplete="off"
                                 spellcheck="false"
                                 prop:value=move || to_text.get()
@@ -432,7 +499,7 @@ pub fn WalletPage() -> impl IntoView {
                         (picked.get().is_none() && !t.trim().is_empty() && suggestions.get().is_empty())
                             .then(|| recipient.get().err())
                             .flatten()
-                            .filter(|_| t.starts_with("npub1") || t.starts_with("drm1") || t.starts_with("did:") || t.len() == 64)
+                            .filter(|_| t.starts_with("npub1") || t.starts_with(&format!("{}1", pin.address_prefix)) || t.starts_with("did:") || t.len() == 64)
                             .map(|e| view! { <p class="mt-1 text-xs text-red-300">{e}</p> })
                     }}
                 </div>
@@ -442,9 +509,9 @@ pub fn WalletPage() -> impl IntoView {
                     Mode::Pack => view! {
                         <div class="mt-4 grid grid-cols-2 gap-3">
                             <div>
-                                <label class="block text-xs text-gray-400 mb-1">"DREAM"</label>
-                                <input class=input inputmode="numeric" prop:value=move || pack_dream.get()
-                                    on:input=move |ev| { pack_dream.set(event_target_value(&ev)); review.set(false); } />
+                                <label class="block text-xs text-gray-400 mb-1">{ticker}</label>
+                                <input class=input inputmode="numeric" prop:value=move || pack_units.get()
+                                    on:input=move |ev| { pack_units.set(event_target_value(&ev)); review.set(false); } />
                             </div>
                             <div>
                                 <label class="block text-xs text-gray-400 mb-1">"Sats for fees"</label>
@@ -454,10 +521,10 @@ pub fn WalletPage() -> impl IntoView {
                         </div>
                     }.into_any(),
                     m => {
-                        let presets: &'static [u64] = if m == Mode::Dream { &[10, 50, 100, 500] } else { &[1_000, 2_000, 5_000] };
+                        let presets: &'static [u64] = if m == Mode::Asset { &[10, 50, 100, 500] } else { &[1_000, 2_000, 5_000] };
                         view! {
                             <div class="mt-4">
-                                <label class="block text-xs text-gray-400 mb-1">{if m == Mode::Dream { "Amount of DREAM" } else { "Amount of sats" }}</label>
+                                <label class="block text-xs text-gray-400 mb-1">{if m == Mode::Asset { format!("Amount of {ticker}") } else { "Amount of sats".to_string() }}</label>
                                 <div class="flex gap-2 flex-wrap">
                                     <input class=format!("{input} max-w-[10rem]") inputmode="numeric" placeholder="0"
                                         prop:value=move || amount.get()
@@ -481,13 +548,13 @@ pub fn WalletPage() -> impl IntoView {
                     let rec = recipient.get();
                     let m = mode.get();
                     let (d, s) = match m {
-                        Mode::Dream => (parse(&amount.get()), 0),
+                        Mode::Asset => (parse(&amount.get()), 0),
                         Mode::Sats => (0, parse(&amount.get())),
-                        Mode::Pack => (parse(&pack_dream.get()), parse(&pack_sats.get())),
+                        Mode::Pack => (parse(&pack_units.get()), parse(&pack_sats.get())),
                     };
                     let bal = balances.get().unwrap_or_default();
                     let ready = rec.is_ok() && (d > 0 || s > 0) && can && wallet.snapshot().is_some();
-                    let short_dream = d > bal.dream;
+                    let short_asset = d > bal.asset;
                     let short_sats = s + FEE_HINT > bal.plain;
                     if !review.get() {
                         return view! {
@@ -500,20 +567,20 @@ pub fn WalletPage() -> impl IntoView {
                                     "Review"
                                 </button>
                                 {(!can && me.get().is_some()).then(|| view! { <span class="text-xs text-gray-500">"Unlock above to send."</span> })}
-                                {(ready && short_dream).then(|| view! { <span class="text-xs text-red-300">"More DREAM than you hold."</span> })}
-                                {(ready && !short_dream && short_sats).then(|| view! { <span class="text-xs text-amber-200/80">"You may not have enough sats for the fee."</span> })}
+                                {(ready && short_asset).then(|| view! { <span class="text-xs text-red-300">{format!("More {ticker} than you hold.")}</span> })}
+                                {(ready && !short_asset && short_sats).then(|| view! { <span class="text-xs text-amber-200/80">"You may not have enough sats for the fee."</span> })}
                             </div>
                         }.into_any();
                     }
                     let (to_script, to_pk) = match rec { Ok(r) => r, Err(_) => return ().into_any() };
                     let what = match m {
-                        Mode::Dream => format!("{} DREAM", grouped(d)),
+                        Mode::Asset => format!("{} {ticker}", grouped(d)),
                         Mode::Sats => format!("{} sats", grouped(s)),
-                        Mode::Pack => format!("{} DREAM and {} sats", grouped(d), grouped(s)),
+                        Mode::Pack => format!("{} {ticker} and {} sats", grouped(d), grouped(s)),
                     };
                     let after = match m {
                         Mode::Sats => format!("{} sats left for fees, about", grouped(bal.plain.saturating_sub(s + FEE_HINT))),
-                        _ => format!("{} DREAM left", grouped(bal.dream.saturating_sub(d))),
+                        _ => format!("{} {ticker} left", grouped(bal.asset.saturating_sub(d))),
                     };
                     view! {
                         <div class="mt-5 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
@@ -521,7 +588,7 @@ pub fn WalletPage() -> impl IntoView {
                                 <dt class="text-gray-500">"To"</dt>
                                 <dd class="text-gray-100 min-w-0 truncate">
                                     {match to_pk.clone() {
-                                        Some(pk) => view! { <Party script=to_script.to_hex_string() /> <span class="text-gray-500 font-mono text-xs">" " {short(&chain::address_of(&pk).unwrap_or_default())}</span> }.into_any(),
+                                        Some(pk) => view! { <Party script=to_script.to_hex_string() /> <span class="text-gray-500 font-mono text-xs">" " {short(&chain::address_of(pin, &pk).unwrap_or_default())}</span> }.into_any(),
                                         None => view! { <span class="font-mono text-xs">{short(&to_script.to_hex_string())}</span> }.into_any(),
                                     }}
                                 </dd>
@@ -564,21 +631,24 @@ pub fn WalletPage() -> impl IntoView {
 
             // ── receive ──────────────────────────────────────────────────
             {move || me.get().and_then(|pk| {
-                let addr = chain::address_of(&pk)?;
+                let addr = chain::address_of(pin, &pk)?;
                 let npub = sidestr_agent::parse_pubkey(&pk).ok().map(|k| sidestr_agent::npub(&k))?;
                 let qr = crate::utils::devices::qr_svg(&addr);
                 let addr_c = addr.clone();
                 let npub_c = npub.clone();
-                let empty = balances.get().is_some_and(|b| b.dream == 0 && b.plain == 0);
+                let empty = balances.get().is_some_and(|b| b.asset == 0 && b.plain == 0);
                 Some(view! {
                     <section class=card aria-labelledby="recv-h">
                         <h2 id="recv-h" class="text-sm font-semibold text-gray-100">"Receive"</h2>
                         <p class="mt-1 text-sm text-gray-400">"Anyone here can pay you by name. Your npub is your wallet: there's nothing to set up."</p>
+                        {wallets.several().then(|| view! {
+                            <p class="mt-1 text-xs text-gray-500">{format!("The address below is your key on {}. The same key receives on every chain this forum offers; each chain writes its addresses with its own prefix.", profile.id)}</p>
+                        })}
                         <div class="mt-4 flex flex-col sm:flex-row gap-5 items-start">
                             <div class="bg-white rounded-xl p-2 w-40 h-40 shrink-0 [&>svg]:w-full [&>svg]:h-full" inner_html=qr aria-label="QR code of your wallet address"></div>
                             <div class="min-w-0 space-y-3 flex-1">
                                 <div>
-                                    <div class=label>"Address"</div>
+                                    <div class=label>{format!("Address on {}", profile.id)}</div>
                                     <div class="flex items-center gap-2 mt-1">
                                         <code class="text-xs text-gray-200 break-all">{addr.clone()}</code>
                                         <button class="text-xs text-amber-400 hover:text-amber-300 shrink-0" on:click=move |_| { copy(addr_c.clone()); toasts.show("Address copied", ToastVariant::Success); }>"Copy"</button>
@@ -593,7 +663,13 @@ pub fn WalletPage() -> impl IntoView {
                                 </div>
                                 {empty.then(|| view! {
                                     <div class="rounded-lg border border-gray-600/50 p-3">
-                                        <p class="text-sm text-gray-300">"New here? Ask the DreamLab faucet for a starter pack: " {PACK_DREAM} " DREAM and " {grouped(PACK_SATS)} " sats."</p>
+                                        <p class="text-sm text-gray-300">
+                                            {if has_asset {
+                                                format!("New here? Ask the {} faucet for a starter pack: {PACK_UNITS} {ticker} and {} sats.", profile.id, grouped(PACK_SATS))
+                                            } else {
+                                                format!("New here? Ask the {} faucet for a starter pack of sats.", profile.id)
+                                            }}
+                                        </p>
                                         <button
                                             class="mt-2 px-3 py-1.5 rounded-lg bg-gray-700/70 hover:bg-gray-700 text-sm text-gray-100 disabled:opacity-40"
                                             disabled=move || faucet_busy.get()
@@ -681,7 +757,7 @@ pub fn WalletPage() -> impl IntoView {
                 Some(view! {
                     <section class=card aria-labelledby="agents-h">
                         <h2 id="agents-h" class="text-sm font-semibold text-gray-100">"Agents"</h2>
-                        <p class="mt-1 text-sm text-gray-400">"Agents have wallets too. Top one up with a starter pack so it can tip and pay its own fees."</p>
+                        <p class="mt-1 text-sm text-gray-400">"Agents have wallets too. Top one up so it can tip and pay its own fees."</p>
                         <ul class="mt-3 divide-y divide-gray-700/50">
                             {rows.into_iter().map(|a| {
                                 let bal = snap.as_ref().zip(chain::script_of(&a.pubkey)).map(|(s, sc)| s.balances(&sc, &[])).unwrap_or_default();
@@ -696,12 +772,12 @@ pub fn WalletPage() -> impl IntoView {
                                                 {name}
                                                 {yours.then(|| view! { <span class="ml-2 text-[10px] uppercase tracking-wide text-amber-300/80">"yours"</span> })}
                                             </div>
-                                            <div class="text-xs text-gray-500 tabular-nums">{grouped(bal.dream)} " DREAM · " {grouped(bal.plain)} " sats"</div>
+                                            <div class="text-xs text-gray-500 tabular-nums">{has_asset.then(|| format!("{} {ticker} · ", grouped(bal.asset)))} {grouped(bal.plain)} " sats"</div>
                                         </div>
                                         <button
                                             class=format!("{chip} bg-gray-700/50 text-gray-200 hover:bg-amber-500/20 hover:text-amber-200")
                                             on:click=move |_| {
-                                                mode.set(Mode::Pack);
+                                                mode.set(if has_asset { Mode::Pack } else { Mode::Sats });
                                                 picked.set(Some((pk.clone(), name_c.clone())));
                                                 review.set(false);
                                                 if let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("give-h")) {
@@ -736,7 +812,7 @@ pub fn WalletPage() -> impl IntoView {
                             {pend.into_iter().map(|p: Pending| {
                                 let what = match p.kind {
                                     PendingKind::Tip => "Tip",
-                                    PendingKind::Dream => "Sent",
+                                    PendingKind::Asset => "Sent",
                                     PendingKind::Sats => "Sent",
                                     PendingKind::Provision => "Starter pack",
                                     PendingKind::Hand => "Poker",
@@ -749,7 +825,7 @@ pub fn WalletPage() -> impl IntoView {
                                             <div class="text-xs text-gray-500">"Confirming…"</div>
                                         </div>
                                         <div class="text-right tabular-nums text-gray-300">
-                                            {(p.dream > 0).then(|| view! { <div>"−" {grouped(p.dream)} " DREAM"</div> })}
+                                            {(p.asset > 0).then(|| view! { <div>"−" {grouped(p.asset)} " " {ticker}</div> })}
                                             {(p.sats > 0).then(|| view! { <div class="text-xs text-gray-500">"−" {grouped(p.sats)} " sats"</div> })}
                                         </div>
                                     </li>
@@ -757,17 +833,17 @@ pub fn WalletPage() -> impl IntoView {
                             }).collect_view()}
                             {hist.into_iter().map(|t| {
                                 let mv = t.movement(&me_hex);
-                                let incoming = mv.dream > 0 || (mv.dream == 0 && mv.sats > 0);
-                                let what = if t.txid == chain::DREAM_ASSET_ID {
-                                    "Issued DREAM"
+                                let incoming = mv.asset > 0 || (mv.asset == 0 && mv.sats > 0);
+                                let what = if profile.asset_id.as_deref() == Some(t.txid.as_str()) {
+                                    format!("Issued {ticker}")
                                 } else if t.tip_event.is_some() {
-                                    if incoming { "Tip received" } else { "Tip" }
+                                    if incoming { "Tip received" } else { "Tip" }.to_string()
                                 } else if t.coinbase {
-                                    "Pegged in"
+                                    "Pegged in".to_string()
                                 } else if incoming {
-                                    "Received"
+                                    "Received".to_string()
                                 } else {
-                                    "Sent"
+                                    "Sent".to_string()
                                 };
                                 let from_to = if incoming { " from " } else { " to " };
                                 view! {
@@ -780,13 +856,13 @@ pub fn WalletPage() -> impl IntoView {
                                             </div>
                                             <div class="text-xs text-gray-500">
                                                 "Block " {t.height} " · " {format_relative_time(u64::from(t.time))}
-                                                {t.broken.clone().map(|_| view! { <span class="text-red-300">" · DREAM rule broken"</span> })}
+                                                {t.broken.clone().map(|_| view! { <span class="text-red-300">" · assets rule broken"</span> })}
                                             </div>
                                         </div>
                                         <div class="text-right tabular-nums">
-                                            {(mv.dream != 0).then(|| view! {
-                                                <div class={if mv.dream > 0 { "text-emerald-300" } else { "text-gray-300" }}>
-                                                    {if mv.dream > 0 { "+" } else { "−" }} {grouped(mv.dream.unsigned_abs())} " DREAM"
+                                            {(mv.asset != 0).then(|| view! {
+                                                <div class={if mv.asset > 0 { "text-emerald-300" } else { "text-gray-300" }}>
+                                                    {if mv.asset > 0 { "+" } else { "−" }} {grouped(mv.asset.unsigned_abs())} " " {ticker}
                                                 </div>
                                             })}
                                             {(mv.sats != 0).then(|| view! {
@@ -807,14 +883,24 @@ pub fn WalletPage() -> impl IntoView {
             <details class=format!("{card} text-sm text-gray-400")>
                 <summary class="cursor-pointer text-gray-200 font-medium">"How this works"</summary>
                 <div class="mt-3 space-y-2 leading-relaxed">
-                    <p>"Your forum key is also your wallet on " <code class="text-gray-300">{chain::CHAIN_ID}</code> ", a sidestr sidechain beside Bitcoin's testnet4. DREAM is a token issued on that chain (" {grouped(1_000_000)} " in all)."</p>
+                    <p>
+                        "Your forum key is also your wallet on " <code class="text-gray-300">{profile.id}</code>
+                        {format!(", a sidestr sidechain beside Bitcoin's {}. ", profile.parent_name)}
+                        {move || match (has_asset, wallet.snapshot().and_then(|s| s.issued().map(|i| i.supply))) {
+                            (true, Some(supply)) => format!("{ticker} is a token issued on that chain ({} in all).", grouped(supply)),
+                            (true, None) => format!("{ticker} is a token issued on that chain."),
+                            (false, _) => format!("{ticker} has not been issued on it yet, so this page shows its sats."),
+                        }}
+                    </p>
                     <p>"This page downloads the chain from a public mirror and checks every block in your browser against the chain's sealed document, so a balance here is never a number a server told you. Transfers are signed in your browser with your key, which never leaves it, and go to the chain through public relays."</p>
-                    <p>"Every transfer pays a small fee in sats. DREAM rides on small coins of 330 sats, so tips and starter packs carry some sats to the recipient too."</p>
-                    <p class="text-amber-200/80">"Only move DREAM from this wallet. Other sidestr wallets don't know about DREAM yet and could destroy it if you spend the same key's coins there."</p>
+                    <p>"Every transfer pays a small fee in sats. Tokens ride on small coins of 330 sats, so tips and starter packs carry some sats to the recipient too."</p>
+                    {has_asset.then(|| view! {
+                        <p class="text-amber-200/80">{format!("Only move {ticker} from this wallet. Other sidestr wallets don't know about {ticker} yet and could destroy it if you spend the same key's coins there.")}</p>
+                    })}
                     <p>
                         "Chain explorer: "
-                        <a class="text-amber-400 hover:text-amber-300" href="https://sidestr.com/explorer/?chain=sidestr:dreamlab" target="_blank" rel="noopener noreferrer">"sidestr.com/explorer"</a>
-                        " · DREAM asset id " <code class="text-xs break-all">{chain::DREAM_ASSET_ID}</code>
+                        <a class="text-amber-400 hover:text-amber-300" href=format!("https://sidestr.com/explorer/?chain={}", profile.id) target="_blank" rel="noopener noreferrer">"sidestr.com/explorer"</a>
+                        {profile.asset_id.clone().map(|id| view! { {format!(" · {ticker} asset id ")} <code class="text-xs break-all">{id}</code> })}
                     </p>
                 </div>
             </details>

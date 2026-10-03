@@ -1,25 +1,36 @@
 //! The chain half of the member wallet, pure and natively testable: the
-//! compiled-in chain lock, the replay of a mirror's block file into a
+//! compiled-in chain locks, the replay of a mirror's block file into a
 //! snapshot, and what the UI reads from a snapshot (balances, a member's
-//! activity, the DREAM tipped on each post).
+//! activity, the asset tipped on each post).
 //!
-//! **The lock (ADR-2015).** The wallet knows exactly one chain and one
-//! asset, both compiled in: `sidestr:dreamlab`, beside Bitcoin testnet4
-//! (`parent: tbtc4`), and DREAM, the asset issued on it at
-//! [`DREAM_ASSET_ID`]. Runtime config can switch the wallet on and point it
-//! at another mirror or other relays; it cannot point it at another chain.
-//! A mirror is never trusted: every block it serves is validated against the
-//! pinned document ([`sidestr_core::mirror`]), so a bad mirror can be stale
-//! or empty but cannot invent a balance.
+//! **The locks (ADR-2015, ADR-2021).** The wallet knows exactly two chains,
+//! both sealed documents compiled in ([`PINS`]):
+//!
+//! - [`DREAMLAB`], `sidestr:dreamlab` beside Bitcoin testnet4
+//!   (`parent: tbtc4`), whose asset DREAM was issued at [`DREAM_ASSET_ID`];
+//! - [`DREAMLAB_TXBT4`], `sidestr:dreamlab-txbt4` beside BLAKE2b testnet4
+//!   (`parent: txbt4`), whose blocks carry Knots' v2 header and whose asset
+//!   (BLAKES7) has no compiled-in id: the deployment names it once issued.
+//!
+//! Runtime config can switch the wallet on, choose which of the two chains
+//! it offers, and point each at another mirror, other relays or another asset
+//! id ([`super::profile`]); it cannot point it at a third chain, and a
+//! document that differs from its pin in id, parent or genesis is refused
+//! ([`check_document`]). A mirror is never trusted: every block it serves is
+//! validated against the pinned document under the header family its parent
+//! hands down ([`sidestr_core::mirror`]), so a bad mirror can be stale or
+//! empty but cannot invent a balance.
 
 use std::collections::HashMap;
 
 use bitcoin::{OutPoint, Script, ScriptBuf, Txid};
-use sidestr_agent::ChainView;
-use sidestr_core::assets::AssetView;
+use sidestr_core::assets::{AssetView, Issued};
+use sidestr_core::block::{HeaderFamily, SidestrBlock};
 use sidestr_core::document::ChainDocument;
 use sidestr_core::records::records_of;
-use sidestr_core::state::State;
+use sidestr_core::rules::Utxo;
+use sidestr_core::{Family, State, StateOf, Stock};
+use sidestr_header::Blake2bV2;
 use sidestr_wallet::coins::Coin;
 
 /// The sealed chain document of `sidestr:dreamlab`, byte for byte as the
@@ -38,7 +49,21 @@ pub const DREAM_ASSET_ID: &str = "608005d32a927de46e92f01b7948feac3469411cc0fbcf
 pub const DREAM: &str = "DREAM";
 /// The default mirror: GitHub Pages, open CORS (SPEC 11).
 pub const DEFAULT_MIRROR: &str = "https://dreamlab-ai.github.io/sidestr-dreamlab";
-/// The relays the producer and the faucet follow (siding's five defaults).
+
+/// The sealed chain document of `sidestr:dreamlab-txbt4`, byte for byte as
+/// its producer serves it (`chain.json`).
+pub const TXBT4_CHAIN_JSON: &str = include_str!("sidestr-dreamlab-txbt4.chain.json");
+/// The second chain's id.
+pub const TXBT4_CHAIN_ID: &str = "sidestr:dreamlab-txbt4";
+/// Its parent: BLAKE2b testnet4. The wallet refuses any other.
+pub const TXBT4_PARENT: &str = "txbt4";
+/// The genesis its document seals.
+pub const TXBT4_GENESIS_HASH: &str =
+    "1009aa2984d5c699fe61ef1e5905afe472a49d67551542045726828c8b82d108";
+/// Its default mirror: its own GitHub Pages repository.
+pub const TXBT4_DEFAULT_MIRROR: &str = "https://dreamlab-ai.github.io/sidestr-dreamlab-txbt4";
+
+/// The relays the producers and the faucets follow (siding's five defaults).
 pub const DEFAULT_RELAYS: [&str; 5] = [
     "wss://nos.lol",
     "wss://relay.damus.io",
@@ -49,29 +74,101 @@ pub const DEFAULT_RELAYS: [&str; 5] = [
 /// The memo a tip carries beside its tally: `tip:nostr:<event id>`.
 pub const TIP_PREFIX: &str = "tip:nostr:";
 
-/// The pinned chain document, checked against the lock.
-pub fn document() -> Result<ChainDocument, String> {
-    let doc = ChainDocument::from_json(CHAIN_JSON).map_err(|e| format!("chain document: {e}"))?;
-    if doc.id != CHAIN_ID || doc.parent != PARENT {
-        return Err("the pinned chain is not sidestr:dreamlab beside testnet4".into());
+/// One compiled-in chain lock: the sealed document and what the wallet shows
+/// for it before any runtime config.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Pin {
+    /// The chain id.
+    pub id: &'static str,
+    /// The parent alias the document must name.
+    pub parent: &'static str,
+    /// The parent in words.
+    pub parent_name: &'static str,
+    /// The genesis the document must seal.
+    pub genesis_hash: &'static str,
+    /// The address prefix the document sets (checked by the tests).
+    pub address_prefix: &'static str,
+    /// The sealed document.
+    pub json: &'static str,
+    /// The default name of the chain's asset, for headings.
+    pub label: &'static str,
+    /// The default ticker.
+    pub ticker: &'static str,
+    /// The asset's compiled-in id, when it was issued before this build.
+    pub asset_id: Option<&'static str>,
+    /// The default mirror.
+    pub mirror: &'static str,
+}
+
+/// `sidestr:dreamlab`, DREAM.
+pub const DREAMLAB: Pin = Pin {
+    id: CHAIN_ID,
+    parent: PARENT,
+    parent_name: "testnet4",
+    genesis_hash: GENESIS_HASH,
+    address_prefix: "drm",
+    json: CHAIN_JSON,
+    label: DREAM,
+    ticker: DREAM,
+    asset_id: Some(DREAM_ASSET_ID),
+    mirror: DEFAULT_MIRROR,
+};
+
+/// `sidestr:dreamlab-txbt4`, BLAKES7 (id named at runtime once issued).
+pub const DREAMLAB_TXBT4: Pin = Pin {
+    id: TXBT4_CHAIN_ID,
+    parent: TXBT4_PARENT,
+    parent_name: "BLAKE2b testnet4",
+    genesis_hash: TXBT4_GENESIS_HASH,
+    address_prefix: "drt",
+    json: TXBT4_CHAIN_JSON,
+    label: "BLAKES7",
+    ticker: "BLAKES7",
+    asset_id: None,
+    mirror: TXBT4_DEFAULT_MIRROR,
+};
+
+/// Every chain the wallet will touch.
+pub const PINS: [&Pin; 2] = [&DREAMLAB, &DREAMLAB_TXBT4];
+
+/// The pin of a chain id, if it is one of [`PINS`].
+pub fn pin(id: &str) -> Option<&'static Pin> {
+    PINS.into_iter().find(|p| p.id == id)
+}
+
+/// Whether `s` is 64 hex digits (a txid, a pubkey, an event id).
+pub fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A chain document, accepted only if it is exactly the chain `pin` locks:
+/// same id, same parent, same genesis.
+pub fn check_document(pin: &Pin, json: &str) -> Result<ChainDocument, String> {
+    let doc = ChainDocument::from_json(json).map_err(|e| format!("chain document: {e}"))?;
+    if doc.id != pin.id || doc.parent != pin.parent {
+        return Err(format!(
+            "the chain is {} beside {}, not {} beside {}",
+            doc.id, doc.parent, pin.id, pin.parent
+        ));
     }
-    if doc.genesis_hash.as_deref() != Some(GENESIS_HASH) {
-        return Err("the pinned chain's genesis is not the locked one".into());
+    if doc.genesis_hash.as_deref() != Some(pin.genesis_hash) {
+        return Err(format!("{}'s genesis is not the locked one", pin.id));
     }
     Ok(doc)
 }
 
-/// DREAM's asset id.
-pub fn dream_id() -> Txid {
-    DREAM_ASSET_ID
-        .parse()
-        .expect("the pinned DREAM id is a txid")
+impl Pin {
+    /// The pinned document, checked against the lock.
+    pub fn document(&self) -> Result<ChainDocument, String> {
+        check_document(self, self.json)
+    }
 }
 
-/// The script a Nostr key's coins pay: `OP_1 <x-only key>`.
+/// The script a Nostr key's coins pay: `OP_1 <x-only key>`. The same on
+/// every sidestr chain, so one key is one wallet on both.
 pub fn script_of(pubkey_hex: &str) -> Option<ScriptBuf> {
     let pk = pubkey_hex.trim().to_ascii_lowercase();
-    if pk.len() != 64 || !pk.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_hex64(&pk) {
         return None;
     }
     ScriptBuf::from_hex(&format!("5120{pk}")).ok()
@@ -88,6 +185,58 @@ pub fn pubkey_of_script(script: &Script) -> Option<String> {
     (b.len() == 34 && b[0] == 0x51 && b[1] == 0x20).then(|| hex::encode(&b[2..]))
 }
 
+/// The validated chain state, under whichever header family the chain's
+/// parent hands down: stock headers beside testnet4, Knots' 164-byte v2
+/// headers beside BLAKE2b testnet4.
+pub enum ChainState {
+    /// A chain beside a stock parent.
+    Stock(State),
+    /// A chain beside a BLAKE2b parent.
+    Blake2b(StateOf<Blake2bV2>),
+}
+
+impl ChainState {
+    /// The document the chain was validated against.
+    pub fn document(&self) -> &ChainDocument {
+        match self {
+            Self::Stock(s) => s.document(),
+            Self::Blake2b(s) => s.document(),
+        }
+    }
+
+    /// The tip height.
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Stock(s) => s.height(),
+            Self::Blake2b(s) => s.height(),
+        }
+    }
+
+    /// The tip block's time.
+    pub fn tip_time(&self) -> u32 {
+        match self {
+            Self::Stock(s) => s.tip().time,
+            Self::Blake2b(s) => s.tip().time,
+        }
+    }
+
+    /// The unspent outputs.
+    pub fn utxo(&self) -> &Utxo {
+        match self {
+            Self::Stock(s) => s.utxo(),
+            Self::Blake2b(s) => s.utxo(),
+        }
+    }
+
+    /// The coins a script holds at the tip.
+    pub fn coins(&self, script: &Script) -> Vec<Coin> {
+        match self {
+            Self::Stock(s) => sidestr_wallet::coins::from_state(s, script),
+            Self::Blake2b(s) => sidestr_wallet::coins::from_state(s, script),
+        }
+    }
+}
+
 /// One side of a transaction as a wallet reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Leg {
@@ -95,8 +244,8 @@ pub struct Leg {
     pub script: String,
     /// Sats.
     pub sats: u64,
-    /// DREAM carried.
-    pub dream: u64,
+    /// Units of the chain's asset carried (DREAM on `sidestr:dreamlab`).
+    pub asset: u64,
 }
 
 /// A transaction summarised for activity lists.
@@ -116,7 +265,7 @@ pub struct TxSummary {
     pub tip_event: Option<String>,
     /// The poker hand it settles, when it carries `hand:<root>`.
     pub hand_root: Option<String>,
-    /// Set when the assets rule reads it as broken: DREAM it touched is gone.
+    /// Set when the assets rule reads it as broken: an asset it touched is gone.
     pub broken: Option<String>,
     /// A block's coinbase: a peg-in claim or the producer's fees.
     pub coinbase: bool,
@@ -125,78 +274,123 @@ pub struct TxSummary {
 /// Tips on one post.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TipTotal {
-    /// DREAM tipped.
-    pub dream: u64,
+    /// Units of the chain's asset tipped.
+    pub asset: u64,
     /// How many tips.
     pub count: u32,
 }
 
 /// The chain as one replay of the mirror left it.
 pub struct Snapshot {
-    /// The validated chain and its assets view.
-    pub view: ChainView,
+    /// The validated chain.
+    pub state: ChainState,
+    /// What each unspent output carries, under the SPEC 12 assets rule.
+    pub assets: AssetView,
+    /// The asset this wallet reads, when the chain has one configured.
+    pub asset: Option<Txid>,
     /// Every transaction, oldest first.
     pub txs: Vec<TxSummary>,
-    /// DREAM tipped per post, by event id.
+    /// The asset tipped per post, by event id.
     pub tips: HashMap<String, TipTotal>,
 }
 
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
+            .field("chain", &self.state.document().id)
             .field("height", &self.height())
             .field("txs", &self.txs.len())
             .finish_non_exhaustive()
     }
 }
 
-fn leg_of(view: &AssetView, op: &OutPoint, script: &Script, sats: u64, dream: &Txid) -> Leg {
-    Leg {
-        script: script.to_hex_string(),
-        sats,
-        dream: view
-            .carried(op)
-            .and_then(|c| c.get(dream))
-            .copied()
-            .unwrap_or(0),
+/// What one family's replay produced, before it is wrapped in a [`ChainState`].
+struct Replayed<F: HeaderFamily> {
+    state: StateOf<F>,
+    assets: AssetView,
+    txs: Vec<TxSummary>,
+    tips: HashMap<String, TipTotal>,
+}
+
+/// Units of `asset` an output's carry holds.
+fn units(carry: Option<&sidestr_core::assets::Carry>, asset: Option<&Txid>) -> u64 {
+    match (carry, asset) {
+        (Some(c), Some(a)) => c.get(a).copied().unwrap_or(0),
+        _ => 0,
     }
 }
 
-/// Replay a mirror's `blocks.dat` against the pinned document. `now` is the
-/// clock for the future-time rule.
-pub fn replay(dat: &[u8], now: Option<u32>) -> Result<Snapshot, String> {
-    let doc = document()?;
-    let dream = dream_id();
+/// Replay a mirror's `blocks.dat` against `pin`'s sealed document, reading
+/// `asset` (if any) under the assets rule. `now` is the clock for the
+/// future-time rule.
+pub fn replay(
+    pin: &Pin,
+    asset: Option<Txid>,
+    dat: &[u8],
+    now: Option<u32>,
+) -> Result<Snapshot, String> {
+    let doc = pin.document()?;
+    let family = doc.family().map_err(|e| format!("chain document: {e}"))?;
+    Ok(match family {
+        Family::Stock => {
+            let r = replay_in::<Stock>(doc, asset, dat, now)?;
+            Snapshot {
+                state: ChainState::Stock(r.state),
+                assets: r.assets,
+                asset,
+                txs: r.txs,
+                tips: r.tips,
+            }
+        }
+        Family::Blake2b => {
+            let r = replay_in::<Blake2bV2>(doc, asset, dat, now)?;
+            Snapshot {
+                state: ChainState::Blake2b(r.state),
+                assets: r.assets,
+                asset,
+                txs: r.txs,
+                tips: r.tips,
+            }
+        }
+    })
+}
+
+fn replay_in<F: HeaderFamily>(
+    doc: ChainDocument,
+    asset: Option<Txid>,
+    dat: &[u8],
+    now: Option<u32>,
+) -> Result<Replayed<F>, String> {
+    let family = F::default();
+    let asset = asset.as_ref();
     let mut assets = AssetView::new();
     let mut txs = Vec::new();
     let mut tips: HashMap<String, TipTotal> = HashMap::new();
-    let state = State::replay_with(doc, dat, now, |before, height, block| {
-        let time = block.header.time;
+    let state = StateOf::<F>::replay_with(doc, dat, now, |before, height, block| {
+        let time = family.time(block.header());
+        let txdata = block.txdata();
         // inputs are read before the block is applied (afterwards they are
         // gone); one that spends an output of an earlier transaction in the
         // same block is resolved from that transaction once the block is read
-        let mut spent: Vec<Vec<Option<Leg>>> = block
-            .txdata
+        let mut spent: Vec<Vec<Option<Leg>>> = txdata
             .iter()
             .map(|tx| {
                 tx.input
                     .iter()
                     .map(|i| {
                         let c = before?.utxo().get(&i.previous_output)?;
-                        Some(leg_of(
-                            &assets,
-                            &i.previous_output,
-                            &c.output.script_pubkey,
-                            c.output.value.to_sat(),
-                            &dream,
-                        ))
+                        Some(Leg {
+                            script: c.output.script_pubkey.to_hex_string(),
+                            sats: c.output.value.to_sat(),
+                            asset: units(assets.carried(&i.previous_output), asset),
+                        })
                     })
                     .collect()
             })
             .collect();
-        let outcomes = assets.apply_transactions(&block.txdata, height);
-        let ids: Vec<Txid> = block.txdata.iter().map(|t| t.compute_txid()).collect();
-        for (ti, tx) in block.txdata.iter().enumerate() {
+        let outcomes = assets.apply_transactions(txdata, height);
+        let ids: Vec<Txid> = txdata.iter().map(|t| t.compute_txid()).collect();
+        for (ti, tx) in txdata.iter().enumerate() {
             for (ii, inp) in tx.input.iter().enumerate() {
                 if spent[ti][ii].is_some() {
                     continue;
@@ -205,20 +399,20 @@ pub fn replay(dat: &[u8], now: Option<u32>) -> Result<Snapshot, String> {
                 let Some(src) = ids[..ti].iter().position(|t| *t == op.txid) else {
                     continue;
                 };
-                let Some(o) = block.txdata[src].output.get(op.vout as usize) else {
+                let Some(o) = txdata[src].output.get(op.vout as usize) else {
                     continue;
                 };
-                let carried = outcomes
-                    .iter()
-                    .find(|oc| oc.txid == op.txid)
-                    .and_then(|oc| oc.carried_out.get(&op.vout))
-                    .and_then(|c| c.get(&dream))
-                    .copied()
-                    .unwrap_or(0);
+                let carried = units(
+                    outcomes
+                        .iter()
+                        .find(|oc| oc.txid == op.txid)
+                        .and_then(|oc| oc.carried_out.get(&op.vout)),
+                    asset,
+                );
                 spent[ti][ii] = Some(Leg {
                     script: o.script_pubkey.to_hex_string(),
                     sats: o.value.to_sat(),
-                    dream: carried,
+                    asset: carried,
                 });
             }
         }
@@ -226,8 +420,8 @@ pub fn replay(dat: &[u8], now: Option<u32>) -> Result<Snapshot, String> {
             .into_iter()
             .map(|v| v.into_iter().flatten().collect())
             .collect();
-        for (i, tx) in block.txdata.iter().enumerate() {
-            let txid = tx.compute_txid();
+        for (i, tx) in txdata.iter().enumerate() {
+            let txid = ids[i];
             let coinbase = i == 0 && tx.is_coinbase();
             let outcome = outcomes.iter().find(|o| o.txid == txid);
             let broken = outcome.and_then(|o| o.error.clone());
@@ -239,28 +433,27 @@ pub fn replay(dat: &[u8], now: Option<u32>) -> Result<Snapshot, String> {
                 .map(|(v, o)| Leg {
                     script: o.script_pubkey.to_hex_string(),
                     sats: o.value.to_sat(),
-                    dream: outcome
-                        .and_then(|oc| oc.carried_out.get(&(v as u32)))
-                        .and_then(|c| c.get(&dream))
-                        .copied()
-                        .unwrap_or(0),
+                    asset: units(
+                        outcome.and_then(|oc| oc.carried_out.get(&(v as u32))),
+                        asset,
+                    ),
                 })
                 .collect();
             let records = records_of(tx);
             let tip_event = records.iter().find_map(|(_, t)| {
                 t.strip_prefix(TIP_PREFIX)
-                    .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .filter(|id| is_hex64(id))
                     .map(str::to_ascii_lowercase)
             });
             let hand_root = records
                 .iter()
                 .find_map(|(_, t)| nostr_bbs_poker::rules::parse_hand_memo(t).map(str::to_string));
-            // a tip counts what output 0 carries of DREAM, when the rule held
+            // a tip counts what output 0 carries of the asset, when the rule held
             if let (Some(ev), None) = (&tip_event, &broken) {
-                let n = outs.first().map(|l| l.dream).unwrap_or(0);
+                let n = outs.first().map(|l| l.asset).unwrap_or(0);
                 if n > 0 {
                     let t = tips.entry(ev.clone()).or_default();
-                    t.dream += n;
+                    t.asset += n;
                     t.count += 1;
                 }
             }
@@ -278,8 +471,9 @@ pub fn replay(dat: &[u8], now: Option<u32>) -> Result<Snapshot, String> {
         }
     })
     .map_err(|e| format!("the mirror's blocks do not validate: {e}"))?;
-    Ok(Snapshot {
-        view: ChainView { state, assets },
+    Ok(Replayed {
+        state,
+        assets,
         txs,
         tips,
     })
@@ -288,29 +482,29 @@ pub fn replay(dat: &[u8], now: Option<u32>) -> Result<Snapshot, String> {
 /// A member's balances.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Balances {
-    /// DREAM held.
-    pub dream: u64,
+    /// Units of the chain's asset held.
+    pub asset: u64,
     /// Sats on coins that carry nothing: what pays fees.
     pub plain: u64,
-    /// Sats riding on DREAM carriers.
+    /// Sats riding on asset carriers (any asset: none of them pay fees).
     pub carrier_sats: u64,
 }
 
 impl Snapshot {
     /// The tip height.
     pub fn height(&self) -> u32 {
-        self.view.state.height()
+        self.state.height()
     }
 
     /// The tip block's time.
     pub fn tip_time(&self) -> u32 {
-        self.view.state.tip().time
+        self.state.tip_time()
     }
 
     /// Coins a script holds, less any `held` (spent by a transaction not yet
     /// mined).
     pub fn coins(&self, script: &Script, held: &[OutPoint]) -> Vec<Coin> {
-        self.view
+        self.state
             .coins(script)
             .into_iter()
             .filter(|c| !held.contains(&c.outpoint))
@@ -319,18 +513,22 @@ impl Snapshot {
 
     /// What a script holds.
     pub fn balances(&self, script: &Script, held: &[OutPoint]) -> Balances {
-        let dream = dream_id();
         let mut b = Balances::default();
         for c in self.coins(script, held) {
-            match self.view.assets.carried(&c.outpoint) {
+            match self.assets.carried(&c.outpoint) {
                 None => b.plain += c.value,
                 Some(m) => {
-                    b.dream += m.get(&dream).copied().unwrap_or(0);
+                    b.asset += units(Some(m), self.asset.as_ref());
                     b.carrier_sats += c.value;
                 }
             }
         }
         b
+    }
+
+    /// The issue of the asset this wallet reads, once the chain shows it.
+    pub fn issued(&self) -> Option<&Issued> {
+        self.asset.and_then(|a| self.assets.issued().get(&a))
     }
 
     /// Transactions touching a script, newest first.
@@ -352,15 +550,15 @@ impl Snapshot {
 
     /// Whether an outpoint is still unspent.
     pub fn unspent(&self, op: &OutPoint) -> bool {
-        self.view.state.utxo().contains_key(op)
+        self.state.utxo().contains_key(op)
     }
 }
 
 /// How one transaction reads from one member's side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Movement {
-    /// DREAM in (positive) or out (negative), net of change.
-    pub dream: i64,
+    /// The asset in (positive) or out (negative), net of change.
+    pub asset: i64,
     /// Sats in or out, net of change and including the fee when sending.
     pub sats: i64,
     /// The other side: the first script paid that is not mine (sending) or
@@ -374,7 +572,7 @@ impl TxSummary {
         let sum = |legs: &[Leg], f: fn(&Leg) -> u64| -> i64 {
             legs.iter().filter(|l| l.script == me).map(f).sum::<u64>() as i64
         };
-        let dream = sum(&self.outs, |l| l.dream) - sum(&self.ins, |l| l.dream);
+        let asset = sum(&self.outs, |l| l.asset) - sum(&self.ins, |l| l.asset);
         let sats = sum(&self.outs, |l| l.sats) - sum(&self.ins, |l| l.sats);
         let sending = self.ins.iter().any(|l| l.script == me);
         let counterparty = if sending {
@@ -389,30 +587,31 @@ impl TxSummary {
                 .map(|l| l.script.clone())
         };
         Movement {
-            dream,
+            asset,
             sats,
             counterparty,
         }
     }
 }
 
-/// Where a payment goes, from what a member typed or picked: an npub, a
-/// `did:nostr:`, 64-hex key, or a `drm1…` address. Secret-shaped text is
-/// refused before anything else, without being echoed.
-pub fn destination_script(text: &str) -> Result<ScriptBuf, String> {
+/// Where a payment on `pin`'s chain goes, from what a member typed or picked:
+/// an npub, a `did:nostr:`, 64-hex key, or an address. An address pays its
+/// script whatever its prefix (sidestr-wallet's rule, `resolve_to`); a key's
+/// script is the same on every chain, so another chain's address of a member
+/// (`drm1…` on `sidestr:dreamlab-txbt4`) pays that member here. Secret-shaped
+/// text is refused before anything else, without being echoed.
+pub fn destination_script(pin: &Pin, text: &str) -> Result<ScriptBuf, String> {
     let t = sidestr_agent::refuse_secret(text.trim()).map_err(|e| e.to_string())?;
     let dest = sidestr_agent::destination(t).map_err(|e| e.to_string())?;
-    let doc = document()?;
-    sidestr_wallet::spend::resolve_to(&dest, &doc.address_prefix)
+    sidestr_wallet::spend::resolve_to(&dest, pin.address_prefix)
         .map(|r| r.script)
         .map_err(|e| e.to_string())
 }
 
-/// The `drm1…` address of a Nostr key.
-pub fn address_of(pubkey_hex: &str) -> Option<String> {
-    let doc = document().ok()?;
+/// A Nostr key's address on `pin`'s chain (`drm1…`, `drt1…`).
+pub fn address_of(pin: &Pin, pubkey_hex: &str) -> Option<String> {
     let pk = sidestr_agent::parse_pubkey(pubkey_hex).ok()?;
-    sidestr_agent::identity(&pk, &doc.address_prefix).map(|i| i.address)
+    sidestr_agent::identity(&pk, pin.address_prefix).map(|i| i.address)
 }
 
 /// Why a provision could not be built.
@@ -424,52 +623,62 @@ pub enum ProvisionError {
     Plain(String),
 }
 
-/// A starter pack in one transaction: `dream` on a carrier to `to` (with the
-/// DREAM change on a carrier back), then `sats` to `to` as plain coins for
-/// their fees. DREAM carriers are the required inputs; plain coins pay the
-/// sats and the fee. Checked against the assets view before it is returned.
+/// A starter pack in one transaction: `units` of the snapshot's asset on a
+/// carrier to `to` (with the change on a carrier back), then `sats` to `to`
+/// as plain coins for their fees. Asset carriers are the required inputs;
+/// plain coins pay the sats and the fee. Checked against the assets view
+/// before it is returned. `ticker` names the asset in errors.
 pub fn build_provision(
     snap: &Snapshot,
     coins: &[Coin],
     signer: &dyn sidestr_wallet::SpendSigner,
     to: &ScriptBuf,
-    dream: u64,
+    units: u64,
     sats: u64,
+    ticker: &str,
 ) -> Result<sidestr_wallet::spend::Spend, ProvisionError> {
     use sidestr_wallet::asset::{sort_coins, CARRIER};
     use sidestr_wallet::compose::{build_outputs, OutputsRequest};
     let me = signer.script();
-    let id = dream_id();
-    let sorted = sort_coins(coins, &snap.view.assets, Some(&id));
+    let id = match (snap.asset, units) {
+        (Some(id), _) => Some(id),
+        (None, 0) => None,
+        (None, _) => {
+            return Err(ProvisionError::Plain(format!(
+                "This chain has no {ticker} yet; give sats only."
+            )))
+        }
+    };
+    let sorted = sort_coins(coins, &snap.assets, id.as_ref());
     let mut required = Vec::new();
     let mut have = 0u64;
-    if dream > 0 {
+    if units > 0 {
         let mut carriers = sorted.carriers.clone();
         carriers.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         for (c, n) in carriers {
-            if have >= dream {
+            if have >= units {
                 break;
             }
             have += n;
             required.push(c);
         }
-        if have < dream {
+        if have < units {
             return Err(ProvisionError::Plain(format!(
-                "Not enough DREAM: you hold {have}, the pack gives {dream}."
+                "Not enough {ticker}: you hold {have}, the pack gives {units}."
             )));
         }
     }
     let mut outputs = Vec::new();
     let mut records = Vec::new();
-    if dream > 0 {
+    if units > 0 {
         outputs.push((to.clone(), CARRIER));
-        let mut assigns = vec![(0u32, dream)];
-        if have > dream {
+        let mut assigns = vec![(0u32, units)];
+        if have > units {
             outputs.push((me.clone(), CARRIER));
-            assigns.push((1, have - dream));
+            assigns.push((1, have - units));
         }
         records.push(
-            sidestr_core::records::tally_text(Some(&id), &assigns)
+            sidestr_core::records::tally_text(id.as_ref(), &assigns)
                 .map_err(|e| ProvisionError::Plain(e.to_string()))?,
         );
     }
@@ -477,13 +686,13 @@ pub fn build_provision(
         outputs.push((to.clone(), sats));
     }
     if outputs.is_empty() {
-        return Err(ProvisionError::Plain(
-            "Choose some DREAM or sats to give.".into(),
-        ));
+        return Err(ProvisionError::Plain(format!(
+            "Choose some {ticker} or sats to give."
+        )));
     }
     let spend = build_outputs(
         &OutputsRequest {
-            chain: snap.view.state.document(),
+            chain: snap.state.document(),
             coins: &sorted.plain,
             required: &required,
             tip_height: snap.height(),
@@ -496,10 +705,9 @@ pub fn build_provision(
     )
     .map_err(ProvisionError::Wallet)?;
     let mut carried_in = Default::default();
-    snap.view
-        .assets
+    snap.assets
         .check(&spend.tx, &mut carried_in)
-        .map_err(|e| ProvisionError::Plain(format!("the pack would break the DREAM rule: {e}")))?;
+        .map_err(|e| ProvisionError::Plain(format!("the pack would break the assets rule: {e}")))?;
     Ok(spend)
 }
 
@@ -536,37 +744,118 @@ pub fn prevouts_for(
 mod tests {
     use super::*;
 
+    const PK: &str = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c";
+
+    fn dream() -> Txid {
+        DREAM_ASSET_ID.parse().unwrap()
+    }
+
+    fn dreamlab_snap() -> Snapshot {
+        replay(
+            &DREAMLAB,
+            Some(dream()),
+            include_bytes!("testdata/blocks.dat"),
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn the_lock_holds_the_pinned_document() {
-        let doc = document().unwrap();
-        assert_eq!(doc.id, CHAIN_ID);
-        assert_eq!(doc.address_prefix, "drm");
-        assert_eq!(dream_id().to_string(), DREAM_ASSET_ID);
+    fn each_lock_holds_its_pinned_document() {
+        for pin in PINS {
+            let doc = pin.document().unwrap();
+            assert_eq!(doc.id, pin.id);
+            assert_eq!(doc.parent, pin.parent);
+            assert_eq!(doc.genesis_hash.as_deref(), Some(pin.genesis_hash));
+            assert_eq!(doc.address_prefix, pin.address_prefix);
+            assert_eq!(super::pin(pin.id), Some(pin));
+        }
+        assert_eq!(
+            DREAMLAB.document().unwrap().family().unwrap(),
+            Family::Stock
+        );
+        assert_eq!(
+            DREAMLAB_TXBT4.document().unwrap().family().unwrap(),
+            Family::Blake2b
+        );
+        assert_eq!(dream().to_string(), DREAM_ASSET_ID);
+        assert_eq!(DREAMLAB.asset_id, Some(DREAM_ASSET_ID));
+        assert_eq!(DREAMLAB_TXBT4.asset_id, None, "BLAKES7 is named at runtime");
+        assert_eq!(super::pin("sidestr:other"), None);
+    }
+
+    /// The txbt4 document with any one locked field changed is refused.
+    #[test]
+    fn a_txbt4_document_that_is_not_the_pinned_one_is_refused() {
+        let wrong_genesis = TXBT4_CHAIN_JSON.replace(TXBT4_GENESIS_HASH, &"00".repeat(32));
+        assert_ne!(wrong_genesis, TXBT4_CHAIN_JSON);
+        let e = check_document(&DREAMLAB_TXBT4, &wrong_genesis).unwrap_err();
+        assert!(e.contains("genesis"), "{e}");
+        let wrong_parent = TXBT4_CHAIN_JSON.replace(r#""parent":"txbt4""#, r#""parent":"tbtc4""#);
+        assert_ne!(wrong_parent, TXBT4_CHAIN_JSON);
+        assert!(check_document(&DREAMLAB_TXBT4, &wrong_parent).is_err());
+        let wrong_id = TXBT4_CHAIN_JSON.replace(
+            r#""id":"sidestr:dreamlab-txbt4""#,
+            r#""id":"sidestr:dreamlab-txbt5""#,
+        );
+        assert_ne!(wrong_id, TXBT4_CHAIN_JSON);
+        assert!(check_document(&DREAMLAB_TXBT4, &wrong_id).is_err());
+        // and neither pinned document passes for the other chain
+        assert!(check_document(&DREAMLAB_TXBT4, CHAIN_JSON).is_err());
+        assert!(check_document(&DREAMLAB, TXBT4_CHAIN_JSON).is_err());
     }
 
     #[test]
     fn scripts_and_keys_round_trip() {
-        let pk = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c";
-        let s = script_of(pk).unwrap();
-        assert_eq!(pubkey_of_script(&s).as_deref(), Some(pk));
+        let s = script_of(PK).unwrap();
+        assert_eq!(pubkey_of_script(&s).as_deref(), Some(PK));
         assert!(script_of("nope").is_none());
-        assert!(address_of(pk).unwrap().starts_with("drm1p"));
-        assert_eq!(destination_script(&format!("did:nostr:{pk}")).unwrap(), s);
-        assert_eq!(destination_script(&address_of(pk).unwrap()).unwrap(), s);
+        assert!(address_of(&DREAMLAB, PK).unwrap().starts_with("drm1p"));
+        assert_eq!(
+            destination_script(&DREAMLAB, &format!("did:nostr:{PK}")).unwrap(),
+            s
+        );
+        assert_eq!(
+            destination_script(&DREAMLAB, &address_of(&DREAMLAB, PK).unwrap()).unwrap(),
+            s
+        );
+    }
+
+    /// One key, one script, two addresses: each chain writes its own prefix,
+    /// and either address pays the same script on either chain.
+    #[test]
+    fn one_key_has_an_address_on_each_chain_and_one_script() {
+        let s = script_of(PK).unwrap();
+        let drm = address_of(&DREAMLAB, PK).unwrap();
+        let drt = address_of(&DREAMLAB_TXBT4, PK).unwrap();
+        assert!(drt.starts_with("drt1p"), "{drt}");
+        assert_ne!(drm, drt);
+        for pin in PINS {
+            assert_eq!(destination_script(pin, &drm).unwrap(), s);
+            assert_eq!(destination_script(pin, &drt).unwrap(), s);
+        }
+        let npub = sidestr_agent::npub(&sidestr_agent::parse_pubkey(PK).unwrap());
+        assert_eq!(destination_script(&DREAMLAB_TXBT4, &npub).unwrap(), s);
     }
 
     #[test]
     fn a_secret_is_never_a_destination() {
-        let e =
-            destination_script("nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5")
-                .unwrap_err();
-        assert!(!e.contains("vl029"), "the secret is echoed: {e}");
+        for pin in PINS {
+            let e = destination_script(
+                pin,
+                "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5",
+            )
+            .unwrap_err();
+            assert!(!e.contains("vl029"), "the secret is echoed: {e}");
+        }
     }
 
     #[test]
     fn an_empty_or_foreign_block_file_is_refused() {
-        assert!(replay(&[], None).is_err());
-        assert!(replay(&[0u8; 12], None).is_err());
+        for pin in PINS {
+            assert!(replay(pin, None, &[], None).is_err());
+            assert!(replay(pin, None, &[0u8; 12], None).is_err());
+        }
     }
 
     /// The live chain as the producer served it after DREAM was issued
@@ -574,9 +863,10 @@ mod tests {
     /// supply where it was minted.
     #[test]
     fn the_live_chain_replays_with_dream_at_the_treasury() {
-        let snap = replay(include_bytes!("testdata/blocks.dat"), None).unwrap();
+        let snap = dreamlab_snap();
+        assert!(matches!(snap.state, ChainState::Stock(_)));
         assert!(snap.height() >= 372);
-        let issued = &snap.view.assets.issued()[&dream_id()];
+        let issued = snap.issued().unwrap();
         assert_eq!(
             (issued.ticker.as_str(), issued.supply, issued.height),
             ("DREAM", 1_000_000, 372)
@@ -584,11 +874,64 @@ mod tests {
         let treasury =
             script_of("f6b84686a2323a233e99c60ed79a59d3ec45289fec58a4c359997e551b0326b0").unwrap();
         let b = snap.balances(&treasury, &[]);
-        assert!(b.dream > 0 && b.dream <= 1_000_000);
+        assert!(b.asset > 0 && b.asset <= 1_000_000);
         let hist = snap.history(&treasury.to_hex_string());
         let issue = hist.iter().find(|t| t.txid == DREAM_ASSET_ID).unwrap();
-        assert_eq!(issue.movement(&treasury.to_hex_string()).dream, 1_000_000);
+        assert_eq!(issue.movement(&treasury.to_hex_string()).asset, 1_000_000);
         assert!(snap.txs.iter().all(|t| t.broken.is_none()));
+        // with no asset named the same chain reads sats only
+        let bare = replay(&DREAMLAB, None, include_bytes!("testdata/blocks.dat"), None).unwrap();
+        let b = bare.balances(&treasury, &[]);
+        assert_eq!(b.asset, 0);
+        assert!(b.carrier_sats > 0, "the carriers are still counted apart");
+        assert!(bare.issued().is_none() && bare.tips.is_empty());
+    }
+
+    /// `sidestr:dreamlab-txbt4` as its producer served it at the seal: the
+    /// BLAKE2b genesis alone, validated under the Knots v2 header family.
+    #[test]
+    fn the_txbt4_genesis_replays_under_the_blake2b_family() {
+        let dat = include_bytes!("testdata/txbt4-genesis.dat");
+        let snap = replay(&DREAMLAB_TXBT4, None, dat, None).unwrap();
+        assert!(matches!(snap.state, ChainState::Blake2b(_)));
+        assert_eq!(snap.height(), 0);
+        assert_eq!(snap.state.document().id, TXBT4_CHAIN_ID);
+        assert_eq!(
+            snap.balances(&script_of(PK).unwrap(), &[]),
+            Balances::default()
+        );
+        // each chain's blocks fail the other's lock
+        assert!(replay(&DREAMLAB, Some(dream()), dat, None).is_err());
+        assert!(replay(
+            &DREAMLAB_TXBT4,
+            None,
+            include_bytes!("testdata/blocks.dat"),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_pack_of_an_asset_the_chain_lacks_is_refused() {
+        let snap = replay(
+            &DREAMLAB_TXBT4,
+            None,
+            include_bytes!("testdata/txbt4-genesis.dat"),
+            None,
+        )
+        .unwrap();
+        let k = sidestr_agent::AgentKey::from_secret_bytes(&[0x42; 32]).unwrap();
+        let e = build_provision(
+            &snap,
+            &[],
+            &k.spend_signer(),
+            &script_of(PK).unwrap(),
+            10,
+            0,
+            "BLAKES7",
+        )
+        .unwrap_err();
+        assert!(matches!(e, ProvisionError::Plain(m) if m.contains("no BLAKES7")));
     }
 
     mod browser_signer {
@@ -603,7 +946,13 @@ mod tests {
         use sidestr_wallet::SpendSigner;
 
         fn snap() -> Snapshot {
-            replay(include_bytes!("testdata/blocks.dat"), None).unwrap()
+            replay(
+                &DREAMLAB,
+                DREAM_ASSET_ID.parse().ok(),
+                include_bytes!("testdata/blocks.dat"),
+                None,
+            )
+            .unwrap()
         }
         fn kp() -> Keypair {
             Keypair::from_secret_key(secp(), &SecretKey::from_slice(&[0x42; 32]).unwrap())
@@ -639,7 +988,7 @@ mod tests {
         fn built() -> (Snapshot, ExternalSigner, sidestr_wallet::spend::Spend) {
             let s = snap();
             let ext = ExternalSigner::new(kp().x_only_public_key().0);
-            let spend = build_provision(&s, &coins(), &ext, &them(), 0, 2_000)
+            let spend = build_provision(&s, &coins(), &ext, &them(), 0, 2_000, DREAM)
                 .unwrap_or_else(|_| panic!("the pack builds"));
             (s, ext, spend)
         }
@@ -655,14 +1004,14 @@ mod tests {
             .unwrap();
             let ext = ExternalSigner::new(treasury);
             let coins = s.coins(&ext.script(), &[]);
-            let spend = build_provision(&s, &coins, &ext, &them(), 100, 1_000)
+            let spend = build_provision(&s, &coins, &ext, &them(), 100, 1_000, DREAM)
                 .unwrap_or_else(|_| panic!("the treasury pack builds"));
             let bare: Transaction = deserialize_hex(&unsigned_hex(&spend.tx)).unwrap();
             assert!(bare.input.iter().all(|i| i.witness.is_empty()));
             assert_eq!(bare.compute_txid(), spend.txid);
             let prevouts = prevouts_for(&spend.tx, &coins, &ext.script()).unwrap();
             assert_eq!(prevouts.len(), spend.tx.input.len());
-            let doc = document().unwrap();
+            let doc = DREAMLAB.document().unwrap();
             // an answer that is still unsigned is refused
             assert!(accept_signed(&spend, &unsigned_hex(&spend.tx), &prevouts, &doc).is_err());
         }
@@ -673,7 +1022,8 @@ mod tests {
             assert_eq!(spend.tx.input.len(), 2);
             let prevouts = prevouts_for(&spend.tx, &coins(), &ext.script()).unwrap();
             let answer = serialize_hex(&sign(&spend.tx, &prevouts, &kp()));
-            let signed = accept_signed(&spend, &answer, &prevouts, &document().unwrap()).unwrap();
+            let signed =
+                accept_signed(&spend, &answer, &prevouts, &DREAMLAB.document().unwrap()).unwrap();
             assert_eq!(signed.txid, spend.txid);
             assert_eq!(
                 signed.vsize, spend.vsize,
@@ -690,9 +1040,13 @@ mod tests {
             let w0 = t.input[0].witness.clone();
             t.input[0].witness = t.input[1].witness.clone();
             t.input[1].witness = w0;
-            assert!(
-                accept_signed(&spend, &serialize_hex(&t), &prevouts, &document().unwrap()).is_err()
-            );
+            assert!(accept_signed(
+                &spend,
+                &serialize_hex(&t),
+                &prevouts,
+                &DREAMLAB.document().unwrap()
+            )
+            .is_err());
         }
 
         #[test]
@@ -702,7 +1056,9 @@ mod tests {
             let other =
                 Keypair::from_secret_key(secp(), &SecretKey::from_slice(&[0x43; 32]).unwrap());
             let answer = serialize_hex(&sign(&spend.tx, &prevouts, &other));
-            assert!(accept_signed(&spend, &answer, &prevouts, &document().unwrap()).is_err());
+            assert!(
+                accept_signed(&spend, &answer, &prevouts, &DREAMLAB.document().unwrap()).is_err()
+            );
         }
 
         #[test]
@@ -712,7 +1068,8 @@ mod tests {
             let mut other = spend.tx.clone();
             other.output[0].script_pubkey = ext.script(); // pays itself instead
             let answer = serialize_hex(&sign(&other, &prevouts, &kp()));
-            let e = accept_signed(&spend, &answer, &prevouts, &document().unwrap()).unwrap_err();
+            let e = accept_signed(&spend, &answer, &prevouts, &DREAMLAB.document().unwrap())
+                .unwrap_err();
             assert!(e.to_string().contains("different transaction"), "{e}");
         }
 
@@ -734,23 +1091,23 @@ mod tests {
             ins: vec![Leg {
                 script: me.clone(),
                 sats: 1000,
-                dream: 100,
+                asset: 100,
             }],
             outs: vec![
                 Leg {
                     script: them.clone(),
                     sats: 330,
-                    dream: 40,
+                    asset: 40,
                 },
                 Leg {
                     script: me.clone(),
                     sats: 330,
-                    dream: 60,
+                    asset: 60,
                 },
                 Leg {
                     script: me.clone(),
                     sats: 140,
-                    dream: 0,
+                    asset: 0,
                 },
             ],
             tip_event: None,
@@ -759,11 +1116,11 @@ mod tests {
             coinbase: false,
         };
         let m = t.movement(&me);
-        assert_eq!(m.dream, -40);
+        assert_eq!(m.asset, -40);
         assert_eq!(m.sats, -530);
         assert_eq!(m.counterparty.as_deref(), Some(them.as_str()));
         let r = t.movement(&them);
-        assert_eq!((r.dream, r.sats), (40, 330));
+        assert_eq!((r.asset, r.sats), (40, 330));
         assert_eq!(r.counterparty.as_deref(), Some(me.as_str()));
     }
 }

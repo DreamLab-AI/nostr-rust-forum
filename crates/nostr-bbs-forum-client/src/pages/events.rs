@@ -38,6 +38,9 @@ struct CalendarEvent {
     poker: bool,
     /// Invited players (`p` tags with a role), for a poker game.
     players: Vec<String>,
+    /// The chain whose asset table a poker game is played at (`chain` tag,
+    /// ADR-2021); `None` for a game scheduled before there were two.
+    chain: Option<String>,
 }
 
 /// RSVP data for an event.
@@ -482,10 +485,11 @@ pub fn EventsPage() -> impl IntoView {
                                                 } else {
                                                     format!("{n} player{} invited", if n == 1 { "" } else { "s" })
                                                 };
+                                                let (table, href) = poker_table_of(evt.chain.as_deref());
                                                 view! {
                                                     <div class="mt-2 ml-[72px] text-xs text-amber-300 flex items-center gap-2">
-                                                        <span>"♠ Poker · "{players}</span>
-                                                        <a href=crate::app::base_href("/table") class="underline hover:text-amber-200">"Go to the table"</a>
+                                                        <span>"♠ Poker · "{table.map(|t| format!("{t} · "))}{players}</span>
+                                                        <a href=href class="underline hover:text-amber-200">"Go to the table"</a>
                                                     </div>
                                                 }
                                             });
@@ -751,6 +755,20 @@ fn BirthdayList() -> impl IntoView {
     }
 }
 
+/// Where a poker game's link goes — its chain's section of the table page
+/// when it names one — and that table's name when this forum offers the
+/// chain.
+fn poker_table_of(chain: Option<&str>) -> (Option<String>, String) {
+    let base = crate::app::base_href("/table");
+    match chain {
+        Some(id) => (
+            crate::wallet::profile::find(id).map(|p| format!("{} table", p.label)),
+            format!("{base}#{}", crate::wallet::profile::anchor_of(id)),
+        ),
+        None => (None, base),
+    }
+}
+
 /// Parse a kind 31923 event into a CalendarEvent.
 ///
 /// Supports two layouts:
@@ -801,6 +819,7 @@ fn parse_calendar_event(event: &NostrEvent) -> CalendarEvent {
             venue: tag("venue").unwrap_or_default(),
             poker: false,
             players: Vec::new(),
+            chain: None,
         };
     }
 
@@ -855,5 +874,45 @@ fn parse_calendar_event(event: &NostrEvent) -> CalendarEvent {
             .filter(|t| t.len() >= 2 && t[0] == "p" && t[1].len() == 64)
             .map(|t| t[1].clone())
             .collect(),
+        chain: tag("chain").filter(|c| c.starts_with("sidestr:")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn poker_event(extra: Vec<Vec<String>>) -> NostrEvent {
+        let mut tags = vec![
+            vec!["d".to_string(), "x".to_string()],
+            vec!["title".to_string(), "Poker night".to_string()],
+            vec!["start".to_string(), "1800000000".to_string()],
+            vec!["t".to_string(), "poker".to_string()],
+        ];
+        tags.extend(extra);
+        NostrEvent {
+            id: "e".repeat(64),
+            pubkey: "a".repeat(64),
+            created_at: 1_800_000_000,
+            kind: 31923,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_poker_game_names_its_chain() {
+        let ev = parse_calendar_event(&poker_event(vec![vec![
+            "chain".into(),
+            "sidestr:dreamlab-txbt4".into(),
+        ]]));
+        assert!(ev.poker);
+        assert_eq!(ev.chain.as_deref(), Some("sidestr:dreamlab-txbt4"));
+        // a game scheduled before there were two chains names none
+        assert_eq!(parse_calendar_event(&poker_event(vec![])).chain, None);
+        // and a tag that is not a sidestr chain id is not taken for one
+        let odd = parse_calendar_event(&poker_event(vec![vec!["chain".into(), "evm:1".into()]]));
+        assert_eq!(odd.chain, None);
     }
 }

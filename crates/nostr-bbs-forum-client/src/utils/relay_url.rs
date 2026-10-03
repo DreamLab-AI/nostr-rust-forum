@@ -128,6 +128,26 @@ pub fn env_override(key: &str) -> Option<String> {
     window_env(key)
 }
 
+/// A `window.__ENV__` value as JSON text, whether the deployment injected a
+/// JSON string or an already-parsed object or array (`POKER_CONFIG`,
+/// `SIDESTR_CHAINS`). Empty strings read as absent.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn env_override_json(key: &str) -> Option<String> {
+    let window = web_sys::window()?;
+    let env = js_sys::Reflect::get(&window, &"__ENV__".into()).ok()?;
+    if env.is_undefined() || env.is_null() {
+        return None;
+    }
+    let val = js_sys::Reflect::get(&env, &key.into()).ok()?;
+    if let Some(s) = val.as_string() {
+        return (!s.trim().is_empty()).then_some(s);
+    }
+    if val.is_object() {
+        return js_sys::JSON::stringify(&val).ok()?.as_string();
+    }
+    None
+}
+
 fn window_env(key: &str) -> Option<String> {
     let window = web_sys::window()?;
     let env = js_sys::Reflect::get(&window, &"__ENV__".into()).ok()?;
