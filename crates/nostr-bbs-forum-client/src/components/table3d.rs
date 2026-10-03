@@ -538,10 +538,12 @@ pub fn Table3d(
         // after dispose: the scene has dropped its listeners, so nothing can
         // call the closure once it is freed
         listener.borrow_mut().take();
-        busy.try_set(false);
-        // `peek_live` is not reset here: it belongs to this component, and
-        // writing it would wake the live region's render effect while the
-        // component is being torn down (a re-entrant task poll in wasm)
+        // Nothing is written here. `busy` belongs to the page: when the whole
+        // page is going (a switch to another table), a write wakes its Deal
+        // button's binding after the page's values are disposed, which
+        // panics. The surface releases `busy` itself whenever the scene stops
+        // being shown (`TableSurface`). `peek_live` is ours, and a write would
+        // wake the live region mid-teardown (a re-entrant task poll in wasm).
     });
 
     let loading = move || matches!(status.get(), Table3dStatus::Loading);

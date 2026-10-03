@@ -199,6 +199,35 @@ pub struct LiveStore {
     nonces: StoredValue<HashMap<String, String>>,
 }
 
+/// What [`LiveStore::send`] carries into its task, read while the store is
+/// alive. Generic only so tests can stand in for the relay and the signer,
+/// which need a browser.
+struct Outbox<S = SendWrapper<Rc<dyn Signer>>, R = RelayConnection> {
+    citizen: String,
+    signer: S,
+    relay: R,
+}
+
+impl<S, R> Outbox<S, R>
+where
+    S: Clone + Send + Sync + 'static,
+    R: Clone + Send + Sync + 'static,
+{
+    /// Read the three values now: `None` once their owner is disposed (the
+    /// table has closed), where a plain read would panic.
+    fn read(
+        citizen: StoredValue<String>,
+        signer: StoredValue<S>,
+        relay: StoredValue<R>,
+    ) -> Option<Self> {
+        Some(Self {
+            citizen: citizen.try_get_value()?,
+            signer: signer.try_get_value()?,
+            relay: relay.try_get_value()?,
+        })
+    }
+}
+
 impl LiveStore {
     /// A session as `me` with the house `citizen`.
     pub fn new(
@@ -282,20 +311,29 @@ impl LiveStore {
         }
     }
 
+    /// What a message to the house needs, read now: `None` once the table
+    /// that owns this store is gone.
+    fn outbox(&self) -> Option<Outbox> {
+        Outbox::read(self.citizen, self.signer, self.relay)
+    }
+
     fn send(&self, msg: ToCitizen) {
-        let store = *self;
+        // Read everything before the task: it runs after this call returns,
+        // and the Leave sent from the table's cleanup runs after the store
+        // is disposed, when reading it would panic.
+        let Some(out) = self.outbox() else {
+            return;
+        };
+        let error = self.error;
         wasm_bindgen_futures::spawn_local(async move {
-            let citizen = store.citizen();
             let json = msg.to_json();
-            let wrapped = {
-                let signer = store.signer.get_value();
-                gift_wrap_with_signer_kind(signer.as_ref(), &citizen, RUMOR_KIND, &json).await
-            };
-            match wrapped {
-                Ok(ev) => store.relay.with_value(|r| r.publish(&ev)),
-                Err(e) => store
-                    .error
-                    .set(Some(format!("Could not reach the house: {e}"))),
+            match gift_wrap_with_signer_kind(out.signer.as_ref(), &out.citizen, RUMOR_KIND, &json)
+                .await
+            {
+                Ok(ev) => out.relay.publish(&ev),
+                Err(e) => {
+                    error.try_set(Some(format!("Could not reach the house: {e}")));
+                }
             }
         });
     }
@@ -423,11 +461,13 @@ impl LiveStore {
     }
 
     async fn pay(&self, root: &str, to_script: &str, amount: u64) {
-        let outcome = match (self.wallet.get_value(), chain::script_of_hex(to_script)) {
-            (Some(w), Some(to)) => {
-                let auth = self.auth.get_value();
-                w.send_asset_for_hand(&auth, to, amount, root).await
-            }
+        // the table may have closed before this task ran
+        let (Some(wallet), Some(auth)) = (self.wallet.try_get_value(), self.auth.try_get_value())
+        else {
+            return;
+        };
+        let outcome = match (wallet, chain::script_of_hex(to_script)) {
+            (Some(w), Some(to)) => w.send_asset_for_hand(&auth, to, amount, root).await,
             (None, _) => Err("The wallet is switched off.".into()),
             (_, None) => Err("The winner's script is not readable.".into()),
         };
@@ -466,14 +506,19 @@ impl LiveStore {
         if fresh != Some(true) {
             return;
         }
-        let unwrapped = {
-            let signer = self.signer.get_value();
-            unwrap_gift_with_signer_kind(&event, signer.as_ref(), RUMOR_KIND).await
+        // an event already in flight when the table closed finds the store
+        // gone, before or after the unwrap: drop it
+        let Some(signer) = self.signer.try_get_value() else {
+            return;
         };
+        let unwrapped = unwrap_gift_with_signer_kind(&event, signer.as_ref(), RUMOR_KIND).await;
         let Ok(unwrapped) = unwrapped else {
             return; // a DM or a zone-key grant: not ours
         };
-        if unwrapped.sender_pubkey != self.citizen() {
+        let Some(citizen) = self.citizen.try_get_value() else {
+            return;
+        };
+        if unwrapped.sender_pubkey != citizen {
             return;
         }
         // the relay re-streams history: anything older than a hand's
@@ -792,5 +837,46 @@ impl LiveStore {
                 store.pay(&root_c, &to_c, amount_c).await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_outbox_reads_a_live_table() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let out = Outbox::read(
+                StoredValue::new("ab".repeat(32)),
+                StoredValue::new("signer".to_string()),
+                StoredValue::new(7u8),
+            )
+            .expect("alive");
+            assert_eq!(out.citizen, "ab".repeat(32));
+            assert_eq!(out.signer, "signer");
+            assert_eq!(out.relay, 7);
+        });
+    }
+
+    #[test]
+    fn the_outbox_of_a_closed_table_is_empty_not_a_panic() {
+        // the DREAM table's cleanup sends a Leave whose task ran once the
+        // table, and so the store, was gone: switching to the practice table
+        // panicked ("a reactive value that has already been disposed").
+        // `send` now reads through `Outbox::read` before it spawns, and
+        // sends nothing once the owner is disposed.
+        let owner = Owner::new();
+        let (c, s, r) = owner.with(|| {
+            (
+                StoredValue::new("ab".repeat(32)),
+                StoredValue::new("signer".to_string()),
+                StoredValue::new(7u8),
+            )
+        });
+        owner.cleanup();
+        assert!(c.try_get_value().is_none(), "the owner disposed its values");
+        assert!(Outbox::read(c, s, r).is_none());
     }
 }

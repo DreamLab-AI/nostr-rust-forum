@@ -606,6 +606,15 @@ fn TableSurface(
             inspect.set(None);
         }
     });
+    // Whenever the scene is not shown (switched off, or failed), nothing is
+    // animating, so the buttons are free. This lives here rather than in the
+    // scene's cleanup: this effect goes with the page, so leaving the table
+    // never writes into a page that is being taken down.
+    Effect::new(move |_| {
+        if !show.get() {
+            busy.set(false);
+        }
+    });
 
     view! {
         <Show when=move || show.get()>

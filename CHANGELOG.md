@@ -18,6 +18,26 @@ timed out on every hand. `gift_wrap::rumor_json_with_id` now serialises the
 rumor with its computed id; readers ignore the extra field, so nothing else
 changes on the wire.
 
+### Fixed: leaving a table no longer kills the page — 2026-10-03
+
+Two panics ("Tried to access a reactive value that has already been
+disposed") left the table page dead.
+
+- **Leaving the DREAM or BLAKES7 table.** Switching from a chain table to
+  any other table, with the 3D table on or off, panicked. The table's
+  cleanup sends the house a Leave from an async task, and that task read the
+  live store (`LiveStore::send` → `citizen()`) after the table had been
+  disposed. `send` now reads the house key, the signer and the relay before
+  it spawns (`Outbox::read`, `poker/live.rs`), so the Leave is actually sent;
+  before, it never was. Gift-wrap processing and paying the house also stop
+  quietly when the table has gone. Seen in production as "3D off, then Deal":
+  production opens on the DREAM table, so reaching Deal meant switching away
+  from it first.
+- **Leaving the practice table with the 3D table on.** The 3D table's cleanup
+  wrote the page's `busy` signal while the page itself was being taken down,
+  which woke the Deal button's binding on a disposed signal. The scene no
+  longer writes to the page on cleanup; `TableSurface` frees the buttons
+  whenever the scene is not shown (switched off or failed).
 
 ### Added: hover to inspect cards on the poker table, 3D and flat — 2026-10-03
 
