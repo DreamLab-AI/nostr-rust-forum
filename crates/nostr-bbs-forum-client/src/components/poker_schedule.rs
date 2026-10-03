@@ -129,6 +129,7 @@ pub fn ScheduleGameModal(
                     .map(|p| (p.pubkey.clone(), "player".to_string()))
                     .collect(),
                 hashtags: vec!["poker".to_string()],
+                extra_tags: Vec::new(),
             };
             let event =
                 match nostr_bbs_core::create_calendar_event_signer_spec(signer.as_ref(), &spec)

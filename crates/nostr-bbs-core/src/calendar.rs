@@ -441,7 +441,26 @@ pub struct CalendarEventSpec {
     /// Further `t` hashtags beside `calendar-event` (e.g. `"poker"`), so a
     /// reader can tell a game night from a lecture.
     pub hashtags: Vec<String>,
+    /// Further single-value tags `[name, value]` an application reads (e.g.
+    /// `("chain", "sidestr:dreamlab-txbt4")` on a poker game). A name the
+    /// builder writes itself (`d`, `title`, `start`, `end`, `location`,
+    /// `max_attendees`, `p`, `t`), an empty name, or an empty value is
+    /// skipped, so a caller cannot forge the event's own fields.
+    pub extra_tags: Vec<(String, String)>,
 }
+
+/// The tag names [`create_calendar_event_signer_spec`] writes itself, which
+/// [`CalendarEventSpec::extra_tags`] may not repeat.
+const BUILDER_TAGS: [&str; 8] = [
+    "d",
+    "title",
+    "start",
+    "end",
+    "location",
+    "max_attendees",
+    "p",
+    "t",
+];
 
 /// Create a time-based calendar event (kind 31923) using a [`Signer`].
 ///
@@ -467,6 +486,7 @@ pub async fn create_calendar_event_signer(
             max_attendees,
             participants: Vec::new(),
             hashtags: Vec::new(),
+            extra_tags: Vec::new(),
         },
     )
     .await
@@ -474,7 +494,8 @@ pub async fn create_calendar_event_signer(
 
 /// [`create_calendar_event_signer`] from a [`CalendarEventSpec`]: the same
 /// event with, in addition, a `["p", <pubkey>, "", <role>]` tag per
-/// participant and a `["t", <tag>]` per hashtag.
+/// participant, a `["t", <tag>]` per hashtag, and a `[name, value]` per
+/// admissible extra tag.
 pub async fn create_calendar_event_signer_spec(
     signer: &dyn Signer,
     spec: &CalendarEventSpec,
@@ -535,6 +556,11 @@ pub async fn create_calendar_event_signer_spec(
             tags.push(vec!["t".to_string(), t.clone()]);
         }
     }
+    for (name, value) in &spec.extra_tags {
+        if !name.is_empty() && !value.is_empty() && !BUILDER_TAGS.contains(&name.as_str()) {
+            tags.push(vec![name.clone(), value.clone()]);
+        }
+    }
 
     let unsigned = UnsignedEvent {
         pubkey,
@@ -592,6 +618,53 @@ mod tests {
 
     fn test_key() -> [u8; 32] {
         [0x01u8; 32]
+    }
+
+    /// Drive a future that never waits (the local signer resolves at once).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut pinned = Box::pin(fut);
+        loop {
+            if let std::task::Poll::Ready(v) = pinned.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    #[test]
+    fn spec_extra_tags_are_written_but_never_forge_the_builders_own() {
+        let signer = crate::signer::PrfSigner::new(crate::keys::generate_keypair().unwrap());
+        let spec = CalendarEventSpec {
+            title: "Poker night".into(),
+            start: 1_800_000_000,
+            end: Some(1_800_007_200),
+            hashtags: vec!["poker".into()],
+            extra_tags: vec![
+                ("chain".into(), "sidestr:dreamlab-txbt4".into()),
+                ("start".into(), "1".into()),
+                ("d".into(), "forged".into()),
+                ("t".into(), "forged".into()),
+                (String::new(), "x".into()),
+                ("empty".into(), String::new()),
+            ],
+            ..Default::default()
+        };
+        let ev = block_on(create_calendar_event_signer_spec(&signer, &spec)).unwrap();
+        assert!(verify_event(&ev));
+        let named = |n: &str| ev.tags.iter().filter(|t| t[0] == n).collect::<Vec<_>>();
+        assert_eq!(
+            named("chain"),
+            vec![&vec![
+                "chain".to_string(),
+                "sidestr:dreamlab-txbt4".to_string()
+            ]]
+        );
+        assert_eq!(named("start").len(), 1);
+        assert_eq!(named("start")[0][1], "1800000000");
+        assert_eq!(named("d").len(), 1);
+        assert_ne!(named("d")[0][1], "forged");
+        assert!(named("t").iter().all(|t| t[1] != "forged"));
+        assert!(named("empty").is_empty() && named("").is_empty());
     }
 
     // -- Calendar event (kind 31923) ------------------------------------------
