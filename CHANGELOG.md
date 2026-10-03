@@ -7,6 +7,18 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: sealed rumors carry their NIP-01 `id`
+
+A NIP-59 rumor is an unsigned event with an `id` and no `sig`. The core
+sealed the bare unsigned template without `id`, so cross-implementation
+readers that key on `rumor.id` (JunkieJarvis's dedup, nostr-tools users)
+treated every kit-originated DM as a duplicate and dropped it: no forum
+member's DM to JunkieJarvis was ever answered, and the practice-table coach
+timed out on every hand. `gift_wrap::rumor_json_with_id` now serialises the
+rumor with its computed id; readers ignore the extra field, so nothing else
+changes on the wire.
+
+
 ### Added: hover to inspect cards on the poker table, 3D and flat — 2026-10-03
 
 Hovering the hero's hole cards, the board, or the other seat's cards once

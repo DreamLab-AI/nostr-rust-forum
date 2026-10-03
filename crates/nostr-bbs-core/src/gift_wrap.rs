@@ -206,6 +206,25 @@ pub fn create_rumor_kind(
     }
 }
 
+/// The rumor as the JSON a seal carries: the unsigned event plus its NIP-01
+/// `id` (hex sha256 of the canonical form), never a `sig`.
+pub fn rumor_json_with_id(rumor: &UnsignedEvent) -> Result<String, GiftWrapError> {
+    let mut v =
+        serde_json::to_value(rumor).map_err(|e| GiftWrapError::Serialization(e.to_string()))?;
+    let id = hex::encode(crate::event::compute_event_id(rumor));
+    match v.as_object_mut() {
+        Some(m) => {
+            m.insert("id".to_string(), serde_json::Value::String(id));
+        }
+        None => {
+            return Err(GiftWrapError::Serialization(
+                "rumor is not a JSON object".into(),
+            ))
+        }
+    }
+    serde_json::to_string(&v).map_err(|e| GiftWrapError::Serialization(e.to_string()))
+}
+
 // ── Layer 2: Seal ────────────────────────────────────────────────────────────
 
 /// Seal a rumor by NIP-44-encrypting it and signing with the sender's key.
@@ -225,9 +244,13 @@ pub fn seal_rumor(
     sender_sk: &[u8; 32],
     recipient_pk: &[u8; 32],
 ) -> Result<NostrEvent, GiftWrapError> {
-    // Serialize the rumor to JSON
-    let rumor_json =
-        serde_json::to_string(rumor).map_err(|e| GiftWrapError::Serialization(e.to_string()))?;
+    // Serialize the rumor to JSON WITH its NIP-01 id. A NIP-59 rumor is an
+    // unsigned event: it carries `id` (so a recipient can dedup on it and
+    // cross-implementation readers such as nostr-tools, which key on
+    // `rumor.id`, treat it as a real message) but no `sig`. Serialising the
+    // bare template without `id` made every kit-originated DM look like a
+    // duplicate to JunkieJarvis's dedup and it was dropped silently.
+    let rumor_json = rumor_json_with_id(rumor)?;
 
     // NIP-44 encrypt: sender → recipient
     let encrypted = nip44::encrypt(sender_sk, recipient_pk, &rumor_json)
@@ -720,6 +743,20 @@ pub fn process_kind4_event(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sealed_rumor_json_carries_its_nip01_id_and_no_sig() {
+        let r = super::create_rumor("a".repeat(64).as_str(), "b".repeat(64).as_str(), "hello");
+        let j = super::rumor_json_with_id(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let expect = hex::encode(crate::event::compute_event_id(&r));
+        assert_eq!(v["id"].as_str().unwrap(), expect);
+        assert!(v.get("sig").is_none());
+        assert_eq!(v["kind"].as_u64().unwrap(), super::KIND_RUMOR);
+        // Round-trips through the unsigned type (the extra `id` is ignored on read).
+        let back: crate::event::UnsignedEvent = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.content, "hello");
+    }
+
     use super::*;
     use crate::keys::generate_keypair as gen_kp;
 
