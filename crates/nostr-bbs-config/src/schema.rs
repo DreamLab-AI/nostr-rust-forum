@@ -1,5 +1,7 @@
 //! Strongly-typed TOML schema for `forum.toml`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level forum configuration: one struct per TOML `[section]`.
@@ -671,6 +673,10 @@ fn default_shared_venues() -> Vec<String> {
     vec!["primary".into(), "secondary".into()]
 }
 
+/// The chain a bare `[poker] citizen_pubkey` names: the house seat it gives
+/// settles on `sidestr:dreamlab` (the only chain before the `citizens` map).
+pub const LEGACY_CITIZEN_CHAIN: &str = "sidestr:dreamlab";
+
 /// `[poker]` — poker table parameters.
 ///
 /// Stakes and the buy-in are expressed in **big blinds** so a single table
@@ -678,6 +684,10 @@ fn default_shared_venues() -> Vec<String> {
 /// by [`Features::poker`]; this section only describes the tables offered.
 /// Projected to the forum client as the JSON object produced by
 /// [`to_env_json`](Self::to_env_json) (`window.__ENV__.POKER_CONFIG`).
+///
+/// Each sidestr chain with an asset table has its own house seat, named in
+/// the `citizens` map by chain id. The older scalar `citizen_pubkey` still
+/// works and means the house seat of [`LEGACY_CITIZEN_CHAIN`].
 ///
 /// # Example
 ///
@@ -688,8 +698,23 @@ fn default_shared_venues() -> Vec<String> {
 /// assert_eq!(poker.buyin_bb, 100);
 /// assert_eq!(
 ///     poker.to_env_json(),
-///     r#"{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null}"#,
+///     r#"{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null,"citizens":{}}"#,
 /// );
+///
+/// // one house seat per chain; the scalar is folded in as sidestr:dreamlab
+/// let two: Poker = toml::from_str(&format!(
+///     "citizen_pubkey = \"{a}\"\ncitizens = {{ \"sidestr:dreamlab-txbt4\" = \"{b}\" }}\n",
+///     a = "aa".repeat(32),
+///     b = "bb".repeat(32),
+/// ))
+/// .unwrap();
+/// two.validate().unwrap();
+/// assert_eq!(two.citizen_for("sidestr:dreamlab"), Some("aa".repeat(32).as_str()));
+/// assert_eq!(two.citizen_for("sidestr:dreamlab-txbt4"), Some("bb".repeat(32).as_str()));
+/// let env: serde_json::Value = serde_json::from_str(&two.to_env_json()).unwrap();
+/// assert_eq!(env["citizen_pubkey"], "aa".repeat(32));
+/// assert_eq!(env["citizens"]["sidestr:dreamlab"], "aa".repeat(32));
+/// assert_eq!(env["citizens"]["sidestr:dreamlab-txbt4"], "bb".repeat(32));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Poker {
@@ -709,10 +734,16 @@ pub struct Poker {
     #[serde(default = "default_poker_bot_profile")]
     pub bot_profile: String,
     /// Optional 64-character lowercase hex pubkey of the citizen (house) agent
-    /// that seats bots and settles hands. `None` until the operator provisions
-    /// one; the client then runs without a house agent.
+    /// of [`LEGACY_CITIZEN_CHAIN`], which seats bots and settles hands. `None`
+    /// until the operator provisions one. Kept for configurations written
+    /// before [`citizens`](Self::citizens); new ones name the chain there.
     #[serde(default)]
     pub citizen_pubkey: Option<String>,
+    /// The house seat of each chain that runs an asset table: sidestr chain
+    /// id (`sidestr:<name>`) → 64-character lowercase hex pubkey. Empty by
+    /// default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub citizens: BTreeMap<String, String>,
 }
 
 impl Default for Poker {
@@ -723,29 +754,87 @@ impl Default for Poker {
             assets: default_poker_assets(),
             bot_profile: default_poker_bot_profile(),
             citizen_pubkey: None,
+            citizens: BTreeMap::new(),
         }
     }
 }
 
+/// What [`Poker::to_env_json`] writes: the authored section with the house
+/// seats resolved.
+#[derive(Serialize)]
+struct PokerEnv<'a> {
+    stakes_bb: &'a [u64],
+    buyin_bb: u64,
+    assets: &'a [String],
+    bot_profile: &'a str,
+    citizen_pubkey: Option<&'a str>,
+    citizens: BTreeMap<&'a str, &'a str>,
+}
+
+fn is_lower_hex64(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 impl Poker {
+    /// The house seat of `chain_id`: its entry in
+    /// [`citizens`](Self::citizens), else, for [`LEGACY_CITIZEN_CHAIN`], the
+    /// scalar [`citizen_pubkey`](Self::citizen_pubkey).
+    pub fn citizen_for(&self, chain_id: &str) -> Option<&str> {
+        self.citizens.get(chain_id).map(String::as_str).or_else(|| {
+            (chain_id == LEGACY_CITIZEN_CHAIN)
+                .then_some(self.citizen_pubkey.as_deref())
+                .flatten()
+        })
+    }
+
+    /// Every chain's house seat, the scalar folded in as
+    /// [`LEGACY_CITIZEN_CHAIN`] when the map does not name that chain.
+    pub fn effective_citizens(&self) -> BTreeMap<&str, &str> {
+        let mut all: BTreeMap<&str, &str> = self
+            .citizens
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        if let Some(pk) = self.citizen_pubkey.as_deref() {
+            all.entry(LEGACY_CITIZEN_CHAIN).or_insert(pk);
+        }
+        all
+    }
+
     /// Render the compact JSON object the forum client reads from
     /// `window.__ENV__.POKER_CONFIG`:
     ///
-    /// `{"stakes_bb":[..],"buyin_bb":N,"assets":[..],"bot_profile":"..","citizen_pubkey":null|".."}`
+    /// `{"stakes_bb":[..],"buyin_bb":N,"assets":[..],"bot_profile":"..","citizen_pubkey":null|"..","citizens":{"<chain id>":".."}}`
     ///
-    /// Every key is always present (`citizen_pubkey` is `null` when unset), in
-    /// declaration order, so the deploy pipeline's hand-synced mirror can be
-    /// diffed against this output byte-for-byte.
+    /// `citizens` is [`effective_citizens`](Self::effective_citizens), and
+    /// `citizen_pubkey` is the house seat of [`LEGACY_CITIZEN_CHAIN`] (from
+    /// either source), so a client that reads only the scalar still finds the
+    /// DREAM table. Every key is always present (`citizen_pubkey` is `null`
+    /// and `citizens` is `{}` when unset), in declaration order, so the deploy
+    /// pipeline's hand-synced mirror can be diffed against this output
+    /// byte-for-byte.
     pub fn to_env_json(&self) -> String {
-        // Serialising plain strings, integers and an `Option<String>` cannot
-        // fail; there are no maps with non-string keys.
-        serde_json::to_string(self).expect("Poker serialises to JSON")
+        let env = PokerEnv {
+            stakes_bb: &self.stakes_bb,
+            buyin_bb: self.buyin_bb,
+            assets: &self.assets,
+            bot_profile: &self.bot_profile,
+            citizen_pubkey: self.citizen_for(LEGACY_CITIZEN_CHAIN),
+            citizens: self.effective_citizens(),
+        };
+        // Plain strings, integers, an `Option<&str>` and a string-keyed map
+        // cannot fail to serialise.
+        serde_json::to_string(&env).expect("Poker serialises to JSON")
     }
 
     /// Semantic checks beyond serde: at least one non-zero, unique stake; a
     /// non-zero buy-in; at least one non-empty, unique asset; a non-empty bot
-    /// profile; and, when present, a 64-character lowercase hex
-    /// `citizen_pubkey`.
+    /// profile; when present, a 64-character lowercase hex `citizen_pubkey`;
+    /// every `citizens` key a `sidestr:<name>` chain id and every value a
+    /// 64-character lowercase hex pubkey; and, when both the scalar and
+    /// `citizens` name the [`LEGACY_CITIZEN_CHAIN`] house seat, the same key.
     ///
     /// # Errors
     ///
@@ -782,12 +871,34 @@ impl Poker {
             return Err("poker.bot_profile must not be empty".into());
         }
         if let Some(pk) = self.citizen_pubkey.as_deref() {
-            let lower_hex = pk
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-            if pk.len() != 64 || !lower_hex {
+            if !is_lower_hex64(pk) {
                 return Err(format!(
                     "poker.citizen_pubkey must be 64-char lowercase hex (got {pk})"
+                ));
+            }
+        }
+        for (chain, pk) in &self.citizens {
+            let named = chain
+                .strip_prefix("sidestr:")
+                .is_some_and(|n| !n.is_empty() && !n.contains(char::is_whitespace));
+            if !named {
+                return Err(format!(
+                    "poker.citizens keys must be sidestr chain ids like \"sidestr:dreamlab\" (got {chain:?})"
+                ));
+            }
+            if !is_lower_hex64(pk) {
+                return Err(format!(
+                    "poker.citizens.\"{chain}\" must be 64-char lowercase hex (got {pk})"
+                ));
+            }
+        }
+        if let (Some(scalar), Some(mapped)) = (
+            self.citizen_pubkey.as_deref(),
+            self.citizens.get(LEGACY_CITIZEN_CHAIN),
+        ) {
+            if scalar != mapped {
+                return Err(format!(
+                    "poker.citizen_pubkey and poker.citizens.\"{LEGACY_CITIZEN_CHAIN}\" name different house seats"
                 ));
             }
         }
@@ -815,7 +926,7 @@ fn default_poker_bot_profile() -> String {
 mod poker_tests {
     use super::*;
 
-    const DEFAULT_JSON: &str = r#"{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null}"#;
+    const DEFAULT_JSON: &str = r#"{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null,"citizens":{}}"#;
 
     #[test]
     fn defaults_match_documented_values() {
@@ -861,9 +972,17 @@ mod poker_tests {
             assets: vec!["sats".into()],
             bot_profile: "lag".into(),
             citizen_pubkey: Some("0f".repeat(32)),
+            citizens: BTreeMap::from([("sidestr:dreamlab-txbt4".into(), "1e".repeat(32))]),
         };
+        // the projection folds the scalar into the map; read back, it names
+        // the same house seats
         let back: Poker = serde_json::from_str(&p.to_env_json()).unwrap();
-        assert_eq!(back, p);
+        assert_eq!(back.effective_citizens(), p.effective_citizens());
+        assert_eq!(back.citizen_pubkey, p.citizen_pubkey);
+        assert_eq!(
+            (back.stakes_bb.clone(), back.buyin_bb),
+            (p.stakes_bb.clone(), p.buyin_bb)
+        );
         let back: Poker = toml::from_str(&toml::to_string(&p).unwrap()).unwrap();
         assert_eq!(back, p);
         // `None` is omitted by TOML and restored by the serde default.
@@ -897,6 +1016,97 @@ citizen_pubkey = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b073866
         assert!(with("a".repeat(65)).validate().is_err(), "long");
         assert!(with("g".repeat(64)).validate().is_err(), "non-hex");
         assert!(with(String::new()).validate().is_err(), "empty");
+    }
+
+    #[test]
+    fn citizens_map_names_a_house_seat_per_chain() {
+        let src = format!(
+            "[citizens]\n\"sidestr:dreamlab\" = \"{}\"\n\"sidestr:dreamlab-txbt4\" = \"{}\"\n",
+            "aa".repeat(32),
+            "bb".repeat(32)
+        );
+        let p: Poker = toml::from_str(&src).expect("parse");
+        assert!(p.validate().is_ok());
+        assert_eq!(
+            p.citizen_for("sidestr:dreamlab"),
+            Some("aa".repeat(32).as_str())
+        );
+        assert_eq!(
+            p.citizen_for("sidestr:dreamlab-txbt4"),
+            Some("bb".repeat(32).as_str())
+        );
+        assert_eq!(p.citizen_for("sidestr:other"), None);
+        let v: serde_json::Value = serde_json::from_str(&p.to_env_json()).unwrap();
+        // the legacy key still carries the DREAM table's house seat
+        assert_eq!(v["citizen_pubkey"], serde_json::json!("aa".repeat(32)));
+        assert_eq!(v["citizens"].as_object().unwrap().len(), 2);
+        // and TOML round-trips the map
+        let back: Poker = toml::from_str(&toml::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn the_scalar_means_sidestr_dreamlab_only() {
+        let p = Poker {
+            citizen_pubkey: Some("cc".repeat(32)),
+            ..Poker::default()
+        };
+        assert_eq!(
+            p.citizen_for(LEGACY_CITIZEN_CHAIN),
+            Some("cc".repeat(32).as_str())
+        );
+        assert_eq!(p.citizen_for("sidestr:dreamlab-txbt4"), None);
+        assert_eq!(
+            p.to_env_json(),
+            format!(
+                r#"{{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":"{0}","citizens":{{"sidestr:dreamlab":"{0}"}}}}"#,
+                "cc".repeat(32)
+            )
+        );
+        // a txbt4-only map leaves the legacy key null
+        let only = Poker {
+            citizens: BTreeMap::from([("sidestr:dreamlab-txbt4".into(), "dd".repeat(32))]),
+            ..Poker::default()
+        };
+        let v: serde_json::Value = serde_json::from_str(&only.to_env_json()).unwrap();
+        assert!(v["citizen_pubkey"].is_null());
+    }
+
+    #[test]
+    fn citizens_entries_are_checked() {
+        let with = |chain: &str, pk: String| Poker {
+            citizens: BTreeMap::from([(chain.to_string(), pk)]),
+            ..Poker::default()
+        };
+        assert!(with("sidestr:dreamlab-txbt4", "a".repeat(64))
+            .validate()
+            .is_ok());
+        assert!(
+            with("dreamlab", "a".repeat(64)).validate().is_err(),
+            "not a chain id"
+        );
+        assert!(
+            with("sidestr:", "a".repeat(64)).validate().is_err(),
+            "no name"
+        );
+        assert!(
+            with("sidestr:a b", "a".repeat(64)).validate().is_err(),
+            "space"
+        );
+        assert!(
+            with("sidestr:x", "A".repeat(64)).validate().is_err(),
+            "uppercase"
+        );
+        assert!(
+            with("sidestr:x", "a".repeat(63)).validate().is_err(),
+            "short"
+        );
+        // the scalar and the map must agree on the DREAM table's house seat
+        let mut both = with(LEGACY_CITIZEN_CHAIN, "a".repeat(64));
+        both.citizen_pubkey = Some("a".repeat(64));
+        assert!(both.validate().is_ok());
+        both.citizen_pubkey = Some("b".repeat(64));
+        assert!(both.validate().is_err());
     }
 
     #[test]

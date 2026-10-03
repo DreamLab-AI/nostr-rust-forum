@@ -314,7 +314,12 @@ stakes_bb   = [2, 10, 20, 100, 200]                    # big-blind sizes, lobby 
 buyin_bb    = 100                                      # buy-in in big blinds
 assets      = ["sats", "dream"]                        # settlement assets, lobby order
 bot_profile = "tag"                                    # house-bot style (tight-aggressive)
-# citizen_pubkey = "<64-char lowercase hex>"           # house agent; omit until provisioned
+# citizen_pubkey = "<64-char lowercase hex>"           # house agent of sidestr:dreamlab; omit until provisioned
+# One house seat per chain that runs an asset table (the scalar above means
+# sidestr:dreamlab; if both name it they must agree):
+# [poker.citizens]
+# "sidestr:dreamlab"       = "<64-char lowercase hex>"
+# "sidestr:dreamlab-txbt4" = "<64-char lowercase hex>"
 
 
 # ─── Operator custody tier ───────────────────────────────────────────────────
