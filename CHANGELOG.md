@@ -7,7 +7,7 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
-### Added: hover to inspect cards on the 3D poker table — 2026-10-03
+### Added: hover to inspect cards on the poker table, 3D and flat — 2026-10-03
 
 Hovering the hero's hole cards, the board, or the other seat's cards once
 shown at showdown lifts that group off the felt to a face-on row in front of
@@ -32,6 +32,20 @@ the cards are. Face-down cards are never inspected; nothing else reacts.
 - New pure modules `js/table3d/inspect.js` and `js/table3d/peek-keys.js`,
   with node tests; the card material's spare fx channel now carries the
   inspection gloss and glint. No new dependencies.
+- The flat table (the DOM table: 3D off, the CSS-only tier, the fallback)
+  inspects too (`components/flat_peek.rs`, `<PeekSlot>`): hovering the hero's
+  face-up hole cards or the board lays a fixed clone over the group in a
+  layer under `<body>` and transitions it (CSS transforms only, from the
+  group's own centre) to the viewport's centre, filling about 80% of the
+  shorter side, above the page and below every modal; ease-out 450 ms up,
+  ease-in 350 ms back onto the slot, which keeps its place (transparent, still
+  hoverable) so nothing reflows. A small tilt of random sign and size settles
+  as it arrives; reduced motion is a crossfade in place, no travel.
+  `will-change` only while it moves. Touch taps, tab stops (Enter/Space,
+  Escape, Tab away; each names its cards), a live region; a new frame, a
+  scroll, a resize or the 3D table taking over drop it at once; the window
+  listeners exist only while a group is up. The state is a pure machine
+  (`PeekModel::next`) in a signal, with unit tests.
 ### Added: click-to-copy on every abridged public key — 2026-10-03
 
 Wherever the forum client shows a shortened key (`abcd12...ef56`,

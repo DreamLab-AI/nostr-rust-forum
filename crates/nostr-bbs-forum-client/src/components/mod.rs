@@ -61,6 +61,7 @@ pub mod topic_list;
 // -- Calendar/Events (Stream 6) ----------------------------------------------
 pub mod create_event_modal;
 pub mod event_card;
+pub mod flat_peek;
 pub mod mini_calendar;
 pub mod notification_center;
 pub mod poker_schedule;

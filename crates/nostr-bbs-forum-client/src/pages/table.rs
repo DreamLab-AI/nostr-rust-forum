@@ -30,9 +30,10 @@ use wasm_bindgen::JsCast;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::copy_key::KeyName;
+use crate::components::flat_peek::{provide_flat_peek, PeekSlot};
 use crate::components::fx::use_render_tier;
 use crate::components::poker_schedule::ScheduleGameModal;
-use crate::components::table3d::{self, Pick, PickTarget, Table3d, Table3dStatus};
+use crate::components::table3d::{self, PeekGroup, Pick, PickTarget, Table3d, Table3dStatus};
 use crate::poker::live::{LiveStore, Pay};
 use crate::poker::{
     self, AssetTable, Choice, HandConfig, HandOutcome, HandState, HistoryRow, Legal, RosterEntry,
@@ -288,13 +289,15 @@ fn card_slot() -> AnyView {
     .into_any()
 }
 
-/// One seat: name, stack, position, street bet, and cards.
+/// One seat: name, stack, position, street bet, and cards. The hero's own
+/// face-up cards (`inspectable`) can be inspected (`components::flat_peek`).
 fn seat_panel(
     v: &SeatView,
     seat: u32,
     label: AnyView,
     blurb: Option<String>,
     unit: &str,
+    inspectable: bool,
 ) -> AnyView {
     let Some(s) = v.seats.get(seat as usize).cloned() else {
         return ().into_any();
@@ -308,6 +311,12 @@ fn seat_panel(
         "ring-1 ring-gray-700/50"
     };
     let cards = match s.hole.clone() {
+        Some(hole) if inspectable => view! {
+            <PeekSlot group=PeekGroup::Hole cards=hole.clone() class="flex gap-1.5">
+                {hole.into_iter().map(card_face).collect_view()}
+            </PeekSlot>
+        }
+        .into_any(),
         Some(hole) => hole.into_iter().map(card_face).collect_view().into_any(),
         None if s.folded => {
             view! { <span class="text-xs text-gray-500 italic">"folded"</span> }.into_any()
@@ -342,8 +351,9 @@ fn seat_panel(
     .into_any()
 }
 
+/// The board: five places, dealt or empty; inspectable once one is dealt.
 fn board_of(cards: &[u8]) -> AnyView {
-    (0..5)
+    let places = (0..5)
         .map(|i| {
             cards
                 .get(i)
@@ -351,8 +361,13 @@ fn board_of(cards: &[u8]) -> AnyView {
                 .map(card_face)
                 .unwrap_or_else(card_slot)
         })
-        .collect_view()
-        .into_any()
+        .collect_view();
+    view! {
+        <PeekSlot group=PeekGroup::Board cards=cards.to_vec() class="flex gap-1.5 sm:gap-2">
+            {places}
+        </PeekSlot>
+    }
+    .into_any()
 }
 
 /// The three-button action bar for a legal envelope.
@@ -577,6 +592,9 @@ fn TableSurface(
     let four_colour = Signal::derive(move || prefs.with(|p| p.poker_four_colour));
     let free_look = RwSignal::new(false);
     let touch = coarse_pointer();
+    // the flat table's own card inspection, live only while it is the table
+    // shown (the 3D table has its own); a new frame drops it
+    let peek_live = provide_flat_peek(Signal::derive(move || !ready.get()), frame);
 
     // Switching the scene off releases the buttons and lets a later switch-on
     // try again after a failure.
@@ -636,6 +654,7 @@ fn TableSurface(
         }}
         <div class=move || if ready.get() { "sr-only" } else { "space-y-4" }>
             {children()}
+            <p class="sr-only" aria-live="polite">{move || peek_live.get()}</p>
         </div>
     }
 }
@@ -999,7 +1018,7 @@ fn PracticeTable() -> impl IntoView {
                                 let bot_label = bot_label.clone();
                                 let bot_blurb = bot_blurb.clone();
                                 move || match seat_view.get() {
-                                    Some(v) => seat_panel(&v, BOT, bot_label.clone().into_any(), Some(bot_blurb.clone()), "chips"),
+                                    Some(v) => seat_panel(&v, BOT, bot_label.clone().into_any(), Some(bot_blurb.clone()), "chips", false),
                                     None => view! {
                                         <div class="rounded-xl bg-gray-900/60 p-4 ring-1 ring-gray-700/50">
                                             <p class="font-semibold text-white">{bot_label.clone()}</p>
@@ -1019,7 +1038,7 @@ fn PracticeTable() -> impl IntoView {
                                 </p>
                             </div>
 
-                            {move || seat_view.get().map(|v| seat_panel(&v, HERO, "You".into_any(), None, "chips"))}
+                            {move || seat_view.get().map(|v| seat_panel(&v, HERO, "You".into_any(), None, "chips", true))}
                         </TableSurface>
 
                         {move || outcome.get().map(|o| {
@@ -1493,7 +1512,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                                         label.clone().into_any()
                                     };
                                     view! {
-                                        {seat_panel(&v, other, label_view, blurb, unit)}
+                                        {seat_panel(&v, other, label_view, blurb, unit, false)}
                                         <div class="flex flex-col items-center gap-2 py-2">
                                             <div class="flex gap-1.5 sm:gap-2">{board()}</div>
                                             <p class="text-sm text-gray-300">
@@ -1501,7 +1520,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                                                 <span class="text-gray-500">" · "{v.street.clone()}</span>
                                             </p>
                                         </div>
-                                        {seat_panel(&v, seat, "You".into_any(), None, unit)}
+                                        {seat_panel(&v, seat, "You".into_any(), None, unit, true)}
                                     }.into_any()
                                 }
                                 None => view! {
