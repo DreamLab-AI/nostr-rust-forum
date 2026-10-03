@@ -5,7 +5,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bitcoin::OutPoint;
+use bitcoin::{OutPoint, Txid};
 use clap::Parser;
 use nostr_bbs_core::gift_wrap::{gift_wrap_kind, unwrap_gift_kind};
 use nostr_bbs_poker::protocol::{ToCitizen, ToHero, RUMOR_KIND};
@@ -24,17 +24,31 @@ use nostr_bbs_poker_citizen::table::{Balances, Citizen, Config, Effect, House};
 #[command(
     name = "nostr-bbs-poker-citizen",
     version,
-    about = "The house seat: deals committed hands over the forum relay, plays the house bot, settles each hand in DREAM on sidestr:dreamlab.",
-    after_help = "The house key is read from --key-file (64 hex or nsec1…), never from a flag's value. Testnet only: coins on sidestr:dreamlab carry no value."
+    about = "The house seat: deals committed hands over the forum relay, plays the house bot, settles each hand in one chain's asset (DREAM on sidestr:dreamlab by default; BLAKES7 on sidestr:dreamlab-txbt4).",
+    after_help = "The house key is read from --key-file (64 hex or nsec1…), never from a flag's value. One instance serves one chain, with its own key and --state file. Testnet only: coins on these chains carry no value."
 )]
 pub struct Cli {
+    /// The pinned chain this house seat settles on: sidestr:dreamlab or sidestr:dreamlab-txbt4.
+    #[arg(
+        long,
+        env = "POKER_CITIZEN_CHAIN",
+        default_value = "sidestr:dreamlab",
+        value_name = "ID"
+    )]
+    chain_id: String,
+    /// The asset the table settles in, by its issue's txid (64 hex). Defaults to DREAM on sidestr:dreamlab; required on any other chain.
+    #[arg(long, env = "POKER_CITIZEN_ASSET", value_name = "TXID")]
+    asset_id: Option<String>,
+    /// The asset's ticker, as members read it. Defaults to DREAM on sidestr:dreamlab; required on any other chain.
+    #[arg(long, env = "POKER_CITIZEN_TICKER", value_name = "TICKER")]
+    ticker: Option<String>,
     /// The house's key file (64 hex characters or an nsec1…).
     #[arg(long, env = "POKER_CITIZEN_KEY_FILE", value_name = "PATH")]
     key_file: PathBuf,
     /// The forum relay (wss://…) the table is played over.
     #[arg(long, env = "POKER_CITIZEN_RELAY", value_name = "URL")]
     relay: String,
-    /// The chain's producer (`/chain.json`, `/blocks.dat`, `POST /tx`).
+    /// The chain's producer (`/chain.json`, `/blocks.dat`, `POST /tx`): 3450 serves sidestr:dreamlab, 3451 sidestr:dreamlab-txbt4 on the estate's box.
     #[arg(
         long,
         env = "SIDESTR_URL",
@@ -53,7 +67,7 @@ pub struct Cli {
     /// Where the ledger is kept.
     #[arg(long, env = "POKER_CITIZEN_STATE", value_name = "PATH")]
     state: PathBuf,
-    /// Big blinds on offer, in DREAM, comma-separated.
+    /// Big blinds on offer, in base units of the table's asset, comma-separated.
     #[arg(
         long,
         env = "POKER_STAKES_BB",
@@ -67,7 +81,7 @@ pub struct Cli {
     /// The house bot's profile: rock, tag, lag, station or maniac.
     #[arg(long, env = "POKER_BOT_PROFILE", default_value = "tag")]
     profile: String,
-    /// The most the house pays out per day, in DREAM.
+    /// The most the house pays out per day, in base units of the table's asset.
     #[arg(long, env = "POKER_DAILY_CAP", default_value_t = 20_000)]
     daily_cap: u64,
     /// How long a member's own report of a payment is trusted before the chain must show it, seconds.
@@ -105,6 +119,8 @@ struct Runner {
     pubkey: String,
     citizen: Citizen,
     doc: ChainDocument,
+    asset: Txid,
+    ticker: String,
     facts: Option<Facts>,
     held: Vec<Held>,
     http: reqwest::Client,
@@ -132,6 +148,11 @@ fn read_key(path: &PathBuf) -> Result<(AgentKey, Zeroizing<[u8; 32]>), String> {
 /// Run the house until the process is stopped.
 pub async fn main() -> Result<(), String> {
     let cli = Cli::parse();
+    let served = chain::select(
+        &cli.chain_id,
+        cli.asset_id.as_deref(),
+        cli.ticker.as_deref(),
+    )?;
     let (key, sk) = read_key(&cli.key_file)?;
     let pubkey = hex::encode(key.pubkey().serialize());
     let stakes_bb: Vec<u64> = cli
@@ -153,6 +174,7 @@ pub async fn main() -> Result<(), String> {
         profile: cli.profile.clone(),
         daily_cap: cli.daily_cap,
         claim_grace_secs: cli.claim_grace_secs,
+        ticker: served.ticker.clone(),
     };
     let house = House {
         pubkey: pubkey.clone(),
@@ -184,11 +206,14 @@ pub async fn main() -> Result<(), String> {
         .text()
         .await
         .map_err(|e| e.to_string())?;
-    let doc = chain::check_document(&doc_json)?;
+    let doc = chain::check_document(served.pin, &doc_json)?;
     eprintln!(
-        "citizen {pubkey} ({}) on {} · producer {} · tables {}",
+        "citizen {pubkey} ({}) on {} · {} {} ({}) · producer {} · tables {}",
         citizen.bot().name,
         cli.relay,
+        served.pin.id,
+        served.ticker,
+        served.asset,
         cli.producer,
         citizen
             .tables()
@@ -204,6 +229,8 @@ pub async fn main() -> Result<(), String> {
         pubkey,
         citizen,
         doc,
+        asset: served.asset,
+        ticker: served.ticker,
         facts: None,
         held: Vec::new(),
         http,
@@ -284,8 +311,17 @@ impl Runner {
                 return;
             }
         };
-        match chain::scan(self.doc.clone(), &dat, Some(now_secs() as u32)) {
+        match chain::scan(self.doc.clone(), self.asset, &dat, Some(now_secs() as u32)) {
             Ok(facts) => {
+                if !facts.asset_issued() && self.facts.is_none() {
+                    eprintln!(
+                        "chain: {} at height {} does not show {}'s issue {}; members cannot buy in until it does",
+                        self.doc.id,
+                        facts.height(),
+                        self.ticker,
+                        self.asset
+                    );
+                }
                 let now = now_secs();
                 self.held.retain(|h| {
                     !facts.txids.contains(&h.txid) && now.saturating_sub(h.at) < HELD_TTL
@@ -302,8 +338,8 @@ impl Runner {
         };
         let held: Vec<OutPoint> = self.held.iter().flat_map(|h| h.outpoints.clone()).collect();
         Balances {
-            hero_dream: f.dream_of(hero),
-            house_dream: f.dream_of_script(&self.key.script(), &held),
+            hero_asset: f.units_of(hero),
+            house_asset: f.units_of_script(&self.key.script(), &held),
         }
     }
 
@@ -334,7 +370,8 @@ impl Runner {
             Ok(p) => p,
             Err(e) => {
                 eprintln!(
-                    "pay {amount} DREAM to {}… for {}…: {e}",
+                    "pay {amount} {} to {}… for {}…: {e}",
+                    self.ticker,
                     &hero[..8],
                     &root[..8]
                 );
@@ -361,7 +398,8 @@ impl Runner {
         match accepted {
             Ok(()) => {
                 eprintln!(
-                    "paid {amount} DREAM to {}… for hand {}…: {txid}",
+                    "paid {amount} {} to {}… for hand {}…: {txid}",
+                    self.ticker,
                     &hero[..8],
                     &root[..8]
                 );

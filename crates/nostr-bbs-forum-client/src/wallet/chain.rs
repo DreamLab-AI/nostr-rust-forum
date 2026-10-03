@@ -887,14 +887,17 @@ mod tests {
         assert!(bare.issued().is_none() && bare.tips.is_empty());
     }
 
-    /// `sidestr:dreamlab-txbt4` as its producer served it at the seal: the
-    /// BLAKE2b genesis alone, validated under the Knots v2 header family.
+    /// `sidestr:dreamlab-txbt4` as its producer served it on 2026-10-03, to
+    /// block 26: every 164-byte v2 header and block signature validated
+    /// under the BLAKE2b family.
     #[test]
-    fn the_txbt4_genesis_replays_under_the_blake2b_family() {
-        let dat = include_bytes!("testdata/txbt4-genesis.dat");
+    fn the_txbt4_chain_replays_under_the_blake2b_family() {
+        let dat = include_bytes!("testdata/txbt4-blocks.dat");
         let snap = replay(&DREAMLAB_TXBT4, None, dat, None).unwrap();
         assert!(matches!(snap.state, ChainState::Blake2b(_)));
-        assert_eq!(snap.height(), 0);
+        assert!(snap.height() >= 26, "{}", snap.height());
+        assert!(snap.txs.iter().filter(|t| t.coinbase).count() >= 27);
+        assert!(snap.txs.iter().all(|t| t.broken.is_none()));
         assert_eq!(snap.state.document().id, TXBT4_CHAIN_ID);
         assert_eq!(
             snap.balances(&script_of(PK).unwrap(), &[]),
@@ -916,7 +919,7 @@ mod tests {
         let snap = replay(
             &DREAMLAB_TXBT4,
             None,
-            include_bytes!("testdata/txbt4-genesis.dat"),
+            include_bytes!("testdata/txbt4-blocks.dat"),
             None,
         )
         .unwrap();

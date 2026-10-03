@@ -2,7 +2,7 @@
 name = "nostr-bbs-poker-citizen"
 version = "1.0.0-beta.13"
 edition = "2021"
-description = "The house seat of the nostr-bbs poker table: deals committed hands to members over gift-wrapped relay messages, plays the house bot, and settles each hand with one DREAM transfer on sidestr:dreamlab"
+description = "The house seat of the nostr-bbs poker table: deals committed hands to members over gift-wrapped relay messages, plays the house bot, and settles each hand with one asset transfer on a pinned sidestr chain (DREAM on sidestr:dreamlab, BLAKES7 on sidestr:dreamlab-txbt4)"
 license = "AGPL-3.0-only"
 repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
 homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"

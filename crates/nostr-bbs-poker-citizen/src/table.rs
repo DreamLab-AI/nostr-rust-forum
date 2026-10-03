@@ -44,6 +44,8 @@ pub struct Config {
     /// How long a member's payment claim is trusted before the chain must
     /// show it, seconds.
     pub claim_grace_secs: u64,
+    /// The table's asset as members read it (`DREAM`, `BLAKES7`).
+    pub ticker: String,
 }
 
 impl Default for Config {
@@ -54,6 +56,7 @@ impl Default for Config {
             profile: "tag".into(),
             daily_cap: 20_000,
             claim_grace_secs: 30 * 60,
+            ticker: "DREAM".into(),
         }
     }
 }
@@ -93,10 +96,10 @@ pub enum Effect {
 /// Balances the runner read from the chain for one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Balances {
-    /// DREAM the sender holds.
-    pub hero_dream: u64,
-    /// DREAM the house holds.
-    pub house_dream: u64,
+    /// Units of the table's asset the sender holds.
+    pub hero_asset: u64,
+    /// Units of the table's asset the house holds.
+    pub house_asset: u64,
 }
 
 /// A hand in play, keyed by its commitment.
@@ -254,7 +257,7 @@ impl Citizen {
     }
 
     /// Why `member` may not sit for a hand at `buyin`, if anything.
-    fn refusal(&self, member: &str, buyin: u64, dream: u64, now: u64) -> Option<String> {
+    fn refusal(&self, member: &str, buyin: u64, held: u64, now: u64) -> Option<String> {
         for o in self.ledger.owed.iter().filter(|o| o.hero == member) {
             let overdue = match &o.claimed {
                 None => true,
@@ -267,15 +270,17 @@ impl Citizen {
                     "it has not been paid"
                 };
                 return Some(format!(
-                    "You still owe {} DREAM for hand {}…: {why}. Pay it and sit again.",
+                    "You still owe {} {} for hand {}…: {why}. Pay it and sit again.",
                     o.amount,
+                    self.cfg.ticker,
                     &o.root[..12]
                 ));
             }
         }
-        if dream < buyin {
+        if held < buyin {
             return Some(format!(
-                "You hold {dream} DREAM; this table's buy-in is {buyin}."
+                "You hold {held} {}; this table's buy-in is {buyin}.",
+                self.cfg.ticker
             ));
         }
         None
@@ -513,11 +518,11 @@ impl Citizen {
                 Effect::Send(member.to_string(), offer),
             ];
         }
-        if let Some(why) = self.refusal(member, stake.buyin, balances.hero_dream, now) {
+        if let Some(why) = self.refusal(member, stake.buyin, balances.hero_asset, now) {
             return err(member, Some(commit), why);
         }
         let house_free = balances
-            .house_dream
+            .house_asset
             .saturating_sub(self.ledger.owing_total());
         if house_free < stake.buyin {
             return err(
@@ -646,7 +651,7 @@ impl Citizen {
         if !self.present(from, now).iter().any(|p| p == opponent) {
             return err(from, None, "That member is not at the table right now.");
         }
-        if let Some(why) = self.refusal(from, stake.buyin, balances.hero_dream, now) {
+        if let Some(why) = self.refusal(from, stake.buyin, balances.hero_asset, now) {
             return err(from, None, why);
         }
         if self
@@ -738,7 +743,7 @@ impl Citizen {
             return err(from, Some(commit), "One of you is already in a hand.");
         }
         self.sessions.entry(from.to_string()).or_default().seen = now;
-        if let Some(why) = self.refusal(from, stake.buyin, balances.hero_dream, now) {
+        if let Some(why) = self.refusal(from, stake.buyin, balances.hero_asset, now) {
             return err(from, Some(commit), why);
         }
         self.challenges.remove(commit);
@@ -1059,6 +1064,8 @@ mod tests {
                 profile: "tag".into(),
                 daily_cap: 5_000,
                 claim_grace_secs: 600,
+                // a BLAKES7 house seat: every member-facing figure names it
+                ticker: "BLAKES7".into(),
             },
             House {
                 pubkey: "c".repeat(64),
@@ -1075,8 +1082,8 @@ mod tests {
     const HERO_PK: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_PK: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const RICH: Balances = Balances {
-        hero_dream: 10_000,
-        house_dream: 10_000,
+        hero_asset: 10_000,
+        house_asset: 10_000,
     };
 
     fn offer_commit(effects: &[Effect]) -> String {
@@ -1223,12 +1230,12 @@ mod tests {
         let mut c = citizen();
         let commit = offer_commit(&hello(&mut c, HERO_PK, 1_000));
         let poor = Balances {
-            hero_dream: 1_999,
-            house_dream: 10_000,
+            hero_asset: 1_999,
+            house_asset: 10_000,
         };
         let out = sit(&mut c, &commit, 20, &"ab".repeat(32), poor);
         assert!(
-            matches!(&out[0], Effect::Send(_, ToHero::Error { message, .. }) if message.contains("buy-in is 2000"))
+            matches!(&out[0], Effect::Send(_, ToHero::Error { message, .. }) if message.contains("BLAKES7; this table's buy-in is 2000"))
         );
         // the offer was consumed by the refused sit: a new one is needed
         let out = sit(&mut c, &commit, 20, &"ab".repeat(32), RICH);
@@ -1247,8 +1254,8 @@ mod tests {
             matches!(&out[0], Effect::Send(_, ToHero::Error { message, .. }) if message.contains("No table"))
         );
         let broke_house = Balances {
-            hero_dream: 10_000,
-            house_dream: 100,
+            hero_asset: 10_000,
+            house_asset: 100,
         };
         let fresh = offer_commit(&hello(&mut c, HERO_PK, 1_000));
         let out = sit(&mut c, &fresh, 20, &"ab".repeat(32), broke_house);
@@ -1549,7 +1556,7 @@ mod tests {
         let commit = offer_commit(&out);
         let out = sit(&mut c, &commit, 20, &"ab".repeat(32), RICH);
         assert!(
-            matches!(&out[0], Effect::Send(_, ToHero::Error { message, .. }) if message.contains("has not been paid"))
+            matches!(&out[0], Effect::Send(_, ToHero::Error { message, .. }) if message.contains("BLAKES7 for hand") && message.contains("has not been paid"))
         );
         let claimed = c.handle(
             HERO_PK,
