@@ -21,7 +21,7 @@ configuration a deployment is unchanged.
   (sidestr-header `Blake2bV2`, already in the build through sidestr-agent)
   beside `txbt4`.
 - Runtime config: `window.__ENV__.SIDESTR_CHAINS`, a JSON array of
-  `{ "id", "mirror"?, "asset_id"?, "ticker"?, "label"?, "citizen_pubkey"?, "relays"? }`
+  `{ "id", "mirror"?, "asset_id"?, "ticker"?, "label"?, "icon"?, "citizen_pubkey"?, "relays"? }`
   in offer order; entries naming an unpinned chain, and fields that do not
   read, are ignored with a console warning. Absent, `sidestr:dreamlab` alone,
   as before; `SIDESTR_MIRROR` / `SIDESTR_RELAYS` still apply to it.
@@ -39,6 +39,13 @@ configuration a deployment is unchanged.
   bound to that chain's wallet and house seat, opened by `#sidestr-<name>`.
   Scheduled games carry a `chain` tag and the modal picks the chain; the events
   page links to that table.
+- Tips on both chains: opening a post's tip control shows a token picker (one
+  row per chain with an asset: its mark, ticker and your balance there; the
+  wallet's chain highlighted), then the amounts for that token. Totals show per
+  asset ("12 DREAM · 500 BLAKES7"). Marks come from the chain profile (a
+  built-in mark per pin, or `"icon"` in `SIDESTR_CHAINS`). The control moved
+  out of the reaction bar to the far right of each post's reply row (a thread
+  reply without a reply box keeps it at the far right of its footer).
 - `nostr-bbs-poker-citizen`: `--chain-id` (default `sidestr:dreamlab`),
   `--asset-id` (DREAM's by default there, required elsewhere), `--ticker`; the
   producer's `/chain.json` must equal the pinned document field for field. One

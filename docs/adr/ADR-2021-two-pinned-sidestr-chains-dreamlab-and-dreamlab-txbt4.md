@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: 0ca3ff7d020af09918c74e32becc15ccc8d41337
+verified_commit: b1c6633b59e96c73d541baa47785e32bac7607ab
 owner: jjohare
 review_trigger: any proposal to pin a third chain or to let runtime config name a chain; a chain with value (a mainnet parent); BLAKES7's issue landing (its id goes into SIDESTR_CHAINS and the txbt4 house seat's --asset-id, not into the code); poker protocol 2 naming the asset on the wire; sidestr-agent gaining a family-generic ChainView (the client and house seat drop their ChainState)
 repo: nostr-rust-forum
@@ -53,7 +53,7 @@ asked for the wallet and the poker table to work on both chains at once.
    preferences (`wallet_chain`); `/wallet` shows a switcher with each chain's ticker and parent, and
    says which chain's balance it shows. Faucet requests, sends, tips, starter packs and extension
    signing go through the chosen chain's store with that chain's id, document, relays and address
-   prefix. One key is one script on both chains; each chain writes its own address (`drm1…`,
+   prefix (tips excepted: D8). One key is one script on both chains; each chain writes its own address (`drm1…`,
    `drt1…`), and an address under either prefix pays that script (sidestr-wallet's rule).
 5. **One asset table per chain with an asset and a house seat.** `[poker] citizens = { "<chain id>"
    = "<hex>" }` names each house seat; the scalar `citizen_pubkey` still works and means
@@ -74,13 +74,24 @@ asked for the wallet and the poker table to work on both chains at once.
    (`CalendarEventSpec::extra_tags`, which skips the builder's own tag names); the schedule modal
    offers the chain when more than one table runs, and the events page links to that table's
    section.
+8. **Tips in any chain's asset, totals per asset, in the reply row.** The tip control is not bound
+   to the wallet's chosen chain: it opens on a token picker — one row per chain with an asset, its
+   mark, ticker and the member's balance there — highlighting the chosen chain, then the amounts
+   for the picked token, sent through that chain's store. The tally names the asset and the
+   `tip:nostr:<event id>` memo is unchanged, so each chain's replay counts its own asset; a post's
+   totals show per asset (`12 DREAM · 500 BLAKES7`), never summed. Name, ticker and mark come
+   from `ChainProfile` (a pin's built-in `chain::Mark`, or an `icon` image URL from
+   `SIDESTR_CHAINS`). The control sits at the far right of a post's reply row, out of
+   `ReactionBar`; where a post has reactions but no reply box (a thread reply), at the far right
+   of its footer, set apart by `ml-auto`. It shows no button on the member's own posts.
 
 ## Consequences
 
 The same member key now holds coins on two testnet chains, and a member can tip, send and play in
 either asset; ADR-2015 D2's identity-key-as-wallet departure extends to the second chain on the same
-testnet-only terms. A second chain is a second download and replay, made only when the member opens
-it. The client and the house seat each carry a small `ChainState` enum until sidestr-agent offers a
+testnet-only terms. A second chain is a second download and replay: the wallet page makes it when the member opens
+that chain, and a page with posts makes it once per session for every chain with an asset, since
+the tip totals read each chain. The client and the house seat each carry a small `ChainState` enum until sidestr-agent offers a
 family-generic view; the pinned documents are duplicated into the house seat's crate. Activating
 BLAKES7 is configuration, not code: its issue txid goes into `SIDESTR_CHAINS` and the second house
 seat's `--asset-id`, and its key into `[poker] citizens`. `POKER_CONFIG` gains a key, so a
@@ -91,7 +102,9 @@ wallet validates but cannot strengthen.
 
 ## Verification
 
-- `cargo test -p nostr-bbs-forum-client`: 607 pass, among them the txbt4 chain replayed to block 26
+- `cargo test -p nostr-bbs-forum-client`: 609 pass, among them the tip picker's default row and
+  per-asset totals (`the_picker_highlights_the_wallets_active_chain`,
+  `totals_are_shown_per_asset`, native tests of the functions the control renders from), the txbt4 chain replayed to block 26
   under `Blake2bV2` (`testdata/txbt4-blocks.dat`, the producer's file on 2026-10-03), each chain's
   blocks refused by the other's lock, a txbt4 document with a wrong genesis, parent or id refused
   (`a_txbt4_document_that_is_not_the_pinned_one_is_refused`), `SIDESTR_CHAINS` entries naming
@@ -104,5 +117,7 @@ wallet validates but cannot strengthen.
 - `cargo test -p nostr-bbs-config` (the `citizens` map, its projection and checks) and `cargo test
   -p nostr-bbs-core` (`extra_tags` written, the builder's own names never forged).
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D
-  warnings`, `cargo test --workspace` and `cargo check -p nostr-bbs-forum-client --target
-  wasm32-unknown-unknown` clean on branch `multichain`.
+  warnings`, `cargo test --workspace` (2,554 pass, 2 ignored) and `cargo check -p
+  nostr-bbs-forum-client --target wasm32-unknown-unknown` clean on branch `multichain`. The raw
+  release wasm (no wasm-opt) grew 97,705 bytes (+1.1%) over `main` before the tip control's
+  picker was added.
