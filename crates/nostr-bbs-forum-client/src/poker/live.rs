@@ -680,13 +680,22 @@ impl LiveStore {
             (Ok(_), false) => Err("the house did not deal from your nonce".to_string()),
             (Err(e), _) => Err(e.to_string()),
         };
-        let my_name = "You".to_string();
+        // the house plays under its character's name; a member under the
+        // display name the forum already knows for their pubkey
+        let other_name = if house {
+            self.offer
+                .get_untracked()
+                .map(|o| o.name)
+                .unwrap_or_else(|| "The house".to_string())
+        } else {
+            crate::components::user_display::use_display_name(&opponent)
+        };
         let names: Vec<String> = (0..2)
             .map(|i| {
                 if i == seat {
-                    my_name.clone()
+                    "You".to_string()
                 } else {
-                    opponent.clone()
+                    other_name.clone()
                 }
             })
             .collect();
