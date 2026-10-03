@@ -174,11 +174,20 @@ pub struct Preferences {
     /// diamonds), so suits are told apart by colour as well as shape.
     #[serde(default)]
     pub poker_four_colour: bool,
+    /// Ask the coach agent for advice on the practice table (Settings →
+    /// Games). On by default — including for a store saved before the field
+    /// existed — and offered only where the operator names a coach.
+    #[serde(default = "default_true")]
+    pub poker_coach: bool,
     /// The sidestr chain the wallet shows and spends on, by id, when the
     /// deployment offers more than one (ADR-2021). `None`, or a chain no
     /// longer offered, is the deployment's first.
     #[serde(default)]
     pub wallet_chain: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Visual theme selection.
@@ -314,6 +323,7 @@ impl Default for Preferences {
             poker_table: false,
             poker_table_3d: false,
             poker_four_colour: false,
+            poker_coach: true,
             wallet_chain: None,
         }
     }

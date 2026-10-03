@@ -744,6 +744,10 @@ pub struct Poker {
     /// default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub citizens: BTreeMap<String, String>,
+    /// Optional 64-character lowercase hex pubkey of the coach agent the
+    /// practice table asks for advice by DM. `None` hides the coach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coach_pubkey: Option<String>,
 }
 
 impl Default for Poker {
@@ -755,6 +759,7 @@ impl Default for Poker {
             bot_profile: default_poker_bot_profile(),
             citizen_pubkey: None,
             citizens: BTreeMap::new(),
+            coach_pubkey: None,
         }
     }
 }
@@ -769,6 +774,8 @@ struct PokerEnv<'a> {
     bot_profile: &'a str,
     citizen_pubkey: Option<&'a str>,
     citizens: BTreeMap<&'a str, &'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coach_pubkey: Option<&'a str>,
 }
 
 fn is_lower_hex64(s: &str) -> bool {
@@ -806,7 +813,7 @@ impl Poker {
     /// Render the compact JSON object the forum client reads from
     /// `window.__ENV__.POKER_CONFIG`:
     ///
-    /// `{"stakes_bb":[..],"buyin_bb":N,"assets":[..],"bot_profile":"..","citizen_pubkey":null|"..","citizens":{"<chain id>":".."}}`
+    /// `{"stakes_bb":[..],"buyin_bb":N,"assets":[..],"bot_profile":"..","citizen_pubkey":null|"..","citizens":{"<chain id>":".."}[,"coach_pubkey":".."]}`
     ///
     /// `citizens` is [`effective_citizens`](Self::effective_citizens), and
     /// `citizen_pubkey` is the house seat of [`LEGACY_CITIZEN_CHAIN`] (from
@@ -814,7 +821,9 @@ impl Poker {
     /// DREAM table. Every key is always present (`citizen_pubkey` is `null`
     /// and `citizens` is `{}` when unset), in declaration order, so the deploy
     /// pipeline's hand-synced mirror can be diffed against this output
-    /// byte-for-byte.
+    /// byte-for-byte. The one exception is `coach_pubkey`, written last and
+    /// only when set, so a deployment without a coach projects exactly what
+    /// it did before the key existed.
     pub fn to_env_json(&self) -> String {
         let env = PokerEnv {
             stakes_bb: &self.stakes_bb,
@@ -823,6 +832,7 @@ impl Poker {
             bot_profile: &self.bot_profile,
             citizen_pubkey: self.citizen_for(LEGACY_CITIZEN_CHAIN),
             citizens: self.effective_citizens(),
+            coach_pubkey: self.coach_pubkey.as_deref(),
         };
         // Plain strings, integers, an `Option<&str>` and a string-keyed map
         // cannot fail to serialise.
@@ -834,7 +844,8 @@ impl Poker {
     /// profile; when present, a 64-character lowercase hex `citizen_pubkey`;
     /// every `citizens` key a `sidestr:<name>` chain id and every value a
     /// 64-character lowercase hex pubkey; and, when both the scalar and
-    /// `citizens` name the [`LEGACY_CITIZEN_CHAIN`] house seat, the same key.
+    /// `citizens` name the [`LEGACY_CITIZEN_CHAIN`] house seat, the same key;
+    /// and, when present, a 64-character lowercase hex `coach_pubkey`.
     ///
     /// # Errors
     ///
@@ -899,6 +910,13 @@ impl Poker {
             if scalar != mapped {
                 return Err(format!(
                     "poker.citizen_pubkey and poker.citizens.\"{LEGACY_CITIZEN_CHAIN}\" name different house seats"
+                ));
+            }
+        }
+        if let Some(pk) = self.coach_pubkey.as_deref() {
+            if !is_lower_hex64(pk) {
+                return Err(format!(
+                    "poker.coach_pubkey must be 64-char lowercase hex (got {pk})"
                 ));
             }
         }
@@ -973,12 +991,14 @@ mod poker_tests {
             bot_profile: "lag".into(),
             citizen_pubkey: Some("0f".repeat(32)),
             citizens: BTreeMap::from([("sidestr:dreamlab-txbt4".into(), "1e".repeat(32))]),
+            coach_pubkey: Some("2d".repeat(32)),
         };
         // the projection folds the scalar into the map; read back, it names
         // the same house seats
         let back: Poker = serde_json::from_str(&p.to_env_json()).unwrap();
         assert_eq!(back.effective_citizens(), p.effective_citizens());
         assert_eq!(back.citizen_pubkey, p.citizen_pubkey);
+        assert_eq!(back.coach_pubkey, p.coach_pubkey);
         assert_eq!(
             (back.stakes_bb.clone(), back.buyin_bb),
             (p.stakes_bb.clone(), p.buyin_bb)
@@ -1107,6 +1127,43 @@ citizen_pubkey = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b073866
         assert!(both.validate().is_ok());
         both.citizen_pubkey = Some("b".repeat(64));
         assert!(both.validate().is_err());
+    }
+
+    #[test]
+    fn coach_pubkey_projects_last_and_only_when_set() {
+        // absent: the projection is exactly the pre-coach output
+        assert_eq!(Poker::default().to_env_json(), DEFAULT_JSON);
+        let jarvis = "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9";
+        let p: Poker = toml::from_str(&format!("coach_pubkey = \"{jarvis}\"\n")).unwrap();
+        p.validate().unwrap();
+        assert_eq!(p.coach_pubkey.as_deref(), Some(jarvis));
+        assert_eq!(
+            p.to_env_json(),
+            format!(
+                r#"{{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null,"citizens":{{}},"coach_pubkey":"{jarvis}"}}"#
+            ),
+        );
+        // the client reads the projection back
+        let back: Poker = serde_json::from_str(&p.to_env_json()).unwrap();
+        assert_eq!(back.coach_pubkey.as_deref(), Some(jarvis));
+    }
+
+    #[test]
+    fn coach_pubkey_must_be_64_lowercase_hex() {
+        let with = |pk: &str| Poker {
+            coach_pubkey: Some(pk.to_string()),
+            ..Poker::default()
+        };
+        assert!(with(&"c".repeat(64)).validate().is_ok());
+        for bad in [
+            "C".repeat(64),
+            "c".repeat(63),
+            "g".repeat(64),
+            String::new(),
+        ] {
+            let err = with(&bad).validate().unwrap_err();
+            assert!(err.contains("poker.coach_pubkey"), "{err}");
+        }
     }
 
     #[test]

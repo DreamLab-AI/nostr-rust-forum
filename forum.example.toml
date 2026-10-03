@@ -315,6 +315,10 @@ buyin_bb    = 100                                      # buy-in in big blinds
 assets      = ["sats", "dream"]                        # settlement assets, lobby order
 bot_profile = "tag"                                    # house-bot style (tight-aggressive)
 # citizen_pubkey = "<64-char lowercase hex>"           # house agent of sidestr:dreamlab; omit until provisioned
+# The practice table's coach: an agent that answers kind-14 DMs from members
+# (e.g. a forum AI agent). Each time it is the member's turn the table DMs it
+# the decision and shows the reply under the table. Omit to hide the coach.
+# coach_pubkey = "<64-char lowercase hex>"
 # One house seat per chain that runs an asset table (the scalar above means
 # sidestr:dreamlab; if both name it they must agree):
 # [poker.citizens]

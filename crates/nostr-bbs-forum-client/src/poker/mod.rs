@@ -27,6 +27,7 @@ use crate::utils::relay_url::env_override;
 use crate::wallet::chain;
 use crate::wallet::profile::{self, ChainProfile};
 
+pub mod coach;
 pub mod live;
 
 pub use nostr_bbs_poker::bots::RosterEntry;
@@ -140,6 +141,9 @@ pub struct PokerConfig {
     pub citizen_pubkey: Option<String>,
     /// The house seat of each chain, by chain id (`[poker] citizens`).
     pub citizens: BTreeMap<String, String>,
+    /// The coach agent the practice table asks for advice (`[poker]
+    /// coach_pubkey`); absent hides the coach. Read through [`Self::coach`].
+    pub coach_pubkey: Option<String>,
 }
 
 impl Default for PokerConfig {
@@ -150,6 +154,7 @@ impl Default for PokerConfig {
             bot_profile: DEFAULT_BOT_PROFILE.to_string(),
             citizen_pubkey: None,
             citizens: BTreeMap::new(),
+            coach_pubkey: None,
         }
     }
 }
@@ -200,6 +205,13 @@ impl PokerConfig {
         .into_iter()
         .flatten()
         .find_map(well_formed)
+    }
+
+    /// The coach agent's pubkey, lowercased, when a well-formed one is named.
+    /// `None` hides the coach entirely.
+    pub fn coach(&self) -> Option<String> {
+        let pk = self.coach_pubkey.as_deref()?.trim().to_ascii_lowercase();
+        nostr_bbs_poker::fair::is_hex64(&pk).then_some(pk)
     }
 
     /// The tables on offer: every distinct big blind of at least 2 (so the
@@ -735,6 +747,48 @@ mod tests {
         };
         let back: Preferences = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
         assert!(back.poker_table);
+    }
+
+    #[test]
+    fn coach_preference_defaults_on_even_for_an_old_store() {
+        assert!(Preferences::default().poker_coach);
+        let mut old = serde_json::to_value(Preferences::default()).unwrap();
+        old.as_object_mut().unwrap().remove("poker_coach");
+        let loaded: Preferences = serde_json::from_value(old).unwrap();
+        assert!(loaded.poker_coach);
+        let off = Preferences {
+            poker_coach: false,
+            ..Preferences::default()
+        };
+        let back: Preferences =
+            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.poker_coach);
+    }
+
+    #[test]
+    fn coach_is_read_from_the_projection_and_absent_hides_it() {
+        // what nostr-bbs-config projects with `[poker] coach_pubkey` set
+        let jarvis = "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9";
+        let c = PokerConfig::from_json(&format!(
+            r#"{{"stakes_bb":[2,10,20,100,200],"buyin_bb":100,"assets":["sats","dream"],"bot_profile":"tag","citizen_pubkey":null,"citizens":{{}},"coach_pubkey":"{jarvis}"}}"#
+        ));
+        assert_eq!(c.coach().as_deref(), Some(jarvis));
+        // without the key (every deployment before the coach) there is none
+        let none = PokerConfig::from_json(
+            r#"{"stakes_bb":[2],"buyin_bb":100,"assets":["sats"],"bot_profile":"tag","citizen_pubkey":null,"citizens":{}}"#,
+        );
+        assert_eq!(none.coach(), None);
+        assert_eq!(PokerConfig::default().coach(), None);
+        // a malformed key hides it too; case and whitespace are forgiven
+        assert_eq!(
+            PokerConfig::from_json(r#"{"coach_pubkey":"nope"}"#).coach(),
+            None
+        );
+        let loose = PokerConfig::from_json(&format!(
+            r#"{{"coach_pubkey":" {} "}}"#,
+            jarvis.to_ascii_uppercase()
+        ));
+        assert_eq!(loose.coach().as_deref(), Some(jarvis));
     }
 
     #[test]

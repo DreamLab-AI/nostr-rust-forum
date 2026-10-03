@@ -13,6 +13,7 @@ use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{gift_wrap_pair_with_signer, NostrEvent};
 
 use crate::components::user_display::try_display_name;
+use crate::poker::coach::is_coach_content;
 use crate::relay::{EoseCallback, EventCallback, Filter, RelayConnection};
 
 /// A single decrypted direct message.
@@ -79,12 +80,7 @@ impl DMStore {
     /// Sorted conversation list (most recent first).
     pub fn conversations(&self) -> Memo<Vec<DMConversation>> {
         let state = self.state;
-        Memo::new(move |_| {
-            let inner = state.get();
-            let mut convos: Vec<DMConversation> = inner.conversations.values().cloned().collect();
-            convos.sort_by_key(|x| std::cmp::Reverse(x.last_timestamp));
-            convos
-        })
+        Memo::new(move |_| state.with(visible_conversations))
     }
 
     /// Messages for the currently selected conversation (chronological).
@@ -109,23 +105,24 @@ impl DMStore {
                 // inbox flattened into one stream.
                 return Vec::new();
             };
-            let mut msgs: Vec<DMMessage> = inner
-                .messages
-                .iter()
-                .filter(|m| {
-                    // The "other party" of a message is the recipient when we
-                    // sent it and the sender when we received it.
-                    let counterparty = if m.is_sent {
-                        &m.recipient_pubkey
-                    } else {
-                        &m.sender_pubkey
-                    };
-                    counterparty.eq_ignore_ascii_case(current)
-                })
-                .cloned()
-                .collect();
-            msgs.sort_by_key(|m| m.timestamp);
-            msgs
+            thread_of(&inner.messages, current)
+        })
+    }
+
+    /// Every message received from `pubkey`, coach exchanges included, in
+    /// arrival order. The practice table's coach reads its replies here; the
+    /// DM pages use [`messages`](Self::messages), which leaves them out.
+    pub fn received_from(&self, pubkey: String) -> Memo<Vec<DMMessage>> {
+        let state = self.state;
+        Memo::new(move |_| {
+            state.with(|inner| {
+                inner
+                    .messages
+                    .iter()
+                    .filter(|m| !m.is_sent && m.sender_pubkey.eq_ignore_ascii_case(&pubkey))
+                    .cloned()
+                    .collect()
+            })
         })
     }
 
@@ -406,11 +403,15 @@ impl DMStore {
             is_read: true,
         };
 
+        let coach = is_coach_content(content);
         self.state.update(|s| {
             if s.current_conversation.as_deref() == Some(recipient_pk_hex)
                 && s.seen_ids.insert(msg.id.clone())
             {
                 s.messages.push(msg.clone());
+            }
+            if coach {
+                return;
             }
             let convo = s
                 .conversations
@@ -958,29 +959,79 @@ fn insert_dm_message(
     is_sent: bool,
     state: RwSignal<DMStateInner>,
 ) {
-    state.update(|s| {
-        if s.seen_ids.insert(msg.id.clone()) {
-            s.messages.push(msg.clone());
-        }
+    state.update(|s| apply_message(s, msg, counterparty_pk, plaintext, timestamp, is_sent));
+}
 
-        let convo = s
-            .conversations
-            .entry(counterparty_pk.to_string())
-            .or_insert_with(|| DMConversation {
-                pubkey: counterparty_pk.to_string(),
-                name: try_display_name(counterparty_pk).unwrap_or_default(),
-                last_message: String::new(),
-                last_timestamp: 0,
-                unread_count: 0,
-            });
-        if timestamp >= convo.last_timestamp {
-            convo.last_message = truncate_message(plaintext, 80);
-            convo.last_timestamp = timestamp;
-        }
-        if !is_sent && s.current_conversation.as_deref() != Some(counterparty_pk) {
-            convo.unread_count += 1;
-        }
-    });
+/// Store a message (once, by id) and fold it into its conversation's summary:
+/// preview, time and unread count.
+///
+/// A coach exchange (the practice table's `[poker-coach]` requests and
+/// `[coach]` replies, [`is_coach_content`]) is stored like any message, so
+/// the table can read the reply, but never touches the summary: it opens no
+/// conversation, sets no preview and counts toward no unread total.
+fn apply_message(
+    s: &mut DMStateInner,
+    msg: DMMessage,
+    counterparty_pk: &str,
+    plaintext: &str,
+    timestamp: u64,
+    is_sent: bool,
+) {
+    if s.seen_ids.insert(msg.id.clone()) {
+        s.messages.push(msg);
+    }
+    if is_coach_content(plaintext) {
+        return;
+    }
+
+    let convo = s
+        .conversations
+        .entry(counterparty_pk.to_string())
+        .or_insert_with(|| DMConversation {
+            pubkey: counterparty_pk.to_string(),
+            name: try_display_name(counterparty_pk).unwrap_or_default(),
+            last_message: String::new(),
+            last_timestamp: 0,
+            unread_count: 0,
+        });
+    if timestamp >= convo.last_timestamp {
+        convo.last_message = truncate_message(plaintext, 80);
+        convo.last_timestamp = timestamp;
+    }
+    if !is_sent && s.current_conversation.as_deref() != Some(counterparty_pk) {
+        convo.unread_count += 1;
+    }
+}
+
+/// One conversation's messages, oldest first, coach exchanges left out.
+///
+/// The "other party" of a message is the recipient when we sent it and the
+/// sender when we received it.
+fn thread_of(messages: &[DMMessage], counterparty: &str) -> Vec<DMMessage> {
+    let mut msgs: Vec<DMMessage> = messages
+        .iter()
+        .filter(|m| !is_coach_content(&m.content))
+        .filter(|m| {
+            let other = if m.is_sent {
+                &m.recipient_pubkey
+            } else {
+                &m.sender_pubkey
+            };
+            other.eq_ignore_ascii_case(counterparty)
+        })
+        .cloned()
+        .collect();
+    msgs.sort_by_key(|m| m.timestamp);
+    msgs
+}
+
+/// The conversation list, most recent first. Coach exchanges never open a
+/// conversation ([`apply_message`]), so a partner met only through the coach
+/// is not listed.
+fn visible_conversations(inner: &DMStateInner) -> Vec<DMConversation> {
+    let mut convos: Vec<DMConversation> = inner.conversations.values().cloned().collect();
+    convos.sort_by_key(|x| std::cmp::Reverse(x.last_timestamp));
+    convos
 }
 
 // -- Helpers ------------------------------------------------------------------
@@ -1237,5 +1288,90 @@ mod tests {
         for f in wrap_filters(&live) {
             assert_eq!(f.since, Some(since));
         }
+    }
+
+    // -- coach exchanges: stored, but out of the inbox ----------------------
+
+    const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const COACH: &str = "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9";
+
+    fn received(id: &str, text: &str, ts: u64) -> DMMessage {
+        DMMessage {
+            id: id.into(),
+            sender_pubkey: COACH.into(),
+            recipient_pubkey: MEMBER.into(),
+            content: text.into(),
+            timestamp: ts,
+            is_sent: false,
+            is_read: false,
+        }
+    }
+
+    fn sent(id: &str, text: &str, ts: u64) -> DMMessage {
+        DMMessage {
+            id: id.into(),
+            sender_pubkey: MEMBER.into(),
+            recipient_pubkey: COACH.into(),
+            content: text.into(),
+            timestamp: ts,
+            is_sent: true,
+            is_read: true,
+        }
+    }
+
+    fn apply(s: &mut DMStateInner, m: DMMessage) {
+        let text = m.content.clone();
+        let (ts, out) = (m.timestamp, m.is_sent);
+        apply_message(s, m, COACH, &text, ts, out);
+    }
+
+    #[test]
+    fn coach_exchange_is_stored_but_opens_no_conversation() {
+        let mut s = DMStateInner::default();
+        apply(&mut s, sent("q", "[poker-coach]\nI am a beginner…", 10));
+        apply(&mut s, received("r", "[coach] Call: top pair.", 12));
+        // kept in storage, so the table can read the reply
+        assert_eq!(s.messages.len(), 2);
+        // but no conversation, no unread
+        assert!(visible_conversations(&s).is_empty());
+        assert_eq!(
+            s.conversations
+                .values()
+                .map(|c| c.unread_count)
+                .sum::<u32>(),
+            0
+        );
+        assert!(thread_of(&s.messages, COACH).is_empty());
+    }
+
+    #[test]
+    fn coach_exchange_leaves_a_real_conversation_untouched() {
+        let mut s = DMStateInner::default();
+        apply(&mut s, received("hi", "Hello from Jarvis", 5));
+        apply(&mut s, sent("q", "[poker-coach]\nI am a beginner…", 10));
+        apply(&mut s, received("r", "  [coach] Fold.", 12));
+
+        let list = visible_conversations(&s);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].last_message, "Hello from Jarvis");
+        assert_eq!(list[0].last_timestamp, 5);
+        assert_eq!(
+            list[0].unread_count, 1,
+            "the coach reply is not unread mail"
+        );
+
+        let thread = thread_of(&s.messages, COACH);
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].id, "hi");
+        // all three are still stored
+        assert_eq!(s.messages.len(), 3);
+    }
+
+    #[test]
+    fn a_message_merely_mentioning_the_tag_is_ordinary_mail() {
+        let mut s = DMStateInner::default();
+        apply(&mut s, received("m", "what does [coach] mean?", 7));
+        assert_eq!(visible_conversations(&s)[0].unread_count, 1);
+        assert_eq!(thread_of(&s.messages, COACH).len(), 1);
     }
 }

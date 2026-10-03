@@ -1221,6 +1221,26 @@ pub fn SettingsPage() -> impl IntoView {
                                 "Heads-up limit hold'em: practice chips against the house bot, and where the forum runs a house seat, DREAM hands against the house or another member."
                             </p>
                         </div>
+
+                        {crate::poker::PokerConfig::load().coach().is_some().then(|| view! {
+                            <div class="space-y-1">
+                                <label class="flex items-center justify-between cursor-pointer">
+                                    <span class="text-sm text-gray-300">"Poker coach (asks JunkieJarvis for advice on the practice table)"</span>
+                                    <input
+                                        type="checkbox"
+                                        prop:checked=move || prefs.get().poker_coach
+                                        on:change=move |_| {
+                                            prefs.update(|p| p.poker_coach = !p.poker_coach);
+                                            save_preferences(&prefs.get_untracked());
+                                        }
+                                        class="rounded border-gray-600 bg-gray-900 text-amber-500 focus:ring-amber-500"
+                                    />
+                                </label>
+                                <p class="text-xs text-gray-500">
+                                    "On your turn at the practice table, the table sends the hand to the coach by private message and shows its advice under the table. These messages stay out of your inbox."
+                                </p>
+                            </div>
+                        })}
                     </div>
                 })}
 

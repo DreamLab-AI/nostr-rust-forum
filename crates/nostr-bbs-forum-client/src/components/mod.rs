@@ -64,6 +64,7 @@ pub mod event_card;
 pub mod flat_peek;
 pub mod mini_calendar;
 pub mod notification_center;
+pub mod poker_coach;
 pub mod poker_schedule;
 pub mod rsvp_buttons;
 pub mod table3d;

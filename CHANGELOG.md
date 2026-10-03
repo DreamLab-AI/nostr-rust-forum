@@ -46,6 +46,43 @@ the cards are. Face-down cards are never inspected; nothing else reacts.
   scroll, a resize or the 3D table taking over drop it at once; the window
   listeners exist only while a group is up. The state is a pure machine
   (`PeekModel::next`) in a signal, with unit tests.
+### Added: a beginner's poker coach at the practice table — 2026-10-03
+
+On the practice table, each time it is your turn, the table asks a coach
+agent about the decision in front of you and shows its advice in a **Coach**
+box under the table. The DREAM and BLAKES7 tables are unchanged.
+
+- Config: `[poker] coach_pubkey` (optional, 64-char lowercase hex,
+  validated), projected into `POKER_CONFIG` as `coach_pubkey`, written last
+  and only when set. A deployment without it projects exactly the JSON it
+  did before. Absent, the coach is hidden entirely.
+- Transport: an ordinary DM. The request is a kind-14 rumor, gift-wrapped to
+  the coach and sent through the DM store over the primary relay. The table
+  then waits for the coach's next message after the request. Nothing changes
+  on the agent's side.
+- Prompt (`poker/coach.rs`, `build_prompt`): starts `[poker-coach]`, and is
+  built only from your own seat view, the engine's legal envelope and the
+  hand log. It covers the rules of heads-up fixed-limit (blinds, streets,
+  small/big bet, the four-bet cap), stakes, both stacks, the button, the
+  street, your hole cards, the board, the pot, the amount to call, the legal
+  actions with their prices, and this hand's betting by street. It asks for a
+  reply under 600 characters starting `[coach]`. Nothing is built off your
+  turn, so a showdown view that carries the bot's cards is never sent.
+- Replies are paired with requests first in, first out (`Ledger`). A slow
+  reply to an earlier decision is therefore dropped as stale rather than
+  shown against the next one. A request is sent 300 ms after your turn
+  starts (if it is still your turn), times out at 30 s and never touches the
+  action buttons.
+- The box shows one of: "Coach is ready", "Asking JunkieJarvis…" (spinner),
+  the reply (plain text, line breaks kept), "No reply from the coach this
+  time", or an error.
+- Settings → Games: "Poker coach (asks JunkieJarvis for advice on the practice
+  table)", preference `poker_coach`, on by default (also for preferences
+  saved before it existed). Only offered when a coach is configured. Off
+  means no requests and no box.
+- DM inbox: a message starting `[poker-coach]` or `[coach]` is still stored,
+  but is left out of the conversation list, the thread and unread counts.
+
 ### Added: click-to-copy on every abridged public key — 2026-10-03
 
 Wherever the forum client shows a shortened key (`abcd12...ef56`,

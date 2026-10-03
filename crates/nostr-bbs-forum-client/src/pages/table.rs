@@ -32,6 +32,7 @@ use crate::auth::use_auth;
 use crate::components::copy_key::KeyName;
 use crate::components::flat_peek::{provide_flat_peek, PeekSlot};
 use crate::components::fx::use_render_tier;
+use crate::components::poker_coach::PokerCoach;
 use crate::components::poker_schedule::ScheduleGameModal;
 use crate::components::table3d::{self, PeekGroup, Pick, PickTarget, Table3d, Table3dStatus};
 use crate::poker::live::{LiveStore, Pay};
@@ -665,6 +666,8 @@ fn TableSurface(
 #[component]
 fn PracticeTable() -> impl IntoView {
     let config = poker::PokerConfig::load();
+    let coach = config.coach();
+    let prefs = use_preferences();
     let stakes = StoredValue::new(config.stakes());
     let bot: StoredValue<RosterEntry> =
         StoredValue::new(poker::pick_bot(&poker::roster(), &config.bot_profile));
@@ -1072,6 +1075,17 @@ fn PracticeTable() -> impl IntoView {
                             "Keys: 1 / F fold · 2 / C check or call · 3 / R bet or raise · Enter next hand"
                         </p>
                     </div>
+
+                    {coach.map(|coach| view! {
+                        <Show when=move || prefs.with(|p| p.poker_coach)>
+                            <PokerCoach
+                                coach=coach.clone()
+                                hand=hand
+                                seat_view=seat_view
+                                legal=legal
+                            />
+                        </Show>
+                    })}
 
                     <div class="glass-card p-4 text-xs space-y-3">
                         <h2 class="text-sm font-semibold text-white">"Fair shuffle"</h2>
