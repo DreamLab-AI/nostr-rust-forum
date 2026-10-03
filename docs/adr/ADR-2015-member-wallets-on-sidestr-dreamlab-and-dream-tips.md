@@ -35,6 +35,9 @@ the clients that read it, not by the producer.
    `issue:DREAM:0` at txid `608005d3…b978a9`, block 372, supply 1,000,000. Runtime config
    (`window.__ENV__`) may set `SIDESTR_WALLET` (off unless `on`, `true` or `1`), `SIDESTR_MIRROR`
    (`https://` only) and `SIDESTR_RELAYS` (`wss://` only). It cannot name another chain or asset.
+   *Amended 2026-10-03 by [ADR-2021](ADR-2021-two-pinned-sidestr-chains-dreamlab-and-dreamlab-txbt4.md):
+   the lock holds two compiled-in chains, `sidestr:dreamlab` and `sidestr:dreamlab-txbt4`; config
+   still cannot name a third.*
 2. **The identity key is the wallet, on this testnet chain only.** A member's receive script is
    `5120‖pubkey`, so anyone can pay anyone by npub, with nothing for the recipient to set up. This is
    a deliberate, scoped departure from agentbox ADR-2101 D3 (derived spend keys), which is proposed

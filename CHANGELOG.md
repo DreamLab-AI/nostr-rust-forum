@@ -7,6 +7,50 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: two sidestr chains — the wallet and the poker table on sidestr:dreamlab and sidestr:dreamlab-txbt4 — 2026-10-03
+
+ADR-2021. The member wallet and the poker asset tables work on two pinned
+chains at once: `sidestr:dreamlab` (beside testnet4, DREAM) and
+`sidestr:dreamlab-txbt4` (beside BLAKE2b testnet4, BLAKES7). With no new
+configuration a deployment is unchanged.
+
+- Chain locks (`wallet/chain.rs`): both sealed documents compiled in (`PINS`);
+  `sidestr:dreamlab`'s pin unchanged; any document whose id, parent or genesis
+  differs from its pin is refused. The replay follows the parent's header
+  family: stock headers beside `tbtc4`, Knots' 164-byte v2 headers
+  (sidestr-header `Blake2bV2`, already in the build through sidestr-agent)
+  beside `txbt4`.
+- Runtime config: `window.__ENV__.SIDESTR_CHAINS`, a JSON array of
+  `{ "id", "mirror"?, "asset_id"?, "ticker"?, "label"?, "citizen_pubkey"?, "relays"? }`
+  in offer order; entries naming an unpinned chain, and fields that do not
+  read, are ignored with a console warning. Absent, `sidestr:dreamlab` alone,
+  as before; `SIDESTR_MIRROR` / `SIDESTR_RELAYS` still apply to it.
+  `sidestr:dreamlab-txbt4` has no compiled asset id: until `SIDESTR_CHAINS`
+  names BLAKES7's it shows sats only and offers no poker table.
+- One wallet store per chain (snapshot, pending, held coins, unlock); pending
+  lists persist per chain (`sidestr.pending.<chain>.<owner>`, the old dreamlab
+  key moved across once). `/wallet` has a chain switcher, remembered in
+  preferences (`wallet_chain`), showing each chain's ticker and parent; faucet,
+  send, tips, packs and extension signing use the chosen chain.
+- Poker: `[poker] citizens = { "<chain id>" = "<hex>" }` (the scalar
+  `citizen_pubkey` still means `sidestr:dreamlab`); `POKER_CONFIG` now always
+  carries `"citizens":{…}` after `"citizen_pubkey"`. `/table` has one tab per
+  asset table ("DREAM table", "BLAKES7 table"), each with its own live store
+  bound to that chain's wallet and house seat, opened by `#sidestr-<name>`.
+  Scheduled games carry a `chain` tag and the modal picks the chain; the events
+  page links to that table.
+- `nostr-bbs-poker-citizen`: `--chain-id` (default `sidestr:dreamlab`),
+  `--asset-id` (DREAM's by default there, required elsewhere), `--ticker`; the
+  producer's `/chain.json` must equal the pinned document field for field. One
+  instance per chain, each with its own key and `--state`.
+- `nostr-bbs-core`: `CalendarEventSpec::extra_tags` (single-value tags; the
+  builder's own names are skipped). `nostr-bbs-config`: `Poker::citizens`,
+  `Poker::citizen_for`, `Poker::effective_citizens`, `LEGACY_CITIZEN_CHAIN`.
+- Breaking for code that builds these structs literally: `CalendarEventSpec`
+  gains `extra_tags`; `Poker` gains `citizens`; the house seat's
+  `table::Config` gains `ticker` and `table::Balances` renames
+  `hero_dream`/`house_dream` to `hero_asset`/`house_asset`.
+
 ### Added: the 3D poker table — 2026-10-03
 
 The practice and DREAM tables can now be shown in 3D: a Three.js scene of the

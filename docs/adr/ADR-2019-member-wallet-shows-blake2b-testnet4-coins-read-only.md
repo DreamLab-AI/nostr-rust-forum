@@ -46,7 +46,9 @@ Bitcoin Core 30.3.0, stock testnet4) follows the SHA-256d branch past the fork, 
    the bare x-only key (sidestr/spec `keys.mjs`: an npub denotes `02` + x), paid as `OP_1 <x>` with no
    tweak.
 2. **This is not a second chain in the lock.** ADR-2015 D1 still governs everything the wallet
-   validates, builds or signs: one sidestr chain, one asset. The `txbt4` figure comes from a backend
+   validates, builds or signs: one sidestr chain, one asset. (Since ADR-2021 the lock holds two
+   sidestr chains, one of them beside `txbt4`; this read-only figure for the parent chain's coins is
+   unchanged and still outside the lock.) The `txbt4` figure comes from a backend
    the operator names, is not validated in the browser, and is shown as that backend's answer (the pair side of D5 is a second hop: the backend's word about another API's word). D2's
    identity-key-as-wallet departure is unchanged in scope: the key already controls those coins
    whether or not the forum shows them, and both chains are testnet.
