@@ -37,6 +37,7 @@ use nostr_bbs_core::{
 
 use crate::auth::use_auth;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
+use crate::components::copy_key::CopyKey;
 use crate::components::toast::{use_toasts, ToastStore, ToastVariant};
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::zone_access::use_zone_access;
@@ -1027,10 +1028,14 @@ fn CardView(
                             .iter()
                             .map(|pk| {
                                 let pk_full = pk.clone();
-                                let short = format!("{}…{}", &pk[..6], &pk[pk.len() - 4..]);
+                                // Character-safe: an assignee is whatever was
+                                // typed into the add-by-pubkey row, and the old
+                                // byte slice panicked on anything short or
+                                // non-ASCII.
+                                let short = crate::utils::Abbrev::Chip.apply(pk);
                                 view! {
                                     <span class="inline-flex items-center gap-1 text-[11px] text-gray-300 bg-gray-800 rounded-full px-2 py-0.5">
-                                        {short}
+                                        <CopyKey full=pk.clone() display=short />
                                         <button
                                             class="text-gray-500 hover:text-red-400"
                                             title="Remove assignee"

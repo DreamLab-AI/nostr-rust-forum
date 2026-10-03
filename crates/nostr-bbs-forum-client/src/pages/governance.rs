@@ -15,6 +15,7 @@ use std::rc::Rc;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::agent_badge::AgentBadge;
+use crate::components::copy_key::CopyKey;
 use crate::relay::RelayConnection;
 use crate::stores::case_projection::use_case_projection_store;
 use crate::stores::panel_registry::{use_panel_registry, ActionEntry, DecisionView, PanelEntry};
@@ -1146,14 +1147,19 @@ fn ReadOnlyActionRow(card: ActionCardData) -> impl IntoView {
             </span>
             {acknowledged.map(|ack| {
                 let by = governance_view::short_id(&ack.signer_pubkey);
+                let by_full = ack.signer_pubkey.clone();
                 let when = crate::utils::format_relative_time(ack.created_at);
                 let exact = js_sys::Date::new(&((ack.created_at as f64) * 1000.0).into())
                     .to_iso_string()
                     .as_string()
                     .unwrap_or_default();
                 view! {
-                    <span class="text-gray-500" title=exact>
-                        {format!("by {by} · {when} · \u{201c}Acknowledge all alerts\u{201d} on the panel")}
+                    <span class="text-gray-500">
+                        "by "
+                        <CopyKey full=by_full display=by />
+                        <span title=exact>
+                            {format!(" · {when} · \u{201c}Acknowledge all alerts\u{201d} on the panel")}
+                        </span>
                     </span>
                 }
             })}
@@ -1264,8 +1270,9 @@ fn DecisionChainRow(view: DecisionView) -> impl IntoView {
     let delegate_to = view
         .entry
         .delegate_to
-        .as_deref()
-        .map(governance_view::short_id);
+        .clone()
+        .map(|full| (governance_view::short_id(&full), full));
+    let signer_full = view.entry.signer_pubkey.clone();
 
     // FR4.1: how far this decision actually got.
     let receipts = use_receipt_store();
@@ -1289,10 +1296,15 @@ fn DecisionChainRow(view: DecisionView) -> impl IntoView {
                 <span class="text-amber-400/70" title="supersedes a prior decision">"↳"</span>
             })}
             <span class=outcome_class>{outcome}</span>
-            {delegate_to.map(|d| view! {
-                <span class="text-purple-400/80" title="delegated to this reviewer">{format!("→ {d}")}</span>
+            {delegate_to.map(|(d, full)| view! {
+                <span class="text-purple-400/80">
+                    <span title="delegated to this reviewer">"→ "</span>
+                    <CopyKey full=full display=d />
+                </span>
             })}
-            <span class="text-gray-500 truncate">{signer_short}</span>
+            <span class="text-gray-500 truncate">
+                <CopyKey full=signer_full display=signer_short />
+            </span>
             {(!reason.is_empty()).then(|| view! {
                 <span class="text-gray-600 truncate italic">{reason}</span>
             })}

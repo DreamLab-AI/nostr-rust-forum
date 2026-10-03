@@ -559,7 +559,7 @@ pub fn App() -> impl IntoView {
                             web_sys::console::log_1(
                                 &format!(
                                     "[app] Published minimal kind-0 for auto-whitelist: {}",
-                                    &pk[..8]
+                                    crate::utils::Abbrev::Name.apply(&pk)
                                 )
                                 .into(),
                             );
@@ -675,7 +675,7 @@ pub fn App() -> impl IntoView {
                         web_sys::console::log_1(
                             &format!(
                                 "[app] Published kind-0 profile for auto-whitelist: {}",
-                                &pubkey[..8]
+                                crate::utils::Abbrev::Name.apply(&pubkey)
                             )
                             .into(),
                         );
@@ -733,7 +733,7 @@ pub fn App() -> impl IntoView {
                         web_sys::console::log_1(
                             &format!(
                                 "[app] Published kind-10002 relay list for: {}",
-                                &pubkey[..8]
+                                crate::utils::Abbrev::Name.apply(&pubkey)
                             )
                             .into(),
                         );
@@ -1047,6 +1047,18 @@ fn Layout(children: Children) -> impl IntoView {
         }
         "Anonymous".to_string()
     });
+    // The chip's label; when it fell back to the shortened key (no profile
+    // name, no claimed nickname) it is a click-to-copy key (full hex).
+    let header_label = move || {
+        let label = display_name.get();
+        match pubkey.get() {
+            Some(pk) if !pk.is_empty() && label == crate::utils::shorten_pubkey(&pk) => {
+                view! { <crate::components::copy_key::CopyKey full=pk display=label class="font-mono" /> }
+                    .into_any()
+            }
+            _ => label.into_any(),
+        }
+    };
 
     let zone_access = crate::stores::zone_access::use_zone_access();
 
@@ -1211,7 +1223,7 @@ fn Layout(children: Children) -> impl IntoView {
                             </A>
                             <div class="flex items-center gap-1.5 bg-gray-800 px-3 py-1 rounded-full text-xs text-gray-300">
                                 {user_icon()}
-                                <span>{move || display_name.get()}</span>
+                                <span>{header_label}</span>
                             </div>
                             <LogoutButton />
                         </Show>
@@ -1323,7 +1335,7 @@ fn Layout(children: Children) -> impl IntoView {
                             <div class="border-t border-gray-800/50 mt-2 pt-2 flex items-center justify-between px-4 py-2">
                                 <div class="flex items-center gap-2 text-gray-300 text-sm">
                                     {user_icon()}
-                                    <span>{move || display_name.get()}</span>
+                                    <span>{header_label}</span>
                                 </div>
                                 <LogoutButton />
                             </div>

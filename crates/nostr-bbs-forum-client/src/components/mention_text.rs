@@ -9,7 +9,11 @@
 
 use leptos::prelude::*;
 
-use crate::components::user_display::{use_display_name, use_display_name_memo};
+use crate::components::copy_key::{CopyKey, KeyName};
+use crate::components::user_display::{
+    try_display_name_tracked, use_display_name, use_display_name_memo,
+};
+use crate::utils::Abbrev;
 
 /// A parsed segment of message text.
 #[derive(Clone, Debug)]
@@ -76,14 +80,14 @@ pub(crate) fn MentionText(
                     }
                     Segment::PubkeyMention(pubkey) => {
                         // Resolve the mentioned user's nickname reactively;
-                        // falls back to the shortened hex while in flight.
-                        let display = use_display_name_memo(pubkey.clone());
+                        // while none resolves, the shortened hex is a
+                        // click-to-copy key (copying the full hex).
                         view! {
                             <span
                                 class="text-amber-400 font-medium cursor-pointer hover:text-amber-300 hover:underline transition-colors"
                                 title=format!("Pubkey: {}", pubkey)
                             >
-                                {"@"}{move || display.get()}
+                                {"@"}<KeyName pubkey=pubkey.clone() />
                             </span>
                         }.into_any()
                     }
@@ -93,13 +97,23 @@ pub(crate) fn MentionText(
                         // when decoding fails.
                         match npub_to_hex(&npub) {
                             Some(hex_pk) => {
-                                let display = use_display_name_memo(hex_pk);
+                                // A resolved name, else the abridged npub —
+                                // the key the author wrote, so the copy is the
+                                // npub, not the decoded hex.
+                                let name = Memo::new(move |_| try_display_name_tracked(&hex_pk));
+                                let npub_full = npub.clone();
                                 view! {
                                     <span
                                         class="text-amber-400 font-medium cursor-pointer hover:text-amber-300 hover:underline transition-colors"
                                         title=format!("Npub: {}", npub)
                                     >
-                                        {"@"}{move || display.get()}
+                                        {"@"}
+                                        {move || match name.get() {
+                                            Some(n) => n.into_any(),
+                                            None => view! {
+                                                <CopyKey full=npub_full.clone() display=shorten_mention(&npub_full) />
+                                            }.into_any(),
+                                        }}
                                     </span>
                                 }.into_any()
                             }
@@ -110,7 +124,7 @@ pub(crate) fn MentionText(
                                         class="text-amber-400 font-medium cursor-pointer hover:text-amber-300 hover:underline transition-colors"
                                         title=format!("Npub: {}", npub)
                                     >
-                                        {"@"}{short}
+                                        {"@"}<CopyKey full=npub.clone() display=short />
                                     </span>
                                 }.into_any()
                             }
@@ -126,7 +140,15 @@ pub(crate) fn MentionText(
                             Some(pk) => {
                                 // Reactive: fills in when kind-0 arrives.
                                 let display = use_display_name_memo(pk.clone());
+                                let name = {
+                                    let pk = pk.clone();
+                                    Memo::new(move |_| try_display_name_tracked(&pk))
+                                };
                                 let href = format!("/community/profile/{}", pk);
+                                // While the link text is the abridged key, a
+                                // sibling copy button sits beside it — never a
+                                // button nested inside the link.
+                                let pk_copy = pk.clone();
                                 view! {
                                     <a
                                         href=href
@@ -135,6 +157,9 @@ pub(crate) fn MentionText(
                                     >
                                         {"@"}{move || display.get()}
                                     </a>
+                                    {move || name.get().is_none().then(|| view! {
+                                        <CopyKey full=pk_copy.clone() icon=true class="ml-0.5 text-gray-500 hover:text-amber-300" />
+                                    })}
                                 }.into_any()
                             }
                             None => {
@@ -361,13 +386,9 @@ pub(crate) fn normalise_mention_pubkey(s: &str) -> Option<String> {
     None
 }
 
-/// Shorten a pubkey or npub for display.
+/// Shorten a pubkey or npub for display ([`Abbrev::Long`], character-safe).
 fn shorten_mention(s: &str) -> String {
-    if s.len() <= 12 {
-        s.to_string()
-    } else {
-        format!("{}...{}", &s[..8], &s[s.len() - 4..])
-    }
+    Abbrev::Long.apply(s)
 }
 
 /// Render markdown inline (strip wrapping `<p>` tags for inline use).

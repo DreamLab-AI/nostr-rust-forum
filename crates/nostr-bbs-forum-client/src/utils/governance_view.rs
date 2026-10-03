@@ -638,15 +638,9 @@ pub fn safe_context_url(raw: &str) -> Option<String> {
 /// the relay checks a 31403's signature, not that every field it carries is
 /// ASCII hex. Byte-slicing one at a fixed offset panics on a multi-byte
 /// boundary, and a panic in WASM aborts the whole reactive render — the entire
-/// forum goes blank. Character-slicing cannot.
+/// forum goes blank. Character-slicing cannot ([`crate::utils::Abbrev::Id`]).
 pub fn short_id(id: &str) -> String {
-    let chars: Vec<char> = id.chars().collect();
-    if chars.len() <= 12 {
-        return id.to_string();
-    }
-    let head: String = chars[..8].iter().collect();
-    let tail: String = chars[chars.len() - 4..].iter().collect();
-    format!("{head}…{tail}")
+    crate::utils::Abbrev::Id.apply(id)
 }
 
 /// Whether there is a proposal to render at all.

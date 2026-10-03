@@ -29,10 +29,10 @@ use wasm_bindgen::JsCast;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::components::copy_key::KeyName;
 use crate::components::fx::use_render_tier;
 use crate::components::poker_schedule::ScheduleGameModal;
 use crate::components::table3d::{self, Pick, PickTarget, Table3d, Table3dStatus};
-use crate::components::user_display::use_display_name_memo;
 use crate::poker::live::{LiveStore, Pay};
 use crate::poker::{
     self, AssetTable, Choice, HandConfig, HandOutcome, HandState, HistoryRow, Legal, RosterEntry,
@@ -1075,11 +1075,11 @@ fn PracticeTable() -> impl IntoView {
 
 // ── The asset tables ──────────────────────────────────────────────────────────
 
-/// A member's name, reactively.
+/// A member's name, reactively — or, while they have none, their abridged
+/// key as a click-to-copy button.
 #[component]
 fn Name(#[prop(into)] pubkey: String) -> impl IntoView {
-    let name = use_display_name_memo(pubkey);
-    view! { <span>{move || name.get()}</span> }
+    view! { <span><KeyName pubkey=pubkey key_class="font-mono" /></span> }
 }
 
 /// An asset table: hands against one chain's house seat or another member,

@@ -35,13 +35,18 @@ pub(crate) fn NsecBackup(
 
     let on_copy = move |_| {
         let nsec = nsec_for_copy.clone();
-        if let Some(window) = web_sys::window() {
-            let clipboard = window.navigator().clipboard();
-            let _ = clipboard.write_text(&nsec);
-            copied.set(true);
-            // Reset after 2 seconds
-            crate::utils::set_timeout_once(move || copied.set(false), 2000);
-        }
+        crate::utils::clipboard::copy_text_then(&nsec, move |ok| {
+            if ok {
+                copied.try_set(true);
+                // Reset after 2 seconds
+                crate::utils::set_timeout_once(
+                    move || {
+                        copied.try_set(false);
+                    },
+                    2000,
+                );
+            }
+        });
     };
 
     let on_download = move |_| {

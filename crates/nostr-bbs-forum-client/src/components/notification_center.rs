@@ -21,6 +21,7 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
 
+use crate::components::copy_key::{KeyedText, KeyedTextView};
 use crate::stores::channels::use_channel_store;
 use crate::stores::notifications::{use_notification_store, Notification, NotificationKind};
 use crate::stores::read_position::use_read_positions;
@@ -178,7 +179,10 @@ fn NotificationRow(notification: Notification, is_open: RwSignal<bool>) -> impl 
     let dot_vis = if notification.read { "invisible" } else { "" };
     let time_str = format_relative_time(notification.timestamp);
     let title = notification.title.clone();
-    let body = notification.body.clone();
+    let body = match &notification.key {
+        Some(key) => KeyedText::with_key(&notification.body, key),
+        None => KeyedText::from(notification.body.as_str()),
+    };
     let link = notification.link.clone();
     let nid = notification.id.clone();
     let kind = notification.kind.clone();
@@ -216,7 +220,7 @@ fn NotificationRow(notification: Notification, is_open: RwSignal<bool>) -> impl 
                         <span class=format!("w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0 {}", dot_vis)></span>
                         <span class="text-sm font-medium text-white truncate">{title}</span>
                     </div>
-                    <p class="text-xs text-gray-400 mt-0.5 line-clamp-2">{body}</p>
+                    <p class="text-xs text-gray-400 mt-0.5 line-clamp-2"><KeyedTextView text=body key_class="font-mono" /></p>
                     <p class="text-[10px] text-gray-600 mt-1">{time_str}</p>
                 </div>
             </div>

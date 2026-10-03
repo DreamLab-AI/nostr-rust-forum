@@ -19,6 +19,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::admin::use_admin;
 use crate::auth::use_auth;
+use crate::components::copy_key::CopyKey;
 use crate::relay::RelayConnection;
 use crate::stores::zones::{load_zones, Zone};
 use crate::utils::shorten_pubkey;
@@ -92,6 +93,9 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
 struct MemberRow {
     pubkey: String,
     name: String,
+    /// `name` is the abridged key (no display name or handle): rendered as a
+    /// click-to-copy key.
+    name_is_key: bool,
     agent: bool,
 }
 
@@ -162,6 +166,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                         .clone()
                         .or_else(|| u.handle.clone())
                         .unwrap_or_else(|| shorten_pubkey(&u.pubkey)),
+                    name_is_key: u.display_name.is_none() && u.handle.is_none(),
                     agent: !zone.with_value(|z| z.agent_keys)
                         && u.cohorts.iter().any(|c| c == AGENT_COHORT),
                 })
@@ -403,7 +408,19 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                         };
                         view! {
                             <li class="flex items-center justify-between py-1.5 gap-3">
-                                <span class="truncate text-gray-200" title=r.pubkey.clone()>{r.name.clone()}</span>
+                                {if r.name_is_key {
+                                    view! {
+                                        <span class="truncate text-gray-200 font-mono">
+                                            <CopyKey full=r.pubkey.clone() display=r.name.clone() />
+                                        </span>
+                                    }
+                                    .into_any()
+                                } else {
+                                    view! {
+                                        <span class="truncate text-gray-200" title=r.pubkey.clone()>{r.name.clone()}</span>
+                                    }
+                                    .into_any()
+                                }}
                                 <span class=format!("text-xs {}", label.1)>{label.0}</span>
                             </li>
                         }

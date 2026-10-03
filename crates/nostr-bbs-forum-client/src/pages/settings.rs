@@ -14,6 +14,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::confirm_dialog::{ConfirmDialog, ConfirmVariant};
+use crate::components::copy_key::CopyKey;
 use crate::components::onboarding_modal::{
     cache_claimed_username, claimed_username_cached, release_username, use_claimed_username,
     username_from_nip05,
@@ -344,13 +345,6 @@ pub fn SettingsPage() -> impl IntoView {
         }
     }
 
-    let pubkey_display = Memo::new(move |_| {
-        auth.pubkey()
-            .get()
-            .map(|pk| shorten_pubkey(&pk))
-            .unwrap_or_else(|| "not logged in".to_string())
-    });
-
     let pubkey_full = Memo::new(move |_| auth.pubkey().get().unwrap_or_default());
 
     // Per-user pod git clone URL (ADR-089). Renders when the user has a
@@ -672,11 +666,12 @@ pub fn SettingsPage() -> impl IntoView {
         if let Some(privkey) = auth.get_privkey_bytes() {
             let hex_str = hex::encode(*privkey);
             // Copy to clipboard
-            if let Some(window) = web_sys::window() {
-                let nav = window.navigator().clipboard();
-                let _ = nav.write_text(&hex_str);
-                toasts_for_nsec.show("Private key copied to clipboard", ToastVariant::Warning);
-            }
+            crate::utils::clipboard::copy_with_toast(
+                &hex_str,
+                "Private key copied to clipboard",
+                ToastVariant::Warning,
+                toasts_for_nsec,
+            );
         } else {
             toasts_for_nsec.show("No private key available", ToastVariant::Error);
         }
@@ -695,11 +690,12 @@ pub fn SettingsPage() -> impl IntoView {
             toasts_for_clone.show("No clone URL available", ToastVariant::Warning);
             return;
         }
-        if let Some(window) = web_sys::window() {
-            let nav = window.navigator().clipboard();
-            let _ = nav.write_text(&cmd);
-            toasts_for_clone.show("Clone command copied", ToastVariant::Success);
-        }
+        crate::utils::clipboard::copy_with_toast(
+            &cmd,
+            "Clone command copied",
+            ToastVariant::Success,
+            toasts_for_clone,
+        );
     };
 
     // -- Username release handler (called from confirm dialog) --
@@ -1325,7 +1321,7 @@ pub fn SettingsPage() -> impl IntoView {
                                                         })}
                                                     </p>
                                                     <p class="text-xs text-gray-500 font-mono truncate">
-                                                        {short}
+                                                        <CopyKey full=pk.clone() display=short />
                                                         {(!added.is_empty()).then(|| format!(" · {added}"))}
                                                     </p>
                                                 </div>
@@ -1533,7 +1529,12 @@ pub fn SettingsPage() -> impl IntoView {
                         </div>
                         <div class="text-sm text-gray-400">
                             "Display: "
-                            <span class="text-gray-300">{move || pubkey_display.get()}</span>
+                            <span class="text-gray-300">
+                                {move || match auth.pubkey().get() {
+                                    Some(pk) => view! { <CopyKey full=pk /> }.into_any(),
+                                    None => "not logged in".into_any(),
+                                }}
+                            </span>
                         </div>
                     </div>
 

@@ -74,13 +74,6 @@ fn lockable_zones() -> Vec<Zone> {
         .collect()
 }
 
-/// Copy `text` to the clipboard (best-effort).
-fn copy_to_clipboard(text: &str) {
-    if let Some(w) = web_sys::window() {
-        let _ = w.navigator().clipboard().write_text(text);
-    }
-}
-
 #[component]
 pub fn InvitesPanel() -> impl IntoView {
     let auth = use_auth();
@@ -279,7 +272,7 @@ pub fn InvitesPanel() -> impl IntoView {
                                 class="flex-1 bg-transparent text-amber-300 font-mono text-xs outline-none"
                             />
                             <button
-                                on:click=move |_| copy_to_clipboard(&link_for_copy)
+                                on:click=move |_| crate::utils::clipboard::copy_text(&link_for_copy)
                                 class="text-xs text-amber-400 hover:text-amber-300 border border-amber-500/30 hover:border-amber-400 rounded px-2 py-1 transition-colors"
                             >
                                 "Copy"
@@ -339,7 +332,7 @@ pub fn InvitesPanel() -> impl IntoView {
                                                 </div>
                                                 <span class="text-xs text-gray-400 whitespace-nowrap">{uses_label}</span>
                                                 <button
-                                                    on:click=move |_| copy_to_clipboard(&full_join_link(&code_copy))
+                                                    on:click=move |_| crate::utils::clipboard::copy_text(&full_join_link(&code_copy))
                                                     class="text-xs text-amber-400 hover:text-amber-300 border border-amber-500/30 hover:border-amber-400 rounded px-2 py-1 transition-colors"
                                                 >
                                                     "Copy"

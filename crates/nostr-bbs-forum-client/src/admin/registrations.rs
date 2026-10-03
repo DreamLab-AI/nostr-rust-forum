@@ -17,7 +17,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use super::use_admin;
 use crate::auth::use_auth;
-use crate::components::user_display::use_display_name_memo;
+use crate::components::copy_key::{KeyName, KeyedText, KeyedTextView};
+use crate::utils::Abbrev;
 
 /// Default cohort granted on approval. Derived from the live `ZONE_CONFIG`
 /// (first declared zone cohort) rather than a hardcoded value, so an approved
@@ -48,7 +49,7 @@ pub fn RegistrationsPanel() -> impl IntoView {
     let registrations = admin.state.registrations;
     let users = admin.state.users;
     let is_loading = admin.state.is_loading;
-    let action_msg: RwSignal<Option<(String, bool)>> = RwSignal::new(None);
+    let action_msg: RwSignal<Option<(KeyedText, bool)>> = RwSignal::new(None);
     let loaded = RwSignal::new(false);
 
     // Selection set for bulk actions, keyed by pubkey.
@@ -109,19 +110,24 @@ pub fn RegistrationsPanel() -> impl IntoView {
         let admin_for_approve = admin.clone();
         std::rc::Rc::new(move |pubkey: String| {
             let Some(signer) = auth.get_signer() else {
-                action_msg.set(Some(("No signing key — log in first".to_string(), false)));
+                action_msg.set(Some(("No signing key — log in first".into(), false)));
                 return;
             };
             let admin_clone = admin_for_approve.clone();
             let cohort = default_approval_cohort();
-            let short = format!("{}…", &pubkey[..8.min(pubkey.len())]);
+            let short = Abbrev::Prefix.apply(&pubkey);
             spawn_local(async move {
                 match admin_clone
                     .add_to_whitelist_signer(&pubkey, &[cohort], &*signer)
                     .await
                 {
-                    Ok(_) => action_msg.set(Some((format!("Approved {short}"), true))),
-                    Err(e) => action_msg.set(Some((format!("Approve failed: {e}"), false))),
+                    Ok(_) => action_msg.set(Some((
+                        KeyedText::new()
+                            .text("Approved ")
+                            .key(pubkey.clone(), short),
+                        true,
+                    ))),
+                    Err(e) => action_msg.set(Some((format!("Approve failed: {e}").into(), false))),
                 }
                 selected.update(|s| s.retain(|p| p != &pubkey));
             });
@@ -136,11 +142,11 @@ pub fn RegistrationsPanel() -> impl IntoView {
         let admin_for_reject = admin.clone();
         std::rc::Rc::new(move |pubkey: String| {
             let Some(signer) = auth.get_signer() else {
-                action_msg.set(Some(("No signing key — log in first".to_string(), false)));
+                action_msg.set(Some(("No signing key — log in first".into(), false)));
                 return;
             };
             let admin_clone = admin_for_reject.clone();
-            let short = format!("{}…", &pubkey[..8.min(pubkey.len())]);
+            let short = Abbrev::Prefix.apply(&pubkey);
             spawn_local(async move {
                 let url = format!(
                     "{}/api/admin/registrations/dismiss",
@@ -152,10 +158,15 @@ pub fn RegistrationsPanel() -> impl IntoView {
                     Ok(_) => {
                         registrations.update(|list| list.retain(|r| r.pubkey != pubkey));
                         admin_clone.recompute_pending();
-                        action_msg.set(Some((format!("Dismissed {short}"), true)));
+                        action_msg.set(Some((
+                            KeyedText::new()
+                                .text("Dismissed ")
+                                .key(pubkey.clone(), short),
+                            true,
+                        )));
                     }
                     Err(e) => {
-                        action_msg.set(Some((format!("Dismiss failed: {e}"), false)));
+                        action_msg.set(Some((format!("Dismiss failed: {e}").into(), false)));
                     }
                 }
                 selected.update(|s| s.retain(|p| p != &pubkey));
@@ -222,7 +233,7 @@ pub fn RegistrationsPanel() -> impl IntoView {
                 };
                 view! {
                     <div class=cls>
-                        <span>{msg}</span>
+                        <span><KeyedTextView text=msg key_class="font-mono" /></span>
                         <button on:click=move |_| action_msg.set(None)
                             class="text-xs opacity-60 hover:opacity-100 ml-4">"dismiss"</button>
                     </div>
@@ -285,7 +296,6 @@ pub fn RegistrationsPanel() -> impl IntoView {
                                 <div class="divide-y divide-gray-700/50">
                                     {list.into_iter().map(|reg| {
                                         let pk = reg.pubkey.clone();
-                                        let pk_short = use_display_name_memo(pk.clone());
                                         let handle = reg.handle.clone()
                                             .map(|h| format!("@{h}"))
                                             .unwrap_or_else(|| "—".to_string());
@@ -321,7 +331,7 @@ pub fn RegistrationsPanel() -> impl IntoView {
                                                 </div>
                                                 <div class="col-span-3">
                                                     <span class="font-mono text-gray-400 bg-gray-900 rounded px-2 py-0.5 text-xs" title=pk.clone()>
-                                                        {move || pk_short.get()}
+                                                        <KeyName pubkey=pk.clone() />
                                                     </span>
                                                 </div>
                                                 <div class="col-span-2 flex justify-end gap-1">

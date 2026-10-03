@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
 use crate::auth::nip98::{fetch_with_nip98_get_signer, fetch_with_nip98_post_signer};
+use crate::components::copy_key::KeyedText;
 use crate::relay::{ConnectionState, Filter, RelayConnection};
+use crate::utils::Abbrev;
 use nostr_bbs_core::signer::Signer;
 
 // -- Types --------------------------------------------------------------------
@@ -141,7 +143,9 @@ pub struct AdminState {
     pub stats: RwSignal<AdminStats>,
     pub is_loading: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
-    pub success: RwSignal<Option<String>>,
+    /// The last action's confirmation. A [`KeyedText`] so the member key it
+    /// names renders as a click-to-copy [`CopyKey`](crate::components::copy_key::CopyKey).
+    pub success: RwSignal<Option<KeyedText>>,
     pub active_tab: RwSignal<AdminTab>,
     /// True while a channel-creation publish is awaiting relay confirmation.
     /// Drives the create form's pending state so it can reset on success,
@@ -363,11 +367,12 @@ impl AdminStore {
         let url = format!("{}/api/whitelist/add", Self::api_base());
         match fetch_with_nip98_post_signer(&url, &body_json, signer).await {
             Ok(_) => {
-                self.state.success.set(Some(format!(
-                    "Added {}...{} to whitelist",
-                    &pubkey[..8],
-                    &pubkey[pubkey.len().saturating_sub(4)..]
-                )));
+                self.state.success.set(Some(
+                    KeyedText::new()
+                        .text("Added ")
+                        .key(pubkey, Abbrev::Long.apply(pubkey))
+                        .text(" to whitelist"),
+                ));
                 self.state.is_loading.set(false);
                 let _ = self.fetch_whitelist_signer(signer).await;
                 Ok(())
@@ -400,11 +405,11 @@ impl AdminStore {
         let url = format!("{}/api/whitelist/update-cohorts", Self::api_base());
         match fetch_with_nip98_post_signer(&url, &body_json, signer).await {
             Ok(_) => {
-                self.state.success.set(Some(format!(
-                    "Updated cohorts for {}...{}",
-                    &pubkey[..8],
-                    &pubkey[pubkey.len().saturating_sub(4)..]
-                )));
+                self.state.success.set(Some(
+                    KeyedText::new()
+                        .text("Updated cohorts for ")
+                        .key(pubkey, Abbrev::Long.apply(pubkey)),
+                ));
                 self.state.is_loading.set(false);
                 let _ = self.fetch_whitelist_signer(signer).await;
                 Ok(())
@@ -439,12 +444,11 @@ impl AdminStore {
                 } else {
                     "demoted from admin"
                 };
-                self.state.success.set(Some(format!(
-                    "{}...{} {}",
-                    &pubkey[..8],
-                    &pubkey[pubkey.len().saturating_sub(4)..],
-                    action
-                )));
+                self.state.success.set(Some(
+                    KeyedText::new()
+                        .key(pubkey, Abbrev::Long.apply(pubkey))
+                        .text(format!(" {action}")),
+                ));
                 self.state.is_loading.set(false);
                 let _ = self.fetch_whitelist_signer(signer).await;
                 Ok(())
@@ -524,16 +528,16 @@ impl AdminStore {
             );
         }
 
-        self.state.success.set(Some(format!(
-            "Deleted {}...{}{}",
-            &pubkey[..8],
-            &pubkey[pubkey.len().saturating_sub(4)..],
-            if delete_events {
-                " (and their messages)"
-            } else {
-                ""
-            }
-        )));
+        self.state.success.set(Some(
+            KeyedText::new()
+                .text("Deleted ")
+                .key(pubkey, Abbrev::Long.apply(pubkey))
+                .text(if delete_events {
+                    " (and their messages)"
+                } else {
+                    ""
+                }),
+        ));
         self.state.is_loading.set(false);
         let _ = self.fetch_whitelist_signer(signer).await;
         Ok(())
@@ -566,11 +570,13 @@ impl AdminStore {
         let url = format!("{}/api/admin/alias", Self::api_base());
         match fetch_with_nip98_post_signer(&url, &body_json, signer).await {
             Ok(_) => {
-                self.state.success.set(Some(format!(
-                    "Linked {}... to prior identity {}...",
-                    &new_pubkey[..8.min(new_pubkey.len())],
-                    &old_pubkey[..8.min(old_pubkey.len())],
-                )));
+                self.state.success.set(Some(
+                    KeyedText::new()
+                        .text("Linked ")
+                        .key(new_pubkey, Abbrev::Prefix.apply(new_pubkey))
+                        .text(" to prior identity ")
+                        .key(old_pubkey, Abbrev::Prefix.apply(old_pubkey)),
+                ));
                 self.state.is_loading.set(false);
                 let _ = self.fetch_whitelist_signer(signer).await;
                 Ok(())
@@ -596,7 +602,7 @@ impl AdminStore {
                 self.state.channels.set(Vec::new());
                 self.state.stats.set(AdminStats::default());
                 self.state.success.set(Some(
-                    "Database reset. First user to register will become admin.".to_string(),
+                    "Database reset. First user to register will become admin.".into(),
                 ));
                 self.state.is_loading.set(false);
                 Ok(())
@@ -705,7 +711,7 @@ impl AdminStore {
                 }
                 creating.set(false);
                 if accepted {
-                    success_sig.set(Some(format!("Channel '{}' created", channel_name)));
+                    success_sig.set(Some(format!("Channel '{}' created", channel_name).into()));
                     channels_sig.update(|list| {
                         if !list.iter().any(|c| c.id == event_id) {
                             list.push(AdminChannel {

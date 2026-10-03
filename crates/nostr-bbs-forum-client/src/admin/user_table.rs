@@ -11,9 +11,10 @@ use wasm_bindgen_futures::spawn_local;
 use super::WhitelistUser;
 use crate::auth::nip98::fetch_with_nip98_post_signer;
 use crate::auth::use_auth;
+use crate::components::copy_key::{CopyKey, KeyName};
 use crate::components::modal::Modal;
-use crate::components::user_display::{try_display_name_tracked, use_display_name_memo};
-use crate::utils::shorten_pubkey;
+use crate::components::user_display::try_display_name_tracked;
+use crate::utils::{shorten_pubkey, Abbrev};
 
 /// Cohort options for the inline editor, derived from the live `ZONE_CONFIG`
 /// (`window.__ENV__.ZONE_CONFIG`) rather than a hardcoded list (Task #7,
@@ -283,9 +284,9 @@ fn SuspendModal(
     };
 
     // Resolved nickname (reactive) plus the truncated hex key as the exact
-    // technical identifier the admin is acting on.
-    let display_name = use_display_name_memo(pubkey.clone());
-    let pk_display = truncate_pubkey(&pubkey);
+    // technical identifier the admin is acting on — both click-to-copy when
+    // they show the key.
+    let pk_display = Abbrev::Long.apply(&pubkey);
 
     // Local visibility for the shared Modal shell; every close path forwards to
     // the caller's `on_close`.
@@ -299,9 +300,11 @@ fn SuspendModal(
         <Modal is_open=is_open title="Suspend User".to_string() on_close=on_modal_close>
             <div>
                 <p class="text-sm text-gray-400 mb-4">
-                    {move || display_name.get()}
+                    <KeyName pubkey=pubkey.clone() key_class="font-mono" />
                     " "
-                    <span class="font-mono text-xs text-gray-500">{pk_display}</span>
+                    <span class="font-mono text-xs text-gray-500">
+                        <CopyKey full=pubkey.clone() display=pk_display />
+                    </span>
                 </p>
 
                 {move || error_msg.get().map(|msg| view! {
@@ -423,9 +426,9 @@ fn NotesModal(
     };
 
     // Resolved nickname (reactive) plus the truncated hex key as the exact
-    // technical identifier the admin is acting on.
-    let display_name = use_display_name_memo(pubkey.clone());
-    let pk_display = truncate_pubkey(&pubkey);
+    // technical identifier the admin is acting on — both click-to-copy when
+    // they show the key.
+    let pk_display = Abbrev::Long.apply(&pubkey);
 
     // Local visibility for the shared Modal shell; every close path forwards to
     // the caller's `on_close`.
@@ -439,9 +442,11 @@ fn NotesModal(
         <Modal is_open=is_open title="Admin Notes".to_string() on_close=on_modal_close>
             <div>
                 <p class="text-sm text-gray-400 mb-4">
-                    {move || display_name.get()}
+                    <KeyName pubkey=pubkey.clone() key_class="font-mono" />
                     " "
-                    <span class="font-mono text-xs text-gray-500">{pk_display}</span>
+                    <span class="font-mono text-xs text-gray-500">
+                        <CopyKey full=pubkey.clone() display=pk_display />
+                    </span>
                 </p>
 
                 <Show
@@ -491,7 +496,7 @@ fn DeleteUserModal(
     on_confirm: impl Fn(bool) + 'static + Clone + Send + Sync,
 ) -> impl IntoView {
     let also_delete_events = RwSignal::new(false);
-    let pk_display = truncate_pubkey(&pubkey);
+    let pk_display = Abbrev::Long.apply(&pubkey);
 
     let confirm = {
         let on_confirm = on_confirm.clone();
@@ -516,7 +521,9 @@ fn DeleteUserModal(
                 <p class="text-sm text-gray-400 mb-4">
                     {display_label}
                     " "
-                    <span class="font-mono text-xs text-gray-500">{pk_display}</span>
+                    <span class="font-mono text-xs text-gray-500">
+                        <CopyKey full=pubkey.clone() display=pk_display />
+                    </span>
                 </p>
 
                 <div class="bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2 text-red-200 text-sm mb-4">
@@ -571,7 +578,7 @@ fn UserRow(
     on_delete_user: DeleteCb,
 ) -> impl IntoView {
     let pk = user.pubkey.clone();
-    let pk_display = truncate_pubkey(&pk);
+    let pk_display = Abbrev::Long.apply(&pk);
     let cohorts = user.cohorts.clone();
     let is_admin_user = user.is_admin;
     // Admin-only real name (enriched from the auth-worker). Rendered on this
@@ -591,29 +598,38 @@ fn UserRow(
     //   shortened hex. The cache read subscribes so the name fills in live when
     //   kind-0 metadata arrives. The auth handle is the key Task #7 fix: most
     //   live "hex" rows have a blank kind-0 name but a claimed handle.
-    let display_name = {
+    // `None` means no name resolved: the row shows the abridged key, as a
+    // click-to-copy button.
+    let resolved_name = {
         let pk = pk.clone();
         let handle = handle_fallback.clone();
         let relay_name = relay_display_name.clone();
         Memo::new(move |_| {
             if let Some(name) = try_display_name_tracked(&pk) {
-                return name;
+                return Some(name);
             }
             if let Some(n) = relay_name.as_ref() {
                 let t = n.trim();
                 if !t.is_empty() {
-                    return t.to_string();
+                    return Some(t.to_string());
                 }
             }
             if let Some(h) = handle.as_ref() {
                 let t = h.trim();
                 if !t.is_empty() {
-                    return format!("@{t}");
+                    return Some(format!("@{t}"));
                 }
             }
-            shorten_pubkey(&pk)
+            None
         })
     };
+    let pk_for_label = pk.clone();
+    let display_name = move || {
+        resolved_name
+            .get()
+            .unwrap_or_else(|| shorten_pubkey(&pk_for_label))
+    };
+    let pk_for_name = pk.clone();
 
     let pk_for_edit = pk.clone();
     let cohorts_for_edit = cohorts.clone();
@@ -702,17 +718,19 @@ fn UserRow(
             // User column -- reactive display name + admin-only real name + truncated pubkey
             <div class="col-span-3">
                 <div class="flex flex-col gap-0.5">
-                    <span class="text-white font-medium text-sm">{display_name}</span>
+                    <span class="text-white font-medium text-sm">
+                        {move || match resolved_name.get() {
+                            Some(name) => name.into_any(),
+                            None => view! { <CopyKey full=pk_for_name.clone() /> }.into_any(),
+                        }}
+                    </span>
                     {real_name.map(|rn| view! {
                         <span class="text-xs text-gray-400" title="Real name (admin-only)">
                             {rn}
                         </span>
                     })}
-                    <span
-                        class="font-mono text-gray-500 bg-gray-900 rounded px-2 py-0.5 text-xs w-fit"
-                        title=pk.clone()
-                    >
-                        {pk_display}
+                    <span class="font-mono text-gray-500 bg-gray-900 rounded px-2 py-0.5 text-xs w-fit">
+                        <CopyKey full=pk.clone() display=pk_display />
                     </span>
                 </div>
             </div>
@@ -872,7 +890,7 @@ fn UserRow(
         })}
         {move || show_delete_modal.get().then(|| {
             let pk = pk_for_delete.clone();
-            let label = display_name.get();
+            let label = display_name();
             let confirm = on_delete_confirm.clone();
             view! {
                 <DeleteUserModal
@@ -984,14 +1002,6 @@ fn capitalize(s: &str) -> String {
         None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
     }
-}
-
-/// Truncate a hex pubkey to show first 8 and last 4 characters.
-fn truncate_pubkey(pk: &str) -> String {
-    if pk.len() <= 16 {
-        return pk.to_string();
-    }
-    format!("{}...{}", &pk[..8], &pk[pk.len() - 4..])
 }
 
 /// Read a checkbox's `checked` state from a DOM `change` event.

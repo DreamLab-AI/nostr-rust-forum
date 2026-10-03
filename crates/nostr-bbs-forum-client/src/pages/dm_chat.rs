@@ -212,10 +212,11 @@ pub fn DmChatPage() -> impl IntoView {
                             </h1>
                             <p class="text-[10px] font-mono text-gray-500 truncate -mt-0.5 mb-0.5">
                                 {move || {
-                                    // TODO(nicknames): keep raw npub as the technical
-                                    // identity fingerprint beneath the recipient nickname.
+                                    // The raw key stays as the technical identity
+                                    // fingerprint beneath the recipient nickname,
+                                    // click-to-copy (full hex).
                                     let rpk = recipient_pubkey();
-                                    crate::utils::shorten_pubkey(&rpk)
+                                    view! { <crate::components::copy_key::CopyKey full=rpk /> }
                                 }}
                             </p>
                             <div class="flex items-center gap-2">

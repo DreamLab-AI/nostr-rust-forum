@@ -239,7 +239,7 @@ pub fn provide_zone_access() {
                             web_sys::console::log_1(
                                 &format!(
                                     "[zone_access] flags for {}: home={}, members={}, private={}, admin={}, cohorts={:?}",
-                                    &pk[..8], h, d, m, admin, cohorts
+                                    crate::utils::Abbrev::Name.apply(&pk), h, d, m, admin, cohorts
                                 )
                                 .into(),
                             );

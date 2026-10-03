@@ -16,35 +16,12 @@
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
-use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::profile_activity::ProfileActivity;
 use crate::components::user_display::use_display_name_tracked;
 use crate::stores::profile_cache::{format_nip05_handle, try_use_profile_cache};
 use crate::utils::{set_timeout_once, shorten_pubkey};
-
-/// Copy `text` to the clipboard via `navigator.clipboard.writeText`, reached
-/// through `Reflect` so we don't need the (unstable) web-sys `Clipboard`
-/// feature. Best-effort: any missing capability is a silent no-op. Mirrors the
-/// approach in [`ProfileModal`](crate::components::profile_modal).
-fn copy_to_clipboard(text: &str) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let nav = window.navigator();
-    let Ok(clipboard) = js_sys::Reflect::get(&nav, &"clipboard".into()) else {
-        return;
-    };
-    if clipboard.is_undefined() {
-        return;
-    }
-    if let Ok(write_fn) = js_sys::Reflect::get(&clipboard, &"writeText".into()) {
-        if let Ok(func) = write_fn.dyn_into::<js_sys::Function>() {
-            let _ = func.call1(&clipboard, &text.into());
-        }
-    }
-}
 
 /// Anchored, read-only profile preview card.
 ///
@@ -91,9 +68,17 @@ pub(crate) fn ProfilePopover(
     let on_copy = move |ev: leptos::ev::MouseEvent| {
         // Keep the click from bubbling to the trigger/backdrop.
         ev.stop_propagation();
-        copy_to_clipboard(&pk_copy);
-        copied.set(true);
-        set_timeout_once(move || copied.set(false), 2_000);
+        crate::utils::clipboard::copy_text_then(&pk_copy, move |ok| {
+            if ok {
+                copied.try_set(true);
+                set_timeout_once(
+                    move || {
+                        copied.try_set(false);
+                    },
+                    2_000,
+                );
+            }
+        });
     };
 
     // "Send DM" navigates to the DM chat route for this user — same target as

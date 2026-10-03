@@ -21,11 +21,12 @@ use wasm_bindgen_futures::spawn_local;
 use crate::admin::agents_roster::{load_roster, AgentRosterEntry};
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::components::copy_key::{CopyKey, KeyName};
 use crate::components::mention_autocomplete::{search_profiles, MentionCandidate};
 use crate::components::tip_button::{asset_icon, grouped};
 use crate::components::toast::{use_toasts, ToastVariant};
-use crate::components::user_display::use_display_name_memo;
-use crate::utils::format_relative_time;
+use crate::utils::clipboard::copy_with_toast;
+use crate::utils::{format_relative_time, Abbrev};
 use crate::wallet::chain::{self, Balances, Snapshot};
 use crate::wallet::parent::{self, Maturity, ParentView};
 use crate::wallet::{
@@ -46,12 +47,9 @@ const PACK_SATS: u64 = 2_000;
 /// What a transfer typically costs: shown before review, not charged by it.
 const FEE_HINT: u64 = 250;
 
+/// Abridge a key, script or address ([`Abbrev::Wallet`], character-safe).
 fn short(s: &str) -> String {
-    if s.len() <= 20 {
-        s.to_string()
-    } else {
-        format!("{}…{}", &s[..12], &s[s.len() - 6..])
-    }
+    Abbrev::Wallet.apply(s)
 }
 
 fn held(wallet: &WalletStore) -> Vec<OutPoint> {
@@ -63,20 +61,14 @@ fn held(wallet: &WalletStore) -> Vec<OutPoint> {
         .collect()
 }
 
-fn copy(text: String) {
-    if let Some(w) = web_sys::window() {
-        let _ = w.navigator().clipboard().write_text(&text);
-    }
-}
-
 /// A script's owner shown by name when it is a member's key.
 #[component]
 fn Party(#[prop(into)] script: String) -> impl IntoView {
     match chain::script_of_hex(&script).and_then(|s| chain::pubkey_of_script(&s)) {
-        Some(pk) => {
-            let name = use_display_name_memo(pk.clone());
-            view! { <span class="text-gray-200">{move || name.get()}</span> }.into_any()
+        Some(pk) => view! {
+            <span class="text-gray-200"><KeyName pubkey=pk key_class="font-mono text-xs" /></span>
         }
+        .into_any(),
         None => view! { <span class="text-gray-400 font-mono text-xs">{short(&script)}</span> }
             .into_any(),
     }
@@ -454,7 +446,7 @@ fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
                     {move || match picked.get() {
                         Some((pk, name)) => view! {
                             <div class="flex items-center justify-between gap-2 bg-gray-800/80 border border-amber-500/40 rounded-lg px-3 py-2">
-                                <span class="text-sm text-gray-100 truncate">{name} <span class="text-gray-500 font-mono text-xs">" " {short(&pk)}</span></span>
+                                <span class="text-sm text-gray-100 truncate">{name} <span class="text-gray-500 font-mono text-xs">" " <CopyKey full=pk.clone() display=short(&pk) /></span></span>
                                 <button class="text-xs text-gray-400 hover:text-gray-200" on:click=move |_| { picked.set(None); review.set(false); }>"Change"</button>
                             </div>
                         }.into_any(),
@@ -474,13 +466,18 @@ fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
                         <ul class="absolute z-40 mt-1 w-full glass-card rounded-lg py-1 max-h-60 overflow-y-auto" role="listbox">
                             <For each=move || suggestions.get() key=|c| c.pubkey.clone() let:c>
                                 {
-                                    let name = c.display_name.clone().or(c.name.clone()).unwrap_or_else(|| short(&c.pubkey));
+                                    let named = c.display_name.clone().or(c.name.clone());
+                                    let name_is_key = named.is_none();
+                                    let name = named.unwrap_or_else(|| short(&c.pubkey));
                                     let pk = c.pubkey.clone();
+                                    let pk_copy = c.pubkey.clone();
                                     let name_c = name.clone();
+                                    // A member with no name is listed by key: the
+                                    // copy sits beside the pick button, not in it.
                                     view! {
-                                        <li>
+                                        <li class="flex items-center">
                                             <button
-                                                class="w-full text-left px-3 py-2 text-sm text-gray-200 hover:bg-gray-700/60"
+                                                class="flex-1 min-w-0 text-left px-3 py-2 text-sm text-gray-200 hover:bg-gray-700/60"
                                                 on:click=move |_| {
                                                     picked.set(Some((pk.clone(), name_c.clone())));
                                                     suggestions.set(Vec::new());
@@ -488,6 +485,9 @@ fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
                                             >
                                                 {name}
                                             </button>
+                                            {name_is_key.then(|| view! {
+                                                <CopyKey full=pk_copy icon=true class="px-3 text-gray-400 hover:text-amber-300" />
+                                            })}
                                         </li>
                                     }
                                 }
@@ -651,14 +651,14 @@ fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
                                     <div class=label>{format!("Address on {}", profile.id)}</div>
                                     <div class="flex items-center gap-2 mt-1">
                                         <code class="text-xs text-gray-200 break-all">{addr.clone()}</code>
-                                        <button class="text-xs text-amber-400 hover:text-amber-300 shrink-0" on:click=move |_| { copy(addr_c.clone()); toasts.show("Address copied", ToastVariant::Success); }>"Copy"</button>
+                                        <button class="text-xs text-amber-400 hover:text-amber-300 shrink-0" on:click=move |_| copy_with_toast(&addr_c, "Address copied", ToastVariant::Success, toasts)>"Copy"</button>
                                     </div>
                                 </div>
                                 <div>
                                     <div class=label>"Or your npub"</div>
                                     <div class="flex items-center gap-2 mt-1">
                                         <code class="text-xs text-gray-400 break-all">{npub.clone()}</code>
-                                        <button class="text-xs text-amber-400 hover:text-amber-300 shrink-0" on:click=move |_| { copy(npub_c.clone()); toasts.show("npub copied", ToastVariant::Success); }>"Copy"</button>
+                                        <button class="text-xs text-amber-400 hover:text-amber-300 shrink-0" on:click=move |_| copy_with_toast(&npub_c, "npub copied", ToastVariant::Success, toasts)>"Copy"</button>
                                     </div>
                                 </div>
                                 {empty.then(|| view! {
@@ -699,7 +699,7 @@ fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
                             <div class=label>"Address"</div>
                             <div class="flex items-center gap-2 mt-1">
                                 <code class="text-xs text-gray-200 break-all">{addr.clone()}</code>
-                                <button class="text-xs text-amber-400 hover:text-amber-300 shrink-0" on:click=move |_| { copy(addr_c.clone()); toasts.show("Address copied", ToastVariant::Success); }>"Copy"</button>
+                                <button class="text-xs text-amber-400 hover:text-amber-300 shrink-0" on:click=move |_| copy_with_toast(&addr_c, "Address copied", ToastVariant::Success, toasts)>"Copy"</button>
                             </div>
                         </div>
                         {move || match parent_view.get() {
@@ -765,11 +765,17 @@ fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
                                 let pk = a.pubkey.clone();
                                 let name = if a.name.is_empty() { short(&a.pubkey) } else { a.name.clone() };
                                 let name_c = name.clone();
+                                let name_is_key = a.name.is_empty();
+                                let pk_copy = a.pubkey.clone();
                                 view! {
                                     <li class="py-2.5 flex items-center gap-3">
                                         <div class="min-w-0 flex-1">
                                             <div class="text-sm text-gray-100 truncate">
-                                                {name}
+                                                {if name_is_key {
+                                                    view! { <CopyKey full=pk_copy display=name class="font-mono" /> }.into_any()
+                                                } else {
+                                                    name.into_any()
+                                                }}
                                                 {yours.then(|| view! { <span class="ml-2 text-[10px] uppercase tracking-wide text-amber-300/80">"yours"</span> })}
                                             </div>
                                             <div class="text-xs text-gray-500 tabular-nums">{has_asset.then(|| format!("{} {ticker} · ", grouped(bal.asset)))} {grouped(bal.plain)} " sats"</div>

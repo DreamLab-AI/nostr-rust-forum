@@ -2,6 +2,7 @@
 
 pub mod bake;
 pub mod bootstrap;
+pub mod clipboard;
 pub mod devices;
 pub mod freshness;
 pub mod governance_view;
@@ -124,22 +125,80 @@ pub fn pubkey_color(pubkey: &str) -> String {
     format!("hsl({}, 55%, 45%)", hue)
 }
 
-/// Shorten a hex pubkey to "abcd12...ef56" format for display.
+/// The abbreviation styles the forum uses for a public key (hex or npub) or
+/// any other long identifier. Every style slices by CHARACTER via
+/// [`Abbrev::apply`], so none of them can panic on non-ASCII input.
 ///
-/// Slices by CHARACTER, not by byte. The guard used to be a byte-length check
-/// followed by `&pubkey[..6]`, which panics whenever byte offset 6 or `len - 4`
-/// falls inside a multi-byte character — and a panic in WASM aborts the whole
-/// reactive render, blanking the client. Every current caller passes 64-char
-/// ASCII hex, but this is a public utility with no type-level guarantee of it,
-/// and a Nostr event field is only ever guaranteed to be a string.
-pub fn shorten_pubkey(pubkey: &str) -> String {
-    let chars: Vec<char> = pubkey.chars().collect();
-    if chars.len() < 12 {
-        return pubkey.to_string();
+/// The visible formats are the ones each surface already used — they are kept
+/// distinct on purpose, because the width of a key in a table column or a
+/// header chip is part of that surface's layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Abbrev {
+    /// `abcdef...wxyz` — 6 head, 4 tail, ASCII dots ([`shorten_pubkey`]).
+    Pubkey,
+    /// `abcdefgh...wxyz` — 8 head, 4 tail, ASCII dots (admin tables, mentions,
+    /// admin action banners).
+    Long,
+    /// `abcdefgh…wxyz` — 8 head, 4 tail, a single ellipsis (governance ids,
+    /// admin alert labels).
+    Id,
+    /// `abcdef…wxyz` — 6 head, 4 tail, a single ellipsis (board assignees).
+    Chip,
+    /// `abcdefghijkl…uvwxyz` — 12 head, 6 tail, a single ellipsis (wallet).
+    Wallet,
+    /// `abcdefgh…` — first 8 then an ellipsis (registration action messages).
+    Prefix,
+    /// `abcdefgh` — the bare first 8 characters: the fallback *name* for a
+    /// member with no profile (mention autocomplete, composer handles).
+    Name,
+}
+
+impl Abbrev {
+    /// `(head, tail, separator)` for this style.
+    const fn parts(self) -> (usize, usize, &'static str) {
+        match self {
+            Abbrev::Pubkey => (6, 4, "..."),
+            Abbrev::Long => (8, 4, "..."),
+            Abbrev::Id => (8, 4, "\u{2026}"),
+            Abbrev::Chip => (6, 4, "\u{2026}"),
+            Abbrev::Wallet => (12, 6, "\u{2026}"),
+            Abbrev::Prefix => (8, 0, "\u{2026}"),
+            Abbrev::Name => (8, 0, ""),
+        }
     }
-    let head: String = chars[..6].iter().collect();
-    let tail: String = chars[chars.len() - 4..].iter().collect();
-    format!("{head}...{tail}")
+
+    /// Abbreviate `s` in this style. See [`abbreviate`].
+    pub fn apply(self, s: &str) -> String {
+        let (head, tail, sep) = self.parts();
+        abbreviate(s, head, tail, sep)
+    }
+}
+
+/// Keep the first `head` and last `tail` characters of `s`, joined by `sep`.
+///
+/// Slices by CHARACTER, not by byte: a byte slice such as `&pk[..8]` panics
+/// whenever the offset falls inside a multi-byte character (or past the end of
+/// a short string), and a panic in WASM aborts the whole reactive render,
+/// blanking the client. A Nostr event field is only ever guaranteed to be a
+/// string, so no caller may assume 64-char ASCII hex.
+///
+/// `s` is returned unchanged when abbreviating would hide fewer than two
+/// characters — eliding a single character only makes the text harder to read.
+pub fn abbreviate(s: &str, head: usize, tail: usize, sep: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= head + tail + 1 {
+        return s.to_string();
+    }
+    let mut out: String = chars[..head].iter().collect();
+    out.push_str(sep);
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
+/// Shorten a hex pubkey to "abcd12...ef56" format for display
+/// ([`Abbrev::Pubkey`]). Character-safe; see [`abbreviate`].
+pub fn shorten_pubkey(pubkey: &str) -> String {
+    Abbrev::Pubkey.apply(pubkey)
 }
 
 /// Simple left arrow SVG icon for back navigation buttons.
@@ -241,5 +300,78 @@ mod shorten_pubkey_tests {
             let out = shorten_pubkey(s);
             assert!(out.contains("..."));
         }
+    }
+}
+
+#[cfg(test)]
+mod abbrev_tests {
+    use super::{abbreviate, Abbrev};
+
+    const HEX: &str = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c";
+    const NPUB: &str = "npub1z8kkggja6h3vtcv0vxk58t2kjfedppee6w3qm5tzscvhkpecvc7qgjdy6l";
+
+    const ALL: [Abbrev; 7] = [
+        Abbrev::Pubkey,
+        Abbrev::Long,
+        Abbrev::Id,
+        Abbrev::Chip,
+        Abbrev::Wallet,
+        Abbrev::Prefix,
+        Abbrev::Name,
+    ];
+
+    #[test]
+    fn hex_pubkey_in_every_style() {
+        assert_eq!(Abbrev::Pubkey.apply(HEX), "11ed64...663c");
+        assert_eq!(Abbrev::Long.apply(HEX), "11ed6422...663c");
+        assert_eq!(Abbrev::Id.apply(HEX), "11ed6422\u{2026}663c");
+        assert_eq!(Abbrev::Chip.apply(HEX), "11ed64\u{2026}663c");
+        assert_eq!(Abbrev::Wallet.apply(HEX), "11ed64225dd5\u{2026}38663c");
+        assert_eq!(Abbrev::Prefix.apply(HEX), "11ed6422\u{2026}");
+        assert_eq!(Abbrev::Name.apply(HEX), "11ed6422");
+    }
+
+    #[test]
+    fn npub_keeps_its_prefix_and_checksum_tail() {
+        assert_eq!(Abbrev::Long.apply(NPUB), "npub1z8k...dy6l");
+        assert_eq!(Abbrev::Pubkey.apply(NPUB), "npub1z...dy6l");
+        assert_eq!(Abbrev::Wallet.apply(NPUB), "npub1z8kkggj\u{2026}gjdy6l");
+    }
+
+    #[test]
+    fn short_input_is_returned_unchanged() {
+        for style in ALL {
+            assert_eq!(style.apply(""), "");
+            assert_eq!(style.apply("abc"), "abc");
+            assert_eq!(style.apply("alice"), "alice");
+        }
+        // Exactly head + tail + 1 characters: eliding one char is pointless.
+        assert_eq!(abbreviate("abcdefghijk", 6, 4, "..."), "abcdefghijk");
+        // One more and it abbreviates.
+        assert_eq!(abbreviate("abcdefghijkl", 6, 4, "..."), "abcdef...ijkl");
+    }
+
+    #[test]
+    fn never_panics_or_splits_a_character() {
+        let inputs = [
+            "日本語テキストの長い文字列です",
+            "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+            "aé",
+            "ééééééééééééééééééééééé",
+            "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+        ];
+        for s in inputs {
+            for style in ALL {
+                let out = style.apply(s);
+                // Every output char came from the input or the separator.
+                assert!(out
+                    .chars()
+                    .all(|c| s.contains(c) || c == '.' || c == '\u{2026}'));
+            }
+        }
+        assert_eq!(
+            Abbrev::Id.apply("😀😀😀😀😀😀😀😀😀😀😀😀😀😀"),
+            "😀😀😀😀😀😀😀😀\u{2026}😀😀😀😀"
+        );
     }
 }

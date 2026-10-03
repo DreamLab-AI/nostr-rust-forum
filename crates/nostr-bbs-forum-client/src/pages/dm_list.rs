@@ -17,6 +17,7 @@ use wasm_bindgen::JsCast;
 
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::components::copy_key::CopyKey;
 use crate::components::info_term::InfoTerm;
 use crate::components::mention_autocomplete::{
     local_candidates, merge_candidates, search_profiles, MentionAutocomplete, MentionCandidate,
@@ -501,8 +502,13 @@ fn ConversationRow(convo: DMConversation) -> impl IntoView {
     let last_message = convo.last_message.clone();
     let has_message = !last_message.is_empty();
 
+    // "Stretched link" card: the name link's `::after` covers the whole card,
+    // so the card stays one click target, while the key fingerprint sits above
+    // that overlay (`relative z-10`) as its own click-to-copy button — never a
+    // button nested inside a link.
+    let full_pk = convo.pubkey.clone();
     view! {
-        <A href=href attr:class="block bg-gray-800 hover:bg-gray-750 border border-gray-700 hover:border-amber-500/30 rounded-lg hover:-translate-y-px hover:shadow-md transition-all duration-200 no-underline text-inherit">
+        <div class="relative block bg-gray-800 hover:bg-gray-750 border border-gray-700 hover:border-amber-500/30 rounded-lg hover:-translate-y-px hover:shadow-md transition-all duration-200 text-inherit">
             <div class="p-4">
                 <div class="flex gap-3 items-center">
                     // Avatar
@@ -517,17 +523,17 @@ fn ConversationRow(convo: DMConversation) -> impl IntoView {
                     <div class="flex-1 min-w-0">
                         <div class="flex items-center justify-between gap-2">
                             <div class="min-w-0">
-                                <span class=move || {
+                                <A href=href attr:class=move || {
                                     if has_unread {
-                                        "font-bold text-sm text-white truncate block"
+                                        "font-bold text-sm text-white truncate block no-underline after:absolute after:inset-0 after:rounded-lg"
                                     } else {
-                                        "font-semibold text-sm text-gray-200 truncate block"
+                                        "font-semibold text-sm text-gray-200 truncate block no-underline after:absolute after:inset-0 after:rounded-lg"
                                     }
                                 }>
                                     {name}
-                                </span>
+                                </A>
                                 <span class="text-[10px] font-mono text-gray-500 truncate block">
-                                    {short_pk}
+                                    <CopyKey full=full_pk display=short_pk class="relative z-10" />
                                 </span>
                             </div>
                             <span class="text-xs text-gray-500 flex-shrink-0">
@@ -557,7 +563,7 @@ fn ConversationRow(convo: DMConversation) -> impl IntoView {
                     </div>
                 </div>
             </div>
-        </A>
+        </div>
     }
 }
 

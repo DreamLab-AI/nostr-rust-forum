@@ -161,10 +161,17 @@ pub fn NoteViewPage() -> impl IntoView {
         if let Some(window) = web_sys::window() {
             let origin = window.location().origin().unwrap_or_default();
             let full_url = format!("{}{}", origin, base_href(&format!("/view/{}", note_id())));
-            let nav = window.navigator().clipboard();
-            let _ = nav.write_text(&full_url);
-            copied.set(true);
-            set_timeout_once(move || copied.set(false), 2000);
+            crate::utils::clipboard::copy_text_then(&full_url, move |ok| {
+                if ok {
+                    copied.try_set(true);
+                    set_timeout_once(
+                        move || {
+                            copied.try_set(false);
+                        },
+                        2000,
+                    );
+                }
+            });
         }
     };
 

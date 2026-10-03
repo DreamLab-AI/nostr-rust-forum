@@ -540,13 +540,11 @@ pub fn PodBrowserPage() -> impl IntoView {
             );
             return;
         };
-        if let Some(window) = web_sys::window() {
-            let nav = window.navigator().clipboard();
-            let _ = nav.write_text(&url);
-        }
-        toasts_for_url_copy.show(
+        crate::utils::clipboard::copy_with_toast(
+            &url,
             "Pod URL copied",
             crate::components::toast::ToastVariant::Success,
+            toasts_for_url_copy,
         );
     };
 
@@ -561,13 +559,11 @@ pub fn PodBrowserPage() -> impl IntoView {
             );
             return;
         }
-        if let Some(window) = web_sys::window() {
-            let nav = window.navigator().clipboard();
-            let _ = nav.write_text(&cmd);
-        }
-        toasts_for_copy.show(
+        crate::utils::clipboard::copy_with_toast(
+            &cmd,
             "Clone command copied",
             crate::components::toast::ToastVariant::Success,
+            toasts_for_copy,
         );
     };
 

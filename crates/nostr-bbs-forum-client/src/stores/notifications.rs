@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 
 use crate::auth::use_auth;
+use crate::components::copy_key::KeyRef;
 use crate::stores::channels::use_channel_store;
 use crate::stores::profile_cache::try_use_profile_cache;
 use crate::stores::read_position::use_read_positions;
@@ -76,6 +77,31 @@ pub struct Notification {
     pub timestamp: u64,
     pub read: bool,
     pub link: Option<String>,
+    /// The member key the body names, when it may show it abridged (a member
+    /// with no profile name). The notification centre renders that abridged
+    /// text as a click-to-copy key. Absent on notifications persisted before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<KeyRef>,
+}
+
+/// Where a notification came from: when, the stable dedup id of its source
+/// event (if any), and the member key its body may name.
+struct Origin {
+    timestamp: u64,
+    dedup_id: Option<String>,
+    key: Option<KeyRef>,
+}
+
+impl Origin {
+    /// Now, with no dedup id and no key.
+    fn now() -> Self {
+        Self {
+            timestamp: now_secs(),
+            dedup_id: None,
+            key: None,
+        }
+    }
 }
 
 /// Serializable store persisted to localStorage.
@@ -184,22 +210,47 @@ impl NotificationStoreV2 {
 
     /// Push a new notification.
     pub fn add(&self, kind: NotificationKind, title: &str, body: &str, link: Option<&str>) {
-        let now = now_secs();
-        self.add_at(kind, title, body, link, now, None);
+        self.add_at(kind, title, body, link, Origin::now());
     }
 
-    /// Push a new notification carrying an explicit timestamp and optional
-    /// stable dedup id (the source event id). When `dedup_id` is supplied and a
-    /// notification with that id already exists, this is a no-op.
+    /// Push a new notification whose body may name a member by their abridged
+    /// key (`key.display`); the notification centre makes that text copyable.
+    pub fn add_naming(
+        &self,
+        kind: NotificationKind,
+        title: &str,
+        body: &str,
+        link: Option<&str>,
+        key: KeyRef,
+    ) {
+        self.add_at(
+            kind,
+            title,
+            body,
+            link,
+            Origin {
+                key: Some(key),
+                ..Origin::now()
+            },
+        );
+    }
+
+    /// Push a new notification carrying an explicit [`Origin`]. When
+    /// `origin.dedup_id` is supplied and a notification with that id already
+    /// exists, this is a no-op.
     fn add_at(
         &self,
         kind: NotificationKind,
         title: &str,
         body: &str,
         link: Option<&str>,
-        timestamp: u64,
-        dedup_id: Option<String>,
+        origin: Origin,
     ) {
+        let Origin {
+            timestamp,
+            dedup_id,
+            key,
+        } = origin;
         // Honour the user's notification level (#wire-settings). The level
         // gates which categories ever reach the store:
         //   None         -> nothing,
@@ -239,6 +290,7 @@ impl NotificationStoreV2 {
             timestamp,
             read: false,
             link: link.map(|s| s.to_string()),
+            key,
         };
 
         self.items.update(|list| {
@@ -370,8 +422,11 @@ impl NotificationStoreV2 {
                     "New topic",
                     &format!("{} was created", name),
                     Some(&format!("/chat/{}", c.id)),
-                    c.created_at,
-                    Some(format!("topic:{}", c.id)),
+                    Origin {
+                        timestamp: c.created_at,
+                        dedup_id: Some(format!("topic:{}", c.id)),
+                        key: None,
+                    },
                 );
             }
         });
@@ -499,8 +554,11 @@ impl NotificationStoreV2 {
                         &title,
                         &format!("{}: {}", author, preview),
                         Some(&format!("/chat/{}", cid)),
-                        event.created_at,
-                        Some(format!("post:{}", event.id)),
+                        Origin {
+                            timestamp: event.created_at,
+                            dedup_id: Some(format!("post:{}", event.id)),
+                            key: Some(pubkey_ref(&event.pubkey)),
+                        },
                     );
                 }
             }
@@ -609,8 +667,11 @@ impl NotificationStoreV2 {
                         "New member",
                         &format!("{} joined the forum", label),
                         Some("/admin"),
-                        entry.fetched_at,
-                        Some(format!("join:{}", pk)),
+                        Origin {
+                            timestamp: entry.fetched_at,
+                            dedup_id: Some(format!("join:{}", pk)),
+                            key: Some(pubkey_ref(pk)),
+                        },
                     );
                 }
             });
@@ -887,6 +948,15 @@ fn event_mentions(event: &nostr_bbs_core::NostrEvent, pubkey: &str) -> bool {
         .tags
         .iter()
         .any(|tag| tag.len() >= 2 && tag[0] == "p" && tag[1].eq_ignore_ascii_case(pubkey))
+}
+
+/// The key a notification names, abridged the way [`author_display`] and the
+/// join label fall back to it.
+fn pubkey_ref(pubkey: &str) -> KeyRef {
+    KeyRef {
+        full: pubkey.to_string(),
+        display: shorten_pubkey(pubkey),
+    }
 }
 
 /// Resolve a pubkey to a human display name, falling back to a shortened hex.

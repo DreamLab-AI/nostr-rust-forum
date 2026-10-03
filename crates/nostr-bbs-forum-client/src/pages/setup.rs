@@ -10,8 +10,8 @@ use nostr_bbs_core::UnsignedEvent;
 
 use crate::app::safe_return_to;
 use crate::auth::use_auth;
+use crate::components::copy_key::CopyKey;
 use crate::relay::RelayConnection;
-use crate::utils::shorten_pubkey;
 
 // -- Validation ---------------------------------------------------------------
 
@@ -84,13 +84,6 @@ pub fn SetupPage() -> impl IntoView {
             about.set(val);
         }
     };
-
-    let pubkey_display = Memo::new(move |_| {
-        auth.pubkey()
-            .get()
-            .map(|pk| shorten_pubkey(&pk))
-            .unwrap_or_else(|| "unknown".to_string())
-    });
 
     let on_submit = move |_| {
         let name = nickname.get_untracked();
@@ -176,7 +169,12 @@ pub fn SetupPage() -> impl IntoView {
                         </p>
                         <div class="inline-flex items-center gap-1.5 bg-gray-800/60 rounded-full px-3 py-1 text-xs text-gray-500 mt-2">
                             {pubkey_icon_svg()}
-                            <span class="font-mono">{move || pubkey_display.get()}</span>
+                            <span class="font-mono">
+                                {move || match auth.pubkey().get() {
+                                    Some(pk) => view! { <CopyKey full=pk /> }.into_any(),
+                                    None => "unknown".into_any(),
+                                }}
+                            </span>
                         </div>
                     </div>
 

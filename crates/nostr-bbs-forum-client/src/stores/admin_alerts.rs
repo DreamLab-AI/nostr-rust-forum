@@ -27,9 +27,11 @@ use leptos::task::spawn_local;
 
 use crate::admin::{fetch_whitelist_rows, WhitelistUser};
 use crate::auth::{use_auth, AuthStore};
+use crate::components::copy_key::KeyRef;
 use crate::stores::notifications::{use_notification_store, NotificationKind, NotificationStoreV2};
 use crate::stores::zone_access::{use_zone_access, ZoneAccess};
 use crate::stores::zones::{load_zones, ZoneVisibility};
+use crate::utils::Abbrev;
 
 /// `localStorage` key holding the JSON array of already-alerted pubkeys.
 const SEEN_KEY: &str = "nostrbbs_admin_seen_joiners";
@@ -71,7 +73,7 @@ pub(crate) fn awaiting_zone_access<'a>(
 }
 
 /// Short human label for a member: display name, else claimed handle, else
-/// truncated pubkey.
+/// truncated pubkey ([`Abbrev::Id`], character-safe).
 fn member_label(user: &WhitelistUser) -> String {
     for candidate in [user.display_name.as_deref(), user.handle.as_deref()]
         .into_iter()
@@ -81,11 +83,15 @@ fn member_label(user: &WhitelistUser) -> String {
             return candidate.trim().to_string();
         }
     }
-    let pk = &user.pubkey;
-    if pk.len() > 12 {
-        format!("{}…{}", &pk[..8], &pk[pk.len() - 4..])
-    } else {
-        pk.clone()
+    Abbrev::Id.apply(&user.pubkey)
+}
+
+/// The member's key as [`member_label`] abridges it, so the notification
+/// centre can render that fallback label as a click-to-copy key.
+fn member_key(user: &WhitelistUser) -> KeyRef {
+    KeyRef {
+        full: user.pubkey.clone(),
+        display: Abbrev::Id.apply(&user.pubkey),
     }
 }
 
@@ -146,7 +152,7 @@ async fn poll_once(auth: AuthStore, store: NotificationStoreV2) {
         );
     } else {
         for user in &unseen {
-            store.add(
+            store.add_naming(
                 NotificationKind::JoinRequest,
                 "New member awaiting access",
                 &format!(
@@ -154,6 +160,7 @@ async fn poll_once(auth: AuthStore, store: NotificationStoreV2) {
                     member_label(user)
                 ),
                 Some("/admin"),
+                member_key(user),
             );
         }
     }
@@ -259,6 +266,11 @@ mod tests {
             false,
         );
         assert_eq!(member_label(&u), "11ed6422…663c");
+        // The fallback label is exactly the key's display, so it renders as a
+        // click-to-copy key that copies the full hex.
+        let k = member_key(&u);
+        assert_eq!(k.display, member_label(&u));
+        assert_eq!(k.full, u.pubkey);
         u.handle = Some("beema".to_string());
         assert_eq!(member_label(&u), "beema");
         u.display_name = Some("Beema".to_string());

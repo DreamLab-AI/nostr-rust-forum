@@ -10,15 +10,14 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_params_map};
 use leptos_router::NavigateOptions;
-use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::badge_display::BadgeGrid;
+use crate::components::copy_key::CopyKey;
 use crate::components::profile_activity::ProfileActivity;
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::badges::{use_badges, BadgeFetchState, EarnedBadge};
-use crate::utils::shorten_pubkey;
 
 /// Parsed kind 0 metadata.
 #[derive(Clone, Debug, Default)]
@@ -229,20 +228,17 @@ pub fn ProfilePage() -> impl IntoView {
 
     let on_copy = move |_| {
         let pk = pubkey.get();
-        if let Some(window) = web_sys::window() {
-            let nav = window.navigator();
-            if let Ok(clipboard) = js_sys::Reflect::get(&nav, &"clipboard".into()) {
-                if !clipboard.is_undefined() {
-                    if let Ok(write_fn) = js_sys::Reflect::get(&clipboard, &"writeText".into()) {
-                        if let Ok(func) = write_fn.dyn_into::<js_sys::Function>() {
-                            let _ = func.call1(&clipboard, &pk.into());
-                            copied.set(true);
-                            crate::utils::set_timeout_once(move || copied.set(false), 2_000);
-                        }
-                    }
-                }
+        crate::utils::clipboard::copy_text_then(&pk, move |ok| {
+            if ok {
+                copied.try_set(true);
+                crate::utils::set_timeout_once(
+                    move || {
+                        copied.try_set(false);
+                    },
+                    2_000,
+                );
             }
-        }
+        });
     };
 
     view! {
@@ -332,7 +328,7 @@ pub fn ProfilePage() -> impl IntoView {
                 <div>
                     <div class="text-xs text-gray-500 mb-1">"Public Key"</div>
                     <div class="font-mono text-xs text-amber-400/70 break-all">
-                        {move || shorten_pubkey(&pubkey.get())}
+                        {move || view! { <CopyKey full=pubkey.get() /> }}
                     </div>
                 </div>
 

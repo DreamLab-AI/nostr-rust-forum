@@ -18,8 +18,9 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::app::base_href;
 use crate::auth::use_auth;
+use crate::components::copy_key::CopyKey;
 use crate::components::user_display::use_display_name_tracked;
-use crate::utils::{format_relative_time, relay_url::relay_api_base, shorten_pubkey};
+use crate::utils::{format_relative_time, relay_url::relay_api_base};
 
 /// One channel in the "most active in" list.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -189,8 +190,8 @@ pub(crate) fn ProfileActivity(pubkey: String, #[prop(optional)] compact: bool) -
                         <div class="text-gray-400">
                             "Also posted as "
                             {others.into_iter().map(|k| view! {
-                                <span class="font-mono text-[11px] text-amber-400/80 mr-1" title=k.clone()>
-                                    {shorten_pubkey(&k)}
+                                <span class="font-mono text-[11px] text-amber-400/80 mr-1">
+                                    <CopyKey full=k />
                                 </span>
                             }).collect_view()}
                         </div>

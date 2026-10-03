@@ -481,7 +481,7 @@ pub(crate) fn MessageInput(
         let handle = c.handle();
         let safe_handle: String = handle.chars().filter(|c| !c.is_whitespace()).collect();
         let safe_handle = if safe_handle.is_empty() {
-            c.pubkey.chars().take(8).collect::<String>()
+            crate::utils::Abbrev::Name.apply(&c.pubkey)
         } else {
             safe_handle
         };

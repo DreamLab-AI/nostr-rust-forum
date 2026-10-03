@@ -44,8 +44,10 @@ use serde::Deserialize;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
+use crate::components::copy_key::CopyKey;
 use crate::stores::profile_cache::{try_use_profile_cache, ProfileEntry};
 use crate::utils::relay_url::relay_api_base;
+use crate::utils::Abbrev;
 
 /// Minimum query length before the relay search endpoint is hit.
 ///
@@ -95,7 +97,15 @@ impl MentionCandidate {
                     .filter(|s| !s.is_empty())
                     .map(String::from)
             })
-            .unwrap_or_else(|| self.pubkey.chars().take(8).collect())
+            .unwrap_or_else(|| Abbrev::Name.apply(&self.pubkey))
+    }
+
+    /// True when [`MentionCandidate::handle`] fell back to the abridged key
+    /// (no display name, name or NIP-05), so the option shows that key.
+    pub fn handle_is_key(&self) -> bool {
+        [&self.display_name, &self.name, &self.nip05]
+            .iter()
+            .all(|f| f.as_deref().is_none_or(|s| s.trim().is_empty()))
     }
 
     /// True when any human-facing label of this candidate contains `q`
@@ -512,6 +522,7 @@ pub(crate) fn MentionAutocomplete(
                                     .enumerate()
                                     .map(|(i, c)| {
                                         let handle = c.handle();
+                                        let handle_is_key = c.handle_is_key();
                                         let nip05 = c.nip05.clone().unwrap_or_default();
                                         let pic = c.picture.clone();
                                         let is_active = i == active;
@@ -544,7 +555,23 @@ pub(crate) fn MentionAutocomplete(
                                                         }
                                                     })}
                                                 <div class="flex-1 min-w-0">
-                                                    <div class="text-xs font-medium truncate">{handle}</div>
+                                                    <div class="text-xs font-medium truncate">
+                                                        {if handle_is_key {
+                                                            // keep_focus: the composer's textarea must
+                                                            // keep focus or the dropdown closes.
+                                                            view! {
+                                                                <CopyKey
+                                                                    full=c.pubkey.clone()
+                                                                    display=handle
+                                                                    class="font-mono"
+                                                                    keep_focus=true
+                                                                />
+                                                            }
+                                                            .into_any()
+                                                        } else {
+                                                            handle.into_any()
+                                                        }}
+                                                    </div>
                                                     {(!nip05.is_empty())
                                                         .then(|| {
                                                             view! {
@@ -638,6 +665,11 @@ mod tests {
         assert_eq!(cand("ff", Some("Disp"), Some("nm")).handle(), "Disp");
         assert_eq!(cand("ff", None, Some("nm")).handle(), "nm");
         assert_eq!(cand("abcdef0123456789", None, None).handle(), "abcdef01");
+        // The 8-char fallback is the abridged key: the option renders it as a
+        // click-to-copy key (copying the full hex), never for a real name.
+        assert!(cand("abcdef0123456789", None, None).handle_is_key());
+        assert!(cand("abcdef0123456789", Some("  "), None).handle_is_key());
+        assert!(!cand("ff", None, Some("nm")).handle_is_key());
         // Blank display_name falls through to name.
         assert_eq!(cand("ff", Some("   "), Some("nm")).handle(), "nm");
     }

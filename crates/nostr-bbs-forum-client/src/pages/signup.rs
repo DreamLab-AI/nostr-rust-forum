@@ -38,6 +38,7 @@ use solid_pod_rs::webid::{pod_git_clone_url, webid_url};
 
 use crate::app::{base_href, safe_return_to};
 use crate::auth::use_auth;
+use crate::components::copy_key::CopyKey;
 use crate::components::info_term::InfoTerm;
 use crate::components::recovery_sheet::RecoverySheet;
 use crate::components::toast::{use_toasts, ToastVariant};
@@ -53,15 +54,16 @@ const AUTH_API: &str = match option_env!("VITE_AUTH_API_URL") {
     None => "https://auth.example.com",
 };
 
-/// Write `text` to the system clipboard and pop a success toast labelled
-/// "{what} copied". Helper inlined here (instead of a per-handler closure
-/// factory) to keep all on:click handlers `FnMut` for Leptos.
+/// Write `text` to the system clipboard and pop a toast labelled
+/// "{what} copied" (or the shared failure toast). Kept as a named helper to
+/// keep all on:click handlers `FnMut` for Leptos.
 fn clipboard_copy(text: &str, what: &str, toasts: crate::components::toast::ToastStore) {
-    if let Some(window) = web_sys::window() {
-        let nav = window.navigator().clipboard();
-        let _ = nav.write_text(text);
-    }
-    toasts.show(format!("{what} copied"), ToastVariant::Success);
+    crate::utils::clipboard::copy_with_toast(
+        text,
+        format!("{what} copied"),
+        ToastVariant::Success,
+        toasts,
+    );
 }
 
 /// Signup wizard phases.
@@ -542,7 +544,10 @@ pub fn SignupPage() -> impl IntoView {
                                             <div class="flex-1 min-w-0">
                                                 <p class="text-xs uppercase tracking-wide text-gray-500">"Your public ID"</p>
                                                 <p class="text-sm text-amber-300 font-mono truncate" data-testid="signup-pubkey">
-                                                    {move || pubkey_short.get()}
+                                                    {move || pubkey.get().map(|pk| {
+                                                        let short = pubkey_short.get();
+                                                        view! { <CopyKey full=pk display=short /> }
+                                                    })}
                                                 </p>
                                             </div>
                                             <button
@@ -579,11 +584,7 @@ pub fn SignupPage() -> impl IntoView {
                                             <button
                                                 on:click=move |_| {
                                                     let url = webid.get_untracked();
-                                                    if let Some(window) = web_sys::window() {
-                                                        let nav = window.navigator().clipboard();
-                                                        let _ = nav.write_text(&url);
-                                                        toasts.show("Space address copied", ToastVariant::Success);
-                                                    }
+                                                    crate::utils::clipboard::copy_with_toast(&url, "Space address copied", ToastVariant::Success, toasts);
                                                 }
                                                 class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
                                             >
@@ -604,11 +605,7 @@ pub fn SignupPage() -> impl IntoView {
                                             <button
                                                 on:click=move |_| {
                                                     let cmd = git_clone.get_untracked();
-                                                    if let Some(window) = web_sys::window() {
-                                                        let nav = window.navigator().clipboard();
-                                                        let _ = nav.write_text(&cmd);
-                                                        toasts.show("Command copied", ToastVariant::Success);
-                                                    }
+                                                    crate::utils::clipboard::copy_with_toast(&cmd, "Command copied", ToastVariant::Success, toasts);
                                                 }
                                                 class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-100 px-3 py-1.5 rounded-md transition-colors"
                                             >

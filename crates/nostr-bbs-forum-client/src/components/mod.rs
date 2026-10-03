@@ -19,6 +19,8 @@ pub mod avatar;
 pub mod badge;
 pub mod bbs_sash;
 pub mod confirm_dialog;
+// Click-to-copy for every abridged public key in the UI.
+pub mod copy_key;
 pub mod empty_state;
 // Inline plain-English explainer for hard terms (relay / WebID / encrypted …)
 // used across the de-jargoned onboarding surfaces.

@@ -7,6 +7,46 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: click-to-copy on every abridged public key — 2026-10-03
+
+Wherever the forum client shows a shortened key (`abcd12...ef56`,
+`abcd1234…`, or the 8-char fallback name of a member with no profile),
+clicking it copies the FULL key: hex as hex, npub as npub.
+
+- One affordance, `components/copy_key.rs`: `<CopyKey full display />` is a
+  `<button type="button">` styled as the inline text it replaces
+  (`cursor: copy`, inherits colour and font), `title="Click to copy <key>"`,
+  `aria-label="Copy public key <abridged>"`. The text swaps to "Copied" /
+  "Copy failed" for 1.2 s under `aria-live="polite"`; a generation counter
+  keeps a stale timer from cutting a later confirmation short. Clicks do not
+  propagate to a wrapping row; inside a link it is rendered as a sibling
+  (`icon` mode), never nested. `<KeyName pubkey />` shows a resolved name or,
+  failing one, the copyable key. `KeyedText` carries a sentence naming a key
+  from a store to its view (admin action banners, registration messages,
+  notification bodies — `Notification.key`, serde-defaulted so stored
+  notifications still load).
+- Converted: admin banners, registrations, user table and its modals, agents
+  roster, zone-encryption roster, mention chips and autocomplete, board
+  assignees, wallet recipient/suggestions/agents, profile modal and page,
+  "also posted as", DM list and DM header, governance signer/delegate/
+  acknowledger, poker table names, settings (account, devices), setup,
+  signup, the header identity chip, and admin-alert/join/post notifications.
+  The DM list card is now a stretched link so the key can sit above it.
+- One clipboard writer, `utils/clipboard.rs`: the async Clipboard API reached
+  through `Reflect` and awaited (a rejection is a failure, not assumed a
+  success), falling back to a hidden-textarea `execCommand("copy")`. Replaces
+  every inline writer (admin invites, NsecBackup, ProfileModal,
+  ProfilePopover, profile page, note view, pod browser, settings, signup,
+  wallet), most of which called web-sys `navigator.clipboard()` directly and
+  threw through WASM where the API is absent. Toast-confirmed copies now report a failure instead of claiming
+  success.
+- One abbreviation: `utils::Abbrev` presets (`Pubkey`, `Long`, `Id`, `Chip`,
+  `Wallet`, `Prefix`, `Name`) over a character-safe `utils::abbreviate`, each
+  surface keeping its visible format. Deletes the byte slicers
+  (`&pk[..8]`, `&pk[..6]…&pk[len-4..]`, `truncate_pubkey`, `shorten_mention`'s
+  body, `short_id`'s body, the wallet's `short`), which panicked on short or
+  non-ASCII input — the board's add-assignee row could blank the client.
+
 ### Added: two sidestr chains — the wallet and the poker table on sidestr:dreamlab and sidestr:dreamlab-txbt4 — 2026-10-03
 
 ADR-2021. The member wallet and the poker asset tables work on two pinned

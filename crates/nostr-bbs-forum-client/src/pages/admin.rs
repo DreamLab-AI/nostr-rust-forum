@@ -25,6 +25,7 @@ use crate::admin::zone_encryption::ZoneEncryptionTab;
 use crate::admin::{provide_admin, use_admin, AdminTab, MembersView};
 use crate::auth::use_auth;
 use crate::components::admin_checklist::AdminChecklist;
+use crate::components::copy_key::KeyedTextView;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::stores::zone_access::use_zone_access;
@@ -261,7 +262,9 @@ fn AdminPanelInner() -> impl IntoView {
                     let admin_suc = admin_for_suc_btn.clone();
                     view! {
                         <div class="mb-4 bg-green-900/50 border border-green-700 rounded-lg px-4 py-3 flex items-center justify-between animate-slide-in-down">
-                            <span class="text-green-200 text-sm">{msg}</span>
+                            <span class="text-green-200 text-sm">
+                                <KeyedTextView text=msg key_class="font-mono" />
+                            </span>
                             <button
                                 on:click=move |_| admin_suc.clear_success()
                                 class="text-green-300 hover:text-green-100 text-xs ml-4"

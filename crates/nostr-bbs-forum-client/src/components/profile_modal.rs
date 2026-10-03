@@ -11,9 +11,9 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
-use wasm_bindgen::JsCast;
 
 use crate::components::avatar::{Avatar, AvatarSize};
+use crate::components::copy_key::CopyKey;
 use crate::components::modal::Modal;
 use crate::components::user_display::use_display_name_tracked;
 use crate::relay::{Filter, RelayConnection};
@@ -109,20 +109,17 @@ pub(crate) fn ProfileModal(
 
     let on_copy = move |_| {
         let pk = pk_stored.get_value();
-        if let Some(window) = web_sys::window() {
-            let nav = window.navigator();
-            if let Ok(clipboard) = js_sys::Reflect::get(&nav, &"clipboard".into()) {
-                if !clipboard.is_undefined() {
-                    if let Ok(write_fn) = js_sys::Reflect::get(&clipboard, &"writeText".into()) {
-                        if let Ok(func) = write_fn.dyn_into::<js_sys::Function>() {
-                            let _ = func.call1(&clipboard, &pk.into());
-                            copied.set(true);
-                            crate::utils::set_timeout_once(move || copied.set(false), 2_000);
-                        }
-                    }
-                }
+        crate::utils::clipboard::copy_text_then(&pk, move |ok| {
+            if ok {
+                copied.try_set(true);
+                crate::utils::set_timeout_once(
+                    move || {
+                        copied.try_set(false);
+                    },
+                    2_000,
+                );
             }
-        }
+        });
     };
 
     let display_name = Memo::new(move |_| {
@@ -168,7 +165,7 @@ pub(crate) fn ProfileModal(
                     <div class="bg-gray-800/50 border border-gray-700/30 rounded-lg p-3">
                         <div class="text-xs text-gray-500 mb-1">"Public Key"</div>
                         <div class="font-mono text-xs text-amber-400/70 break-all">
-                            {move || short_pk.get_value()}
+                            <CopyKey full=pk_stored.get_value() display=short_pk.get_value() />
                         </div>
                     </div>
 

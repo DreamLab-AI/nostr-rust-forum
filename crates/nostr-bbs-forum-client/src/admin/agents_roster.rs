@@ -25,8 +25,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::auth::nip98::{fetch_with_nip98_get_signer, fetch_with_nip98_post_signer};
 use crate::auth::{use_auth, AuthStore};
+use crate::components::copy_key::{CopyKey, KeyName};
 use crate::components::toast::{use_toasts, ToastStore, ToastVariant};
-use crate::components::user_display::use_display_name_memo;
 use crate::utils::format_relative_time;
 
 /// One `agent_registry` row as served by `GET /api/governance/agents`. The
@@ -212,7 +212,6 @@ pub fn AgentsRoster() -> impl IntoView {
     // (`registered_by = admin_pk`, server-side). Surface it read-only so the
     // operator sees whose authority the roster row will cite.
     let admin_pk = auth.pubkey().get_untracked().unwrap_or_default();
-    let principal_name = use_display_name_memo(admin_pk.clone());
 
     // Initial load once a signer is available (mirrors AdminPanelInner's
     // signer-gated fetch — the admin flag arrives asynchronously after login).
@@ -325,7 +324,7 @@ pub fn AgentsRoster() -> impl IntoView {
                     // signer (this admin). Read-only.
                     <div class="text-xs text-gray-500">
                         "Authorising principal: "
-                        <span class="text-gray-300">{move || principal_name.get()}</span>
+                        <span class="text-gray-300"><KeyName pubkey=admin_pk.clone() key_class="font-mono text-xs" /></span>
                         " (recorded as "<span class="font-mono">"registered_by"</span>" from your signature)"
                     </div>
                     {move || form_err.get().map(|msg| view! { <p class="text-red-400 text-sm">{msg}</p> })}
@@ -433,7 +432,7 @@ where
     let pk_short = crate::utils::shorten_pubkey(&entry.pubkey);
     let registered_at = entry.registered_at as u64;
     let active = entry.is_active();
-    let principal = use_display_name_memo(entry.registered_by.clone());
+    let principal = entry.registered_by.clone();
     let rate_edit = RwSignal::new(entry.rate_limit());
 
     let status_class = if active {
@@ -458,11 +457,15 @@ where
             // Agent identity
             <div class="col-span-3 min-w-0">
                 <div class="text-gray-200 font-medium truncate">{name}</div>
-                <div class="text-xs text-gray-500 font-mono truncate" title=pubkey>{pk_short}</div>
+                <div class="text-xs text-gray-500 font-mono truncate">
+                    <CopyKey full=pubkey display=pk_short />
+                </div>
             </div>
             // Authorising principal
             <div class="col-span-3 min-w-0">
-                <div class="text-gray-300 truncate">{move || principal.get()}</div>
+                <div class="text-gray-300 truncate">
+                    <KeyName pubkey=principal key_class="font-mono text-xs" />
+                </div>
                 {(!time_display.is_empty()).then(|| view! {
                     <div class="text-xs text-gray-500">{format!("since {time_display}")}</div>
                 })}
