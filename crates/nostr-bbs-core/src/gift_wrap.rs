@@ -528,8 +528,9 @@ async fn seal_rumor_with_signer(
     signer: &dyn Signer,
     recipient_pubkey: &str,
 ) -> Result<NostrEvent, SignerGiftWrapError> {
-    let rumor_json = serde_json::to_string(rumor)
-        .map_err(|e| SignerGiftWrapError::Serialization(e.to_string()))?;
+    // Same JSON as the native seal: the rumor with its NIP-01 id, no sig.
+    let rumor_json =
+        rumor_json_with_id(rumor).map_err(|e| SignerGiftWrapError::Serialization(e.to_string()))?;
 
     // NIP-44 encrypt the rumor to the recipient via the signer (sender → recipient).
     let encrypted = signer.nip44_encrypt(recipient_pubkey, &rumor_json).await?;
