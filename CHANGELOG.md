@@ -7,6 +7,28 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: `nostr-bbs-sidestr-admin`, the operator CLI for the pinned sidestr chains
+
+The crates.io `sidestr-agent` 0.6.0 CLI cannot replay `sidestr:dreamlab-txbt4`:
+its parent (txbt4) hands down `Blake2bV2` headers and every replay-backed
+command fails with "data not consumed entirely". The new bin crate
+`crates/nostr-bbs-sidestr-admin` replays with the house seat's two-family
+replay and does what an operator needs on either chain:
+
+- `assets` (plain sats, carrier sats, every asset held: id, ticker, units),
+  `issue <TICKER> <SUPPLY> [--decimals N]` (SPEC 12: the whole supply on one
+  carrier to the issuer), `send-asset <ID|TICKER> <RECIPIENT> <UNITS> [--memo]`
+  and `send <RECIPIENT> <SATS>`.
+- `--chain-id` picks the compiled pin; the producer's `/chain.json` must be
+  that sealed document exactly or the tool refuses.
+- Recipients are hex pubkeys or `npub1…`; the key is read from `--key-file`
+  (hex or `nsec1…`), held in zeroizing memory, never printed.
+- Nothing is posted without `--post`; the default prints the signed hex and
+  txid, `--dry-run` prints neither hex nor anything postable.
+- `nostr-bbs-poker-citizen::chain` gains `replay` / `Replayed` (state plus
+  assets view under the document's header family); `scan` now runs on the
+  same helper, with unchanged behaviour.
+
 ### Fixed: sealed rumors carry their NIP-01 `id`
 
 A NIP-59 rumor is an unsigned event with an `id` and no `sig`. The core

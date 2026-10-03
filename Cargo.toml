@@ -32,6 +32,10 @@ members = [
     # The poker table's house seat: pure table state machine + native service.
     "crates/nostr-bbs-poker-citizen",
 
+    # Operator CLI for the pinned sidestr chains: holdings, asset issue,
+    # sends, replayed under either header family. Pure library + native bin.
+    "crates/nostr-bbs-sidestr-admin",
+
     # Leptos CSR forum client.
     "crates/nostr-bbs-forum-client",
 

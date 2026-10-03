@@ -14,9 +14,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use bitcoin::{OutPoint, Script, ScriptBuf, Txid};
+use bitcoin::{OutPoint, Script, ScriptBuf, Transaction, Txid};
 use sidestr_agent::AgentKey;
-use sidestr_core::assets::AssetView;
+use sidestr_core::assets::{AssetView, Outcome};
 use sidestr_core::block::{HeaderFamily, SidestrBlock};
 use sidestr_core::document::ChainDocument;
 use sidestr_core::records::records_of;
@@ -263,6 +263,52 @@ pub fn pubkey_of_script(script: &Script) -> Option<String> {
     (b.len() == 34 && b[0] == 0x51 && b[1] == 0x20).then(|| hex::encode(&b[2..]))
 }
 
+/// The validated chain and what each unspent output carries, as one replay
+/// left them: the view an operator's wallet reads holdings from and builds
+/// issues and transfers against.
+pub struct Replayed {
+    /// The validated chain.
+    pub state: ChainState,
+    /// What each unspent output carries.
+    pub assets: AssetView,
+}
+
+/// Replay a block file against `doc` (one of the pinned documents) under the
+/// header family its parent hands down, applying the assets rule to every
+/// block. `now` is the clock for the future-time rule.
+pub fn replay(doc: ChainDocument, dat: &[u8], now: Option<u32>) -> Result<Replayed, String> {
+    let family = doc.family().map_err(|e| format!("chain document: {e}"))?;
+    let (state, assets) = match family {
+        Family::Stock => {
+            let (s, a) = replay_in::<Stock>(doc, dat, now, |_, _| {})?;
+            (ChainState::Stock(s), a)
+        }
+        Family::Blake2b => {
+            let (s, a) = replay_in::<Blake2bV2>(doc, dat, now, |_, _| {})?;
+            (ChainState::Blake2b(s), a)
+        }
+    };
+    Ok(Replayed { state, assets })
+}
+
+/// Replay under family `F`, applying the assets rule block by block and
+/// handing each block's transactions and their assets outcomes to `on_txs`.
+fn replay_in<F: HeaderFamily>(
+    doc: ChainDocument,
+    dat: &[u8],
+    now: Option<u32>,
+    mut on_txs: impl FnMut(&[Transaction], &[Outcome]),
+) -> Result<(StateOf<F>, AssetView), String> {
+    let mut assets = AssetView::new();
+    let state = StateOf::<F>::replay_with(doc, dat, now, |_, height, block| {
+        let txdata = block.txdata();
+        let outcomes = assets.apply_transactions(txdata, height);
+        on_txs(txdata, &outcomes);
+    })
+    .map_err(|e| format!("the producer's blocks do not validate: {e}"))?;
+    Ok((state, assets))
+}
+
 /// Replay a block file against `doc` (one of the pinned documents), reading
 /// every `hand:<root>` payment of `asset`. `now` is the clock for the
 /// future-time rule.
@@ -305,12 +351,9 @@ fn scan_in<F: HeaderFamily>(
     dat: &[u8],
     now: Option<u32>,
 ) -> Result<Scanned<F>, String> {
-    let mut assets = AssetView::new();
     let mut hand_payments: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     let mut txids = HashSet::new();
-    let state = StateOf::<F>::replay_with(doc, dat, now, |_, height, block| {
-        let txdata = block.txdata();
-        let outcomes = assets.apply_transactions(txdata, height);
+    let (state, assets) = replay_in::<F>(doc, dat, now, |txdata, outcomes| {
         for tx in txdata {
             let txid = tx.compute_txid();
             txids.insert(txid.to_string());
@@ -359,8 +402,7 @@ fn scan_in<F: HeaderFamily>(
                     .or_default() += units;
             }
         }
-    })
-    .map_err(|e| format!("the producer's blocks do not validate: {e}"))?;
+    })?;
     Ok((state, assets, hand_payments, txids))
 }
 

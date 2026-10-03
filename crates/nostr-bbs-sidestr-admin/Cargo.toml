@@ -1,0 +1,41 @@
+[package]
+name = "nostr-bbs-sidestr-admin"
+version = "1.0.0-beta.13"
+edition = "2021"
+description = "Operator CLI for a kit deployment's pinned sidestr chains: replays the producer's blocks under the parent's header family (stock or BLAKE2b) and lists a key's holdings, issues an asset, and sends sats or asset units"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
+documentation = "https://docs.rs/nostr-bbs-sidestr-admin"
+keywords = ["nostr", "sidestr", "bbs", "wallet", "cli"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+rust-version = "1.85"
+# An operator tool for this kit's pinned chains; not a reusable library.
+publish = false
+
+[lib]
+# Key and recipient parsing, holdings and the transaction builders are pure
+# and compile to wasm32 (kit CI checks every member for wasm32).
+path = "src/lib.rs"
+
+[[bin]]
+name = "nostr-bbs-sidestr-admin"
+path = "src/main.rs"
+
+[dependencies]
+nostr-bbs-core = { workspace = true }
+# The pinned chain documents and the two-family replay the house seat uses.
+nostr-bbs-poker-citizen = { path = "../nostr-bbs-poker-citizen", version = "1.0.0-beta.13" }
+hex = { workspace = true }
+zeroize = { workspace = true }
+sidestr-agent = { version = "0.6", default-features = false }
+sidestr-core = "0.4.2"
+sidestr-wallet = "0.5.3"
+bitcoin = { version = "0.32", features = ["secp-lowmemory"] }
+
+# HTTP and the CLI: native only, so the wasm32 check sees a pure library.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

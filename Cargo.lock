@@ -2620,6 +2620,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr-bbs-sidestr-admin"
+version = "1.0.0-beta.13"
+dependencies = [
+ "bitcoin",
+ "clap",
+ "hex",
+ "nostr-bbs-core",
+ "nostr-bbs-poker-citizen",
+ "reqwest",
+ "sidestr-agent",
+ "sidestr-core",
+ "sidestr-wallet",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "nostr-bbs-upstream-canary"
 version = "1.0.0-beta.10"
 dependencies = [
