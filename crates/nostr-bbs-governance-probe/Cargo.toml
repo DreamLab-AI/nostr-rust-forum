@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-governance-probe"
-version = "1.0.0-beta.12"
+version = "1.0.0-beta.13"
 edition = "2021"
 description = "ADR-2011 / PRD-augmentation-conditions M4 probe suite: drives the escalation boundary on a live nostr-bbs relay and auth API and writes one receipt per probe"
 license = "AGPL-3.0-only"

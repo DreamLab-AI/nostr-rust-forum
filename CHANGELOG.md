@@ -362,6 +362,10 @@ existing balance, receipt or issued deposit address is touched.
   screenshots the page for the home-screen tile.
 
 
+## [1.0.0-beta.13] — 2026-10-03
+
+- Kit crates `nostr-bbs-core`, `-config`, `-mesh`, `-rate-limit` republished against solid-pod-rs `=0.5.0-alpha.12` (beta.12 pinned `=0.5.0-alpha.10`). Downstream workspaces that also pin solid-pod-rs alpha.12 — the VisionClaw host — can now depend on a published kit instead of a git patch. No API change in the kit crates.
+
 ## [1.0.0-beta.11] — 2026-09-14
 
 Augmentation-conditions release: `nostr-bbs-core` and `nostr-bbs-mesh` move to

@@ -161,7 +161,7 @@ wasm-bindgen-test = "0.3"
 # `format_multibase_sec1`) and the full-point decoder (`parse_multibase_sec1`)
 # that nostr-bbs-core re-exports; `did-nostr-types` now pulls k256.
 # (alpha.7 introduced the three-context `@context` the tier1 tests assert.)
-# NOTE: requires solid-pod-rs 0.5.0-alpha.10 to be PUBLISHED to crates.io
+# NOTE: requires solid-pod-rs 0.5.0-alpha.12 to be PUBLISHED to crates.io
 # (cargo publish from the solid-pod-rs workspace) before `cargo update` here
 # will resolve.
 # EXACT pin (`=`): a caret range would let the crates.io pivot silently pull a
@@ -170,10 +170,10 @@ wasm-bindgen-test = "0.3"
 solid-pod-rs = { version = "=0.5.0-alpha.12", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.3).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.12" }
-nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.12" }
-nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.12" }
-nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.12" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.13" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.13" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.13" }
+nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.13" }
 nostr-bbs-ascii = { path = "crates/nostr-bbs-ascii", version = "1.0.0-beta.10" }
 
 # Image decoders for server-side ASCII rendering (nostr-bbs-ascii `decode`
