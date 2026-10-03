@@ -11,6 +11,7 @@ use crate::components::agent_badge::AgentBadge;
 use crate::components::avatar::{Avatar, AvatarSize};
 use crate::components::mention_text::MentionText;
 use crate::components::reaction_bar::ReactionBar;
+use crate::components::tip_button::TipControl;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
@@ -180,6 +181,12 @@ pub fn ThreadView(
                         "Reply"
                     </button>
                 </Show>
+
+                // Tips (ADR-2015, ADR-2021): at the far right of the reply
+                // row, away from the emoji reactions above it.
+                <div class="ml-auto pl-2">
+                    <TipControl event_id=parent_eid.get_value() author_pubkey=parent_pk.get_value() />
+                </div>
             </div>
 
             // Expanded thread replies
@@ -214,7 +221,16 @@ pub fn ThreadView(
                                         <div class="text-xs text-gray-300 leading-relaxed">
                                             <MentionText content=content />
                                         </div>
-                                        <ReactionBar event_id=eid author_pubkey=author_pk />
+                                        // a reply has no reply box: its tips sit at
+                                        // the far right of its footer
+                                        <div class="flex items-start gap-2">
+                                            <div class="min-w-0">
+                                                <ReactionBar event_id=eid.clone() author_pubkey=author_pk.clone() />
+                                            </div>
+                                            <div class="ml-auto pl-2 mt-1">
+                                                <TipControl event_id=eid author_pubkey=author_pk />
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                             }

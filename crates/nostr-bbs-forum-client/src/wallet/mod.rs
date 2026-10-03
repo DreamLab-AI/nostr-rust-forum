@@ -17,8 +17,9 @@
 //! There is one [`WalletStore`] per chain the deployment offers
 //! ([`profile`]), each with its own snapshot, pending list, held coins and
 //! persisted state, so the chains never mix; [`Wallets`] holds them all and
-//! the member's choice of chain, which every surface that spends follows
-//! ([`use_wallet`]).
+//! the member's choice of chain ([`use_wallets`]); the wallet page follows
+//! the choice, the tip control offers every chain with an asset, and each
+//! poker table spends from its own chain's store.
 //!
 //! Off unless the deployment sets `window.__ENV__.SIDESTR_WALLET = "on"`, so
 //! an instance that has not opted in renders exactly as before.
@@ -210,12 +211,6 @@ impl Wallets {
         self.get(id).unwrap_or_else(|| self.first())
     }
 
-    /// The chosen chain's wallet, without subscribing to the choice.
-    pub fn current_untracked(&self) -> WalletStore {
-        let id = self.selected.get_untracked();
-        self.get(id).unwrap_or_else(|| self.first())
-    }
-
     fn first(&self) -> WalletStore {
         // provide_wallet makes one store per profile and profiles() is never empty
         self.stores.with_value(|l| l[0])
@@ -274,13 +269,6 @@ pub fn use_wallets() -> Option<Wallets> {
         return None;
     }
     use_context::<Wallets>()
-}
-
-/// The wallet of the chain the member chose, when the wallet is switched on
-/// and provided. Read once, where the component is built: a surface that
-/// must follow a change of chain while it is open reads [`use_wallets`].
-pub fn use_wallet() -> Option<WalletStore> {
-    use_wallets().map(|w| w.current_untracked())
 }
 
 /// Fetch `url` as bytes.

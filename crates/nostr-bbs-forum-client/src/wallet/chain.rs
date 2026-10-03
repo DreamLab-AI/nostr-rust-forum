@@ -74,6 +74,16 @@ pub const DEFAULT_RELAYS: [&str; 5] = [
 /// The memo a tip carries beside its tally: `tip:nostr:<event id>`.
 pub const TIP_PREFIX: &str = "tip:nostr:";
 
+/// The built-in mark drawn beside a chain's asset figures, when the
+/// deployment names no icon image for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// A four-point spark (DREAM).
+    Spark,
+    /// A faceted hexagon (BLAKES7).
+    Facet,
+}
+
 /// One compiled-in chain lock: the sealed document and what the wallet shows
 /// for it before any runtime config.
 #[derive(Debug, PartialEq, Eq)]
@@ -98,6 +108,8 @@ pub struct Pin {
     pub asset_id: Option<&'static str>,
     /// The default mirror.
     pub mirror: &'static str,
+    /// The asset's built-in mark.
+    pub mark: Mark,
 }
 
 /// `sidestr:dreamlab`, DREAM.
@@ -112,6 +124,7 @@ pub const DREAMLAB: Pin = Pin {
     ticker: DREAM,
     asset_id: Some(DREAM_ASSET_ID),
     mirror: DEFAULT_MIRROR,
+    mark: Mark::Spark,
 };
 
 /// `sidestr:dreamlab-txbt4`, BLAKES7 (id named at runtime once issued).
@@ -126,6 +139,7 @@ pub const DREAMLAB_TXBT4: Pin = Pin {
     ticker: "BLAKES7",
     asset_id: None,
     mirror: TXBT4_DEFAULT_MIRROR,
+    mark: Mark::Facet,
 };
 
 /// Every chain the wallet will touch.

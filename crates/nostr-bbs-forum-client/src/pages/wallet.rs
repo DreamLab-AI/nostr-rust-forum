@@ -22,7 +22,7 @@ use crate::admin::agents_roster::{load_roster, AgentRosterEntry};
 use crate::app::base_href;
 use crate::auth::use_auth;
 use crate::components::mention_autocomplete::{search_profiles, MentionCandidate};
-use crate::components::tip_button::{dream_icon, grouped};
+use crate::components::tip_button::{asset_icon, grouped};
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::utils::format_relative_time;
@@ -309,7 +309,7 @@ fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
             <header class="flex items-start justify-between gap-4">
                 <div>
                     <h1 class="text-2xl font-bold text-gray-100 flex items-center gap-2">
-                        {dream_icon("w-6 h-6 text-amber-400")}
+                        {asset_icon(profile, "w-6 h-6 text-amber-400")}
                         "Wallet"
                     </h1>
                     <p class="text-sm text-gray-400 mt-1">

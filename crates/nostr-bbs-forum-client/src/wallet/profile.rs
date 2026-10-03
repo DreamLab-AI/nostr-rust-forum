@@ -8,7 +8,7 @@
 //!
 //! The deployment lists its chains in `window.__ENV__.SIDESTR_CHAINS`, a JSON
 //! array (a string or an already-parsed array) of
-//! `{ "id", "mirror"?, "asset_id"?, "ticker"?, "label"?, "citizen_pubkey"?, "relays"? }`,
+//! `{ "id", "mirror"?, "asset_id"?, "ticker"?, "label"?, "icon"?, "citizen_pubkey"?, "relays"? }`,
 //! in the order the wallet offers them. An entry naming a chain that is not
 //! pinned is ignored with a warning, as is any field that does not read
 //! (a mirror that is not `https://`, an asset id that is not 64 hex digits);
@@ -51,6 +51,9 @@ pub struct ChainProfile {
     pub asset_id: Option<String>,
     /// The asset's ticker.
     pub ticker: String,
+    /// An image for the asset (`https://`), drawn instead of the pin's
+    /// built-in mark ([`chain::Mark`]).
+    pub icon_url: Option<String>,
     /// The relays transactions and faucet requests go to.
     pub relays: Vec<String>,
     /// The house seat of this chain's poker table, when the entry names one
@@ -72,6 +75,7 @@ impl ChainProfile {
             mirror: pin.mirror.to_string(),
             asset_id: pin.asset_id.map(str::to_string),
             ticker: pin.ticker.to_string(),
+            icon_url: None,
             relays: default_relays(),
             citizen_pubkey: None,
         }
@@ -124,11 +128,12 @@ struct Entry {
     asset_id: Option<String>,
     ticker: Option<String>,
     label: Option<String>,
+    icon: Option<String>,
     citizen_pubkey: Option<String>,
     relays: Option<Vec<String>>,
 }
 
-fn https_mirror(m: &str) -> Option<String> {
+fn https_url(m: &str) -> Option<String> {
     let m = m.trim();
     (m.starts_with("https://") && m.len() > "https://".len())
         .then(|| m.trim_end_matches('/').to_string())
@@ -163,7 +168,7 @@ fn apply_legacy(
         return;
     }
     if let (false, Some(m)) = (own_mirror, legacy.mirror) {
-        match https_mirror(m) {
+        match https_url(m) {
             Some(m) => p.mirror = m,
             None => warnings.push(format!(
                 "SIDESTR_MIRROR {m:?} is not an https:// URL; ignored"
@@ -191,7 +196,7 @@ fn profile_of(entry: Entry, warnings: &mut Vec<String>) -> Option<(ChainProfile,
     let mut p = ChainProfile::from_pin(pin);
     let mut own_mirror = false;
     if let Some(m) = entry.mirror.as_deref() {
-        match https_mirror(m) {
+        match https_url(m) {
             Some(m) => {
                 p.mirror = m;
                 own_mirror = true;
@@ -226,6 +231,12 @@ fn profile_of(entry: Entry, warnings: &mut Vec<String>) -> Option<(ChainProfile,
         // a ticker set without a label names the chain's money too
         None if entry.ticker.is_some() => p.label = p.ticker.clone(),
         None => {}
+    }
+    if let Some(i) = entry.icon.as_deref() {
+        match https_url(i) {
+            Some(url) => p.icon_url = Some(url),
+            None => warnings.push(format!("{id}: icon {i:?} is not an https:// URL; ignored")),
+        }
     }
     if let Some(pk) = entry.citizen_pubkey.as_deref().map(str::trim) {
         if chain::is_hex64(pk) {
@@ -385,7 +396,7 @@ mod tests {
     fn two_chains_in_the_order_given() {
         let json = format!(
             r#"[
-                {{"id":"sidestr:dreamlab-txbt4","asset_id":"{}","ticker":"BLAKES7","citizen_pubkey":"{}","mirror":"https://m.example/t"}},
+                {{"id":"sidestr:dreamlab-txbt4","asset_id":"{}","ticker":"BLAKES7","citizen_pubkey":"{}","mirror":"https://m.example/t","icon":"https://m.example/b7.svg"}},
                 {{"id":"sidestr:dreamlab","label":"Dream","citizen_pubkey":"{}"}}
             ]"#,
             BLAKES7.to_ascii_uppercase(),
@@ -408,6 +419,7 @@ mod tests {
             ("BLAKES7", "BLAKES7")
         );
         assert_eq!(t.citizen_pubkey.as_deref(), Some(CITIZEN));
+        assert_eq!(t.icon_url.as_deref(), Some("https://m.example/b7.svg"));
         assert_eq!(t.pin(), &chain::DREAMLAB_TXBT4);
         assert_eq!(t.anchor(), "sidestr-dreamlab-txbt4");
         let d = &list[1];
@@ -469,14 +481,15 @@ mod tests {
 
     #[test]
     fn fields_that_do_not_read_fall_back_to_the_pin() {
-        let json = r#"[{"id":"sidestr:dreamlab-txbt4","mirror":"http://plain.example","asset_id":"xyz","ticker":"BLAKES 7!","citizen_pubkey":"nope","relays":["ws://plain.example"]}]"#;
+        let json = r#"[{"id":"sidestr:dreamlab-txbt4","mirror":"http://plain.example","asset_id":"xyz","ticker":"BLAKES 7!","icon":"javascript:alert(1)","citizen_pubkey":"nope","relays":["ws://plain.example"]}]"#;
         let (list, warnings) = resolve(Some(json), Legacy::default());
         let p = &list[0];
         assert_eq!(p.mirror, chain::TXBT4_DEFAULT_MIRROR);
         assert_eq!(p.asset_id, None);
         assert_eq!(p.ticker, "BLAKES7");
         assert_eq!(p.citizen_pubkey, None);
+        assert_eq!(p.icon_url, None);
         assert_eq!(p.relays.len(), 5);
-        assert_eq!(warnings.len(), 5, "{warnings:?}");
+        assert_eq!(warnings.len(), 6, "{warnings:?}");
     }
 }

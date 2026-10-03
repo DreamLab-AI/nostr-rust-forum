@@ -41,6 +41,7 @@ use crate::components::media_embed::MediaEmbed;
 use crate::components::mention_text::{normalise_mention_pubkey, MentionText};
 use crate::components::message_input::MessageInput;
 use crate::components::reaction_bar::ReactionBar;
+use crate::components::tip_button::TipControl;
 use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::relay::RelayConnection;
@@ -1389,16 +1390,21 @@ fn RootPost(
                             is_admin=is_admin
                             on_delete=on_delete
                         />
-                        <Show when=move || can_reply.get()>
-                            <button
-                                class="text-xs text-gray-500 hover:text-[color:var(--zone-accent)] transition-colors ml-auto"
-                                on:click=move |_: leptos::ev::MouseEvent| {
-                                    let (id, pubkey, snippet) = reply_info.get_value();
-                                    on_reply.run(ReplyTarget { id, pubkey, author: author.get_untracked(), snippet });
-                                }
-                                aria-label="Reply to this topic"
-                            >"\u{21A9} Reply"</button>
-                        </Show>
+                        // The reply row: Reply, then tips at the far right
+                        // (ADR-2021), away from the emoji reactions below.
+                        <div class="ml-auto flex items-center gap-3">
+                            <Show when=move || can_reply.get()>
+                                <button
+                                    class="text-xs text-gray-500 hover:text-[color:var(--zone-accent)] transition-colors"
+                                    on:click=move |_: leptos::ev::MouseEvent| {
+                                        let (id, pubkey, snippet) = reply_info.get_value();
+                                        on_reply.run(ReplyTarget { id, pubkey, author: author.get_untracked(), snippet });
+                                    }
+                                    aria-label="Reply to this topic"
+                                >"\u{21A9} Reply"</button>
+                            </Show>
+                            <TipControl event_id=post_id.clone() author_pubkey=post_pubkey.clone() open_down=true />
+                        </div>
                     </div>
                     <Show
                         when=move || is_editing.get()
@@ -1508,16 +1514,21 @@ fn ReplyCard(
                             is_admin=is_admin
                             on_delete=on_delete
                         />
-                        <Show when=move || can_reply.get()>
-                            <button
-                                class="text-xs text-gray-600 hover:text-[color:var(--zone-accent)] transition-colors ml-auto"
-                                on:click=move |_: leptos::ev::MouseEvent| {
-                                    let (id, pubkey, snippet) = reply_info.get_value();
-                                    on_reply.run(ReplyTarget { id, pubkey, author: author.get_untracked(), snippet });
-                                }
-                                aria-label="Reply to this post"
-                            >"\u{21A9} Reply"</button>
-                        </Show>
+                        // The reply row: Reply, then tips at the far right
+                        // (ADR-2021), away from the emoji reactions below.
+                        <div class="ml-auto flex items-center gap-3">
+                            <Show when=move || can_reply.get()>
+                                <button
+                                    class="text-xs text-gray-600 hover:text-[color:var(--zone-accent)] transition-colors"
+                                    on:click=move |_: leptos::ev::MouseEvent| {
+                                        let (id, pubkey, snippet) = reply_info.get_value();
+                                        on_reply.run(ReplyTarget { id, pubkey, author: author.get_untracked(), snippet });
+                                    }
+                                    aria-label="Reply to this post"
+                                >"\u{21A9} Reply"</button>
+                            </Show>
+                            <TipControl event_id=post_id.clone() author_pubkey=post_pubkey.clone() open_down=true />
+                        </div>
                     </div>
                     {quote.map(|q| {
                         let qn = use_display_name_memo(q.pubkey.clone());
