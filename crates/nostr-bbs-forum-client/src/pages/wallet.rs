@@ -20,7 +20,7 @@ use crate::components::toast::{use_toasts, ToastVariant};
 use crate::components::user_display::use_display_name_memo;
 use crate::utils::format_relative_time;
 use crate::wallet::chain::{self, Balances, Snapshot};
-use crate::wallet::parent::{self, ParentView};
+use crate::wallet::parent::{self, Maturity, ParentView};
 use crate::wallet::{use_wallet, LoadStatus, Pending, PendingKind, SpendPath, WalletStore};
 
 /// What the give form sends.
@@ -637,6 +637,25 @@ pub fn WalletPage() -> impl IntoView {
                                             format!(" ({sign}{} unconfirmed)", grouped(v.balance.unconfirmed.unsigned_abs()))
                                         })}
                                     </p>
+                                    {match v.balance.maturity {
+                                        Maturity::Split { spendable, immature } => view! {
+                                            <p class="text-xs text-gray-400">
+                                                {grouped(spendable)} " sats spendable now"
+                                                {(immature > 0).then(|| format!(
+                                                    " · {} sats mined, spendable after {} confirmations",
+                                                    grouped(immature),
+                                                    grouped(u64::from(parent::COINBASE_MATURITY))
+                                                ))}
+                                            </p>
+                                        }.into_any(),
+                                        Maturity::Unknown => view! {
+                                            <p class="text-xs text-gray-400">
+                                                "May include mined coins younger than "
+                                                {grouped(u64::from(parent::COINBASE_MATURITY))}
+                                                " confirmations, which cannot be spent yet; the backend does not say which coins were mined."
+                                            </p>
+                                        }.into_any(),
+                                    }}
                                     {v.pair.map(|p| view! {
                                         <p class="text-xs text-gray-400">
                                             "Only on BLAKE2b: " {grouped(p.only_blake)} " · only on stock testnet4: " {grouped(p.only_stock)}

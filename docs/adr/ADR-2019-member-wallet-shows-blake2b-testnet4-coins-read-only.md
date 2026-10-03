@@ -35,6 +35,16 @@ Bitcoin Core 30.3.0, stock testnet4) follows the SHA-256d branch past the fork, 
    (no value)". The address is derived from the session pubkey (`OP_1 <x-only key>`, untweaked, as
    blaketest does; bech32m `tb1p` through the `bitcoin` crate, no hand-written encoder); no secret
    key is read. Unset, nothing is shown and nothing is fetched.
+   *Amended 2026-10-03 (coinbase maturity, Reef `2bd3cb8`):* the confirmed figure is split into
+   spendable now and mined coins still maturing, a coinbase output younger than 6,705 confirmations
+   (`COINBASE_MATURITY` in Reef `lib/wallet.mjs`; counted as Reef's `isMature`, `tip + 1 − height ≥
+   6,705`), because every upgraded testnet4 node (Knots 29.4.2) refuses a payment that spends one
+   (`bad-txns-premature-spend-of-coinbase`). The split needs `/address/:a/utxo` entries carrying a
+   `coinbase` flag and the backend's `/blocks/tip/height`; stock Esplora and blaketestnode PR #1 send
+   neither the flag nor (blaketestnode) that route, so with today's backends the figure is shown
+   labelled as possibly including immature mined coins. The address rule is unchanged: the key is
+   the bare x-only key (sidestr/spec `keys.mjs`: an npub denotes `02` + x), paid as `OP_1 <x>` with no
+   tweak.
 2. **This is not a second chain in the lock.** ADR-2015 D1 still governs everything the wallet
    validates, builds or signs: one sidestr chain, one asset. The `txbt4` figure comes from a backend
    the operator names, is not validated in the browser, and is shown as that backend's answer (the pair side of D5 is a second hop: the backend's word about another API's word). D2's
@@ -46,7 +56,8 @@ Bitcoin Core 30.3.0, stock testnet4) follows the SHA-256d branch past the fork, 
    and a different signing path from sidestr spends; the browser-signer proposal likewise excludes
    parent transactions. Adding a send path reopens this record.
 4. **The backend follows upstream, not a bespoke API.** The forum reads Esplora's `address/:a` (the
-   route blaketest reads its balance from; `chain_stats` and `mempool_stats`, funded minus spent) and,
+   route blaketest reads its balance from; `chain_stats` and `mempool_stats`, funded minus spent),
+   `address/:a/utxo` and `blocks/tip/height` for maturity (D1; optional, a 404 only drops the split) and,
    for D5, blaketestnode's `address/:a/pair`. An answer about any other address is refused. Preferred backend: bitcoin-blake/blaketestnode with
    `run --address-index`, proposed upstream as bitcoin-blake/blaketestnode PR #1 (2026-09-30), which
    serves those routes from the node's own validated UTXO set. Fallback: a Knots 29.4.1 BLAKE2b
@@ -94,7 +105,7 @@ Built and staged: the view is in the client and off until a deployment sets both
 and `BLAKE_TESTNET_API`, and it reaches members when the website kit pin moves past the merge.
 Live activation further needs a conforming backend, which the estate does not run yet.
 
-Ratification evidence, `wallet::parent::tests` (7 tests): the `tb1p` address of secret keys 1 and 3
+Ratification evidence, `wallet::parent::tests` (7 tests at `eca8db6`; 12 after the D1 maturity amendment, which adds `COINBASE_MATURITY = 6705` pinned to Reef `2bd3cb8`, a 50-confirmation coinbase coin reported immature beside a spendable ordinary one, the 6,704/6,705 boundary, the unknown case without flag or tip, and the `5120 <x>` bare-key output): the `tb1p` address of secret keys 1 and 3
 matches bitcoin-blake/blaketest `bitcoin.js` `getTaprootAddress` at gh-pages `df14e48`
 (`tb1p0xlxvlhem…47zagq`, `tb1plycg5qvj…wq2wgh`), and pays the same `5120<key>` script as the sidestr
 wallet; invalid and off-curve keys have no address; `BLAKE_TESTNET_API` unset, empty, bare or
