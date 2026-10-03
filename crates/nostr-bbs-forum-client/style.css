@@ -1288,7 +1288,36 @@ select:focus {
     margin-bottom: 0.5rem;
 }
 
+/* inspection (js/table3d/inspect.js): while a group of cards is lifted to
+   the camera, the bet and pot tags under it step aside; the seat labels
+   stay, and the lifted cards are laid out between them */
+.t3d-amount { transition: opacity 0.2s ease; }
+.t3d-overlay[data-t3d-inspecting] .t3d-amount { opacity: 0; }
+
+/* one tab stop per inspectable group, laid over its cards by
+   js/table3d/peek-keys.js: invisible until focused from the keyboard, when
+   its ring frames the cards; the pointer goes through to the canvas */
+.t3d-peek {
+    position: absolute;
+    left: 0;
+    top: 0;
+    z-index: 1;
+    padding: 0;
+    border: 0;
+    border-radius: 0.5rem;
+    background: transparent;
+    pointer-events: none;
+    will-change: transform;
+}
+
+.t3d-peek:focus-visible {
+    outline: 2px solid rgba(251, 191, 36, 0.95);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 6px rgba(251, 191, 36, 0.18);
+}
+
 @media (prefers-reduced-motion: reduce) {
     .t3d-tag { transition: none; }
     .t3d-tag[data-t3d-check] { animation: none; }
+    .t3d-amount { transition: none; }
 }

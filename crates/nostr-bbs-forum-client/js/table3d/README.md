@@ -26,7 +26,9 @@ js/table3d/                 the scene (copied verbatim by Trunk to <public-url>/
   cards.js                  one InstancedMesh for every card and the deck stub
   chips.js                  one InstancedMesh for every chip, piles and flights
   camera.js                 seated framing, limited orbit, parallax, input
-  picking.js       (pure)   felt point → pick target
+  picking.js       (pure)   felt point → pick target; inspectable groups
+  inspect.js       (pure)   card inspection: state machine, flourishes, face-on layout
+  peek-keys.js              keyboard buttons for inspection (stand-in DOM in tests)
   overlay.js                pins the DOM labels, writes the numbers the chips reached
   quality.js       (pure)   start tier, DPR cap, adaptive pixel ratio
   three.js                  the one import of the vendored three.js
@@ -78,6 +80,7 @@ the engine:
   began. `null` empties the table.
 - **Events:** `{"type":"ready","backend","tier"}`, `{"type":"busy","value"}`,
   `{"type":"pick","target":"heroCards"|"pot"|"stack"|"seat","seat"}`,
+  `{"type":"peek","group":"hole"|"board"|"villain","inspecting","cards"}`,
   `{"type":"quality","dpr"}`, `{"type":"lost","reason"}`. A listener added
   after start is sent `ready` and the current `busy` at once.
 
@@ -167,6 +170,47 @@ up (no peek mode). Flips lift the card by half its width as it turns; a
 vertex curl was left out because TSL's `positionNode` runs after the
 instance transform in r186.
 
+### Inspecting cards
+
+Hovering a group of face-up cards lifts it to the camera for a closer look:
+the hero's hole cards together, the board together, and the other seat's
+cards together once they are shown (never while face down). Nothing else on
+the table reacts to hover.
+
+- **The lift.** The group rises off the felt and travels to a face-on row in
+  front of the camera on a cubic ease-out (700 ms), filling about 80% of the
+  canvas's shorter side where the row's shape allows (never more than 92% of
+  the width), and laid out between the two seat labels; the bet and pot tags
+  step aside while it is up (`data-t3d-inspecting` on the overlay). Leaving
+  drops it on a cubic ease-in (500 ms) to exactly its resting pose. Every
+  tween starts from where the cards are, so re-entering mid-drop reverses
+  with no snap and nothing queued; durations scale with the distance left.
+- **Flourishes**, one chosen uniformly per inspection, all within the travel
+  time: `flip` (a tumble end over end with a glint sweeping the face), `fan`
+  (the cards spread like a hand, then square up), `spin` (a full turn about
+  the vertical, settling face-on), `float` (a bob and rock while the coat's
+  gloss comes up), `wave` (a ripple runs along the row). Every offset is zero
+  at both ends, and a drop only fades the one in progress, so the drop has no
+  flourish of its own. The glint and gloss are the card material's fourth fx
+  channel (`clearcoat`, `clearcoatRoughness`, a face-only emissive sweep).
+- **Reduced motion:** a 140 ms crossfade from the felt to the face-on pose, no
+  travel and no flourish.
+- **Touch:** tap a group to inspect, tap anywhere else to drop. **Keyboard:**
+  `<Table3d>` renders one `<button data-t3d-peek>` per group beside the
+  canvas; `peek-keys.js` shows only the groups face up, lays each over its
+  cards (its focus ring frames them as they lift), and maps Enter or Space to
+  toggle and Escape, or Tab away, to drop. Those keys stop at the button, so
+  the page's Enter (next hand) never sees them. The page announces each lift
+  in a polite live region ("Inspecting your hole cards: A♠ K♥").
+- **The view stays authoritative.** The inspection pose is composed over each
+  card's resting pose when the instances are written (`CardSet.poser`), never
+  stored in the card states or the director's model. A frame with new log
+  entries drops the group first and the next beat waits for it to land
+  (`busy` behaves as before: true only while the director has beats);
+  nothing new lifts while the director is busy, and a fast-forward puts
+  everything down at once. Inspection keeps render-on-demand: the loop runs
+  while a group moves, or while one is up and the camera moves.
+
 ## Assets and licences
 
 | Asset | Licence | Where |
@@ -186,6 +230,8 @@ node crates/nostr-bbs-forum-client/tools/table3d-test.mjs
 ```
 
 Runs the director, choreography, timeline, chip breakdown, card atlas,
-painter (on a recording context) and picking under node, with no browser and
-no three.js. The Rust side's pure helpers (backend choice, frame and option
+painter (on a recording context), picking, and card inspection (the state
+machine through enter, leave, reversal, drop-on-frame, reduced motion and
+dispose; the flourishes; the face-on layout; the keyboard buttons on
+stand-in elements) under node, with no browser and no three.js. The Rust side's pure helpers (backend choice, frame and option
 JSON, event parsing) are unit tests in `src/components/table3d.rs`.

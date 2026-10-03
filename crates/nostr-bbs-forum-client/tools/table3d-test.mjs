@@ -7,7 +7,9 @@
 // state included) from both seats, frame by frame as the table page would
 // send them, and requires the beats to land exactly on each view with no
 // reconcile drift. Also covers the timeline, the chip breakdown, the card
-// atlas, the choreography's beat plans and felt picking. No browser and no
+// atlas, the choreography's beat plans, felt picking and card inspection
+// (the state machine, its flourishes and layout, and the keyboard buttons
+// on stand-in elements). No browser and no
 // three.js: the modules under test import nothing.
 
 import { test } from 'node:test';
@@ -30,7 +32,9 @@ import { Timeline, Easing, arc } from '../js/table3d/timeline.js';
 import { DENOMS, breakdown, pileLayout, shownValue, minDenomIndex, COLUMN_MAX } from '../js/table3d/stacks.js';
 import { AtlasSlots, ATLAS, cardParts, pipLayout, drawFace, drawBack } from '../js/table3d/card-faces.js';
 import { planBeat, durations } from '../js/table3d/choreography.js';
-import { pickOnFelt } from '../js/table3d/picking.js';
+import { pickOnFelt, groupCards, groupOnFelt, groupsOf, PEEK_GROUPS } from '../js/table3d/picking.js';
+import { Inspector, PEEK, FLOURISHES, faceOnLayout, flourishPose } from '../js/table3d/inspect.js';
+import { PeekKeys } from '../js/table3d/peek-keys.js';
 import { AdaptiveDpr, dprCap, startTier } from '../js/table3d/quality.js';
 import { LAYOUT, CARD } from '../js/table3d/layout.js';
 import { bestFive, newHand, act, seatView } from '../js/librepoker/poker.js';
@@ -411,6 +415,322 @@ test('felt picking finds the hero cards, the pot, the stack and the far seat', (
 
 test('beatsFor ignores entries it does not draw', () => {
   assert.deepEqual(beatsFor({ ev: 'nonsense' }, emptyModel(), testdata('view_new.json')), []);
+});
+
+// ── inspection ──────────────────────────────────────────────────────────────
+
+/** A table mid-hand: hero seat 0 with A♠ K♥, three board cards, villain hidden. */
+function peekModel() {
+  const m = emptyModel();
+  m.hero = 0;
+  m.button = 0;
+  m.seats[0] = { ...m.seats[0], stack: 180, cards: [12, 50] };
+  m.seats[1] = { ...m.seats[1], stack: 180, cards: [null, null] };
+  m.board = [0, 13, 26];
+  m.pot = 40;
+  return m;
+}
+
+/** Run `insp` for `ms` in 16 ms steps, returning each step's `s` for `group`. */
+function run(insp, ms, group) {
+  const out = [];
+  for (let t = 0; t < ms; t += 16) {
+    insp.tick(16);
+    const g = insp.groups.get(group);
+    out.push(g ? g.s : 0);
+  }
+  return out;
+}
+
+test('inspection groups: the hero cards, the board, and the other seat only once shown', () => {
+  const m = peekModel();
+  assert.deepEqual(groupCards(m, 'hole'), { ids: ['s0c0', 's0c1'], cards: [12, 50] });
+  assert.deepEqual(groupCards(m, 'board'), { ids: ['b0', 'b1', 'b2'], cards: [0, 13, 26] });
+  assert.equal(groupCards(m, 'villain'), null, 'face-down cards are never inspected');
+  assert.deepEqual(groupsOf(m), ['hole', 'board']);
+  m.seats[1].cards = [7, 8];
+  assert.deepEqual(groupCards(m, 'villain'), { ids: ['s1c0', 's1c1'], cards: [7, 8] });
+  assert.deepEqual(groupsOf(m), PEEK_GROUPS);
+  // from seat 1 the groups follow the hero
+  m.hero = 1;
+  assert.deepEqual(groupCards(m, 'hole').ids, ['s1c0', 's1c1']);
+  assert.deepEqual(groupCards(m, 'villain').ids, ['s0c0', 's0c1']);
+  m.hero = 0;
+  m.seats[1].mucked = true;
+  assert.equal(groupCards(m, 'villain'), null, 'a mucked hand is not shown');
+  m.board = [];
+  assert.equal(groupCards(m, 'board'), null);
+  assert.equal(groupCards(m, 'chips'), null);
+});
+
+test('felt points find the group whose cards cover them, and nothing else', () => {
+  const m = peekModel();
+  assert.equal(groupOnFelt(LAYOUT.near.hole[1], m), 'hole');
+  assert.equal(groupOnFelt(LAYOUT.board[2], m), 'board');
+  assert.equal(groupOnFelt(LAYOUT.board[4], m), null, 'the river is not out yet');
+  assert.equal(groupOnFelt(LAYOUT.far.hole[0], m), null, 'face down');
+  assert.equal(groupOnFelt(LAYOUT.pot, m), null);
+  assert.equal(groupOnFelt(LAYOUT.near.stack, m), null);
+  m.seats[1].cards = [7, 8];
+  assert.equal(groupOnFelt(LAYOUT.far.hole[0], m), 'villain');
+  assert.equal(groupOnFelt(null, m), null);
+});
+
+test('enter lifts on an ease-out in ~700 ms, leave drops on an ease-in in ~500 ms', () => {
+  const m = peekModel();
+  const events = [];
+  const insp = new Inspector({ random: () => 0 });
+  insp.onPeek = (e) => events.push(e);
+  assert.ok(insp.enter('hole', groupCards(m, 'hole')));
+  assert.deepEqual(events, [{ group: 'hole', inspecting: true, cards: [12, 50] }]);
+  assert.equal(insp.enter('hole', groupCards(m, 'hole')), false, 'entering again is a no-op');
+  const up = run(insp, 704, 'hole');
+  assert.equal(up.at(-1), 1);
+  assert.equal(insp.moving, false);
+  assert.ok(up.findIndex((s) => s >= 1) >= Math.floor(PEEK.rise / 16) - 1, 'takes the whole travel time');
+  for (let i = 1; i < up.length; i++) assert.ok(up[i] >= up[i - 1], 'never goes back');
+  // ease-out: past half way well before half the time
+  assert.ok(up[Math.floor(up.length / 4)] > 0.4);
+  assert.ok(insp.leave());
+  assert.deepEqual(events[1], { group: 'hole', inspecting: false, cards: [12, 50] });
+  const down = run(insp, 512, 'hole');
+  assert.ok(insp.idle, 'landed and forgotten');
+  assert.ok(down.findIndex((s) => s === 0) >= Math.floor(PEEK.drop / 16) - 1);
+  // ease-in: still mostly up a quarter of the way through
+  assert.ok(down[Math.floor(down.length / 4)] > 0.9);
+  assert.equal(insp.levelOf('s0c0'), 0);
+  assert.equal(insp.leave(), false, 'nothing to drop');
+});
+
+test('re-entering mid-drop reverses from where the cards are: no snap, same flourish, nothing queued', () => {
+  const m = peekModel();
+  let r = 0;
+  const insp = new Inspector({ random: () => [0.1, 0.9][r++ % 2] });
+  insp.enter('board', groupCards(m, 'board'));
+  const flourish = insp.groups.get('board').flourish;
+  const trace = run(insp, 400, 'board');
+  insp.leave();
+  trace.push(...run(insp, 160, 'board'));
+  const mid = insp.groups.get('board');
+  assert.ok(mid.s > 0 && mid.s < 1 && mid.dir < 0);
+  insp.enter('board', groupCards(m, 'board'));
+  assert.equal(insp.groups.get('board').flourish, flourish, 'a reversal keeps its flourish');
+  trace.push(...run(insp, 720, 'board'));
+  assert.equal(insp.groups.get('board').s, 1);
+  for (let i = 1; i < trace.length; i++) assert.ok(Math.abs(trace[i] - trace[i - 1]) < 0.08, `jump at step ${i}`);
+  // rapid in and out never stacks anything up
+  for (let i = 0; i < 20; i++) {
+    insp.leave();
+    insp.tick(5);
+    insp.enter('board', groupCards(m, 'board'));
+    insp.tick(5);
+  }
+  assert.equal(insp.groups.size, 1);
+  run(insp, 720, 'board');
+  assert.equal(insp.groups.get('board').s, 1);
+});
+
+test('switching groups drops the old one while the new one rises', () => {
+  const m = peekModel();
+  const events = [];
+  const insp = new Inspector();
+  insp.onPeek = (e) => events.push([e.group, e.inspecting]);
+  insp.enter('hole', groupCards(m, 'hole'));
+  run(insp, 300, 'hole');
+  insp.enter('board', groupCards(m, 'board'));
+  assert.equal(insp.active, 'board');
+  assert.equal(insp.groups.get('hole').dir, -1);
+  assert.deepEqual(events, [['hole', true], ['hole', false], ['board', true]]);
+  run(insp, 720, 'board');
+  assert.deepEqual([...insp.groups.keys()], ['board']);
+});
+
+test('a new frame drops the group first; while blocked nothing lifts; fast-forward lands at once', () => {
+  const m = peekModel();
+  const insp = new Inspector();
+  insp.enter('hole', groupCards(m, 'hole'));
+  run(insp, 720, 'hole');
+  // the scene's update(): a queued beat drops the group, busy blocks lifting
+  insp.dropAll();
+  insp.setBlocked(true);
+  assert.equal(insp.active, null);
+  assert.equal(insp.enter('board', groupCards(m, 'board')), false, 'no lift while the director plays');
+  assert.equal(insp.idle, false, 'still landing: the next beat waits for idle');
+  run(insp, 512, 'hole');
+  assert.ok(insp.idle, 'landed: the beat may play');
+  insp.setBlocked(false);
+  assert.ok(insp.enter('board', groupCards(m, 'board')));
+  run(insp, 200, 'board');
+  insp.reset();
+  assert.ok(insp.idle);
+  assert.equal(insp.active, null);
+  // the inspector never touched the model
+  assert.deepEqual(m, peekModel());
+});
+
+test('reduced motion is a short crossfade with no flourish', () => {
+  const m = peekModel();
+  const insp = new Inspector({ reducedMotion: true });
+  insp.enter('hole', groupCards(m, 'hole'));
+  assert.equal(insp.groups.get('hole').mode, 'fade');
+  const up = run(insp, PEEK.fade + 16, 'hole');
+  assert.equal(up.at(-1), 1);
+  assert.ok(up.length * 16 <= 240);
+  insp.leave();
+  run(insp, PEEK.fade + 16, 'hole');
+  assert.ok(insp.idle);
+  // switching it on mid-way applies from the next tween
+  insp.setReducedMotion(false);
+  insp.enter('hole', groupCards(m, 'hole'));
+  assert.equal(insp.groups.get('hole').mode, 'motion');
+});
+
+test('every flourish starts and ends on the plain pose, and is chosen uniformly', () => {
+  assert.ok(FLOURISHES.length >= 4);
+  for (const name of FLOURISHES) {
+    for (const [i, n] of [[0, 2], [1, 2], [0, 5], [4, 5], [2, 5]]) {
+      for (const f of [0, 1]) {
+        const o = flourishPose(name, f, i, n);
+        for (const k of ['dx', 'dy', 'dz', 'roll']) assert.ok(Math.abs(o[k]) < 1e-9, `${name} ${k} at ${f}`);
+        // a full turn is the plain pose
+        for (const k of ['tumble', 'spin']) {
+          const a = ((o[k] % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+          assert.ok(a < 1e-9 || Math.PI * 2 - a < 1e-9, `${name} ${k} at ${f}`);
+        }
+      }
+      // and moves in between
+      const mid = flourishPose(name, 0.5, i, n);
+      assert.ok(Object.values(mid).some((v) => Math.abs(v) > 1e-3) || (name === 'fan' && i === (n - 1) / 2), `${name} does nothing`);
+    }
+    assert.ok(flourishPose(name, 0, 0, 2).sheen === 0);
+  }
+  const seen = new Map();
+  for (let k = 0; k < 100; k++) {
+    const insp = new Inspector({ random: () => k / 100 });
+    insp.enter('hole', groupCards(peekModel(), 'hole'));
+    seen.set(insp.lastFlourish, (seen.get(insp.lastFlourish) || 0) + 1);
+  }
+  assert.equal(seen.size, FLOURISHES.length);
+  for (const n of seen.values()) assert.equal(n, 100 / FLOURISHES.length);
+});
+
+test('the face-on row fills about 80% of the shorter side and stays between the labels', () => {
+  const fovY = (36 * Math.PI) / 180;
+  const tan = Math.tan(fovY / 2);
+  const px = (metres, d, h) => (metres * h) / (2 * d * tan);
+  // two hole cards, landscape: height-bound at 80% of the height
+  let lay = faceOnLayout(2, { fovY, w: 1000, h: 625 });
+  assert.ok(Math.abs(px(CARD.h, lay.d, 625) - 500) < 1);
+  assert.equal(lay.xs.length, 2);
+  assert.ok(Math.abs(lay.xs[0] + lay.xs[1]) < 1e-12, 'centred');
+  // five board cards: width-bound, inside 92% of the width
+  lay = faceOnLayout(5, { fovY, w: 1000, h: 625 });
+  const span = lay.xs[4] - lay.xs[0] + CARD.w;
+  assert.ok(px(span, lay.d, 625) <= 920 + 1e-6);
+  // a square phone stage
+  lay = faceOnLayout(2, { fovY, w: 360, h: 360 });
+  assert.ok(px(CARD.h, lay.d, 360) <= 0.8 * 360 + 1e-6);
+  // labels at the top and bottom: the row fits between them
+  const band = { top: 90, bottom: 520 };
+  lay = faceOnLayout(2, { fovY, w: 1000, h: 625, band });
+  const hPx = px(CARD.h, lay.d, 625);
+  const centre = 625 / 2 - (lay.y * 625) / (2 * lay.d * tan);
+  assert.ok(centre - hPx / 2 >= band.top - 1e-6 && centre + hPx / 2 <= band.bottom + 1e-6);
+  assert.ok(lay.d > 0.05, 'beyond the near plane');
+});
+
+/** A stand-in element: attributes, style, hidden, and counted listeners. */
+class FakeEl {
+  constructor(attrs) {
+    this.attrs = { ...attrs };
+    this.style = {};
+    this.hidden = true;
+    this.listeners = new Map();
+  }
+  getAttribute(k) {
+    return this.attrs[k] ?? null;
+  }
+  setAttribute(k, v) {
+    this.attrs[k] = String(v);
+  }
+  addEventListener(t, fn) {
+    if (!this.listeners.has(t)) this.listeners.set(t, new Set());
+    this.listeners.get(t).add(fn);
+  }
+  removeEventListener(t, fn) {
+    this.listeners.get(t)?.delete(fn);
+  }
+  get listenerCount() {
+    let n = 0;
+    for (const s of this.listeners.values()) n += s.size;
+    return n;
+  }
+  fire(t, ev = {}) {
+    const e = { ...ev, preventDefault() { e.prevented = true; }, stopPropagation() { e.stopped = true; } };
+    for (const fn of this.listeners.get(t) || []) fn(e);
+    return e;
+  }
+}
+
+test('keyboard: Enter and Space toggle, Escape and blur drop, and dispose leaves no listeners', () => {
+  const els = PEEK_GROUPS.map((g) => new FakeEl({ 'data-t3d-peek': g }));
+  const root = { querySelectorAll: () => els };
+  const log = [];
+  let up = null;
+  const keys = new PeekKeys(root, {
+    onToggle: (g) => {
+      up = up === g ? null : g;
+      log.push(['toggle', g]);
+    },
+    onDrop: (g) => {
+      const was = up === g;
+      if (was) up = null;
+      log.push(['drop', g]);
+      return was;
+    },
+  });
+  assert.ok(els.every((e) => e.listenerCount === 2));
+  keys.sync(new Set(['hole', 'board']), null, new Map([['hole', { x: 10, y: 20, w: 100, h: 80 }]]));
+  assert.deepEqual(els.map((e) => e.hidden), [false, false, true], 'the face-down seat has no tab stop');
+  assert.equal(els[0].style.transform, 'translate(10.0px, 20.0px)');
+  assert.equal(els[0].style.width, '100.0px');
+  const enter = els[0].fire('keydown', { key: 'Enter' });
+  assert.equal(up, 'hole');
+  assert.ok(enter.prevented && enter.stopped, "the page's Enter (next hand) never sees it");
+  keys.sync(new Set(['hole', 'board']), up, null);
+  assert.equal(els[0].getAttribute('aria-pressed'), 'true');
+  assert.equal(els[1].getAttribute('aria-pressed'), 'false');
+  els[0].fire('keydown', { key: ' ' });
+  assert.equal(up, null, 'Space toggles back down');
+  els[1].fire('keydown', { key: 'Enter' });
+  const esc = els[1].fire('keydown', { key: 'Escape' });
+  assert.equal(up, null);
+  assert.ok(esc.prevented && esc.stopped);
+  const idle = els[1].fire('keydown', { key: 'Escape' });
+  assert.ok(!idle.prevented && !idle.stopped, 'Escape with nothing up is left to the page');
+  const other = els[0].fire('keydown', { key: '2' });
+  assert.ok(!other.stopped, 'the action keys still reach the page');
+  els[1].fire('keydown', { key: 'Enter' });
+  els[1].fire('blur');
+  assert.equal(up, null, 'Tab away drops');
+  els[1].fire('keydown', { key: 'a' });
+  assert.deepEqual(log.at(-1), ['drop', 'board'], 'other keys do nothing');
+  keys.dispose();
+  assert.ok(els.every((e) => e.listenerCount === 0), 'no listeners left');
+  assert.ok(els.every((e) => e.hidden));
+});
+
+test('a disposed inspector lifts nothing and reports nothing', () => {
+  const insp = new Inspector();
+  const events = [];
+  insp.onPeek = (e) => events.push(e);
+  insp.enter('hole', groupCards(peekModel(), 'hole'));
+  insp.dispose();
+  assert.ok(insp.idle);
+  assert.equal(insp.onPeek, null);
+  assert.equal(insp.enter('board', groupCards(peekModel(), 'board')), false);
+  assert.equal(insp.tick(16), false);
+  assert.equal(events.length, 1);
 });
 
 // ── quality ─────────────────────────────────────────────────────────────────

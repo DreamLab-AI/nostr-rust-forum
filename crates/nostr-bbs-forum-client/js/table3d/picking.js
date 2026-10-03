@@ -48,3 +48,61 @@ export function pickOnFelt(p, model) {
   }
   return null;
 }
+
+// ── inspection groups ───────────────────────────────────────────────────────
+//
+// What a hover (or a tap, or a key) can lift up for a closer look: the
+// hero's hole cards together, the board together, and, once they are shown,
+// the other seat's cards together. A face-down card is never inspected.
+
+/** The inspectable groups, in tab order. */
+export const PEEK_GROUPS = Object.freeze(['hole', 'board', 'villain']);
+
+/**
+ * The cards of `group` in `model` as `{ids, cards}` (place ids and engine
+ * card numbers), or `null` when the group has nothing face up to show.
+ */
+export function groupCards(model, group) {
+  if (!model) return null;
+  const hero = model.hero | 0;
+  const seatCards = (seat) => {
+    const s = model.seats[seat];
+    if (!s || !s.cards || s.mucked || s.cards.length !== 2 || s.cards.some((c) => c == null)) return null;
+    return { ids: [`s${seat}c0`, `s${seat}c1`], cards: [...s.cards] };
+  };
+  switch (group) {
+    case 'hole':
+      return seatCards(hero);
+    case 'villain':
+      return seatCards(hero === 0 ? 1 : 0);
+    case 'board':
+      return model.board.length ? { ids: model.board.map((_, i) => `b${i}`), cards: [...model.board] } : null;
+    default:
+      return null;
+  }
+}
+
+/** Every group `model` can show, in tab order. */
+export function groupsOf(model) {
+  return PEEK_GROUPS.filter((g) => groupCards(model, g));
+}
+
+/**
+ * The group whose cards, resting on the felt, cover point `p` (`{x, z}`),
+ * or `null`. Only groups with something face up count.
+ */
+export function groupOnFelt(p, model) {
+  if (!p || !model) return null;
+  const hero = model.hero | 0;
+  const near = LAYOUT[sideOf(hero, hero)];
+  const far = LAYOUT[sideOf(hero === 0 ? 1 : 0, hero)];
+  const spots = {
+    hole: near.hole,
+    villain: far.hole,
+    board: LAYOUT.board.slice(0, model.board.length),
+  };
+  for (const g of PEEK_GROUPS) {
+    if (groupCards(model, g) && spots[g].some((a) => onCard(p, a, 0.006))) return g;
+  }
+  return null;
+}

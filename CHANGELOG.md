@@ -7,6 +7,31 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: hover to inspect cards on the 3D poker table — 2026-10-03
+
+Hovering the hero's hole cards, the board, or the other seat's cards once
+shown at showdown lifts that group off the felt to a face-on row in front of
+the camera (cubic ease-out, 700 ms); leaving drops it back to exactly its
+resting pose (ease-in, 500 ms), and re-entering mid-drop reverses from where
+the cards are. Face-down cards are never inspected; nothing else reacts.
+
+- One flourish per inspection, chosen at random, all within the travel:
+  flip with a glint, fan, slow spin, float with a gloss ramp, and a wave
+  along the row. Reduced motion (the OS or the app preference) is a 140 ms
+  crossfade with no travel.
+- Touch: tap a group to inspect, tap elsewhere to drop. Keyboard: one tab
+  stop per face-up group (`<button data-t3d-peek>` in `<Table3d>`), Enter or
+  Space toggles, Escape or Tab away drops; its focus ring frames the cards.
+- Seam: a new `peek` event (`{group, inspecting, cards}`), parsed as
+  `Table3dEvent::Peek`; `<Table3d>` announces it in a polite live region
+  ("Inspecting your hole cards: A♠ K♥", `table3d::peek_text`).
+- The inspection never touches the seat view or the director's model: its
+  pose is composed over the cards' resting poses at commit. A new frame
+  drops the group before the next beat plays; the action buttons are held
+  only while the director is busy, as before.
+- New pure modules `js/table3d/inspect.js` and `js/table3d/peek-keys.js`,
+  with node tests; the card material's spare fx channel now carries the
+  inspection gloss and glint. No new dependencies.
 ### Added: click-to-copy on every abridged public key — 2026-10-03
 
 Wherever the forum client shows a shortened key (`abcd12...ef56`,

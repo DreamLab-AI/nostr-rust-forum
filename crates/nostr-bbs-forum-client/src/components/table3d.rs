@@ -192,6 +192,70 @@ pub struct Pick {
     pub seat: Option<u32>,
 }
 
+/// A group of cards the member can lift up for a closer look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeekGroup {
+    /// The hero's own hole cards.
+    Hole,
+    /// The community cards dealt so far.
+    Board,
+    /// The other seat's cards, once shown at showdown.
+    Villain,
+}
+
+impl PeekGroup {
+    /// The group's name in the scene's events and the `data-t3d-peek` buttons.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hole => "hole",
+            Self::Board => "board",
+            Self::Villain => "villain",
+        }
+    }
+
+    /// Read a group name from the scene; `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Hole, Self::Board, Self::Villain]
+            .into_iter()
+            .find(|g| g.as_str() == s)
+    }
+
+    /// The group in words, as the inspect announcement and its button say it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hole => "your hole cards",
+            Self::Board => "the board",
+            Self::Villain => "their cards",
+        }
+    }
+}
+
+/// A group of cards lifted for inspection (`inspecting`) or dropped back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peek {
+    /// Which group.
+    pub group: PeekGroup,
+    /// Lifted (true) or dropped back to the felt (false).
+    pub inspecting: bool,
+    /// The group's cards, as engine card numbers.
+    pub cards: Vec<u8>,
+}
+
+/// The live-region text for a [`Peek`], naming cards with `name` (the
+/// engine's `card_name` in the page): "Inspecting your hole cards: A♠ K♥",
+/// or nothing once the cards are back on the felt.
+pub fn peek_text(peek: &Peek, name: impl Fn(u8) -> String) -> String {
+    if !peek.inspecting {
+        return String::new();
+    }
+    let cards: Vec<String> = peek.cards.iter().map(|&c| name(c)).collect();
+    if cards.is_empty() {
+        format!("Inspecting {}", peek.group.label())
+    } else {
+        format!("Inspecting {}: {}", peek.group.label(), cards.join(" "))
+    }
+}
+
 /// An event from the scene.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Table3dEvent {
@@ -201,6 +265,8 @@ pub enum Table3dEvent {
     Busy(bool),
     /// A tap on something worth a tap.
     Pick(Pick),
+    /// A group of cards was lifted for inspection, or dropped back.
+    Peek(Peek),
     /// The adaptive pixel ratio moved to this value.
     Quality(f64),
     /// The GPU device or context was lost; the scene has stopped.
@@ -224,6 +290,12 @@ struct RawEvent {
     #[serde(default)]
     dpr: Option<f64>,
     #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    inspecting: Option<bool>,
+    #[serde(default)]
+    cards: Option<Vec<u8>>,
+    #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     error: Option<String>,
@@ -244,6 +316,11 @@ pub fn parse_event(json: &str) -> Option<Table3dEvent> {
                 _ => return None,
             },
             seat: raw.seat,
+        }),
+        "peek" => Table3dEvent::Peek(Peek {
+            group: PeekGroup::parse(raw.group.as_deref()?)?,
+            inspecting: raw.inspecting?,
+            cards: raw.cards.unwrap_or_default(),
         }),
         "quality" => Table3dEvent::Quality(raw.dpr?),
         "lost" => Table3dEvent::Lost(raw.reason.unwrap_or_default()),
@@ -330,6 +407,8 @@ pub fn Table3d(
 ) -> impl IntoView {
     let prefs = crate::stores::preferences::use_preferences();
     let reduced = Memo::new(move |_| prefs.with(|p| p.reduced_motion) || os_reduced_motion());
+    // what is lifted for inspection, in words, for the live region
+    let peek_live = RwSignal::new(String::new());
 
     let canvas_ref = NodeRef::<leptos::html::Canvas>::new();
     let handle: Rc<RefCell<Option<JsValue>>> = Rc::new(RefCell::new(None));
@@ -379,6 +458,9 @@ pub fn Table3d(
                                         if let Some(f) = on_pick {
                                             f.run(p);
                                         }
+                                    }
+                                    Some(Table3dEvent::Peek(p)) => {
+                                        peek_live.try_set(peek_text(&p, crate::poker::card_name));
                                     }
                                     Some(Table3dEvent::Lost(reason)) => {
                                         busy.try_set(false);
@@ -457,6 +539,9 @@ pub fn Table3d(
         // call the closure once it is freed
         listener.borrow_mut().take();
         busy.try_set(false);
+        // `peek_live` is not reset here: it belongs to this component, and
+        // writing it would wake the live region's render effect while the
+        // component is being torn down (a re-entrant task poll in wasm)
     });
 
     let loading = move || matches!(status.get(), Table3dStatus::Loading);
@@ -477,6 +562,23 @@ pub fn Table3d(
                 <div data-t3d-anchor="near-bet" class="t3d-amount"><span data-t3d-field="near-bet"></span></div>
                 <div data-t3d-anchor="pot" class="t3d-amount t3d-pot">"Pot "<span data-t3d-field="pot"></span></div>
             </div>
+            // Keyboard access to inspection (js/table3d/peek-keys.js): one
+            // tab stop per group the table has face up, laid over its cards;
+            // Enter or Space lifts it, Escape or Tab away drops it.
+            {[PeekGroup::Hole, PeekGroup::Board, PeekGroup::Villain]
+                .into_iter()
+                .map(|g| view! {
+                    <button
+                        type="button"
+                        class="t3d-peek"
+                        data-t3d-peek=g.as_str()
+                        aria-label=format!("Inspect {}", g.label())
+                        aria-pressed="false"
+                        hidden=true
+                    ></button>
+                })
+                .collect_view()}
+            <p class="sr-only" aria-live="polite">{move || peek_live.get()}</p>
             <Show when=loading>
                 <div class="t3d-veil">
                     <span class="loading-ring"></span>
@@ -594,6 +696,22 @@ mod tests {
             }))
         );
         assert_eq!(
+            parse_event(r#"{"type":"peek","group":"hole","inspecting":true,"cards":[12,50]}"#),
+            Some(Table3dEvent::Peek(Peek {
+                group: PeekGroup::Hole,
+                inspecting: true,
+                cards: vec![12, 50],
+            }))
+        );
+        assert_eq!(
+            parse_event(r#"{"type":"peek","group":"board","inspecting":false}"#),
+            Some(Table3dEvent::Peek(Peek {
+                group: PeekGroup::Board,
+                inspecting: false,
+                cards: vec![],
+            }))
+        );
+        assert_eq!(
             parse_event(r#"{"type":"quality","dpr":1.25}"#),
             Some(Table3dEvent::Quality(1.25))
         );
@@ -612,6 +730,9 @@ mod tests {
             r#"{"type":"busy"}"#,
             r#"{"type":"pick","target":"felt"}"#,
             r#"{"type":"teleport"}"#,
+            r#"{"type":"peek","group":"deck","inspecting":true}"#,
+            r#"{"type":"peek","group":"hole"}"#,
+            r#"{"type":"peek","group":"hole","inspecting":true,"cards":[999]}"#,
         ] {
             assert_eq!(parse_event(junk), None, "{junk}");
         }
@@ -623,5 +744,29 @@ mod tests {
         assert!(Table3dStatus::Ready(Backend::WebGl).is_ready());
         assert!(Table3dStatus::Failed(String::new()).is_failed());
         assert!(!Table3dStatus::Loading.is_ready());
+    }
+
+    #[test]
+    fn peek_groups_round_trip_and_announce_their_cards() {
+        for g in [PeekGroup::Hole, PeekGroup::Board, PeekGroup::Villain] {
+            assert_eq!(PeekGroup::parse(g.as_str()), Some(g));
+        }
+        assert_eq!(PeekGroup::parse("pot"), None);
+        // the page names cards with the engine; a stand-in here
+        let name = |c: u8| ["A♠", "K♥", "7♣", "2♦", "T♠"][usize::from(c) % 5].to_string();
+        let mut p = Peek {
+            group: PeekGroup::Hole,
+            inspecting: true,
+            cards: vec![0, 1],
+        };
+        assert_eq!(peek_text(&p, name), "Inspecting your hole cards: A♠ K♥");
+        p.group = PeekGroup::Board;
+        p.cards = vec![2, 3, 4];
+        assert_eq!(peek_text(&p, name), "Inspecting the board: 7♣ 2♦ T♠");
+        p.group = PeekGroup::Villain;
+        p.cards = vec![];
+        assert_eq!(peek_text(&p, name), "Inspecting their cards");
+        p.inspecting = false;
+        assert_eq!(peek_text(&p, name), "", "dropping clears the announcement");
     }
 }

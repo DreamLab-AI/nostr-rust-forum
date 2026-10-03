@@ -4,7 +4,8 @@
 // short deck stub the dealer works from. Each has a visual state — position,
 // yaw, how far it is turned face up, lift, opacity, glow, dim, and the face
 // it shows — that the timeline tweens; `commit()` writes the instance
-// matrices and attributes once per rendered frame.
+// matrices and attributes once per rendered frame. The fourth fx channel is
+// the inspection sheen (inspect.js): gloss, and a glint while it is positive.
 
 import * as THREE from './three.js';
 import { CARD, LAYOUT } from './layout.js';
@@ -80,6 +81,12 @@ export class CardSet {
     this.mesh.receiveShadow = true;
     this.mesh.frustumCulled = false;
     this.mesh.name = 'cards';
+    /**
+     * Optional `(id, state, restingMatrix) => {matrix, alpha, sheen} | null`:
+     * the inspection pose composed over a card's resting pose (index.js).
+     * It never writes to the state, which stays the director's.
+     */
+    this.poser = null;
     /** id → visual state */
     this.state = new Map(CARD_IDS.map((id) => [id, blankState()]));
     this.dirty = true;
@@ -164,10 +171,12 @@ export class CardSet {
       this._qf.setFromAxisAngle(this._zAxis, turn);
       this._q.multiply(this._qf);
       this._m.compose(this._p, this._q, this._s);
-      this.mesh.setMatrixAt(i, this._m);
+      // a card lifted for inspection is posed over its resting place
+      const over = this.poser ? this.poser(id, s, this._m) : null;
+      this.mesh.setMatrixAt(i, over ? over.matrix : this._m);
       const rect = s.card == null ? this.backRect : this.atlas.rectFor(s.card);
       this.faceAttr.setXYZW(i, ...rect);
-      this.fxAttr.setXYZW(i, s.glow, s.dim, s.alpha, 0);
+      this.fxAttr.setXYZW(i, s.glow, s.dim, over ? s.alpha * over.alpha : s.alpha, over ? over.sheen : 0);
     });
     this.mesh.instanceMatrix.needsUpdate = true;
     this.faceAttr.needsUpdate = true;

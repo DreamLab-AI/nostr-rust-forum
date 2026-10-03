@@ -55,7 +55,7 @@ export class CameraRig {
     this.parallax = { want: { x: 0, y: 0 }, now: { x: 0, y: 0 } };
     this.moved = true;
     this.drag = null;
-    this.onTap = null; // (ndcX, ndcY) => void
+    this.onTap = null; // (ndcX, ndcY, pointerType) => void
     this.onChange = null; // () => void: something to render
     this._v = new THREE.Vector3();
     this.bind();
@@ -208,7 +208,7 @@ export class CameraRig {
         if (!this.drag || this.drag.id !== e.pointerId) return;
         const tap = this.drag.moved < 6;
         this.drag = null;
-        if (tap && this.onTap) this.onTap(...this.ndc(e));
+        if (tap && this.onTap) this.onTap(...this.ndc(e), e.pointerType);
       },
       pointercancel: () => {
         this.drag = null;

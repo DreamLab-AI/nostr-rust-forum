@@ -13,7 +13,7 @@ import { TABLE } from './layout.js';
 
 const {
   abs, attribute, clamp, float, instancedDynamicBufferAttribute, length, max, min, mix,
-  mx_fractal_noise_float, mx_noise_float, oneMinus, positionWorld, select, smoothstep,
+  mx_fractal_noise_float, mx_noise_float, oneMinus, positionWorld, select, sin, smoothstep,
   texture, uniform, uv, vec2, vec3, bumpMap,
 } = THREE.TSL;
 
@@ -135,7 +135,16 @@ export function cardMaterial({ atlasTexture, faceAttr, fxAttr, backRect }) {
   const u = uv();
   const toEdge = min(min(u.x, oneMinus(u.x)), min(u.y, oneMinus(u.y)));
   const rim = oneMinus(smoothstep(0.0, 0.07, toEdge));
-  m.emissiveNode = vec3(1.0, 0.7, 0.24).mul(fx.x).mul(rim.mul(2.4).add(0.08));
+  // inspection sheen (fx.w): its size raises the coat's gloss; while it is
+  // positive (a card on its way up) a glint also sweeps the face corner to
+  // corner as it grows, and is gone by the time it reaches 1
+  const sheen = abs(fx.w);
+  m.clearcoatNode = float(0.35).add(sheen.mul(0.65));
+  m.clearcoatRoughnessNode = float(0.3).sub(sheen.mul(0.24));
+  const diag = u.x.add(oneMinus(u.y)).mul(0.5);
+  const sweep = oneMinus(smoothstep(0.0, 0.09, abs(diag.sub(sheen.mul(1.6).sub(0.3)))));
+  const glint = select(fx.w.greaterThan(0.0).and(side.greaterThan(0.75)), sweep.mul(sin(sheen.mul(Math.PI))).mul(0.55), float(0.0));
+  m.emissiveNode = vec3(1.0, 0.7, 0.24).mul(fx.x).mul(rim.mul(2.4).add(0.08)).add(vec3(1.0, 0.97, 0.9).mul(glint));
   m.opacityNode = clamp(fx.z, 0.0, 1.0);
   m.metadata = { back };
   return m;

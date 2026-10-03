@@ -9,6 +9,12 @@
 // settles, or something was just repainted. An idle table costs nothing. A
 // hidden tab or a table scrolled out of view stops the loop, and anything
 // queued meanwhile is fast-forwarded rather than replayed.
+//
+// Inspection (inspect.js): hovering a face-up group of cards lifts it to the
+// camera. Its pose is composed over the cards' resting poses at commit time
+// (CardSet.poser), never written to the card states, so the director's
+// model and beats are untouched; a new frame drops the group first and the
+// next beat waits until it has landed.
 
 import * as THREE from './three.js';
 import { anisotropy, createRenderer } from './renderer.js';
@@ -21,7 +27,9 @@ import { Overlay } from './overlay.js';
 import { Director, emptyModel } from './director.js';
 import { Timeline, arc, lerp } from './timeline.js';
 import { CARD_IDS, pileAmounts, planBeat, posesOf } from './choreography.js';
-import { pickOnFelt } from './picking.js';
+import { groupCards, groupOnFelt, groupsOf, pickOnFelt } from './picking.js';
+import { Inspector, faceOnLayout, flourishPose } from './inspect.js';
+import { PeekKeys } from './peek-keys.js';
 import { AdaptiveDpr, dprCap, startTier } from './quality.js';
 import { blobMaterial, buttonFace, buttonMaterials, chipMasks, tiling } from './materials.js';
 import { CARD, LAYOUT, sideOf } from './layout.js';
@@ -171,14 +179,17 @@ class Table3D {
 
     this.rig = new CameraRig(this.canvas, { reducedMotion: this.opts.reducedMotion, freeLook: this.opts.freeLook });
     this.rig.onChange = () => this.request();
-    this.rig.onTap = (x, y) => this.tap(x, y);
+    this.rig.onTap = (x, y, pointerType) => this.tap(x, y, pointerType);
     this.raycaster = new THREE.Raycaster();
     this.plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     this.hit = new THREE.Vector3();
     this.hoverHandler = (e) => this.hover(e);
+    this.leaveHandler = (e) => this.hoverOut(e);
     this.canvas.addEventListener('pointermove', this.hoverHandler);
+    this.canvas.addEventListener('pointerleave', this.leaveHandler);
 
     this.overlay = new Overlay(this.container && this.container.querySelector('[data-t3d-overlay]'));
+    this.buildInspection();
     this.resize();
     this.observe();
 
@@ -297,6 +308,11 @@ class Table3D {
     if (this.resizeObserver) this.resizeObserver.disconnect();
     if (this.intersection) this.intersection.disconnect();
     if (this.hoverHandler) this.canvas.removeEventListener('pointermove', this.hoverHandler);
+    if (this.leaveHandler) this.canvas.removeEventListener('pointerleave', this.leaveHandler);
+    if (this.inspector) this.inspector.dispose();
+    if (this.peekKeys) this.peekKeys.dispose();
+    if (this.overlay && this.overlay.root) this.overlay.root.removeAttribute('data-t3d-inspecting');
+    if (this.cards) this.cards.poser = null;
     if (this.rig) this.rig.dispose();
     if (this.cards) this.cards.dispose();
     if (this.chips) this.chips.dispose();
@@ -340,6 +356,11 @@ class Table3D {
   setBusy(v) {
     if (this.busy === v) return;
     this.busy = v;
+    if (this.inspector) {
+      this.inspector.setBlocked(v);
+      // the pointer may have rested on a group while the beats played
+      if (!v && this.lastHover) this.hoverAt(...this.lastHover);
+    }
     this.emit({ type: 'busy', value: v });
   }
 
@@ -348,6 +369,7 @@ class Table3D {
   update(frame) {
     if (this.disposed || this.lost) return;
     const r = this.director.update(frame);
+    if ((r === 'snap' || r === 'queued') && this.inspector) this.inspector.dropAll();
     if (r === 'snap') {
       this.timeline.finish();
       this.current = null;
@@ -376,7 +398,10 @@ class Table3D {
   }
 
   setOptions(o) {
-    if (o.reducedMotion !== undefined) this.opts.reducedMotion = !!o.reducedMotion;
+    if (o.reducedMotion !== undefined) {
+      this.opts.reducedMotion = !!o.reducedMotion;
+      if (this.inspector) this.inspector.setReducedMotion(this.opts.reducedMotion);
+    }
     if (o.freeLook !== undefined) this.opts.freeLook = !!o.freeLook;
     if (this.rig) this.rig.setOptions({ reducedMotion: this.opts.reducedMotion, freeLook: this.opts.freeLook });
     if (o.fourColour !== undefined) {
@@ -416,8 +441,16 @@ class Table3D {
     this.last = now;
 
     this.timeline.tick(dt);
+    // a group that lands this tick leaves the inspector, so note it was up:
+    // its last commit must put it back exactly on its resting pose
+    const wasPeeking = !this.inspector.idle;
+    const peekMoving = this.inspector.tick(dt);
     this.advance();
     const camMoving = this.rig.tick(dt);
+    // a lifted group faces the camera, so it follows every camera move
+    if (wasPeeking && (peekMoving || camMoving || this.needsRender || this.inspector.idle)) this.cards.touch();
+    // the face-on layout for this frame, after the camera has moved
+    this.peekFrame = null;
     const cardsChanged = this.cards.commit();
     const chipsChanged = this.chips.commit();
     if (cardsChanged || chipsChanged || this.button.userData.moving) this.commitBlobs();
@@ -425,6 +458,7 @@ class Table3D {
       this.renderer.render(this.scene, this.rig.camera);
       this.overlay.place(this.rig.camera, this.size.w, this.size.h);
       this.overlay.write(this.chips.amounts, this.director.model, this.winners);
+      this.syncPeekKeys();
       this.needsRender = false;
     }
     if (continuous) {
@@ -435,7 +469,7 @@ class Table3D {
         this.emit({ type: 'quality', dpr: next });
       }
     }
-    if (this.timeline.active || camMoving || this.director.pending > 0 || this.current) {
+    if (this.timeline.active || camMoving || peekMoving || this.director.pending > 0 || this.current) {
       this.request();
     } else {
       this.last = 0;
@@ -449,6 +483,8 @@ class Table3D {
       this.finishBeat(this.current);
       this.current = null;
     }
+    // an inspected group lands before the next beat plays
+    if (!this.inspector.idle && this.director.pending > 0) return;
     const item = this.director.next();
     if (item) {
       this.startBeat(item);
@@ -464,6 +500,7 @@ class Table3D {
 
   /** Jump past everything queued, straight to the newest view. */
   fastForward() {
+    if (this.inspector) this.inspector.reset();
     this.timeline.finish();
     this.current = null;
     this.director.skipAll();
@@ -701,7 +738,7 @@ class Table3D {
       const s = this.cards.get(id);
       if (!s.visible) continue;
       const height = s.y + s.lift;
-      const fade = Math.max(0, 1 - height * 12) * s.alpha;
+      const fade = Math.max(0, 1 - height * 12) * s.alpha * (1 - this.inspector.levelOf(id));
       put(s.x, s.z, CARD.w * 1.5, CARD.h * 1.35, s.yaw, fade);
     }
     put(LAYOUT.deck.x, LAYOUT.deck.z, CARD.h * 1.4, CARD.w * 1.5, 0, 0.9);
@@ -722,16 +759,238 @@ class Table3D {
     return this.raycaster.ray.intersectPlane(this.plane, this.hit) ? { x: this.hit.x, z: this.hit.z } : null;
   }
 
-  tap(x, y) {
+  tap(x, y, pointerType = 'mouse') {
     const pick = pickOnFelt(this.feltPoint(x, y), this.director.model);
     if (pick) this.emit(pick);
+    // touch (and pen): a tap on a group inspects it, a tap anywhere else drops
+    if (pointerType === 'mouse') return;
+    const g = this.groupUnder(x, y);
+    if (g && g === this.inspector.active) return;
+    if (g) this.peek(g, 'tap');
+    else this.inspector.leave();
   }
 
   hover(e) {
     if (e.pointerType !== 'mouse' || this.rig.drag) return;
     const [x, y] = this.rig.ndc(e);
+    this.lastHover = [x, y];
+    this.hoverAt(x, y);
+  }
+
+  hoverAt(x, y) {
+    const g = this.groupUnder(x, y);
     const pick = pickOnFelt(this.feltPoint(x, y), this.director.model);
-    this.canvas.style.cursor = pick ? 'pointer' : '';
+    this.canvas.style.cursor = pick || g ? 'pointer' : '';
+    if (g) {
+      if (g !== this.inspector.active) this.peek(g, 'hover');
+    } else if (this.peekSource === 'hover') {
+      this.inspector.leave();
+    }
+  }
+
+  hoverOut(e) {
+    if (e.pointerType !== 'mouse') return;
+    this.lastHover = null;
+    if (this.peekSource === 'hover') this.inspector.leave();
+  }
+
+  // ── inspection ────────────────────────────────────────────────────────────
+
+  buildInspection() {
+    this.inspector = new Inspector({ reducedMotion: this.opts.reducedMotion });
+    this.inspector.setBlocked(this.busy);
+    this.peekSource = null;
+    this.lastHover = null;
+    this.peekFrame = null;
+    this.inspector.onPeek = (ev) => {
+      if (!ev.inspecting) this.peekSource = null;
+      if (this.overlay.root) this.overlay.root.toggleAttribute('data-t3d-inspecting', ev.inspecting);
+      this.emit({ type: 'peek', group: ev.group, inspecting: ev.inspecting, cards: ev.cards });
+      this.needsRender = true;
+      this.request();
+    };
+    this._pm = new THREE.Matrix4();
+    this._pp = new THREE.Vector3();
+    this._pq = new THREE.Quaternion();
+    this._ps = new THREE.Vector3();
+    this._pt = new THREE.Vector3();
+    this._qf = new THREE.Quaternion();
+    this._qx = new THREE.Quaternion();
+    this._basis = new THREE.Matrix4();
+    this._right = new THREE.Vector3();
+    this._up = new THREE.Vector3();
+    this._back = new THREE.Vector3();
+    this._down = new THREE.Vector3();
+    this._camPos = new THREE.Vector3();
+    this._one = new THREE.Vector3(1, 1, 1);
+    this._ax = new THREE.Vector3(1, 0, 0);
+    this._ay = new THREE.Vector3(0, 1, 0);
+    this._az = new THREE.Vector3(0, 0, 1);
+    this._inv = new THREE.Matrix4();
+    this._ray = new THREE.Ray();
+    this._corner = new THREE.Vector3();
+    this.cards.poser = (id, _st, resting) => this.peekPose(id, resting);
+    this.peekKeys = new PeekKeys(this.container, {
+      onToggle: (g) => {
+        if (this.inspector.active === g) this.inspector.leave();
+        else this.peek(g, 'key');
+      },
+      onDrop: (g) => (this.peekSource === 'key' ? this.inspector.leave(g) : false),
+    });
+  }
+
+  /** Lift group `g`, remembering what asked (hover, tap or key). */
+  peek(g, source) {
+    if (this.inspector.enter(g, groupCards(this.director.model, g))) {
+      this.peekSource = source;
+      this.request();
+    }
+  }
+
+  /** The group whose cards are under NDC (x, y), lifted ones first. */
+  groupUnder(x, y) {
+    this.raycaster.setFromCamera({ x, y }, this.rig.camera);
+    for (const g of this.inspector.groups.values()) {
+      for (const id of g.ids) if (this.rayHitsCard(id)) return g.group;
+    }
+    return groupOnFelt(this.feltPoint(x, y), this.director.model);
+  }
+
+  /** Whether the raycaster's ray crosses card `id` where it is drawn now. */
+  rayHitsCard(id) {
+    const i = CARD_IDS.indexOf(id);
+    if (i < 0) return false;
+    this.cards.mesh.getMatrixAt(i, this._inv);
+    if (Math.abs(this._inv.determinant()) < 1e-12) return false;
+    this._inv.invert();
+    this._ray.copy(this.raycaster.ray).applyMatrix4(this._inv);
+    const t = -this._ray.origin.y / (this._ray.direction.y || 1e-9);
+    if (!(t > 0)) return false;
+    const px = this._ray.origin.x + this._ray.direction.x * t;
+    const pz = this._ray.origin.z + this._ray.direction.z * t;
+    return Math.abs(px) <= CARD.w / 2 + 0.004 && Math.abs(pz) <= CARD.h / 2 + 0.004;
+  }
+
+  /** The free band between the seat labels, in canvas pixels. */
+  labelBand() {
+    const root = this.overlay.root;
+    if (!root) return null;
+    const far = root.querySelector('[data-t3d-anchor="far-seat"]');
+    const near = root.querySelector('[data-t3d-anchor="near-seat"]');
+    const c = this.canvas.getBoundingClientRect();
+    const h = this.size.h;
+    let top = 0;
+    let bottom = h;
+    if (far) {
+      const r = far.getBoundingClientRect();
+      if (r.height > 0 && r.bottom - c.top < h / 2) top = r.bottom - c.top;
+    }
+    if (near) {
+      const r = near.getBoundingClientRect();
+      if (r.height > 0 && r.top - c.top > h / 2) bottom = r.top - c.top;
+    }
+    return { top, bottom };
+  }
+
+  /** The camera's basis and the face-on layouts, once per frame. */
+  peekFrameState() {
+    if (this.peekFrame) return this.peekFrame;
+    const cam = this.rig.camera;
+    cam.updateMatrixWorld(true);
+    this._right.setFromMatrixColumn(cam.matrixWorld, 0).normalize();
+    this._up.setFromMatrixColumn(cam.matrixWorld, 1).normalize();
+    this._back.setFromMatrixColumn(cam.matrixWorld, 2).normalize();
+    this._down.copy(this._up).negate();
+    this._camPos.setFromMatrixPosition(cam.matrixWorld);
+    // a face-on card: its x along camera right, its face (+y) towards the
+    // camera, its top (−z) up
+    this._basis.makeBasis(this._right, this._back, this._down);
+    this._qf.setFromRotationMatrix(this._basis);
+    this.peekFrame = { band: this.labelBand(), layouts: new Map() };
+    return this.peekFrame;
+  }
+
+  layoutFor(n) {
+    const pf = this.peekFrameState();
+    let lay = pf.layouts.get(n);
+    if (!lay) {
+      const cam = this.rig.camera;
+      lay = faceOnLayout(n, { fovY: (cam.fov * Math.PI) / 180, w: this.size.w, h: this.size.h, band: pf.band, near: cam.near });
+      pf.layouts.set(n, lay);
+    }
+    return lay;
+  }
+
+  /**
+   * The inspection pose of card `id` over its `resting` matrix, or null when
+   * it is not lifted: `{matrix, alpha, sheen}`.
+   */
+  peekPose(id, resting) {
+    const hit = this.inspector.lookup(id);
+    if (!hit || !this.size) return null;
+    const { g, i, n } = hit;
+    this.peekFrameState();
+    const lay = this.layoutFor(n);
+    const motion = g.mode === 'motion';
+    const fl = motion ? flourishPose(g.flourish, g.f, i, n) : null;
+    const w = motion ? g.w : 0;
+    const s = g.s;
+    // the face-on target, with the flourish's offsets (scaled by its weight)
+    const t = this._pt
+      .copy(this._camPos)
+      .addScaledVector(this._back, -(lay.d - (fl ? fl.dz * w : 0)))
+      .addScaledVector(this._right, lay.xs[i] + (fl ? fl.dx * w : 0))
+      .addScaledVector(this._up, lay.y + (fl ? fl.dy * w : 0));
+    resting.decompose(this._pp, this._pq, this._ps);
+    if (!motion) {
+      // reduced motion: fade out on the felt, fade in face-on
+      if (s < 0.5) return { matrix: resting, alpha: 1 - s * 2, sheen: 0 };
+      this._pm.compose(t, this._qf, this._one);
+      return { matrix: this._pm, alpha: (s - 0.5) * 2, sheen: 0 };
+    }
+    // travel: straight towards the camera, lifted off the felt early on
+    this._pp.lerp(t, s);
+    this._pp.y += 0.05 * Math.sin(Math.PI * s);
+    this._pq.slerp(this._qf, s);
+    // the flourish turns the card in its own frame, after the travel's turn
+    if (fl.tumble) this._pq.multiply(this._qx.setFromAxisAngle(this._ax, fl.tumble * w));
+    if (fl.spin) this._pq.multiply(this._qx.setFromAxisAngle(this._az, fl.spin * w));
+    if (fl.roll) this._pq.multiply(this._qx.setFromAxisAngle(this._ay, fl.roll * w));
+    this._pm.compose(this._pp, this._pq, this._one);
+    // gloss rises with the flourish; a falling card's is negative: no glint
+    const sheen = fl.sheen * w * (g.dir < 0 ? -1 : 1);
+    return { matrix: this._pm, alpha: 1, sheen };
+  }
+
+  /** Lay the keyboard buttons over their groups and mark the lifted one. */
+  syncPeekKeys() {
+    if (!this.peekKeys || !this.size) return;
+    const model = this.director.model;
+    const available = new Set(this.busy ? [] : groupsOf(model));
+    for (const g of this.inspector.groups.keys()) available.add(g);
+    const rects = new Map();
+    const c = this.rig.camera;
+    for (const g of available) {
+      const members = this.inspector.groups.get(g) || groupCards(model, g);
+      if (!members) continue;
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const id of members.ids) {
+        const idx = CARD_IDS.indexOf(id);
+        if (idx < 0) continue;
+        this.cards.mesh.getMatrixAt(idx, this._inv);
+        for (const [cx, cz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+          this._corner.set((cx * CARD.w) / 2, 0, (cz * CARD.h) / 2).applyMatrix4(this._inv).project(c);
+          const px = ((this._corner.x + 1) / 2) * this.size.w;
+          const py = ((1 - this._corner.y) / 2) * this.size.h;
+          x0 = Math.min(x0, px);
+          y0 = Math.min(y0, py);
+          x1 = Math.max(x1, px);
+          y1 = Math.max(y1, py);
+        }
+      }
+      if (x1 > x0) rects.set(g, { x: x0 - 4, y: y0 - 4, w: x1 - x0 + 8, h: y1 - y0 + 8 });
+    }
+    this.peekKeys.sync(available, this.inspector.active, rects);
   }
 }
 
@@ -753,6 +1012,11 @@ export async function create(canvas, opts = {}, deps = {}) {
     },
     get drift() {
       return t.director.drift;
+    },
+    // the inspection now: which group is up and the last flourish chosen
+    get inspect() {
+      const i = t.inspector;
+      return i ? { active: i.active, lastFlourish: i.lastFlourish, groups: [...i.groups.keys()] } : null;
     },
   };
   try {
