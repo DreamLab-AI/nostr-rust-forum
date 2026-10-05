@@ -270,7 +270,7 @@ impl PanelRegistry {
                     .unwrap_or("medium")
                     .to_string();
 
-                if let Ok(req) = serde_json::from_str::<governance::ActionRequest>(&event.content) {
+                if let Some(req) = parse_action_request(&event.content) {
                     self.state.update(|s| {
                         // NIP-33 replaceability, per (pubkey, d): a republished
                         // request REPLACES its earlier version rather than
@@ -444,6 +444,41 @@ impl PanelRegistry {
             _ => {}
         }
     }
+}
+
+/// Parse a 31402's content into the generic request the surfaces render.
+///
+/// Two shapes are admitted. The generic ACSP body is `{"fields": …, …}`. The
+/// `ontology-governance` profile (ADR-2013, [`nostr_bbs_core::ontology_governance`])
+/// publishes a flat `PatchProposal` instead — `level`, `iri`, `page`,
+/// `hypothesis`, `diff`, `stale_after` at the top level, no `fields` key — so a
+/// strict parse rejected every corpus proposal and the case never reached the
+/// inbox while the relay held it. A JSON object without `fields` is therefore
+/// read as its own field set, with `hypothesis` standing in for `reasoning`.
+/// Its `context_url` is an OKF IRI, not a link, so it is left to the tag and the
+/// view's scheme check rather than lifted here.
+///
+/// Anything that is not a JSON object still yields `None`: a request with no
+/// readable body is not one a reviewer can decide.
+pub fn parse_action_request(content: &str) -> Option<governance::ActionRequest> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let obj = value.as_object()?;
+    if obj.contains_key("fields") {
+        return serde_json::from_value(value).ok();
+    }
+    let str_field = |k: &str| obj.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Some(governance::ActionRequest {
+        reasoning: str_field("reasoning").or_else(|| str_field("hypothesis")),
+        context_url: None,
+        risk_tier: None,
+        confidence: obj
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .map(|c| c as f32),
+        task_properties: None,
+        probe: None,
+        fields: value,
+    })
 }
 
 /// Whether an incoming replaceable event supersedes the one already held.
@@ -1123,5 +1158,55 @@ mod tests {
         let admin = |pk: &str| pk == "admin";
         assert_eq!(panel_acknowledgement_for(&s, by_d("ours"), admin), None);
         assert!(panel_acknowledgement_for(&s, by_d("theirs"), admin).is_some());
+    }
+
+    /// The live a429 shape: an `ontology-governance` PatchProposal, flat, with
+    /// no `fields` key. Strictly parsed it was dropped and the case never
+    /// reached the inbox.
+    const PATCH_PROPOSAL: &str = r#"{"level":"schema","kind":"amend","iri":"urn:ngm:class:fungible-token","page":"Fungible Token","hypothesis":"Fungible and non-fungible tokens are disjoint.","diff":"+disjoint-with:\n","digest":"sha256:02","blockers":[],"stale_after":"2026-10-19T16:18:38Z"}"#;
+
+    #[test]
+    fn a_patch_proposal_parses_as_its_own_field_set() {
+        let req = parse_action_request(PATCH_PROPOSAL).expect("proposal dropped");
+        assert_eq!(req.fields["page"], "Fungible Token");
+        assert_eq!(req.fields["level"], "schema");
+        assert_eq!(
+            req.reasoning.as_deref(),
+            Some("Fungible and non-fungible tokens are disjoint.")
+        );
+        assert_eq!(req.context_url, None, "an OKF IRI is not a link");
+    }
+
+    #[test]
+    fn a_generic_request_still_parses_strictly() {
+        let req =
+            parse_action_request(r#"{"fields":{"x":1},"reasoning":"r","confidence":0.5}"#).unwrap();
+        assert_eq!(req.fields["x"], 1);
+        assert_eq!(req.reasoning.as_deref(), Some("r"));
+        assert_eq!(req.confidence, Some(0.5));
+        assert!(parse_action_request("not json").is_none());
+        assert!(parse_action_request("[1,2]").is_none());
+        assert!(parse_action_request(r#"{"fields":{},"confidence":"high"}"#).is_none());
+    }
+
+    #[test]
+    fn a_patch_proposal_event_reaches_the_inbox() {
+        let r = fresh_registry();
+        r.ingest_event(&NostrEvent {
+            id: "a429".into(),
+            pubkey: "admin".into(),
+            created_at: 1_791_217_122,
+            kind: 31402,
+            tags: vec![
+                vec!["d".into(), "026164eb".into()],
+                vec!["panel".into(), "ontology-governance".into()],
+                vec!["level".into(), "schema".into()],
+            ],
+            content: PATCH_PROPOSAL.into(),
+            sig: String::new(),
+        });
+        let s = r.state.read_untracked();
+        assert_eq!(s.actions.len(), 1);
+        assert_eq!(s.actions[0].event_id, "a429");
     }
 }

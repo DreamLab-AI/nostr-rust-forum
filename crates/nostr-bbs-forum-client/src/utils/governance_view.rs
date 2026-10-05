@@ -394,6 +394,13 @@ pub fn chain_is_decided(chain: &[ChainStep]) -> bool {
         .any(|s| !s.superseded && s.outcome != "delegate")
 }
 
+/// Whether a case has left the inbox for the archive: it is decided, or a
+/// panel-level "Acknowledge all alerts" has dismissed it. A delegated case is
+/// neither (see [`chain_is_decided`]) and stays in the inbox for its delegatee.
+pub fn is_settled(decided: bool, acknowledged: bool) -> bool {
+    decided || acknowledged
+}
+
 /// The pubkey an admin delegated this case to, if the delegation still stands.
 ///
 /// Only the *effective* (non-superseded) delegation counts: an admin who
@@ -1606,6 +1613,18 @@ mod tests {
         assert_eq!(
             b.with_relay_tier(Some("high")).declared,
             Some(RiskTier::Low)
+        );
+    }
+
+    #[test]
+    fn only_decided_or_acknowledged_cases_are_archived() {
+        assert!(!is_settled(false, false), "an open case stays in the inbox");
+        assert!(is_settled(true, false));
+        assert!(is_settled(false, true));
+        let delegated = [step("d1", "delegate", Some("reviewer"), false)];
+        assert!(
+            !is_settled(chain_is_decided(&delegated), false),
+            "a delegated case waits for its delegatee"
         );
     }
 }

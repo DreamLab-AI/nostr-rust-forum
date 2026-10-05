@@ -197,10 +197,33 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
         v
     });
 
+    // The inbox holds only open cases. A decided or acknowledged case has
+    // nothing left to ask of anyone, and leaving it in an oldest-first list
+    // buried every new request under the settled ones. Settled cases move to
+    // a collapsed archive, newest first, where the decision chain stays
+    // readable.
+    let pending = Memo::new(move |_| {
+        cards
+            .get()
+            .into_iter()
+            .filter(|c| !governance_view::is_settled(c.decided, c.acknowledged.is_some()))
+            .collect::<Vec<_>>()
+    });
+    let archived = Memo::new(move |_| {
+        let mut v: Vec<ActionCardData> = cards
+            .get()
+            .into_iter()
+            .filter(|c| governance_view::is_settled(c.decided, c.acknowledged.is_some()))
+            .collect();
+        v.sort_by_key(|c| std::cmp::Reverse(c.item.created_at));
+        v
+    });
+
     let panel_count = Memo::new(move |_| state.read().panels.len());
-    // Count only the requests this surface renders, so the stat and the
-    // empty-state gate agree with the member suppression.
-    let action_count = Memo::new(move |_| cards.get().len());
+    // Count only the open requests this surface renders, so the stat and the
+    // empty-state gate agree with the member suppression and the archive split.
+    let action_count = Memo::new(move |_| pending.get().len());
+    let archived_count = Memo::new(move |_| archived.get().len());
 
     view! {
         <div class="governance-page max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -275,7 +298,7 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                 <p class="text-gray-500 text-sm mb-4">"Oldest first — a case that has been waiting is the one that needs you."</p>
                 <div class="governance-inbox space-y-2 mb-8">
                     <For
-                        each=move || cards.get()
+                        each=move || pending.get()
                         key=|c| (
                             c.item.event_id.clone(),
                             c.decidable,
@@ -296,6 +319,35 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                         }}
                     </For>
                 </div>
+            </Show>
+
+            // Settled cases: collapsed by default so the inbox stays the place
+            // where work waits. The same decidability split as the inbox, so an
+            // admin can still supersede a decision from here.
+            <Show when=move || archived_count.get() != 0>
+                <details class="governance-archive mb-8 bg-gray-800/40 rounded-lg">
+                    <summary class="cursor-pointer select-none px-4 py-3 text-gray-300 font-semibold">
+                        {move || format!("Archive — {} decided", archived_count.get())}
+                    </summary>
+                    <div class="space-y-2 px-2 pb-2">
+                        <For
+                            each=move || archived.get()
+                            key=|c| (
+                                c.item.event_id.clone(),
+                                c.decidable,
+                                c.decided,
+                                c.acknowledged.as_ref().map(|a| a.event_id.clone()),
+                            )
+                            let:c
+                        >
+                            {if c.decidable {
+                                view! { <ActionRow card=c /> }.into_any()
+                            } else {
+                                view! { <ReadOnlyActionRow card=c /> }.into_any()
+                            }}
+                        </For>
+                    </div>
+                </details>
             </Show>
 
             <Show
@@ -543,10 +595,18 @@ pub struct ActionCardData {
     pub acknowledged: Option<PanelAck>,
 }
 
-/// Human-readable title for a request, from its `title` tag, else its `d`-tag.
+/// Human-readable title for a request: its `title` tag, else a `title` or
+/// `page` field (an ontology proposal names its page, and its `d` is a digest),
+/// else its `d`-tag.
 fn card_title(item: &ActionEntry) -> String {
     nostr_bbs_core::governance::extract_tag(&item.tags, "title")
         .map(str::to_string)
+        .or_else(|| {
+            ["title", "page"]
+                .iter()
+                .find_map(|k| item.fields.get(*k).and_then(|v| v.as_str()))
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| item.d_tag.clone())
 }
 
