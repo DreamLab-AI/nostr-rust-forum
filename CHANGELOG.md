@@ -7,6 +7,36 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: ontology proposals reach the governance inbox
+
+The forum client parsed every 31402 as `{"fields": …}` and silently dropped
+anything else. The `ontology-governance` profile (ADR-2013) publishes a flat
+`PatchProposal` (`level`, `iri`, `page`, `hypothesis`, `diff`, `stale_after`)
+with no `fields` key, so every corpus proposal was admitted by the relay and
+never shown. `panel_registry::parse_action_request` now reads an object
+without `fields` as its own field set, with `hypothesis` as the reasoning; a
+card without a `title` tag is titled from its `title`/`page` field rather than
+its digest `d` tag. Client only.
+
+### Changed: decided cases leave the governance inbox for an archive
+
+The inbox lists open cases only. Decided cases, and cases a panel's
+"Acknowledge all alerts" dismissed, move to a collapsed "Archive — N decided"
+section, newest first, with the same decidability split (an admin can still
+supersede from there). Delegated cases stay in the inbox for their delegatee.
+"Pending Actions" counts open cases. Client only.
+
+### Note: subscription replay is what spends the relay's D1 read budget
+
+Every REQ without `since` replays history from D1, so the cost of a client is
+its re-subscription rate. On 2026-10-05 the dreamlab relay was at 2-5M rows/day
+of a 5M free tier: ~1.5M/day from an agentbox bridge re-issuing its
+subscriptions every 15 s (a workaround for the hibernation deafness fixed here
+in f709bf0; now hourly), and ~2M/day while one forum client reconnected every
+~80 s, because `relay.rs` replays every subscription on reopen. Not yet done:
+replay on reconnect with `since` = last EOSE minus a margin, exempting kind
+1059 (gift wraps backdate `created_at` by up to two days).
+
 ### Added: `nostr-bbs-sidestr-admin`, the operator CLI for the pinned sidestr chains
 
 The crates.io `sidestr-agent` 0.6.0 CLI cannot replay `sidestr:dreamlab-txbt4`:
@@ -658,6 +688,10 @@ existing balance, receipt or issued deposit address is touched.
   `index.html` gains the `apple-touch-icon` it never had, without which iOS
   screenshots the page for the home-screen tile.
 
+
+## [1.0.0-beta.14] — 2026-10-05
+
+- Kit crates `nostr-bbs-core`, `-config`, `-mesh`, `-rate-limit` republished with the changes since beta.13: sealed rumors carry their NIP-01 `id` (both the key and signer seal paths), `CalendarEventSpec::extra_tags`, and the `[poker]` config with its per-chain `citizens` map. beta.13 is yanked: its seal drops the rumor id, so cross-implementation readers discard kit-originated DMs.
 
 ## [1.0.0-beta.13] — 2026-10-03
 

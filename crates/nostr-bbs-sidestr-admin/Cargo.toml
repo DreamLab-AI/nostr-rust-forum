@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-sidestr-admin"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 edition = "2021"
 description = "Operator CLI for a kit deployment's pinned sidestr chains: replays the producer's blocks under the parent's header family (stock or BLAKE2b) and lists a key's holdings, issues an asset, and sends sats or asset units"
 license = "AGPL-3.0-only"
@@ -26,7 +26,7 @@ path = "src/main.rs"
 [dependencies]
 nostr-bbs-core = { workspace = true }
 # The pinned chain documents and the two-family replay the house seat uses.
-nostr-bbs-poker-citizen = { path = "../nostr-bbs-poker-citizen", version = "1.0.0-beta.13" }
+nostr-bbs-poker-citizen = { path = "../nostr-bbs-poker-citizen", version = "1.0.0-beta.14" }
 hex = { workspace = true }
 zeroize = { workspace = true }
 serde = { workspace = true }

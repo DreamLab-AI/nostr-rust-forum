@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-poker"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 edition = "2021"
 description = "nostr-bbs community forum — heads-up poker: the Libre Poker engine and bots in Rust, the fair-deal and settlement rules, the hand record, and the member↔house table protocol"
 license = "AGPL-3.0-only"
