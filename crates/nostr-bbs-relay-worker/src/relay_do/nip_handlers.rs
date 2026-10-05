@@ -4740,6 +4740,59 @@ mod ontology_governance_boundary_tests {
         assert_eq!(demote.new_state, CaseState::Decided);
     }
 
+    /// A promote or demote settles an ontology case exactly as approve does:
+    /// the projected state is terminal, so the cron sweeps and the projection
+    /// guard (`state IN ('open', 'under_review', 'reopened')`) leave it alone,
+    /// and a second response on it is refused.
+    #[test]
+    fn promote_and_demote_settle_the_case_like_approve() {
+        for (content, persisted) in [
+            (r#"{"action":"approve"}"#, "decided"),
+            (
+                r#"{"action":"promote","iri":"urn:ngm:class:knowledge-graph"}"#,
+                "promoted",
+            ),
+            (
+                r#"{"action":"demote","iri":"urn:ngm:class:knowledge-graph"}"#,
+                "decided",
+            ),
+        ] {
+            let proj = plan_action_response(
+                "case-onto-1",
+                Some(&schema_case_row()),
+                &"e".repeat(64),
+                content,
+                "human-bob",
+                None,
+                2_000,
+            )
+            .expect("a human decision projects");
+            assert!(proj.new_state.is_terminal(), "{content} settles the case");
+            assert_eq!(proj.new_state.as_str(), persisted);
+            assert!(!matches!(persisted, "open" | "under_review" | "reopened"));
+
+            let mut settled = schema_case_row();
+            settled.state = persisted.into();
+            assert!(
+                matches!(
+                    plan_action_response(
+                        "case-onto-1",
+                        Some(&settled),
+                        &"f".repeat(64),
+                        r#"{"action":"approve"}"#,
+                        "human-bob",
+                        Some(proj.decision_id.clone()),
+                        2_001,
+                    ),
+                    Err(governance::broker::OrchestrationError::Case(
+                        governance::broker::CaseError::AlreadyTerminal(_)
+                    ))
+                ),
+                "a {persisted} case refuses a second response"
+            );
+        }
+    }
+
     /// A `promote`/`demote` with no `iri` is refused rather than parked: the
     /// apply path has nothing to act on, and inventing a subject for it is the
     /// one mistake that writes to the wrong page.

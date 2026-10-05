@@ -736,10 +736,15 @@ impl RationaleError {
 /// the human's own words at a consequential tier (FR2.2).
 ///
 /// `approve`, `reject`, `amend` and `delegate` resolve the case a human was
-/// asked about. `promote` and `precedent` are downstream bookkeeping on an
-/// already-decided case and are not gated.
+/// asked about, and so do `promote` and `demote` on an ontology-governance
+/// case: there they are the decision itself, and a promote writes to the
+/// corpus (ADR-2109). Only `precedent`, which records a scope on an
+/// already-decided case, is not gated.
 pub fn outcome_requires_rationale(action: &str) -> bool {
-    matches!(action, "approve" | "reject" | "amend" | "delegate")
+    matches!(
+        action,
+        "approve" | "reject" | "amend" | "delegate" | "promote" | "demote"
+    )
 }
 
 /// Enforce the FR2.2 rationale rule for a 31403 (ADR-2011).
@@ -845,12 +850,31 @@ mod rationale_tests {
         }
     }
 
-    /// `promote` and `precedent` are not human decisions on the requested act;
-    /// they are downstream bookkeeping, and FR2.2 does not name them.
+    /// `precedent` records a scope on an already-decided case; it is not a
+    /// human decision on the requested act, and FR2.2 does not name it.
     #[test]
-    fn promote_and_precedent_are_not_gated() {
-        for action in ["promote", "precedent"] {
-            assert_eq!(check_rationale(RiskTier::Critical, action, None), Ok(()));
+    fn precedent_is_not_gated() {
+        assert_eq!(
+            check_rationale(RiskTier::Critical, "precedent", None),
+            Ok(())
+        );
+    }
+
+    /// On an ontology case `promote` and `demote` ARE the decision, and a
+    /// promote writes to the corpus: they carry the same rationale rule as
+    /// approve, so a scripted 31403 cannot skip what the UI enforces.
+    #[test]
+    fn promote_and_demote_are_gated_like_approve() {
+        for action in ["promote", "demote"] {
+            assert_eq!(
+                check_rationale(RiskTier::High, action, None),
+                Err(RationaleError::Missing)
+            );
+            assert_eq!(
+                check_rationale(RiskTier::Critical, action, Some(&twenty_astral())),
+                Ok(())
+            );
+            assert_eq!(check_rationale(RiskTier::Low, action, None), Ok(()));
         }
     }
 

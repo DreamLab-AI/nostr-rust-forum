@@ -33,6 +33,7 @@
 use nostr_bbs_core::governance::{
     self, broker::DecisionOutcome, PanelPolicy, RiskTier, TaskProperties,
 };
+use nostr_bbs_core::ontology_governance::{PANEL_ONTOLOGY_GOVERNANCE, TAG_CONTEXT_URL};
 
 // ── Rationale gate (FR2.2, EXP-AC-002) ──────────────────────────────────────
 
@@ -436,6 +437,74 @@ pub fn is_decidable_by(chain: &[ChainStep], viewer_pubkey: Option<&str>, is_admi
         return true;
     }
     delegated_to(chain).is_some_and(|d| d.eq_ignore_ascii_case(viewer))
+}
+
+// ── Ontology cases (ADR-2013) ───────────────────────────────────────────────
+
+/// Which decision buttons a writable card offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionControls {
+    /// Approve / Reject — every case that is not a decidable ontology case.
+    ApproveReject,
+    /// Promote / Demote / Reject on an `ontology-governance` case, carrying the
+    /// subject IRI the signed `promote`/`demote` must name.
+    PromoteDemote { iri: String },
+}
+
+/// Whether a 31402 belongs to the `ontology-governance` panel.
+///
+/// Read from the request's own `a`/`panel` tag, or — for a request that names
+/// neither — from the `d` of the panel the registry resolved it to.
+pub fn is_ontology_case(request_tags: &[Vec<String>], resolved_panel_d_tag: Option<&str>) -> bool {
+    let named = match resolve_panel_ref(request_tags, "") {
+        PanelRef::Addressed { d_tag, .. } | PanelRef::Named { d_tag, .. } => Some(d_tag),
+        PanelRef::LatestFromAgent { .. } => None,
+    };
+    named.as_deref() == Some(PANEL_ONTOLOGY_GOVERNANCE)
+        || resolved_panel_d_tag == Some(PANEL_ONTOLOGY_GOVERNANCE)
+}
+
+/// The subject IRI an ontology case's `promote`/`demote` must sign.
+///
+/// The request's own `iri` field first — that is the profile's subject. The
+/// `context_url` tag is a fallback only when it is a `urn:` IRI: the tag is
+/// also a reviewer link, and an `https://` page is not a corpus subject. A
+/// blank value, or one carrying a control character, is no IRI at all; it is
+/// otherwise passed through byte for byte, because the applier matches it
+/// against the corpus exactly. `None` for a non-ontology case.
+pub fn ontology_subject_iri(
+    request_tags: &[Vec<String>],
+    fields: &serde_json::Value,
+    resolved_panel_d_tag: Option<&str>,
+) -> Option<String> {
+    if !is_ontology_case(request_tags, resolved_panel_d_tag) {
+        return None;
+    }
+    let usable = |s: &&str| !s.trim().is_empty() && !s.chars().any(char::is_control);
+    fields
+        .get("iri")
+        .and_then(|v| v.as_str())
+        .filter(usable)
+        .or_else(|| {
+            governance::extract_tag(request_tags, TAG_CONTEXT_URL)
+                .filter(usable)
+                .filter(|s| s.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("urn:")))
+        })
+        .map(str::to_string)
+}
+
+/// The decision buttons for a card. An ontology case with no recoverable IRI
+/// keeps Approve / Reject: a subjectless `promote` is refused by the relay, and
+/// inventing a subject would write to the wrong page.
+pub fn decision_controls(
+    request_tags: &[Vec<String>],
+    fields: &serde_json::Value,
+    resolved_panel_d_tag: Option<&str>,
+) -> DecisionControls {
+    match ontology_subject_iri(request_tags, fields, resolved_panel_d_tag) {
+        Some(iri) => DecisionControls::PromoteDemote { iri },
+        None => DecisionControls::ApproveReject,
+    }
 }
 
 // ── Panel-level acknowledgement ─────────────────────────────────────────────
@@ -1626,5 +1695,147 @@ mod tests {
             !is_settled(chain_is_decided(&delegated), false),
             "a delegated case waits for its delegatee"
         );
+    }
+
+    // ── Ontology cases (ADR-2013) ───────────────────────────────────────
+
+    const SUBJECT: &str = "urn:ngm:class:knowledge-graph";
+
+    /// The tags and flat content `vault propose` publishes on a 31402.
+    fn ontology_request() -> (Vec<Vec<String>>, serde_json::Value) {
+        (
+            vec![
+                tag("d", "sha256:abc"),
+                tag("panel", "ontology-governance"),
+                tag("context_url", SUBJECT),
+                tag("level", "schema"),
+            ],
+            serde_json::json!({
+                "level": "schema",
+                "kind": "amend",
+                "iri": SUBJECT,
+                "page": "Knowledge Graph",
+                "hypothesis": "narrow the parent class",
+                "diff": "- a\n+ b",
+            }),
+        )
+    }
+
+    #[test]
+    fn an_ontology_case_offers_promote_and_demote_on_its_iri() {
+        let (tags, fields) = ontology_request();
+        assert!(is_ontology_case(&tags, None));
+        assert_eq!(
+            decision_controls(&tags, &fields, None),
+            DecisionControls::PromoteDemote {
+                iri: SUBJECT.into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_panel_is_recognised_from_an_a_tag_or_the_resolved_panel() {
+        let addressed = vec![tag("a", "31400:agentpk:ontology-governance")];
+        assert!(is_ontology_case(&addressed, None));
+        // Neither tag: only the registry's resolution can say.
+        assert!(is_ontology_case(&[], Some(PANEL_ONTOLOGY_GOVERNANCE)));
+        assert!(!is_ontology_case(&[], Some("deploy-approvals")));
+        assert!(!is_ontology_case(&[], None));
+    }
+
+    #[test]
+    fn the_request_iri_wins_over_the_context_url_tag() {
+        let (mut tags, fields) = ontology_request();
+        tags.retain(|t| t[0] != "context_url");
+        tags.push(tag("context_url", "urn:ngm:class:something-else"));
+        assert_eq!(
+            ontology_subject_iri(&tags, &fields, None).as_deref(),
+            Some(SUBJECT)
+        );
+    }
+
+    #[test]
+    fn a_urn_context_url_is_the_fallback_subject() {
+        let (tags, mut fields) = ontology_request();
+        fields.as_object_mut().unwrap().remove("iri");
+        assert_eq!(
+            ontology_subject_iri(&tags, &fields, None).as_deref(),
+            Some(SUBJECT)
+        );
+    }
+
+    /// A reviewer link is not a corpus subject: an `https://` context_url
+    /// must never be signed as the thing being promoted.
+    #[test]
+    fn a_web_context_url_is_not_a_subject() {
+        let (mut tags, mut fields) = ontology_request();
+        fields.as_object_mut().unwrap().remove("iri");
+        tags.retain(|t| t[0] != "context_url");
+        tags.push(tag("context_url", "https://example.org/page"));
+        assert_eq!(ontology_subject_iri(&tags, &fields, None), None);
+        assert_eq!(
+            decision_controls(&tags, &fields, None),
+            DecisionControls::ApproveReject,
+            "a subjectless ontology case keeps Approve / Reject"
+        );
+    }
+
+    #[test]
+    fn a_blank_or_control_bearing_iri_is_no_iri() {
+        let (mut tags, _) = ontology_request();
+        tags.retain(|t| t[0] != "context_url");
+        for bad in ["", "   ", "urn:ngm:\nclass:x"] {
+            let fields = serde_json::json!({ "iri": bad });
+            assert_eq!(ontology_subject_iri(&tags, &fields, None), None, "{bad:?}");
+        }
+        // A non-string `iri` is not read as one either.
+        let fields = serde_json::json!({ "iri": 7 });
+        assert_eq!(ontology_subject_iri(&tags, &fields, None), None);
+    }
+
+    #[test]
+    fn a_non_ontology_case_is_unchanged_even_if_it_carries_an_iri() {
+        let tags = vec![
+            tag("panel", "deploy-approvals"),
+            tag("context_url", SUBJECT),
+        ];
+        let fields = serde_json::json!({ "iri": SUBJECT });
+        assert_eq!(ontology_subject_iri(&tags, &fields, None), None);
+        assert_eq!(
+            decision_controls(&tags, &fields, Some("deploy-approvals")),
+            DecisionControls::ApproveReject
+        );
+    }
+
+    /// What the buttons publish parses back, in the relay's own parser, as the
+    /// outcome that names the subject.
+    #[test]
+    fn promote_and_demote_content_carries_the_subject_iri() {
+        for outcome in [
+            DecisionOutcome::Promote {
+                iri: SUBJECT.into(),
+            },
+            DecisionOutcome::Demote {
+                iri: SUBJECT.into(),
+            },
+        ] {
+            let content = decision_content(&outcome, "checked against the parent class");
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["iri"].as_str(), Some(SUBJECT));
+            assert_eq!(
+                DecisionOutcome::from_response_content(&content),
+                Some(outcome)
+            );
+        }
+    }
+
+    #[test]
+    fn a_promoted_or_demoted_case_is_decided_and_archived() {
+        for outcome in ["promote", "demote"] {
+            let chain = [step("dec-1", outcome, None, false)];
+            assert!(chain_is_decided(&chain), "{outcome} decides the case");
+            assert!(is_settled(chain_is_decided(&chain), false));
+            assert!(!is_decidable_by(&chain, Some("admin"), true));
+        }
     }
 }

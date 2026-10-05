@@ -23,7 +23,8 @@ use crate::stores::receipts::use_receipt_store;
 use crate::stores::signer_admin::SignerAdminCache;
 use crate::stores::zone_access::use_zone_access;
 use crate::utils::governance_view::{
-    self, CardSection, CaseBoundary, PanelAck, ACK_ALERTS_ACTION, MIN_RATIONALE_LEN,
+    self, CardSection, CaseBoundary, DecisionControls, PanelAck, ACK_ALERTS_ACTION,
+    MIN_RATIONALE_LEN,
 };
 use nostr_bbs_core::governance::broker::DecisionOutcome;
 use wasm_bindgen_futures::spawn_local;
@@ -128,12 +129,19 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
             .actions
             .iter()
             .map(|a| {
-                let panel = crate::stores::panel_registry::resolve_panel_for(
+                let resolved = crate::stores::panel_registry::resolve_panel_for(
                     &s.panels,
                     &a.tags,
                     &a.agent_pubkey,
-                )
-                .map(|p| p.context());
+                );
+                let panel = resolved.map(|p| p.context());
+                // ADR-2013: an ontology case is decided by Promote / Demote on
+                // the subject IRI, which the signed 31403 must name.
+                let controls = governance_view::decision_controls(
+                    &a.tags,
+                    &a.fields,
+                    resolved.map(|p| p.d_tag.as_str()),
+                );
                 let boundary = a
                     .boundary(
                         panel.as_ref(),
@@ -184,6 +192,7 @@ pub fn GovernancePage(#[prop(default = false)] member_view: bool) -> impl IntoVi
                     decidable,
                     decided,
                     acknowledged,
+                    controls,
                 }
             })
             // FR6.2: a case delegated to this viewer is shown to them even when
@@ -593,6 +602,8 @@ pub struct ActionCardData {
     /// The panel-level `acknowledge-alerts` that dismissed this alert, when no
     /// decision on the case itself has. Never set alongside `decided`.
     pub acknowledged: Option<PanelAck>,
+    /// Approve / Reject, or Promote / Demote on an ontology case's subject.
+    pub controls: DecisionControls,
 }
 
 /// Human-readable title for a request: its `title` tag, else a `title` or
@@ -951,8 +962,9 @@ fn ActionRow(card: ActionCardData) -> impl IntoView {
 
     let is_authed = auth.is_authenticated();
     // FR2.2: the gate. One predicate, tested in `governance_view`, applied to
-    // every control — approve, reject, amend and delegate alike, because a
-    // delegation on a critical case is as consequential as a decision on it.
+    // every control — approve/promote/demote, reject, amend and delegate alike,
+    // because a delegation on a critical case is as consequential as a decision
+    // on it.
     let gate_ok =
         Memo::new(move |_| governance_view::rationale_satisfied(effective, &rationale.get()));
     let blocked = move || {
@@ -968,6 +980,23 @@ fn ActionRow(card: ActionCardData) -> impl IntoView {
 
     let on_approve = move |_| (publish.get_value())(DecisionOutcome::Approve);
     let on_reject = move |_| (publish.get_value())(DecisionOutcome::Reject);
+    // ADR-2013: on an ontology case the signed decision names its subject in
+    // its own bytes, so the applier never reads the IRI back off the request.
+    let subject = match card.controls.clone() {
+        DecisionControls::PromoteDemote { iri } => Some(iri),
+        DecisionControls::ApproveReject => None,
+    };
+    let subject_stored = StoredValue::new(subject.clone());
+    let on_promote = move |_| {
+        if let Some(iri) = subject_stored.get_value() {
+            (publish.get_value())(DecisionOutcome::Promote { iri })
+        }
+    };
+    let on_demote = move |_| {
+        if let Some(iri) = subject_stored.get_value() {
+            (publish.get_value())(DecisionOutcome::Demote { iri })
+        }
+    };
     let on_amend = move |_| {
         let diff = amend_diff.get_untracked();
         if diff.trim().is_empty() {
@@ -1018,21 +1047,56 @@ fn ActionRow(card: ActionCardData) -> impl IntoView {
                                 </span>
                             }
                         })}
+                        {subject.clone().map(|iri| view! {
+                            <span class="text-xs text-gray-500 break-all">
+                                "Subject: "<code class="text-gray-300">{iri}</code>
+                            </span>
+                        })}
                         <div class="flex flex-wrap gap-2">
-                            <button
-                                class=format!("{btn} bg-green-500/10 text-green-400 border-green-500/20 hover:bg-green-500/20")
-                                disabled=blocked
-                                on:click=on_approve
-                            >
-                                {move || if pending.get().as_deref() == Some("approve") { "…" } else { "Approve" }}
-                            </button>
-                            <button
-                                class=format!("{btn} bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20")
-                                disabled=blocked
-                                on:click=on_reject
-                            >
-                                {move || if pending.get().as_deref() == Some("reject") { "…" } else { "Reject" }}
-                            </button>
+                            {if subject.is_some() {
+                                view! {
+                                    <button
+                                        class=format!("{btn} bg-green-500/10 text-green-400 border-green-500/20 hover:bg-green-500/20")
+                                        disabled=blocked
+                                        on:click=on_promote
+                                    >
+                                        {move || if pending.get().as_deref() == Some("promote") { "…" } else { "Promote" }}
+                                    </button>
+                                    <button
+                                        class=format!("{btn} bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20")
+                                        disabled=blocked
+                                        on:click=on_demote
+                                    >
+                                        {move || if pending.get().as_deref() == Some("demote") { "…" } else { "Demote" }}
+                                    </button>
+                                    <button
+                                        class=format!("{btn} bg-gray-500/10 text-gray-300 border-gray-500/30 hover:bg-gray-500/20")
+                                        disabled=blocked
+                                        on:click=on_reject
+                                    >
+                                        {move || if pending.get().as_deref() == Some("reject") { "…" } else { "Reject" }}
+                                    </button>
+                                }
+                                .into_any()
+                            } else {
+                                view! {
+                                    <button
+                                        class=format!("{btn} bg-green-500/10 text-green-400 border-green-500/20 hover:bg-green-500/20")
+                                        disabled=blocked
+                                        on:click=on_approve
+                                    >
+                                        {move || if pending.get().as_deref() == Some("approve") { "…" } else { "Approve" }}
+                                    </button>
+                                    <button
+                                        class=format!("{btn} bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20")
+                                        disabled=blocked
+                                        on:click=on_reject
+                                    >
+                                        {move || if pending.get().as_deref() == Some("reject") { "…" } else { "Reject" }}
+                                    </button>
+                                }
+                                .into_any()
+                            }}
                             <button
                                 class=format!("{btn} bg-blue-500/10 text-blue-400 border-blue-500/20 hover:bg-blue-500/20")
                                 disabled=blocked

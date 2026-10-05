@@ -181,12 +181,12 @@ wasm-bindgen-test = "0.3"
 solid-pod-rs = { version = "=0.5.0-alpha.12", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.3).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.14" }
-nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.14" }
-nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.14" }
-nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.14" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.15" }
+nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.15" }
+nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.15" }
+nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.15" }
 nostr-bbs-ascii = { path = "crates/nostr-bbs-ascii", version = "1.0.0-beta.10" }
-nostr-bbs-poker = { path = "crates/nostr-bbs-poker", version = "1.0.0-beta.14" }
+nostr-bbs-poker = { path = "crates/nostr-bbs-poker", version = "1.0.0-beta.15" }
 
 # Image decoders for server-side ASCII rendering (nostr-bbs-ascii `decode`
 # feature, enabled by the preview/pod workers). default-features off so no

@@ -7,6 +7,29 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.15] — 2026-10-05
+
+### Changed: promote and demote carry the rationale rule (`nostr-bbs-core`)
+
+`outcome_requires_rationale` now gates `promote` and `demote` like `approve`.
+On an ontology case they are the decision itself, and a promote writes to the
+corpus, so a 31403 published straight to the relay can no longer skip the
+High/Critical rationale the governance UI already demands. Only `precedent`
+stays ungated.
+
+### Added: Promote / Demote on ontology cases in the governance view
+
+An `ontology-governance` case (ADR-2013) could only be approved or rejected,
+and an `approve` names no subject, so the agentbox applier had nothing to act
+on. The decision card now offers Promote / Demote / Reject on such a case and
+publishes `{"action":"promote"|"demote","iri":…}`, so the signed 31403 names
+the page in its own bytes. The subject is the request's `iri` field, falling
+back to a `urn:` `context_url` tag; a case with neither keeps Approve / Reject
+(`governance_view::decision_controls`). The case is recognised by its
+`a`/`panel` tag or by the panel the registry resolved it to. The rationale
+gate, Amend and Delegate are unchanged. The relay already projected both
+outcomes; a test now pins that they settle the case as approve does.
+
 ### Fixed: a re-posted ActionRequest moves its case, so decisions on it apply
 
 `broker_cases` is keyed by the 31402 `d` tag and was written with
