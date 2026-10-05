@@ -727,6 +727,42 @@ pub fn effective_principal(pubkey: &str, device_owner: Option<&str>, enabled: bo
 // NIP-01: EVENT handling
 // ---------------------------------------------------------------------------
 
+/// Project a 31402 into `broker_cases`, keyed by its `d` tag.
+///
+/// A case is created once, but it must follow the request the relay currently
+/// holds: 31402 is parameterised-replaceable, so a re-post with the same `d`
+/// replaces the stored event, and a 31403 is only projected when it cites the
+/// case's `nostr_event_id` (`receipts.rs`). With `INSERT OR IGNORE` a re-post
+/// left the case on the replaced (or swept) event, and every decision on the
+/// live one was stored but never applied (2026-10-05: a429e066 → 16fd671f).
+///
+/// The update is narrow: same author, still undecided, and strictly newer than
+/// the event the case points at (a missing event counts as oldest). It keeps
+/// `created_at` (case age and ageing stay honest), `created_by`, the
+/// calibration mark and the probe digest, so a re-post cannot reset the clock
+/// or re-roll sampling.
+pub(crate) const CASE_UPSERT_SQL: &str = "INSERT INTO broker_cases \
+     (id, category, subject_kind, subject_id, title, summary, state, priority, \
+      created_by, nostr_event_id, created_at, updated_at, \
+      declared_tier, effective_tier, tp_verifiability, tp_reversibility, tp_stakes, \
+      calibration_sample, probe_digest, max_pending_hours, stale_after) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?10, \
+             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
+     ON CONFLICT (id) DO UPDATE SET \
+       category = excluded.category, subject_kind = excluded.subject_kind, \
+       subject_id = excluded.subject_id, title = excluded.title, \
+       summary = excluded.summary, priority = excluded.priority, \
+       nostr_event_id = excluded.nostr_event_id, updated_at = excluded.updated_at, \
+       declared_tier = excluded.declared_tier, effective_tier = excluded.effective_tier, \
+       tp_verifiability = excluded.tp_verifiability, \
+       tp_reversibility = excluded.tp_reversibility, tp_stakes = excluded.tp_stakes, \
+       max_pending_hours = excluded.max_pending_hours, stale_after = excluded.stale_after \
+     WHERE broker_cases.created_by = excluded.created_by \
+       AND broker_cases.state IN ('open', 'under_review', 'reopened') \
+       AND broker_cases.nostr_event_id <> excluded.nostr_event_id \
+       AND excluded.updated_at > COALESCE( \
+             (SELECT e.created_at FROM events e WHERE e.id = broker_cases.nostr_event_id), 0)";
+
 impl NostrRelayDO {
     /// Resolve the configured NIP-42 enforcement mode (`AUTH_MODE`). Absent or
     /// unrecognised ⇒ the secure default (`nip42`). Reads a JS-boundary env var,
@@ -2397,15 +2433,7 @@ impl NostrRelayDO {
             &calibration_key,
         );
 
-        let stmt = db.prepare(
-            "INSERT OR IGNORE INTO broker_cases \
-             (id, category, subject_kind, subject_id, title, summary, state, priority, \
-              created_by, nostr_event_id, created_at, updated_at, \
-              declared_tier, effective_tier, tp_verifiability, tp_reversibility, tp_stakes, \
-              calibration_sample, probe_digest, max_pending_hours, stale_after) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?10, \
-                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-        );
+        let stmt = db.prepare(CASE_UPSERT_SQL);
         if let Ok(bound) = stmt.bind(&[
             JsValue::from_str(d_tag),
             JsValue::from_str(category),
@@ -3791,6 +3819,27 @@ mod write_gate_tests {
     }
 
     // ---- Kanban gates (kinds 30301/30302, kanban-scoped 31402) --------------
+
+    #[test]
+    fn case_upsert_follows_a_repost_only_within_its_guards() {
+        // Behaviour is exercised against SQLite with the relay migrations
+        // (re-post after sweep, older re-post, other author, decided case);
+        // these pin the guards so none is dropped silently.
+        let sql = super::CASE_UPSERT_SQL;
+        assert!(sql.contains("ON CONFLICT (id) DO UPDATE SET"));
+        assert!(sql.contains("nostr_event_id = excluded.nostr_event_id"));
+        assert!(sql.contains("broker_cases.created_by = excluded.created_by"));
+        assert!(sql.contains("broker_cases.state IN ('open', 'under_review', 'reopened')"));
+        assert!(sql.contains("COALESCE"));
+        for frozen in [
+            "created_at = excluded",
+            "created_by = excluded.created_by,",
+            "calibration_sample = excluded",
+            "probe_digest = excluded",
+        ] {
+            assert!(!sql.contains(frozen), "{frozen} must not be updated");
+        }
+    }
 
     #[test]
     fn kanban_kinds_are_ban_and_write_gated() {

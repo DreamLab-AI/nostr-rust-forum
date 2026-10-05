@@ -7,6 +7,18 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: a re-posted ActionRequest moves its case, so decisions on it apply
+
+`broker_cases` is keyed by the 31402 `d` tag and was written with
+`INSERT OR IGNORE`, so a re-post (same `d`, new event) left the case on the
+replaced or swept event. A 31403 is projected only when it cites the case's
+`nostr_event_id`, so the decision on the live request was stored and never
+applied — the owner's approval of the re-posted Fungible Token proposal
+(16fd671f) hit this and needed a manual row repair. `CASE_UPSERT_SQL` now
+follows a re-post when it is from the same author, the case is undecided, and
+the new event is newer than the one the case cites (a missing event counts as
+oldest). `created_at`, the calibration mark and the probe digest are kept.
+
 ### Fixed: the relay no longer accepts an event it will silently delete (NIP-40)
 
 Admission ignored an `expiration` tag that was not unix seconds, but the
