@@ -267,6 +267,27 @@ pub fn tag_value(event: &NostrEvent, name: &str) -> Option<String> {
         .map(|t| t[1].clone())
 }
 
+/// NIP-40 admission for an event's `expiration` tag at time `now`.
+///
+/// `Ok(())` when there is no tag or it names a future instant. NIP-40 values
+/// are unix seconds; anything else is refused rather than ignored, because the
+/// retention sweep (`cron.rs`) and any other relay would read it differently —
+/// SQLite's `CAST('2026-10-06T…' AS INTEGER)` is 2026, so an RFC 3339 value used
+/// to be accepted here and then deleted on the next cron run.
+pub fn expiration_admission(event: &NostrEvent, now: u64) -> Result<(), &'static str> {
+    let Some(raw) = tag_value(event, "expiration") else {
+        return Ok(());
+    };
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid: expiration must be unix seconds (NIP-40)");
+    }
+    match raw.parse::<u64>() {
+        Ok(ts) if ts < now => Err("invalid: event expired"),
+        Ok(_) => Ok(()),
+        Err(_) => Err("invalid: expiration must be unix seconds (NIP-40)"),
+    }
+}
+
 #[doc(hidden)]
 pub fn d_tag_value(event: &NostrEvent) -> String {
     for tag in &event.tags {
@@ -690,6 +711,53 @@ mod tests {
             tag_value(&event, "expiration"),
             Some("1700000000".to_string())
         );
+    }
+
+    #[test]
+    fn expiration_admission_accepts_absent_and_future_seconds() {
+        let none = make_event("aaa", "bbb", 1, 1000, vec![], "x");
+        assert_eq!(expiration_admission(&none, 1_000), Ok(()));
+        let future = make_event(
+            "aaa",
+            "bbb",
+            1,
+            1000,
+            vec![vec!["expiration".into(), "2000".into()]],
+            "x",
+        );
+        assert_eq!(expiration_admission(&future, 1_000), Ok(()));
+    }
+
+    #[test]
+    fn expiration_admission_refuses_past_and_non_numeric() {
+        let past = make_event(
+            "aaa",
+            "bbb",
+            1,
+            1000,
+            vec![vec!["expiration".into(), "999".into()]],
+            "x",
+        );
+        assert_eq!(
+            expiration_admission(&past, 1_000),
+            Err("invalid: event expired")
+        );
+        // The a429e066 shape: RFC 3339 instead of unix seconds.
+        for bad in ["2026-10-06T00:00:00Z", "", "12a", "-5", " 2000"] {
+            let e = make_event(
+                "aaa",
+                "bbb",
+                31402,
+                1000,
+                vec![vec!["expiration".into(), bad.into()]],
+                "x",
+            );
+            assert_eq!(
+                expiration_admission(&e, 1_000),
+                Err("invalid: expiration must be unix seconds (NIP-40)"),
+                "{bad:?}"
+            );
+        }
     }
 
     // ── d_tag_value ─────────────────────────────────────────────────────

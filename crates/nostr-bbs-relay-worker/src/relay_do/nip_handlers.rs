@@ -772,14 +772,11 @@ impl NostrRelayDO {
             return;
         }
 
-        // NIP-40: Reject events with an expired `expiration` tag
-        if let Some(exp) = filter::tag_value(&event, "expiration") {
-            if let Ok(exp_ts) = exp.parse::<u64>() {
-                if exp_ts < auth::js_now_secs() {
-                    Self::send_ok(ws, &event.id, false, "invalid: event expired");
-                    return;
-                }
-            }
+        // NIP-40: refuse an expired `expiration` tag, and a malformed one — the
+        // retention sweep would otherwise delete an accepted event silently.
+        if let Err(reason) = filter::expiration_admission(&event, auth::js_now_secs()) {
+            Self::send_ok(ws, &event.id, false, reason);
+            return;
         }
 
         // Verify event ID and Schnorr signature before any side effects

@@ -7,13 +7,24 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: the relay no longer accepts an event it will silently delete (NIP-40)
+
+Admission ignored an `expiration` tag that was not unix seconds, but the
+retention sweep selected `CAST(value AS INTEGER) < now`, which SQLite evaluates
+as 2026 for `"2026-10-06T00:00:00Z"`. So an RFC 3339 expiration was `OK true`
+and then deleted on the next cron tick — this is how the first ontology
+proposal (a429e066, from `vault propose`) disappeared. Admission now refuses a
+non-numeric `expiration` with `invalid: expiration must be unix seconds
+(NIP-40)` (`filter::expiration_admission`), and the sweep only considers
+all-digit values. The producer is fixed too (VisionClaw f1147d915).
+
 ### Fixed: ontology proposals reach the governance inbox
 
 The forum client parsed every 31402 as `{"fields": …}` and silently dropped
 anything else. The `ontology-governance` profile (ADR-2013) publishes a flat
 `PatchProposal` (`level`, `iri`, `page`, `hypothesis`, `diff`, `stale_after`)
-with no `fields` key, so every corpus proposal was admitted by the relay and
-never shown. `panel_registry::parse_action_request` now reads an object
+with no `fields` key, so a corpus proposal the relay kept would never have
+been shown (none was kept — see the NIP-40 fix below). `panel_registry::parse_action_request` now reads an object
 without `fields` as its own field set, with `hypothesis` as the reasoning; a
 card without a `title` tag is titled from its `title`/`page` field rather than
 its digest `d` tag. Client only.

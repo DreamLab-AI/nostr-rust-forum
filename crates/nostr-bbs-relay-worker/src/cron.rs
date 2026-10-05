@@ -416,6 +416,7 @@ pub async fn sweep_retention(env: &Env) -> Result<RetentionSweepResult, String> 
     // carry the tag — normally zero rows.
     let expiry_sql = "SELECT DISTINCT event_id AS id FROM event_tags \
          WHERE name = 'expiration' \
+           AND value <> '' AND value NOT GLOB '*[^0-9]*' \
            AND CAST(value AS INTEGER) < ?1 \
          LIMIT ?2";
 
