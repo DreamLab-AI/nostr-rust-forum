@@ -7,6 +7,15 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: the house seat survives a relay redeploy (`nostr-bbs-poker-citizen`, `nostr-bbs-forum-client`)
+
+The house seat and the coach probe a relay connection that has been silent for
+90 s with a REQ the relay must answer, and reconnect when it stays silent 20 s
+past the probe. Before this, a relay-worker redeploy left their sockets open
+and silent for hours, and the DREAM table showed "Reaching the house…" with an
+empty stakes list. The table now repeats its hello every 8 s until the house
+offers, and says the house is not answering rather than waiting silently.
+
 ### Fixed: topics open at the very bottom (`nostr-bbs-forum-client`)
 
 Opening a topic pins the page to the bottom edge of the reply composer (the
