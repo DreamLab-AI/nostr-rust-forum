@@ -811,6 +811,29 @@ pub fn App() -> impl IntoView {
         });
     }
 
+    // Zone-key sweep (ADR-2016 follow-on): once per page load, an admin's
+    // browser grants each zone key it holds to every eligible member it has
+    // no record of granting — members who joined by invite or auto-approve,
+    // or were allocated from a device without the key. Waits for the relay
+    // session, the admin flag and this device's stored keys.
+    if let Some(auto_grant) = crate::zone_crypto::auto_grant::AutoGrant::capture() {
+        let relay_authed = relay.authenticated();
+        let access = use_zone_access();
+        let keys_loaded = auto_grant.keys_loaded();
+        let swept = StoredValue::new(false);
+        Effect::new(move |_| {
+            if swept.get_value()
+                || !relay_authed.get()
+                || !access.is_admin.get()
+                || !keys_loaded.get()
+            {
+                return;
+            }
+            swept.set_value(true);
+            auto_grant.sweep();
+        });
+    }
+
     // Subscribe to governance events (kinds 31400-31405) and feed them into the
     // PanelRegistry store so the governance page renders live agent panels.
     {

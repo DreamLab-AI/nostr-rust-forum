@@ -10,6 +10,8 @@
 //! who joins after a rotation can read the zone's history.
 //! Both actions re-read the member roster from the relay first, so a tab left
 //! open across a cohort change never grants or rotates to a stale list.
+//! Grants also go out without this tab: on allocation and at an admin's
+//! sign-in ([`crate::zone_crypto::auto_grant`]).
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -23,10 +25,9 @@ use crate::components::copy_key::CopyKey;
 use crate::relay::RelayConnection;
 use crate::stores::zones::{load_zones, Zone};
 use crate::utils::shorten_pubkey;
+use crate::zone_crypto::auto_grant::{grant_count, send_grants};
 use crate::zone_crypto::store::{try_use_zone_key_store, ZoneKeyStore};
-use crate::zone_crypto::{
-    build_grant_wrap, generate_zone_key, grant_plan, grant_targets, ZoneKey, AGENT_COHORT,
-};
+use crate::zone_crypto::{generate_zone_key, grant_plan, grant_targets, ZoneKey, AGENT_COHORT};
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
@@ -223,45 +224,19 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             )));
             let relay = relay.clone();
             spawn_local(async move {
-                let total: usize = plan.iter().map(|(_, r)| r.len()).sum();
-                let mut failed = 0usize;
-                for (key, recipients) in plan {
-                    for pk in recipients {
-                        match build_grant_wrap(&*signer, &pk, &key, now_secs()).await {
-                            Ok(wrap) => {
-                                let key_for_ack = key.clone();
-                                let pk_for_ack = pk.clone();
-                                let on_ok = Rc::new(move |ok: bool, _msg: String| {
-                                    if ok {
-                                        let key = key_for_ack.clone();
-                                        let pk = pk_for_ack.clone();
-                                        spawn_local(async move {
-                                            keys.record_grants(
-                                                &key.zone,
-                                                key.epoch,
-                                                std::slice::from_ref(&pk),
-                                            )
-                                            .await;
-                                            // The tab may be closed by now.
-                                            let _ = sent.try_update(|s| {
-                                                s.insert(pk);
-                                            });
-                                        });
-                                    }
-                                });
-                                if relay.publish_with_ack(&wrap, Some(on_ok)).is_err() {
-                                    failed += 1;
-                                }
-                            }
-                            Err(_) => failed += 1,
-                        }
-                    }
-                }
+                let total = grant_count(&plan);
+                // The tab may be closed by the time the relay acks.
+                let on_recorded = Rc::new(move |_: &ZoneKey, pk: &str| {
+                    let _ = sent.try_update(|s| {
+                        s.insert(pk.to_string());
+                    });
+                });
+                let report = send_grants(keys, &relay, &*signer, plan, on_recorded).await;
                 let _ = busy.try_set(false);
-                let _ = status.try_set(Some(if failed == 0 {
+                let _ = status.try_set(Some(if report.failed == 0 {
                     format!("Sent {total} grant(s). Members receive the key next time they open the forum.")
                 } else {
-                    format!("Sent {} grant(s); {failed} could not be built or sent — try again.", total - failed)
+                    format!("Sent {} grant(s); {} could not be built or sent — try again.", report.sent, report.failed)
                 }));
             });
         }

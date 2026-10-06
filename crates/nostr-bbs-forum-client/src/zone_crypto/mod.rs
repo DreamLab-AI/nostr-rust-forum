@@ -72,6 +72,7 @@
 //! — a per-zone operator trade-off, since an agent holding the key means the
 //! zone's plaintext reaches the agent stack and whatever model it calls.
 
+pub mod auto_grant;
 pub mod grant_ledger;
 pub mod read_cache;
 pub mod store;

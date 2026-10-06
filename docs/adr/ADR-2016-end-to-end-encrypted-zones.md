@@ -124,7 +124,15 @@ leaves room to migrate.
   longer work for encrypted zones.
 - An admin must create the first key and grant it; a member without a grant
   can read nothing new and cannot post. Grants are per member key, so a new
-  member needs a grant on approval.
+  member needs a grant on approval. Since the auto-grant follow-on
+  (`zone_crypto/auto_grant.rs`) that grant is sent without the Encryption
+  tab, still from an admin's browser: on allocation (Members table cohort
+  edit, section-request approval, registration approval) to that member, and
+  once per page load at an admin's sign-in to every eligible member the
+  device's ledger has no record of. An admin signed in through a NIP-07
+  extension is told how many grants are waiting rather than sent a sweep,
+  since an extension may prompt for each encryption and signature. No server
+  or agent holds a key to grant on anyone's behalf.
 - Which members hold a key is known only for grants sent from the granting
   admin's device.
 - Follow-on: sealed-original history migration (ADR-2017); encrypting reactions if

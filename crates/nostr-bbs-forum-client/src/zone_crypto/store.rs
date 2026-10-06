@@ -42,6 +42,9 @@ pub struct ZoneKeyStore {
     /// keep link previews off: a preview would send the URL to the preview
     /// worker, outside the zone.
     pub encrypted_ids: RwSignal<HashSet<String>>,
+    /// Set once the keys stored on this device have been loaded (or the
+    /// load has failed), so nothing judges "no key held" too early.
+    pub hydrated: RwSignal<bool>,
     /// Ciphertexts and sealed-original envelopes seen, so a key that arrives
     /// later can decrypt what is already on screen, swapping an envelope's
     /// placeholder for the original event in place (ADR-2017).
@@ -63,6 +66,7 @@ impl ZoneKeyStore {
             keys: RwSignal::new(HashMap::new()),
             revision: RwSignal::new(0),
             encrypted_ids: RwSignal::new(HashSet::new()),
+            hydrated: RwSignal::new(false),
             cache: StoredValue::new(ReadCache::default()),
             processed: StoredValue::new(HashSet::new()),
             admin_cache: StoredValue::new(HashMap::new()),
@@ -181,6 +185,11 @@ impl ZoneKeyStore {
 
     /// Load keys and the processed-wrap set from IndexedDB.
     pub async fn hydrate(&self) {
+        self.load_stored().await;
+        let _ = self.hydrated.try_set(true);
+    }
+
+    async fn load_stored(&self) {
         let Ok(db) = ForumDb::open().await else {
             return;
         };

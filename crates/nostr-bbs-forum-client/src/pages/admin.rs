@@ -632,13 +632,22 @@ fn UsersTab() -> impl IntoView {
     };
 
     let admin_for_update = admin.clone();
+    let auto_grant = crate::zone_crypto::auto_grant::AutoGrant::capture();
     let on_update_cohorts = move |pubkey: String, add: Vec<String>, remove: Vec<String>| {
         if let Some(signer) = auth.get_signer() {
             let admin_clone = admin_for_update.clone();
+            let auto_grant = auto_grant.clone();
             spawn_local(async move {
-                let _ = admin_clone
+                let ok = admin_clone
                     .update_cohorts_signer(&pubkey, &add, &remove, &*signer)
-                    .await;
+                    .await
+                    .is_ok();
+                // A cohort added may open an encrypted zone: send its key.
+                if ok && !add.is_empty() {
+                    if let Some(g) = auto_grant {
+                        g.after_allocation(&pubkey);
+                    }
+                }
             });
         }
     };

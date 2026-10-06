@@ -7,6 +7,17 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: zone keys granted without the Encryption tab (`nostr-bbs-forum-client`)
+
+Allocating a member a cohort that opens an encrypted zone now sends them
+its key straight away (the Members table, section-request approval and
+registration approval), and an admin's sign-in grants each held key to any
+eligible member this device has no record of granting — members who joined
+by invite or auto-approve included. Grants are still sealed in an admin's
+browser under the Encryption tab's rules (`agent_keys`, history for late
+joiners); an admin on a NIP-07 extension gets a count of waiting grants
+instead of a sweep. ADR-2016 updated.
+
 ### Fixed: the poker table after a reload, and back-to-back payments (`nostr-bbs-forum-client`)
 
 The relay replays the house's last minutes in no useful order, so after a

@@ -42,6 +42,7 @@ pub fn SectionRequests() -> impl IntoView {
     let auth = use_auth();
     let admin = use_admin();
     let toasts = use_toasts();
+    let auto_grant = StoredValue::new_local(crate::zone_crypto::auto_grant::AutoGrant::capture());
     let conn_state = relay.connection_state();
 
     let requests = RwSignal::new(Vec::<SectionRequest>::new());
@@ -204,7 +205,7 @@ pub fn SectionRequests() -> impl IntoView {
                                         <RequestRow
                                             req=req
                                             on_approve=move || {
-                                                approve_request(req_for_approve.clone(), requests_sig, auth_a, admin_a.clone(), toasts_a, relay_a.clone());
+                                                approve_request(req_for_approve.clone(), requests_sig, auth_a, admin_a.clone(), toasts_a, relay_a.clone(), auto_grant.with_value(Clone::clone));
                                             }
                                             on_deny=move || {
                                                 deny_request(req_for_deny.clone(), requests_sig, auth_d, toasts_d, relay_d.clone());
@@ -292,6 +293,7 @@ fn approve_request(
     admin: crate::admin::AdminStore,
     toasts: crate::components::toast::ToastStore,
     relay: RelayConnection,
+    auto_grant: Option<crate::zone_crypto::auto_grant::AutoGrant>,
 ) {
     let signer = match auth.get_signer() {
         Some(s) => s,
@@ -321,6 +323,10 @@ fn approve_request(
                     format!("Approved: {} added to {}", pk_display, cohort),
                     ToastVariant::Success,
                 );
+                // The approved cohort may open an encrypted zone: send its key.
+                if let Some(g) = &auto_grant {
+                    g.after_allocation(&pk);
+                }
 
                 // Publish kind-9000 (add user to group) as confirmation
                 if let Some(my_pk) = auth.pubkey().get_untracked() {

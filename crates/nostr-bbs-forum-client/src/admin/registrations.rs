@@ -103,6 +103,7 @@ pub fn RegistrationsPanel() -> impl IntoView {
     // `add_to_whitelist_signer` refetches the whitelist on success, which
     // recomputes the pending count, so the row drops out automatically.
     //
+    let auto_grant = crate::zone_crypto::auto_grant::AutoGrant::capture();
     // Wrapped in `Rc` so it can be cloned cheaply into each table row and the
     // bulk handler — the reactive list closure re-runs, so it cannot move the
     // callback out (it must clone it), which `Rc<dyn Fn>` makes a `Fn` closure.
@@ -116,17 +117,24 @@ pub fn RegistrationsPanel() -> impl IntoView {
             let admin_clone = admin_for_approve.clone();
             let cohort = default_approval_cohort();
             let short = Abbrev::Prefix.apply(&pubkey);
+            let auto_grant = auto_grant.clone();
             spawn_local(async move {
                 match admin_clone
                     .add_to_whitelist_signer(&pubkey, &[cohort], &*signer)
                     .await
                 {
-                    Ok(_) => action_msg.set(Some((
-                        KeyedText::new()
-                            .text("Approved ")
-                            .key(pubkey.clone(), short),
-                        true,
-                    ))),
+                    Ok(_) => {
+                        action_msg.set(Some((
+                            KeyedText::new()
+                                .text("Approved ")
+                                .key(pubkey.clone(), short),
+                            true,
+                        )));
+                        // The default cohort may open an encrypted zone.
+                        if let Some(g) = &auto_grant {
+                            g.after_allocation(&pubkey);
+                        }
+                    }
                     Err(e) => action_msg.set(Some((format!("Approve failed: {e}").into(), false))),
                 }
                 selected.update(|s| s.retain(|p| p != &pubkey));
