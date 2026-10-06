@@ -8,6 +8,12 @@
 //! matching the wrap's `p` tag, so the house must be authenticated before
 //! its REQ. `OK` is `["OK", <id>, <bool>, <message>]`. Frames are paced
 //! under the relay's per-IP limit.
+//!
+//! A socket can outlive the relay behind it: after a worker redeploy the
+//! connection has been seen to stay open for hours with nothing on it, the
+//! house deaf to every member. So a quiet connection is probed with a REQ
+//! the relay must answer (an `EOSE`), and one that stays silent through the
+//! probe is treated as closed, which sends the runner round to reconnect.
 
 use std::time::Duration;
 
@@ -32,6 +38,30 @@ const AUTH_WAIT: Duration = Duration::from_secs(20);
 const FRAME_GAP: Duration = Duration::from_millis(60);
 /// The subscription id for the house's inbox.
 pub const SUB_ID: &str = "citizen-inbox";
+/// The subscription id of the liveness probe.
+const PROBE_ID: &str = "citizen-probe";
+/// Silence after which the relay is probed.
+const PROBE_AFTER: Duration = Duration::from_secs(90);
+/// How long a probe may go unanswered before the socket counts as dead.
+const PROBE_WAIT: Duration = Duration::from_secs(20);
+
+/// What a read with no frame by its deadline means.
+#[derive(Debug, PartialEq, Eq)]
+enum Silence {
+    /// Quiet, not yet probed: send the probe.
+    Probe,
+    /// The probe went unanswered: the relay is gone.
+    Dead,
+}
+
+/// When the next read gives up waiting, and what that silence will mean:
+/// [`PROBE_AFTER`] past the last frame, or [`PROBE_WAIT`] past a probe.
+fn read_deadline(last_rx: Instant, probe_sent: Option<Instant>) -> (Instant, Silence) {
+    match probe_sent {
+        Some(at) => (at + PROBE_WAIT, Silence::Dead),
+        None => (last_rx + PROBE_AFTER, Silence::Probe),
+    }
+}
 
 /// A frame from the relay the runner acts on.
 #[derive(Debug)]
@@ -67,6 +97,12 @@ pub struct Relay {
     ws: Ws,
     last_frame: Option<Instant>,
     authed: bool,
+    /// When the relay last sent anything (any frame proves it is there).
+    /// Kept on the connection, not in [`Relay::raw`], because the runners
+    /// read inside `select!` and drop the read whenever another arm wins.
+    last_rx: Instant,
+    /// When the outstanding probe was sent, if one is.
+    probe_sent: Option<Instant>,
 }
 
 impl Relay {
@@ -82,6 +118,8 @@ impl Relay {
             ws,
             last_frame: None,
             authed: false,
+            last_rx: Instant::now(),
+            probe_sent: None,
         };
         if let Ok(Some(challenge)) = timeout(CHALLENGE_WAIT, relay.await_challenge()).await {
             let id = relay.send_auth(&challenge).await?;
@@ -173,13 +211,47 @@ impl Relay {
         self.send(json!(["EVENT", event])).await
     }
 
+    /// Send the liveness probe: a REQ for an id no event has, which the
+    /// relay answers with an `EOSE` alone.
+    async fn probe(&mut self) -> Result<(), String> {
+        let filter = json!({ "ids": ["0".repeat(64)], "limit": 1 });
+        self.send(json!(["REQ", PROBE_ID, filter])).await
+    }
+
     async fn raw(&mut self) -> Option<Vec<Value>> {
         loop {
-            match self.ws.next().await {
+            let (deadline, silence) = read_deadline(self.last_rx, self.probe_sent);
+            let Ok(next) = tokio::time::timeout_at(deadline, self.ws.next()).await else {
+                match silence {
+                    Silence::Dead => {
+                        eprintln!("relay: silent through a probe; treating the socket as closed");
+                        return None;
+                    }
+                    Silence::Probe => {
+                        self.probe_sent = Some(Instant::now());
+                        if self.probe().await.is_err() {
+                            return None;
+                        }
+                        continue;
+                    }
+                }
+            };
+            if next.is_some() {
+                self.last_rx = Instant::now();
+                self.probe_sent = None;
+            }
+            match next {
                 None => return None,
                 Some(Err(_)) => return None,
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) {
+                        // The probe's answer: close it and read on.
+                        if arr.get(1).and_then(Value::as_str) == Some(PROBE_ID) {
+                            if arr.first().and_then(Value::as_str) == Some("EOSE") {
+                                let _ = self.send(json!(["CLOSE", PROBE_ID])).await;
+                            }
+                            continue;
+                        }
                         return Some(arr);
                     }
                 }
@@ -273,5 +345,31 @@ pub async fn publish_once(url: &str, event_json: &str, id: &str) -> bool {
                 return ok;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_quiet_socket_is_probed_after_the_idle_spell() {
+        let t = Instant::now();
+        assert_eq!(read_deadline(t, None), (t + PROBE_AFTER, Silence::Probe));
+    }
+
+    #[test]
+    fn an_unanswered_probe_means_the_relay_is_gone() {
+        let t = Instant::now();
+        let probed = t + PROBE_AFTER;
+        assert_eq!(
+            read_deadline(t, Some(probed)),
+            (probed + PROBE_WAIT, Silence::Dead)
+        );
+    }
+
+    #[test]
+    fn a_dead_socket_is_noticed_within_two_minutes() {
+        assert!(PROBE_AFTER + PROBE_WAIT <= Duration::from_secs(120));
     }
 }

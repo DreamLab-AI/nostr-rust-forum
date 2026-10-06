@@ -1554,6 +1554,9 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                                     <div class="rounded-xl bg-gray-900/60 p-4 ring-1 ring-gray-700/50 text-sm text-gray-400">
                                         {move || match live.offer.get() {
                                             Some(o) => format!("{} deals. Tables: {}.", o.name, o.tables.iter().map(|t| t.label.clone()).collect::<Vec<_>>().join(", ")),
+                                            None if live.house_quiet.get() => {
+                                                "The house is not answering yet. Still asking…".to_string()
+                                            }
                                             None => "Reaching the house…".to_string(),
                                         }}
                                     </div>

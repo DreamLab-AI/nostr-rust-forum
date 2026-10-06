@@ -36,6 +36,10 @@ use crate::wallet::{chain, WalletStore};
 const LOOKBACK_SECS: u64 = 2 * 24 * 60 * 60 + 3_600;
 /// Hands kept in the history card.
 const HISTORY_LEN: usize = 20;
+/// How long the table waits for the house's offer before saying hello again.
+/// A hello can land while the house is between connections; asking again is
+/// harmless (the house answers each with the same offer).
+const HELLO_RETRY_MS: i32 = 8_000;
 
 /// What the house offered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +184,8 @@ pub struct LiveStore {
     pub notice: RwSignal<Option<String>>,
     /// Waiting for the house to answer.
     pub busy: RwSignal<bool>,
+    /// A hello has gone unanswered; the table keeps asking.
+    pub house_quiet: RwSignal<bool>,
     /// Hands finished this session.
     pub history: RwSignal<Vec<HistoryRow>>,
     /// Net over the session.
@@ -247,6 +253,7 @@ impl LiveStore {
             error: RwSignal::new(None),
             notice: RwSignal::new(None),
             busy: RwSignal::new(false),
+            house_quiet: RwSignal::new(false),
             history: RwSignal::new(Vec::new()),
             session_net: RwSignal::new(0),
             hands_played: RwSignal::new(0),
@@ -299,6 +306,27 @@ impl LiveStore {
             .with_value(|r| r.subscribe(vec![filter], on_event, None));
         self.sub.set_value(Some(id));
         self.hello();
+        self.await_offer();
+    }
+
+    /// Say hello again every [`HELLO_RETRY_MS`] until the house offers,
+    /// marking the house quiet meanwhile. Stops when the table is left or
+    /// gone.
+    fn await_offer(&self) {
+        let store = *self;
+        crate::utils::set_timeout_once(
+            move || {
+                let unanswered = store.offer.try_with_untracked(Option::is_none);
+                let open = store.sub.try_with_value(Option::is_some);
+                if unanswered != Some(true) || open != Some(true) {
+                    return;
+                }
+                store.house_quiet.try_set(true);
+                store.hello();
+                store.await_offer();
+            },
+            HELLO_RETRY_MS,
+        );
     }
 
     /// Close the inbox and leave the table.
@@ -563,6 +591,7 @@ impl LiveStore {
                         self.stake_bb.set(t.bb);
                     }
                 }
+                self.house_quiet.set(false);
                 self.offer.set(Some(Offer {
                     citizen,
                     script,
