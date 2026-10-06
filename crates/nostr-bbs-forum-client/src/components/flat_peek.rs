@@ -384,6 +384,13 @@ impl FlatPeek {
         self.settle_later(el, gen);
     }
 
+    /// Whether any clone is on the layer, rising or shrinking.
+    fn any_lifted(&self) -> bool {
+        self.lifted
+            .try_with_value(|l| !l.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Once risen, drop `will-change`, so the browser repaints the enlarged
     /// cards at full resolution rather than scaling a bitmap.
     fn settle_later(&self, el: web_sys::HtmlElement, gen: u64) {
@@ -424,6 +431,8 @@ impl FlatPeek {
             Some(())
         });
         if !matches!(found, Some(Some(()))) {
+            // nothing of this group was up; release taps if nothing else is
+            self.remove_where(|_| false);
             return;
         }
         let this = *self;
@@ -604,7 +613,9 @@ pub fn provide_flat_peek(enabled: Signal<bool>, frame: Signal<Option<String>>) -
             if let Some(n) = now {
                 peek.raise(n, m.tilt_deg);
             }
-            if lifted_by_tap(&m) {
+            // only over a clone that actually rose: a raise that found no
+            // slot or layer must not leave an empty layer swallowing taps
+            if lifted_by_tap(&m) && peek.any_lifted() {
                 capture_taps(true);
             }
             peek.sync_listeners(now.is_some());
