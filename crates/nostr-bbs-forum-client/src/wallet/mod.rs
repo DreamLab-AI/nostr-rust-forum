@@ -502,6 +502,38 @@ impl WalletStore {
             .collect()
     }
 
+    /// The asset this member can spend now, and the asset coming back to
+    /// them as change from their transfers the chain has not shown yet.
+    /// The producer only takes inputs already in a block, so the change is
+    /// counted but never spent before it lands.
+    pub fn asset_now_and_incoming(&self, script: &bitcoin::Script) -> Option<(u64, u64)> {
+        let snap = self.snapshot_untracked()?;
+        let held = self.held();
+        let free = snap.balances(script, &held).asset;
+        let all = snap.balances(script, &[]).asset;
+        let sent = self.pending.get_untracked().iter().map(|p| p.asset).sum();
+        Some((free, incoming_units(all, free, sent)))
+    }
+
+    /// The transfer that already pays hand `root` from `script`: one waiting
+    /// in this browser's pending list, or one the chain shows.
+    pub fn paid_hand(&self, script: &bitcoin::Script, root: &str) -> Option<String> {
+        if let Some(p) = self
+            .pending
+            .get_untracked()
+            .iter()
+            .find(|p| p.hand_root.as_deref() == Some(root))
+        {
+            return Some(p.txid.clone());
+        }
+        let snap = self.snapshot_untracked()?;
+        let me = script.to_hex_string();
+        snap.txs
+            .iter()
+            .find(|t| t.hand_root.as_deref() == Some(root) && t.ins.iter().any(|l| l.script == me))
+            .map(|t| t.txid.clone())
+    }
+
     /// The asset tipped on a post on this chain, the mirror's count plus this
     /// browser's pending tips.
     pub fn tip_total(&self, event_id: &str) -> TipTotal {
@@ -889,8 +921,24 @@ pub fn explain(e: sidestr_wallet::Error, ticker: &str) -> String {
     }
 }
 
+/// The change a member's unmined transfers return to them: what the coins
+/// they spend carry (`all` less `free`) beyond what the transfers send.
+fn incoming_units(all: u64, free: u64, sent: u64) -> u64 {
+    all.saturating_sub(free).saturating_sub(sent)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn change_from_an_unmined_transfer_is_incoming() {
+        // one coin of 49_900 spent to pay 2: 49_898 comes back
+        assert_eq!(incoming_units(49_900, 0, 2), 49_898);
+        // nothing pending: nothing incoming
+        assert_eq!(incoming_units(500, 500, 0), 0);
+        // a stale pending entry never makes the count go negative
+        assert_eq!(incoming_units(10, 10, 5), 0);
+    }
+
     use super::*;
 
     #[test]

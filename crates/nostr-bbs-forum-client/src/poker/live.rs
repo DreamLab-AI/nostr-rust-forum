@@ -36,6 +36,12 @@ use crate::wallet::{chain, WalletStore};
 const LOOKBACK_SECS: u64 = 2 * 24 * 60 * 60 + 3_600;
 /// Hands kept in the history card.
 const HISTORY_LEN: usize = 20;
+/// How often a queued payment looks for the change it waits on. The wallet
+/// re-reads the chain every 20 s while a transfer is pending.
+const QUEUE_POLL_MS: i32 = 5_000;
+/// Looks before a queued payment gives up: ten minutes, well past a block
+/// (a minute) plus the mirror's sync (about two).
+const QUEUE_POLLS: u32 = 120;
 /// How long the table waits for the house's offer before saying hello again.
 /// A hello can land while the house is between connections; asking again is
 /// harmless (the house answers each with the same offer).
@@ -121,6 +127,14 @@ pub enum Pay {
         /// Why the last attempt failed, if it did.
         error: Option<String>,
     },
+    /// We owe, and the change from our last transfer covers it: it goes
+    /// out by itself once the chain shows that transfer.
+    Queued {
+        /// The winner's script, hex.
+        to_script: String,
+        /// Base units.
+        amount: u64,
+    },
     /// We paid.
     Sent(String),
     /// The opponent owes us; the chain has not shown it yet.
@@ -203,6 +217,41 @@ pub struct LiveStore {
     sub: StoredValue<Option<String>>,
     seen: StoredValue<HashSet<String>>,
     nonces: StoredValue<HashMap<String, String>>,
+    /// Hands whose end this table has read.
+    done: StoredValue<HashSet<String>>,
+    /// The hand state shown, by when the house sent it.
+    shown: StoredValue<Option<Shown>>,
+}
+
+/// The hand state on screen, for ordering what the relay replays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shown {
+    commit: String,
+    at: u64,
+    log_len: usize,
+}
+
+/// Whether a hand state the house sent at `at` should replace what is
+/// shown. The relay re-streams the last minutes of the inbox in no useful
+/// order (a gift wrap's own time is randomised), so an opening state can
+/// arrive after its hand ended, or after the next hand began.
+fn state_is_current(
+    done: &HashSet<String>,
+    shown: Option<&Shown>,
+    commit: &str,
+    at: u64,
+    log_len: usize,
+) -> bool {
+    if done.contains(commit) {
+        return false;
+    }
+    match shown {
+        None => true,
+        // within a hand the log only grows
+        Some(s) if s.commit == commit => log_len >= s.log_len,
+        // another hand: only a later one
+        Some(s) => at >= s.at,
+    }
 }
 
 /// What [`LiveStore::send`] carries into its task, read while the store is
@@ -267,6 +316,8 @@ impl LiveStore {
             sub: StoredValue::new(None),
             seen: StoredValue::new(HashSet::new()),
             nonces: StoredValue::new(HashMap::new()),
+            done: StoredValue::new(HashSet::new()),
+            shown: StoredValue::new(None),
         }
     }
 
@@ -494,6 +545,39 @@ impl LiveStore {
         else {
             return;
         };
+        let mine = self
+            .me
+            .try_get_value()
+            .as_deref()
+            .and_then(chain::script_of);
+        if let (Some(w), Some(mine)) = (wallet.as_ref(), mine.as_ref()) {
+            // never pay a hand twice: the relay replays a hand's end after a
+            // reload, and this browser may already have paid it
+            if let Some(txid) = w.paid_hand(mine, root) {
+                self.set_pay(root, Pay::Sent(txid.clone()));
+                self.send(ToCitizen::Paid {
+                    root: root.to_string(),
+                    txid,
+                });
+                return;
+            }
+            // short only because our last transfer's change has not landed:
+            // wait for it rather than fail (the producer takes no input
+            // that is not yet in a block)
+            if let Some((free, incoming)) = w.asset_now_and_incoming(mine) {
+                if free < amount && free.saturating_add(incoming) >= amount {
+                    self.set_pay(
+                        root,
+                        Pay::Queued {
+                            to_script: to_script.to_string(),
+                            amount,
+                        },
+                    );
+                    self.pay_when_landed(root.to_string(), QUEUE_POLLS);
+                    return;
+                }
+            }
+        }
         let outcome = match (wallet, chain::script_of_hex(to_script)) {
             (Some(w), Some(to)) => w.send_asset_for_hand(&auth, to, amount, root).await,
             (None, _) => Err("The wallet is switched off.".into()),
@@ -515,6 +599,69 @@ impl LiveStore {
         if let Ok(txid) = outcome {
             self.send(ToCitizen::Paid { root, txid });
         }
+    }
+
+    /// Set the settlement of the last hand, if it is still hand `root`.
+    fn set_pay(&self, root: &str, pay: Pay) {
+        self.finished.try_update(|f| {
+            if let Some(f) = f.as_mut().filter(|f| f.root == root) {
+                f.pay = pay;
+            }
+        });
+    }
+
+    /// Look every [`QUEUE_POLL_MS`] for the change a queued payment waits
+    /// on, and pay once it is spendable. Gives up, back to "Pay now", when
+    /// the change stops being due (its transfer was dropped) or after
+    /// `polls` looks.
+    fn pay_when_landed(&self, root: String, polls: u32) {
+        let store = *self;
+        crate::utils::set_timeout_once(
+            move || {
+                let Some(Some(f)) = store.finished.try_get_untracked() else {
+                    return; // the table closed
+                };
+                let Pay::Queued { to_script, amount } = f.pay.clone() else {
+                    return;
+                };
+                if f.root != root {
+                    return;
+                }
+                let mine = store
+                    .me
+                    .try_get_value()
+                    .as_deref()
+                    .and_then(chain::script_of);
+                let funds = store
+                    .wallet
+                    .try_get_value()
+                    .flatten()
+                    .zip(mine)
+                    .and_then(|(w, m)| w.asset_now_and_incoming(&m));
+                match funds {
+                    Some((free, _)) if free >= amount => {
+                        wasm_bindgen_futures::spawn_local(async move {
+                            store.pay(&root, &to_script, amount).await;
+                        });
+                    }
+                    Some((free, incoming)) if free + incoming >= amount && polls > 1 => {
+                        store.pay_when_landed(root, polls - 1);
+                    }
+                    _ => store.set_pay(
+                        &root,
+                        Pay::Owed {
+                            to_script,
+                            amount,
+                            error: Some(
+                                "Your last payment has not reached the chain yet. Try again in a minute."
+                                    .into(),
+                            ),
+                        },
+                    ),
+                }
+            },
+            QUEUE_POLL_MS,
+        );
     }
 
     /// The chain shows the opponent's transfer for the last hand.
@@ -561,10 +708,10 @@ impl LiveStore {
                 return;
             }
         };
-        self.on_message(msg);
+        self.on_message(msg, unwrapped.rumor.created_at);
     }
 
-    fn on_message(&self, msg: ToHero) {
+    fn on_message(&self, msg: ToHero, at: u64) {
         match msg {
             ToHero::Offer {
                 v,
@@ -665,6 +812,18 @@ impl LiveStore {
                 view,
                 log,
             } => {
+                let current = self.done.with_value(|d| {
+                    self.shown
+                        .with_value(|s| state_is_current(d, s.as_ref(), &commit, at, log.len()))
+                });
+                if !current {
+                    return;
+                }
+                self.shown.set_value(Some(Shown {
+                    commit: commit.clone(),
+                    at,
+                    log_len: log.len(),
+                }));
                 self.waiting.set(None);
                 self.finished.set(None);
                 self.error.set(None);
@@ -693,6 +852,20 @@ impl LiveStore {
                 buyin,
                 settlement,
             } => {
+                if !self
+                    .done
+                    .try_update_value(|d| d.insert(commit.clone()))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                // a replayed end may be older than the hand now showing
+                if self
+                    .shown
+                    .with_value(|s| s.as_ref().is_some_and(|s| s.commit != commit && s.at > at))
+                {
+                    return;
+                }
                 self.finish(
                     commit, seat, opponent, house, view, log, secret, nonces, seed, record, root,
                     buyin, settlement,
@@ -872,6 +1045,37 @@ impl LiveStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shown(commit: &str, at: u64, log_len: usize) -> Shown {
+        Shown {
+            commit: commit.into(),
+            at,
+            log_len,
+        }
+    }
+
+    #[test]
+    fn a_replayed_opening_never_covers_a_later_state_of_its_hand() {
+        let done = HashSet::new();
+        let now = shown("a", 100, 5);
+        assert!(!state_is_current(&done, Some(&now), "a", 90, 2));
+        assert!(state_is_current(&done, Some(&now), "a", 110, 6));
+    }
+
+    #[test]
+    fn an_ended_hand_is_never_shown_again() {
+        let done: HashSet<String> = ["a".to_string()].into();
+        assert!(!state_is_current(&done, None, "a", 200, 9));
+    }
+
+    #[test]
+    fn an_older_hand_never_covers_a_newer_one() {
+        let done = HashSet::new();
+        let now = shown("b", 200, 1);
+        assert!(!state_is_current(&done, Some(&now), "a", 150, 7));
+        assert!(state_is_current(&done, Some(&now), "c", 210, 1));
+        assert!(state_is_current(&done, None, "a", 150, 7));
+    }
 
     #[test]
     fn the_outbox_reads_a_live_table() {

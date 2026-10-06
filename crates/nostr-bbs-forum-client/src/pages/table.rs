@@ -1182,9 +1182,9 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
         let (Some(w), Some(script)) = (wallet, my_script.as_ref()) else {
             return None;
         };
-        let snap = w.snapshot()?;
-        let held = w.held();
-        Some(snap.balances(script, &held).asset)
+        // read the snapshot for its tracking; the counts read it untracked
+        w.snapshot()?;
+        w.asset_now_and_incoming(script)
     });
     Effect::new(move |_| {
         let Some(w) = wallet else { return };
@@ -1270,7 +1270,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
             && !table_busy.get()
             && live.offer.get().is_some()
             && live.waiting.get().is_none()
-            && balance.get().is_some_and(|d| d >= chosen_buyin.get())
+            && balance.get().is_some_and(|(d, _)| d >= chosen_buyin.get())
     });
 
     let opponent_label = move |h: &crate::poker::live::LiveHand| -> (String, Option<String>) {
@@ -1390,6 +1390,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
             Pay::Sent(txid) => view! { <p class="text-xs text-gray-300">"You paid "<span class="font-mono">{f.net.unsigned_abs()}</span>" "{unit}" — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
             Pay::Received(txid) => view! { <p class="text-xs text-green-300">"Paid to you — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
             Pay::Awaiting { amount } => view! { <p class="text-xs text-amber-300">"You are owed "{*amount}" "{unit}"; waiting for the chain to show it."</p> }.into_any(),
+            Pay::Queued { amount, .. } => view! { <p class="text-xs text-amber-300">"You owe "{*amount}" "{unit}". Your last payment is still confirming; this one goes out by itself when it lands (about a minute)."</p> }.into_any(),
             Pay::Owed { amount, error, .. } => {
                 let amount = *amount;
                 view! {
@@ -1459,7 +1460,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                         <div class="flex gap-2">
                             <button
                                 class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-gray-900 disabled:opacity-50"
-                                prop:disabled=move || balance.get().is_none_or(|d| d < c.buyin)
+                                prop:disabled=move || balance.get().is_none_or(|(d, _)| d < c.buyin)
                                 on:click=move |_| live.accept(&accept)
                             >
                                 "Accept"
@@ -1487,7 +1488,10 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                     </p>
                 </div>
                 <div class="text-right text-sm text-gray-300">
-                    <p>{format!("Your {unit}: ")}<span class="font-mono text-amber-300">{move || balance.get().map(|d| d.to_string()).unwrap_or_else(|| "…".into())}</span></p>
+                    <p>{format!("Your {unit}: ")}<span class="font-mono text-amber-300">{move || balance.get().map(|(free, _)| free.to_string()).unwrap_or_else(|| "…".into())}</span>
+                        {move || balance.get().filter(|(_, incoming)| *incoming > 0).map(|(_, incoming)| view! {
+                            <span class="block text-xs text-gray-400">{format!("+{incoming} confirming")}</span>
+                        })}</p>
                     <A href=base_href("/wallet") attr:class="text-xs text-amber-400 hover:text-amber-300 underline">"Wallet"</A>
                 </div>
             </div>
@@ -1596,7 +1600,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                             {move || live.waiting.get().map(|w| view! {
                                 <p class="text-sm text-amber-300">"Waiting for "<Name pubkey=w.opponent.clone() />" to accept your challenge…"</p>
                             })}
-                            {move || (balance.get().is_some_and(|d| d < chosen_buyin.get())).then(|| view! {
+                            {move || (balance.get().is_some_and(|(d, _)| d < chosen_buyin.get())).then(|| view! {
                                 <p class="text-xs text-amber-300">"This table's buy-in is "{chosen_buyin.get()}" "{unit}"; ask the faucet from your wallet."</p>
                             })}
                         </Show>

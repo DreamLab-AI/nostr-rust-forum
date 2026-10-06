@@ -7,6 +7,23 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: the poker table after a reload, and back-to-back payments (`nostr-bbs-forum-client`)
+
+The relay replays the house's last minutes in no useful order, so after a
+reload an opening hand state could cover a hand that had ended, and the
+house answered "That is not a hand in play". A hand state now replaces the
+shown one only if it is later in the same hand, or from a later hand, and
+never once that hand has ended. A replayed hand end can no longer pay a hand
+twice: the wallet first looks for a transfer already paying `hand:<root>`,
+pending in this browser or on the chain.
+
+Paying a hand while the last payment's change is unmined used to fail with
+"you hold 0". The table now shows that change as "+N confirming" and queues
+the payment, sending it by itself once the change lands. The producer
+accepts no input that is not yet in a block, so nothing is ever spent from
+an unconfirmed transfer and the house still credits only what the chain
+shows.
+
 ### Fixed: the house seat survives a relay redeploy (`nostr-bbs-poker-citizen`, `nostr-bbs-forum-client`)
 
 The house seat and the coach probe a relay connection that has been silent for
