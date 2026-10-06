@@ -131,6 +131,12 @@ impl PeekModel {
     }
 }
 
+/// Whether the group up now was lifted by a tap (not a mouse or a key): only
+/// then does the clone layer take the next tap (`capture_taps`).
+pub fn lifted_by_tap(model: &PeekModel) -> bool {
+    matches!(model.active, Some((_, PeekSource::Tap)))
+}
+
 /// Where the enlarged group goes: the translation (px) that centres a group
 /// at `rect` (left, top, width, height) in a `vw` × `vh` viewport, and the
 /// scale that makes it fill [`FILL`] of the shorter side (no wider than
@@ -425,9 +431,10 @@ impl FlatPeek {
         crate::utils::set_timeout_once(move || this.remove_where(|c| c.gen == gen && c.down), wait);
     }
 
-    /// Remove the clones matching `pred` and show their slots again.
+    /// Remove the clones matching `pred` and show their slots again; once
+    /// none is left, taps go through to the page again.
     fn remove_where(&self, pred: impl Fn(&Lifted) -> bool) {
-        let _ = self.lifted.try_update_value(|l| {
+        let emptied = self.lifted.try_update_value(|l| {
             l.retain(|c| {
                 if pred(c) {
                     c.el.remove();
@@ -436,8 +443,12 @@ impl FlatPeek {
                 } else {
                     true
                 }
-            })
+            });
+            l.is_empty()
         });
+        if emptied == Some(true) {
+            capture_taps(false);
+        }
     }
 
     /// While a group is up: a tap elsewhere drops it, and a scroll or a
@@ -500,6 +511,22 @@ fn existing_layer() -> Option<web_sys::Element> {
         .query_selector(".peek2d-layer")
         .ok()
         .flatten()
+}
+
+/// Whether the clone layer takes taps itself. A group lifted by a tap covers
+/// most of a phone's screen, the action buttons included; the tap that puts
+/// it down must land on the layer, not on whatever lies under the cards. It
+/// stays on until the last clone has shrunk away, so the click that follows
+/// the tap never reaches the page either.
+fn capture_taps(on: bool) {
+    let Some(layer) = existing_layer() else {
+        return;
+    };
+    let _ = if on {
+        layer.set_attribute("data-peek-capture", "")
+    } else {
+        layer.remove_attribute("data-peek-capture")
+    };
 }
 
 fn layer() -> Option<web_sys::Element> {
@@ -576,6 +603,9 @@ pub fn provide_flat_peek(enabled: Signal<bool>, frame: Signal<Option<String>>) -
             }
             if let Some(n) = now {
                 peek.raise(n, m.tilt_deg);
+            }
+            if lifted_by_tap(&m) {
+                capture_taps(true);
             }
             peek.sync_listeners(now.is_some());
         }
@@ -711,6 +741,20 @@ mod tests {
 
     const HOLE: PeekGroup = PeekGroup::Hole;
     const BOARD: PeekGroup = PeekGroup::Board;
+
+    #[test]
+    fn only_a_tap_lift_captures_the_next_tap() {
+        let m = PeekModel::default();
+        assert!(!lifted_by_tap(&m));
+        let tapped = m.next(PeekInput::Toggle(HOLE, PeekSource::Tap), 0.3);
+        assert!(lifted_by_tap(&tapped));
+        assert!(!lifted_by_tap(&m.next(PeekInput::Enter(BOARD), 0.3)));
+        assert!(!lifted_by_tap(
+            &m.next(PeekInput::Toggle(BOARD, PeekSource::Key), 0.3)
+        ));
+        // the tap that lands on the layer puts the group down
+        assert!(!lifted_by_tap(&tapped.next(PeekInput::TapAway, 0.3)));
+    }
 
     #[test]
     fn hover_lifts_and_leaving_drops() {

@@ -386,25 +386,29 @@ fn action_bar(
         }
         .into_any();
     };
+    // Each choice keeps its own column, so a button never moves under the
+    // reader's thumb between streets: a wrapping row used to push "RAISE TO n"
+    // onto a second, full-width line on a phone whenever its label outgrew
+    // the first, and back again when it did not.
     let button = move |choice: Choice, key: &'static str, style: &'static str| {
         poker::choice_label(&l, choice).map(|label| {
             view! {
                 <button
-                    class=format!("flex-1 min-w-[6rem] px-4 py-3 rounded-lg font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-wait {style}")
+                    class=format!("min-h-[44px] px-2 sm:px-4 py-3 rounded-lg font-semibold text-sm leading-tight touch-manipulation transition-colors disabled:opacity-50 disabled:cursor-wait {style}")
                     prop:disabled=busy
                     on:click=move |_| on_act(choice)
                 >
                     {label}
-                    <span class="ml-2 text-[10px] opacity-60 font-mono">{key}</span>
+                    <span class="kbd-hint ml-2 text-[10px] opacity-60 font-mono">{key}</span>
                 </button>
             }
         })
     };
     view! {
-        <div class="flex flex-wrap gap-2">
-            {button(Choice::Fold, "1", "bg-gray-700 hover:bg-gray-600 text-gray-100")}
-            {button(Choice::Passive, "2", "bg-gray-600 hover:bg-gray-500 text-white")}
-            {button(Choice::Aggressive, "3", "bg-amber-500 hover:bg-amber-400 text-gray-900")}
+        <div class="grid grid-cols-3 gap-2">
+            {button(Choice::Fold, "1", "col-start-1 bg-gray-700 hover:bg-gray-600 text-gray-100")}
+            {button(Choice::Passive, "2", "col-start-2 bg-gray-600 hover:bg-gray-500 text-white")}
+            {button(Choice::Aggressive, "3", "col-start-3 bg-amber-500 hover:bg-amber-400 text-gray-900")}
         </div>
     }
     .into_any()
@@ -1067,12 +1071,12 @@ fn PracticeTable() -> impl IntoView {
 
                         <Show when=move || !in_play.get()>
                             <button
-                                class="w-full px-4 py-3 rounded-lg font-semibold text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 transition-colors disabled:opacity-50 disabled:cursor-wait"
+                                class="w-full min-h-[44px] px-4 py-3 rounded-lg font-semibold text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 touch-manipulation transition-colors disabled:opacity-50 disabled:cursor-wait"
                                 prop:disabled=move || table_busy.get()
                                 on:click=move |_| deal()
                             >
                                 {move || if hand.with(Option::is_some) { "Next hand" } else { "Deal" }}
-                                <span class="ml-2 text-[10px] opacity-60 font-mono">"Enter"</span>
+                                <span class="kbd-hint ml-2 text-[10px] opacity-60 font-mono">"Enter"</span>
                             </button>
                         </Show>
 
@@ -1080,7 +1084,7 @@ fn PracticeTable() -> impl IntoView {
                             <p class="text-sm text-red-400" role="alert">{e}</p>
                         })}
 
-                        <p class="text-xs text-gray-500">
+                        <p class="kbd-hint text-xs text-gray-500">
                             "Keys: 1 / F fold · 2 / C check or call · 3 / R bet or raise · Enter next hand"
                         </p>
                     </div>
@@ -1578,12 +1582,12 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                                     </select>
                                 </label>
                                 <button
-                                    class="flex-1 min-w-[10rem] px-4 py-3 rounded-lg font-semibold text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 transition-colors disabled:opacity-50"
+                                    class="flex-1 min-w-[10rem] min-h-[44px] px-4 py-3 rounded-lg font-semibold text-sm bg-amber-500 hover:bg-amber-400 text-gray-900 touch-manipulation transition-colors disabled:opacity-50"
                                     prop:disabled=move || !can_sit.get()
                                     on:click=move |_| live.sit()
                                 >
                                     {move || if live.busy.get() { "Dealing…" } else if live.finished.get().is_some() { "Next hand against the house" } else { "Sit against the house" }}
-                                    <span class="ml-2 text-[10px] opacity-60 font-mono">"Enter"</span>
+                                    <span class="kbd-hint ml-2 text-[10px] opacity-60 font-mono">"Enter"</span>
                                 </button>
                             </div>
                             {move || live.waiting.get().map(|w| view! {
@@ -1595,14 +1599,14 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
                         </Show>
                         <Show when=move || in_play.get()>
                             <button
-                                class="text-xs text-gray-500 hover:text-red-300 underline"
+                                class="min-h-[44px] px-1 py-3 text-xs text-gray-500 hover:text-red-300 underline touch-manipulation"
                                 on:click=move |_| live.leave_hand()
                             >
                                 "Fold and leave the hand"
                             </button>
                         </Show>
 
-                        <p class="text-xs text-gray-500">
+                        <p class="kbd-hint text-xs text-gray-500">
                             "Keys: 1 / F fold · 2 / C check or call · 3 / R bet or raise · Enter sit"
                         </p>
                     </div>

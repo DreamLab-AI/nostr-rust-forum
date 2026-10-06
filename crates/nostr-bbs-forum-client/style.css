@@ -1333,6 +1333,8 @@ select:focus {
 .peek2d-slot {
     border-radius: 0.5rem;
     outline: none;
+    /* tapping to lift and again to drop must not read as a double-tap zoom */
+    touch-action: manipulation;
 }
 
 .peek2d-slot[role="button"] { cursor: zoom-in; }
@@ -1347,6 +1349,14 @@ select:focus {
     inset: 0;
     z-index: 8000;
     pointer-events: none;
+}
+
+/* lifted by a tap: the enlarged cards cover the action buttons, so the tap
+   that puts them down lands on the layer, never on a button underneath it
+   (components/flat_peek.rs, `FlatPeek::capture_taps`) */
+.peek2d-layer[data-peek-capture] {
+    pointer-events: auto;
+    touch-action: none;
 }
 
 .peek2d-clone {
@@ -1376,3 +1386,13 @@ select:focus {
     animation: none;
 }
 .peek2d-clone.peek2d-fade.peek2d-up { opacity: 1; }
+
+/* -- 34. Keyboard hints on touch screens ------------------------------------
+   The poker table labels its buttons with their shortcut keys (1, 2, 3,
+   Enter) and prints a key legend (src/pages/table.rs). A phone has no such
+   keys, and the hints only crowd the buttons, so a device whose only pointer
+   is coarse and cannot hover hides them.
+   --------------------------------------------------------------------------- */
+@media (hover: none) and (pointer: coarse) {
+    .kbd-hint { display: none; }
+}
