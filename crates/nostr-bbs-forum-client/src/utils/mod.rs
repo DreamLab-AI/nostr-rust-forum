@@ -142,8 +142,6 @@ pub enum Abbrev {
     /// `abcdefgh…wxyz` — 8 head, 4 tail, a single ellipsis (governance ids,
     /// admin alert labels).
     Id,
-    /// `abcdef…wxyz` — 6 head, 4 tail, a single ellipsis (board assignees).
-    Chip,
     /// `abcdefghijkl…uvwxyz` — 12 head, 6 tail, a single ellipsis (wallet).
     Wallet,
     /// `abcdefgh…` — first 8 then an ellipsis (registration action messages).
@@ -160,7 +158,6 @@ impl Abbrev {
             Abbrev::Pubkey => (6, 4, "..."),
             Abbrev::Long => (8, 4, "..."),
             Abbrev::Id => (8, 4, "\u{2026}"),
-            Abbrev::Chip => (6, 4, "\u{2026}"),
             Abbrev::Wallet => (12, 6, "\u{2026}"),
             Abbrev::Prefix => (8, 0, "\u{2026}"),
             Abbrev::Name => (8, 0, ""),
@@ -315,11 +312,10 @@ mod abbrev_tests {
     const HEX: &str = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c";
     const NPUB: &str = "npub1z8kkggja6h3vtcv0vxk58t2kjfedppee6w3qm5tzscvhkpecvc7qgjdy6l";
 
-    const ALL: [Abbrev; 7] = [
+    const ALL: [Abbrev; 6] = [
         Abbrev::Pubkey,
         Abbrev::Long,
         Abbrev::Id,
-        Abbrev::Chip,
         Abbrev::Wallet,
         Abbrev::Prefix,
         Abbrev::Name,
@@ -330,7 +326,6 @@ mod abbrev_tests {
         assert_eq!(Abbrev::Pubkey.apply(HEX), "11ed64...663c");
         assert_eq!(Abbrev::Long.apply(HEX), "11ed6422...663c");
         assert_eq!(Abbrev::Id.apply(HEX), "11ed6422\u{2026}663c");
-        assert_eq!(Abbrev::Chip.apply(HEX), "11ed64\u{2026}663c");
         assert_eq!(Abbrev::Wallet.apply(HEX), "11ed64225dd5\u{2026}38663c");
         assert_eq!(Abbrev::Prefix.apply(HEX), "11ed6422\u{2026}");
         assert_eq!(Abbrev::Name.apply(HEX), "11ed6422");

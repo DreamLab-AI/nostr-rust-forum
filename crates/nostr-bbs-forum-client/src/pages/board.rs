@@ -37,7 +37,7 @@ use nostr_bbs_core::{
 
 use crate::auth::use_auth;
 use crate::components::breadcrumb::{Breadcrumb, BreadcrumbItem};
-use crate::components::copy_key::CopyKey;
+use crate::components::member_picker::{member_key_hint_tracked, MemberName, MemberPicker};
 use crate::components::toast::{use_toasts, ToastStore, ToastVariant};
 use crate::relay::{ConnectionState, Filter, RelayConnection};
 use crate::stores::zone_access::use_zone_access;
@@ -725,6 +725,23 @@ pub fn BoardPage() -> impl IntoView {
 
 // -- Card ------------------------------------------------------------------------
 
+/// Collapsed-card assignee line: nicknames (abridged key while unresolved),
+/// each followed by its key hint in brackets when another member shares the
+/// nickname. Tracked, so names fill in as profiles arrive.
+fn assignee_summary(assignees: &[String]) -> String {
+    assignees
+        .iter()
+        .map(|pk| {
+            let name = crate::components::user_display::use_display_name_tracked(pk);
+            match member_key_hint_tracked(pk, assignees) {
+                Some(hint) => format!("{name} ({hint})"),
+                None => name,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[component]
 fn CardView(
     card: KanbanCard,
@@ -749,7 +766,6 @@ fn CardView(
     let edit_due = RwSignal::new(card.due.map(due_to_input_value).unwrap_or_default());
     // Two-step delete confirmation.
     let del_confirm = RwSignal::new(false);
-    let assignee_input = RwSignal::new(String::new());
 
     let title = card.title.clone();
     let description = card.description.clone();
@@ -1000,15 +1016,14 @@ fn CardView(
                                 </span>
                             }
                         })}
+                    // Plain text: this sits inside the expand button, so no
+                    // nested copy controls — the expanded row carries those.
                     {(!assignees.is_empty())
                         .then(|| {
+                            let assignees = assignees.clone();
                             view! {
-                                <span class="text-[11px] text-gray-400">
-                                    {format!(
-                                        "{} assignee{}",
-                                        assignees.len(),
-                                        if assignees.len() == 1 { "" } else { "s" },
-                                    )}
+                                <span class="text-[11px] text-gray-400 truncate">
+                                    {move || assignee_summary(&assignees)}
                                 </span>
                             }
                         })}
@@ -1020,7 +1035,8 @@ fn CardView(
                     {(!description.is_empty())
                         .then(|| render_description(&description))}
 
-                    // Assignees: chips with remove, plus an add-by-pubkey row.
+                    // Assignees: nickname chips with remove, plus a
+                    // type-to-search picker. The card still stores pubkeys.
                     <div class="flex items-center gap-1.5 flex-wrap">
                         <span class="text-[11px] text-gray-500">"Assignees:"</span>
                         {card
@@ -1028,14 +1044,15 @@ fn CardView(
                             .iter()
                             .map(|pk| {
                                 let pk_full = pk.clone();
-                                // Character-safe: an assignee is whatever was
-                                // typed into the add-by-pubkey row, and the old
-                                // byte slice panicked on anything short or
-                                // non-ASCII.
-                                let short = crate::utils::Abbrev::Chip.apply(pk);
+                                let peers: Vec<String> = card
+                                    .assignees
+                                    .iter()
+                                    .filter(|p| *p != pk)
+                                    .cloned()
+                                    .collect();
                                 view! {
                                     <span class="inline-flex items-center gap-1 text-[11px] text-gray-300 bg-gray-800 rounded-full px-2 py-0.5">
-                                        <CopyKey full=pk.clone() display=short />
+                                        <MemberName pubkey=pk.clone() peers=peers />
                                         <button
                                             class="text-gray-500 hover:text-red-400"
                                             title="Remove assignee"
@@ -1053,37 +1070,20 @@ fn CardView(
                                 }
                             })
                             .collect_view()}
-                        <input
-                            type="text"
-                            placeholder="Add pubkey (hex)"
-                            prop:value=move || assignee_input.get()
-                            on:input=move |ev| assignee_input.set(event_target_value(&ev))
-                            class="w-36 bg-gray-900 border border-gray-600 rounded px-2 py-0.5 text-[11px] text-white placeholder-gray-500 za-focus"
-                        />
-                        <button
-                            class="text-[11px] text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 rounded px-2 py-0.5"
-                            on:click=move |_| {
-                                let pk = assignee_input.get_untracked().trim().to_string();
-                                if pk.len() != 64 || hex::decode(&pk).is_err() {
-                                    toasts.show(
-                                        "Assignee must be a 64-hex pubkey",
-                                        ToastVariant::Error,
-                                    );
-                                    return;
-                                }
+                        <MemberPicker
+                            exclude=card.assignees.clone()
+                            placeholder="Assign by nickname\u{2026}"
+                            on_pick=Callback::new(move |pk: String| {
                                 let card = card_sv.get_value();
-                                if card.assignees.contains(&pk) {
+                                if card.assignees.iter().any(|a| a.eq_ignore_ascii_case(&pk)) {
                                     toasts.show("Already assigned", ToastVariant::Info);
                                     return;
                                 }
                                 let mut input = input_from(&card);
                                 input.assignees.push(pk);
                                 publish_card_sv.with_value(|p| p(input, "Assignee added"));
-                                assignee_input.set(String::new());
-                            }
-                        >
-                            "Add"
-                        </button>
+                            })
+                        />
                     </div>
 
                     // Pending decision row

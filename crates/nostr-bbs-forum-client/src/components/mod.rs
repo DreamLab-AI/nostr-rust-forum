@@ -32,6 +32,7 @@ pub mod toast;
 // -- Rich Messages (Stream 2) ------------------------------------------------
 pub mod link_preview;
 pub mod media_embed;
+pub mod member_picker;
 pub mod mention_autocomplete;
 pub mod mention_text;
 pub mod message_input;
