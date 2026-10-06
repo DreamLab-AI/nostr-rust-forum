@@ -7,6 +7,34 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: topics open at the very bottom (`nostr-bbs-forum-client`)
+
+Opening a topic pins the page to the bottom edge of the reply composer (the
+newest post when signed out) and keeps it there while replies stream in and
+images, embeds and link previews expand the posts above. The pin re-applies on
+every reply and every body resize until the topic has been quiet for 2.5 s
+(12 s ceiling), and any wheel, touch, key or pointer input ends it at once.
+`?focus=` deep links still centre and flash their post. The old landing
+listener was leaked and read a disposed `StoredValue`; it is now removed on
+cleanup.
+
+### Fixed: the poker table on phones (`nostr-bbs-forum-client`)
+
+The action bar is a fixed three-column grid with 44 px buttons, so a long
+"RAISE TO n" label no longer pushes a button onto its own row between streets.
+A tap-lifted card group's clone layer takes the next tap, so putting the cards
+down no longer folds, calls or raises through them; capture only turns on over
+a clone that actually rose and is released when the layer empties. Buttons and
+card groups set `touch-action: manipulation` (no iOS double-tap zoom), and the
+keyboard-shortcut hints are hidden on touch-only devices.
+
+### Changed: board assignees by nickname (`nostr-bbs-forum-client`)
+
+Kanban cards show assignees by nickname, and the picker searches members by
+name (the @mention search) instead of taking a hex key; a pasted hex key or
+`npub` still works, and cards still store the pubkey. When members share a
+nickname each gets a short key hint, grown until the keys differ.
+
 ## [1.0.0-beta.15] — 2026-10-05
 
 ### Changed: promote and demote carry the rationale rule (`nostr-bbs-core`)
