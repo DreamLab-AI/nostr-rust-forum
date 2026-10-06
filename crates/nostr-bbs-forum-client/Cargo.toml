@@ -96,6 +96,7 @@ web-sys = { workspace = true, features = [
     "IntersectionObserver",
     "IntersectionObserverEntry",
     "IntersectionObserverInit",
+    "ResizeObserver",
     "FileReader",
     "File",
     "FileList",

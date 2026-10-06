@@ -200,9 +200,60 @@ fn edit_chain_ids(original: &NostrEvent, events: &[NostrEvent]) -> Vec<String> {
     ids
 }
 
-/// How long after first paint the "land on newest" scroll keeps re-applying
-/// while replies stream in.
+/// The landing keeps re-pinning until the topic has stopped growing for this
+/// long: replies stream in, and images, embeds and link previews expand the
+/// posts above the bottom after first paint.
 const LANDING_SETTLE_MS: f64 = 2_500.0;
+
+/// Hard ceiling on the landing phase, however slowly media loads.
+const LANDING_MAX_MS: f64 = 12_000.0;
+
+/// Input this soon after landing starts is momentum carried over from the
+/// previous page, not the reader taking control.
+const LANDING_INPUT_GRACE_MS: f64 = 400.0;
+
+/// Progress of the "open at the bottom" landing for one mount of the page.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Landing {
+    /// When the first pin was scheduled (`0.0` = not started).
+    started_at: f64,
+    /// When the topic last grew (a reply arrived or the layout resized).
+    last_growth: f64,
+    /// The reader took over, or the topic settled: never move them again.
+    done: bool,
+    /// Post to pin, and whether it is a `?focus=` deep link.
+    target: Option<(String, bool)>,
+    /// The focus outline has been flashed once.
+    flashed: bool,
+}
+
+impl Landing {
+    /// Record growth at `now` and report whether the page should be
+    /// re-pinned. Starts the phase on first call; ends it once the topic has
+    /// been quiet for [`LANDING_SETTLE_MS`] or [`LANDING_MAX_MS`] has passed.
+    fn grow(&mut self, now: f64) -> bool {
+        if self.done || self.target.is_none() {
+            return false;
+        }
+        if self.started_at == 0.0 {
+            self.started_at = now;
+            self.last_growth = now;
+        }
+        if now - self.started_at > LANDING_MAX_MS || now - self.last_growth > LANDING_SETTLE_MS {
+            self.done = true;
+            return false;
+        }
+        self.last_growth = now;
+        true
+    }
+
+    /// The reader scrolled, tapped or pressed a key at `now`.
+    fn reader_input(&mut self, now: f64) {
+        if self.started_at > 0.0 && now - self.started_at > LANDING_INPUT_GRACE_MS {
+            self.done = true;
+        }
+    }
+}
 
 /// DOM id of a rendered post, for deep-link scrolling.
 fn post_anchor_id(event_id: &str) -> String {
@@ -228,6 +279,42 @@ fn landing_target(
         // effect re-runs as replies arrive and will pick the focus up.
     }
     reply_ids.last().map(|id| (id.clone(), false))
+}
+
+/// Scroll the landing into place. A focus target is centred (and outlined
+/// once when `flash`); otherwise the page goes to the very bottom: the reply
+/// composer's bottom edge when it is rendered, else the newest post's.
+fn pin_landing(target: &str, is_focus: bool, flash: bool) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let opts = web_sys::ScrollIntoViewOptions::new();
+    if is_focus {
+        let Some(el) = doc.get_element_by_id(&post_anchor_id(target)) else {
+            return;
+        };
+        opts.set_block(web_sys::ScrollLogicalPosition::Center);
+        el.scroll_into_view_with_scroll_into_view_options(&opts);
+        if flash {
+            let cl = el.class_list();
+            let _ = cl.add_2("ring-2", "ring-amber-400/70");
+            crate::utils::set_timeout_once(
+                move || {
+                    let _ = cl.remove_2("ring-2", "ring-amber-400/70");
+                },
+                2_500,
+            );
+        }
+        return;
+    }
+    let Some(el) = doc
+        .get_element_by_id("thread-reply-composer")
+        .or_else(|| doc.get_element_by_id(&post_anchor_id(target)))
+    else {
+        return;
+    };
+    opts.set_block(web_sys::ScrollLogicalPosition::End);
+    el.scroll_into_view_with_scroll_into_view_options(&opts);
 }
 
 /// Root e-tag value of a kind-42 (prefer the "root" marker, else first `e`).
@@ -548,77 +635,98 @@ pub fn ThreadPage() -> impl IntoView {
 
     // -- Landing position ---------------------------------------------------
     //
-    // Opening a topic lands on its newest post; a `?focus=<event id>` deep link
-    // (search results, notifications via `/go/:id`) lands on that post and
-    // flashes it. Replies stream in from the store after first paint, so the
-    // bottom landing re-applies as the list grows until the reader scrolls or
-    // a short settle window passes — then it never moves under them again.
+    // Opening a topic lands at the very bottom: the newest post with the reply
+    // composer under it, since scrolling up to read back is easier than
+    // hunting down. A `?focus=<event id>` deep link (search results,
+    // notifications via `/go/:id`) centres that post instead and flashes it.
+    // Replies stream in and media expands posts after first paint, so the pin
+    // re-applies on every reply and every layout resize until the topic stops
+    // growing or the reader scrolls, taps or types — then it never moves under
+    // them again.
     let query = use_query_map();
     let focus_param = move || query.read().get("focus");
-    let landing_done = StoredValue::new(false);
-    let landing_started_at = StoredValue::new(0.0f64);
+    let landing = StoredValue::new(Landing::default());
+
+    // Re-pin a moment after growth so the new layout has been painted.
+    let schedule_pin = move || {
+        crate::utils::set_timeout_once(
+            move || {
+                let Some(state) = landing.try_get_value() else {
+                    return;
+                };
+                if state.done {
+                    return;
+                }
+                let Some((target, is_focus)) = state.target else {
+                    return;
+                };
+                let flash = is_focus && !state.flashed;
+                if flash {
+                    landing.try_update_value(|l| l.flashed = true);
+                }
+                pin_landing(&target, is_focus, flash);
+            },
+            60,
+        );
+    };
+
     Effect::new(move |_| {
-        if landing_done.get_value() || loading.get() {
+        if loading.get() {
             return;
         }
         let Some(root) = topic_root.get() else { return };
         let reply_ids: Vec<String> = replies.get().iter().map(|r| r.id.clone()).collect();
         let focus = focus_param();
-        let Some((target, is_focus)) = landing_target(focus.as_deref(), &root.id, &reply_ids)
-        else {
-            return;
-        };
+        let target = landing_target(focus.as_deref(), &root.id, &reply_ids);
         let now = js_sys::Date::now();
-        if landing_started_at.get_value() == 0.0 {
-            landing_started_at.set_value(now);
-            // Any deliberate scroll by the reader ends the landing phase.
-            if let Some(w) = web_sys::window() {
-                let cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                    if js_sys::Date::now() - landing_started_at.get_value() > 400.0 {
-                        landing_done.set_value(true);
-                    }
-                });
-                let _ = w.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref());
-                let _ =
-                    w.add_event_listener_with_callback("touchmove", cb.as_ref().unchecked_ref());
-                cb.forget();
-            }
-        } else if now - landing_started_at.get_value() > LANDING_SETTLE_MS {
-            landing_done.set_value(true);
-            return;
-        }
-        if is_focus {
-            landing_done.set_value(true);
-        }
-        crate::utils::set_timeout_once(
-            move || {
-                let Some(el) = web_sys::window()
-                    .and_then(|w| w.document())
-                    .and_then(|d| d.get_element_by_id(&post_anchor_id(&target)))
-                else {
-                    return;
-                };
-                let opts = web_sys::ScrollIntoViewOptions::new();
-                opts.set_block(if is_focus {
-                    web_sys::ScrollLogicalPosition::Center
-                } else {
-                    web_sys::ScrollLogicalPosition::End
-                });
-                el.scroll_into_view_with_scroll_into_view_options(&opts);
-                if is_focus {
-                    let cl = el.class_list();
-                    let _ = cl.add_2("ring-2", "ring-amber-400/70");
-                    crate::utils::set_timeout_once(
-                        move || {
-                            let _ = cl.remove_2("ring-2", "ring-amber-400/70");
-                        },
-                        2_500,
-                    );
+        let repin = landing
+            .try_update_value(|l| {
+                if l.done {
+                    return false;
                 }
-            },
-            60,
-        );
+                l.target = target;
+                l.grow(now)
+            })
+            .unwrap_or(false);
+        if repin {
+            schedule_pin();
+        }
     });
+
+    // Layout growth (images, embeds, link previews, avatars) re-pins too.
+    if let Some(body) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.body())
+    {
+        let on_resize = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+            let now = js_sys::Date::now();
+            if landing.try_update_value(|l| l.grow(now)).unwrap_or(false) {
+                schedule_pin();
+            }
+        });
+        if let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) {
+            observer.observe(&body);
+            let guard = send_wrapper::SendWrapper::new((observer, on_resize));
+            on_cleanup(move || {
+                let (observer, on_resize) = guard.take();
+                observer.disconnect();
+                drop(on_resize);
+            });
+        }
+    }
+
+    // Any deliberate input by the reader ends the landing phase.
+    let end_landing = move || {
+        let now = js_sys::Date::now();
+        landing.try_update_value(|l| l.reader_input(now));
+    };
+    let input_listeners = [
+        window_event_listener(leptos::ev::wheel, move |_| end_landing()),
+        window_event_listener(leptos::ev::touchmove, move |_| end_landing()),
+        window_event_listener(leptos::ev::keydown, move |_| end_landing()),
+        window_event_listener(leptos::ev::pointerdown, move |_| end_landing()),
+    ];
+    on_cleanup(move || input_listeners.into_iter().for_each(|h| h.remove()));
 
     // Topic-not-found: store finished, channel resolved, but no matching root.
     let not_found = Memo::new(move |_| {
@@ -1622,6 +1730,66 @@ mod tests {
         );
         assert_eq!(landing_target(Some(" "), "root", &[]), None);
         assert_eq!(landing_target(None, "root", &[]), None);
+    }
+
+    fn landing_to(target: &str) -> Landing {
+        Landing {
+            target: Some((target.into(), false)),
+            ..Landing::default()
+        }
+    }
+
+    #[test]
+    fn landing_waits_for_a_target() {
+        let mut l = Landing::default();
+        assert!(!l.grow(1_000.0));
+        assert_eq!(l.started_at, 0.0);
+        assert!(!l.done);
+    }
+
+    #[test]
+    fn landing_repins_while_the_topic_keeps_growing() {
+        let mut l = landing_to("cc");
+        assert!(l.grow(1_000.0));
+        // Media keeps expanding posts every couple of seconds: each growth
+        // extends the window past the first settle period.
+        assert!(l.grow(3_000.0));
+        assert!(l.grow(5_000.0));
+        assert!(l.grow(7_000.0));
+        assert!(!l.done);
+    }
+
+    #[test]
+    fn landing_settles_after_a_quiet_spell() {
+        let mut l = landing_to("cc");
+        assert!(l.grow(1_000.0));
+        assert!(!l.grow(1_000.0 + LANDING_SETTLE_MS + 1.0));
+        assert!(l.done);
+        assert!(!l.grow(1_000.0 + LANDING_SETTLE_MS + 2.0));
+    }
+
+    #[test]
+    fn landing_has_a_hard_ceiling() {
+        let mut l = landing_to("cc");
+        let mut now = 1_000.0;
+        assert!(l.grow(now));
+        while now <= 1_000.0 + LANDING_MAX_MS {
+            now += 1_000.0;
+            l.grow(now);
+        }
+        assert!(l.done);
+    }
+
+    #[test]
+    fn reader_input_ends_landing_after_the_grace() {
+        let mut l = landing_to("cc");
+        l.reader_input(500.0); // before start: ignored
+        assert!(l.grow(1_000.0));
+        l.reader_input(1_000.0 + LANDING_INPUT_GRACE_MS - 1.0); // momentum
+        assert!(!l.done);
+        l.reader_input(1_000.0 + LANDING_INPUT_GRACE_MS + 1.0);
+        assert!(l.done);
+        assert!(!l.grow(1_100.0 + LANDING_INPUT_GRACE_MS));
     }
 
     #[test]
