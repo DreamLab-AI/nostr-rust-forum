@@ -48,7 +48,7 @@ pub const DREAM_ASSET_ID: &str = "608005d32a927de46e92f01b7948feac3469411cc0fbcf
 /// The ticker shown.
 pub const DREAM: &str = "DREAM";
 /// The default mirror: GitHub Pages, open CORS (SPEC 11).
-pub const DEFAULT_MIRROR: &str = "https://dreamlab-ai.github.io/sidestr-dreamlab";
+pub const DEFAULT_MIRROR: &str = "https://raw.githubusercontent.com/DreamLab-AI/sidestr-dreamlab/main";
 
 /// The sealed chain document of `sidestr:dreamlab-txbt4`, byte for byte as
 /// its producer serves it (`chain.json`).
@@ -61,7 +61,7 @@ pub const TXBT4_PARENT: &str = "txbt4";
 pub const TXBT4_GENESIS_HASH: &str =
     "1009aa2984d5c699fe61ef1e5905afe472a49d67551542045726828c8b82d108";
 /// Its default mirror: its own GitHub Pages repository.
-pub const TXBT4_DEFAULT_MIRROR: &str = "https://dreamlab-ai.github.io/sidestr-dreamlab-txbt4";
+pub const TXBT4_DEFAULT_MIRROR: &str = "https://raw.githubusercontent.com/DreamLab-AI/sidestr-dreamlab-txbt4/main";
 
 /// The relays the producers and the faucets follow (siding's five defaults).
 pub const DEFAULT_RELAYS: [&str; 5] = [
