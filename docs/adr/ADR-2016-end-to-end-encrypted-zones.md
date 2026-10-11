@@ -18,7 +18,7 @@ domain: BASELINE-architecture.md
 
 ## Context
 
-`nostr_bbs_config::Zone.encrypted` existed and operators set it (the DreamLab
+`nostr_bbs_config::Zone.encrypted` existed and operators set it (the dreamlab
 family zone), but nothing acted on it: channel messages were signed plaintext
 in D1, in backups, and to any Nostr client the relay would serve. Zone
 membership is access control only — it protects against other users while the

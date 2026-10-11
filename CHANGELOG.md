@@ -1017,7 +1017,7 @@ Governance-receipts and identity release; every kit crate moves to
 `1.0.0-beta.10`. The relay gains a durable receipt for every governance
 event it accepts, the client gains bootstrap, freshness and reconcile paths,
 and identity subkeys carry published test vectors. Registry crates
-superseded by this release are yanked once the DreamLab deployment pins it.
+superseded by this release are yanked once the dreamlab deployment pins it.
 
 ### Added
 
@@ -1036,7 +1036,7 @@ superseded by this release are yanked once the DreamLab deployment pins it.
 - **Trust sweep (relay-worker).** A periodic sweep retires stale trust rows
   (`486ec5a`).
 - **Indexed tag lookups (relay-worker).** A trigger-maintained `event_tags`
-  table replaces JSON scans, the D1 free-tier fix the DreamLab deployment has
+  table replaces JSON scans, the D1 free-tier fix the dreamlab deployment has
   pinned since 2026-08-25 (`a754468`).
 - **`bench_keys` benchmark** (`f18b471`).
 

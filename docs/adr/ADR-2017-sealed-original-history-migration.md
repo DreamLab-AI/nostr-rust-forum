@@ -207,7 +207,7 @@ Feature-specific coverage within that total:
 - agentbox `management-api/lib/zone-keys.js` (separate repo, `e0e331afd`): 39
   tests, each of the six checks shown to be load-bearing by disabling it.
 
-### First production run (DreamLab, 2026-09-27/28)
+### First production run (dreamlab, 2026-09-27/28)
 
 `activation_status: live` since the first `purge`. Run with the deployed kit at
 `2f437bc` against `wss://dreamlab-nostr-relay.solitary-paper-764d.workers.dev`,

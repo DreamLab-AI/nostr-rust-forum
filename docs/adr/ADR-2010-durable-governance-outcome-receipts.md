@@ -8,7 +8,7 @@ activation_status: staged
 supersedes: []
 superseded_by: []
 verified_commit: a5b809e
-owner: nostr-rust-forum maintainers (DreamLab AI)
+owner: nostr-rust-forum maintainers (dreamlab AI)
 review_trigger: adoption of the receipt contract or changes to projection, retention, authority consumers or signing UI
 repo: nostr-rust-forum
 domain: BASELINE-architecture.md

@@ -8,7 +8,7 @@ activation_status: live
 supersedes: []
 superseded_by: []
 verified_commit: 23be587
-owner: nostr-rust-forum maintainers (DreamLab AI)
+owner: nostr-rust-forum maintainers (dreamlab AI)
 review_trigger: next material change to crate topology, key model, or pod mesh
 repo: nostr-rust-forum
 ---

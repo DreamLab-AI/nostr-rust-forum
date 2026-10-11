@@ -1,6 +1,6 @@
 # PRD: Gap-Close Sprint — nostr-rust-forum slice
 
-**Owner:** nostr-rust-forum maintainers (DreamLab AI)
+**Owner:** nostr-rust-forum maintainers (dreamlab AI)
 **Status:** Proposed
 **Date:** 2026-07-08
 **Wave entry:** P0 (COM-13/F2 disclosure, REC-1 NIP-42), then P1 (F1, COM-16, COM-17, F8), P2 (F6, F9)
