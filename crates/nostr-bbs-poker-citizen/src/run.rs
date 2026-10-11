@@ -122,6 +122,8 @@ struct Runner {
     asset: Txid,
     ticker: String,
     facts: Option<Facts>,
+    /// The producer's `/tip` hash at the last full scan; an unchanged tip skips the re-download and replay.
+    scanned_tip: Option<String>,
     held: Vec<Held>,
     http: reqwest::Client,
     bot_turns: VecDeque<(Instant, String)>,
@@ -232,6 +234,7 @@ pub async fn main() -> Result<(), String> {
         asset: served.asset,
         ticker: served.ticker,
         facts: None,
+        scanned_tip: None,
         held: Vec::new(),
         http,
         bot_turns: VecDeque::new(),
@@ -292,7 +295,21 @@ impl Runner {
         true
     }
 
+    /// The producer's tip hash, or `None` when `/tip` cannot be read (then the chain is rescanned in full).
+    async fn producer_tip(&self) -> Option<String> {
+        let url = format!("{}/tip", self.cli.producer.trim_end_matches('/'));
+        let body = self.http.get(&url).send().await.ok()?.bytes().await.ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+        v.get("hash")?.as_str().map(str::to_owned)
+    }
+
     async fn refresh_chain(&mut self) {
+        // blocks.dat is append-only and a scan is a pure function of it, so while the tip is the one
+        // already scanned there is nothing new to learn: skip the full download and replay.
+        let tip = self.producer_tip().await;
+        if self.facts.is_some() && tip.is_some() && tip == self.scanned_tip {
+            return;
+        }
         let url = format!(
             "{}/blocks.dat?t={}",
             self.cli.producer.trim_end_matches('/'),
@@ -327,6 +344,7 @@ impl Runner {
                     !facts.txids.contains(&h.txid) && now.saturating_sub(h.at) < HELD_TTL
                 });
                 self.facts = Some(facts);
+                self.scanned_tip = tip;
             }
             Err(e) => eprintln!("chain: {e}"),
         }
