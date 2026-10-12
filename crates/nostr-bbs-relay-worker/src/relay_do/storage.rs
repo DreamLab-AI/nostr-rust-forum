@@ -153,6 +153,25 @@ impl NostrRelayDO {
             self.upsert_profile(event).await;
         }
 
+        // Persist the channel creator at creation. `is_channel_creator` reads
+        // this row, so a kind-5 deletion of the kind-40 event cannot strip the
+        // creator's kind-41 rights. First write wins; failures never block storage.
+        if stored && event.kind == 40 {
+            if let Ok(stmt) = db
+                .prepare(
+                    "INSERT INTO channel_creators (channel_id, pubkey, created_at) \
+                     VALUES (?1, ?2, ?3) ON CONFLICT (channel_id) DO NOTHING",
+                )
+                .bind(&[
+                    JsValue::from_str(&event.id),
+                    JsValue::from_str(&event.pubkey),
+                    JsValue::from_f64(event.created_at as f64),
+                ])
+            {
+                let _ = stmt.run().await;
+            }
+        }
+
         stored
     }
 

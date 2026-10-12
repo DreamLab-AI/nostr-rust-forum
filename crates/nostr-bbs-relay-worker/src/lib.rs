@@ -678,6 +678,30 @@ pub(crate) const PROBE_BLIND_STMTS: [&str; 4] = [
     "DELETE FROM event_tags WHERE name = 'probe'",
 ];
 
+/// The `events` table, as `relay_do/storage.rs` writes it. `d_tag` and
+/// `received_at` are inserted on every save, so a table without them fails every
+/// write. Held identical to `migrations/0009_events.sql` by a test.
+pub const EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS events (\
+    id TEXT PRIMARY KEY, \
+    pubkey TEXT NOT NULL, \
+    created_at INTEGER NOT NULL, \
+    kind INTEGER NOT NULL, \
+    tags TEXT NOT NULL, \
+    content TEXT NOT NULL, \
+    sig TEXT NOT NULL, \
+    d_tag TEXT NOT NULL DEFAULT '', \
+    received_at INTEGER NOT NULL DEFAULT 0\
+)";
+
+/// The creator of each kind-40 channel, persisted when the channel is saved so
+/// that a later kind-5 deletion of the kind-40 event cannot strip the creator's
+/// kind-41 rights. Held identical to `migrations/0009_events.sql` by a test.
+pub const CHANNEL_CREATORS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS channel_creators (\
+    channel_id TEXT PRIMARY KEY, \
+    pubkey TEXT NOT NULL, \
+    created_at INTEGER NOT NULL\
+)";
+
 /// Idempotent schema migrations.
 ///
 /// All statements use `IF NOT EXISTS` for tables or silently ignore errors
@@ -688,6 +712,24 @@ async fn ensure_schema(env: &Env) {
         Ok(db) => db,
         Err(_) => return,
     };
+
+    // --- Events table (migration 0009) ---
+    // Must precede every ALTER and index below that touches `events`: on a fresh
+    // D1 there is otherwise no table, and every save fails. A table created from
+    // the older SETUP.md lacks `d_tag` and `received_at`; the ALTERs below add
+    // them (errors on an existing column are ignored).
+    if let Err(e) = db.prepare(EVENTS_CREATE_SQL).run().await {
+        console_error!("ensure_schema: events create failed: {e}");
+    }
+    if let Err(e) = db.prepare(CHANNEL_CREATORS_CREATE_SQL).run().await {
+        console_error!("ensure_schema: channel_creators create failed: {e}");
+    }
+    for stmt in [
+        "ALTER TABLE events ADD COLUMN d_tag TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE events ADD COLUMN received_at INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let _ = db.prepare(stmt).run().await;
+    }
 
     // --- Whitelist table (ADR-2014 phase 1, migration 0008) ---
     // Must precede the ALTERs below: on a fresh D1 there is otherwise no table
@@ -960,6 +1002,9 @@ async fn ensure_schema(env: &Env) {
         // p-tag recipient filtering is applied via the tags LIKE pattern at query time;
         // this index narrows the scan to kind-1059 rows first.
         "CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)",
+        "CREATE INDEX IF NOT EXISTS idx_events_pubkey ON events(pubkey)",
+        "CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_events_replaceable ON events(kind, pubkey, d_tag)",
         // Sprint v10: profiles indexes for batch lookup and prefix typeahead.
         "CREATE INDEX IF NOT EXISTS idx_profiles_name ON profiles(name)",
         "CREATE INDEX IF NOT EXISTS idx_profiles_display_name ON profiles(display_name)",

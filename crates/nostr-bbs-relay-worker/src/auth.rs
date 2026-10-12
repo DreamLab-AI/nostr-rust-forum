@@ -158,12 +158,14 @@ struct IsAdminRow {
     is_admin: i32,
 }
 
-/// Query D1 to check whether a pubkey is an admin via the `members` and
-/// `whitelist` tables, consistent with the auth-worker's admin model.
+/// Query D1 to check whether a pubkey is an admin via the relay's `whitelist`
+/// table.
 ///
-/// P0-02 fix: previously only `whitelist` was checked, which meant a user
-/// added as admin via the `members` table would be rejected by the relay
-/// for admin-gated NIP-29 events.
+/// The auth-worker's `members` table lives in its own database and is not
+/// created by any relay migration, so the relay no longer queries it (it
+/// failed on every call and the error was swallowed). Admin parity with the
+/// auth-worker comes from the shared static `ADMIN_PUBKEYS` set below plus the
+/// `is_admin` flag on `whitelist`.
 ///
 /// Task #7 fix (admin-resolution): resolution order is now
 /// **`ADMIN_PUBKEYS` (static) ∪ D1**, matching the auth-worker
@@ -189,15 +191,6 @@ async fn query_is_admin(pubkey: &str, env: &Env) -> bool {
     }
 
     if let Ok(db) = env.d1("DB") {
-        let stmt = db.prepare("SELECT is_admin FROM members WHERE pubkey = ?1");
-        if let Ok(bound) = stmt.bind(&[JsValue::from_str(pubkey)]) {
-            if let Ok(Some(row)) = bound.first::<IsAdminRow>(None).await {
-                if row.is_admin == 1 {
-                    return true;
-                }
-            }
-        }
-
         let stmt = db.prepare("SELECT is_admin FROM whitelist WHERE pubkey = ?1");
         if let Ok(bound) = stmt.bind(&[JsValue::from_str(pubkey)]) {
             if let Ok(Some(row)) = bound.first::<IsAdminRow>(None).await {

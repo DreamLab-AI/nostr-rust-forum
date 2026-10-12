@@ -2198,7 +2198,12 @@ impl NostrRelayDO {
 // ---------------------------------------------------------------------------
 
 impl NostrRelayDO {
-    /// Check whether a pubkey is the creator of a channel (kind-40 event).
+    /// Check whether a pubkey is the creator of a channel.
+    ///
+    /// Reads the `channel_creators` row persisted when the kind-40 event was
+    /// saved, so deleting that event (kind-5) does not change the answer. A
+    /// channel created before the table existed has no row; it falls back to the
+    /// kind-40 event, which is the best evidence left.
     pub(crate) async fn is_channel_creator(&self, pubkey: &str, channel_id: &str) -> bool {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
@@ -2210,14 +2215,18 @@ impl NostrRelayDO {
             pubkey: String,
         }
 
-        let stmt = db.prepare("SELECT pubkey FROM events WHERE id = ?1 AND kind = 40 LIMIT 1");
-        match stmt.bind(&[JsValue::from_str(channel_id)]) {
-            Ok(s) => match s.first::<ChannelCreatorRow>(None).await {
-                Ok(Some(row)) => row.pubkey == pubkey,
-                _ => false,
-            },
-            Err(_) => false,
+        for sql in [
+            "SELECT pubkey FROM channel_creators WHERE channel_id = ?1 LIMIT 1",
+            "SELECT pubkey FROM events WHERE id = ?1 AND kind = 40 LIMIT 1",
+        ] {
+            let Ok(bound) = db.prepare(sql).bind(&[JsValue::from_str(channel_id)]) else {
+                continue;
+            };
+            if let Ok(Some(row)) = bound.first::<ChannelCreatorRow>(None).await {
+                return row.pubkey == pubkey;
+            }
         }
+        false
     }
 
     /// ADR-099: whether device-key honouring is enabled. Reads the

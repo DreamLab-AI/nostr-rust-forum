@@ -64,21 +64,18 @@ CREATE INDEX IF NOT EXISTS idx_challenges_created ON challenges(created_at);
 
 Initialize the relay database schema:
 
-```sql
--- Run via: wrangler d1 execute nostr-bbs-relay --command "..."
-CREATE TABLE IF NOT EXISTS events (
-    id TEXT PRIMARY KEY,
-    pubkey TEXT NOT NULL,
-    kind INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    tags TEXT NOT NULL,
-    sig TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_pubkey ON events(pubkey);
-CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
-CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+The relay database schema is checked in as a migration. The relay worker also
+creates these tables, and adds any missing column, at startup, so this step only
+matters if you want them before the first request:
+
+```bash
+wrangler d1 execute nostr-bbs-relay --file crates/nostr-bbs-relay-worker/migrations/0009_events.sql
 ```
+
+`events` needs the `d_tag` and `received_at` columns: the relay inserts both on
+every save. A table created from an older version of this guide has only the
+first seven columns; add the rest with the two `ALTER TABLE` statements in the
+migration's header.
 
 The membership table `whitelist` is checked in as a migration (ADR-2014
 phase 1). The relay worker also creates it, and adds any missing column, at
