@@ -26,7 +26,7 @@ solid-pod-rs-phase1 = [
 ]
 
 [dependencies]
-nostr-bbs-core = { workspace = true }
+nostr-bbs-core = { workspace = true, features = ["did"] }
 nostr-bbs-rate-limit = { workspace = true }
 # Server-side image→ASCII rendering of pod image resources (decode feature pulls
 # the `image` decoders). Applied as a presentation transform on resource GET,

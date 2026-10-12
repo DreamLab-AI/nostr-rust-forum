@@ -8,7 +8,9 @@
 //! - **NIP-98** HTTP auth token creation and verification
 //! - **Sealed originals** ([`sealed`]) — zone-encrypted envelopes carrying a
 //!   complete signed plaintext event, for migrating encrypted-zone history (ADR-2017)
-//! - **DID:nostr** document generation (delegates to `solid_pod_rs::did_nostr_types`)
+//! - **DID:nostr** document generation (feature `did`; delegates to
+//!   `solid_pod_rs::did_nostr_types`, which is AGPL-3.0-only, so the feature is
+//!   off by default and a build that enables it is AGPL as a whole)
 //! - **Key management** including HKDF derivation from WebAuthn PRF output
 //! - **Value types** (`EventId`, `Timestamp`, `Tag`, etc.)
 //!
@@ -46,6 +48,7 @@ pub mod admin_shared;
 pub mod boot_profile;
 pub mod cors;
 pub mod d1_helpers;
+#[cfg(feature = "did")]
 pub mod did;
 pub mod feature_gate;
 pub mod governance;
@@ -121,6 +124,7 @@ pub use moderation_events::{
     KIND_REPORT_NIP56, KIND_UNBAN, KIND_UNMUTE, KIND_WARNING, MOD_KINDS,
 };
 
+#[cfg(feature = "did")]
 pub use did::{
     did_nostr_uri, format_multibase_public_key, format_multibase_schnorr, format_multibase_sec1,
     is_valid_hex_pubkey, parse_multibase_schnorr, parse_multibase_sec1,

@@ -14,7 +14,7 @@ The kit ships **vanilla**. An operator stands up a community by copying
 and deployment values — no forking, no code changes.
 
 [![Release](https://img.shields.io/badge/release-v1.0.0--beta.6-blue)](CHANGELOG.md)
-[![License](https://img.shields.io/badge/license-AGPL--3.0--only-green)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--only-green)](LICENSE) [![core licence](https://img.shields.io/badge/nostr--bbs--core-MIT%20OR%20Apache--2.0-blue)](crates/nostr-bbs-core/README.md)
 [![Identity](https://img.shields.io/badge/identity-did%3Anostr%20Multikey-8b5cf6)](#identity--keys)
 [![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20WASM-orange)](#architecture)
 
