@@ -4,6 +4,30 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.16] - 2026-10-12 (licence: MIT OR Apache-2.0)
+
+### Changed
+
+- **Licence changed to `MIT OR Apache-2.0`** from this version onward. Every
+  line of this crate was written by DreamLab AI and its agents (94 commits,
+  no outside contributor; provenance checked 2026-10-12), so the change is
+  the rights holder's. Versions `<= 1.0.0-beta.15` remain `AGPL-3.0-only` as
+  published; nothing already released changes licence. The rest of the
+  `nostr-rust-forum` workspace (workers, clients, server) stays AGPL-3.0-only.
+- **`did` module is now behind an off-by-default `did` feature.** It wraps
+  `solid_pod_rs::did_nostr_types`, and `solid-pod-rs` is AGPL-3.0-only; a
+  build with `did` enabled is therefore AGPL as a combined work and must be
+  treated as such. Default features pull no copyleft dependency. In-workspace
+  dependants (`bbs-client`, `pod-worker`, `auth-worker`) enable the feature
+  explicitly and are unchanged in behaviour.
+
+### Why
+
+- Lets permissive consumers (the Ontomark toolchain's governance verbs,
+  Agentbox, the Obsidian plugin) depend on the Nostr primitives directly
+  without inheriting AGPL, while keeping the DID path and the forum itself
+  copyleft.
+
 ## [1.0.0-beta.4] - 2026-07-03 (closeout — did-doc canonicalisation gate)
 
 ### Changed
