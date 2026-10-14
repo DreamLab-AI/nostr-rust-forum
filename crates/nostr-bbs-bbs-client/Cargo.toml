@@ -28,7 +28,7 @@ nostr-bbs-config = { workspace = true }
 # agent-governance control-panel schema (PanelDefinition / ActionDef / FieldDef /
 # ActionRequest+Response). The BBS renders the SAME human-in-the-loop panels the
 # main client does, in ASCII — no reimplementation of the governance model.
-nostr-bbs-core = { workspace = true }
+nostr-bbs-core = { workspace = true, features = ["did"] }
 # Solid pod / WebID / did:nostr URL formatting (pure `core` feature, wasm-safe) —
 # powers the File Base (pod browser), User List (WebID profiles), and System Info
 # screens against the same infrastructure the forum client uses.

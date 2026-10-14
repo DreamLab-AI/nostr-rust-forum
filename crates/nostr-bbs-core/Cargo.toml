@@ -1,12 +1,13 @@
 [package]
 name = "nostr-bbs-core"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 edition = "2021"
 description = "nostr-bbs community forum — core types"
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
 homepage = "https://github.com/DreamLab-AI/nostr-rust-forum"
 documentation = "https://docs.rs/nostr-bbs-core"
+readme = "README.md"
 keywords = ["nostr", "bbs", "forum", "nip04", "nip44"]
 categories = ["cryptography", "web-programming"]
 rust-version = "1.85"
@@ -18,6 +19,13 @@ crate-type = ["lib", "cdylib"]
 # target first and dies on "Unrecognized option: warm-up-time" before any
 # benchmark executes, which silently empties the dream-cycle perf evaluator.
 bench = false
+
+[features]
+default = []
+# DID:nostr document rendering. Pulls `solid-pod-rs`, which is AGPL-3.0-only:
+# a build with this feature on is AGPL as a whole. Off by default so the
+# default crate is MIT OR Apache-2.0 end to end.
+did = ["dep:solid-pod-rs"]
 
 [dependencies]
 nostr = { workspace = true }
@@ -38,7 +46,7 @@ cbc = { workspace = true }
 bech32 = { workspace = true }
 async-trait = { workspace = true }
 # Canonical did:nostr types + payments (upstream).
-solid-pod-rs = { workspace = true }
+solid-pod-rs = { workspace = true, optional = true }
 
 wasm-bindgen = { workspace = true }
 
