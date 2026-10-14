@@ -2377,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-core"
-version = "1.0.0-beta.15"
+version = "1.0.0-beta.16"
 dependencies = [
  "aes",
  "async-trait",
@@ -4010,9 +4010,9 @@ dependencies = [
 
 [[package]]
 name = "solid-pod-rs"
-version = "0.5.0-alpha.12"
+version = "0.5.0-alpha.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f1d9628ede063b8b657df1d67e6805059ee9a2caceeb513a8a5de9b30a1b4cd"
+checksum = "42f9bf7552d00addc7085acb23d60811d9349aa17329af7414ada71abbd146da"
 dependencies = [
  "async-trait",
  "base64",
