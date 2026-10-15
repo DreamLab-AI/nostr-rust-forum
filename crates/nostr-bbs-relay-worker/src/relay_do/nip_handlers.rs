@@ -122,6 +122,24 @@ pub fn gift_wrap_recipient(event: &NostrEvent) -> Option<String> {
     }
 }
 
+/// Whether `event` may be shown to a session authenticated as `session_pubkey`.
+///
+/// Only kind-1059 gift wraps are restricted: a wrap is readable solely by its
+/// recipient (`p` tag). The REQ/COUNT filter gate keys on the filter's `kinds`,
+/// so a filter with no `kinds` (or an empty list) reaches wraps without ever
+/// being seen as a wrap read; this per-event check closes that on the shared
+/// read path, whatever the filter said. Every other kind passes unchanged
+/// (zone and cohort rules are applied separately by `authorize_event`).
+pub fn gift_wrap_readable_by(event: &NostrEvent, session_pubkey: Option<&str>) -> bool {
+    if event.kind != GIFT_WRAP_KIND {
+        return true;
+    }
+    match (gift_wrap_recipient(event), session_pubkey) {
+        (Some(recipient), Some(viewer)) => recipient.eq_ignore_ascii_case(viewer),
+        _ => false,
+    }
+}
+
 // ── ADR-2011: the effective escalation boundary ─────────────────────────────
 
 /// Who resolved a case — a human, or a system actor acting on its behalf.
@@ -1551,6 +1569,9 @@ impl NostrRelayDO {
         // batch a single `posts_read` increment at EOSE for the TL0→TL1 promotion.
         let mut delivered: i32 = 0;
         for event in &events {
+            if !gift_wrap_readable_by(event, session_pubkey.as_deref()) {
+                continue;
+            }
             match self.authorize_event(event, &ctx, &zones).await {
                 ReadDecision::Deliver => {
                     Self::send_event(&ws, sub_id, event);
@@ -2101,10 +2122,13 @@ impl NostrRelayDO {
 
         let events = self.query_events(&filters).await;
         let zones = ZoneConfig::load(&self.env);
-        let ctx = self.resolve_viewer_context(session_pubkey).await;
+        let ctx = self.resolve_viewer_context(session_pubkey.clone()).await;
 
         let mut count: u64 = 0;
         for event in &events {
+            if !gift_wrap_readable_by(event, session_pubkey.as_deref()) {
+                continue;
+            }
             match self.authorize_event(event, &ctx, &zones).await {
                 ReadDecision::Deliver | ReadDecision::DeliverAs(_) => count += 1,
                 ReadDecision::Withhold => {}
@@ -3306,6 +3330,54 @@ mod count_auth_tests {
 
     fn filter(json: serde_json::Value) -> NostrFilter {
         serde_json::from_value(json).expect("valid filter")
+    }
+
+    fn wrap(recipient: &str) -> NostrEvent {
+        serde_json::from_value(serde_json::json!({
+            "id": "0".repeat(64), "pubkey": "e".repeat(64), "created_at": 1, "kind": 1059,
+            "tags": [["p", recipient]], "content": "x", "sig": "0".repeat(128)
+        }))
+        .expect("valid event")
+    }
+
+    #[test]
+    fn wrap_is_readable_only_by_its_recipient() {
+        let ev = wrap(&"a".repeat(64));
+        assert!(gift_wrap_readable_by(&ev, Some(&"a".repeat(64))));
+        assert!(
+            gift_wrap_readable_by(&ev, Some(&"A".repeat(64))),
+            "case-insensitive"
+        );
+    }
+
+    #[test]
+    fn counter_example_other_viewers_and_anonymous_cannot_read_a_wrap() {
+        let ev = wrap(&"a".repeat(64));
+        assert!(!gift_wrap_readable_by(&ev, Some(&"b".repeat(64))));
+        assert!(!gift_wrap_readable_by(&ev, None));
+    }
+
+    #[test]
+    fn counter_example_wrap_without_a_recipient_is_unreadable() {
+        let mut ev = wrap(&"a".repeat(64));
+        ev.tags.clear();
+        assert!(!gift_wrap_readable_by(&ev, Some(&"a".repeat(64))));
+    }
+
+    #[test]
+    fn non_wrap_kinds_are_unaffected() {
+        let mut ev = wrap(&"a".repeat(64));
+        ev.kind = 1;
+        assert!(gift_wrap_readable_by(&ev, None));
+        assert!(gift_wrap_readable_by(&ev, Some(&"b".repeat(64))));
+    }
+
+    #[test]
+    fn a_kindless_filter_is_not_stopped_by_the_filter_gate_so_the_event_check_must_hold() {
+        // Documents the gap this check closes: the filter gate passes it through.
+        let filters = vec![filter(serde_json::json!({ "authors": ["e".repeat(64)] }))];
+        assert!(NostrRelayDO::gate_kind_1059_filters(filters, &None).is_some());
+        assert!(!gift_wrap_readable_by(&wrap(&"a".repeat(64)), None));
     }
 
     #[test]

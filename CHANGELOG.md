@@ -7,6 +7,13 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: kind-1059 gift wraps no longer readable through a `kinds`-less REQ or COUNT (`nostr-bbs-relay-worker`)
+
+The REQ/COUNT gate decided whether a filter read gift wraps from the filter's `kinds`. A filter with no
+`kinds` (for example `{"authors":[...]}`) passed it, and the historical query could return other people's
+wraps. Both read paths now drop any kind-1059 event whose `p` recipient is not the authenticated session
+(`gift_wrap_readable_by`), whatever the filter said.
+
 ### Added: `[[ingress]]` recipients declared in config (`nostr-bbs-config`, `nostr-bbs-relay-worker`)
 
 A pubkey listed under `[[ingress]]` in `forum.toml` is admitted as a gift-wrap (kind-1059) recipient
