@@ -4,7 +4,7 @@ title: Declare gift-wrap recipients in config so the relay admits them without a
 date: 2026-10-15
 decision_status: accepted
 implementation_status: complete
-activation_status: staged
+activation_status: live
 supersedes: []
 superseded_by: []
 verified_commit: 547135d
@@ -59,3 +59,5 @@ places, and a second recipient (for example a monitoring key that reads a copy) 
 trip, the fail-closed counter-examples (malformed, empty, stranger, junk principal), the disclosure
 merge (registry wins, unattributed entries omitted), and a structural test that the gate consults the
 list only inside the gift-wrap branch. Surviving a live `reset-db` is argued from those tests, not run.
+
+Live 2026-10-15: pinned by the DreamLab estate at `aee1997`; the relay reports `ingressRecipient: true` for all three declared keys.
