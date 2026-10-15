@@ -10,7 +10,7 @@
 #   doc       — cargo doc --no-deps (catch broken links)
 #   coverage  — measured workspace line/branch/function coverage (hard gate)
 #   deny      — cargo-deny licence/advisory/ban/source policy
-#   drift-gates — identity-vector parity (hard) + anti-drift lint (advisory, ER-5b)
+#   drift-gates — identity-vector parity (hard) + anti-drift lint (hard, ER-5b)
 #   ci-pass   — single required status check aggregator
 #
 # Separate audit.yml handles weekly RustSec advisory scans.
@@ -264,15 +264,13 @@ jobs:
   #       sub-key vectors. Node-only, no npm dependencies. agentbox is checked
   #       out read-only so the mirrored derivation is pinned to the real call
   #       sites; without it the script still runs the vectors and says so.
-  #   anti-drift-lint — ADR-077 P3 / ADR-085 lint. Rules 1-2 are clean today;
-  #       rule 3 (branded operator strings) currently reports the sidestr:dreamlab
-  #       chain ids and wallet copy. Until those are moved into the forum-config
-  #       overlay or the rule is scoped to exempt chain ids, the lint step is
-  #       advisory (continue-on-error) so it surfaces the findings without
-  #       turning main red. Remove continue-on-error once it exits 0.
+  #   anti-drift-lint — ADR-077 P3 / ADR-085 lint, a hard step. Rule 3 (branded
+  #       operator strings) exempts the kit's reference chain id
+  #       `sidestr:dreamlab` (+ `-txbt4`), its chain JSON and repo; any other
+  #       branded string in the kit crates fails the job.
   #
-  # Not in the ci-pass aggregator's needs: the parity step is the only hard
-  # failure here, and this job is deliberately cheap (no Rust toolchain).
+  # Not in the ci-pass aggregator's needs: this job is deliberately cheap (no
+  # Rust toolchain) and runs only when its scripts or fixtures change.
   # ---------------------------------------------------------------------------
   drift-gates:
     name: drift gates (lint + identity-vector parity)
@@ -294,8 +292,7 @@ jobs:
           AGENTBOX_ROOT: ${{ github.workspace }}/_agentbox
         run: node scripts/identity-vector-parity.mjs
 
-      - name: Anti-drift lint (advisory until rule 3 is clean)
-        continue-on-error: true
+      - name: Anti-drift lint
         run: bash scripts/anti-drift-lint.sh
 
   # ---------------------------------------------------------------------------

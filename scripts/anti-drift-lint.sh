@@ -141,7 +141,8 @@ fi
 
 # --- Rule 3: branded operator strings re-introduced into substrate --------
 # Operators must inject branding via forum-config/, not hardcode it back into
-# the substrate crates. The kit-repo URL in NIP-11 is allowlisted.
+# the substrate crates. The kit-repo URL in NIP-11 is allowlisted, and so is
+# the kit's reference chain id `sidestr:dreamlab` (see the awk filter below).
 BRANDED_RES=$(
   while IFS= read -r source; do
     # Rust unit-test modules are fixtures, not emitted substrate. Stop at the
@@ -149,7 +150,16 @@ BRANDED_RES=$(
     # production code above it. Other asset types are scanned in full.
     awk '
       /#\[cfg\(test\)\]/ { if (FILENAME ~ /\.rs$/) exit }
-      /DreamLab|dreamlab|minimoonoir/ {
+      {
+        # `sidestr:dreamlab` (+ `-txbt4`) is the kit'"'"'s reference chain: a kit
+        # identifier, its embedded chain JSON and its repo, not operator
+        # branding. Strip those tokens before testing, so a real brand string
+        # on the same line is still caught.
+        line = $0
+        gsub(/DreamLab-AI\/sidestr-dreamlab(-txbt4)?/, "", line)
+        gsub(/sidestr[:-]dreamlab(-txbt4)?/, "", line)
+      }
+      line ~ /DreamLab|dreamlab|minimoonoir/ {
         if ($0 !~ /^[[:space:]]*\/\// &&
             $0 !~ /github\.com\/DreamLab-AI\/nostr-rust-forum/ &&
             $0 !~ /w3id\.org\/dreamlab\/mesh/) {

@@ -313,7 +313,7 @@ pub(crate) fn TipControl(
             return view! {
                 {back}
                 <p class="text-xs text-gray-400">
-                    "Your key lives in your browser extension, which can't sign DreamLab transfers. Podkey can, and asks you to confirm each one; or unlock your wallet for this tab to tip."
+                    "Your key lives in your browser extension, which can't sign these transfers. Podkey can, and asks you to confirm each one; or unlock your wallet for this tab to tip."
                 </p>
                 <a href=base_href("/wallet") class="mt-2 inline-block text-xs text-amber-400 hover:text-amber-300">"Open wallet →"</a>
             }.into_any();

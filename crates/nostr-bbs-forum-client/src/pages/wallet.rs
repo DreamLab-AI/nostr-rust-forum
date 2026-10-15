@@ -375,7 +375,7 @@ fn ChainWallet(wallet: WalletStore, wallets: Wallets) -> impl IntoView {
                 <section class=card aria-labelledby="unlock-h">
                     <h2 id="unlock-h" class="text-sm font-semibold text-gray-100">"Unlock to send"</h2>
                     <p class="mt-1 text-sm text-gray-400">
-                        "You signed in with a browser extension, which can receive tokens but can't sign DreamLab transfers. Podkey can: it shows you each transfer and asks you to confirm, and your key never leaves it. Or paste your nsec to send from this tab. It stays in this tab's memory and is forgotten when you close it or sign out; it is never sent anywhere."
+                        "You signed in with a browser extension, which can receive tokens but can't sign these transfers. Podkey can: it shows you each transfer and asks you to confirm, and your key never leaves it. Or paste your nsec to send from this tab. It stays in this tab's memory and is forgotten when you close it or sign out; it is never sent anywhere."
                     </p>
                     <form class="mt-3 flex gap-2" on:submit=move |ev| {
                         ev.prevent_default();
