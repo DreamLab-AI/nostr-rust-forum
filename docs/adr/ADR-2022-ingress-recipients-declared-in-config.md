@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: ec8621a
+verified_commit: 547135d
 owner: jjohare
 review_trigger: the gift-wrap admission rule changes, or a client library for form ingress is added to the kit
 repo: nostr-rust-forum
