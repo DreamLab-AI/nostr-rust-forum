@@ -142,6 +142,28 @@ banner_image_url = "/images/heroes/business-hero.webp"
 encrypted        = false
 
 
+# ─── Ingress recipients ──────────────────────────────────────────────────────
+# OPTIONAL. Pubkeys the relay accepts end-to-end-encrypted form traffic for
+# (contact, signup, chat gift wraps) WITHOUT a whitelist row, so the forms keep
+# working after an operator reset of the relay database. Render the list into the
+# relay worker's INGRESS_RECIPIENTS binding with
+# `nostr_bbs_config::ingress::ingress_relay_var`.
+#
+# This only lets the relay ACCEPT wraps addressed to the key. It grants no cohort,
+# admin right or zone key; never give such a key the "agent" cohort.
+#
+#   role:           "primary" (your inbox) | "copy" (a second recipient, e.g. a
+#                   monitoring key) | "agent" (an assistant that replies).
+#   authorised_by:  pubkey of the person who authorised the key. When set, the
+#                   public agent disclosure names it; leave empty to keep the
+#                   entry out of the disclosure.
+#
+# [[ingress]]
+# label         = "site-inbox"
+# pubkey        = "0000000000000000000000000000000000000000000000000000000000000000"
+# role          = "primary"
+# authorised_by = "0000000000000000000000000000000000000000000000000000000000000000"
+
 # ─── Trust thresholds ────────────────────────────────────────────────────────
 # OPTIONAL. Reputation gates for moderated channels.
 [trust]

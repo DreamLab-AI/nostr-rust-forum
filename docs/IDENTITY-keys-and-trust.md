@@ -93,6 +93,12 @@ gift-wrap (kind 1059) recipient from the first `["p", <hex>]` tag — the recipi
 not the ephemeral author — and accepts only if that recipient is a whitelisted
 member (`crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs:103-110,510-516`).
 
+A recipient declared under `[[ingress]]` in `forum.toml` (ADR-2022) is admitted without a whitelist
+row: the deploy renders the list into the relay's `INGRESS_RECIPIENTS` binding and the gate checks it
+first, in the gift-wrap branch only (`crates/nostr-bbs-relay-worker/src/ingress.rs`,
+`crates/nostr-bbs-config/src/ingress.rs`). A missing or malformed binding fails closed to the
+whitelist rule above, and declaring a recipient grants it no cohort, admin right or zone key.
+
 ### Onboarding & recovery
 
 - **Recovery/device-onboarding sheet** (legacy ADR-095) — additive to the one-time
@@ -145,6 +151,9 @@ at EOSE to drive promotion; the cron sweep drives demotion.
    identically in both workers; any looser parse widens the auth surface.
 4. **Gift-wrap admission keys on the recipient `p` tag**, never the ephemeral
    author (`nip_handlers.rs:103-110`).
+   An `[[ingress]]` recipient widens only this branch; it is never consulted for
+   the author of a non-gift-wrap event, and the `agent` cohort is never how it is
+   named (ADR-2022).
 5. **TL3 is never auto-demoted**; demotion stays time-driven on the cron trigger,
    never inline on the hot admission path.
 6. **A derived subkey is root-recoverable** — this disclaimer must survive any

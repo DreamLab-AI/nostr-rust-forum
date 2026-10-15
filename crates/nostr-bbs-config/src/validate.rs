@@ -222,6 +222,9 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
     // poker: coherent tables and a well-formed citizen pubkey.
     cfg.poker.validate()?;
 
+    // ingress: well-formed, unique recipients for end-to-end-encrypted form traffic.
+    crate::ingress::validate_ingress(&cfg.ingress)?;
+
     // Zone ids must be unique. `ZoneConfig::get` resolves by FIRST match, so a
     // duplicate `[[zones]]` id with weaker required_cohorts/visibility could
     // silently shadow the intended access rule — an operator typo must fail
@@ -364,6 +367,7 @@ mod tests {
             calendar: Calendar::default(),
             poker: Poker::default(),
             encryption: Encryption::default(),
+            ingress: Vec::new(),
         }
     }
 
@@ -511,6 +515,21 @@ pod_base_url = "https://pods.example.com"
             Some("https://pods.example.com")
         );
         validate_config(&cfg).expect("federated config with valid pod_base_url must validate");
+    }
+
+    #[test]
+    fn ingress_is_validated_with_the_whole_config() {
+        let mut cfg = baseline_cfg();
+        assert!(validate_config(&cfg).is_ok(), "empty ingress is valid");
+        cfg.ingress.push(crate::ingress::IngressRecipient {
+            label: "inbox".into(),
+            pubkey: "not-hex".into(),
+            role: crate::ingress::IngressRole::Primary,
+            description: String::new(),
+            authorised_by: String::new(),
+        });
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.contains("ingress[0].pubkey"), "{err}");
     }
 
     #[test]

@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit:
+verified_commit: d673708
 owner: jjohare
 review_trigger: a chain with value behind the table; a second operator running a house seat; mental poker or a hitch channel replacing the house as dealer; any proposal to add a forum event kind for hands or settlements; the daily cap or buy-ins moving above what the treasury's plain sats can settle
 repo: nostr-rust-forum

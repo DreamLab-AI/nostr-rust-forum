@@ -855,7 +855,12 @@ impl NostrRelayDO {
         // messages addressed to existing members (no spam to non-members) while
         // permitting the ephemeral author.
         if event.kind == GIFT_WRAP_KIND {
+            // A recipient declared in config (`INGRESS_RECIPIENTS`) is admitted
+            // without a D1 row, so an operator reset cannot silence it. Every
+            // other recipient still has to be whitelisted.
+            let ingress = crate::ingress::ingress_from_env(&self.env);
             let recipient_ok = match gift_wrap_recipient(&event) {
+                Some(pk) if nostr_bbs_config::ingress::is_ingress_recipient(&ingress, &pk) => true,
                 Some(pk) => self.is_whitelisted(&pk).await,
                 None => false,
             };

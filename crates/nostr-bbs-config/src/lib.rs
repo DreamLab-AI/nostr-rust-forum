@@ -24,6 +24,7 @@
 //! # Modules
 //!
 //! - [`schema`] — strongly-typed TOML schema (one struct per `[section]`).
+//! - [`ingress`] — `[[ingress]]` recipients the relay admits encrypted form traffic for.
 //! - [`loader`] — `load_from_str` / `load_from_path` entry points.
 //! - [`validate`] — semantic checks beyond serde (e.g. URL formats, port ranges).
 //!
@@ -38,6 +39,7 @@
 
 #![warn(missing_docs)]
 
+pub mod ingress;
 pub mod loader;
 pub mod schema;
 pub mod validate;

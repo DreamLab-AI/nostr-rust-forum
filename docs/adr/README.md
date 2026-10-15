@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_19 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_22 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -51,3 +51,6 @@ _19 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2017](ADR-2017-sealed-original-history-migration.md) | Migrate plaintext history into encrypted zones as sealed originals, then purge the plaintext silently | 2026-09-27 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
 | [ADR-2018](ADR-2018-relay-read-caches-and-activity-throttle.md) | Make relay read cost scale with requests, not delivered events — per-DO lookup caches and a coalesced trust ledger | 2026-09-29 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
 | [ADR-2019](ADR-2019-member-wallet-shows-blake2b-testnet4-coins-read-only.md) | The member wallet shows the identity key's BLAKE2b testnet4 coins read-only, beside the one sidestr chain | 2026-09-30 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
+| [ADR-2020](ADR-2020-dream-poker-table-house-seat-and-dealt-member-hands.md) | Play poker for DREAM against a house seat that holds its own key, and between members with the house dealing; settle each hand with one chain transfer | 2026-10-03 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
+| [ADR-2021](ADR-2021-two-pinned-sidestr-chains-dreamlab-and-dreamlab-txbt4.md) | Pin two sidestr chains — sidestr:dreamlab and sidestr:dreamlab-txbt4 — with one wallet store and one asset table per chain | 2026-10-03 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
+| [ADR-2022](ADR-2022-ingress-recipients-declared-in-config.md) | Declare gift-wrap recipients in config so the relay admits them without a whitelist row | 2026-10-15 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |

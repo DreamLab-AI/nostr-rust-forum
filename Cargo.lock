@@ -2600,6 +2600,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "js-sys",
+ "nostr-bbs-config",
  "nostr-bbs-core",
  "nostr-bbs-mesh",
  "nostr-bbs-rate-limit",

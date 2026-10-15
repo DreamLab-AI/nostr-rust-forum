@@ -184,6 +184,13 @@ pub async fn handle_check_whitelist(req: &Request, env: &Env) -> Result<Response
                 "members": has_members,
                 "private": has_private,
             },
+            // True when the pubkey is a config-declared gift-wrap recipient
+            // (`INGRESS_RECIPIENTS`). Independent of `isWhitelisted`: it grants
+            // no access, it only says wraps addressed to this key are admitted.
+            "ingressRecipient": nostr_bbs_config::ingress::is_ingress_recipient(
+                &crate::ingress::ingress_from_env(env),
+                &pubkey,
+            ),
             "verifiedAt": js_sys::Date::now() as u64,
             "source": "relay",
         }),

@@ -73,6 +73,10 @@ pub struct ForumConfig {
     /// Zone end-to-end encryption master gate (ADR-2016).
     #[serde(default)]
     pub encryption: Encryption,
+    /// `[[ingress]]` recipients the relay admits gift wraps for without a
+    /// whitelist row (see [`crate::ingress`]). Empty by default.
+    #[serde(default)]
+    pub ingress: Vec<crate::ingress::IngressRecipient>,
 }
 
 /// Zone end-to-end encryption master gate (ADR-2016).

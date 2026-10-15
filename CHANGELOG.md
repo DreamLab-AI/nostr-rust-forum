@@ -7,6 +7,15 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: `[[ingress]]` recipients declared in config (`nostr-bbs-config`, `nostr-bbs-relay-worker`)
+
+A pubkey listed under `[[ingress]]` in `forum.toml` is admitted as a gift-wrap (kind-1059) recipient
+without a whitelist row, so contact, signup and chat forms keep working after `POST /api/admin/reset-db`.
+The deploy renders the list into the relay's `INGRESS_RECIPIENTS` binding (`ingress_relay_var`); a missing
+or malformed binding fails closed. `check-whitelist` reports `ingressRecipient`, and
+`/api/agents/disclosure` names declared recipients that carry an `authorised_by`. No cohort, admin right or
+zone key is granted. ADR-2022.
+
 ### Added: zone keys granted without the Encryption tab (`nostr-bbs-forum-client`)
 
 Allocating a member a cohort that opens an encrypted zone now sends them
