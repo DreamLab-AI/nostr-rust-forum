@@ -17,6 +17,7 @@ on:
     paths:
       - '**/Cargo.lock'
       - 'scripts/security-audit.sh'
+      - 'scripts/ci/dep-watchlist.*'
       - 'docs/security/advisory-exceptions.md'
       - '.github/workflows/audit.yml'
   pull_request:
@@ -24,6 +25,7 @@ on:
     paths:
       - '**/Cargo.lock'
       - 'scripts/security-audit.sh'
+      - 'scripts/ci/dep-watchlist.*'
       - 'docs/security/advisory-exceptions.md'
       - '.github/workflows/audit.yml'
   workflow_dispatch:
@@ -40,8 +42,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
 
+      # Same cache key as the ci.yml `deny` job so the cargo-deny build is reused.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: deny
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: cargo audit
         run: bash scripts/security-audit.sh
+
+      # The advisory DB is fetched live, so an unchanged lockfile can go red
+      # (e.g. 2026-10-14: rustls 0.23.45, quinn-proto 0.11.15). Running the same
+      # check as ci.yml on the weekly schedule surfaces drift before release.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: cargo deny check advisories
+        run: cargo deny check advisories
+
+      # Informational: locked vs latest crates.io version of watched crates.
+      - name: Dependency watch list
+        continue-on-error: true
+        run: bash scripts/ci/dep-watchlist.sh

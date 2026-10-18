@@ -16,3 +16,21 @@ this workspace. The security maintainers own the list. It must be reviewed by
 Exceptions suppress CI warnings, not vulnerabilities in application-owned
 code. A newly published vulnerability or a change in deployment target must
 trigger immediate reassessment rather than waiting for the review date.
+
+## Advisory drift and the watch list
+
+The advisory database is fetched live by `cargo audit` and `cargo deny`, so a
+lockfile that has not changed can turn red when a new advisory is published
+(2026-10-14: `rustls 0.23.45` and `quinn-proto 0.11.15`). `ci.yml` only runs
+`cargo deny` on push and pull request, so drift could first appear at release
+time. `audit.yml` therefore also runs `cargo deny check advisories` on its weekly
+schedule (Monday 06:17 UTC), alongside `cargo audit`.
+
+`scripts/ci/dep-watchlist.sh` reads the crates listed in
+`scripts/ci/dep-watchlist.txt` (currently `rustls`, `quinn-proto`), prints each
+locked version from `Cargo.lock` and compares it with the latest crates.io
+release. It runs as a non-blocking step, emits a `::warning::` annotation when a
+crate is behind, and fails open (exit 0 with a warning) when crates.io is
+unreachable. Add a crate to the list after any advisory that hits a TLS or
+transport dependency; a lockfile bump is the usual fix.
+

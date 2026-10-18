@@ -1,0 +1,4 @@
+# Crates whose locked version is compared against crates.io latest by
+# scripts/ci/dep-watchlist.sh (one crate name per line).
+rustls
+quinn-proto
