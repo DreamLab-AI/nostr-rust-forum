@@ -4,6 +4,17 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.17] - 2026-10-18
+
+### Changed
+
+- **`solid-pod-rs` is a caret range, now `0.5.0-alpha.14`.** beta.16 pinned
+  `=0.5.0-alpha.13`, so a consumer could not take a newer solid-pod-rs alpha,
+  including a security release, without a new nostr-bbs-core. The range lets
+  the consumer's `cargo update` move it (estate register ER-35). alpha.14
+  carries the MCP skill pay-per-read fix, hardened git spawns, Solid-OIDC
+  `aud`/`kid` binding and case-folded path guards.
+
 ## [1.0.0-beta.4] - 2026-07-03 (closeout — did-doc canonicalisation gate)
 
 ### Changed
