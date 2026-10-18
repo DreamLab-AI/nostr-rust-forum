@@ -365,6 +365,14 @@ mod tests {
         assert_eq!(ADMIN_CACHE_KEY, "admin_pubkeys_cache");
     }
 
+    /// `KV` and `SESSIONS` share one namespace id; the rate limiter writes
+    /// `rl:{ip}:{bucket}` keys to `SESSIONS`, so the admin cache key must never
+    /// fall under that prefix.
+    #[test]
+    fn admin_cache_key_cannot_collide_with_rate_limit_keys() {
+        assert!(!ADMIN_CACHE_KEY.starts_with("rl:"));
+    }
+
     #[test]
     fn pubkey_hex_validation() {
         let valid = "a".repeat(64);

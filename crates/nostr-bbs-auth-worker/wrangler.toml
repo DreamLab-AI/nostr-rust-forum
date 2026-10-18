@@ -19,6 +19,10 @@ binding = "RELAY_DB"
 database_name = "nostr-bbs-relay"
 database_id = "00000000-0000-0000-0000-000000000000"
 
+# NOTE: SESSIONS and KV below intentionally bind the SAME namespace id.
+# Key prefixes are disjoint: SESSIONS is used by nostr-bbs-rate-limit
+# (`rl:{ip}:{bucket}`); KV holds the admin cache (`admin_pubkeys_cache`,
+# admins.rs). Guarded by a unit test in admins.rs.
 [[kv_namespaces]]
 binding = "SESSIONS"
 id = "901345296c2848788066686aa67d5909"
@@ -34,6 +38,7 @@ id = "8ec8759ab40d4709a831bf6b0e5241eb"
 # ADMIN_KV namespace eliminated — no provisioning needed.
 
 # Legacy alias used by admins.rs cache (60-second admin pubkey list).
+# Intentionally the same namespace as SESSIONS above (see note there).
 [[kv_namespaces]]
 binding = "KV"
 id = "901345296c2848788066686aa67d5909"
