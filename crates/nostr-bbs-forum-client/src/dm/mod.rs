@@ -118,12 +118,13 @@ impl DMStore {
     /// DM pages use [`messages`](Self::messages), which leaves them out.
     pub fn received_from(&self, pubkey: String) -> Memo<Vec<DMMessage>> {
         let state = self.state;
+        let pubkey = pubkey.to_ascii_lowercase();
         Memo::new(move |_| {
             state.with(|inner| {
                 inner
                     .messages
                     .iter()
-                    .filter(|m| !m.is_sent && m.sender_pubkey.eq_ignore_ascii_case(&pubkey))
+                    .filter(|m| !m.is_sent && m.sender_pubkey == pubkey)
                     .cloned()
                     .collect()
             })
@@ -929,7 +930,8 @@ async fn process_gift_wrap_event(
         }
     };
 
-    let sender_pubkey = unwrapped.sender_pubkey.clone();
+    let my_pubkey = my_pubkey.to_ascii_lowercase();
+    let sender_pubkey = unwrapped.sender_pubkey.to_ascii_lowercase();
     let is_sent = sender_pubkey == my_pubkey;
 
     // The rumor's "p" tag identifies the recipient
@@ -938,12 +940,12 @@ async fn process_gift_wrap_event(
         .tags
         .iter()
         .find(|t| t.len() >= 2 && t[0] == "p")
-        .map(|t| t[1].clone())
+        .map(|t| t[1].to_ascii_lowercase())
         .unwrap_or_else(|| {
             if is_sent {
                 String::new()
             } else {
-                my_pubkey.to_string()
+                my_pubkey.clone()
             }
         });
 
@@ -959,7 +961,8 @@ async fn process_gift_wrap_event(
 
     let plaintext = unwrapped.rumor.content.clone();
     // Use the rumor's created_at as the real timestamp (wrap timestamp is randomized)
-    let timestamp = unwrapped.rumor.created_at;
+    // (sender-controlled, so clamp it to now).
+    let timestamp = clamp_to_now(unwrapped.rumor.created_at, now_secs());
 
     // Use the outer wrap event ID for deduplication
     let msg = DMMessage {
@@ -991,15 +994,17 @@ async fn process_kind4_event(
     my_pubkey: &str,
     state: RwSignal<DMStateInner>,
 ) {
-    let is_sent = event.pubkey == my_pubkey;
+    let my_pubkey = my_pubkey.to_ascii_lowercase();
+    let sender_pubkey = event.pubkey.to_ascii_lowercase();
+    let is_sent = sender_pubkey == my_pubkey;
     let counterparty_pk = if is_sent {
         event
             .tags
             .iter()
             .find(|t| t.len() >= 2 && t[0] == "p")
-            .map(|t| t[1].clone())
+            .map(|t| t[1].to_ascii_lowercase())
     } else {
-        Some(event.pubkey.clone())
+        Some(sender_pubkey.clone())
     };
 
     let counterparty_pk = match counterparty_pk {
@@ -1019,16 +1024,17 @@ async fn process_kind4_event(
         }
     };
 
+    let timestamp = clamp_to_now(event.created_at, now_secs());
     let msg = DMMessage {
         id: event.id.clone(),
-        sender_pubkey: event.pubkey.clone(),
+        sender_pubkey,
         recipient_pubkey: if is_sent {
             counterparty_pk.clone()
         } else {
-            my_pubkey.to_string()
+            my_pubkey
         },
         content: plaintext.clone(),
-        timestamp: event.created_at,
+        timestamp,
         is_sent,
         is_read: is_sent,
     };
@@ -1037,7 +1043,7 @@ async fn process_kind4_event(
         msg,
         &counterparty_pk,
         &plaintext,
-        event.created_at,
+        timestamp,
         is_sent,
         state,
     );
@@ -1102,9 +1108,12 @@ fn apply_message(
     is_sent: bool,
     coach: Option<&str>,
 ) {
-    if s.seen_ids.insert(msg.id.clone()) {
-        s.messages.push(msg);
+    // A re-streamed event (relay reconnect, overlapping subscriptions) must not
+    // touch the summary a second time, or the unread badge inflates.
+    if !s.seen_ids.insert(msg.id.clone()) {
+        return;
     }
+    s.messages.push(msg);
     if is_coach_exchange_with(plaintext, counterparty_pk, coach) {
         return;
     }
@@ -1133,16 +1142,19 @@ fn apply_message(
 /// The "other party" of a message is the recipient when we sent it and the
 /// sender when we received it.
 fn thread_of(messages: &[DMMessage], counterparty: &str, coach: Option<&str>) -> Vec<DMMessage> {
+    // Pubkeys are lowercased at ingestion, so the only normalisation left is
+    // the caller's argument (a UI route value or config string).
+    let counterparty = counterparty.to_ascii_lowercase();
     let mut msgs: Vec<DMMessage> = messages
         .iter()
-        .filter(|m| !is_coach_exchange_with(&m.content, counterparty, coach))
+        .filter(|m| !is_coach_exchange_with(&m.content, &counterparty, coach))
         .filter(|m| {
             let other = if m.is_sent {
                 &m.recipient_pubkey
             } else {
                 &m.sender_pubkey
             };
-            other.eq_ignore_ascii_case(counterparty)
+            *other == counterparty
         })
         .cloned()
         .collect();
@@ -1160,6 +1172,24 @@ fn visible_conversations(inner: &DMStateInner) -> Vec<DMConversation> {
 }
 
 // -- Helpers ------------------------------------------------------------------
+
+/// Tags of the kind-10050 DM-relay list (NIP-17): one `["relay", url]` per
+/// relay. (`"r"` is the NIP-65 relay-list tag and is not read for 10050.)
+fn dm_relay_tags(relay_url: &str) -> Vec<Vec<String>> {
+    vec![vec!["relay".to_string(), relay_url.to_string()]]
+}
+
+/// Clamp a sender-controlled timestamp to `now`. A rumor's `created_at` is
+/// chosen by the sender, so a far-future value would otherwise pin its message
+/// to the top of the thread and win the conversation preview forever.
+fn clamp_to_now(timestamp: u64, now: u64) -> u64 {
+    timestamp.min(now)
+}
+
+/// Current Unix time in seconds, from the browser clock.
+fn now_secs() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
+}
 
 fn truncate_message(content: &str, max_chars: usize) -> String {
     let t = content.trim();
@@ -1208,7 +1238,7 @@ async fn ensure_dm_relay_published(relay: &RelayConnection, signer: &dyn Signer,
         pubkey: my_pubkey.to_string(),
         created_at: now,
         kind: 10050,
-        tags: vec![vec!["r".to_string(), relay_url]],
+        tags: dm_relay_tags(&relay_url),
         content: String::new(),
     };
 
@@ -1448,6 +1478,46 @@ mod tests {
         let text = m.content.clone();
         let (ts, out) = (m.timestamp, m.is_sent);
         apply_message(s, m, COACH, &text, ts, out, Some(COACH));
+    }
+
+    #[test]
+    fn dm_relay_list_uses_the_nip17_relay_tag() {
+        assert_eq!(
+            dm_relay_tags("wss://relay.example"),
+            vec![vec!["relay".to_string(), "wss://relay.example".to_string()]]
+        );
+    }
+
+    #[test]
+    fn clamp_to_now_pins_future_timestamps() {
+        assert_eq!(clamp_to_now(5_000, 1_000), 1_000);
+        assert_eq!(clamp_to_now(900, 1_000), 900);
+        assert_eq!(clamp_to_now(1_000, 1_000), 1_000);
+    }
+
+    #[test]
+    fn restreamed_message_does_not_inflate_unread_or_preview() {
+        let mut s = DMStateInner::default();
+        let m = received("dup", "hello", 10);
+        apply_message(&mut s, m.clone(), COACH, "hello", 10, false, None);
+        apply_message(&mut s, m, COACH, "hello", 10, false, None);
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.conversations[COACH].unread_count, 1);
+        // a replay must not rewrite the preview either
+        let mut again = received("dup", "tampered", 99);
+        again.id = "dup".into();
+        apply_message(&mut s, again, COACH, "tampered", 99, false, None);
+        assert_eq!(s.conversations[COACH].last_message, "hello");
+        assert_eq!(s.conversations[COACH].last_timestamp, 10);
+    }
+
+    #[test]
+    fn thread_matching_is_exact_on_lowercased_keys() {
+        let mut m = received("a", "hi", 1);
+        m.sender_pubkey = "ab".repeat(32);
+        let thread = thread_of(std::slice::from_ref(&m), &"AB".repeat(32), None);
+        assert_eq!(thread.len(), 1);
+        assert!(thread_of(&[m], &"cd".repeat(32), None).is_empty());
     }
 
     #[test]
