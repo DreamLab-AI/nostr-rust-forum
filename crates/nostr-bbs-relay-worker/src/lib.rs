@@ -188,15 +188,17 @@ fn json_response(
 // Entry point
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Set once `ensure_schema` has completed in this isolate. A Worker isolate is
+    /// single-threaded, so a thread-local `Cell` is the whole synchronisation.
+    static SCHEMA_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 // Invoked via wasm-bindgen by the Workers runtime; appears unused on native
 // builds because there is no native caller of the `#[event(fetch)]` glue.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    // Idempotent schema migrations (trust columns, new tables, etc.)
-    ensure_schema(&env).await;
-    nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
-
     // CORS preflight
     if req.method() == Method::Options {
         return Ok(Response::empty()?
@@ -208,6 +210,15 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.headers().get("Upgrade")?.as_deref() == Some("websocket") {
         let stub = env.durable_object("RELAY")?.get_by_name("main")?;
         return stub.fetch_with_request(req).await;
+    }
+
+    // Idempotent schema migrations (trust columns, new tables, etc.). Run once
+    // per isolate and only for HTTP routes: preflights and WebSocket upgrades
+    // never touch the schema, and the DO does its own D1 work.
+    if !SCHEMA_READY.with(|c| c.get()) {
+        ensure_schema(&env).await;
+        nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
+        SCHEMA_READY.with(|c| c.set(true));
     }
 
     let url = req.url()?;
@@ -709,6 +720,51 @@ pub const CHANNEL_CREATORS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS channe
     created_at INTEGER NOT NULL\
 )";
 
+/// Broker case aggregate (human-in-the-loop governance decisions). Created ahead
+/// of the `ALTER TABLE broker_cases` block so a fresh D1 has a table to alter;
+/// the ALTERs then add the ADR-2011 / ADR-2013 columns.
+pub const BROKER_CASES_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS broker_cases (\
+            id TEXT PRIMARY KEY NOT NULL, \
+            category TEXT NOT NULL, \
+            subject_kind TEXT NOT NULL, \
+            subject_id TEXT NOT NULL, \
+            title TEXT NOT NULL, \
+            summary TEXT NOT NULL DEFAULT '', \
+            state TEXT NOT NULL DEFAULT 'open', \
+            priority INTEGER NOT NULL DEFAULT 50, \
+            from_share_state TEXT, \
+            to_share_state TEXT, \
+            created_by TEXT NOT NULL, \
+            assigned_to TEXT, \
+            nostr_event_id TEXT, \
+            created_at INTEGER NOT NULL, \
+            updated_at INTEGER NOT NULL\
+        )";
+
+/// ADR-2010 durable governance outcome receipts. One row per signed governance
+/// event, keyed by the FULL event id, recording the stage the response actually
+/// reached. Written at `relay-accepted` right after the envelope is stored;
+/// transitions to `projection-committed` inside the same batch as the decision
+/// row and case state, so the two can never disagree. `replays` counts
+/// redeliveries without re-running the mutation. Created ahead of the ALTERs.
+pub const GOVERNANCE_RECEIPTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS governance_receipts (\
+            event_id TEXT PRIMARY KEY NOT NULL, \
+            kind INTEGER NOT NULL, \
+            case_id TEXT NOT NULL, \
+            request_event_id TEXT, \
+            signer_pubkey TEXT NOT NULL, \
+            decision_outcome TEXT, \
+            target_operation TEXT, \
+            supersedes_event_id TEXT, \
+            stage TEXT NOT NULL, \
+            stage_error TEXT, \
+            decision_id TEXT, \
+            signed_at INTEGER NOT NULL, \
+            accepted_at INTEGER, \
+            projected_at INTEGER, \
+            replays INTEGER NOT NULL DEFAULT 0\
+        )";
+
 /// Idempotent schema migrations.
 ///
 /// All statements use `IF NOT EXISTS` for tables or silently ignore errors
@@ -752,6 +808,18 @@ async fn ensure_schema(env: &Env) {
             if let Err(e) = db.prepare(stmt).run().await {
                 console_error!("ensure_schema: push table failed: {e}");
             }
+        }
+    }
+
+    // --- Governance tables (broker_cases, governance_receipts) ---
+    // Must precede the ALTERs below for the same reason as events/whitelist: on a
+    // fresh D1 the ALTERs otherwise fail and the effective_tier index is skipped.
+    for (name, sql) in [
+        ("broker_cases", BROKER_CASES_CREATE_SQL),
+        ("governance_receipts", GOVERNANCE_RECEIPTS_CREATE_SQL),
+    ] {
+        if let Err(e) = db.prepare(sql).run().await {
+            console_error!("ensure_schema: {name} create failed: {e}");
         }
     }
 
@@ -889,24 +957,6 @@ async fn ensure_schema(env: &Env) {
             rate_limit_per_min INTEGER NOT NULL DEFAULT 60, \
             active INTEGER NOT NULL DEFAULT 1\
         )",
-        // Broker case aggregate — human-in-the-loop governance decisions.
-        "CREATE TABLE IF NOT EXISTS broker_cases (\
-            id TEXT PRIMARY KEY NOT NULL, \
-            category TEXT NOT NULL, \
-            subject_kind TEXT NOT NULL, \
-            subject_id TEXT NOT NULL, \
-            title TEXT NOT NULL, \
-            summary TEXT NOT NULL DEFAULT '', \
-            state TEXT NOT NULL DEFAULT 'open', \
-            priority INTEGER NOT NULL DEFAULT 50, \
-            from_share_state TEXT, \
-            to_share_state TEXT, \
-            created_by TEXT NOT NULL, \
-            assigned_to TEXT, \
-            nostr_event_id TEXT, \
-            created_at INTEGER NOT NULL, \
-            updated_at INTEGER NOT NULL\
-        )",
         // Individual decisions on broker cases (append-only audit trail).
         // F6 (DDD §7a): `superseded_by` names the decision that supersedes this
         // row (NULL = current/effective). It is a projection-derived column — the
@@ -923,30 +973,6 @@ async fn ensure_schema(env: &Env) {
             superseded_by TEXT, \
             decided_at INTEGER NOT NULL\
         )",
-        // ADR-2010 — durable governance outcome receipts. One row per signed
-        // governance event, keyed by the FULL event id, recording the stage the
-        // response actually reached. Written at `relay-accepted` right after the
-        // envelope is stored; transitions to `projection-committed` inside the
-        // same batch as the decision row and case state, so the two can never
-        // disagree. `replays` counts redeliveries without re-running the mutation.
-        "CREATE TABLE IF NOT EXISTS governance_receipts (\
-            event_id TEXT PRIMARY KEY NOT NULL, \
-            kind INTEGER NOT NULL, \
-            case_id TEXT NOT NULL, \
-            request_event_id TEXT, \
-            signer_pubkey TEXT NOT NULL, \
-            decision_outcome TEXT, \
-            target_operation TEXT, \
-            supersedes_event_id TEXT, \
-            stage TEXT NOT NULL, \
-            stage_error TEXT, \
-            decision_id TEXT, \
-            signed_at INTEGER NOT NULL, \
-            accepted_at INTEGER, \
-            projected_at INTEGER, \
-            replays INTEGER NOT NULL DEFAULT 0\
-        )",
-        // Role assignments for broker governance (which pubkeys can claim cases).
         "CREATE TABLE IF NOT EXISTS broker_roles (\
             pubkey TEXT NOT NULL, \
             role TEXT NOT NULL, \
@@ -1201,6 +1227,43 @@ mod cors_tests {
             "https://dreamlab-ai.com"
         );
         assert_eq!(super::select_origin(&[], "https://dreamlab-ai.com"), "");
+    }
+}
+
+#[cfg(test)]
+mod schema_order_tests {
+    use super::{BROKER_CASES_CREATE_SQL, GOVERNANCE_RECEIPTS_CREATE_SQL, SCHEMA_READY};
+
+    #[test]
+    fn governance_tables_exist_for_the_alters_and_the_tier_index() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute(BROKER_CASES_CREATE_SQL, []).unwrap();
+        conn.execute(GOVERNANCE_RECEIPTS_CREATE_SQL, []).unwrap();
+        // Idempotent on a second pass.
+        conn.execute(BROKER_CASES_CREATE_SQL, []).unwrap();
+        // The statements that failed on a fresh D1 when the tables came later.
+        conn.execute(
+            "ALTER TABLE broker_cases ADD COLUMN effective_tier TEXT",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "ALTER TABLE governance_receipts ADD COLUMN applied_at INTEGER",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_broker_cases_effective_tier ON broker_cases(effective_tier)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_guard_is_per_isolate_and_starts_unset() {
+        assert!(!SCHEMA_READY.with(|c| c.get()));
+        SCHEMA_READY.with(|c| c.set(true));
+        assert!(SCHEMA_READY.with(|c| c.get()));
     }
 }
 
