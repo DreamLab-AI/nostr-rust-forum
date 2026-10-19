@@ -105,6 +105,29 @@ pub fn calendar_write_permitted(zone: Option<&str>, has_write: bool) -> bool {
     }
 }
 
+/// The keys a sanction (suspension, silence, ban, mute) is checked against: the
+/// raw signing key, plus its owner when that differs (a registered device key).
+pub fn sanction_subjects<'a>(raw: &'a str, principal: &'a str) -> Vec<&'a str> {
+    let mut subjects = vec![raw];
+    if principal != raw {
+        subjects.push(principal);
+    }
+    subjects
+}
+
+/// Whether a stored channel creator is any of `subjects`. `channel_creators`
+/// records the RAW signing key (a device key for a channel made from a device),
+/// older rows included, so the owner alone can never be enough.
+pub fn creator_matches(creator: &str, subjects: &[&str]) -> bool {
+    subjects.contains(&creator)
+}
+
+/// Whether the device-owner lookup is worth making for an event of `kind`:
+/// never for gift wraps, whose author is a fresh one-time key.
+pub fn needs_owner_lookup(kind: u64) -> bool {
+    kind != GIFT_WRAP_KIND
+}
+
 /// NIP-59: extract the gift-wrap (kind-1059) RECIPIENT pubkey from the first
 /// `["p", <hex>]` tag. Returns `None` when the event is not a gift wrap, or when
 /// no non-empty `p` tag is present. The recipient — not the ephemeral author —
@@ -865,6 +888,27 @@ impl NostrRelayDO {
             return;
         }
 
+        // ADR-099: resolve the effective principal ONCE, and only now: the
+        // lookup costs a D1 read and a cache entry per distinct key, so it must
+        // not run for events that fail verification or the write gate, nor for
+        // gift wraps (a fresh one-time key each, never a device). A registered
+        // device key acts for its owner for ALLOWLIST, TRUST LEVEL and ZONE WRITE
+        // only; SANCTIONS (suspension, silence, ban) apply to the key AND the
+        // owner; ADMIN status stays the raw signing key's own, so a device key
+        // never inherits admin powers. Gate-off / non-device ⇒ `principal ==
+        // event.pubkey`. The RSVP cohort check, the posts_created counter, the
+        // activity stamp and the delete-any trust level below also use the
+        // principal, so they agree with the trust level and zone-write path that
+        // resolve through the owner; the mesh-peer, agent, reviewer, delegation
+        // and supersession checks, NIP-09 own-event scope and moderation
+        // mirroring stay on the raw signing key.
+        let principal = if needs_owner_lookup(event.kind) {
+            self.effective_pubkey(&event.pubkey).await
+        } else {
+            event.pubkey.clone()
+        };
+        let sanction_subjects = sanction_subjects(&event.pubkey, &principal);
+
         // NIP-59 gift wraps (kind-1059) are signed by a fresh ephemeral key per
         // message, so the author is intentionally NOT a member and the standard
         // author-membership check would always reject them. Instead, gate on the
@@ -898,8 +942,7 @@ impl NostrRelayDO {
             // pubkey verbatim (gate-off / non-device ⇒ unchanged behaviour). The
             // event's signature was already verified strictly above against the
             // device's own key; we only rebind WHO the allowlist is checked for.
-            let allowlist_pubkey = self.effective_pubkey(&event.pubkey).await;
-            if !self.is_whitelisted(&allowlist_pubkey).await {
+            if !self.is_whitelisted(&principal).await {
                 // NIP-42 semantics: a denial AFTER a completed AUTH is
                 // `restricted:` (authenticated but not authorised), distinct
                 // from `auth-required:`. Legacy `allowlist` mode keeps the
@@ -924,20 +967,23 @@ impl NostrRelayDO {
             return;
         }
 
-        // Suspension and silence check
-        let (suspended, silenced) = trust::check_suspension(&event.pubkey, &self.env).await;
-        if suspended {
-            Self::send_ok(ws, &event.id, false, "blocked: account suspended");
-            return;
-        }
-        if silenced {
-            Self::send_ok(
-                ws,
-                &event.id,
-                false,
-                "blocked: account silenced (read-only)",
-            );
-            return;
+        // Suspension and silence check: the device key OR its owner being
+        // sanctioned blocks the event.
+        for subject in &sanction_subjects {
+            let (suspended, silenced) = trust::check_suspension(subject, &self.env).await;
+            if suspended {
+                Self::send_ok(ws, &event.id, false, "blocked: account suspended");
+                return;
+            }
+            if silenced {
+                Self::send_ok(
+                    ws,
+                    &event.id,
+                    false,
+                    "blocked: account silenced (read-only)",
+                );
+                return;
+            }
         }
 
         // WI-2: moderation ingress check against moderation_actions (60s DO
@@ -950,17 +996,20 @@ impl NostrRelayDO {
         // P2-03: use admin_cache to avoid redundant D1 queries on every event.
         if is_ban_gated_kind(event.kind)
             && !self.admin_cache.is_admin(&event.pubkey, &self.env).await
-            && self.mod_cache.is_blocked(&event.pubkey, &self.env).await
         {
-            Self::send_ok(ws, &event.id, false, "blocked: author is banned or muted");
-            return;
+            for subject in &sanction_subjects {
+                if self.mod_cache.is_blocked(subject, &self.env).await {
+                    Self::send_ok(ws, &event.id, false, "blocked: author is banned or muted");
+                    return;
+                }
+            }
         }
 
         // Trust-level gating for specific event kinds
         // P2-03: cached lookup — same TTL entry reused from above if still fresh.
         let is_admin = self.admin_cache.is_admin(&event.pubkey, &self.env).await;
         if !is_admin {
-            let trust_level = trust::get_trust_level(&event.pubkey, &self.env).await;
+            let trust_level = trust::get_trust_level(&principal, &self.env).await;
 
             // kind-40 (channel creation): TL2+ required
             if event.kind == 40 && trust_level < TrustLevel::Regular {
@@ -975,7 +1024,7 @@ impl NostrRelayDO {
 
             // kind-41 (channel metadata/pin): TL2+ for own channel, TL3+ for any
             if event.kind == 41 {
-                let Some(channel_id) = filter::tag_value(&event, "e") else {
+                let Some(channel_id) = filter::channel_tag(&event) else {
                     Self::send_ok(ws, &event.id, false, "invalid: missing channel tag");
                     return;
                 };
@@ -990,7 +1039,9 @@ impl NostrRelayDO {
                 }
                 // If TL2 (not TL3), verify they are the channel creator
                 if trust_level < TrustLevel::Trusted
-                    && !self.is_channel_creator(&event.pubkey, &channel_id).await
+                    && !self
+                        .is_channel_creator(&sanction_subjects, &channel_id)
+                        .await
                 {
                     Self::send_ok(
                         ws,
@@ -1169,8 +1220,7 @@ impl NostrRelayDO {
                 }
             }
             if let Some(zone) = zone {
-                if !is_admin && !trust::has_zone_write_access(&event.pubkey, &zone, &self.env).await
-                {
+                if !is_admin && !trust::has_zone_write_access(&principal, &zone, &self.env).await {
                     Self::send_ok(ws, &event.id, false, "zone access denied");
                     return;
                 }
@@ -1216,7 +1266,7 @@ impl NostrRelayDO {
                     // `project_tier` short-circuits admins/owners to Full anyway;
                     // here we ask the author's own tier for the TARGET's real zone.
                     let (author_cohorts, author_cohort_admin) =
-                        self.cached_viewer_cohorts(&event.pubkey).await;
+                        self.cached_viewer_cohorts(&principal).await;
                     let tier = calendar_projection::project_tier(
                         &author_cohorts,
                         &zone,
@@ -1247,7 +1297,7 @@ impl NostrRelayDO {
             // that zone's effective write cohorts.
             let zone = nostr_bbs_core::read_zone_tag(&event);
             let has_write = match zone {
-                Some(z) => trust::has_zone_write_access(&event.pubkey, z, &self.env).await,
+                Some(z) => trust::has_zone_write_access(&principal, z, &self.env).await,
                 None => false,
             };
             if !calendar_write_permitted(zone, has_write) {
@@ -1278,12 +1328,12 @@ impl NostrRelayDO {
             // for content-producing event kinds (kind-1 text, kind-42 channel msg,
             // kind-40 channel create, kind-7 reaction, kind-1984 report).
             if matches!(event.kind, 1 | 7 | 40 | 42 | KIND_REPORT_NIP56) {
-                trust::increment_posts_created(&event.pubkey, &self.env).await;
+                trust::increment_posts_created(&principal, &self.env).await;
             }
             // ADR-2018: the `last_active_at` stamp and promotion check are
             // coalesced to one flush per pubkey per window; `posts_created`
             // above stays exact because it is the promotion counter itself.
-            self.note_write_activity(&event.pubkey).await;
+            self.note_write_activity(&principal).await;
 
             // NIP-09: Process deletion events. Same-author targets always
             // delete; admins and TL3+ (Trusted) may delete anyone's events —
@@ -1292,8 +1342,7 @@ impl NostrRelayDO {
             // non-admin gating block above (admins skip it entirely).
             if event.kind == 5 {
                 let can_delete_any = is_admin
-                    || trust::get_trust_level(&event.pubkey, &self.env).await
-                        >= TrustLevel::Trusted;
+                    || trust::get_trust_level(&principal, &self.env).await >= TrustLevel::Trusted;
                 self.process_deletion(&event, can_delete_any).await;
             }
 
@@ -2036,12 +2085,8 @@ impl NostrRelayDO {
         }
 
         // Zone-scoped channel kinds: kind-40 defs (channel id == event id),
-        // kind-42 content (channel id == `e` tag).
-        let channel_id: Option<String> = match event.kind {
-            40 => Some(event.id.clone()),
-            42 => filter::channel_tag(event),
-            _ => None,
-        };
+        // kind-41 metadata and kind-42 content (channel id == root/first `e` tag).
+        let channel_id: Option<String> = filter::zone_channel_id(event);
 
         if let Some(cid) = channel_id {
             // Only a channel EXPLICITLY bound to a zone is read-gated. An
@@ -2063,9 +2108,11 @@ impl NostrRelayDO {
                 if !ctx.is_admin {
                     let is_member = zone_read_permitted(zones, &zone, ctx);
                     if !is_member {
-                        if event.kind == 40 {
-                            // Channel definition: served only if the zone is not
-                            // Hidden (Locked/Public tiles render).
+                        if matches!(event.kind, 40 | 41) {
+                            // Channel definition or its metadata update (a rename
+                            // must agree with the definition the tile shows):
+                            // served only if the zone is not Hidden
+                            // (Locked/Public tiles render).
                             if !zones.defs_visible_to_nonmember(&zone) {
                                 return ReadDecision::Withhold;
                             }
@@ -2207,16 +2254,9 @@ impl NostrRelayDO {
             .collect();
 
         for a_ref in &a_targets {
-            let parts: Vec<&str> = a_ref.split(':').collect();
-            if parts.len() < 3 {
+            let Some((kind, pubkey, d_tag)) = filter::split_a_ref(a_ref) else {
                 continue;
-            }
-            let kind: f64 = match parts[0].parse() {
-                Ok(k) => k,
-                Err(_) => continue,
             };
-            let pubkey = parts[1];
-            let d_tag = parts[2];
 
             // Own events only, unless the author holds delete-any privilege
             // (the a-ref names its owner, so the SQL below stays scoped to
@@ -2250,7 +2290,7 @@ impl NostrRelayDO {
     /// saved, so deleting that event (kind-5) does not change the answer. A
     /// channel created before the table existed has no row; it falls back to the
     /// kind-40 event, which is the best evidence left.
-    pub(crate) async fn is_channel_creator(&self, pubkey: &str, channel_id: &str) -> bool {
+    pub(crate) async fn is_channel_creator(&self, subjects: &[&str], channel_id: &str) -> bool {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
             Err(_) => return false,
@@ -2269,7 +2309,7 @@ impl NostrRelayDO {
                 continue;
             };
             if let Ok(Some(row)) = bound.first::<ChannelCreatorRow>(None).await {
-                return row.pubkey == pubkey;
+                return creator_matches(&row.pubkey, subjects);
             }
         }
         false
@@ -4063,6 +4103,27 @@ mod write_gate_tests {
 #[cfg(test)]
 mod device_key_tests {
     use super::*;
+
+    #[test]
+    fn sanctions_cover_the_device_key_and_its_owner() {
+        assert_eq!(sanction_subjects("d", "o"), vec!["d", "o"]);
+        assert_eq!(sanction_subjects("d", "d"), vec!["d"]);
+    }
+
+    #[test]
+    fn creator_recorded_as_the_device_key_still_matches_via_the_raw_key() {
+        let subjects = sanction_subjects("device", "owner");
+        assert!(creator_matches("device", &subjects));
+        assert!(creator_matches("owner", &subjects));
+        assert!(!creator_matches("someone-else", &subjects));
+    }
+
+    #[test]
+    fn gift_wraps_skip_the_owner_lookup() {
+        assert!(!needs_owner_lookup(GIFT_WRAP_KIND));
+        assert!(needs_owner_lookup(1));
+        assert!(needs_owner_lookup(30910));
+    }
 
     const DEVICE: &str = "de";
     const OWNER: &str = "01";

@@ -125,28 +125,17 @@ impl NostrRelayDO {
 
         // Tag filters (#e, #p, #t, etc.)
         for (key, values) in &filter.extra {
-            if !key.starts_with('#') {
-                continue;
-            }
-            let tag_name = &key[1..];
-            if !tag_name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
-                continue;
-            }
-
-            let tag_values: Vec<&str> = match values.as_array() {
-                Some(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
-                None => continue,
+            let (tag_name, tag_values) = match tag_filter_plan(key, values) {
+                TagFilterPlan::Ignore => continue,
+                TagFilterPlan::MatchNothing => {
+                    conditions.push("1 = 0".to_string());
+                    continue;
+                }
+                TagFilterPlan::Values(name, values) => (name, values),
             };
-            if tag_values.is_empty() {
-                conditions.push("1 = 0".to_string());
-                continue;
-            }
 
-            let nonempty: Vec<&&str> = tag_values.iter().filter(|v| !v.is_empty()).collect();
-            if !nonempty.is_empty() {
+            let nonempty = &tag_values;
+            {
                 let name_placeholder = format!("?{}", *param_idx);
                 params.push(JsValue::from_str(tag_name));
                 *param_idx += 1;
@@ -171,24 +160,89 @@ impl NostrRelayDO {
                          AND t.name = {name_placeholder} AND t.value IN ({values}))"
                     ));
                 }
-            } else {
-                conditions.push("1 = 0".to_string());
             }
         }
 
         // NIP-50: Full-text search on content
-        if let Some(ref search) = filter.search {
-            if !search.is_empty() {
-                let escaped = search.replace('%', "\\%").replace('_', "\\_");
-                let pattern = format!("%{escaped}%");
-                conditions.push(format!("content LIKE ?{} ESCAPE '\\'", *param_idx));
-                params.push(JsValue::from_str(&pattern));
-                *param_idx += 1;
-            }
+        if let Some(search) = search_term(filter) {
+            let pattern = like_pattern(search);
+            conditions.push(format!("content LIKE ?{} ESCAPE '\\'", *param_idx));
+            params.push(JsValue::from_str(&pattern));
+            *param_idx += 1;
         }
 
         tag_driver
     }
+}
+
+// ---------------------------------------------------------------------------
+// Filter semantics shared by the SQL builder and the live matcher
+// ---------------------------------------------------------------------------
+
+/// How one `#x` entry of a filter is to be applied. Both the SQL builder and
+/// [`event_matches_filters`] decide through [`tag_filter_plan`], so a stored
+/// read and a live broadcast cannot disagree about the same filter.
+enum TagFilterPlan<'a> {
+    /// Not a tag filter, an unusable tag name, or a non-array value: skipped.
+    Ignore,
+    /// An empty array, or one holding only empty strings: nothing can match.
+    MatchNothing,
+    /// The tag name and the non-empty string values, one of which must match.
+    Values(&'a str, Vec<&'a str>),
+}
+
+fn tag_filter_plan<'a>(key: &'a str, values: &'a serde_json::Value) -> TagFilterPlan<'a> {
+    let Some(tag_name) = key.strip_prefix('#') else {
+        return TagFilterPlan::Ignore;
+    };
+    if !tag_name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return TagFilterPlan::Ignore;
+    }
+    // `probe` rows are kept out of `event_tags` (trg_event_tags_probe_blind), so
+    // a stored `#probe` read returns nothing; the live path must agree.
+    if tag_name == "probe" {
+        return TagFilterPlan::MatchNothing;
+    }
+    let Some(arr) = values.as_array() else {
+        return TagFilterPlan::Ignore;
+    };
+    let nonempty: Vec<&str> = arr
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if nonempty.is_empty() {
+        TagFilterPlan::MatchNothing
+    } else {
+        TagFilterPlan::Values(tag_name, nonempty)
+    }
+}
+
+/// The NIP-50 term a filter applies, or `None` when absent or empty.
+fn search_term(filter: &NostrFilter) -> Option<&str> {
+    filter.search.as_deref().filter(|s| !s.is_empty())
+}
+
+/// SQL `LIKE` pattern for a search term, using `\` as the escape character.
+/// The escape character itself is escaped first, otherwise a term containing a
+/// backslash would match the character after it instead of the backslash.
+fn like_pattern(term: &str) -> String {
+    let escaped = term
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// The live equivalent of `content LIKE like_pattern(term)`: a substring match
+/// that is case-insensitive over ASCII only, as SQLite's default `LIKE` is.
+fn content_matches_search(content: &str, term: &str) -> bool {
+    content
+        .to_ascii_lowercase()
+        .contains(&term.to_ascii_lowercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -224,19 +278,21 @@ pub fn event_matches_filters(event: &NostrEvent, filters: &[NostrFilter]) -> boo
             }
         }
 
-        // Tag filters (#e, #p, #t, etc.) -- must match at least one value per tag
+        // NIP-50: the live path honours `search` exactly as the SQL `LIKE` does.
+        if let Some(term) = search_term(filter) {
+            if !content_matches_search(&event.content, term) {
+                continue;
+            }
+        }
+
+        // Tag filters (#e, #p, #t, etc.) -- must match at least one value per
+        // tag. The shared plan keeps this in step with the SQL builder.
         for (key, values) in &filter.extra {
-            if !key.starts_with('#') {
-                continue;
-            }
-            let tag_name = &key[1..];
-            let required: Vec<&str> = match values.as_array() {
-                Some(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
-                None => continue,
+            let (tag_name, required) = match tag_filter_plan(key, values) {
+                TagFilterPlan::Ignore => continue,
+                TagFilterPlan::MatchNothing => continue 'outer,
+                TagFilterPlan::Values(name, values) => (name, values),
             };
-            if required.is_empty() {
-                continue;
-            }
 
             // Check that the event has at least one tag matching this filter
             let has_match = event.tags.iter().any(|tag| {
@@ -272,6 +328,31 @@ pub fn channel_tag(event: &NostrEvent) -> Option<String> {
         .find(|t| t.get(3).map(String::as_str) == Some("root"))
         .or_else(|| e_tags().next())
         .map(|t| t[1].clone())
+}
+
+/// The channel whose zone governs reading `event`, if it is channel-scoped:
+/// a kind-40 definition is its own channel; kind-41 metadata and kind-42
+/// messages name theirs through [`channel_tag`].
+#[doc(hidden)]
+pub fn zone_channel_id(event: &NostrEvent) -> Option<String> {
+    match event.kind {
+        40 => Some(event.id.clone()),
+        41 | 42 => channel_tag(event),
+        _ => None,
+    }
+}
+
+/// Split a NIP-33 `a` reference, `kind:pubkey:d-tag`, into its parts.
+///
+/// Only the first two colons separate fields: a d-tag may itself contain `:`,
+/// and splitting on every colon truncated it so the deletion matched nothing.
+#[doc(hidden)]
+pub fn split_a_ref(a_ref: &str) -> Option<(f64, &str, &str)> {
+    let mut parts = a_ref.splitn(3, ':');
+    let kind: f64 = parts.next()?.parse().ok()?;
+    let pubkey = parts.next()?;
+    let d_tag = parts.next()?;
+    Some((kind, pubkey, d_tag))
 }
 
 /// Extract the first value for a given tag name from an event.
@@ -682,6 +763,106 @@ mod tests {
         assert!(!event_matches_filters(&event, &[filter]));
     }
 
+    // ── live matcher vs SQL semantics ────────────────────────────────────
+
+    fn filter_from(json: serde_json::Value) -> NostrFilter {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn live_matcher_follows_sql_semantics_table() {
+        let tagged = make_event(
+            "i",
+            "p",
+            1,
+            10,
+            vec![
+                vec!["t".into(), "rust".into()],
+                vec!["probe".into(), "x".into()],
+            ],
+            "Hello 100% World_x back\\slash",
+        );
+        // (filter, expected live match). Each row's expectation is what the SQL
+        // builder's conditions select for this event.
+        let cases = [
+            (serde_json::json!({"search": "hello"}), true),
+            (serde_json::json!({"search": "WORLD"}), true),
+            (serde_json::json!({"search": "absent"}), false),
+            (serde_json::json!({"search": ""}), true),
+            (serde_json::json!({"search": "100%"}), true),
+            (serde_json::json!({"search": "d_x"}), true),
+            (serde_json::json!({"search": "k\\s"}), true),
+            (serde_json::json!({"search": "kxs"}), false),
+            (serde_json::json!({"#t": []}), false),
+            (serde_json::json!({"#t": [""]}), false),
+            (serde_json::json!({"#t": [1, 2]}), false),
+            (serde_json::json!({"#t": ["rust"]}), true),
+            (serde_json::json!({"#t": ["go"]}), false),
+            (serde_json::json!({"#t": "rust"}), true),
+            (serde_json::json!({"#bad name": ["zzz"]}), true),
+            (serde_json::json!({"#bad name": []}), true),
+            // A bare "#" passes the SQL name check and then selects `name = ''`.
+            (serde_json::json!({"#": ["zzz"]}), false),
+            (serde_json::json!({"#t": ["rust"], "search": "nope"}), false),
+            // Probe tags are never indexed, so SQL never matches them.
+            (serde_json::json!({"#probe": ["x"]}), false),
+        ];
+        for (json, expected) in cases {
+            let f = filter_from(json.clone());
+            assert_eq!(
+                event_matches_filters(&tagged, &[f]),
+                expected,
+                "filter {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn like_pattern_escapes_the_escape_character_first() {
+        assert_eq!(like_pattern("a\\b"), "%a\\\\b%");
+        assert_eq!(like_pattern("50%_"), "%50\\%\\_%");
+    }
+
+    #[test]
+    fn split_a_ref_keeps_colons_inside_the_d_tag() {
+        assert_eq!(
+            split_a_ref("30023:abc:room:2026:notes"),
+            Some((30023.0, "abc", "room:2026:notes"))
+        );
+        assert_eq!(split_a_ref("30023:abc:"), Some((30023.0, "abc", "")));
+        assert_eq!(split_a_ref("30023:abc"), None);
+        assert_eq!(split_a_ref("x:abc:d"), None);
+    }
+
+    // ── zone_channel_id ──────────────────────────────────────────────────
+
+    #[test]
+    fn zone_channel_id_maps_41_through_the_root_marker_not_the_first_e() {
+        let tags = vec![
+            vec!["e".into(), "public-decoy".into()],
+            vec![
+                "e".into(),
+                "private-channel".into(),
+                "".into(),
+                "root".into(),
+            ],
+        ];
+        for kind in [41, 42] {
+            let event = make_event("id", "pk", kind, 1, tags.clone(), "x");
+            assert_eq!(
+                zone_channel_id(&event).as_deref(),
+                Some("private-channel"),
+                "kind {kind}"
+            );
+        }
+        let def = make_event("chan-id", "pk", 40, 1, vec![], "{}");
+        assert_eq!(zone_channel_id(&def).as_deref(), Some("chan-id"));
+        assert_eq!(
+            zone_channel_id(&make_event("i", "p", 1, 1, tags, "x")),
+            None
+        );
+    }
+
     // ── tag_value ────────────────────────────────────────────────────────
 
     #[test]
@@ -897,12 +1078,12 @@ mod tests {
     }
 
     #[test]
-    fn tag_filter_empty_values_array_is_skipped() {
+    fn tag_filter_empty_values_array_matches_nothing() {
         let event = make_event("aaa", "bbb", 1, 1000, vec![], "hello");
         let mut filter = empty_filter();
         filter.extra.insert("#e".to_string(), serde_json::json!([]));
-        // Empty required array is skipped (continues), so the filter still matches
-        assert!(event_matches_filters(&event, &[filter]));
+        // The SQL builder emits `1 = 0` for an empty array; the live path agrees.
+        assert!(!event_matches_filters(&event, &[filter]));
     }
 
     #[test]

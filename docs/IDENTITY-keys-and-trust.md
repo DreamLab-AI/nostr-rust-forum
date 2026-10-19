@@ -64,7 +64,12 @@ the auth worker's, and carries a `revoked INTEGER NOT NULL DEFAULT 0` flag
 (`crates/nostr-bbs-auth-worker/src/devices.rs:81-110`). Revocation is a
 `revoked = 1` write the relay honours at NIP-42 AUTH time (`devices.rs:7`). When
 the feature is off, a known device→owner mapping is **ignored** and the author key
-is used as-is (`nip_handlers.rs:531,3010`).
+is used as-is (`nip_handlers.rs:531,3010`). On the relay, a device key acts for its
+owner for the allowlist, trust level and zone-write only; sanctions apply to both keys
+and admin status stays the signing key's own. The read path
+(`nip_handlers.rs:1917`) does grant admin READS to a device key via `access_pubkey`
+while admin WRITES stay on the signing key; this is intended and predates the
+write-path rules above.
 
 ### Key lifecycle
 

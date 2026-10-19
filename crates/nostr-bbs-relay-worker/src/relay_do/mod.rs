@@ -133,11 +133,13 @@ impl DurableObject for NostrRelayDO {
             .get("CF-Connecting-IP")?
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Connection rate limit
+        // Connection rate limit. The slot is reserved in the same borrow as the
+        // check: this method awaits below, and a second upgrade arriving in one
+        // of those windows would otherwise read the same pre-increment count and
+        // slip past the cap. Every early return after this point releases it.
         {
-            let counts = self.connection_counts.borrow();
-            let conn_count = counts.get(&ip).copied().unwrap_or(0);
-            if conn_count >= MAX_CONNECTIONS_PER_IP {
+            let mut counts = self.connection_counts.borrow_mut();
+            if !reserve_connection_slot(&mut counts, &ip, MAX_CONNECTIONS_PER_IP) {
                 return Response::error("Too many connections", 429);
             }
         }
@@ -149,7 +151,13 @@ impl DurableObject for NostrRelayDO {
         // them). No-op when nothing hibernated.
         self.recover_untracked_sessions().await;
 
-        let pair = WebSocketPair::new()?;
+        let pair = match WebSocketPair::new() {
+            Ok(pair) => pair,
+            Err(e) => {
+                release_connection_slot(&mut self.connection_counts.borrow_mut(), &ip);
+                return Err(e);
+            }
+        };
         let server = pair.server;
         let client = pair.client;
 
@@ -180,12 +188,6 @@ impl DurableObject for NostrRelayDO {
                     challenge: challenge.clone(),
                 },
             );
-        }
-
-        {
-            let mut counts = self.connection_counts.borrow_mut();
-            let count = counts.get(&ip).copied().unwrap_or(0);
-            counts.insert(ip, count + 1);
         }
 
         // NIP-42: persist the challenge to DO storage BEFORE sending it, so a
@@ -284,11 +286,34 @@ impl DurableObject for NostrRelayDO {
                 self.handle_req(session_id, &ip, &sub_id, filters).await;
             }
             "CLOSE" => {
-                if let Some(sub_id) = arr[1].as_str() {
+                // CLOSE and AUTH are frames too: leaving them off the limiter let
+                // a client flood the DO for free. A CLOSE for a subscription the
+                // session holds is exempt: it only sheds load.
+                let sub_id = arr[1].as_str();
+                let holds = sub_id.is_some_and(|id| {
+                    self.sessions
+                        .borrow()
+                        .get(&session_id)
+                        .is_some_and(|s| s.subscriptions.contains_key(id))
+                });
+                if !close_admitted(holds, || self.check_rate_limit(&ip)) {
+                    Self::send_notice(&ws, "rate limit exceeded");
+                    return Ok(());
+                }
+                if let Some(sub_id) = sub_id {
                     self.handle_close(session_id, sub_id).await;
                 }
             }
             "AUTH" => {
+                if !self.check_rate_limit(&ip) {
+                    // Answer with a refused OK so the client knows to retry
+                    // rather than sit unauthenticated behind a silent notice.
+                    match arr[1].get("id").and_then(|v| v.as_str()) {
+                        Some(id) => Self::send_ok(&ws, id, false, "rate-limited: slow down"),
+                        None => Self::send_notice(&ws, "rate limit exceeded"),
+                    }
+                    return Ok(());
+                }
                 let auth_event: NostrEvent = match serde_json::from_value(arr[1].clone()) {
                     Ok(e) => e,
                     Err(_) => {
@@ -351,5 +376,79 @@ impl DurableObject for NostrRelayDO {
             console_log!("[RelayDO] Idle timeout -- cleared in-memory state for eviction");
         }
         Response::ok("ok")
+    }
+}
+
+/// Whether a CLOSE frame is processed. A CLOSE for a subscription the session
+/// holds is always honoured (it only sheds load, and holdings are bounded by
+/// `MAX_SUBSCRIPTIONS`); a CLOSE for an unknown id must pass the frame limiter,
+/// which is consulted only then so a held-id CLOSE spends no budget.
+pub(crate) fn close_admitted(
+    holds_subscription: bool,
+    within_budget: impl FnOnce() -> bool,
+) -> bool {
+    holds_subscription || within_budget()
+}
+
+/// Reserve one connection slot for `ip` if it is under `max`. The check and the
+/// increment share one `&mut` borrow, so no `.await` can fall between them.
+pub(crate) fn reserve_connection_slot(
+    counts: &mut HashMap<String, u32>,
+    ip: &str,
+    max: u32,
+) -> bool {
+    let count = counts.get(ip).copied().unwrap_or(0);
+    if count >= max {
+        return false;
+    }
+    counts.insert(ip.to_string(), count + 1);
+    true
+}
+
+/// Release a slot taken by [`reserve_connection_slot`], dropping the entry at zero.
+pub(crate) fn release_connection_slot(counts: &mut HashMap<String, u32>, ip: &str) {
+    match counts.get(ip).copied().unwrap_or(1) {
+        0 | 1 => {
+            counts.remove(ip);
+        }
+        n => {
+            counts.insert(ip.to_string(), n - 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod connection_slot_tests {
+    use super::*;
+
+    #[test]
+    fn close_of_a_held_subscription_skips_the_limiter() {
+        assert!(close_admitted(true, || panic!(
+            "limiter must not be consulted"
+        )));
+        assert!(close_admitted(false, || true));
+        assert!(!close_admitted(false, || false));
+    }
+
+    #[test]
+    fn reservation_stops_at_the_cap_and_release_frees_a_slot() {
+        let mut counts = HashMap::new();
+        assert!(reserve_connection_slot(&mut counts, "1.1.1.1", 2));
+        assert!(reserve_connection_slot(&mut counts, "1.1.1.1", 2));
+        assert!(!reserve_connection_slot(&mut counts, "1.1.1.1", 2));
+        // Another address has its own budget.
+        assert!(reserve_connection_slot(&mut counts, "2.2.2.2", 2));
+        release_connection_slot(&mut counts, "1.1.1.1");
+        assert!(reserve_connection_slot(&mut counts, "1.1.1.1", 2));
+    }
+
+    #[test]
+    fn release_removes_the_entry_at_zero_and_tolerates_unknown_ips() {
+        let mut counts = HashMap::new();
+        assert!(reserve_connection_slot(&mut counts, "1.1.1.1", 2));
+        release_connection_slot(&mut counts, "1.1.1.1");
+        assert!(counts.is_empty());
+        release_connection_slot(&mut counts, "9.9.9.9");
+        assert!(counts.is_empty());
     }
 }

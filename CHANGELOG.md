@@ -7,6 +7,49 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: a banned or suspended owner could publish through a device key (`nostr-bbs-relay-worker`)
+
+`handle_event` resolved a registered device key to its owner for the allowlist only; the suspension, silence, ban and
+admin gates still read the raw author, so a sanctioned owner evaded moderation by signing with a device key. The
+effective principal is now resolved once, after signature verification and the write gate and never for gift wraps,
+and an event is refused if either the device key or its owner is suspended, silenced, banned or muted. The allowlist,
+trust level and zone-write checks use the owner; admin status stays the signing key's own, so a device key never
+inherits admin powers (a stolen admin device key cannot sign an enforced ban, and banning a device key directly holds).
+The RSVP cohort check, the `posts_created` counter, activity stamp and delete-any trust level follow the owner too,
+so a device key's posts promote its owner. A channel's creator is matched against both keys, since creation records the raw signing key. Behaviour with device
+keys off is unchanged.
+
+### Fixed: kind-41 channel metadata used a different channel than kind-42 and was not zone-read-gated (`nostr-bbs-relay-worker`)
+
+The kind-41 write gate took the first `e` tag, so a decoy first `e` could authorise edits to another channel, and
+the zone read gate mapped only kinds 40 and 42, so kind-41 escaped zone gating altogether.
+Kind-41 now resolves its channel with `channel_tag` (root marker, else first `e`) for both gates, and is zone-gated
+identically to the kind-40 definition.
+
+### Fixed: CLOSE and AUTH frames bypassed the per-IP frame limiter (`nostr-bbs-relay-worker`)
+
+Only EVENT, REQ and COUNT were counted, so a client could flood the Durable Object with CLOSE or AUTH frames for free.
+Both now pass the same limiter and budget. An over-budget AUTH is answered with a refused `OK` (`rate-limited`) so the
+client retries, and a CLOSE for a subscription the session holds is always processed since it only sheds load.
+
+### Fixed: live subscriptions matched filters differently from stored reads (`nostr-bbs-relay-worker`)
+
+`event_matches_filters` ignored `search`, treated an empty tag array as no constraint and applied tag names the SQL
+builder discards. SQL builder and live matcher now decide through shared helpers: `search` is an ASCII
+case-insensitive substring match, an empty tag array matches nothing an invalid tag name is ignored and a `#probe` filter matches nothing live, as it does in SQL (probe tags are never indexed). The
+`LIKE` pattern builder also escapes the backslash escape character itself.
+
+### Fixed: NIP-09 `a`-tag deletion truncated d-tags containing `:` (`nostr-bbs-relay-worker`)
+
+The reference `kind:pubkey:d-tag` was split on every colon, so the d-tag stopped at its first `:` and the delete
+matched nothing. Only the first two colons now separate fields.
+
+### Fixed: the per-IP connection cap raced across await points (`nostr-bbs-relay-worker`)
+
+The count was checked, then incremented only after several awaits, so concurrent upgrades from one address could
+all read the same count. The slot is now reserved in the same borrow as the check and released on the early-return
+path.
+
 ### Fixed: live broadcast leaked protected kinds to kinds-less subscriptions (`nostr-bbs-relay-worker`)
 
 REQ and COUNT decide protected reads from the kinds a filter names, so `{}` or `{"#p":[...]}` passed both gates

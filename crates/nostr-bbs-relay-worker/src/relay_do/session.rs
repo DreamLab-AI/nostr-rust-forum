@@ -332,13 +332,7 @@ impl NostrRelayDO {
             self.clear_session_storage(session_id).await;
 
             if let Some(ip) = ip {
-                let mut counts = self.connection_counts.borrow_mut();
-                let count = counts.get(&ip).copied().unwrap_or(1);
-                if count <= 1 {
-                    counts.remove(&ip);
-                } else {
-                    counts.insert(ip, count - 1);
-                }
+                super::release_connection_slot(&mut self.connection_counts.borrow_mut(), &ip);
             }
 
             // If no sessions remain, schedule an idle timeout alarm so the
