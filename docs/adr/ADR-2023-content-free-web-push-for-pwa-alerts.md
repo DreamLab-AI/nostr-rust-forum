@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: f4b7470ad7355cd06e174ec2dc513610b142577c
+verified_commit: 1b6b87d7bea85fb4d540856f9c9b6ee55c7f57ca
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: Any request to carry message text in a push payload (RFC 8291), or a second service worker (the BBS) wanting its own push subscription
 repo: nostr-rust-forum
@@ -46,5 +46,5 @@ repo: nostr-rust-forum
 ## Verification
 - `cargo test -p nostr-bbs-relay-worker push` covers: the RFC 8292 §2 example JWT verifying under its published key, VAPID round-trip, endpoint allow-list, token hashing, fan-out classification and the self-copy skip, and every SQL statement run on SQLite. `cargo test -p nostr-bbs-core push` covers preferences and quiet hours.
 - `cargo test -p nostr-bbs-forum-client` covers the Tier 0 DM gating and system-notification predicate.
-- At `verified_commit`: relay-worker, core and forum-client suites pass (1,720 Rust tests across the three crates), the service-worker suite passes (`node --test crates/nostr-bbs-forum-client/tests/sw-push.test.mjs`, 11 tests), clippy is clean, and both wasm32 builds succeed.
+- At `verified_commit`: relay-worker, core and forum-client suites pass (1,723 Rust tests across the three crates), the service-worker suite passes (`node --test crates/nostr-bbs-forum-client/tests/sw-push.test.mjs`, 11 tests), clippy is clean, and both wasm32 builds succeed.
 - Not verified here: a live Cloudflare deploy, a real push service round trip, and device behaviour on iOS. `activation_status` stays `staged` until an operator sets the VAPID pair and tests on devices.
