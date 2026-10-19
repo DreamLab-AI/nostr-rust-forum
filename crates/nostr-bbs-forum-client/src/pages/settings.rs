@@ -384,7 +384,7 @@ pub fn SettingsPage() -> impl IntoView {
             let pk_for_event = pk.clone();
             let on_event: Rc<dyn Fn(nostr_bbs_core::NostrEvent)> =
                 Rc::new(move |event: nostr_bbs_core::NostrEvent| {
-                    if event.kind != 0 {
+                    if event.kind != 0 || !kind0_is_for(&event.pubkey, &pk_for_event) {
                         return;
                     }
                     if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&event.content) {
@@ -552,6 +552,20 @@ pub fn SettingsPage() -> impl IntoView {
             input.set_value("");
             toasts_for_pic.show(
                 "Image too large — maximum size is 2 MB",
+                ToastVariant::Warning,
+            );
+            return;
+        }
+        let mime = file.type_();
+        if mime == "image/svg+xml" {
+            input.set_value("");
+            toasts_for_pic.show("SVG avatars are not supported", ToastVariant::Warning);
+            return;
+        }
+        if !avatar_type_allowed(&mime) {
+            input.set_value("");
+            toasts_for_pic.show(
+                "Unsupported image type — use PNG, JPEG, WebP or GIF",
                 ToastVariant::Warning,
             );
             return;
@@ -1566,7 +1580,8 @@ pub fn SettingsPage() -> impl IntoView {
                             on:click=move |_| {
                                 if auth.get().is_nip07 {
                                     // Show toast immediately for NIP-07 — no confirmation dialog needed
-                                    let toasts = use_toasts();
+                                    // Reuse the handle bound at component setup:
+                                    // expect_context panics in a DOM handler (#32).
                                     toasts.show(
                                         "Private key export is not available with NIP-07 browser extensions. Your key is managed by the extension.",
                                         ToastVariant::Warning,
@@ -1781,6 +1796,23 @@ fn publish_profile_metadata(
     });
 }
 
+/// Whether `mime` is an accepted avatar type. SVG is refused: the pod serves
+/// stored bytes with the declared type, so an SVG carrying a script would be a
+/// stored XSS when opened directly.
+fn avatar_type_allowed(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
+}
+
+/// Whether a kind-0 event may hydrate the profile form for `requested`. The
+/// relay is untrusted: a validly signed kind-0 from another author must not
+/// seed fields the member then re-signs as their own.
+fn kind0_is_for(event_pubkey: &str, requested: &str) -> bool {
+    event_pubkey.eq_ignore_ascii_case(requested)
+}
+
 /// Derive a timestamped pod filename for an uploaded avatar from its MIME
 /// type, e.g. `avatar-1765432100.png`. The timestamp busts client caches
 /// when a user replaces their picture.
@@ -1790,7 +1822,6 @@ fn avatar_filename(mime: &str) -> String {
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
-        "image/svg+xml" => "svg",
         "image/avif" => "avif",
         _ => "img",
     };
@@ -1908,4 +1939,27 @@ fn git_icon() -> impl IntoView {
 fn info_icon() -> impl IntoView {
     // Circle-i info glyph.
     section_icon("M12 22a10 10 0 100-20 10 10 0 000 20zM12 16v-4M12 8h.01")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avatar_types_exclude_svg_and_unknowns() {
+        for ok in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+            assert!(avatar_type_allowed(ok), "{ok}");
+        }
+        for bad in ["image/svg+xml", "image/avif", "text/html", ""] {
+            assert!(!avatar_type_allowed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn kind0_hydration_requires_the_requested_author() {
+        let me = "ab".repeat(32);
+        assert!(kind0_is_for(&me, &me));
+        assert!(kind0_is_for(&me.to_uppercase(), &me));
+        assert!(!kind0_is_for(&"cd".repeat(32), &me));
+    }
 }
