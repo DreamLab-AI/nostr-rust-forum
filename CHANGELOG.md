@@ -21,9 +21,11 @@ secret (`cargo run -p nostr-bbs-relay-worker --example vapid_keygen`; SETUP.md s
 
 ### Added: DM arrival notifications and hidden-tab system alerts (`nostr-bbs-forum-client`)
 
-A received DM now creates a `DM` notification (it never did), gated on the account's sync baseline and
-de-duplicated per wrap. While the page is hidden, permission is granted and server push is not active on the
-device, new notifications are also raised as generic system notifications through the service worker.
+A received DM now creates a `DM` notification (it never did), from anywhere in the app: a layout-level watcher
+opens new gift wraps, gated on the account's sync baseline and de-duplicated per wrap. While the page is hidden
+and permission is granted, addressed notifications (DMs, mentions, join and RSVP notices) are also raised as
+generic system notifications through the service worker. Settings offers a "Browser alerts" permission control
+even when the relay has Web Push off.
 
 ### Fixed: kind-1059 gift wraps no longer readable through a `kinds`-less REQ or COUNT (`nostr-bbs-relay-worker`)
 

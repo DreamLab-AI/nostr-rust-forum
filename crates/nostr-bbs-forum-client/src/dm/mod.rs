@@ -767,6 +767,68 @@ fn subscribe_dm_with_auth_retry(
     );
 }
 
+// -- App-wide incoming-DM watcher (Tier 0, ADR-2023) ---------------------------
+
+/// Subscribe to gift wraps addressed to `my_pubkey` for the whole app session
+/// and raise a notification for each fresh DM.
+///
+/// The [`DMStore`] is provided per page (the DM list, a chat, the poker table),
+/// so its subscription only exists while one of those is open; a DM arriving
+/// anywhere else would never notify. This watcher lives in the layout instead.
+/// It keeps no message state: it opens each wrap not yet announced, hands the
+/// sender and rumor timestamp to the notification store (which applies the
+/// baseline and de-duplication rules), and forgets the plaintext.
+///
+/// Returns the subscription id so the caller can close it on sign-out or a
+/// dropped session. Call only once the relay session is NIP-42 authenticated.
+pub fn start_incoming_watcher(
+    relay: &RelayConnection,
+    signer: Rc<dyn Signer>,
+    my_pubkey: &str,
+) -> String {
+    let my_pk = my_pubkey.to_string();
+    let since = ((js_sys::Date::now() / 1000.0) as u64).saturating_sub(GIFT_WRAP_LOOKBACK_SECS);
+    let filters = gift_wrap_filters(&my_pk, Some(since));
+    let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
+        if event.kind != KIND_GIFT_WRAP {
+            return;
+        }
+        let signer = signer.clone();
+        let me = my_pk.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            watch_one(&event, signer.as_ref(), &me).await;
+        });
+    });
+    relay.subscribe(filters, on_event, None)
+}
+
+/// Open one wrap and notify if it is a fresh DM from someone else.
+async fn watch_one(event: &NostrEvent, signer: &dyn Signer, me: &str) {
+    let Some(store) = crate::stores::notifications::global_notification_store() else {
+        return;
+    };
+    // Already announced (or settled as backlog) on an earlier load: skip the
+    // decryption entirely.
+    if store.dm_settled(&event.id) {
+        return;
+    }
+    // Zone-key grants and poker traffic ride the same transport and fail here;
+    // that is expected, not an error.
+    let Ok(unwrapped) = unwrap_gift_with_signer(event, signer).await else {
+        return;
+    };
+    if is_coach_content(&unwrapped.rumor.content) {
+        return;
+    }
+    let is_sent = unwrapped.sender_pubkey == me;
+    store.notify_dm(
+        &event.id,
+        &unwrapped.sender_pubkey,
+        unwrapped.rumor.created_at,
+        is_sent,
+    );
+}
+
 // -- Event processing ---------------------------------------------------------
 
 /// Spawn an async decrypt of a single inbound DM event.
@@ -896,19 +958,7 @@ async fn process_gift_wrap_event(
         is_read: is_sent,
     };
 
-    // Tier 0 (ADR-2023): a received DM raises a notification. Coach exchanges
-    // are poker-table plumbing, not mail, and never notify.
-    let notifiable = !is_sent && !is_coach_content(&plaintext);
-    let wrap_id = msg.id.clone();
-    let sender = msg.sender_pubkey.clone();
-
     insert_dm_message(msg, &counterparty_pk, &plaintext, timestamp, is_sent, state);
-
-    if notifiable {
-        if let Some(store) = crate::stores::notifications::global_notification_store() {
-            store.notify_dm(&wrap_id, &sender, timestamp, is_sent);
-        }
-    }
 }
 
 /// Decrypt a legacy kind 4 DM event and insert into state.

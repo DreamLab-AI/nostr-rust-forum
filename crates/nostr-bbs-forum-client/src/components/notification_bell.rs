@@ -90,6 +90,37 @@ pub(crate) fn NotificationBell() -> impl IntoView {
     v2_store.init_sync();
     let panel_open = RwSignal::new(false);
 
+    // ADR-2023 Tier 0: DMs notify from anywhere in the app. The per-page DM
+    // store only subscribes while a DM screen is open, so the layout watches
+    // gift wraps itself once the relay session is authenticated, and re-arms
+    // after a reconnect or an account switch.
+    if let Some(relay) = use_context::<crate::relay::RelayConnection>() {
+        let conn = relay.connection_state();
+        let relay_authed = relay.authenticated();
+        let me = crate::auth::use_auth().pubkey();
+        let auth_for_dm = crate::auth::use_auth();
+        let watching: StoredValue<Option<(String, String)>> = StoredValue::new(None);
+        Effect::new(move |_| {
+            let ready =
+                conn.get() == crate::relay::ConnectionState::Connected && relay_authed.get();
+            let pk = me.get();
+            let current = watching.get_value();
+            let wanted = if ready { pk } else { None };
+            if current.as_ref().map(|(_, p)| p) == wanted.as_ref() {
+                return;
+            }
+            if let Some((sid, _)) = current {
+                relay.unsubscribe(&sid);
+                watching.set_value(None);
+            }
+            let (Some(pk), Some(signer)) = (wanted, auth_for_dm.get_signer()) else {
+                return;
+            };
+            let sid = crate::dm::start_incoming_watcher(&relay, signer, &pk);
+            watching.set_value(Some((sid, pk)));
+        });
+    }
+
     // ADR-2023: once signed in, keep this device's push registration fresh (at
     // most daily; a no-op unless the member already turned alerts on here).
     let push_auth = crate::auth::use_auth();

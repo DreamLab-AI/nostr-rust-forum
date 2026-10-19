@@ -20,6 +20,11 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     pending_reply  INTEGER NOT NULL DEFAULT 0,
     pending_topic  INTEGER NOT NULL DEFAULT 0,
     pending_post   INTEGER NOT NULL DEFAULT 0,
+    -- bump_seq counts events counted for this device; pushed_seq is bump_seq as of
+    -- the last successful push. bump_seq > pushed_seq means a burst was counted but
+    -- never pushed about (throttled), which the cron trailing flush wakes it for.
+    bump_seq       INTEGER NOT NULL DEFAULT 0,
+    pushed_seq     INTEGER NOT NULL DEFAULT 0,
     link_reply     TEXT,
     link_topic     TEXT,
     link_post      TEXT

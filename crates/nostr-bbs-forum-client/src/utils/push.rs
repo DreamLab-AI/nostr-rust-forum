@@ -31,6 +31,8 @@ use crate::utils::relay_url::relay_api_base;
 extern "C" {
     #[wasm_bindgen(js_name = pushSupported)]
     fn js_supported() -> bool;
+    #[wasm_bindgen(js_name = pushNotificationsSupported)]
+    fn js_notifications_supported() -> bool;
     #[wasm_bindgen(js_name = pushPermission)]
     fn js_permission() -> String;
     #[wasm_bindgen(js_name = pushRequestPermission)]
@@ -93,9 +95,23 @@ pub fn supported() -> bool {
     js_supported()
 }
 
+/// Whether system notifications (not necessarily server push) can be shown:
+/// the Notification API plus a service worker to raise them through.
+pub fn notifications_supported() -> bool {
+    js_notifications_supported()
+}
+
+/// Wait for a prompt raised by [`request_permission_now`] and return the answer.
+pub async fn await_permission(prompt: js_sys::Promise) -> Permission {
+    match resolve(prompt).await {
+        Ok(v) => Permission::parse(&v.as_string().unwrap_or_default()),
+        Err(_) => permission(),
+    }
+}
+
 /// Current permission.
 pub fn permission() -> Permission {
-    if !js_supported() {
+    if !js_notifications_supported() {
         return Permission::Unsupported;
     }
     Permission::parse(&js_permission())
@@ -265,7 +281,8 @@ pub async fn enable(
 /// Raise the permission prompt now, if it has not been answered. Call this
 /// directly from the click handler, before spawning any async work.
 pub fn request_permission_now() -> Option<js_sys::Promise> {
-    (js_supported() && permission() == Permission::Default).then(js_request_permission)
+    (js_notifications_supported() && permission() == Permission::Default)
+        .then(js_request_permission)
 }
 
 /// Subscribe in the browser, register with the relay, store drain credentials.

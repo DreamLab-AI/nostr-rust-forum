@@ -81,6 +81,7 @@ pub const PUSH_SCHEMA_SQL: [&str; 3] = [
         last_push_at INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, \
         pending_dm INTEGER NOT NULL DEFAULT 0, pending_reply INTEGER NOT NULL DEFAULT 0, \
         pending_topic INTEGER NOT NULL DEFAULT 0, pending_post INTEGER NOT NULL DEFAULT 0, \
+        bump_seq INTEGER NOT NULL DEFAULT 0, pushed_seq INTEGER NOT NULL DEFAULT 0, \
         link_reply TEXT, link_topic TEXT, link_post TEXT)",
     "CREATE INDEX IF NOT EXISTS idx_push_subscriptions_pubkey ON push_subscriptions(pubkey)",
     "CREATE TABLE IF NOT EXISTS push_prefs (\
@@ -111,7 +112,8 @@ const SQL_UPSERT_SUBSCRIPTION: &str =
      VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
      ON CONFLICT(id) DO UPDATE SET pubkey = excluded.pubkey, token_hash = excluded.token_hash, \
        refreshed_at = excluded.refreshed_at, failures = 0, \
-       pending_dm = 0, pending_reply = 0, pending_topic = 0, pending_post = 0";
+       pending_dm = 0, pending_reply = 0, pending_topic = 0, pending_post = 0, \
+       bump_seq = 0, pushed_seq = 0";
 
 /// Insert or replace a member's preferences.
 const SQL_UPSERT_PREFS: &str = "INSERT INTO push_prefs (pubkey, replies, dms, new_topics, new_posts, muted_channels, \
@@ -133,12 +135,16 @@ const SQL_DRAIN_SUBTRACT: &str =
        pending_reply = MAX(pending_reply - ?3, 0), pending_topic = MAX(pending_topic - ?4, 0), \
        pending_post = MAX(pending_post - ?5, 0) WHERE id = ?1";
 
-/// Devices with undelivered counters whose last push is older than `?1`:
-/// throttled alerts the trailing flush must still wake them for.
+/// Devices owed a wake-up: events were counted since the last successful push
+/// (`bump_seq > pushed_seq`), they are still undrained, and the last push is older
+/// than `?1`. One burst earns exactly one flush: a successful flush sets
+/// `pushed_seq = bump_seq`, so an app that never drains cannot be woken every tick.
 const SQL_PENDING_DUE: &str = "SELECT id, pubkey, endpoint, last_push_at, \
-       pending_dm, pending_reply, pending_topic, pending_post \
+       pending_dm, pending_reply, pending_topic \
      FROM push_subscriptions \
-     WHERE (pending_dm + pending_reply + pending_topic + pending_post) > 0 AND last_push_at <= ?1 \
+     WHERE bump_seq > pushed_seq \
+       AND (pending_dm + pending_reply + pending_topic + pending_post) > 0 \
+       AND last_push_at <= ?1 \
      ORDER BY last_push_at ASC LIMIT ?2";
 
 /// A device is flushed once its last push is at least this old, which is longer
@@ -150,6 +156,12 @@ const FLUSH_BATCH: usize = 100;
 /// Delete subscriptions the app has not refreshed since `?1`.
 const SQL_SWEEP_STALE: &str = "DELETE FROM push_subscriptions WHERE refreshed_at < ?1";
 
+/// A push was accepted: remember when, clear failures, and mark every counted
+/// event so far as pushed about (`pushed_seq = bump_seq`). A bump that lands
+/// between the send and this statement is still covered, because the woken
+/// service worker drains the counters after it.
+const SQL_MARK_PUSHED: &str = "UPDATE push_subscriptions SET last_push_at = ?2, failures = 0, pushed_seq = bump_seq WHERE id = ?1";
+
 /// Delete subscriptions that failed `?1` times in a row.
 const SQL_DELETE_FAILED: &str = "DELETE FROM push_subscriptions WHERE failures >= ?1";
 
@@ -158,11 +170,11 @@ const SQL_DELETE_FAILED: &str = "DELETE FROM push_subscriptions WHERE failures >
 fn bump_sql(category: Category) -> String {
     if category.has_link() {
         format!(
-            "UPDATE push_subscriptions SET pending_{0} = pending_{0} + 1, link_{0} = ?2 WHERE id = ?1",
+            "UPDATE push_subscriptions SET pending_{0} = pending_{0} + 1, link_{0} = ?2, bump_seq = bump_seq + 1 WHERE id = ?1",
             category.as_str()
         )
     } else {
-        "UPDATE push_subscriptions SET pending_dm = pending_dm + 1 WHERE id = ?1".to_string()
+        "UPDATE push_subscriptions SET pending_dm = pending_dm + 1, bump_seq = bump_seq + 1 WHERE id = ?1".to_string()
     }
 }
 
@@ -529,9 +541,7 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>, bump_counters: bool) {
     for (id, outcome) in &results {
         let stmt = match outcome {
             SendOutcome::Delivered => db
-                .prepare(
-                    "UPDATE push_subscriptions SET last_push_at = ?2, failures = 0 WHERE id = ?1",
-                )
+                .prepare(SQL_MARK_PUSHED)
                 .bind(&[js_str(id), js_f64(now as f64)]),
             SendOutcome::Gone => db
                 .prepare("DELETE FROM push_subscriptions WHERE id = ?1")
@@ -1829,5 +1839,82 @@ mod tests {
             row(0.0, 0.0, 0.0, 1.0).into_job().link.is_none(),
             "counters already hold the links"
         );
+    }
+
+    /// Ids the trailing flush would wake at `now`.
+    fn due(conn: &rusqlite::Connection, now: i64) -> Vec<String> {
+        let mut stmt = conn.prepare(SQL_PENDING_DUE).unwrap();
+        stmt.query_map(rusqlite::params![now - FLUSH_AFTER_SECS as i64, 50], |r| {
+            r.get(0)
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    #[test]
+    fn one_burst_earns_exactly_one_flush() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute(&bump_sql(Category::Dm), rusqlite::params!["s1"])
+            .unwrap();
+        conn.execute(&bump_sql(Category::Dm), rusqlite::params!["s1"])
+            .unwrap();
+        assert_eq!(
+            due(&conn, 1_000),
+            vec!["s1"],
+            "counted but never pushed about"
+        );
+
+        // The flush pushes successfully. The app never drains (a visible tab, or
+        // a stale token), so the counters stay above zero...
+        conn.execute(SQL_MARK_PUSHED, rusqlite::params!["s1", 1_000])
+            .unwrap();
+        assert_eq!(count(&conn, "SELECT pending_dm FROM push_subscriptions"), 2);
+        // ...but the device must NOT be woken again on later ticks.
+        assert!(due(&conn, 1_300).is_empty());
+        assert!(due(&conn, 100_000).is_empty());
+    }
+
+    #[test]
+    fn only_events_counted_after_a_push_make_a_device_due_again() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute(&bump_sql(Category::Reply), rusqlite::params!["s1", "/go/a"])
+            .unwrap();
+        conn.execute(SQL_MARK_PUSHED, rusqlite::params!["s1", 1_000])
+            .unwrap();
+        assert!(due(&conn, 2_000).is_empty());
+
+        // A new event arrives, is throttled (no push), and so is owed a flush.
+        conn.execute(&bump_sql(Category::Reply), rusqlite::params!["s1", "/go/b"])
+            .unwrap();
+        assert!(
+            due(&conn, 1_050).is_empty(),
+            "still inside the flush window"
+        );
+        assert_eq!(due(&conn, 1_200), vec!["s1"]);
+    }
+
+    #[test]
+    fn a_drained_device_is_never_flushed() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute(&bump_sql(Category::Dm), rusqlite::params!["s1"])
+            .unwrap();
+        // The woken service worker (or an open app) drained it before the tick.
+        conn.execute(SQL_DRAIN_SUBTRACT, rusqlite::params!["s1", 1, 0, 0, 0])
+            .unwrap();
+        assert!(due(&conn, 5_000).is_empty(), "nothing left to say");
+    }
+
+    #[test]
+    fn re_registering_forgets_the_old_owners_bursts() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute(&bump_sql(Category::Dm), rusqlite::params!["s1"])
+            .unwrap();
+        subscribe_row(&conn, "s1", PK_B, 2, "t2");
+        assert!(due(&conn, 5_000).is_empty());
     }
 }

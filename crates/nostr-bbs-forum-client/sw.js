@@ -257,10 +257,16 @@ async function forumWindows() {
 
 async function handlePush() {
   // A visible, focused window already shows the activity in-app.
-  if ((await forumWindows()).some((c) => c.visibilityState === 'visible')) return;
-
   const cfg = await readPushCfg();
-  const items = composePushNotifications(await drainPending(cfg));
+  const drained = await drainPending(cfg);
+  if ((await forumWindows()).some((c) => c.visibilityState === 'visible')) {
+    // The member is looking at the app, which already shows this. Draining
+    // anyway clears the counters server side: if they stayed above zero the
+    // relay would see an outstanding burst and keep waking this device.
+    return;
+  }
+
+  const items = composePushNotifications(drained);
   const title = (cfg && cfg.brand) || 'Community';
   if (items.length === 0) {
     // Another device already drained, or the relay was unreachable. A push

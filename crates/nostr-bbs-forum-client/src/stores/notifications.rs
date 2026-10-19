@@ -294,6 +294,7 @@ impl NotificationStoreV2 {
             format!("nbbs-local-{}", system_tag(&kind)),
             link.map(|l| l.trim_start_matches('/').to_string())
                 .unwrap_or_default(),
+            system_alert_allowed(&kind),
         );
 
         let notification = Notification {
@@ -319,12 +320,20 @@ impl NotificationStoreV2 {
         });
         self.persist();
 
-        crate::utils::push::show_local_if_hidden(
-            &crate::utils::push::brand_label(),
-            local_alert.0,
-            &local_alert.2,
-            &local_alert.1,
-        );
+        if local_alert.3 {
+            crate::utils::push::show_local_if_hidden(
+                &crate::utils::push::brand_label(),
+                local_alert.0,
+                &local_alert.2,
+                &local_alert.1,
+            );
+        }
+    }
+
+    /// Whether a DM wrap has already been announced or settled as backlog, so
+    /// the watcher can skip decrypting it.
+    pub fn dm_settled(&self, wrap_id: &str) -> bool {
+        self.seen_messages.with_untracked(|s| s.contains(wrap_id))
     }
 
     /// Notify about a received direct message (Tier 0, ADR-2023).
@@ -335,6 +344,13 @@ impl NotificationStoreV2 {
     /// same wrap (persisted, so a reload does not re-announce). `wrap_id` is the
     /// kind-1059 event id, which is stable across reloads.
     pub fn notify_dm(&self, wrap_id: &str, sender: &str, timestamp: u64, is_sent: bool) {
+        // The sync floor is stamped when the bell mounts (`init_sync`). A wrap
+        // that somehow arrives first must not be judged against floor 0, which
+        // would announce the whole two-day lookback. Not burned: nothing is
+        // decided yet.
+        if self.baseline.get_untracked() == 0 {
+            return;
+        }
         let seen = self.seen_messages.with_untracked(|s| s.contains(wrap_id));
         let verdict = dm_verdict(is_sent, timestamp, self.baseline.get_untracked(), seen);
         if verdict.burn {
@@ -888,6 +904,14 @@ fn dm_verdict(is_sent: bool, timestamp: u64, baseline: u64, already_seen: bool) 
     }
 }
 
+/// Whether `kind` may be raised as an OS-level alert while the page is hidden.
+/// Generic channel chatter (`Message`) stays in-app: it mirrors the server push
+/// defaults, where new posts are opt-in, and under the default "All" level it
+/// would otherwise buzz for every post in every channel.
+fn system_alert_allowed(kind: &NotificationKind) -> bool {
+    !matches!(kind, NotificationKind::Message)
+}
+
 /// A notification cannot be from the future: clamp `timestamp` to `now`.
 fn clamp_to_now(timestamp: u64, now: u64) -> u64 {
     timestamp.min(now)
@@ -1292,6 +1316,21 @@ mod tests {
             },
             "already announced: nothing to do"
         );
+    }
+
+    #[test]
+    fn only_addressed_kinds_raise_system_alerts() {
+        assert!(!system_alert_allowed(&NotificationKind::Message));
+        for k in [
+            NotificationKind::DM,
+            NotificationKind::Mention,
+            NotificationKind::JoinRequest,
+            NotificationKind::JoinApproved,
+            NotificationKind::EventRSVP,
+            NotificationKind::System,
+        ] {
+            assert!(system_alert_allowed(&k), "{k:?}");
+        }
     }
 
     #[test]

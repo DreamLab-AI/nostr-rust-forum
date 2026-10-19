@@ -150,7 +150,7 @@ test('missing credentials never call the relay and still show something', async 
   assert.equal(w.shown[0].title, 'Community');
 });
 
-test('a visible window suppresses the system notification', async () => {
+test('a visible window suppresses the notification but still drains the counters', async () => {
   const w = makeWorker({
     cfg: CFG,
     drain: { dm: 1 },
@@ -158,7 +158,7 @@ test('a visible window suppresses the system notification', async () => {
   });
   await w.fire('push', {});
   assert.equal(w.shown.length, 0);
-  assert.equal(w.fetched.length, 0, 'counters stay pending for the in-app view');
+  assert.equal(w.fetched.length, 1, 'drained anyway, or the relay keeps waking this device');
 });
 
 test('clicking opens the deep link inside the scope when no window exists', async () => {

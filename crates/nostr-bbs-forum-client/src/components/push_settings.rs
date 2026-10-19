@@ -15,13 +15,23 @@ use crate::utils::push::{self, Permission};
 /// Default quiet window when the member first switches quiet hours on.
 const DEFAULT_QUIET: (u16, u16) = (22 * 60, 7 * 60);
 
+/// Which controls the card offers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Hidden,
+    Push,
+    LocalOnly,
+}
+
 #[component]
 pub fn PushSettings() -> impl IntoView {
     let auth = use_auth();
     let toasts = use_toasts();
 
-    // None while loading; Some(false) = unavailable (hide); Some(true) = show.
-    let available: RwSignal<Option<bool>> = RwSignal::new(None);
+    // None while loading. `Push`: server push is on, full controls. `LocalOnly`:
+    // the relay has push off but this browser can show system alerts while the
+    // app sits in a background tab, so only the permission is offered.
+    let mode: RwSignal<Option<Mode>> = RwSignal::new(None);
     let permission = RwSignal::new(push::permission());
     let active = RwSignal::new(push::active_on_device());
     let busy = RwSignal::new(false);
@@ -33,8 +43,15 @@ pub fn PushSettings() -> impl IntoView {
     // Screen, so `supported()` is false there. Still show the card (with the
     // install hint) as long as the relay has push on.
     leptos::task::spawn_local(async move {
-        let on = (push::supported() || needs_install) && push::fetch_config().await.is_some();
-        available.set(Some(on));
+        let server_push =
+            (push::supported() || needs_install) && push::fetch_config().await.is_some();
+        mode.set(Some(if server_push {
+            Mode::Push
+        } else if push::notifications_supported() {
+            Mode::LocalOnly
+        } else {
+            Mode::Hidden
+        }));
     });
 
     // Load the member's preferences once this device is subscribed.
@@ -160,8 +177,48 @@ pub fn PushSettings() -> impl IntoView {
         persist();
     };
 
+    let allow_local = move |_| {
+        let asked = push::request_permission_now();
+        leptos::task::spawn_local(async move {
+            if let Some(prompt) = asked {
+                permission.set(push::await_permission(prompt).await);
+            } else {
+                permission.set(push::permission());
+            }
+        });
+    };
+
     view! {
-        <Show when=move || available.get() == Some(true)>
+        <Show when=move || mode.get() == Some(Mode::LocalOnly)>
+            <div class="glass-card p-6 space-y-4" data-testid="local-alert-settings">
+                <h2 class="text-lg font-semibold text-white">"Browser alerts"</h2>
+                <div class="border-t border-gray-700/50"></div>
+                <p class="text-sm text-gray-400">
+                    "Get a system alert for direct messages and mentions while this app is open in a \
+                     background tab or window. Alerts only say what kind of thing happened."
+                </p>
+                <Show when=move || permission.get() == Permission::Denied>
+                    <p class="text-sm text-amber-400" role="note">
+                        "Notifications are blocked for this site. Allow them in your browser's site settings, then come back."
+                    </p>
+                </Show>
+                <Show
+                    when=move || permission.get() == Permission::Granted
+                    fallback=move || view! {
+                        <button
+                            class="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-medium disabled:opacity-50"
+                            disabled=move || permission.get() == Permission::Denied
+                            on:click=allow_local
+                        >
+                            "Allow browser alerts"
+                        </button>
+                    }
+                >
+                    <p class="text-sm text-gray-300">"Browser alerts are on."</p>
+                </Show>
+            </div>
+        </Show>
+        <Show when=move || mode.get() == Some(Mode::Push)>
             <div class="glass-card p-6 space-y-4" data-testid="push-settings">
                 <h2 class="text-lg font-semibold text-white">"Push notifications"</h2>
                 <div class="border-t border-gray-700/50"></div>

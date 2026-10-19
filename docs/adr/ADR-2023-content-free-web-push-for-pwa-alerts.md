@@ -32,7 +32,10 @@ repo: nostr-rust-forum
 5. **Subscription hygiene.** Register and unsubscribe require NIP-98 and a whitelisted pubkey; endpoints must be `https` on an allow-listed push-service host (SSRF guard); at most 10 subscriptions per pubkey; a 404/410 from the push service deletes the row, repeated failures delete it too.
 6. **The forum service worker (`/community/sw.js`) owns push.** The BBS SW (`bbs-sw.js`, scope `/community/bbs/`) does not subscribe in v1.
 7. **Default off.** The relay needs `PUSH_ENABLED="true"`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT` and the secret `VAPID_PRIVATE_KEY`. The client learns of the feature from `GET /api/push/config`, so no client rebuild or `window.__ENV__` change is needed to switch it on.
-8. **Tier 0 ships with it:** a received DM now creates a `DM` notification (baseline- and dedupe-gated like posts), and when the tab is hidden, permission is granted and Web Push is not active on this device, the page raises the notification through `registration.showNotification()`.
+8. **Tier 0 ships with it, and needs no server push.**
+   - A layout-level watcher (`dm::start_incoming_watcher`, mounted by the notification bell once the relay session is authenticated) opens each gift wrap not yet announced and creates a `DM` notification. The per-page `DMStore` only subscribes while a DM screen is open, so it cannot do this. The sync baseline and a persisted per-wrap id make it announce a DM once.
+   - While the page is hidden, permission is granted and server push is not active on the device, addressed notifications (DMs, mentions, join and RSVP notices) are also raised as generic system notifications through the service worker registration. Generic channel chatter (`Message`) stays in-app, matching the server defaults where new posts are opt-in.
+   - With server push off, Settings offers a minimal "Browser alerts" permission control, so Tier 0 is reachable on a deployment that has not set up VAPID.
 
 ## Consequences
 - Alerts reach closed PWAs on desktop and Android, and on iOS 16.4+ once installed to the Home Screen, with permission requested from a tap.

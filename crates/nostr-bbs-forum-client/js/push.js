@@ -66,6 +66,11 @@ export function pushSupported() {
   );
 }
 
+/** System notifications possible at all: Notification API + a service worker. */
+export function pushNotificationsSupported() {
+  return typeof window !== 'undefined' && 'Notification' in window && 'serviceWorker' in navigator;
+}
+
 /** "default" | "granted" | "denied" | "unsupported". */
 export function pushPermission() {
   return 'Notification' in window ? Notification.permission : 'unsupported';
