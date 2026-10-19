@@ -11,8 +11,12 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 `handle_event` resolved a registered device key to its owner for the allowlist only; the suspension, silence, ban and
 admin gates still read the raw author, so a sanctioned owner evaded moderation by signing with a device key. The
-effective principal is now resolved once and an event is refused if either the device key or its owner is sanctioned.
-Behaviour with device keys off is unchanged.
+effective principal is now resolved once, after signature verification and the write gate and never for gift wraps,
+and an event is refused if either the device key or its owner is suspended, silenced, banned or muted. The allowlist,
+trust level and zone-write checks use the owner; admin status stays the signing key's own, so a device key never
+inherits admin powers (a stolen admin device key cannot sign an enforced ban, and banning a device key directly holds).
+A channel's creator is matched against both keys, since creation records the raw signing key. Behaviour with device
+keys off is unchanged.
 
 ### Fixed: kind-41 channel metadata used a different channel than kind-42 and was not zone-read-gated (`nostr-bbs-relay-worker`)
 

@@ -105,6 +105,29 @@ pub fn calendar_write_permitted(zone: Option<&str>, has_write: bool) -> bool {
     }
 }
 
+/// The keys a sanction (suspension, silence, ban, mute) is checked against: the
+/// raw signing key, plus its owner when that differs (a registered device key).
+pub fn sanction_subjects<'a>(raw: &'a str, principal: &'a str) -> Vec<&'a str> {
+    let mut subjects = vec![raw];
+    if principal != raw {
+        subjects.push(principal);
+    }
+    subjects
+}
+
+/// Whether a stored channel creator is any of `subjects`. `channel_creators`
+/// records the RAW signing key (a device key for a channel made from a device),
+/// older rows included, so the owner alone can never be enough.
+pub fn creator_matches(creator: &str, subjects: &[&str]) -> bool {
+    subjects.contains(&creator)
+}
+
+/// Whether the device-owner lookup is worth making for an event of `kind`:
+/// never for gift wraps, whose author is a fresh one-time key.
+pub fn needs_owner_lookup(kind: u64) -> bool {
+    kind != GIFT_WRAP_KIND
+}
+
 /// NIP-59: extract the gift-wrap (kind-1059) RECIPIENT pubkey from the first
 /// `["p", <hex>]` tag. Returns `None` when the event is not a gift wrap, or when
 /// no non-empty `p` tag is present. The recipient — not the ephemeral author —
@@ -826,17 +849,6 @@ impl NostrRelayDO {
             return;
         }
 
-        // ADR-099: resolve the effective principal ONCE. A registered device key
-        // acts for its owner, so the allowlist, suspension, ban and admin gates
-        // below must all see the owner as well as the key; checking the raw
-        // author alone let a banned or suspended owner publish through a device
-        // key. Gate-off / non-device ⇒ `principal == event.pubkey`.
-        let principal = self.effective_pubkey(&event.pubkey).await;
-        let mut sanction_subjects = vec![event.pubkey.as_str()];
-        if principal != event.pubkey {
-            sanction_subjects.push(principal.as_str());
-        }
-
         // NIP-40: refuse an expired `expiration` tag, and a malformed one — the
         // retention sweep would otherwise delete an accepted event silently.
         if let Err(reason) = filter::expiration_admission(&event, auth::js_now_secs()) {
@@ -875,6 +887,22 @@ impl NostrRelayDO {
             Self::send_ok(ws, &event.id, false, reason);
             return;
         }
+
+        // ADR-099: resolve the effective principal ONCE, and only now: the
+        // lookup costs a D1 read and a cache entry per distinct key, so it must
+        // not run for events that fail verification or the write gate, nor for
+        // gift wraps (a fresh one-time key each, never a device). A registered
+        // device key acts for its owner for ALLOWLIST, TRUST LEVEL and ZONE WRITE
+        // only; SANCTIONS (suspension, silence, ban) apply to the key AND the
+        // owner; ADMIN status stays the raw signing key's own, so a device key
+        // never inherits admin powers. Gate-off / non-device ⇒ `principal ==
+        // event.pubkey`.
+        let principal = if needs_owner_lookup(event.kind) {
+            self.effective_pubkey(&event.pubkey).await
+        } else {
+            event.pubkey.clone()
+        };
+        let sanction_subjects = sanction_subjects(&event.pubkey, &principal);
 
         // NIP-59 gift wraps (kind-1059) are signed by a fresh ephemeral key per
         // message, so the author is intentionally NOT a member and the standard
@@ -961,7 +989,8 @@ impl NostrRelayDO {
         // publish warnings even while under moderation for other reasons.
         //
         // P2-03: use admin_cache to avoid redundant D1 queries on every event.
-        if is_ban_gated_kind(event.kind) && !self.admin_cache.is_admin(&principal, &self.env).await
+        if is_ban_gated_kind(event.kind)
+            && !self.admin_cache.is_admin(&event.pubkey, &self.env).await
         {
             for subject in &sanction_subjects {
                 if self.mod_cache.is_blocked(subject, &self.env).await {
@@ -973,7 +1002,7 @@ impl NostrRelayDO {
 
         // Trust-level gating for specific event kinds
         // P2-03: cached lookup — same TTL entry reused from above if still fresh.
-        let is_admin = self.admin_cache.is_admin(&principal, &self.env).await;
+        let is_admin = self.admin_cache.is_admin(&event.pubkey, &self.env).await;
         if !is_admin {
             let trust_level = trust::get_trust_level(&principal, &self.env).await;
 
@@ -1005,7 +1034,9 @@ impl NostrRelayDO {
                 }
                 // If TL2 (not TL3), verify they are the channel creator
                 if trust_level < TrustLevel::Trusted
-                    && !self.is_channel_creator(&principal, &channel_id).await
+                    && !self
+                        .is_channel_creator(&sanction_subjects, &channel_id)
+                        .await
                 {
                     Self::send_ok(
                         ws,
@@ -2253,7 +2284,7 @@ impl NostrRelayDO {
     /// saved, so deleting that event (kind-5) does not change the answer. A
     /// channel created before the table existed has no row; it falls back to the
     /// kind-40 event, which is the best evidence left.
-    pub(crate) async fn is_channel_creator(&self, pubkey: &str, channel_id: &str) -> bool {
+    pub(crate) async fn is_channel_creator(&self, subjects: &[&str], channel_id: &str) -> bool {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
             Err(_) => return false,
@@ -2272,7 +2303,7 @@ impl NostrRelayDO {
                 continue;
             };
             if let Ok(Some(row)) = bound.first::<ChannelCreatorRow>(None).await {
-                return row.pubkey == pubkey;
+                return creator_matches(&row.pubkey, subjects);
             }
         }
         false
@@ -4066,6 +4097,27 @@ mod write_gate_tests {
 #[cfg(test)]
 mod device_key_tests {
     use super::*;
+
+    #[test]
+    fn sanctions_cover_the_device_key_and_its_owner() {
+        assert_eq!(sanction_subjects("d", "o"), vec!["d", "o"]);
+        assert_eq!(sanction_subjects("d", "d"), vec!["d"]);
+    }
+
+    #[test]
+    fn creator_recorded_as_the_device_key_still_matches_via_the_raw_key() {
+        let subjects = sanction_subjects("device", "owner");
+        assert!(creator_matches("device", &subjects));
+        assert!(creator_matches("owner", &subjects));
+        assert!(!creator_matches("someone-else", &subjects));
+    }
+
+    #[test]
+    fn gift_wraps_skip_the_owner_lookup() {
+        assert!(!needs_owner_lookup(GIFT_WRAP_KIND));
+        assert!(needs_owner_lookup(1));
+        assert!(needs_owner_lookup(30910));
+    }
 
     const DEVICE: &str = "de";
     const OWNER: &str = "01";
