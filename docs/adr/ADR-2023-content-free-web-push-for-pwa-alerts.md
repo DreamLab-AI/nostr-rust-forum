@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: 83c5c297cd2b410ecbc76e896d86217be615a227
+verified_commit: 5394a989592c129fd70b1cc047e6c23ccafd0b47
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: Any request to carry message text in a push payload (RFC 8291), or a second service worker (the BBS) wanting its own push subscription
 repo: nostr-rust-forum
@@ -49,5 +49,6 @@ repo: nostr-rust-forum
 ## Verification
 - `cargo test -p nostr-bbs-relay-worker push` covers: the RFC 8292 §2 example JWT verifying under its published key, VAPID round-trip, endpoint allow-list, token hashing, fan-out classification and the self-copy skip, and every SQL statement run on SQLite. `cargo test -p nostr-bbs-core push` covers preferences and quiet hours.
 - `cargo test -p nostr-bbs-forum-client` covers the Tier 0 DM gating and system-notification predicate.
-- At `verified_commit`: relay-worker, core and forum-client suites pass (1,732 Rust tests across the three crates), the service-worker suite passes (`node --test crates/nostr-bbs-forum-client/tests/sw-push.test.mjs`, 11 tests), clippy is clean, and both wasm32 builds succeed.
+- At `verified_commit`: relay-worker, core and forum-client suites pass (1,735 Rust tests across the three crates), the service-worker suite passes (`node --test crates/nostr-bbs-forum-client/tests/sw-push.test.mjs`, 11 tests), clippy is clean, and both wasm32 builds succeed.
+- The release Trunk build (`trunk build --release --public-url /community/`) succeeds and emits `snippets/*/js/push.js` and the push handlers in `sw.js`. `deepsec revalidate` over the diff's findings leaves no unfixed HIGH or HIGH_BUG that this work introduced.
 - Not verified here: a live Cloudflare deploy, a real push service round trip, and device behaviour on iOS. `activation_status` stays `staged` until an operator sets the VAPID pair and tests on devices.

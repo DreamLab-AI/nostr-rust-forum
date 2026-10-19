@@ -20,8 +20,8 @@ domain: BASELINE-architecture.md
 
 The operator wants every forum member to hold a wallet on the estate's sidestr chain, limited to
 testnet4 and a dreamlab token, so members can provision other members and agents, and can tip each
-other's comments. JavaScriptSolidServer (upstream of solid-pod-rs, at `e7e0525`, package `0.0.220`)
-has no sidestr code, so the feature cannot land upstream-first. It goes in this kit, off by default.
+other's comments. JavaScriptSolidServer (upstream of solid-pod-rs, re-checked at `8d68ceb`, package `0.0.221`, and its
+`plugins` repository at `63a16cb`) has no sidestr code, so the feature cannot land upstream-first. It goes in this kit, off by default.
 ADR-2012 already settled that the chain is the ledger and the forum keeps no balance of its own. On a
 sidestr chain a Nostr key's coins pay `OP_1 <x-only key>`, so every member's npub is already an
 address. `sidestr:dreamlab` names no SPEC 12 rules, so an issued asset there is held to the rule by
