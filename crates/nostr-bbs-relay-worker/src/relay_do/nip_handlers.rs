@@ -2108,9 +2108,11 @@ impl NostrRelayDO {
                 if !ctx.is_admin {
                     let is_member = zone_read_permitted(zones, &zone, ctx);
                     if !is_member {
-                        if event.kind == 40 {
-                            // Channel definition: served only if the zone is not
-                            // Hidden (Locked/Public tiles render).
+                        if matches!(event.kind, 40 | 41) {
+                            // Channel definition or its metadata update (a rename
+                            // must agree with the definition the tile shows):
+                            // served only if the zone is not Hidden
+                            // (Locked/Public tiles render).
                             if !zones.defs_visible_to_nonmember(&zone) {
                                 return ReadDecision::Withhold;
                             }

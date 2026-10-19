@@ -23,18 +23,20 @@ keys off is unchanged.
 
 The kind-41 write gate took the first `e` tag, so a decoy first `e` could authorise edits to another channel, and
 the zone read gate mapped only kinds 40 and 42, so a locked channel's name and description were readable anonymously.
-Kind-41 now resolves its channel with `channel_tag` (root marker, else first `e`) for both gates.
+Kind-41 now resolves its channel with `channel_tag` (root marker, else first `e`) for both gates, and is served to
+non-members exactly as the kind-40 definition is.
 
 ### Fixed: CLOSE and AUTH frames bypassed the per-IP frame limiter (`nostr-bbs-relay-worker`)
 
 Only EVENT, REQ and COUNT were counted, so a client could flood the Durable Object with CLOSE or AUTH frames for free.
-Both now pass the same limiter and budget.
+Both now pass the same limiter and budget. An over-budget AUTH is answered with a refused `OK` (`rate-limited`) so the
+client retries, and a CLOSE for a subscription the session holds is always processed since it only sheds load.
 
 ### Fixed: live subscriptions matched filters differently from stored reads (`nostr-bbs-relay-worker`)
 
 `event_matches_filters` ignored `search`, treated an empty tag array as no constraint and applied tag names the SQL
 builder discards. SQL builder and live matcher now decide through shared helpers: `search` is an ASCII
-case-insensitive substring match, an empty tag array matches nothing and an invalid tag name is ignored. The
+case-insensitive substring match, an empty tag array matches nothing an invalid tag name is ignored and a `#probe` filter matches nothing live, as it does in SQL (probe tags are never indexed). The
 `LIKE` pattern builder also escapes the backslash escape character itself.
 
 ### Fixed: NIP-09 `a`-tag deletion truncated d-tags containing `:` (`nostr-bbs-relay-worker`)

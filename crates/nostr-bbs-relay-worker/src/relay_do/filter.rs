@@ -201,6 +201,11 @@ fn tag_filter_plan<'a>(key: &'a str, values: &'a serde_json::Value) -> TagFilter
     {
         return TagFilterPlan::Ignore;
     }
+    // `probe` rows are kept out of `event_tags` (trg_event_tags_probe_blind), so
+    // a stored `#probe` read returns nothing; the live path must agree.
+    if tag_name == "probe" {
+        return TagFilterPlan::MatchNothing;
+    }
     let Some(arr) = values.as_array() else {
         return TagFilterPlan::Ignore;
     };
@@ -771,7 +776,10 @@ mod tests {
             "p",
             1,
             10,
-            vec![vec!["t".into(), "rust".into()]],
+            vec![
+                vec!["t".into(), "rust".into()],
+                vec!["probe".into(), "x".into()],
+            ],
             "Hello 100% World_x back\\slash",
         );
         // (filter, expected live match). Each row's expectation is what the SQL
@@ -796,6 +804,8 @@ mod tests {
             // A bare "#" passes the SQL name check and then selects `name = ''`.
             (serde_json::json!({"#": ["zzz"]}), false),
             (serde_json::json!({"#t": ["rust"], "search": "nope"}), false),
+            // Probe tags are never indexed, so SQL never matches them.
+            (serde_json::json!({"#probe": ["x"]}), false),
         ];
         for (json, expected) in cases {
             let f = filter_from(json.clone());

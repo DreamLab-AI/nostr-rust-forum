@@ -287,18 +287,31 @@ impl DurableObject for NostrRelayDO {
             }
             "CLOSE" => {
                 // CLOSE and AUTH are frames too: leaving them off the limiter let
-                // a client flood the DO for free.
-                if !self.check_rate_limit(&ip) {
+                // a client flood the DO for free. A CLOSE for a subscription the
+                // session holds is exempt: it only sheds load.
+                let sub_id = arr[1].as_str();
+                let holds = sub_id.is_some_and(|id| {
+                    self.sessions
+                        .borrow()
+                        .get(&session_id)
+                        .is_some_and(|s| s.subscriptions.contains_key(id))
+                });
+                if !close_admitted(holds, || self.check_rate_limit(&ip)) {
                     Self::send_notice(&ws, "rate limit exceeded");
                     return Ok(());
                 }
-                if let Some(sub_id) = arr[1].as_str() {
+                if let Some(sub_id) = sub_id {
                     self.handle_close(session_id, sub_id).await;
                 }
             }
             "AUTH" => {
                 if !self.check_rate_limit(&ip) {
-                    Self::send_notice(&ws, "rate limit exceeded");
+                    // Answer with a refused OK so the client knows to retry
+                    // rather than sit unauthenticated behind a silent notice.
+                    match arr[1].get("id").and_then(|v| v.as_str()) {
+                        Some(id) => Self::send_ok(&ws, id, false, "rate-limited: slow down"),
+                        None => Self::send_notice(&ws, "rate limit exceeded"),
+                    }
                     return Ok(());
                 }
                 let auth_event: NostrEvent = match serde_json::from_value(arr[1].clone()) {
@@ -366,6 +379,17 @@ impl DurableObject for NostrRelayDO {
     }
 }
 
+/// Whether a CLOSE frame is processed. A CLOSE for a subscription the session
+/// holds is always honoured (it only sheds load, and holdings are bounded by
+/// `MAX_SUBSCRIPTIONS`); a CLOSE for an unknown id must pass the frame limiter,
+/// which is consulted only then so a held-id CLOSE spends no budget.
+pub(crate) fn close_admitted(
+    holds_subscription: bool,
+    within_budget: impl FnOnce() -> bool,
+) -> bool {
+    holds_subscription || within_budget()
+}
+
 /// Reserve one connection slot for `ip` if it is under `max`. The check and the
 /// increment share one `&mut` borrow, so no `.await` can fall between them.
 pub(crate) fn reserve_connection_slot(
@@ -396,6 +420,15 @@ pub(crate) fn release_connection_slot(counts: &mut HashMap<String, u32>, ip: &st
 #[cfg(test)]
 mod connection_slot_tests {
     use super::*;
+
+    #[test]
+    fn close_of_a_held_subscription_skips_the_limiter() {
+        assert!(close_admitted(true, || panic!(
+            "limiter must not be consulted"
+        )));
+        assert!(close_admitted(false, || true));
+        assert!(!close_admitted(false, || false));
+    }
 
     #[test]
     fn reservation_stops_at_the_cap_and_release_frees_a_slot() {
