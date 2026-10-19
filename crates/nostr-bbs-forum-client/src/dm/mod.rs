@@ -105,7 +105,11 @@ impl DMStore {
                 // inbox flattened into one stream.
                 return Vec::new();
             };
-            thread_of(&inner.messages, current)
+            thread_of(
+                &inner.messages,
+                current,
+                crate::poker::PokerConfig::load().coach().as_deref(),
+            )
         })
     }
 
@@ -114,12 +118,13 @@ impl DMStore {
     /// DM pages use [`messages`](Self::messages), which leaves them out.
     pub fn received_from(&self, pubkey: String) -> Memo<Vec<DMMessage>> {
         let state = self.state;
+        let pubkey = pubkey.to_ascii_lowercase();
         Memo::new(move |_| {
             state.with(|inner| {
                 inner
                     .messages
                     .iter()
-                    .filter(|m| !m.is_sent && m.sender_pubkey.eq_ignore_ascii_case(&pubkey))
+                    .filter(|m| !m.is_sent && m.sender_pubkey == pubkey)
                     .cloned()
                     .collect()
             })
@@ -403,7 +408,7 @@ impl DMStore {
             is_read: true,
         };
 
-        let coach = is_coach_content(content);
+        let coach = is_coach_exchange(content, recipient_pk_hex);
         self.state.update(|s| {
             if s.current_conversation.as_deref() == Some(recipient_pk_hex)
                 && s.seen_ids.insert(msg.id.clone())
@@ -767,6 +772,78 @@ fn subscribe_dm_with_auth_retry(
     );
 }
 
+// -- App-wide incoming-DM watcher (Tier 0, ADR-2023) ---------------------------
+
+/// Most stored wraps the watcher asks the relay for on connect.
+const WATCHER_HISTORY_LIMIT: u64 = 100;
+
+/// Subscribe to gift wraps addressed to `my_pubkey` for the whole app session
+/// and raise a notification for each fresh DM.
+///
+/// The [`DMStore`] is provided per page (the DM list, a chat, the poker table),
+/// so its subscription only exists while one of those is open; a DM arriving
+/// anywhere else would never notify. This watcher lives in the layout instead.
+/// It keeps no message state: it opens each wrap not yet announced, hands the
+/// sender and rumor timestamp to the notification store (which applies the
+/// baseline and de-duplication rules), and forgets the plaintext.
+///
+/// Returns the subscription id so the caller can close it on sign-out or a
+/// dropped session. Call only once the relay session is NIP-42 authenticated.
+pub fn start_incoming_watcher(
+    relay: &RelayConnection,
+    signer: Rc<dyn Signer>,
+    my_pubkey: &str,
+) -> String {
+    let my_pk = my_pubkey.to_string();
+    let since = ((js_sys::Date::now() / 1000.0) as u64).saturating_sub(GIFT_WRAP_LOOKBACK_SECS);
+    let mut filters = gift_wrap_filters(&my_pk, Some(since));
+    // Bound the history this always-on watcher decrypts: anyone can send a wrap,
+    // so an unbounded window is a decrypt flood on every page load. Live wraps
+    // are not subject to the limit.
+    for f in &mut filters {
+        f.limit = Some(WATCHER_HISTORY_LIMIT);
+    }
+    let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
+        if event.kind != KIND_GIFT_WRAP {
+            return;
+        }
+        let signer = signer.clone();
+        let me = my_pk.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            watch_one(&event, signer.as_ref(), &me).await;
+        });
+    });
+    relay.subscribe(filters, on_event, None)
+}
+
+/// Open one wrap and notify if it is a fresh DM from someone else.
+async fn watch_one(event: &NostrEvent, signer: &dyn Signer, me: &str) {
+    let Some(store) = crate::stores::notifications::global_notification_store() else {
+        return;
+    };
+    // Already announced (or settled as backlog) on an earlier load: skip the
+    // decryption entirely.
+    if store.dm_settled(&event.id) {
+        return;
+    }
+    // Zone-key grants and poker traffic ride the same transport and fail here;
+    // that is expected, not an error.
+    let Ok(unwrapped) = unwrap_gift_with_signer(event, signer).await else {
+        return;
+    };
+    let is_sent = unwrapped.sender_pubkey == me;
+    // Only the other party can be the coach: a wrap we sent is our own copy.
+    if !is_sent && is_coach_exchange(&unwrapped.rumor.content, &unwrapped.sender_pubkey) {
+        return;
+    }
+    store.notify_dm(
+        &event.id,
+        &unwrapped.sender_pubkey,
+        unwrapped.rumor.created_at,
+        is_sent,
+    );
+}
+
 // -- Event processing ---------------------------------------------------------
 
 /// Spawn an async decrypt of a single inbound DM event.
@@ -853,7 +930,8 @@ async fn process_gift_wrap_event(
         }
     };
 
-    let sender_pubkey = unwrapped.sender_pubkey.clone();
+    let my_pubkey = my_pubkey.to_ascii_lowercase();
+    let sender_pubkey = unwrapped.sender_pubkey.to_ascii_lowercase();
     let is_sent = sender_pubkey == my_pubkey;
 
     // The rumor's "p" tag identifies the recipient
@@ -862,12 +940,12 @@ async fn process_gift_wrap_event(
         .tags
         .iter()
         .find(|t| t.len() >= 2 && t[0] == "p")
-        .map(|t| t[1].clone())
+        .map(|t| t[1].to_ascii_lowercase())
         .unwrap_or_else(|| {
             if is_sent {
                 String::new()
             } else {
-                my_pubkey.to_string()
+                my_pubkey.clone()
             }
         });
 
@@ -883,7 +961,8 @@ async fn process_gift_wrap_event(
 
     let plaintext = unwrapped.rumor.content.clone();
     // Use the rumor's created_at as the real timestamp (wrap timestamp is randomized)
-    let timestamp = unwrapped.rumor.created_at;
+    // (sender-controlled, so clamp it to now).
+    let timestamp = clamp_to_now(unwrapped.rumor.created_at, now_secs());
 
     // Use the outer wrap event ID for deduplication
     let msg = DMMessage {
@@ -915,15 +994,17 @@ async fn process_kind4_event(
     my_pubkey: &str,
     state: RwSignal<DMStateInner>,
 ) {
-    let is_sent = event.pubkey == my_pubkey;
+    let my_pubkey = my_pubkey.to_ascii_lowercase();
+    let sender_pubkey = event.pubkey.to_ascii_lowercase();
+    let is_sent = sender_pubkey == my_pubkey;
     let counterparty_pk = if is_sent {
         event
             .tags
             .iter()
             .find(|t| t.len() >= 2 && t[0] == "p")
-            .map(|t| t[1].clone())
+            .map(|t| t[1].to_ascii_lowercase())
     } else {
-        Some(event.pubkey.clone())
+        Some(sender_pubkey.clone())
     };
 
     let counterparty_pk = match counterparty_pk {
@@ -943,28 +1024,22 @@ async fn process_kind4_event(
         }
     };
 
+    let timestamp = clamp_to_now(event.created_at, now_secs());
     let msg = DMMessage {
         id: event.id.clone(),
-        sender_pubkey: event.pubkey.clone(),
+        sender_pubkey,
         recipient_pubkey: if is_sent {
             counterparty_pk.clone()
         } else {
-            my_pubkey.to_string()
+            my_pubkey
         },
         content: plaintext.clone(),
-        timestamp: event.created_at,
+        timestamp,
         is_sent,
         is_read: is_sent,
     };
 
-    insert_dm_message(
-        msg,
-        &counterparty_pk,
-        &plaintext,
-        event.created_at,
-        is_sent,
-        state,
-    );
+    insert_dm_message(msg, &counterparty_pk, &plaintext, timestamp, is_sent, state);
 }
 
 /// Shared helper: deduplicate and insert a DM message into the reactive state,
@@ -977,7 +1052,37 @@ fn insert_dm_message(
     is_sent: bool,
     state: RwSignal<DMStateInner>,
 ) {
-    state.update(|s| apply_message(s, msg, counterparty_pk, plaintext, timestamp, is_sent));
+    let coach = crate::poker::PokerConfig::load().coach();
+    state.update(|s| {
+        apply_message(
+            s,
+            msg,
+            counterparty_pk,
+            plaintext,
+            timestamp,
+            is_sent,
+            coach.as_deref(),
+        )
+    });
+}
+
+/// Whether `content` exchanged with `counterparty` is poker-table plumbing:
+/// tagged like a coach request or reply AND the other party is the configured
+/// coach agent. The tag alone proves nothing, since anyone can start a message
+/// with `[coach]`; classifying on text alone hid such a message from the
+/// recipient's inbox and notifications, and made the sender skip their own
+/// NIP-17 copy, so it vanished from their history for good.
+fn is_coach_exchange_with(content: &str, counterparty: &str, coach: Option<&str>) -> bool {
+    is_coach_content(content) && coach.is_some_and(|c| c.eq_ignore_ascii_case(counterparty))
+}
+
+/// [`is_coach_exchange_with`] against the operator's configured coach.
+fn is_coach_exchange(content: &str, counterparty: &str) -> bool {
+    is_coach_exchange_with(
+        content,
+        counterparty,
+        crate::poker::PokerConfig::load().coach().as_deref(),
+    )
 }
 
 /// Store a message (once, by id) and fold it into its conversation's summary:
@@ -994,11 +1099,15 @@ fn apply_message(
     plaintext: &str,
     timestamp: u64,
     is_sent: bool,
+    coach: Option<&str>,
 ) {
-    if s.seen_ids.insert(msg.id.clone()) {
-        s.messages.push(msg);
+    // A re-streamed event (relay reconnect, overlapping subscriptions) must not
+    // touch the summary a second time, or the unread badge inflates.
+    if !s.seen_ids.insert(msg.id.clone()) {
+        return;
     }
-    if is_coach_content(plaintext) {
+    s.messages.push(msg);
+    if is_coach_exchange_with(plaintext, counterparty_pk, coach) {
         return;
     }
 
@@ -1025,17 +1134,20 @@ fn apply_message(
 ///
 /// The "other party" of a message is the recipient when we sent it and the
 /// sender when we received it.
-fn thread_of(messages: &[DMMessage], counterparty: &str) -> Vec<DMMessage> {
+fn thread_of(messages: &[DMMessage], counterparty: &str, coach: Option<&str>) -> Vec<DMMessage> {
+    // Pubkeys are lowercased at ingestion, so the only normalisation left is
+    // the caller's argument (a UI route value or config string).
+    let counterparty = counterparty.to_ascii_lowercase();
     let mut msgs: Vec<DMMessage> = messages
         .iter()
-        .filter(|m| !is_coach_content(&m.content))
+        .filter(|m| !is_coach_exchange_with(&m.content, &counterparty, coach))
         .filter(|m| {
             let other = if m.is_sent {
                 &m.recipient_pubkey
             } else {
                 &m.sender_pubkey
             };
-            other.eq_ignore_ascii_case(counterparty)
+            *other == counterparty
         })
         .cloned()
         .collect();
@@ -1053,6 +1165,24 @@ fn visible_conversations(inner: &DMStateInner) -> Vec<DMConversation> {
 }
 
 // -- Helpers ------------------------------------------------------------------
+
+/// Tags of the kind-10050 DM-relay list (NIP-17): one `["relay", url]` per
+/// relay. (`"r"` is the NIP-65 relay-list tag and is not read for 10050.)
+fn dm_relay_tags(relay_url: &str) -> Vec<Vec<String>> {
+    vec![vec!["relay".to_string(), relay_url.to_string()]]
+}
+
+/// Clamp a sender-controlled timestamp to `now`. A rumor's `created_at` is
+/// chosen by the sender, so a far-future value would otherwise pin its message
+/// to the top of the thread and win the conversation preview forever.
+fn clamp_to_now(timestamp: u64, now: u64) -> u64 {
+    timestamp.min(now)
+}
+
+/// Current Unix time in seconds, from the browser clock.
+fn now_secs() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
+}
 
 fn truncate_message(content: &str, max_chars: usize) -> String {
     let t = content.trim();
@@ -1101,7 +1231,7 @@ async fn ensure_dm_relay_published(relay: &RelayConnection, signer: &dyn Signer,
         pubkey: my_pubkey.to_string(),
         created_at: now,
         kind: 10050,
-        tags: vec![vec!["r".to_string(), relay_url]],
+        tags: dm_relay_tags(&relay_url),
         content: String::new(),
     };
 
@@ -1340,7 +1470,47 @@ mod tests {
     fn apply(s: &mut DMStateInner, m: DMMessage) {
         let text = m.content.clone();
         let (ts, out) = (m.timestamp, m.is_sent);
-        apply_message(s, m, COACH, &text, ts, out);
+        apply_message(s, m, COACH, &text, ts, out, Some(COACH));
+    }
+
+    #[test]
+    fn dm_relay_list_uses_the_nip17_relay_tag() {
+        assert_eq!(
+            dm_relay_tags("wss://relay.example"),
+            vec![vec!["relay".to_string(), "wss://relay.example".to_string()]]
+        );
+    }
+
+    #[test]
+    fn clamp_to_now_pins_future_timestamps() {
+        assert_eq!(clamp_to_now(5_000, 1_000), 1_000);
+        assert_eq!(clamp_to_now(900, 1_000), 900);
+        assert_eq!(clamp_to_now(1_000, 1_000), 1_000);
+    }
+
+    #[test]
+    fn restreamed_message_does_not_inflate_unread_or_preview() {
+        let mut s = DMStateInner::default();
+        let m = received("dup", "hello", 10);
+        apply_message(&mut s, m.clone(), COACH, "hello", 10, false, None);
+        apply_message(&mut s, m, COACH, "hello", 10, false, None);
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.conversations[COACH].unread_count, 1);
+        // a replay must not rewrite the preview either
+        let mut again = received("dup", "tampered", 99);
+        again.id = "dup".into();
+        apply_message(&mut s, again, COACH, "tampered", 99, false, None);
+        assert_eq!(s.conversations[COACH].last_message, "hello");
+        assert_eq!(s.conversations[COACH].last_timestamp, 10);
+    }
+
+    #[test]
+    fn thread_matching_is_exact_on_lowercased_keys() {
+        let mut m = received("a", "hi", 1);
+        m.sender_pubkey = "ab".repeat(32);
+        let thread = thread_of(std::slice::from_ref(&m), &"AB".repeat(32), None);
+        assert_eq!(thread.len(), 1);
+        assert!(thread_of(&[m], &"cd".repeat(32), None).is_empty());
     }
 
     #[test]
@@ -1359,7 +1529,7 @@ mod tests {
                 .sum::<u32>(),
             0
         );
-        assert!(thread_of(&s.messages, COACH).is_empty());
+        assert!(thread_of(&s.messages, COACH, Some(COACH)).is_empty());
     }
 
     #[test]
@@ -1378,7 +1548,7 @@ mod tests {
             "the coach reply is not unread mail"
         );
 
-        let thread = thread_of(&s.messages, COACH);
+        let thread = thread_of(&s.messages, COACH, Some(COACH));
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].id, "hi");
         // all three are still stored
@@ -1390,6 +1560,44 @@ mod tests {
         let mut s = DMStateInner::default();
         apply(&mut s, received("m", "what does [coach] mean?", 7));
         assert_eq!(visible_conversations(&s)[0].unread_count, 1);
-        assert_eq!(thread_of(&s.messages, COACH).len(), 1);
+        assert_eq!(thread_of(&s.messages, COACH, Some(COACH)).len(), 1);
+    }
+
+    #[test]
+    fn the_tag_only_counts_from_the_configured_coach() {
+        let stranger = "3333333333333333333333333333333333333333333333333333333333333333";
+        // Same text, different counterparty: ordinary mail.
+        let mut s = DMStateInner::default();
+        let mut m = received("x", "[coach] hello, are you free tonight?", 7);
+        m.sender_pubkey = stranger.into();
+        let text = m.content.clone();
+        apply_message(&mut s, m, stranger, &text, 7, false, Some(COACH));
+        let list = visible_conversations(&s);
+        assert_eq!(
+            list.len(),
+            1,
+            "a stranger's tagged message opens a conversation"
+        );
+        assert_eq!(list[0].unread_count, 1, "and counts as unread");
+        assert_eq!(
+            thread_of(&s.messages, stranger, Some(COACH)).len(),
+            1,
+            "and shows in the thread"
+        );
+    }
+
+    #[test]
+    fn with_no_coach_configured_nothing_is_table_traffic() {
+        assert!(!is_coach_exchange_with("[coach] Fold.", COACH, None));
+        assert!(!is_coach_exchange_with("[poker-coach] hi", COACH, None));
+        assert!(is_coach_exchange_with("[coach] Fold.", COACH, Some(COACH)));
+        assert!(
+            is_coach_exchange_with("[coach] Fold.", &COACH.to_uppercase(), Some(COACH)),
+            "hex case is not significant"
+        );
+        assert!(
+            !is_coach_exchange_with("plain text", COACH, Some(COACH)),
+            "the coach's ordinary mail is mail"
+        );
     }
 }

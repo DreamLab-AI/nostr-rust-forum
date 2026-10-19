@@ -108,8 +108,8 @@ library is installed in this container. See
 
 **Remaining.** The `consumer-received` and `applied`/`rejected` stages are not implemented — they belong to
 agentbox and the mutation owner and need the versioned receipt contract this ADR says both sets of
-maintainers must agree. `project_appeal` and `project_supersession` are not yet receipt-wired; only the
-first-order `project_action_response` path is. No retention policy for `governance_receipts`. Browser-side
+maintainers must agree. `project_appeal` and `project_supersession` are now receipt-wired through the same stage machine
+(`apply_with_receipt`), with state, chain and standing guards (known-findings KF-11, KF-12). No retention policy for `governance_receipts`. Browser-side
 acceptance (rationale capture, signer cancellation, acknowledgement timeout, conflicting in-flight actions)
 is untouched. Revoked-signer and conflicting-response handling remains with the existing authority checks:
 the receipt records what happened, it does not add an authority gate.

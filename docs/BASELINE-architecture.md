@@ -252,3 +252,14 @@ The pay routes are live (`PAY_ENABLED = "true"` in production). `crates/nostr-bb
 **Rejected alternative:** a pinned channel such as `1.98.0`. A pin keeps CI green on release day, but then someone has to remember to move it, and a forgotten pin fails silently: the build stays green on an old compiler while the rest of the estate moves on. A floating channel fails loudly, and the fix takes minutes.
 
 **Reopen if** a stable release breaks the build in a way the recovery pattern cannot fix, such as a miscompile, a wasm32 target regression, or an MSRV floor raised by a dependency. Also reopen if the forum ever ships a crate whose consumers need a declared MSRV.
+
+## Web Push alerts are content-free — ADR-2023
+
+The relay wakes installed PWAs with an **empty** VAPID-signed push after `save_event` (`relay_do/push_fanout.rs`,
+`push.rs`); the forum service worker (`sw.js`, which owns push) then calls `POST /api/push/drain` with a
+per-subscription bearer token and shows generic notifications from counters. Invariants: no message text, author
+or channel in any push-service request; recipients of kind 40/42 alerts pass `resolve_viewer_context` +
+`authorize_event`; a wrap addressed to its own submitter alerts nobody; subscription endpoints are `https` on an
+allow-listed push-service host; the feature is off unless `PUSH_ENABLED="true"` and the VAPID pair is consistent.
+Carrying text in a payload (RFC 8291) needs a new ADR. Tables `push_subscriptions` / `push_prefs` (migration
+`0010_push.sql`); preference wire types live in `nostr_bbs_core::push`.

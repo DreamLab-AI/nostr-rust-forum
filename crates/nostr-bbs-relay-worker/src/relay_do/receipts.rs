@@ -212,6 +212,148 @@ pub struct ProjectionCommit {
     pub decided_at: u64,
 }
 
+/// Case states a supersession may act on (DDD §7a.3). `reopened` is the
+/// appeal-then-overturn path; an `open` or `under_review` case gets a first-order
+/// decision instead. Held identical to the `IN (...)` list in
+/// [`SUPERSESSION_DECISION_SQL`] by a test.
+pub const SUPERSEDABLE_STATES: [&str; 6] = [
+    "decided",
+    "delegated",
+    "promoted",
+    "precedent",
+    "superseded",
+    "reopened",
+];
+
+// Supersession batch (ADR-2010 / DDD §7a). Four statements, each conditional on
+// its predecessor having changed exactly one row, so a stale snapshot writes
+// nothing at all. S1 appends the superseding decision only if the case is still
+// in the state the plan saw (and that state is supersedable), the superseded
+// decision still belongs to this case and is still effective, and the event's
+// own receipt is awaiting projection.
+const SUPERSESSION_DECISION_SQL: &str = r#"INSERT INTO broker_decisions
+ (decision_id, case_id, outcome, outcome_detail, broker_pubkey, reasoning, prior_decision_id, decided_at)
+ SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+ WHERE EXISTS (SELECT 1 FROM broker_cases WHERE id = ?2 AND state = ?9
+ AND state IN ('decided', 'delegated', 'promoted', 'precedent', 'superseded', 'reopened'))
+ AND EXISTS (SELECT 1 FROM broker_decisions WHERE decision_id = ?7 AND case_id = ?2 AND superseded_by IS NULL)
+ AND EXISTS (SELECT 1 FROM governance_receipts WHERE event_id = ?10 AND case_id = ?2
+ AND stage IN ('relay-accepted', 'projection-failed'))"#;
+const SUPERSESSION_MARK_SQL: &str = r#"UPDATE broker_decisions SET superseded_by = ?1
+ WHERE decision_id = ?2 AND superseded_by IS NULL AND changes() = 1"#;
+const SUPERSESSION_CASE_SQL: &str = r#"UPDATE broker_cases
+ SET state = 'superseded', assigned_to = ?1, updated_at = ?2
+ WHERE id = ?3 AND changes() = 1"#;
+
+/// The complete set of writes one committed supersession performs. Carried
+/// together because they must commit together: the superseding decision row, the
+/// `superseded_by` mark on the decision it replaces, the case's move to
+/// `superseded`, and the receipt's transition to `projection-committed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersessionCommit {
+    /// Full signed id of the superseding 31403.
+    pub event_id: String,
+    /// The case named by the superseding event's own `d` tag.
+    pub case_id: String,
+    /// Full event id of the decision being superseded (the `supersedes` `e` tag).
+    pub superseded_event_id: String,
+    /// `broker_decisions.decision_id` of the decision being superseded.
+    pub superseded_decision_id: String,
+    /// The case state the plan was made against.
+    pub expected_state: String,
+    /// `broker_decisions.decision_id` of the superseding decision.
+    pub decision_id: String,
+    /// Canonical action string.
+    pub outcome: String,
+    /// Delegate target, amend diff and so on.
+    pub outcome_detail: Option<String>,
+    /// The stated reason (§7a.2).
+    pub reasoning: String,
+    /// The superseder's pubkey.
+    pub broker_pubkey: String,
+    /// `event.created_at`.
+    pub decided_at: u64,
+}
+
+/// Reopen a terminal case for its requester of record (appeal standing, DDD
+/// §7a.2). `?1` now, `?2` case, `?3` appellant, `?4` the cited decision id. One
+/// row changes only if the appellant is the case's `created_by` (compared
+/// case-insensitively, KF-6), the case is in a terminal state, and the cited
+/// decision belongs to this very case; anything else changes nothing.
+pub const APPEAL_REOPEN_SQL: &str = "UPDATE broker_cases SET state = 'reopened', updated_at = ?1 \
+ WHERE id = ?2 AND lower(created_by) = lower(?3) \
+ AND state IN ('decided', 'delegated', 'promoted', 'precedent', 'superseded') \
+ AND EXISTS (SELECT 1 FROM broker_decisions WHERE decision_id = ?4 AND case_id = ?2)";
+
+/// The writes one committed appeal performs: the case reopening and the
+/// receipt's transition, as one batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppealCommit {
+    /// Full signed id of the appeal 31402.
+    pub event_id: String,
+    /// The case being reopened (the appeal's `case` tag).
+    pub case_id: String,
+    /// The appellant's pubkey.
+    pub appellant: String,
+    /// Full event id of the cited decision (the `appeal`-marked `e` tag).
+    pub cited_event_id: String,
+    /// `broker_decisions.decision_id` derived from the cited event.
+    pub cited_decision_id: String,
+    /// `event.created_at`.
+    pub at: u64,
+}
+
+/// What one stage-machine run commits: a first-order response or a supersession.
+#[derive(Debug, Clone, Copy)]
+pub enum Commit<'a> {
+    /// A first-order decision (`request`-correlated).
+    Response(&'a ProjectionCommit),
+    /// A superseding decision (`supersedes`-correlated; carries no request id).
+    Supersession(&'a SupersessionCommit),
+    /// An appeal reopening a case (`appeal`-correlated).
+    Appeal(&'a AppealCommit),
+}
+
+impl Commit<'_> {
+    /// Whether `correlation` describes the same signed event this plan was
+    /// assembled from. An incomplete receipt never certifies a different one.
+    fn matches(&self, correlation: &ReceiptCorrelation) -> bool {
+        match self {
+            Commit::Response(c) => {
+                correlation.event_id == c.event_id
+                    && correlation.case_id == c.case_id
+                    && correlation.signer_pubkey == c.broker_pubkey
+                    && correlation.request_event_id.as_deref() == Some(c.request_event_id.as_str())
+                    && correlation.decision_outcome.as_deref() == Some(c.outcome.as_str())
+            }
+            Commit::Supersession(c) => {
+                correlation.event_id == c.event_id
+                    && correlation.case_id == c.case_id
+                    && correlation.signer_pubkey == c.broker_pubkey
+                    && correlation.supersedes_event_id.as_deref()
+                        == Some(c.superseded_event_id.as_str())
+                    && correlation.decision_outcome.as_deref() == Some(c.outcome.as_str())
+            }
+            // The receipt's `case_id` is the appeal's `d` tag until ADR-2024 gives
+            // the appeal its own `case` correlation, so only the signed event,
+            // the appellant and the cited decision are bound here.
+            Commit::Appeal(c) => {
+                correlation.event_id == c.event_id
+                    && correlation.signer_pubkey == c.appellant
+                    && correlation.request_event_id.as_deref() == Some(c.cited_event_id.as_str())
+            }
+        }
+    }
+
+    fn event_id(&self) -> &str {
+        match self {
+            Commit::Response(c) => &c.event_id,
+            Commit::Supersession(c) => &c.event_id,
+            Commit::Appeal(c) => &c.event_id,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Outcomes
 // ---------------------------------------------------------------------------
@@ -279,6 +421,15 @@ pub trait ReceiptStore {
     /// `projection-committed` **as one transaction**.
     async fn commit_projection(&self, commit: &ProjectionCommit) -> Result<(), String>;
 
+    /// Commit a supersession: the superseding decision row, the `superseded_by`
+    /// mark, the case's move to `superseded` and the receipt's transition, **as
+    /// one transaction**, each statement required to change exactly one row.
+    async fn commit_supersession(&self, commit: &SupersessionCommit) -> Result<(), String>;
+
+    /// Commit an appeal: reopen the case and move the receipt to
+    /// `projection-committed` as one transaction.
+    async fn commit_appeal(&self, commit: &AppealCommit) -> Result<(), String>;
+
     /// Move the receipt to `projection-failed`, recording why.
     async fn mark_projection_failed(
         &self,
@@ -301,7 +452,7 @@ pub trait ReceiptStore {
 pub async fn apply_with_receipt<S>(
     store: &S,
     correlation: &ReceiptCorrelation,
-    commit: &ProjectionCommit,
+    commit: Commit<'_>,
     now: u64,
 ) -> ReceiptOutcome
 where
@@ -309,12 +460,7 @@ where
 {
     // Refuse a caller assembling a plan from a different signed response or
     // request. An incomplete receipt never certifies an external operation.
-    if correlation.event_id != commit.event_id
-        || correlation.case_id != commit.case_id
-        || correlation.signer_pubkey != commit.broker_pubkey
-        || correlation.request_event_id.as_deref() != Some(commit.request_event_id.as_str())
-        || correlation.decision_outcome.as_deref() != Some(commit.outcome.as_str())
-    {
+    if !commit.matches(correlation) {
         return ReceiptOutcome::Uncorrelated;
     }
     let accept = match store.record_accepted(correlation, now).await {
@@ -337,7 +483,12 @@ where
         }
     };
 
-    match store.commit_projection(commit).await {
+    let committed = match commit {
+        Commit::Response(c) => store.commit_projection(c).await,
+        Commit::Supersession(c) => store.commit_supersession(c).await,
+        Commit::Appeal(c) => store.commit_appeal(c).await,
+    };
+    match committed {
         Ok(()) => {
             if replays > 0 {
                 ReceiptOutcome::Reconciled { replays }
@@ -352,7 +503,7 @@ where
             // fails the receipt stays at `relay-accepted`, which is still
             // correct: it claims only what is true, and remains retryable.
             let _ = store
-                .mark_projection_failed(&commit.event_id, &e, now)
+                .mark_projection_failed(commit.event_id(), &e, now)
                 .await;
             ReceiptOutcome::ProjectionFailed { error: e }
         }
@@ -399,6 +550,39 @@ pub struct D1ReceiptStore {
 impl D1ReceiptStore {
     pub fn new(db: worker::D1Database) -> Self {
         Self { db }
+    }
+
+    /// Run `stmts` as one D1 batch and require every statement to have
+    /// succeeded and changed exactly one row (a zero is a TOCTOU conflict: the
+    /// snapshot the plan was made against has moved).
+    async fn run_batch(&self, stmts: Vec<worker::D1PreparedStatement>) -> Result<(), String> {
+        let expected = stmts.len();
+        let results = self
+            .db
+            .batch(stmts)
+            .await
+            .map_err(|e| format!("projection batch failed: {e:?}"))?;
+
+        if results.len() != expected {
+            return Err("projection batch returned an incomplete result".to_string());
+        }
+        for r in &results {
+            if !r.success() {
+                return Err(format!(
+                    "projection batch reported failure: {}",
+                    r.error().unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+        }
+        for r in &results {
+            if r.meta().ok().flatten().and_then(|m| m.changes) != Some(1) {
+                return Err(
+                    "projection conflict: case/request/state changed or receipt incomplete"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -529,32 +713,78 @@ impl ReceiptStore for D1ReceiptStore {
         // One batch, one implicit transaction: the decision, the case state and
         // the receipt either all land or none do. This is what makes a
         // half-applied projection unrepresentable rather than merely unlikely.
-        let results = self
-            .db
-            .batch(vec![decision, case, receipt])
-            .await
-            .map_err(|e| format!("projection batch failed: {e:?}"))?;
+        self.run_batch(vec![decision, case, receipt]).await
+    }
 
-        if results.len() != 3 {
-            return Err("projection batch returned an incomplete result".to_string());
-        }
-        for r in &results {
-            if !r.success() {
-                return Err(format!(
-                    "projection batch reported failure: {}",
-                    r.error().unwrap_or_else(|| "unknown".to_string())
-                ));
-            }
-        }
-        for r in &results {
-            if r.meta().ok().flatten().and_then(|m| m.changes) != Some(1) {
-                return Err(
-                    "projection conflict: case/request/state changed or receipt incomplete"
-                        .to_string(),
-                );
-            }
-        }
-        Ok(())
+    async fn commit_supersession(&self, c: &SupersessionCommit) -> Result<(), String> {
+        let decision = self
+            .db
+            .prepare(SUPERSESSION_DECISION_SQL)
+            .bind(&[
+                JsValue::from_str(&c.decision_id),
+                JsValue::from_str(&c.case_id),
+                JsValue::from_str(&c.outcome),
+                js_opt(c.outcome_detail.as_deref()),
+                JsValue::from_str(&c.broker_pubkey),
+                JsValue::from_str(&c.reasoning),
+                JsValue::from_str(&c.superseded_decision_id),
+                JsValue::from_f64(c.decided_at as f64),
+                JsValue::from_str(&c.expected_state),
+                JsValue::from_str(&c.event_id),
+            ])
+            .map_err(|e| format!("supersession decision bind: {e:?}"))?;
+        let mark = self
+            .db
+            .prepare(SUPERSESSION_MARK_SQL)
+            .bind(&[
+                JsValue::from_str(&c.decision_id),
+                JsValue::from_str(&c.superseded_decision_id),
+            ])
+            .map_err(|e| format!("supersession mark bind: {e:?}"))?;
+        let case = self
+            .db
+            .prepare(SUPERSESSION_CASE_SQL)
+            .bind(&[
+                JsValue::from_str(&c.broker_pubkey),
+                JsValue::from_f64(c.decided_at as f64),
+                JsValue::from_str(&c.case_id),
+            ])
+            .map_err(|e| format!("supersession case bind: {e:?}"))?;
+        let receipt = self
+            .db
+            .prepare(PROJECTION_RECEIPT_SQL)
+            .bind(&[
+                JsValue::from_str(ReceiptStage::ProjectionCommitted.as_str()),
+                JsValue::from_f64(c.decided_at as f64),
+                JsValue::from_str(&c.decision_id),
+                JsValue::from_str(&c.event_id),
+            ])
+            .map_err(|e| format!("supersession receipt bind: {e:?}"))?;
+        self.run_batch(vec![decision, mark, case, receipt]).await
+    }
+
+    async fn commit_appeal(&self, c: &AppealCommit) -> Result<(), String> {
+        let reopen = self
+            .db
+            .prepare(APPEAL_REOPEN_SQL)
+            .bind(&[
+                JsValue::from_f64(c.at as f64),
+                JsValue::from_str(&c.case_id),
+                JsValue::from_str(&c.appellant),
+                JsValue::from_str(&c.cited_decision_id),
+            ])
+            .map_err(|e| format!("appeal reopen bind: {e:?}"))?;
+        let receipt = self
+            .db
+            .prepare(PROJECTION_RECEIPT_SQL)
+            .bind(&[
+                JsValue::from_str(ReceiptStage::ProjectionCommitted.as_str()),
+                JsValue::from_f64(c.at as f64),
+                JsValue::NULL,
+                JsValue::from_str(&c.event_id),
+            ])
+            .map_err(|e| format!("appeal receipt bind: {e:?}"))?;
+        self.run_batch(vec![reopen, receipt]).await
     }
 
     async fn mark_projection_failed(
@@ -725,6 +955,79 @@ pub async fn handle_receipts_list(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// SQLite fixtures for the governance projection SQL, shared by the receipt and
+/// appeal tests. The DDL comes from the constants `ensure_schema` applies, not
+/// from `migrations/`: the live schema path is what deploys, and migration 0002
+/// lacks `broker_decisions.superseded_by`, which only `ensure_schema` adds.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::{
+        BROKER_CASES_CREATE_SQL, BROKER_DECISIONS_CREATE_SQL, GOVERNANCE_RECEIPTS_CREATE_SQL,
+    };
+
+    /// An in-memory database with the three governance tables as `ensure_schema`
+    /// leaves them (including the ADR-2011 `effective_tier` column).
+    pub(crate) fn governance_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for ddl in [
+            BROKER_CASES_CREATE_SQL,
+            BROKER_DECISIONS_CREATE_SQL,
+            GOVERNANCE_RECEIPTS_CREATE_SQL,
+            "ALTER TABLE broker_cases ADD COLUMN effective_tier TEXT",
+        ] {
+            conn.execute(ddl, []).unwrap();
+        }
+        conn
+    }
+
+    /// Insert a case in `state`.
+    pub(crate) fn seed_case(
+        conn: &rusqlite::Connection,
+        id: &str,
+        state: &str,
+        created_by: &str,
+        effective_tier: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO broker_cases (id, category, subject_kind, subject_id, title, state, \
+             created_by, nostr_event_id, created_at, updated_at, effective_tier) \
+             VALUES (?1, 'manual_submission', 'x', 'x', 't', ?2, ?3, ?4, 1, 1, ?5)",
+            rusqlite::params![id, state, created_by, format!("req-{id}"), effective_tier],
+        )
+        .unwrap();
+    }
+
+    /// Insert an effective (not superseded) decision.
+    pub(crate) fn seed_decision(
+        conn: &rusqlite::Connection,
+        decision_id: &str,
+        case_id: &str,
+        signer: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO broker_decisions (decision_id, case_id, outcome, broker_pubkey, decided_at) \
+             VALUES (?1, ?2, 'approve', ?3, 1)",
+            rusqlite::params![decision_id, case_id, signer],
+        )
+        .unwrap();
+    }
+
+    /// Insert a receipt at `stage`.
+    pub(crate) fn seed_receipt(
+        conn: &rusqlite::Connection,
+        event_id: &str,
+        case_id: &str,
+        stage: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO governance_receipts (event_id, kind, case_id, signer_pubkey, stage, \
+             signed_at) VALUES (?1, 31403, ?2, 'human-bob', ?3, 1)",
+            rusqlite::params![event_id, case_id, stage],
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +1158,46 @@ mod tests {
             Ok(())
         }
 
+        async fn commit_appeal(&self, c: &AppealCommit) -> Result<(), String> {
+            *self.commit_calls.borrow_mut() += 1;
+            self.applied
+                .borrow_mut()
+                .case_states
+                .insert(c.case_id.clone(), "reopened".to_string());
+            let mut receipts = self.receipts.borrow_mut();
+            let replays = receipts.get(&c.event_id).map(|r| r.1).unwrap_or(0);
+            receipts.insert(
+                c.event_id.clone(),
+                (ReceiptStage::ProjectionCommitted, replays, None),
+            );
+            Ok(())
+        }
+
+        async fn commit_supersession(&self, c: &SupersessionCommit) -> Result<(), String> {
+            *self.commit_calls.borrow_mut() += 1;
+            {
+                let mut left = self.fail_commit_times.borrow_mut();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err("D1_ERROR: projection batch aborted".to_string());
+                }
+            }
+            let mut applied = self.applied.borrow_mut();
+            if !applied.decisions.contains(&c.decision_id) {
+                applied.decisions.push(c.decision_id.clone());
+            }
+            applied
+                .case_states
+                .insert(c.case_id.clone(), "superseded".to_string());
+            let mut receipts = self.receipts.borrow_mut();
+            let replays = receipts.get(&c.event_id).map(|r| r.1).unwrap_or(0);
+            receipts.insert(
+                c.event_id.clone(),
+                (ReceiptStage::ProjectionCommitted, replays, None),
+            );
+            Ok(())
+        }
+
         async fn mark_projection_failed(
             &self,
             event_id: &str,
@@ -925,7 +1268,12 @@ mod tests {
                 _ => c.request_event_id = None,
             }
             assert!(matches!(
-                block_on(apply_with_receipt(&store, &c, &commit_plan(), 1)),
+                block_on(apply_with_receipt(
+                    &store,
+                    &c,
+                    Commit::Response(&commit_plan()),
+                    1
+                )),
                 ReceiptOutcome::Uncorrelated
             ));
         }
@@ -939,7 +1287,7 @@ mod tests {
         let out = block_on(apply_with_receipt(
             &store,
             &correlation(),
-            &commit_plan(),
+            Commit::Response(&commit_plan()),
             1_700_000_001,
         ));
 
@@ -966,12 +1314,12 @@ mod tests {
         let c = correlation();
         let plan = commit_plan();
 
-        let first = block_on(apply_with_receipt(&store, &c, &plan, 1));
+        let first = block_on(apply_with_receipt(&store, &c, Commit::Response(&plan), 1));
         assert!(matches!(first, ReceiptOutcome::Committed { .. }));
 
         // Same signed event delivered twice more.
-        let second = block_on(apply_with_receipt(&store, &c, &plan, 2));
-        let third = block_on(apply_with_receipt(&store, &c, &plan, 3));
+        let second = block_on(apply_with_receipt(&store, &c, Commit::Response(&plan), 2));
+        let third = block_on(apply_with_receipt(&store, &c, Commit::Response(&plan), 3));
 
         assert_eq!(second, ReceiptOutcome::DuplicateIgnored { replays: 1 });
         assert_eq!(third, ReceiptOutcome::DuplicateIgnored { replays: 2 });
@@ -997,7 +1345,7 @@ mod tests {
         let out = block_on(apply_with_receipt(
             &store,
             &correlation(),
-            &commit_plan(),
+            Commit::Response(&commit_plan()),
             5,
         ));
 
@@ -1032,10 +1380,10 @@ mod tests {
         let c = correlation();
         let plan = commit_plan();
 
-        let first = block_on(apply_with_receipt(&store, &c, &plan, 5));
+        let first = block_on(apply_with_receipt(&store, &c, Commit::Response(&plan), 5));
         assert!(matches!(first, ReceiptOutcome::ProjectionFailed { .. }));
 
-        let second = block_on(apply_with_receipt(&store, &c, &plan, 6));
+        let second = block_on(apply_with_receipt(&store, &c, Commit::Response(&plan), 6));
         assert_eq!(second, ReceiptOutcome::Reconciled { replays: 1 });
         assert_eq!(store.decision_count(), 1);
         assert_eq!(store.case_state("case-1").as_deref(), Some("approved"));
@@ -1045,7 +1393,7 @@ mod tests {
         );
 
         // A third delivery is now a plain duplicate.
-        let third = block_on(apply_with_receipt(&store, &c, &plan, 7));
+        let third = block_on(apply_with_receipt(&store, &c, Commit::Response(&plan), 7));
         assert!(matches!(third, ReceiptOutcome::DuplicateIgnored { .. }));
         assert_eq!(store.decision_count(), 1, "still exactly one mutation");
     }
@@ -1056,7 +1404,7 @@ mod tests {
         let c = correlation();
         let plan = commit_plan();
         for _ in 0..3 {
-            let out = block_on(apply_with_receipt(&store, &c, &plan, 9));
+            let out = block_on(apply_with_receipt(&store, &c, Commit::Response(&plan), 9));
             assert!(!out.is_applied());
         }
         assert_eq!(store.decision_count(), 0);
@@ -1065,7 +1413,7 @@ mod tests {
             Some(ReceiptStage::ProjectionFailed)
         );
         // The fourth succeeds once the injected failures are exhausted.
-        let ok = block_on(apply_with_receipt(&store, &c, &plan, 10));
+        let ok = block_on(apply_with_receipt(&store, &c, Commit::Response(&plan), 10));
         assert!(ok.is_applied());
         assert_eq!(store.decision_count(), 1);
     }
@@ -1076,7 +1424,7 @@ mod tests {
         let out = block_on(apply_with_receipt(
             &store,
             &correlation(),
-            &commit_plan(),
+            Commit::Response(&commit_plan()),
             1,
         ));
         match &out {
@@ -1231,7 +1579,12 @@ mod tests {
         );
         let c = correlate(&ev).unwrap();
         let store = FakeStore::new();
-        let out = block_on(apply_with_receipt(&store, &c, &commit_plan(), 1));
+        let out = block_on(apply_with_receipt(
+            &store,
+            &c,
+            Commit::Response(&commit_plan()),
+            1,
+        ));
         assert_eq!(
             out,
             ReceiptOutcome::Committed {
@@ -1248,7 +1601,12 @@ mod tests {
         );
         let c = correlate(&ev).unwrap();
         let store = FakeStore::new();
-        let out = block_on(apply_with_receipt(&store, &c, &commit_plan(), 1));
+        let out = block_on(apply_with_receipt(
+            &store,
+            &c,
+            Commit::Response(&commit_plan()),
+            1,
+        ));
         assert_eq!(out, ReceiptOutcome::Uncorrelated);
         assert_eq!(store.decision_count(), 0);
     }
@@ -1339,6 +1697,371 @@ mod tests {
         assert!(correlate(&ev).is_none());
         let ev = event(vec![t(&["d", ""])], r#"{"action":"approve"}"#);
         assert!(correlate(&ev).is_none());
+    }
+
+    fn supersession_event(tags: Vec<Vec<String>>) -> NostrEvent {
+        event(tags, r#"{"action":"reject","reasoning":"revoked"}"#)
+    }
+
+    fn supersession_correlation() -> ReceiptCorrelation {
+        ReceiptCorrelation {
+            event_id: "s".repeat(64),
+            kind: 31403,
+            case_id: "case-1".into(),
+            request_event_id: None,
+            signer_pubkey: "human-bob".into(),
+            decision_outcome: Some("reject".into()),
+            target_operation: None,
+            supersedes_event_id: Some("a".repeat(64)),
+            signed_at: 10,
+        }
+    }
+
+    fn supersession_plan() -> SupersessionCommit {
+        SupersessionCommit {
+            event_id: "s".repeat(64),
+            case_id: "case-1".into(),
+            superseded_event_id: "a".repeat(64),
+            superseded_decision_id: format!("dec-{}", "a".repeat(16)),
+            expected_state: "decided".into(),
+            decision_id: format!("dec-{}", "s".repeat(16)),
+            outcome: "reject".into(),
+            outcome_detail: None,
+            reasoning: "revoked".into(),
+            broker_pubkey: "human-bob".into(),
+            decided_at: 10,
+        }
+    }
+
+    #[test]
+    fn supersession_correlation_uses_supersedes_tag_not_request() {
+        // A supersedes-only 31403 carries no request id; the `supersedes` marked
+        // `e` tag must never be read as the request.
+        let target = "a".repeat(64);
+        let c = correlate(&supersession_event(vec![
+            t(&["d", "case-1"]),
+            t(&["e", &target, "", "supersedes"]),
+        ]))
+        .expect("correlates");
+        assert_eq!(c.request_event_id, None);
+        assert_eq!(c.supersedes_event_id.as_deref(), Some(target.as_str()));
+        assert_eq!(c.decision_outcome.as_deref(), Some("reject"));
+    }
+
+    #[test]
+    fn supersession_commits_through_the_stage_machine_without_a_request_id() {
+        let store = FakeStore::new();
+        let out = block_on(apply_with_receipt(
+            &store,
+            &supersession_correlation(),
+            Commit::Supersession(&supersession_plan()),
+            10,
+        ));
+        assert!(matches!(out, ReceiptOutcome::Committed { .. }), "{out:?}");
+        assert_eq!(store.case_state("case-1").as_deref(), Some("superseded"));
+        assert_eq!(
+            store.stage_of(&"s".repeat(64)),
+            Some(ReceiptStage::ProjectionCommitted)
+        );
+    }
+
+    #[test]
+    fn supersession_redelivery_is_duplicate_ignored() {
+        let store = FakeStore::new();
+        let c = supersession_correlation();
+        let plan = supersession_plan();
+        let first = block_on(apply_with_receipt(
+            &store,
+            &c,
+            Commit::Supersession(&plan),
+            10,
+        ));
+        let second = block_on(apply_with_receipt(
+            &store,
+            &c,
+            Commit::Supersession(&plan),
+            11,
+        ));
+        assert!(matches!(first, ReceiptOutcome::Committed { .. }));
+        assert_eq!(second, ReceiptOutcome::DuplicateIgnored { replays: 1 });
+        assert_eq!(store.decision_count(), 1);
+        assert_eq!(*store.commit_calls.borrow(), 1, "no second mutation");
+    }
+
+    #[test]
+    fn a_supersession_plan_for_another_target_is_uncorrelated() {
+        let store = FakeStore::new();
+        let mut plan = supersession_plan();
+        plan.superseded_event_id = "b".repeat(64);
+        let out = block_on(apply_with_receipt(
+            &store,
+            &supersession_correlation(),
+            Commit::Supersession(&plan),
+            10,
+        ));
+        assert_eq!(out, ReceiptOutcome::Uncorrelated);
+        assert_eq!(store.decision_count(), 0);
+    }
+
+    #[test]
+    fn supersedable_states_match_the_batch_sql() {
+        for state in SUPERSEDABLE_STATES {
+            assert!(
+                SUPERSESSION_DECISION_SQL.contains(&format!("'{state}'")),
+                "{state} missing from the SQL"
+            );
+        }
+        assert!(!SUPERSESSION_DECISION_SQL.contains("'open'"));
+        assert!(!SUPERSESSION_DECISION_SQL.contains("'under_review'"));
+    }
+
+    #[test]
+    fn an_appeal_commits_through_the_stage_machine_and_redelivery_is_ignored() {
+        let cited = "a".repeat(64);
+        let correlation = ReceiptCorrelation {
+            event_id: "p".repeat(64),
+            kind: 31402,
+            case_id: "appeal-9".into(),
+            request_event_id: Some(cited.clone()),
+            signer_pubkey: "agent-alice".into(),
+            decision_outcome: None,
+            target_operation: None,
+            supersedes_event_id: None,
+            signed_at: 5,
+        };
+        let plan = AppealCommit {
+            event_id: "p".repeat(64),
+            case_id: "case-1".into(),
+            appellant: "agent-alice".into(),
+            cited_event_id: cited.clone(),
+            cited_decision_id: format!("dec-{}", &cited[..16]),
+            at: 5,
+        };
+        let store = FakeStore::new();
+        let first = block_on(apply_with_receipt(
+            &store,
+            &correlation,
+            Commit::Appeal(&plan),
+            5,
+        ));
+        let second = block_on(apply_with_receipt(
+            &store,
+            &correlation,
+            Commit::Appeal(&plan),
+            6,
+        ));
+        assert!(
+            matches!(first, ReceiptOutcome::Committed { .. }),
+            "{first:?}"
+        );
+        assert_eq!(second, ReceiptOutcome::DuplicateIgnored { replays: 1 });
+        assert_eq!(store.case_state("case-1").as_deref(), Some("reopened"));
+
+        let mut other = plan.clone();
+        other.cited_event_id = "b".repeat(64);
+        assert_eq!(
+            block_on(apply_with_receipt(
+                &FakeStore::new(),
+                &correlation,
+                Commit::Appeal(&other),
+                5
+            )),
+            ReceiptOutcome::Uncorrelated
+        );
+    }
+
+    // -- The supersession batch, run against SQLite (the engine D1 is built on) --
+
+    use super::test_support::*;
+
+    /// Run the four supersession statements in order inside one transaction and
+    /// return rows changed by each, as D1's `batch` reports them.
+    fn run_supersession(conn: &mut rusqlite::Connection, c: &SupersessionCommit) -> Vec<usize> {
+        let tx = conn.transaction().unwrap();
+        let changes = vec![
+            tx.execute(
+                SUPERSESSION_DECISION_SQL,
+                rusqlite::params![
+                    c.decision_id,
+                    c.case_id,
+                    c.outcome,
+                    c.outcome_detail,
+                    c.broker_pubkey,
+                    c.reasoning,
+                    c.superseded_decision_id,
+                    c.decided_at as i64,
+                    c.expected_state,
+                    c.event_id
+                ],
+            )
+            .unwrap(),
+            tx.execute(
+                SUPERSESSION_MARK_SQL,
+                rusqlite::params![c.decision_id, c.superseded_decision_id],
+            )
+            .unwrap(),
+            tx.execute(
+                SUPERSESSION_CASE_SQL,
+                rusqlite::params![c.broker_pubkey, c.decided_at as i64, c.case_id],
+            )
+            .unwrap(),
+            tx.execute(
+                PROJECTION_RECEIPT_SQL,
+                rusqlite::params![
+                    ReceiptStage::ProjectionCommitted.as_str(),
+                    c.decided_at as i64,
+                    c.decision_id,
+                    c.event_id
+                ],
+            )
+            .unwrap(),
+        ];
+        tx.commit().unwrap();
+        changes
+    }
+
+    fn seeded(state: &str) -> (rusqlite::Connection, SupersessionCommit) {
+        let plan = supersession_plan();
+        let conn = governance_db();
+        seed_case(&conn, &plan.case_id, state, "agent-alice", None);
+        seed_decision(
+            &conn,
+            &plan.superseded_decision_id,
+            &plan.case_id,
+            "human-bob",
+        );
+        seed_receipt(&conn, &plan.event_id, &plan.case_id, "relay-accepted");
+        (conn, plan)
+    }
+
+    fn one(conn: &rusqlite::Connection, sql: &str) -> Option<String> {
+        use rusqlite::types::Value;
+        match conn.query_row(sql, [], |r| r.get::<_, Value>(0)).unwrap() {
+            Value::Null => None,
+            Value::Integer(n) => Some(n.to_string()),
+            Value::Text(t) => Some(t),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supersession_batch_commits_all_four_together() {
+        let (mut conn, plan) = seeded("decided");
+        assert_eq!(run_supersession(&mut conn, &plan), vec![1, 1, 1, 1]);
+        assert_eq!(
+            one(&conn, "SELECT state FROM broker_cases").as_deref(),
+            Some("superseded")
+        );
+        assert_eq!(
+            one(
+                &conn,
+                &format!(
+                    "SELECT superseded_by FROM broker_decisions WHERE decision_id = '{}'",
+                    plan.superseded_decision_id
+                )
+            )
+            .as_deref(),
+            Some(plan.decision_id.as_str())
+        );
+        assert_eq!(
+            one(
+                &conn,
+                &format!(
+                    "SELECT prior_decision_id FROM broker_decisions WHERE decision_id = '{}'",
+                    plan.decision_id
+                )
+            )
+            .as_deref(),
+            Some(plan.superseded_decision_id.as_str())
+        );
+        assert_eq!(
+            one(&conn, "SELECT stage FROM governance_receipts").as_deref(),
+            Some("projection-committed")
+        );
+    }
+
+    #[test]
+    fn supersession_batch_commits_from_a_reopened_case() {
+        let (mut conn, plan) = seeded("reopened");
+        let mut plan = plan;
+        plan.expected_state = "reopened".into();
+        assert_eq!(run_supersession(&mut conn, &plan), vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn supersession_batch_writes_nothing_when_case_moved() {
+        // The plan saw `decided`; the case has since moved on.
+        let (mut conn, plan) = seeded("reopened");
+        assert_eq!(run_supersession(&mut conn, &plan), vec![0, 0, 0, 0]);
+        assert_eq!(
+            one(&conn, "SELECT state FROM broker_cases").as_deref(),
+            Some("reopened")
+        );
+        assert_eq!(
+            one(&conn, "SELECT superseded_by FROM broker_decisions"),
+            None,
+            "prior decision unmutated"
+        );
+        assert_eq!(
+            one(&conn, "SELECT count(*) FROM broker_decisions").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            one(&conn, "SELECT stage FROM governance_receipts").as_deref(),
+            Some("relay-accepted")
+        );
+    }
+
+    #[test]
+    fn supersession_batch_refuses_an_open_case_even_if_the_snapshot_says_so() {
+        let (mut conn, mut plan) = seeded("open");
+        plan.expected_state = "open".into();
+        assert_eq!(run_supersession(&mut conn, &plan), vec![0, 0, 0, 0]);
+        assert_eq!(
+            one(&conn, "SELECT state FROM broker_cases").as_deref(),
+            Some("open")
+        );
+    }
+
+    #[test]
+    fn supersession_batch_refuses_an_already_superseded_target() {
+        let (mut conn, plan) = seeded("decided");
+        conn.execute(
+            "UPDATE broker_decisions SET superseded_by = 'dec-other'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(run_supersession(&mut conn, &plan), vec![0, 0, 0, 0]);
+        assert_eq!(
+            one(&conn, "SELECT superseded_by FROM broker_decisions").as_deref(),
+            Some("dec-other")
+        );
+    }
+
+    #[test]
+    fn supersession_batch_refuses_a_decision_from_another_case() {
+        let plan = supersession_plan();
+        let mut conn = governance_db();
+        seed_case(&conn, "case-1", "decided", "agent-alice", None);
+        seed_case(&conn, "case-b", "decided", "agent-alice", None);
+        seed_decision(&conn, &plan.superseded_decision_id, "case-b", "human-bob");
+        seed_receipt(&conn, &plan.event_id, "case-1", "relay-accepted");
+        assert_eq!(run_supersession(&mut conn, &plan), vec![0, 0, 0, 0]);
+        assert_eq!(
+            one(&conn, "SELECT superseded_by FROM broker_decisions"),
+            None
+        );
+    }
+
+    #[test]
+    fn supersession_batch_needs_a_receipt_awaiting_projection() {
+        let (mut conn, plan) = seeded("decided");
+        conn.execute(
+            "UPDATE governance_receipts SET stage = 'projection-committed'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(run_supersession(&mut conn, &plan), vec![0, 0, 0, 0]);
     }
 }
 

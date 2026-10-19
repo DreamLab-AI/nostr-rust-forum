@@ -90,6 +90,66 @@ pub(crate) fn NotificationBell() -> impl IntoView {
     v2_store.init_sync();
     let panel_open = RwSignal::new(false);
 
+    // ADR-2023 Tier 0: DMs notify from anywhere in the app. The per-page DM
+    // store only subscribes while a DM screen is open, so the layout watches
+    // gift wraps itself once the relay session is authenticated, and re-arms
+    // after a reconnect or an account switch.
+    if let Some(relay) = use_context::<crate::relay::RelayConnection>() {
+        let conn = relay.connection_state();
+        let relay_authed = relay.authenticated();
+        let me = crate::auth::use_auth().pubkey();
+        let auth_for_dm = crate::auth::use_auth();
+        let watching: StoredValue<Option<(String, String)>> = StoredValue::new(None);
+        // The signer is not a reactive value, so it can be absent at the moment
+        // the session turns ready. Re-run a few times rather than never arming.
+        let retry = RwSignal::new(0u32);
+        Effect::new(move |_| {
+            let attempt = retry.get();
+            let ready =
+                conn.get() == crate::relay::ConnectionState::Connected && relay_authed.get();
+            let pk = me.get();
+            let current = watching.get_value();
+            let wanted = if ready { pk } else { None };
+            if current.as_ref().map(|(_, p)| p) == wanted.as_ref() {
+                return;
+            }
+            if let Some((sid, _)) = current {
+                relay.unsubscribe(&sid);
+                watching.set_value(None);
+            }
+            let Some(pk) = wanted else {
+                return;
+            };
+            let Some(signer) = auth_for_dm.get_signer() else {
+                if attempt < 10 {
+                    crate::utils::set_timeout_once(move || retry.update(|n| *n += 1), 1_000);
+                }
+                return;
+            };
+            let sid = crate::dm::start_incoming_watcher(&relay, signer, &pk);
+            watching.set_value(Some((sid, pk)));
+        });
+    }
+
+    // ADR-2023: once signed in, keep this device's push registration fresh (at
+    // most daily; a no-op unless the member already turned alerts on here).
+    let push_auth = crate::auth::use_auth();
+    let push_authed = push_auth.is_authenticated();
+    let push_refreshed = std::cell::Cell::new(false);
+    Effect::new(move |_| {
+        // Tracked: re-runs when sign-in completes (the signer itself is not reactive).
+        if !push_authed.get() || push_refreshed.get() {
+            return;
+        }
+        if let Some(signer) = push_auth.get_signer() {
+            push_refreshed.set(true);
+            leptos::task::spawn_local(crate::utils::push::refresh_if_due(
+                signer,
+                crate::utils::push::brand_label(),
+            ));
+        }
+    });
+
     // Bug #18: route open-state through the shared PopoverCoord so opening
     // this popover automatically closes any sibling popover (Bookmarks etc.)
     // Two-way sync — see app.rs::Layout for the parallel bookmarks block.

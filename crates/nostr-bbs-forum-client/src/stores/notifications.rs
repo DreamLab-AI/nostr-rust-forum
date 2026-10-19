@@ -20,7 +20,7 @@
 //! - never notify on a post the user has already read (its `created_at` is at
 //!   or before the channel's last-read position).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use gloo::events::EventListener;
 use gloo::storage::{LocalStorage, Storage};
@@ -36,7 +36,10 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::utils::shorten_pubkey;
 
-const STORAGE_KEY: &str = "nostrbbs:notifications";
+/// Prefix of the visible notification list. The owning pubkey is appended (see
+/// [`items_key`]), exactly as for [`SYNC_STATE_KEY`], so a second account on a
+/// shared browser never sees the previous account's notifications.
+const ITEMS_KEY: &str = "nostrbbs:notifications";
 /// Prefix for the per-pubkey producer sync state (baseline high-water mark +
 /// already-notified event ids). The signed-in pubkey is appended (see
 /// [`sync_state_key`]) so a different account logging in on the same device
@@ -50,7 +53,8 @@ const SYNC_STATE_KEY: &str = "nostrbbs:notif_sync";
 const ANON_OWNER: &str = "anon";
 const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 /// Cap on persisted dedup ids so the set can't grow without bound. Far above the
-/// 100-notification visible cap; old ids are evicted FIFO-style on overflow.
+/// 100-notification visible cap; the oldest id is evicted first on overflow
+/// ([`SeenIds`]).
 const MAX_SEEN_IDS: usize = 2_000;
 
 // -- Types --------------------------------------------------------------------
@@ -136,6 +140,66 @@ struct SyncState {
     notified_ids: Vec<String>,
 }
 
+/// Insertion-ordered, capacity-bounded set of already-handled event ids.
+///
+/// Eviction is genuinely FIFO: the id inserted longest ago goes first, so the
+/// ids dropped on overflow are always the ones least likely to still be on the
+/// relay. (A bare `HashSet` evicts an arbitrary element.)
+#[derive(Clone, Debug)]
+struct SeenIds {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+    cap: usize,
+}
+
+impl SeenIds {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            order: VecDeque::new(),
+            set: HashSet::new(),
+            cap,
+        }
+    }
+
+    /// Rebuild from persisted ids, oldest first; later duplicates are ignored
+    /// and an over-long list keeps its newest `cap` entries.
+    fn from_ids<I: IntoIterator<Item = String>>(ids: I, cap: usize) -> Self {
+        let mut seen = Self::with_cap(cap);
+        for id in ids {
+            seen.insert(id);
+        }
+        seen
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    /// Record `id`, evicting the oldest entry when full. Returns `false` if it
+    /// was already present (its age is not refreshed).
+    fn insert(&mut self, id: String) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        while self.order.len() >= self.cap {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.set.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.set.insert(id.clone());
+        self.order.push_back(id);
+        true
+    }
+
+    /// The ids, oldest first, for persistence.
+    fn ids(&self) -> Vec<String> {
+        self.order.iter().cloned().collect()
+    }
+}
+
 // -- Reactive store -----------------------------------------------------------
 
 /// Reactive notification store, provided via context.
@@ -163,21 +227,21 @@ pub struct NotificationStoreV2 {
     /// Message event ids already turned into a "new post" notification. Seeded
     /// from the persisted [`SyncState::notified_ids`] on construction so dedup
     /// survives reloads and 7-day item eviction.
-    seen_messages: RwSignal<HashSet<String>>,
+    seen_messages: RwSignal<SeenIds>,
 }
 
 impl NotificationStoreV2 {
     fn new() -> Self {
-        let loaded = load_from_storage();
-        // Sync state is loaded per-pubkey by `init_sync`'s resolver once auth
-        // resolves — not here, where the signed-in account is not yet known.
+        // The visible list AND the sync state are loaded per-pubkey by
+        // `init_sync`'s resolver once auth resolves — not here, where the
+        // signed-in account is not yet known.
         Self {
-            items: RwSignal::new(loaded),
+            items: RwSignal::new(Vec::new()),
             synced: RwSignal::new(false),
             baseline: RwSignal::new(0),
             owner: RwSignal::new(None),
             seen_channels: RwSignal::new(HashSet::new()),
-            seen_messages: RwSignal::new(HashSet::new()),
+            seen_messages: RwSignal::new(SeenIds::with_cap(MAX_SEEN_IDS)),
         }
     }
 
@@ -251,6 +315,11 @@ impl NotificationStoreV2 {
             dedup_id,
             key,
         } = origin;
+        // A sender controls the timestamp they put on a DM rumor or a post. A
+        // future one would sort to the top and, because age is computed with
+        // `saturating_sub`, never be evicted, pushing real history out of the
+        // capped list. Clamp it to now.
+        let timestamp = clamp_to_now(timestamp, now_secs());
         // Honour the user's notification level (#wire-settings). The level
         // gates which categories ever reach the store:
         //   None         -> nothing,
@@ -282,6 +351,16 @@ impl NotificationStoreV2 {
             }
         };
 
+        // Tier 0 (ADR-2023): also raise a system notification when the page is
+        // hidden. Text is generic by design: it can appear on a lock screen.
+        let local_alert = (
+            system_text(&kind),
+            format!("nbbs-local-{}", system_tag(&kind)),
+            link.map(|l| l.trim_start_matches('/').to_string())
+                .unwrap_or_default(),
+            system_alert_allowed(&kind),
+        );
+
         let notification = Notification {
             id,
             kind,
@@ -304,6 +383,63 @@ impl NotificationStoreV2 {
             }
         });
         self.persist();
+
+        if local_alert.3 {
+            crate::utils::push::show_local_if_hidden(
+                &crate::utils::push::brand_label(),
+                local_alert.0,
+                &local_alert.2,
+                &local_alert.1,
+            );
+        }
+    }
+
+    /// Whether a DM wrap has already been announced or settled as backlog, so
+    /// the watcher can skip decrypting it.
+    pub fn dm_settled(&self, wrap_id: &str) -> bool {
+        self.seen_messages.with_untracked(|s| s.contains(wrap_id))
+    }
+
+    /// Notify about a received direct message (Tier 0, ADR-2023).
+    ///
+    /// Called by the DM store for every gift wrap it successfully opens. The
+    /// same gates as channel posts apply: never the user's own message, never
+    /// history older than this account's sync baseline, and never twice for the
+    /// same wrap (persisted, so a reload does not re-announce). `wrap_id` is the
+    /// kind-1059 event id, which is stable across reloads.
+    pub fn notify_dm(&self, wrap_id: &str, sender: &str, timestamp: u64, is_sent: bool) {
+        // The sync floor is stamped when the bell mounts (`init_sync`). A wrap
+        // that somehow arrives first must not be judged against floor 0, which
+        // would announce the whole two-day lookback. Not burned: nothing is
+        // decided yet.
+        if self.baseline.get_untracked() == 0 {
+            return;
+        }
+        let seen = self.seen_messages.with_untracked(|s| s.contains(wrap_id));
+        let verdict = dm_verdict(is_sent, timestamp, self.baseline.get_untracked(), seen);
+        // Not burned when the notification level would reject the message:
+        // loosening the level later must still be able to announce it.
+        let level_allows = notification_kind_allowed(&NotificationKind::DM);
+        if should_burn(verdict.burn, verdict.notify, level_allows) {
+            self.seen_messages.update(|s| {
+                s.insert(wrap_id.to_string());
+            });
+            self.persist_sync_state();
+        }
+        if !verdict.notify {
+            return;
+        }
+        self.add_at(
+            NotificationKind::DM,
+            "New direct message",
+            &format!("From {}", author_display(sender)),
+            Some(&format!("/dm/{sender}")),
+            Origin {
+                timestamp,
+                dedup_id: Some(format!("dm:{wrap_id}")),
+                key: Some(pubkey_ref(sender)),
+            },
+        );
     }
 
     /// Clear all notifications.
@@ -371,13 +507,17 @@ impl NotificationStoreV2 {
                 return; // already loaded for this account
             }
             let state = load_sync_state(&owner_key);
+            let owner_for_items = owner_key.clone();
             store.owner.set(Some(owner_key));
             // Reset per-account dedup so a switch never leaks the prior
             // account's "already seen" sets.
             store.seen_channels.set(HashSet::new());
-            store
-                .seen_messages
-                .set(state.notified_ids.iter().cloned().collect());
+            store.seen_messages.set(SeenIds::from_ids(
+                state.notified_ids.iter().cloned(),
+                MAX_SEEN_IDS,
+            ));
+            // The visible list is per-account too: swap in this owner's own.
+            store.items.set(load_from_storage(&owner_for_items));
             known_profiles.set(HashSet::new());
             join_seeded.set(false);
             if state.baseline == 0 {
@@ -512,28 +652,12 @@ impl NotificationStoreV2 {
                     // A read-position rejection is left unburned; re-checking it
                     // on a later pass is cheap, and it means a corrected read
                     // position can still surface the reply.
-                    if verdict.is_permanent() {
-                        store.seen_messages.update(|s| {
-                            // Bound the persisted dedup set; on overflow drop an
-                            // arbitrary oldest-ish entry. Re-notifying a
-                            // long-evicted post is far less bad than an
-                            // unbounded set.
-                            if s.len() >= MAX_SEEN_IDS {
-                                if let Some(victim) = s.iter().next().cloned() {
-                                    s.remove(&victim);
-                                }
-                            }
-                            s.insert(event.id.clone());
-                        });
-                        seen_changed = true;
-                    }
-
-                    if verdict != PostVerdict::Notify {
-                        continue;
-                    }
-
-                    let author = author_display(&event.pubkey);
-                    let preview = post_preview(&event.content);
+                    //
+                    // The notification LEVEL is the one mutable input left: a
+                    // post that would notify but is rejected by the level
+                    // (`MentionsOnly` vs a plain post, or `None`) is not burned,
+                    // so loosening the level later can still surface it.
+                    //
                     // `mentions_me` (computed above) also classifies the
                     // notification as `Mention` so it survives the MentionsOnly
                     // notification level; plain channel posts stay `Message` and
@@ -549,6 +673,26 @@ impl NotificationStoreV2 {
                             format!("New reply in {}", channel_name),
                         )
                     };
+                    let level_allows = notification_kind_allowed(&kind);
+                    if should_burn(
+                        verdict.is_permanent(),
+                        verdict == PostVerdict::Notify,
+                        level_allows,
+                    ) {
+                        store.seen_messages.update(|s| {
+                            // Bounded FIFO: re-notifying a long-evicted post is
+                            // far less bad than an unbounded set.
+                            s.insert(event.id.clone());
+                        });
+                        seen_changed = true;
+                    }
+
+                    if verdict != PostVerdict::Notify {
+                        continue;
+                    }
+
+                    let author = author_display(&event.pubkey);
+                    let preview = post_preview(&event.content);
                     store.add_at(
                         kind,
                         &title,
@@ -685,7 +829,7 @@ impl NotificationStoreV2 {
     ///
     /// Root cause of "mark all read keeps resetting" (multi-client clobber):
     /// each client holds its OWN in-memory `items`, but they share the single
-    /// [`STORAGE_KEY`] entry with no reconciliation. Tab A marking all read
+    /// per-owner [`items_key`] entry with no reconciliation. Tab A marking all read
     /// persists `read:true`; a STALE tab B then persists its own `read:false`
     /// snapshot (on its next `mark_read` / `add` / producer write) and silently
     /// reverts the shared key back to unread. The `storage` event fires ONLY in
@@ -695,12 +839,16 @@ impl NotificationStoreV2 {
     /// can never echo into a cross-tab write loop.
     fn init_cross_tab_sync(&self) {
         let items = self.items;
+        let owner = self.owner;
         let listener = EventListener::new(&gloo::utils::window(), "storage", move |event| {
             let changed = event
                 .dyn_ref::<web_sys::StorageEvent>()
                 .and_then(|e| e.key());
-            if storage_change_is_ours(changed.as_deref()) {
-                items.set(load_items_no_persist());
+            let Some(owner) = owner.get_untracked() else {
+                return;
+            };
+            if storage_change_is_ours(changed.as_deref(), &owner) {
+                items.set(load_items_no_persist(&owner));
             }
         });
         // The store lives for the whole app session; keep the listener alive.
@@ -708,10 +856,15 @@ impl NotificationStoreV2 {
     }
 
     fn persist(&self) {
+        // No owner yet (auth unresolved): there is no account to file the list
+        // under, so keep it in memory only.
+        let Some(owner) = self.owner.get_untracked() else {
+            return;
+        };
         let data = PersistedNotifications {
             items: self.items.get_untracked(),
         };
-        let _ = LocalStorage::set(STORAGE_KEY, data);
+        let _ = LocalStorage::set(items_key(&owner), data);
     }
 
     /// Persist the producer sync state (baseline + already-notified ids) to the
@@ -724,9 +877,7 @@ impl NotificationStoreV2 {
         };
         let state = SyncState {
             baseline: self.baseline.get_untracked(),
-            notified_ids: self
-                .seen_messages
-                .with_untracked(|s| s.iter().cloned().collect()),
+            notified_ids: self.seen_messages.with_untracked(|s| s.ids()),
         };
         let _ = LocalStorage::set(sync_state_key(&owner), state);
     }
@@ -792,6 +943,82 @@ fn fallback_singleton() -> NotificationStoreV2 {
         *cell.borrow_mut() = Some(store);
         store
     })
+}
+
+/// The process-wide store, for code that runs outside a reactive owner (the DM
+/// store's spawned tasks). `None` before `provide_notification_store` ran.
+pub fn global_notification_store() -> Option<NotificationStoreV2> {
+    FALLBACK_STORE.with(|cell| *cell.borrow())
+}
+
+/// Outcome of the DM notification gate: whether to notify, and whether the wrap
+/// id is now settled and belongs in the persisted dedup set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DmVerdict {
+    notify: bool,
+    burn: bool,
+}
+
+/// Decide whether a received DM notifies. The id is only burned when the
+/// answer cannot change (own message, or older than the sync floor), or when it
+/// notifies; the same rule as [`PostVerdict::is_permanent`].
+fn dm_verdict(is_sent: bool, timestamp: u64, baseline: u64, already_seen: bool) -> DmVerdict {
+    if already_seen {
+        return DmVerdict {
+            notify: false,
+            burn: false,
+        };
+    }
+    if is_sent || timestamp <= baseline {
+        return DmVerdict {
+            notify: false,
+            burn: true,
+        };
+    }
+    DmVerdict {
+        notify: true,
+        burn: true,
+    }
+}
+
+/// Whether `kind` may be raised as an OS-level alert while the page is hidden.
+/// Generic channel chatter (`Message`) stays in-app: it mirrors the server push
+/// defaults, where new posts are opt-in, and under the default "All" level it
+/// would otherwise buzz for every post in every channel.
+fn system_alert_allowed(kind: &NotificationKind) -> bool {
+    !matches!(kind, NotificationKind::Message)
+}
+
+/// A notification cannot be from the future: clamp `timestamp` to `now`.
+fn clamp_to_now(timestamp: u64, now: u64) -> u64 {
+    timestamp.min(now)
+}
+
+/// Generic body for the system notification of `kind`. Never message content:
+/// lock screens show it.
+fn system_text(kind: &NotificationKind) -> &'static str {
+    match kind {
+        NotificationKind::DM => "New direct message",
+        NotificationKind::Mention => "You were mentioned",
+        NotificationKind::Message => "New activity",
+        NotificationKind::JoinRequest => "New membership request",
+        NotificationKind::JoinApproved => "Your membership was approved",
+        NotificationKind::EventRSVP => "Event update",
+        NotificationKind::System => "New notice",
+    }
+}
+
+/// Per-kind tag so a burst of one kind collapses into one system notification.
+fn system_tag(kind: &NotificationKind) -> &'static str {
+    match kind {
+        NotificationKind::DM => "dm",
+        NotificationKind::Mention => "mention",
+        NotificationKind::Message => "message",
+        NotificationKind::JoinRequest => "join",
+        NotificationKind::JoinApproved => "approved",
+        NotificationKind::EventRSVP => "rsvp",
+        NotificationKind::System => "system",
+    }
 }
 
 // -- Helpers ------------------------------------------------------------------
@@ -986,22 +1213,52 @@ fn post_preview(content: &str) -> String {
     }
 }
 
+/// Storage key of `owner`'s visible notification list.
+fn items_key(owner: &str) -> String {
+    format!("{}:{}", ITEMS_KEY, owner)
+}
+
+/// Whether to record an id in the persisted dedup set. `permanent` is "the
+/// verdict can never change"; a verdict that WOULD notify but is refused by the
+/// mutable notification level must stay unburned so a looser level can still
+/// announce it later.
+fn should_burn(permanent: bool, would_notify: bool, level_allows: bool) -> bool {
+    permanent && (!would_notify || level_allows)
+}
+
+/// Remove the persisted notification lists on logout: `pubkey`'s own, the
+/// anonymous one, and the pre-scoping global key (whose owner is unknowable).
+/// The next account to sign in on this browser therefore starts empty. The
+/// per-pubkey sync state is deliberately kept — it is the same account's
+/// baseline and dedup history, not content a successor could read.
+pub fn clear_persisted_for_logout(pubkey: Option<&str>) {
+    if let Some(pk) = pubkey {
+        LocalStorage::delete(items_key(pk));
+    }
+    LocalStorage::delete(items_key(ANON_OWNER));
+    LocalStorage::delete(ITEMS_KEY);
+}
+
 /// Whether a `storage` event on `changed_key` should reload the notification
-/// list: a targeted write to OUR [`STORAGE_KEY`], or a whole-storage clear
-/// (`None`, e.g. `localStorage.clear()` on logout in another tab). Any other
-/// key (e.g. the per-pubkey sync state) is irrelevant to the visible list.
+/// list of `owner`: a targeted write to OUR per-owner [`items_key`], or a
+/// whole-storage clear (`None`, e.g. `localStorage.clear()` on logout in
+/// another tab). Any other key (e.g. the sync state, or another account's list)
+/// is irrelevant to the visible list.
 /// Extracted pure so the cross-tab dispatch is unit-testable without a DOM.
-fn storage_change_is_ours(changed_key: Option<&str>) -> bool {
-    matches!(changed_key, Some(STORAGE_KEY) | None)
+fn storage_change_is_ours(changed_key: Option<&str>, owner: &str) -> bool {
+    match changed_key {
+        None => true,
+        Some(k) => k == items_key(owner),
+    }
 }
 
 /// Parse the persisted notification list WITHOUT re-persisting it — the
 /// read-only path used by the cross-tab `storage` handler ([`NotificationStoreV2::init_cross_tab_sync`]).
 /// Re-persisting here would bounce a fresh `storage` event back to the other
 /// tabs; mirrors [`load_from_storage`] minus the migration write-back.
-fn load_items_no_persist() -> Vec<Notification> {
+fn load_items_no_persist(owner: &str) -> Vec<Notification> {
     let now = now_secs();
-    match LocalStorage::get::<serde_json::Value>(STORAGE_KEY) {
+    match LocalStorage::get::<serde_json::Value>(items_key(owner)) {
         Ok(value) => parse_persisted_items(&value, now),
         Err(_) => Vec::new(),
     }
@@ -1017,19 +1274,20 @@ fn load_items_no_persist() -> Vec<Notification> {
 /// bad entry, so we parse leniently — element by element — and keep only the
 /// entries that map cleanly onto the current `Notification` schema. The migrated
 /// (cleaned) list is written straight back so the drift heals on first load.
-fn load_from_storage() -> Vec<Notification> {
+fn load_from_storage(owner: &str) -> Vec<Notification> {
     let now = now_secs();
+    let key = items_key(owner);
 
     // Parse leniently: read the raw JSON value, then deserialize each item on its
     // own so a single legacy/corrupt entry is dropped rather than blanking all.
-    let items: Vec<Notification> = match LocalStorage::get::<serde_json::Value>(STORAGE_KEY) {
+    let items: Vec<Notification> = match LocalStorage::get::<serde_json::Value>(&key) {
         Ok(value) => parse_persisted_items(&value, now),
         Err(_) => Vec::new(),
     };
 
     // Persist the cleaned/evicted/migrated list back.
     let _ = LocalStorage::set(
-        STORAGE_KEY,
+        &key,
         PersistedNotifications {
             items: items.clone(),
         },
@@ -1140,6 +1398,77 @@ mod tests {
     }
 
     #[test]
+    fn dm_verdict_notifies_only_fresh_messages_from_others() {
+        let v = dm_verdict(false, 200, 100, false);
+        assert_eq!(
+            v,
+            DmVerdict {
+                notify: true,
+                burn: true
+            }
+        );
+        assert!(!dm_verdict(true, 200, 100, false).notify, "own message");
+        assert!(
+            !dm_verdict(false, 100, 100, false).notify,
+            "at the baseline is backlog"
+        );
+        assert!(
+            !dm_verdict(false, 50, 100, false).notify,
+            "before the baseline"
+        );
+        assert_eq!(
+            dm_verdict(false, 200, 100, true),
+            DmVerdict {
+                notify: false,
+                burn: false
+            },
+            "already announced: nothing to do"
+        );
+    }
+
+    #[test]
+    fn only_addressed_kinds_raise_system_alerts() {
+        assert!(!system_alert_allowed(&NotificationKind::Message));
+        for k in [
+            NotificationKind::DM,
+            NotificationKind::Mention,
+            NotificationKind::JoinRequest,
+            NotificationKind::JoinApproved,
+            NotificationKind::EventRSVP,
+            NotificationKind::System,
+        ] {
+            assert!(system_alert_allowed(&k), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn future_timestamps_are_clamped_to_now() {
+        assert_eq!(clamp_to_now(5_000, 1_000), 1_000, "far future");
+        assert_eq!(clamp_to_now(u64::MAX, 1_000), 1_000);
+        assert_eq!(clamp_to_now(900, 1_000), 900, "the past is untouched");
+        assert_eq!(clamp_to_now(1_000, 1_000), 1_000);
+    }
+
+    #[test]
+    fn system_text_never_carries_content_and_tags_are_distinct() {
+        let kinds = [
+            NotificationKind::Message,
+            NotificationKind::Mention,
+            NotificationKind::DM,
+            NotificationKind::JoinRequest,
+            NotificationKind::JoinApproved,
+            NotificationKind::EventRSVP,
+            NotificationKind::System,
+        ];
+        let tags: std::collections::HashSet<_> = kinds.iter().map(system_tag).collect();
+        assert_eq!(tags.len(), kinds.len());
+        for k in &kinds {
+            let t = system_text(k);
+            assert!(t.len() < 40 && !t.contains(':'), "{t}");
+        }
+    }
+
+    #[test]
     fn a_reply_addressed_to_me_survives_a_channel_wide_read_position() {
         // THE "ingress particularly" regression. Opening a section's
         // topic-title list stamps the WHOLE channel read, so a reply to my post
@@ -1224,10 +1553,48 @@ mod tests {
         // wrote OUR list key or cleared all storage (logout) — never for an
         // unrelated key like the per-pubkey sync state. This is what stops a
         // stale second tab from clobbering a "mark all read" (the reset bug).
-        assert!(storage_change_is_ours(Some(STORAGE_KEY)));
-        assert!(storage_change_is_ours(None)); // localStorage.clear()
-        assert!(!storage_change_is_ours(Some(&sync_state_key(ME))));
-        assert!(!storage_change_is_ours(Some("nostrbbs:something-else")));
+        assert!(storage_change_is_ours(Some(&items_key(ME)), ME));
+        assert!(storage_change_is_ours(None, ME)); // localStorage.clear()
+        assert!(!storage_change_is_ours(Some(&sync_state_key(ME)), ME));
+        // another account's list, and the retired global key, are not ours
+        assert!(!storage_change_is_ours(Some(&items_key(OTHER)), ME));
+        assert!(!storage_change_is_ours(Some(ITEMS_KEY), ME));
+        assert!(!storage_change_is_ours(Some("nostrbbs:something-else"), ME));
+    }
+
+    #[test]
+    fn items_key_is_scoped_per_owner() {
+        assert_eq!(items_key(ME), format!("nostrbbs:notifications:{ME}"));
+        assert_ne!(items_key(ME), items_key(OTHER));
+        assert_eq!(items_key(ANON_OWNER), "nostrbbs:notifications:anon");
+    }
+
+    #[test]
+    fn level_rejected_notification_is_not_burned() {
+        // would notify, level refuses -> leave unburned
+        assert!(!should_burn(true, true, false));
+        // would notify, level allows -> burn
+        assert!(should_burn(true, true, true));
+        // immutable non-notify verdicts burn whatever the level says
+        assert!(should_burn(true, false, false));
+        // reversible verdicts never burn
+        assert!(!should_burn(false, false, true));
+    }
+
+    #[test]
+    fn seen_ids_evict_oldest_first() {
+        let mut s = SeenIds::with_cap(3);
+        for id in ["a", "b", "c"] {
+            assert!(s.insert(id.into()));
+        }
+        assert!(!s.insert("a".into()), "duplicate");
+        s.insert("d".into());
+        assert!(!s.contains("a"), "oldest evicted");
+        assert!(s.contains("b") && s.contains("c") && s.contains("d"));
+        assert_eq!(s.ids(), ["b", "c", "d"]);
+        // reload keeps order and trims to the newest `cap`
+        let r = SeenIds::from_ids(["w", "x", "y", "z"].map(String::from), 3);
+        assert_eq!(r.ids(), ["x", "y", "z"]);
     }
 
     #[test]

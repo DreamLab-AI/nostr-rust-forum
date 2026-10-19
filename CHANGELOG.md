@@ -7,6 +7,186 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: a fresh Durable Object isolate could hand a new connection a prior session's identity (`nostr-bbs-relay-worker`)
+
+Session auth and subscriptions persist in DO storage under `ws_auth:{id}` / `ws_sub:{id}`, but the in-memory
+session counter restarted at 1 whenever the runtime rebuilt the object. A socket that died without its rows being
+cleared left `ws_auth:1` behind, and the next isolate's first connection, still unauthenticated, was recovered
+under that identity. The counter is now seeded from a persisted high-water mark that is advanced before each id
+is used, so an id is never re-issued while its rows might still exist.
+
+### Fixed: a superseding 31403 could mutate another case's decision chain, and supersession was not atomic (`nostr-bbs-relay-worker`)
+
+The ingest gate checked only that the signer outranked the superseded decision's signer, so a 31403 could cite a
+decision on a different case, re-supersede one that already had a successor, move an `open` or `under_review`
+case to `superseded`, or (as a `system:` decider) supersede a high or critical case, and a missing case row was
+treated as created by nobody. The decision row, the `superseded_by` mark and the case state were three unbatched
+writes with their results discarded. Supersession now goes through the ADR-2010 receipt stage machine as one
+four-statement batch in which every statement must change exactly one row, and the ingest and plan refusals carry
+the tokens `supersession_target_missing`, `_case_mismatch`, `_target_already_superseded`, `_unauthorised`,
+`_state_not_supersedable:<state>`, `_case_missing`, `_human_required` and `self_review`. `blocked: unauthorised
+supersession` is now `blocked: supersession_unauthorised`.
+
+### Fixed: any account could reopen any terminal case with an appeal; standing and shape only (`nostr-bbs-relay-worker`)
+
+`project_appeal` took the case from the `d` tag and checked nothing about who was appealing. Only the case's
+requester of record may now appeal, the appeal must cite a decision on that case, and the case must be terminal;
+a refusal leaves a `projection-failed` receipt instead of a silent no-op. An appeal-marked 31402 must carry a
+`case` tag different from its `d` tag (`blocked: appeal_shape`), since `d` equal to the case id would replace the
+requester's own signed request. Still open pending ADR-2024 (known-findings KF-12, partially fixed): the receipt is keyed on the appeal's own `d` tag
+rather than the case, and the forum client still lists an appeal as a new pending case.
+
+### Fixed: a banned or suspended owner could publish through a device key (`nostr-bbs-relay-worker`)
+
+`handle_event` resolved a registered device key to its owner for the allowlist only; the suspension, silence, ban and
+admin gates still read the raw author, so a sanctioned owner evaded moderation by signing with a device key. The
+effective principal is now resolved once, after signature verification and the write gate and never for gift wraps,
+and an event is refused if either the device key or its owner is suspended, silenced, banned or muted. The allowlist,
+trust level and zone-write checks use the owner; admin status stays the signing key's own, so a device key never
+inherits admin powers (a stolen admin device key cannot sign an enforced ban, and banning a device key directly holds).
+The RSVP cohort check, the `posts_created` counter, activity stamp and delete-any trust level follow the owner too,
+so a device key's posts promote its owner. A channel's creator is matched against both keys, since creation records the raw signing key. Behaviour with device
+keys off is unchanged.
+
+### Fixed: kind-41 channel metadata used a different channel than kind-42 and was not zone-read-gated (`nostr-bbs-relay-worker`)
+
+The kind-41 write gate took the first `e` tag, so a decoy first `e` could authorise edits to another channel, and
+the zone read gate mapped only kinds 40 and 42, so kind-41 escaped zone gating altogether.
+Kind-41 now resolves its channel with `channel_tag` (root marker, else first `e`) for both gates, and is zone-gated
+identically to the kind-40 definition.
+
+### Fixed: CLOSE and AUTH frames bypassed the per-IP frame limiter (`nostr-bbs-relay-worker`)
+
+Only EVENT, REQ and COUNT were counted, so a client could flood the Durable Object with CLOSE or AUTH frames for free.
+Both now pass the same limiter and budget. An over-budget AUTH is answered with a refused `OK` (`rate-limited`) so the
+client retries, and a CLOSE for a subscription the session holds is always processed since it only sheds load.
+
+### Fixed: live subscriptions matched filters differently from stored reads (`nostr-bbs-relay-worker`)
+
+`event_matches_filters` ignored `search`, treated an empty tag array as no constraint and applied tag names the SQL
+builder discards. SQL builder and live matcher now decide through shared helpers: `search` is an ASCII
+case-insensitive substring match, an empty tag array matches nothing an invalid tag name is ignored and a `#probe` filter matches nothing live, as it does in SQL (probe tags are never indexed). The
+`LIKE` pattern builder also escapes the backslash escape character itself.
+
+### Fixed: NIP-09 `a`-tag deletion truncated d-tags containing `:` (`nostr-bbs-relay-worker`)
+
+The reference `kind:pubkey:d-tag` was split on every colon, so the d-tag stopped at its first `:` and the delete
+matched nothing. Only the first two colons now separate fields.
+
+### Fixed: the per-IP connection cap raced across await points (`nostr-bbs-relay-worker`)
+
+The count was checked, then incremented only after several awaits, so concurrent upgrades from one address could
+all read the same count. The slot is now reserved in the same borrow as the check and released on the early-return
+path.
+
+### Fixed: schema bootstrap ran ~80 D1 statements on every request, and fresh databases skipped governance ALTERs (`nostr-bbs-relay-worker`)
+
+`ensure_schema` (including a DELETE) ran before the CORS preflight, the WebSocket upgrade and any auth, on every
+request. It now runs at most once per isolate, after the preflight but before the WebSocket branch (the Durable
+Object never bootstraps the schema), and only latches once every CREATE has succeeded. Separately, the `broker_cases` and
+`governance_receipts` ALTERs ran before those tables' CREATEs, so on a fresh D1 they failed and the
+`effective_tier` index was skipped; both tables are now created first.
+
+### Fixed: blank `RELAY_URL` skipped the NIP-42 relay-tag check silently (`nostr-bbs-relay-worker`)
+
+Enforcement is unchanged (the shipped `wrangler.toml` still deploys blank), but the relay now logs a console error
+on every AUTH when `AUTH_MODE` is `nip42` and `RELAY_URL` is blank. `wrangler.toml` marks `RELAY_URL` as required
+in that mode, and SETUP.md documents it and `CALIBRATION_SELECTION_KEY` (unset falls back to an empty HMAC key).
+
+### Fixed: two events for one device in one window both sent a push, and DM pushes had no budget (`nostr-bbs-relay-worker`)
+
+The per-device throttle read `last_push_at` before the send and wrote it after, so a race sent twice. Delivery now
+claims the slot with an atomic `UPDATE ... WHERE last_push_at <= now - interval` first, sends only on a changed row,
+and rolls the timestamp back if the send fails. Gift-wrap senders are not allowlisted, so each device also has a
+rolling hourly DM wake-up budget (default 30, `PUSH_DM_HOURLY_BUDGET`); over-budget DMs still count in the app but
+do not wake it, and the cron flush skips a device held only by a spent budget until its window resets. Adds two `push_subscriptions` columns (migration 0010 and `ensure_schema`).
+
+### Fixed: saving the profile deleted every kind-0 field Settings does not manage (`nostr-bbs-forum-client`)
+
+Settings rebuilt the replaceable kind-0 from only name, about, picture, birthday and nip05, so `lud16`, `lud06`, `banner`, `website`, the bot flag and anything set from another client vanished permanently on save. The hydrated kind-0 object is now kept and `merge_profile_fields` overwrites only the managed fields; an existing `nip05` is kept unless a username is claimed.
+
+Saving before the relay had answered still published without those fields, so Save, picture upload and picture remove are now disabled ("Loading profile…") until the kind-0 arrives or the relay signals end-of-stored-events with none; only then does a member with no kind-0 start from an empty object. A relay that stays silent for 5 s is not taken to mean there is no profile: Save stays disabled and "Profile not loaded yet. Check your connection." is shown until the relay answers.
+
+Each kind-0 subscription now carries a generation, so after an account switch the previous account's event, end-of-stored-events or timer can no longer fill the form or flip the state; previously the first account's `lud16` and `banner` could be re-signed under the second. An unclaimed save also drops a stale `nip05` on our own host (no longer backed by the host's `nostr.json`), keeping any foreign-host value.
+
+Settings used its own `example.test` placeholder for the NIP-05 host, so every claimed save published `name@example.test` and the stale-handle check never matched in a configured build. It now imports the onboarding modal's `NOSTR_BBS_NIP05_DOMAIN`-derived constant. The kind-0 subscription is also closed as soon as it is answered or superseded, instead of staying open on a slow relay and counting against the relay's per-session subscription cap.
+
+Leaving Settings while the profile was still loading could panic the app: the 5 s timer read signals the unmounted page had disposed, and the kind-0 subscription was never closed. The timer and relay callbacks now use `try_` accessors and return once the page is gone, and an `on_cleanup` closes the subscription on re-run and on unmount.
+
+### Fixed: DM relay list used the wrong tag (`nostr-bbs-forum-client`)
+
+The kind-10050 event was published with `["r", url]`; NIP-17 reads `["relay", url]`, as the BBS client already emits. The tag name is now pinned by a test.
+
+### Fixed: Export Private Key panicked for NIP-07 sessions (`nostr-bbs-forum-client`)
+
+The click handler called `use_toasts()` inside a DOM event, where `expect_context` panics (bug #32). It now reuses the handle bound at component setup.
+
+### Fixed: SVG avatars were accepted (`nostr-bbs-forum-client`)
+
+The pod serves stored bytes with their declared type, so an SVG carrying a script was a stored XSS when opened directly. Avatar uploads now accept only PNG, JPEG, WebP and GIF; SVG is refused with "SVG avatars are not supported". Post-media uploads are unchanged.
+
+### Fixed: Profile hydration trusted any signed kind-0 (`nostr-bbs-forum-client`)
+
+A relay could answer the settings page's own-profile query with another author's event and seed fields the member would then re-sign. Events whose `pubkey` differs from the requested one are now ignored.
+
+### Fixed: Notifications leaked between accounts on a shared browser (`nostr-bbs-forum-client`)
+
+The visible list lived under one global key and survived logout. It is now stored per owner pubkey (like the sync state), reloaded when the account changes, and deleted on logout together with the anonymous list and the retired global key. The cross-tab `storage` handler matches the new key shape.
+
+### Fixed: Level-gated notifications were burned and dedup eviction was not FIFO (`nostr-bbs-forum-client`)
+
+A post or DM the notification level rejected was still recorded as seen, so loosening the level never announced it; it is now left unburned. The seen-id cap evicted an arbitrary element despite documenting FIFO; it is now an insertion-ordered set that evicts the oldest.
+
+### Fixed: DM store: inflated unread badge, mixed-case keys, sender-controlled time (`nostr-bbs-forum-client`)
+
+A re-streamed event bumped the unread count and rewrote the preview; only a first-seen message now updates the summary. Pubkeys are lowercased at ingestion and compared exactly, and a rumor's `created_at` is clamped to now.
+
+### Fixed: Service worker cached stable-URL assets cache-first (`nostr-bbs-forum-client`)
+
+Trunk `copy-file` / `copy-dir` assets such as `icons/` keep stable URLs but were served cache-first, pinning stale copies. Only fingerprinted (`-<16 hex>.`) or `snippets/` files are cache-first now; other static files are network-first with a cache fallback.
+
+The fingerprint pattern also accepts the wasm binary's `-<16 hex>_bg.wasm` name, so the app's largest asset still loads offline.
+
+### Fixed: live broadcast leaked protected kinds to kinds-less subscriptions (`nostr-bbs-relay-worker`)
+
+REQ and COUNT decide protected reads from the kinds a filter names, so `{}` or `{"#p":[...]}` passed both gates
+and was stored as a live subscription; `broadcast_event` then delivered every later moderation event (30910-30916,
+plaintext reasons and targets) and legacy DM envelope (kinds 4, 13, 14) to it, authenticated or not. Broadcast now
+applies `protected_read_permitted` per event and per session, exactly as REQ does per event.
+
+### Fixed: DMs starting with `[coach]` or `[poker-coach]` were hidden and silenced from any sender (`nostr-bbs-forum-client`)
+
+Table traffic was recognised by its text alone. A stranger's message that began with the tag vanished from the
+recipient's inbox, thread, unread count and notifications, and a member sending one skipped their own NIP-17
+copy and lost it from their history. Classification now also requires the other party to be the configured coach.
+
+### Fixed: kind-42 zone write and read gates resolved the channel from a decoy first `e` tag (`nostr-bbs-relay-worker`)
+
+The gates took the FIRST `e` tag as the channel while the client (and Web Push) place a message by its
+`root`-marked `e`. A member could name a channel they may write to, or an unscoped one, first and a
+zone-private channel as `root`: the relay authorised the decoy and every client rendered the post in the
+private thread. Both gates now use `filter::channel_tag` (root marker, else first `e`).
+
+### Added: content-free Web Push alerts for replies, DMs and new messages (`nostr-bbs-relay-worker`, `nostr-bbs-forum-client`, `nostr-bbs-core`)
+
+An installed PWA can now be woken when it is closed. The relay sends an empty VAPID-signed push (RFC 8292,
+ES256) after storing a reply or @-mention (kind 42 `p` tag), a DM wrap (kind 1059), or, for members who opt in,
+a new topic (kind 40) or post (kind 42). The service worker then fetches only counters over HTTPS
+(`POST /api/push/drain`) and shows a generic notification, so no message detail crosses Google, Apple or
+Mozilla. Recipients pass the same zone read gate as live delivery; the sender's own NIP-17 copy never alerts.
+Members choose categories and quiet hours in Settings (`/api/push/prefs`, shared `nostr_bbs_core::push`
+types). Off by default: set `PUSH_ENABLED`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT` and the `VAPID_PRIVATE_KEY`
+secret (`cargo run -p nostr-bbs-relay-worker --example vapid_keygen`; SETUP.md section 10). Pushes are throttled per device and a cron trailing flush delivers what a burst held back. New D1 migration
+`0010_push.sql`. ADR-2023.
+
+### Added: DM arrival notifications and hidden-tab system alerts (`nostr-bbs-forum-client`)
+
+A received DM now creates a `DM` notification (it never did), from anywhere in the app: a layout-level watcher
+opens new gift wraps, gated on the account's sync baseline and de-duplicated per wrap. While the page is hidden
+and permission is granted, addressed notifications (DMs, mentions, join and RSVP notices) are also raised as
+generic system notifications through the service worker. Settings offers a "Browser alerts" permission control
+even when the relay has Web Push off.
+
 ### Fixed: kind-1059 gift wraps no longer readable through a `kinds`-less REQ or COUNT (`nostr-bbs-relay-worker`)
 
 The REQ/COUNT gate decided whether a filter read gift wraps from the filter's `kinds`. A filter with no

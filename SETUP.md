@@ -127,6 +127,19 @@ Set your domain in all `RP_ID`, `EXPECTED_ORIGIN`, `ALLOWED_ORIGIN`, and `ALLOWE
 Set the two secrets (`NATIVE_POD_ADMIN_KEY`, `WELCOME_MASTER_KEY`) with
 `wrangler secret put` -- never commit them to `wrangler.toml`.
 
+**`RELAY_URL` (relay-worker, REQUIRED in `nip42` mode).** The shipped
+`wrangler.toml` leaves it blank, and a blank value makes the relay skip the
+NIP-42 `["relay", <url>]` tag check on AUTH responses (it fails open; the
+per-session challenge still applies). Set it to the `wss://` URL clients connect
+to. While `AUTH_MODE` is `nip42` and `RELAY_URL` is blank the relay logs a
+console error on every AUTH.
+
+**`CALIBRATION_SELECTION_KEY` (relay-worker secret).** Set it with
+`wrangler secret put CALIBRATION_SELECTION_KEY`. Unset, calibration sampling
+falls back to an empty HMAC key, so a requesting agent can predict which
+requests are sampled; the relay logs a warning on every projection. Set it
+before relying on any calibration or probe-catch figure.
+
 **`DEVICE_KEYS_ENABLED` (ADR-099)** defaults to `false`. Only the exact string
 `"true"` enables revocable device keys, and it must be set in all three places
 together -- the auth-worker, the relay-worker, and the client's
@@ -328,6 +341,41 @@ let config = BbsConfig {
 provide_context(config);
 provide_zone_access();
 ```
+
+## 10. Web Push alerts (optional, ADR-2023)
+
+Replies, direct messages and new topics/posts can wake an installed PWA (desktop,
+Android, and iOS 16.4+ once added to the Home Screen) even when the app is
+closed. The push is content-free: the push service (Google, Apple, Mozilla)
+only ever sees an empty, signed wake-up; the app then fetches generic counters
+from your relay over HTTPS.
+
+1. Generate a VAPID key pair:
+
+   ```bash
+   cargo run -p nostr-bbs-relay-worker --example vapid_keygen
+   ```
+
+2. In the relay worker's `wrangler.toml` set `PUSH_ENABLED = "true"`,
+   `VAPID_PUBLIC_KEY` to the printed public key and `VAPID_SUBJECT` to a
+   `mailto:` or `https:` contact for your operator.
+3. Store the private key as a secret (never in `wrangler.toml`):
+
+   ```bash
+   wrangler secret put VAPID_PRIVATE_KEY
+   ```
+
+   Optionally set `PUSH_DM_HOURLY_BUDGET` (default `30`): the most DM wake-ups
+   one device receives per rolling hour. Gift-wrap senders are not allowlisted,
+   so the budget stops a stranger buzzing a member's phone; over-budget DMs still
+   count in the app, they just do not wake it.
+4. Deploy the relay worker. The D1 tables are created automatically (they are
+   also in `migrations/0010_push.sql`). Members then see **Settings > Push
+   notifications** in the forum client.
+
+Check `GET <relay>/api/push/config`: `{"enabled":true,"public_key":"..."}`
+means the key pair is consistent. If the configured public key does not match
+the private key the relay logs `VAPID_PUBLIC_KEY does not match` and stays off.
 
 ## Troubleshooting
 

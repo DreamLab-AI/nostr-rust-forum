@@ -2604,6 +2604,7 @@ dependencies = [
  "nostr-bbs-core",
  "nostr-bbs-mesh",
  "nostr-bbs-rate-limit",
+ "p256",
  "rusqlite",
  "serde",
  "serde_json",
