@@ -134,8 +134,6 @@ pub fn SettingsPage() -> impl IntoView {
     let profile_load_slow = RwSignal::new(false);
     // Bumped on every kind-0 subscription; callbacks of an earlier one go inert.
     let profile_gen = RwSignal::new(0u64);
-    // Id of the live kind-0 subscription, so it is closed once answered or superseded.
-    let profile_sub = StoredValue::new(None::<String>);
 
     // Real name (admin-only): loaded from + saved to the auth-worker D1 via
     // NIP-98 authed routes. NEVER published to kind-0 / the relay.
@@ -385,7 +383,6 @@ pub fn SettingsPage() -> impl IntoView {
         let base_sig = profile_base;
         let slow_sig = profile_load_slow;
         let gen_sig = profile_gen;
-        let sub_slot = profile_sub;
 
         Effect::new(move |_| {
             if conn_state.get() != ConnectionState::Connected {
@@ -403,32 +400,12 @@ pub fn SettingsPage() -> impl IntoView {
             // or timer can never touch this account's state.
             let my_gen = gen_sig.get_untracked() + 1;
             gen_sig.set(my_gen);
-            // Close the previous subscription: a slow relay may have left it
-            // open, and a live entry is replayed on reconnect and counts
-            // against the relay's per-session cap.
-            if let Some(old) = sub_to_close(sub_slot.get_value(), my_gen) {
-                relay.unsubscribe(&old);
-            }
-            sub_slot.set_value(None);
-            let close_sub: Rc<dyn Fn()> = {
-                let relay = relay.clone();
-                Rc::new(move || {
-                    if generation_current(my_gen, gen_sig.get_untracked()) {
-                        if let Some(id) = sub_slot.get_value() {
-                            relay.unsubscribe(&id);
-                            sub_slot.set_value(None);
-                        }
-                    }
-                })
-            };
-            let close_on_event = close_sub.clone();
-            let close_on_eose = close_sub.clone();
             base_sig.set(ProfileHydration::Pending);
             slow_sig.set(false);
             let pk_for_event = pk.clone();
             let on_event: Rc<dyn Fn(nostr_bbs_core::NostrEvent)> =
                 Rc::new(move |event: nostr_bbs_core::NostrEvent| {
-                    if !generation_current(my_gen, gen_sig.get_untracked())
+                    if !generation_current(my_gen, gen_sig.try_get_untracked())
                         || event.kind != 0
                         || !kind0_is_for(&event.pubkey, &pk_for_event)
                     {
@@ -439,8 +416,6 @@ pub fn SettingsPage() -> impl IntoView {
                         // Settings does not manage (see `merge_profile_fields`).
                         if obj.is_object() {
                             base_sig.set(ProfileHydration::Loaded(obj.clone()));
-                            // Answered: nothing more to wait for.
-                            close_on_event();
                         }
                         // The nickname is the DISPLAY name — prefer
                         // `display_name`, falling back to `name` for events
@@ -489,30 +464,33 @@ pub fn SettingsPage() -> impl IntoView {
                 on_event,
                 // EOSE with no kind-0 means the member has none yet.
                 Some(Rc::new(move || {
-                    if generation_current(my_gen, gen_sig.get_untracked())
-                        && base_sig.get_untracked() == ProfileHydration::Pending
+                    if generation_current(my_gen, gen_sig.try_get_untracked())
+                        && base_sig.try_get_untracked() == Some(ProfileHydration::Pending)
                     {
                         base_sig.set(ProfileHydration::NotFound);
-                    }
-                    if generation_current(my_gen, gen_sig.get_untracked()) {
-                        close_on_eose();
                     }
                 })),
             );
 
-            sub_slot.set_value(Some(sub_id));
+            // Closes the subscription when this effect re-runs (reconnect, account
+            // switch) AND when the page unmounts, so it never lingers to be
+            // replayed on reconnect against the relay's per-session cap.
+            let relay_cleanup = relay.clone();
+            on_cleanup(move || relay_cleanup.unsubscribe(&sub_id));
 
             // After 5 seconds, flag a slow relay. Silence is NOT evidence that no
             // profile exists, so the state stays `Pending` (Save stays disabled,
             // a notice appears) and the subscription stays open: a late event or
-            // EOSE still resolves it and then closes it. A superseded timer does
-            // nothing (the next effect run already closed its subscription).
+            // EOSE still resolves it. The timer can outlive the page, whose
+            // signals are then disposed (reading one panics), so it only acts
+            // while its handles are alive and its generation current — the same
+            // guard `pages/admin.rs` applies to its auto-dismiss timer.
             crate::utils::set_timeout_once(
                 move || {
-                    if generation_current(my_gen, gen_sig.get_untracked())
-                        && base_sig.get_untracked() == ProfileHydration::Pending
+                    if generation_current(my_gen, gen_sig.try_get_untracked())
+                        && base_sig.try_get_untracked() == Some(ProfileHydration::Pending)
                     {
-                        slow_sig.set(true);
+                        let _ = slow_sig.try_set(true);
                     }
                 },
                 5_000,
@@ -1839,16 +1817,12 @@ impl ProfileHydration {
     }
 }
 
-/// Whether a callback created for subscription `captured` may still act, i.e.
-/// no newer kind-0 subscription (reconnect, account switch) has superseded it.
-fn generation_current(captured: u64, current: u64) -> bool {
-    captured == current
-}
-
-/// The subscription to close when generation `_next` starts: the previous one,
-/// if any. (Each generation owns at most one live subscription.)
-fn sub_to_close(previous: Option<String>, _next: u64) -> Option<String> {
-    previous
+/// Whether a callback created for subscription `captured` may still act:
+/// `current` is the live generation, or `None` once the page has unmounted and
+/// its signals are disposed. A newer subscription (reconnect, account switch)
+/// supersedes it.
+fn generation_current(captured: u64, current: Option<u64>) -> bool {
+    current == Some(captured)
 }
 
 /// The kind-0 fields the Settings page owns.
@@ -2232,15 +2206,6 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_subscription_is_the_one_closed() {
-        assert_eq!(
-            sub_to_close(Some("sub_4".into()), 2),
-            Some("sub_4".to_string())
-        );
-        assert_eq!(sub_to_close(None, 1), None, "nothing live on first run");
-    }
-
-    #[test]
     fn settings_and_onboarding_share_one_nip05_host() {
         assert_eq!(
             NIP05_USERNAME_HOST,
@@ -2255,8 +2220,12 @@ mod tests {
     #[test]
     fn superseded_subscription_callbacks_are_inert() {
         // event, EOSE and timer all gate on the same decision
-        assert!(generation_current(3, 3));
-        assert!(!generation_current(2, 3), "stale event/EOSE/timer ignored");
+        assert!(generation_current(3, Some(3)));
+        assert!(
+            !generation_current(2, Some(3)),
+            "stale event/EOSE/timer ignored"
+        );
+        assert!(!generation_current(3, None), "disposed page: nothing runs");
     }
 
     #[test]

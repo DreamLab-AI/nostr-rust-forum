@@ -17,6 +17,8 @@ Each kind-0 subscription now carries a generation, so after an account switch th
 
 Settings used its own `example.test` placeholder for the NIP-05 host, so every claimed save published `name@example.test` and the stale-handle check never matched in a configured build. It now imports the onboarding modal's `NOSTR_BBS_NIP05_DOMAIN`-derived constant. The kind-0 subscription is also closed as soon as it is answered or superseded, instead of staying open on a slow relay and counting against the relay's per-session subscription cap.
 
+Leaving Settings while the profile was still loading could panic the app: the 5 s timer read signals the unmounted page had disposed, and the kind-0 subscription was never closed. The timer and relay callbacks now use `try_` accessors and return once the page is gone, and an `on_cleanup` closes the subscription on re-run and on unmount.
+
 ### Fixed: DM relay list used the wrong tag (`nostr-bbs-forum-client`)
 
 The kind-10050 event was published with `["r", url]`; NIP-17 reads `["relay", url]`, as the BBS client already emits. The tag name is now pinned by a test.
