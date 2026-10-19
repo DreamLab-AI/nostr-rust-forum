@@ -28,8 +28,11 @@ use crate::utils::pod_client::upload_to_pod_signer;
 use crate::utils::relay_url::auth_api_base;
 use crate::utils::shorten_pubkey;
 
-/// NIP-05 host that backs claimed usernames (mirrors onboarding_modal::NIP05_HOST).
-const NIP05_USERNAME_HOST: &str = "example.test";
+/// NIP-05 host that backs claimed usernames. The SAME constant the onboarding
+/// modal bakes from `NOSTR_BBS_NIP05_DOMAIN`, imported so the two cannot drift
+/// (a local placeholder here once published `alice@example.test` for every
+/// claimed save).
+use crate::components::onboarding_modal::NIP05_HOST as NIP05_USERNAME_HOST;
 
 /// Pod API base URL — same source-of-truth as `pages::pod_browser` and
 /// `utils::pod_client`. Surfaces the `[pod].base_url` operator-config
@@ -131,6 +134,8 @@ pub fn SettingsPage() -> impl IntoView {
     let profile_load_slow = RwSignal::new(false);
     // Bumped on every kind-0 subscription; callbacks of an earlier one go inert.
     let profile_gen = RwSignal::new(0u64);
+    // Id of the live kind-0 subscription, so it is closed once answered or superseded.
+    let profile_sub = StoredValue::new(None::<String>);
 
     // Real name (admin-only): loaded from + saved to the auth-worker D1 via
     // NIP-98 authed routes. NEVER published to kind-0 / the relay.
@@ -380,6 +385,7 @@ pub fn SettingsPage() -> impl IntoView {
         let base_sig = profile_base;
         let slow_sig = profile_load_slow;
         let gen_sig = profile_gen;
+        let sub_slot = profile_sub;
 
         Effect::new(move |_| {
             if conn_state.get() != ConnectionState::Connected {
@@ -397,6 +403,26 @@ pub fn SettingsPage() -> impl IntoView {
             // or timer can never touch this account's state.
             let my_gen = gen_sig.get_untracked() + 1;
             gen_sig.set(my_gen);
+            // Close the previous subscription: a slow relay may have left it
+            // open, and a live entry is replayed on reconnect and counts
+            // against the relay's per-session cap.
+            if let Some(old) = sub_to_close(sub_slot.get_value(), my_gen) {
+                relay.unsubscribe(&old);
+            }
+            sub_slot.set_value(None);
+            let close_sub: Rc<dyn Fn()> = {
+                let relay = relay.clone();
+                Rc::new(move || {
+                    if generation_current(my_gen, gen_sig.get_untracked()) {
+                        if let Some(id) = sub_slot.get_value() {
+                            relay.unsubscribe(&id);
+                            sub_slot.set_value(None);
+                        }
+                    }
+                })
+            };
+            let close_on_event = close_sub.clone();
+            let close_on_eose = close_sub.clone();
             base_sig.set(ProfileHydration::Pending);
             slow_sig.set(false);
             let pk_for_event = pk.clone();
@@ -413,6 +439,8 @@ pub fn SettingsPage() -> impl IntoView {
                         // Settings does not manage (see `merge_profile_fields`).
                         if obj.is_object() {
                             base_sig.set(ProfileHydration::Loaded(obj.clone()));
+                            // Answered: nothing more to wait for.
+                            close_on_event();
                         }
                         // The nickname is the DISPLAY name — prefer
                         // `display_name`, falling back to `name` for events
@@ -466,23 +494,25 @@ pub fn SettingsPage() -> impl IntoView {
                     {
                         base_sig.set(ProfileHydration::NotFound);
                     }
+                    if generation_current(my_gen, gen_sig.get_untracked()) {
+                        close_on_eose();
+                    }
                 })),
             );
 
-            // After 5 seconds, unsubscribe if the relay has answered. A silent
-            // relay is NOT evidence that no profile exists, so the state stays
-            // `Pending` (Save stays disabled, a notice appears) and the
-            // subscription stays open: a late event or EOSE still resolves it.
-            let relay_unsub = relay.clone();
+            sub_slot.set_value(Some(sub_id));
+
+            // After 5 seconds, flag a slow relay. Silence is NOT evidence that no
+            // profile exists, so the state stays `Pending` (Save stays disabled,
+            // a notice appears) and the subscription stays open: a late event or
+            // EOSE still resolves it and then closes it. A superseded timer does
+            // nothing (the next effect run already closed its subscription).
             crate::utils::set_timeout_once(
                 move || {
-                    if !generation_current(my_gen, gen_sig.get_untracked()) {
-                        // Superseded: drop only our own subscription.
-                        relay_unsub.unsubscribe(&sub_id);
-                    } else if base_sig.get_untracked() == ProfileHydration::Pending {
+                    if generation_current(my_gen, gen_sig.get_untracked())
+                        && base_sig.get_untracked() == ProfileHydration::Pending
+                    {
                         slow_sig.set(true);
-                    } else {
-                        relay_unsub.unsubscribe(&sub_id);
                     }
                 },
                 5_000,
@@ -1815,6 +1845,12 @@ fn generation_current(captured: u64, current: u64) -> bool {
     captured == current
 }
 
+/// The subscription to close when generation `_next` starts: the previous one,
+/// if any. (Each generation owns at most one live subscription.)
+fn sub_to_close(previous: Option<String>, _next: u64) -> Option<String> {
+    previous
+}
+
 /// The kind-0 fields the Settings page owns.
 struct ManagedFields<'a> {
     display_name: &'a str,
@@ -2193,6 +2229,27 @@ mod tests {
         let existing = serde_json::json!({ "nip05": "me@elsewhere.example" });
         let out = merge_profile_fields(existing, managed("N", ""));
         assert_eq!(out["nip05"], "me@elsewhere.example");
+    }
+
+    #[test]
+    fn the_previous_subscription_is_the_one_closed() {
+        assert_eq!(
+            sub_to_close(Some("sub_4".into()), 2),
+            Some("sub_4".to_string())
+        );
+        assert_eq!(sub_to_close(None, 1), None, "nothing live on first run");
+    }
+
+    #[test]
+    fn settings_and_onboarding_share_one_nip05_host() {
+        assert_eq!(
+            NIP05_USERNAME_HOST,
+            option_env!("NOSTR_BBS_NIP05_DOMAIN").unwrap_or("example.test")
+        );
+        assert_eq!(
+            NIP05_USERNAME_HOST,
+            crate::components::onboarding_modal::NIP05_HOST
+        );
     }
 
     #[test]

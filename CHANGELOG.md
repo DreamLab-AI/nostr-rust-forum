@@ -15,6 +15,8 @@ Saving before the relay had answered still published without those fields, so Sa
 
 Each kind-0 subscription now carries a generation, so after an account switch the previous account's event, end-of-stored-events or timer can no longer fill the form or flip the state; previously the first account's `lud16` and `banner` could be re-signed under the second. An unclaimed save also drops a stale `nip05` on our own host (no longer backed by the host's `nostr.json`), keeping any foreign-host value.
 
+Settings used its own `example.test` placeholder for the NIP-05 host, so every claimed save published `name@example.test` and the stale-handle check never matched in a configured build. It now imports the onboarding modal's `NOSTR_BBS_NIP05_DOMAIN`-derived constant. The kind-0 subscription is also closed as soon as it is answered or superseded, instead of staying open on a slow relay and counting against the relay's per-session subscription cap.
+
 ### Fixed: DM relay list used the wrong tag (`nostr-bbs-forum-client`)
 
 The kind-10050 event was published with `["r", url]`; NIP-17 reads `["relay", url]`, as the BBS client already emits. The tag name is now pinned by a test.
