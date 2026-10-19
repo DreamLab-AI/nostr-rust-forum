@@ -973,9 +973,9 @@ impl NostrRelayDO {
 
         // Trust-level gating for specific event kinds
         // P2-03: cached lookup — same TTL entry reused from above if still fresh.
-        let is_admin = self.admin_cache.is_admin(&event.pubkey, &self.env).await;
+        let is_admin = self.admin_cache.is_admin(&principal, &self.env).await;
         if !is_admin {
-            let trust_level = trust::get_trust_level(&event.pubkey, &self.env).await;
+            let trust_level = trust::get_trust_level(&principal, &self.env).await;
 
             // kind-40 (channel creation): TL2+ required
             if event.kind == 40 && trust_level < TrustLevel::Regular {
@@ -1005,7 +1005,7 @@ impl NostrRelayDO {
                 }
                 // If TL2 (not TL3), verify they are the channel creator
                 if trust_level < TrustLevel::Trusted
-                    && !self.is_channel_creator(&event.pubkey, &channel_id).await
+                    && !self.is_channel_creator(&principal, &channel_id).await
                 {
                     Self::send_ok(
                         ws,
@@ -1184,8 +1184,7 @@ impl NostrRelayDO {
                 }
             }
             if let Some(zone) = zone {
-                if !is_admin && !trust::has_zone_write_access(&event.pubkey, &zone, &self.env).await
-                {
+                if !is_admin && !trust::has_zone_write_access(&principal, &zone, &self.env).await {
                     Self::send_ok(ws, &event.id, false, "zone access denied");
                     return;
                 }
@@ -1262,7 +1261,7 @@ impl NostrRelayDO {
             // that zone's effective write cohorts.
             let zone = nostr_bbs_core::read_zone_tag(&event);
             let has_write = match zone {
-                Some(z) => trust::has_zone_write_access(&event.pubkey, z, &self.env).await,
+                Some(z) => trust::has_zone_write_access(&principal, z, &self.env).await,
                 None => false,
             };
             if !calendar_write_permitted(zone, has_write) {
