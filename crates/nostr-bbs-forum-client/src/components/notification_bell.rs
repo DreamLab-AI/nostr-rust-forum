@@ -100,7 +100,11 @@ pub(crate) fn NotificationBell() -> impl IntoView {
         let me = crate::auth::use_auth().pubkey();
         let auth_for_dm = crate::auth::use_auth();
         let watching: StoredValue<Option<(String, String)>> = StoredValue::new(None);
+        // The signer is not a reactive value, so it can be absent at the moment
+        // the session turns ready. Re-run a few times rather than never arming.
+        let retry = RwSignal::new(0u32);
         Effect::new(move |_| {
+            let attempt = retry.get();
             let ready =
                 conn.get() == crate::relay::ConnectionState::Connected && relay_authed.get();
             let pk = me.get();
@@ -113,7 +117,13 @@ pub(crate) fn NotificationBell() -> impl IntoView {
                 relay.unsubscribe(&sid);
                 watching.set_value(None);
             }
-            let (Some(pk), Some(signer)) = (wanted, auth_for_dm.get_signer()) else {
+            let Some(pk) = wanted else {
+                return;
+            };
+            let Some(signer) = auth_for_dm.get_signer() else {
+                if attempt < 10 {
+                    crate::utils::set_timeout_once(move || retry.update(|n| *n += 1), 1_000);
+                }
                 return;
             };
             let sid = crate::dm::start_incoming_watcher(&relay, signer, &pk);

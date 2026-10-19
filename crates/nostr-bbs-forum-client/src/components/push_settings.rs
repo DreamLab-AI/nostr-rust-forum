@@ -36,6 +36,8 @@ pub fn PushSettings() -> impl IntoView {
     let active = RwSignal::new(push::active_on_device());
     let busy = RwSignal::new(false);
     let prefs: RwSignal<Option<PushPrefs>> = RwSignal::new(None);
+    // The last state the server confirmed; a failed save rolls the toggles back to it.
+    let confirmed: RwSignal<Option<PushPrefs>> = RwSignal::new(None);
     let needs_install = push::needs_install();
 
     // Is the feature switched on at the relay?
@@ -64,7 +66,10 @@ pub fn PushSettings() -> impl IntoView {
         };
         leptos::task::spawn_local(async move {
             match push::load_prefs(signer.as_ref()).await {
-                Ok(p) => prefs.set(Some(p)),
+                Ok(p) => {
+                    confirmed.set(Some(p.clone()));
+                    prefs.set(Some(p));
+                }
                 Err(e) => toasts.show(e, ToastVariant::Error),
             }
         });
@@ -86,11 +91,18 @@ pub fn PushSettings() -> impl IntoView {
         leptos::task::spawn_local(async move {
             match push::save_prefs(signer.as_ref(), &p).await {
                 Ok(saved) => {
+                    confirmed.set(Some(saved.clone()));
                     if save_seq.try_get_value() == Some(seq) {
                         prefs.set(Some(saved));
                     }
                 }
-                Err(e) => toasts.show(e, ToastVariant::Error),
+                Err(e) => {
+                    // Put the toggles back to what the server actually holds.
+                    if save_seq.try_get_value() == Some(seq) {
+                        prefs.set(confirmed.get_untracked());
+                    }
+                    toasts.show(e, ToastVariant::Error);
+                }
             }
         });
     };
@@ -126,6 +138,7 @@ pub fn PushSettings() -> impl IntoView {
                 Ok(()) => {
                     active.set(false);
                     prefs.set(None);
+                    confirmed.set(None);
                     toasts.show("Alerts are off for this device.", ToastVariant::Info);
                 }
                 Err(e) => toasts.show(e, ToastVariant::Error),

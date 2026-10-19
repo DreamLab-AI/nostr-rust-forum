@@ -769,6 +769,9 @@ fn subscribe_dm_with_auth_retry(
 
 // -- App-wide incoming-DM watcher (Tier 0, ADR-2023) ---------------------------
 
+/// Most stored wraps the watcher asks the relay for on connect.
+const WATCHER_HISTORY_LIMIT: u64 = 100;
+
 /// Subscribe to gift wraps addressed to `my_pubkey` for the whole app session
 /// and raise a notification for each fresh DM.
 ///
@@ -788,7 +791,13 @@ pub fn start_incoming_watcher(
 ) -> String {
     let my_pk = my_pubkey.to_string();
     let since = ((js_sys::Date::now() / 1000.0) as u64).saturating_sub(GIFT_WRAP_LOOKBACK_SECS);
-    let filters = gift_wrap_filters(&my_pk, Some(since));
+    let mut filters = gift_wrap_filters(&my_pk, Some(since));
+    // Bound the history this always-on watcher decrypts: anyone can send a wrap,
+    // so an unbounded window is a decrypt flood on every page load. Live wraps
+    // are not subject to the limit.
+    for f in &mut filters {
+        f.limit = Some(WATCHER_HISTORY_LIMIT);
+    }
     let on_event: EventCallback = Rc::new(move |event: NostrEvent| {
         if event.kind != KIND_GIFT_WRAP {
             return;

@@ -57,6 +57,9 @@ const MAX_TAGGED_RECIPIENTS: usize = 20;
 const MAX_BROADCAST_CANDIDATES: usize = 500;
 /// Default cap on pushes sent for one event (`PUSH_MAX_FANOUT` overrides).
 const DEFAULT_MAX_FANOUT: usize = 100;
+/// Most bound parameters in one `IN (...)` list. D1 allows 100 per statement;
+/// longer lists are queried in chunks of this size.
+const IN_CHUNK: usize = 90;
 /// Consecutive failed sends before a subscription is dropped.
 const MAX_FAILURES: i64 = 5;
 /// Subscriptions not refreshed by the app for this long are swept by cron.
@@ -737,31 +740,37 @@ impl SubRow {
 /// caller applies [`PushPrefs::default`]).
 pub async fn load_prefs(env: &Env, pubkeys: &[String]) -> HashMap<String, PushPrefs> {
     let mut out = HashMap::new();
-    if pubkeys.is_empty() {
-        return out;
-    }
     let Ok(db) = env.d1("DB") else { return out };
-    let placeholders = (1..=pubkeys.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT pubkey, replies, dms, new_topics, new_posts, muted_channels, quiet_start, quiet_end, tz_offset \
-         FROM push_prefs WHERE pubkey IN ({placeholders})"
-    );
-    let binds: Vec<_> = pubkeys.iter().map(|p| js_str(p)).collect();
-    let Ok(stmt) = db.prepare(sql).bind(&binds) else {
-        return out;
-    };
-    if let Ok(res) = stmt.all().await {
-        if let Ok(rows) = res.results::<PrefsRow>() {
-            for row in rows {
-                let pk = row.pubkey().to_string();
-                out.insert(pk, row.into_prefs());
-            }
+    for chunk in pubkeys.chunks(IN_CHUNK) {
+        let sql = in_query(
+            "SELECT pubkey, replies, dms, new_topics, new_posts, muted_channels, quiet_start, quiet_end, tz_offset \
+             FROM push_prefs WHERE pubkey IN",
+            chunk.len(),
+        );
+        let binds: Vec<_> = chunk.iter().map(|p| js_str(p)).collect();
+        match db.prepare(sql).bind(&binds) {
+            Ok(stmt) => match stmt.all().await {
+                Ok(res) => {
+                    for row in res.results::<PrefsRow>().unwrap_or_default() {
+                        let pk = row.pubkey().to_string();
+                        out.insert(pk, row.into_prefs());
+                    }
+                }
+                Err(e) => console_error!("push: prefs query failed: {e}"),
+            },
+            Err(e) => console_error!("push: prefs bind failed: {e}"),
         }
     }
     out
+}
+
+/// `prefix` followed by `(?1,?2,...,?n)`.
+fn in_query(prefix: &str, n: usize) -> String {
+    let placeholders = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{prefix} ({placeholders})")
 }
 
 /// Pubkeys that have both a subscription and the given opt-in column set.
@@ -793,27 +802,23 @@ pub async fn broadcast_candidates(env: &Env, category: Category) -> Vec<String> 
 
 /// Subscriptions belonging to any of `pubkeys`.
 pub async fn load_subscriptions(env: &Env, pubkeys: &[String]) -> Vec<SubRow> {
-    if pubkeys.is_empty() {
-        return Vec::new();
+    let mut out = Vec::new();
+    let Ok(db) = env.d1("DB") else { return out };
+    for chunk in pubkeys.chunks(IN_CHUNK) {
+        let sql = in_query(
+            "SELECT id, pubkey, endpoint, last_push_at FROM push_subscriptions WHERE pubkey IN",
+            chunk.len(),
+        );
+        let binds: Vec<_> = chunk.iter().map(|p| js_str(p)).collect();
+        match db.prepare(sql).bind(&binds) {
+            Ok(stmt) => match stmt.all().await {
+                Ok(res) => out.extend(res.results::<SubRow>().unwrap_or_default()),
+                Err(e) => console_error!("push: subscription query failed: {e}"),
+            },
+            Err(e) => console_error!("push: subscription bind failed: {e}"),
+        }
     }
-    let Ok(db) = env.d1("DB") else {
-        return Vec::new();
-    };
-    let placeholders = (1..=pubkeys.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT id, pubkey, endpoint, last_push_at FROM push_subscriptions WHERE pubkey IN ({placeholders})"
-    );
-    let binds: Vec<_> = pubkeys.iter().map(|p| js_str(p)).collect();
-    let Ok(stmt) = db.prepare(sql).bind(&binds) else {
-        return Vec::new();
-    };
-    match stmt.all().await {
-        Ok(res) => res.results::<SubRow>().unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,6 +1014,9 @@ async fn prefs_get(req: &Request, env: &Env) -> Result<Response> {
         Ok(pk) => pk,
         Err((b, s)) => return respond(req, env, &b, s),
     };
+    if !is_whitelisted(env, &pubkey).await {
+        return respond(req, env, &json!({ "error": "Not authorized" }), 403);
+    }
     let prefs = load_prefs(env, std::slice::from_ref(&pubkey))
         .await
         .remove(&pubkey)
@@ -1021,6 +1029,11 @@ async fn prefs_set(req: &Request, env: &Env, body: &[u8]) -> Result<Response> {
         Ok(pk) => pk,
         Err((b, s)) => return respond(req, env, &b, s),
     };
+    // Same door as subscribe: any key can mint a valid NIP-98 token, so without
+    // this a stranger could grow `push_prefs` without bound.
+    if !is_whitelisted(env, &pubkey).await {
+        return respond(req, env, &json!({ "error": "Not authorized" }), 403);
+    }
     let mut prefs: PushPrefs = match serde_json::from_slice(body) {
         Ok(p) => p,
         Err(_) => return respond(req, env, &json!({ "error": "invalid preferences" }), 400),
@@ -1916,5 +1929,39 @@ mod tests {
             .unwrap();
         subscribe_row(&conn, "s1", PK_B, 2, "t2");
         assert!(due(&conn, 5_000).is_empty());
+    }
+
+    #[test]
+    fn in_lists_are_chunked_under_the_d1_parameter_cap() {
+        const { assert!(IN_CHUNK <= 100, "D1 allows at most 100 bound parameters") };
+        let q = in_query("SELECT x FROM t WHERE k IN", 3);
+        assert_eq!(q, "SELECT x FROM t WHERE k IN (?1,?2,?3)");
+        let keys: Vec<String> = (0..500).map(|i| format!("{i:064x}")).collect();
+        let chunks: Vec<_> = keys.chunks(IN_CHUNK).collect();
+        assert!(chunks.iter().all(|c| c.len() <= IN_CHUNK));
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).sum::<usize>(),
+            500,
+            "no key is dropped"
+        );
+    }
+
+    #[test]
+    fn a_chunked_in_query_runs_on_sqlite() {
+        let conn = db();
+        for i in 0..5 {
+            subscribe_row(&conn, &format!("s{i}"), &format!("{i:064x}"), 1, "t");
+        }
+        let sql = in_query("SELECT id FROM push_subscriptions WHERE pubkey IN", 2);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let ids: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![format!("{:064x}", 1), format!("{:064x}", 3)],
+                |r| r.get(0),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(ids, vec!["s1", "s3"]);
     }
 }
