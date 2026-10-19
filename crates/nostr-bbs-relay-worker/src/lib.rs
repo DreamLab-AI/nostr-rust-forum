@@ -762,7 +762,10 @@ pub const GOVERNANCE_RECEIPTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS gov
             signed_at INTEGER NOT NULL, \
             accepted_at INTEGER, \
             projected_at INTEGER, \
-            replays INTEGER NOT NULL DEFAULT 0\
+            replays INTEGER NOT NULL DEFAULT 0, \
+            applied_at INTEGER, \
+            applied_by TEXT, \
+            acknowledgement TEXT\
         )";
 
 /// Idempotent schema migrations.
@@ -1251,11 +1254,16 @@ mod schema_order_tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "ALTER TABLE governance_receipts ADD COLUMN applied_at INTEGER",
-            [],
-        )
-        .unwrap();
+        // The CREATE already carries the provenance columns, so the live ALTER is a
+        // harmless duplicate-column error (discarded by ensure_schema).
+        assert!(conn
+            .execute(
+                "ALTER TABLE governance_receipts ADD COLUMN applied_at INTEGER",
+                []
+            )
+            .is_err());
+        conn.prepare("SELECT applied_at, applied_by, acknowledgement FROM governance_receipts")
+            .unwrap();
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_broker_cases_effective_tier ON broker_cases(effective_tier)",
             [],
