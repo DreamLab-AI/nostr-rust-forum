@@ -7,6 +7,38 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: DM relay list used the wrong tag (`nostr-bbs-forum-client`)
+
+The kind-10050 event was published with `["r", url]`; NIP-17 reads `["relay", url]`, as the BBS client already emits. The tag name is now pinned by a test.
+
+### Fixed: Export Private Key panicked for NIP-07 sessions (`nostr-bbs-forum-client`)
+
+The click handler called `use_toasts()` inside a DOM event, where `expect_context` panics (bug #32). It now reuses the handle bound at component setup.
+
+### Fixed: SVG avatars were accepted (`nostr-bbs-forum-client`)
+
+The pod serves stored bytes with their declared type, so an SVG carrying a script was a stored XSS when opened directly. Avatar uploads now accept only PNG, JPEG, WebP and GIF; SVG is refused with "SVG avatars are not supported". Post-media uploads are unchanged.
+
+### Fixed: Profile hydration trusted any signed kind-0 (`nostr-bbs-forum-client`)
+
+A relay could answer the settings page's own-profile query with another author's event and seed fields the member would then re-sign. Events whose `pubkey` differs from the requested one are now ignored.
+
+### Fixed: Notifications leaked between accounts on a shared browser (`nostr-bbs-forum-client`)
+
+The visible list lived under one global key and survived logout. It is now stored per owner pubkey (like the sync state), reloaded when the account changes, and deleted on logout together with the anonymous list and the retired global key. The cross-tab `storage` handler matches the new key shape.
+
+### Fixed: Level-gated notifications were burned and dedup eviction was not FIFO (`nostr-bbs-forum-client`)
+
+A post or DM the notification level rejected was still recorded as seen, so loosening the level never announced it; it is now left unburned. The seen-id cap evicted an arbitrary element despite documenting FIFO; it is now an insertion-ordered set that evicts the oldest.
+
+### Fixed: DM store: inflated unread badge, mixed-case keys, sender-controlled time (`nostr-bbs-forum-client`)
+
+A re-streamed event bumped the unread count and rewrote the preview; only a first-seen message now updates the summary. Pubkeys are lowercased at ingestion and compared exactly, and a rumor's `created_at` is clamped to now.
+
+### Fixed: Service worker cached stable-URL assets cache-first (`nostr-bbs-forum-client`)
+
+Trunk `copy-file` / `copy-dir` assets such as `icons/` keep stable URLs but were served cache-first, pinning stale copies. Only fingerprinted (`-<16 hex>.`) or `snippets/` files are cache-first now; other static files are network-first with a cache fallback.
+
 ### Fixed: live broadcast leaked protected kinds to kinds-less subscriptions (`nostr-bbs-relay-worker`)
 
 REQ and COUNT decide protected reads from the kinds a filter names, so `{}` or `{"#p":[...]}` passed both gates
