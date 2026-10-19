@@ -1809,6 +1809,7 @@ impl NostrRelayDO {
             sessions.get(&session_id).map(|s| s.challenge.clone())
         };
         let own_relay_url = self.own_relay_url();
+        nip42::warn_if_relay_url_unconfigured(self.auth_mode(), own_relay_url.as_deref());
         let now = auth::js_now_secs();
 
         match nip42::evaluate_auth_event(

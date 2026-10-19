@@ -34,8 +34,8 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use worker::{
-    console_error, console_log, Env, Fetch, Headers, Method, Request, RequestInit, Response,
-    Result, Url,
+    console_error, console_log, D1Database, Env, Fetch, Headers, Method, Request, RequestInit,
+    Response, Result, Url,
 };
 
 use crate::auth;
@@ -85,7 +85,8 @@ pub const PUSH_SCHEMA_SQL: [&str; 3] = [
         pending_dm INTEGER NOT NULL DEFAULT 0, pending_reply INTEGER NOT NULL DEFAULT 0, \
         pending_topic INTEGER NOT NULL DEFAULT 0, pending_post INTEGER NOT NULL DEFAULT 0, \
         bump_seq INTEGER NOT NULL DEFAULT 0, pushed_seq INTEGER NOT NULL DEFAULT 0, \
-        link_reply TEXT, link_topic TEXT, link_post TEXT)",
+        link_reply TEXT, link_topic TEXT, link_post TEXT, \
+        dm_window_start INTEGER NOT NULL DEFAULT 0, dm_window_count INTEGER NOT NULL DEFAULT 0)",
     "CREATE INDEX IF NOT EXISTS idx_push_subscriptions_pubkey ON push_subscriptions(pubkey)",
     "CREATE TABLE IF NOT EXISTS push_prefs (\
         pubkey TEXT PRIMARY KEY, replies INTEGER NOT NULL DEFAULT 1, dms INTEGER NOT NULL DEFAULT 1, \
@@ -93,6 +94,21 @@ pub const PUSH_SCHEMA_SQL: [&str; 3] = [
         muted_channels TEXT NOT NULL DEFAULT '[]', quiet_start INTEGER, quiet_end INTEGER, \
         tz_offset INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0)",
 ];
+
+/// Columns added to `push_subscriptions` after a deployment may already have
+/// created the table; `ensure_schema` runs these and discards the duplicate-column
+/// error. Mirrors the tail of `migrations/0010_push.sql`.
+pub const PUSH_ALTER_SQL: [&str; 2] = [
+    "ALTER TABLE push_subscriptions ADD COLUMN dm_window_start INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE push_subscriptions ADD COLUMN dm_window_count INTEGER NOT NULL DEFAULT 0",
+];
+
+/// Default DM wake-ups per device per hour (`PUSH_DM_HOURLY_BUDGET` overrides).
+/// Gift-wrap senders are not allowlisted, so anyone can address a wrap to a
+/// member; without a budget a stranger can buzz a phone every few seconds.
+pub const DEFAULT_DM_HOURLY_BUDGET: u32 = 30;
+/// Length of the DM budget window.
+const DM_BUDGET_WINDOW_SECS: u64 = 60 * 60;
 
 fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -138,16 +154,20 @@ const SQL_DRAIN_SUBTRACT: &str =
        pending_reply = MAX(pending_reply - ?3, 0), pending_topic = MAX(pending_topic - ?4, 0), \
        pending_post = MAX(pending_post - ?5, 0) WHERE id = ?1";
 
-/// Devices owed a wake-up: events were counted since the last successful push
+/// Devices owed a wake-up (`?3` = DM budget, `?4` = now, `?5` = DM window length): events were counted since the last successful push
 /// (`bump_seq > pushed_seq`), they are still undrained, and the last push is older
-/// than `?1`. One burst earns exactly one flush: a successful flush sets
+/// than `?1`, and not held only by a spent DM budget (a device whose sole pending
+/// item is an over-budget DM stays out of the batch until its window resets, so
+/// it cannot crowd out other devices' flushes). One burst earns exactly one flush: a successful flush sets
 /// `pushed_seq = bump_seq`, so an app that never drains cannot be woken every tick.
 const SQL_PENDING_DUE: &str = "SELECT id, pubkey, endpoint, last_push_at, \
-       pending_dm, pending_reply, pending_topic \
+       pending_dm, pending_reply, pending_topic, pending_post \
      FROM push_subscriptions \
      WHERE bump_seq > pushed_seq \
        AND (pending_dm + pending_reply + pending_topic + pending_post) > 0 \
        AND last_push_at <= ?1 \
+       AND NOT (pending_reply + pending_topic + pending_post = 0 \
+                AND dm_window_count >= ?3 AND ?4 - dm_window_start < ?5) \
      ORDER BY last_push_at ASC LIMIT ?2";
 
 /// A device is flushed once its last push is at least this old, which is longer
@@ -169,6 +189,29 @@ const SQL_SWEEP_STALE: &str = "DELETE FROM push_subscriptions WHERE refreshed_at
 /// between the send and this statement is still covered, because the woken
 /// service worker drains the counters after it.
 const SQL_MARK_PUSHED: &str = "UPDATE push_subscriptions SET last_push_at = ?2, failures = 0, pushed_seq = bump_seq WHERE id = ?1";
+
+/// Claim a device's push slot before sending. Succeeds (one row changed) only
+/// when its last push is at or before `?3` (`now` minus the shortest throttle of
+/// the categories being sent), so two events racing for one device in the same
+/// window cannot both send: the second sees `last_push_at = ?2` and changes
+/// nothing. A never-pushed device has `last_push_at = 0` and always qualifies.
+const SQL_CLAIM_PUSH: &str =
+    "UPDATE push_subscriptions SET last_push_at = ?2 WHERE id = ?1 AND last_push_at <= ?3";
+
+/// Undo a claim (`?3` = the claimed timestamp, `?2` = the previous value) when
+/// the send did not happen or failed. Guarded on `last_push_at = ?3` so a newer
+/// claim by a later event is never clobbered.
+const SQL_ROLLBACK_CLAIM: &str =
+    "UPDATE push_subscriptions SET last_push_at = ?2 WHERE id = ?1 AND last_push_at = ?3";
+
+/// Spend one DM wake-up from the device's rolling hourly budget (`?3` = budget,
+/// `?4` = window length). A window older than `?4` restarts at `?2` with a count
+/// of one. Changes a row only while budget remains; SQLite evaluates every right
+/// hand side against the old row, so the two CASE expressions agree.
+const SQL_TAKE_DM_BUDGET: &str = "UPDATE push_subscriptions SET \
+       dm_window_start = CASE WHEN ?2 - dm_window_start >= ?4 THEN ?2 ELSE dm_window_start END, \
+       dm_window_count = CASE WHEN ?2 - dm_window_start >= ?4 THEN 1 ELSE dm_window_count + 1 END \
+     WHERE id = ?1 AND (?2 - dm_window_start >= ?4 OR dm_window_count < ?3)";
 
 /// Delete subscriptions that failed `?1` times in a row.
 const SQL_DELETE_FAILED: &str = "DELETE FROM push_subscriptions WHERE failures >= ?1";
@@ -398,6 +441,16 @@ pub fn classify_status(status: u16) -> SendOutcome {
     }
 }
 
+/// Sort key for choosing the category that sets a push's urgency, TTL and topic.
+fn lead_rank(category: Category) -> u8 {
+    match category {
+        Category::Dm => 0,
+        Category::Reply => 1,
+        Category::Topic => 2,
+        Category::Post => 3,
+    }
+}
+
 /// Whether a push to a device last pushed at `last_push_at` is held back.
 pub fn throttled(category: Category, last_push_at: u64, now_secs: u64) -> bool {
     let min = category.min_interval_secs();
@@ -430,6 +483,50 @@ pub fn max_fanout(env: &Env) -> usize {
         .and_then(|v| v.to_string().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_FANOUT)
+}
+
+/// Parse a `PUSH_DM_HOURLY_BUDGET` value; absent, unparsable or zero falls back
+/// to [`DEFAULT_DM_HOURLY_BUDGET`].
+pub fn parse_dm_budget(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_DM_HOURLY_BUDGET)
+}
+
+/// Read the `PUSH_DM_HOURLY_BUDGET` cap.
+pub fn dm_hourly_budget(env: &Env) -> u32 {
+    parse_dm_budget(
+        env.var("PUSH_DM_HOURLY_BUDGET")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    )
+}
+
+/// Run a single-row UPDATE and report whether it changed a row. A statement or
+/// metadata error counts as "no", so a D1 fault never causes a duplicate send.
+async fn changed_one(db: &D1Database, sql: &str, binds: &[wasm_bindgen::JsValue]) -> bool {
+    let prepared = match db.prepare(sql).bind(binds) {
+        Ok(s) => s,
+        Err(e) => {
+            console_error!("push: bind failed: {e}");
+            return false;
+        }
+    };
+    match prepared.run().await {
+        Ok(res) => {
+            res.meta()
+                .ok()
+                .flatten()
+                .and_then(|m| m.changes)
+                .unwrap_or(0)
+                > 0
+        }
+        Err(e) => {
+            console_error!("push: claim statement failed: {e}");
+            false
+        }
+    }
 }
 
 /// Whether Web Push is switched on (`PUSH_ENABLED="true"`).
@@ -510,17 +607,14 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>, bump_counters: bool) {
         entry.2.push(job.category);
     }
 
+    let dm_budget = dm_hourly_budget(&env);
+    let mut previous_push: HashMap<String, u64> = HashMap::new();
     let mut auth_by_aud: HashMap<String, String> = HashMap::new();
     let mut results = Vec::new();
-    for (id, (endpoint, last_push_at, cats)) in per_device {
+    for (id, (endpoint, last_push_at, mut cats)) in per_device {
         // Strongest category sets urgency/TTL/topic; the device is throttled
         // only when every category on it is.
-        let Some(lead) = cats.iter().copied().min_by_key(|c| match c {
-            Category::Dm => 0,
-            Category::Reply => 1,
-            Category::Topic => 2,
-            Category::Post => 3,
-        }) else {
+        let Some(lead) = cats.iter().copied().min_by_key(|c| lead_rank(*c)) else {
             continue;
         };
         if cats.iter().all(|c| throttled(*c, last_push_at, now)) {
@@ -530,6 +624,55 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>, bump_counters: bool) {
             results.push((id, SendOutcome::Gone));
             continue;
         };
+        // Claim the slot atomically BEFORE sending. `last_push_at` above was read
+        // before this send, so two events for one device in one window both pass
+        // the check; only one UPDATE can move `last_push_at` past the cutoff.
+        let cutoff = now.saturating_sub(
+            cats.iter()
+                .map(|c| c.min_interval_secs())
+                .min()
+                .unwrap_or(0),
+        );
+        if !changed_one(
+            &db,
+            SQL_CLAIM_PUSH,
+            &[js_str(&id), js_f64(now as f64), js_f64(cutoff as f64)],
+        )
+        .await
+        {
+            continue;
+        }
+        // DM wrap senders are not allowlisted: spend the per-device hourly budget.
+        // An over-budget DM still counts (the app shows it on next open) but does
+        // not wake the device; if nothing else is owed, hand the slot back.
+        previous_push.insert(id.clone(), last_push_at);
+        let mut lead = lead;
+        if cats.contains(&Category::Dm)
+            && !changed_one(
+                &db,
+                SQL_TAKE_DM_BUDGET,
+                &[
+                    js_str(&id),
+                    js_f64(now as f64),
+                    js_f64(f64::from(dm_budget)),
+                    js_f64(DM_BUDGET_WINDOW_SECS as f64),
+                ],
+            )
+            .await
+        {
+            console_log!("push: DM budget spent for {id:.8}");
+            cats.retain(|c| *c != Category::Dm);
+            let Some(next) = cats.iter().copied().min_by_key(|c| lead_rank(*c)) else {
+                changed_one(
+                    &db,
+                    SQL_ROLLBACK_CLAIM,
+                    &[js_str(&id), js_f64(last_push_at as f64), js_f64(now as f64)],
+                )
+                .await;
+                continue;
+            };
+            lead = next;
+        }
         let authorization = auth_by_aud
             .entry(aud.clone())
             .or_insert_with(|| vapid.authorization(&aud, now))
@@ -560,6 +703,19 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>, bump_counters: bool) {
         };
         if let Ok(s) = stmt {
             stmts.push(s);
+        }
+        // A failed send did not wake the device: give the throttle slot back so
+        // the next event (or the cron flush) may try again.
+        if *outcome == SendOutcome::Failed {
+            if let Some(prev) = previous_push.get(id) {
+                if let Ok(s) = db.prepare(SQL_ROLLBACK_CLAIM).bind(&[
+                    js_str(id),
+                    js_f64(*prev as f64),
+                    js_f64(now as f64),
+                ]) {
+                    stmts.push(s);
+                }
+            }
         }
     }
     if let Ok(s) = db
@@ -595,11 +751,15 @@ pub async fn flush_pending(env: &Env) {
         return;
     }
     let Ok(db) = env.d1("DB") else { return };
-    let cutoff = auth::js_now_secs().saturating_sub(FLUSH_AFTER_SECS);
-    let Ok(stmt) = db
-        .prepare(SQL_PENDING_DUE)
-        .bind(&[js_f64(cutoff as f64), js_f64(FLUSH_BATCH as f64)])
-    else {
+    let now = auth::js_now_secs();
+    let cutoff = now.saturating_sub(FLUSH_AFTER_SECS);
+    let Ok(stmt) = db.prepare(SQL_PENDING_DUE).bind(&[
+        js_f64(cutoff as f64),
+        js_f64(FLUSH_BATCH as f64),
+        js_f64(f64::from(dm_hourly_budget(env))),
+        js_f64(now as f64),
+        js_f64(DM_BUDGET_WINDOW_SECS as f64),
+    ]) else {
         return;
     };
     let rows = match stmt.all().await {
@@ -609,7 +769,7 @@ pub async fn flush_pending(env: &Env) {
             return;
         }
     };
-    let jobs: Vec<PushJob> = rows.into_iter().map(DueRow::into_job).collect();
+    let jobs: Vec<PushJob> = rows.into_iter().flat_map(DueRow::into_jobs).collect();
     if !jobs.is_empty() {
         console_log!("push: trailing flush waking {} device(s)", jobs.len());
         deliver(env.clone(), jobs, false).await;
@@ -625,28 +785,30 @@ struct DueRow {
     pending_dm: f64,
     pending_reply: f64,
     pending_topic: f64,
+    pending_post: f64,
 }
 
 impl DueRow {
-    /// The wake-up job: the strongest pending category leads (urgency/topic).
-    fn into_job(self) -> PushJob {
-        let category = if self.pending_dm > 0.0 {
-            Category::Dm
-        } else if self.pending_reply > 0.0 {
-            Category::Reply
-        } else if self.pending_topic > 0.0 {
-            Category::Topic
-        } else {
-            // Only posts can be left (the query guarantees something pends).
-            Category::Post
-        };
-        PushJob {
-            id: self.id,
-            endpoint: self.endpoint,
+    /// One wake-up job per pending category; `deliver` merges them per device and
+    /// the strongest sets urgency/topic. Emitting every category matters when the
+    /// DM budget is spent: the device can still be woken for its replies.
+    fn into_jobs(self) -> Vec<PushJob> {
+        [
+            (self.pending_dm, Category::Dm),
+            (self.pending_reply, Category::Reply),
+            (self.pending_topic, Category::Topic),
+            (self.pending_post, Category::Post),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0.0)
+        .map(|(_, category)| PushJob {
+            id: self.id.clone(),
+            endpoint: self.endpoint.clone(),
             category,
             link: None,
             last_push_at: self.last_push_at as u64,
-        }
+        })
+        .collect()
     }
 }
 
@@ -1475,6 +1637,11 @@ mod tests {
             .iter()
             .any(|s| s.contains("push_subscriptions")));
         assert!(PUSH_SCHEMA_SQL.iter().any(|s| s.contains("push_prefs")));
+        for col in ["dm_window_start", "dm_window_count"] {
+            assert!(migration.contains(col));
+            assert!(PUSH_SCHEMA_SQL[0].contains(col));
+            assert!(PUSH_ALTER_SQL.iter().any(|s| s.contains(col)));
+        }
     }
 
     // -- SQL, run against SQLite (the engine D1 is built on) ------------------
@@ -1851,7 +2018,16 @@ mod tests {
         let cutoff = 1_000 - FLUSH_AFTER_SECS as i64;
         let mut stmt = conn.prepare(SQL_PENDING_DUE).unwrap();
         let ids: Vec<String> = stmt
-            .query_map(rusqlite::params![cutoff, 10], |r| r.get(0))
+            .query_map(
+                rusqlite::params![
+                    cutoff,
+                    10,
+                    DEFAULT_DM_HOURLY_BUDGET,
+                    1_000,
+                    DM_BUDGET_WINDOW_SECS as i64
+                ],
+                |r| r.get(0),
+            )
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -1865,34 +2041,169 @@ mod tests {
     }
 
     #[test]
-    fn a_flush_job_leads_with_the_strongest_pending_category() {
-        let row = |dm, reply, topic, _post| DueRow {
+    fn flush_jobs_carry_no_link_and_skip_empty_categories() {
+        let row = DueRow {
             id: "s".into(),
             endpoint: "https://fcm.googleapis.com/x".into(),
             last_push_at: 5.0,
-            pending_dm: dm,
-            pending_reply: reply,
-            pending_topic: topic,
+            pending_dm: 0.0,
+            pending_reply: 0.0,
+            pending_topic: 0.0,
+            pending_post: 1.0,
         };
-        assert_eq!(row(1.0, 1.0, 1.0, 1.0).into_job().category, Category::Dm);
-        assert_eq!(row(0.0, 2.0, 1.0, 1.0).into_job().category, Category::Reply);
-        assert_eq!(row(0.0, 0.0, 3.0, 1.0).into_job().category, Category::Topic);
-        assert_eq!(row(0.0, 0.0, 0.0, 9.0).into_job().category, Category::Post);
-        assert!(
-            row(0.0, 0.0, 0.0, 1.0).into_job().link.is_none(),
-            "counters already hold the links"
-        );
+        let jobs = row.into_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].category, Category::Post);
+        assert!(jobs[0].link.is_none(), "counters already hold the links");
     }
 
     /// Ids the trailing flush would wake at `now`.
     fn due(conn: &rusqlite::Connection, now: i64) -> Vec<String> {
         let mut stmt = conn.prepare(SQL_PENDING_DUE).unwrap();
-        stmt.query_map(rusqlite::params![now - FLUSH_AFTER_SECS as i64, 50], |r| {
-            r.get(0)
-        })
+        stmt.query_map(
+            rusqlite::params![
+                now - FLUSH_AFTER_SECS as i64,
+                50,
+                DEFAULT_DM_HOURLY_BUDGET,
+                now,
+                DM_BUDGET_WINDOW_SECS as i64
+            ],
+            |r| r.get(0),
+        )
         .unwrap()
         .map(Result::unwrap)
         .collect()
+    }
+
+    #[test]
+    fn a_device_held_only_by_a_spent_dm_budget_is_not_flushed_until_the_window_resets() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute(&bump_sql(Category::Dm), rusqlite::params!["s1"])
+            .unwrap();
+        conn.execute(
+            "UPDATE push_subscriptions SET dm_window_start = 5000, dm_window_count = ?1",
+            [DEFAULT_DM_HOURLY_BUDGET],
+        )
+        .unwrap();
+        assert!(due(&conn, 5_500).is_empty(), "budget spent, window open");
+        assert_eq!(due(&conn, 5_000 + 3_600), vec!["s1"], "window reset");
+
+        // A pending reply keeps the device eligible even with the budget spent.
+        conn.execute(&bump_sql(Category::Reply), rusqlite::params!["s1", "/go/a"])
+            .unwrap();
+        assert_eq!(due(&conn, 5_500), vec!["s1"]);
+    }
+
+    #[test]
+    fn due_rows_emit_one_job_per_pending_category() {
+        let row = DueRow {
+            id: "s1".into(),
+            endpoint: "https://fcm.googleapis.com/x".into(),
+            last_push_at: 0.0,
+            pending_dm: 2.0,
+            pending_reply: 1.0,
+            pending_topic: 0.0,
+            pending_post: 3.0,
+        };
+        let cats: Vec<Category> = row.into_jobs().into_iter().map(|j| j.category).collect();
+        assert_eq!(cats, vec![Category::Dm, Category::Reply, Category::Post]);
+    }
+
+    fn claim(conn: &rusqlite::Connection, id: &str, now: i64, min: i64) -> usize {
+        conn.execute(SQL_CLAIM_PUSH, rusqlite::params![id, now, now - min])
+            .unwrap()
+    }
+
+    #[test]
+    fn only_one_of_two_racing_events_claims_the_push_slot() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        // Both events read last_push_at = 0 before sending; only the first claim wins.
+        assert_eq!(claim(&conn, "s1", 1_000, 5), 1, "never pushed: claimable");
+        assert_eq!(claim(&conn, "s1", 1_000, 5), 0, "same window: refused");
+        assert_eq!(claim(&conn, "s1", 1_004, 5), 0, "inside the interval");
+        assert_eq!(claim(&conn, "s1", 1_005, 5), 1, "interval elapsed");
+        assert_eq!(
+            count(&conn, "SELECT last_push_at FROM push_subscriptions"),
+            1_005
+        );
+    }
+
+    #[test]
+    fn a_failed_send_hands_the_slot_back_without_clobbering_a_newer_claim() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute("UPDATE push_subscriptions SET last_push_at = 900", [])
+            .unwrap();
+        assert_eq!(claim(&conn, "s1", 1_000, 5), 1);
+        let rolled = conn
+            .execute(SQL_ROLLBACK_CLAIM, rusqlite::params!["s1", 900, 1_000])
+            .unwrap();
+        assert_eq!(rolled, 1);
+        assert_eq!(
+            count(&conn, "SELECT last_push_at FROM push_subscriptions"),
+            900
+        );
+        // A later claim at 1_010 must survive a stale rollback of the 1_000 claim.
+        assert_eq!(claim(&conn, "s1", 1_010, 5), 1);
+        let rolled = conn
+            .execute(SQL_ROLLBACK_CLAIM, rusqlite::params!["s1", 900, 1_000])
+            .unwrap();
+        assert_eq!(rolled, 0);
+        assert_eq!(
+            count(&conn, "SELECT last_push_at FROM push_subscriptions"),
+            1_010
+        );
+    }
+
+    fn take_dm(conn: &rusqlite::Connection, now: i64, budget: i64) -> usize {
+        conn.execute(
+            SQL_TAKE_DM_BUDGET,
+            rusqlite::params!["s1", now, budget, DM_BUDGET_WINDOW_SECS as i64],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dm_wakeups_are_capped_per_hour_and_the_window_rolls() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        let t0 = 10_000;
+        for i in 0..3 {
+            assert_eq!(take_dm(&conn, t0 + i, 3), 1, "within budget");
+        }
+        assert_eq!(take_dm(&conn, t0 + 100, 3), 0, "fourth DM is over budget");
+        assert_eq!(take_dm(&conn, t0 + 3_599, 3), 0, "window still open");
+        assert_eq!(take_dm(&conn, t0 + 3_600, 3), 1, "new window restarts");
+        assert_eq!(
+            count(&conn, "SELECT dm_window_count FROM push_subscriptions"),
+            1
+        );
+        assert_eq!(take_dm(&conn, t0 + 3_601, 3), 1);
+        assert_eq!(take_dm(&conn, t0 + 3_602, 3), 1);
+        assert_eq!(take_dm(&conn, t0 + 3_603, 3), 0);
+    }
+
+    #[test]
+    fn dm_budget_env_parsing_defaults_to_thirty() {
+        assert_eq!(parse_dm_budget(None), 30);
+        assert_eq!(parse_dm_budget(Some("")), 30);
+        assert_eq!(parse_dm_budget(Some("abc")), 30);
+        assert_eq!(parse_dm_budget(Some("0")), 30);
+        assert_eq!(parse_dm_budget(Some(" 12 ")), 12);
+    }
+
+    #[test]
+    fn alter_statements_bring_an_old_table_up_to_date() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE push_subscriptions (id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        for stmt in PUSH_ALTER_SQL {
+            conn.execute(stmt, []).unwrap();
+        }
+        conn.prepare("SELECT dm_window_start, dm_window_count FROM push_subscriptions")
+            .expect("both columns exist after the ALTERs");
     }
 
     #[test]

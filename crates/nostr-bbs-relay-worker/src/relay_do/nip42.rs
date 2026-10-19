@@ -216,6 +216,26 @@ pub fn evaluate_auth_event(
     AuthVerdict::Ok(event.pubkey.clone())
 }
 
+/// Whether an AUTH is being verified without relay scoping: `AUTH_MODE` is
+/// `nip42` but `RELAY_URL` is unset or blank, so [`evaluate_auth_event`] skips
+/// the `relay` tag check. Enforcement is deliberately unchanged (operators deploy
+/// the shipped `wrangler.toml`, which leaves `RELAY_URL` blank); this predicate
+/// exists so the relay can say so, loudly, on every AUTH.
+pub fn relay_url_unconfigured_in_nip42(mode: AuthMode, own_relay_url: Option<&str>) -> bool {
+    mode == AuthMode::Nip42 && own_relay_url.is_none_or(|s| s.trim().is_empty())
+}
+
+/// Log a console error when [`relay_url_unconfigured_in_nip42`] holds. Call once
+/// per AUTH, before [`evaluate_auth_event`].
+pub fn warn_if_relay_url_unconfigured(mode: AuthMode, own_relay_url: Option<&str>) {
+    if relay_url_unconfigured_in_nip42(mode, own_relay_url) {
+        #[cfg(target_arch = "wasm32")]
+        worker::console_error!(
+            "nip42: RELAY_URL is blank, so the AUTH relay-tag check is skipped; set RELAY_URL to this relay's wss:// URL"
+        );
+    }
+}
+
 /// Whether an EVENT (write) is admitted, given the mode and whether the session
 /// completed NIP-42 AUTH.
 ///
@@ -275,6 +295,19 @@ pub fn allowlist_denial_reason(mode: AuthMode, session_authed: bool) -> &'static
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_relay_url_skips_the_relay_tag_check_and_is_flagged() {
+        assert!(relay_url_unconfigured_in_nip42(AuthMode::Nip42, None));
+        assert!(relay_url_unconfigured_in_nip42(AuthMode::Nip42, Some("")));
+        assert!(relay_url_unconfigured_in_nip42(AuthMode::Nip42, Some("  ")));
+        assert!(!relay_url_unconfigured_in_nip42(
+            AuthMode::Nip42,
+            Some("wss://relay.example")
+        ));
+        // Legacy allowlist mode never runs the relay-scoping defence, so no warning.
+        assert!(!relay_url_unconfigured_in_nip42(AuthMode::Allowlist, None));
+    }
 
     fn filter_kinds(kinds: Option<Vec<u64>>) -> NostrFilter {
         let mut v = serde_json::Map::new();

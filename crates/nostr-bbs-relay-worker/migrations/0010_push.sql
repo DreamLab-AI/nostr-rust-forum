@@ -27,7 +27,11 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     pushed_seq     INTEGER NOT NULL DEFAULT 0,
     link_reply     TEXT,
     link_topic     TEXT,
-    link_post      TEXT
+    link_post      TEXT,
+    -- Rolling hourly budget of DM wake-ups (gift-wrap senders are not
+    -- allowlisted): window start and count within it. See PUSH_DM_HOURLY_BUDGET.
+    dm_window_start INTEGER NOT NULL DEFAULT 0,
+    dm_window_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_push_subscriptions_pubkey ON push_subscriptions(pubkey);
 
