@@ -29,7 +29,7 @@ repo: nostr-rust-forum
    - kind 42: `p`-tagged members receive a *reply* alert; opted-in members receive a *post* alert. kind 40: opted-in members receive a *topic* alert.
    - Every kind 40/42 recipient passes the same `resolve_viewer_context` + `authorize_event` gate as live delivery, so a push never reveals a post the recipient cannot read.
 4. **Server-side preferences** (`push_prefs`, per pubkey): replies, dms, new_topics, new_posts, muted channels, quiet hours. Defaults: replies and dms on; topics and posts off. Counts for suppressed categories are not accumulated.
-5. **Subscription hygiene.** Register and unsubscribe require NIP-98 and a whitelisted pubkey; endpoints must be `https` on an allow-listed push-service host (SSRF guard); at most 10 subscriptions per pubkey; a 404/410 from the push service deletes the row, repeated failures delete it too.
+5. **Subscription hygiene.** Register and unsubscribe require NIP-98 and a whitelisted pubkey; endpoints must be `https` on an allow-listed push-service host (SSRF guard); a device can also unsubscribe with its own drain credentials (no signer), which is how logout stops that device waking for the account that left; at most 10 subscriptions per pubkey; a 404/410 from the push service deletes the row, repeated failures delete it too.
 6. **The forum service worker (`/community/sw.js`) owns push.** The BBS SW (`bbs-sw.js`, scope `/community/bbs/`) does not subscribe in v1.
 7. **Default off.** The relay needs `PUSH_ENABLED="true"`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT` and the secret `VAPID_PRIVATE_KEY`. The client learns of the feature from `GET /api/push/config`, so no client rebuild or `window.__ENV__` change is needed to switch it on.
 8. **Tier 0 ships with it, and needs no server push.**

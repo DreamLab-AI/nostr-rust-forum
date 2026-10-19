@@ -156,6 +156,11 @@ const FLUSH_AFTER_SECS: u64 = 120;
 /// Devices woken per cron tick.
 const FLUSH_BATCH: usize = 100;
 
+/// Remove a subscription by its drain credentials (id and token hash): proof of
+/// owning the device, so teardown on logout needs no signer.
+const SQL_DELETE_BY_TOKEN: &str =
+    "DELETE FROM push_subscriptions WHERE id = ?1 AND token_hash = ?2";
+
 /// Delete subscriptions the app has not refreshed since `?1`.
 const SQL_SWEEP_STALE: &str = "DELETE FROM push_subscriptions WHERE refreshed_at < ?1";
 
@@ -985,6 +990,31 @@ async fn subscribe(req: &Request, env: &Env, body: &[u8]) -> Result<Response> {
 }
 
 async fn unsubscribe(req: &Request, env: &Env, body: &[u8]) -> Result<Response> {
+    // Device teardown (logout, or the browser refused to unsubscribe): the drain
+    // credentials prove ownership of this subscription, so no NIP-98 signature
+    // is needed. A request that carries an Authorization header takes the
+    // signed path below.
+    if req.headers().get("Authorization").ok().flatten().is_none() {
+        #[derive(Deserialize)]
+        struct Credentials {
+            id: String,
+            token: String,
+        }
+        let Ok(c) = serde_json::from_slice::<Credentials>(body) else {
+            return respond(
+                req,
+                env,
+                &json!({ "error": "expected {id, token} or a NIP-98 header" }),
+                400,
+            );
+        };
+        env.d1("DB")?
+            .prepare(SQL_DELETE_BY_TOKEN)
+            .bind(&[js_str(&c.id), js_str(&sha256_hex(&c.token))])?
+            .run()
+            .await?;
+        return respond(req, env, &json!({ "ok": true }), 200);
+    }
     let pubkey = match authenticate(req, env, "POST", Some(body)).await {
         Ok(pk) => pk,
         Err((b, s)) => return respond(req, env, &b, s),
@@ -1963,5 +1993,36 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(ids, vec!["s1", "s3"]);
+    }
+
+    #[test]
+    fn a_device_can_unsubscribe_with_its_own_token_and_nobody_elses() {
+        let conn = db();
+        subscribe_row(&conn, "mine", PK_A, 1, "my-token");
+        subscribe_row(&conn, "theirs", PK_B, 1, "their-token");
+        // Wrong token: nothing happens.
+        let n = conn
+            .execute(
+                SQL_DELETE_BY_TOKEN,
+                rusqlite::params!["mine", sha256_hex("their-token")],
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+        // Right token on the wrong id: nothing happens either.
+        let n = conn
+            .execute(
+                SQL_DELETE_BY_TOKEN,
+                rusqlite::params!["theirs", sha256_hex("my-token")],
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+        let n = conn
+            .execute(
+                SQL_DELETE_BY_TOKEN,
+                rusqlite::params!["mine", sha256_hex("my-token")],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM push_subscriptions"), 1);
     }
 }

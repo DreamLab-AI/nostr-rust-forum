@@ -674,6 +674,8 @@ impl AuthStore {
 
     /// Log out: zero privkey, clear state and storage.
     pub fn logout(&self) {
+        // ADR-2023: this device must stop waking for the account that signs out.
+        crate::utils::push::teardown_on_logout();
         self.privkey.update_value(|opt| {
             if let Some(ref mut v) = opt {
                 v.iter_mut().for_each(|b| *b = 0);

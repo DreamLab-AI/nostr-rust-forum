@@ -26,22 +26,30 @@ function withStore(mode, fn) {
   return openDb().then(
     (db) =>
       new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE, mode);
-        const result = fn(tx.objectStore(STORE));
-        tx.oncomplete = () => {
+        let tx;
+        try {
+          tx = db.transaction(STORE, mode);
+          const result = fn(tx.objectStore(STORE));
+          tx.oncomplete = () => {
+            db.close();
+            resolve(result && result.result !== undefined ? result.result : undefined);
+          };
+          tx.onerror = () => {
+            db.close();
+            reject(tx.error);
+          };
+          // A quota or version abort fires onabort, not onerror: without this the
+          // promise never settles and the connection leaks.
+          tx.onabort = () => {
+            db.close();
+            reject(tx.error || new Error('IndexedDB transaction aborted'));
+          };
+        } catch (e) {
+          // transaction()/put() can throw synchronously (closed database,
+          // unserialisable value): release the connection and fail the promise.
           db.close();
-          resolve(result && result.result !== undefined ? result.result : undefined);
-        };
-        tx.onerror = () => {
-          db.close();
-          reject(tx.error);
-        };
-        // A quota or version abort fires onabort, not onerror: without this the
-        // promise never settles and the connection leaks.
-        tx.onabort = () => {
-          db.close();
-          reject(tx.error || new Error('IndexedDB transaction aborted'));
-        };
+          reject(e);
+        }
       })
   );
 }
@@ -156,4 +164,16 @@ export async function pushShowLocal(title, body, url, tag) {
     badge: 'icons/icon-192.png',
     data: { url },
   });
+}
+
+/**
+ * Fire-and-forget POST that survives page navigation (logout redirects at once).
+ * `text/plain` keeps it a CORS "simple" request, so no preflight is needed.
+ */
+export function pushBeacon(url, body) {
+  try {
+    return navigator.sendBeacon(url, new Blob([body], { type: 'text/plain' }));
+  } catch (_) {
+    return false;
+  }
 }

@@ -135,12 +135,9 @@ pub fn PushSettings() -> impl IntoView {
     };
 
     let turn_off = move |_| {
-        let Some(signer) = auth.get_signer() else {
-            return;
-        };
         busy.set(true);
         leptos::task::spawn_local(async move {
-            match push::disable(signer).await {
+            match push::disable().await {
                 Ok(()) => {
                     active.set(false);
                     prefs.set(None);

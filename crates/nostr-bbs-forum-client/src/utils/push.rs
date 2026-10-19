@@ -49,12 +49,18 @@ extern "C" {
     fn js_store_cfg(json: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_name = pushClearCfg)]
     fn js_clear_cfg() -> js_sys::Promise;
+    #[wasm_bindgen(js_name = pushBeacon)]
+    fn js_beacon(url: &str, body: &str) -> bool;
     #[wasm_bindgen(js_name = pushShowLocal)]
     fn js_show_local(title: &str, body: &str, url: &str, tag: &str) -> js_sys::Promise;
 }
 
 /// `localStorage` flag: this device holds a live, registered push subscription.
 const ACTIVE_KEY: &str = "nostrbbs:push_active";
+/// `localStorage` copy of the drain credentials (the same JSON the service
+/// worker reads from IndexedDB), so logout can tear the device down
+/// synchronously, before the page navigates away.
+const CFG_KEY: &str = "nostrbbs:push_cfg";
 /// `localStorage` timestamp (ms) of the last successful registration refresh.
 const REFRESHED_KEY: &str = "nostrbbs:push_refreshed_ms";
 /// The relay forgets subscriptions the app has not refreshed for 90 days; the
@@ -309,30 +315,68 @@ async fn register(signer: &dyn Signer, vapid_public_key: &str, brand: &str) -> R
     Ok(())
 }
 
-/// Turn alerts off for this device: drop the browser subscription, tell the
-/// relay, forget the drain credentials.
-pub async fn disable(signer: Rc<dyn Signer>) -> Result<(), String> {
-    // If the browser refuses to unsubscribe, still tear down our side: leaving
-    // the device marked active with a live drain token would keep waking it.
-    let endpoint = resolve(js_unsubscribe())
-        .await
+/// The unsubscribe request for the stored drain credentials, if any: the URL and
+/// JSON body of `POST /api/push/unsubscribe` (no signature; the token is the
+/// proof of ownership).
+pub fn teardown_request(cfg_json: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(cfg_json).ok()?;
+    let (api, id, token) = (
+        v.get("api")?.as_str()?,
+        v.get("id")?.as_str()?,
+        v.get("token")?.as_str()?,
+    );
+    Some((
+        format!("{api}/api/push/unsubscribe"),
+        serde_json::json!({ "id": id, "token": token }).to_string(),
+    ))
+}
+
+/// Turn alerts off for this device: tell the relay (with the device's own drain
+/// credentials, so no signer is needed), drop the browser subscription, forget
+/// the credentials. Each step runs even if an earlier one fails: leaving the
+/// device marked active with a live drain token would keep waking it.
+pub async fn disable() -> Result<(), String> {
+    if let Some((url, body)) = LocalStorage::get::<String>(CFG_KEY)
         .ok()
-        .and_then(|v| v.as_string())
-        .unwrap_or_default();
-    if !endpoint.is_empty() {
-        let body = serde_json::json!({ "endpoint": endpoint }).to_string();
-        // Best effort: if the relay is unreachable it forgets the row after a
-        // 410 from the push service or the 90-day sweep.
-        let _ = fetch_with_nip98_post_signer(
-            &format!("{}/api/push/unsubscribe", relay_api_base()),
-            &body,
-            signer.as_ref(),
-        )
-        .await;
+        .and_then(|cfg| teardown_request(&cfg))
+    {
+        if let Some(window) = web_sys::window() {
+            let init = web_sys::RequestInit::new();
+            init.set_method("POST");
+            init.set_body(&JsValue::from_str(&body));
+            if let Ok(req) = web_sys::Request::new_with_str_and_init(&url, &init) {
+                // Best effort: an unreachable relay forgets the row after a 410
+                // from the push service or the 90-day sweep.
+                let _ = JsFuture::from(window.fetch_with_request(&req)).await;
+            }
+        }
     }
+    let _ = resolve(js_unsubscribe()).await;
     let _ = resolve(js_clear_cfg()).await;
+    LocalStorage::delete(CFG_KEY);
     set_active(false);
     Ok(())
+}
+
+/// Logout hook: stop this device waking for the account that just signed out.
+/// Synchronous up to the beacon, because logout navigates away immediately; the
+/// browser-side cleanup finishes in the background where it can.
+pub fn teardown_on_logout() {
+    if !active_on_device() {
+        return;
+    }
+    if let Some((url, body)) = LocalStorage::get::<String>(CFG_KEY)
+        .ok()
+        .and_then(|cfg| teardown_request(&cfg))
+    {
+        js_beacon(&url, &body);
+    }
+    LocalStorage::delete(CFG_KEY);
+    set_active(false);
+    wasm_bindgen_futures::spawn_local(async {
+        let _ = resolve(js_unsubscribe()).await;
+        let _ = resolve(js_clear_cfg()).await;
+    });
 }
 
 /// Re-register once a day while the app is open, so a rotated browser
@@ -461,6 +505,22 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({ "api": "https://relay.example", "id": "id1", "token": "tok", "brand": "DreamLab" })
+        );
+    }
+
+    #[test]
+    fn teardown_request_is_built_from_the_stored_credentials() {
+        let cfg = drain_cfg_json("https://relay.example", "id1", "tok", "DreamLab");
+        let (url, body) = teardown_request(&cfg).unwrap();
+        assert_eq!(url, "https://relay.example/api/push/unsubscribe");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "id": "id1", "token": "tok" })
+        );
+        assert!(teardown_request("not json").is_none());
+        assert!(
+            teardown_request(r#"{"api":"x"}"#).is_none(),
+            "needs id and token"
         );
     }
 
