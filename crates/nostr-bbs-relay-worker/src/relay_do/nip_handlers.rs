@@ -726,6 +726,7 @@ impl SupersessionRefusal {
 /// the event names, and still be effective. Authority is checked after, because
 /// it needs the role ranks.
 pub(crate) fn supersession_ingest_refusal(
+    event_id: &str,
     case_id: &str,
     target: Option<&SupersededDecisionRow>,
 ) -> std::result::Result<(), SupersessionRefusal> {
@@ -733,10 +734,15 @@ pub(crate) fn supersession_ingest_refusal(
     if target.case_id != case_id {
         return Err(SupersessionRefusal::CaseMismatch);
     }
-    if target.superseded_by.is_some() {
-        return Err(SupersessionRefusal::TargetAlreadySuperseded);
+    // A redelivery of the very event that already superseded the target must
+    // pass: NIP-01 wants a duplicate accepted (`OK true`), and the projection
+    // reports it as `DuplicateIgnored`. Only a *different* successor refuses.
+    match target.superseded_by.as_deref() {
+        Some(by) if by != decision_id_for_event(event_id) => {
+            Err(SupersessionRefusal::TargetAlreadySuperseded)
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Why an appeal is refused (stage error `projection-failed`).
@@ -1384,7 +1390,7 @@ impl NostrRelayDO {
             if let Some(superseded_event_id) = governance::extract_supersedes_target(&event.tags) {
                 let case_id = governance::extract_d_tag(&event.tags).unwrap_or("");
                 if let Err(refusal) = self
-                    .supersession_authorised(&event.pubkey, case_id, superseded_event_id)
+                    .supersession_authorised(&event.pubkey, &event.id, case_id, superseded_event_id)
                     .await
                 {
                     Self::send_ok(ws, &event.id, false, refusal.reason());
@@ -3179,6 +3185,7 @@ impl NostrRelayDO {
     pub(crate) async fn supersession_authorised(
         &self,
         superseder: &str,
+        event_id: &str,
         case_id: &str,
         superseded_event_id: &str,
     ) -> std::result::Result<(), SupersessionRefusal> {
@@ -3187,7 +3194,7 @@ impl NostrRelayDO {
             .d1("DB")
             .map_err(|_| SupersessionRefusal::TargetMissing)?;
         let target = Self::load_superseded_decision(&db, superseded_event_id).await;
-        supersession_ingest_refusal(case_id, target.as_ref())?;
+        supersession_ingest_refusal(event_id, case_id, target.as_ref())?;
         let target = target.ok_or(SupersessionRefusal::TargetMissing)?;
 
         let original_rank = self.governance_rank(&target.broker_pubkey).await;
@@ -4194,6 +4201,27 @@ mod governance_projection_tests {
         );
     }
 
+    const EV: &str = "ev-new";
+
+    #[test]
+    fn redelivered_superseding_event_passes_ingest() {
+        let done = SupersededDecisionRow {
+            broker_pubkey: "human-bob".into(),
+            case_id: "case-1".into(),
+            superseded_by: Some(decision_id_for_event(EV)),
+        };
+        // The same signed event again: accepted, projection ignores the duplicate.
+        assert_eq!(
+            supersession_ingest_refusal(EV, "case-1", Some(&done)),
+            Ok(())
+        );
+        // A different event racing for the same target is still refused.
+        assert_eq!(
+            supersession_ingest_refusal("ev-other", "case-1", Some(&done)),
+            Err(SupersessionRefusal::TargetAlreadySuperseded)
+        );
+    }
+
     #[test]
     fn ingest_refuses_a_missing_foreign_or_spent_target() {
         let row = |case: &str, by: Option<&str>| SupersededDecisionRow {
@@ -4202,19 +4230,19 @@ mod governance_projection_tests {
             superseded_by: by.map(str::to_string),
         };
         assert_eq!(
-            supersession_ingest_refusal("case-1", None),
+            supersession_ingest_refusal(EV, "case-1", None),
             Err(SupersessionRefusal::TargetMissing)
         );
         assert_eq!(
-            supersession_ingest_refusal("case-1", Some(&row("case-2", None))),
+            supersession_ingest_refusal(EV, "case-1", Some(&row("case-2", None))),
             Err(SupersessionRefusal::CaseMismatch)
         );
         assert_eq!(
-            supersession_ingest_refusal("case-1", Some(&row("case-1", Some("dec-x")))),
+            supersession_ingest_refusal(EV, "case-1", Some(&row("case-1", Some("dec-x")))),
             Err(SupersessionRefusal::TargetAlreadySuperseded)
         );
         assert_eq!(
-            supersession_ingest_refusal("case-1", Some(&row("case-1", None))),
+            supersession_ingest_refusal(EV, "case-1", Some(&row("case-1", None))),
             Ok(())
         );
     }
