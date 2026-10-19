@@ -127,6 +127,8 @@ pub fn SettingsPage() -> impl IntoView {
     let profile_saving = RwSignal::new(false);
     // The member's full hydrated kind-0, so a save keeps fields Settings does not manage.
     let profile_base = RwSignal::new(ProfileHydration::Pending);
+    // Set when the kind-0 wait has run out; the state stays `Pending` regardless.
+    let profile_load_slow = RwSignal::new(false);
 
     // Real name (admin-only): loaded from + saved to the auth-worker D1 via
     // NIP-98 authed routes. NEVER published to kind-0 / the relay.
@@ -374,6 +376,7 @@ pub fn SettingsPage() -> impl IntoView {
         let birthday_sig = birthday;
         let auth_for_fetch = auth;
         let base_sig = profile_base;
+        let slow_sig = profile_load_slow;
 
         Effect::new(move |_| {
             if conn_state.get() != ConnectionState::Connected {
@@ -387,6 +390,7 @@ pub fn SettingsPage() -> impl IntoView {
             // A new subscription (first connect, reconnect, account switch)
             // starts unhydrated: never merge into another account's object.
             base_sig.set(ProfileHydration::Pending);
+            slow_sig.set(false);
             let pk_for_event = pk.clone();
             let on_event: Rc<dyn Fn(nostr_bbs_core::NostrEvent)> =
                 Rc::new(move |event: nostr_bbs_core::NostrEvent| {
@@ -452,14 +456,17 @@ pub fn SettingsPage() -> impl IntoView {
                 })),
             );
 
-            // Auto-unsubscribe after 5 seconds; a relay that never answered by
-            // then is treated as having no kind-0 so Save is not stuck disabled.
+            // After 5 seconds, unsubscribe if the relay has answered. A silent
+            // relay is NOT evidence that no profile exists, so the state stays
+            // `Pending` (Save stays disabled, a notice appears) and the
+            // subscription stays open: a late event or EOSE still resolves it.
             let relay_unsub = relay.clone();
             crate::utils::set_timeout_once(
                 move || {
-                    relay_unsub.unsubscribe(&sub_id);
                     if base_sig.get_untracked() == ProfileHydration::Pending {
-                        base_sig.set(ProfileHydration::NotFound);
+                        slow_sig.set(true);
+                    } else {
+                        relay_unsub.unsubscribe(&sub_id);
                     }
                 },
                 5_000,
@@ -959,6 +966,16 @@ pub fn SettingsPage() -> impl IntoView {
                             }
                         }}
                     </button>
+                    {move || {
+                        profile_base
+                            .get()
+                            .show_load_notice(profile_load_slow.get())
+                            .then(|| view! {
+                                <p class="text-xs text-amber-400">
+                                    "Profile not loaded yet. Check your connection."
+                                </p>
+                            })
+                    }}
 
                     // Real name (admin-only) — separate backend, separate save.
                     <div class="border-t border-gray-700/50 pt-4 mt-2 space-y-3">
@@ -1749,7 +1766,8 @@ enum ProfileHydration {
     Pending,
     /// The existing kind-0 object.
     Loaded(serde_json::Value),
-    /// The relay answered (or the wait timed out) with no kind-0.
+    /// The relay signalled end-of-stored-events without a kind-0. A timeout
+    /// never produces this: silence is not proof of absence.
     NotFound,
 }
 
@@ -1757,6 +1775,12 @@ impl ProfileHydration {
     /// Whether a save may proceed now.
     fn may_save(&self) -> bool {
         !matches!(self, ProfileHydration::Pending)
+    }
+
+    /// Whether to show "Profile not loaded yet": still waiting after the wait
+    /// has run out.
+    fn show_load_notice(&self, wait_elapsed: bool) -> bool {
+        wait_elapsed && !self.may_save()
     }
 
     /// The object to merge managed fields into: the loaded kind-0, or an empty
@@ -2084,6 +2108,11 @@ mod tests {
     fn saving_waits_for_the_kind0_reply() {
         assert!(!ProfileHydration::Pending.may_save());
         assert!(ProfileHydration::NotFound.may_save());
+        // a timeout leaves the state Pending: still no save, and the notice shows
+        assert!(!ProfileHydration::Pending.may_save());
+        assert!(ProfileHydration::Pending.show_load_notice(true));
+        assert!(!ProfileHydration::Pending.show_load_notice(false));
+        assert!(!ProfileHydration::NotFound.show_load_notice(true));
         assert!(ProfileHydration::Loaded(serde_json::json!({"lud16": "a@b"})).may_save());
         // NotFound merges into an empty object; Loaded keeps the fields
         assert_eq!(

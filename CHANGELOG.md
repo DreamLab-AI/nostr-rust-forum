@@ -11,7 +11,7 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 Settings rebuilt the replaceable kind-0 from only name, about, picture, birthday and nip05, so `lud16`, `lud06`, `banner`, `website`, the bot flag and anything set from another client vanished permanently on save. The hydrated kind-0 object is now kept and `merge_profile_fields` overwrites only the managed fields; an existing `nip05` is kept unless a username is claimed.
 
-Saving before the relay had answered still published without those fields, so Save, picture upload and picture remove are now disabled ("Loading profile…") until the kind-0 arrives, the relay signals end-of-stored-events with none, or the existing 5 s wait elapses; only then does a member with no kind-0 start from an empty object.
+Saving before the relay had answered still published without those fields, so Save, picture upload and picture remove are now disabled ("Loading profile…") until the kind-0 arrives or the relay signals end-of-stored-events with none; only then does a member with no kind-0 start from an empty object. A relay that stays silent for 5 s is not taken to mean there is no profile: Save stays disabled and "Profile not loaded yet. Check your connection." is shown until the relay answers.
 
 ### Fixed: DM relay list used the wrong tag (`nostr-bbs-forum-client`)
 
