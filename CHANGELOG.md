@@ -7,6 +7,13 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: kind-42 zone write and read gates resolved the channel from a decoy first `e` tag (`nostr-bbs-relay-worker`)
+
+The gates took the FIRST `e` tag as the channel while the client (and Web Push) place a message by its
+`root`-marked `e`. A member could name a channel they may write to, or an unscoped one, first and a
+zone-private channel as `root`: the relay authorised the decoy and every client rendered the post in the
+private thread. Both gates now use `filter::channel_tag` (root marker, else first `e`).
+
 ### Added: content-free Web Push alerts for replies, DMs and new messages (`nostr-bbs-relay-worker`, `nostr-bbs-forum-client`, `nostr-bbs-core`)
 
 An installed PWA can now be woken when it is closed. The relay sends an empty VAPID-signed push (RFC 8292,

@@ -257,6 +257,23 @@ pub fn event_matches_filters(event: &NostrEvent, filters: &[NostrFilter]) -> boo
 // Tag helpers
 // ---------------------------------------------------------------------------
 
+/// The channel a kind-42 message belongs to: its `root`-marked `e` tag, else the
+/// first `e` tag.
+///
+/// This is the same resolution the forum client uses to place a message in a
+/// channel. The write and read gates previously took the FIRST `e` tag, so a
+/// member could put a decoy first `e` naming a channel they may write to (or an
+/// unscoped one) and a `root` `e` naming a zone-private channel: the relay
+/// authorised the decoy while every client rendered the post in the private
+/// thread. All three must agree on one answer.
+pub fn channel_tag(event: &NostrEvent) -> Option<String> {
+    let e_tags = || event.tags.iter().filter(|t| t.len() >= 2 && t[0] == "e");
+    e_tags()
+        .find(|t| t.get(3).map(String::as_str) == Some("root"))
+        .or_else(|| e_tags().next())
+        .map(|t| t[1].clone())
+}
+
 /// Extract the first value for a given tag name from an event.
 #[doc(hidden)]
 pub fn tag_value(event: &NostrEvent, name: &str) -> Option<String> {
@@ -666,6 +683,59 @@ mod tests {
     }
 
     // ── tag_value ────────────────────────────────────────────────────────
+
+    #[test]
+    fn channel_tag_prefers_the_root_marker_over_a_decoy_first_e() {
+        let event = make_event(
+            "aaa",
+            "bbb",
+            42,
+            1000,
+            vec![
+                vec!["e".into(), "public-decoy".into()],
+                vec![
+                    "e".into(),
+                    "private-channel".into(),
+                    "".into(),
+                    "root".into(),
+                ],
+            ],
+            "hi",
+        );
+        assert_eq!(channel_tag(&event).as_deref(), Some("private-channel"));
+        // The old resolution would have authorised the decoy.
+        assert_eq!(tag_value(&event, "e").as_deref(), Some("public-decoy"));
+    }
+
+    #[test]
+    fn channel_tag_falls_back_to_the_first_e_without_a_root_marker() {
+        let event = make_event(
+            "a",
+            "b",
+            42,
+            1,
+            vec![
+                vec!["e".into(), "chan".into()],
+                vec!["e".into(), "other".into()],
+            ],
+            "x",
+        );
+        assert_eq!(channel_tag(&event).as_deref(), Some("chan"));
+        assert_eq!(channel_tag(&make_event("a", "b", 42, 1, vec![], "x")), None);
+        // A reply marker is not a root marker.
+        let reply_first = make_event(
+            "a",
+            "b",
+            42,
+            1,
+            vec![
+                vec!["e".into(), "parent".into(), "".into(), "reply".into()],
+                vec!["e".into(), "chan".into(), "".into(), "root".into()],
+            ],
+            "x",
+        );
+        assert_eq!(channel_tag(&reply_first).as_deref(), Some("chan"));
+    }
 
     #[test]
     fn tag_value_extracts_first_match() {

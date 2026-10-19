@@ -79,6 +79,9 @@ pub fn PushSettings() -> impl IntoView {
     // request may write its echo back, otherwise a slow earlier response lands
     // last and puts the old state on screen.
     let save_seq = StoredValue::new(0u64);
+    // Sequence of the newest save the server has confirmed, so a slow, older
+    // response can never replace the rollback baseline.
+    let confirmed_seq = StoredValue::new(0u64);
     let persist = move || {
         let Some(p) = prefs.get_untracked() else {
             return;
@@ -91,7 +94,10 @@ pub fn PushSettings() -> impl IntoView {
         leptos::task::spawn_local(async move {
             match push::save_prefs(signer.as_ref(), &p).await {
                 Ok(saved) => {
-                    confirmed.set(Some(saved.clone()));
+                    if confirmed_seq.try_get_value().is_some_and(|c| seq > c) {
+                        confirmed_seq.set_value(seq);
+                        confirmed.set(Some(saved.clone()));
+                    }
                     if save_seq.try_get_value() == Some(seq) {
                         prefs.set(Some(saved));
                     }

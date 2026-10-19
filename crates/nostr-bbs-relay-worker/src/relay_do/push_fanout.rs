@@ -78,6 +78,12 @@ impl NostrRelayDO {
                 .wants(*cat, channel.as_deref(), now)
         });
 
+        // Bound the per-candidate work BEFORE it starts. Each candidate costs a
+        // cohort lookup and a zone check (D1 on a cache miss), awaited serially on
+        // the single Durable Object, and the device cap below only trims jobs
+        // afterwards. Named recipients come first, so they are never crowded out.
+        candidates.truncate(push::max_fanout(&self.env));
+
         // Read gate for zone-scoped content. DMs are addressed by the wrap's
         // `p` tag and gated at ingress (ADR-2005), so they skip it.
         if matches!(event.kind, 40 | 42) {

@@ -1133,7 +1133,7 @@ impl NostrRelayDO {
 
         // Zone enforcement for channel messages (kind-42)
         if event.kind == 42 {
-            let Some(channel_id) = filter::tag_value(&event, "e") else {
+            let Some(channel_id) = filter::channel_tag(&event) else {
                 Self::send_ok(ws, &event.id, false, "invalid: missing channel tag");
                 return;
             };
@@ -2039,7 +2039,7 @@ impl NostrRelayDO {
         // kind-42 content (channel id == `e` tag).
         let channel_id: Option<String> = match event.kind {
             40 => Some(event.id.clone()),
-            42 => filter::tag_value(event, "e"),
+            42 => filter::channel_tag(event),
             _ => None,
         };
 
