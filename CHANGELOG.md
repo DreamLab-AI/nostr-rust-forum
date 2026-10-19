@@ -13,6 +13,8 @@ Settings rebuilt the replaceable kind-0 from only name, about, picture, birthday
 
 Saving before the relay had answered still published without those fields, so Save, picture upload and picture remove are now disabled ("Loading profile…") until the kind-0 arrives or the relay signals end-of-stored-events with none; only then does a member with no kind-0 start from an empty object. A relay that stays silent for 5 s is not taken to mean there is no profile: Save stays disabled and "Profile not loaded yet. Check your connection." is shown until the relay answers.
 
+Each kind-0 subscription now carries a generation, so after an account switch the previous account's event, end-of-stored-events or timer can no longer fill the form or flip the state; previously the first account's `lud16` and `banner` could be re-signed under the second. An unclaimed save also drops a stale `nip05` on our own host (no longer backed by the host's `nostr.json`), keeping any foreign-host value.
+
 ### Fixed: DM relay list used the wrong tag (`nostr-bbs-forum-client`)
 
 The kind-10050 event was published with `["r", url]`; NIP-17 reads `["relay", url]`, as the BBS client already emits. The tag name is now pinned by a test.

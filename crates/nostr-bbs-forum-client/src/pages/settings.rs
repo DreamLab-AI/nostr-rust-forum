@@ -129,6 +129,8 @@ pub fn SettingsPage() -> impl IntoView {
     let profile_base = RwSignal::new(ProfileHydration::Pending);
     // Set when the kind-0 wait has run out; the state stays `Pending` regardless.
     let profile_load_slow = RwSignal::new(false);
+    // Bumped on every kind-0 subscription; callbacks of an earlier one go inert.
+    let profile_gen = RwSignal::new(0u64);
 
     // Real name (admin-only): loaded from + saved to the auth-worker D1 via
     // NIP-98 authed routes. NEVER published to kind-0 / the relay.
@@ -377,6 +379,7 @@ pub fn SettingsPage() -> impl IntoView {
         let auth_for_fetch = auth;
         let base_sig = profile_base;
         let slow_sig = profile_load_slow;
+        let gen_sig = profile_gen;
 
         Effect::new(move |_| {
             if conn_state.get() != ConnectionState::Connected {
@@ -389,12 +392,20 @@ pub fn SettingsPage() -> impl IntoView {
 
             // A new subscription (first connect, reconnect, account switch)
             // starts unhydrated: never merge into another account's object.
+            // Callbacks capture this generation and ignore everything once a
+            // newer subscription exists, so the previous account's event, EOSE
+            // or timer can never touch this account's state.
+            let my_gen = gen_sig.get_untracked() + 1;
+            gen_sig.set(my_gen);
             base_sig.set(ProfileHydration::Pending);
             slow_sig.set(false);
             let pk_for_event = pk.clone();
             let on_event: Rc<dyn Fn(nostr_bbs_core::NostrEvent)> =
                 Rc::new(move |event: nostr_bbs_core::NostrEvent| {
-                    if event.kind != 0 || !kind0_is_for(&event.pubkey, &pk_for_event) {
+                    if !generation_current(my_gen, gen_sig.get_untracked())
+                        || event.kind != 0
+                        || !kind0_is_for(&event.pubkey, &pk_for_event)
+                    {
                         return;
                     }
                     if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&event.content) {
@@ -450,7 +461,9 @@ pub fn SettingsPage() -> impl IntoView {
                 on_event,
                 // EOSE with no kind-0 means the member has none yet.
                 Some(Rc::new(move || {
-                    if base_sig.get_untracked() == ProfileHydration::Pending {
+                    if generation_current(my_gen, gen_sig.get_untracked())
+                        && base_sig.get_untracked() == ProfileHydration::Pending
+                    {
                         base_sig.set(ProfileHydration::NotFound);
                     }
                 })),
@@ -463,7 +476,10 @@ pub fn SettingsPage() -> impl IntoView {
             let relay_unsub = relay.clone();
             crate::utils::set_timeout_once(
                 move || {
-                    if base_sig.get_untracked() == ProfileHydration::Pending {
+                    if !generation_current(my_gen, gen_sig.get_untracked()) {
+                        // Superseded: drop only our own subscription.
+                        relay_unsub.unsubscribe(&sub_id);
+                    } else if base_sig.get_untracked() == ProfileHydration::Pending {
                         slow_sig.set(true);
                     } else {
                         relay_unsub.unsubscribe(&sub_id);
@@ -1793,6 +1809,12 @@ impl ProfileHydration {
     }
 }
 
+/// Whether a callback created for subscription `captured` may still act, i.e.
+/// no newer kind-0 subscription (reconnect, account switch) has superseded it.
+fn generation_current(captured: u64, current: u64) -> bool {
+    captured == current
+}
+
 /// The kind-0 fields the Settings page owns.
 struct ManagedFields<'a> {
     display_name: &'a str,
@@ -1807,8 +1829,9 @@ struct ManagedFields<'a> {
 /// Kind-0 is replaceable, so anything absent from the published event is lost
 /// for good. Starting from the full hydrated object keeps every field Settings
 /// does not manage (`lud16`, `banner`, `website`, fields set from other
-/// clients). `display_name` and `name` are always written; `nip05` only when a
-/// username is claimed (otherwise any existing value is kept). `about`,
+/// clients). `display_name` and `name` are always written; `nip05` is set when
+/// a username is claimed, and otherwise removed only if it is an unclaimed
+/// handle on our own host (a foreign-host value is kept). `about`,
 /// `picture` and `birthday` are removed when empty, which is how clearing them
 /// works. A non-object `existing` is treated as no prior kind-0.
 fn merge_profile_fields(
@@ -1837,6 +1860,17 @@ fn merge_profile_fields(
                 "name".into(),
                 Value::String(managed.display_name.to_string()),
             );
+            // A handle on our own host that is no longer claimed is not backed
+            // by the host's nostr.json (or belongs to a new holder): drop it.
+            // A handle on any other host is not ours to touch.
+            let own_suffix = format!("@{}", NIP05_USERNAME_HOST).to_ascii_lowercase();
+            let stale_own = obj
+                .get("nip05")
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.to_ascii_lowercase().ends_with(&own_suffix));
+            if stale_own {
+                obj.remove("nip05");
+            }
         }
     }
     for (key, value) in [
@@ -2144,14 +2178,28 @@ mod tests {
     fn empty_managed_optionals_are_dropped_not_written() {
         let existing = serde_json::json!({
             "about": "bio", "picture": "https://x/p.png", "birthday": "1990-01-01",
-            "nip05": "other@elsewhere.example"
+            "nip05": format!("released@{}", NIP05_USERNAME_HOST.to_uppercase())
         });
         let out = merge_profile_fields(existing, managed("N", ""));
         assert!(out.get("about").is_none());
         assert!(out.get("picture").is_none());
         assert!(out.get("birthday").is_none());
-        // no claim: an existing nip05 is not Settings' to remove
-        assert_eq!(out["nip05"], "other@elsewhere.example");
+        // no claim: a stale handle on our own host is dropped (any case)
+        assert!(out.get("nip05").is_none());
+    }
+
+    #[test]
+    fn foreign_host_nip05_survives_an_unclaimed_save() {
+        let existing = serde_json::json!({ "nip05": "me@elsewhere.example" });
+        let out = merge_profile_fields(existing, managed("N", ""));
+        assert_eq!(out["nip05"], "me@elsewhere.example");
+    }
+
+    #[test]
+    fn superseded_subscription_callbacks_are_inert() {
+        // event, EOSE and timer all gate on the same decision
+        assert!(generation_current(3, 3));
+        assert!(!generation_current(2, 3), "stale event/EOSE/timer ignored");
     }
 
     #[test]
