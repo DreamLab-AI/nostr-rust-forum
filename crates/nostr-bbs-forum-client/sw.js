@@ -7,8 +7,12 @@
 ///     the network (not the browser HTTP cache) on every load. A stale shell
 ///     pins a stale build hash and a stale bundle pointer across reloads.
 ///   * Content-hashed static assets (wasm/js/css/img/font) -> CACHE-FIRST.
-///     Trunk fingerprints these (`name-<hash>.ext`), so a new build emits a new
-///     URL; cache-first on an immutable URL is safe and fast.
+///     Trunk fingerprints these (`name-<16 hex>.ext`, the wasm as `name-<16 hex>_bg.wasm`, and wasm-bindgen
+///     snippets under `snippets/`), so a new build emits a new URL; cache-first
+///     on an immutable URL is safe and fast.
+///   * Other static files (Trunk `copy-file` / `copy-dir` output such as
+///     `icons/`, which keeps a stable URL) -> NETWORK-FIRST, cache fallback, so
+///     a changed icon is never pinned behind a stale cache entry.
 ///   * Everything else (API, WS upgrades) -> NETWORK-ONLY.
 ///
 /// The cache name embeds a build token so each deploy gets a fresh cache and
@@ -23,6 +27,17 @@ const CACHE_VERSION =
 const CACHE_NAME = `nostr-bbs-forum-${CACHE_VERSION}`;
 
 const STATIC_ASSETS = ['./', './index.html'];
+
+// Trunk fingerprints bundle output as `name-<16 hex digits>.ext` (`_bg.wasm`
+// for the wasm binary); wasm-bindgen
+// JS snippets live under `snippets/` and are content-addressed by their path.
+// Anything else static keeps a stable URL, so it must not be served cache-first.
+const STATIC_EXT = /\.(wasm|js|css|png|jpg|jpeg|svg|ico|webp|woff2?)$/;
+const FINGERPRINTED = /-[0-9a-f]{16}(_bg)?\./;
+
+function isContentHashed(pathname) {
+  return FINGERPRINTED.test(pathname) || pathname.includes('/snippets/');
+}
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -120,8 +135,38 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // Network-first (cache fallback) for static files with a stable URL: they can
+  // change between deploys without their URL changing.
+  if (STATIC_EXT.test(url.pathname) && !isContentHashed(url.pathname)) {
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          if (response.ok) {
+            const clone = response.clone();
+            caches
+              .open(CACHE_NAME)
+              .then((cache) => cache.put(event.request, clone));
+          }
+          return response;
+        })
+        .catch(() =>
+          caches
+            .match(event.request)
+            .then(
+              (cached) =>
+                cached ||
+                new Response('Offline', {
+                  status: 503,
+                  statusText: 'Offline',
+                })
+            )
+        )
+    );
+    return;
+  }
+
   // Cache-first for immutable, content-hashed static assets.
-  if (url.pathname.match(/\.(wasm|js|css|png|jpg|jpeg|svg|ico|webp|woff2?)$/)) {
+  if (STATIC_EXT.test(url.pathname)) {
     event.respondWith(
       caches.match(event.request).then(
         (cached) =>

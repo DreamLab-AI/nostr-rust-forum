@@ -72,6 +72,52 @@ and rolls the timestamp back if the send fails. Gift-wrap senders are not allowl
 rolling hourly DM wake-up budget (default 30, `PUSH_DM_HOURLY_BUDGET`); over-budget DMs still count in the app but
 do not wake it, and the cron flush skips a device held only by a spent budget until its window resets. Adds two `push_subscriptions` columns (migration 0010 and `ensure_schema`).
 
+### Fixed: saving the profile deleted every kind-0 field Settings does not manage (`nostr-bbs-forum-client`)
+
+Settings rebuilt the replaceable kind-0 from only name, about, picture, birthday and nip05, so `lud16`, `lud06`, `banner`, `website`, the bot flag and anything set from another client vanished permanently on save. The hydrated kind-0 object is now kept and `merge_profile_fields` overwrites only the managed fields; an existing `nip05` is kept unless a username is claimed.
+
+Saving before the relay had answered still published without those fields, so Save, picture upload and picture remove are now disabled ("Loading profile…") until the kind-0 arrives or the relay signals end-of-stored-events with none; only then does a member with no kind-0 start from an empty object. A relay that stays silent for 5 s is not taken to mean there is no profile: Save stays disabled and "Profile not loaded yet. Check your connection." is shown until the relay answers.
+
+Each kind-0 subscription now carries a generation, so after an account switch the previous account's event, end-of-stored-events or timer can no longer fill the form or flip the state; previously the first account's `lud16` and `banner` could be re-signed under the second. An unclaimed save also drops a stale `nip05` on our own host (no longer backed by the host's `nostr.json`), keeping any foreign-host value.
+
+Settings used its own `example.test` placeholder for the NIP-05 host, so every claimed save published `name@example.test` and the stale-handle check never matched in a configured build. It now imports the onboarding modal's `NOSTR_BBS_NIP05_DOMAIN`-derived constant. The kind-0 subscription is also closed as soon as it is answered or superseded, instead of staying open on a slow relay and counting against the relay's per-session subscription cap.
+
+Leaving Settings while the profile was still loading could panic the app: the 5 s timer read signals the unmounted page had disposed, and the kind-0 subscription was never closed. The timer and relay callbacks now use `try_` accessors and return once the page is gone, and an `on_cleanup` closes the subscription on re-run and on unmount.
+
+### Fixed: DM relay list used the wrong tag (`nostr-bbs-forum-client`)
+
+The kind-10050 event was published with `["r", url]`; NIP-17 reads `["relay", url]`, as the BBS client already emits. The tag name is now pinned by a test.
+
+### Fixed: Export Private Key panicked for NIP-07 sessions (`nostr-bbs-forum-client`)
+
+The click handler called `use_toasts()` inside a DOM event, where `expect_context` panics (bug #32). It now reuses the handle bound at component setup.
+
+### Fixed: SVG avatars were accepted (`nostr-bbs-forum-client`)
+
+The pod serves stored bytes with their declared type, so an SVG carrying a script was a stored XSS when opened directly. Avatar uploads now accept only PNG, JPEG, WebP and GIF; SVG is refused with "SVG avatars are not supported". Post-media uploads are unchanged.
+
+### Fixed: Profile hydration trusted any signed kind-0 (`nostr-bbs-forum-client`)
+
+A relay could answer the settings page's own-profile query with another author's event and seed fields the member would then re-sign. Events whose `pubkey` differs from the requested one are now ignored.
+
+### Fixed: Notifications leaked between accounts on a shared browser (`nostr-bbs-forum-client`)
+
+The visible list lived under one global key and survived logout. It is now stored per owner pubkey (like the sync state), reloaded when the account changes, and deleted on logout together with the anonymous list and the retired global key. The cross-tab `storage` handler matches the new key shape.
+
+### Fixed: Level-gated notifications were burned and dedup eviction was not FIFO (`nostr-bbs-forum-client`)
+
+A post or DM the notification level rejected was still recorded as seen, so loosening the level never announced it; it is now left unburned. The seen-id cap evicted an arbitrary element despite documenting FIFO; it is now an insertion-ordered set that evicts the oldest.
+
+### Fixed: DM store: inflated unread badge, mixed-case keys, sender-controlled time (`nostr-bbs-forum-client`)
+
+A re-streamed event bumped the unread count and rewrote the preview; only a first-seen message now updates the summary. Pubkeys are lowercased at ingestion and compared exactly, and a rumor's `created_at` is clamped to now.
+
+### Fixed: Service worker cached stable-URL assets cache-first (`nostr-bbs-forum-client`)
+
+Trunk `copy-file` / `copy-dir` assets such as `icons/` keep stable URLs but were served cache-first, pinning stale copies. Only fingerprinted (`-<16 hex>.`) or `snippets/` files are cache-first now; other static files are network-first with a cache fallback.
+
+The fingerprint pattern also accepts the wasm binary's `-<16 hex>_bg.wasm` name, so the app's largest asset still loads offline.
+
 ### Fixed: live broadcast leaked protected kinds to kinds-less subscriptions (`nostr-bbs-relay-worker`)
 
 REQ and COUNT decide protected reads from the kinds a filter names, so `{}` or `{"#p":[...]}` passed both gates

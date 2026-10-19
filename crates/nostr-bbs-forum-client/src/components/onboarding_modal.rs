@@ -56,7 +56,7 @@ use crate::utils::relay_url::auth_api_base;
 /// `NOSTR_BBS_NIP05_DOMAIN`; placeholder only for un-configured local builds.
 /// Retained for the dormant `nip05_for` / `username_from_nip05` helpers and the
 /// kind-0 probe — never surfaced in the modal UI any more.
-const NIP05_HOST: &str = match option_env!("NOSTR_BBS_NIP05_DOMAIN") {
+pub(crate) const NIP05_HOST: &str = match option_env!("NOSTR_BBS_NIP05_DOMAIN") {
     Some(d) => d,
     None => "example.test",
 };

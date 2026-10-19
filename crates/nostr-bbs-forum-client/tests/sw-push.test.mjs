@@ -23,6 +23,7 @@ function makeWorker({ cfg, drain, windows = [] }) {
   const fetched = [];
   const focused = [];
   const navigated = [];
+  const stored = new Map(); // Cache API stand-in, keyed by request URL
 
   const fakeIdb = {
     open() {
@@ -71,12 +72,21 @@ function makeWorker({ cfg, drain, windows = [] }) {
     fetch: async (url, init) => {
       fetched.push({ url, init });
       if (drain === 'network-error') throw new Error('offline');
-      return { ok: drain !== null, json: async () => drain };
+      return { ok: drain !== null, json: async () => drain, clone() { return this; }, from: 'network' };
     },
     URL,
     JSON,
     Promise,
-    caches: { open: async () => ({}), keys: async () => [], match: async () => undefined },
+    Response: class {
+      constructor(body, init) {
+        Object.assign(this, { body }, init);
+      }
+    },
+    caches: {
+      open: async () => ({ put: async (req, res) => stored.set(req.url, res) }),
+      keys: async () => [],
+      match: async (req) => stored.get(typeof req === 'string' ? req : req.url),
+    },
     console,
     queueMicrotask,
   };
@@ -88,7 +98,19 @@ function makeWorker({ cfg, drain, windows = [] }) {
     listeners[type]({ ...event, waitUntil: (p) => (pending = p) });
     await pending;
   };
-  return { fire, shown, opened, fetched, focused, navigated };
+  /** Fire a same-origin GET `fetch` event; resolves to what respondWith got
+   *  (`undefined` when the worker declined to handle it). */
+  const fetchEvent = async (pathname, mode = 'no-cors') => {
+    let responded;
+    listeners.fetch({
+      request: { method: 'GET', url: 'https://forum.example' + pathname, mode },
+      respondWith: (p) => (responded = Promise.resolve(p)),
+    });
+    const res = responded && (await responded);
+    await new Promise((r) => setTimeout(r)); // let the fire-and-forget cache.put land
+    return res;
+  };
+  return { fire, fetchEvent, stored, shown, opened, fetched, focused, navigated };
 }
 
 const CFG = { api: 'https://relay.example', id: 'sub1', token: 'tok', brand: 'DreamLab' };
@@ -217,4 +239,51 @@ test('clicking never focuses the BBS window or one outside the scope', async () 
   await w.fire('notificationclick', { notification: { close() {}, data: { url: 'dm' } } });
   assert.deepEqual(log, []);
   assert.deepEqual(w.opened, ['https://forum.example/community/dm']);
+});
+
+// Real Trunk output names (from a `trunk build` dist listing).
+const WASM = '/community/nostr-bbs-forum-client-fe2d3df96da40e55_bg.wasm';
+const BUNDLE_JS = '/community/nostr-bbs-forum-client-fe2d3df96da40e55.js';
+const SNIPPET = '/community/snippets/nostr-bbs-forum-client-0123456789abcdef/js/push.js';
+const ICON = '/community/icons/icon-192.png';
+
+test('fingerprinted and snippet assets are served cache-first', async () => {
+  for (const p of [WASM, BUNDLE_JS, SNIPPET]) {
+    const w = makeWorker({ cfg: CFG, drain: {} });
+    w.stored.set('https://forum.example' + p, { from: 'cache' });
+    const res = await w.fetchEvent(p);
+    assert.equal(res.from, 'cache', p);
+    assert.equal(w.fetched.length, 0, 'no network round trip on a hit');
+  }
+  // a miss goes to the network and is stored
+  const w = makeWorker({ cfg: CFG, drain: {} });
+  const p = '/community/app-0123456789abcdef.css';
+  const res = await w.fetchEvent(p);
+  assert.equal(res.from, 'network');
+  assert.ok(w.stored.has('https://forum.example' + p));
+});
+
+test('stable-URL static files are network-first with a cache fallback', async () => {
+  // online: the network wins even though a stale copy is cached
+  const w = makeWorker({ cfg: CFG, drain: {} });
+  w.stored.set('https://forum.example' + ICON, { from: 'cache' });
+  const fresh = await w.fetchEvent(ICON);
+  assert.equal(fresh.from, 'network');
+  assert.equal(w.stored.get('https://forum.example' + ICON).from, 'network', 'cache refreshed');
+
+  // offline: falls back to the cached copy, else a 503
+  const off = makeWorker({ cfg: CFG, drain: 'network-error' });
+  off.stored.set('https://forum.example' + ICON, { from: 'cache' });
+  assert.equal((await off.fetchEvent(ICON)).from, 'cache');
+  const cold = makeWorker({ cfg: CFG, drain: 'network-error' });
+  assert.equal((await cold.fetchEvent(ICON)).status, 503);
+});
+
+test('the shell documents are never cache-first', async () => {
+  for (const p of ['/community/index.html', '/community/sw.js', '/community/manifest.webmanifest']) {
+    const w = makeWorker({ cfg: CFG, drain: {} });
+    w.stored.set('https://forum.example' + p, { from: 'cache' });
+    const res = await w.fetchEvent(p);
+    assert.equal(res.from, 'network', p);
+  }
 });

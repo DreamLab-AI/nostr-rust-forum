@@ -28,8 +28,11 @@ use crate::utils::pod_client::upload_to_pod_signer;
 use crate::utils::relay_url::auth_api_base;
 use crate::utils::shorten_pubkey;
 
-/// NIP-05 host that backs claimed usernames (mirrors onboarding_modal::NIP05_HOST).
-const NIP05_USERNAME_HOST: &str = "example.test";
+/// NIP-05 host that backs claimed usernames. The SAME constant the onboarding
+/// modal bakes from `NOSTR_BBS_NIP05_DOMAIN`, imported so the two cannot drift
+/// (a local placeholder here once published `alice@example.test` for every
+/// claimed save).
+use crate::components::onboarding_modal::NIP05_HOST as NIP05_USERNAME_HOST;
 
 /// Pod API base URL — same source-of-truth as `pages::pod_browser` and
 /// `utils::pod_client`. Surfaces the `[pod].base_url` operator-config
@@ -125,6 +128,12 @@ pub fn SettingsPage() -> impl IntoView {
     let avatar_url = RwSignal::new(String::new());
     let birthday = RwSignal::new(String::new()); // "MM-DD" format
     let profile_saving = RwSignal::new(false);
+    // The member's full hydrated kind-0, so a save keeps fields Settings does not manage.
+    let profile_base = RwSignal::new(ProfileHydration::Pending);
+    // Set when the kind-0 wait has run out; the state stays `Pending` regardless.
+    let profile_load_slow = RwSignal::new(false);
+    // Bumped on every kind-0 subscription; callbacks of an earlier one go inert.
+    let profile_gen = RwSignal::new(0u64);
 
     // Real name (admin-only): loaded from + saved to the auth-worker D1 via
     // NIP-98 authed routes. NEVER published to kind-0 / the relay.
@@ -371,6 +380,9 @@ pub fn SettingsPage() -> impl IntoView {
         let avatar_sig = avatar_url;
         let birthday_sig = birthday;
         let auth_for_fetch = auth;
+        let base_sig = profile_base;
+        let slow_sig = profile_load_slow;
+        let gen_sig = profile_gen;
 
         Effect::new(move |_| {
             if conn_state.get() != ConnectionState::Connected {
@@ -381,13 +393,30 @@ pub fn SettingsPage() -> impl IntoView {
                 None => return,
             };
 
+            // A new subscription (first connect, reconnect, account switch)
+            // starts unhydrated: never merge into another account's object.
+            // Callbacks capture this generation and ignore everything once a
+            // newer subscription exists, so the previous account's event, EOSE
+            // or timer can never touch this account's state.
+            let my_gen = gen_sig.get_untracked() + 1;
+            gen_sig.set(my_gen);
+            base_sig.set(ProfileHydration::Pending);
+            slow_sig.set(false);
             let pk_for_event = pk.clone();
             let on_event: Rc<dyn Fn(nostr_bbs_core::NostrEvent)> =
                 Rc::new(move |event: nostr_bbs_core::NostrEvent| {
-                    if event.kind != 0 {
+                    if !generation_current(my_gen, gen_sig.try_get_untracked())
+                        || event.kind != 0
+                        || !kind0_is_for(&event.pubkey, &pk_for_event)
+                    {
                         return;
                     }
                     if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&event.content) {
+                        // Keep the whole object so a save preserves fields
+                        // Settings does not manage (see `merge_profile_fields`).
+                        if obj.is_object() {
+                            base_sig.set(ProfileHydration::Loaded(obj.clone()));
+                        }
                         // The nickname is the DISPLAY name — prefer
                         // `display_name`, falling back to `name` for events
                         // published before the username/nickname split.
@@ -433,14 +462,36 @@ pub fn SettingsPage() -> impl IntoView {
                     ..Default::default()
                 }],
                 on_event,
-                None,
+                // EOSE with no kind-0 means the member has none yet.
+                Some(Rc::new(move || {
+                    if generation_current(my_gen, gen_sig.try_get_untracked())
+                        && base_sig.try_get_untracked() == Some(ProfileHydration::Pending)
+                    {
+                        base_sig.set(ProfileHydration::NotFound);
+                    }
+                })),
             );
 
-            // Auto-unsubscribe after 5 seconds
-            let relay_unsub = relay.clone();
+            // Closes the subscription when this effect re-runs (reconnect, account
+            // switch) AND when the page unmounts, so it never lingers to be
+            // replayed on reconnect against the relay's per-session cap.
+            let relay_cleanup = relay.clone();
+            on_cleanup(move || relay_cleanup.unsubscribe(&sub_id));
+
+            // After 5 seconds, flag a slow relay. Silence is NOT evidence that no
+            // profile exists, so the state stays `Pending` (Save stays disabled,
+            // a notice appears) and the subscription stays open: a late event or
+            // EOSE still resolves it. The timer can outlive the page, whose
+            // signals are then disposed (reading one panics), so it only acts
+            // while its handles are alive and its generation current — the same
+            // guard `pages/admin.rs` applies to its auto-dismiss timer.
             crate::utils::set_timeout_once(
                 move || {
-                    relay_unsub.unsubscribe(&sub_id);
+                    if generation_current(my_gen, gen_sig.try_get_untracked())
+                        && base_sig.try_get_untracked() == Some(ProfileHydration::Pending)
+                    {
+                        let _ = slow_sig.try_set(true);
+                    }
                 },
                 5_000,
             );
@@ -510,6 +561,9 @@ pub fn SettingsPage() -> impl IntoView {
     let toasts_for_profile = toasts;
     let relay_for_save = relay.clone();
     let on_save_profile = move |_| {
+        if !profile_base.get_untracked().may_save() {
+            return;
+        }
         let name = nickname.get_untracked().trim().to_string();
         if name.is_empty() {
             toasts_for_profile.show("Nickname cannot be empty", ToastVariant::Warning);
@@ -525,6 +579,7 @@ pub fn SettingsPage() -> impl IntoView {
             about.get_untracked().trim().to_string(),
             avatar_url.get_untracked().trim().to_string(),
             birthday.get_untracked().trim().to_string(),
+            profile_base.get_untracked().into_base(),
             "Profile updated",
         );
     };
@@ -542,6 +597,10 @@ pub fn SettingsPage() -> impl IntoView {
         let Some(file) = input.files().and_then(|fl| fl.get(0)) else {
             return;
         };
+        if !profile_base.get_untracked().may_save() {
+            input.set_value("");
+            return;
+        }
         // NB: do NOT reset the input value yet. Clearing it before the blob
         // bytes are read can invalidate the selected File in some browsers
         // (observed `NotFoundError` on read). We reset only in early returns
@@ -552,6 +611,20 @@ pub fn SettingsPage() -> impl IntoView {
             input.set_value("");
             toasts_for_pic.show(
                 "Image too large — maximum size is 2 MB",
+                ToastVariant::Warning,
+            );
+            return;
+        }
+        let mime = file.type_();
+        if mime == "image/svg+xml" {
+            input.set_value("");
+            toasts_for_pic.show("SVG avatars are not supported", ToastVariant::Warning);
+            return;
+        }
+        if !avatar_type_allowed(&mime) {
+            input.set_value("");
+            toasts_for_pic.show(
+                "Unsupported image type — use PNG, JPEG, WebP or GIF",
                 ToastVariant::Warning,
             );
             return;
@@ -572,6 +645,7 @@ pub fn SettingsPage() -> impl IntoView {
         let claimed = claimed_username.get_untracked();
         let bio = about.get_untracked().trim().to_string();
         let bday = birthday.get_untracked().trim().to_string();
+        let base = profile_base.get_untracked().into_base();
         let input_reset = input.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let filename = avatar_filename(&file.type_());
@@ -608,6 +682,7 @@ pub fn SettingsPage() -> impl IntoView {
                         bio,
                         url,
                         bday,
+                        base,
                         "Profile picture updated",
                     );
                 }
@@ -626,6 +701,9 @@ pub fn SettingsPage() -> impl IntoView {
     let toasts_for_pic_remove = toasts;
     let relay_for_pic_remove = relay.clone();
     let on_remove_picture = move |_: leptos::ev::MouseEvent| {
+        if !profile_base.get_untracked().may_save() {
+            return;
+        }
         avatar_url.set(String::new());
         publish_profile_metadata(
             auth,
@@ -637,6 +715,7 @@ pub fn SettingsPage() -> impl IntoView {
             about.get_untracked().trim().to_string(),
             String::new(),
             birthday.get_untracked().trim().to_string(),
+            profile_base.get_untracked().into_base(),
             "Profile picture removed",
         );
     };
@@ -848,6 +927,7 @@ pub fn SettingsPage() -> impl IntoView {
                                         />
                                         <button
                                             on:click=on_remove
+                                            disabled=move || !profile_base.get().may_save()
                                             class="text-xs text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded px-2 py-1 transition-colors"
                                         >
                                             "Remove"
@@ -859,7 +939,7 @@ pub fn SettingsPage() -> impl IntoView {
                                 type="file"
                                 accept="image/*"
                                 on:change=on_pic_file
-                                disabled=move || pic_uploading.get()
+                                disabled=move || pic_uploading.get() || !profile_base.get().may_save()
                                 class="block w-full text-sm text-gray-400 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-amber-500 file:text-gray-900 hover:file:bg-amber-400 file:cursor-pointer disabled:opacity-50"
                             />
                             <p class="text-xs text-gray-500">
@@ -897,11 +977,29 @@ pub fn SettingsPage() -> impl IntoView {
 
                     <button
                         on:click=on_save_profile
-                        disabled=move || profile_saving.get()
+                        disabled=move || profile_saving.get() || !profile_base.get().may_save()
                         class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors text-sm flex items-center gap-1.5"
                     >
-                        {move || if profile_saving.get() { "Saving..." } else { "Save Profile" }}
+                        {move || {
+                            if !profile_base.get().may_save() {
+                                "Loading profile…"
+                            } else if profile_saving.get() {
+                                "Saving..."
+                            } else {
+                                "Save Profile"
+                            }
+                        }}
                     </button>
+                    {move || {
+                        profile_base
+                            .get()
+                            .show_load_notice(profile_load_slow.get())
+                            .then(|| view! {
+                                <p class="text-xs text-amber-400">
+                                    "Profile not loaded yet. Check your connection."
+                                </p>
+                            })
+                    }}
 
                     // Real name (admin-only) — separate backend, separate save.
                     <div class="border-t border-gray-700/50 pt-4 mt-2 space-y-3">
@@ -1566,7 +1664,8 @@ pub fn SettingsPage() -> impl IntoView {
                             on:click=move |_| {
                                 if auth.get().is_nip07 {
                                     // Show toast immediately for NIP-07 — no confirmation dialog needed
-                                    let toasts = use_toasts();
+                                    // Reuse the handle bound at component setup:
+                                    // expect_context panics in a DOM handler (#32).
                                     toasts.show(
                                         "Private key export is not available with NIP-07 browser extensions. Your key is managed by the extension.",
                                         ToastVariant::Warning,
@@ -1681,6 +1780,123 @@ fn spawn_local_release(
 /// it keeps owning the `name` + `nip05` fields; username changes go
 /// through the explicit, validated claim flow.
 ///
+/// Whether the member's existing kind-0 has been fetched yet.
+///
+/// Saving before it has would publish a kind-0 without the fields Settings does
+/// not manage and so delete them from the relay (kind-0 is replaceable).
+#[derive(Clone, Debug, PartialEq)]
+enum ProfileHydration {
+    /// The relay has not answered yet.
+    Pending,
+    /// The existing kind-0 object.
+    Loaded(serde_json::Value),
+    /// The relay signalled end-of-stored-events without a kind-0. A timeout
+    /// never produces this: silence is not proof of absence.
+    NotFound,
+}
+
+impl ProfileHydration {
+    /// Whether a save may proceed now.
+    fn may_save(&self) -> bool {
+        !matches!(self, ProfileHydration::Pending)
+    }
+
+    /// Whether to show "Profile not loaded yet": still waiting after the wait
+    /// has run out.
+    fn show_load_notice(&self, wait_elapsed: bool) -> bool {
+        wait_elapsed && !self.may_save()
+    }
+
+    /// The object to merge managed fields into: the loaded kind-0, or an empty
+    /// object when none exists.
+    fn into_base(self) -> serde_json::Value {
+        match self {
+            ProfileHydration::Loaded(v) => v,
+            _ => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
+
+/// Whether a callback created for subscription `captured` may still act:
+/// `current` is the live generation, or `None` once the page has unmounted and
+/// its signals are disposed. A newer subscription (reconnect, account switch)
+/// supersedes it.
+fn generation_current(captured: u64, current: Option<u64>) -> bool {
+    current == Some(captured)
+}
+
+/// The kind-0 fields the Settings page owns.
+struct ManagedFields<'a> {
+    display_name: &'a str,
+    claimed: Option<&'a str>,
+    about: &'a str,
+    picture: &'a str,
+    birthday: &'a str,
+}
+
+/// Merge the Settings-managed fields into the member's existing kind-0 object.
+///
+/// Kind-0 is replaceable, so anything absent from the published event is lost
+/// for good. Starting from the full hydrated object keeps every field Settings
+/// does not manage (`lud16`, `banner`, `website`, fields set from other
+/// clients). `display_name` and `name` are always written; `nip05` is set when
+/// a username is claimed, and otherwise removed only if it is an unclaimed
+/// handle on our own host (a foreign-host value is kept). `about`,
+/// `picture` and `birthday` are removed when empty, which is how clearing them
+/// works. A non-object `existing` is treated as no prior kind-0.
+fn merge_profile_fields(
+    existing: serde_json::Value,
+    managed: ManagedFields<'_>,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let mut obj = match existing {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert(
+        "display_name".into(),
+        Value::String(managed.display_name.to_string()),
+    );
+    match managed.claimed {
+        Some(username) => {
+            obj.insert("name".into(), Value::String(username.to_string()));
+            obj.insert(
+                "nip05".into(),
+                Value::String(format!("{}@{}", username, NIP05_USERNAME_HOST)),
+            );
+        }
+        None => {
+            obj.insert(
+                "name".into(),
+                Value::String(managed.display_name.to_string()),
+            );
+            // A handle on our own host that is no longer claimed is not backed
+            // by the host's nostr.json (or belongs to a new holder): drop it.
+            // A handle on any other host is not ours to touch.
+            let own_suffix = format!("@{}", NIP05_USERNAME_HOST).to_ascii_lowercase();
+            let stale_own = obj
+                .get("nip05")
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.to_ascii_lowercase().ends_with(&own_suffix));
+            if stale_own {
+                obj.remove("nip05");
+            }
+        }
+    }
+    for (key, value) in [
+        ("about", managed.about),
+        ("picture", managed.picture),
+        ("birthday", managed.birthday),
+    ] {
+        if value.is_empty() {
+            obj.remove(key);
+        } else {
+            obj.insert(key.into(), Value::String(value.to_string()));
+        }
+    }
+    Value::Object(obj)
+}
+
 /// Shared by the Save Profile button, the picture upload flow, and the
 /// picture Remove flow so kind-0 (a replaceable event) is always rebuilt
 /// from the full field set and never clobbers sibling fields.
@@ -1695,6 +1911,7 @@ fn publish_profile_metadata(
     bio: String,
     pic: String,
     bday: String,
+    base: serde_json::Value,
     success_msg: &'static str,
 ) {
     let pubkey_hex = match auth.pubkey().get_untracked() {
@@ -1707,37 +1924,18 @@ fn publish_profile_metadata(
 
     saving.set(true);
 
-    let mut metadata = serde_json::Map::new();
-    metadata.insert(
-        "display_name".into(),
-        serde_json::Value::String(name.clone()),
+    let merged = merge_profile_fields(
+        base,
+        ManagedFields {
+            display_name: &name,
+            claimed: claimed.as_deref(),
+            about: &bio,
+            picture: &pic,
+            birthday: &bday,
+        },
     );
-    match &claimed {
-        Some(username) => {
-            metadata.insert("name".into(), serde_json::Value::String(username.clone()));
-            metadata.insert(
-                "nip05".into(),
-                serde_json::Value::String(format!("{}@{}", username, NIP05_USERNAME_HOST)),
-            );
-        }
-        None => {
-            // No claimed username: keep `name` mirroring the display name
-            // for clients that only read `name`, but nothing here is ever
-            // treated as a claimed handle.
-            metadata.insert("name".into(), serde_json::Value::String(name.clone()));
-        }
-    }
-    if !bio.is_empty() {
-        metadata.insert("about".into(), serde_json::Value::String(bio));
-    }
-    if !pic.is_empty() {
-        metadata.insert("picture".into(), serde_json::Value::String(pic.clone()));
-    }
-    if !bday.is_empty() {
-        metadata.insert("birthday".into(), serde_json::Value::String(bday));
-    }
 
-    let content = serde_json::to_string(&serde_json::Value::Object(metadata)).unwrap_or_default();
+    let content = serde_json::to_string(&merged).unwrap_or_default();
 
     let unsigned = UnsignedEvent {
         pubkey: pubkey_hex,
@@ -1781,6 +1979,23 @@ fn publish_profile_metadata(
     });
 }
 
+/// Whether `mime` is an accepted avatar type. SVG is refused: the pod serves
+/// stored bytes with the declared type, so an SVG carrying a script would be a
+/// stored XSS when opened directly.
+fn avatar_type_allowed(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
+}
+
+/// Whether a kind-0 event may hydrate the profile form for `requested`. The
+/// relay is untrusted: a validly signed kind-0 from another author must not
+/// seed fields the member then re-signs as their own.
+fn kind0_is_for(event_pubkey: &str, requested: &str) -> bool {
+    event_pubkey.eq_ignore_ascii_case(requested)
+}
+
 /// Derive a timestamped pod filename for an uploaded avatar from its MIME
 /// type, e.g. `avatar-1765432100.png`. The timestamp busts client caches
 /// when a user replaces their picture.
@@ -1790,7 +2005,6 @@ fn avatar_filename(mime: &str) -> String {
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
-        "image/svg+xml" => "svg",
         "image/avif" => "avif",
         _ => "img",
     };
@@ -1908,4 +2122,137 @@ fn git_icon() -> impl IntoView {
 fn info_icon() -> impl IntoView {
     // Circle-i info glyph.
     section_icon("M12 22a10 10 0 100-20 10 10 0 000 20zM12 16v-4M12 8h.01")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avatar_types_exclude_svg_and_unknowns() {
+        for ok in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+            assert!(avatar_type_allowed(ok), "{ok}");
+        }
+        for bad in ["image/svg+xml", "image/avif", "text/html", ""] {
+            assert!(!avatar_type_allowed(bad), "{bad}");
+        }
+    }
+
+    fn managed<'a>(name: &'a str, about: &'a str) -> ManagedFields<'a> {
+        ManagedFields {
+            display_name: name,
+            claimed: None,
+            about,
+            picture: "",
+            birthday: "",
+        }
+    }
+
+    #[test]
+    fn saving_waits_for_the_kind0_reply() {
+        assert!(!ProfileHydration::Pending.may_save());
+        assert!(ProfileHydration::NotFound.may_save());
+        // a timeout leaves the state Pending: still no save, and the notice shows
+        assert!(!ProfileHydration::Pending.may_save());
+        assert!(ProfileHydration::Pending.show_load_notice(true));
+        assert!(!ProfileHydration::Pending.show_load_notice(false));
+        assert!(!ProfileHydration::NotFound.show_load_notice(true));
+        assert!(ProfileHydration::Loaded(serde_json::json!({"lud16": "a@b"})).may_save());
+        // NotFound merges into an empty object; Loaded keeps the fields
+        assert_eq!(
+            ProfileHydration::NotFound.into_base(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            ProfileHydration::Loaded(serde_json::json!({"lud16": "a@b"})).into_base(),
+            serde_json::json!({"lud16": "a@b"})
+        );
+    }
+
+    #[test]
+    fn unmanaged_kind0_fields_survive_a_save() {
+        let existing = serde_json::json!({
+            "name": "old", "display_name": "Old", "lud16": "me@wallet.example",
+            "banner": "https://x/b.png", "website": "https://me.example", "bot": false
+        });
+        let out = merge_profile_fields(existing, managed("New", ""));
+        assert_eq!(out["display_name"], "New");
+        assert_eq!(out["name"], "New");
+        assert_eq!(out["lud16"], "me@wallet.example");
+        assert_eq!(out["banner"], "https://x/b.png");
+        assert_eq!(out["website"], "https://me.example");
+        assert_eq!(out["bot"], false);
+    }
+
+    #[test]
+    fn empty_managed_optionals_are_dropped_not_written() {
+        let existing = serde_json::json!({
+            "about": "bio", "picture": "https://x/p.png", "birthday": "1990-01-01",
+            "nip05": format!("released@{}", NIP05_USERNAME_HOST.to_uppercase())
+        });
+        let out = merge_profile_fields(existing, managed("N", ""));
+        assert!(out.get("about").is_none());
+        assert!(out.get("picture").is_none());
+        assert!(out.get("birthday").is_none());
+        // no claim: a stale handle on our own host is dropped (any case)
+        assert!(out.get("nip05").is_none());
+    }
+
+    #[test]
+    fn foreign_host_nip05_survives_an_unclaimed_save() {
+        let existing = serde_json::json!({ "nip05": "me@elsewhere.example" });
+        let out = merge_profile_fields(existing, managed("N", ""));
+        assert_eq!(out["nip05"], "me@elsewhere.example");
+    }
+
+    #[test]
+    fn settings_and_onboarding_share_one_nip05_host() {
+        assert_eq!(
+            NIP05_USERNAME_HOST,
+            option_env!("NOSTR_BBS_NIP05_DOMAIN").unwrap_or("example.test")
+        );
+        assert_eq!(
+            NIP05_USERNAME_HOST,
+            crate::components::onboarding_modal::NIP05_HOST
+        );
+    }
+
+    #[test]
+    fn superseded_subscription_callbacks_are_inert() {
+        // event, EOSE and timer all gate on the same decision
+        assert!(generation_current(3, Some(3)));
+        assert!(
+            !generation_current(2, Some(3)),
+            "stale event/EOSE/timer ignored"
+        );
+        assert!(!generation_current(3, None), "disposed page: nothing runs");
+    }
+
+    #[test]
+    fn no_prior_kind0_yields_exactly_the_managed_fields() {
+        let out = merge_profile_fields(
+            serde_json::Value::Null,
+            ManagedFields {
+                display_name: "N",
+                claimed: Some("alice"),
+                about: "hi",
+                picture: "https://x/p.png",
+                birthday: "2000-02-02",
+            },
+        );
+        let expected = serde_json::json!({
+            "display_name": "N", "name": "alice",
+            "nip05": format!("alice@{}", NIP05_USERNAME_HOST),
+            "about": "hi", "picture": "https://x/p.png", "birthday": "2000-02-02"
+        });
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn kind0_hydration_requires_the_requested_author() {
+        let me = "ab".repeat(32);
+        assert!(kind0_is_for(&me, &me));
+        assert!(kind0_is_for(&me.to_uppercase(), &me));
+        assert!(!kind0_is_for(&"cd".repeat(32), &me));
+    }
 }
