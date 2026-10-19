@@ -3,11 +3,11 @@ id: ADR-2023
 title: Content-free Web Push delivers reply, DM and new-message alerts to the PWA
 date: 2026-10-19
 decision_status: accepted
-implementation_status: partial
+implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit:
+verified_commit: f4b7470ad7355cd06e174ec2dc513610b142577c
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: Any request to carry message text in a push payload (RFC 8291), or a second service worker (the BBS) wanting its own push subscription
 repo: nostr-rust-forum
@@ -44,6 +44,7 @@ repo: nostr-rust-forum
 - Each installed instance has its own subscription; an instance that never reopens leaves a stale row until the push service reports 404/410.
 
 ## Verification
-- `cargo test -p nostr-bbs-relay-worker push` covers: the RFC 8292 §2 example JWT verifying under its published key, VAPID round-trip, endpoint allow-list, preference and quiet-hour logic, token hashing, fan-out classification and the self-copy skip.
+- `cargo test -p nostr-bbs-relay-worker push` covers: the RFC 8292 §2 example JWT verifying under its published key, VAPID round-trip, endpoint allow-list, token hashing, fan-out classification and the self-copy skip, and every SQL statement run on SQLite. `cargo test -p nostr-bbs-core push` covers preferences and quiet hours.
 - `cargo test -p nostr-bbs-forum-client` covers the Tier 0 DM gating and system-notification predicate.
-- `verified_commit` is stamped when the implementation lands and the suites above pass.
+- At `verified_commit`: relay-worker, core and forum-client suites pass (1,720 Rust tests across the three crates), the service-worker suite passes (`node --test crates/nostr-bbs-forum-client/tests/sw-push.test.mjs`, 11 tests), clippy is clean, and both wasm32 builds succeed.
+- Not verified here: a live Cloudflare deploy, a real push service round trip, and device behaviour on iOS. `activation_status` stays `staged` until an operator sets the VAPID pair and tests on devices.
