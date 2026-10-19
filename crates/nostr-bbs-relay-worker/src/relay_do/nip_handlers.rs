@@ -826,6 +826,17 @@ impl NostrRelayDO {
             return;
         }
 
+        // ADR-099: resolve the effective principal ONCE. A registered device key
+        // acts for its owner, so the allowlist, suspension, ban and admin gates
+        // below must all see the owner as well as the key; checking the raw
+        // author alone let a banned or suspended owner publish through a device
+        // key. Gate-off / non-device ⇒ `principal == event.pubkey`.
+        let principal = self.effective_pubkey(&event.pubkey).await;
+        let mut sanction_subjects = vec![event.pubkey.as_str()];
+        if principal != event.pubkey {
+            sanction_subjects.push(principal.as_str());
+        }
+
         // NIP-40: refuse an expired `expiration` tag, and a malformed one — the
         // retention sweep would otherwise delete an accepted event silently.
         if let Err(reason) = filter::expiration_admission(&event, auth::js_now_secs()) {
@@ -898,8 +909,7 @@ impl NostrRelayDO {
             // pubkey verbatim (gate-off / non-device ⇒ unchanged behaviour). The
             // event's signature was already verified strictly above against the
             // device's own key; we only rebind WHO the allowlist is checked for.
-            let allowlist_pubkey = self.effective_pubkey(&event.pubkey).await;
-            if !self.is_whitelisted(&allowlist_pubkey).await {
+            if !self.is_whitelisted(&principal).await {
                 // NIP-42 semantics: a denial AFTER a completed AUTH is
                 // `restricted:` (authenticated but not authorised), distinct
                 // from `auth-required:`. Legacy `allowlist` mode keeps the
@@ -924,20 +934,23 @@ impl NostrRelayDO {
             return;
         }
 
-        // Suspension and silence check
-        let (suspended, silenced) = trust::check_suspension(&event.pubkey, &self.env).await;
-        if suspended {
-            Self::send_ok(ws, &event.id, false, "blocked: account suspended");
-            return;
-        }
-        if silenced {
-            Self::send_ok(
-                ws,
-                &event.id,
-                false,
-                "blocked: account silenced (read-only)",
-            );
-            return;
+        // Suspension and silence check: the device key OR its owner being
+        // sanctioned blocks the event.
+        for subject in &sanction_subjects {
+            let (suspended, silenced) = trust::check_suspension(subject, &self.env).await;
+            if suspended {
+                Self::send_ok(ws, &event.id, false, "blocked: account suspended");
+                return;
+            }
+            if silenced {
+                Self::send_ok(
+                    ws,
+                    &event.id,
+                    false,
+                    "blocked: account silenced (read-only)",
+                );
+                return;
+            }
         }
 
         // WI-2: moderation ingress check against moderation_actions (60s DO
@@ -948,12 +961,14 @@ impl NostrRelayDO {
         // publish warnings even while under moderation for other reasons.
         //
         // P2-03: use admin_cache to avoid redundant D1 queries on every event.
-        if is_ban_gated_kind(event.kind)
-            && !self.admin_cache.is_admin(&event.pubkey, &self.env).await
-            && self.mod_cache.is_blocked(&event.pubkey, &self.env).await
+        if is_ban_gated_kind(event.kind) && !self.admin_cache.is_admin(&principal, &self.env).await
         {
-            Self::send_ok(ws, &event.id, false, "blocked: author is banned or muted");
-            return;
+            for subject in &sanction_subjects {
+                if self.mod_cache.is_blocked(subject, &self.env).await {
+                    Self::send_ok(ws, &event.id, false, "blocked: author is banned or muted");
+                    return;
+                }
+            }
         }
 
         // Trust-level gating for specific event kinds
@@ -975,7 +990,7 @@ impl NostrRelayDO {
 
             // kind-41 (channel metadata/pin): TL2+ for own channel, TL3+ for any
             if event.kind == 41 {
-                let Some(channel_id) = filter::tag_value(&event, "e") else {
+                let Some(channel_id) = filter::channel_tag(&event) else {
                     Self::send_ok(ws, &event.id, false, "invalid: missing channel tag");
                     return;
                 };
@@ -2036,12 +2051,8 @@ impl NostrRelayDO {
         }
 
         // Zone-scoped channel kinds: kind-40 defs (channel id == event id),
-        // kind-42 content (channel id == `e` tag).
-        let channel_id: Option<String> = match event.kind {
-            40 => Some(event.id.clone()),
-            42 => filter::channel_tag(event),
-            _ => None,
-        };
+        // kind-41 metadata and kind-42 content (channel id == root/first `e` tag).
+        let channel_id: Option<String> = filter::zone_channel_id(event);
 
         if let Some(cid) = channel_id {
             // Only a channel EXPLICITLY bound to a zone is read-gated. An
@@ -2207,16 +2218,9 @@ impl NostrRelayDO {
             .collect();
 
         for a_ref in &a_targets {
-            let parts: Vec<&str> = a_ref.split(':').collect();
-            if parts.len() < 3 {
+            let Some((kind, pubkey, d_tag)) = filter::split_a_ref(a_ref) else {
                 continue;
-            }
-            let kind: f64 = match parts[0].parse() {
-                Ok(k) => k,
-                Err(_) => continue,
             };
-            let pubkey = parts[1];
-            let d_tag = parts[2];
 
             // Own events only, unless the author holds delete-any privilege
             // (the a-ref names its owner, so the SQL below stays scoped to
