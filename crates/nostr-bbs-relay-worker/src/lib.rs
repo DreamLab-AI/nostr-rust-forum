@@ -750,6 +750,24 @@ pub const BROKER_CASES_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS broker_cas
             updated_at INTEGER NOT NULL\
         )";
 
+/// Individual decisions on broker cases (append-only audit trail). F6 (DDD §7a):
+/// `superseded_by` names the decision that supersedes this row (NULL =
+/// current/effective). It is a projection-derived column: the superseding
+/// kind-31403 marks the prior row without ever mutating the underlying Nostr
+/// event (Invariant 5). Only `ensure_schema` creates it (migration 0002 predates
+/// F6), so the SQLite tests build their schema from this constant.
+pub const BROKER_DECISIONS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS broker_decisions (\
+            decision_id TEXT PRIMARY KEY NOT NULL, \
+            case_id TEXT NOT NULL REFERENCES broker_cases(id), \
+            outcome TEXT NOT NULL, \
+            outcome_detail TEXT, \
+            broker_pubkey TEXT NOT NULL, \
+            reasoning TEXT NOT NULL DEFAULT '', \
+            prior_decision_id TEXT, \
+            superseded_by TEXT, \
+            decided_at INTEGER NOT NULL\
+        )";
+
 /// ADR-2010 durable governance outcome receipts. One row per signed governance
 /// event, keyed by the FULL event id, recording the stage the response actually
 /// reached. Written at `relay-accepted` right after the envelope is stored;
@@ -839,6 +857,7 @@ async fn ensure_schema(env: &Env) -> bool {
     // fresh D1 the ALTERs otherwise fail and the effective_tier index is skipped.
     for (name, sql) in [
         ("broker_cases", BROKER_CASES_CREATE_SQL),
+        ("broker_decisions", BROKER_DECISIONS_CREATE_SQL),
         ("governance_receipts", GOVERNANCE_RECEIPTS_CREATE_SQL),
     ] {
         if let Err(e) = db.prepare(sql).run().await {
@@ -980,22 +999,6 @@ async fn ensure_schema(env: &Env) -> bool {
             registered_at INTEGER NOT NULL, \
             rate_limit_per_min INTEGER NOT NULL DEFAULT 60, \
             active INTEGER NOT NULL DEFAULT 1\
-        )",
-        // Individual decisions on broker cases (append-only audit trail).
-        // F6 (DDD §7a): `superseded_by` names the decision that supersedes this
-        // row (NULL = current/effective). It is a projection-derived column — the
-        // superseding kind-31403 marks the prior row without ever mutating the
-        // underlying Nostr event (Invariant 5).
-        "CREATE TABLE IF NOT EXISTS broker_decisions (\
-            decision_id TEXT PRIMARY KEY NOT NULL, \
-            case_id TEXT NOT NULL REFERENCES broker_cases(id), \
-            outcome TEXT NOT NULL, \
-            outcome_detail TEXT, \
-            broker_pubkey TEXT NOT NULL, \
-            reasoning TEXT NOT NULL DEFAULT '', \
-            prior_decision_id TEXT, \
-            superseded_by TEXT, \
-            decided_at INTEGER NOT NULL\
         )",
         "CREATE TABLE IF NOT EXISTS broker_roles (\
             pubkey TEXT NOT NULL, \

@@ -7,6 +7,27 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: a superseding 31403 could mutate another case's decision chain, and supersession was not atomic (`nostr-bbs-relay-worker`)
+
+The ingest gate checked only that the signer outranked the superseded decision's signer, so a 31403 could cite a
+decision on a different case, re-supersede one that already had a successor, move an `open` or `under_review`
+case to `superseded`, or (as a `system:` decider) supersede a high or critical case, and a missing case row was
+treated as created by nobody. The decision row, the `superseded_by` mark and the case state were three unbatched
+writes with their results discarded. Supersession now goes through the ADR-2010 receipt stage machine as one
+four-statement batch in which every statement must change exactly one row, and the ingest and plan refusals carry
+the tokens `supersession_target_missing`, `_case_mismatch`, `_target_already_superseded`, `_unauthorised`,
+`_state_not_supersedable:<state>`, `_case_missing`, `_human_required` and `self_review`. `blocked: unauthorised
+supersession` is now `blocked: supersession_unauthorised`.
+
+### Fixed: any account could reopen any terminal case with an appeal; standing and shape only (`nostr-bbs-relay-worker`)
+
+`project_appeal` took the case from the `d` tag and checked nothing about who was appealing. Only the case's
+requester of record may now appeal, the appeal must cite a decision on that case, and the case must be terminal;
+a refusal leaves a `projection-failed` receipt instead of a silent no-op. An appeal-marked 31402 must carry a
+`case` tag different from its `d` tag (`blocked: appeal_shape`), since `d` equal to the case id would replace the
+requester's own signed request. Still open pending ADR-2024 (known-findings KF-12, partially fixed): the receipt is keyed on the appeal's own `d` tag
+rather than the case, and the forum client still lists an appeal as a new pending case.
+
 ### Fixed: a banned or suspended owner could publish through a device key (`nostr-bbs-relay-worker`)
 
 `handle_event` resolved a registered device key to its owner for the allowlist only; the suspension, silence, ban and
