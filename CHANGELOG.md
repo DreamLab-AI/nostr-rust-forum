@@ -22,9 +22,9 @@ keys off is unchanged.
 ### Fixed: kind-41 channel metadata used a different channel than kind-42 and was not zone-read-gated (`nostr-bbs-relay-worker`)
 
 The kind-41 write gate took the first `e` tag, so a decoy first `e` could authorise edits to another channel, and
-the zone read gate mapped only kinds 40 and 42, so a locked channel's name and description were readable anonymously.
-Kind-41 now resolves its channel with `channel_tag` (root marker, else first `e`) for both gates, and is served to
-non-members exactly as the kind-40 definition is.
+the zone read gate mapped only kinds 40 and 42, so kind-41 escaped zone gating altogether.
+Kind-41 now resolves its channel with `channel_tag` (root marker, else first `e`) for both gates, and is zone-gated
+identically to the kind-40 definition.
 
 ### Fixed: CLOSE and AUTH frames bypassed the per-IP frame limiter (`nostr-bbs-relay-worker`)
 
