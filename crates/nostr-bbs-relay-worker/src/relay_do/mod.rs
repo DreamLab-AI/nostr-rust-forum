@@ -77,6 +77,10 @@ const MAX_FILTERS: usize = 10;
 // Durable Object
 // ---------------------------------------------------------------------------
 
+/// DO-storage key holding the next session id to issue (see
+/// [`NostrRelayDO::allocate_session_id`]).
+pub(crate) const SESSION_ID_MARK_KEY: &str = "session_id_mark";
+
 #[durable_object]
 pub struct NostrRelayDO {
     pub(crate) state: State,
@@ -161,12 +165,7 @@ impl DurableObject for NostrRelayDO {
         let server = pair.server;
         let client = pair.client;
 
-        let session_id = {
-            let mut id = self.next_session_id.borrow_mut();
-            let current = *id;
-            *id += 1;
-            current
-        };
+        let session_id = self.allocate_session_id().await;
 
         // Tag the WebSocket so session data survives DO hibernation.
         // Tags are persisted by the runtime even when in-memory state is lost.

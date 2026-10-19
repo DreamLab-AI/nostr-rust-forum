@@ -7,6 +7,14 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: a fresh Durable Object isolate could hand a new connection a prior session's identity (`nostr-bbs-relay-worker`)
+
+Session auth and subscriptions persist in DO storage under `ws_auth:{id}` / `ws_sub:{id}`, but the in-memory
+session counter restarted at 1 whenever the runtime rebuilt the object. A socket that died without its rows being
+cleared left `ws_auth:1` behind, and the next isolate's first connection, still unauthenticated, was recovered
+under that identity. The counter is now seeded from a persisted high-water mark that is advanced before each id
+is used, so an id is never re-issued while its rows might still exist.
+
 ### Fixed: a superseding 31403 could mutate another case's decision chain, and supersession was not atomic (`nostr-bbs-relay-worker`)
 
 The ingest gate checked only that the signer outranked the superseded decision's signer, so a 31403 could cite a

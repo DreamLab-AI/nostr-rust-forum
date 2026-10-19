@@ -11,7 +11,7 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 use super::filter::NostrFilter;
-use super::NostrRelayDO;
+use super::{NostrRelayDO, SESSION_ID_MARK_KEY};
 
 // ---------------------------------------------------------------------------
 // Session state per WebSocket connection
@@ -269,6 +269,42 @@ impl NostrRelayDO {
     /// `fetch`). Mirrors [`save_auth`](Self::save_auth) / [`save_subscriptions`]
     /// so the AUTH handshake survives a hibernation that occurs before the client
     /// answers the challenge.
+    /// Hand out a session id that is unique across the lifetime of this
+    /// Durable Object, not just this isolate.
+    ///
+    /// `ws_auth:{id}` / `ws_sub:{id}` / `ws_challenge:{id}` rows persist in DO
+    /// storage so a hibernated session can be recovered. The in-memory counter
+    /// used to restart at 1 whenever the runtime rebuilt the object, so a
+    /// socket that died without its rows being cleared left `ws_auth:1` behind
+    /// and the next fresh isolate's first connection, still unauthenticated,
+    /// was handed that identity on recovery. The counter is now seeded from a
+    /// persisted high-water mark and the mark is advanced before the id is
+    /// used, so an id is never re-issued while its rows might still exist.
+    /// Costs one storage read on the first connection per isolate and one
+    /// write per connection.
+    pub(crate) async fn allocate_session_id(&self) -> u64 {
+        let storage = self.state.storage();
+        // First allocation in this isolate: resume from the persisted mark.
+        // No RefCell borrow is held across an await.
+        if *self.next_session_id.borrow() == 1 {
+            if let Some(mark) = storage.get::<u64>(SESSION_ID_MARK_KEY).await.ok().flatten() {
+                *self.next_session_id.borrow_mut() = next_session_id_from_mark(mark);
+            }
+        }
+        let current = {
+            let mut id = self.next_session_id.borrow_mut();
+            let current = *id;
+            *id += 1;
+            current
+        };
+        // Persist BEFORE the id is used, so a crash between here and the
+        // accept cannot lead to the same id being handed out again later.
+        if let Err(e) = storage.put(SESSION_ID_MARK_KEY, current + 1).await {
+            console_warn!("[session] failed to persist session id mark: {e}");
+        }
+        current
+    }
+
     pub(crate) async fn save_challenge(&self, session_id: u64, challenge: &str) {
         Self::persist_challenge(&self.state.storage(), session_id, challenge).await;
     }
@@ -489,5 +525,31 @@ mod tests {
         // Never moves backwards.
         assert_eq!(next_session_id_after(9, 2), 9);
         assert_eq!(next_session_id_after(u64::MAX, u64::MAX), u64::MAX);
+    }
+}
+
+/// The counter value to resume from given a persisted mark. A mark below 1
+/// (unwritten or corrupt) yields 1, matching a cold start.
+pub(crate) fn next_session_id_from_mark(mark: u64) -> u64 {
+    mark.max(1)
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::next_session_id_from_mark;
+
+    #[test]
+    fn resumes_from_the_persisted_mark_and_never_below_one() {
+        assert_eq!(
+            next_session_id_from_mark(0),
+            1,
+            "unwritten/corrupt mark is a cold start"
+        );
+        assert_eq!(next_session_id_from_mark(1), 1);
+        // A prior isolate handed out ids up to 41 and persisted mark 42: the
+        // next isolate must start at 42, so a stale `ws_auth:41` row can never
+        // be matched by a new, unauthenticated connection.
+        assert_eq!(next_session_id_from_mark(42), 42);
+        assert_eq!(next_session_id_from_mark(u64::MAX), u64::MAX);
     }
 }
