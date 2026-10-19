@@ -2144,11 +2144,8 @@ mod tests {
         for stmt in PUSH_ALTER_SQL {
             conn.execute(stmt, []).unwrap();
         }
-        conn.execute(
-            "SELECT dm_window_start, dm_window_count FROM push_subscriptions",
-            [],
-        )
-        .ok();
+        conn.prepare("SELECT dm_window_start, dm_window_count FROM push_subscriptions")
+            .expect("both columns exist after the ALTERs");
     }
 
     #[test]

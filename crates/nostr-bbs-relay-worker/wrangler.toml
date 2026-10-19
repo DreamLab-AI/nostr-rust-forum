@@ -34,7 +34,12 @@ AUTH_MODE = "nip42"
 # Set this to the wss:// URL clients connect to (the same value the client
 # reads from window.__ENV__.RELAY_URL). When BLANK the relay-tag check is
 # skipped (the challenge still fully protects the handshake) — so leaving it
-# unset is safe, and setting it enables strict relay scoping.
+# unset still leaves the handshake challenge-protected, but strict relay
+# scoping is OFF.
+#
+# >>> RELAY_URL is REQUIRED in nip42 mode. Replace the blank below with this
+# >>> relay's wss:// URL before deploying. While AUTH_MODE = "nip42" and this is
+# >>> blank the relay logs a console error on every AUTH. <<<
 RELAY_URL = ""
 
 # Escalation-default posture (REC-6 share / WP-9). The default authority
@@ -60,8 +65,9 @@ ESCALATION_DEFAULT_POSTURE = "escalate_to_human"
 # Committing the key to this file would hand it to every agent that can read the
 # repository and restore exactly that hole.
 #
-# Unset, the relay still samples (silently disabling oversight is the worse
-# failure) and logs a warning on every projection. Set it before relying on the
+# Unset, the relay still samples with an EMPTY HMAC key (silently disabling
+# oversight is the worse failure), which an agent can predict, and logs a
+# warning on every projection. Set it before relying on the
 # calibration or probe-catch numbers for anything.
 
 # Content-free Web Push (ADR-2023). Off by default. To enable: generate a P-256

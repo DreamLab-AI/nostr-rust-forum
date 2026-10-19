@@ -49,6 +49,26 @@ matched nothing. Only the first two colons now separate fields.
 The count was checked, then incremented only after several awaits, so concurrent upgrades from one address could
 all read the same count. The slot is now reserved in the same borrow as the check and released on the early-return
 path.
+### Fixed: schema bootstrap ran ~80 D1 statements on every request, and fresh databases skipped governance ALTERs (`nostr-bbs-relay-worker`)
+
+`ensure_schema` (including a DELETE) ran before the CORS preflight, the WebSocket upgrade and any auth, on every
+request. It now runs at most once per isolate, after those two branches. Separately, the `broker_cases` and
+`governance_receipts` ALTERs ran before those tables' CREATEs, so on a fresh D1 they failed and the
+`effective_tier` index was skipped; both tables are now created first.
+
+### Fixed: blank `RELAY_URL` skipped the NIP-42 relay-tag check silently (`nostr-bbs-relay-worker`)
+
+Enforcement is unchanged (the shipped `wrangler.toml` still deploys blank), but the relay now logs a console error
+on every AUTH when `AUTH_MODE` is `nip42` and `RELAY_URL` is blank. `wrangler.toml` marks `RELAY_URL` as required
+in that mode, and SETUP.md documents it and `CALIBRATION_SELECTION_KEY` (unset falls back to an empty HMAC key).
+
+### Fixed: two events for one device in one window both sent a push, and DM pushes had no budget (`nostr-bbs-relay-worker`)
+
+The per-device throttle read `last_push_at` before the send and wrote it after, so a race sent twice. Delivery now
+claims the slot with an atomic `UPDATE ... WHERE last_push_at <= now - interval` first, sends only on a changed row,
+and rolls the timestamp back if the send fails. Gift-wrap senders are not allowlisted, so each device also has a
+rolling hourly DM wake-up budget (default 30, `PUSH_DM_HOURLY_BUDGET`); over-budget DMs still count in the app but
+do not wake it. Adds two `push_subscriptions` columns (migration 0010 and `ensure_schema`).
 
 ### Fixed: live broadcast leaked protected kinds to kinds-less subscriptions (`nostr-bbs-relay-worker`)
 
