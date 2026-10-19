@@ -809,6 +809,10 @@ async fn ensure_schema(env: &Env) {
                 console_error!("ensure_schema: push table failed: {e}");
             }
         }
+        // A deployment that created the table before the DM budget columns.
+        for stmt in push::PUSH_ALTER_SQL {
+            let _ = db.prepare(stmt).run().await;
+        }
     }
 
     // --- Governance tables (broker_cases, governance_receipts) ---
