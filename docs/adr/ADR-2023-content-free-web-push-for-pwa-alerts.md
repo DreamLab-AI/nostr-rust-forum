@@ -7,7 +7,7 @@ implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: 46f94cb467ac551cc671ae43968d12ca1e4f8828
+verified_commit: 83c5c297cd2b410ecbc76e896d86217be615a227
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: Any request to carry message text in a push payload (RFC 8291), or a second service worker (the BBS) wanting its own push subscription
 repo: nostr-rust-forum
