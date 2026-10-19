@@ -329,6 +329,37 @@ provide_context(config);
 provide_zone_access();
 ```
 
+## 10. Web Push alerts (optional, ADR-2023)
+
+Replies, direct messages and new topics/posts can wake an installed PWA (desktop,
+Android, and iOS 16.4+ once added to the Home Screen) even when the app is
+closed. The push is content-free: the push service (Google, Apple, Mozilla)
+only ever sees an empty, signed wake-up; the app then fetches generic counters
+from your relay over HTTPS.
+
+1. Generate a VAPID key pair:
+
+   ```bash
+   cargo run -p nostr-bbs-relay-worker --example vapid_keygen
+   ```
+
+2. In the relay worker's `wrangler.toml` set `PUSH_ENABLED = "true"`,
+   `VAPID_PUBLIC_KEY` to the printed public key and `VAPID_SUBJECT` to a
+   `mailto:` or `https:` contact for your operator.
+3. Store the private key as a secret (never in `wrangler.toml`):
+
+   ```bash
+   wrangler secret put VAPID_PRIVATE_KEY
+   ```
+
+4. Deploy the relay worker. The D1 tables are created automatically (they are
+   also in `migrations/0010_push.sql`). Members then see **Settings > Push
+   notifications** in the forum client.
+
+Check `GET <relay>/api/push/config`: `{"enabled":true,"public_key":"..."}`
+means the key pair is consistent. If the configured public key does not match
+the private key the relay logs `VAPID_PUBLIC_KEY does not match` and stays off.
+
 ## Troubleshooting
 
 - **Passkey registration fails**: Verify `RP_ID` matches your domain exactly (no `https://` prefix)

@@ -9,6 +9,7 @@ pub mod governance_view;
 pub mod image_compress;
 pub mod paths;
 pub mod pod_client;
+pub mod push;
 pub mod pwa_install;
 pub mod reconcile;
 pub mod relay_url;

@@ -27,6 +27,7 @@ mod moderation;
 mod nip11;
 mod profile_stats;
 mod profiles;
+mod push;
 mod relay_do;
 mod trust;
 mod trust_sweep;
@@ -286,6 +287,11 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
     // Setup status check (public -- returns whether initial admin setup is needed)
     if path == "/api/setup-status" && method == Method::Get {
         return whitelist::handle_setup_status(&req, env).await;
+    }
+
+    // Content-free Web Push (ADR-2023): subscribe, prefs, drain, config.
+    if let Some(rest) = path.strip_prefix("/api/push/") {
+        return push::handle(req, env, rest).await;
     }
 
     // Whitelist check (public)
@@ -739,6 +745,16 @@ async fn ensure_schema(env: &Env) {
         console_error!("ensure_schema: whitelist create failed: {e}");
     }
 
+    // --- Web Push tables (ADR-2023, migration 0010) ---
+    // Only when the feature is on, so a default deploy pays nothing per request.
+    if push::enabled(env) {
+        for stmt in push::PUSH_SCHEMA_SQL {
+            if let Err(e) = db.prepare(stmt).run().await {
+                console_error!("ensure_schema: push table failed: {e}");
+            }
+        }
+    }
+
     // --- Whitelist columns (idempotent: errors ignored if column exists) ---
     let alter_stmts = [
         "ALTER TABLE whitelist ADD COLUMN is_admin INTEGER DEFAULT 0",
@@ -1095,6 +1111,9 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         }
         Err(e) => console_error!("trust demotion sweep failed: {e}"),
     }
+
+    // ADR-2023: drop push subscriptions the app stopped refreshing.
+    push::sweep_stale(&env).await;
 
     // Enforce the NIP-11 retention policy and NIP-40 expiration: DELETE rows
     // past their kind's retention window and past their expiration tag. Paged

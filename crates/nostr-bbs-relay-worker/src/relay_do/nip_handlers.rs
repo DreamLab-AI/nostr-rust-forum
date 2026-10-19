@@ -1265,11 +1265,15 @@ impl NostrRelayDO {
             return;
         }
 
+        // ADR-2023: `save_event` answers `true` for an id it already holds, so
+        // note a repeat submission now (before the insert) and let it not alert
+        // anyone a second time.
+        let push_repeat = self.push_event_known(&event).await;
+
         // Save to D1
         if self.save_event(&event, treatment).await {
             Self::send_ok(ws, &event.id, true, "");
             self.broadcast_event(&event).await;
-
             // Activity tracking: increment posts_created and update last_active
             // for content-producing event kinds (kind-1 text, kind-42 channel msg,
             // kind-40 channel create, kind-7 reaction, kind-1984 report).
@@ -1345,6 +1349,19 @@ impl NostrRelayDO {
                         );
                     }
                 }
+            }
+
+            // ADR-2023: wake members whose app is closed. Last, so the DO's
+            // own bookkeeping above never queues behind recipient lookups;
+            // the sender already has their OK, and the pushes themselves go
+            // out under `wait_until`.
+            if !push_repeat {
+                let submitter = self
+                    .sessions
+                    .borrow()
+                    .get(&session_id)
+                    .and_then(|s| s.authed_pubkey.clone());
+                self.push_fanout(&event, submitter).await;
             }
         } else {
             Self::send_ok(ws, &event.id, false, "error: failed to save event");

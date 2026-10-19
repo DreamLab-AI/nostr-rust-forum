@@ -282,6 +282,15 @@ impl NotificationStoreV2 {
             }
         };
 
+        // Tier 0 (ADR-2023): also raise a system notification when the page is
+        // hidden. Text is generic by design: it can appear on a lock screen.
+        let local_alert = (
+            system_text(&kind),
+            format!("nbbs-local-{}", system_tag(&kind)),
+            link.map(|l| l.trim_start_matches('/').to_string())
+                .unwrap_or_default(),
+        );
+
         let notification = Notification {
             id,
             kind,
@@ -304,6 +313,50 @@ impl NotificationStoreV2 {
             }
         });
         self.persist();
+
+        crate::utils::push::show_local_if_hidden(
+            &crate::utils::push::brand_label(),
+            local_alert.0,
+            &local_alert.2,
+            &local_alert.1,
+        );
+    }
+
+    /// Notify about a received direct message (Tier 0, ADR-2023).
+    ///
+    /// Called by the DM store for every gift wrap it successfully opens. The
+    /// same gates as channel posts apply: never the user's own message, never
+    /// history older than this account's sync baseline, and never twice for the
+    /// same wrap (persisted, so a reload does not re-announce). `wrap_id` is the
+    /// kind-1059 event id, which is stable across reloads.
+    pub fn notify_dm(&self, wrap_id: &str, sender: &str, timestamp: u64, is_sent: bool) {
+        let seen = self.seen_messages.with_untracked(|s| s.contains(wrap_id));
+        let verdict = dm_verdict(is_sent, timestamp, self.baseline.get_untracked(), seen);
+        if verdict.burn {
+            self.seen_messages.update(|s| {
+                if s.len() >= MAX_SEEN_IDS {
+                    if let Some(victim) = s.iter().next().cloned() {
+                        s.remove(&victim);
+                    }
+                }
+                s.insert(wrap_id.to_string());
+            });
+            self.persist_sync_state();
+        }
+        if !verdict.notify {
+            return;
+        }
+        self.add_at(
+            NotificationKind::DM,
+            "New direct message",
+            &format!("From {}", author_display(sender)),
+            Some(&format!("/dm/{sender}")),
+            Origin {
+                timestamp,
+                dedup_id: Some(format!("dm:{wrap_id}")),
+                key: Some(pubkey_ref(sender)),
+            },
+        );
     }
 
     /// Clear all notifications.
@@ -794,6 +847,69 @@ fn fallback_singleton() -> NotificationStoreV2 {
     })
 }
 
+/// The process-wide store, for code that runs outside a reactive owner (the DM
+/// store's spawned tasks). `None` before `provide_notification_store` ran.
+pub fn global_notification_store() -> Option<NotificationStoreV2> {
+    FALLBACK_STORE.with(|cell| *cell.borrow())
+}
+
+/// Outcome of the DM notification gate: whether to notify, and whether the wrap
+/// id is now settled and belongs in the persisted dedup set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DmVerdict {
+    notify: bool,
+    burn: bool,
+}
+
+/// Decide whether a received DM notifies. The id is only burned when the
+/// answer cannot change (own message, or older than the sync floor), or when it
+/// notifies; the same rule as [`PostVerdict::is_permanent`].
+fn dm_verdict(is_sent: bool, timestamp: u64, baseline: u64, already_seen: bool) -> DmVerdict {
+    if already_seen {
+        return DmVerdict {
+            notify: false,
+            burn: false,
+        };
+    }
+    if is_sent || timestamp <= baseline {
+        return DmVerdict {
+            notify: false,
+            burn: true,
+        };
+    }
+    DmVerdict {
+        notify: true,
+        burn: true,
+    }
+}
+
+/// Generic body for the system notification of `kind`. Never message content:
+/// lock screens show it.
+fn system_text(kind: &NotificationKind) -> &'static str {
+    match kind {
+        NotificationKind::DM => "New direct message",
+        NotificationKind::Mention => "You were mentioned",
+        NotificationKind::Message => "New activity",
+        NotificationKind::JoinRequest => "New membership request",
+        NotificationKind::JoinApproved => "Your membership was approved",
+        NotificationKind::EventRSVP => "Event update",
+        NotificationKind::System => "New notice",
+    }
+}
+
+/// Per-kind tag so a burst of one kind collapses into one system notification.
+fn system_tag(kind: &NotificationKind) -> &'static str {
+    match kind {
+        NotificationKind::DM => "dm",
+        NotificationKind::Mention => "mention",
+        NotificationKind::Message => "message",
+        NotificationKind::JoinRequest => "join",
+        NotificationKind::JoinApproved => "approved",
+        NotificationKind::EventRSVP => "rsvp",
+        NotificationKind::System => "system",
+    }
+}
+
 // -- Helpers ------------------------------------------------------------------
 
 fn now_secs() -> u64 {
@@ -1137,6 +1253,54 @@ mod tests {
         );
         assert_eq!(v, PostVerdict::BeforeBaseline);
         assert!(v.is_permanent());
+    }
+
+    #[test]
+    fn dm_verdict_notifies_only_fresh_messages_from_others() {
+        let v = dm_verdict(false, 200, 100, false);
+        assert_eq!(
+            v,
+            DmVerdict {
+                notify: true,
+                burn: true
+            }
+        );
+        assert!(!dm_verdict(true, 200, 100, false).notify, "own message");
+        assert!(
+            !dm_verdict(false, 100, 100, false).notify,
+            "at the baseline is backlog"
+        );
+        assert!(
+            !dm_verdict(false, 50, 100, false).notify,
+            "before the baseline"
+        );
+        assert_eq!(
+            dm_verdict(false, 200, 100, true),
+            DmVerdict {
+                notify: false,
+                burn: false
+            },
+            "already announced: nothing to do"
+        );
+    }
+
+    #[test]
+    fn system_text_never_carries_content_and_tags_are_distinct() {
+        let kinds = [
+            NotificationKind::Message,
+            NotificationKind::Mention,
+            NotificationKind::DM,
+            NotificationKind::JoinRequest,
+            NotificationKind::JoinApproved,
+            NotificationKind::EventRSVP,
+            NotificationKind::System,
+        ];
+        let tags: std::collections::HashSet<_> = kinds.iter().map(system_tag).collect();
+        assert_eq!(tags.len(), kinds.len());
+        for k in &kinds {
+            let t = system_text(k);
+            assert!(t.len() < 40 && !t.contains(':'), "{t}");
+        }
     }
 
     #[test]

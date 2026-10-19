@@ -150,3 +150,168 @@ self.addEventListener('message', (event) => {
     self.skipWaiting();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Web Push (ADR-2023): content-free wake-ups.
+//
+// The relay sends an EMPTY push. We wake, read the drain credentials the page
+// stored in IndexedDB ("nostr-bbs-push" / "kv" / "cfg" — written by js/push.js),
+// ask the relay over HTTPS what is pending, and show generic notifications.
+// Nothing about a message ever travels through the push service, and the
+// Nostr key is never needed here.
+// ---------------------------------------------------------------------------
+
+const PUSH_DB = 'nostr-bbs-push';
+const PUSH_STORE = 'kv';
+const PUSH_CFG_KEY = 'cfg';
+
+function readPushCfg() {
+  return new Promise((resolve) => {
+    try {
+      const open = indexedDB.open(PUSH_DB, 1);
+      open.onupgradeneeded = () => open.result.createObjectStore(PUSH_STORE);
+      open.onerror = () => resolve(null);
+      open.onsuccess = () => {
+        const db = open.result;
+        const get = db.transaction(PUSH_STORE, 'readonly').objectStore(PUSH_STORE).get(PUSH_CFG_KEY);
+        get.onsuccess = () => {
+          db.close();
+          try {
+            resolve(get.result ? JSON.parse(get.result) : null);
+          } catch (_) {
+            resolve(null);
+          }
+        };
+        get.onerror = () => {
+          db.close();
+          resolve(null);
+        };
+      };
+    } catch (_) {
+      resolve(null);
+    }
+  });
+}
+
+async function drainPending(cfg) {
+  if (!cfg || !cfg.api || !cfg.id || !cfg.token) return null;
+  try {
+    const resp = await fetch(`${cfg.api}/api/push/drain`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: cfg.id, token: cfg.token }),
+    });
+    return resp.ok ? await resp.json() : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function plural(n, one, many) {
+  return n === 1 ? one : `${n} ${many}`;
+}
+
+/** Notifications to show for a drain result: [{tag, body, url}]. */
+function composePushNotifications(drained) {
+  const out = [];
+  if (!drained) return out;
+  if (drained.dm > 0) {
+    out.push({ tag: 'nbbs-dm', body: plural(drained.dm, 'New direct message', 'new direct messages'), url: 'dm' });
+  }
+  if (drained.reply > 0) {
+    out.push({
+      tag: 'nbbs-reply',
+      body: plural(drained.reply, 'New reply or mention', 'new replies and mentions'),
+      url: (drained.link_reply || '').replace(/^\//, '') || '',
+    });
+  }
+  if (drained.topic > 0) {
+    out.push({
+      tag: 'nbbs-topic',
+      body: plural(drained.topic, 'New topic', 'new topics'),
+      url: (drained.link_topic || '').replace(/^\//, '') || '',
+    });
+  }
+  if (drained.post > 0) {
+    out.push({
+      tag: 'nbbs-post',
+      body: plural(drained.post, 'New message', 'new messages'),
+      url: (drained.link_post || '').replace(/^\//, '') || '',
+    });
+  }
+  return out;
+}
+
+/**
+ * Windows that belong to the forum app: inside this SW's scope, and not the
+ * retro BBS (a separate SPA under scope/bbs/ with its own service worker).
+ * `matchAll` returns every window on the origin, and on a branded deployment
+ * the marketing site shares it, so an unfiltered check would let a visible
+ * marketing tab swallow every forum alert.
+ */
+async function forumWindows() {
+  const scope = self.registration.scope;
+  const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  return all.filter((w) => w.url.startsWith(scope) && !w.url.startsWith(scope + 'bbs'));
+}
+
+async function handlePush() {
+  // A visible, focused window already shows the activity in-app.
+  if ((await forumWindows()).some((c) => c.visibilityState === 'visible')) return;
+
+  const cfg = await readPushCfg();
+  const items = composePushNotifications(await drainPending(cfg));
+  const title = (cfg && cfg.brand) || 'Community';
+  if (items.length === 0) {
+    // Another device already drained, or the relay was unreachable. A push
+    // must still show something (userVisibleOnly), so keep it generic.
+    items.push({ tag: 'nbbs-generic', body: 'There is new activity. Open to catch up.', url: '' });
+  }
+  await Promise.all(
+    items.map((n) =>
+      self.registration.showNotification(title, {
+        body: n.body,
+        tag: n.tag,
+        renotify: true,
+        icon: 'icons/icon-192.png',
+        badge: 'icons/icon-192.png',
+        data: { url: n.url },
+      })
+    )
+  );
+}
+
+self.addEventListener('push', (event) => {
+  event.waitUntil(handlePush());
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const rel = (event.notification.data && event.notification.data.url) || '';
+  // Only ever open a page inside our own scope: a click target is data that
+  // came over the network, so an off-origin value falls back to the app root.
+  const scope = new URL(self.registration.scope);
+  let targetUrl = new URL(rel, scope);
+  if (targetUrl.origin !== scope.origin || !targetUrl.pathname.startsWith(scope.pathname)) {
+    targetUrl = scope;
+  }
+  const target = targetUrl.href;
+  event.waitUntil(
+    (async () => {
+      for (const w of await forumWindows()) {
+        if ('focus' in w) {
+          await w.focus();
+          if ('navigate' in w) {
+            try {
+              await w.navigate(target);
+            } catch (_) {
+              /* cross-scope or uncontrolled: focus is enough */
+            }
+          }
+          return;
+        }
+      }
+      await self.clients.openWindow(target);
+    })()
+  );
+});

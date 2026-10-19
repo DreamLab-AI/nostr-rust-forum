@@ -1169,6 +1169,11 @@ pub fn SettingsPage() -> impl IntoView {
                     </div>
                 </div>
 
+                // -- Section 4b-ii: Push notifications (ADR-2023) --
+                // Renders nothing unless the browser supports push and the
+                // relay has Web Push switched on.
+                <crate::components::push_settings::PushSettings />
+
                 // -- Section 4c: Content --
                 <div class="glass-card p-6 space-y-4">
                     <h2 class="text-lg font-semibold text-white flex items-center gap-2">

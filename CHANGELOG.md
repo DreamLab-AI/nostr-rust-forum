@@ -7,6 +7,24 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Added: content-free Web Push alerts for replies, DMs and new messages (`nostr-bbs-relay-worker`, `nostr-bbs-forum-client`, `nostr-bbs-core`)
+
+An installed PWA can now be woken when it is closed. The relay sends an empty VAPID-signed push (RFC 8292,
+ES256) after storing a reply or @-mention (kind 42 `p` tag), a DM wrap (kind 1059), or, for members who opt in,
+a new topic (kind 40) or post (kind 42). The service worker then fetches only counters over HTTPS
+(`POST /api/push/drain`) and shows a generic notification, so no message detail crosses Google, Apple or
+Mozilla. Recipients pass the same zone read gate as live delivery; the sender's own NIP-17 copy never alerts.
+Members choose categories and quiet hours in Settings (`/api/push/prefs`, shared `nostr_bbs_core::push`
+types). Off by default: set `PUSH_ENABLED`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT` and the `VAPID_PRIVATE_KEY`
+secret (`cargo run -p nostr-bbs-relay-worker --example vapid_keygen`; SETUP.md section 10). New D1 migration
+`0010_push.sql`. ADR-2023.
+
+### Added: DM arrival notifications and hidden-tab system alerts (`nostr-bbs-forum-client`)
+
+A received DM now creates a `DM` notification (it never did), gated on the account's sync baseline and
+de-duplicated per wrap. While the page is hidden, permission is granted and server push is not active on the
+device, new notifications are also raised as generic system notifications through the service worker.
+
 ### Fixed: kind-1059 gift wraps no longer readable through a `kinds`-less REQ or COUNT (`nostr-bbs-relay-worker`)
 
 The REQ/COUNT gate decided whether a filter read gift wraps from the filter's `kinds`. A filter with no

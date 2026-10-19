@@ -37,6 +37,8 @@ async-trait = { workspace = true }
 # C5 fix: NIP-42 AUTH challenge generation requires CSPRNG. The js-feature
 # routes getrandom calls to crypto.getRandomValues on the CF Workers runtime.
 getrandom = { workspace = true }
+# ADR-2023 VAPID (RFC 8292) ES256 signing; RustCrypto, already pinned workspace-wide.
+p256 = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }

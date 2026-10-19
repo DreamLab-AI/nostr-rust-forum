@@ -24,6 +24,7 @@ mod filter;
 mod mod_cache;
 mod nip42;
 mod nip_handlers;
+mod push_fanout;
 mod read_cache;
 pub(crate) mod receipts;
 mod session;

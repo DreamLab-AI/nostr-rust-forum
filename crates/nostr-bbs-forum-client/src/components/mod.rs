@@ -89,6 +89,7 @@ pub mod offline_banner;
 
 // -- Accessibility & Polish (Stream 11) --------------------------------------
 pub mod nsec_backup;
+pub mod push_settings;
 // Recovery & device-onboarding sheet (ADR-095): printable one-page QR sheet
 // that backs up the account and onboards 0xchat — client-side only.
 pub mod recovery_sheet;

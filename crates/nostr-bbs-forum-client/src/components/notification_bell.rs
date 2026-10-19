@@ -90,6 +90,25 @@ pub(crate) fn NotificationBell() -> impl IntoView {
     v2_store.init_sync();
     let panel_open = RwSignal::new(false);
 
+    // ADR-2023: once signed in, keep this device's push registration fresh (at
+    // most daily; a no-op unless the member already turned alerts on here).
+    let push_auth = crate::auth::use_auth();
+    let push_authed = push_auth.is_authenticated();
+    let push_refreshed = std::cell::Cell::new(false);
+    Effect::new(move |_| {
+        // Tracked: re-runs when sign-in completes (the signer itself is not reactive).
+        if !push_authed.get() || push_refreshed.get() {
+            return;
+        }
+        if let Some(signer) = push_auth.get_signer() {
+            push_refreshed.set(true);
+            leptos::task::spawn_local(crate::utils::push::refresh_if_due(
+                signer,
+                crate::utils::push::brand_label(),
+            ));
+        }
+    });
+
     // Bug #18: route open-state through the shared PopoverCoord so opening
     // this popover automatically closes any sibling popover (Bookmarks etc.)
     // Two-way sync — see app.rs::Layout for the parallel bookmarks block.

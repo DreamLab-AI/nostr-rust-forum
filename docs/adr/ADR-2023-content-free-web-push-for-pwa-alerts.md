@@ -1,0 +1,49 @@
+---
+id: ADR-2023
+title: Content-free Web Push delivers reply, DM and new-message alerts to the PWA
+date: 2026-10-19
+decision_status: accepted
+implementation_status: partial
+activation_status: staged
+supersedes: []
+superseded_by: []
+verified_commit:
+owner: DreamLab-AI/nostr-rust-forum maintainers
+review_trigger: Any request to carry message text in a push payload (RFC 8291), or a second service worker (the BBS) wanting its own push subscription
+repo: nostr-rust-forum
+---
+
+# ADR-2023 — Content-free Web Push delivers reply, DM and new-message alerts to the PWA
+
+## Context
+- Alerts exist only in-app (`stores/notifications.rs`) and only while a tab holds the relay WebSocket. A closed or backgrounded PWA, the normal mobile state, gets nothing. `NotificationKind::DM` is rendered but nothing ever produces it.
+- `sw.js` has no `push` / `notificationclick` handler; the relay fans out to live sessions only (`relay_do/broadcast.rs`).
+- Gift-wrapped DMs (kind 1059) and E2E zones (ADR-2016) reach the relay as ciphertext plus a visible recipient `p` tag. The nsec lives in `localStorage`, which a service worker cannot read, and moving it to IndexedDB would breach the ADR-109 threat model.
+- Push payloads transit Google, Apple and Mozilla. Cryptography must come from audited RustCrypto crates, never a bespoke envelope.
+
+## Decision
+1. **Option A, payload-less Web Push.** The relay POSTs an empty, VAPID-signed (RFC 8292, ES256 via `p256`) request to each subscription endpoint. No message text, author, channel or recipient detail crosses a push service. RFC 8291 encrypted payloads are explicitly out of scope; adopting them needs a new ADR.
+2. **The service worker drains counts on wake.** Each subscription holds a random 256-bit bearer token (only its SHA-256 is stored). On `push` the SW calls `POST /api/push/drain {id, token}` and receives content-free counters (`dm`, `reply`, `topic`, `post`) plus at most one `/go/<event-id>` deep link per category, then shows one notification per non-zero category. A zero or failed drain shows a generic notification so `userVisibleOnly` is honoured.
+3. **The relay fans out after `save_event`** (`nip_handlers.rs`), resolving recipients and then sending inside `state.wait_until`, so the sender's OK is never delayed. No Queues binding is added.
+   - kind 1059: recipient is the `p` tag; skipped when the submitting session is authenticated as that same pubkey (the NIP-17 self-copy), which needs no protocol change.
+   - kind 42: `p`-tagged members receive a *reply* alert; opted-in members receive a *post* alert. kind 40: opted-in members receive a *topic* alert.
+   - Every kind 40/42 recipient passes the same `resolve_viewer_context` + `authorize_event` gate as live delivery, so a push never reveals a post the recipient cannot read.
+4. **Server-side preferences** (`push_prefs`, per pubkey): replies, dms, new_topics, new_posts, muted channels, quiet hours. Defaults: replies and dms on; topics and posts off. Counts for suppressed categories are not accumulated.
+5. **Subscription hygiene.** Register and unsubscribe require NIP-98 and a whitelisted pubkey; endpoints must be `https` on an allow-listed push-service host (SSRF guard); at most 10 subscriptions per pubkey; a 404/410 from the push service deletes the row, repeated failures delete it too.
+6. **The forum service worker (`/community/sw.js`) owns push.** The BBS SW (`bbs-sw.js`, scope `/community/bbs/`) does not subscribe in v1.
+7. **Default off.** The relay needs `PUSH_ENABLED="true"`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT` and the secret `VAPID_PRIVATE_KEY`. The client learns of the feature from `GET /api/push/config`, so no client rebuild or `window.__ENV__` change is needed to switch it on.
+8. **Tier 0 ships with it:** a received DM now creates a `DM` notification (baseline- and dedupe-gated like posts), and when the tab is hidden, permission is granted and Web Push is not active on this device, the page raises the notification through `registration.showNotification()`.
+
+## Consequences
+- Alerts reach closed PWAs on desktop and Android, and on iOS 16.4+ once installed to the Home Screen, with permission requested from a tap.
+- Notification text is necessarily generic ("New direct message", "3 new replies"). Richer text means RFC 8291 and a new ADR.
+- A new D1 migration (`0010_push.sql`; also applied idempotently by `ensure_schema`) adds `push_subscriptions` and `push_prefs`. Fan-out costs one D1 read per event and one subrequest per notified device; it is capped per event (`PUSH_MAX_FANOUT`, default 100) and post/topic pushes are throttled to one per device per minute.
+- Operators must generate a VAPID key pair (P-256) and set the secret; the kit repin follows the dual-pin rule.
+- WebKit (iOS) can revoke a subscription after repeated pushes that show no notification. The only path that skips one is a visible window inside the forum scope (the retro BBS and any same-origin marketing tab do not count), and the service worker otherwise always shows something, generic if it must.
+- A repeated submission of an already stored event (a client republishing after a reconnect) does not alert twice.
+- Each installed instance has its own subscription; an instance that never reopens leaves a stale row until the push service reports 404/410.
+
+## Verification
+- `cargo test -p nostr-bbs-relay-worker push` covers: the RFC 8292 §2 example JWT verifying under its published key, VAPID round-trip, endpoint allow-list, preference and quiet-hour logic, token hashing, fan-out classification and the self-copy skip.
+- `cargo test -p nostr-bbs-forum-client` covers the Tier 0 DM gating and system-notification predicate.
+- `verified_commit` is stamped when the implementation lands and the suites above pass.

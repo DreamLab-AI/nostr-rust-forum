@@ -64,6 +64,17 @@ ESCALATION_DEFAULT_POSTURE = "escalate_to_human"
 # failure) and logs a warning on every projection. Set it before relying on the
 # calibration or probe-catch numbers for anything.
 
+# Content-free Web Push (ADR-2023). Off by default. To enable: generate a P-256
+# VAPID key pair (SETUP.md "Web Push"), set PUSH_ENABLED = "true", put the public
+# key and a contact URL below, and store the private key as a Worker secret:
+#   wrangler secret put VAPID_PRIVATE_KEY
+# The private key must never be committed to this file.
+PUSH_ENABLED     = "false"
+VAPID_PUBLIC_KEY = ""
+VAPID_SUBJECT    = "mailto:admin@example.com"
+# Cap on devices woken per stored event (default 100).
+PUSH_MAX_FANOUT  = "100"
+
 # Mesh federation (PRD-010 Phase 3 / ADR-073)
 MESH_MODE               = "standalone"
 MESH_PEER_RELAYS        = ""

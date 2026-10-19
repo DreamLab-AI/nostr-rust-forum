@@ -896,7 +896,19 @@ async fn process_gift_wrap_event(
         is_read: is_sent,
     };
 
+    // Tier 0 (ADR-2023): a received DM raises a notification. Coach exchanges
+    // are poker-table plumbing, not mail, and never notify.
+    let notifiable = !is_sent && !is_coach_content(&plaintext);
+    let wrap_id = msg.id.clone();
+    let sender = msg.sender_pubkey.clone();
+
     insert_dm_message(msg, &counterparty_pk, &plaintext, timestamp, is_sent, state);
+
+    if notifiable {
+        if let Some(store) = crate::stores::notifications::global_notification_store() {
+            store.notify_dm(&wrap_id, &sender, timestamp, is_sent);
+        }
+    }
 }
 
 /// Decrypt a legacy kind 4 DM event and insert into state.
