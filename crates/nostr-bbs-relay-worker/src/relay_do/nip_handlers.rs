@@ -896,7 +896,12 @@ impl NostrRelayDO {
         // only; SANCTIONS (suspension, silence, ban) apply to the key AND the
         // owner; ADMIN status stays the raw signing key's own, so a device key
         // never inherits admin powers. Gate-off / non-device ⇒ `principal ==
-        // event.pubkey`.
+        // event.pubkey`. The RSVP cohort check, the posts_created counter, the
+        // activity stamp and the delete-any trust level below also use the
+        // principal, so they agree with the trust level and zone-write path that
+        // resolve through the owner; the mesh-peer, agent, reviewer, delegation
+        // and supersession checks, NIP-09 own-event scope and moderation
+        // mirroring stay on the raw signing key.
         let principal = if needs_owner_lookup(event.kind) {
             self.effective_pubkey(&event.pubkey).await
         } else {
@@ -1261,7 +1266,7 @@ impl NostrRelayDO {
                     // `project_tier` short-circuits admins/owners to Full anyway;
                     // here we ask the author's own tier for the TARGET's real zone.
                     let (author_cohorts, author_cohort_admin) =
-                        self.cached_viewer_cohorts(&event.pubkey).await;
+                        self.cached_viewer_cohorts(&principal).await;
                     let tier = calendar_projection::project_tier(
                         &author_cohorts,
                         &zone,
@@ -1323,12 +1328,12 @@ impl NostrRelayDO {
             // for content-producing event kinds (kind-1 text, kind-42 channel msg,
             // kind-40 channel create, kind-7 reaction, kind-1984 report).
             if matches!(event.kind, 1 | 7 | 40 | 42 | KIND_REPORT_NIP56) {
-                trust::increment_posts_created(&event.pubkey, &self.env).await;
+                trust::increment_posts_created(&principal, &self.env).await;
             }
             // ADR-2018: the `last_active_at` stamp and promotion check are
             // coalesced to one flush per pubkey per window; `posts_created`
             // above stays exact because it is the promotion counter itself.
-            self.note_write_activity(&event.pubkey).await;
+            self.note_write_activity(&principal).await;
 
             // NIP-09: Process deletion events. Same-author targets always
             // delete; admins and TL3+ (Trusted) may delete anyone's events —
@@ -1337,8 +1342,7 @@ impl NostrRelayDO {
             // non-admin gating block above (admins skip it entirely).
             if event.kind == 5 {
                 let can_delete_any = is_admin
-                    || trust::get_trust_level(&event.pubkey, &self.env).await
-                        >= TrustLevel::Trusted;
+                    || trust::get_trust_level(&principal, &self.env).await >= TrustLevel::Trusted;
                 self.process_deletion(&event, can_delete_any).await;
             }
 

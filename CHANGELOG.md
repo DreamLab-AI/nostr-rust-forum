@@ -15,7 +15,8 @@ effective principal is now resolved once, after signature verification and the w
 and an event is refused if either the device key or its owner is suspended, silenced, banned or muted. The allowlist,
 trust level and zone-write checks use the owner; admin status stays the signing key's own, so a device key never
 inherits admin powers (a stolen admin device key cannot sign an enforced ban, and banning a device key directly holds).
-A channel's creator is matched against both keys, since creation records the raw signing key. Behaviour with device
+The RSVP cohort check, the `posts_created` counter, activity stamp and delete-any trust level follow the owner too,
+so a device key's posts promote its owner. A channel's creator is matched against both keys, since creation records the raw signing key. Behaviour with device
 keys off is unchanged.
 
 ### Fixed: kind-41 channel metadata used a different channel than kind-42 and was not zone-read-gated (`nostr-bbs-relay-worker`)
