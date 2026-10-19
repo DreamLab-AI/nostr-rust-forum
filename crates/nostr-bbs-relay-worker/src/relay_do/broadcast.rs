@@ -6,6 +6,7 @@ use worker::*;
 
 use super::calendar_projection;
 use super::filter::{event_matches_filters, tag_value, NostrFilter};
+use super::nip42::{is_protected_read_kind, protected_read_permitted};
 use super::nip_handlers::ReadDecision;
 use super::NostrRelayDO;
 use crate::zone_config::ZoneConfig;
@@ -39,6 +40,19 @@ pub fn event_treatment(kind: u64) -> EventTreatment {
 // ---------------------------------------------------------------------------
 // Broadcasting
 // ---------------------------------------------------------------------------
+
+/// The `p`-tagged recipients of `event` when its kind is protected-read, else
+/// `None` (nothing to gate).
+fn protected_recipients(event: &NostrEvent) -> Option<Vec<String>> {
+    is_protected_read_kind(event.kind).then(|| {
+        event
+            .tags
+            .iter()
+            .filter(|t| t.len() >= 2 && t[0] == "p")
+            .map(|t| t[1].clone())
+            .collect()
+    })
+}
 
 /// A broadcast delivery candidate: a session's authed pubkey (if any), its
 /// WebSocket, and a snapshot of its (sub_id, filters) subscriptions.
@@ -88,7 +102,28 @@ impl NostrRelayDO {
             None
         };
 
+        // Protected kinds ({4,13,14,1059,30910-30916}) are decided per event AND per
+        // session, here as on REQ and COUNT. The REQ gates look at the kinds a
+        // filter names, and a filter that omits `kinds` names none, so it is
+        // stored as a live subscription and would otherwise be handed every
+        // later moderation event (plaintext reasons and targets) and DM envelope
+        // (recipient, timing) with no check at all.
+        let protected_recipients = protected_recipients(event);
+        let auth_mode = self.auth_mode();
+
         for (authed_pubkey, ws, subscriptions) in &candidates {
+            if let Some(recipients) = &protected_recipients {
+                if !protected_read_permitted(
+                    event.kind,
+                    &event.pubkey,
+                    recipients,
+                    authed_pubkey.as_deref(),
+                    auth_mode,
+                ) {
+                    continue;
+                }
+            }
+
             // For kind-1059 events, skip sessions not authenticated as the
             // intended recipient.
             if let Some(ref recipient) = kind_1059_recipient {
@@ -432,5 +467,70 @@ mod tests {
     fn nip59_kind_1059_sealed_dm_is_regular() {
         // kind-1059 is a regular event (no special replacement semantics)
         assert_eq!(event_treatment(1059), EventTreatment::Regular);
+    }
+
+    #[test]
+    fn only_protected_kinds_have_broadcast_recipients_to_gate() {
+        use super::super::nip42::AuthMode;
+        let mk = |kind: u64| NostrEvent {
+            id: "i".into(),
+            pubkey: "author".into(),
+            created_at: 1,
+            kind,
+            tags: vec![vec!["p".into(), "bob".into()], vec!["e".into(), "x".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(protected_recipients(&mk(4)), Some(vec!["bob".to_string()]));
+        assert_eq!(
+            protected_recipients(&mk(30910)),
+            Some(vec!["bob".to_string()])
+        );
+        assert_eq!(
+            protected_recipients(&mk(42)),
+            None,
+            "channel posts are zone-gated, not protected-read"
+        );
+
+        // The decision the loop applies, for an unauthenticated kinds-less subscriber:
+        let dm = mk(4);
+        let r = protected_recipients(&dm).unwrap();
+        assert!(!protected_read_permitted(
+            4,
+            &dm.pubkey,
+            &r,
+            None,
+            AuthMode::Nip42
+        ));
+        assert!(protected_read_permitted(
+            4,
+            &dm.pubkey,
+            &r,
+            Some("bob"),
+            AuthMode::Nip42
+        ));
+        assert!(!protected_read_permitted(
+            4,
+            &dm.pubkey,
+            &r,
+            Some("mallory"),
+            AuthMode::Nip42
+        ));
+        let ban = mk(30910);
+        let r = protected_recipients(&ban).unwrap();
+        assert!(!protected_read_permitted(
+            30910,
+            &ban.pubkey,
+            &r,
+            None,
+            AuthMode::Nip42
+        ));
+        assert!(protected_read_permitted(
+            30910,
+            &ban.pubkey,
+            &r,
+            Some("anyone-authed"),
+            AuthMode::Nip42
+        ));
     }
 }

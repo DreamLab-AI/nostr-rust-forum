@@ -105,7 +105,11 @@ impl DMStore {
                 // inbox flattened into one stream.
                 return Vec::new();
             };
-            thread_of(&inner.messages, current)
+            thread_of(
+                &inner.messages,
+                current,
+                crate::poker::PokerConfig::load().coach().as_deref(),
+            )
         })
     }
 
@@ -403,7 +407,7 @@ impl DMStore {
             is_read: true,
         };
 
-        let coach = is_coach_content(content);
+        let coach = is_coach_exchange(content, recipient_pk_hex);
         self.state.update(|s| {
             if s.current_conversation.as_deref() == Some(recipient_pk_hex)
                 && s.seen_ids.insert(msg.id.clone())
@@ -826,10 +830,11 @@ async fn watch_one(event: &NostrEvent, signer: &dyn Signer, me: &str) {
     let Ok(unwrapped) = unwrap_gift_with_signer(event, signer).await else {
         return;
     };
-    if is_coach_content(&unwrapped.rumor.content) {
+    let is_sent = unwrapped.sender_pubkey == me;
+    // Only the other party can be the coach: a wrap we sent is our own copy.
+    if !is_sent && is_coach_exchange(&unwrapped.rumor.content, &unwrapped.sender_pubkey) {
         return;
     }
-    let is_sent = unwrapped.sender_pubkey == me;
     store.notify_dm(
         &event.id,
         &unwrapped.sender_pubkey,
@@ -1048,7 +1053,37 @@ fn insert_dm_message(
     is_sent: bool,
     state: RwSignal<DMStateInner>,
 ) {
-    state.update(|s| apply_message(s, msg, counterparty_pk, plaintext, timestamp, is_sent));
+    let coach = crate::poker::PokerConfig::load().coach();
+    state.update(|s| {
+        apply_message(
+            s,
+            msg,
+            counterparty_pk,
+            plaintext,
+            timestamp,
+            is_sent,
+            coach.as_deref(),
+        )
+    });
+}
+
+/// Whether `content` exchanged with `counterparty` is poker-table plumbing:
+/// tagged like a coach request or reply AND the other party is the configured
+/// coach agent. The tag alone proves nothing, since anyone can start a message
+/// with `[coach]`; classifying on text alone hid such a message from the
+/// recipient's inbox and notifications, and made the sender skip their own
+/// NIP-17 copy, so it vanished from their history for good.
+fn is_coach_exchange_with(content: &str, counterparty: &str, coach: Option<&str>) -> bool {
+    is_coach_content(content) && coach.is_some_and(|c| c.eq_ignore_ascii_case(counterparty))
+}
+
+/// [`is_coach_exchange_with`] against the operator's configured coach.
+fn is_coach_exchange(content: &str, counterparty: &str) -> bool {
+    is_coach_exchange_with(
+        content,
+        counterparty,
+        crate::poker::PokerConfig::load().coach().as_deref(),
+    )
 }
 
 /// Store a message (once, by id) and fold it into its conversation's summary:
@@ -1065,11 +1100,12 @@ fn apply_message(
     plaintext: &str,
     timestamp: u64,
     is_sent: bool,
+    coach: Option<&str>,
 ) {
     if s.seen_ids.insert(msg.id.clone()) {
         s.messages.push(msg);
     }
-    if is_coach_content(plaintext) {
+    if is_coach_exchange_with(plaintext, counterparty_pk, coach) {
         return;
     }
 
@@ -1096,10 +1132,10 @@ fn apply_message(
 ///
 /// The "other party" of a message is the recipient when we sent it and the
 /// sender when we received it.
-fn thread_of(messages: &[DMMessage], counterparty: &str) -> Vec<DMMessage> {
+fn thread_of(messages: &[DMMessage], counterparty: &str, coach: Option<&str>) -> Vec<DMMessage> {
     let mut msgs: Vec<DMMessage> = messages
         .iter()
-        .filter(|m| !is_coach_content(&m.content))
+        .filter(|m| !is_coach_exchange_with(&m.content, counterparty, coach))
         .filter(|m| {
             let other = if m.is_sent {
                 &m.recipient_pubkey
@@ -1411,7 +1447,7 @@ mod tests {
     fn apply(s: &mut DMStateInner, m: DMMessage) {
         let text = m.content.clone();
         let (ts, out) = (m.timestamp, m.is_sent);
-        apply_message(s, m, COACH, &text, ts, out);
+        apply_message(s, m, COACH, &text, ts, out, Some(COACH));
     }
 
     #[test]
@@ -1430,7 +1466,7 @@ mod tests {
                 .sum::<u32>(),
             0
         );
-        assert!(thread_of(&s.messages, COACH).is_empty());
+        assert!(thread_of(&s.messages, COACH, Some(COACH)).is_empty());
     }
 
     #[test]
@@ -1449,7 +1485,7 @@ mod tests {
             "the coach reply is not unread mail"
         );
 
-        let thread = thread_of(&s.messages, COACH);
+        let thread = thread_of(&s.messages, COACH, Some(COACH));
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].id, "hi");
         // all three are still stored
@@ -1461,6 +1497,44 @@ mod tests {
         let mut s = DMStateInner::default();
         apply(&mut s, received("m", "what does [coach] mean?", 7));
         assert_eq!(visible_conversations(&s)[0].unread_count, 1);
-        assert_eq!(thread_of(&s.messages, COACH).len(), 1);
+        assert_eq!(thread_of(&s.messages, COACH, Some(COACH)).len(), 1);
+    }
+
+    #[test]
+    fn the_tag_only_counts_from_the_configured_coach() {
+        let stranger = "3333333333333333333333333333333333333333333333333333333333333333";
+        // Same text, different counterparty: ordinary mail.
+        let mut s = DMStateInner::default();
+        let mut m = received("x", "[coach] hello, are you free tonight?", 7);
+        m.sender_pubkey = stranger.into();
+        let text = m.content.clone();
+        apply_message(&mut s, m, stranger, &text, 7, false, Some(COACH));
+        let list = visible_conversations(&s);
+        assert_eq!(
+            list.len(),
+            1,
+            "a stranger's tagged message opens a conversation"
+        );
+        assert_eq!(list[0].unread_count, 1, "and counts as unread");
+        assert_eq!(
+            thread_of(&s.messages, stranger, Some(COACH)).len(),
+            1,
+            "and shows in the thread"
+        );
+    }
+
+    #[test]
+    fn with_no_coach_configured_nothing_is_table_traffic() {
+        assert!(!is_coach_exchange_with("[coach] Fold.", COACH, None));
+        assert!(!is_coach_exchange_with("[poker-coach] hi", COACH, None));
+        assert!(is_coach_exchange_with("[coach] Fold.", COACH, Some(COACH)));
+        assert!(
+            is_coach_exchange_with("[coach] Fold.", &COACH.to_uppercase(), Some(COACH)),
+            "hex case is not significant"
+        );
+        assert!(
+            !is_coach_exchange_with("plain text", COACH, Some(COACH)),
+            "the coach's ordinary mail is mail"
+        );
     }
 }

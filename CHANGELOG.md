@@ -7,6 +7,19 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: live broadcast leaked protected kinds to kinds-less subscriptions (`nostr-bbs-relay-worker`)
+
+REQ and COUNT decide protected reads from the kinds a filter names, so `{}` or `{"#p":[...]}` passed both gates
+and was stored as a live subscription; `broadcast_event` then delivered every later moderation event (30910-30916,
+plaintext reasons and targets) and legacy DM envelope (kinds 4, 13, 14) to it, authenticated or not. Broadcast now
+applies `protected_read_permitted` per event and per session, exactly as REQ does per event.
+
+### Fixed: DMs starting with `[coach]` or `[poker-coach]` were hidden and silenced from any sender (`nostr-bbs-forum-client`)
+
+Table traffic was recognised by its text alone. A stranger's message that began with the tag vanished from the
+recipient's inbox, thread, unread count and notifications, and a member sending one skipped their own NIP-17
+copy and lost it from their history. Classification now also requires the other party to be the configured coach.
+
 ### Fixed: kind-42 zone write and read gates resolved the channel from a decoy first `e` tag (`nostr-bbs-relay-worker`)
 
 The gates took the FIRST `e` tag as the channel while the client (and Web Push) place a message by its
