@@ -1114,6 +1114,8 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 
     // ADR-2023: drop push subscriptions the app stopped refreshing.
     push::sweep_stale(&env).await;
+    // ADR-2023: wake devices whose burst was throttled and never got its push.
+    push::flush_pending(&env).await;
 
     // Enforce the NIP-11 retention policy and NIP-40 expiration: DELETE rows
     // past their kind's retention window and past their expiration tag. Paged

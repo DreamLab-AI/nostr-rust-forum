@@ -16,7 +16,7 @@ a new topic (kind 40) or post (kind 42). The service worker then fetches only co
 Mozilla. Recipients pass the same zone read gate as live delivery; the sender's own NIP-17 copy never alerts.
 Members choose categories and quiet hours in Settings (`/api/push/prefs`, shared `nostr_bbs_core::push`
 types). Off by default: set `PUSH_ENABLED`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT` and the `VAPID_PRIVATE_KEY`
-secret (`cargo run -p nostr-bbs-relay-worker --example vapid_keygen`; SETUP.md section 10). New D1 migration
+secret (`cargo run -p nostr-bbs-relay-worker --example vapid_keygen`; SETUP.md section 10). Pushes are throttled per device and a cron trailing flush delivers what a burst held back. New D1 migration
 `0010_push.sql`. ADR-2023.
 
 ### Added: DM arrival notifications and hidden-tab system alerts (`nostr-bbs-forum-client`)

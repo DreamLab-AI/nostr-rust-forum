@@ -53,6 +53,10 @@ pub fn PushSettings() -> impl IntoView {
         });
     });
 
+    // Saves can be in flight together (two quick toggles). Only the newest
+    // request may write its echo back, otherwise a slow earlier response lands
+    // last and puts the old state on screen.
+    let save_seq = StoredValue::new(0u64);
     let persist = move || {
         let Some(p) = prefs.get_untracked() else {
             return;
@@ -60,9 +64,15 @@ pub fn PushSettings() -> impl IntoView {
         let Some(signer) = auth.get_signer() else {
             return;
         };
+        let seq = save_seq.get_value() + 1;
+        save_seq.set_value(seq);
         leptos::task::spawn_local(async move {
             match push::save_prefs(signer.as_ref(), &p).await {
-                Ok(saved) => prefs.set(Some(saved)),
+                Ok(saved) => {
+                    if save_seq.try_get_value() == Some(seq) {
+                        prefs.set(Some(saved));
+                    }
+                }
                 Err(e) => toasts.show(e, ToastVariant::Error),
             }
         });

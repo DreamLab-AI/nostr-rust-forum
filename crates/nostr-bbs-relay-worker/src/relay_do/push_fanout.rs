@@ -129,6 +129,7 @@ impl NostrRelayDO {
         if jobs.is_empty() {
             return;
         }
-        self.state.wait_until(push::deliver(self.env.clone(), jobs));
+        self.state
+            .wait_until(push::deliver(self.env.clone(), jobs, true));
     }
 }

@@ -251,6 +251,11 @@ impl NotificationStoreV2 {
             dedup_id,
             key,
         } = origin;
+        // A sender controls the timestamp they put on a DM rumor or a post. A
+        // future one would sort to the top and, because age is computed with
+        // `saturating_sub`, never be evicted, pushing real history out of the
+        // capped list. Clamp it to now.
+        let timestamp = clamp_to_now(timestamp, now_secs());
         // Honour the user's notification level (#wire-settings). The level
         // gates which categories ever reach the store:
         //   None         -> nothing,
@@ -883,6 +888,11 @@ fn dm_verdict(is_sent: bool, timestamp: u64, baseline: u64, already_seen: bool) 
     }
 }
 
+/// A notification cannot be from the future: clamp `timestamp` to `now`.
+fn clamp_to_now(timestamp: u64, now: u64) -> u64 {
+    timestamp.min(now)
+}
+
 /// Generic body for the system notification of `kind`. Never message content:
 /// lock screens show it.
 fn system_text(kind: &NotificationKind) -> &'static str {
@@ -1282,6 +1292,14 @@ mod tests {
             },
             "already announced: nothing to do"
         );
+    }
+
+    #[test]
+    fn future_timestamps_are_clamped_to_now() {
+        assert_eq!(clamp_to_now(5_000, 1_000), 1_000, "far future");
+        assert_eq!(clamp_to_now(u64::MAX, 1_000), 1_000);
+        assert_eq!(clamp_to_now(900, 1_000), 900, "the past is untouched");
+        assert_eq!(clamp_to_now(1_000, 1_000), 1_000);
     }
 
     #[test]

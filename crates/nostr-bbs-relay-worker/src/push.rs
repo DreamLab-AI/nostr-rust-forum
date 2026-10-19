@@ -133,6 +133,20 @@ const SQL_DRAIN_SUBTRACT: &str =
        pending_reply = MAX(pending_reply - ?3, 0), pending_topic = MAX(pending_topic - ?4, 0), \
        pending_post = MAX(pending_post - ?5, 0) WHERE id = ?1";
 
+/// Devices with undelivered counters whose last push is older than `?1`:
+/// throttled alerts the trailing flush must still wake them for.
+const SQL_PENDING_DUE: &str = "SELECT id, pubkey, endpoint, last_push_at, \
+       pending_dm, pending_reply, pending_topic, pending_post \
+     FROM push_subscriptions \
+     WHERE (pending_dm + pending_reply + pending_topic + pending_post) > 0 AND last_push_at <= ?1 \
+     ORDER BY last_push_at ASC LIMIT ?2";
+
+/// A device is flushed once its last push is at least this old, which is longer
+/// than every per-category throttle, so a flush never itself spams.
+const FLUSH_AFTER_SECS: u64 = 120;
+/// Devices woken per cron tick.
+const FLUSH_BATCH: usize = 100;
+
 /// Delete subscriptions the app has not refreshed since `?1`.
 const SQL_SWEEP_STALE: &str = "DELETE FROM push_subscriptions WHERE refreshed_at < ?1";
 
@@ -429,7 +443,7 @@ pub fn vapid_from_env(env: &Env) -> Option<VapidKeys> {
 /// Bump counters for every job, then send the un-throttled ones. Runs inside the
 /// Durable Object's `wait_until`, after the sender has its `OK`. Failures are
 /// logged, never propagated.
-pub async fn deliver(env: Env, jobs: Vec<PushJob>) {
+pub async fn deliver(env: Env, jobs: Vec<PushJob>, bump_counters: bool) {
     if jobs.is_empty() {
         return;
     }
@@ -445,9 +459,10 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>) {
     };
     let now = auth::js_now_secs();
 
-    // 1. Counters + deep links, one batch.
+    // 1. Counters + deep links, one batch. (The cron trailing flush re-wakes
+    //    devices whose counters were already bumped, so it skips this step.)
     let mut bumps = Vec::with_capacity(jobs.len());
-    for job in &jobs {
+    for job in jobs.iter().filter(|_| bump_counters) {
         let sql = bump_sql(job.category);
         let stmt = db.prepare(sql);
         let bound = if job.category.has_link() {
@@ -460,8 +475,10 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>) {
             Err(e) => console_error!("push: bind failed: {e}"),
         }
     }
-    if let Err(e) = db.batch(bumps).await {
-        console_error!("push: counter batch failed: {e}");
+    if !bumps.is_empty() {
+        if let Err(e) = db.batch(bumps).await {
+            console_error!("push: counter batch failed: {e}");
+        }
     }
 
     // 2. One wake-up per device (several categories collapse into one push).
@@ -550,6 +567,69 @@ async fn send_empty_push(endpoint: &str, authorization: &str, lead: Category) ->
     let req = Request::new_with_init(endpoint, &init)?;
     let resp = Fetch::Request(req).send().await?;
     Ok(resp.status_code())
+}
+
+/// Trailing flush, run from the cron tick: wake devices that still hold
+/// undelivered counters because a burst was throttled. Without it the second of
+/// two quick DMs would stay silent until the next event.
+pub async fn flush_pending(env: &Env) {
+    if !enabled(env) {
+        return;
+    }
+    let Ok(db) = env.d1("DB") else { return };
+    let cutoff = auth::js_now_secs().saturating_sub(FLUSH_AFTER_SECS);
+    let Ok(stmt) = db
+        .prepare(SQL_PENDING_DUE)
+        .bind(&[js_f64(cutoff as f64), js_f64(FLUSH_BATCH as f64)])
+    else {
+        return;
+    };
+    let rows = match stmt.all().await {
+        Ok(res) => res.results::<DueRow>().unwrap_or_default(),
+        Err(e) => {
+            console_error!("push: pending flush query failed: {e}");
+            return;
+        }
+    };
+    let jobs: Vec<PushJob> = rows.into_iter().map(DueRow::into_job).collect();
+    if !jobs.is_empty() {
+        console_log!("push: trailing flush waking {} device(s)", jobs.len());
+        deliver(env.clone(), jobs, false).await;
+    }
+}
+
+/// A device with undelivered counters, as the flush reads it.
+#[derive(Deserialize)]
+struct DueRow {
+    id: String,
+    endpoint: String,
+    last_push_at: f64,
+    pending_dm: f64,
+    pending_reply: f64,
+    pending_topic: f64,
+    pending_post: f64,
+}
+
+impl DueRow {
+    /// The wake-up job: the strongest pending category leads (urgency/topic).
+    fn into_job(self) -> PushJob {
+        let category = if self.pending_dm > 0.0 {
+            Category::Dm
+        } else if self.pending_reply > 0.0 {
+            Category::Reply
+        } else if self.pending_topic > 0.0 {
+            Category::Topic
+        } else {
+            Category::Post
+        };
+        PushJob {
+            id: self.id,
+            endpoint: self.endpoint,
+            category,
+            link: None,
+            last_push_at: self.last_push_at as u64,
+        }
+    }
 }
 
 /// Delete subscriptions the app has not refreshed for [`STALE_AFTER_SECS`].
@@ -1320,9 +1400,13 @@ mod tests {
     }
 
     #[test]
-    fn background_chatter_is_throttled_but_addressed_alerts_are_not() {
-        assert!(!throttled(Category::Dm, 1_000, 1_001));
-        assert!(!throttled(Category::Reply, 1_000, 1_001));
+    fn every_category_is_throttled_background_chatter_most() {
+        // Addressed alerts get a short floor (5 s) so a stranger's burst of
+        // gift wraps cannot buzz a phone 30 times a second; the trailing flush
+        // delivers what the floor held back.
+        assert!(throttled(Category::Dm, 1_000, 1_001));
+        assert!(throttled(Category::Reply, 1_000, 1_004));
+        assert!(!throttled(Category::Dm, 1_000, 1_005));
         assert!(throttled(Category::Post, 1_000, 1_030));
         assert!(!throttled(Category::Post, 1_000, 1_060));
         assert!(!throttled(Category::Post, 0, 5), "never pushed before");
@@ -1679,5 +1763,72 @@ mod tests {
             tz_offset: 0.0,
         };
         assert!(row.into_prefs().muted_channels.is_empty());
+    }
+
+    #[test]
+    fn the_trailing_flush_finds_only_devices_with_stale_undelivered_counters() {
+        let conn = db();
+        subscribe_row(&conn, "quiet", PK_A, 1, "t");
+        subscribe_row(&conn, "recent", PK_A, 1, "t");
+        subscribe_row(&conn, "due", PK_B, 1, "t");
+        subscribe_row(&conn, "never", PK_B, 1, "t");
+        conn.execute(&bump_sql(Category::Dm), rusqlite::params!["recent"])
+            .unwrap();
+        conn.execute(
+            "UPDATE push_subscriptions SET last_push_at = 990 WHERE id = 'recent'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &bump_sql(Category::Reply),
+            rusqlite::params!["due", "/go/x"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE push_subscriptions SET last_push_at = 100 WHERE id = 'due'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &bump_sql(Category::Post),
+            rusqlite::params!["never", "/go/y"],
+        )
+        .unwrap();
+
+        let cutoff = 1_000 - FLUSH_AFTER_SECS as i64;
+        let mut stmt = conn.prepare(SQL_PENDING_DUE).unwrap();
+        let ids: Vec<String> = stmt
+            .query_map(rusqlite::params![cutoff, 10], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // "quiet" has nothing pending; "recent" pushed 10 s ago (inside the
+        // window); "due" and "never" (last_push_at 0) are owed a wake-up.
+        assert_eq!(
+            ids,
+            vec!["never".to_string(), "due".to_string()],
+            "oldest push first"
+        );
+    }
+
+    #[test]
+    fn a_flush_job_leads_with_the_strongest_pending_category() {
+        let row = |dm, reply, topic, post| DueRow {
+            id: "s".into(),
+            endpoint: "https://fcm.googleapis.com/x".into(),
+            last_push_at: 5.0,
+            pending_dm: dm,
+            pending_reply: reply,
+            pending_topic: topic,
+            pending_post: post,
+        };
+        assert_eq!(row(1.0, 1.0, 1.0, 1.0).into_job().category, Category::Dm);
+        assert_eq!(row(0.0, 2.0, 1.0, 1.0).into_job().category, Category::Reply);
+        assert_eq!(row(0.0, 0.0, 3.0, 1.0).into_job().category, Category::Topic);
+        assert_eq!(row(0.0, 0.0, 0.0, 9.0).into_job().category, Category::Post);
+        assert!(
+            row(0.0, 0.0, 0.0, 1.0).into_job().link.is_none(),
+            "counters already hold the links"
+        );
     }
 }

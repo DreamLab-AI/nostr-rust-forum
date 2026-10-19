@@ -55,10 +55,13 @@ impl Category {
     }
 
     /// Minimum seconds between pushes to one device. Counters still accumulate
-    /// while throttled; the next push (or the next app open) shows them.
+    /// while throttled; the cron trailing flush (and the next push or app open)
+    /// delivers them. Even addressed alerts are throttled: gift-wrap admission
+    /// only requires a whitelisted *recipient*, so any throwaway key can send a
+    /// wrap, and an unthrottled push would let a stranger buzz a member's phone.
     pub fn min_interval_secs(self) -> u64 {
         match self {
-            Category::Dm | Category::Reply => 0,
+            Category::Dm | Category::Reply => 5,
             Category::Topic | Category::Post => 60,
         }
     }
