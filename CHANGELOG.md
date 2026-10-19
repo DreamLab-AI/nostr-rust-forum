@@ -19,13 +19,14 @@ the tokens `supersession_target_missing`, `_case_mismatch`, `_target_already_sup
 `_state_not_supersedable:<state>`, `_case_missing`, `_human_required` and `self_review`. `blocked: unauthorised
 supersession` is now `blocked: supersession_unauthorised`.
 
-### Fixed: any account could reopen any terminal case with an appeal (`nostr-bbs-relay-worker`)
+### Fixed: any account could reopen any terminal case with an appeal; standing and shape only (`nostr-bbs-relay-worker`)
 
 `project_appeal` took the case from the `d` tag and checked nothing about who was appealing. Only the case's
 requester of record may now appeal, the appeal must cite a decision on that case, and the case must be terminal;
 a refusal leaves a `projection-failed` receipt instead of a silent no-op. An appeal-marked 31402 must carry a
 `case` tag different from its `d` tag (`blocked: appeal_shape`), since `d` equal to the case id would replace the
-requester's own signed request. The receipt and client correlation for the new shape wait on ADR-2024.
+requester's own signed request. Still open pending ADR-2024 (known-findings KF-12, partially fixed): the receipt is keyed on the appeal's own `d` tag
+rather than the case, and the forum client still lists an appeal as a new pending case.
 
 ### Fixed: a banned or suspended owner could publish through a device key (`nostr-bbs-relay-worker`)
 
