@@ -49,6 +49,7 @@ matched nothing. Only the first two colons now separate fields.
 The count was checked, then incremented only after several awaits, so concurrent upgrades from one address could
 all read the same count. The slot is now reserved in the same borrow as the check and released on the early-return
 path.
+
 ### Fixed: schema bootstrap ran ~80 D1 statements on every request, and fresh databases skipped governance ALTERs (`nostr-bbs-relay-worker`)
 
 `ensure_schema` (including a DELETE) ran before the CORS preflight, the WebSocket upgrade and any auth, on every
