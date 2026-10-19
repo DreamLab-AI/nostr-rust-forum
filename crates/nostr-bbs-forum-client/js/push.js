@@ -36,6 +36,12 @@ function withStore(mode, fn) {
           db.close();
           reject(tx.error);
         };
+        // A quota or version abort fires onabort, not onerror: without this the
+        // promise never settles and the connection leaks.
+        tx.onabort = () => {
+          db.close();
+          reject(tx.error || new Error('IndexedDB transaction aborted'));
+        };
       })
   );
 }

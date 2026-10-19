@@ -312,9 +312,12 @@ async fn register(signer: &dyn Signer, vapid_public_key: &str, brand: &str) -> R
 /// Turn alerts off for this device: drop the browser subscription, tell the
 /// relay, forget the drain credentials.
 pub async fn disable(signer: Rc<dyn Signer>) -> Result<(), String> {
+    // If the browser refuses to unsubscribe, still tear down our side: leaving
+    // the device marked active with a live drain token would keep waking it.
     let endpoint = resolve(js_unsubscribe())
-        .await?
-        .as_string()
+        .await
+        .ok()
+        .and_then(|v| v.as_string())
         .unwrap_or_default();
     if !endpoint.is_empty() {
         let body = serde_json::json!({ "endpoint": endpoint }).to_string();
