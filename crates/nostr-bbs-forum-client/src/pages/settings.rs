@@ -126,7 +126,7 @@ pub fn SettingsPage() -> impl IntoView {
     let birthday = RwSignal::new(String::new()); // "MM-DD" format
     let profile_saving = RwSignal::new(false);
     // The member's full hydrated kind-0, so a save keeps fields Settings does not manage.
-    let profile_base = RwSignal::new(serde_json::Value::Null);
+    let profile_base = RwSignal::new(ProfileHydration::Pending);
 
     // Real name (admin-only): loaded from + saved to the auth-worker D1 via
     // NIP-98 authed routes. NEVER published to kind-0 / the relay.
@@ -384,6 +384,9 @@ pub fn SettingsPage() -> impl IntoView {
                 None => return,
             };
 
+            // A new subscription (first connect, reconnect, account switch)
+            // starts unhydrated: never merge into another account's object.
+            base_sig.set(ProfileHydration::Pending);
             let pk_for_event = pk.clone();
             let on_event: Rc<dyn Fn(nostr_bbs_core::NostrEvent)> =
                 Rc::new(move |event: nostr_bbs_core::NostrEvent| {
@@ -394,7 +397,7 @@ pub fn SettingsPage() -> impl IntoView {
                         // Keep the whole object so a save preserves fields
                         // Settings does not manage (see `merge_profile_fields`).
                         if obj.is_object() {
-                            base_sig.set(obj.clone());
+                            base_sig.set(ProfileHydration::Loaded(obj.clone()));
                         }
                         // The nickname is the DISPLAY name — prefer
                         // `display_name`, falling back to `name` for events
@@ -441,14 +444,23 @@ pub fn SettingsPage() -> impl IntoView {
                     ..Default::default()
                 }],
                 on_event,
-                None,
+                // EOSE with no kind-0 means the member has none yet.
+                Some(Rc::new(move || {
+                    if base_sig.get_untracked() == ProfileHydration::Pending {
+                        base_sig.set(ProfileHydration::NotFound);
+                    }
+                })),
             );
 
-            // Auto-unsubscribe after 5 seconds
+            // Auto-unsubscribe after 5 seconds; a relay that never answered by
+            // then is treated as having no kind-0 so Save is not stuck disabled.
             let relay_unsub = relay.clone();
             crate::utils::set_timeout_once(
                 move || {
                     relay_unsub.unsubscribe(&sub_id);
+                    if base_sig.get_untracked() == ProfileHydration::Pending {
+                        base_sig.set(ProfileHydration::NotFound);
+                    }
                 },
                 5_000,
             );
@@ -518,6 +530,9 @@ pub fn SettingsPage() -> impl IntoView {
     let toasts_for_profile = toasts;
     let relay_for_save = relay.clone();
     let on_save_profile = move |_| {
+        if !profile_base.get_untracked().may_save() {
+            return;
+        }
         let name = nickname.get_untracked().trim().to_string();
         if name.is_empty() {
             toasts_for_profile.show("Nickname cannot be empty", ToastVariant::Warning);
@@ -533,7 +548,7 @@ pub fn SettingsPage() -> impl IntoView {
             about.get_untracked().trim().to_string(),
             avatar_url.get_untracked().trim().to_string(),
             birthday.get_untracked().trim().to_string(),
-            profile_base.get_untracked(),
+            profile_base.get_untracked().into_base(),
             "Profile updated",
         );
     };
@@ -551,6 +566,10 @@ pub fn SettingsPage() -> impl IntoView {
         let Some(file) = input.files().and_then(|fl| fl.get(0)) else {
             return;
         };
+        if !profile_base.get_untracked().may_save() {
+            input.set_value("");
+            return;
+        }
         // NB: do NOT reset the input value yet. Clearing it before the blob
         // bytes are read can invalidate the selected File in some browsers
         // (observed `NotFoundError` on read). We reset only in early returns
@@ -595,7 +614,7 @@ pub fn SettingsPage() -> impl IntoView {
         let claimed = claimed_username.get_untracked();
         let bio = about.get_untracked().trim().to_string();
         let bday = birthday.get_untracked().trim().to_string();
-        let base = profile_base.get_untracked();
+        let base = profile_base.get_untracked().into_base();
         let input_reset = input.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let filename = avatar_filename(&file.type_());
@@ -651,6 +670,9 @@ pub fn SettingsPage() -> impl IntoView {
     let toasts_for_pic_remove = toasts;
     let relay_for_pic_remove = relay.clone();
     let on_remove_picture = move |_: leptos::ev::MouseEvent| {
+        if !profile_base.get_untracked().may_save() {
+            return;
+        }
         avatar_url.set(String::new());
         publish_profile_metadata(
             auth,
@@ -662,7 +684,7 @@ pub fn SettingsPage() -> impl IntoView {
             about.get_untracked().trim().to_string(),
             String::new(),
             birthday.get_untracked().trim().to_string(),
-            profile_base.get_untracked(),
+            profile_base.get_untracked().into_base(),
             "Profile picture removed",
         );
     };
@@ -874,6 +896,7 @@ pub fn SettingsPage() -> impl IntoView {
                                         />
                                         <button
                                             on:click=on_remove
+                                            disabled=move || !profile_base.get().may_save()
                                             class="text-xs text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-400 rounded px-2 py-1 transition-colors"
                                         >
                                             "Remove"
@@ -885,7 +908,7 @@ pub fn SettingsPage() -> impl IntoView {
                                 type="file"
                                 accept="image/*"
                                 on:change=on_pic_file
-                                disabled=move || pic_uploading.get()
+                                disabled=move || pic_uploading.get() || !profile_base.get().may_save()
                                 class="block w-full text-sm text-gray-400 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-amber-500 file:text-gray-900 hover:file:bg-amber-400 file:cursor-pointer disabled:opacity-50"
                             />
                             <p class="text-xs text-gray-500">
@@ -923,10 +946,18 @@ pub fn SettingsPage() -> impl IntoView {
 
                     <button
                         on:click=on_save_profile
-                        disabled=move || profile_saving.get()
+                        disabled=move || profile_saving.get() || !profile_base.get().may_save()
                         class="bg-amber-500 hover:bg-amber-400 disabled:bg-gray-600 disabled:cursor-not-allowed text-gray-900 font-semibold px-4 py-2 rounded-lg transition-colors text-sm flex items-center gap-1.5"
                     >
-                        {move || if profile_saving.get() { "Saving..." } else { "Save Profile" }}
+                        {move || {
+                            if !profile_base.get().may_save() {
+                                "Loading profile…"
+                            } else if profile_saving.get() {
+                                "Saving..."
+                            } else {
+                                "Save Profile"
+                            }
+                        }}
                     </button>
 
                     // Real name (admin-only) — separate backend, separate save.
@@ -1708,6 +1739,36 @@ fn spawn_local_release(
 /// it keeps owning the `name` + `nip05` fields; username changes go
 /// through the explicit, validated claim flow.
 ///
+/// Whether the member's existing kind-0 has been fetched yet.
+///
+/// Saving before it has would publish a kind-0 without the fields Settings does
+/// not manage and so delete them from the relay (kind-0 is replaceable).
+#[derive(Clone, Debug, PartialEq)]
+enum ProfileHydration {
+    /// The relay has not answered yet.
+    Pending,
+    /// The existing kind-0 object.
+    Loaded(serde_json::Value),
+    /// The relay answered (or the wait timed out) with no kind-0.
+    NotFound,
+}
+
+impl ProfileHydration {
+    /// Whether a save may proceed now.
+    fn may_save(&self) -> bool {
+        !matches!(self, ProfileHydration::Pending)
+    }
+
+    /// The object to merge managed fields into: the loaded kind-0, or an empty
+    /// object when none exists.
+    fn into_base(self) -> serde_json::Value {
+        match self {
+            ProfileHydration::Loaded(v) => v,
+            _ => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
+
 /// The kind-0 fields the Settings page owns.
 struct ManagedFields<'a> {
     display_name: &'a str,
@@ -2017,6 +2078,22 @@ mod tests {
             picture: "",
             birthday: "",
         }
+    }
+
+    #[test]
+    fn saving_waits_for_the_kind0_reply() {
+        assert!(!ProfileHydration::Pending.may_save());
+        assert!(ProfileHydration::NotFound.may_save());
+        assert!(ProfileHydration::Loaded(serde_json::json!({"lud16": "a@b"})).may_save());
+        // NotFound merges into an empty object; Loaded keeps the fields
+        assert_eq!(
+            ProfileHydration::NotFound.into_base(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            ProfileHydration::Loaded(serde_json::json!({"lud16": "a@b"})).into_base(),
+            serde_json::json!({"lud16": "a@b"})
+        );
     }
 
     #[test]
