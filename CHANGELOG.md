@@ -7,6 +7,10 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: saving the profile deleted every kind-0 field Settings does not manage (`nostr-bbs-forum-client`)
+
+Settings rebuilt the replaceable kind-0 from only name, about, picture, birthday and nip05, so `lud16`, `lud06`, `banner`, `website`, the bot flag and anything set from another client vanished permanently on save. The hydrated kind-0 object is now kept and `merge_profile_fields` overwrites only the managed fields; an existing `nip05` is kept unless a username is claimed.
+
 ### Fixed: DM relay list used the wrong tag (`nostr-bbs-forum-client`)
 
 The kind-10050 event was published with `["r", url]`; NIP-17 reads `["relay", url]`, as the BBS client already emits. The tag name is now pinned by a test.

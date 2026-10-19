@@ -125,6 +125,8 @@ pub fn SettingsPage() -> impl IntoView {
     let avatar_url = RwSignal::new(String::new());
     let birthday = RwSignal::new(String::new()); // "MM-DD" format
     let profile_saving = RwSignal::new(false);
+    // The member's full hydrated kind-0, so a save keeps fields Settings does not manage.
+    let profile_base = RwSignal::new(serde_json::Value::Null);
 
     // Real name (admin-only): loaded from + saved to the auth-worker D1 via
     // NIP-98 authed routes. NEVER published to kind-0 / the relay.
@@ -371,6 +373,7 @@ pub fn SettingsPage() -> impl IntoView {
         let avatar_sig = avatar_url;
         let birthday_sig = birthday;
         let auth_for_fetch = auth;
+        let base_sig = profile_base;
 
         Effect::new(move |_| {
             if conn_state.get() != ConnectionState::Connected {
@@ -388,6 +391,11 @@ pub fn SettingsPage() -> impl IntoView {
                         return;
                     }
                     if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&event.content) {
+                        // Keep the whole object so a save preserves fields
+                        // Settings does not manage (see `merge_profile_fields`).
+                        if obj.is_object() {
+                            base_sig.set(obj.clone());
+                        }
                         // The nickname is the DISPLAY name — prefer
                         // `display_name`, falling back to `name` for events
                         // published before the username/nickname split.
@@ -525,6 +533,7 @@ pub fn SettingsPage() -> impl IntoView {
             about.get_untracked().trim().to_string(),
             avatar_url.get_untracked().trim().to_string(),
             birthday.get_untracked().trim().to_string(),
+            profile_base.get_untracked(),
             "Profile updated",
         );
     };
@@ -586,6 +595,7 @@ pub fn SettingsPage() -> impl IntoView {
         let claimed = claimed_username.get_untracked();
         let bio = about.get_untracked().trim().to_string();
         let bday = birthday.get_untracked().trim().to_string();
+        let base = profile_base.get_untracked();
         let input_reset = input.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let filename = avatar_filename(&file.type_());
@@ -622,6 +632,7 @@ pub fn SettingsPage() -> impl IntoView {
                         bio,
                         url,
                         bday,
+                        base,
                         "Profile picture updated",
                     );
                 }
@@ -651,6 +662,7 @@ pub fn SettingsPage() -> impl IntoView {
             about.get_untracked().trim().to_string(),
             String::new(),
             birthday.get_untracked().trim().to_string(),
+            profile_base.get_untracked(),
             "Profile picture removed",
         );
     };
@@ -1696,6 +1708,66 @@ fn spawn_local_release(
 /// it keeps owning the `name` + `nip05` fields; username changes go
 /// through the explicit, validated claim flow.
 ///
+/// The kind-0 fields the Settings page owns.
+struct ManagedFields<'a> {
+    display_name: &'a str,
+    claimed: Option<&'a str>,
+    about: &'a str,
+    picture: &'a str,
+    birthday: &'a str,
+}
+
+/// Merge the Settings-managed fields into the member's existing kind-0 object.
+///
+/// Kind-0 is replaceable, so anything absent from the published event is lost
+/// for good. Starting from the full hydrated object keeps every field Settings
+/// does not manage (`lud16`, `banner`, `website`, fields set from other
+/// clients). `display_name` and `name` are always written; `nip05` only when a
+/// username is claimed (otherwise any existing value is kept). `about`,
+/// `picture` and `birthday` are removed when empty, which is how clearing them
+/// works. A non-object `existing` is treated as no prior kind-0.
+fn merge_profile_fields(
+    existing: serde_json::Value,
+    managed: ManagedFields<'_>,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let mut obj = match existing {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert(
+        "display_name".into(),
+        Value::String(managed.display_name.to_string()),
+    );
+    match managed.claimed {
+        Some(username) => {
+            obj.insert("name".into(), Value::String(username.to_string()));
+            obj.insert(
+                "nip05".into(),
+                Value::String(format!("{}@{}", username, NIP05_USERNAME_HOST)),
+            );
+        }
+        None => {
+            obj.insert(
+                "name".into(),
+                Value::String(managed.display_name.to_string()),
+            );
+        }
+    }
+    for (key, value) in [
+        ("about", managed.about),
+        ("picture", managed.picture),
+        ("birthday", managed.birthday),
+    ] {
+        if value.is_empty() {
+            obj.remove(key);
+        } else {
+            obj.insert(key.into(), Value::String(value.to_string()));
+        }
+    }
+    Value::Object(obj)
+}
+
 /// Shared by the Save Profile button, the picture upload flow, and the
 /// picture Remove flow so kind-0 (a replaceable event) is always rebuilt
 /// from the full field set and never clobbers sibling fields.
@@ -1710,6 +1782,7 @@ fn publish_profile_metadata(
     bio: String,
     pic: String,
     bday: String,
+    base: serde_json::Value,
     success_msg: &'static str,
 ) {
     let pubkey_hex = match auth.pubkey().get_untracked() {
@@ -1722,37 +1795,18 @@ fn publish_profile_metadata(
 
     saving.set(true);
 
-    let mut metadata = serde_json::Map::new();
-    metadata.insert(
-        "display_name".into(),
-        serde_json::Value::String(name.clone()),
+    let merged = merge_profile_fields(
+        base,
+        ManagedFields {
+            display_name: &name,
+            claimed: claimed.as_deref(),
+            about: &bio,
+            picture: &pic,
+            birthday: &bday,
+        },
     );
-    match &claimed {
-        Some(username) => {
-            metadata.insert("name".into(), serde_json::Value::String(username.clone()));
-            metadata.insert(
-                "nip05".into(),
-                serde_json::Value::String(format!("{}@{}", username, NIP05_USERNAME_HOST)),
-            );
-        }
-        None => {
-            // No claimed username: keep `name` mirroring the display name
-            // for clients that only read `name`, but nothing here is ever
-            // treated as a claimed handle.
-            metadata.insert("name".into(), serde_json::Value::String(name.clone()));
-        }
-    }
-    if !bio.is_empty() {
-        metadata.insert("about".into(), serde_json::Value::String(bio));
-    }
-    if !pic.is_empty() {
-        metadata.insert("picture".into(), serde_json::Value::String(pic.clone()));
-    }
-    if !bday.is_empty() {
-        metadata.insert("birthday".into(), serde_json::Value::String(bday));
-    }
 
-    let content = serde_json::to_string(&serde_json::Value::Object(metadata)).unwrap_or_default();
+    let content = serde_json::to_string(&merged).unwrap_or_default();
 
     let unsigned = UnsignedEvent {
         pubkey: pubkey_hex,
@@ -1953,6 +2007,65 @@ mod tests {
         for bad in ["image/svg+xml", "image/avif", "text/html", ""] {
             assert!(!avatar_type_allowed(bad), "{bad}");
         }
+    }
+
+    fn managed<'a>(name: &'a str, about: &'a str) -> ManagedFields<'a> {
+        ManagedFields {
+            display_name: name,
+            claimed: None,
+            about,
+            picture: "",
+            birthday: "",
+        }
+    }
+
+    #[test]
+    fn unmanaged_kind0_fields_survive_a_save() {
+        let existing = serde_json::json!({
+            "name": "old", "display_name": "Old", "lud16": "me@wallet.example",
+            "banner": "https://x/b.png", "website": "https://me.example", "bot": false
+        });
+        let out = merge_profile_fields(existing, managed("New", ""));
+        assert_eq!(out["display_name"], "New");
+        assert_eq!(out["name"], "New");
+        assert_eq!(out["lud16"], "me@wallet.example");
+        assert_eq!(out["banner"], "https://x/b.png");
+        assert_eq!(out["website"], "https://me.example");
+        assert_eq!(out["bot"], false);
+    }
+
+    #[test]
+    fn empty_managed_optionals_are_dropped_not_written() {
+        let existing = serde_json::json!({
+            "about": "bio", "picture": "https://x/p.png", "birthday": "1990-01-01",
+            "nip05": "other@elsewhere.example"
+        });
+        let out = merge_profile_fields(existing, managed("N", ""));
+        assert!(out.get("about").is_none());
+        assert!(out.get("picture").is_none());
+        assert!(out.get("birthday").is_none());
+        // no claim: an existing nip05 is not Settings' to remove
+        assert_eq!(out["nip05"], "other@elsewhere.example");
+    }
+
+    #[test]
+    fn no_prior_kind0_yields_exactly_the_managed_fields() {
+        let out = merge_profile_fields(
+            serde_json::Value::Null,
+            ManagedFields {
+                display_name: "N",
+                claimed: Some("alice"),
+                about: "hi",
+                picture: "https://x/p.png",
+                birthday: "2000-02-02",
+            },
+        );
+        let expected = serde_json::json!({
+            "display_name": "N", "name": "alice",
+            "nip05": format!("alice@{}", NIP05_USERNAME_HOST),
+            "about": "hi", "picture": "https://x/p.png", "birthday": "2000-02-02"
+        });
+        assert_eq!(out, expected);
     }
 
     #[test]
