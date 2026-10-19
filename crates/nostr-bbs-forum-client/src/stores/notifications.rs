@@ -829,7 +829,7 @@ impl NotificationStoreV2 {
     ///
     /// Root cause of "mark all read keeps resetting" (multi-client clobber):
     /// each client holds its OWN in-memory `items`, but they share the single
-    /// [`STORAGE_KEY`] entry with no reconciliation. Tab A marking all read
+    /// per-owner [`items_key`] entry with no reconciliation. Tab A marking all read
     /// persists `read:true`; a STALE tab B then persists its own `read:false`
     /// snapshot (on its next `mark_read` / `add` / producer write) and silently
     /// reverts the shared key back to unread. The `storage` event fires ONLY in
