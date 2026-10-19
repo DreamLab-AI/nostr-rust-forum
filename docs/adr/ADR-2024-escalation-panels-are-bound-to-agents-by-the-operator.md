@@ -7,7 +7,7 @@ implementation_status: none
 activation_status: inactive
 supersedes: []
 superseded_by: []
-verified_commit:
+verified_commit: a76c3233
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: Before any deployment sets GOVERNANCE_PANEL_BINDING=enforce; or when a second operator deploys [governance]
 repo: nostr-rust-forum
