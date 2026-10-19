@@ -52,7 +52,8 @@ path.
 ### Fixed: schema bootstrap ran ~80 D1 statements on every request, and fresh databases skipped governance ALTERs (`nostr-bbs-relay-worker`)
 
 `ensure_schema` (including a DELETE) ran before the CORS preflight, the WebSocket upgrade and any auth, on every
-request. It now runs at most once per isolate, after those two branches. Separately, the `broker_cases` and
+request. It now runs at most once per isolate, after the preflight but before the WebSocket branch (the Durable
+Object never bootstraps the schema), and only latches once every CREATE has succeeded. Separately, the `broker_cases` and
 `governance_receipts` ALTERs ran before those tables' CREATEs, so on a fresh D1 they failed and the
 `effective_tier` index was skipped; both tables are now created first.
 
@@ -68,7 +69,7 @@ The per-device throttle read `last_push_at` before the send and wrote it after, 
 claims the slot with an atomic `UPDATE ... WHERE last_push_at <= now - interval` first, sends only on a changed row,
 and rolls the timestamp back if the send fails. Gift-wrap senders are not allowlisted, so each device also has a
 rolling hourly DM wake-up budget (default 30, `PUSH_DM_HOURLY_BUDGET`); over-budget DMs still count in the app but
-do not wake it. Adds two `push_subscriptions` columns (migration 0010 and `ensure_schema`).
+do not wake it, and the cron flush skips a device held only by a spent budget until its window resets. Adds two `push_subscriptions` columns (migration 0010 and `ensure_schema`).
 
 ### Fixed: live broadcast leaked protected kinds to kinds-less subscriptions (`nostr-bbs-relay-worker`)
 

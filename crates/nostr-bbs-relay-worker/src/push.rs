@@ -154,16 +154,20 @@ const SQL_DRAIN_SUBTRACT: &str =
        pending_reply = MAX(pending_reply - ?3, 0), pending_topic = MAX(pending_topic - ?4, 0), \
        pending_post = MAX(pending_post - ?5, 0) WHERE id = ?1";
 
-/// Devices owed a wake-up: events were counted since the last successful push
+/// Devices owed a wake-up (`?3` = DM budget, `?4` = now, `?5` = DM window length): events were counted since the last successful push
 /// (`bump_seq > pushed_seq`), they are still undrained, and the last push is older
-/// than `?1`. One burst earns exactly one flush: a successful flush sets
+/// than `?1`, and not held only by a spent DM budget (a device whose sole pending
+/// item is an over-budget DM stays out of the batch until its window resets, so
+/// it cannot crowd out other devices' flushes). One burst earns exactly one flush: a successful flush sets
 /// `pushed_seq = bump_seq`, so an app that never drains cannot be woken every tick.
 const SQL_PENDING_DUE: &str = "SELECT id, pubkey, endpoint, last_push_at, \
-       pending_dm, pending_reply, pending_topic \
+       pending_dm, pending_reply, pending_topic, pending_post \
      FROM push_subscriptions \
      WHERE bump_seq > pushed_seq \
        AND (pending_dm + pending_reply + pending_topic + pending_post) > 0 \
        AND last_push_at <= ?1 \
+       AND NOT (pending_reply + pending_topic + pending_post = 0 \
+                AND dm_window_count >= ?3 AND ?4 - dm_window_start < ?5) \
      ORDER BY last_push_at ASC LIMIT ?2";
 
 /// A device is flushed once its last push is at least this old, which is longer
@@ -747,11 +751,15 @@ pub async fn flush_pending(env: &Env) {
         return;
     }
     let Ok(db) = env.d1("DB") else { return };
-    let cutoff = auth::js_now_secs().saturating_sub(FLUSH_AFTER_SECS);
-    let Ok(stmt) = db
-        .prepare(SQL_PENDING_DUE)
-        .bind(&[js_f64(cutoff as f64), js_f64(FLUSH_BATCH as f64)])
-    else {
+    let now = auth::js_now_secs();
+    let cutoff = now.saturating_sub(FLUSH_AFTER_SECS);
+    let Ok(stmt) = db.prepare(SQL_PENDING_DUE).bind(&[
+        js_f64(cutoff as f64),
+        js_f64(FLUSH_BATCH as f64),
+        js_f64(f64::from(dm_hourly_budget(env))),
+        js_f64(now as f64),
+        js_f64(DM_BUDGET_WINDOW_SECS as f64),
+    ]) else {
         return;
     };
     let rows = match stmt.all().await {
@@ -761,7 +769,7 @@ pub async fn flush_pending(env: &Env) {
             return;
         }
     };
-    let jobs: Vec<PushJob> = rows.into_iter().map(DueRow::into_job).collect();
+    let jobs: Vec<PushJob> = rows.into_iter().flat_map(DueRow::into_jobs).collect();
     if !jobs.is_empty() {
         console_log!("push: trailing flush waking {} device(s)", jobs.len());
         deliver(env.clone(), jobs, false).await;
@@ -777,28 +785,30 @@ struct DueRow {
     pending_dm: f64,
     pending_reply: f64,
     pending_topic: f64,
+    pending_post: f64,
 }
 
 impl DueRow {
-    /// The wake-up job: the strongest pending category leads (urgency/topic).
-    fn into_job(self) -> PushJob {
-        let category = if self.pending_dm > 0.0 {
-            Category::Dm
-        } else if self.pending_reply > 0.0 {
-            Category::Reply
-        } else if self.pending_topic > 0.0 {
-            Category::Topic
-        } else {
-            // Only posts can be left (the query guarantees something pends).
-            Category::Post
-        };
-        PushJob {
-            id: self.id,
-            endpoint: self.endpoint,
+    /// One wake-up job per pending category; `deliver` merges them per device and
+    /// the strongest sets urgency/topic. Emitting every category matters when the
+    /// DM budget is spent: the device can still be woken for its replies.
+    fn into_jobs(self) -> Vec<PushJob> {
+        [
+            (self.pending_dm, Category::Dm),
+            (self.pending_reply, Category::Reply),
+            (self.pending_topic, Category::Topic),
+            (self.pending_post, Category::Post),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0.0)
+        .map(|(_, category)| PushJob {
+            id: self.id.clone(),
+            endpoint: self.endpoint.clone(),
             category,
             link: None,
             last_push_at: self.last_push_at as u64,
-        }
+        })
+        .collect()
     }
 }
 
@@ -2008,7 +2018,16 @@ mod tests {
         let cutoff = 1_000 - FLUSH_AFTER_SECS as i64;
         let mut stmt = conn.prepare(SQL_PENDING_DUE).unwrap();
         let ids: Vec<String> = stmt
-            .query_map(rusqlite::params![cutoff, 10], |r| r.get(0))
+            .query_map(
+                rusqlite::params![
+                    cutoff,
+                    10,
+                    DEFAULT_DM_HOURLY_BUDGET,
+                    1_000,
+                    DM_BUDGET_WINDOW_SECS as i64
+                ],
+                |r| r.get(0),
+            )
             .unwrap()
             .map(Result::unwrap)
             .collect();
@@ -2022,34 +2041,73 @@ mod tests {
     }
 
     #[test]
-    fn a_flush_job_leads_with_the_strongest_pending_category() {
-        let row = |dm, reply, topic, _post| DueRow {
+    fn flush_jobs_carry_no_link_and_skip_empty_categories() {
+        let row = DueRow {
             id: "s".into(),
             endpoint: "https://fcm.googleapis.com/x".into(),
             last_push_at: 5.0,
-            pending_dm: dm,
-            pending_reply: reply,
-            pending_topic: topic,
+            pending_dm: 0.0,
+            pending_reply: 0.0,
+            pending_topic: 0.0,
+            pending_post: 1.0,
         };
-        assert_eq!(row(1.0, 1.0, 1.0, 1.0).into_job().category, Category::Dm);
-        assert_eq!(row(0.0, 2.0, 1.0, 1.0).into_job().category, Category::Reply);
-        assert_eq!(row(0.0, 0.0, 3.0, 1.0).into_job().category, Category::Topic);
-        assert_eq!(row(0.0, 0.0, 0.0, 9.0).into_job().category, Category::Post);
-        assert!(
-            row(0.0, 0.0, 0.0, 1.0).into_job().link.is_none(),
-            "counters already hold the links"
-        );
+        let jobs = row.into_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].category, Category::Post);
+        assert!(jobs[0].link.is_none(), "counters already hold the links");
     }
 
     /// Ids the trailing flush would wake at `now`.
     fn due(conn: &rusqlite::Connection, now: i64) -> Vec<String> {
         let mut stmt = conn.prepare(SQL_PENDING_DUE).unwrap();
-        stmt.query_map(rusqlite::params![now - FLUSH_AFTER_SECS as i64, 50], |r| {
-            r.get(0)
-        })
+        stmt.query_map(
+            rusqlite::params![
+                now - FLUSH_AFTER_SECS as i64,
+                50,
+                DEFAULT_DM_HOURLY_BUDGET,
+                now,
+                DM_BUDGET_WINDOW_SECS as i64
+            ],
+            |r| r.get(0),
+        )
         .unwrap()
         .map(Result::unwrap)
         .collect()
+    }
+
+    #[test]
+    fn a_device_held_only_by_a_spent_dm_budget_is_not_flushed_until_the_window_resets() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute(&bump_sql(Category::Dm), rusqlite::params!["s1"])
+            .unwrap();
+        conn.execute(
+            "UPDATE push_subscriptions SET dm_window_start = 5000, dm_window_count = ?1",
+            [DEFAULT_DM_HOURLY_BUDGET],
+        )
+        .unwrap();
+        assert!(due(&conn, 5_500).is_empty(), "budget spent, window open");
+        assert_eq!(due(&conn, 5_000 + 3_600), vec!["s1"], "window reset");
+
+        // A pending reply keeps the device eligible even with the budget spent.
+        conn.execute(&bump_sql(Category::Reply), rusqlite::params!["s1", "/go/a"])
+            .unwrap();
+        assert_eq!(due(&conn, 5_500), vec!["s1"]);
+    }
+
+    #[test]
+    fn due_rows_emit_one_job_per_pending_category() {
+        let row = DueRow {
+            id: "s1".into(),
+            endpoint: "https://fcm.googleapis.com/x".into(),
+            last_push_at: 0.0,
+            pending_dm: 2.0,
+            pending_reply: 1.0,
+            pending_topic: 0.0,
+            pending_post: 3.0,
+        };
+        let cats: Vec<Category> = row.into_jobs().into_iter().map(|j| j.category).collect();
+        assert_eq!(cats, vec![Category::Dm, Category::Reply, Category::Post]);
     }
 
     fn claim(conn: &rusqlite::Connection, id: &str, now: i64, min: i64) -> usize {

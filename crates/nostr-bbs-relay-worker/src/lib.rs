@@ -194,6 +194,14 @@ thread_local! {
     static SCHEMA_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Latch the once-per-isolate guard after a schema pass. A pass that reported a
+/// failed CREATE leaves it open so the next request retries.
+fn record_schema_pass(ok: bool) {
+    if ok {
+        SCHEMA_READY.with(|c| c.set(true));
+    }
+}
+
 // Invoked via wasm-bindgen by the Workers runtime; appears unused on native
 // builds because there is no native caller of the `#[event(fetch)]` glue.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -206,19 +214,20 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             .with_headers(cors_headers(&req, &env)));
     }
 
+    // Idempotent schema migrations (trust columns, new tables, etc.). Once per
+    // isolate, after the preflight short-circuit but BEFORE the WebSocket branch:
+    // the Durable Object and `scheduled` never bootstrap the schema, so a
+    // WebSocket-only isolate would otherwise never create it.
+    if !SCHEMA_READY.with(|c| c.get()) {
+        let ok = ensure_schema(&env).await;
+        nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
+        record_schema_pass(ok);
+    }
+
     // WebSocket upgrade -> Durable Object
     if req.headers().get("Upgrade")?.as_deref() == Some("websocket") {
         let stub = env.durable_object("RELAY")?.get_by_name("main")?;
         return stub.fetch_with_request(req).await;
-    }
-
-    // Idempotent schema migrations (trust columns, new tables, etc.). Run once
-    // per isolate and only for HTTP routes: preflights and WebSocket upgrades
-    // never touch the schema, and the DO does its own D1 work.
-    if !SCHEMA_READY.with(|c| c.get()) {
-        ensure_schema(&env).await;
-        nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
-        SCHEMA_READY.with(|c| c.set(true));
     }
 
     let url = req.url()?;
@@ -768,15 +777,18 @@ pub const GOVERNANCE_RECEIPTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS gov
             acknowledgement TEXT\
         )";
 
-/// Idempotent schema migrations.
+/// Idempotent schema migrations. Returns `true` only when every CREATE succeeded
+/// (ALTER errors are expected duplicate-column noise and do not count), so the
+/// caller retries on the next request after a transient D1 failure.
 ///
 /// All statements use `IF NOT EXISTS` for tables or silently ignore errors
 /// for `ALTER TABLE ADD COLUMN` (D1/SQLite raises an error if the column
 /// already exists, which we swallow).
-async fn ensure_schema(env: &Env) {
+async fn ensure_schema(env: &Env) -> bool {
+    let mut ok = true;
     let db = match env.d1("DB") {
         Ok(db) => db,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     // --- Events table (migration 0009) ---
@@ -786,9 +798,11 @@ async fn ensure_schema(env: &Env) {
     // them (errors on an existing column are ignored).
     if let Err(e) = db.prepare(EVENTS_CREATE_SQL).run().await {
         console_error!("ensure_schema: events create failed: {e}");
+        ok = false;
     }
     if let Err(e) = db.prepare(CHANNEL_CREATORS_CREATE_SQL).run().await {
         console_error!("ensure_schema: channel_creators create failed: {e}");
+        ok = false;
     }
     for stmt in [
         "ALTER TABLE events ADD COLUMN d_tag TEXT NOT NULL DEFAULT ''",
@@ -802,6 +816,7 @@ async fn ensure_schema(env: &Env) {
     // for them to alter, and admission and every whitelist write fail.
     if let Err(e) = db.prepare(WHITELIST_CREATE_SQL).run().await {
         console_error!("ensure_schema: whitelist create failed: {e}");
+        ok = false;
     }
 
     // --- Web Push tables (ADR-2023, migration 0010) ---
@@ -810,6 +825,7 @@ async fn ensure_schema(env: &Env) {
         for stmt in push::PUSH_SCHEMA_SQL {
             if let Err(e) = db.prepare(stmt).run().await {
                 console_error!("ensure_schema: push table failed: {e}");
+                ok = false;
             }
         }
         // A deployment that created the table before the DM budget columns.
@@ -827,6 +843,7 @@ async fn ensure_schema(env: &Env) {
     ] {
         if let Err(e) = db.prepare(sql).run().await {
             console_error!("ensure_schema: {name} create failed: {e}");
+            ok = false;
         }
     }
 
@@ -1028,7 +1045,10 @@ async fn ensure_schema(env: &Env) {
         )",
     ];
     for stmt in create_stmts {
-        let _ = db.prepare(stmt).run().await;
+        if let Err(e) = db.prepare(stmt).run().await {
+            console_error!("ensure_schema: create failed: {e}");
+            ok = false;
+        }
     }
 
     // DDD §6 invariant 7 — probe blinding. Ordered, so run as its own sequence
@@ -1085,6 +1105,7 @@ async fn ensure_schema(env: &Env) {
     for stmt in index_stmts {
         let _ = db.prepare(stmt).run().await;
     }
+    ok
 }
 
 /// Check whether the request's Accept header includes `application/nostr+json`.
@@ -1274,7 +1295,12 @@ mod schema_order_tests {
     #[test]
     fn schema_guard_is_per_isolate_and_starts_unset() {
         assert!(!SCHEMA_READY.with(|c| c.get()));
-        SCHEMA_READY.with(|c| c.set(true));
+        super::record_schema_pass(false);
+        assert!(
+            !SCHEMA_READY.with(|c| c.get()),
+            "a failed pass must be retried"
+        );
+        super::record_schema_pass(true);
         assert!(SCHEMA_READY.with(|c| c.get()));
     }
 }
