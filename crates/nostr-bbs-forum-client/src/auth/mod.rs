@@ -676,6 +676,11 @@ impl AuthStore {
     pub fn logout(&self) {
         // ADR-2023: this device must stop waking for the account that signs out.
         crate::utils::push::teardown_on_logout();
+        // The visible notification list is per-account; drop it so the next
+        // account on this browser does not inherit it.
+        crate::stores::notifications::clear_persisted_for_logout(
+            self.state.get_untracked().pubkey.as_deref(),
+        );
         self.privkey.update_value(|opt| {
             if let Some(ref mut v) = opt {
                 v.iter_mut().for_each(|b| *b = 0);

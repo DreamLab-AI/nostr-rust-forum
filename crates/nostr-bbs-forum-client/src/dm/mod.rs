@@ -1039,14 +1039,7 @@ async fn process_kind4_event(
         is_read: is_sent,
     };
 
-    insert_dm_message(
-        msg,
-        &counterparty_pk,
-        &plaintext,
-        timestamp,
-        is_sent,
-        state,
-    );
+    insert_dm_message(msg, &counterparty_pk, &plaintext, timestamp, is_sent, state);
 }
 
 /// Shared helper: deduplicate and insert a DM message into the reactive state,
