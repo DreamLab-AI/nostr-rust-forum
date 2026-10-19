@@ -7,7 +7,7 @@
 ///     the network (not the browser HTTP cache) on every load. A stale shell
 ///     pins a stale build hash and a stale bundle pointer across reloads.
 ///   * Content-hashed static assets (wasm/js/css/img/font) -> CACHE-FIRST.
-///     Trunk fingerprints these (`name-<16 hex>.ext`, and wasm-bindgen
+///     Trunk fingerprints these (`name-<16 hex>.ext`, the wasm as `name-<16 hex>_bg.wasm`, and wasm-bindgen
 ///     snippets under `snippets/`), so a new build emits a new URL; cache-first
 ///     on an immutable URL is safe and fast.
 ///   * Other static files (Trunk `copy-file` / `copy-dir` output such as
@@ -28,11 +28,12 @@ const CACHE_NAME = `nostr-bbs-forum-${CACHE_VERSION}`;
 
 const STATIC_ASSETS = ['./', './index.html'];
 
-// Trunk fingerprints bundle output as `name-<16 hex digits>.ext`; wasm-bindgen
+// Trunk fingerprints bundle output as `name-<16 hex digits>.ext` (`_bg.wasm`
+// for the wasm binary); wasm-bindgen
 // JS snippets live under `snippets/` and are content-addressed by their path.
 // Anything else static keeps a stable URL, so it must not be served cache-first.
 const STATIC_EXT = /\.(wasm|js|css|png|jpg|jpeg|svg|ico|webp|woff2?)$/;
-const FINGERPRINTED = /-[0-9a-f]{16}\./;
+const FINGERPRINTED = /-[0-9a-f]{16}(_bg)?\./;
 
 function isContentHashed(pathname) {
   return FINGERPRINTED.test(pathname) || pathname.includes('/snippets/');

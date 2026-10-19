@@ -241,12 +241,14 @@ test('clicking never focuses the BBS window or one outside the scope', async () 
   assert.deepEqual(w.opened, ['https://forum.example/community/dm']);
 });
 
-const HASHED = '/community/nostr-bbs-forum-client-0123456789abcdef_bg.wasm';
+// Real Trunk output names (from a `trunk build` dist listing).
+const WASM = '/community/nostr-bbs-forum-client-fe2d3df96da40e55_bg.wasm';
+const BUNDLE_JS = '/community/nostr-bbs-forum-client-fe2d3df96da40e55.js';
 const SNIPPET = '/community/snippets/nostr-bbs-forum-client-0123456789abcdef/js/push.js';
 const ICON = '/community/icons/icon-192.png';
 
 test('fingerprinted and snippet assets are served cache-first', async () => {
-  for (const p of [HASHED.replace('_bg.wasm', '.js'), SNIPPET]) {
+  for (const p of [WASM, BUNDLE_JS, SNIPPET]) {
     const w = makeWorker({ cfg: CFG, drain: {} });
     w.stored.set('https://forum.example' + p, { from: 'cache' });
     const res = await w.fetchEvent(p);
@@ -275,4 +277,13 @@ test('stable-URL static files are network-first with a cache fallback', async ()
   assert.equal((await off.fetchEvent(ICON)).from, 'cache');
   const cold = makeWorker({ cfg: CFG, drain: 'network-error' });
   assert.equal((await cold.fetchEvent(ICON)).status, 503);
+});
+
+test('the shell documents are never cache-first', async () => {
+  for (const p of ['/community/index.html', '/community/sw.js', '/community/manifest.webmanifest']) {
+    const w = makeWorker({ cfg: CFG, drain: {} });
+    w.stored.set('https://forum.example' + p, { from: 'cache' });
+    const res = await w.fetchEvent(p);
+    assert.equal(res.from, 'network', p);
+  }
 });

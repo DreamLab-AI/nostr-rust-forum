@@ -45,6 +45,8 @@ A re-streamed event bumped the unread count and rewrote the preview; only a firs
 
 Trunk `copy-file` / `copy-dir` assets such as `icons/` keep stable URLs but were served cache-first, pinning stale copies. Only fingerprinted (`-<16 hex>.`) or `snippets/` files are cache-first now; other static files are network-first with a cache fallback.
 
+The fingerprint pattern also accepts the wasm binary's `-<16 hex>_bg.wasm` name, so the app's largest asset still loads offline.
+
 ### Fixed: live broadcast leaked protected kinds to kinds-less subscriptions (`nostr-bbs-relay-worker`)
 
 REQ and COUNT decide protected reads from the kinds a filter names, so `{}` or `{"#p":[...]}` passed both gates
