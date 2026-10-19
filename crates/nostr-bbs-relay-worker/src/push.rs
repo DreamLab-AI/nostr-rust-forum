@@ -607,7 +607,6 @@ struct DueRow {
     pending_dm: f64,
     pending_reply: f64,
     pending_topic: f64,
-    pending_post: f64,
 }
 
 impl DueRow {
@@ -620,6 +619,7 @@ impl DueRow {
         } else if self.pending_topic > 0.0 {
             Category::Topic
         } else {
+            // Only posts can be left (the query guarantees something pends).
             Category::Post
         };
         PushJob {
@@ -1813,14 +1813,13 @@ mod tests {
 
     #[test]
     fn a_flush_job_leads_with_the_strongest_pending_category() {
-        let row = |dm, reply, topic, post| DueRow {
+        let row = |dm, reply, topic, _post| DueRow {
             id: "s".into(),
             endpoint: "https://fcm.googleapis.com/x".into(),
             last_push_at: 5.0,
             pending_dm: dm,
             pending_reply: reply,
             pending_topic: topic,
-            pending_post: post,
         };
         assert_eq!(row(1.0, 1.0, 1.0, 1.0).into_job().category, Category::Dm);
         assert_eq!(row(0.0, 2.0, 1.0, 1.0).into_job().category, Category::Reply);
