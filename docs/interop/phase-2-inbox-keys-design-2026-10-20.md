@@ -101,3 +101,26 @@ to the mirror pubkey is admitted via ingress with no D1 row.
 - **D2. Mirror reading.** Switch Amethyst to the mirror key (recommended: zero relay change,
   grants never enter the phone) versus keeping the operator nsec in Amethyst and accepting that the
   phone can decrypt grants (status quo risk, no action).
+
+## Landing: how the dual paths come down
+
+Every dual path in Phases 2 to 4 exists so that a member who is mid-migration is never cut off:
+inbox key beside identity key, v2 ledger beside v1, 1014 tickets beside 21453 grants, derived
+epochs beside legacy ones, kind-42 `zk` transport beside NIP-171 rumors. None of it is protocol
+debt. It is transition scaffolding, and it comes down on a cutover date the operator sets.
+
+Before cutover, any member who logs in crosses automatically: the client registers an inbox key
+and receives a ticket in the background. After cutover the relay admits only the new shapes.
+A member who did not log in before cutover keeps their identity or takes a new one; an admin
+re-whitelists it and the zone owner issues a ticket to its inbox key. The imported-epoch record
+(ADR-2028 decision 3) lets the owner grant full history, so the only cost of missing the
+automatic path is one admin action. A new identity is clean for everything except authorship:
+posts signed by the old key stay attributed to it, and there is no honest way to re-author them.
+
+The removal release then deletes: 21453 build and parse everywhere (client, migrator, agentbox
+module), the v1 ledger fallback, the identity-key grant subscription, random epoch generation,
+and the ADR-2017 sealed-original reader once sealed originals are recorded as imported epochs.
+`RECIPIENT_KEYS_ENABLED` and `GRANT_SWEEP_ENABLED` stop being flags. What remains by decision:
+the `zk` tag on kind 42 (our transport) and one imported-epoch record per zone (the price of not
+re-signing ciphertext). The cutover date is an operator decision and is recorded in ADR-2028 when
+Phase 4 begins.
