@@ -834,6 +834,11 @@ async fn watch_one(event: &NostrEvent, signer: &dyn Signer, me: &str) {
     let Ok(unwrapped) = unwrap_gift_with_signer(event, signer).await else {
         return;
     };
+    // Reactions, deletions and file messages now unwrap too (ADR-2027); this
+    // inbox renders chat only until it grows UI for them.
+    if unwrapped.rumor_kind() != Some(nostr_bbs_core::gift_wrap::RumorKind::Chat) {
+        return;
+    }
     let is_sent = unwrapped.sender_pubkey == me;
     // Only the other party can be the coach: a wrap we sent is our own copy.
     if !is_sent && is_coach_exchange(&unwrapped.rumor.content, &unwrapped.sender_pubkey) {
@@ -934,6 +939,11 @@ async fn process_gift_wrap_event(
             return;
         }
     };
+    // Reactions, deletions and file messages now unwrap too (ADR-2027); this
+    // inbox renders chat only until it grows UI for them.
+    if unwrapped.rumor_kind() != Some(nostr_bbs_core::gift_wrap::RumorKind::Chat) {
+        return;
+    }
 
     let my_pubkey = my_pubkey.to_ascii_lowercase();
     let sender_pubkey = unwrapped.sender_pubkey.to_ascii_lowercase();

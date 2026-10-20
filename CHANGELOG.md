@@ -7,6 +7,12 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Changed: relay ban gate and counters cover kind 9 and 34550; NIP-29 no longer advertised; `groups.rs` builders deprecated
+
+The ban gate now covers kind 9 and kind 34550; kind 9 counts towards `posts_created` and profile-stat posts.
+NIP-11 drops 29 from `supported_nips` (only admin kinds are gated). Every public builder in
+`nostr-bbs-core::groups` is `#[deprecated]` (no caller; ADR-2029 is a-scoped); removal is a later step.
+
 ### Fixed: Web Push registration refused every non-branded Chromium browser (`nostr-bbs-relay-worker`)
 
 Vivaldi, Brave, Linux Chromium and some Edge channels subscribe on `jmt17.google.com`, Google's second FCM host,
@@ -38,6 +44,24 @@ the channel or thread URL out of linked sites' and image hosts' logs; the YouTub
 
 Recorded with the advisor's corrections (bounded revision, length-prefixed zone id, no plaintext master
 in the shared IndexedDB) after the first design was found to re-derive a secret removed members still hold.
+
+### Upgrade Phase 0 and 1: backup discipline and interop hygiene (2026-10-20)
+
+Phase 0: `docs/runbooks/disaster-recovery.md` and `scripts/dr-export.sh`. One restore rehearsal
+was run into a scratch D1 and deleted; per-table counts matched production exactly (21 tables,
+7,987 rows). The runbook records that the live account names its D1 and R2 resources
+`dreamlab-*` while every config in this repo says `nostr-bbs-*`; D1 binds by UUID, R2 by name.
+
+Phase 1, all additive or correctness fixes, no wire change: core 1.0.0-beta.19 accepts NIP-17
+rumor kinds 7, 5 and 15 through the generic unwrap and exposes `RumorKind`; consumers that only
+expect chat (both DM inboxes, the mesh transport, the poker coach) now check or pin the kind, and
+the crate states the invariant that unwrapping authenticates but never authorises. Relay
+addressable (3xxxx) replacement is conditional on NIP-01 order (newer wins, equal timestamp lowest
+id) and `save_event` reports whether the row was kept so a refused stale event is neither
+broadcast nor projected into moderation and broker tables. The ban gate and post counters cover
+kinds 9 and 34550. NIP-29 is no longer advertised (never implemented); the unused `groups.rs`
+builders are deprecated. Baseline citations corrected. Cross-vendor audit by Codex gpt-6-astra and
+an Opus review were applied before commit.
 
 ### Proposed, not built: interoperability with nostr.chat, Anagram and Iris (ADR-2027, ADR-2028, ADR-2029)
 

@@ -71,6 +71,10 @@ pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 pub const KIND_MESH_EVENT: u64 = 30050;
 
 /// Nostr kind for a mesh service-list event (ADR-074 §D9 / ADR-075 §D4).
+///
+/// One constant, two meanings: the service-list envelope built in this module,
+/// and the mesh-anchor broadcast (`transport.rs`, `broadcast_kind30033`; tag set
+/// in `lib.rs`). Both share kind 30033 and are told apart by their tags.
 pub const KIND_MESH_SERVICES: u64 = 30033;
 
 /// The seven enumerated envelope kinds (ADR-075 §D3). The wire form is the

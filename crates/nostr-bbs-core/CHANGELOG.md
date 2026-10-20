@@ -4,6 +4,22 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.19] - 2026-10-20
+
+### Added
+
+- `gift_wrap::RumorKind` (`Chat` 14, `Reaction` 7, `Deletion` 5, `File` 15) and
+  `UnwrappedGift::rumor_kind()`.
+
+### Changed
+
+- `unwrap_gift` and `unwrap_gift_with_signer` accept the four NIP-17 rumor kinds
+  instead of only kind 14 (ADR-2027). Any other kind is still refused with the
+  same `InvalidKind { expected: 14, .. }` error, which never echoes decrypted
+  content. `unwrap_gift_kind` / `unwrap_gift_with_signer_kind` still match
+  exactly one caller-chosen kind. Callers that treated "unwrap succeeded" as
+  "this is a chat message" must now check `rumor_kind()`.
+
 ## [1.0.0-beta.18] - 2026-10-19
 
 ### Licence (applies from 1.0.0-beta.18, merged 2026-10-20)

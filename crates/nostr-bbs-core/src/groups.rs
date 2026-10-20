@@ -121,6 +121,7 @@ fn build_and_sign(
 /// Create a group chat message (kind 9).
 ///
 /// Content is the message text. Tags: `["h", group_id]`.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn create_group_message(
     privkey: &[u8; 32],
     group_id: &str,
@@ -134,6 +135,7 @@ pub fn create_group_message(
 /// Create group metadata (kind 39000).
 ///
 /// Tags: `["h", group_id]`, `["name", name]`, `["about", about]`, `["picture", picture]`.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn create_group_metadata(
     privkey: &[u8; 32],
     group_id: &str,
@@ -154,6 +156,7 @@ pub fn create_group_metadata(
 /// Create an add-user event (kind 9000).
 ///
 /// Tags: `["h", group_id]`, `["p", user_pubkey]`.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn create_add_user(
     privkey: &[u8; 32],
     group_id: &str,
@@ -171,6 +174,7 @@ pub fn create_add_user(
 /// Create a remove-user event (kind 9001).
 ///
 /// Tags: `["h", group_id]`, `["p", user_pubkey]`.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn create_remove_user(
     privkey: &[u8; 32],
     group_id: &str,
@@ -188,6 +192,7 @@ pub fn create_remove_user(
 /// Create a group-delete event (kind 9005) to request deletion of an event within a group.
 ///
 /// Tags: `["h", group_id]`, `["e", event_id]`.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn create_group_delete(
     privkey: &[u8; 32],
     group_id: &str,
@@ -205,6 +210,7 @@ pub fn create_group_delete(
 /// Create a join request (kind 9021).
 ///
 /// Tags: `["h", group_id]`. Optional message in content.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn create_join_request(
     privkey: &[u8; 32],
     group_id: &str,
@@ -223,6 +229,7 @@ pub fn create_join_request(
 /// Create a registration request (kind 9024).
 ///
 /// Tags: `["h", group_id]`. Metadata in content (e.g. JSON profile data).
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn create_registration_request(
     privkey: &[u8; 32],
     group_id: &str,
@@ -251,6 +258,7 @@ pub fn create_registration_request(
 ///
 /// The event is parameterized-replaceable: the relay replaces any prior
 /// kind-39000 event with the same `d` tag value.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn build_group_metadata(
     relay_privkey: &[u8; 32],
     group_id: &str,
@@ -278,6 +286,7 @@ pub fn build_group_metadata(
 ///
 /// The event is parameterized-replaceable: the relay replaces any prior
 /// kind-39001 event with the same `d` tag value.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn build_group_admins(
     relay_privkey: &[u8; 32],
     group_id: &str,
@@ -303,6 +312,7 @@ pub fn build_group_admins(
 ///
 /// The event is parameterized-replaceable: the relay replaces any prior
 /// kind-39002 event with the same `d` tag value.
+#[deprecated(note = "no caller; ADR-2029 room dialect is a-scoped, not h-scoped")]
 pub fn build_group_members(
     relay_privkey: &[u8; 32],
     group_id: &str,
@@ -319,6 +329,7 @@ pub fn build_group_members(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::event::verify_event;
     use k256::schnorr::SigningKey;

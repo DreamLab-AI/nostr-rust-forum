@@ -29,6 +29,31 @@ const MAX_QUERY_LIMIT: u32 = 1000;
 const MAX_ROWS_PER_FRAME: u32 = super::MAX_FILTERS as u32 * MAX_QUERY_LIMIT;
 
 // ---------------------------------------------------------------------------
+// Addressable (3xxxx) replacement
+// ---------------------------------------------------------------------------
+
+/// Insert an addressable event unless a stored row for the same
+/// `(kind, pubkey, d_tag)` supersedes it (newer `created_at`, or equal
+/// `created_at` with a lower id). Binds `?1..?9` as the plain insert does.
+const ADDRESSABLE_INSERT_SQL: &str = "\
+INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, d_tag, received_at) \
+SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
+WHERE NOT EXISTS ( \
+    SELECT 1 FROM events \
+    WHERE pubkey = ?2 AND kind = ?4 AND d_tag = ?8 AND id <> ?1 \
+      AND (created_at > ?3 OR (created_at = ?3 AND id < ?1)) \
+) \
+ON CONFLICT (id) DO NOTHING";
+
+/// Delete the rows for the same `(kind, pubkey, d_tag)` that the incoming
+/// event supersedes. Binds `?1` id, `?2` pubkey, `?3` created_at, `?4` kind,
+/// `?5` d_tag.
+const ADDRESSABLE_PRUNE_SQL: &str = "\
+DELETE FROM events \
+WHERE pubkey = ?2 AND kind = ?4 AND d_tag = ?5 AND id <> ?1 \
+  AND (created_at < ?3 OR (created_at = ?3 AND id > ?1))";
+
+// ---------------------------------------------------------------------------
 // D1 row type for query results
 // ---------------------------------------------------------------------------
 
@@ -117,26 +142,44 @@ impl NostrRelayDO {
                 db.batch(vec![delete_bound, insert_bound]).await.is_ok()
             }
             EventTreatment::ParameterizedReplaceable => {
-                let delete_stmt = db.prepare(
-                    "DELETE FROM events WHERE pubkey = ?1 AND kind = ?2 AND d_tag = ?3 AND created_at < ?4",
-                );
-                let delete_binds = [
+                // NIP-01 replacement is a total order on (created_at, id):
+                // the newer event wins and, on equal created_at, the
+                // lexicographically lowest id. Insert only if no stored row
+                // for this (kind, pubkey, d_tag) beats the incoming event,
+                // then drop whatever the incoming event beats. The prune is
+                // harmless when the insert was refused: a row the incoming
+                // event beats is beaten by the row that refused it.
+                let insert_stmt = db.prepare(ADDRESSABLE_INSERT_SQL);
+                let prune_stmt = db.prepare(ADDRESSABLE_PRUNE_SQL);
+                let prune_binds = [
+                    JsValue::from_str(&event.id),
                     JsValue::from_str(&event.pubkey),
+                    JsValue::from_f64(event.created_at as f64),
                     JsValue::from_f64(event.kind as f64),
                     JsValue::from_str(&d_tag),
-                    JsValue::from_f64(event.created_at as f64),
                 ];
 
-                let delete_bound = match delete_stmt.bind(&delete_binds) {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
                 let insert_bound = match insert_stmt.bind(&insert_binds) {
                     Ok(s) => s,
                     Err(_) => return false,
                 };
+                let prune_bound = match prune_stmt.bind(&prune_binds) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
 
-                db.batch(vec![delete_bound, insert_bound]).await.is_ok()
+                // Report whether the INSERT landed. A stale event is refused by
+                // the WHERE NOT EXISTS guard with no error, and the caller must
+                // not broadcast or project an event the store did not keep
+                // (moderation and broker projections are 3xxxx kinds too).
+                match db.batch(vec![insert_bound, prune_bound]).await {
+                    Ok(results) => results
+                        .first()
+                        .and_then(|r| r.meta().ok().flatten())
+                        .and_then(|m| m.changes)
+                        .is_some_and(|n| n > 0),
+                    Err(_) => false,
+                }
             }
             EventTreatment::Regular => match insert_stmt.bind(&insert_binds) {
                 Ok(s) => s.run().await.is_ok(),
@@ -377,5 +420,86 @@ impl NostrRelayDO {
         };
 
         matches!(stmt.first::<serde_json::Value>(None).await, Ok(Some(_)))
+    }
+}
+
+#[cfg(test)]
+mod addressable_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    const PK: &str = "aa";
+    const KIND: i64 = 30023;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::EVENTS_CREATE_SQL).unwrap();
+        conn
+    }
+
+    /// Run the same two statements `save_event` batches, in the same order.
+    fn save(conn: &Connection, id: &str, created_at: i64, d_tag: &str) {
+        conn.execute(
+            ADDRESSABLE_INSERT_SQL,
+            params![id, PK, created_at, KIND, "[]", "c", "s", d_tag, 0],
+        )
+        .unwrap();
+        conn.execute(
+            ADDRESSABLE_PRUNE_SQL,
+            params![id, PK, created_at, KIND, d_tag],
+        )
+        .unwrap();
+    }
+
+    fn ids(conn: &Connection, d_tag: &str) -> Vec<String> {
+        let mut st = conn
+            .prepare("SELECT id FROM events WHERE d_tag = ?1 ORDER BY id")
+            .unwrap();
+        st.query_map([d_tag], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn newer_event_replaces_older() {
+        let conn = db();
+        save(&conn, "old", 100, "x");
+        save(&conn, "new", 200, "x");
+        assert_eq!(ids(&conn, "x"), ["new"]);
+    }
+
+    #[test]
+    fn late_older_event_is_refused() {
+        let conn = db();
+        save(&conn, "new", 200, "x");
+        save(&conn, "old", 100, "x");
+        assert_eq!(ids(&conn, "x"), ["new"]);
+    }
+
+    #[test]
+    fn same_second_lower_id_wins() {
+        let conn = db();
+        save(&conn, "bbb", 100, "x");
+        save(&conn, "aaa", 100, "x");
+        assert_eq!(ids(&conn, "x"), ["aaa"]);
+    }
+
+    #[test]
+    fn same_second_higher_id_is_refused() {
+        let conn = db();
+        save(&conn, "aaa", 100, "x");
+        save(&conn, "bbb", 100, "x");
+        assert_eq!(ids(&conn, "x"), ["aaa"]);
+    }
+
+    #[test]
+    fn resending_the_stored_event_keeps_it_and_other_d_tags_are_independent() {
+        let conn = db();
+        save(&conn, "aaa", 100, "x");
+        save(&conn, "aaa", 100, "x");
+        save(&conn, "zzz", 50, "y");
+        assert_eq!(ids(&conn, "x"), ["aaa"]);
+        assert_eq!(ids(&conn, "y"), ["zzz"]);
     }
 }

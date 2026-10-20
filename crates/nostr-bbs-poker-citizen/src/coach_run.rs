@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use nostr_bbs_core::gift_wrap::{gift_wrap, unwrap_gift};
+use nostr_bbs_core::gift_wrap::{gift_wrap, unwrap_gift_kind, RumorKind};
 use nostr_bbs_core::keys::SecretKey;
 use nostr_bbs_core::NostrEvent;
 use serde_json::Value;
@@ -234,9 +234,11 @@ impl Runner {
     }
 
     fn on_event(&mut self, ev: NostrEvent) {
-        let unwrapped = match unwrap_gift(&ev, &self.sk) {
+        // Exact kind 14: the generic unwrap also admits reaction, deletion and
+        // file rumors since core beta.19, and a coach request is chat only.
+        let unwrapped = match unwrap_gift_kind(&ev, &self.sk, RumorKind::Chat.kind()) {
             Ok(u) => u,
-            Err(_) => return, // not a DM, or not ours
+            Err(_) => return, // not a chat DM, or not ours
         };
         let asker = unwrapped.sender_pubkey;
         let rumor = unwrapped.rumor;

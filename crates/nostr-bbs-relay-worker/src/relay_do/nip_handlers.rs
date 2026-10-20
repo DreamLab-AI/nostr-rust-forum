@@ -66,13 +66,26 @@ fn is_nip29_admin_kind(kind: u64) -> bool {
 ///
 /// Pure predicate so the gate scope is unit-testable without an `Env`.
 pub fn is_ban_gated_kind(kind: u64) -> bool {
-    matches!(kind, 1 | 5 | 7 | 40 | 41 | 42 | 30023)
-        || kind == KIND_REPORT_NIP56
+    matches!(
+        kind,
+        1 | 5 | 7 | 9 | 40 | 41 | 42 | 30023 | KIND_COMMUNITY_DEFINITION
+    ) || kind == KIND_REPORT_NIP56
         || kind == nostr_bbs_core::KIND_CALENDAR_DATE_EVENT
         || kind == nostr_bbs_core::KIND_CALENDAR_EVENT
         || kind == KIND_CALENDAR_RSVP
         || nostr_bbs_core::is_kanban_kind(kind)
         || kind == nostr_bbs_core::KIND_AGENT_INTENT
+}
+
+/// NIP-72 community definition (kind 34550): content-bearing, so a banned author
+/// must not publish one (ADR-2029 room dialect).
+const KIND_COMMUNITY_DEFINITION: u64 = 34550;
+
+/// Content kinds that bump the author's `posts_created` trust counter: kind-1
+/// text, kind-9 chat, kind-7 reaction, kind-40 channel create, kind-42 channel
+/// message and kind-1984 report. Pure so the scope is unit-testable.
+pub fn counts_as_post(kind: u64) -> bool {
+    matches!(kind, 1 | 7 | 9 | 40 | 42 | KIND_REPORT_NIP56)
 }
 
 /// Phase C (write side): whether an RSVP (kind 31925) is permitted to be written,
@@ -1553,9 +1566,9 @@ impl NostrRelayDO {
             Self::send_ok(ws, &event.id, true, "");
             self.broadcast_event(&event).await;
             // Activity tracking: increment posts_created and update last_active
-            // for content-producing event kinds (kind-1 text, kind-42 channel msg,
+            // for content-producing event kinds (kind-1 text, kind-9 chat, kind-42 channel msg,
             // kind-40 channel create, kind-7 reaction, kind-1984 report).
-            if matches!(event.kind, 1 | 7 | 40 | 42 | KIND_REPORT_NIP56) {
+            if counts_as_post(event.kind) {
                 trust::increment_posts_created(&principal, &self.env).await;
             }
             // ADR-2018: the `last_active_at` stamp and promotion check are
@@ -4769,6 +4782,23 @@ mod write_gate_tests {
         ] {
             assert!(!sql.contains(frozen), "{frozen} must not be updated");
         }
+    }
+
+    #[test]
+    fn kind_9_and_34550_are_ban_gated() {
+        assert!(is_ban_gated_kind(9));
+        assert!(is_ban_gated_kind(34550));
+        // NIP-29 admin kinds are gated separately, not by the ban predicate.
+        assert!(!is_ban_gated_kind(9000));
+    }
+
+    #[test]
+    fn kind_9_counts_as_a_post() {
+        for k in [1, 7, 9, 40, 42, KIND_REPORT_NIP56] {
+            assert!(counts_as_post(k), "kind {k} must count");
+        }
+        assert!(!counts_as_post(41));
+        assert!(!counts_as_post(1059));
     }
 
     #[test]

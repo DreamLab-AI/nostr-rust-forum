@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-core"
-version = "1.0.0-beta.18"
+version = "1.0.0-beta.19"
 dependencies = [
  "aes",
  "async-trait",

@@ -14,6 +14,7 @@ use crate::keys::generate_keypair;
 use crate::nip04;
 use crate::nip44;
 use k256::schnorr::SigningKey;
+use nostr::Kind;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -97,6 +98,83 @@ pub enum GiftWrapError {
 
 // ── Output types ─────────────────────────────────────────────────────────────
 
+/// The rumor kinds a NIP-17 profile accepts inside a gift wrap.
+///
+/// NIP-17 chat is more than kind 14: reactions (kind 7), deletions (kind 5) and
+/// file messages (kind 15) travel in the same wrap. [`unwrap_gift`] and
+/// [`unwrap_gift_with_signer`] accept exactly these four; a rumor of any other
+/// kind is refused as [`GiftWrapError::InvalidKind`] (use
+/// [`unwrap_gift_kind`] for an application kind such as poker's 20779).
+///
+/// # Invariant: unwrapping authenticates, it never authorises
+///
+/// A successful generic unwrap proves the wrap and seal verified and that the
+/// rumor is one of these four kinds. It does not mean the caller should act on
+/// the rumor: a kind-5 rumor is a *request* to delete, a kind-7 a reaction. Every
+/// consumer checks [`UnwrappedGift::rumor_kind`] before interpreting content,
+/// and a consumer that only ever expects one kind calls [`unwrap_gift_kind`]
+/// with that kind so the check cannot be forgotten. The `actual` field of
+/// `InvalidKind` is the rumor's kind number, which is derived from plaintext;
+/// no error carries rumor content.
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_core::gift_wrap::RumorKind;
+///
+/// assert_eq!(RumorKind::from_kind(14), Some(RumorKind::Chat));
+/// assert_eq!(RumorKind::from_kind(7), Some(RumorKind::Reaction));
+/// assert_eq!(RumorKind::from_kind(5), Some(RumorKind::Deletion));
+/// assert_eq!(RumorKind::from_kind(15), Some(RumorKind::File));
+/// assert_eq!(RumorKind::from_kind(1), None);
+/// assert_eq!(RumorKind::File.kind(), 15);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RumorKind {
+    /// Kind 14, a private chat message.
+    Chat,
+    /// Kind 7, a reaction (NIP-25).
+    Reaction,
+    /// Kind 5, an event deletion request (NIP-09).
+    Deletion,
+    /// Kind 15, a file message (NIP-17).
+    File,
+}
+
+/// NIP-17 kind 15 (file message); `nostr` 0.44 has no named constant for it.
+const KIND_FILE_MESSAGE: u16 = 15;
+
+impl RumorKind {
+    /// Classify a raw rumor kind, or `None` if NIP-17 does not carry it.
+    pub fn from_kind(kind: u64) -> Option<Self> {
+        let kind = Kind::from(u16::try_from(kind).ok()?);
+        if kind == Kind::PrivateDirectMessage {
+            Some(Self::Chat)
+        } else if kind == Kind::Reaction {
+            Some(Self::Reaction)
+        } else if kind == Kind::EventDeletion {
+            Some(Self::Deletion)
+        } else if kind == Kind::from(KIND_FILE_MESSAGE) {
+            Some(Self::File)
+        } else {
+            None
+        }
+    }
+
+    /// The Nostr kind number of this rumor type.
+    pub fn kind(self) -> u64 {
+        u64::from(
+            match self {
+                Self::Chat => Kind::PrivateDirectMessage,
+                Self::Reaction => Kind::Reaction,
+                Self::Deletion => Kind::EventDeletion,
+                Self::File => Kind::from(KIND_FILE_MESSAGE),
+            }
+            .as_u16(),
+        )
+    }
+}
+
 /// The result of unwrapping a gift-wrapped event, exposing all three layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnwrappedGift {
@@ -106,6 +184,27 @@ pub struct UnwrappedGift {
     pub rumor: UnsignedEvent,
     /// The intermediate seal (kind 13).
     pub seal: NostrEvent,
+}
+
+impl UnwrappedGift {
+    /// The rumor's NIP-17 type, or `None` when it was unwrapped with an
+    /// explicit application kind ([`unwrap_gift_kind`]) that NIP-17 does not
+    /// define.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use nostr_bbs_core::gift_wrap::{gift_wrap_kind, unwrap_gift, RumorKind};
+    /// use nostr_bbs_core::generate_keypair;
+    ///
+    /// let (a, b) = (generate_keypair().unwrap(), generate_keypair().unwrap());
+    /// let wrap = gift_wrap_kind(a.secret.as_bytes(), &a.public.to_hex(), &b.public.to_hex(), 7, "+").unwrap();
+    /// let got = unwrap_gift(&wrap, b.secret.as_bytes()).unwrap();
+    /// assert_eq!(got.rumor_kind(), Some(RumorKind::Reaction));
+    /// ```
+    pub fn rumor_kind(&self) -> Option<RumorKind> {
+        RumorKind::from_kind(self.rumor.kind)
+    }
 }
 
 // ── Timestamp helpers ────────────────────────────────────────────────────────
@@ -419,7 +518,7 @@ pub fn gift_wrap_kind(
 /// 2. NIP-44 decrypts content using `recipient_sk` + gift's throwaway pubkey → Seal
 /// 3. Validates the seal is kind 13
 /// 4. NIP-44 decrypts seal content using `recipient_sk` + seal's sender pubkey → Rumor
-/// 5. Validates the rumor is kind 14
+/// 5. Validates the rumor is a NIP-17 kind ([`RumorKind`]: 14, 7, 5 or 15)
 ///
 /// # Arguments
 /// * `gift` - The kind 1059 gift wrap event
@@ -428,7 +527,9 @@ pub fn unwrap_gift(
     gift: &NostrEvent,
     recipient_sk: &[u8; 32],
 ) -> Result<UnwrappedGift, GiftWrapError> {
-    unwrap_gift_kind(gift, recipient_sk, KIND_RUMOR)
+    unwrap_gift_accepting(gift, recipient_sk, KIND_RUMOR, |k| {
+        RumorKind::from_kind(k).is_some()
+    })
 }
 
 /// [`unwrap_gift`] for a rumor of `expected_kind` (see [`create_rumor_kind`]);
@@ -437,6 +538,17 @@ pub fn unwrap_gift_kind(
     gift: &NostrEvent,
     recipient_sk: &[u8; 32],
     expected_kind: u64,
+) -> Result<UnwrappedGift, GiftWrapError> {
+    unwrap_gift_accepting(gift, recipient_sk, expected_kind, |k| k == expected_kind)
+}
+
+/// Shared unwrap: `accept` decides the rumor kind; `report_kind` is the kind
+/// named in the (fixed-string) refusal.
+fn unwrap_gift_accepting(
+    gift: &NostrEvent,
+    recipient_sk: &[u8; 32],
+    report_kind: u64,
+    accept: impl Fn(u64) -> bool,
 ) -> Result<UnwrappedGift, GiftWrapError> {
     // Validate outer kind
     if gift.kind != KIND_GIFT_WRAP {
@@ -484,9 +596,9 @@ pub fn unwrap_gift_kind(
         parse_unsigned_rumor(&rumor_json).map_err(|m| GiftWrapError::ParseError(m.into()))?;
 
     // Validate rumor kind
-    if rumor.kind != expected_kind {
+    if !accept(rumor.kind) {
         return Err(GiftWrapError::InvalidKind {
-            expected: expected_kind,
+            expected: report_kind,
             actual: rumor.kind,
         });
     }
@@ -691,7 +803,10 @@ pub async fn unwrap_gift_with_signer(
     gift: &NostrEvent,
     signer: &dyn Signer,
 ) -> Result<UnwrappedGift, SignerGiftWrapError> {
-    unwrap_gift_with_signer_kind(gift, signer, KIND_RUMOR).await
+    unwrap_gift_with_signer_accepting(gift, signer, KIND_RUMOR, |k| {
+        RumorKind::from_kind(k).is_some()
+    })
+    .await
 }
 
 /// [`unwrap_gift_with_signer`] for a rumor of `expected_kind` (see
@@ -700,6 +815,16 @@ pub async fn unwrap_gift_with_signer_kind(
     gift: &NostrEvent,
     signer: &dyn Signer,
     expected_kind: u64,
+) -> Result<UnwrappedGift, SignerGiftWrapError> {
+    unwrap_gift_with_signer_accepting(gift, signer, expected_kind, |k| k == expected_kind).await
+}
+
+/// Shared signer unwrap; see `unwrap_gift_accepting`.
+async fn unwrap_gift_with_signer_accepting(
+    gift: &NostrEvent,
+    signer: &dyn Signer,
+    report_kind: u64,
+    accept: impl Fn(u64) -> bool,
 ) -> Result<UnwrappedGift, SignerGiftWrapError> {
     if gift.kind != KIND_GIFT_WRAP {
         return Err(SignerGiftWrapError::InvalidKind {
@@ -733,9 +858,9 @@ pub async fn unwrap_gift_with_signer_kind(
     let rumor = parse_unsigned_rumor(&rumor_json)
         .map_err(|m| SignerGiftWrapError::Serialization(m.into()))?;
 
-    if rumor.kind != expected_kind {
+    if !accept(rumor.kind) {
         return Err(SignerGiftWrapError::InvalidKind {
-            expected: expected_kind,
+            expected: report_kind,
             actual: rumor.kind,
         });
     }
@@ -941,6 +1066,57 @@ mod tests {
                 actual: KIND_RUMOR
             })
         ));
+    }
+
+    #[test]
+    fn nip17_rumor_kinds_round_trip_through_unwrap_gift() {
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        for (kind, expect) in [
+            (14, RumorKind::Chat),
+            (7, RumorKind::Reaction),
+            (5, RumorKind::Deletion),
+            (15, RumorKind::File),
+        ] {
+            let wrapped =
+                gift_wrap_kind(&sender_sk, &sender_pk, &recipient_pk, kind, "payload").unwrap();
+            let got = unwrap_gift(&wrapped, &recipient_sk).unwrap();
+            assert_eq!(got.rumor.kind, kind);
+            assert_eq!(got.rumor_kind(), Some(expect));
+            assert_eq!(expect.kind(), kind);
+            assert_eq!(got.sender_pubkey, sender_pk);
+        }
+    }
+
+    #[test]
+    fn unknown_rumor_kind_is_still_refused_by_unwrap_gift() {
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        for kind in [1u64, 20779, 70_000] {
+            let wrapped =
+                gift_wrap_kind(&sender_sk, &sender_pk, &recipient_pk, kind, "secret-body").unwrap();
+            let err = unwrap_gift(&wrapped, &recipient_sk).unwrap_err();
+            assert!(matches!(
+                err,
+                GiftWrapError::InvalidKind {
+                    expected: KIND_RUMOR,
+                    actual
+                } if actual == kind
+            ));
+            assert!(!err.to_string().contains("secret-body"));
+        }
+    }
+
+    #[test]
+    fn explicit_kind_unwrap_has_no_nip17_kind() {
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let w = gift_wrap_kind(&sender_sk, &sender_pk, &recipient_pk, 20779, "x").unwrap();
+        let got = unwrap_gift_kind(&w, &recipient_sk, 20779).unwrap();
+        assert_eq!(got.rumor_kind(), None);
+        // explicit-kind unwrap stays exact: a reaction is refused for kind 14
+        let r = gift_wrap_kind(&sender_sk, &sender_pk, &recipient_pk, 7, "+").unwrap();
+        assert!(unwrap_gift_kind(&r, &recipient_sk, KIND_RUMOR).is_err());
     }
 
     #[test]
@@ -1193,6 +1369,44 @@ mod tests {
         let unwrapped = block_on(unwrap_gift_with_signer(&wrapped, &recipient)).unwrap();
         assert_eq!(unwrapped.sender_pubkey, sender_pk);
         assert_eq!(unwrapped.rumor.content, content);
+    }
+
+    #[test]
+    fn signer_unwrap_accepts_nip17_kinds_and_refuses_unknown() {
+        let (sender, _) = prf_signer();
+        let (recipient, recipient_pk) = prf_signer();
+        for (kind, expect) in [
+            (14, RumorKind::Chat),
+            (7, RumorKind::Reaction),
+            (5, RumorKind::Deletion),
+            (15, RumorKind::File),
+        ] {
+            let w = block_on(gift_wrap_with_signer_kind(
+                &sender,
+                &recipient_pk,
+                kind,
+                "p",
+            ))
+            .unwrap();
+            let got = block_on(unwrap_gift_with_signer(&w, &recipient)).unwrap();
+            assert_eq!(got.rumor_kind(), Some(expect));
+        }
+        let w = block_on(gift_wrap_with_signer_kind(
+            &sender,
+            &recipient_pk,
+            1,
+            "secret-body",
+        ))
+        .unwrap();
+        let err = block_on(unwrap_gift_with_signer(&w, &recipient)).unwrap_err();
+        assert!(matches!(
+            err,
+            SignerGiftWrapError::InvalidKind {
+                expected: KIND_RUMOR,
+                actual: 1
+            }
+        ));
+        assert!(!err.to_string().contains("secret-body"));
     }
 
     #[test]

@@ -596,6 +596,10 @@ mod dm_ws {
         wasm_bindgen_futures::spawn_local(async move {
             if event.kind == KIND_GIFT_WRAP {
                 match nostr_bbs_core::unwrap_gift_with_signer(&event, signer.as_ref()).await {
+                    // Chat only: reactions, deletions and file messages now
+                    // unwrap too (ADR-2027) but have no BBS rendering yet.
+                    Ok(u) if u.rumor_kind() != Some(nostr_bbs_core::gift_wrap::RumorKind::Chat) => {
+                    }
                     Ok(u) => {
                         let sender = u.sender_pubkey.clone();
                         let is_sent = sender == my_pk;
