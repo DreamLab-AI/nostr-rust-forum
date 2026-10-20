@@ -7,6 +7,13 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: Web Push registration refused every non-branded Chromium browser (`nostr-bbs-relay-worker`)
+
+Vivaldi, Brave, Linux Chromium and some Edge channels subscribe on `jmt17.google.com`, Google's second FCM host,
+not `fcm.googleapis.com`; the endpoint allow-list only knew the latter, so "Turn on alerts for this device"
+failed with `endpoint host is not a known push service`. The exact host is now admitted; `google.com` is still
+not a suffix.
+
 ### Fixed: a fresh Durable Object isolate could hand a new connection a prior session's identity (`nostr-bbs-relay-worker`)
 
 Session auth and subscriptions persist in DO storage under `ws_auth:{id}` / `ws_sub:{id}`, but the in-memory

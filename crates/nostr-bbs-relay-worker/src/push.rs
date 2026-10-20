@@ -69,8 +69,14 @@ const VAPID_JWT_TTL_SECS: u64 = 12 * 60 * 60;
 
 /// Push-service host suffixes a subscription endpoint may use. Anything else
 /// is refused so the worker can never be steered into fetching arbitrary URLs.
-const ALLOWED_PUSH_HOSTS: [&str; 4] = [
+const ALLOWED_PUSH_HOSTS: [&str; 5] = [
     "fcm.googleapis.com",
+    // Google's second FCM host: branded Chrome subscribes on fcm.googleapis.com,
+    // every other Chromium build (Vivaldi, Brave, Linux Chromium, some Edge
+    // channels) on jmt17.google.com; Chromium's push_messaging_constants.cc
+    // names both. Listed as an exact host on purpose: `google.com` as a suffix
+    // would admit every Google service.
+    "jmt17.google.com",
     "push.apple.com",
     "push.services.mozilla.com",
     "notify.windows.com",
@@ -1454,6 +1460,11 @@ mod tests {
                 "https://wns2-par02p.notify.windows.com/w/?token=x",
                 "https://wns2-par02p.notify.windows.com",
             ),
+            // Non-branded Chromium (Vivaldi, Brave, Linux Chromium) subscribes here.
+            (
+                "https://jmt17.google.com/fcm/send/abc",
+                "https://jmt17.google.com",
+            ),
         ] {
             assert_eq!(validate_endpoint(url).as_deref(), Ok(aud), "{url}");
         }
@@ -1467,6 +1478,10 @@ mod tests {
             "https://fcm.googleapis.com.evil.example/x",
             "https://notfcm.googleapis.com.attacker.io/x",
             "https://xfcm.googleapis.com/x",
+            // The FCM host is admitted exactly; no other google.com service is.
+            "https://accounts.google.com/x",
+            "https://jmt17.google.com.evil.example/x",
+            "https://notjmt17.google.com/x",
             "https://user:pw@fcm.googleapis.com/x",
             "https://fcm.googleapis.com:8443/x",
             "https://127.0.0.1/x",
