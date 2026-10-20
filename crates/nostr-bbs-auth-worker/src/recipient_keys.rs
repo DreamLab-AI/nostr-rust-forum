@@ -23,12 +23,17 @@
 //! created by the relay worker, which reads it at admission. This module only
 //! reads and writes rows; it does not create the table.
 //!
-//! ## Proof of possession
+//! ## Member-signed authorization
 //!
 //! A registration carries a kind-[`RECIPIENT_KEY_PROOF_KIND`] event signed by the
-//! new inbox key, committing to `(owner, exp)`, so a member cannot register a key
-//! they do not hold. The kind is distinct from the device-link proof so a proof
-//! made for one purpose cannot be replayed for the other.
+//! MEMBER's identity key (the NIP-98-authenticated owner), authorizing the inbox
+//! key via a `k` tag with an `exp`. It must NOT be self-signed by the inbox key:
+//! a key-signed proof is self-asserted, so a tampered or hostile lookup reply
+//! could present any key with a proof it signed and redirect zone-key grants to
+//! it. The member's signature is what a grant issuer later verifies, so trust
+//! rests on the member, not on the lookup channel (Phase 4 security review).
+//! The kind is distinct from the device-link proof so a proof made for one
+//! purpose cannot be replayed for the other.
 //!
 //! Keys are never logged and never echoed in error messages.
 
@@ -47,6 +52,9 @@ pub const RECIPIENT_KEYS_ENABLED_VAR: &str = "RECIPIENT_KEYS_ENABLED";
 
 /// Event kind of the inbox-key proof-of-possession event.
 const RECIPIENT_KEY_PROOF_KIND: u64 = 27237;
+/// Kind of the possession proof, signed by the inbox key itself (distinct from
+/// the member-signed authorization so neither can be passed off as the other).
+const RECIPIENT_KEY_POSSESSION_KIND: u64 = 27238;
 
 /// Longest permitted proof lifetime in seconds: `now < exp <= now + window`.
 const PROOF_MAX_WINDOW_SECS: u64 = 300;
@@ -97,7 +105,7 @@ struct KeyRow {
     role: String,
     created_at: u64,
     revoked: bool,
-    /// The verified kind-27237 registration proof, stored verbatim so a grant
+    /// The verified kind-27237 member-signed authorization, stored verbatim so a grant
     /// issuer can check that this key really belongs to `owner_pubkey` before
     /// wrapping a zone key to it. `None` for epoch rows and for rows registered
     /// before the column existed; issuers refuse those.
@@ -149,6 +157,8 @@ struct RegisterBody {
     role: String,
     #[serde(default)]
     proof: Option<NostrEvent>,
+    #[serde(default)]
+    possession: Option<NostrEvent>,
 }
 
 #[derive(Deserialize)]
@@ -183,15 +193,19 @@ fn verify_key_proof(
     owner: &str,
     now: u64,
 ) -> std::result::Result<(), &'static str> {
-    if proof.pubkey.to_ascii_lowercase() != key {
-        return Err("proof not signed by the registered key");
+    // The authorization must be signed by the MEMBER (the NIP-98-authenticated
+    // owner) and name the inbox key in a `k` tag. A key-signed proof would be
+    // self-asserted and a hostile lookup reply could redirect zone keys; the
+    // member's signature is what a grant issuer later verifies (Phase 4 review).
+    if proof.pubkey.to_ascii_lowercase() != owner {
+        return Err("proof not signed by the authenticated owner");
     }
     if proof.kind != RECIPIENT_KEY_PROOF_KIND {
         return Err("proof has wrong kind");
     }
-    let owner_tag = proof_tag(proof, "owner").ok_or("proof missing owner tag")?;
-    if owner_tag.to_ascii_lowercase() != owner {
-        return Err("proof owner does not match authenticated owner");
+    let key_tag = proof_tag(proof, "k").ok_or("proof missing k (inbox key) tag")?;
+    if key_tag.to_ascii_lowercase() != key {
+        return Err("proof does not authorize the registered key");
     }
     let exp: u64 = proof_tag(proof, "exp")
         .and_then(|v| v.parse().ok())
@@ -203,6 +217,40 @@ fn verify_key_proof(
         return Err("proof exp too far in the future");
     }
     verify_event_strict(proof).map_err(|_| "proof signature invalid")?;
+    Ok(())
+}
+
+/// Verify the possession proof: a kind-[`RECIPIENT_KEY_POSSESSION_KIND`] event
+/// signed by the inbox `key` itself, naming `owner`. Proves the registrant
+/// holds the key's secret, so a member cannot register a key they do not hold.
+///
+/// `key` and `owner` must already be lowercase.
+fn verify_possession(
+    possession: &NostrEvent,
+    key: &str,
+    owner: &str,
+    now: u64,
+) -> std::result::Result<(), &'static str> {
+    if possession.pubkey.to_ascii_lowercase() != key {
+        return Err("possession not signed by the registered key");
+    }
+    if possession.kind != RECIPIENT_KEY_POSSESSION_KIND {
+        return Err("possession has wrong kind");
+    }
+    let owner_tag = proof_tag(possession, "owner").ok_or("possession missing owner tag")?;
+    if owner_tag.to_ascii_lowercase() != owner {
+        return Err("possession owner does not match authenticated owner");
+    }
+    let exp: u64 = proof_tag(possession, "exp")
+        .and_then(|v| v.parse().ok())
+        .ok_or("possession missing or invalid exp tag")?;
+    if exp <= now {
+        return Err("possession expired");
+    }
+    if exp > now + PROOF_MAX_WINDOW_SECS {
+        return Err("possession exp too far in the future");
+    }
+    verify_event_strict(possession).map_err(|_| "possession signature invalid")?;
     Ok(())
 }
 
@@ -259,6 +307,17 @@ async fn do_register(store: &dyn KeyStore, caller: &str, body: &[u8], now: u64) 
         return err(400, "proof required");
     };
     if let Err(msg) = verify_key_proof(proof, &key, &owner, now) {
+        return err(400, msg);
+    }
+    // Possession: signed by the key itself, naming the owner. Without it a
+    // member could register someone else's pubkey as their inbox key (naming it
+    // in a member-signed authorization they CAN sign) and then read and delete
+    // that person's wraps. The possession proof is signed by the key, which the
+    // member cannot forge for a key they do not hold.
+    let Some(possession) = body.possession.as_ref() else {
+        return err(400, "possession proof required");
+    };
+    if let Err(msg) = verify_possession(possession, &key, &owner, now) {
         return err(400, msg);
     }
     upsert_row(
@@ -697,14 +756,16 @@ mod tests {
     const STRANGER: u8 = 0x33;
     const ADMIN: u8 = 0x44;
 
-    fn proof(signer: u8, kind: u64, owner: &str, exp: u64) -> NostrEvent {
+    /// A member-signed inbox-key authorization: signed by `signer`, naming the
+    /// inbox `key` in a `k` tag. A valid one is signed by the owner.
+    fn proof(signer: u8, kind: u64, key: &str, exp: u64) -> NostrEvent {
         sign_event_deterministic(
             UnsignedEvent {
                 pubkey: pk(signer),
                 created_at: NOW,
                 kind,
                 tags: vec![
-                    vec!["owner".into(), owner.into()],
+                    vec!["k".into(), key.into()],
                     vec!["exp".into(), exp.to_string()],
                 ],
                 content: String::new(),
@@ -718,14 +779,60 @@ mod tests {
         serde_json::to_vec(&json!({ "key": key, "role": role, "proof": p })).unwrap()
     }
 
+    /// A possession proof: signed by the inbox `key_signer`, naming `owner`,
+    /// kind [`RECIPIENT_KEY_POSSESSION_KIND`].
+    fn possession(key_signer: u8, owner: &str, exp: u64) -> NostrEvent {
+        sign_event_deterministic(
+            UnsignedEvent {
+                pubkey: pk(key_signer),
+                created_at: NOW,
+                kind: RECIPIENT_KEY_POSSESSION_KIND,
+                tags: vec![
+                    vec!["owner".into(), owner.into()],
+                    vec!["exp".into(), exp.to_string()],
+                ],
+                content: String::new(),
+            },
+            &sk(key_signer),
+        )
+        .unwrap()
+    }
+
+    fn reg_body_p(key: &str, role: &str, p: &NostrEvent, poss: &NostrEvent) -> Vec<u8> {
+        serde_json::to_vec(&json!({ "key": key, "role": role, "proof": p, "possession": poss }))
+            .unwrap()
+    }
+
     fn register_inbox(store: &Mem, owner: u8, inbox: u8) -> Reply {
-        let p = proof(inbox, RECIPIENT_KEY_PROOF_KIND, &pk(owner), NOW + 60);
+        // Owner-signed authorization naming the inbox key (finding #3), plus a
+        // possession proof signed by the inbox key naming the owner.
+        let p = proof(owner, RECIPIENT_KEY_PROOF_KIND, &pk(inbox), NOW + 60);
+        let poss = possession(inbox, &pk(owner), NOW + 60);
         block_on(do_register(
             store,
             &pk(owner),
-            &reg_body(&pk(inbox), "inbox", &p),
+            &reg_body_p(&pk(inbox), "inbox", &p, &poss),
             NOW,
         ))
+    }
+
+    #[test]
+    fn cannot_register_a_key_you_do_not_hold() {
+        // OWNER authorizes STRANGER's identity key as "their" inbox key (OWNER
+        // can sign that authorization) but cannot sign a possession proof for
+        // STRANGER's key. Without a valid possession proof, registration fails,
+        // so OWNER cannot make STRANGER's pubkey a readable inbox key of theirs.
+        let s = Mem::default();
+        let auth = proof(OWNER, RECIPIENT_KEY_PROOF_KIND, &pk(STRANGER), NOW + 60);
+        let forged = possession(OWNER, &pk(OWNER), NOW + 60); // signed by OWNER, not STRANGER
+        let r = block_on(do_register(
+            &s,
+            &pk(OWNER),
+            &reg_body_p(&pk(STRANGER), "inbox", &auth, &forged),
+            NOW,
+        ));
+        assert_eq!(r.status, 400);
+        assert!(s.0.borrow().is_empty());
     }
 
     fn revoke_body(key: &str) -> Vec<u8> {
@@ -747,8 +854,8 @@ mod tests {
     #[test]
     fn register_refused_when_proof_signed_by_different_key() {
         let s = Mem::default();
-        // The caller names INBOX but the proof is signed by STRANGER's key.
-        let p = proof(STRANGER, RECIPIENT_KEY_PROOF_KIND, &pk(OWNER), NOW + 60);
+        // The caller is OWNER but the authorization is signed by STRANGER.
+        let p = proof(STRANGER, RECIPIENT_KEY_PROOF_KIND, &pk(INBOX), NOW + 60);
         let r = block_on(do_register(
             &s,
             &pk(OWNER),
@@ -762,8 +869,8 @@ mod tests {
     #[test]
     fn register_refused_when_caller_is_not_the_proof_owner() {
         let s = Mem::default();
-        // Proof commits to OWNER; STRANGER replays it under their own NIP-98 identity.
-        let p = proof(INBOX, RECIPIENT_KEY_PROOF_KIND, &pk(OWNER), NOW + 60);
+        // Authorization signed by OWNER; STRANGER replays it under their own NIP-98 identity.
+        let p = proof(OWNER, RECIPIENT_KEY_PROOF_KIND, &pk(INBOX), NOW + 60);
         let r = block_on(do_register(
             &s,
             &pk(STRANGER),
@@ -777,7 +884,7 @@ mod tests {
     #[test]
     fn register_refuses_epoch_role_missing_proof_and_identity_key() {
         let s = Mem::default();
-        let p = proof(INBOX, RECIPIENT_KEY_PROOF_KIND, &pk(OWNER), NOW + 60);
+        let p = proof(OWNER, RECIPIENT_KEY_PROOF_KIND, &pk(INBOX), NOW + 60);
         let r = block_on(do_register(
             &s,
             &pk(OWNER),
@@ -804,7 +911,7 @@ mod tests {
     #[test]
     fn register_refuses_wrong_kind_and_expired_proof() {
         let s = Mem::default();
-        let wrong_kind = proof(INBOX, 27236, &pk(OWNER), NOW + 60);
+        let wrong_kind = proof(OWNER, 27236, &pk(INBOX), NOW + 60);
         let r = block_on(do_register(
             &s,
             &pk(OWNER),
@@ -812,7 +919,7 @@ mod tests {
             NOW,
         ));
         assert_eq!(r.status, 400);
-        let expired = proof(INBOX, RECIPIENT_KEY_PROOF_KIND, &pk(OWNER), NOW);
+        let expired = proof(OWNER, RECIPIENT_KEY_PROOF_KIND, &pk(INBOX), NOW);
         let r = block_on(do_register(
             &s,
             &pk(OWNER),
@@ -886,15 +993,18 @@ mod tests {
         // The stored registration proof travels with the key so an issuer can
         // bind it to the owner before wrapping anything to it.
         assert_eq!(e["proof"]["kind"], json!(RECIPIENT_KEY_PROOF_KIND));
-        assert_eq!(e["proof"]["pubkey"], json!(pk(INBOX)));
+        // Member-signed authorization: the proof is signed by the OWNER and
+        // names the inbox key in a `k` tag (finding #3).
+        assert_eq!(e["proof"]["pubkey"], json!(pk(OWNER)));
     }
 
     #[test]
     fn lookup_orders_newest_first() {
         let s = Mem::default();
         for (b, t) in [(0x51u8, NOW), (0x52, NOW + 20), (0x53, NOW + 10)] {
-            let p = proof(b, RECIPIENT_KEY_PROOF_KIND, &pk(OWNER), t + 60);
-            let body = reg_body(&pk(b), "inbox", &p);
+            let p = proof(OWNER, RECIPIENT_KEY_PROOF_KIND, &pk(b), t + 60);
+            let poss = possession(b, &pk(OWNER), t + 60);
+            let body = reg_body_p(&pk(b), "inbox", &p, &poss);
             assert_eq!(block_on(do_register(&s, &pk(OWNER), &body, t)).status, 200);
         }
         let r = block_on(do_lookup(&s, true, Some(&pk(OWNER))));

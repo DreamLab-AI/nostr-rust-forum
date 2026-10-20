@@ -514,6 +514,27 @@ impl ZoneKeyStore {
         let ledger = self.grants.get_value();
         ledger.record(&IdbGrantKv, zone, epoch, recipients).await;
     }
+
+    /// Members this device has ever granted any of `epochs` of `zone` to
+    /// (recipient key irrelevant): the "known" targets the first-grant gate
+    /// auto-grants without a fresh confirmation.
+    pub async fn members_ever_granted(&self, zone: &str, epochs: &[u32]) -> HashSet<String> {
+        let ledger = self.grants.get_value();
+        ledger.members_ever(&IdbGrantKv, zone, epochs).await
+    }
+
+    /// `zone`'s persisted set of admin-approved first-time grant targets.
+    pub async fn approved_targets(&self, zone: &str) -> HashSet<String> {
+        let ledger = self.grants.get_value();
+        ledger.approved(&IdbGrantKv, zone).await
+    }
+
+    /// Record that an admin approved `pubkey` as a first-time grant target for
+    /// `zone` (persisted), so this and later sweeps auto-grant to it.
+    pub async fn approve_target(&self, zone: &str, pubkey: &str) {
+        let ledger = self.grants.get_value();
+        ledger.approve(&IdbGrantKv, zone, pubkey).await;
+    }
 }
 
 /// The grant ledger's storage: the `zone_kv` IndexedDB store.

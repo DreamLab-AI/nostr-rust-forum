@@ -64,25 +64,70 @@ pub fn encrypted_zone_rules() -> Vec<ZoneRule> {
         .collect()
 }
 
-/// The grants still owed, across every zone this admin holds a key for.
+/// The outcome of planning the grants owed: what to auto-send now, and the
+/// brand-new targets held back for a one-time admin confirmation.
+///
+/// The split is the first-grant confirmation gate (deepsec #1): the admin's
+/// own relay is the membership authority (ADR-2016), so a compromised or
+/// hostile relay could inject an attacker pubkey into a required cohort. The
+/// sweep must not silently wrap the zone epoch key to a pubkey it has never
+/// granted before on nothing but the relay's say-so. A never-granted pubkey is
+/// surfaced in [`pending`](Self::pending) for the admin to confirm once; a
+/// pubkey already in the ledger (granted a prior epoch) or on the persisted
+/// approved set is "known" and auto-grants, so rotation stays automatic.
+//
+// Follow-up (option B, robust fix): signed membership records — each member
+// admitted by an admin-signed join event the client verifies — so the client
+// never trusts raw relay roster rows at all. That is an ADR-2016 trust-model
+// change (the relay stops being the sole membership authority) and is tracked
+// separately.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MissingPlan {
+    /// Grants to send now: one `(key, recipients)` pair per epoch, to targets
+    /// that are known (previously granted) or admin-approved.
+    pub grants: Vec<(ZoneKey, Vec<String>)>,
+    /// `(zone, pubkey)` pairs of never-before-granted targets. Not wrapped:
+    /// surfaced for the admin to approve once (see
+    /// [`AutoGrant::approve`](crate::zone_crypto::auto_grant::AutoGrant::approve)).
+    pub pending: Vec<(String, String)>,
+}
+
+/// The grants still owed, across every zone this admin holds a key for, split
+/// by the first-grant confirmation gate.
 ///
 /// `held` maps zone id to the keys this admin holds for it; `sent` maps
-/// `(zone, epoch)` to the members this device's ledger records as granted.
+/// `(zone, epoch)` to the members this device's ledger records as granted at
+/// the key they would be granted at now. `known` maps zone id to the pubkeys
+/// that may be auto-granted without a fresh confirmation — those the ledger
+/// has ever granted any epoch of the zone, plus the persisted approved set.
+///
 /// A member is owed a zone's newest key when they are one of its
 /// [`grant_targets`] and the ledger has no record of it; with that grant go
 /// the earlier keys they were not sent ([`grant_plan`] with history), so a
-/// member who joins after a rotation can read the zone's older messages.
-/// `only` narrows the recipients to those pubkeys (an allocation).
+/// member who joins after a rotation can read the zone's older messages. A
+/// target that is `me`, or in `known` for the zone, auto-grants; any other
+/// never-granted target lands in [`MissingPlan::pending`] instead — unless
+/// `auto_grant_new` is set (an explicit admin allocation), when new targets
+/// both auto-grant and are reported in `pending` so the caller can persist the
+/// approval. `only` narrows the recipients to those pubkeys (an allocation).
+// Each parameter is a distinct, named input (roster, identity, held keys,
+// ledger history, the known/approved set, the allocation flag and the `only`
+// filter); bundling them would hide rather than clarify, so the arg-count lint
+// is allowed here deliberately.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_missing(
     zones: &[ZoneRule],
     members: &[(String, Vec<String>)],
     me: &str,
     held: &HashMap<String, Vec<ZoneKey>>,
     sent: &HashMap<(String, u32), HashSet<String>>,
+    known: &HashMap<String, HashSet<String>>,
+    auto_grant_new: bool,
     only: Option<&HashSet<String>>,
-) -> Vec<(ZoneKey, Vec<String>)> {
+) -> MissingPlan {
     let none = HashSet::new();
-    let mut out = Vec::new();
+    let me_lower = me.to_ascii_lowercase();
+    let mut out = MissingPlan::default();
     for zone in zones {
         let Some(keys) = held.get(&zone.id).filter(|k| !k.is_empty()) else {
             continue;
@@ -91,16 +136,26 @@ pub fn plan_missing(
             continue;
         };
         let have = sent.get(&(zone.id.clone(), newest)).unwrap_or(&none);
-        let recipients: Vec<String> =
-            grant_targets(members, &zone.required_cohorts, me, zone.agent_keys)
-                .into_iter()
-                .filter(|pk| only.is_none_or(|o| o.contains(pk)))
-                .filter(|pk| !have.contains(pk))
-                .collect();
-        if recipients.is_empty() {
+        let known_z = known.get(&zone.id).unwrap_or(&none);
+        let recipients = grant_targets(members, &zone.required_cohorts, me, zone.agent_keys)
+            .into_iter()
+            .filter(|pk| only.is_none_or(|o| o.contains(pk)))
+            .filter(|pk| !have.contains(pk));
+        let mut auto: Vec<String> = Vec::new();
+        for pk in recipients {
+            if pk == me_lower || known_z.contains(&pk) {
+                auto.push(pk);
+            } else {
+                out.pending.push((zone.id.clone(), pk.clone()));
+                if auto_grant_new {
+                    auto.push(pk);
+                }
+            }
+        }
+        if auto.is_empty() {
             continue;
         }
-        out.extend(grant_plan(keys, &recipients, true, |epoch| {
+        out.grants.extend(grant_plan(keys, &auto, true, |epoch| {
             sent.get(&(zone.id.clone(), epoch))
                 .cloned()
                 .unwrap_or_default()
@@ -276,13 +331,17 @@ impl AutoGrant {
         self.store.hydrated.into()
     }
 
-    /// Work out the grants owed, from a fresh roster read. `only` narrows
-    /// them to those members.
+    /// Work out the grants owed, from a fresh roster read, split by the
+    /// first-grant confirmation gate. `only` narrows them to those members;
+    /// `auto_grant_new` auto-grants (and reports) never-granted targets instead
+    /// of holding them pending — set for an explicit admin allocation, never
+    /// for the silent sweep.
     async fn plan(
         &self,
         signer: &dyn Signer,
         only: Option<&HashSet<String>>,
-    ) -> Result<Vec<(ZoneKey, Vec<String>)>, String> {
+        auto_grant_new: bool,
+    ) -> Result<MissingPlan, String> {
         let zones = encrypted_zone_rules();
         let held: HashMap<String, Vec<ZoneKey>> = zones
             .iter()
@@ -290,7 +349,7 @@ impl AutoGrant {
             .filter(|(_, keys)| !keys.is_empty())
             .collect();
         if held.is_empty() {
-            return Ok(Vec::new());
+            return Ok(MissingPlan::default());
         }
         let rows = crate::admin::fetch_whitelist_rows(signer).await?;
         let members: Vec<(String, Vec<String>)> =
@@ -306,14 +365,51 @@ impl AutoGrant {
             .collect();
         let targets = granted_targets(resolve_targets(signer, &candidates).await);
         let mut sent = HashMap::new();
-        for keys in held.values() {
+        // Pubkeys that may be auto-granted without a fresh confirmation:
+        // ever granted any held epoch (recipient key irrelevant, so a re-issue
+        // to an existing member's new inbox key is never gated) plus the
+        // persisted approved set. Built from the device's own ledger, never
+        // the relay's roster.
+        let mut known: HashMap<String, HashSet<String>> = HashMap::new();
+        for (zone, keys) in &held {
             for k in keys {
                 let s = self.store.grants_sent_to(&k.zone, k.epoch, &targets).await;
                 sent.insert((k.zone.clone(), k.epoch), s);
             }
+            let epochs: Vec<u32> = keys.iter().map(|k| k.epoch).collect();
+            let mut k = self.store.members_ever_granted(zone, &epochs).await;
+            k.extend(self.store.approved_targets(zone).await);
+            known.insert(zone.clone(), k);
         }
         let me = self.auth.pubkey().get_untracked().unwrap_or_default();
-        Ok(plan_missing(&zones, &members, &me, &held, &sent, only))
+        // First-run baseline: a device with NO record for a zone (ledger and
+        // approved set both empty) has nothing to compare an injected roster
+        // row against, so quarantining every owed member would only break
+        // rotation on a fresh admin browser (the ledger is per-browser; there
+        // is no durable "ever granted" source). Adopt the current eligible
+        // roster as the baseline once and persist it; from then on the device
+        // has a baseline and a genuinely new pubkey is held pending. A relay
+        // compromised before a device's first sweep is adopted — documented in
+        // ADR-2016; the robust fix is a durable admin-signed grant ledger.
+        for zone in &zones {
+            if known.get(&zone.id).is_none_or(HashSet::is_empty) && held.contains_key(&zone.id) {
+                let base = grant_targets(&members, &zone.required_cohorts, &me, zone.agent_keys);
+                for pk in &base {
+                    self.store.approve_target(&zone.id, pk).await;
+                }
+                known.insert(zone.id.clone(), base.into_iter().collect());
+            }
+        }
+        Ok(plan_missing(
+            &zones,
+            &members,
+            &me,
+            &held,
+            &sent,
+            &known,
+            auto_grant_new,
+            only,
+        ))
     }
 
     async fn run(&self, only: Option<&HashSet<String>>) -> Result<GrantReport, String> {
@@ -321,11 +417,24 @@ impl AutoGrant {
             .auth
             .get_signer()
             .ok_or_else(|| "Sign in again to grant zone keys.".to_string())?;
-        let plan = self.plan(&*signer, only).await?;
-        if plan.is_empty() {
+        // An allocation is an explicit admin action on this pubkey, not a
+        // silent sweep: approve any never-granted target so it is granted now
+        // and remembered, rather than held for a second confirmation.
+        let plan = self.plan(&*signer, only, true).await?;
+        for (zone, pk) in &plan.pending {
+            self.store.approve_target(zone, pk).await;
+        }
+        if plan.grants.is_empty() {
             return Ok(GrantReport::default());
         }
-        Ok(send_grants(self.store, &self.relay, &*signer, plan, Rc::new(|_, _| ())).await)
+        Ok(send_grants(
+            self.store,
+            &self.relay,
+            &*signer,
+            plan.grants,
+            Rc::new(|_, _| ()),
+        )
+        .await)
     }
 
     fn toast(&self, message: String, variant: ToastVariant) {
@@ -362,7 +471,12 @@ impl AutoGrant {
     }
 
     /// The sign-in sweep: grant every held key to each eligible member this
-    /// device has no record of granting. With a NIP-07 signer, only report.
+    /// device has no record of granting, EXCEPT a pubkey never granted this
+    /// zone before. A never-granted target is held for a one-time admin
+    /// confirmation (the first-grant gate, deepsec #1) and surfaced here, not
+    /// wrapped — so a hostile relay injecting an attacker pubkey into a cohort
+    /// cannot make the sweep silently exfiltrate the zone key. With a NIP-07
+    /// signer, only report.
     pub fn sweep(&self) {
         let this = self.clone();
         spawn_local(async move {
@@ -370,19 +484,33 @@ impl AutoGrant {
                 return;
             };
             let extension = this.auth.state.with_untracked(|s| s.is_nip07);
-            let plan = match this.plan(&*signer, None).await {
+            let plan = match this.plan(&*signer, None, false).await {
                 Ok(p) => p,
                 Err(e) => {
                     web_sys::console::warn_1(&format!("[zone-key] sweep skipped: {e}").into());
                     return;
                 }
             };
-            let waiting = grant_count(&plan);
+            // Never-granted targets are held back: tell the admin to confirm
+            // them in Admin → Encryption, and never wrap a key to them here.
+            if !plan.pending.is_empty() {
+                let new_pubkeys: HashSet<&String> = plan.pending.iter().map(|(_, pk)| pk).collect();
+                this.toast(
+                    format!(
+                        "{} new member(s) are awaiting approval before a zone key is sent. \
+                         Confirm them in Admin → Encryption.",
+                        new_pubkeys.len()
+                    ),
+                    ToastVariant::Info,
+                );
+            }
+            let waiting = grant_count(&plan.grants);
             if waiting == 0 {
                 return;
             }
             if extension {
-                let members: HashSet<&String> = plan.iter().flat_map(|(_, r)| r.iter()).collect();
+                let members: HashSet<&String> =
+                    plan.grants.iter().flat_map(|(_, r)| r.iter()).collect();
                 this.toast(
                     format!(
                         "{} member(s) are missing a zone key. Grant them from Admin → Encryption.",
@@ -392,7 +520,14 @@ impl AutoGrant {
                 );
                 return;
             }
-            let r = send_grants(this.store, &this.relay, &*signer, plan, Rc::new(|_, _| ())).await;
+            let r = send_grants(
+                this.store,
+                &this.relay,
+                &*signer,
+                plan.grants,
+                Rc::new(|_, _| ()),
+            )
+            .await;
             if r.failed > 0 {
                 this.toast(
                     format!(
@@ -409,6 +544,53 @@ impl AutoGrant {
                     ),
                     ToastVariant::Success,
                 );
+            }
+        });
+    }
+
+    /// The `(zone, pubkey)` targets a sweep would hold for approval right now:
+    /// never-granted pubkeys the relay's roster puts in a required cohort. The
+    /// Encryption tab lists these so the admin can confirm each with
+    /// [`approve`](Self::approve).
+    pub async fn pending_targets(&self) -> Vec<(String, String)> {
+        let Some(signer) = self.auth.get_signer() else {
+            return Vec::new();
+        };
+        self.plan(&*signer, None, false)
+            .await
+            .map(|p| p.pending)
+            .unwrap_or_default()
+    }
+
+    /// Confirm a never-granted `pubkey` as a legitimate target for `zone`:
+    /// persist the approval so this and future sweeps auto-grant to it, then
+    /// grant the zone's held keys to it now. The one admin action that lets a
+    /// brand-new pubkey receive a zone key, closing the silent-exfiltration
+    /// hole without a second confirmation per rotation.
+    pub fn approve(&self, zone: &str, pubkey: &str) {
+        let this = self.clone();
+        let zone = zone.to_string();
+        let pubkey = pubkey.to_ascii_lowercase();
+        spawn_local(async move {
+            this.store.approve_target(&zone, &pubkey).await;
+            let only: HashSet<String> = std::iter::once(pubkey).collect();
+            match this.run(Some(&only)).await {
+                Ok(r) if r.sent > 0 && r.failed == 0 => this.toast(
+                    format!("Approved and sent {} zone key(s).", r.sent),
+                    ToastVariant::Success,
+                ),
+                Ok(r) if r.failed > 0 => this.toast(
+                    format!(
+                        "{} zone key grant(s) could not be sent. Retry from Admin → Encryption.",
+                        r.failed
+                    ),
+                    ToastVariant::Error,
+                ),
+                Ok(_) => {}
+                Err(e) => this.toast(
+                    format!("Zone keys were not granted: {e}"),
+                    ToastVariant::Error,
+                ),
             }
         });
     }
@@ -451,15 +633,31 @@ mod tests {
         HashMap::from([(zone.to_string(), keys)])
     }
 
+    /// Known (previously granted or approved) targets for one zone.
+    fn known(zone: &str, pks: &[String]) -> HashMap<String, HashSet<String>> {
+        HashMap::from([(zone.to_string(), pks.iter().cloned().collect())])
+    }
+
     #[test]
     fn grants_the_newest_key_to_every_eligible_member_not_on_record() {
         let zones = [rule("zone3", "family", false)];
         let sent = HashMap::from([(("zone3".to_string(), 1), HashSet::from([ME.to_string()]))]);
-        let plan = plan_missing(&zones, &members(), ME, &held("zone3", &[1]), &sent, None);
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].0.epoch, 1);
+        // b was granted a prior epoch (known), so the gate does not hold them.
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1]),
+            &sent,
+            &known("zone3", &[pk('b')]),
+            false,
+            None,
+        );
+        assert_eq!(plan.grants.len(), 1);
+        assert_eq!(plan.grants[0].0.epoch, 1);
         // b is in the zone; c is not; d is an agent in a zone without agent_keys.
-        assert_eq!(plan[0].1, vec![pk('b')]);
+        assert_eq!(plan.grants[0].1, vec![pk('b')]);
+        assert!(plan.pending.is_empty());
     }
 
     #[test]
@@ -471,9 +669,11 @@ mod tests {
             ME,
             &held("zone4", &[1]),
             &HashMap::new(),
+            &known("zone4", &[pk('b'), pk('d')]),
+            false,
             None,
         );
-        assert!(plan[0].1.contains(&pk('d')));
+        assert!(plan.grants[0].1.contains(&pk('d')));
     }
 
     #[test]
@@ -484,10 +684,19 @@ mod tests {
             (("zone3".to_string(), 1), everyone_else.clone()),
             (("zone3".to_string(), 2), everyone_else),
         ]);
-        let plan = plan_missing(&zones, &members(), ME, &held("zone3", &[1, 2]), &sent, None);
-        let epochs: Vec<u32> = plan.iter().map(|(k, _)| k.epoch).collect();
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1, 2]),
+            &sent,
+            &known("zone3", &[pk('b')]),
+            false,
+            None,
+        );
+        let epochs: Vec<u32> = plan.grants.iter().map(|(k, _)| k.epoch).collect();
         assert_eq!(epochs, vec![2, 1]);
-        assert!(plan.iter().all(|(_, r)| r == &vec![pk('b')]));
+        assert!(plan.grants.iter().all(|(_, r)| r == &vec![pk('b')]));
     }
 
     #[test]
@@ -495,8 +704,18 @@ mod tests {
         let zones = [rule("zone3", "family", false)];
         let all = HashSet::from([ME.to_string(), pk('b')]);
         let sent = HashMap::from([(("zone3".to_string(), 1), all)]);
-        let plan = plan_missing(&zones, &members(), ME, &held("zone3", &[1]), &sent, None);
-        assert!(plan.is_empty());
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1]),
+            &sent,
+            &known("zone3", &[pk('b')]),
+            false,
+            None,
+        );
+        assert!(plan.grants.is_empty());
+        assert!(plan.pending.is_empty());
     }
 
     #[test]
@@ -508,10 +727,22 @@ mod tests {
         let mut keys = held("zone3", &[1]);
         keys.extend(held("zone2", &[1]));
         let only = HashSet::from([pk('c')]);
-        let plan = plan_missing(&zones, &members(), ME, &keys, &HashMap::new(), Some(&only));
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].0.zone, "zone2");
-        assert_eq!(plan[0].1, vec![pk('c')]);
+        // An allocation (auto_grant_new) grants a brand-new target and reports
+        // it so the caller persists the approval.
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &keys,
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            Some(&only),
+        );
+        assert_eq!(plan.grants.len(), 1);
+        assert_eq!(plan.grants[0].0.zone, "zone2");
+        assert_eq!(plan.grants[0].1, vec![pk('c')]);
+        assert_eq!(plan.pending, vec![("zone2".to_string(), pk('c'))]);
     }
 
     #[test]
@@ -526,10 +757,118 @@ mod tests {
             ME,
             &held("zone3", &[1]),
             &HashMap::new(),
+            &known("zone3", &[pk('b')]),
+            false,
             None,
         );
-        assert!(plan.iter().all(|(k, _)| k.zone == "zone3"));
-        assert_eq!(grant_count(&plan), 2); // me and b
+        assert!(plan.grants.iter().all(|(k, _)| k.zone == "zone3"));
+        assert_eq!(grant_count(&plan.grants), 2); // me and b
+    }
+
+    #[test]
+    fn a_never_granted_pubkey_is_held_pending_not_auto_granted() {
+        // deepsec #1: a hostile relay injects b (never granted this zone) into
+        // the required cohort. The sweep must not wrap the epoch key to b.
+        let zones = [rule("zone3", "family", false)];
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1]),
+            &HashMap::new(),
+            &HashMap::new(), // nothing known: b has never been granted
+            false,
+            None,
+        );
+        // Only me (always known) is auto-granted; b is surfaced for approval.
+        assert_eq!(plan.grants.len(), 1);
+        assert_eq!(plan.grants[0].1, vec![ME.to_string()]);
+        assert_eq!(plan.pending, vec![("zone3".to_string(), pk('b'))]);
+    }
+
+    #[test]
+    fn an_approved_pubkey_is_auto_granted() {
+        // After approve() records b in the approved set, the same sweep grants
+        // to it with no further confirmation.
+        let zones = [rule("zone3", "family", false)];
+        let sent = HashMap::from([(("zone3".to_string(), 1), HashSet::from([ME.to_string()]))]);
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1]),
+            &sent,
+            &known("zone3", &[pk('b')]), // b now approved
+            false,
+            None,
+        );
+        assert_eq!(plan.grants.len(), 1);
+        assert_eq!(plan.grants[0].1, vec![pk('b')]);
+        assert!(plan.pending.is_empty());
+    }
+
+    #[test]
+    fn a_previously_granted_pubkey_auto_grants_on_a_new_epoch() {
+        // Rotation stays automatic: b held epoch 1 (ledger record -> known) and
+        // is auto-granted epoch 2 without any approval, even on a fresh sweep.
+        let zones = [rule("zone3", "family", false)];
+        let sent = HashMap::from([(
+            ("zone3".to_string(), 1),
+            HashSet::from([ME.to_string(), pk('b')]),
+        )]);
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1, 2]),
+            &sent,
+            &known("zone3", &[pk('b')]), // ever-granted epoch 1 -> known
+            false,
+            None,
+        );
+        // Newest epoch 2 goes to b with no pending entry.
+        assert!(plan.pending.is_empty());
+        let epoch2 = plan.grants.iter().find(|(k, _)| k.epoch == 2).unwrap();
+        assert!(epoch2.1.contains(&pk('b')));
+    }
+
+    #[test]
+    fn me_is_always_granted_even_when_never_recorded() {
+        // The admin's own identity is never held pending: they must be able to
+        // read the zone they hold the key for.
+        let zones = [rule("zone3", "family", false)];
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1]),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            None,
+        );
+        assert!(plan.grants.iter().any(|(_, r)| r.contains(&ME.to_string())));
+        assert!(plan.pending.iter().all(|(_, pk)| pk != ME));
+    }
+
+    #[test]
+    fn agents_are_still_excluded_from_pending_and_grants() {
+        // d is an agent in a zone without agent_keys: never granted, never
+        // even surfaced for approval.
+        let d = pk('d');
+        let zones = [rule("zone3", "family", false)];
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1]),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            None,
+        );
+        assert!(plan.grants.iter().all(|(_, r)| !r.contains(&d)));
+        assert!(plan.pending.iter().all(|(_, pubkey)| pubkey != &d));
     }
 
     #[derive(Default)]
@@ -562,8 +901,19 @@ mod tests {
         let have = futures::executor::block_on(ledger.sent_to(&kv, "zone3", 1, &targets));
         let sent = HashMap::from([(("zone3".to_string(), 1), have)]);
         let zones = [rule("zone3", "family", false)];
-        let plan = plan_missing(&zones, &members(), ME, &held("zone3", &[1]), &sent, None);
-        assert!(plan[0].1.contains(&pk('b')));
+        // b is known: a v1 entry means b was granted a prior epoch, so a
+        // re-issue to their new inbox key is auto, never gated.
+        let plan = plan_missing(
+            &zones,
+            &members(),
+            ME,
+            &held("zone3", &[1]),
+            &sent,
+            &known("zone3", &[pk('b')]),
+            false,
+            None,
+        );
+        assert!(plan.grants[0].1.contains(&pk('b')));
         // Once recorded at the inbox key, b is no longer owed.
         futures::executor::block_on(ledger.record(&kv, "zone3", 1, &[(pk('b'), pk('9'))]));
         let have = futures::executor::block_on(ledger.sent_to(&kv, "zone3", 1, &targets));

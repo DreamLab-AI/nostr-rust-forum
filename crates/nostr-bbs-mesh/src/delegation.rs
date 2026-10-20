@@ -176,9 +176,19 @@ impl DelegationToken {
         delegatee_hex: &str,
         event_kind: u64,
         event_created_at: u64,
+        now: Option<u64>,
     ) -> Result<(), DelegationError> {
         let conditions = self.verify(delegatee_hex)?;
-        conditions.check(event_kind, event_created_at)
+        conditions.check(event_kind, event_created_at)?;
+        // Enforce the delegation's upper time bound against the node's own
+        // clock, not only against the delegatee-controlled event timestamp.
+        // Without this a delegatee backdates the rumor's `created_at` to sit
+        // inside a window that has already closed, so a time-bounded delegation
+        // never actually expires (Phase 4 security review, finding #4).
+        if let Some(now) = now {
+            conditions.check_unexpired(now)?;
+        }
+        Ok(())
     }
 }
 
@@ -247,6 +257,20 @@ impl Conditions {
         }
         Ok(())
     }
+
+    /// Reject a delegation whose upper time bound has already passed on the
+    /// verifier's clock. A delegation with no `created_at<` bound is open-ended
+    /// by construction and never expires here. See [`Token::verify_for_event`].
+    pub fn check_unexpired(&self, now: u64) -> Result<(), DelegationError> {
+        if let Some(lt) = self.created_at_lt {
+            if now > lt {
+                return Err(DelegationError::ConditionsUnmet(format!(
+                    "delegation window closed at {lt}, now {now}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn is_hex(s: &str) -> bool {
@@ -308,6 +332,14 @@ mod tests {
         assert!(c.check(14, 150).is_ok());
         assert!(c.check(14, 100).is_err()); // strict >
         assert!(c.check(14, 200).is_err()); // strict <
+                                            // Finding #4: the upper bound is also enforced against the verifier's
+                                            // clock, so a backdated event cannot use an expired window.
+        assert!(c.check_unexpired(150).is_ok()); // window still open
+        assert!(c.check_unexpired(200).is_ok()); // boundary: now == lt, still open
+        assert!(c.check_unexpired(250).is_err()); // window closed in real time
+                                                  // A delegation with no upper bound never expires here.
+        let open = Conditions::parse("created_at>100").unwrap();
+        assert!(open.check_unexpired(u64::MAX).is_ok());
     }
 
     #[test]

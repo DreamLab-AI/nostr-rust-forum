@@ -1082,9 +1082,14 @@ async fn authenticate(
 
 async fn is_whitelisted(env: &Env, pubkey: &str) -> bool {
     let Ok(db) = env.d1("DB") else { return false };
+    // Must honour whitelist expiry, matching the admission path
+    // (`storage.rs::is_whitelisted`) and the `/api/check-whitelist` endpoint.
+    // Omitting it here let push notifications keep reaching a member whose
+    // whitelist entry had expired (divergent-duplicate bug found 2026-10-20).
+    let now = auth::js_now_secs();
     let Ok(stmt) = db
-        .prepare("SELECT 1 AS ok FROM whitelist WHERE pubkey = ?1")
-        .bind(&[js_str(pubkey)])
+        .prepare("SELECT 1 AS ok FROM whitelist WHERE pubkey = ?1 AND (expires_at IS NULL OR expires_at > ?2)")
+        .bind(&[js_str(pubkey), js_f64(now as f64)])
     else {
         return false;
     };

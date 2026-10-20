@@ -19,6 +19,17 @@ use std::sync::Mutex;
 /// `grants_sent:v2:<zone>:<epoch>` (v2).
 pub const KV_GRANTS_SENT: &str = "grants_sent";
 
+/// `zone_kv` id prefix for the per-zone "approved targets" set:
+/// `zone_approved_targets:<zone>`. A pubkey here was confirmed once by an
+/// admin as a legitimate first-time grant target for the zone (the first-grant
+/// confirmation gate, deepsec #1), so later sweeps auto-grant to it.
+pub const KV_APPROVED_TARGETS: &str = "zone_approved_targets";
+
+/// Storage id for `zone`'s approved-targets set.
+pub fn approved_id(zone: &str) -> String {
+    format!("{KV_APPROVED_TARGETS}:{zone}")
+}
+
 /// Storage id for the `(zone, epoch)` grant set (v2). Entries are
 /// `"<member>:<recipient key>"`: the key the wrap was addressed to, so a
 /// re-issue to a member's new inbox key is not mistaken for already granted.
@@ -142,6 +153,59 @@ impl GrantLedger {
             }
         }
         out
+    }
+
+    /// Members this device has ever granted any of `epochs` of `zone` to,
+    /// whichever key each grant went to. Unlike [`sent_to`](Self::sent_to)
+    /// this ignores the recipient key: it answers "is this pubkey a target we
+    /// have granted before", the question the first-grant gate asks. A member
+    /// granted a prior epoch is "known" and keeps auto-granting across a
+    /// rotation; a never-granted pubkey is "new" and held for approval.
+    pub async fn members_ever<K: GrantKv>(
+        &self,
+        kv: &K,
+        zone: &str,
+        epochs: &[u32],
+    ) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for &epoch in epochs {
+            out.extend(self.sent(kv, zone, epoch).await);
+        }
+        out
+    }
+
+    /// `zone`'s persisted approved-targets set (empty when none stored).
+    pub async fn approved<K: GrantKv>(&self, kv: &K, zone: &str) -> HashSet<String> {
+        let id = approved_id(zone);
+        self.ensure_loaded(kv, &id).await;
+        self.snapshot(&id).into_iter().collect()
+    }
+
+    /// Record that an admin approved `pubkey` as a first-time grant target for
+    /// `zone`, and persist the set. Persisted with the same grow-only,
+    /// re-write-until-matched discipline as [`record`](Self::record), so a
+    /// concurrent approval is never lost.
+    pub async fn approve<K: GrantKv>(&self, kv: &K, zone: &str, pubkey: &str) {
+        let id = approved_id(zone);
+        self.ensure_loaded(kv, &id).await;
+        self.with(|i| {
+            i.sets
+                .entry(id.clone())
+                .or_default()
+                .insert(pubkey.to_ascii_lowercase());
+        });
+        for _ in 0..MAX_PERSIST_ROUNDS {
+            let snap = self.snapshot(&id);
+            let Ok(json) = serde_json::to_string(&snap) else {
+                return;
+            };
+            if !kv.put(&id, &json).await {
+                return;
+            }
+            if self.with(|i| i.sets.get(&id).map_or(0, BTreeSet::len)) == snap.len() {
+                return;
+            }
+        }
     }
 
     /// Record that `(zone, epoch)` reached each `(member, recipient key)`, and
@@ -346,6 +410,44 @@ mod tests {
     fn ids_are_v2_and_v1_is_a_distinct_fallback() {
         assert_eq!(ledger_id("z", 3), "grants_sent:v2:z:3");
         assert_eq!(ledger_id_v1("z", 3), "grants_sent:z:3");
+        assert_eq!(approved_id("z"), "zone_approved_targets:z");
+    }
+
+    #[test]
+    fn members_ever_unions_every_epoch_target_independent() {
+        let kv = SlowKv::default();
+        let ledger = GrantLedger::default();
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        futures::executor::block_on(async {
+            // a granted at identity in epoch 1, b granted at an inbox key in 2.
+            ledger
+                .record(&kv, "zone3", 1, &[(a.clone(), a.clone())])
+                .await;
+            ledger
+                .record(&kv, "zone3", 2, &[(b.clone(), "ff".repeat(32))])
+                .await;
+        });
+        let ever = futures::executor::block_on(ledger.members_ever(&kv, "zone3", &[1, 2]));
+        assert!(ever.contains(&a) && ever.contains(&b));
+        // A member granted only epoch 2 is still "ever granted" when only
+        // epoch 1 is queried? No — the query is scoped to the epochs asked.
+        let ever1 = futures::executor::block_on(ledger.members_ever(&kv, "zone3", &[1]));
+        assert!(ever1.contains(&a) && !ever1.contains(&b));
+    }
+
+    #[test]
+    fn approve_persists_and_is_read_back() {
+        let kv = SlowKv::default();
+        let ledger = GrantLedger::default();
+        let m = "aa".repeat(32);
+        assert!(futures::executor::block_on(ledger.approved(&kv, "zone3")).is_empty());
+        futures::executor::block_on(ledger.approve(&kv, "zone3", &m));
+        assert!(futures::executor::block_on(ledger.approved(&kv, "zone3")).contains(&m));
+        // Survives a fresh ledger reading the same storage.
+        let fresh = GrantLedger::default();
+        assert!(futures::executor::block_on(fresh.approved(&kv, "zone3")).contains(&m));
+        // Scoped per zone.
+        assert!(futures::executor::block_on(fresh.approved(&kv, "zone2")).is_empty());
     }
 
     #[test]

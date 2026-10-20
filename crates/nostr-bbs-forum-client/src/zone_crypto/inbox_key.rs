@@ -15,7 +15,7 @@
 //! 1. local state in IndexedDB → else the relay backup → else generate;
 //! 2. persist locally as *pending*;
 //! 3. publish the backup (only for a newly generated key);
-//! 4. register with the auth-worker (proof signed by the inbox key);
+//! 4. register with the auth-worker (authorization signed by the member's identity key);
 //! 5. mark *active*.
 //!
 //! A key is active only after step 5, so a failed registration never leaves a
@@ -46,6 +46,14 @@ pub const KIND_APP_DATA: u64 = 30078;
 pub const BACKUP_D_TAG: &str = "nostr-bbs/zone-inbox/v1";
 /// Kind of the proof event signed by the inbox key (NIP-98 style).
 pub const KIND_PROOF: u64 = 27237;
+/// Kind of the possession proof, signed by the inbox key itself, naming its
+/// owner. Distinct from [`KIND_PROOF`] so the two cannot be interchanged: the
+/// authorization proves the member consented to the key, the possession proof
+/// proves the registrant actually HOLDS the key's secret. Without the latter a
+/// member could register someone else's pubkey as "their" inbox key (naming it
+/// in a member-signed authorization) and thereby read and delete that person's
+/// wraps (Phase 4 security review: possession regression).
+pub const KIND_POSSESSION: u64 = 27238;
 /// Seconds a registration proof stays valid.
 pub const PROOF_TTL_SECS: u64 = 300;
 
@@ -145,8 +153,15 @@ pub trait InboxPort {
     async fn fetch_backups(&self) -> Result<Vec<NostrEvent>, String>;
     /// Publish the backup; `Ok` only when the relay answered OK true.
     async fn publish_backup(&self, event: &NostrEvent) -> Result<(), String>;
-    /// Register `key` with the auth-worker, `proof` signed by that key.
-    async fn register(&self, key: &str, proof: &NostrEvent) -> Result<(), String>;
+    /// Register `key` with the auth-worker. `proof` is the member-signed
+    /// authorization naming `key`; `possession` is signed by `key` itself,
+    /// naming the owner, proving the registrant holds it.
+    async fn register(
+        &self,
+        key: &str,
+        proof: &NostrEvent,
+        possession: &NostrEvent,
+    ) -> Result<(), String>;
 }
 
 fn d_tag(ev: &NostrEvent) -> Option<&str> {
@@ -211,19 +226,53 @@ pub async fn open_backup(identity: &dyn Signer, ev: &NostrEvent) -> Result<Inbox
     Ok(b)
 }
 
-/// The registration proof, signed by the inbox key: kind 27237 (distinct from the
-/// NIP-98 kind 27235 and the device-link proof 27236, so neither can be replayed
-/// here), tags `owner`
-/// (identity pubkey) and `exp` (unix seconds). One function so a change to the
-/// auth-worker's contract is a one-line edit.
-pub async fn build_proof(inbox: &dyn Signer, owner: &str, now: u64) -> Result<NostrEvent, String> {
+/// The inbox-key authorization, signed by the MEMBER's identity key: kind 27237
+/// (distinct from the NIP-98 kind 27235 and the device-link proof 27236, so
+/// neither can be replayed here), with a `k` tag naming the inbox pubkey it
+/// authorizes and an `exp` tag (unix seconds).
+///
+/// This MUST be signed by the identity key, not by the inbox key. An
+/// inbox-key-signed proof would be self-asserted — anyone generating an inbox
+/// key could claim any owner — so a tampered or hostile lookup reply could
+/// redirect zone-key grants to an attacker's key. Signed by the member, the
+/// issuer verifies the member actually authorized this key, independent of the
+/// lookup channel (Phase 4 security review, finding #3).
+pub async fn build_proof(
+    identity: &dyn Signer,
+    inbox_pubkey: &str,
+    now: u64,
+) -> Result<NostrEvent, String> {
+    identity
+        .sign_event(UnsignedEvent {
+            pubkey: identity.public_key().to_string(),
+            created_at: now,
+            kind: KIND_PROOF,
+            tags: vec![
+                vec!["k".to_string(), inbox_pubkey.to_ascii_lowercase()],
+                vec!["exp".to_string(), (now + PROOF_TTL_SECS).to_string()],
+            ],
+            content: String::new(),
+        })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The possession proof: signed by the INBOX key, naming its `owner`. Proves
+/// the registrant holds the key's secret, so a member cannot register a key
+/// they do not control (e.g. another member's identity key). Kind
+/// [`KIND_POSSESSION`], distinct from the member-signed authorization.
+pub async fn build_possession(
+    inbox: &dyn Signer,
+    owner: &str,
+    now: u64,
+) -> Result<NostrEvent, String> {
     inbox
         .sign_event(UnsignedEvent {
             pubkey: inbox.public_key().to_string(),
             created_at: now,
-            kind: KIND_PROOF,
+            kind: KIND_POSSESSION,
             tags: vec![
-                vec!["owner".to_string(), owner.to_string()],
+                vec!["owner".to_string(), owner.to_ascii_lowercase()],
                 vec!["exp".to_string(), (now + PROOF_TTL_SECS).to_string()],
             ],
             content: String::new(),
@@ -234,13 +283,20 @@ pub async fn build_proof(inbox: &dyn Signer, owner: &str, now: u64) -> Result<No
 
 async fn register<P: InboxPort>(
     port: &P,
+    identity: &dyn Signer,
     st: &mut LocalInbox,
-    owner: &str,
     now: u64,
 ) -> Result<InboxKey, String> {
     let inbox = signer_from_hex(&st.sk_hex)?;
-    let proof = build_proof(&inbox, owner, now).await?;
-    port.register(inbox.public_key(), &proof)
+    // Two proofs (Phase 4 security review): the authorization is signed by the
+    // MEMBER (identity) naming the inbox key, so the issuer trusts member
+    // consent, not the lookup channel (finding #3); the possession proof is
+    // signed by the INBOX key naming the owner, so a member cannot register a
+    // key they do not hold (possession regression).
+    let owner = identity.public_key().to_string();
+    let proof = build_proof(identity, inbox.public_key(), now).await?;
+    let possession = build_possession(&inbox, &owner, now).await?;
+    port.register(inbox.public_key(), &proof, &possession)
         .await
         .map_err(|e| format!("inbox key registration failed: {e}"))?;
     st.registered = true;
@@ -332,7 +388,8 @@ async fn backup_then_register<P: InboxPort>(
             return Err("inbox key could not be saved locally".into());
         }
     }
-    register(port, st, owner, now).await.map(|_| ())
+    let _ = owner;
+    register(port, identity, st, now).await.map(|_| ())
 }
 
 // -- Issuer side: lookup ------------------------------------------------------
@@ -360,12 +417,18 @@ pub fn proof_binds(proof: &serde_json::Value, key: &str, member: &str) -> bool {
     let Ok(ev) = serde_json::from_value::<NostrEvent>(proof.clone()) else {
         return false;
     };
+    // The authorization must be signed by the MEMBER (ev.pubkey == member) and
+    // name the inbox key in a `k` tag. A proof signed by the key itself would be
+    // self-asserted: a hostile lookup reply could present any key with a proof
+    // it signed, redirecting zone keys to the attacker. Requiring the member's
+    // signature means the issuer trusts member consent, not the lookup channel
+    // (Phase 4 security review, finding #3).
     ev.kind == KIND_PROOF
-        && ev.pubkey.eq_ignore_ascii_case(key)
+        && ev.pubkey.eq_ignore_ascii_case(member)
         && ev
             .tags
             .iter()
-            .any(|t| t.len() >= 2 && t[0] == "owner" && t[1].eq_ignore_ascii_case(member))
+            .any(|t| t.len() >= 2 && t[0] == "k" && t[1].eq_ignore_ascii_case(key))
         && verify_event_strict(&ev).is_ok()
 }
 
@@ -612,12 +675,20 @@ impl InboxPort for LivePort {
         slot.wait().await
     }
 
-    async fn register(&self, key: &str, proof: &NostrEvent) -> Result<(), String> {
+    async fn register(
+        &self,
+        key: &str,
+        proof: &NostrEvent,
+        possession: &NostrEvent,
+    ) -> Result<(), String> {
         let url = format!(
             "{}/api/recipient-keys/register",
             crate::utils::relay_url::relay_api_base()
         );
-        let body = serde_json::json!({ "key": key, "role": "inbox", "proof": proof }).to_string();
+        let body = serde_json::json!({
+            "key": key, "role": "inbox", "proof": proof, "possession": possession
+        })
+        .to_string();
         crate::auth::nip98::fetch_with_nip98_post_signer(&url, &body, &*self.identity)
             .await
             .map(|_| ())
@@ -716,10 +787,18 @@ mod tests {
             self.relay.borrow_mut().push(e.clone());
             Ok(())
         }
-        async fn register(&self, key: &str, proof: &NostrEvent) -> Result<(), String> {
+        async fn register(
+            &self,
+            key: &str,
+            proof: &NostrEvent,
+            possession: &NostrEvent,
+        ) -> Result<(), String> {
             if self.register_fails.get() {
                 return Err("HTTP 500".into());
             }
+            // The possession proof must be signed by the key being registered.
+            assert_eq!(possession.pubkey, key, "possession not signed by the key");
+            assert_eq!(possession.kind, KIND_POSSESSION);
             self.registered
                 .borrow_mut()
                 .push((key.to_string(), proof.clone()));
@@ -737,16 +816,21 @@ mod tests {
         assert_eq!(d_tag(&ev), Some(BACKUP_D_TAG));
         let b = block_on(open_backup(identity, &ev)).unwrap();
         assert_eq!(b.sk_hex, key.sk_hex);
-        // Registered with a proof signed by the inbox key naming the owner.
+        // Registered with an authorization signed by the MEMBER (identity),
+        // naming the inbox key in a `k` tag (finding #3: not self-signed).
         let (reg_key, proof) = port.registered.borrow()[0].clone();
         assert_eq!(reg_key, key.pubkey);
-        assert_eq!(proof.pubkey, key.pubkey);
+        assert_eq!(proof.pubkey, identity.public_key());
         assert_eq!(proof.kind, KIND_PROOF);
         assert!(verify_event_strict(&proof).is_ok());
-        assert!(proof
-            .tags
-            .contains(&vec!["owner".into(), identity.public_key().into()]));
+        assert!(proof.tags.contains(&vec!["k".into(), key.pubkey.clone()]));
         assert!(proof.tags.contains(&vec!["exp".into(), "1300".into()]));
+        // And the member-signed authorization binds this key to the member.
+        assert!(proof_binds(
+            &serde_json::to_value(&proof).unwrap(),
+            &key.pubkey,
+            identity.public_key()
+        ));
         assert!(port.local.borrow().as_ref().unwrap().registered);
     }
 
@@ -878,21 +962,32 @@ mod tests {
         let m = member.public_key();
         let inbox = local_signer();
         let k = inbox.public_key();
-        let proof = block_on(build_proof(&inbox, m, 1_000)).unwrap();
+        // The authorization is signed by the MEMBER, naming the inbox key k.
+        let proof = block_on(build_proof(&member, k, 1_000)).unwrap();
         let proof_json = serde_json::to_string(&proof).unwrap();
         let body = format!(
             r#"{{"keys":[{{"key":"{k}","role":"inbox","revoked":0,"created_at":9,"proof":{proof_json}}}]}}"#
         );
         assert_eq!(parse_lookup(&body, m), Lookup::Found(k.to_string()));
 
-        // Wrong owner in the proof: the key is not bound to this member.
+        // Verified against a different member: not bound to them.
         let other_signer = local_signer();
         let other = other_signer.public_key();
         assert!(matches!(parse_lookup(&body, other), Lookup::Unknown(_)));
 
-        // Proof signed by a different key than the entry names.
+        // Finding #3: a SELF-asserted proof (signed by the inbox key itself,
+        // naming the member) must be rejected — it is exactly what a hostile
+        // lookup reply would present to redirect zone keys.
+        let self_signed = block_on(build_proof(&inbox, k, 1_000)).unwrap();
+        let body = format!(
+            r#"{{"keys":[{{"key":"{k}","role":"inbox","revoked":0,"created_at":9,"proof":{}}}]}}"#,
+            serde_json::to_string(&self_signed).unwrap()
+        );
+        assert!(matches!(parse_lookup(&body, m), Lookup::Unknown(_)));
+
+        // A proof signed by some stranger (not the member) naming k: rejected.
         let stranger = local_signer();
-        let forged = block_on(build_proof(&stranger, m, 1_000)).unwrap();
+        let forged = block_on(build_proof(&stranger, k, 1_000)).unwrap();
         let body = format!(
             r#"{{"keys":[{{"key":"{k}","role":"inbox","revoked":0,"created_at":9,"proof":{}}}]}}"#,
             serde_json::to_string(&forged).unwrap()

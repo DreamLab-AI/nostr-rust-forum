@@ -496,7 +496,7 @@ pub fn decode_incoming_wrap(
             // Delegatee is the seal signer; verify + apply conditions to the
             // rumor (ADR-074 §D8, and this module's documented rumor-binding
             // decision). Then the envelope `from` MUST be the delegator.
-            token.verify_for_event(&seal_pubkey, rumor.kind, rumor.created_at)?;
+            token.verify_for_event(&seal_pubkey, rumor.kind, rumor.created_at, opts.now)?;
             if token.delegator_hex() != from_hex {
                 return Err(MeshError::AttributionMismatch);
             }
