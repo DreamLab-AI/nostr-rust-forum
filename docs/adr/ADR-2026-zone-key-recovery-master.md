@@ -6,7 +6,7 @@ decision_status: proposed
 implementation_status: none
 activation_status: inactive
 supersedes: []
-superseded_by: []
+superseded_by: [ADR-2028]
 verified_commit: fb9ef30 (proposal only; nothing implemented to verify)
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: An admin losing every device holding a zone key, or a second admin joining an encrypted zone

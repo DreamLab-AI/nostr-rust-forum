@@ -263,3 +263,22 @@ or channel in any push-service request; recipients of kind 40/42 alerts pass `re
 allow-listed push-service host; the feature is off unless `PUSH_ENABLED="true"` and the VAPID pair is consistent.
 Carrying text in a payload (RFC 8291) needs a new ADR. Tables `push_subscriptions` / `push_prefs` (migration
 `0010_push.sql`); preference wire types live in `nostr_bbs_core::push`.
+
+## Deployment profiles — ADR-2029 (proposed)
+
+The kit is specified to build one of two boards from one source tree, chosen once per
+deployment by `[deployment] profile` in `forum.toml`. `forum` is everything this document
+describes. `room` (proposed, not implemented) replaces NIP-28 channels with Anagram public
+rooms (kind 34550 definition, kind 9 messages, flat `q` replies), encrypted zones with NIP-171
+epoch groups (ADR-2028) and adds the NIP-17 overlay (ADR-2027), so that nostr.chat, Anagram and
+Iris read and join it natively. Kanban, calendar, governance and moderation kinds are identical
+in both. The DreamLab deployment is and remains `forum`; a profile cannot change after the first
+post because the channel kind is inside every signed event id. Comparison, diagrams and the
+decision tree: `docs/deployment-profiles.md`. The relay is the authority for the dialect: it
+takes `CHANNEL_DIALECT` from config, publishes it in its NIP-11 `nostr_bbs` block, and pins it in
+a D1 settings row on first write; the single client build reads it at runtime. `forum`-only
+surfaces are `channel_zones`, the zone write gate (`nip_handlers.rs:1414`), the zone read decision
+(`:2354`), sealed originals (ADR-2017) and the channel-creator table (`:2549`). The dialect
+abstraction must also cover the ban gate (`:69`), post counters (`:1556`), profile stats
+(`profile_stats.rs:11`) and, in the client, tag interpretation in `core/src/thread.rs:69` and
+`pages/message_jump.rs:68`, not only kind numbers.

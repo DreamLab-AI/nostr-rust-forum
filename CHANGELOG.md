@@ -39,6 +39,24 @@ the channel or thread URL out of linked sites' and image hosts' logs; the YouTub
 Recorded with the advisor's corrections (bounded revision, length-prefixed zone id, no plaintext master
 in the shared IndexedDB) after the first design was found to re-derive a secret removed members still hold.
 
+### Proposed, not built: interoperability with nostr.chat, Anagram and Iris (ADR-2027, ADR-2028, ADR-2029)
+
+Three assessments under `docs/interop/` and three proposed ADRs, advisor-reviewed, no code. ADR-2027: reach
+the nostr.chat cluster by NIP-17 routing changes only (resolve the recipient's kind 10050, publish wraps to
+several relays, accept rumor kinds 7/5/15, indexer publication behind a per-member opt-in); public channels
+stay NIP-28; the double ratchet is consumed as a pinned crate if ever, never ported. ADR-2028, superseding
+ADR-2026: zones adopt the NIP-171 key plane and `kind:1014` tickets, legacy epochs are imported into a
+private record because ciphertext-signed posts cannot be re-sealed, the zone-to-group binding lives in
+`ZONE_CONFIG`, one owner per zone, board transport stays signed kind 42. ADR-2029: a second deployment
+profile, `room`, speaking Anagram public rooms (kind 34550 + kind 9, flat chat with quotes, world-read),
+NIP-171 private groups and the NIP-17 overlay, with the relay as the single authority for the dialect; the
+DreamLab board stays `forum`. Documentation written ahead of the code: `docs/deployment-profiles.md`
+(comparison, three diagrams, decision tree), `SETUP.md` step 0, the `[deployment] profile` key in
+`forum.example.toml`, README, baseline. Production backup verified read-only: all events live in D1, a
+full export succeeded, D1 Time Travel is enabled; a lossy reset is acceptable only for operational
+metadata, re-sealing of plaintext originals and the operator's own mirror DMs.
+
+
 ### Fixed: a fresh Durable Object isolate could hand a new connection a prior session's identity (`nostr-bbs-relay-worker`)
 
 Session auth and subscriptions persist in DO storage under `ws_auth:{id}` / `ws_sub:{id}`, but the in-memory

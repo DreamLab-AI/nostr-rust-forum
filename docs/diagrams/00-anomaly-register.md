@@ -68,3 +68,11 @@ mindmap
 ## Verdict
 
 Workers' SQL parameterisation, request-path unwraps, NIP-98 consolidation (one authoritative core impl), device-key gating coverage, and licence headers in source all verified **clean**. O1 and O3 were closed by the 2026-06-11 fix wave (R10/R11). The remaining debt is concentrated in O2, O4-O8: behavioural gaps best attacked with failing repro tests (diagram-driven diagnosis phase 3) rather than doc edits.
+
+## Pending corpus entry — room-dialect sequence (ADR-2029)
+
+When ADR-2029 lands, this corpus gains `room-dialect-channels.md`: the kind 34550 definition
+publish, kind 9 post and `q` reply, edit by the Anagram convention, kind 7/5 with `h` and `k`,
+and the relay's dialect-selected ban gate and trust counters, each cited to the lines that
+implement them. Until then `docs/deployment-profiles.md` holds the three design-level
+diagrams; they are not citation-verified and must not be copied into this corpus as is.

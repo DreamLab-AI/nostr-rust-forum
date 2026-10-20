@@ -27,9 +27,29 @@
 # ─── Deployment ──────────────────────────────────────────────────────────────
 # Human-readable name and canonical hostname. The hostname MUST be https://
 # (http://localhost is allowed for local development).
+#
+# `profile` (proposed, ADR-2029) picks the wire shape of public channels and
+# private spaces for the LIFETIME of the deployment. It cannot be changed after
+# the first post, because the channel kind is inside every signed event id.
+#   "forum" (default) — NIP-28 channels (kind 40/42), nested threads, encrypted
+#                       zones (ADR-2016), relay-side moderation. Not readable
+#                       from nostr.chat, Anagram or Iris.
+#   "room"            — Anagram public rooms (kind 34550 + kind 9), flat chat
+#                       with quotes, world-readable channels that nostr.chat
+#                       also mirrors to public relays, NIP-171 epoch groups
+#                       (ADR-2028) for private spaces, NIP-17 DM overlay
+#                       (ADR-2027). Readable and joinable from nostr.chat,
+#                       Anagram and Iris. Your whitelist governs writes to
+#                       YOUR replica only; only an author's own deletions
+#                       travel to other relays.
+# Projected to the relay as CHANNEL_DIALECT; the relay publishes it in NIP-11
+# and pins it in its database on first write; the client reads it at runtime.
+# Until ADR-2029 is accepted and implemented, only "forum" deploys.
+# See docs/deployment-profiles.md.
 [deployment]
 name     = "Community Forum"
 hostname = "https://forum.example.com"
+profile  = "forum"
 
 
 # ─── WebAuthn ────────────────────────────────────────────────────────────────
