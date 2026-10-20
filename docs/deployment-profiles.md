@@ -18,13 +18,23 @@ profile = "forum"   # or "room"
 | Who can read channels | Members, after NIP-42 AUTH, and anyone for channels not in a zone | Anyone with the relay URL. Kind 9 is not a protected kind, and nostr.chat also copies room traffic to five public app relays. |
 | Who can write | Whitelisted members | To our replica, whitelisted members. To the room as nostr.chat sees it, anyone: a non-whitelisted key posts to the public app relays and nostr.chat readers see it while ours do not. `blocked` is hidden on read by both clients; `trusted` only unlocks links and media in nostr.chat. |
 | Private spaces | Encrypted zones, ADR-2016: `zk`-tagged kind 42, relay zone gate, sealed history | NIP-171 epoch groups, ADR-2028: gift-wrapped kind 14 to the epoch key, tickets, recovery master. Readable natively by Anagram. |
-| Direct messages | NIP-17 gift wraps on our relay | NIP-17 with the ADR-2027 overlay: recipient's relay list resolved, member lists published to the indexers behind an opt-in |
+| Direct messages | NIP-17 gift wraps on our relay. A member may opt in to a public inbox.[^dm] | NIP-17 with the ADR-2027 overlay: recipient's relay list resolved, member lists published to the indexers behind an opt-in.[^dm] |
 | Moderation on the wire | Relay ban gate, trust levels, admin hide, zone cohorts | Relay ban gate and trust counters apply to kinds 9 and 34550 on our relay. An admin deletion removes the message from our relay for everyone reading it, but it survives on the public app relays. Only an author's own deletion travels everywhere. |
 | Threads | Nested | Flat chat with inline quotes, as nostr.chat renders it. `q` names the message replied to. |
 | Edits | Not on the wire | Anagram edit convention: new event with the original `created_at`, `e` tag marked `edit`. Our relay admits these past-dated edits in `room`. |
 | Kanban, calendar, governance | Ours, unchanged | Ours, unchanged, invisible to foreign clients |
 | Forward secrecy in private spaces | None within an epoch | None within an epoch; master holders cannot be revoked by rotation |
 | Can it be switched later | No | No. The channel kind is inside every signed event id. |
+
+[^dm]: The public inbox is off by default, and the setting is only available when this device has a registered inbox key and the old zone-key grants have been cleared from the relay. Switching it on shows this consent text, which is fixed by the ADR-2027 Acceptance record and rendered verbatim by the settings page:
+
+    Make your inbox public?
+
+    Your membership of this board becomes publicly visible: a record naming this relay is published to the Nostr indexers under your key, and anyone can look it up. Anyone on Nostr can then send you direct messages here, including people who are not members. Push notifications will wake you for those messages. Your posts stay as private as they are now. You can turn this off later, but the published record may already have been copied.
+
+    Buttons: Make my inbox public. Not now.
+
+    The record is a kind 10050 and a kind 10002, published to three public indexers: wss://purplepag.es, wss://indexer.coracle.social and wss://relay.nos.social (the list nostr.chat uses). Turning the setting off publishes a 10050 with no relay tags and a 10002 that does not name this relay as an unmarked or read relay, because nostr.chat falls back to a member's 10002 read relays when the 10050 is empty. nostr.chat also publishes a sender's own copy of each message to their own 10050 relays, so once you opt in, DMs you send from a nostr.chat tab will land on this relay too; that is expected. Direct messages from people who are not members and not already in your contacts wait in Requests, with no notification, until you accept or block them.
 
 ## 1. Wire shape per profile
 
