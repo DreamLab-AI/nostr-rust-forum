@@ -176,19 +176,18 @@ embodiment, and closed memory/learning loops — none of which Buzz has.
 
 The forum has always spoken standard Nostr — `did:nostr` identity, NIP-28 channels,
 NIP-59 gift-wrapped private messages, NIP-42 relay AUTH, NIP-52 calendars — so any Nostr
-client can read a public zone and verify every signature. Recent work (on the
-`feat/upgrade-phase-0-1` branch, landing behind feature flags) extends that to **direct
-interoperability with the emerging nostr.chat / Anagram / Iris cluster**: a member can be
-reached from those apps, and a new community can be stood up to join them natively.
+client can read a public zone and verify every signature. The kit now extends that to
+**direct interoperability with the emerging nostr.chat / Anagram / Iris cluster**: a member
+can be reached from those apps, and a new community can be stood up to join them natively.
 
-Three layers, each with its honest status. **None is on the deployed board yet** — the
-branch is not merged, and every new path ships behind a flag that is off, so the live
-forum is unchanged.
+Three layers, each with its honest status. Each ships behind a feature flag that is **off
+by default**, so turning it on is a per-deployment choice and the default deployment stays a
+plain NIP-28 forum.
 
 | Layer | What it adds | Status |
 |-------|--------------|--------|
-| **NIP-17 DM overlay** ([ADR-2027](docs/adr/ADR-2027-nip17-overlay-for-nostr-chat-interop.md)) | Resolves a recipient's kind-10050 inbox relays and publishes gift wraps there, so a nostr.chat / Anagram / Iris user can DM a forum member and be answered; plus reactions, deletions and file messages inside DMs, and an opt-in public inbox. | **Accepted**, implemented behind `RECIPIENT_KEYS_ENABLED` (off). Not deployed. |
-| **NIP-171 epoch-group zones** ([ADR-2028](docs/adr/ADR-2028-zones-adopt-nip171-key-plane.md)) | Re-expresses encrypted zones as Anagram's NIP-171 epoch groups — a 12-word recovery master, derived epoch keys, and `kind:1014` tickets — so a zone's key history is recoverable from the mnemonic and a zone can be opened to Anagram members. | **Proposed**, built behind `ZONE_GROUPS_ENABLED` (off), with a hard pre-activation blocker recorded in the ADR. |
+| **NIP-17 DM overlay** ([ADR-2027](docs/adr/ADR-2027-nip17-overlay-for-nostr-chat-interop.md)) | Resolves a recipient's kind-10050 inbox relays and publishes gift wraps there, so a nostr.chat / Anagram / Iris user can DM a forum member and be answered; plus reactions, deletions and file messages inside DMs, and an opt-in public inbox. | **Accepted** and implemented; behind `RECIPIENT_KEYS_ENABLED`, off by default. |
+| **NIP-171 epoch-group zones** ([ADR-2028](docs/adr/ADR-2028-zones-adopt-nip171-key-plane.md)) | Re-expresses encrypted zones as Anagram's NIP-171 epoch groups — a 12-word recovery master, derived epoch keys, and `kind:1014` tickets — so a zone's key history is recoverable from the mnemonic and a zone can be opened to Anagram members. | **Proposed** and built; behind `ZONE_GROUPS_ENABLED`, off by default, with a hard pre-activation blocker recorded in the ADR. |
 | **`room` deployment profile** ([ADR-2029](docs/adr/ADR-2029-room-profile-deployment-type.md)) | A second profile that speaks Anagram public rooms (kind 34550 definitions + kind 9 messages) instead of NIP-28, carrying the two layers above, so the whole board is readable and joinable from the cluster. | **Accepted as a roadmap profile.** Documented and config-validated; the dialect code is not built. |
 
 How each is set up, and the full wire-level comparison with the cluster:
@@ -492,7 +491,7 @@ them.
 | Solid pods (LDP + WAC, edge + native tier) | integrated | Native git-backed tier gated by `[native_pod]`, disabled by default. |
 | NIP-42 relay AUTH | scaffolded | Relay currently gates on a **pubkey allowlist** (`auth_required: false`); challenge/response machinery exists but is not yet the enforced admission path. **Buzz is ahead here** — its NIP-42 gate is wired end-to-end. |
 | Cross-relay mesh federation | planned | `nostr-bbs-mesh` is scaffold only (`MeshTransport` trait + session state, no concrete transport) and is **not** a dependency of the relay-worker. **Standalone is the supported deployment mode.** Designed, not shipped — on both sides of the Buzz comparison. |
-| Wider-Nostr interop (NIP-17 overlay, NIP-171 zones, `room` profile) | planned / scaffolded | On the `feat/upgrade-phase-0-1` branch, behind flags that are off; not merged, not deployed. Status per layer in the [ecosystem-interop section](#interoperating-with-the-wider-nostr-ecosystem) (ADR-2027/2028/2029). |
+| Wider-Nostr interop (NIP-17 overlay, NIP-171 zones, `room` profile) | integrated / scaffolded | Ships behind feature flags that are off by default; enabling is a per-deployment choice. Status per layer in the [ecosystem-interop section](#interoperating-with-the-wider-nostr-ecosystem) (ADR-2027 accepted, ADR-2028 proposed, ADR-2029 roadmap). |
 
 Downstream, the [dreamlab-ai-website](https://github.com/DreamLab-AI/dreamlab-ai-website)
 governance dashboard is blocked on this repo shipping the upstream-disclosure badge and the
