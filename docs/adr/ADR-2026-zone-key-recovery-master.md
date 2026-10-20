@@ -2,7 +2,7 @@
 id: ADR-2026
 title: Derive zone epoch keys from a 12-word recovery master so a lost admin device does not lose a zone
 date: 2026-10-19
-decision_status: proposed
+decision_status: superseded
 implementation_status: none
 activation_status: inactive
 supersedes: []
