@@ -459,7 +459,9 @@ impl DMStore {
                 match gift_wrap_with_signer(signer.as_ref(), &recipient, &content_owned).await {
                     Ok(to_recipient) => relay.publish(&to_recipient),
                     Err(e) => {
-                        web_sys::console::error_1(&format!("[DM] Coach wrap failed: {e}").into());
+                        web_sys::console::error_1(
+                            &format!("[DM] Coach wrap failed: {}", send_failure_text(&e)).into(),
+                        );
                         state.update(|s| {
                             s.seen_ids.remove(&local_id);
                             s.messages.retain(|m| m.id != local_id);
@@ -489,12 +491,13 @@ impl DMStore {
                     relay.publish(&to_self);
                 }
                 Err(e) => {
-                    web_sys::console::error_1(&format!("[DM] Gift wrap failed: {e}").into());
+                    let why = send_failure_text(&e);
+                    web_sys::console::error_1(&format!("[DM] Gift wrap failed: {why}").into());
                     // Roll the optimistic bubble back and surface the error.
                     state.update(|s| {
                         s.seen_ids.remove(&local_id);
                         s.messages.retain(|m| m.id != local_id);
-                        s.error = Some(format!("Could not send message: {e}"));
+                        s.error = Some(format!("Could not send message: {why}"));
                     });
                 }
             }
@@ -906,15 +909,17 @@ async fn process_gift_wrap_event(
             return;
         }
         Err(e) => {
-            let msg = e.to_string();
+            // Core's own errors are fixed strings (never decrypted bytes); a
+            // signer error carries the backend's text, which names the
+            // extension's capability, not message content.
             web_sys::console::warn_1(
-                &format!("[DM] Gift unwrap failed for {}: {}", event.id, msg).into(),
+                &format!("[DM] Gift unwrap failed for {}: {e}", event.id).into(),
             );
             // A NIP-07 extension that implements only NIP-04 (no `window.nostr
             // .nip44`) cannot decrypt gift wraps at all — every unwrap fails the
             // same way and the list would otherwise stay silently empty. Surface
             // a clear, actionable message instead of leaving the user guessing.
-            if msg.contains("nip44 not supported") || msg.contains("window.nostr.nip44") {
+            if signer_lacks_nip44(&e) {
                 state.update(|s| {
                     if s.error.is_none() {
                         s.error = Some(
@@ -1269,6 +1274,43 @@ pub fn provide_dm_store() {
 /// Get the DM store from context. Panics if `provide_dm_store()` was not called.
 pub fn use_dm_store() -> DMStore {
     expect_context::<DMStore>()
+}
+
+/// Whether an unwrap failure means the NIP-07 extension has no NIP-44 at all.
+///
+/// Matched on the signer variant, never on core's own error text: core's
+/// messages are fixed strings about layers, and only the signer backend
+/// reports the extension's capabilities.
+fn signer_lacks_nip44(e: &nostr_bbs_core::gift_wrap::SignerGiftWrapError) -> bool {
+    match e {
+        nostr_bbs_core::gift_wrap::SignerGiftWrapError::Signer(se) => {
+            let msg = se.to_string();
+            msg.contains("nip44 not supported") || msg.contains("window.nostr.nip44")
+        }
+        _ => false,
+    }
+}
+
+/// What to tell the user (and the console) when a DM could not be wrapped.
+///
+/// One fixed sentence per category. The signer's own text is passed through
+/// because it names a capability or a refusal the user can act on; nothing
+/// on the wrap path carries message content in an error.
+fn send_failure_text(e: &nostr_bbs_core::gift_wrap::SignerGiftWrapError) -> String {
+    use nostr_bbs_core::gift_wrap::SignerGiftWrapError as E;
+    if signer_lacks_nip44(e) {
+        return "your Nostr extension does not support NIP-44 encryption".to_string();
+    }
+    match e {
+        E::Signer(se) => format!("your signer refused: {se}"),
+        E::Serialization(_) | E::InvalidKind { .. } => {
+            "the message could not be encoded".to_string()
+        }
+        E::KeyError(_) => "a key on the envelope was malformed".to_string(),
+        E::SealVerification(_) | E::WrapVerification(_) | E::AuthorMismatch { .. } => {
+            "the encrypted envelope failed its own check".to_string()
+        }
+    }
 }
 
 // -- Tests --------------------------------------------------------------------

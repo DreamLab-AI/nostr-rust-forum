@@ -14,6 +14,31 @@ not `fcm.googleapis.com`; the endpoint allow-list only knew the latter, so "Turn
 failed with `endpoint host is not a known push service`. The exact host is now admitted; `google.com` is still
 not a suffix.
 
+### Changed: every gift-wrap reader verifies the wrap before decrypting and never echoes decrypted bytes (ADR-2025)
+
+From a review of lnbits/anagram. `nostr-bbs-core` 1.0.0-beta.18 verifies the kind-1059's own id and
+signature before either NIP-44 layer is opened (`WrapVerification`), and every decrypt or parse error on
+the unwrap path is a fixed string naming the layer, since serde quotes offending values and a malformed
+rumor could otherwise copy its decrypted bytes into a console line. The forum client's zone-grant unwrap
+and the zone migrator's `open_gift_wrap`, which never went through core, get the same check and the same
+fixed strings; the DM screen shows one fixed sentence per send-failure category and detects an extension
+without NIP-44 by the signer error variant and its text, never by core's text. Wire format unchanged: rumor, seal, wrap, the
+kind-21453 grant payload and the `zk` tag are byte-identical, and compatibility tests open a pre-`id`
+bare-rumor seal, a rumor signed by a foreign client, and non-DM rumor kinds through both paths.
+
+### Added: meta Content Security Policy and `no-referrer` on the forum client
+
+`object-src 'none'; base-uri 'none'; form-action 'self'` as a meta tag, first in `<head>`. No `script-src`:
+GitHub Pages sends no headers, Trunk's inline loader hash changes per build and the deploy step rewrites
+the `window.__ENV__` block. `frame-ancestors` cannot be set from a meta tag. `referrer: no-referrer` keeps
+the channel or thread URL out of linked sites' and image hosts' logs; the YouTube iframe opts back in with
+`referrerpolicy="strict-origin-when-cross-origin"` because YouTube refuses an embed with no Referer.
+
+### Proposed, not built: a 12-word recovery master for zone epoch keys (ADR-2026)
+
+Recorded with the advisor's corrections (bounded revision, length-prefixed zone id, no plaintext master
+in the shared IndexedDB) after the first design was found to re-derive a secret removed members still hold.
+
 ### Fixed: a fresh Durable Object isolate could hand a new connection a prior session's identity (`nostr-bbs-relay-worker`)
 
 Session auth and subscriptions persist in DO storage under `ws_auth:{id}` / `ws_sub:{id}`, but the in-memory

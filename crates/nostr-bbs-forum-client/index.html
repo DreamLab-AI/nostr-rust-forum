@@ -2,6 +2,16 @@
 <html lang="en" class="dark">
 <head>
     <meta charset="utf-8" />
+    <!-- Content Security Policy, meta form: GitHub Pages cannot send response
+         headers. Deliberately no script-src: Trunk injects an inline loader
+         whose hash changes every build, and the deploy step rewrites the
+         window.__ENV__ block below, so a script hash list cannot be kept
+         honest here. object-src and base-uri close the plugin-injection and
+         <base>-hijack routes that need no script at all; form-action keeps a
+         future form from posting the session elsewhere. frame-ancestors is
+         header-only and cannot be set from a meta tag. -->
+    <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; form-action 'self'" />
+    <meta name="referrer" content="no-referrer" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>nostr-bbs</title>
     <meta name="description" content="A fast, decentralized, Nostr-powered forum" />

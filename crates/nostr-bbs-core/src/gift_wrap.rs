@@ -76,6 +76,13 @@ pub enum GiftWrapError {
     #[error("seal verification failed: {0}")]
     SealVerification(String),
 
+    /// The outer gift wrap's own id/signature failed verification. The wrap
+    /// is signed by a throwaway key, so this proves nothing about the sender,
+    /// but an event that is not even self-consistent is not a NIP-59 wrap and
+    /// is refused before any decryption runs.
+    #[error("gift wrap verification failed: {0}")]
+    WrapVerification(String),
+
     /// The rumor's author does not match the verified seal signer. NIP-59
     /// binds `rumor.pubkey == seal.pubkey`; a mismatch means the inner author
     /// is attacker-controlled independent of who signed the seal.
@@ -172,6 +179,31 @@ fn hex_to_32(hex_str: &str) -> Result<[u8; 32], GiftWrapError> {
 }
 
 // ── Layer 1: Rumor ───────────────────────────────────────────────────────────
+
+/// Error text for every parse failure on the unwrap path.
+///
+/// Fixed strings on purpose: serde's type errors quote the offending value
+/// (`invalid type: string "..."`), so passing them through would copy
+/// decrypted bytes into whatever log line the caller writes. The variant
+/// says which layer failed; nothing says what was in it.
+const SEAL_PARSE: &str = "seal JSON malformed";
+const RUMOR_PARSE: &str = "rumor JSON malformed";
+const WRAP_DECRYPT: &str = "gift wrap layer";
+const SEAL_DECRYPT: &str = "seal layer";
+
+/// Parse the decrypted seal content as the rumor.
+///
+/// Only the NIP-01 fields of an unsigned event are read. Anything else the
+/// JSON carries is ignored: the `id` our own seals add (see
+/// [`rumor_json_with_id`]) and, deliberately, a `sig` from a client that
+/// signs its rumors against NIP-59. The relay admits wraps from clients this
+/// workspace does not control, and a wrap already stored must keep opening,
+/// so a signed rumor is tolerated rather than refused. The author binding
+/// (`rumor.pubkey == seal.pubkey`) is what protects the recipient, and it is
+/// enforced regardless.
+fn parse_unsigned_rumor(rumor_json: &str) -> Result<UnsignedEvent, &'static str> {
+    serde_json::from_str(rumor_json).map_err(|_| RUMOR_PARSE)
+}
 
 /// Create an unsigned Rumor event (kind 14) containing the DM content.
 ///
@@ -414,14 +446,19 @@ pub fn unwrap_gift_kind(
         });
     }
 
+    // The wrap must be a self-consistent signed event before anything is
+    // decrypted. Its key is a throwaway, so this is a shape check, not a
+    // sender check; the seal verification below is the one that matters.
+    verify_event_strict(gift).map_err(|e| GiftWrapError::WrapVerification(e.to_string()))?;
+
     // Decrypt layer 1: gift wrap → seal
     // The gift's pubkey is the throwaway key that encrypted the content
     let throwaway_pk_bytes = hex_to_32(&gift.pubkey)?;
     let seal_json = nip44::decrypt(recipient_sk, &throwaway_pk_bytes, &gift.content)
-        .map_err(|e| GiftWrapError::Decryption(format!("gift wrap decryption: {e}")))?;
+        .map_err(|_| GiftWrapError::Decryption(WRAP_DECRYPT.into()))?;
 
     let seal: NostrEvent = serde_json::from_str(&seal_json)
-        .map_err(|e| GiftWrapError::ParseError(format!("seal JSON parse: {e}")))?;
+        .map_err(|_| GiftWrapError::ParseError(SEAL_PARSE.into()))?;
 
     // Validate seal kind
     if seal.kind != KIND_SEAL {
@@ -441,10 +478,10 @@ pub fn unwrap_gift_kind(
     // The seal's pubkey is the sender's real key
     let sender_pk_bytes = hex_to_32(&seal.pubkey)?;
     let rumor_json = nip44::decrypt(recipient_sk, &sender_pk_bytes, &seal.content)
-        .map_err(|e| GiftWrapError::Decryption(format!("seal decryption: {e}")))?;
+        .map_err(|_| GiftWrapError::Decryption(SEAL_DECRYPT.into()))?;
 
-    let rumor: UnsignedEvent = serde_json::from_str(&rumor_json)
-        .map_err(|e| GiftWrapError::ParseError(format!("rumor JSON parse: {e}")))?;
+    let rumor =
+        parse_unsigned_rumor(&rumor_json).map_err(|m| GiftWrapError::ParseError(m.into()))?;
 
     // Validate rumor kind
     if rumor.kind != expected_kind {
@@ -506,6 +543,11 @@ pub enum SignerGiftWrapError {
     /// [`GiftWrapError::SealVerification`]).
     #[error("seal verification failed: {0}")]
     SealVerification(String),
+
+    /// The outer gift wrap's own id/signature failed verification (see
+    /// [`GiftWrapError::WrapVerification`]).
+    #[error("gift wrap verification failed: {0}")]
+    WrapVerification(String),
 
     /// The rumor's author does not match the verified seal signer (see
     /// [`GiftWrapError::AuthorMismatch`]).
@@ -666,11 +708,14 @@ pub async fn unwrap_gift_with_signer_kind(
         });
     }
 
+    // Shape check before any decryption; see `unwrap_gift_kind`.
+    verify_event_strict(gift).map_err(|e| SignerGiftWrapError::WrapVerification(e.to_string()))?;
+
     // Layer 1: gift wrap → seal. The gift's pubkey is the throwaway key the
     // sender used to encrypt to us; we decrypt with our key against it.
     let seal_json = signer.nip44_decrypt(&gift.pubkey, &gift.content).await?;
     let seal: NostrEvent = serde_json::from_str(&seal_json)
-        .map_err(|e| SignerGiftWrapError::Serialization(format!("seal JSON parse: {e}")))?;
+        .map_err(|_| SignerGiftWrapError::Serialization(SEAL_PARSE.into()))?;
 
     if seal.kind != KIND_SEAL {
         return Err(SignerGiftWrapError::InvalidKind {
@@ -685,8 +730,8 @@ pub async fn unwrap_gift_with_signer_kind(
 
     // Layer 2: seal → rumor. The seal's pubkey is the sender's real key.
     let rumor_json = signer.nip44_decrypt(&seal.pubkey, &seal.content).await?;
-    let rumor: UnsignedEvent = serde_json::from_str(&rumor_json)
-        .map_err(|e| SignerGiftWrapError::Serialization(format!("rumor JSON parse: {e}")))?;
+    let rumor = parse_unsigned_rumor(&rumor_json)
+        .map_err(|m| SignerGiftWrapError::Serialization(m.into()))?;
 
     if rumor.kind != expected_kind {
         return Err(SignerGiftWrapError::InvalidKind {
@@ -737,7 +782,7 @@ pub fn process_kind4_event(
 
     // The sender's pubkey is the event pubkey; use NIP-04 (AES-256-CBC), NOT NIP-44
     nip04::nip04_decrypt(recipient_sk, &event.pubkey, &event.content)
-        .map_err(|e| GiftWrapError::Decryption(format!("NIP-04 decryption: {e}")))
+        .map_err(|_| GiftWrapError::Decryption("NIP-04 layer".into()))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1388,5 +1433,169 @@ mod tests {
             "expected AuthorMismatch, got: {:?}",
             result
         );
+    }
+
+    // ── NIP-59 strictness (anagram review, 2026-10) ─────────────────────────
+
+    /// Build a seal whose plaintext is `rumor_json` verbatim, signed by
+    /// `sender_sk`, encrypted to `recipient_pk`. Lets a test smuggle in a
+    /// rumor the public constructors would never produce.
+    fn seal_raw_json(sender_sk: &[u8; 32], recipient_pk: &str, rumor_json: &str) -> NostrEvent {
+        let recipient_pk_bytes = hex_to_32(recipient_pk).unwrap();
+        let encrypted = nip44::encrypt(sender_sk, &recipient_pk_bytes, rumor_json).unwrap();
+        let signing_key = SigningKey::from_bytes(sender_sk).unwrap();
+        let sender_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
+        sign_event(
+            UnsignedEvent {
+                pubkey: sender_pubkey,
+                created_at: randomized_timestamp(),
+                kind: KIND_SEAL,
+                tags: vec![],
+                content: encrypted,
+            },
+            &signing_key,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unwrap_rejects_tampered_outer_wrap() {
+        // The relay verifies on ingest, but this crate is read by other
+        // consumers too: a wrap whose own signature does not verify is not a
+        // NIP-59 gift wrap and must never reach the decrypt step.
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let mut wrapped = gift_wrap(&sender_sk, &sender_pk, &recipient_pk, "hi").unwrap();
+        wrapped.sig = "00".repeat(64);
+        let result = unwrap_gift(&wrapped, &recipient_sk);
+        assert!(
+            matches!(result, Err(GiftWrapError::WrapVerification(_))),
+            "expected WrapVerification, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn unwrap_errors_never_echo_decrypted_content() {
+        // serde's type errors quote the offending value ("invalid type: string
+        // \"...\""), so a malformed rumor could leak its decrypted bytes into a
+        // log line. Every error on the unwrap path must be a fixed string.
+        let (sender_sk, _) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let canary = "CANARY-9f3c-decrypted-bytes";
+        let rumor_json = format!(
+            r#"{{"pubkey":"{p}","created_at":"{canary}","kind":14,"tags":[],"content":"x"}}"#,
+            p = "a".repeat(64)
+        );
+        let seal = seal_raw_json(&sender_sk, &recipient_pk, &rumor_json);
+        let wrapped = wrap_seal(&seal, &recipient_pk).unwrap();
+        let err = unwrap_gift(&wrapped, &recipient_sk).unwrap_err();
+        let shown = format!("{err} / {err:?}");
+        assert!(
+            !shown.contains(canary),
+            "error echoed decrypted content: {shown}"
+        );
+    }
+
+    #[test]
+    fn signer_unwrap_rejects_tampered_outer_wrap() {
+        let (sender, _) = prf_signer();
+        let (recipient, recipient_pk) = prf_signer();
+        let mut wrapped = block_on(gift_wrap_with_signer(&sender, &recipient_pk, "hi")).unwrap();
+        wrapped.sig = "00".repeat(64);
+        let result = block_on(unwrap_gift_with_signer(&wrapped, &recipient));
+        assert!(
+            matches!(result, Err(SignerGiftWrapError::WrapVerification(_))),
+            "expected WrapVerification, got: {result:?}"
+        );
+    }
+
+    // ── Compatibility: every wrap shape already stored must still open ──────
+
+    #[test]
+    fn legacy_seal_without_rumor_id_still_opens() {
+        // Before the seal carried the rumor's NIP-01 `id` it held a bare
+        // `UnsignedEvent`. Those wraps are on the relay today.
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let rumor = create_rumor(&sender_pk, &recipient_pk, "old shape");
+        let bare = serde_json::to_string(&rumor).unwrap();
+        assert!(!bare.contains("\"id\""));
+        let seal = seal_raw_json(&sender_sk, &recipient_pk, &bare);
+        let wrapped = wrap_seal(&seal, &recipient_pk).unwrap();
+        let got = unwrap_gift(&wrapped, &recipient_sk).unwrap();
+        assert_eq!(got.rumor.content, "old shape");
+        assert_eq!(got.sender_pubkey, sender_pk);
+    }
+
+    #[test]
+    fn rumor_signed_by_a_foreign_client_still_opens() {
+        // NIP-59 says the rumor MUST be unsigned, but the relay admits wraps
+        // from clients outside this workspace. A `sig` is ignored, never a
+        // reason to drop a message; the author binding still holds.
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let rumor = create_rumor(&sender_pk, &recipient_pk, "signed anyway");
+        let mut v: serde_json::Value = serde_json::to_value(&rumor).unwrap();
+        v["id"] = serde_json::Value::String(hex::encode(crate::event::compute_event_id(&rumor)));
+        v["sig"] = serde_json::Value::String("00".repeat(64));
+        let seal = seal_raw_json(&sender_sk, &recipient_pk, &v.to_string());
+        let wrapped = wrap_seal(&seal, &recipient_pk).unwrap();
+        let got = unwrap_gift(&wrapped, &recipient_sk).unwrap();
+        assert_eq!(got.rumor.content, "signed anyway");
+    }
+
+    #[test]
+    fn non_dm_rumor_kinds_still_open_through_both_paths() {
+        // Zone-key grants (kind 21453) and poker wraps ride the same envelope
+        // with `unwrap_gift_kind` / `unwrap_gift_with_signer_kind`.
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        for kind in [21453u64, 30_000, 1] {
+            let wrapped =
+                gift_wrap_kind(&sender_sk, &sender_pk, &recipient_pk, kind, "{}").unwrap();
+            let got = unwrap_gift_kind(&wrapped, &recipient_sk, kind).unwrap();
+            assert_eq!(got.rumor.kind, kind);
+            let (recipient_signer, recipient_signer_pk) = prf_signer();
+            let wrapped =
+                gift_wrap_kind(&sender_sk, &sender_pk, &recipient_signer_pk, kind, "{}").unwrap();
+            let got = block_on(unwrap_gift_with_signer_kind(
+                &wrapped,
+                &recipient_signer,
+                kind,
+            ))
+            .unwrap();
+            assert_eq!(got.rumor.kind, kind);
+        }
+    }
+
+    #[test]
+    fn seal_with_tags_from_a_foreign_client_still_opens() {
+        // NIP-59 says the seal's tags MUST be empty; a client outside this
+        // workspace may not comply, and the relay admits its wraps. Tags are
+        // ignored, never a reason to drop a message.
+        let (sender_sk, sender_pk) = test_keypair();
+        let (recipient_sk, recipient_pk) = test_keypair();
+        let rumor = create_rumor(&sender_pk, &recipient_pk, "tagged seal");
+        let encrypted = nip44::encrypt(
+            &sender_sk,
+            &hex_to_32(&recipient_pk).unwrap(),
+            &serde_json::to_string(&rumor).unwrap(),
+        )
+        .unwrap();
+        let signing_key = SigningKey::from_bytes(&sender_sk).unwrap();
+        let seal = sign_event(
+            UnsignedEvent {
+                pubkey: sender_pk.clone(),
+                created_at: randomized_timestamp(),
+                kind: KIND_SEAL,
+                tags: vec![vec!["client".into(), "foreign".into()]],
+                content: encrypted,
+            },
+            &signing_key,
+        )
+        .unwrap();
+        let wrapped = wrap_seal(&seal, &recipient_pk).unwrap();
+        let got = unwrap_gift(&wrapped, &recipient_sk).unwrap();
+        assert_eq!(got.rumor.content, "tagged seal");
     }
 }

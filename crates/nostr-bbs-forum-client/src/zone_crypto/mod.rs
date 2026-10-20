@@ -465,7 +465,8 @@ pub fn is_zone_message(ev: &NostrEvent) -> bool {
 pub fn decrypt_with(ev: &NostrEvent, key: &ZoneKey) -> Result<String, String> {
     let sk = key.secret_bytes().ok_or("bad zone secret")?;
     let author = hex32(&ev.pubkey).ok_or("bad author pubkey")?;
-    nostr_bbs_core::nip44::decrypt(&sk, &author, &ev.content).map_err(|e| e.to_string())
+    nostr_bbs_core::nip44::decrypt(&sk, &author, &ev.content)
+        .map_err(|_| "ciphertext does not open with this zone key".to_string())
 }
 
 /// Classify `ev` for display, looking keys up by `(zone, epoch)`.
@@ -662,10 +663,16 @@ pub async fn build_grant_wrap(
     nostr_bbs_core::gift_wrap::wrap_seal(&seal, recipient).map_err(|e| e.to_string())
 }
 
-/// Unwrap a kind-1059 addressed to us, accepting any rumor kind (core's
-/// `unwrap_gift_with_signer` admits only kind-14 DMs). Returns the verified
-/// seal author and the rumor. Same checks as core: the seal's id and
-/// signature verify, and the rumor's author is the seal's author.
+/// Unwrap a kind-1059 addressed to us, accepting any rumor kind. The store
+/// uses the kind to tell a grant from a DM or poker wrap sharing the same
+/// inbox, so unlike core's `unwrap_gift_with_signer_kind` it does not refuse
+/// on kind. Returns the verified seal author and the rumor.
+///
+/// Same checks as core, in the same order: the wrap's own id and signature
+/// verify before anything is decrypted, the seal's id and signature verify,
+/// and the rumor's author is the seal's author. Every error is a fixed
+/// string: serde quotes offending values in its messages, and a parse
+/// failure here is a failure on decrypted bytes.
 pub async fn unwrap_any(
     gift: &NostrEvent,
     signer: &dyn Signer,
@@ -673,20 +680,22 @@ pub async fn unwrap_any(
     if gift.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP {
         return Err(format!("not a gift wrap (kind {})", gift.kind));
     }
+    verify_event_strict(gift).map_err(|_| "gift wrap id or signature does not verify")?;
     let seal_json = signer
         .nip44_decrypt(&gift.pubkey, &gift.content)
         .await
-        .map_err(|e| e.to_string())?;
-    let seal: NostrEvent = serde_json::from_str(&seal_json).map_err(|e| e.to_string())?;
+        .map_err(|_| "gift wrap layer does not decrypt")?;
+    let seal: NostrEvent = serde_json::from_str(&seal_json).map_err(|_| "seal JSON malformed")?;
     if seal.kind != SEAL_KIND {
         return Err(format!("not a seal (kind {})", seal.kind));
     }
-    verify_event_strict(&seal).map_err(|e| e.to_string())?;
+    verify_event_strict(&seal).map_err(|_| "seal id or signature does not verify")?;
     let rumor_json = signer
         .nip44_decrypt(&seal.pubkey, &seal.content)
         .await
-        .map_err(|e| e.to_string())?;
-    let rumor: UnsignedEvent = serde_json::from_str(&rumor_json).map_err(|e| e.to_string())?;
+        .map_err(|_| "seal layer does not decrypt")?;
+    let rumor: UnsignedEvent =
+        serde_json::from_str(&rumor_json).map_err(|_| "rumor JSON malformed")?;
     if rumor.pubkey != seal.pubkey {
         return Err("rumor author does not match seal author".into());
     }
@@ -911,6 +920,42 @@ mod tests {
         assert_eq!(got.secret, key.secret);
         // A third party cannot open it.
         assert!(block_on(unwrap_any(&wrap, &signer())).is_err());
+    }
+
+    #[test]
+    fn grant_unwrap_refuses_a_tampered_wrap_before_decrypting() {
+        let admin = signer();
+        let member = signer();
+        let key = generate_zone_key("zone3", 1, admin.public_key(), 0).unwrap();
+        let mut wrap = block_on(build_grant_wrap(&admin, member.public_key(), &key, 100)).unwrap();
+        wrap.sig = "00".repeat(64);
+        let err = block_on(unwrap_any(&wrap, &member)).unwrap_err();
+        assert!(err.contains("gift wrap id or signature"), "{err}");
+    }
+
+    #[test]
+    fn grant_unwrap_errors_never_echo_decrypted_bytes() {
+        // A seal whose plaintext is not a rumor: serde would quote the value
+        // of `created_at` in its message, so the canary must not surface.
+        let admin = signer();
+        let member = signer();
+        let canary = "CANARY-grant-plaintext";
+        let rumor_json = format!(
+            r#"{{"pubkey":"{}","created_at":"{canary}","kind":21453,"tags":[],"content":""}}"#,
+            admin.public_key()
+        );
+        let sealed = block_on(admin.nip44_encrypt(member.public_key(), &rumor_json)).unwrap();
+        let seal = block_on(admin.sign_event(UnsignedEvent {
+            pubkey: admin.public_key().to_string(),
+            created_at: 100,
+            kind: SEAL_KIND,
+            tags: vec![],
+            content: sealed,
+        }))
+        .unwrap();
+        let wrap = nostr_bbs_core::gift_wrap::wrap_seal(&seal, member.public_key()).unwrap();
+        let err = block_on(unwrap_any(&wrap, &member)).unwrap_err();
+        assert!(!err.contains(canary), "error echoed decrypted bytes: {err}");
     }
 
     #[test]

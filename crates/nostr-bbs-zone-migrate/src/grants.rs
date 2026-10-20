@@ -87,6 +87,7 @@ pub fn open_gift_wrap(
             gift.kind
         )));
     }
+    verify_event_strict(gift).map_err(|_| unwrap("wrap id or signature does not verify"))?;
     let wrap_pk = hex32(&gift.pubkey).ok_or_else(|| unwrap("wrap pubkey is not 64 hex"))?;
     let seal_json = nostr_bbs_core::nip44::decrypt(recipient.as_bytes(), &wrap_pk, &gift.content)
         .map_err(|_| unwrap("wrap does not decrypt with this key"))?;
@@ -309,6 +310,28 @@ mod tests {
             .unwrap_err(),
             GrantError::NotAdmin(sealer.clone())
         );
+    }
+
+    #[test]
+    fn tampered_wrap_is_refused_before_any_decryption() {
+        let me = SecretKey::from_bytes([0x22; 32]).unwrap();
+        let me_pk = nostr_bbs_core::keys::pubkey_hex(me.as_bytes()).unwrap();
+        let sender = [0x44u8; 32];
+        let sender_pk = nostr_bbs_core::keys::pubkey_hex(&sender).unwrap();
+        let mut wrap = nostr_bbs_core::gift_wrap::gift_wrap_kind(
+            &sender,
+            &sender_pk,
+            &me_pk,
+            KIND_ZONE_KEY_GRANT,
+            "{}",
+        )
+        .unwrap();
+        assert!(open_gift_wrap(&wrap, &me).is_ok());
+        wrap.sig = "00".repeat(64);
+        match open_gift_wrap(&wrap, &me).unwrap_err() {
+            GrantError::Unwrap(why) => assert!(why.contains("wrap id or signature"), "{why}"),
+            other => panic!("expected Unwrap, got {other:?}"),
+        }
     }
 
     #[test]

@@ -112,8 +112,8 @@ impl ZoneKeyStore {
         });
         spawn_local(async move {
             if let Ok(db) = ForumDb::open().await {
-                if let Err(e) = db.put_zone_key(&key).await {
-                    web_sys::console::warn_1(&format!("[zone-key] persist failed: {e:?}").into());
+                if db.put_zone_key(&key).await.is_err() {
+                    web_sys::console::warn_1(&"[zone-key] persist failed (IndexedDB write)".into());
                 }
             }
         });
@@ -280,8 +280,8 @@ impl ZoneKeyStore {
         let persisted = match ForumDb::open().await {
             Ok(db) => match db.put_zone_key(&key).await {
                 Ok(()) => true,
-                Err(e) => {
-                    web_sys::console::warn_1(&format!("[zone-key] persist failed: {e:?}").into());
+                Err(_) => {
+                    web_sys::console::warn_1(&"[zone-key] persist failed (IndexedDB write)".into());
                     false
                 }
             },

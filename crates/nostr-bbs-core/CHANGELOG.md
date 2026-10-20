@@ -4,6 +4,24 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.18] - 2026-10-19
+
+### Changed
+
+- **`unwrap_gift*` and `unwrap_gift_with_signer*` verify the outer kind-1059 before decrypting**
+  (ADR-2025). A wrap whose own id or signature does not verify is refused as the new
+  `GiftWrapError::WrapVerification` / `SignerGiftWrapError::WrapVerification`. The wrap key is a
+  throwaway, so this is a shape check; seal verification and the `rumor.pubkey == seal.pubkey`
+  binding are unchanged. Every wrap a relay running `verify_event_strict` on ingest has stored
+  already passes. **API note:** both enums gain a variant and are not `#[non_exhaustive]`, so an
+  exhaustive `match` outside this workspace needs a new arm.
+- **Unwrap errors are fixed strings.** `Decryption`, `ParseError` and `Serialization` payloads
+  name the layer (`gift wrap layer`, `seal layer`, `seal JSON malformed`, `rumor JSON malformed`,
+  `NIP-04 layer`) instead of carrying serde's or the cipher's message; serde quotes offending values, so
+  the old text could echo decrypted bytes into a caller's log. `Signer` still carries the
+  backend's text. A rumor carrying a `sig` is still accepted and the field ignored, on purpose:
+  see ADR-2025 for why refusing it would risk stored DMs.
+
 ## [1.0.0-beta.17] - 2026-10-18
 
 ### Changed
