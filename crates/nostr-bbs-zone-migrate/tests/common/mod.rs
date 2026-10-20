@@ -80,6 +80,21 @@ pub fn post(secret: [u8; 32], channel: &str, created_at: u64, content: &str) -> 
     )
 }
 
+/// A live zone-encrypted kind-42 (`zk` tag, opaque content) by AUTHOR2, as the
+/// forum client writes them: evidence of the zone's real epoch key.
+pub fn live_zk_post(channel: &str, zone: &str, epoch: u32, zone_secret: [u8; 32]) -> NostrEvent {
+    sign(
+        AUTHOR2,
+        42,
+        1_599_999_999,
+        vec![
+            tag(&["e", channel, "", "root"]),
+            tag(&["zk", zone, &epoch.to_string(), &pk(zone_secret)]),
+        ],
+        "ciphertext",
+    )
+}
+
 pub fn zone_key(zone: &str, epoch: u32, secret: [u8; 32], source: KeySource) -> ZoneKey {
     ZoneKey::new(zone, epoch, &hex::encode(secret), &pk(secret), source).unwrap()
 }

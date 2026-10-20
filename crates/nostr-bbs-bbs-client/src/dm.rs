@@ -95,6 +95,8 @@ struct DmInner {
     /// message id. Absent means settled (history loaded from the relay, or
     /// acknowledged and cleared), so only in-flight and failed sends show a marker.
     delivery: std::collections::HashMap<String, Delivery>,
+    /// The DM socket dropped and a reconnect is pending or in progress.
+    reconnecting: bool,
 }
 
 /// Reactive DM store, provided as Leptos context (mirrors `RelayStore`: every
@@ -154,6 +156,11 @@ impl DmStore {
     /// Latest error, if any.
     pub fn error(&self) -> Option<String> {
         self.inner.with(|s| s.error.clone())
+    }
+
+    /// Whether the DM socket is down and being re-established.
+    pub fn reconnecting(&self) -> bool {
+        self.inner.with(|s| s.reconnecting)
     }
 
     /// Delivery state of a sent message, or `None` once it is settled.
@@ -553,7 +560,7 @@ pub fn group_conversations(
 #[cfg(target_arch = "wasm32")]
 mod dm_ws {
     use super::{build_auth_unsigned, dm_filters, DmStore, GIFT_WRAP_LOOKBACK_SECS};
-    use crate::outbox::{Delivery, Outbox};
+    use crate::outbox::{Delivery, Outbox, Reconnect};
     use leptos::prelude::Update;
     use nostr_bbs_core::gift_wrap::{KIND_ENCRYPTED_DM, KIND_GIFT_WRAP};
     use nostr_bbs_core::signer::Signer;
@@ -575,6 +582,11 @@ mod dm_ws {
         static AUTH_ID: RefCell<Option<String>> = const { RefCell::new(None) };
         /// Whether the relay has issued an AUTH challenge on this socket.
         static CHALLENGED: RefCell<bool> = const { RefCell::new(false) };
+        static RECONNECT: RefCell<Reconnect> = RefCell::new(Reconnect::default());
+        /// Bumped by `reset`; stale socket handlers and timers compare against it.
+        static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// A reconnect timer is armed (onerror + onclose must schedule only one).
+        static RETRY_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static OUTBOX: RefCell<Outbox> = RefCell::new(Outbox::default());
     }
 
@@ -590,6 +602,48 @@ mod dm_ws {
                 .filter(|ws| ws.ready_state() == web_sys::WebSocket::OPEN)
                 .cloned()
         })
+    }
+
+    /// Detach a socket's handlers before it is dropped or replaced, so its late
+    /// `onclose` cannot trigger a reconnect storm (same care as the forum relay).
+    fn detach(ws: &web_sys::WebSocket) {
+        ws.set_onopen(None);
+        ws.set_onmessage(None);
+        ws.set_onerror(None);
+        ws.set_onclose(None);
+    }
+
+    /// The socket dropped (`onclose`/`onerror`): unauthenticate, show
+    /// "reconnecting" and arm one backoff timer that re-runs `connect`.
+    fn on_drop(store: DmStore, generation: u64) {
+        if GENERATION.with(|g| g.get()) != generation || RETRY_PENDING.with(|p| p.get()) {
+            return;
+        }
+        let jitter = js_sys::Math::random();
+        let delay = RECONNECT
+            .with(|r| OUTBOX.with(|o| r.borrow_mut().on_close(&mut o.borrow_mut(), jitter)));
+        AUTH_ID.with(|a| *a.borrow_mut() = None);
+        store.inner.update(|s| s.reconnecting = true);
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        RETRY_PENDING.with(|p| p.set(true));
+        let cb = Closure::once_into_js(move || {
+            RETRY_PENDING.with(|p| p.set(false));
+            if GENERATION.with(|g| g.get()) != generation {
+                return;
+            }
+            let signer = SIGNER.with(|s| s.borrow().clone());
+            let url = RELAY_URL.with(|u| u.borrow().clone());
+            let pk = MY_PK.with(|p| p.borrow().clone());
+            if let Some(signer) = signer {
+                connect(store, signer, &url, &pk);
+            }
+        });
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.unchecked_ref(),
+            delay as i32,
+        );
     }
 
     fn send_str(text: &str) {
@@ -641,10 +695,12 @@ mod dm_ws {
                 continue;
             };
             let open = ws_open().is_some();
+            // The ack timer runs only for a frame that actually left; a queued
+            // one is timed when `flush_outbox` sends it.
             if let Some(f) = OUTBOX.with(|o| o.borrow_mut().submit(&ev.id, frame, open)) {
                 send_str(&f);
+                arm_ack_timeout(store, ev.id.clone());
             }
-            arm_ack_timeout(store, ev.id.clone());
         }
     }
 
@@ -652,8 +708,9 @@ mod dm_ws {
         let Some(window) = web_sys::window() else {
             return;
         };
+        let token = OUTBOX.with(|o| o.borrow_mut().arm_timer(&event_id));
         let cb = Closure::<dyn FnMut()>::new(move || {
-            let settled = OUTBOX.with(|o| o.borrow_mut().on_timeout(&event_id));
+            let settled = OUTBOX.with(|o| o.borrow_mut().on_timer(&event_id, token));
             apply(store, settled);
         });
         let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -664,12 +721,14 @@ mod dm_ws {
     }
 
     /// Send everything queued while the socket was connecting.
-    fn flush_outbox() {
+    fn flush_outbox(store: DmStore) {
         if ws_open().is_none() {
             return;
         }
-        for f in OUTBOX.with(|o| o.borrow_mut().flush(true)) {
+        let sent = OUTBOX.with(|o| o.borrow_mut().flush_with_ids(true));
+        for (id, f) in sent {
             send_str(&f);
+            arm_ack_timeout(store, id);
         }
     }
 
@@ -680,9 +739,13 @@ mod dm_ws {
     pub fn reset() {
         WS.with(|c| {
             if let Some(ws) = c.borrow_mut().take() {
+                detach(&ws);
                 let _ = ws.close();
             }
         });
+        GENERATION.with(|g| g.set(g.get() + 1));
+        RETRY_PENDING.with(|p| p.set(false));
+        RECONNECT.with(|r| *r.borrow_mut() = Reconnect::default());
         SIGNER.with(|s| *s.borrow_mut() = None);
         RELAY_URL.with(|u| u.borrow_mut().clear());
         MY_PK.with(|p| p.borrow_mut().clear());
@@ -833,7 +896,7 @@ mod dm_ws {
                 // A relay that never challenged does not gate writes on AUTH.
                 if !CHALLENGED.with(|c| *c.borrow()) {
                     OUTBOX.with(|o| o.borrow_mut().set_authed(true));
-                    flush_outbox();
+                    flush_outbox(store);
                 }
             }
             Some("OK") => {
@@ -845,14 +908,14 @@ mod dm_ws {
                     if AUTH_ID.with(|a| a.borrow().as_deref() == Some(id)) {
                         if ok {
                             OUTBOX.with(|o| o.borrow_mut().set_authed(true));
-                            flush_outbox();
+                            flush_outbox(store);
                         }
                         return;
                     }
                     let settled = OUTBOX.with(|o| o.borrow_mut().on_ok(id, ok, reason));
                     apply(store, settled);
                     // An `auth-required` re-queue may be sendable right away.
-                    flush_outbox();
+                    flush_outbox(store);
                 }
             }
             _ => {}
@@ -873,9 +936,21 @@ mod dm_ws {
             return;
         }
 
+        // Replace any dead or still-connecting socket without leaving its
+        // handlers live.
+        WS.with(|c| {
+            if let Some(old) = c.borrow_mut().take() {
+                detach(&old);
+                let _ = old.close();
+            }
+        });
+        let generation = GENERATION.with(|g| g.get());
         let ws = match web_sys::WebSocket::new(url) {
             Ok(w) => w,
-            Err(_) => return,
+            Err(_) => {
+                on_drop(store, generation);
+                return;
+            }
         };
 
         // A fresh socket starts unauthenticated.
@@ -883,8 +958,10 @@ mod dm_ws {
         AUTH_ID.with(|a| *a.borrow_mut() = None);
         CHALLENGED.with(|c| *c.borrow_mut() = false);
         let onopen = Closure::<dyn FnMut()>::new(move || {
+            RECONNECT.with(|r| r.borrow_mut().on_open());
+            store.inner.update(|s| s.reconnecting = false);
             send_dm_req();
-            flush_outbox();
+            flush_outbox(store);
         });
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
@@ -897,6 +974,13 @@ mod dm_ws {
             });
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
+
+        let onclose = Closure::<dyn FnMut()>::new(move || on_drop(store, generation));
+        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+        onclose.forget();
+        let onerror = Closure::<dyn FnMut()>::new(move || on_drop(store, generation));
+        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        onerror.forget();
 
         WS.with(|c| *c.borrow_mut() = Some(ws));
     }
@@ -1153,6 +1237,9 @@ fn dm_thread(
         </div>
         {move || store.error().map(|e| view! {
             <div class="bbs-panel bbs-dim">{format!("  \u{2717} {e}")}</div>
+        })}
+        {move || store.reconnecting().then(|| view! {
+            <div class="bbs-panel bbs-dim">"  \u{27f3} reconnecting\u{2026}"</div>
         })}
         {move || {
             let all = store.inner.with(|s| s.messages.clone());

@@ -109,6 +109,12 @@ pub struct NostrRelayDO {
     /// Phase 2: 60s memo of owner → unrevoked inbox keys. Never filled at AUTH:
     /// `save_auth` persists only the pubkey, so it is looked up on demand.
     pub(crate) recipient_keys_cache: TtlCache<Vec<String>>,
+    /// ADR-2028: 60s memo of epoch key → zone (positive results only).
+    pub(crate) epoch_zone_cache: TtlCache<String>,
+    /// ADR-2028: 60s memo of all registered epoch rows under one key (non-empty only).
+    pub(crate) epoch_rows_cache: TtlCache<Vec<(String, String)>>,
+    /// ADR-2028: 60s memo of `zone/epoch` → first stored pubkey (positive only).
+    pub(crate) zone_epoch_cache: TtlCache<String>,
     /// ADR-2018: per-pubkey throttle for the trust-ledger activity writes.
     pub(crate) activity: ActivityLedger,
 }
@@ -130,6 +136,9 @@ impl DurableObject for NostrRelayDO {
             device_owner_cache: TtlCache::new(LOOKUP_TTL_SECS),
             recipient_row_cache: TtlCache::new(LOOKUP_TTL_SECS),
             recipient_keys_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            epoch_zone_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            epoch_rows_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            zone_epoch_cache: TtlCache::new(LOOKUP_TTL_SECS),
             activity: ActivityLedger::new(),
         }
     }

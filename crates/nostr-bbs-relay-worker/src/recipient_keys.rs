@@ -57,6 +57,15 @@ pub(crate) const LOOKUP_OWNER_SQL: &str = "SELECT owner_pubkey, revoked FROM rec
 pub(crate) const KEYS_FOR_OWNER_SQL: &str = "SELECT key FROM recipient_keys \
     WHERE owner_pubkey = ?1 AND role = 'inbox' AND revoked = 0";
 
+/// Zone of one unrevoked epoch key (ADR-2028 decision 8). Revoked rows and
+/// rows without a zone do not match.
+pub(crate) const EPOCH_ZONE_SQL: &str = "SELECT zone FROM recipient_keys \
+    WHERE key = ?1 AND role = 'epoch' AND revoked = 0 AND zone IS NOT NULL LIMIT 1";
+
+/// Every unrevoked epoch key with its zone.
+pub(crate) const EPOCH_ROWS_SQL: &str = "SELECT key, zone FROM recipient_keys \
+    WHERE role = 'epoch' AND revoked = 0 AND zone IS NOT NULL";
+
 /// Whether the feature is on. Exact match on `"true"`, like the device-key gate.
 pub(crate) fn recipient_keys_enabled_var(raw: Option<&str>) -> bool {
     raw == Some("true")
@@ -193,6 +202,44 @@ pub(crate) async fn keys_for_owner(db: &D1Database, owner: &str) -> Vec<String> 
     }
 }
 
+/// The zone an unrevoked `role = 'epoch'` key belongs to. D1 failure, a
+/// missing `recipient_keys` table included, reads as not an epoch key.
+pub(crate) async fn epoch_zone(db: &D1Database, key: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        zone: String,
+    }
+    let key = key.to_ascii_lowercase();
+    let stmt = db
+        .prepare(EPOCH_ZONE_SQL)
+        .bind(&[JsValue::from_str(&key)])
+        .ok()?;
+    match stmt.first::<Row>(None).await {
+        Ok(Some(r)) => Some(r.zone),
+        _ => None,
+    }
+}
+
+/// All unrevoked epoch keys as `(key, zone)`, lowercase keys. Empty on failure.
+pub(crate) async fn epoch_rows(db: &D1Database) -> Vec<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        key: String,
+        zone: String,
+    }
+    let Ok(rows) = db
+        .prepare(EPOCH_ROWS_SQL)
+        .all()
+        .await
+        .and_then(|r| r.results::<Row>())
+    else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .map(|r| (r.key.to_ascii_lowercase(), r.zone))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +370,32 @@ mod tests {
         add(&c, "ee", OWNER, "epoch", 0);
         assert_eq!(lookup(&c, "ee"), None);
         assert!(keys(&c, OWNER).is_empty());
+    }
+
+    #[test]
+    fn epoch_zone_sql_finds_unrevoked_epoch_rows_only() {
+        let c = db();
+        c.execute(
+            "INSERT INTO recipient_keys (key, owner_pubkey, zone, role, created_at, revoked) \
+             VALUES ('e1','z','family','epoch',1,0), ('e2','z','family','epoch',1,1), \
+                    ('e3','z',NULL,'epoch',1,0), ('i1','o','family','inbox',1,0)",
+            [],
+        )
+        .unwrap();
+        let zone = |k: &str| -> Option<String> {
+            c.query_row(EPOCH_ZONE_SQL, params![k], |r| r.get(0)).ok()
+        };
+        assert_eq!(zone("e1").as_deref(), Some("family"));
+        for k in ["e2", "e3", "i1", "nope"] {
+            assert_eq!(zone(k), None, "{k}");
+        }
+        let mut s = c.prepare(EPOCH_ROWS_SQL).unwrap();
+        let rows: Vec<(String, String)> = s
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, vec![("e1".to_string(), "family".to_string())]);
     }
 
     #[test]

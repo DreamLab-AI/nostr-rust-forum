@@ -75,9 +75,12 @@
 pub mod auto_grant;
 pub mod grant_ledger;
 pub mod inbox_key;
+pub mod keyset;
+pub mod nip171;
 pub mod public_inbox;
 pub mod read_cache;
 pub mod store;
+pub mod tickets;
 
 use nostr_bbs_core::sealed::{has_sealed_tag, open_sealed};
 use nostr_bbs_core::signer::Signer;
@@ -152,12 +155,43 @@ pub struct ZoneKey {
     pub granted_by: String,
     /// Unix seconds this client learned the key.
     pub received_at: u64,
+    /// Group identity pubkey (hex) this epoch key was derived under (NIP-171,
+    /// ADR-2028), or `None` for a legacy random epoch key. Older stored keys
+    /// deserialise as `None`.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 impl ZoneKey {
-    /// Storage id: `"<zone>:<epoch>"`.
-    pub fn id(&self) -> String {
-        key_id(&self.zone, self.epoch)
+    /// Storage id: `"<zone>:<group|->:<epoch>:<pubkey>"` (ADR-2028 decision
+    /// 6). The pubkey is part of it so two keys claiming one `(zone, epoch)`
+    /// both survive and the conflict is visible instead of overwritten.
+    pub fn store_id(&self) -> String {
+        // Gated on ZONE_GROUPS_ENABLED (ADR-2028, Phase 4 blocker fix). With the
+        // flag OFF the id is the legacy `<zone>:<epoch>`, so a second grant for
+        // one epoch replaces the first (last-write-wins) exactly as before the
+        // NIP-171 work, and `migrate_zone_keys` is a no-op because a legacy row's
+        // id already equals its store_id. With the flag ON the pubkey and group
+        // join the id, so two keys claiming one epoch both persist and the
+        // inconsistency is detectable. The whole key plane is unreachable while
+        // the flag is off, so this keeps flag-off byte-identical to today.
+        self.store_id_with(crate::zone_crypto::tickets::zone_groups_enabled())
+    }
+
+    /// [`store_id`](Self::store_id) with the flag supplied, so both modes are
+    /// unit-testable (the native flag is always off).
+    pub(crate) fn store_id_with(&self, zone_groups_enabled: bool) -> String {
+        if zone_groups_enabled {
+            format!(
+                "{}:{}:{}:{}",
+                self.zone,
+                self.group.as_deref().unwrap_or("-"),
+                self.epoch,
+                self.pubkey
+            )
+        } else {
+            key_id(&self.zone, self.epoch)
+        }
     }
 
     /// The 32 secret bytes, if well-formed.
@@ -198,6 +232,7 @@ pub fn generate_zone_key(
         pubkey: kp.public.to_hex(),
         granted_by: creator.to_string(),
         received_at: now,
+        group: None,
     })
 }
 
@@ -335,6 +370,7 @@ pub fn validate_grant(
         pubkey: derived,
         granted_by: sealer.to_string(),
         received_at: now,
+        group: None,
     })
 }
 

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use nostr_bbs_core::keys::SecretKey;
 use nostr_bbs_zone_migrate::channels::{list_channels, parse_channels, ChannelSpec};
 use nostr_bbs_zone_migrate::engine::{self, Hooks, Plan};
-use nostr_bbs_zone_migrate::grants::{fetch_grants, RejectedGrant};
+use nostr_bbs_zone_migrate::grants::{fetch_grants_with, GroupBinding, RejectedGrant};
 use nostr_bbs_zone_migrate::identity::{identity_from_env, parse_identity, IDENTITY_ENV};
 use nostr_bbs_zone_migrate::keys::{parse_key_file, KeyRing};
 use nostr_bbs_zone_migrate::relay::{fetch_all, http_origin, Filter, Relay};
@@ -67,6 +67,12 @@ struct Cli {
     /// addressed to the inbox key are opened too (inbox key first, then the identity).
     #[arg(long, global = true, value_name = "PATH")]
     inbox_key: Option<PathBuf>,
+
+    /// With --fetch-grants: accept NIP-171 kind-1014 epoch tickets signed by this zone's group
+    /// identity, as `<zone>=<64-hex group pubkey>` (repeatable). Tickets signed by any other key
+    /// are refused.
+    #[arg(long, global = true, value_name = "ZONE=HEX")]
+    group_pubkey: Vec<GroupBinding>,
 
     /// State file recording the run (required by seal, verify, purge, status).
     #[arg(long, global = true, value_name = "PATH")]
@@ -318,7 +324,7 @@ async fn load_keys(
             Some(path) => Some(read_inbox_key(path)?),
             None => None,
         };
-        let harvest = fetch_grants(relay, me, inbox.as_ref()).await?;
+        let harvest = fetch_grants_with(relay, me, inbox.as_ref(), &cli.group_pubkey).await?;
         let accepted = harvest.keys.len();
         for key in harvest.keys {
             ring.insert(key)?;

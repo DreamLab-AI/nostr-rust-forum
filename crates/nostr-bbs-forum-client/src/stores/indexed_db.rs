@@ -10,7 +10,7 @@
 //! - `profiles`  — key `pubkey`, index `updated` on `updated_at`
 //! - `deletions` — key `event_id`, index `target` on `target_id`
 //! - `outbox`    — autoIncrement key, index `created` on `created_at`
-//! - `zone_keys` — key `id` (`"<zone>:<epoch>"`), zone end-to-end encryption keys (ADR-2016)
+//! - `zone_keys` — key `id` (`"<zone>:<group|->:<epoch>:<pubkey>"`; pre-ADR-2028 entries were `"<zone>:<epoch>"` and are rewritten on load), zone end-to-end encryption keys (ADR-2016)
 //! - `zone_kv`   — key `id`, small JSON values for zone encryption bookkeeping
 //!   (processed gift-wrap ids, grants this admin has sent)
 
@@ -73,18 +73,23 @@ pub struct StoredZoneKey {
     pub pubkey: String,
     pub granted_by: String,
     pub received_at: u64,
+    /// Group identity pubkey for a NIP-171 derived key; absent on entries
+    /// written before ADR-2028, which read back as a legacy key.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 impl From<&crate::zone_crypto::ZoneKey> for StoredZoneKey {
     fn from(k: &crate::zone_crypto::ZoneKey) -> Self {
         Self {
-            id: k.id(),
+            id: k.store_id(),
             zone: k.zone.clone(),
             epoch: k.epoch,
             secret: k.secret.clone(),
             pubkey: k.pubkey.clone(),
             granted_by: k.granted_by.clone(),
             received_at: k.received_at,
+            group: k.group.clone(),
         }
     }
 }
@@ -98,6 +103,7 @@ impl From<StoredZoneKey> for crate::zone_crypto::ZoneKey {
             pubkey: r.pubkey,
             granted_by: r.granted_by,
             received_at: r.received_at,
+            group: r.group,
         }
     }
 }
@@ -355,6 +361,36 @@ impl ForumDb {
             .filter_map(|i| from_js::<StoredZoneKey>(arr.get(i)).ok())
             .map(crate::zone_crypto::ZoneKey::from)
             .collect())
+    }
+
+    /// One-way migration to the ADR-2028 key shape: an entry whose stored id
+    /// is not its [`ZoneKey::store_id`] (the old `"<zone>:<epoch>"`) is written
+    /// under the new id with `group` absent, then the old entry is deleted.
+    /// The new row is written first, so an interruption never loses a key.
+    pub async fn migrate_zone_keys(&self) -> Result<(), JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readonly)?;
+        let store = tx.object_store(STORE_ZONE_KEYS)?;
+        let req = store.get_all()?;
+        let result = idb_request_result(&req).await?;
+        let arr: js_sys::Array = result.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
+        let stale: Vec<StoredZoneKey> = (0..arr.length())
+            .filter_map(|i| from_js::<StoredZoneKey>(arr.get(i)).ok())
+            .filter(|r| r.id != crate::zone_crypto::ZoneKey::from(r.clone()).store_id())
+            .collect();
+        for rec in stale {
+            let old_id = rec.id.clone();
+            let key = crate::zone_crypto::ZoneKey::from(rec);
+            self.put_zone_key(&key).await?;
+            let tx = self
+                .db
+                .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
+            let store = tx.object_store(STORE_ZONE_KEYS)?;
+            let req = store.delete(&JsValue::from_str(&old_id))?;
+            idb_request_result(&req).await?;
+        }
+        Ok(())
     }
 
     /// Write a small JSON value to `zone_kv`.
@@ -756,6 +792,7 @@ mod tests {
             pubkey: "22".repeat(32),
             granted_by: "33".repeat(32),
             received_at: 1_790_000_000,
+            group: None,
         }
     }
 
@@ -772,7 +809,11 @@ mod tests {
         let k = key();
         let rec = StoredZoneKey::from(&k);
         let v = serde_json::to_value(&rec).unwrap();
-        assert_eq!(v["id"], "zone3:2");
+        // The id is the store key, which is flag-aware (legacy `<zone>:<epoch>`
+        // with ZONE_GROUPS_ENABLED off, the native test default; `<zone>:<group>:
+        // <epoch>:<pubkey>` with it on). Assert against store_id so the test is
+        // correct in either mode rather than pinning one form.
+        assert_eq!(v["id"], k.store_id());
         assert_eq!(v["secret"], k.secret);
         let back: StoredZoneKey = serde_json::from_value(v).unwrap();
         assert_eq!(ZoneKey::from(back), k);

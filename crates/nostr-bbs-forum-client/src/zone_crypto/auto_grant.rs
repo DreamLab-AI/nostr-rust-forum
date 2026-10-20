@@ -174,6 +174,13 @@ pub async fn send_grants(
         ..GrantReport::default()
     };
     let targets = resolve_targets(signer, &members).await;
+    // Tickets need the relay's zone-group bindings. A failed load falls back
+    // to the 21453 grant for every recipient.
+    if super::tickets::zone_groups_enabled() {
+        if let Err(e) = super::tickets::ensure_bindings_loaded().await {
+            web_sys::console::warn_1(&format!("[zone-key] bindings: {e}").into());
+        }
+    }
     for (key, recipients) in plan {
         for pk in recipients {
             // A failed lookup is not "no inbox key": wrapping to the identity
@@ -188,7 +195,27 @@ pub async fn send_grants(
                 }
                 None => pk.clone(),
             };
-            let Ok(wrap) = build_grant_wrap(signer, &target, &key, now_secs()).await else {
+            // With ZONE_GROUPS_ENABLED, a zone bound to a group identity this
+            // browser holds gets an NIP-171 ticket (ADR-2028 decision 2);
+            // every other case keeps the 21453 grant.
+            let ticket = if super::tickets::zone_groups_enabled() {
+                super::tickets::issue_ticket_wrap(
+                    &super::tickets::HeldGroupIdentities,
+                    super::tickets::loaded_bindings().as_ref(),
+                    &key,
+                    &pk,
+                    &target,
+                    now_secs(),
+                )
+                .await
+            } else {
+                None
+            };
+            let built = match ticket {
+                Some(t) => t,
+                None => build_grant_wrap(signer, &target, &key, now_secs()).await,
+            };
+            let Ok(wrap) = built else {
                 report.failed += 1;
                 continue;
             };

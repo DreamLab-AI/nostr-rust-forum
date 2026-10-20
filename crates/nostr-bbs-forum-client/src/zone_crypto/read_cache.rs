@@ -177,6 +177,7 @@ mod tests {
             pubkey: pk_hex(ZONE),
             granted_by: pk_hex(MIGRATOR),
             received_at: 0,
+            group: None,
         }
     }
 

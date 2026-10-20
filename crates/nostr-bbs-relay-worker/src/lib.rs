@@ -35,6 +35,7 @@ mod trust_sweep;
 mod user_admin;
 mod whitelist;
 mod zone_config;
+mod zone_groups;
 
 /// Re-export so the `worker` crate runtime can discover the Durable Object.
 pub use relay_do::NostrRelayDO;
@@ -855,12 +856,21 @@ async fn ensure_schema(env: &Env) -> bool {
 
     // --- Recipient keys (Phase 2, migration 0011) ---
     // Only when the feature is on, so a default deploy pays nothing per request.
-    if recipient_keys::recipient_keys_enabled_var(
-        env.var(recipient_keys::RECIPIENT_KEYS_ENABLED_VAR)
+    let zone_groups_on = zone_groups::zone_groups_enabled_var(
+        env.var(zone_groups::ZONE_GROUPS_ENABLED_VAR)
             .ok()
             .map(|v| v.to_string())
             .as_deref(),
-    ) {
+    );
+    // ZONE_GROUPS_ENABLED also needs the table: it holds the `epoch` rows.
+    if zone_groups_on
+        || recipient_keys::recipient_keys_enabled_var(
+            env.var(recipient_keys::RECIPIENT_KEYS_ENABLED_VAR)
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+        )
+    {
         for stmt in [
             recipient_keys::RECIPIENT_KEYS_CREATE_SQL,
             recipient_keys::RECIPIENT_KEYS_INDEX_SQL,
@@ -877,6 +887,18 @@ async fn ensure_schema(env: &Env) -> bool {
             .prepare(recipient_keys::RECIPIENT_KEYS_ADD_PROOF_SQL)
             .run()
             .await;
+    }
+
+    // --- Zone epoch keys (Phase 4b, migration 0013) ---
+    if zone_groups_on {
+        if let Err(e) = db
+            .prepare(zone_groups::ZONE_EPOCH_KEYS_CREATE_SQL)
+            .run()
+            .await
+        {
+            console_error!("ensure_schema: zone_epoch_keys create failed: {e}");
+            ok = false;
+        }
     }
 
     // --- Governance tables (broker_cases, governance_receipts) ---

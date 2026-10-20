@@ -14,7 +14,7 @@ use nostr_bbs_core::{verify_event, NostrEvent};
 use serde::Serialize;
 
 use crate::channels::ChannelSpec;
-use crate::keys::KeyRing;
+use crate::keys::{is_hex64, KeyRing};
 
 /// A plaintext original to be sealed, with any envelopes already on the relay
 /// that claim to wrap it.
@@ -60,6 +60,9 @@ pub struct ChannelScan {
     /// Envelopes keyed by the original id in their `sealed` tag, including
     /// those whose original is no longer on the relay.
     pub envelopes_by_inner: HashMap<String, Vec<NostrEvent>>,
+    /// `(epoch, pubkey)` of the `zk` tag on every live zone-encrypted post of
+    /// this channel's zone (no `sealed` tag): what the zone really uses.
+    pub observed_zk: Vec<(u32, String)>,
 }
 
 /// Classify `events` (as returned by a `#e` REQ for the channel) for `spec`.
@@ -73,6 +76,7 @@ pub fn scan_channel(spec: &ChannelSpec, events: &[NostrEvent], keys: &KeyRing) -
     };
     let mut envelopes_by_inner: HashMap<String, Vec<NostrEvent>> = HashMap::new();
     let mut originals = Vec::new();
+    let mut observed_zk = Vec::new();
 
     for ev in events {
         if ev.kind != 42 || channel_of(ev) != Some(spec.id.as_str()) {
@@ -92,6 +96,11 @@ pub fn scan_channel(spec: &ChannelSpec, events: &[NostrEvent], keys: &KeyRing) -
             .any(|t| t.first().map(String::as_str) == Some("zk"))
         {
             plan.encrypted_posts += 1;
+            observed_zk.extend(ev.tags.iter().filter_map(|t| {
+                (t.len() >= 4 && t[0] == "zk" && t[1] == spec.zone && is_hex64(&t[3]))
+                    .then(|| Some((t[2].parse::<u32>().ok()?, t[3].to_ascii_lowercase())))
+                    .flatten()
+            }));
         } else if verify_event(ev) {
             originals.push(ev.clone());
         } else {
@@ -126,5 +135,6 @@ pub fn scan_channel(spec: &ChannelSpec, events: &[NostrEvent], keys: &KeyRing) -
         plan,
         candidates,
         envelopes_by_inner,
+        observed_zk,
     }
 }

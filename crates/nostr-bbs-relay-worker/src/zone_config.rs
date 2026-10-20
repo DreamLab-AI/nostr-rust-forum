@@ -56,6 +56,11 @@ pub struct Zone {
     /// plaintext.
     #[serde(default)]
     pub encrypted: bool,
+    /// ADR-2028 decision 4: the NIP-171 group identity pubkey bound to this
+    /// zone (64 lowercase hex). The binding lives here and nowhere else; a `zk`
+    /// tag's fifth element is only a hint checked against it.
+    #[serde(default)]
+    pub group_pubkey: Option<String>,
 }
 
 impl Zone {
@@ -118,6 +123,31 @@ impl ZoneConfig {
     /// Look up a zone definition by id.
     pub fn get(&self, id: &str) -> Option<&Zone> {
         self.zones.iter().find(|z| z.id == id)
+    }
+
+    /// The zone's bound group pubkey, if one is configured and well formed
+    /// (64 lowercase hex). A malformed value reads as unbound.
+    pub fn group_for(&self, id: &str) -> Option<&str> {
+        self.get(id)?
+            .group_pubkey
+            .as_deref()
+            .filter(|g| g.len() == 64 && g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    }
+
+    /// The `zone_groups` map served in the NIP-11 `nostr_bbs` block: zone id to
+    /// bound group pubkey. `Hidden` zones are left out, since the document is
+    /// public and `Hidden` means omitted entirely for non-members.
+    pub fn zone_groups_block(&self) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        for z in &self.zones {
+            if z.visibility == ZoneVisibility::Hidden {
+                continue;
+            }
+            if let Some(g) = self.group_for(&z.id) {
+                m.insert(z.id.clone(), serde_json::Value::String(g.to_string()));
+            }
+        }
+        serde_json::Value::Object(m)
     }
 
     /// Whether the zone's content must be end-to-end encrypted: the
@@ -305,6 +335,31 @@ mod tests {
         )
         .with_encryption(true);
         assert!(!zc.is_encrypted("zone1"));
+    }
+
+    #[test]
+    fn group_for_parses_and_is_served() {
+        let g = "ab".repeat(32);
+        let zc = ZoneConfig::from_json(&format!(
+            r#"[{{"id":"family","required_cohorts":["family"],"group_pubkey":"{g}"}},
+                {{"id":"secret","required_cohorts":["x"],"visibility":"hidden","group_pubkey":"{g}"}},
+                {{"id":"bad","required_cohorts":["y"],"group_pubkey":"{}"}},
+                {{"id":"plain","required_cohorts":["z"]}}]"#,
+            "AB".repeat(32)
+        ));
+        assert_eq!(zc.group_for("family"), Some(g.as_str()));
+        assert_eq!(zc.group_for("bad"), None, "uppercase is not the binding");
+        assert_eq!(zc.group_for("plain"), None);
+        assert_eq!(zc.group_for("nope"), None);
+        let block = zc.zone_groups_block();
+        assert_eq!(block, serde_json::json!({ "family": g }));
+    }
+
+    #[test]
+    fn five_element_zk_tag_keeps_its_shape_pass() {
+        let (mut tags, ct) = zk_payload();
+        tags[1].push("cd".repeat(32));
+        assert!(is_zone_ciphertext("zone3", &tags, &ct));
     }
 
     #[test]

@@ -184,18 +184,18 @@ pub fn relay_urls_match(a: &str, b: &str) -> bool {
 /// `relay` tag names THIS relay (canonicalised); and `created_at` is within
 /// `±max_skew` of `now`.
 ///
-/// `own_relay_url = None` (or blank) SKIPS the relay-tag check — the relay's own
-/// URL is unconfigured, and the per-session unpredictable challenge is already
-/// the primary anti-replay property, so this fails *open* only for the
-/// defence-in-depth relay-scoping check and never for the challenge/signature.
-/// This lets the gate roll out safely before an operator sets `RELAY_URL`.
+/// `own_relay_url = None` (or blank) REJECTS the AUTH with
+/// `invalid: relay url unconfigured`: the relay-tag check is never skipped, or
+/// a malicious relay could pass our challenge to a victim as its own and relay
+/// the victim's signed AUTH back. The caller derives the URL from the host the
+/// upgrade request arrived at when `RELAY_URL` is blank (see [`resolve_own_url`]).
 ///
 /// Pure over its inputs (the Schnorr verify is itself a pure function of the
 /// event), so the full verdict table is unit-testable without a DO.
 pub fn evaluate_auth_event(
     event: &NostrEvent,
     expected_challenge: Option<&str>,
-    own_relay_url: Option<&str>,
+    allowed_relay_urls: &[String],
     now: u64,
     max_skew: u64,
 ) -> AuthVerdict {
@@ -215,16 +215,22 @@ pub fn evaluate_auth_event(
         _ => return AuthVerdict::Rejected("invalid: challenge mismatch"),
     }
 
-    // Relay URL must name THIS relay (canonicalised) — but only when we know our
-    // own URL. NIP-42 scopes a client's AUTH to a specific relay so a malicious
-    // relay cannot replay it elsewhere; enforcing it here is defence-in-depth on
-    // top of the per-session challenge.
-    if let Some(own) = own_relay_url.filter(|s| !s.trim().is_empty()) {
-        match filter::tag_value(event, "relay") {
-            Some(claimed) if relay_urls_match(&claimed, own) => {}
-            Some(_) => return AuthVerdict::Rejected("invalid: relay url mismatch"),
-            None => return AuthVerdict::Rejected("invalid: missing relay tag"),
-        }
+    // Relay URL must name THIS relay (canonicalised). NIP-42 scopes a client's
+    // AUTH to a specific relay so a malicious relay cannot replay it elsewhere.
+    // The allowed set is EXPLICIT operator config (RELAY_URL plus optional
+    // RELAY_URL_ALIASES), never a value derived from the inbound request: a
+    // request-derived identity lets an attacker's Host poison the binding
+    // (Phase 4 security review). Empty set => fail closed, reject every AUTH.
+    if allowed_relay_urls.is_empty() {
+        return AuthVerdict::Rejected("invalid: relay url unconfigured");
+    }
+    match filter::tag_value(event, "relay") {
+        Some(claimed)
+            if allowed_relay_urls
+                .iter()
+                .any(|a| relay_urls_match(&claimed, a)) => {}
+        Some(_) => return AuthVerdict::Rejected("invalid: relay url mismatch"),
+        None => return AuthVerdict::Rejected("invalid: missing relay tag"),
     }
 
     // created_at within the permitted skew window (guards a stale/replayed AUTH).
@@ -235,22 +241,48 @@ pub fn evaluate_auth_event(
     AuthVerdict::Ok(event.pubkey.clone())
 }
 
-/// Whether an AUTH is being verified without relay scoping: `AUTH_MODE` is
-/// `nip42` but `RELAY_URL` is unset or blank, so [`evaluate_auth_event`] skips
-/// the `relay` tag check. Enforcement is deliberately unchanged (operators deploy
-/// the shipped `wrangler.toml`, which leaves `RELAY_URL` blank); this predicate
-/// exists so the relay can say so, loudly, on every AUTH.
-pub fn relay_url_unconfigured_in_nip42(mode: AuthMode, own_relay_url: Option<&str>) -> bool {
-    mode == AuthMode::Nip42 && own_relay_url.is_none_or(|s| s.trim().is_empty())
+/// The relay's own URLs for the AUTH relay-tag check, from EXPLICIT config only:
+/// the `RELAY_URL` var plus an optional comma-separated `RELAY_URL_ALIASES` (for
+/// a relay reachable at more than one hostname, e.g. a custom domain and
+/// `workers.dev`). Each is canonicalised; blanks are dropped; the result is
+/// deduplicated. Never derived from the inbound request. An empty result means
+/// unconfigured, and [`evaluate_auth_event`] then fails closed.
+pub fn allowed_relay_urls(var: Option<&str>, aliases: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim();
+        if !s.is_empty() {
+            let c = canonical_relay_url(s);
+            if !out.iter().any(|e| relay_urls_match(e, &c)) {
+                out.push(c);
+            }
+        }
+    };
+    if let Some(v) = var {
+        push(v);
+    }
+    if let Some(a) = aliases {
+        for part in a.split(',') {
+            push(part);
+        }
+    }
+    out
+}
+
+/// Whether `AUTH_MODE` is `nip42` but no relay URL is configured, so
+/// [`evaluate_auth_event`] fails closed and refuses every AUTH. The predicate
+/// exists so the relay can say so, loudly, at startup and in NIP-11.
+pub fn relay_url_unconfigured_in_nip42(mode: AuthMode, allowed: &[String]) -> bool {
+    mode == AuthMode::Nip42 && allowed.is_empty()
 }
 
 /// Log a console error when [`relay_url_unconfigured_in_nip42`] holds. Call once
 /// per AUTH, before [`evaluate_auth_event`].
-pub fn warn_if_relay_url_unconfigured(mode: AuthMode, own_relay_url: Option<&str>) {
-    if relay_url_unconfigured_in_nip42(mode, own_relay_url) {
+pub fn warn_if_relay_url_unconfigured(mode: AuthMode, allowed: &[String]) {
+    if relay_url_unconfigured_in_nip42(mode, allowed) {
         #[cfg(target_arch = "wasm32")]
         worker::console_error!(
-            "nip42: RELAY_URL is blank, so the AUTH relay-tag check is skipped; set RELAY_URL to this relay's wss:// URL"
+            "nip42: RELAY_URL is unset, so every authenticated write is REFUSED. Set RELAY_URL to this relay's wss:// URL (and RELAY_URL_ALIASES for extra hostnames)."
         );
     }
 }
@@ -316,16 +348,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blank_relay_url_skips_the_relay_tag_check_and_is_flagged() {
-        assert!(relay_url_unconfigured_in_nip42(AuthMode::Nip42, None));
-        assert!(relay_url_unconfigured_in_nip42(AuthMode::Nip42, Some("")));
-        assert!(relay_url_unconfigured_in_nip42(AuthMode::Nip42, Some("  ")));
-        assert!(!relay_url_unconfigured_in_nip42(
-            AuthMode::Nip42,
-            Some("wss://relay.example")
-        ));
+    fn empty_allowlist_in_nip42_is_flagged_as_unconfigured() {
+        let empty: Vec<String> = Vec::new();
+        let set = vec!["wss://relay.example".to_string()];
+        assert!(relay_url_unconfigured_in_nip42(AuthMode::Nip42, &empty));
+        assert!(!relay_url_unconfigured_in_nip42(AuthMode::Nip42, &set));
         // Legacy allowlist mode never runs the relay-scoping defence, so no warning.
-        assert!(!relay_url_unconfigured_in_nip42(AuthMode::Allowlist, None));
+        assert!(!relay_url_unconfigured_in_nip42(
+            AuthMode::Allowlist,
+            &empty
+        ));
+    }
+
+    #[test]
+    fn allowed_relay_urls_are_explicit_config_only() {
+        // Entries are canonicalised (see canonical_relay_url) and deduped.
+        assert_eq!(
+            allowed_relay_urls(Some("wss://set.example"), None),
+            vec![canonical_relay_url("wss://set.example")]
+        );
+        // Var plus a comma-separated alias list: the var's own host appears once
+        // even though the aliases repeat it in a different case/slash form.
+        let got = allowed_relay_urls(
+            Some("wss://Forum.Example.org/"),
+            Some(" wss://relay.acct.workers.dev , wss://forum.example.org "),
+        );
+        assert_eq!(
+            got,
+            vec![
+                canonical_relay_url("wss://forum.example.org"),
+                canonical_relay_url("wss://relay.acct.workers.dev"),
+            ]
+        );
+        // Nothing configured => empty => evaluate_auth_event fails closed.
+        for blank in [None, Some(""), Some("  ")] {
+            assert!(allowed_relay_urls(blank, None).is_empty());
+        }
+        assert!(relay_url_unconfigured_in_nip42(
+            AuthMode::Nip42,
+            &allowed_relay_urls(None, None)
+        ));
+    }
+
+    #[test]
+    fn auth_matches_any_configured_alias_and_rejects_others() {
+        let allowed = allowed_relay_urls(
+            Some("wss://forum.example.org"),
+            Some("wss://relay.acct.workers.dev"),
+        );
+        for (claimed, ok) in [
+            ("wss://relay.acct.workers.dev/", true),
+            ("wss://forum.example.org", true),
+            ("wss://evil.example", false),
+        ] {
+            let matched = allowed.iter().any(|a| relay_urls_match(claimed, a));
+            assert_eq!(matched, ok, "{claimed}");
+        }
     }
 
     fn filter_kinds(kinds: Option<Vec<u64>>) -> NostrFilter {

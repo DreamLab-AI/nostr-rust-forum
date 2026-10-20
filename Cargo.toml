@@ -105,6 +105,9 @@ hmac = "0.12.1"
 hkdf = "0.12.4"
 sha2 = "0.10.9"
 getrandom = { version = "0.2", features = ["js"] }
+# BIP-39 mnemonic and seed (NIP-171 recovery master, forum-client only).
+bip39 = { version = "2.2", default-features = false, features = ["std"] }
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 bech32 = "0.11"

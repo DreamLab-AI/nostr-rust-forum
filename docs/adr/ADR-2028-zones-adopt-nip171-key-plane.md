@@ -102,3 +102,37 @@ private transport, there is no `zk`-tagged kind 9, and the kind-42 zone gate of 
 not exist. `ZONE_CONFIG` cohorts, the zone-to-group binding of decision 4 and `zk`-encrypted
 kanban and calendar remain in both profiles. The DreamLab board, on the `forum` profile, is
 unaffected.
+
+## Operator decisions recorded during Phase 4 (2026-10-20)
+
+- **Zone owners (decision 7).** The operator owns all three live zones. One recovery master per
+  zone, generated in the operator's browser, backed up per the draft's owner-backup record and on
+  paper. Other admins keep moderation and cohort rights and do not issue tickets. This matches the
+  current reality that the operator's browser holds every zone's epoch secrets.
+- **Cutover (landing section of the Phase 2 design).** Thirty days after Phase 4 is deployed to
+  the live board, the relay stops admitting the legacy shapes: rumor kind 21453 grants, grants
+  addressed to identity keys, and random (non-derived) epoch keys. Members whose client logged in
+  during the window crossed automatically. A member who did not needs one admin action: the owner
+  issues a ticket to their registered inbox key, with history from the imported-epoch record. The
+  removal release that deletes the dual paths follows the cutover. The exact date is written here
+  on the day Phase 4 deploys.
+- **Status.** Phase 4 steps 1 to 3 (derivation with the draft's test vector, relay binding and
+  epoch uniqueness, tickets beside 21453) are being implemented flagged off under
+  `ZONE_GROUPS_ENABLED`. Step 4, the per-zone migration, begins with the smallest zone and only
+  after the Phase 0 export and a dry run.
+
+## Hard blocker before `ZONE_GROUPS_ENABLED` is turned on (recorded 2026-10-20)
+
+The relay's one-key-per-`(zone, epoch)` binding (decision 6) must be established only by the
+zone owner through an authenticated admin path that carries the epoch NUMBER, not by member
+`zk` traffic. As built in Phase 4 (flagged off), the binding is first-write-wins over any
+member's `zk` tag, so a cohort member can claim future epochs `current+1..` with junk pubkeys
+and permanently block the owner's later rotations (`zone_epoch_keys` has no delete path except
+the admin reset added as defence-in-depth). The real fix is part of the owner tooling (Phase 4
+step 4): add an `epoch` column to the admin epoch-registration, have the relay accept a member
+`zk` at epoch E only when the owner has registered epoch E's key, and bound claimable epochs to
+`current+1`. `ZONE_GROUPS_ENABLED` MUST NOT be enabled on any deployment until that lands. Until
+then the flag stays off and the squat is unreachable (the gate only runs with the flag on).
+
+Interim defence-in-depth shipped flagged-off: a per-event cap on honoured `zk` tags, and an
+admin reset path for `zone_epoch_keys`.

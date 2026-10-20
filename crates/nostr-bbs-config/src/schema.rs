@@ -243,6 +243,17 @@ pub struct Zone {
     /// the agent calls — an operator trade-off, made per zone.
     #[serde(default)]
     pub agent_keys: bool,
+    /// NIP-171 group identity public key bound to this zone (ADR-2028): the key
+    /// that signs this zone's `kind:1014` epoch tickets. 64-char lowercase hex.
+    /// Projected into the relay's `ZONE_CONFIG` as `group_pubkey`; with the
+    /// relay's `ZONE_GROUPS_ENABLED` flag on, the relay refuses an epoch key or
+    /// ticket not signed by it, and the client reads the binding from NIP-11
+    /// rather than trusting a `zk` tag hint. Only meaningful on an `encrypted`
+    /// zone. Absent ⇒ the zone uses legacy random epoch keys (ADR-2016); the
+    /// binding is the one thing a `zk` tag can never be trusted to assert, so it
+    /// lives here in operator-controlled config.
+    #[serde(default)]
+    pub group_pubkey: Option<String>,
     /// Auto-approve new joiners into this zone. When `true`, a brand-new user
     /// (first kind-0 auto-whitelist) is automatically granted this zone's
     /// `required_cohorts`, so they land in it without an admin approving them.

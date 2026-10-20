@@ -117,7 +117,12 @@ impl NostrRelayDO {
             // Phase 2: the session's inbox keys, looked up only for a wrap and
             // only with the feature on, so the hot path adds no async work.
             let inbox_keys: Vec<String> = match authed_pubkey {
-                Some(pk) if event.kind == 1059 => self.cached_recipient_keys(pk).await,
+                Some(pk) if event.kind == 1059 => {
+                    let mut keys = self.cached_recipient_keys(pk).await;
+                    // ADR-2028: a zone's epoch-key wrap goes to its cohort.
+                    keys.extend(self.epoch_read_keys(authed_pubkey).await);
+                    keys
+                }
                 _ => Vec::new(),
             };
             if let Some(recipients) = &protected_recipients {

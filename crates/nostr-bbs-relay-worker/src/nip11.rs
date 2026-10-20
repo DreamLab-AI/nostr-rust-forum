@@ -190,7 +190,7 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         })
         .collect();
 
-    json!({
+    let mut info = json!({
         "name": relay_name,
         "description": "Private whitelist-only Nostr relay (nostr-bbs).",
         "pubkey": admin_pubkey,
@@ -282,7 +282,20 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
                 &escalation_posture,
             ),
         },
-    })
+    });
+
+    // ADR-2028 decision 4: serve the zone-to-group binding. Only with the flag
+    // on, so the document is byte-identical to before when it is off.
+    if crate::zone_groups::zone_groups_enabled_var(
+        env.var(crate::zone_groups::ZONE_GROUPS_ENABLED_VAR)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    ) {
+        info["nostr_bbs"]["zone_groups"] =
+            crate::zone_config::ZoneConfig::load(env).zone_groups_block();
+    }
+    info
 }
 
 #[cfg(test)]

@@ -15,6 +15,13 @@
 //! 5. the secret derives to the stated pubkey;
 //! 6. the seal's author is a relay admin (`GET /api/check-whitelist`).
 //!
+//! A **kind-1014 NIP-171 epoch ticket** (ADR-2028 decision 2) is accepted
+//! beside the 21453 grant. A ticket is a regular signed event inside the
+//! rumor slot, so it keeps its `sig`; it is accepted only when its signer is
+//! the group pubkey supplied for a zone with `--group-pubkey <zone>=<hex>`
+//! (the CLI has no NIP-11 cache) and its `p` tag is the opening key's owner.
+//! A relay admin check does not apply: the group identity is not an admin.
+//!
 //! Decryption uses core `nip44` and verification core
 //! `verify_event_strict`; nothing here is hand-rolled. Core's `unwrap_gift`
 //! is not used because it admits only kind-14 DM rumors.
@@ -33,6 +40,9 @@ use crate::relay::{fetch_all, Filter, Relay, RelayError};
 /// NIP-59 rumor kind carrying a zone-key grant (forum client
 /// `zone_crypto::KIND_ZONE_KEY_GRANT`).
 pub const KIND_ZONE_KEY_GRANT: u64 = 21453;
+
+/// NIP-171 epoch ticket (signed `kind:1014`).
+pub const KIND_EPOCH_TICKET: u64 = 1014;
 
 const KIND_GIFT_WRAP: u64 = 1059;
 const KIND_SEAL: u64 = 13;
@@ -56,6 +66,9 @@ pub enum GrantError {
     /// The grant was sealed by a pubkey that is not a relay admin.
     #[error("grant was not sealed by an admin ({0})")]
     NotAdmin(String),
+    /// A ticket's signer is not bound to exactly one zone by `--group-pubkey`.
+    #[error("ticket signer {0} is not bound to exactly one zone (--group-pubkey)")]
+    NoGroupBinding(String),
 }
 
 #[derive(Deserialize)]
@@ -80,6 +93,25 @@ pub fn open_gift_wrap(
     gift: &NostrEvent,
     recipient: &SecretKey,
 ) -> Result<(String, UnsignedEvent), GrantError> {
+    let (sealer, mut rumor_json) = open_gift_wrap_raw(gift, recipient)?;
+    let rumor: Result<UnsignedEvent, _> = serde_json::from_str(&rumor_json);
+    rumor_json.zeroize();
+    let rumor = rumor.map_err(|_| GrantError::Unwrap("rumor is not an event".to_string()))?;
+    if rumor.pubkey != sealer {
+        return Err(GrantError::Unwrap(
+            "rumor author does not match seal author".to_string(),
+        ));
+    }
+    Ok((sealer, rumor))
+}
+
+/// The wrap and seal checks of [`open_gift_wrap`], returning the verified
+/// seal author and the decrypted rumor JSON unparsed (a 1014 ticket needs its
+/// `sig`, which `UnsignedEvent` drops). The caller zeroizes the string.
+fn open_gift_wrap_raw(
+    gift: &NostrEvent,
+    recipient: &SecretKey,
+) -> Result<(String, String), GrantError> {
     let unwrap = |why: &str| GrantError::Unwrap(why.to_string());
     if gift.kind != KIND_GIFT_WRAP {
         return Err(GrantError::Unwrap(format!(
@@ -101,16 +133,107 @@ pub fn open_gift_wrap(
     }
     verify_event_strict(&seal).map_err(|_| unwrap("seal id or signature does not verify"))?;
     let seal_pk = hex32(&seal.pubkey).ok_or_else(|| unwrap("seal pubkey is not 64 hex"))?;
-    let mut rumor_json =
-        nostr_bbs_core::nip44::decrypt(recipient.as_bytes(), &seal_pk, &seal.content)
-            .map_err(|_| unwrap("seal does not decrypt with this key"))?;
-    let rumor: Result<UnsignedEvent, _> = serde_json::from_str(&rumor_json);
-    rumor_json.zeroize();
-    let rumor = rumor.map_err(|_| unwrap("rumor is not an event"))?;
-    if rumor.pubkey != seal.pubkey {
-        return Err(unwrap("rumor author does not match seal author"));
+    let rumor_json = nostr_bbs_core::nip44::decrypt(recipient.as_bytes(), &seal_pk, &seal.content)
+        .map_err(|_| unwrap("seal does not decrypt with this key"))?;
+    Ok((seal.pubkey, rumor_json))
+}
+
+/// A zone and the group identity pubkey the relay binds to it
+/// (`--group-pubkey <zone>=<hex>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupBinding {
+    /// Zone id.
+    pub zone: String,
+    /// Group identity pubkey, 64 lowercase hex.
+    pub group: String,
+}
+
+impl std::str::FromStr for GroupBinding {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (zone, group) = s
+            .split_once('=')
+            .ok_or_else(|| "expected <zone>=<64-hex group pubkey>".to_string())?;
+        let group = group.to_ascii_lowercase();
+        if zone.is_empty() || !is_hex64(&group) {
+            return Err("expected <zone>=<64-hex group pubkey>".to_string());
+        }
+        Ok(Self {
+            zone: zone.to_string(),
+            group,
+        })
     }
-    Ok((seal.pubkey, rumor))
+}
+
+/// Validate a signed kind-1014 ticket found in a rumor slot.
+///
+/// `rumor_json` is the decrypted rumor, `sealer` the verified seal author,
+/// `me` the member pubkeys a ticket may name (the identity, as in the forum
+/// client; never the inbox key) and `groups` the supplied bindings. Rules,
+/// all MUSTs of NIP-171: signed event with a verifying id and signature;
+/// author equals the seal's author; exactly one `p` and one `epoch` tag
+/// (plain decimal); content 64 lowercase hex and a valid scalar; the signer
+/// is bound to exactly one supplied zone; the epoch is at least 1.
+pub fn validate_ticket(
+    rumor_json: &str,
+    sealer: &str,
+    me: &[String],
+    groups: &[GroupBinding],
+) -> Result<ZoneKey, GrantError> {
+    let ev: NostrEvent = serde_json::from_str(rumor_json).map_err(|_| GrantError::Malformed)?;
+    if ev.kind != KIND_EPOCH_TICKET {
+        return Err(GrantError::WrongKind(ev.kind));
+    }
+    verify_event_strict(&ev).map_err(|_| GrantError::Malformed)?;
+    if ev.pubkey != sealer {
+        return Err(GrantError::Unwrap(
+            "ticket author does not match seal author".to_string(),
+        ));
+    }
+    let one = |name: &str| -> Option<String> {
+        let mut it = ev
+            .tags
+            .iter()
+            .filter(|t| t.first().is_some_and(|n| n == name));
+        match (it.next(), it.next()) {
+            (Some(t), None) if t.len() == 2 => Some(t[1].clone()),
+            _ => None,
+        }
+    };
+    let member = one("p").ok_or(GrantError::Malformed)?;
+    let epoch = one("epoch").ok_or(GrantError::Malformed)?;
+    let lower_hex64 = |s: &str| is_hex64(s) && !s.bytes().any(|b| b.is_ascii_uppercase());
+    if !lower_hex64(&member) || !lower_hex64(&ev.content) {
+        return Err(GrantError::Malformed);
+    }
+    if epoch.is_empty()
+        || !epoch.bytes().all(|b| b.is_ascii_digit())
+        || (epoch.len() > 1 && epoch.starts_with('0'))
+    {
+        return Err(GrantError::Malformed);
+    }
+    let epoch: u32 = epoch.parse().map_err(|_| GrantError::Malformed)?;
+    if epoch == 0 || !me.contains(&member) {
+        return Err(GrantError::Malformed);
+    }
+    let mut bound = groups.iter().filter(|g| g.group == ev.pubkey);
+    let zone = match (bound.next(), bound.next()) {
+        (Some(g), None) => g.zone.clone(),
+        _ => return Err(GrantError::NoGroupBinding(ev.pubkey.clone())),
+    };
+    let secret = hex32(&ev.content).ok_or(GrantError::Malformed)?;
+    let pubkey = nostr_bbs_core::keys::pubkey_hex(&secret).map_err(|_| GrantError::Malformed)?;
+    ZoneKey::new(
+        &zone,
+        epoch,
+        &ev.content,
+        &pubkey,
+        KeySource::Grant {
+            granted_by: ev.pubkey.clone(),
+        },
+    )
+    .map_err(|_| GrantError::Malformed)
 }
 
 /// Open a gift wrap with the first of `keys` that decrypts it. Callers pass
@@ -190,23 +313,37 @@ pub struct GrantHarvest {
     pub ignored: usize,
 }
 
-/// Fetch every kind-1059 wrap addressed to `me` (and to `inbox`, when the
-/// admin has a registered inbox key) and keep the valid zone-key grants. The
-/// inbox secret is tried first, then the identity. Each distinct sealer's
-/// admin status is asked once.
+/// [`fetch_grants_with`] with no group bindings: kind-1014 tickets are then
+/// all refused, as before they existed.
 pub async fn fetch_grants<R: Relay>(
     relay: &mut R,
     me: &SecretKey,
     inbox: Option<&SecretKey>,
 ) -> Result<GrantHarvest, RelayError> {
+    fetch_grants_with(relay, me, inbox, &[]).await
+}
+
+/// Fetch every kind-1059 wrap addressed to `me` (and to `inbox`, when the
+/// admin has a registered inbox key) and keep the valid zone-key grants and
+/// NIP-171 epoch tickets. The inbox secret is tried first, then the identity.
+/// Each distinct sealer's admin status is asked once (grants only; a ticket's
+/// sealer is a group identity checked against `groups`).
+pub async fn fetch_grants_with<R: Relay>(
+    relay: &mut R,
+    me: &SecretKey,
+    inbox: Option<&SecretKey>,
+    groups: &[GroupBinding],
+) -> Result<GrantHarvest, RelayError> {
     let mut p_tags = Vec::new();
     let mut openers: Vec<&SecretKey> = Vec::new();
+    let mut owned: Vec<String> = Vec::new();
     if let Some(inbox) = inbox {
         p_tags.push(inbox.public_key().to_hex());
         openers.push(inbox);
     }
     p_tags.push(me.public_key().to_hex());
     openers.push(me);
+    owned.push(me.public_key().to_hex());
     let filter = Filter {
         kinds: Some(vec![KIND_GIFT_WRAP]),
         p_tags: Some(p_tags),
@@ -216,26 +353,48 @@ pub async fn fetch_grants<R: Relay>(
     let mut harvest = GrantHarvest::default();
     let mut admin_cache: HashMap<String, bool> = HashMap::new();
     for wrap in &wraps {
-        let Ok((sealer, mut rumor)) = open_gift_wrap_with(wrap, &openers) else {
+        let Some((sealer, mut rumor_json)) = openers
+            .iter()
+            .find_map(|k| open_gift_wrap_raw(wrap, k).ok())
+        else {
             harvest.ignored += 1;
             continue;
         };
-        if rumor.kind != KIND_ZONE_KEY_GRANT {
-            rumor.content.zeroize();
-            harvest.ignored += 1;
-            continue;
-        }
-        let is_admin = match admin_cache.get(&sealer) {
-            Some(v) => *v,
-            None => {
-                let v = relay.is_admin(&sealer).await?;
-                admin_cache.insert(sealer.clone(), v);
-                v
+        // The rumor carries the zone secret in hex either way.
+        let kind = serde_json::from_str::<serde_json::Value>(&rumor_json)
+            .ok()
+            .and_then(|v| v["kind"].as_u64());
+        let verdict = match kind {
+            Some(KIND_EPOCH_TICKET) => validate_ticket(&rumor_json, &sealer, &owned, groups),
+            Some(KIND_ZONE_KEY_GRANT) => {
+                let rumor: Result<UnsignedEvent, _> = serde_json::from_str(&rumor_json);
+                match rumor {
+                    Ok(r) if r.pubkey == sealer => {
+                        let is_admin = match admin_cache.get(&sealer) {
+                            Some(v) => *v,
+                            None => {
+                                let v = relay.is_admin(&sealer).await?;
+                                admin_cache.insert(sealer.clone(), v);
+                                v
+                            }
+                        };
+                        let out = validate_grant(&r, &sealer, is_admin);
+                        let mut r = r;
+                        r.content.zeroize();
+                        out
+                    }
+                    _ => Err(GrantError::Unwrap(
+                        "rumor author does not match seal author".to_string(),
+                    )),
+                }
+            }
+            _ => {
+                rumor_json.zeroize();
+                harvest.ignored += 1;
+                continue;
             }
         };
-        let verdict = validate_grant(&rumor, &sealer, is_admin);
-        // The rumor content carries the zone secret in hex.
-        rumor.content.zeroize();
+        rumor_json.zeroize();
         match verdict {
             Ok(key) => harvest.keys.push(key),
             Err(e) => harvest.rejected.push(RejectedGrant {

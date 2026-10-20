@@ -141,6 +141,10 @@ pub struct SealReport {
 ///    published; after `OK true` it is fetched back by id, opened with the
 ///    zone key, and its inner event must equal the original byte for byte.
 ///
+/// Before anything is sealed, each zone's current key must match the highest
+/// epoch and pubkey seen in the `zk` tags of its live encrypted posts
+/// (`EngineError::Refused` otherwise); a grant alone never picks the seal key.
+///
 /// The entry becomes `sealed`, or `failed` with the reason.
 pub async fn seal<R: Relay>(
     relay: &mut R,
@@ -208,6 +212,16 @@ pub async fn seal<R: Relay>(
         .collect();
     if !missing.is_empty() {
         return Err(EngineError::MissingKeys(missing.into_iter().collect()));
+    }
+
+    // The seal key must be the key the zone really uses, never merely the
+    // highest epoch some grant supplied.
+    let zones_to_seal: BTreeSet<String> = work
+        .iter()
+        .map(|(id, _)| state.entries[id].zone.clone())
+        .collect();
+    for zone in &zones_to_seal {
+        check_anchor(zone, keys, &scans)?;
     }
 
     let total = work.len();
@@ -580,6 +594,58 @@ fn adopt(
         }
         Some((outer.id.clone(), zk.1, sha256_hex(inner.as_bytes())))
     })
+}
+
+/// Refuse to seal `zone` unless its current key is the one its live
+/// encrypted posts use: the highest observed `zk` epoch must equal the key's
+/// epoch and its pubkey must match. A grant-only key with no observed post at
+/// its epoch is never a seal key. Messages name the epoch and the reason but
+/// never key material.
+// FOLLOW-UP (Phase 4 review): a zone with no live encrypted post is refused,
+// which is correct for a re-seal but blocks the legitimate FIRST encryption of
+// an all-plaintext zone. None of the three live zones are all-plaintext, so
+// this does not affect the current migration; before the kit is used to encrypt
+// a fresh zone, add an explicit `--allow-unanchored-first-encryption` opt-in
+// that permits sealing ONLY when no posts are observed (a populated zone must
+// still match its live ciphertext, flag or not).
+fn check_anchor(zone: &str, keys: &KeyRing, scans: &[ChannelScan]) -> Result<(), EngineError> {
+    let current = keys.current(zone).expect("checked above");
+    let mut observed: std::collections::BTreeMap<u32, BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for scan in scans.iter().filter(|s| s.plan.zone == zone) {
+        for (epoch, pk) in &scan.observed_zk {
+            observed.entry(*epoch).or_default().insert(pk.as_str());
+        }
+    }
+    let refuse = |why: String| {
+        Err(EngineError::Refused(format!(
+            "refusing to seal zone {zone} with the epoch {} key: {why}. Nothing was sealed.",
+            current.epoch()
+        )))
+    };
+    let Some((top, pks)) = observed.iter().next_back() else {
+        return refuse(
+            "no live encrypted post of this zone was seen on the relay to confirm it is the zone's key"
+                .to_string(),
+        );
+    };
+    if pks.len() > 1 {
+        return refuse(format!(
+            "posts at the zone's highest observed epoch {top} name more than one key"
+        ));
+    }
+    if *top != current.epoch() {
+        return refuse(format!(
+            "the zone's highest observed epoch is {top}, so a key at epoch {} has no post to confirm it",
+            current.epoch()
+        ));
+    }
+    if !pks.contains(current.pubkey()) {
+        return refuse(format!(
+            "its public key differs from the one the zone's epoch {top} posts use"
+        ));
+    }
+    Ok(())
 }
 
 /// `(zone, epoch)` from an envelope's `zk` tag.

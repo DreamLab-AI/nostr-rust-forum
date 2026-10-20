@@ -20,10 +20,9 @@ use super::inbox_key::{
     deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, recipient_keys_enabled,
     subscription_targets, sweep_targets, unwrap_inbox_then_identity, LivePort, SweepCandidate,
 };
+use super::keyset::{self, SendKeyError};
 use super::read_cache::ReadCache;
-use super::{
-    is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKey, KIND_ZONE_KEY_GRANT,
-};
+use super::{is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKey};
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::indexed_db::ForumDb;
 
@@ -39,7 +38,8 @@ fn now_secs() -> u64 {
 /// Zone keys and the per-message decryption state.
 #[derive(Clone, Copy)]
 pub struct ZoneKeyStore {
-    /// Keys by `"<zone>:<epoch>"`.
+    /// Keys by [`ZoneKey::store_id`] (zone, group, epoch, pubkey), so two
+    /// keys claiming one epoch both stay visible (ADR-2028 decision 6).
     pub keys: RwSignal<HashMap<String, ZoneKey>>,
     /// Bumped whenever keys change or messages are re-decrypted.
     pub revision: RwSignal<u64>,
@@ -89,15 +89,21 @@ impl ZoneKeyStore {
         }
     }
 
-    /// Key for `(zone, epoch)`, untracked.
+    /// Key for `(zone, epoch)`, untracked. Deterministic when an epoch is
+    /// inconsistent (see [`keyset::read_key`]); the read path still checks
+    /// the result against the message's `zk` pubkey.
     pub fn lookup(&self, zone: &str, epoch: u32) -> Option<ZoneKey> {
         self.keys
-            .with_untracked(|m| m.get(&super::key_id(zone, epoch)).cloned())
+            .with_untracked(|m| keyset::read_key(m.values(), zone, epoch))
     }
 
-    /// Highest-epoch key held for `zone`, untracked.
-    pub fn latest(&self, zone: &str) -> Option<ZoneKey> {
-        self.keys.with_untracked(|m| latest_in(m, zone))
+    /// The key to send under for `zone`: `Err` while any epoch of the zone is
+    /// claimed by two different pubkeys, `Ok(None)` when no key is eligible
+    /// (including a derived genesis epoch 0 with no live epoch yet). See
+    /// [`keyset::send_key`].
+    pub fn current_send_key(&self, zone: &str) -> Result<Option<ZoneKey>, SendKeyError> {
+        self.keys
+            .with_untracked(|m| keyset::send_key(m.values(), zone))
     }
 
     /// Every key held for `zone`, oldest epoch first, untracked.
@@ -117,7 +123,7 @@ impl ZoneKeyStore {
     /// Add a key (persisted), then re-decrypt anything waiting for it.
     /// Returns `false` when the key was already held.
     pub fn insert(&self, key: ZoneKey) -> bool {
-        let id = key.id();
+        let id = key.store_id();
         if self.keys.with_untracked(|m| m.get(&id) == Some(&key)) {
             return false;
         }
@@ -207,11 +213,15 @@ impl ZoneKeyStore {
         let Ok(db) = ForumDb::open().await else {
             return;
         };
+        // One-way: rewrite entries stored under the old "<zone>:<epoch>" id.
+        if db.migrate_zone_keys().await.is_err() {
+            web_sys::console::warn_1(&"[zone-key] store migration failed".into());
+        }
         if let Ok(keys) = db.get_all_zone_keys().await {
             if !keys.is_empty() {
                 self.keys.update(|m| {
                     for k in keys {
-                        m.insert(k.id(), k);
+                        m.insert(k.store_id(), k);
                     }
                 });
                 self.redecrypt();
@@ -314,9 +324,17 @@ impl ZoneKeyStore {
             // unmarked so a later session with a capable signer retries.
             Err(_) => return,
         };
-        if rumor.kind != KIND_ZONE_KEY_GRANT {
-            self.mark_processed(&wrap.id).await;
-            return;
+        match super::tickets::route(rumor.kind, super::tickets::zone_groups_enabled()) {
+            super::tickets::Route::Grant => {}
+            super::tickets::Route::Ignore => {
+                self.mark_processed(&wrap.id).await;
+                return;
+            }
+            super::tickets::Route::Ticket => {
+                self.process_ticket(wrap, inbox_ref, signer, me, via_inbox)
+                    .await;
+                return;
+            }
         }
         // A grant is marked processed only once its outcome is final. An
         // unreachable admin check or a key that did not reach IndexedDB leaves
@@ -374,6 +392,46 @@ impl ZoneKeyStore {
 
     /// Add a key and wait for it to reach IndexedDB. The key is usable this
     /// session either way; returns whether it was persisted.
+    /// An NIP-171 epoch ticket (ADR-2028 decision 2): opened with its
+    /// signature intact, accepted only from the zone's bound group identity,
+    /// and stored as the same [`ZoneKey`] a 21453 grant yields. No admin
+    /// check: the group identity is not an admin. Unloaded bindings leave the
+    /// wrap unmarked so the next session retries; any other refusal is final.
+    async fn process_ticket(
+        &self,
+        wrap: &NostrEvent,
+        inbox: Option<&dyn Signer>,
+        identity: &dyn Signer,
+        me: &str,
+        via_inbox: bool,
+    ) {
+        use super::tickets::{
+            ensure_bindings_loaded, loaded_bindings, ticket_verdict, TicketVerdict,
+        };
+        if let Err(e) = ensure_bindings_loaded().await {
+            web_sys::console::warn_1(&format!("[zone-key] bindings: {e}").into());
+        }
+        let opened = super::tickets::open_ticket(wrap, inbox, identity).await;
+        match ticket_verdict(opened, me, loaded_bindings().as_ref(), now_secs()) {
+            TicketVerdict::Retry => {}
+            TicketVerdict::Refuse(why) => {
+                web_sys::console::warn_1(&format!("[zone-key] ticket refused: {why}").into());
+                self.mark_processed(&wrap.id).await;
+            }
+            TicketVerdict::Accept(key) => {
+                let key = *key;
+                let id = super::key_id(&key.zone, key.epoch);
+                let persisted = self.insert_persisted(key).await;
+                if via_inbox && persisted {
+                    self.mark_inbox_granted(&id).await;
+                }
+                if persisted {
+                    self.mark_processed(&wrap.id).await;
+                }
+            }
+        }
+    }
+
     async fn insert_persisted(&self, key: ZoneKey) -> bool {
         let persisted = match ForumDb::open().await {
             Ok(db) => match db.put_zone_key(&key).await {
@@ -385,7 +443,7 @@ impl ZoneKeyStore {
             },
             Err(_) => false,
         };
-        let id = key.id();
+        let id = key.store_id();
         if self.keys.with_untracked(|m| m.get(&id) != Some(&key)) {
             self.keys.update(|m| {
                 m.insert(id, key);
@@ -597,7 +655,10 @@ pub async fn prepare_outgoing(
     let Some((zone_id, display, encrypted)) = channel_zone(channels, channel_id) else {
         return Ok(unsigned);
     };
-    let latest = keys.and_then(|s| s.latest(&zone_id));
+    let latest = match keys {
+        Some(s) => s.current_send_key(&zone_id).map_err(|e| e.to_string())?,
+        None => None,
+    };
     let plan = super::write_plan(encrypted, &display, latest)?;
     if plan == super::WritePlan::Plain {
         return Ok(unsigned);

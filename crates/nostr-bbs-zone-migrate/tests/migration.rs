@@ -8,7 +8,9 @@ use nostr_bbs_core::sealed::{open_sealed, parse_sealed};
 use nostr_bbs_core::{sign_event, NostrEvent, UnsignedEvent};
 use nostr_bbs_zone_migrate::channels::ChannelSpec;
 use nostr_bbs_zone_migrate::engine::{self, EngineError, PURGE_REASON};
-use nostr_bbs_zone_migrate::grants::{fetch_grants, KIND_ZONE_KEY_GRANT};
+use nostr_bbs_zone_migrate::grants::{
+    fetch_grants, fetch_grants_with, GroupBinding, KIND_EPOCH_TICKET, KIND_ZONE_KEY_GRANT,
+};
 use nostr_bbs_zone_migrate::keys::{KeyRing, KeySource};
 use nostr_bbs_zone_migrate::state::{State, Status, Step};
 
@@ -41,6 +43,8 @@ fn seeded(n: usize) -> (FakeRelay, Vec<NostrEvent>) {
         relay.insert(o.clone());
     }
     relay.insert(post(AUTHOR, OTHER_CHANNEL, 1_600_000_000, "not listed"));
+    // The zone's real current key, as its live encrypted posts show it.
+    relay.insert(live_zk_post(CHANNEL, "zone3", 2, ZONE3_E2));
     (relay, originals)
 }
 
@@ -141,7 +145,7 @@ fn full_run_seals_verifies_and_purges_preserving_every_original() {
         assert!(relay.has(st.entries[&o.id].outer_id.as_ref().unwrap()));
     }
     // The unlisted channel is untouched and nothing was published as kind 5.
-    assert_eq!(relay.events.iter().filter(|e| e.kind == 42).count(), 6);
+    assert_eq!(relay.events.iter().filter(|e| e.kind == 42).count(), 7);
     assert!(relay.published.iter().all(|e| e.kind == 42));
 
     // After purge, verify still proves the envelopes byte for byte via the
@@ -489,6 +493,7 @@ fn grants_from_admins_are_accepted_and_others_refused_or_ignored() {
         keys.insert(key).unwrap();
     }
     relay.insert(post(AUTHOR, CHANNEL, 1_600_000_000, "granted"));
+    relay.insert(live_zk_post(CHANNEL, "zone3", 2, ZONE3_E2));
     let mut st = new_state();
     let mut sink = Sink::default();
     assert_eq!(
@@ -498,4 +503,287 @@ fn grants_from_admins_are_accepted_and_others_refused_or_ignored() {
         1
     );
     assert_eq!(verify(&mut relay, &keys, &mut st, &mut sink).verified, 1);
+}
+
+// ── NIP-171 epoch tickets (kind 1014) ────────────────────────────────────────
+
+/// A signed ticket by `group` for `member`, wrapped to MIGRATOR with a seal
+/// signed by `seal_by`, the way the forum client's `wrap_ticket` does.
+fn ticket_wrap(
+    group: [u8; 32],
+    seal_by: [u8; 32],
+    tags: Vec<Vec<String>>,
+    content: &str,
+) -> NostrEvent {
+    let me = pk(MIGRATOR);
+    let ticket = sign(group, KIND_EPOCH_TICKET, 5, tags, content);
+    let me_bytes: [u8; 32] = hex::decode(&me).unwrap().try_into().unwrap();
+    let sealed = nostr_bbs_core::nip44::encrypt(
+        &seal_by,
+        &me_bytes,
+        &serde_json::to_string(&ticket).unwrap(),
+    )
+    .unwrap();
+    let seal = sign(seal_by, 13, 1, vec![], &sealed);
+    nostr_bbs_core::gift_wrap::wrap_seal(&seal, &me).unwrap()
+}
+
+fn good_tags(epoch: &str) -> Vec<Vec<String>> {
+    vec![tag(&["p", &pk(MIGRATOR)]), tag(&["epoch", epoch])]
+}
+
+fn binding(group: [u8; 32]) -> GroupBinding {
+    format!("zone3={}", pk(group)).parse().unwrap()
+}
+
+#[test]
+fn ticket_from_the_bound_group_is_accepted_beside_a_21453_grant() {
+    let group = [0x71; 32];
+    let admin = [0x55; 32];
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.admins.insert(pk(admin));
+    relay.insert(ticket_wrap(
+        group,
+        group,
+        good_tags("3"),
+        &hex::encode(ZONE3_E2),
+    ));
+    relay.insert(grant_wrap(admin, KIND_ZONE_KEY_GRANT, ZONE3_E1, 1));
+    let h = block_on(fetch_grants_with(
+        &mut relay,
+        &sk(MIGRATOR),
+        None,
+        &[binding(group)],
+    ))
+    .unwrap();
+    assert!(h.rejected.is_empty(), "{:?}", h.rejected);
+    let mut got: Vec<_> = h.keys.iter().map(|k| (k.zone(), k.epoch())).collect();
+    got.sort();
+    assert_eq!(got, vec![("zone3", 1), ("zone3", 3)]);
+    let t = h.keys.iter().find(|k| k.epoch() == 3).unwrap();
+    assert_eq!(t.pubkey(), pk(ZONE3_E2));
+    assert_eq!(
+        t.source(),
+        &KeySource::Grant {
+            granted_by: pk(group)
+        }
+    );
+}
+
+#[test]
+fn ticket_without_a_binding_or_from_another_signer_is_refused() {
+    let group = [0x71; 32];
+    let other = [0x72; 32];
+    let content = hex::encode(ZONE3_E2);
+    for (label, wrap, bindings) in [
+        (
+            "no binding",
+            ticket_wrap(group, group, good_tags("3"), &content),
+            vec![],
+        ),
+        (
+            "binding names another group",
+            ticket_wrap(group, group, good_tags("3"), &content),
+            vec![binding(other)],
+        ),
+        (
+            "seal signed by an impostor",
+            ticket_wrap(group, other, good_tags("3"), &content),
+            vec![binding(group)],
+        ),
+        (
+            "two p tags",
+            ticket_wrap(
+                group,
+                group,
+                vec![
+                    tag(&["p", &pk(MIGRATOR)]),
+                    tag(&["p", &pk(MIGRATOR)]),
+                    tag(&["epoch", "3"]),
+                ],
+                &content,
+            ),
+            vec![binding(group)],
+        ),
+        (
+            "missing epoch",
+            ticket_wrap(group, group, vec![tag(&["p", &pk(MIGRATOR)])], &content),
+            vec![binding(group)],
+        ),
+        (
+            "non-hex content",
+            ticket_wrap(group, group, good_tags("3"), "not hex"),
+            vec![binding(group)],
+        ),
+        (
+            "out-of-range scalar",
+            ticket_wrap(group, group, good_tags("3"), &"f".repeat(64)),
+            vec![binding(group)],
+        ),
+        (
+            "uppercase hex",
+            ticket_wrap(
+                group,
+                group,
+                good_tags("3"),
+                &hex::encode([0xab; 32]).to_uppercase(),
+            ),
+            vec![binding(group)],
+        ),
+        (
+            "epoch 0 is record-only",
+            ticket_wrap(group, group, good_tags("0"), &content),
+            vec![binding(group)],
+        ),
+        (
+            "ticket for someone else",
+            ticket_wrap(
+                group,
+                group,
+                vec![tag(&["p", &pk(AUTHOR)]), tag(&["epoch", "3"])],
+                &content,
+            ),
+            vec![binding(group)],
+        ),
+    ] {
+        let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+        relay.insert(wrap);
+        let h = block_on(fetch_grants_with(
+            &mut relay,
+            &sk(MIGRATOR),
+            None,
+            &bindings,
+        ))
+        .unwrap();
+        assert!(h.keys.is_empty(), "{label}: accepted");
+        assert_eq!(h.rejected.len(), 1, "{label}");
+    }
+    // The plain entry point has no bindings, so it refuses tickets too.
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(ticket_wrap(group, group, good_tags("3"), &content));
+    let h = block_on(fetch_grants(&mut relay, &sk(MIGRATOR), None)).unwrap();
+    assert!(h.keys.is_empty() && h.rejected.len() == 1);
+}
+
+#[test]
+fn group_pubkey_flag_parses_zone_equals_hex() {
+    assert!("zone3=zz".parse::<GroupBinding>().is_err());
+    assert!("=".parse::<GroupBinding>().is_err());
+    assert!("nothing".parse::<GroupBinding>().is_err());
+    assert_eq!(binding([0x71; 32]).group, pk([0x71; 32]));
+}
+
+#[test]
+fn ticket_naming_the_inbox_key_is_refused_like_the_client() {
+    let group = [0x71; 32];
+    let inbox = [0x23; 32];
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(ticket_wrap(
+        group,
+        group,
+        vec![tag(&["p", &pk(inbox)]), tag(&["epoch", "3"])],
+        &hex::encode(ZONE3_E2),
+    ));
+    let h = block_on(fetch_grants_with(
+        &mut relay,
+        &sk(MIGRATOR),
+        Some(&sk(inbox)),
+        &[binding(group)],
+    ))
+    .unwrap();
+    assert!(h.keys.is_empty());
+    assert_eq!(h.rejected.len(), 1);
+}
+
+// ── Seal key anchored to the zone's observed key ─────────────────────────────
+
+fn refusal_with(relay_posts: Vec<NostrEvent>, keys: &KeyRing) -> Result<String, usize> {
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(post(AUTHOR, CHANNEL, 1_600_000_000, "plain"));
+    for p in relay_posts {
+        relay.insert(p);
+    }
+    let mut st = new_state();
+    let mut sink = Sink::default();
+    match seal(&mut relay, keys, &mut st, None, &mut sink) {
+        Err(EngineError::Refused(m)) => {
+            assert!(relay.published.is_empty(), "nothing may be published");
+            Ok(m)
+        }
+        Ok(r) => Err(r.plan.channels[0].would_seal.len() + 1000 * r.failed.len().max(1)),
+        Err(e) => panic!("unexpected {e:?}"),
+    }
+}
+
+#[test]
+fn higher_epoch_grant_with_no_observed_post_is_never_a_seal_key() {
+    // The ring holds a granted epoch 3, but every live post uses epoch 2.
+    let mut keys = ring();
+    keys.insert(zone_key(
+        "zone3",
+        3,
+        [0x35; 32],
+        KeySource::Grant {
+            granted_by: pk([0x55; 32]),
+        },
+    ))
+    .unwrap();
+    let msg = refusal_with(vec![live_zk_post(CHANNEL, "zone3", 2, ZONE3_E2)], &keys).unwrap();
+    assert!(
+        msg.contains("epoch 3") && msg.contains("highest observed epoch is 2"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains(&hex::encode([0x35; 32])),
+        "no key material in the message"
+    );
+    // No live post at all: nothing confirms any key.
+    let msg = refusal_with(vec![], &ring()).unwrap();
+    assert!(msg.contains("no live encrypted post"), "{msg}");
+}
+
+#[test]
+fn observed_pubkey_mismatch_at_the_same_epoch_is_refused_and_a_match_seals() {
+    // The posts name a different epoch-2 key than the one held.
+    let msg = refusal_with(vec![live_zk_post(CHANNEL, "zone3", 2, [0x36; 32])], &ring()).unwrap();
+    assert!(msg.contains("differs"), "{msg}");
+    // Two keys claimed at the highest observed epoch: ambiguous, refused.
+    let msg = refusal_with(
+        vec![
+            live_zk_post(CHANNEL, "zone3", 2, ZONE3_E2),
+            live_zk_post(CHANNEL, "zone3", 2, [0x36; 32]),
+        ],
+        &ring(),
+    )
+    .unwrap();
+    assert!(msg.contains("more than one key"), "{msg}");
+    // A match seals.
+    assert!(refusal_with(vec![live_zk_post(CHANNEL, "zone3", 2, ZONE3_E2)], &ring()).is_err());
+}
+
+#[test]
+fn ticket_epoch_key_must_match_what_the_zone_posts_use() {
+    let group = [0x71; 32];
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    relay.insert(ticket_wrap(
+        group,
+        group,
+        good_tags("2"),
+        &hex::encode([0x36; 32]),
+    ));
+    let h = block_on(fetch_grants_with(
+        &mut relay,
+        &sk(MIGRATOR),
+        None,
+        &[binding(group)],
+    ))
+    .unwrap();
+    assert_eq!(h.keys.len(), 1);
+    let mut keys = KeyRing::new();
+    for k in h.keys {
+        keys.insert(k).unwrap();
+    }
+    // The ticket's epoch-2 key differs from the observed epoch-2 key.
+    let msg = refusal_with(vec![live_zk_post(CHANNEL, "zone3", 2, ZONE3_E2)], &keys).unwrap();
+    assert!(msg.contains("differs"), "{msg}");
 }

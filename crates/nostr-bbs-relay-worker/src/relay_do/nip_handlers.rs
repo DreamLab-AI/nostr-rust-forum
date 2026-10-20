@@ -1057,13 +1057,21 @@ impl NostrRelayDO {
         )
     }
 
-    /// The relay's own canonical URL (`RELAY_URL`), used to verify a client's
-    /// NIP-42 `["relay", …]` tag. Returns `None` when unset/blank, which makes
-    /// `evaluate_auth_event` skip the relay-tag check (fail-open on that
-    /// defence-in-depth check only; the per-session challenge still applies).
-    pub(crate) fn own_relay_url(&self) -> Option<String> {
+    /// The `RELAY_URL` var, if non-blank.
+    fn relay_url_var(&self) -> Option<String> {
         self.env
             .var("RELAY_URL")
+            .ok()
+            .map(|v| v.to_string())
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Extra relay URLs this relay also answers to, from the optional
+    /// comma-separated `RELAY_URL_ALIASES` var (a custom domain plus the
+    /// `workers.dev` host, say). Explicit config only.
+    fn relay_url_aliases(&self) -> Option<String> {
+        self.env
+            .var("RELAY_URL_ALIASES")
             .ok()
             .map(|v| v.to_string())
             .filter(|s| !s.trim().is_empty())
@@ -1549,6 +1557,34 @@ impl NostrRelayDO {
             }
         }
 
+        // ADR-2028 decisions 4 and 6: the `zk` group hint and epoch uniqueness,
+        // for the zone the event is bound to (the channel's bound zone for a
+        // kind 42, the zone tag for kanban). A `zk` naming any other zone, or an
+        // unscoped channel, claims nothing. WARNING: within the bound zone a
+        // cohort member CAN still first-write-win future epochs (current+1..)
+        // with junk pubkeys and block the owner's later rotations; the claim cap
+        // bounds the blast radius but does not close it. The real fix is an
+        // owner-only epoch binding, the hard pre-flag-on blocker in ADR-2028.
+        // ZONE_GROUPS_ENABLED must stay off until that lands.
+        if self.zone_groups_enabled()
+            && (event.kind == 42 || nostr_bbs_core::is_kanban_kind(event.kind))
+        {
+            let bound: Option<String> = if event.kind == 42 {
+                match filter::channel_tag(&event) {
+                    Some(cid) => self.cached_channel_zone(&cid).await,
+                    None => None,
+                }
+            } else {
+                nostr_bbs_core::read_zone_tag(&event).map(str::to_string)
+            };
+            if let Some(zone) = bound {
+                if let Err(reason) = self.zone_group_gate(&zone, &event.tags).await {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+            }
+        }
+
         // NIP-16 event treatment
         let treatment = event_treatment(event.kind);
 
@@ -1850,7 +1886,7 @@ impl NostrRelayDO {
         // NIP-59: kind-1059 (Sealed DM) read gate + mandatory #p rewrite. Shared
         // with the COUNT path so both reject unauthenticated kind-1059 reads and
         // bind results to the authed recipient identically.
-        let read_set = self.recipient_read_set(&session_pubkey).await;
+        let read_set = self.wrap_read_set(&session_pubkey).await;
         let filters = match Self::gate_kind_1059_filters_with(
             filters,
             &session_pubkey,
@@ -2074,14 +2110,19 @@ impl NostrRelayDO {
             let sessions = self.sessions.borrow();
             sessions.get(&session_id).map(|s| s.challenge.clone())
         };
-        let own_relay_url = self.own_relay_url();
-        nip42::warn_if_relay_url_unconfigured(self.auth_mode(), own_relay_url.as_deref());
+        let allowed = nip42::allowed_relay_urls(
+            self.relay_url_var().as_deref(),
+            self.relay_url_aliases().as_deref(),
+        );
+        // Loud when unconfigured: in nip42 mode an empty allowlist refuses every
+        // authenticated write. Operators must set RELAY_URL before deploy.
+        nip42::warn_if_relay_url_unconfigured(self.auth_mode(), &allowed);
         let now = auth::js_now_secs();
 
         match nip42::evaluate_auth_event(
             &event,
             expected_challenge.as_deref(),
-            own_relay_url.as_deref(),
+            &allowed,
             now,
             nip42::AUTH_MAX_SKEW_SECS,
         ) {
@@ -2226,10 +2267,12 @@ impl NostrRelayDO {
             None => (Vec::new(), false),
         };
         let viewer_is_admin = is_admin || cohort_admin;
-        let recipient_keys = match &session_pubkey {
+        let mut recipient_keys = match &session_pubkey {
             Some(pk) => self.cached_recipient_keys(pk).await,
             None => Vec::new(),
         };
+        // ADR-2028: epoch keys of the viewer's zones read like inbox keys here.
+        recipient_keys.extend(self.epoch_read_keys(&session_pubkey).await);
         ViewerContext {
             session_pubkey,
             access_pubkey,
@@ -2297,6 +2340,13 @@ impl NostrRelayDO {
         let Some(pk) = gift_wrap_recipient(event) else {
             return Err(REASON_NOT_WHITELISTED);
         };
+        // ADR-2028 decision 8: a registered, unrevoked epoch key is a zone's
+        // recipient. There is no owner to check, so no whitelist read; ingress
+        // and the inbox route behave as before for every other key.
+        if !is_ingress && self.zone_groups_enabled() && self.cached_epoch_zone(&pk).await.is_some()
+        {
+            return Ok(());
+        }
         if !self.recipient_keys_enabled() {
             return if is_ingress || self.is_whitelisted(&pk).await {
                 Ok(())
@@ -2389,6 +2439,134 @@ impl NostrRelayDO {
         let pk = session_pubkey.as_ref()?;
         let extra = self.cached_recipient_keys(pk).await;
         Some(crate::recipient_keys::read_set(pk, &extra))
+    }
+
+    /// ADR-2028: whether zone groups are on. Only the exact string `"true"` in
+    /// `ZONE_GROUPS_ENABLED` enables; absent means off.
+    pub(crate) fn zone_groups_enabled(&self) -> bool {
+        crate::zone_groups::zone_groups_enabled_var(
+            self.env
+                .var(crate::zone_groups::ZONE_GROUPS_ENABLED_VAR)
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+        )
+    }
+
+    /// Zone of an unrevoked epoch key through the 60s memo (positive only, so a
+    /// key registered a moment later is admitted on the next frame).
+    pub(crate) async fn cached_epoch_zone(&self, key: &str) -> Option<String> {
+        let key = key.to_ascii_lowercase();
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.epoch_zone_cache.get(&key, now) {
+            return Some(hit);
+        }
+        let db = self.env.d1("DB").ok()?;
+        let zone = crate::recipient_keys::epoch_zone(&db, &key).await?;
+        self.epoch_zone_cache.insert(&key, zone.clone(), now);
+        Some(zone)
+    }
+
+    /// The epoch keys a session may read wraps for: those of the zones whose
+    /// read rule its owner-rebound cohorts pass. Empty when the feature is off
+    /// or the session is unauthenticated. Read paths only: these keys are never
+    /// part of the deletion sets, so a cohort member cannot delete a zone's wrap.
+    pub(crate) async fn epoch_read_keys(&self, session_pubkey: &Option<String>) -> Vec<String> {
+        let Some(pk) = session_pubkey else {
+            return Vec::new();
+        };
+        if !self.zone_groups_enabled() {
+            return Vec::new();
+        }
+        let now = auth::js_now_secs();
+        let rows = match self.epoch_rows_cache.get("all", now) {
+            Some(r) => r,
+            None => {
+                let fresh = match self.env.d1("DB") {
+                    Ok(db) => crate::recipient_keys::epoch_rows(&db).await,
+                    Err(_) => Vec::new(),
+                };
+                if !fresh.is_empty() {
+                    self.epoch_rows_cache.insert("all", fresh.clone(), now);
+                }
+                fresh
+            }
+        };
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let access = self.effective_pubkey(pk).await;
+        let (cohorts, cohort_admin) = self.cached_viewer_cohorts(&access).await;
+        let is_admin = self.admin_cache.is_admin(&access, &self.env).await || cohort_admin;
+        crate::zone_groups::epoch_keys_for_viewer(
+            &rows,
+            &ZoneConfig::load(&self.env),
+            true,
+            &cohorts,
+            is_admin,
+        )
+    }
+
+    /// Read set for REQ/COUNT: [`Self::recipient_read_set`] plus the session's
+    /// readable epoch keys. `None` only when both are absent, which keeps the
+    /// single-pubkey rule.
+    pub(crate) async fn wrap_read_set(
+        &self,
+        session_pubkey: &Option<String>,
+    ) -> Option<Vec<String>> {
+        let base = self.recipient_read_set(session_pubkey).await;
+        let epochs = self.epoch_read_keys(session_pubkey).await;
+        if epochs.is_empty() {
+            return base;
+        }
+        let pk = session_pubkey.as_ref()?;
+        let mut set = base.unwrap_or_else(|| crate::recipient_keys::read_set(pk, &[]));
+        for k in epochs {
+            if !crate::recipient_keys::set_contains(&set, &k) {
+                set.push(k);
+            }
+        }
+        Some(set)
+    }
+
+    /// ADR-2028 decisions 4 and 6 for an event bound to `zone`: the `zk` group
+    /// hint against the binding, then epoch uniqueness. Every claim is checked
+    /// before any is inserted, so a refused event claims nothing.
+    pub(crate) async fn zone_group_gate(
+        &self,
+        zone: &str,
+        tags: &[Vec<String>],
+    ) -> std::result::Result<(), &'static str> {
+        use crate::zone_groups::{
+            claim_epoch_key, epoch_verdict, hint_verdict, lookup_epoch_key, zk_claims,
+            REASON_EPOCH_UNAVAILABLE,
+        };
+        let claims = zk_claims(zone, tags);
+        if claims.is_empty() {
+            return Ok(());
+        }
+        hint_verdict(true, &ZoneConfig::load(&self.env), zone, &claims)?;
+        let db = self.env.d1("DB").map_err(|_| REASON_EPOCH_UNAVAILABLE)?;
+        let now = auth::js_now_secs();
+        for c in &claims {
+            let ck = format!("{zone}/{}", c.epoch);
+            let stored = match self.zone_epoch_cache.get(&ck, now) {
+                Some(s) => Some(s),
+                None => lookup_epoch_key(&db, zone, c.epoch)
+                    .await
+                    .map_err(|_| REASON_EPOCH_UNAVAILABLE)?,
+            };
+            epoch_verdict(stored.as_deref(), &c.pubkey)?;
+        }
+        for c in &claims {
+            let winner = claim_epoch_key(&db, zone, c.epoch, &c.pubkey, now)
+                .await
+                .map_err(|_| REASON_EPOCH_UNAVAILABLE)?;
+            self.zone_epoch_cache
+                .insert(&format!("{zone}/{}", c.epoch), winner.clone(), now);
+            epoch_verdict(Some(&winner), &c.pubkey)?;
+        }
+        Ok(())
     }
 
     /// Record `delivered` reads for an authed reader and flush the trust ledger
@@ -2588,7 +2766,7 @@ impl NostrRelayDO {
         }
 
         // kind-1059 gate identical to REQ; deny-by-default → count 0 on reject.
-        let read_set = self.recipient_read_set(&session_pubkey).await;
+        let read_set = self.wrap_read_set(&session_pubkey).await;
         let filters = match Self::gate_kind_1059_filters_with(
             filters,
             &session_pubkey,
@@ -6573,6 +6751,36 @@ mod recipient_key_read_tests {
                 &extra,
                 AuthMode::Nip42,
             )
+    }
+
+    /// ADR-2028 decision 8: the viewer's set is its pubkey plus the epoch keys
+    /// `epoch_keys_for_viewer` derives from its cohorts, so a cohort member is
+    /// served the zone's wrap without authenticating as the epoch key.
+    #[test]
+    fn epoch_wrap_is_served_to_a_cohort_member_and_withheld_from_others() {
+        let zones = ZoneConfig::from_json(
+            r#"[{"id":"family","required_cohorts":["family"],"visibility":"locked"}]"#,
+        );
+        let rows = vec![("ee".to_string(), "family".to_string())];
+        let ev = wrap_to("ee");
+        let f = serde_json::json!({ "kinds": [1059], "#p": ["ee"] });
+        let cohort = vec!["family".to_string()];
+        let member_keys =
+            crate::zone_groups::epoch_keys_for_viewer(&rows, &zones, true, &cohort, false);
+        let stranger_keys =
+            crate::zone_groups::epoch_keys_for_viewer(&rows, &zones, true, &[], false);
+        let member: Vec<&str> = member_keys.iter().map(String::as_str).collect();
+        let stranger: Vec<&str> = stranger_keys.iter().map(String::as_str).collect();
+        assert!(delivered(OWNER, &member, f.clone(), &ev));
+        assert!(!delivered(OTHER, &stranger, f, &ev));
+    }
+
+    #[test]
+    fn epoch_keys_never_enter_the_deletion_set() {
+        // Deletion uses `recipient_read_set`, which never adds epoch keys; the
+        // ownership predicate it feeds therefore refuses an epoch wrap.
+        let own = read_set(OWNER, &[]);
+        assert!(!wrap_addressed_to(1059, r#"[["p","ee"]]"#, &own));
     }
 
     #[test]

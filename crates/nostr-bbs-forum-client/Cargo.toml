@@ -151,6 +151,12 @@ serde_json = { workspace = true, features = ["float_roundtrip"] }
 hex = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
+# NIP-171 recovery-master derivation (zone_crypto::nip171): BIP-39 seed, HKDF-SHA256,
+# NFKD input normalisation, OS entropy.
+bip39 = { workspace = true }
+hkdf = { workspace = true }
+getrandom = { workspace = true }
+unicode-normalization = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
 k256 = { workspace = true }

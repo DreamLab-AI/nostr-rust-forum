@@ -30,17 +30,17 @@ DEVICE_KEYS_ENABLED = "false"
 # Anything other than "allowlist" resolves to the secure default (nip42).
 AUTH_MODE = "nip42"
 # The relay's own canonical URL, used to verify the NIP-42 `["relay", <url>]`
-# tag on AUTH responses (defence-in-depth on top of the per-session challenge).
-# Set this to the wss:// URL clients connect to (the same value the client
-# reads from window.__ENV__.RELAY_URL). When BLANK the relay-tag check is
-# skipped (the challenge still fully protects the handshake) — so leaving it
-# unset still leaves the handshake challenge-protected, but strict relay
-# scoping is OFF.
-#
-# >>> RELAY_URL is REQUIRED in nip42 mode. Replace the blank below with this
-# >>> relay's wss:// URL before deploying. While AUTH_MODE = "nip42" and this is
-# >>> blank the relay logs a console error on every AUTH. <<<
+# tag on AUTH responses so a malicious relay cannot replay a client's AUTH here.
+# REQUIRED in nip42 mode: set this to the exact wss:// URL clients connect to.
+# When BLANK the relay FAILS CLOSED and refuses every authenticated write (it
+# never derives its identity from the request, which would let an attacker's
+# Host poison the check). So set it BEFORE deploying, or the board stops
+# accepting writes. The relay logs an error on every AUTH while it is blank.
 RELAY_URL = ""
+# Optional: extra wss:// URLs this relay also answers to, comma-separated, for a
+# relay reachable at more than one hostname (e.g. a custom domain plus the
+# workers.dev host). Each is matched the same way as RELAY_URL.
+RELAY_URL_ALIASES = ""
 
 # Escalation-default posture (REC-6 share / WP-9). The default authority
 # boundary the Agent Control Surface assumes, projected in the NIP-11
