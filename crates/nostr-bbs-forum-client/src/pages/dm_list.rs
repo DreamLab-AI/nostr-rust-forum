@@ -23,6 +23,7 @@ use crate::components::mention_autocomplete::{
     local_candidates, merge_candidates, search_profiles, MentionAutocomplete, MentionCandidate,
     NETWORK_SEARCH_MIN_LEN,
 };
+use crate::dm::requests::{self, Lane, RequestsStore};
 use crate::dm::{provide_dm_store, use_dm_store, DMConversation};
 use crate::relay::{ConnectionState, RelayConnection};
 use crate::utils::{format_relative_time, pubkey_color};
@@ -56,6 +57,13 @@ pub fn DmListPage() -> impl IntoView {
     // Provide DM store for this subtree
     provide_dm_store();
     let dm_store = use_dm_store();
+
+    // Message requests (ADR-2027): with the flag off none of this renders.
+    let requests_on = requests::enabled();
+    let req_store = RequestsStore::new(&auth.pubkey().get_untracked().unwrap_or_default());
+    provide_context(req_store);
+    let mutes = crate::stores::mute::use_mute_store();
+    let show_requests = RwSignal::new(false);
 
     // New conversation input. The field is a name search (issue #25): you type
     // a display name / @handle and pick a person; a pasted raw hex key or npub
@@ -126,6 +134,11 @@ pub fn DmListPage() -> impl IntoView {
             return false;
         }
         new_dm_error.set(None);
+        // Someone the member starts a conversation with is a contact, so their
+        // reply is not a request.
+        if requests_on {
+            req_store.accept(&pk);
+        }
         new_pubkey_input.set(String::new());
         search_open.set(false);
         search_candidates.set(Vec::new());
@@ -246,6 +259,28 @@ pub fn DmListPage() -> impl IntoView {
     };
 
     let conversations = dm_store.conversations();
+    // (main list, requests): everything is in the main list with the flag off.
+    let split = Memo::new(move |_| {
+        let all = conversations.get();
+        if !requests_on {
+            return (all, Vec::new());
+        }
+        let (mut main, mut reqs) = (Vec::new(), Vec::new());
+        for c in all {
+            match req_store.lane_of(&c.pubkey, mutes.is_user_muted(&c.pubkey)) {
+                Lane::Main => main.push(c),
+                Lane::Requests => reqs.push(c),
+                Lane::Hidden => {}
+            }
+        }
+        (main, reqs)
+    });
+    Effect::new(move |_| {
+        if requests_on {
+            let keys: Vec<String> = conversations.get().into_iter().map(|c| c.pubkey).collect();
+            req_store.resolve(&keys);
+        }
+    });
     let is_loading = dm_store.is_loading();
     let error = dm_store.error();
 
@@ -422,6 +457,29 @@ pub fn DmListPage() -> impl IntoView {
                 })
             }}
 
+            // Tabs: only with message requests switched on.
+            {requests_on.then(|| view! {
+                <div class="flex gap-2 mb-4" role="tablist" data-testid="dm-tabs">
+                    <button
+                        role="tab"
+                        aria-selected=move || (!show_requests.get()).to_string()
+                        class="px-4 py-2 rounded-full text-sm font-medium border border-gray-700 text-gray-300 aria-selected:bg-amber-500/20 aria-selected:text-amber-400"
+                        on:click=move |_| show_requests.set(false)
+                    >
+                        "Messages"
+                    </button>
+                    <button
+                        role="tab"
+                        data-testid="dm-requests-tab"
+                        aria-selected=move || show_requests.get().to_string()
+                        class="px-4 py-2 rounded-full text-sm font-medium border border-gray-700 text-gray-300 aria-selected:bg-amber-500/20 aria-selected:text-amber-400"
+                        on:click=move |_| show_requests.set(true)
+                    >
+                        {move || format!("Requests ({})", split.get().1.len())}
+                    </button>
+                </div>
+            })}
+
             // Conversation list
             {move || {
                 if is_loading.get() {
@@ -433,8 +491,40 @@ pub fn DmListPage() -> impl IntoView {
                         </div>
                     }.into_any()
                 } else {
-                    let convos = conversations.get();
-                    if convos.is_empty() {
+                    let in_requests = requests_on && show_requests.get();
+                    let convos = if in_requests { split.get().1 } else { split.get().0 };
+                    if in_requests && !convos.is_empty() {
+                        view! {
+                            <div class="space-y-3" data-testid="dm-requests">
+                                <p class="text-xs text-gray-500">
+                                    "People who are not members of this board. Requests do not add to your unread count."
+                                </p>
+                                {convos.into_iter().map(|convo| {
+                                    let accept_pk = convo.pubkey.clone();
+                                    let block_pk = convo.pubkey.clone();
+                                    view! {
+                                        <div class="space-y-1">
+                                            <ConversationRow convo=convo/>
+                                            <div class="flex gap-2 justify-end">
+                                                <button
+                                                    class="text-xs text-gray-900 bg-amber-500 hover:bg-amber-400 rounded px-3 py-1 font-semibold"
+                                                    on:click=move |_| req_store.accept(&accept_pk)
+                                                >
+                                                    "Accept"
+                                                </button>
+                                                <button
+                                                    class="text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded px-3 py-1"
+                                                    on:click=move |_| req_store.block(&block_pk, mutes)
+                                                >
+                                                    "Block"
+                                                </button>
+                                            </div>
+                                        </div>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        }.into_any()
+                    } else if convos.is_empty() {
                         let empty_icon: Box<dyn FnOnce() -> leptos::prelude::AnyView + Send> = Box::new(|| view! {
                             <svg class="w-7 h-7 text-amber-400/60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                                 <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" stroke-linecap="round" stroke-linejoin="round"/>

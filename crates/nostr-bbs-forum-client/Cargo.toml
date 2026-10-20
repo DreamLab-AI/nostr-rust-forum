@@ -22,6 +22,9 @@ dev-auth = []
 
 [dependencies]
 nostr-bbs-core = { workspace = true }
+# `EventBuilder::relay_list` builds the NIP-65 tags for the public-inbox opt-in.
+# Already in the wasm graph through nostr-bbs-core, so no new code ships.
+nostr = { workspace = true }
 # The poker table's engine types, rules, protocol and replay verifier,
 # shared with the house seat (nostr-bbs-poker-citizen).
 nostr-bbs-poker = { workspace = true }

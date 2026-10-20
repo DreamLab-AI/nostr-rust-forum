@@ -34,12 +34,18 @@ pub(crate) const RECIPIENT_KEYS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS r
     zone         TEXT, \
     role         TEXT NOT NULL CHECK(role IN ('inbox','epoch')), \
     created_at   INTEGER NOT NULL, \
-    revoked      INTEGER NOT NULL DEFAULT 0\
+    revoked      INTEGER NOT NULL DEFAULT 0,\
+    proof        TEXT\
 )";
 
 /// Owner lookup index, created alongside the table.
 pub(crate) const RECIPIENT_KEYS_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_recipient_keys_owner ON recipient_keys(owner_pubkey)";
+
+/// Migration 0012. Idempotent in effect: on a table that already has the column
+/// SQLite returns a duplicate-column error, which `ensure_schema` ignores.
+pub(crate) const RECIPIENT_KEYS_ADD_PROOF_SQL: &str =
+    "ALTER TABLE recipient_keys ADD COLUMN proof TEXT";
 
 /// Row for one inbox key, revoked or not. Deliberately no `revoked = 0`
 /// filter: a revoked key must be recognisable as registered, or it would fall

@@ -27,7 +27,11 @@ protect against a stolen identity signer, which can still recover the inbox key.
    `recipient_keys(key PK, owner_pubkey, zone, role IN ('inbox','epoch'), created_at, revoked)`.
    `effective_pubkey` never reads it. Feature switch `RECIPIENT_KEYS_ENABLED`, default off. Grant
    issuers (`auto_grant`, `zone-migrate`, agentbox `zone-keys.js`) get a lookup endpoint limited to
-   admins and zone owners.
+   admins and zone owners. Each lookup entry carries the member's own kind-27237 registration
+   proof, stored verbatim at registration (`recipient_keys.proof`, migration 0012). An issuer
+   re-verifies that proof, signed by the inbox key with an `owner` tag naming the member, before
+   wrapping anything to the key, so a wrong or hostile row can never redirect zone keys. Rows
+   without a proof are refused and the grant is retried, never downgraded to the identity key.
 3. **Relay rules.**
    - Admission (`:1149-1153`): `p` in `INGRESS_RECIPIENTS` accepts; `p` with an unrevoked inbox row
      accepts only if the owner is whitelisted; otherwise `p` itself must be whitelisted. An

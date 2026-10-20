@@ -10,11 +10,24 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use nostr_bbs_core::gift_wrap::{unwrap_gift_with_signer, KIND_ENCRYPTED_DM, KIND_GIFT_WRAP};
 use nostr_bbs_core::signer::Signer;
-use nostr_bbs_core::{gift_wrap_pair_with_signer, gift_wrap_with_signer, NostrEvent};
+use nostr_bbs_core::{
+    gift_wrap_pair_with_signer, gift_wrap_rumor_pair_with_signer, gift_wrap_with_signer, NostrEvent,
+};
 
 use crate::components::user_display::try_display_name;
 use crate::poker::coach::is_coach_content;
-use crate::relay::{EoseCallback, EventCallback, Filter, RelayConnection};
+use crate::relay::{
+    EoseCallback, EventCallback, Filter, OneShot, PublishCallback, RelayConnection,
+};
+
+pub mod consent;
+pub mod delivery;
+pub mod requests;
+pub mod routing;
+pub mod rumors;
+
+pub use delivery::{Attempt, Delivery};
+pub use rumors::Attachment;
 
 /// A single decrypted direct message.
 #[derive(Clone, Debug, PartialEq)]
@@ -51,6 +64,59 @@ struct DMStateInner {
     seen_ids: HashSet<String>,
     is_loading: bool,
     error: Option<String>,
+    /// Rumor id -> message id. A reaction or deletion names the RUMOR (both wraps
+    /// of a message share it); `DMMessage.id` is the outer wrap's.
+    rumor_index: HashMap<String, String>,
+    /// Message id -> rumor id, the inverse, for the UI to address a message.
+    msg_rumor: HashMap<String, String>,
+    /// Reactions by target rumor id. Kept even when the target has not arrived
+    /// yet (relays do not order a reaction after its message).
+    reactions: HashMap<String, Vec<Reaction>>,
+    /// `(target rumor id, deleter)` pairs. A deletion that arrives before its
+    /// target still applies; keyed by deleter so a stranger cannot cancel or
+    /// forge someone else's.
+    tombstones: HashSet<(String, String)>,
+    /// File-message attachments by message id.
+    attachments: HashMap<String, Attachment>,
+    /// Outcome of each message we sent, by message id (extended path only).
+    deliveries: HashMap<String, DeliveryReport>,
+    /// A question waiting for the member: may we connect to a stranger's relays?
+    consent: Option<consent::ConsentRequest>,
+}
+
+/// A reaction to a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    /// Lowercase hex of whoever reacted.
+    pub sender: String,
+    /// `+`, `-` or an emoji.
+    pub emoji: String,
+    /// The reaction's own rumor id (so it can itself be deleted).
+    pub rumor_id: String,
+}
+
+/// What happened to a message we sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryReport {
+    /// The single outcome to show: sent, partial or failed.
+    pub outcome: Delivery,
+    /// One entry per relay the recipient's copy was addressed to.
+    pub to_recipient: Vec<Attempt>,
+    /// Our own copy's attempt.
+    pub own_copy: Vec<Attempt>,
+}
+
+/// Per-message extras for the DM screen, keyed by `DMMessage.id`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DMExtras {
+    /// Reactions on each message.
+    pub reactions: HashMap<String, Vec<Reaction>>,
+    /// File-message attachments (render as a link; nothing is fetched).
+    pub attachments: HashMap<String, Attachment>,
+    /// Delivery outcome of messages we sent.
+    pub deliveries: HashMap<String, DeliveryReport>,
+    /// Rumor id of each message, for reacting to or deleting it.
+    pub rumor_ids: HashMap<String, String>,
 }
 
 /// Reactive DM store provided as Leptos context.
@@ -150,14 +216,40 @@ impl DMStore {
     #[allow(dead_code)]
     pub fn total_unread(&self) -> Memo<u32> {
         let state = self.state;
+        // Requests and blocked conversations stay out of the badge.
+        let requests = use_context::<requests::RequestsStore>();
+        let mutes = use_context::<crate::stores::mute::MuteStore>();
         Memo::new(move |_| {
-            state
-                .get()
-                .conversations
-                .values()
-                .map(|c| c.unread_count)
-                .sum()
+            state.with(|s| {
+                requests::unread_total(s.conversations.values().map(|c| {
+                    let lane = requests.map_or(requests::Lane::Main, |r| {
+                        r.lane_of(&c.pubkey, mutes.is_some_and(|m| m.is_user_muted(&c.pubkey)))
+                    });
+                    (c.unread_count, lane)
+                }))
+            })
         })
+    }
+
+    /// Reactions, attachments, delivery outcomes and rumor ids for the DM
+    /// screen, keyed by `DMMessage.id`. Empty with `RECIPIENT_KEYS_ENABLED` off.
+    // Consumed by the DM page; no page renders these yet.
+    #[allow(dead_code)]
+    pub fn extras(&self) -> Memo<DMExtras> {
+        let state = self.state;
+        Memo::new(move |_| state.with(extras_of))
+    }
+
+    /// The confirmation waiting for the member, if any (see [`consent`]).
+    pub fn pending_consent(&self) -> Memo<Option<consent::ConsentRequest>> {
+        let state = self.state;
+        Memo::new(move |_| state.with(|s| s.consent.clone()))
+    }
+
+    /// Answer the pending confirmation: `true` is "Send anyway".
+    pub fn answer_consent(&self, accept: bool) {
+        self.state.update(|s| s.consent = None);
+        consent::answer(accept);
     }
 
     pub fn clear_error(&self) {
@@ -268,7 +360,7 @@ impl DMStore {
 
     /// Select a conversation and mark it as read.
     pub fn select_conversation(&self, pubkey: &str) {
-        let pk = pubkey.to_string();
+        let pk = canonical_or_lower(pubkey);
         self.state.update(|s| {
             s.current_conversation = Some(pk.clone());
             if let Some(convo) = s.conversations.get_mut(&pk) {
@@ -300,7 +392,7 @@ impl DMStore {
         partner_pubkey: &str,
     ) {
         let my_pk = my_pubkey.to_string();
-        let partner_pk = partner_pubkey.to_string();
+        let partner_pk = canonical_or_lower(partner_pubkey);
         let state = self.state;
 
         state.update(|s| {
@@ -356,6 +448,9 @@ impl DMStore {
     /// The optimistic UI update is applied synchronously; the encrypted publish
     /// happens on a spawned task because the signer is async.
     ///
+    /// The recipient may be given as hex (any case) or `npub`; it is normalised
+    /// to lowercase hex before anything is keyed, tagged or wrapped.
+    ///
     /// Also publishes kind-10050 (preferred DM relay) on first send if not already done.
     pub fn send_message(
         &self,
@@ -365,18 +460,36 @@ impl DMStore {
         signer: Rc<dyn Signer>,
         my_pubkey: &str,
     ) -> Result<(), String> {
+        self.send_message_to(relay, recipient_pk_hex, content, None, signer, my_pubkey)
+    }
+
+    /// [`send_message`](Self::send_message), optionally as a reply to the
+    /// message whose rumor id is `reply_to` (see [`DMExtras::rumor_ids`]).
+    ///
+    /// With `RECIPIENT_KEYS_ENABLED` on, the rumor also carries the
+    /// `["e", id, "", "reply"]` tag and `imeta` for media URLs, and the
+    /// recipient's copy goes to the relays they named. With it off this is
+    /// today's single-relay send and `reply_to` is ignored.
+    pub fn send_message_to(
+        &self,
+        relay: &RelayConnection,
+        recipient_pk_hex: &str,
+        content: &str,
+        reply_to: Option<&str>,
+        signer: Rc<dyn Signer>,
+        my_pubkey: &str,
+    ) -> Result<(), String> {
         if content.trim().is_empty() {
             return Err("Message cannot be empty".into());
         }
 
-        // Validate recipient pubkey before doing any crypto.
-        if hex::decode(recipient_pk_hex)
-            .ok()
-            .filter(|b| b.len() == 32)
-            .is_none()
-        {
-            return Err("Invalid recipient pubkey hex".into());
-        }
+        // Validate and normalise the recipient before doing any crypto: hex in
+        // any case or an npub all become the same lowercase hex, which is what
+        // the `p` tag, the conversation key and the ledger then use.
+        let recipient = canonical_pubkey(recipient_pk_hex)?;
+        let recipient = recipient.as_str();
+        let my_pubkey = my_pubkey.to_ascii_lowercase();
+        let my_pubkey = my_pubkey.as_str();
 
         let now = (js_sys::Date::now() / 1000.0) as u64;
 
@@ -401,16 +514,33 @@ impl DMStore {
         let msg = DMMessage {
             id: local_id.clone(),
             sender_pubkey: my_pubkey.to_string(),
-            recipient_pubkey: recipient_pk_hex.to_string(),
+            recipient_pubkey: recipient.to_string(),
             content: content.to_string(),
             timestamp: now,
             is_sent: true,
             is_read: true,
         };
 
-        let coach = is_coach_exchange(content, recipient_pk_hex);
+        let coach = is_coach_exchange(content, recipient);
+
+        // The rumor, with the optional reply and imeta tags, only on the
+        // extended path; the plain path keeps core's own DM rumor. Checked
+        // BEFORE the bubble appears, so a refused send leaves no trace.
+        let extended = extras_enabled() && !coach;
+        let rumor = if extended {
+            let rumor = rumors::chat_rumor(signer.public_key(), recipient, content, reply_to);
+            self.state.with_untracked(|s| {
+                rumors::validate_outgoing(&rumor, recipient, signer.public_key(), &|id| {
+                    known_in_conversation(s, id, signer.public_key(), recipient)
+                })
+            })?;
+            Some(rumor)
+        } else {
+            None
+        };
+
         self.state.update(|s| {
-            if s.current_conversation.as_deref() == Some(recipient_pk_hex)
+            if s.current_conversation.as_deref() == Some(recipient)
                 && s.seen_ids.insert(msg.id.clone())
             {
                 s.messages.push(msg.clone());
@@ -420,10 +550,10 @@ impl DMStore {
             }
             let convo = s
                 .conversations
-                .entry(recipient_pk_hex.to_string())
+                .entry(recipient.to_string())
                 .or_insert_with(|| DMConversation {
-                    pubkey: recipient_pk_hex.to_string(),
-                    name: try_display_name(recipient_pk_hex).unwrap_or_default(),
+                    pubkey: recipient.to_string(),
+                    name: try_display_name(recipient).unwrap_or_default(),
                     last_message: String::new(),
                     last_timestamp: 0,
                     unread_count: 0,
@@ -435,13 +565,24 @@ impl DMStore {
         // Encrypt + sign + publish on a spawned task (the signer is async, and a
         // NIP-07 extension performs the seal signature off the main flow).
         let relay = relay.clone();
-        let recipient = recipient_pk_hex.to_string();
+        let recipient = recipient.to_string();
         let content_owned = content.to_string();
         let my_pk = my_pubkey.to_string();
         let state = self.state;
         wasm_bindgen_futures::spawn_local(async move {
             // Publish kind-10050 (preferred DM relay) once per pubkey per session.
             ensure_dm_relay_published(&relay, signer.as_ref(), &my_pk).await;
+
+            // The public-inbox top-up (indexer sockets, up to 8 s each) runs as
+            // its own task: a send never waits on it. A no-op with the flag or
+            // the opt-in off.
+            {
+                let topup_signer = signer.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    crate::zone_crypto::public_inbox::top_up_if_opted_in(topup_signer.as_ref())
+                        .await;
+                });
+            }
 
             // NIP-17 requires TWO wraps: one encrypted to the recipient, one
             // encrypted back to us. Without the self-copy a sent message is
@@ -470,7 +611,14 @@ impl DMStore {
                 }
                 return;
             }
-            match gift_wrap_pair_with_signer(signer.as_ref(), &recipient, &content_owned).await {
+
+            let wrapped = match &rumor {
+                Some(r) => gift_wrap_rumor_pair_with_signer(signer.as_ref(), &recipient, r).await,
+                None => {
+                    gift_wrap_pair_with_signer(signer.as_ref(), &recipient, &content_owned).await
+                }
+            };
+            match wrapped {
                 Ok((to_recipient, to_self)) => {
                     // Re-key the optimistic message to the real wrap event ID so
                     // the relay echo dedups against it instead of duplicating.
@@ -479,6 +627,7 @@ impl DMStore {
                     // to us through our own `#p` subscription, so it is the one
                     // that would otherwise render a second bubble. The
                     // recipient copy is never delivered to us at all.
+                    let rumor_id = rumor.as_ref().map(rumor_id_of);
                     state.update(|s| {
                         if s.seen_ids.remove(&local_id) {
                             s.seen_ids.insert(to_self.id.clone());
@@ -486,9 +635,31 @@ impl DMStore {
                         if let Some(m) = s.messages.iter_mut().find(|m| m.id == local_id) {
                             m.id = to_self.id.clone();
                         }
+                        if let Some(rid) = &rumor_id {
+                            index_rumor(s, rid, &to_self.id);
+                        }
                     });
-                    relay.publish(&to_recipient);
-                    relay.publish(&to_self);
+                    if extended {
+                        let report = publish_extended(
+                            state,
+                            &relay,
+                            &my_pk,
+                            &recipient,
+                            &to_recipient,
+                            &to_self,
+                        )
+                        .await;
+                        record_delivery(state, &to_self.id, report);
+                    } else {
+                        // Own copy first, so the sent message is recoverable
+                        // after a reload even if the recipient's publish fails.
+                        for copy in delivery::plain_order() {
+                            match copy {
+                                delivery::Copy::Own => relay.publish(&to_self),
+                                delivery::Copy::Recipient => relay.publish(&to_recipient),
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     let why = send_failure_text(&e);
@@ -504,6 +675,119 @@ impl DMStore {
         });
 
         Ok(())
+    }
+
+    /// React to the message whose rumor id is `target_rumor_id` (see
+    /// [`DMExtras::rumor_ids`]) with `emoji`. A kind 7 rumor through the same
+    /// wrap and publish path as a message. Needs `RECIPIENT_KEYS_ENABLED`.
+    // Consumed by the DM page; no page offers a reaction button yet.
+    #[allow(dead_code)]
+    pub fn send_reaction(
+        &self,
+        relay: &RelayConnection,
+        recipient_pk_hex: &str,
+        target_rumor_id: &str,
+        emoji: &str,
+        signer: Rc<dyn Signer>,
+    ) -> Result<(), String> {
+        if !extras_enabled() {
+            return Err("Reactions are not enabled".into());
+        }
+        let emoji = emoji.trim();
+        if emoji.is_empty() || emoji.chars().count() > 16 {
+            return Err("Invalid reaction".into());
+        }
+        if !rumors::is_rumor_id(target_rumor_id) {
+            return Err("Invalid message reference".into());
+        }
+        let recipient = canonical_pubkey(recipient_pk_hex)?;
+        let me = signer.public_key().to_string();
+        let rumor = rumors::reaction_rumor(
+            &me,
+            &recipient,
+            &target_rumor_id.to_ascii_lowercase(),
+            emoji,
+        );
+        self.state.with_untracked(|s| {
+            rumors::validate_outgoing(&rumor, &recipient, &me, &|id| {
+                known_in_conversation(s, id, &me, &recipient)
+            })
+        })?;
+        self.send_control_rumor(relay, recipient, rumor, signer, me);
+        Ok(())
+    }
+
+    /// Delete our own messages (rumor ids from [`DMExtras::rumor_ids`]): removed
+    /// here at once, and a kind 5 rumor tells the other side. Refuses ids that
+    /// are not messages we sent. Needs `RECIPIENT_KEYS_ENABLED`.
+    // Consumed by the DM page; no page offers a delete action yet.
+    #[allow(dead_code)]
+    pub fn send_deletion(
+        &self,
+        relay: &RelayConnection,
+        recipient_pk_hex: &str,
+        target_rumor_ids: &[String],
+        signer: Rc<dyn Signer>,
+    ) -> Result<(), String> {
+        if !extras_enabled() {
+            return Err("Deletion is not enabled".into());
+        }
+        let recipient = canonical_pubkey(recipient_pk_hex)?;
+        let me = signer.public_key().to_string();
+        let targets: Vec<String> = target_rumor_ids
+            .iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        let all_mine = !targets.is_empty()
+            && self
+                .state
+                .with_untracked(|s| targets.iter().all(|t| owns_rumor(s, t, &me)));
+        if !all_mine {
+            return Err("You can only delete your own messages".into());
+        }
+        let rumor = rumors::deletion_rumor(&me, &recipient, &targets);
+        self.state.with_untracked(|s| {
+            rumors::validate_outgoing(&rumor, &recipient, &me, &|id| {
+                known_in_conversation(s, id, &me, &recipient)
+            })
+        })?;
+        self.send_control_rumor(relay, recipient, rumor, signer, me);
+        Ok(())
+    }
+
+    /// Wrap and publish a reaction or deletion rumor, then apply it locally
+    /// under the self-copy's wrap id (so the relay echo dedups against it).
+    fn send_control_rumor(
+        &self,
+        relay: &RelayConnection,
+        recipient: String,
+        rumor: nostr_bbs_core::UnsignedEvent,
+        signer: Rc<dyn Signer>,
+        me: String,
+    ) {
+        let relay = relay.clone();
+        let state = self.state;
+        wasm_bindgen_futures::spawn_local(async move {
+            match gift_wrap_rumor_pair_with_signer(signer.as_ref(), &recipient, &rumor).await {
+                Ok((to_recipient, to_self)) => {
+                    let rumor_id = rumor_id_of(&rumor);
+                    state.update(|s| apply_control_rumor(s, &to_self.id, &me, &rumor_id, &rumor));
+                    let report =
+                        publish_extended(state, &relay, &me, &recipient, &to_recipient, &to_self)
+                            .await;
+                    if report.outcome == Delivery::Failed {
+                        state.update(|s| {
+                            s.error = Some("Could not deliver that to any relay".into());
+                        });
+                    }
+                }
+                Err(e) => {
+                    let why = send_failure_text(&e);
+                    web_sys::console::error_1(&format!("[DM] Gift wrap failed: {why}").into());
+                    state.update(|s| s.error = Some(format!("Could not send: {why}")));
+                }
+            }
+        });
     }
 
     /// Inject a message directly into the store (dev-auth echo bot only).
@@ -844,6 +1128,11 @@ async fn watch_one(event: &NostrEvent, signer: &dyn Signer, me: &str) {
     if !is_sent && is_coach_exchange(&unwrapped.rumor.content, &unwrapped.sender_pubkey) {
         return;
     }
+    // A request from a non-member waits in Requests without a notification
+    // (ADR-2027); a no-op with the flag off.
+    if !is_sent && !requests::notifies_for(&unwrapped.sender_pubkey, me).await {
+        return;
+    }
     store.notify_dm(
         &event.id,
         &unwrapped.sender_pubkey,
@@ -939,11 +1228,18 @@ async fn process_gift_wrap_event(
             return;
         }
     };
-    // Reactions, deletions and file messages now unwrap too (ADR-2027); this
-    // inbox renders chat only until it grows UI for them.
-    if unwrapped.rumor_kind() != Some(nostr_bbs_core::gift_wrap::RumorKind::Chat) {
+    // Reactions, deletions and file messages unwrap too (ADR-2027). Today's
+    // behaviour, chat only, stands unless the interop flag is on.
+    let incoming = if unwrapped.rumor_kind() == Some(nostr_bbs_core::gift_wrap::RumorKind::Chat) {
+        rumors::Incoming::Chat
+    } else if extras_enabled() {
+        match rumors::classify(&unwrapped.rumor) {
+            Some(other) => other,
+            None => return,
+        }
+    } else {
         return;
-    }
+    };
 
     let my_pubkey = my_pubkey.to_ascii_lowercase();
     let sender_pubkey = unwrapped.sender_pubkey.to_ascii_lowercase();
@@ -974,7 +1270,24 @@ async fn process_gift_wrap_event(
         return;
     }
 
-    let plaintext = unwrapped.rumor.content.clone();
+    let rumor_id = rumor_id_of(&unwrapped.rumor);
+
+    // What the message says. A file message shows its URL as the text and keeps
+    // the attachment alongside; a reaction or deletion is not a message at all.
+    let (plaintext, attachment, preview) = match incoming {
+        rumors::Incoming::Chat => {
+            let text = unwrapped.rumor.content.clone();
+            (text.clone(), None, text)
+        }
+        rumors::Incoming::File(att) => (att.url.clone(), Some(att), "[file]".to_string()),
+        rumors::Incoming::Reaction { .. } | rumors::Incoming::Deletion { .. } => {
+            state.update(|s| {
+                apply_control_rumor(s, &event.id, &sender_pubkey, &rumor_id, &unwrapped.rumor)
+            });
+            return;
+        }
+    };
+
     // Use the rumor's created_at as the real timestamp (wrap timestamp is randomized)
     // (sender-controlled, so clamp it to now).
     let timestamp = clamp_to_now(unwrapped.rumor.created_at, now_secs());
@@ -984,13 +1297,31 @@ async fn process_gift_wrap_event(
         id: event.id.clone(),
         sender_pubkey,
         recipient_pubkey,
-        content: plaintext.clone(),
+        content: plaintext,
         timestamp,
         is_sent,
         is_read: is_sent,
     };
 
-    insert_dm_message(msg, &counterparty_pk, &plaintext, timestamp, is_sent, state);
+    if extras_enabled() {
+        // Index even a wrap already seen (our own echo), so a reaction to a
+        // message we sent can find it; skip a message its sender has deleted.
+        let skip = state.with_untracked(|s| is_tombstoned(s, &rumor_id, &msg.sender_pubkey));
+        state.update(|s| index_rumor(s, &rumor_id, &msg.id));
+        if skip {
+            state.update(|s| {
+                s.seen_ids.insert(msg.id.clone());
+            });
+            return;
+        }
+        if let Some(att) = attachment {
+            state.update(|s| {
+                s.attachments.insert(msg.id.clone(), att);
+            });
+        }
+    }
+
+    insert_dm_message(msg, &counterparty_pk, &preview, timestamp, is_sent, state);
 }
 
 /// Decrypt a legacy kind 4 DM event and insert into state.
@@ -1152,7 +1483,7 @@ fn apply_message(
 fn thread_of(messages: &[DMMessage], counterparty: &str, coach: Option<&str>) -> Vec<DMMessage> {
     // Pubkeys are lowercased at ingestion, so the only normalisation left is
     // the caller's argument (a UI route value or config string).
-    let counterparty = counterparty.to_ascii_lowercase();
+    let counterparty = canonical_or_lower(counterparty);
     let mut msgs: Vec<DMMessage> = messages
         .iter()
         .filter(|m| !is_coach_exchange_with(&m.content, &counterparty, coach))
@@ -1177,6 +1508,367 @@ fn visible_conversations(inner: &DMStateInner) -> Vec<DMConversation> {
     let mut convos: Vec<DMConversation> = inner.conversations.values().cloned().collect();
     convos.sort_by_key(|x| std::cmp::Reverse(x.last_timestamp));
     convos
+}
+
+// -- Recipient identity -------------------------------------------------------
+
+/// A recipient pubkey as lowercase hex, from hex in any case or an `npub`.
+///
+/// Parsed through `nostr::PublicKey`, so a malformed key, or a 64-character
+/// string that is not a point on the curve, is refused before any crypto runs.
+/// Everything downstream (the `p` tag, the conversation key, the ledger) then
+/// agrees on one spelling: a mixed-case key used to make a second conversation
+/// and a wrap whose `p` tag the relay's recipient gate did not match.
+fn canonical_pubkey(input: &str) -> Result<String, String> {
+    nostr::PublicKey::parse(input.trim())
+        .map(|k| k.to_hex())
+        .map_err(|_| "Invalid recipient pubkey".to_string())
+}
+
+/// [`canonical_pubkey`], or the plain lowercase when it does not parse (a
+/// conversation key from a route is looked up, not trusted).
+fn canonical_or_lower(input: &str) -> String {
+    canonical_pubkey(input).unwrap_or_else(|_| input.trim().to_ascii_lowercase())
+}
+
+// -- Extended NIP-17 behaviour (ADR-2027), behind RECIPIENT_KEYS_ENABLED -------
+
+/// Whether the interoperable NIP-17 behaviour is switched on: multi-relay
+/// delivery, reactions, deletions and file messages. Off leaves the DM path as
+/// it was.
+fn extras_enabled() -> bool {
+    crate::zone_crypto::inbox_key::recipient_keys_enabled()
+}
+
+/// A rumor's NIP-01 id as hex: what a reaction or deletion refers to.
+fn rumor_id_of(rumor: &nostr_bbs_core::UnsignedEvent) -> String {
+    hex::encode(nostr_bbs_core::compute_event_id(rumor))
+}
+
+fn index_rumor(s: &mut DMStateInner, rumor_id: &str, msg_id: &str) {
+    s.rumor_index
+        .insert(rumor_id.to_string(), msg_id.to_string());
+    s.msg_rumor.insert(msg_id.to_string(), rumor_id.to_string());
+}
+
+/// Whether `rumor_id` is a message we know that `sender` sent.
+fn owns_rumor(s: &DMStateInner, rumor_id: &str, sender: &str) -> bool {
+    s.rumor_index
+        .get(rumor_id)
+        .and_then(|mid| s.messages.iter().find(|m| &m.id == mid))
+        .is_some_and(|m| m.sender_pubkey == sender)
+}
+
+/// Whether `rumor_id` is a message already in the conversation between `me`
+/// and `recipient` (either direction) in the local store.
+fn known_in_conversation(s: &DMStateInner, rumor_id: &str, me: &str, recipient: &str) -> bool {
+    s.rumor_index
+        .get(rumor_id)
+        .and_then(|mid| s.messages.iter().find(|m| &m.id == mid))
+        .is_some_and(|m| {
+            (m.sender_pubkey == me && m.recipient_pubkey == recipient)
+                || (m.sender_pubkey == recipient && m.recipient_pubkey == me)
+        })
+}
+
+fn is_tombstoned(s: &DMStateInner, rumor_id: &str, sender: &str) -> bool {
+    s.tombstones
+        .contains(&(rumor_id.to_string(), sender.to_string()))
+}
+
+/// Attach a reaction to its target rumor. Idempotent per wrap id and per
+/// `(sender, emoji)`; ignored if the sender already deleted it.
+fn apply_reaction(
+    s: &mut DMStateInner,
+    wrap_id: &str,
+    sender: &str,
+    rumor_id: &str,
+    target: &str,
+    emoji: &str,
+) {
+    if !s.seen_ids.insert(wrap_id.to_string()) || is_tombstoned(s, rumor_id, sender) {
+        return;
+    }
+    let list = s.reactions.entry(target.to_string()).or_default();
+    if list.iter().any(|r| r.sender == sender && r.emoji == emoji) {
+        return;
+    }
+    list.push(Reaction {
+        sender: sender.to_string(),
+        emoji: emoji.to_string(),
+        rumor_id: rumor_id.to_string(),
+    });
+}
+
+/// Apply a deletion request from `deleter`: it removes that sender's OWN
+/// messages and reactions, and nothing else. The request is remembered either
+/// way, so one that arrives before its target still takes effect.
+fn apply_deletion(s: &mut DMStateInner, wrap_id: &str, deleter: &str, targets: &[String]) {
+    if !s.seen_ids.insert(wrap_id.to_string()) {
+        return;
+    }
+    for target in targets {
+        s.tombstones.insert((target.clone(), deleter.to_string()));
+        if owns_rumor(s, target, deleter) {
+            if let Some(mid) = s.rumor_index.get(target).cloned() {
+                // `seen_ids` keeps the wrap id, so a re-streamed copy is not
+                // resurrected.
+                s.messages.retain(|m| m.id != mid);
+                s.attachments.remove(&mid);
+                s.deliveries.remove(&mid);
+            }
+            s.reactions.remove(target);
+        }
+        for list in s.reactions.values_mut() {
+            list.retain(|r| !(r.rumor_id == *target && r.sender == deleter));
+        }
+    }
+}
+
+/// Apply a reaction or deletion rumor sent by `sender` (us, or the other side).
+fn apply_control_rumor(
+    s: &mut DMStateInner,
+    wrap_id: &str,
+    sender: &str,
+    rumor_id: &str,
+    rumor: &nostr_bbs_core::UnsignedEvent,
+) {
+    match rumors::classify(rumor) {
+        Some(rumors::Incoming::Reaction { target, emoji }) => {
+            apply_reaction(s, wrap_id, sender, rumor_id, &target, &emoji)
+        }
+        Some(rumors::Incoming::Deletion { targets }) => {
+            apply_deletion(s, wrap_id, sender, &targets)
+        }
+        _ => {}
+    }
+}
+
+/// The per-message extras, with reactions re-keyed from rumor id to message id.
+fn extras_of(s: &DMStateInner) -> DMExtras {
+    let reactions = s
+        .reactions
+        .iter()
+        .filter_map(|(target, list)| {
+            let mid = s.rumor_index.get(target)?;
+            (!list.is_empty()).then(|| (mid.clone(), list.clone()))
+        })
+        .collect();
+    DMExtras {
+        reactions,
+        attachments: s.attachments.clone(),
+        deliveries: s.deliveries.clone(),
+        rumor_ids: s.msg_rumor.clone(),
+    }
+}
+
+fn record_delivery(state: RwSignal<DMStateInner>, msg_id: &str, report: DeliveryReport) {
+    if report.outcome != Delivery::Sent {
+        web_sys::console::warn_1(
+            &format!(
+                "[DM] delivery {:?}: {:?}",
+                report.outcome, report.to_recipient
+            )
+            .into(),
+        );
+    }
+    state.update(|s| {
+        if report.outcome == Delivery::Failed {
+            s.error = Some("Message not delivered: no relay accepted it".into());
+        }
+        s.deliveries.insert(msg_id.to_string(), report);
+    });
+}
+
+// -- Multi-relay publish --------------------------------------------------------
+
+/// How long our own relay has to acknowledge a publish.
+const OWN_ACK_TIMEOUT_MS: i32 = 8_000;
+/// How long a foreign relay has to acknowledge a publish.
+const FOREIGN_ACK_TIMEOUT_MS: i32 = 8_000;
+
+/// Answers still outstanding for one send, and where they land.
+struct Tally {
+    to_recipient: std::cell::RefCell<Vec<Attempt>>,
+    own_copy: std::cell::RefCell<Vec<Attempt>>,
+    outstanding: std::cell::Cell<usize>,
+    done: Rc<OneShot<()>>,
+}
+
+impl Tally {
+    fn record(&self, for_recipient: bool, attempt: Attempt) {
+        let list = if for_recipient {
+            &self.to_recipient
+        } else {
+            &self.own_copy
+        };
+        list.borrow_mut().push(attempt);
+        self.settle();
+    }
+
+    /// One outstanding item is accounted for; wake the waiter when none remain.
+    fn settle(&self) {
+        self.outstanding
+            .set(self.outstanding.get().saturating_sub(1));
+        if self.outstanding.get() == 0 {
+            self.done.fill(());
+        }
+    }
+}
+
+/// Publish to our own relay and wait for its `OK` (or the timeout).
+async fn publish_ours(relay: &RelayConnection, event: &NostrEvent) -> Attempt {
+    let url = crate::utils::relay_url::relay_url();
+    let slot: Rc<OneShot<(bool, String)>> = OneShot::new();
+    let on_ok_slot = slot.clone();
+    let on_ok: PublishCallback = Rc::new(move |accepted, msg| on_ok_slot.fill((accepted, msg)));
+    if let Err(e) = relay.publish_with_ack(event, Some(on_ok)) {
+        return Attempt::failed(&url, &e);
+    }
+    let timeout = slot.clone();
+    crate::utils::set_timeout_once(
+        move || timeout.fill((false, "timeout".to_string())),
+        OWN_ACK_TIMEOUT_MS,
+    );
+    let (accepted, reason) = slot.wait().await;
+    Attempt {
+        relay: url,
+        accepted,
+        reason,
+    }
+}
+
+/// A report for a send that stopped early, with `why` as the only recipient
+/// attempt so the cause is on the message.
+fn stopped(why: &str, own_copy: Vec<Attempt>) -> DeliveryReport {
+    let to_recipient = vec![Attempt::failed("", why)];
+    DeliveryReport {
+        outcome: delivery::fold(&to_recipient, &own_copy),
+        to_recipient,
+        own_copy,
+    }
+}
+
+/// Ask the member to confirm connecting to a stranger's relays; no answer in
+/// [`consent::ANSWER_TIMEOUT_MS`] counts as "Cancel".
+async fn ask_consent(
+    state: RwSignal<DMStateInner>,
+    recipient: &str,
+    foreign: &[nostr::RelayUrl],
+) -> bool {
+    let answer = consent::begin();
+    state.update(|s| {
+        s.consent = Some(consent::ConsentRequest {
+            recipient: recipient.to_string(),
+            hosts: delivery::hosts(foreign),
+        });
+    });
+    let timeout = answer.clone();
+    crate::utils::set_timeout_once(move || timeout.fill(false), consent::ANSWER_TIMEOUT_MS);
+    let accepted = answer.wait().await;
+    state.update(|s| s.consent = None);
+    accepted
+}
+
+/// Publish both copies of a wrapped rumor and report what each relay said.
+///
+/// 1. Our own copy goes first, alone, and the send waits for our relay to
+///    acknowledge it. If that fails nothing is sent to the recipient: a message
+///    that arrived but cannot be recovered by its author is worse than one that
+///    visibly failed.
+/// 2. Only then the route and membership are resolved. A plan with no recipient
+///    target at all ([`delivery::NO_ROUTE`]) is `Failed` before anything else
+///    is published.
+/// 3. For a non-member with foreign relays the member must confirm once per
+///    recipient; no foreign socket opens before that
+///    ([`delivery::release_steps`]).
+/// 4. The recipient's copy goes to the relays they named, and to ours only when
+///    they are a member (our relay refuses a wrap for a non-member). Nothing is
+///    called "sent" unless the recipient's copy was acknowledged somewhere.
+async fn publish_extended(
+    state: RwSignal<DMStateInner>,
+    relay: &RelayConnection,
+    me: &str,
+    recipient: &str,
+    to_recipient: &NostrEvent,
+    to_self: &NostrEvent,
+) -> DeliveryReport {
+    let own = publish_ours(relay, to_self).await;
+    if !delivery::own_copy_stored(&own) {
+        return stopped(
+            "your own copy could not be stored, so nothing was sent",
+            vec![own],
+        );
+    }
+
+    let route = routing::route_for(relay, recipient).await;
+    let member = recipient_is_member(recipient).await;
+    let plan = delivery::plan(&route, member);
+    if plan.is_empty() {
+        return stopped(delivery::NO_ROUTE, vec![own]);
+    }
+
+    let accepted = consent::is_accepted(me, recipient).await;
+    let required = delivery::consent_needed(member, &plan.foreign, accepted);
+    let mut given = false;
+    if required {
+        given = ask_consent(state, recipient, &plan.foreign).await;
+        if !given {
+            return stopped("cancelled: foreign relays were not approved", vec![own]);
+        }
+        consent::remember(me, recipient).await;
+    }
+    let steps = delivery::release_steps(&delivery::send_order(&plan), required, given);
+    // The first step, our own copy, has already been published and acknowledged.
+    let rest = &steps[1..];
+
+    let tally = Rc::new(Tally {
+        to_recipient: Default::default(),
+        own_copy: std::cell::RefCell::new(vec![own]),
+        outstanding: std::cell::Cell::new(rest.len()),
+        done: OneShot::new(),
+    });
+    for (_, target) in rest {
+        let (relay, ev, tally) = (relay.clone(), to_recipient.clone(), tally.clone());
+        match target {
+            delivery::Target::Ours => wasm_bindgen_futures::spawn_local(async move {
+                let attempt = publish_ours(&relay, &ev).await;
+                tally.record(true, attempt);
+            }),
+            delivery::Target::Foreign(url) => {
+                let url = url.to_string();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let attempt =
+                        match crate::relay::publish_to(&url, &ev, FOREIGN_ACK_TIMEOUT_MS).await {
+                            Ok(()) => Attempt::ok(&url),
+                            Err(reason) => Attempt::failed(&url, &reason),
+                        };
+                    tally.record(true, attempt);
+                });
+            }
+        }
+    }
+    tally.done.wait().await;
+
+    let recipient_attempts = tally.to_recipient.borrow().clone();
+    let own_copy = tally.own_copy.borrow().clone();
+    DeliveryReport {
+        outcome: delivery::fold(&recipient_attempts, &own_copy),
+        to_recipient: recipient_attempts,
+        own_copy,
+    }
+}
+
+/// Whether `recipient` is a member of this board, from the one membership cache
+/// in the DM module ([`requests::reaches_our_relay_cached`]).
+///
+/// A lookup that fails counts as "member": sending to our relay as well costs
+/// one refused `OK` the send path already treats as expected, while wrongly
+/// skipping our relay would strand a member's message.
+async fn recipient_is_member(recipient: &str) -> bool {
+    requests::reaches_our_relay_cached(recipient)
+        .await
+        .unwrap_or(true)
 }
 
 // -- Helpers ------------------------------------------------------------------
@@ -1651,5 +2343,269 @@ mod tests {
             !is_coach_exchange_with("plain text", COACH, Some(COACH)),
             "the coach's ordinary mail is mail"
         );
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    //! Recipient normalisation, reactions, deletions and file messages.
+    use super::*;
+    use nostr_bbs_core::UnsignedEvent;
+
+    const ME: &str = "a41654017f6850b13857d19d8ae0e3f88f1365600cab0321e8101c9e92682f7a";
+    const YOU: &str = "b41654017f6850b13857d19d8ae0e3f88f1365600cab0321e8101c9e92682f7a";
+    const OTHER: &str = "c41654017f6850b13857d19d8ae0e3f88f1365600cab0321e8101c9e92682f7a";
+    const TARGET: &str = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0";
+
+    fn npub_of(hex: &str) -> String {
+        use nostr::ToBech32;
+        nostr::PublicKey::parse(hex).unwrap().to_bech32().unwrap()
+    }
+
+    fn message(id: &str, from: &str, to: &str) -> DMMessage {
+        DMMessage {
+            id: id.into(),
+            sender_pubkey: from.into(),
+            recipient_pubkey: to.into(),
+            content: "hello".into(),
+            timestamp: 5,
+            is_sent: from == ME,
+            is_read: true,
+        }
+    }
+
+    /// State holding one message from YOU, indexed under rumor id TARGET.
+    fn state_with_target() -> DMStateInner {
+        let mut s = DMStateInner::default();
+        s.seen_ids.insert("wrap-1".into());
+        s.messages.push(message("wrap-1", YOU, ME));
+        index_rumor(&mut s, TARGET, "wrap-1");
+        s
+    }
+
+    fn rumor(kind: u64, sender: &str, tags: Vec<Vec<&str>>, content: &str) -> UnsignedEvent {
+        UnsignedEvent {
+            pubkey: sender.into(),
+            created_at: 1,
+            kind,
+            tags: tags
+                .into_iter()
+                .map(|t| t.into_iter().map(String::from).collect())
+                .collect(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn mixed_case_hex_and_npub_recipients_normalise_to_the_same_lowercase_hex() {
+        let upper = YOU.to_ascii_uppercase();
+        assert_eq!(canonical_pubkey(&upper).unwrap(), YOU);
+        assert_eq!(canonical_pubkey(YOU).unwrap(), YOU);
+        assert_eq!(canonical_pubkey(&npub_of(YOU)).unwrap(), YOU);
+        assert_eq!(canonical_pubkey(&format!("  {YOU}\n")).unwrap(), YOU);
+    }
+
+    #[test]
+    fn the_p_tag_a_recipient_is_wrapped_with_is_the_lowercase_hex() {
+        for spelling in [YOU.to_ascii_uppercase(), npub_of(YOU), YOU.to_string()] {
+            let hex = canonical_pubkey(&spelling).unwrap();
+            let r = rumors::chat_rumor(ME, &hex, "hi", None);
+            assert!(r.tags.contains(&vec!["p".to_string(), YOU.to_string()]));
+        }
+    }
+
+    #[test]
+    fn a_malformed_recipient_is_refused() {
+        for bad in ["", "zz", &"g".repeat(64), &"a".repeat(63), "npub1notvalid"] {
+            assert!(canonical_pubkey(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_conversation_opened_by_npub_or_upper_case_finds_the_lowercase_thread() {
+        let mut s = DMStateInner::default();
+        s.messages.push(message("w", ME, YOU));
+        for key in [npub_of(YOU), YOU.to_ascii_uppercase()] {
+            assert_eq!(thread_of(&s.messages, &key, None).len(), 1);
+            assert_eq!(canonical_or_lower(&key), YOU);
+        }
+    }
+
+    #[test]
+    fn a_reaction_attaches_to_the_message_it_names() {
+        let mut s = state_with_target();
+        let r = rumor(7, ME, vec![vec!["e", TARGET], vec!["p", YOU]], "🔥");
+        apply_control_rumor(&mut s, "wrap-r", ME, "r1", &r);
+        let extras = extras_of(&s);
+        let on_msg = &extras.reactions["wrap-1"];
+        assert_eq!(on_msg.len(), 1);
+        assert_eq!(
+            (on_msg[0].emoji.as_str(), on_msg[0].sender.as_str()),
+            ("🔥", ME)
+        );
+        assert!(
+            s.conversations.is_empty(),
+            "a reaction opens no conversation"
+        );
+        assert_eq!(s.messages.len(), 1, "and is not a message");
+    }
+
+    #[test]
+    fn a_restreamed_or_repeated_reaction_counts_once() {
+        let mut s = state_with_target();
+        let r = rumor(7, ME, vec![vec!["e", TARGET]], "+");
+        apply_control_rumor(&mut s, "wrap-r", ME, "r1", &r);
+        apply_control_rumor(&mut s, "wrap-r", ME, "r1", &r);
+        apply_control_rumor(&mut s, "wrap-r2", ME, "r2", &r);
+        assert_eq!(extras_of(&s).reactions["wrap-1"].len(), 1);
+    }
+
+    #[test]
+    fn a_reaction_that_arrives_before_its_message_is_kept() {
+        let mut s = DMStateInner::default();
+        let r = rumor(7, YOU, vec![vec!["e", TARGET]], "+");
+        apply_control_rumor(&mut s, "wrap-r", YOU, "r1", &r);
+        assert!(
+            extras_of(&s).reactions.is_empty(),
+            "no message to show it on yet"
+        );
+        s.messages.push(message("wrap-1", YOU, ME));
+        index_rumor(&mut s, TARGET, "wrap-1");
+        assert_eq!(extras_of(&s).reactions["wrap-1"].len(), 1);
+    }
+
+    #[test]
+    fn a_deletion_from_the_sender_removes_that_senders_own_message() {
+        let mut s = state_with_target();
+        let d = rumor(5, YOU, vec![vec!["e", TARGET]], "");
+        apply_control_rumor(&mut s, "wrap-d", YOU, "d1", &d);
+        assert!(s.messages.is_empty());
+        assert!(
+            s.seen_ids.contains("wrap-1"),
+            "the wrap stays seen so a re-stream cannot resurrect it"
+        );
+    }
+
+    #[test]
+    fn a_deletion_from_anyone_else_removes_nothing() {
+        let mut s = state_with_target();
+        let d = rumor(5, OTHER, vec![vec!["e", TARGET]], "");
+        apply_control_rumor(&mut s, "wrap-d", OTHER, "d1", &d);
+        assert_eq!(s.messages.len(), 1);
+        // ...and the stranger's tombstone does not hide YOU's message later.
+        assert!(!is_tombstoned(&s, TARGET, YOU));
+    }
+
+    #[test]
+    fn a_deletion_that_arrives_first_still_applies_to_a_later_message() {
+        let mut s = DMStateInner::default();
+        let d = rumor(5, YOU, vec![vec!["e", TARGET]], "");
+        apply_control_rumor(&mut s, "wrap-d", YOU, "d1", &d);
+        assert!(is_tombstoned(&s, TARGET, YOU));
+        assert!(!is_tombstoned(&s, TARGET, OTHER));
+    }
+
+    #[test]
+    fn deleting_a_message_drops_its_reactions_and_attachment() {
+        let mut s = state_with_target();
+        s.attachments.insert(
+            "wrap-1".into(),
+            Attachment {
+                url: "https://f.example.com/a.png".into(),
+                file_type: "image/png".into(),
+            },
+        );
+        apply_control_rumor(
+            &mut s,
+            "wrap-r",
+            ME,
+            "r1",
+            &rumor(7, ME, vec![vec!["e", TARGET]], "+"),
+        );
+        apply_control_rumor(
+            &mut s,
+            "wrap-d",
+            YOU,
+            "d1",
+            &rumor(5, YOU, vec![vec!["e", TARGET]], ""),
+        );
+        let extras = extras_of(&s);
+        assert!(extras.reactions.is_empty() && extras.attachments.is_empty());
+    }
+
+    #[test]
+    fn a_senders_deletion_can_retract_their_own_reaction() {
+        let mut s = state_with_target();
+        apply_control_rumor(
+            &mut s,
+            "wrap-r",
+            ME,
+            "react-1",
+            &rumor(7, ME, vec![vec!["e", TARGET]], "+"),
+        );
+        apply_deletion(&mut s, "wrap-d", ME, &["react-1".to_string()]);
+        assert!(extras_of(&s).reactions.is_empty());
+    }
+
+    #[test]
+    fn only_messages_we_sent_can_be_deleted_by_us() {
+        let s = state_with_target();
+        assert!(owns_rumor(&s, TARGET, YOU));
+        assert!(!owns_rumor(&s, TARGET, ME));
+        assert!(!owns_rumor(&s, "unknown", YOU));
+    }
+
+    #[test]
+    fn nothing_extra_is_recorded_for_a_plain_chat_state() {
+        let s = DMStateInner::default();
+        assert_eq!(extras_of(&s), DMExtras::default());
+    }
+
+    #[test]
+    fn a_file_message_renders_its_url_as_an_attachment_without_fetching() {
+        let r = rumor(
+            15,
+            YOU,
+            vec![vec!["file-type", "image/png"]],
+            "https://f.example.com/a.png",
+        );
+        let Some(rumors::Incoming::File(att)) = rumors::classify(&r) else {
+            panic!("expected a file message");
+        };
+        let mut s = DMStateInner::default();
+        let mut m = message("wrap-f", YOU, ME);
+        m.content = att.url.clone();
+        s.attachments.insert(m.id.clone(), att);
+        apply_message(&mut s, m, YOU, "[file]", 5, false, None);
+        assert_eq!(s.conversations[YOU].last_message, "[file]");
+        assert_eq!(extras_of(&s).attachments["wrap-f"].file_type, "image/png");
+    }
+
+    #[test]
+    fn mixed_case_and_npub_recipients_wrap_to_the_same_lowercase_p_tag() {
+        use nostr_bbs_core::gift_wrap::unwrap_gift_with_signer;
+        use nostr_bbs_core::keys::generate_keypair;
+        use nostr_bbs_core::signer::PrfSigner;
+
+        let me = PrfSigner::new(generate_keypair().unwrap());
+        let you = PrfSigner::new(generate_keypair().unwrap());
+        let you_hex = you.public_key().to_string();
+        let spellings = [
+            you_hex.to_ascii_uppercase(),
+            npub_of(&you_hex),
+            you_hex.clone(),
+        ];
+        for spelling in spellings {
+            let recipient = canonical_pubkey(&spelling).unwrap();
+            let (to_you, to_me) =
+                futures::executor::block_on(gift_wrap_pair_with_signer(&me, &recipient, "hello"))
+                    .unwrap();
+            for (wrap, reader) in [(&to_you, &you), (&to_me, &me)] {
+                let got =
+                    futures::executor::block_on(unwrap_gift_with_signer(wrap, reader)).unwrap();
+                let p = got.rumor.tags.iter().find(|t| t[0] == "p").unwrap();
+                assert_eq!(p[1], you_hex, "spelling {spelling}");
+            }
+        }
     }
 }

@@ -97,6 +97,11 @@ struct KeyRow {
     role: String,
     created_at: u64,
     revoked: bool,
+    /// The verified kind-27237 registration proof, stored verbatim so a grant
+    /// issuer can check that this key really belongs to `owner_pubkey` before
+    /// wrapping a zone key to it. `None` for epoch rows and for rows registered
+    /// before the column existed; issuers refuse those.
+    proof: Option<String>,
 }
 
 /// Storage failure. Carries no key material, so it is safe to surface or log.
@@ -265,6 +270,7 @@ async fn do_register(store: &dyn KeyStore, caller: &str, body: &[u8], now: u64) 
             role: ROLE_INBOX.into(),
             created_at: now,
             revoked: false,
+            proof: serde_json::to_string(proof).ok(),
         },
     )
     .await
@@ -322,6 +328,10 @@ async fn do_lookup(store: &dyn KeyStore, caller_is_admin: bool, owner: Option<&s
                         "role": r.role,
                         "revoked": u8::from(r.revoked),
                         "created_at": r.created_at,
+                        "proof": r
+                            .proof
+                            .as_deref()
+                            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok()),
                     })
                 })
                 .collect();
@@ -365,6 +375,7 @@ async fn do_epoch(
             role: ROLE_EPOCH.into(),
             created_at: now,
             revoked: false,
+            proof: None,
         },
     )
     .await
@@ -373,15 +384,15 @@ async fn do_epoch(
 // ── D1 store ────────────────────────────────────────────────────────────────
 
 const SQL_INSERT: &str =
-    "INSERT INTO recipient_keys (key, owner_pubkey, zone, role, created_at, revoked) \
-     VALUES (?1, ?2, ?3, ?4, ?5, 0) ON CONFLICT (key) DO NOTHING";
+    "INSERT INTO recipient_keys (key, owner_pubkey, zone, role, created_at, revoked, proof) \
+     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6) ON CONFLICT (key) DO NOTHING";
 const SQL_GET: &str =
-    "SELECT key, owner_pubkey, zone, role, created_at, revoked FROM recipient_keys WHERE key = ?1";
+    "SELECT key, owner_pubkey, zone, role, created_at, revoked, proof FROM recipient_keys WHERE key = ?1";
 const SQL_REVOKE_ANY: &str = "UPDATE recipient_keys SET revoked = 1 WHERE key = ?1";
 const SQL_REVOKE_OWNED: &str =
     "UPDATE recipient_keys SET revoked = 1 WHERE key = ?1 AND owner_pubkey = ?2";
 const SQL_LIST_INBOX: &str =
-    "SELECT key, owner_pubkey, zone, role, created_at, revoked FROM recipient_keys \
+    "SELECT key, owner_pubkey, zone, role, created_at, revoked, proof FROM recipient_keys \
      WHERE owner_pubkey = ?1 AND role = 'inbox' AND revoked = 0 ORDER BY created_at DESC, key";
 
 #[derive(Deserialize)]
@@ -392,6 +403,8 @@ struct D1Row {
     role: String,
     created_at: f64,
     revoked: f64,
+    #[serde(default)]
+    proof: Option<String>,
 }
 
 impl From<D1Row> for KeyRow {
@@ -403,6 +416,7 @@ impl From<D1Row> for KeyRow {
             role: r.role,
             created_at: r.created_at as u64,
             revoked: r.revoked != 0.0,
+            proof: r.proof,
         }
     }
 }
@@ -433,6 +447,9 @@ impl KeyStore for D1Store {
                 zone,
                 JsValue::from_str(&row.role),
                 JsValue::from_f64(row.created_at as f64),
+                row.proof
+                    .as_deref()
+                    .map_or(JsValue::NULL, JsValue::from_str),
             ])
             .map_err(|_| StoreError)?
             .run()
@@ -860,10 +877,16 @@ mod tests {
         block_on(do_revoke(&s, &pk(OWNER), false, &revoke_body(&pk(0x55))));
         let r = block_on(do_lookup(&s, true, Some(&pk(OWNER))));
         assert_eq!(r.status, 200);
-        assert_eq!(
-            r.body["keys"],
-            json!([{ "key": pk(INBOX), "role": "inbox", "revoked": 0, "created_at": NOW }])
-        );
+        assert_eq!(r.body["keys"].as_array().map(Vec::len), Some(1));
+        let e = &r.body["keys"][0];
+        assert_eq!(e["key"], json!(pk(INBOX)));
+        assert_eq!(e["role"], json!("inbox"));
+        assert_eq!(e["revoked"], json!(0));
+        assert_eq!(e["created_at"], json!(NOW));
+        // The stored registration proof travels with the key so an issuer can
+        // bind it to the owner before wrapping anything to it.
+        assert_eq!(e["proof"]["kind"], json!(RECIPIENT_KEY_PROOF_KIND));
+        assert_eq!(e["proof"]["pubkey"], json!(pk(INBOX)));
     }
 
     #[test]

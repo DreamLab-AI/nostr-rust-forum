@@ -96,3 +96,25 @@ of opting in is fixed here so that the implementation cannot soften it:
 
 The same words appear in `docs/deployment-profiles.md` and in the settings page, and a test asserts
 the settings page renders them verbatim.
+
+## Implementation notes recorded during Phase 3 (2026-10-20)
+
+- **Replying to a non-member exposes the member's IP and timing to relays that recipient chose.**
+  This is inherent to decision 1 and is not mitigated by the envelope. The client shows a
+  one-time confirmation per recipient naming the relay hosts before the first foreign publish:
+  "Replying connects directly to relays chosen by this person. Their operators can see your IP
+  address and connection time. Message contents remain encrypted."
+- **NIP-65 read-relay fallback.** When a recipient has no kind 10050, the client falls back to the
+  read and unmarked entries of their kind 10002, as nostr.chat does (`store.js:1415`). A strict
+  reading of NIP-17 disallows this; interoperability with the cluster is the reason for the
+  deviation, and it is confined to the DM routing module.
+- **Indexer freshness.** Before publishing a merged relay list the client keeps a local baseline of
+  the newest list it has seen or published, prompts when the indexers' answer would remove relays
+  the baseline holds, and proceeds only when two of the three indexers answer or the baseline
+  agrees with a single answer.
+- **Unknown membership routes to the main list, not Requests.** A lookup against our auth-worker
+  cannot be made to fail by an outsider, and quarantining a member's message during a slow lookup
+  was judged the worse failure. The stale-cache window is one session.
+- `nostr-bbs-core` 1.0.0-beta.20 adds `gift_wrap_rumor_with_signer` and its pair form so
+  reactions, deletions, replies and `imeta` travel through the ADR-2025 envelope; the forum client
+  restricts a rumor's `p` tags to the recipient and self.

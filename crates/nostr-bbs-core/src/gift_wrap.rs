@@ -793,6 +793,69 @@ pub async fn gift_wrap_pair_with_signer(
     Ok((wrap_to_recipient, wrap_to_self))
 }
 
+/// Gift-wrap a caller-built rumor for `recipient_pubkey`: seal (signed through
+/// the [`Signer`]) then wrap (throwaway key).
+///
+/// The other `gift_wrap_*` functions mint a rumor carrying only a `p` tag.
+/// A reaction, a deletion, a reply (`["e", id, "", "reply"]`) or a message with
+/// `imeta` needs more tags, so the caller builds the rumor and this function
+/// supplies the envelope, so no caller re-implements seal or wrap.
+///
+/// The rumor's `pubkey` must be the signer's own key; otherwise the receiver's
+/// seal-versus-rumor author check refuses it, so a mismatch is rejected here.
+///
+/// # Example
+///
+/// Compiled here; the round trip is exercised by the unit tests, which have
+/// an executor.
+///
+/// ```no_run
+/// use nostr_bbs_core::gift_wrap::gift_wrap_rumor_with_signer;
+/// use nostr_bbs_core::signer::Signer;
+/// use nostr_bbs_core::UnsignedEvent;
+///
+/// async fn react(me: &dyn Signer, you: &str, target_rumor_id: &str) {
+///     let rumor = UnsignedEvent {
+///         pubkey: me.public_key().to_string(),
+///         created_at: 1_700_000_000,
+///         kind: 7,
+///         tags: vec![
+///             vec!["e".into(), target_rumor_id.into()],
+///             vec!["p".into(), you.into()],
+///         ],
+///         content: "+".into(),
+///     };
+///     let _wrap = gift_wrap_rumor_with_signer(me, you, &rumor).await.unwrap();
+/// }
+/// ```
+pub async fn gift_wrap_rumor_with_signer(
+    signer: &dyn Signer,
+    recipient_pubkey: &str,
+    rumor: &UnsignedEvent,
+) -> Result<NostrEvent, SignerGiftWrapError> {
+    if rumor.pubkey != signer.public_key() {
+        return Err(SignerGiftWrapError::KeyError(
+            "rumor pubkey is not the signer's key".to_string(),
+        ));
+    }
+    let seal = seal_rumor_with_signer(rumor, signer, recipient_pubkey).await?;
+    wrap_seal(&seal, recipient_pubkey).map_err(|e| SignerGiftWrapError::KeyError(e.to_string()))
+}
+
+/// [`gift_wrap_rumor_with_signer`] twice over one rumor: `(to_recipient,
+/// to_self)`, the NIP-17 pair (see [`gift_wrap_pair_with_signer`] for why the
+/// sender's own copy exists). Both wraps carry the same rumor, so both sides
+/// see the same `created_at`, tags and rumor id.
+pub async fn gift_wrap_rumor_pair_with_signer(
+    signer: &dyn Signer,
+    recipient_pubkey: &str,
+    rumor: &UnsignedEvent,
+) -> Result<(NostrEvent, NostrEvent), SignerGiftWrapError> {
+    let to_recipient = gift_wrap_rumor_with_signer(signer, recipient_pubkey, rumor).await?;
+    let to_self = gift_wrap_rumor_with_signer(signer, signer.public_key(), rumor).await?;
+    Ok((to_recipient, to_self))
+}
+
 /// Unwrap a gift-wrapped (kind 1059) event using a [`Signer`] for decryption.
 ///
 /// Both NIP-44 layers (gift→seal and seal→rumor) are decrypted through the
@@ -1353,6 +1416,46 @@ mod tests {
         let kp = gen_kp().unwrap();
         let pk = kp.public.to_hex();
         (PrfSigner::new(kp), pk)
+    }
+
+    #[test]
+    fn caller_built_rumor_keeps_its_tags_through_the_wrap() {
+        let (sender, sender_pk) = prf_signer();
+        let (recipient, recipient_pk) = prf_signer();
+        let rumor = UnsignedEvent {
+            pubkey: sender_pk.clone(),
+            created_at: 1_700_000_000,
+            kind: 7,
+            tags: vec![
+                vec!["e".into(), "ab".repeat(32), String::new(), "reply".into()],
+                vec!["p".into(), recipient_pk.clone()],
+            ],
+            content: "+".into(),
+        };
+        let (to_recipient, to_self) = block_on(gift_wrap_rumor_pair_with_signer(
+            &sender,
+            &recipient_pk,
+            &rumor,
+        ))
+        .unwrap();
+        let got = block_on(unwrap_gift_with_signer(&to_recipient, &recipient)).unwrap();
+        assert_eq!(got.rumor_kind(), Some(RumorKind::Reaction));
+        assert_eq!(got.rumor.tags, rumor.tags);
+        assert_eq!(got.sender_pubkey, sender_pk);
+        let mine = block_on(unwrap_gift_with_signer(&to_self, &sender)).unwrap();
+        assert_eq!(
+            rumor_json_with_id(&mine.rumor).unwrap(),
+            rumor_json_with_id(&got.rumor).unwrap()
+        );
+        assert_ne!(to_recipient.id, to_self.id);
+    }
+
+    #[test]
+    fn caller_built_rumor_must_name_the_signer() {
+        let (sender, _) = prf_signer();
+        let (_, other_pk) = prf_signer();
+        let rumor = create_rumor(&other_pk, &other_pk, "spoof");
+        assert!(block_on(gift_wrap_rumor_with_signer(&sender, &other_pk, &rumor)).is_err());
     }
 
     #[test]

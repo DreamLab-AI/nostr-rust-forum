@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS recipient_keys (
     zone         TEXT,
     role         TEXT NOT NULL CHECK(role IN ('inbox','epoch')),
     created_at   INTEGER NOT NULL,
-    revoked      INTEGER NOT NULL DEFAULT 0
+    revoked      INTEGER NOT NULL DEFAULT 0,
+    proof        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_recipient_keys_owner ON recipient_keys(owner_pubkey);

@@ -30,6 +30,7 @@ use nostr_bbs_core::signer::Signer;
 
 use crate::chrome::BbsState;
 use crate::config::BbsConfig;
+use crate::outbox::Delivery;
 use crate::signer::BbsSigner;
 
 /// NIP-59 gift-wraps randomise their outer `created_at` up to ~2 days into the
@@ -90,6 +91,10 @@ struct DmInner {
     error: Option<String>,
     /// Whether the initial history load is still in flight.
     loading: bool,
+    /// Relay-acknowledgement state of messages sent this session, keyed by
+    /// message id. Absent means settled (history loaded from the relay, or
+    /// acknowledged and cleared), so only in-flight and failed sends show a marker.
+    delivery: std::collections::HashMap<String, Delivery>,
 }
 
 /// Reactive DM store, provided as Leptos context (mirrors `RelayStore`: every
@@ -149,6 +154,23 @@ impl DmStore {
     /// Latest error, if any.
     pub fn error(&self) -> Option<String> {
         self.inner.with(|s| s.error.clone())
+    }
+
+    /// Delivery state of a sent message, or `None` once it is settled.
+    pub fn delivery(&self, id: &str) -> Option<Delivery> {
+        self.inner.with(|s| s.delivery.get(id).copied())
+    }
+
+    /// Record a delivery transition; `Sent` clears the marker.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn set_delivery(&self, id: &str, state: Delivery) {
+        self.inner.update(|s| {
+            if state == Delivery::Sent {
+                s.delivery.remove(id);
+            } else {
+                s.delivery.insert(id.to_string(), state);
+            }
+        });
     }
 
     /// Clear the surfaced error.
@@ -229,9 +251,11 @@ impl DmStore {
     ///
     /// The bubble is inserted optimistically (a `local-…` id); the async
     /// gift-wrap + publish happens on a spawned task because the signer is async
-    /// and a NIP-07 extension prompts off the main flow. Our own gift-wrap is
-    /// never echoed back to us (its author is a throwaway key, its `#p` is the
-    /// recipient), so the optimistic bubble is the sole record — no re-key dance.
+    /// and a NIP-07 extension prompts off the main flow. Two wraps are produced
+    /// (NIP-17): the self-copy, published first so the sender's history survives
+    /// a reload, then the recipient copy. The bubble is re-keyed to the self-copy
+    /// id so the relay's echo of it dedups, and stays `Sending` until both wraps
+    /// are acknowledged (`Failed` on `OK false` or timeout).
     #[cfg(target_arch = "wasm32")]
     pub fn send(&self, signer: Rc<dyn Signer>, my_pk: String, recipient: String, content: String) {
         let text = content.trim().to_string();
@@ -261,8 +285,19 @@ impl DmStore {
 
         let store = *self;
         wasm_bindgen_futures::spawn_local(async move {
-            match nostr_bbs_core::gift_wrap_with_signer(signer.as_ref(), &recipient, &text).await {
-                Ok(wrapped) => dm_ws::publish(&wrapped),
+            match wrap_for_send(signer.as_ref(), &recipient, &text).await {
+                Ok(wraps) => {
+                    let id = wraps[0].id.clone();
+                    store.inner.update(|s| {
+                        s.seen.remove(&local_id);
+                        s.seen.insert(id.clone());
+                        if let Some(m) = s.messages.iter_mut().find(|m| m.id == local_id) {
+                            m.id = id.clone();
+                        }
+                        s.delivery.insert(id.clone(), Delivery::Sending);
+                    });
+                    dm_ws::publish_tracked(store, &id, &wraps);
+                }
                 Err(e) => {
                     web_sys::console::error_1(&format!("[bbs-dm] gift wrap failed: {e}").into());
                     store.inner.update(|s| {
@@ -321,6 +356,39 @@ fn now_secs() -> u64 {
 }
 
 // ── Pure logic (unit-tested on native) ────────────────────────────────────────
+
+/// Gift-wrap `text` for `recipient` as a NIP-17 pair and return the wraps in
+/// PUBLISH order: `[self-copy, recipient-copy]`. The self-copy goes first so the
+/// sender's own history is durable even if the recipient publish is interrupted.
+/// `[0].id` is the id the relay echoes back to us, so it keys the bubble.
+pub async fn wrap_for_send(
+    signer: &dyn Signer,
+    recipient: &str,
+    text: &str,
+) -> Result<[nostr_bbs_core::NostrEvent; 2], String> {
+    let (to_recipient, to_self) =
+        nostr_bbs_core::gift_wrap_pair_with_signer(signer, recipient, text)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok([to_self, to_recipient])
+}
+
+/// Clamp a sender-controlled timestamp to `now`. A rumor's `created_at` is
+/// chosen by the sender, so a far-future stamp would pin the message to the top
+/// of the thread forever. Past stamps are kept. Identical to the forum client's
+/// `clamp_to_now`.
+pub fn clamp_to_now(timestamp: u64, now: u64) -> u64 {
+    timestamp.min(now)
+}
+
+/// Marker appended to a sent bubble for its delivery state (empty when settled).
+pub fn delivery_label(state: Option<Delivery>) -> &'static str {
+    match state {
+        Some(Delivery::Sending) => " [sending\u{2026}]",
+        Some(Delivery::Failed) => " [failed \u{2717}]",
+        Some(Delivery::Sent) | None => "",
+    }
+}
 
 /// True iff `s` is a 64-char lowercase-or-mixed hex string (a Nostr x-only pk).
 pub fn is_hex_pubkey(s: &str) -> bool {
@@ -485,6 +553,7 @@ pub fn group_conversations(
 #[cfg(target_arch = "wasm32")]
 mod dm_ws {
     use super::{build_auth_unsigned, dm_filters, DmStore, GIFT_WRAP_LOOKBACK_SECS};
+    use crate::outbox::{Delivery, Outbox};
     use leptos::prelude::Update;
     use nostr_bbs_core::gift_wrap::{KIND_ENCRYPTED_DM, KIND_GIFT_WRAP};
     use nostr_bbs_core::signer::Signer;
@@ -501,7 +570,16 @@ mod dm_ws {
         static MY_PK: RefCell<String> = const { RefCell::new(String::new()) };
         /// AUTH challenge stashed if it arrives before the signer is registered.
         static PENDING_AUTH: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// Frames queued while the socket is not OPEN, and per-message ack tracking.
+        /// Id of our in-flight AUTH response event; its `OK true` opens the outbox.
+        static AUTH_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// Whether the relay has issued an AUTH challenge on this socket.
+        static CHALLENGED: RefCell<bool> = const { RefCell::new(false) };
+        static OUTBOX: RefCell<Outbox> = RefCell::new(Outbox::default());
     }
+
+    /// How long to wait for the relay's `OK` before a send is shown as failed.
+    const ACK_TIMEOUT_MS: i32 = 15_000;
 
     const DM_SUB_ID: &str = "bbs-dm";
 
@@ -537,9 +615,61 @@ mod dm_ws {
         send_str(&serde_json::Value::Array(frame).to_string());
     }
 
-    pub fn publish(event: &NostrEvent) {
-        if let Ok(msg) = serde_json::to_string(&serde_json::json!(["EVENT", event])) {
-            send_str(&msg);
+    /// Apply a settled delivery transition to the store (surfacing failures).
+    fn apply(store: DmStore, settled: Option<(String, Delivery)>) {
+        if let Some((id, state)) = settled {
+            store.set_delivery(&id, state);
+            if state == Delivery::Failed {
+                store.inner.update(|s| {
+                    s.error = Some(
+                        "A message was not accepted by the relay (refused or timed out)."
+                            .to_string(),
+                    );
+                });
+            }
+        }
+    }
+
+    /// Publish `events` in order for message `msg_id`, tracking the relay's `OK`
+    /// for each. Frames are queued while the socket is not OPEN and flushed on
+    /// open; an unacknowledged wrap fails the message after [`ACK_TIMEOUT_MS`].
+    pub fn publish_tracked(store: DmStore, msg_id: &str, events: &[NostrEvent]) {
+        let ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+        OUTBOX.with(|o| o.borrow_mut().track(msg_id, &ids));
+        for ev in events {
+            let Ok(frame) = serde_json::to_string(&serde_json::json!(["EVENT", ev])) else {
+                continue;
+            };
+            let open = ws_open().is_some();
+            if let Some(f) = OUTBOX.with(|o| o.borrow_mut().submit(&ev.id, frame, open)) {
+                send_str(&f);
+            }
+            arm_ack_timeout(store, ev.id.clone());
+        }
+    }
+
+    fn arm_ack_timeout(store: DmStore, event_id: String) {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let settled = OUTBOX.with(|o| o.borrow_mut().on_timeout(&event_id));
+            apply(store, settled);
+        });
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            ACK_TIMEOUT_MS,
+        );
+        cb.forget();
+    }
+
+    /// Send everything queued while the socket was connecting.
+    fn flush_outbox() {
+        if ws_open().is_none() {
+            return;
+        }
+        for f in OUTBOX.with(|o| o.borrow_mut().flush(true)) {
+            send_str(&f);
         }
     }
 
@@ -557,6 +687,9 @@ mod dm_ws {
         RELAY_URL.with(|u| u.borrow_mut().clear());
         MY_PK.with(|p| p.borrow_mut().clear());
         PENDING_AUTH.with(|c| *c.borrow_mut() = None);
+        OUTBOX.with(|o| *o.borrow_mut() = Outbox::default());
+        AUTH_ID.with(|a| *a.borrow_mut() = None);
+        CHALLENGED.with(|c| *c.borrow_mut() = false);
     }
 
     /// Answer a NIP-42 challenge with a signed kind-22242, then replay the REQ so
@@ -569,12 +702,14 @@ mod dm_ws {
                 return;
             }
         };
+        CHALLENGED.with(|c| *c.borrow_mut() = true);
         let relay_url = RELAY_URL.with(|u| u.borrow().clone());
         let now = (js_sys::Date::now() / 1000.0) as u64;
         let unsigned = build_auth_unsigned(signer.public_key(), &relay_url, &challenge, now);
         wasm_bindgen_futures::spawn_local(async move {
             match signer.sign_event(unsigned).await {
                 Ok(signed) => {
+                    AUTH_ID.with(|a| *a.borrow_mut() = Some(signed.id.clone()));
                     if let Ok(msg) = serde_json::to_string(&serde_json::json!(["AUTH", signed])) {
                         send_str(&msg);
                     }
@@ -616,7 +751,7 @@ mod dm_ws {
                             sender_pubkey: sender,
                             recipient_pubkey: recipient,
                             content: u.rumor.content.clone(),
-                            timestamp: u.rumor.created_at,
+                            timestamp: super::clamp_to_now(u.rumor.created_at, super::now_secs()),
                             is_sent,
                         });
                     }
@@ -658,7 +793,7 @@ mod dm_ws {
                         sender_pubkey: event.pubkey.clone(),
                         recipient_pubkey: if is_sent { counterparty } else { my_pk.clone() },
                         content: plaintext,
-                        timestamp: event.created_at,
+                        timestamp: super::clamp_to_now(event.created_at, super::now_secs()),
                         is_sent,
                     }),
                     Err(e) => web_sys::console::warn_1(
@@ -693,7 +828,33 @@ mod dm_ws {
                     handle_auth(ch.to_string());
                 }
             }
-            Some("EOSE") => store.inner.update(|s| s.loading = false),
+            Some("EOSE") => {
+                store.inner.update(|s| s.loading = false);
+                // A relay that never challenged does not gate writes on AUTH.
+                if !CHALLENGED.with(|c| *c.borrow()) {
+                    OUTBOX.with(|o| o.borrow_mut().set_authed(true));
+                    flush_outbox();
+                }
+            }
+            Some("OK") => {
+                if let (Some(id), Some(ok)) = (
+                    arr.get(1).and_then(|v| v.as_str()),
+                    arr.get(2).and_then(|v| v.as_bool()),
+                ) {
+                    let reason = arr.get(3).and_then(|v| v.as_str()).unwrap_or("");
+                    if AUTH_ID.with(|a| a.borrow().as_deref() == Some(id)) {
+                        if ok {
+                            OUTBOX.with(|o| o.borrow_mut().set_authed(true));
+                            flush_outbox();
+                        }
+                        return;
+                    }
+                    let settled = OUTBOX.with(|o| o.borrow_mut().on_ok(id, ok, reason));
+                    apply(store, settled);
+                    // An `auth-required` re-queue may be sendable right away.
+                    flush_outbox();
+                }
+            }
             _ => {}
         }
     }
@@ -717,8 +878,13 @@ mod dm_ws {
             Err(_) => return,
         };
 
+        // A fresh socket starts unauthenticated.
+        OUTBOX.with(|o| o.borrow_mut().set_authed(false));
+        AUTH_ID.with(|a| *a.borrow_mut() = None);
+        CHALLENGED.with(|c| *c.borrow_mut() = false);
         let onopen = Closure::<dyn FnMut()>::new(move || {
             send_dm_req();
+            flush_outbox();
         });
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         onopen.forget();
@@ -1012,9 +1178,11 @@ fn dm_thread(
                     {msgs.into_iter().map(|m| {
                         let is_me = m.sender_pubkey == me;
                         let who = if is_me { "you".to_string() } else { peer_name.clone() };
-                        let body = m.content.clone();
+                        let state = store.delivery(&m.id);
+                        let body = format!("{}{}", m.content, delivery_label(state));
                         view! {
-                            <div class="bbs-row bbs-dm-msg" class:bbs-dm-sent=is_me>
+                            <div class="bbs-row bbs-dm-msg" class:bbs-dm-sent=is_me
+                                class:bbs-dm-failed=state == Some(Delivery::Failed)>
                                 <span class="accent">{format!("<{who}> ")}</span>{body}
                             </div>
                         }
@@ -1063,6 +1231,83 @@ mod tests {
 
     const ME: &str = "11111111111111111111111111111111111111111111111111111111111111aa";
     const BOB: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTAB)
+        }
+        static VTAB: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTAB)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = Box::pin(fut);
+        loop {
+            if let Poll::Ready(v) = pinned.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn signer() -> (nostr_bbs_core::PrfSigner, String) {
+        let kp = nostr_bbs_core::generate_keypair().unwrap();
+        let pk = kp.public.to_hex();
+        (nostr_bbs_core::PrfSigner::new(kp), pk)
+    }
+
+    #[test]
+    fn send_produces_self_copy_first_then_recipient_copy() {
+        let (me, me_pk) = signer();
+        let (bob, bob_pk) = signer();
+        let wraps = block_on(wrap_for_send(&me, &bob_pk, "hello bob")).unwrap();
+        // [0] is addressed to the sender and readable by the sender.
+        assert_eq!(rumor_recipient(&wraps[0].tags), Some(me_pk.clone()));
+        let mine = block_on(nostr_bbs_core::unwrap_gift_with_signer(&wraps[0], &me)).unwrap();
+        assert_eq!(mine.rumor.content, "hello bob");
+        assert_eq!(mine.sender_pubkey, me_pk);
+        // [1] is addressed to, and readable by, the recipient.
+        assert_eq!(rumor_recipient(&wraps[1].tags), Some(bob_pk));
+        let theirs = block_on(nostr_bbs_core::unwrap_gift_with_signer(&wraps[1], &bob)).unwrap();
+        assert_eq!(theirs.rumor.content, "hello bob");
+        assert_ne!(wraps[0].id, wraps[1].id);
+    }
+
+    #[test]
+    fn inbox_filter_accepts_wraps_addressed_to_self() {
+        let f = dm_filters(ME, None);
+        assert_eq!(f[0]["#p"][0], ME);
+        assert!(f[0]["kinds"].as_array().unwrap().iter().any(|k| k == 1059));
+    }
+
+    #[test]
+    fn clamp_to_now_pins_future_timestamps() {
+        assert_eq!(clamp_to_now(5_000, 1_000), 1_000);
+        assert_eq!(clamp_to_now(900, 1_000), 900);
+        assert_eq!(clamp_to_now(1_000, 1_000), 1_000);
+    }
+
+    #[test]
+    fn clamped_future_message_does_not_outrank_newer_traffic() {
+        let hostile = msg(
+            "a",
+            BOB,
+            ME,
+            "pinned?",
+            clamp_to_now(9_999_999, 1_000),
+            false,
+        );
+        let later = msg("b", BOB, ME, "later", 1_500, false);
+        let sorted = messages_for_peer(&[later, hostile], ME, BOB);
+        assert_eq!(sorted.last().unwrap().id, "b");
+    }
+
+    #[test]
+    fn delivery_label_marks_only_unsettled_sends() {
+        assert_eq!(delivery_label(None), "");
+        assert_eq!(delivery_label(Some(Delivery::Sent)), "");
+        assert!(delivery_label(Some(Delivery::Sending)).contains("sending"));
+        assert!(delivery_label(Some(Delivery::Failed)).contains("failed"));
+    }
+
     const JAR: &str = "2de44d5622eef79519ac078f6e227a85aecbaefd561e4e50c5f51dfadbf916e9";
 
     #[test]

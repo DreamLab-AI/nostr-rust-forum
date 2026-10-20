@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-bbs-core"
-version = "1.0.0-beta.19"
+version = "1.0.0-beta.20"
 dependencies = [
  "aes",
  "async-trait",
@@ -2485,6 +2485,7 @@ dependencies = [
  "leptos",
  "leptos_meta",
  "leptos_router",
+ "nostr",
  "nostr-bbs-core",
  "nostr-bbs-poker",
  "qrcode",

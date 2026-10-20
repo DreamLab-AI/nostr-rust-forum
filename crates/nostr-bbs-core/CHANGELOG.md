@@ -4,6 +4,16 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.20] - 2026-10-20
+
+### Added
+
+- `gift_wrap_rumor_with_signer` and `gift_wrap_rumor_pair_with_signer`: wrap a caller-built
+  unsigned rumor (any NIP-17 kind, with its own tags, so reactions, deletions, replies and
+  `imeta` can travel) through the same ADR-2025 envelope as `gift_wrap_with_signer`. The rumor's
+  `pubkey` must equal the signer's key, enforced at runtime. Callers remain responsible for the
+  rumor's `p` and `e` tags; the forum client restricts `p` to {recipient, self}.
+
 ## [1.0.0-beta.19] - 2026-10-20
 
 ### Added

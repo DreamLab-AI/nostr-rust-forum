@@ -253,15 +253,20 @@ impl ZoneKeyStore {
                     return;
                 }
                 let (relay, signer, me) = (relay.clone(), signer.clone(), me.clone());
+                super::public_inbox::sweep_wrap_started();
                 spawn_local(async move {
                     store.process_wrap(&ev, &*signer, &me, &relay).await;
+                    super::public_inbox::sweep_wrap_done(&me);
                 });
             })
         };
+        // The end of stored events on the identity subscription settles the
+        // old-grant cleanup flag the public-inbox opt-in waits for.
+        let eose_me = me.clone();
         relay.subscribe(
             vec![wrap_filter(subscription_targets(&me, None))],
             on_event.clone(),
-            None,
+            Some(Rc::new(move || super::public_inbox::sweep_eose(&eose_me))),
         );
         if !recipient_keys_enabled() {
             return;
@@ -351,7 +356,15 @@ impl ZoneKeyStore {
             is_grant: true,
             key_safe: valid && persisted && replacement_exists,
         };
-        for id in sweep_targets(grant_sweep_enabled(), &[candidate]) {
+        let doomed = sweep_targets(grant_sweep_enabled(), std::slice::from_ref(&candidate));
+        if candidate.to_identity
+            && candidate.is_grant
+            && super::public_inbox::grant_blocks_cleanup(admin.is_some(), valid, !doomed.is_empty())
+        {
+            // Still waiting on its replacement key: cleanup is not finished.
+            super::public_inbox::sweep_grant_left(me);
+        }
+        for id in doomed {
             let unsigned = deletion_for_wrap(me, &id, now_secs());
             if let Ok(del) = signer.sign_event(unsigned).await {
                 relay.publish(&del);

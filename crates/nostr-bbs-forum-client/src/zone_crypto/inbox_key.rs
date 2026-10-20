@@ -350,34 +350,64 @@ pub enum Lookup {
 
 /// Read a lookup reply: `{"keys":[{"key","role","revoked","created_at"}]}`.
 /// The newest unrevoked `inbox` entry wins; an empty list is a definite none.
-pub fn parse_lookup(body: &str) -> Lookup {
+/// Whether `proof` binds `key` to `member`: a kind-27237 event signed by the
+/// inbox key itself, carrying an `owner` tag naming the member, with a valid
+/// signature. Freshness (`exp`) is not checked here: the proof was time-bound
+/// when the auth-worker accepted it, and the issuer verifies binding, not age.
+/// Without this check an issuer would wrap zone keys to whatever key a
+/// lookup reply named, so a wrong or hostile row could redirect them.
+pub fn proof_binds(proof: &serde_json::Value, key: &str, member: &str) -> bool {
+    let Ok(ev) = serde_json::from_value::<NostrEvent>(proof.clone()) else {
+        return false;
+    };
+    ev.kind == KIND_PROOF
+        && ev.pubkey.eq_ignore_ascii_case(key)
+        && ev
+            .tags
+            .iter()
+            .any(|t| t.len() >= 2 && t[0] == "owner" && t[1].eq_ignore_ascii_case(member))
+        && verify_event_strict(&ev).is_ok()
+}
+
+/// Parse an admin lookup reply for `member`. Only entries whose stored
+/// registration proof binds the key to `member` are considered; a reply whose
+/// every entry fails that check is `Unknown`, never `None`, so the issuer
+/// retries rather than falling back to the identity key.
+pub fn parse_lookup(body: &str, member: &str) -> Lookup {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Lookup::Unknown("lookup reply is not JSON".into());
     };
     let Some(list) = v.get("keys").and_then(|k| k.as_array()) else {
         return Lookup::Unknown("lookup reply has no keys list".into());
     };
-    let best = list
+    let candidates: Vec<(u64, &str)> = list
         .iter()
         .filter(|e| e.get("role").and_then(|r| r.as_str()).unwrap_or("inbox") == "inbox")
         .filter(|e| !matches!(e.get("revoked"), Some(r) if r.as_bool() == Some(true) || r.as_i64().is_some_and(|n| n != 0)))
         .filter_map(|e| {
             let key = e.get("key")?.as_str()?;
             (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
-                .then(|| (e.get("created_at").and_then(|c| c.as_u64()).unwrap_or(0), key))
+                .then(|| (e.get("created_at").and_then(|c| c.as_u64()).unwrap_or(0), key, e.get("proof")))
         })
-        .max_by_key(|(c, _)| *c);
-    match best {
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|(c, key, proof)| proof.filter(|p| proof_binds(p, key, member)).map(|_| (c, key)))
+        .collect();
+    let any_entries = !list.is_empty();
+    match candidates.into_iter().max_by_key(|(c, _)| *c) {
         Some((_, k)) => Lookup::Found(k.to_ascii_lowercase()),
+        None if any_entries => {
+            Lookup::Unknown("no inbox key in the lookup reply is bound to this member".into())
+        }
         None => Lookup::None,
     }
 }
 
 /// Turn a fetch result into a [`Lookup`]. A 404 is a definite "none"; every
 /// other failure is unknown.
-pub fn classify_lookup(result: Result<String, String>) -> Lookup {
+pub fn classify_lookup(result: Result<String, String>, member: &str) -> Lookup {
     match result {
-        Ok(body) => parse_lookup(&body),
+        Ok(body) => parse_lookup(&body, member),
         Err(e) if e.contains("HTTP 404") => Lookup::None,
         Err(e) => Lookup::Unknown(e),
     }
@@ -605,6 +635,7 @@ pub async fn lookup_inbox_key(admin: &dyn Signer, owner: &str) -> Lookup {
         crate::auth::nip98::fetch_with_nip98_get_signer(&url, admin)
             .await
             .map_err(|e| e.to_string()),
+        owner,
     )
 }
 
@@ -842,25 +873,49 @@ mod tests {
     }
 
     #[test]
-    fn lookup_parsing_distinguishes_none_from_unknown() {
-        let k = "ab".repeat(32);
+    fn lookup_parsing_binds_keys_to_the_member_through_their_proof() {
+        let member = local_signer();
+        let m = member.public_key();
+        let inbox = local_signer();
+        let k = inbox.public_key();
+        let proof = block_on(build_proof(&inbox, m, 1_000)).unwrap();
+        let proof_json = serde_json::to_string(&proof).unwrap();
         let body = format!(
-            r#"{{"keys":[{{"key":"{}","role":"inbox","revoked":0,"created_at":9}},
-                {{"key":"{}","role":"inbox","revoked":1,"created_at":99}}]}}"#,
-            k,
-            "cd".repeat(32)
+            r#"{{"keys":[{{"key":"{k}","role":"inbox","revoked":0,"created_at":9,"proof":{proof_json}}}]}}"#
         );
-        assert_eq!(parse_lookup(&body), Lookup::Found(k));
-        assert_eq!(parse_lookup(r#"{"keys":[]}"#), Lookup::None);
-        assert!(matches!(parse_lookup("nonsense"), Lookup::Unknown(_)));
-        assert_eq!(classify_lookup(Err("HTTP 404".into())), Lookup::None);
+        assert_eq!(parse_lookup(&body, m), Lookup::Found(k.to_string()));
+
+        // Wrong owner in the proof: the key is not bound to this member.
+        let other_signer = local_signer();
+        let other = other_signer.public_key();
+        assert!(matches!(parse_lookup(&body, other), Lookup::Unknown(_)));
+
+        // Proof signed by a different key than the entry names.
+        let stranger = local_signer();
+        let forged = block_on(build_proof(&stranger, m, 1_000)).unwrap();
+        let body = format!(
+            r#"{{"keys":[{{"key":"{k}","role":"inbox","revoked":0,"created_at":9,"proof":{}}}]}}"#,
+            serde_json::to_string(&forged).unwrap()
+        );
+        assert!(matches!(parse_lookup(&body, m), Lookup::Unknown(_)));
+
+        // Legacy row with no proof: refused, and the issuer retries rather than
+        // falling back to the identity key.
+        let body = format!(
+            r#"{{"keys":[{{"key":"{k}","role":"inbox","revoked":0,"created_at":9,"proof":null}}]}}"#
+        );
+        assert!(matches!(parse_lookup(&body, m), Lookup::Unknown(_)));
+
+        // No entries at all is a definite none.
+        assert_eq!(parse_lookup(r#"{"keys":[]}"#, m), Lookup::None);
+        assert!(matches!(parse_lookup("nonsense", m), Lookup::Unknown(_)));
+        assert_eq!(classify_lookup(Err("HTTP 404".into()), m), Lookup::None);
         assert!(matches!(
-            classify_lookup(Err("HTTP 500".into())),
+            classify_lookup(Err("HTTP 500".into()), m),
             Lookup::Unknown(_)
         ));
-        let m = "11".repeat(32);
-        assert_eq!(grant_target(&m, Lookup::None).unwrap(), m);
-        assert!(grant_target(&m, Lookup::Unknown("x".into())).is_err());
+        assert_eq!(grant_target(m, Lookup::None).unwrap(), m);
+        assert!(grant_target(m, Lookup::Unknown("x".into())).is_err());
     }
 
     fn cand(id: &str, to_identity: bool, is_grant: bool, key_safe: bool) -> SweepCandidate {

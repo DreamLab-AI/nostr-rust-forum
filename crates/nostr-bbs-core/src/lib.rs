@@ -66,9 +66,9 @@ pub use event::{
 };
 pub use gift_wrap::{
     create_rumor_kind, gift_wrap, gift_wrap_kind, gift_wrap_pair_with_signer,
-    gift_wrap_with_signer, gift_wrap_with_signer_kind, unwrap_gift, unwrap_gift_kind,
-    unwrap_gift_with_signer, unwrap_gift_with_signer_kind, GiftWrapError, RumorKind,
-    SignerGiftWrapError, UnwrappedGift,
+    gift_wrap_rumor_pair_with_signer, gift_wrap_rumor_with_signer, gift_wrap_with_signer,
+    gift_wrap_with_signer_kind, unwrap_gift, unwrap_gift_kind, unwrap_gift_with_signer,
+    unwrap_gift_with_signer_kind, GiftWrapError, RumorKind, SignerGiftWrapError, UnwrappedGift,
 };
 pub use keys::{
     derive_from_prf, derive_subkey, generate_keypair, Keypair, PublicKey, SecretKey, Signature,

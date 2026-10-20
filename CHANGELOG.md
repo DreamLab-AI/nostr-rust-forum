@@ -45,6 +45,33 @@ the channel or thread URL out of linked sites' and image hosts' logs; the YouTub
 Recorded with the advisor's corrections (bounded revision, length-prefixed zone id, no plaintext master
 in the shared IndexedDB) after the first design was found to re-derive a secret removed members still hold.
 
+### Upgrade Phase 3: NIP-17 overlay, ADR-2027 accepted and implemented behind the flag (2026-10-20)
+
+ADR-2027 was accepted by the operator and decision 1 is implemented, all behind the same
+`RECIPIENT_KEYS_ENABLED` flag, default off. Forum client DMs: the recipient's kind 10050 (then
+NIP-65 read relays) is resolved from the public indexers and our relay concurrently, candidates
+verified by signature and author; the recipient copy goes to up to four `wss://` foreign relays and
+to our relay only for members or ingress recipients; the self-copy goes to our relay first and must
+be acknowledged before any recipient copy is sent; delivery is Sent, Partial or Failed and never
+Sent with zero acknowledgements; an empty route is Failed before anything is published. Replying
+to a non-member shows a one-time-per-recipient confirmation naming the relay hosts, because the
+member's browser connects to relays that recipient chose. Rumor kinds 7, 5 and 15 render as
+reaction, sender-only deletion and `https` attachment; outgoing rumors are validated so `p` tags
+name only the recipient and self and `e` tags reference known messages; replies carry the `reply`
+marker and media carries `imeta`. A Requests lane holds DMs from outsiders with no unread badge.
+The `public_inbox` opt-in publishes the member's relay lists to purplepag.es, indexer.coracle.social
+and relay.nos.social by merging over the newest list already there, keeps a local baseline so a
+stale indexer cannot shrink the list, needs two indexers or an agreeing baseline, retracts fully on
+opt-out, and shows the consent text fixed in ADR-2027 verbatim. BBS client: NIP-17 self-copy, an
+outbox state machine that queues until NIP-42 AUTH completes and marks Sent only when both wraps
+are acknowledged, and the same future-timestamp clamp as the forum client. Inbox-key attestation:
+the auth-worker stores and returns each key's kind-27237 registration proof (migration 0012) and
+grant issuers refuse any key whose proof does not bind it to the member. `nostr-bbs-core`
+1.0.0-beta.20 adds `gift_wrap_rumor_with_signer` and its pair form. Reviews: Opus seam review
+(outsider lookup never reached indexers, among seven confirmed findings), Codex gpt-6-astra
+cross-vendor audit (six findings, five fixed, one accepted and documented), deepsec over the
+pre-fix tree (one HIGH, fixed here); 3,043 workspace tests.
+
 ### Upgrade Phase 2: private inbox keys for zone-key grants (ADR-2027 decision 2), flagged off (2026-10-20)
 
 Zone-key grants (rumor kind 21453) can now be addressed to a per-member inbox key instead of the

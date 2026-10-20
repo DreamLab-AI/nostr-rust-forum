@@ -182,7 +182,7 @@ wasm-bindgen-test = "0.3"
 solid-pod-rs = { version = "0.5.0-alpha.14", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.3).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.19" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.20" }
 nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.16" }
 nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.16" }
 nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.16" }

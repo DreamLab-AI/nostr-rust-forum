@@ -178,7 +178,12 @@ pub fn DmChatPage() -> impl IntoView {
 
     // Short display name for recipient (resolved from NameCache)
 
+    // The one-time-per-recipient consent dialogue for replying to a non-member
+    // through relays that recipient chose (ADR-2027, Phase 3 notes). The send
+    // path withholds every foreign publish until this answers; unmounted it
+    // would time out as Cancel and fail closed.
     view! {
+        <crate::dm::consent::ConsentPrompt store=dm_store />
         <div class="flex flex-col h-[calc(100vh-64px)]">
             // Header
             <div class="bg-gray-800 border-b border-gray-700 p-4">

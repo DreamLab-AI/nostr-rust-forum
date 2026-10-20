@@ -1070,6 +1070,9 @@ pub fn SettingsPage() -> impl IntoView {
                     }}
                 </div>
 
+                // -- Public inbox (ADR-2027 decision 1; flagged) --
+                <PublicInboxSection />
+
                 // -- Section 4: Appearance --
                 <div class="glass-card p-6 space-y-4">
                     <h2 class="text-lg font-semibold text-white flex items-center gap-2">
@@ -2076,6 +2079,203 @@ fn proceed_to_install(zone_id: String, show_manual: RwSignal<bool>) {
     }
 }
 
+// -- Public inbox (ADR-2027 decision 1) ------------------------------------------
+
+/// Title of the consent dialog. FIXED by the ADR-2027 Acceptance record; a test
+/// compares all four consent strings with the ADR text, so changing one without
+/// the other fails the build.
+const CONSENT_TITLE: &str = "Make your inbox public?";
+/// Body of the consent dialog, verbatim from the ADR-2027 Acceptance record.
+const CONSENT_BODY: &str = "Your membership of this board becomes publicly visible: a record naming this relay is published to the Nostr indexers under your key, and anyone can look it up. Anyone on Nostr can then send you direct messages here, including people who are not members. Push notifications will wake you for those messages. Your posts stay as private as they are now. You can turn this off later, but the published record may already have been copied.";
+/// Primary button of the consent dialog.
+const CONSENT_CONFIRM: &str = "Make my inbox public";
+/// Secondary button of the consent dialog.
+const CONSENT_CANCEL: &str = "Not now";
+/// Help line above the toggle; not part of the fixed consent text.
+const PUBLISH_HELP: &str = "Publishing links your public key to this board's relay on public indexers; turning it off later cannot erase copies others already fetched.";
+/// Shown while a change is saved but not yet published.
+const PENDING_NOTE: &str = "Saved, but not published yet: the Nostr indexers could not be reached, and your existing relay lists are never overwritten unread. It will be retried the next time you send a message or sign in.";
+/// Shown after the opt-in is switched off: a retraction cannot recall copies.
+const RETRACTION_CAVEAT: &str = "Your inbox is no longer public. The retraction has been sent to the indexers, but the published record may already have been copied.";
+
+/// The "Public inbox" settings section. Renders nothing unless
+/// `RECIPIENT_KEYS_ENABLED` is on.
+#[component]
+fn PublicInboxSection() -> impl IntoView {
+    use crate::zone_crypto::inbox_key::recipient_keys_enabled;
+    use crate::zone_crypto::public_inbox::{self as pi, ToggleState};
+
+    let flag_on = recipient_keys_enabled();
+    if pi::toggle_state(flag_on, false, false, false) == ToggleState::Hidden {
+        return ().into_any();
+    }
+    let auth = use_auth();
+    let toasts = use_toasts();
+    let opted_in = RwSignal::new(false);
+    let registered = RwSignal::new(false);
+    let cleanup = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let confirm_open = RwSignal::new(false);
+    let caveat = RwSignal::new(false);
+    let pending = RwSignal::new(false);
+    // (target state, relays a publication would remove) awaiting a decision.
+    let shrunk: RwSignal<Option<(bool, Vec<String>)>> = RwSignal::new(None);
+
+    // Load the three inputs once the member's key is known.
+    Effect::new(move |_| {
+        let Some(pk) = auth.pubkey().get() else {
+            return;
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            opted_in.set(pi::opted_in(&pk).await);
+            registered.set(pi::inbox_registered(&pk).await);
+            cleanup.set(pi::cleanup_finished(&pk).await);
+            pending.set(pi::pending(&pk).await);
+        });
+    });
+
+    let state = Memo::new(move |_| {
+        pi::toggle_state(flag_on, opted_in.get(), registered.get(), cleanup.get())
+    });
+
+    let apply_with = move |on: bool, resolution: pi::Resolution| {
+        let Some(signer) = auth.get_signer() else {
+            toasts.show("Sign in again to change this.", ToastVariant::Error);
+            return;
+        };
+        busy.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            match pi::set_opt_in(&*signer, on, resolution).await {
+                Ok(report) => {
+                    opted_in.set(on);
+                    shrunk.set(None);
+                    // Owed until enough indexers took it.
+                    pending.set(!report.quorum_met());
+                    caveat.set(!on);
+                    if !report.failed.is_empty() {
+                        toasts.show(
+                            format!(
+                                "{} indexer(s) did not accept the update. It will be retried next time you sign in.",
+                                report.failed.len()
+                            ),
+                            ToastVariant::Warning,
+                        );
+                    }
+                }
+                // The choice is saved; the indexers could not be read, so
+                // nothing was published and it will be retried.
+                Err(pi::PublishError::Unreadable) => {
+                    opted_in.set(on);
+                    caveat.set(false);
+                    pending.set(true);
+                }
+                // The relay list on the indexers looks older than one this
+                // browser published: ask before anything is removed.
+                Err(pi::PublishError::Shrunk { removed }) => {
+                    opted_in.set(on);
+                    caveat.set(false);
+                    pending.set(true);
+                    shrunk.set(Some((on, removed)));
+                }
+                Err(e) => toasts.show(format!("Could not change this: {e}"), ToastVariant::Error),
+            }
+            busy.set(false);
+        });
+    };
+
+    let apply = move |on: bool| apply_with(on, pi::Resolution::Ask);
+
+    let on_toggle = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        match state.get_untracked() {
+            ToggleState::Enabled if opted_in.get_untracked() => apply(false),
+            ToggleState::Enabled => confirm_open.set(true),
+            _ => {}
+        }
+    };
+    let on_confirm = Callback::new(move |_| apply(true));
+
+    view! {
+        <div class="glass-card p-6 space-y-4" data-testid="settings-public-inbox">
+            <h2 class="text-lg font-semibold text-white">"Public inbox"</h2>
+            <div class="border-t border-gray-700/50"></div>
+            <p class="text-sm text-gray-400">
+                "Let people who are not members of this board send you direct messages. \
+                 Messages from people you do not know wait in Requests until you accept them."
+            </p>
+            <p class="text-xs text-gray-500" data-testid="public-inbox-help">{PUBLISH_HELP}</p>
+            <div class="flex items-center gap-3">
+                <button
+                    type="button"
+                    role="switch"
+                    data-testid="public-inbox-toggle"
+                    aria-checked=move || opted_in.get().to_string()
+                    aria-label="Public inbox"
+                    disabled=move || busy.get() || matches!(state.get(), ToggleState::Disabled(_))
+                    on:click=on_toggle
+                    class=move || if opted_in.get() {
+                        "relative w-11 h-6 rounded-full bg-amber-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    } else {
+                        "relative w-11 h-6 rounded-full bg-gray-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    }
+                >
+                    <span class=move || if opted_in.get() {
+                        "absolute top-0.5 left-5 w-5 h-5 rounded-full bg-white transition-all"
+                    } else {
+                        "absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-all"
+                    }></span>
+                </button>
+                <span class="text-sm text-gray-300">
+                    {move || if opted_in.get() { "On" } else { "Off" }}
+                </span>
+            </div>
+            {move || match state.get() {
+                ToggleState::Disabled(why) => Some(view! {
+                    <p class="text-xs text-gray-500" data-testid="public-inbox-why">{why.explanation()}</p>
+                }),
+                _ => None,
+            }}
+            {move || shrunk.get().map(|(on, removed)| view! {
+                <div class="space-y-2" data-testid="public-inbox-shrunk">
+                    <p class="text-xs text-amber-300">
+                        {format!("Your relay list on the indexers looks older than one you published before; publishing now would remove: {}.", removed.join(", "))}
+                    </p>
+                    <div class="flex gap-2">
+                        <button class="text-xs bg-amber-500 text-gray-900 rounded px-3 py-1 font-semibold"
+                            on:click=move |_| apply_with(on, pi::Resolution::KeepThem)>"Keep them and publish"</button>
+                        <button class="text-xs text-red-400 border border-red-500/30 rounded px-3 py-1"
+                            on:click=move |_| apply_with(on, pi::Resolution::Anyway)>"Publish anyway"</button>
+                        <button class="text-xs text-gray-300 border border-gray-600 rounded px-3 py-1"
+                            on:click=move |_| shrunk.set(None)>"Cancel"</button>
+                    </div>
+                </div>
+            })}
+            {move || (pending.get() && shrunk.get().is_none()).then(|| view! {
+                <button class="text-xs text-amber-400 underline"
+                    on:click=move |_| apply(opted_in.get_untracked())>"Retry now"</button>
+            })}
+            {move || pending.get().then(|| view! {
+                <p class="text-xs text-amber-300" data-testid="public-inbox-pending">{PENDING_NOTE}</p>
+            })}
+            {move || caveat.get().then(|| view! {
+                <p class="text-xs text-amber-300" data-testid="public-inbox-caveat">{RETRACTION_CAVEAT}</p>
+            })}
+            <ConfirmDialog
+                is_open=confirm_open
+                title=CONSENT_TITLE.to_string()
+                message=CONSENT_BODY.to_string()
+                confirm_label=CONSENT_CONFIRM.to_string()
+                cancel_label=CONSENT_CANCEL.to_string()
+                variant=ConfirmVariant::Warning
+                on_confirm=on_confirm
+            />
+        </div>
+    }
+    .into_any()
+}
+
 fn section_icon(d: &'static str) -> impl IntoView {
     view! {
         <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2254,5 +2454,56 @@ mod tests {
         assert!(kind0_is_for(&me, &me));
         assert!(kind0_is_for(&me.to_uppercase(), &me));
         assert!(!kind0_is_for(&"cd".repeat(32), &me));
+    }
+    // -- Public inbox consent (ADR-2027 Acceptance record) --
+
+    const ADR: &str =
+        include_str!("../../../../docs/adr/ADR-2027-nip17-overlay-for-nostr-chat-interop.md");
+    const PROFILES: &str = include_str!("../../../../docs/deployment-profiles.md");
+
+    /// (title, paragraph, primary, secondary) parsed from the ADR's quoted block.
+    fn adr_consent() -> (String, String, String, String) {
+        let record = ADR
+            .split("## Acceptance record")
+            .nth(1)
+            .expect("acceptance record");
+        let quoted: Vec<String> = record
+            .lines()
+            .filter_map(|l| l.strip_prefix('>'))
+            .map(|l| l.trim().to_string())
+            .collect();
+        let title = quoted[0].trim_matches('*').to_string();
+        let button_at = quoted
+            .iter()
+            .position(|l| l.starts_with("Button:"))
+            .expect("button line");
+        let paragraph = quoted[1..button_at].join(" ");
+        let bold: Vec<&str> = quoted[button_at].split("**").skip(1).step_by(2).collect();
+        (title, paragraph, bold[0].to_string(), bold[1].to_string())
+    }
+
+    #[test]
+    fn consent_text_is_the_adr_text_verbatim() {
+        let (title, body, confirm, cancel) = adr_consent();
+        assert_eq!(CONSENT_TITLE, title);
+        assert_eq!(CONSENT_BODY, body);
+        assert_eq!(CONSENT_CONFIRM, confirm);
+        assert_eq!(CONSENT_CANCEL, cancel);
+    }
+
+    #[test]
+    fn deployment_profiles_carries_the_same_consent_words() {
+        assert!(PROFILES.contains(CONSENT_BODY));
+        assert!(PROFILES.contains(CONSENT_TITLE));
+        assert!(PROFILES.contains(CONSENT_CONFIRM));
+        assert!(PROFILES.contains(CONSENT_CANCEL));
+        for indexer in crate::zone_crypto::public_inbox::INDEXERS {
+            assert!(PROFILES.contains(indexer), "{indexer} missing from docs");
+        }
+    }
+
+    #[test]
+    fn the_retraction_caveat_says_the_record_may_have_been_copied() {
+        assert!(RETRACTION_CAVEAT.contains("may already have been copied"));
     }
 }

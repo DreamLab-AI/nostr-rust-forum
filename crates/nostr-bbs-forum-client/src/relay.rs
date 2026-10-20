@@ -132,6 +132,10 @@ struct RelayInner {
     /// Whether a delayed drain is already scheduled (avoids timer pile-up).
     drain_scheduled: bool,
     relay_url: String,
+    /// A one-shot connection to a foreign relay (see [`RelayConnection::to_url`]):
+    /// writes go out as soon as the socket is open instead of waiting for a
+    /// NIP-42 AUTH that a foreign relay may never ask for.
+    immediate_writes: bool,
     /// Per-subscription dedup of delivered events, keyed `"{sub_id}:{event_id}"`.
     ///
     /// The relay sends one EVENT frame per MATCHING SUBSCRIPTION, so the same
@@ -272,7 +276,20 @@ fn drain_send_queue(inner_rc: Rc<RefCell<RelayInner>>) {
 impl RelayConnection {
     /// Create a new relay connection manager. Does not connect immediately.
     pub fn new() -> Self {
-        let relay_url = get_relay_url();
+        Self::build(get_relay_url(), false)
+    }
+
+    /// A short-lived connection to a relay that is not ours (a recipient's
+    /// NIP-17 inbox relay). Writes are never held back for NIP-42 AUTH: a
+    /// foreign relay that never issues a challenge would otherwise leave the
+    /// session "unauthenticated" for ever and the frame unsent. Does not connect
+    /// immediately; the caller must [`disconnect`](Self::disconnect) it, which
+    /// also ends the reconnect loop.
+    pub fn to_url(url: &str) -> Self {
+        Self::build(url.to_string(), true)
+    }
+
+    fn build(relay_url: String, immediate_writes: bool) -> Self {
         let inner = Rc::new(RefCell::new(RelayInner {
             ws: None,
             subscriptions: HashMap::new(),
@@ -284,6 +301,7 @@ impl RelayConnection {
             send_queue: VecDeque::new(),
             drain_scheduled: false,
             relay_url,
+            immediate_writes,
             seen_events: HashSet::new(),
             deferred_writes: Vec::new(),
             auth_signer: None,
@@ -582,10 +600,11 @@ impl RelayConnection {
         let deferred = self.with_inner(|rc| {
             let mut inner = rc.borrow_mut();
             let is_open = matches!(&inner.ws, Some(ws) if ws.ready_state() == WebSocket::OPEN);
-            let is_authed = inner
-                .authed_sink
-                .map(|s| s.get_untracked())
-                .unwrap_or(false);
+            let is_authed = inner.immediate_writes
+                || inner
+                    .authed_sink
+                    .map(|s| s.get_untracked())
+                    .unwrap_or(false);
             if is_open && !is_authed {
                 inner.deferred_writes.push(msg.to_string());
                 true
@@ -673,6 +692,81 @@ impl RelayConnection {
             delay as i32,
         );
     }
+}
+
+/// A value that one callback supplies and one task awaits. First writer wins.
+///
+/// The relay API is callback-shaped (`subscribe`, `publish_with_ack`); the DM
+/// send path is a task that wants to `await` an answer. Single-threaded, so
+/// `Rc`/`RefCell` rather than a channel.
+pub(crate) struct OneShot<T> {
+    value: RefCell<Option<T>>,
+    waker: RefCell<Option<std::task::Waker>>,
+}
+
+impl<T> OneShot<T> {
+    /// An empty slot.
+    pub(crate) fn new() -> Rc<Self> {
+        Rc::new(Self {
+            value: RefCell::new(None),
+            waker: RefCell::new(None),
+        })
+    }
+
+    /// Store `v` unless the slot is already full, and wake the waiter.
+    pub(crate) fn fill(&self, v: T) {
+        if self.value.borrow().is_none() {
+            *self.value.borrow_mut() = Some(v);
+            if let Some(w) = self.waker.borrow_mut().take() {
+                w.wake();
+            }
+        }
+    }
+
+    /// Resolve once [`fill`](Self::fill) has run.
+    pub(crate) async fn wait(self: &Rc<Self>) -> T {
+        std::future::poll_fn(|cx| {
+            if let Some(v) = self.value.borrow_mut().take() {
+                return std::task::Poll::Ready(v);
+            }
+            *self.waker.borrow_mut() = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        })
+        .await
+    }
+}
+
+/// Publish one event to a relay that is not ours and report what it said.
+///
+/// Opens a short-lived [`RelayConnection::to_url`] socket, sends the event,
+/// waits up to `timeout_ms` for the relay's `OK`, then closes the socket (which
+/// also stops its reconnect loop). `Ok(())` means the relay accepted the event;
+/// `Err(reason)` carries the relay's refusal text, `"timeout"` when it never
+/// answered, or the local failure. Silence is a failure, never a success.
+pub(crate) async fn publish_to(
+    url: &str,
+    event: &NostrEvent,
+    timeout_ms: i32,
+) -> Result<(), String> {
+    let conn = RelayConnection::to_url(url);
+    let slot: Rc<OneShot<Result<(), String>>> = OneShot::new();
+    let on_ok_slot = slot.clone();
+    let on_ok: PublishCallback = Rc::new(move |accepted, message| {
+        on_ok_slot.fill(if accepted { Ok(()) } else { Err(message) });
+    });
+    conn.connect();
+    if let Err(e) = conn.publish_with_ack(event, Some(on_ok)) {
+        conn.disconnect();
+        return Err(e);
+    }
+    let timeout_slot = slot.clone();
+    crate::utils::set_timeout_once(
+        move || timeout_slot.fill(Err("timeout".to_string())),
+        timeout_ms,
+    );
+    let outcome = slot.wait().await;
+    conn.disconnect();
+    outcome
 }
 
 /// Parse and route incoming relay messages to the appropriate subscription callbacks.
