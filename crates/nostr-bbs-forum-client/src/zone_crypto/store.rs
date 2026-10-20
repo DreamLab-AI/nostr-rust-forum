@@ -16,6 +16,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use super::grant_ledger::{GrantKv, GrantLedger};
+use super::inbox_key::{
+    deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, recipient_keys_enabled,
+    subscription_targets, sweep_targets, unwrap_inbox_then_identity, LivePort, SweepCandidate,
+};
 use super::read_cache::ReadCache;
 use super::{
     is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKey, KIND_ZONE_KEY_GRANT,
@@ -25,6 +29,8 @@ use crate::stores::indexed_db::ForumDb;
 
 /// `zone_kv` id holding the ids of gift wraps already unwrapped here.
 const KV_PROCESSED: &str = "processed_wraps";
+/// `(zone, epoch)` ids whose grant has arrived addressed to the inbox key.
+const KV_INBOX_GRANTED: &str = "inbox_granted";
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
@@ -50,10 +56,16 @@ pub struct ZoneKeyStore {
     /// placeholder for the original event in place (ADR-2017).
     cache: StoredValue<ReadCache>,
     processed: StoredValue<HashSet<String>>,
+    /// `key_id`s that have been received through the inbox key on this device.
+    /// A copy addressed to the identity is only ever swept once its id is here.
+    inbox_granted: StoredValue<HashSet<String>>,
     admin_cache: StoredValue<HashMap<String, bool>>,
     /// "Granted from this device", shared by every Encryption-tab card.
     grants: StoredValue<Arc<GrantLedger>>,
     sync_started: StoredValue<bool>,
+    /// Secret of the active inbox key (hex), once registered. Always `None`
+    /// with `RECIPIENT_KEYS_ENABLED` off.
+    inbox_sk: StoredValue<Option<String>>,
     /// Captured at construction: relay callbacks and spawned tasks run
     /// without a reactive owner, so `use_context` is not available there.
     channels: crate::stores::channels::ChannelStore,
@@ -69,9 +81,11 @@ impl ZoneKeyStore {
             hydrated: RwSignal::new(false),
             cache: StoredValue::new(ReadCache::default()),
             processed: StoredValue::new(HashSet::new()),
+            inbox_granted: StoredValue::new(HashSet::new()),
             admin_cache: StoredValue::new(HashMap::new()),
             grants: StoredValue::new(Arc::new(GrantLedger::default())),
             sync_started: StoredValue::new(false),
+            inbox_sk: StoredValue::new(None),
         }
     }
 
@@ -208,6 +222,11 @@ impl ZoneKeyStore {
                 self.processed.update_value(|s| s.extend(ids));
             }
         }
+        if let Ok(Some(json)) = db.get_zone_kv(KV_INBOX_GRANTED).await {
+            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&json) {
+                self.inbox_granted.update_value(|s| s.extend(ids));
+            }
+        }
     }
 
     /// Subscribe to the member's gift wraps once the relay session is
@@ -220,31 +239,71 @@ impl ZoneKeyStore {
         }
         self.sync_started.set_value(true);
         let store = *self;
-        let on_event = Rc::new(move |ev: NostrEvent| {
-            if ev.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP {
-                return;
-            }
-            if store.processed.with_value(|s| s.contains(&ev.id)) {
-                return;
-            }
-            let signer = signer.clone();
-            spawn_local(async move {
-                store.process_wrap(&ev, &*signer).await;
-            });
-        });
+        let on_event = {
+            let (relay, signer, me) = (relay.clone(), signer.clone(), me.clone());
+            Rc::new(move |ev: NostrEvent| {
+                if ev.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP {
+                    return;
+                }
+                // With the sweep on, wraps already handled are looked at again
+                // when addressed to the identity: an old grant is deleted once
+                // its key is safe here.
+                let revisit = grant_sweep_enabled() && p_tags(&ev).any(|p| p == me);
+                if !revisit && store.processed.with_value(|s| s.contains(&ev.id)) {
+                    return;
+                }
+                let (relay, signer, me) = (relay.clone(), signer.clone(), me.clone());
+                spawn_local(async move {
+                    store.process_wrap(&ev, &*signer, &me, &relay).await;
+                });
+            })
+        };
         relay.subscribe(
-            vec![Filter {
-                kinds: Some(vec![nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP]),
-                p_tags: Some(vec![me]),
-                ..Default::default()
-            }],
-            on_event,
+            vec![wrap_filter(subscription_targets(&me, None))],
+            on_event.clone(),
             None,
         );
+        if !recipient_keys_enabled() {
+            return;
+        }
+        // Inbox key: create, restore or confirm it, then listen on it too.
+        // Grants may still arrive at the identity key during the transition,
+        // which the subscription above keeps covering.
+        let relay = relay.clone();
+        spawn_local(async move {
+            let port = LivePort {
+                relay: relay.clone(),
+                identity: signer.clone(),
+            };
+            match ensure_inbox_key(&port, &*signer, now_secs()).await {
+                Ok(key) => {
+                    store.inbox_sk.set_value(Some(key.sk_hex));
+                    relay.subscribe(vec![wrap_filter(vec![key.pubkey])], on_event, None);
+                }
+                Err(e) => {
+                    web_sys::console::warn_1(&format!("[zone-key] inbox key: {e}").into());
+                }
+            }
+        });
     }
 
-    async fn process_wrap(&self, wrap: &NostrEvent, signer: &dyn Signer) {
-        let (sealer, rumor) = match super::unwrap_any(wrap, signer).await {
+    async fn process_wrap(
+        &self,
+        wrap: &NostrEvent,
+        signer: &dyn Signer,
+        me: &str,
+        relay: &RelayConnection,
+    ) {
+        let inbox = self
+            .inbox_sk
+            .get_value()
+            .and_then(|sk| super::inbox_key::inbox_signer(&sk).ok());
+        let inbox_ref = inbox.as_ref().map(|s| s as &dyn Signer);
+        let inbox_pk = inbox.as_ref().map(|s| s.public_key().to_string());
+        let via_inbox = inbox_pk
+            .as_deref()
+            .is_some_and(|ipk| p_tags(wrap).any(|p| p == ipk));
+        let (sealer, rumor) = match unwrap_inbox_then_identity(wrap, inbox_ref, signer).await {
             Ok(v) => v,
             // Not for us to read (or the signer cannot NIP-44): leave it
             // unmarked so a later session with a capable signer retries.
@@ -259,18 +318,44 @@ impl ZoneKeyStore {
         // the wrap unmarked, so the next session retries instead of losing the
         // key for good.
         let admin = self.sealer_is_admin(&sealer).await;
-        let (valid, persisted) = match admin {
-            None => (false, false),
+        let (valid, persisted, grant_id) = match admin {
+            None => (false, false, None),
             Some(is_admin) => match validate_grant(&rumor, &sealer, is_admin, now_secs()) {
-                Ok(key) => (true, self.insert_persisted(key).await),
+                Ok(key) => {
+                    let id = super::key_id(&key.zone, key.epoch);
+                    let persisted = self.insert_persisted(key).await;
+                    if via_inbox && persisted {
+                        self.mark_inbox_granted(&id).await;
+                    }
+                    (true, persisted, Some(id))
+                }
                 Err(e) => {
                     web_sys::console::warn_1(&format!("[zone-key] grant refused: {e}").into());
-                    (false, false)
+                    (false, false, None)
                 }
             },
         };
         if super::grant_settled(admin, valid, persisted) {
             self.mark_processed(&wrap.id).await;
+        }
+        // Deleting the identity copy is safe only once the SAME (zone, epoch)
+        // key has also arrived addressed to the inbox key on this device, so a
+        // replacement provably exists on the relay. Local persistence alone is
+        // not enough: a wiped IndexedDB would then have no copy left anywhere.
+        let replacement_exists = grant_id
+            .as_deref()
+            .is_some_and(|id| self.inbox_granted.with_value(|s| s.contains(id)));
+        let candidate = SweepCandidate {
+            wrap_id: wrap.id.clone(),
+            to_identity: p_tags(wrap).any(|p| p == me),
+            is_grant: true,
+            key_safe: valid && persisted && replacement_exists,
+        };
+        for id in sweep_targets(grant_sweep_enabled(), &[candidate]) {
+            let unsigned = deletion_for_wrap(me, &id, now_secs());
+            if let Ok(del) = signer.sign_event(unsigned).await {
+                relay.publish(&del);
+            }
         }
     }
 
@@ -307,6 +392,18 @@ impl ZoneKeyStore {
         }
     }
 
+    async fn mark_inbox_granted(&self, id: &str) {
+        self.inbox_granted.update_value(|s| {
+            s.insert(id.to_string());
+        });
+        let ids: Vec<String> = self
+            .inbox_granted
+            .with_value(|s| s.iter().cloned().collect());
+        if let (Ok(db), Ok(json)) = (ForumDb::open().await, serde_json::to_string(&ids)) {
+            let _ = db.put_zone_kv(KV_INBOX_GRANTED, &json).await;
+        }
+    }
+
     /// Whether `pubkey` is a relay admin, or `None` when the relay could not
     /// be asked. Only definite answers are cached (per session).
     pub async fn sealer_is_admin(&self, pubkey: &str) -> Option<bool> {
@@ -326,9 +423,23 @@ impl ZoneKeyStore {
         ledger.sent(&IdbGrantKv, zone, epoch).await
     }
 
-    /// Record that `(zone, epoch)` was granted to `recipients`. Safe to call
+    /// Members already granted `(zone, epoch)` at the key they would be
+    /// granted at now (`targets`: member to recipient key; absent means the
+    /// member's identity).
+    pub async fn grants_sent_to(
+        &self,
+        zone: &str,
+        epoch: u32,
+        targets: &HashMap<String, String>,
+    ) -> HashSet<String> {
+        let ledger = self.grants.get_value();
+        ledger.sent_to(&IdbGrantKv, zone, epoch, targets).await
+    }
+
+    /// Record that `(zone, epoch)` was granted to each `(member, recipient
+    /// key)`. Safe to call
     /// concurrently: acks for one batch arrive together (see [`GrantLedger`]).
-    pub async fn record_grants(&self, zone: &str, epoch: u32, recipients: &[String]) {
+    pub async fn record_grants(&self, zone: &str, epoch: u32, recipients: &[(String, String)]) {
         let ledger = self.grants.get_value();
         ledger.record(&IdbGrantKv, zone, epoch, recipients).await;
     }
@@ -354,6 +465,21 @@ impl GrantKv for IdbGrantKv {
             Err(_) => false,
         }
     }
+}
+
+fn wrap_filter(p: Vec<String>) -> Filter {
+    Filter {
+        kinds: Some(vec![nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP]),
+        p_tags: Some(p),
+        ..Default::default()
+    }
+}
+
+fn p_tags(ev: &NostrEvent) -> impl Iterator<Item = &str> {
+    ev.tags
+        .iter()
+        .filter(|t| t.len() >= 2 && t[0] == "p")
+        .map(|t| t[1].as_str())
 }
 
 fn latest_in(m: &HashMap<String, ZoneKey>, zone: &str) -> Option<ZoneKey> {

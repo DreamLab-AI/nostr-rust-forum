@@ -113,6 +113,23 @@ pub fn open_gift_wrap(
     Ok((seal.pubkey, rumor))
 }
 
+/// Open a gift wrap with the first of `keys` that decrypts it. Callers pass
+/// the inbox secret first and the identity secret second; the error from the
+/// last key is returned when none opens the wrap.
+pub fn open_gift_wrap_with(
+    gift: &NostrEvent,
+    keys: &[&SecretKey],
+) -> Result<(String, UnsignedEvent), GrantError> {
+    let mut last = GrantError::Unwrap("no key supplied".to_string());
+    for key in keys {
+        match open_gift_wrap(gift, key) {
+            Ok(opened) => return Ok(opened),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// Validate a decrypted grant rumor sealed by `sealer`.
 ///
 /// `is_admin` is injected so the rule is testable; the migrator passes the
@@ -173,22 +190,33 @@ pub struct GrantHarvest {
     pub ignored: usize,
 }
 
-/// Fetch every kind-1059 wrap addressed to `me` and keep the valid zone-key
-/// grants. Each distinct sealer's admin status is asked once.
+/// Fetch every kind-1059 wrap addressed to `me` (and to `inbox`, when the
+/// admin has a registered inbox key) and keep the valid zone-key grants. The
+/// inbox secret is tried first, then the identity. Each distinct sealer's
+/// admin status is asked once.
 pub async fn fetch_grants<R: Relay>(
     relay: &mut R,
     me: &SecretKey,
+    inbox: Option<&SecretKey>,
 ) -> Result<GrantHarvest, RelayError> {
+    let mut p_tags = Vec::new();
+    let mut openers: Vec<&SecretKey> = Vec::new();
+    if let Some(inbox) = inbox {
+        p_tags.push(inbox.public_key().to_hex());
+        openers.push(inbox);
+    }
+    p_tags.push(me.public_key().to_hex());
+    openers.push(me);
     let filter = Filter {
         kinds: Some(vec![KIND_GIFT_WRAP]),
-        p_tags: Some(vec![me.public_key().to_hex()]),
+        p_tags: Some(p_tags),
         ..Filter::default()
     };
     let wraps = fetch_all(relay, &filter).await?.events;
     let mut harvest = GrantHarvest::default();
     let mut admin_cache: HashMap<String, bool> = HashMap::new();
     for wrap in &wraps {
-        let Ok((sealer, mut rumor)) = open_gift_wrap(wrap, me) else {
+        let Ok((sealer, mut rumor)) = open_gift_wrap_with(wrap, &openers) else {
             harvest.ignored += 1;
             continue;
         };
@@ -332,6 +360,38 @@ mod tests {
             GrantError::Unwrap(why) => assert!(why.contains("wrap id or signature"), "{why}"),
             other => panic!("expected Unwrap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inbox_key_is_tried_before_identity_and_either_opens() {
+        let identity = SecretKey::from_bytes([0x22; 32]).unwrap();
+        let inbox = SecretKey::from_bytes([0x23; 32]).unwrap();
+        let sender = [0x44u8; 32];
+        let sender_pk = nostr_bbs_core::keys::pubkey_hex(&sender).unwrap();
+        let wrap_to = |sk: &SecretKey| {
+            let pk = nostr_bbs_core::keys::pubkey_hex(sk.as_bytes()).unwrap();
+            nostr_bbs_core::gift_wrap::gift_wrap_kind(
+                &sender,
+                &sender_pk,
+                &pk,
+                KIND_ZONE_KEY_GRANT,
+                "{}",
+            )
+            .unwrap()
+        };
+        let keys = [&inbox, &identity];
+        let (sealer, rumor) = open_gift_wrap_with(&wrap_to(&inbox), &keys).unwrap();
+        assert_eq!(
+            (sealer.as_str(), rumor.kind),
+            (&*sender_pk, KIND_ZONE_KEY_GRANT)
+        );
+        assert!(open_gift_wrap_with(&wrap_to(&identity), &keys).is_ok());
+        // Without the inbox key, a wrap to the inbox cannot be opened.
+        assert!(matches!(
+            open_gift_wrap_with(&wrap_to(&inbox), &[&identity]).unwrap_err(),
+            GrantError::Unwrap(_)
+        ));
+        assert!(open_gift_wrap_with(&wrap_to(&inbox), &[]).is_err());
     }
 
     #[test]

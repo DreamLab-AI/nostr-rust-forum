@@ -462,7 +462,7 @@ fn grants_from_admins_are_accepted_and_others_refused_or_ignored() {
         nostr_bbs_core::gift_wrap::gift_wrap(&admin, &pk(admin), &pk(AUTHOR), "not yours").unwrap(),
     );
 
-    let harvest = block_on(fetch_grants(&mut relay, &sk(MIGRATOR))).unwrap();
+    let harvest = block_on(fetch_grants(&mut relay, &sk(MIGRATOR), None)).unwrap();
     assert_eq!(harvest.keys.len(), 1);
     let k = &harvest.keys[0];
     assert_eq!(

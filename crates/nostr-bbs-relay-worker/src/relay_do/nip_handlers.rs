@@ -176,6 +176,16 @@ pub fn gift_wrap_readable_by(event: &NostrEvent, session_pubkey: Option<&str>) -
     }
 }
 
+/// [`gift_wrap_readable_by`] for a viewer holding several recipient keys
+/// (Phase 2, set A: identity pubkey plus registered inbox keys). Same rule:
+/// only the FIRST `p` is the recipient, matched case-insensitively.
+pub fn gift_wrap_readable_by_any(event: &NostrEvent, viewer_keys: &[String]) -> bool {
+    if event.kind != GIFT_WRAP_KIND {
+        return true;
+    }
+    gift_wrap_recipient(event).is_some_and(|r| crate::recipient_keys::set_contains(viewer_keys, &r))
+}
+
 // ── ADR-2011: the effective escalation boundary ─────────────────────────────
 
 /// Who resolved a case — a human, or a system actor acting on its behalf.
@@ -1150,18 +1160,10 @@ impl NostrRelayDO {
             // without a D1 row, so an operator reset cannot silence it. Every
             // other recipient still has to be whitelisted.
             let ingress = crate::ingress::ingress_from_env(&self.env);
-            let recipient_ok = match gift_wrap_recipient(&event) {
-                Some(pk) if nostr_bbs_config::ingress::is_ingress_recipient(&ingress, &pk) => true,
-                Some(pk) => self.is_whitelisted(&pk).await,
-                None => false,
-            };
-            if !recipient_ok {
-                Self::send_ok(
-                    ws,
-                    &event.id,
-                    false,
-                    "blocked: gift-wrap recipient not whitelisted",
-                );
+            let is_ingress = gift_wrap_recipient(&event)
+                .is_some_and(|pk| nostr_bbs_config::ingress::is_ingress_recipient(&ingress, &pk));
+            if let Err(refusal) = self.gift_wrap_recipient_verdict(&event, is_ingress).await {
+                Self::send_ok(ws, &event.id, false, refusal);
                 return;
             }
         } else {
@@ -1848,7 +1850,12 @@ impl NostrRelayDO {
         // NIP-59: kind-1059 (Sealed DM) read gate + mandatory #p rewrite. Shared
         // with the COUNT path so both reject unauthenticated kind-1059 reads and
         // bind results to the authed recipient identically.
-        let filters = match Self::gate_kind_1059_filters(filters, &session_pubkey) {
+        let read_set = self.recipient_read_set(&session_pubkey).await;
+        let filters = match Self::gate_kind_1059_filters_with(
+            filters,
+            &session_pubkey,
+            read_set.as_deref(),
+        ) {
             Some(f) => f,
             None => {
                 Self::send_notice(
@@ -1890,7 +1897,11 @@ impl NostrRelayDO {
         // batch a single `posts_read` increment at EOSE for the TL0→TL1 promotion.
         let mut delivered: i32 = 0;
         for event in &events {
-            if !gift_wrap_readable_by(event, session_pubkey.as_deref()) {
+            let readable = match &read_set {
+                Some(set) => gift_wrap_readable_by_any(event, set),
+                None => gift_wrap_readable_by(event, session_pubkey.as_deref()),
+            };
+            if !readable {
                 continue;
             }
             match self.authorize_event(event, &ctx, &zones).await {
@@ -2106,6 +2117,10 @@ pub(crate) struct ViewerContext {
     pub is_admin: bool,
     pub viewer_cohorts: Vec<String>,
     pub viewer_is_admin: bool,
+    /// Phase 2: the session's registered inbox keys (empty when the feature is
+    /// off). Lets a kind-1059 addressed to one of them pass the protected-kind
+    /// gate for the owner's session.
+    pub recipient_keys: Vec<String>,
 }
 
 /// Per-event read decision shared by every read path.
@@ -2138,9 +2153,25 @@ impl NostrRelayDO {
     /// client from reading another user's sealed DMs. Returns `None` when the
     /// request must be rejected (kind-1059 requested by an unauthenticated
     /// session). Shared by REQ and COUNT so neither can leak DMs.
+    #[cfg(test)]
     fn gate_kind_1059_filters(
         filters: Vec<NostrFilter>,
         session_pubkey: &Option<String>,
+    ) -> Option<Vec<NostrFilter>> {
+        Self::gate_kind_1059_filters_with(filters, session_pubkey, None)
+    }
+
+    /// [`Self::gate_kind_1059_filters`] with the recipient-keys switch (Phase 2).
+    /// `recipient_keys_on == false` overwrites `#p` with the authed pubkey,
+    /// exactly as before. `true` stores the filter as the client sent it: the
+    /// stored (and live-broadcast) filter must not depend on a key list that can
+    /// be stale or empty at subscribe time, or a key registered a moment later
+    /// would sit behind a dead subscription. Isolation is the per-event check
+    /// (`gift_wrap_readable_by_any`, first `p` against set A at delivery time).
+    fn gate_kind_1059_filters_with(
+        filters: Vec<NostrFilter>,
+        session_pubkey: &Option<String>,
+        read_set: Option<&[String]>,
     ) -> Option<Vec<NostrFilter>> {
         let needs_kind_1059 = filters
             .iter()
@@ -2153,8 +2184,20 @@ impl NostrRelayDO {
                 .into_iter()
                 .map(|mut f| {
                     if f.kinds.as_ref().is_some_and(|k| k.contains(&1059)) {
-                        f.extra
-                            .insert("#p".to_string(), serde_json::json!([authed_pk]));
+                        match read_set {
+                            None => {
+                                f.extra
+                                    .insert("#p".to_string(), serde_json::json!([authed_pk]));
+                            }
+                            // A client-sent `#p` is stored as sent. Without one,
+                            // bind to A so the SQL `LIMIT` cannot be spent on
+                            // other members' wraps.
+                            Some(set) => {
+                                f.extra
+                                    .entry("#p".to_string())
+                                    .or_insert_with(|| serde_json::json!(set));
+                            }
+                        }
                     }
                     f
                 })
@@ -2183,12 +2226,17 @@ impl NostrRelayDO {
             None => (Vec::new(), false),
         };
         let viewer_is_admin = is_admin || cohort_admin;
+        let recipient_keys = match &session_pubkey {
+            Some(pk) => self.cached_recipient_keys(pk).await,
+            None => Vec::new(),
+        };
         ViewerContext {
             session_pubkey,
             access_pubkey,
             is_admin,
             viewer_cohorts,
             viewer_is_admin,
+            recipient_keys,
         }
     }
 
@@ -2234,6 +2282,113 @@ impl NostrRelayDO {
         let fresh = self.device_owner(pubkey).await;
         self.device_owner_cache.insert(pubkey, fresh.clone(), now);
         fresh
+    }
+
+    /// The gift-wrap recipient gate. Feature off: `is_ingress`, else the
+    /// recipient must be whitelisted, with the historical refusal. Feature on:
+    /// ingress, else a registered inbox key judged by its owner's membership,
+    /// else the key itself must be a member.
+    async fn gift_wrap_recipient_verdict(
+        &self,
+        event: &NostrEvent,
+        is_ingress: bool,
+    ) -> std::result::Result<(), &'static str> {
+        use crate::recipient_keys::{route, verdict, Route, REASON_NOT_WHITELISTED};
+        let Some(pk) = gift_wrap_recipient(event) else {
+            return Err(REASON_NOT_WHITELISTED);
+        };
+        if !self.recipient_keys_enabled() {
+            return if is_ingress || self.is_whitelisted(&pk).await {
+                Ok(())
+            } else {
+                Err(REASON_NOT_WHITELISTED)
+            };
+        }
+        let row = if is_ingress {
+            None
+        } else {
+            self.cached_recipient_row(&pk).await
+        };
+        let route = route(is_ingress, row.as_ref());
+        let member = match &route {
+            Route::OwnerMustBeMember(owner) => self.is_whitelisted(owner).await,
+            Route::RecipientMustBeMember => self.is_whitelisted(&pk).await,
+            _ => false,
+        };
+        verdict(&route, member)
+    }
+
+    /// Phase 2: whether registered recipient keys are honoured. Only the exact
+    /// string `"true"` in `RECIPIENT_KEYS_ENABLED` enables; absent ⇒ off.
+    pub(crate) fn recipient_keys_enabled(&self) -> bool {
+        crate::recipient_keys::recipient_keys_enabled_var(
+            self.env
+                .var(crate::recipient_keys::RECIPIENT_KEYS_ENABLED_VAR)
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+        )
+    }
+
+    /// `recipient_keys` registration for `key` through the 60s memo. Both
+    /// outcomes are cached; a revoked row is returned as such.
+    pub(crate) async fn cached_recipient_row(&self, key: &str) -> Option<(String, bool)> {
+        let key = key.to_ascii_lowercase();
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.recipient_row_cache.get(&key, now) {
+            return hit;
+        }
+        let fresh = match self.env.d1("DB") {
+            Ok(db) => crate::recipient_keys::lookup_owner(&db, &key).await,
+            Err(_) => None,
+        };
+        // Cache hits only. A cached miss would keep a key that was registered
+        // a moment later on the Unregistered route for up to the TTL, judged
+        // by its own whitelist status instead of its owner's. A miss is one
+        // indexed D1 read, which is what every unregistered recipient cost
+        // before this feature existed.
+        if fresh.is_some() {
+            self.recipient_row_cache.insert(&key, fresh.clone(), now);
+        }
+        fresh
+    }
+
+    /// `owner`'s unrevoked inbox keys through the 60s memo. Empty when the
+    /// feature is off (no D1 read at all).
+    pub(crate) async fn cached_recipient_keys(&self, owner: &str) -> Vec<String> {
+        if !self.recipient_keys_enabled() {
+            return Vec::new();
+        }
+        let owner = owner.to_ascii_lowercase();
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.recipient_keys_cache.get(&owner, now) {
+            return hit;
+        }
+        let fresh = match self.env.d1("DB") {
+            Ok(db) => crate::recipient_keys::keys_for_owner(&db, &owner).await,
+            Err(_) => Vec::new(),
+        };
+        // Cache non-empty lists only, so a key registered after an empty
+        // lookup is readable on the next call, not after the TTL.
+        if !fresh.is_empty() {
+            self.recipient_keys_cache.insert(&owner, fresh.clone(), now);
+        }
+        fresh
+    }
+
+    /// Set A for a session: its pubkey plus registered inbox keys. `None` when
+    /// the feature is off or the session is unauthenticated, so callers keep
+    /// today's single-pubkey rule.
+    pub(crate) async fn recipient_read_set(
+        &self,
+        session_pubkey: &Option<String>,
+    ) -> Option<Vec<String>> {
+        if !self.recipient_keys_enabled() {
+            return None;
+        }
+        let pk = session_pubkey.as_ref()?;
+        let extra = self.cached_recipient_keys(pk).await;
+        Some(crate::recipient_keys::read_set(pk, &extra))
     }
 
     /// Record `delivered` reads for an authed reader and flush the trust ledger
@@ -2290,11 +2445,12 @@ impl NostrRelayDO {
                 .filter(|t| t.len() >= 2 && t[0] == "p")
                 .map(|t| t[1].clone())
                 .collect();
-            if !nip42::protected_read_permitted(
+            if !nip42::protected_read_permitted_with_keys(
                 event.kind,
                 &event.pubkey,
                 &recipients,
                 ctx.session_pubkey.as_deref(),
+                &ctx.recipient_keys,
                 self.auth_mode(),
             ) {
                 return ReadDecision::Withhold;
@@ -2432,7 +2588,12 @@ impl NostrRelayDO {
         }
 
         // kind-1059 gate identical to REQ; deny-by-default → count 0 on reject.
-        let filters = match Self::gate_kind_1059_filters(filters, &session_pubkey) {
+        let read_set = self.recipient_read_set(&session_pubkey).await;
+        let filters = match Self::gate_kind_1059_filters_with(
+            filters,
+            &session_pubkey,
+            read_set.as_deref(),
+        ) {
             Some(f) => f,
             None => {
                 Self::send_count(ws, sub_id, 0);
@@ -2446,7 +2607,11 @@ impl NostrRelayDO {
 
         let mut count: u64 = 0;
         for event in &events {
-            if !gift_wrap_readable_by(event, session_pubkey.as_deref()) {
+            let readable = match &read_set {
+                Some(set) => gift_wrap_readable_by_any(event, set),
+                None => gift_wrap_readable_by(event, session_pubkey.as_deref()),
+            };
+            if !readable {
                 continue;
             }
             match self.authorize_event(event, &ctx, &zones).await {
@@ -2481,6 +2646,7 @@ impl NostrRelayDO {
             .map(|t| t[1].as_str())
             .collect();
 
+        let mut own_keys: Option<Vec<String>> = None;
         for target_id in &target_ids {
             let result = if can_delete_any {
                 let stmt = db.prepare("DELETE FROM events WHERE id = ?1");
@@ -2499,6 +2665,41 @@ impl NostrRelayDO {
                 }
             };
             let _ = result;
+
+            // Phase 2 recipient branch, kind 1059 only: the wrap's first `p`
+            // must be one of the signer's own recipient keys (decided in Rust
+            // on the first `p`, never by an any-`p` SQL match).
+            if !can_delete_any && self.recipient_keys_enabled() {
+                if own_keys.is_none() {
+                    own_keys = self
+                        .recipient_read_set(&Some(deletion_event.pubkey.clone()))
+                        .await;
+                }
+                let Some(set) = own_keys.as_ref() else {
+                    continue;
+                };
+                #[derive(serde::Deserialize)]
+                struct WrapRow {
+                    kind: f64,
+                    tags: String,
+                }
+                let Ok(sel) = db
+                    .prepare("SELECT kind, tags FROM events WHERE id = ?1 AND kind = 1059 LIMIT 1")
+                    .bind(&[JsValue::from_str(target_id)])
+                else {
+                    continue;
+                };
+                if let Ok(Some(row)) = sel.first::<WrapRow>(None).await {
+                    if crate::recipient_keys::wrap_addressed_to(row.kind as u64, &row.tags, set) {
+                        if let Ok(del) = db
+                            .prepare("DELETE FROM events WHERE id = ?1 AND kind = 1059")
+                            .bind(&[JsValue::from_str(target_id)])
+                        {
+                            let _ = del.run().await;
+                        }
+                    }
+                }
+            }
         }
 
         // Collect "a" tags (parameterized replaceable targets: "kind:pubkey:d-tag")
@@ -3545,6 +3746,8 @@ impl NostrRelayDO {
         #[derive(serde::Deserialize)]
         struct EventPubkeyRow {
             pubkey: String,
+            kind: f64,
+            tags: String,
         }
 
         let target_ids: Vec<&str> = event
@@ -3554,12 +3757,31 @@ impl NostrRelayDO {
             .map(|t| t[1].as_str())
             .collect();
 
+        // Phase 2: a wrap addressed to one of the deleter's own recipient keys is
+        // theirs to remove. Looked up lazily, once, on the raw signer.
+        let mut own_keys: Option<Vec<String>> = None;
+
         for target_id in &target_ids {
-            let stmt = db.prepare("SELECT pubkey FROM events WHERE id = ?1 LIMIT 1");
+            let stmt = db.prepare("SELECT pubkey, kind, tags FROM events WHERE id = ?1 LIMIT 1");
             match stmt.bind(&[JsValue::from_str(target_id)]) {
                 Ok(s) => {
                     if let Ok(Some(row)) = s.first::<EventPubkeyRow>(None).await {
                         if row.pubkey != event.pubkey {
+                            if row.kind as u64 == GIFT_WRAP_KIND && self.recipient_keys_enabled() {
+                                if own_keys.is_none() {
+                                    own_keys =
+                                        self.recipient_read_set(&Some(event.pubkey.clone())).await;
+                                }
+                                if own_keys.as_ref().is_some_and(|set| {
+                                    crate::recipient_keys::wrap_addressed_to(
+                                        row.kind as u64,
+                                        &row.tags,
+                                        set,
+                                    )
+                                }) {
+                                    continue;
+                                }
+                            }
                             return true;
                         }
                     }
@@ -6245,6 +6467,7 @@ mod zone_read_rule_tests {
             is_admin: false,
             viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
             viewer_is_admin: admin,
+            recipient_keys: vec![],
         }
     }
 
@@ -6256,6 +6479,7 @@ mod zone_read_rule_tests {
             is_admin: false,
             viewer_cohorts: vec![],
             viewer_is_admin: false,
+            recipient_keys: vec![],
         };
         assert!(zone_read_permitted(&zones(), "public", &anon));
         assert!(zone_read_permitted(&zones(), "public", &ctx(&[], false)));
@@ -6288,5 +6512,225 @@ mod zone_read_rule_tests {
             zone_read_permitted(&zones(), "zone9", &ctx(&[], true)),
             "admins bypass"
         );
+    }
+}
+
+#[cfg(test)]
+mod recipient_key_read_tests {
+    //! Phase 2: reads and deletion with registered inbox keys. The chain below
+    //! composes the same predicates the REQ/COUNT/broadcast paths run, in order:
+    //! the `#p` rewrite, `gift_wrap_readable_by_any`, then the protected-kind gate.
+    use super::*;
+    use crate::recipient_keys::{read_set, wrap_addressed_to};
+
+    const OWNER: &str = "aa";
+    const INBOX: &str = "bb";
+    const OTHER: &str = "cc";
+
+    fn wrap_to(recipient: &str) -> NostrEvent {
+        serde_json::from_value(serde_json::json!({
+            "id": "0".repeat(64), "pubkey": "e".repeat(64), "created_at": 1, "kind": 1059,
+            "tags": [["p", recipient]], "content": "x", "sig": "0".repeat(128)
+        }))
+        .expect("valid event")
+    }
+
+    fn req(v: serde_json::Value) -> Vec<NostrFilter> {
+        vec![serde_json::from_value(v).expect("filter")]
+    }
+
+    /// Would `session` (with inbox keys `keys`) be shown `event` by a REQ asking `filter`?
+    fn delivered(
+        session: &str,
+        keys: &[&str],
+        filter: serde_json::Value,
+        event: &NostrEvent,
+    ) -> bool {
+        let extra: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        let set = read_set(session, &extra);
+        let f = NostrRelayDO::gate_kind_1059_filters_with(
+            req(filter),
+            &Some(session.to_string()),
+            Some(&set),
+        )
+        .expect("authed");
+        // The stored filter is the client's own; an absent `#p` constrains nothing.
+        let sql_matches = match f[0].extra.get("#p").and_then(|v| v.as_array()) {
+            None => true,
+            Some(p) => event
+                .tags
+                .iter()
+                .any(|t| t[0] == "p" && p.iter().any(|v| v.as_str() == Some(t[1].as_str()))),
+        };
+        let recipients: Vec<String> = event.tags.iter().map(|t| t[1].clone()).collect();
+        sql_matches
+            && gift_wrap_readable_by_any(event, &set)
+            && nip42::protected_read_permitted_with_keys(
+                event.kind,
+                &event.pubkey,
+                &recipients,
+                Some(session),
+                &extra,
+                AuthMode::Nip42,
+            )
+    }
+
+    #[test]
+    fn req_with_p_inbox_key_returns_to_the_owner_only() {
+        let ev = wrap_to(INBOX);
+        let f = serde_json::json!({ "kinds": [1059], "#p": [INBOX] });
+        assert!(delivered(OWNER, &[INBOX], f.clone(), &ev));
+        assert!(
+            !delivered(OTHER, &[], f, &ev),
+            "another session sees nothing"
+        );
+    }
+
+    #[test]
+    fn req_without_p_defaults_to_the_whole_set() {
+        let f = serde_json::json!({ "kinds": [1059] });
+        assert!(delivered(OWNER, &[INBOX], f.clone(), &wrap_to(INBOX)));
+        assert!(delivered(OWNER, &[INBOX], f, &wrap_to(OWNER)));
+    }
+
+    #[test]
+    fn count_gate_is_the_same_chain() {
+        // COUNT shares gate_kind_1059_filters_with and the per-event predicates.
+        let f = serde_json::json!({ "kinds": [1059], "#p": [INBOX, OTHER] });
+        assert!(delivered(OWNER, &[INBOX], f.clone(), &wrap_to(INBOX)));
+        assert!(!delivered(OWNER, &[INBOX], f, &wrap_to(OTHER)));
+    }
+
+    #[test]
+    fn no_p_is_bound_to_set_a_and_a_sent_p_is_kept() {
+        let set = read_set(OWNER, &[INBOX.into()]);
+        let out = NostrRelayDO::gate_kind_1059_filters_with(
+            req(serde_json::json!({ "kinds": [1059] })),
+            &Some(OWNER.into()),
+            Some(&set),
+        )
+        .unwrap();
+        assert_eq!(out[0].extra.get("#p"), Some(&serde_json::json!(set)));
+        let out = NostrRelayDO::gate_kind_1059_filters_with(
+            req(serde_json::json!({ "kinds": [1059], "#p": [INBOX] })),
+            &Some(OWNER.into()),
+            Some(&set),
+        )
+        .unwrap();
+        assert_eq!(out[0].extra.get("#p"), Some(&serde_json::json!([INBOX])));
+    }
+
+    #[test]
+    fn foreign_p_is_stored_as_sent_and_the_event_check_withholds() {
+        let out = NostrRelayDO::gate_kind_1059_filters_with(
+            req(serde_json::json!({ "kinds": [1059], "#p": [OTHER] })),
+            &Some(OWNER.into()),
+            Some(&read_set(OWNER, &[INBOX.into()])),
+        )
+        .unwrap();
+        assert_eq!(out[0].extra.get("#p"), Some(&serde_json::json!([OTHER])));
+        assert!(!delivered(
+            OWNER,
+            &[INBOX],
+            serde_json::json!({ "kinds": [1059], "#p": [OTHER] }),
+            &wrap_to(OTHER)
+        ));
+    }
+
+    #[test]
+    fn inbox_req_after_an_empty_cached_key_list_is_stored_intact_and_delivers_once_refreshed() {
+        // Identity REQ ran first and saw no keys; registration lands afterwards.
+        let f = serde_json::json!({ "kinds": [1059], "#p": [INBOX] });
+        let stored = NostrRelayDO::gate_kind_1059_filters_with(
+            req(f.clone()),
+            &Some(OWNER.into()),
+            Some(&read_set(OWNER, &[])),
+        )
+        .unwrap();
+        assert_eq!(stored[0].extra.get("#p"), Some(&serde_json::json!([INBOX])));
+        let ev = wrap_to(INBOX);
+        assert!(!delivered(OWNER, &[], f.clone(), &ev), "list still empty");
+        assert!(delivered(OWNER, &[INBOX], f, &ev), "list refreshed");
+    }
+
+    #[test]
+    fn a_second_p_does_not_make_a_wrap_readable_by_its_holder() {
+        let mut ev = wrap_to(OTHER);
+        ev.tags.push(vec!["p".into(), INBOX.into()]);
+        assert!(!gift_wrap_readable_by_any(
+            &ev,
+            &read_set(OWNER, &[INBOX.into()])
+        ));
+    }
+
+    #[test]
+    fn feature_off_keeps_the_overwrite_and_the_single_key_rule() {
+        let out = NostrRelayDO::gate_kind_1059_filters(
+            req(serde_json::json!({ "kinds": [1059], "#p": [OTHER] })),
+            &Some(OWNER.into()),
+        )
+        .unwrap();
+        assert_eq!(out[0].extra.get("#p"), Some(&serde_json::json!([OWNER])));
+        assert!(!nip42::protected_read_permitted(
+            1059,
+            &"e".repeat(64),
+            &[INBOX.to_string()],
+            Some(OWNER),
+            AuthMode::Nip42
+        ));
+    }
+
+    #[test]
+    fn inbox_keys_open_only_kind_1059_in_the_protected_gate() {
+        let keys = [INBOX.to_string()];
+        assert!(!nip42::protected_read_permitted_with_keys(
+            14,
+            "e",
+            &[INBOX.to_string()],
+            Some(OWNER),
+            &keys,
+            AuthMode::Nip42
+        ));
+    }
+
+    // ── deletion lane ──────────────────────────────────────────────────────
+
+    #[test]
+    fn member_deletes_a_wrap_to_their_inbox_key_but_not_to_another_member() {
+        use rusqlite::{params, Connection};
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::EVENTS_CREATE_SQL).unwrap();
+        for (id, p) in [("w1", INBOX), ("w2", OTHER)] {
+            c.execute(
+                "INSERT INTO events (id,pubkey,created_at,kind,tags,content,sig) VALUES (?1,'eph',1,1059,?2,'x','s')",
+                params![id, serde_json::json!([["p", p]]).to_string()],
+            )
+            .unwrap();
+        }
+        let set = read_set(OWNER, &[INBOX.into()]);
+        let mut deleted = vec![];
+        for id in ["w1", "w2"] {
+            let (kind, tags): (i64, String) = c
+                .query_row(
+                    "SELECT kind, tags FROM events WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            // deletion_targets_others: not "others" iff addressed to the signer's set.
+            if wrap_addressed_to(kind as u64, &tags, &set) {
+                c.execute(
+                    "DELETE FROM events WHERE id = ?1 AND kind = 1059",
+                    params![id],
+                )
+                .unwrap();
+                deleted.push(id);
+            }
+        }
+        assert_eq!(deleted, vec!["w1"]);
+        let left: i64 = c
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "the wrap to another member survives");
     }
 }

@@ -74,6 +74,7 @@
 
 pub mod auto_grant;
 pub mod grant_ledger;
+pub mod inbox_key;
 pub mod read_cache;
 pub mod store;
 

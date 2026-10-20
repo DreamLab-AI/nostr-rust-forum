@@ -58,6 +58,7 @@ NATIVE_POD_URL = "https://example.com"
 # Revocable device keys (ADR-099). Exact string "true" enables; default off.
 # Must be set the same on the relay-worker and the client window.__ENV__.
 DEVICE_KEYS_ENABLED = "false"
+RECIPIENT_KEYS_ENABLED = "false"
 
 # Secrets — set via `wrangler secret put`, never inline here:
 #   NATIVE_POD_ADMIN_KEY   admin key for the native pod tier

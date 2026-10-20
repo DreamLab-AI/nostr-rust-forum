@@ -6,7 +6,9 @@ use worker::*;
 
 use super::calendar_projection;
 use super::filter::{event_matches_filters, tag_value, NostrFilter};
-use super::nip42::{is_protected_read_kind, protected_read_permitted};
+#[cfg(test)]
+use super::nip42::protected_read_permitted;
+use super::nip42::{is_protected_read_kind, protected_read_permitted_with_keys};
 use super::nip_handlers::ReadDecision;
 use super::NostrRelayDO;
 use crate::zone_config::ZoneConfig;
@@ -112,12 +114,19 @@ impl NostrRelayDO {
         let auth_mode = self.auth_mode();
 
         for (authed_pubkey, ws, subscriptions) in &candidates {
+            // Phase 2: the session's inbox keys, looked up only for a wrap and
+            // only with the feature on, so the hot path adds no async work.
+            let inbox_keys: Vec<String> = match authed_pubkey {
+                Some(pk) if event.kind == 1059 => self.cached_recipient_keys(pk).await,
+                _ => Vec::new(),
+            };
             if let Some(recipients) = &protected_recipients {
-                if !protected_read_permitted(
+                if !protected_read_permitted_with_keys(
                     event.kind,
                     &event.pubkey,
                     recipients,
                     authed_pubkey.as_deref(),
+                    &inbox_keys,
                     auth_mode,
                 ) {
                     continue;
@@ -129,6 +138,7 @@ impl NostrRelayDO {
             if let Some(ref recipient) = kind_1059_recipient {
                 match authed_pubkey {
                     Some(pk) if pk == recipient => {}
+                    Some(_) if inbox_keys.iter().any(|k| k.eq_ignore_ascii_case(recipient)) => {}
                     _ => continue,
                 }
             }

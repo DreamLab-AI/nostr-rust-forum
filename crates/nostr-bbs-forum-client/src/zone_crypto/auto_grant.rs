@@ -16,7 +16,7 @@
 //! Targets come from a fresh read of the relay's roster and follow the
 //! Encryption tab's rules ([`grant_targets`], [`grant_plan`] with history), so
 //! agents get a key only in an `agent_keys` zone. An admin signed in through a
-//! NIP-07 extension is not sent a sign-in sweep: each grant is a NIP-44
+//! NIP-07 extension is not sent a sign-in sweep (it still looks up inbox keys, to count who is owed a re-issue): each grant is a NIP-44
 //! encryption and a signature, which an extension may prompt for one by one.
 //! The sweep tells that admin how many grants are waiting instead.
 
@@ -27,6 +27,7 @@ use leptos::prelude::*;
 use nostr_bbs_core::signer::Signer;
 use wasm_bindgen_futures::spawn_local;
 
+use super::inbox_key::{grant_target, lookup_inbox_key, recipient_keys_enabled, Lookup};
 use super::store::{try_use_zone_key_store, ZoneKeyStore};
 use super::{build_grant_wrap, grant_plan, grant_targets, ZoneKey};
 use crate::auth::{use_auth, AuthStore};
@@ -127,6 +128,36 @@ pub fn grant_count(plan: &[(ZoneKey, Vec<String>)]) -> usize {
     plan.iter().map(|(_, r)| r.len()).sum()
 }
 
+/// The key each of `members` should be granted at, from the auth-worker's
+/// inbox-key lookup. Empty with `RECIPIENT_KEYS_ENABLED` off (no requests
+/// made): every grant then goes to the member's identity, as before. A member
+/// whose lookup failed maps to `Err`.
+pub async fn resolve_targets(
+    signer: &dyn Signer,
+    members: &HashSet<String>,
+) -> HashMap<String, Result<String, String>> {
+    let mut out = HashMap::new();
+    if !recipient_keys_enabled() {
+        return out;
+    }
+    for m in members {
+        let l: Lookup = lookup_inbox_key(signer, m).await;
+        out.insert(m.clone(), grant_target(m, l));
+    }
+    out
+}
+
+/// The lookups that gave a key, as member to recipient key. A member whose
+/// lookup failed is left out, so only a definite answer decides who is owed.
+pub fn granted_targets(
+    resolved: HashMap<String, Result<String, String>>,
+) -> HashMap<String, String> {
+    resolved
+        .into_iter()
+        .filter_map(|(m, t)| t.ok().map(|t| (m, t)))
+        .collect()
+}
+
 /// Send `plan`: one gift wrap per recipient and key, each recorded in this
 /// device's ledger once the relay accepts it. `on_recorded` runs after each
 /// record (the Encryption tab updates its "granted here" list from it).
@@ -142,9 +173,22 @@ pub async fn send_grants(
         members: members.len(),
         ..GrantReport::default()
     };
+    let targets = resolve_targets(signer, &members).await;
     for (key, recipients) in plan {
         for pk in recipients {
-            let Ok(wrap) = build_grant_wrap(signer, &pk, &key, now_secs()).await else {
+            // A failed lookup is not "no inbox key": wrapping to the identity
+            // would put the grant back where the inbox key exists to keep it
+            // from. The member stays unrecorded and is retried.
+            let target = match targets.get(&pk) {
+                Some(Ok(t)) => t.clone(),
+                Some(Err(e)) => {
+                    web_sys::console::warn_1(&format!("[zone-key] inbox lookup: {e}").into());
+                    report.failed += 1;
+                    continue;
+                }
+                None => pk.clone(),
+            };
+            let Ok(wrap) = build_grant_wrap(signer, &target, &key, now_secs()).await else {
                 report.failed += 1;
                 continue;
             };
@@ -156,10 +200,11 @@ pub async fn send_grants(
                 }
                 let key = key_for_ack.clone();
                 let pk = pk.clone();
+                let target = target.clone();
                 let on_recorded = on_recorded.clone();
                 spawn_local(async move {
                     store
-                        .record_grants(&key.zone, key.epoch, std::slice::from_ref(&pk))
+                        .record_grants(&key.zone, key.epoch, &[(pk.clone(), target)])
                         .await;
                     on_recorded(&key, &pk);
                 });
@@ -223,10 +268,20 @@ impl AutoGrant {
         let rows = crate::admin::fetch_whitelist_rows(signer).await?;
         let members: Vec<(String, Vec<String>)> =
             rows.into_iter().map(|u| (u.pubkey, u.cohorts)).collect();
+        // Where each member's grant would go now. Empty with the flag off
+        // (every member counts at their identity key, as before). An
+        // extension admin looks up too: re-issuing needs the inbox keys, and
+        // the cost is one signature prompt per lookup.
+        let candidates: HashSet<String> = members
+            .iter()
+            .map(|(m, _)| m.clone())
+            .filter(|m| only.is_none_or(|o| o.contains(m)))
+            .collect();
+        let targets = granted_targets(resolve_targets(signer, &candidates).await);
         let mut sent = HashMap::new();
         for keys in held.values() {
             for k in keys {
-                let s = self.store.grants_sent(&k.zone, k.epoch).await;
+                let s = self.store.grants_sent_to(&k.zone, k.epoch, &targets).await;
                 sent.insert((k.zone.clone(), k.epoch), s);
             }
         }
@@ -448,5 +503,43 @@ mod tests {
         );
         assert!(plan.iter().all(|(k, _)| k.zone == "zone3"));
         assert_eq!(grant_count(&plan), 2); // me and b
+    }
+
+    #[derive(Default)]
+    struct MemKv(std::cell::RefCell<HashMap<String, String>>);
+    impl super::super::grant_ledger::GrantKv for MemKv {
+        async fn get(&self, id: &str) -> Option<String> {
+            self.0.borrow().get(id).cloned()
+        }
+        async fn put(&self, id: &str, json: &str) -> bool {
+            self.0.borrow_mut().insert(id.into(), json.into());
+            true
+        }
+    }
+
+    #[test]
+    fn an_extension_admin_still_re_issues_to_a_member_with_a_v1_entry_and_a_new_inbox_key() {
+        use super::super::grant_ledger::{ledger_id_v1, GrantLedger};
+        let kv = MemKv::default();
+        kv.0.borrow_mut().insert(
+            ledger_id_v1("zone3", 1),
+            serde_json::to_string(&[pk('b')]).unwrap(),
+        );
+        let ledger = GrantLedger::default();
+        // Lookup results are the same whichever kind of signer asked.
+        let targets = granted_targets(HashMap::from([
+            (pk('b'), Ok(pk('9'))),
+            (pk('c'), Err("HTTP 500".to_string())),
+        ]));
+        assert_eq!(targets.len(), 1);
+        let have = futures::executor::block_on(ledger.sent_to(&kv, "zone3", 1, &targets));
+        let sent = HashMap::from([(("zone3".to_string(), 1), have)]);
+        let zones = [rule("zone3", "family", false)];
+        let plan = plan_missing(&zones, &members(), ME, &held("zone3", &[1]), &sent, None);
+        assert!(plan[0].1.contains(&pk('b')));
+        // Once recorded at the inbox key, b is no longer owed.
+        futures::executor::block_on(ledger.record(&kv, "zone3", 1, &[(pk('b'), pk('9'))]));
+        let have = futures::executor::block_on(ledger.sent_to(&kv, "zone3", 1, &targets));
+        assert!(have.contains(&pk('b')));
     }
 }

@@ -21,6 +21,7 @@ mod http;
 mod invites;
 mod moderation;
 mod pod;
+mod recipient_keys;
 mod schema;
 mod username;
 mod webauthn;
@@ -586,6 +587,26 @@ async fn route_sprint_api(
     }
     if path == "/api/devices/revoke" && *method == Method::Post {
         let resp = devices::handle_revoke(body_bytes, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+
+    // -- Recipient keys (Phase 2, ADR-2027) -----------------------------
+    // Gated behind RECIPIENT_KEYS_ENABLED == "true" inside each handler; off by
+    // default (404). Registry rows live in the relay's D1 via RELAY_DB.
+    if path == "/api/recipient-keys/register" && *method == Method::Post {
+        let resp = recipient_keys::handle_register(body_bytes, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/recipient-keys/revoke" && *method == Method::Post {
+        let resp = recipient_keys::handle_revoke(body_bytes, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/recipient-keys/lookup" && *method == Method::Get {
+        let resp = recipient_keys::handle_lookup(&query, auth_header, env, origin).await?;
+        return Ok(Some(resp));
+    }
+    if path == "/api/recipient-keys/epoch" && *method == Method::Post {
+        let resp = recipient_keys::handle_epoch(body_bytes, auth_header, env, origin).await?;
         return Ok(Some(resp));
     }
 

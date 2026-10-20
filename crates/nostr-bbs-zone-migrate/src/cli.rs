@@ -8,7 +8,7 @@ use nostr_bbs_core::keys::SecretKey;
 use nostr_bbs_zone_migrate::channels::{list_channels, parse_channels, ChannelSpec};
 use nostr_bbs_zone_migrate::engine::{self, Hooks, Plan};
 use nostr_bbs_zone_migrate::grants::{fetch_grants, RejectedGrant};
-use nostr_bbs_zone_migrate::identity::{identity_from_env, IDENTITY_ENV};
+use nostr_bbs_zone_migrate::identity::{identity_from_env, parse_identity, IDENTITY_ENV};
 use nostr_bbs_zone_migrate::keys::{parse_key_file, KeyRing};
 use nostr_bbs_zone_migrate::relay::{fetch_all, http_origin, Filter, Relay};
 use nostr_bbs_zone_migrate::state::{self, State, Status};
@@ -62,6 +62,11 @@ struct Cli {
     /// Also use zone-key grants addressed to the admin key (kind-1059 wraps sealed by an admin).
     #[arg(long, global = true)]
     fetch_grants: bool,
+
+    /// File holding the admin's zone-inbox secret (hex or nsec, 0600). With --fetch-grants, grants
+    /// addressed to the inbox key are opened too (inbox key first, then the identity).
+    #[arg(long, global = true, value_name = "PATH")]
+    inbox_key: Option<PathBuf>,
 
     /// State file recording the run (required by seal, verify, purge, status).
     #[arg(long, global = true, value_name = "PATH")]
@@ -268,6 +273,21 @@ struct GrantReport {
     ignored: usize,
 }
 
+/// Read the admin's zone-inbox secret from a file (hex or nsec). The file
+/// content is zeroised after parsing and errors never echo it.
+fn read_inbox_key(path: &Path) -> Result<SecretKey, Failure> {
+    let text = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|e| Failure(format!("inbox key file {}: {e}", path.display())))?,
+    );
+    parse_identity(&text).map_err(|_| {
+        Failure(format!(
+            "inbox key file {}: not a 64-hex key or nsec",
+            path.display()
+        ))
+    })
+}
+
 async fn load_keys(
     cli: &Cli,
     relay: &mut NetRelay,
@@ -294,7 +314,11 @@ async fn load_keys(
     }
     let mut report = None;
     if cli.fetch_grants {
-        let harvest = fetch_grants(relay, me).await?;
+        let inbox = match &cli.inbox_key {
+            Some(path) => Some(read_inbox_key(path)?),
+            None => None,
+        };
+        let harvest = fetch_grants(relay, me, inbox.as_ref()).await?;
         let accepted = harvest.keys.len();
         for key in harvest.keys {
             ring.insert(key)?;
@@ -524,6 +548,24 @@ mod tests {
         let cli = parse("nostr-bbs-zone-migrate verify --relay wss://r --state s.json --json");
         assert!(cli.json && cli.state.is_some());
         assert!(parse("nostr-bbs-zone-migrate --relay wss://r --print-channels").print_channels);
+    }
+
+    #[test]
+    fn inbox_key_flag_is_optional_and_reads_a_file() {
+        assert!(parse("nostr-bbs-zone-migrate --relay wss://r plan")
+            .inbox_key
+            .is_none());
+        let cli = parse(
+            "nostr-bbs-zone-migrate --relay wss://r --fetch-grants --inbox-key /k/inbox plan",
+        );
+        assert_eq!(cli.inbox_key.as_deref(), Some(Path::new("/k/inbox")));
+        let dir = std::env::temp_dir().join(format!("zm-inbox-{}", std::process::id()));
+        std::fs::write(&dir, format!("{}\n", "11".repeat(32))).unwrap();
+        assert!(read_inbox_key(&dir).is_ok());
+        std::fs::write(&dir, "nonsense").unwrap();
+        assert!(read_inbox_key(&dir).is_err());
+        std::fs::remove_file(&dir).unwrap();
+        assert!(read_inbox_key(Path::new("/nonexistent/zm-inbox")).is_err());
     }
 
     #[test]

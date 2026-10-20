@@ -104,6 +104,11 @@ pub struct NostrRelayDO {
     pub(crate) cohort_cache: TtlCache<(Vec<String>, bool)>,
     /// ADR-2018: 60s-TTL memo of device pubkey → owner (None = not a device key).
     pub(crate) device_owner_cache: TtlCache<Option<String>>,
+    /// Phase 2: 60s memo of recipient key → `(owner, revoked)` (None = unregistered).
+    pub(crate) recipient_row_cache: TtlCache<Option<(String, bool)>>,
+    /// Phase 2: 60s memo of owner → unrevoked inbox keys. Never filled at AUTH:
+    /// `save_auth` persists only the pubkey, so it is looked up on demand.
+    pub(crate) recipient_keys_cache: TtlCache<Vec<String>>,
     /// ADR-2018: per-pubkey throttle for the trust-ledger activity writes.
     pub(crate) activity: ActivityLedger,
 }
@@ -123,6 +128,8 @@ impl DurableObject for NostrRelayDO {
             channel_zone_cache: TtlCache::new(LOOKUP_TTL_SECS),
             cohort_cache: TtlCache::new(LOOKUP_TTL_SECS),
             device_owner_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            recipient_row_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            recipient_keys_cache: TtlCache::new(LOOKUP_TTL_SECS),
             activity: ActivityLedger::new(),
         }
     }

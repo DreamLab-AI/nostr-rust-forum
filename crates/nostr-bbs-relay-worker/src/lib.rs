@@ -28,6 +28,7 @@ mod nip11;
 mod profile_stats;
 mod profiles;
 mod push;
+mod recipient_keys;
 mod relay_do;
 mod trust;
 mod trust_sweep;
@@ -849,6 +850,25 @@ async fn ensure_schema(env: &Env) -> bool {
         // A deployment that created the table before the DM budget columns.
         for stmt in push::PUSH_ALTER_SQL {
             let _ = db.prepare(stmt).run().await;
+        }
+    }
+
+    // --- Recipient keys (Phase 2, migration 0011) ---
+    // Only when the feature is on, so a default deploy pays nothing per request.
+    if recipient_keys::recipient_keys_enabled_var(
+        env.var(recipient_keys::RECIPIENT_KEYS_ENABLED_VAR)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    ) {
+        for stmt in [
+            recipient_keys::RECIPIENT_KEYS_CREATE_SQL,
+            recipient_keys::RECIPIENT_KEYS_INDEX_SQL,
+        ] {
+            if let Err(e) = db.prepare(stmt).run().await {
+                console_error!("ensure_schema: recipient_keys create failed: {e}");
+                ok = false;
+            }
         }
     }
 

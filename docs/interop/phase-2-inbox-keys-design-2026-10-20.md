@@ -41,8 +41,17 @@ protect against a stolen identity signer, which can still recover the inbox key.
    - Deletion lane for cleanup: `deletion_targets_others` (`:1296-1305`) treats a 1059 addressed to
      A as the member's own event, and the non-privileged SQL in `process_deletion` (`:2493`) gains a
      recipient branch. Without this, members below trust level 3 cannot remove their old grants.
+   - Deletion and linkability: a kind 5 signed by the identity that `e`-tags a wrap addressed to
+     an inbox key ties the two keys together for anyone who saw the wrap, which undoes the private
+     registration row for that member. The sweep therefore deletes only identity-addressed wraps,
+     and a client must never delete an inbox-addressed wrap with the identity signer; the relay
+     lane permits it only so that a future inbox-signed deletion path can use it.
    - Push (`push_fanout.rs:24,48`) looks up the raw `p`; inbox keys have no subscription, so grants
      trigger no notification, which is correct.
+   - Caches: the relay memoises the row lookup and the owner's key list for 60 seconds. Row
+     *misses* are not cached, so a freshly registered key is admissible on the next wrap; a
+     revocation or a newly added key is visible to reads and to the deletion lane within a
+     minute. Grants retry on `OK false`, so the delay never loses a grant.
    - Missing row: sender gets `OK false`, and the grant ledger records a member only on `OK true`
      (`auto_grant.rs:153-165`), so the member is retried, not wrongly marked granted. Reader gets
      nothing and nothing reports it.
@@ -57,7 +66,11 @@ protect against a stolen identity signer, which can still recover the inbox key.
 5. **Existing grants: re-issue, then each member deletes the old copies.** Only the recipient can
    tell which of the wraps are grants: each is signed by a throwaway key with encrypted content,
    and the ledger stores member pubkeys, not wrap ids. The member's client unwraps every 21453
-   addressed to its identity and sends a kind 5 per wrap through the new deletion lane. The grant
+   addressed to its identity and sends a kind 5 per wrap through the new deletion lane, but only
+   for a `(zone, epoch)` whose grant has ALSO arrived addressed to the inbox key on that device.
+   Local persistence alone never suffices: a wiped IndexedDB would otherwise leave no copy of the
+   key anywhere. The sweep is therefore self-pacing: it can only ever delete what the re-issue
+   has already replaced, device by device. The grant
    ledger key (`grant_ledger.rs:18-24`) becomes `grants_sent:v2:<zone>:<epoch>` recording the
    recipient key, otherwise re-issue skips every member as already granted.
 6. **Phase 4 carries over.** NIP-171 kind 1014 tickets go to the same inbox key under the same

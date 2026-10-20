@@ -45,6 +45,26 @@ the channel or thread URL out of linked sites' and image hosts' logs; the YouTub
 Recorded with the advisor's corrections (bounded revision, length-prefixed zone id, no plaintext master
 in the shared IndexedDB) after the first design was found to re-derive a secret removed members still hold.
 
+### Upgrade Phase 2: private inbox keys for zone-key grants (ADR-2027 decision 2), flagged off (2026-10-20)
+
+Zone-key grants (rumor kind 21453) can now be addressed to a per-member inbox key instead of the
+identity key, so a member who later advertises this relay in a public kind 10050 does not hand
+their zone grants to every NIP-17 client they log into. Everything is behind
+`RECIPIENT_KEYS_ENABLED` (relay and auth-worker vars, client `window.__ENV__`), default off; with
+the flag off every path is byte-identical to before. Relay: `recipient_keys` table (migration
+0011), admission precedence ingress > registered row > raw whitelist, read set A = authed key plus
+its registered inbox keys applied per event on REQ, COUNT, broadcast and the protected-read gate,
+a kind-1059-only recipient deletion lane, 60 s positive-only caches. Auth-worker: register (proof
+kind 27237 signed by the new key), revoke, admin lookup, epoch registration for Phase 4. Client:
+random inbox key backed up as kind 30078 NIP-44 self-encrypted, backup before registration,
+restore on a fresh browser and generate nothing when the relay is unreachable or the backup will
+not decrypt; grant issuers look up inbox keys; v2 grant ledger keyed by recipient key. The
+old-grant sweep exists behind a second flag `GRANT_SWEEP_ENABLED`, off, and can only delete an
+identity-addressed grant whose `(zone, epoch)` has already arrived at the inbox key on that
+device. Zone migrator and the agentbox zone-key module read inbox-addressed grants when given the
+key. Design: `docs/interop/phase-2-inbox-keys-design-2026-10-20.md`. Four workers, Opus seam
+review (two blocking seam bugs fixed), Codex gpt-6-astra cross-vendor audit, deepsec PASS.
+
 ### Upgrade Phase 0 and 1: backup discipline and interop hygiene (2026-10-20)
 
 Phase 0: `docs/runbooks/disaster-recovery.md` and `scripts/dr-export.sh`. One restore rehearsal

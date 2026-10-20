@@ -82,11 +82,26 @@ pub fn is_correspondence_kind(kind: u64) -> bool {
 ///   relay is in `Nip42` mode, exactly mirroring `protected_read_blocked`, so
 ///   legacy `Allowlist` deployments keep their current read behaviour.
 /// - Everything else is not protected and passes through untouched.
+#[cfg(test)]
 pub fn protected_read_permitted(
     kind: u64,
     author: &str,
     recipients: &[String],
     session_pubkey: Option<&str>,
+    mode: AuthMode,
+) -> bool {
+    protected_read_permitted_with_keys(kind, author, recipients, session_pubkey, &[], mode)
+}
+
+/// [`protected_read_permitted`] with the viewer's registered inbox keys
+/// (Phase 2). For kind 1059 ONLY, a recipient that is one of `inbox_keys` counts
+/// as the viewer. Empty `inbox_keys` (the feature off) is the original rule.
+pub fn protected_read_permitted_with_keys(
+    kind: u64,
+    author: &str,
+    recipients: &[String],
+    session_pubkey: Option<&str>,
+    inbox_keys: &[String],
     mode: AuthMode,
 ) -> bool {
     if !is_protected_read_kind(kind) {
@@ -97,7 +112,11 @@ pub fn protected_read_permitted(
             return false;
         };
         return viewer.eq_ignore_ascii_case(author)
-            || recipients.iter().any(|r| r.eq_ignore_ascii_case(viewer));
+            || recipients.iter().any(|r| r.eq_ignore_ascii_case(viewer))
+            || (kind == 1059
+                && recipients
+                    .iter()
+                    .any(|r| inbox_keys.iter().any(|k| k.eq_ignore_ascii_case(r))));
     }
     // Moderation kinds: authentication is the whole rule, and only in nip42 mode.
     mode != AuthMode::Nip42 || session_pubkey.is_some()

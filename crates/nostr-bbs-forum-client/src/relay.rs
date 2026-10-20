@@ -68,6 +68,9 @@ pub struct Filter {
     /// tag so a subscription can follow a subject rather than an author.
     #[serde(rename = "#t", skip_serializing_if = "Option::is_none")]
     pub t_tags: Option<Vec<String>>,
+    /// `#d` filter, for addressable events such as kind-30078 app data.
+    #[serde(rename = "#d", skip_serializing_if = "Option::is_none")]
+    pub d_tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
