@@ -2,8 +2,8 @@
 id: ADR-2027
 title: Reach the nostr.chat cluster by NIP-17 routing changes only; keep NIP-28 channels; consume, never port, the double ratchet
 date: 2026-10-20
-decision_status: proposed
-implementation_status: none
+decision_status: accepted
+implementation_status: partial
 activation_status: inactive
 supersedes: []
 superseded_by: []
@@ -77,3 +77,22 @@ byte-identical to the one published to ours, a test that a kind 21453 grant is n
 `public_inbox` key, a relay test that an outsider's AUTH plus a wrap to a non-member is still
 refused, a relay test that a wrap to a registered inbox key of a member is admitted, and one
 exercised D1 restore with the `event_tags` count compared before and after.
+
+## Acceptance record (2026-10-20)
+
+Accepted by the operator on 2026-10-20 after Phase 2 (private inbox keys, `docs/interop/phase-2-inbox-keys-design-2026-10-20.md`)
+landed flagged off. Decision 2's precondition is met in code. Phase 3 implements decision 1 behind
+the existing `RECIPIENT_KEYS_ENABLED` flag, with the `public_inbox` opt-in off by default and
+gated on a registered inbox key and a finished grant cleanup. The consent text shown at the moment
+of opting in is fixed here so that the implementation cannot soften it:
+
+> **Make your inbox public?**
+> Your membership of this board becomes publicly visible: a record naming this relay is published
+> to the Nostr indexers under your key, and anyone can look it up. Anyone on Nostr can then send you
+> direct messages here, including people who are not members. Push notifications will wake you for
+> those messages. Your posts stay as private as they are now. You can turn this off later, but the
+> published record may already have been copied.
+> Button: **Make my inbox public**. Secondary: **Not now**.
+
+The same words appear in `docs/deployment-profiles.md` and in the settings page, and a test asserts
+the settings page renders them verbatim.
