@@ -53,6 +53,26 @@ DELETE FROM events \
 WHERE pubkey = ?2 AND kind = ?4 AND d_tag = ?5 AND id <> ?1 \
   AND (created_at < ?3 OR (created_at = ?3 AND id > ?1))";
 
+/// Plain replaceable (kind 0, 3, 10000-19999) counterpart of
+/// [`ADDRESSABLE_INSERT_SQL`]: the key is `(kind, pubkey)` with no `d_tag`.
+/// Same NIP-01 order, same binds `?1..?9`.
+const REPLACEABLE_INSERT_SQL: &str = "\
+INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, d_tag, received_at) \
+SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
+WHERE NOT EXISTS ( \
+    SELECT 1 FROM events \
+    WHERE pubkey = ?2 AND kind = ?4 AND id <> ?1 \
+      AND (created_at > ?3 OR (created_at = ?3 AND id < ?1)) \
+) \
+ON CONFLICT (id) DO NOTHING";
+
+/// Plain replaceable counterpart of [`ADDRESSABLE_PRUNE_SQL`]. Binds `?1` id,
+/// `?2` pubkey, `?3` created_at, `?4` kind.
+const REPLACEABLE_PRUNE_SQL: &str = "\
+DELETE FROM events \
+WHERE pubkey = ?2 AND kind = ?4 AND id <> ?1 \
+  AND (created_at < ?3 OR (created_at = ?3 AND id > ?1))";
+
 // ---------------------------------------------------------------------------
 // D1 row type for query results
 // ---------------------------------------------------------------------------
@@ -121,25 +141,35 @@ impl NostrRelayDO {
 
         let stored = match treatment {
             EventTreatment::Replaceable => {
-                let delete_stmt = db.prepare(
-                    "DELETE FROM events WHERE pubkey = ?1 AND kind = ?2 AND created_at < ?3",
-                );
-                let delete_binds = [
+                // Same NIP-01 total order as the addressable arm below, keyed
+                // on (kind, pubkey) alone. Before this, a late older kind 0 or
+                // 10050 was stored beside the current one and acknowledged.
+                let insert_stmt = db.prepare(REPLACEABLE_INSERT_SQL);
+                let prune_stmt = db.prepare(REPLACEABLE_PRUNE_SQL);
+                let prune_binds = [
+                    JsValue::from_str(&event.id),
                     JsValue::from_str(&event.pubkey),
-                    JsValue::from_f64(event.kind as f64),
                     JsValue::from_f64(event.created_at as f64),
+                    JsValue::from_f64(event.kind as f64),
                 ];
 
-                let delete_bound = match delete_stmt.bind(&delete_binds) {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
                 let insert_bound = match insert_stmt.bind(&insert_binds) {
                     Ok(s) => s,
                     Err(_) => return false,
                 };
+                let prune_bound = match prune_stmt.bind(&prune_binds) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
 
-                db.batch(vec![delete_bound, insert_bound]).await.is_ok()
+                match db.batch(vec![insert_bound, prune_bound]).await {
+                    Ok(results) => results
+                        .first()
+                        .and_then(|r| r.meta().ok().flatten())
+                        .and_then(|m| m.changes)
+                        .is_some_and(|n| n > 0),
+                    Err(_) => false,
+                }
             }
             EventTreatment::ParameterizedReplaceable => {
                 // NIP-01 replacement is a total order on (created_at, id):
@@ -501,5 +531,66 @@ mod addressable_tests {
         save(&conn, "zzz", 50, "y");
         assert_eq!(ids(&conn, "x"), ["aaa"]);
         assert_eq!(ids(&conn, "y"), ["zzz"]);
+    }
+
+    // Plain replaceable kinds (0, 3, 1xxxx): same order, keyed on (kind, pubkey).
+
+    const RKIND: i64 = 10050;
+
+    fn save_r(conn: &Connection, id: &str, created_at: i64) -> usize {
+        let n = conn
+            .execute(
+                REPLACEABLE_INSERT_SQL,
+                params![id, PK, created_at, RKIND, "[]", "c", "s", "", 0],
+            )
+            .unwrap();
+        conn.execute(REPLACEABLE_PRUNE_SQL, params![id, PK, created_at, RKIND])
+            .unwrap();
+        n
+    }
+
+    fn ids_r(conn: &Connection) -> Vec<String> {
+        let mut st = conn
+            .prepare("SELECT id FROM events WHERE pubkey = ?1 AND kind = ?2 ORDER BY id")
+            .unwrap();
+        st.query_map(params![PK, RKIND], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn replaceable_newer_replaces_older_and_reports_one_change() {
+        let conn = db();
+        assert_eq!(save_r(&conn, "old", 100), 1);
+        assert_eq!(save_r(&conn, "new", 200), 1);
+        assert_eq!(ids_r(&conn), ["new"]);
+    }
+
+    #[test]
+    fn replaceable_late_older_event_is_refused_and_reports_zero_changes() {
+        let conn = db();
+        save_r(&conn, "new", 200);
+        assert_eq!(save_r(&conn, "old", 100), 0);
+        assert_eq!(ids_r(&conn), ["new"]);
+    }
+
+    #[test]
+    fn replaceable_same_second_lower_id_wins() {
+        let conn = db();
+        save_r(&conn, "bbb", 100);
+        assert_eq!(save_r(&conn, "aaa", 100), 1);
+        assert_eq!(ids_r(&conn), ["aaa"]);
+        assert_eq!(save_r(&conn, "ccc", 100), 0);
+        assert_eq!(ids_r(&conn), ["aaa"]);
+    }
+
+    #[test]
+    fn replaceable_is_independent_of_addressable_rows() {
+        let conn = db();
+        save(&conn, "addr", 100, "x");
+        save_r(&conn, "repl", 50);
+        assert_eq!(ids(&conn, "x"), ["addr"]);
+        assert_eq!(ids_r(&conn), ["repl"]);
     }
 }
