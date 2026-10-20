@@ -6,6 +6,31 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 
 ## [1.0.0-beta.18] - 2026-10-19
 
+### Licence (applies from 1.0.0-beta.18, merged 2026-10-20)
+
+### Changed
+
+- **Licence changed to `MIT OR Apache-2.0`** from `1.0.0-beta.18` onward. Every
+  line of this crate was written by DreamLab AI and its agents (94 commits,
+  no outside contributor; provenance checked 2026-10-12), so the change is
+  the rights holder's. Versions `<= 1.0.0-beta.17` remain `AGPL-3.0-only` as
+  published (beta.16 and beta.17 shipped under AGPL before this merge); nothing already released changes licence. The rest of the
+  `nostr-rust-forum` workspace (workers, clients, server) stays AGPL-3.0-only.
+- **`did` module is now behind an off-by-default `did` feature.** It wraps
+  `solid_pod_rs::did_nostr_types`, and `solid-pod-rs` is AGPL-3.0-only; a
+  build with `did` enabled is therefore AGPL as a combined work and must be
+  treated as such. Default features pull no copyleft dependency. In-workspace
+  dependants (`bbs-client`, `pod-worker`, `auth-worker`) enable the feature
+  explicitly and are unchanged in behaviour.
+
+### Why
+
+- Lets permissive consumers (the Ontomark toolchain's governance verbs,
+  Agentbox, the Obsidian plugin) depend on the Nostr primitives directly
+  without inheriting AGPL, while keeping the DID path and the forum itself
+  copyleft.
+
+
 ### Changed
 
 - **`unwrap_gift*` and `unwrap_gift_with_signer*` verify the outer kind-1059 before decrypting**
