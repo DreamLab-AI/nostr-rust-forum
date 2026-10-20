@@ -196,6 +196,10 @@ pub(crate) fn MediaEmbed(
                             class="absolute inset-0 w-full h-full border-0"
                             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                             allowfullscreen=true
+                            // The page sends no Referer (ADR-2025); YouTube refuses an
+                            // embed with none ("Error 153"), so this frame opts back in
+                            // to the browser default.
+                            referrerpolicy="strict-origin-when-cross-origin"
                             title="YouTube video"
                         />
                     </div>

@@ -29,6 +29,34 @@ This guide walks through deploying nostr-rust-forum on Cloudflare Workers with a
    cargo install worker-build --version 0.8.4 --locked
    ```
 
+## 0. Choose a deployment profile (proposed, ADR-2029)
+
+Before creating any Cloudflare resource, decide which of the two profiles this
+deployment is. The choice cannot be changed after the first post, because the
+channel kind is inside every signed event id.
+
+| | `forum` (default) | `room` |
+|---|---|---|
+| Channels | NIP-28, nested threads, encrypted zones | Anagram rooms (kind 34550 + kind 9), flat chat with quotes, world-readable, mirrored by nostr.chat to public relays |
+| Readable from nostr.chat / Anagram / Iris | No | Yes |
+| Private spaces | Encrypted zones (ADR-2016) | NIP-171 epoch groups (ADR-2028) |
+| DMs | NIP-17 on this relay | NIP-17 with the ADR-2027 overlay |
+
+Set it once in `forum.toml`:
+
+```toml
+[deployment]
+profile = "forum"   # or "room"
+```
+
+Read [docs/deployment-profiles.md](docs/deployment-profiles.md) for the full
+comparison, the three diagrams and the decision tree. The profile is projected
+to the relay as `CHANNEL_DIALECT`; the relay publishes it in its NIP-11
+document and pins it in its database on first write, and the single client
+build reads it from the relay at runtime. Until ADR-2029 is accepted and
+implemented, only `forum` deploys; `room` is documented ahead of the code so
+that the decision can be judged by what an operator would read.
+
 ## 1. Cloudflare Account Setup
 
 Create the following resources in your Cloudflare account:

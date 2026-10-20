@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_23 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_28 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -55,3 +55,8 @@ _23 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2021](ADR-2021-two-pinned-sidestr-chains-dreamlab-and-dreamlab-txbt4.md) | Pin two sidestr chains — sidestr:dreamlab and sidestr:dreamlab-txbt4 — with one wallet store and one asset table per chain | 2026-10-03 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
 | [ADR-2022](ADR-2022-ingress-recipients-declared-in-config.md) | Declare gift-wrap recipients in config so the relay admits them without a whitelist row | 2026-10-15 | accepted | complete | live | — | — | jjohare | nostr-rust-forum |
 | [ADR-2023](ADR-2023-content-free-web-push-for-pwa-alerts.md) | Content-free Web Push delivers reply, DM and new-message alerts to the PWA | 2026-10-19 | accepted | complete | staged | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
+| [ADR-2025](ADR-2025-nip59-unwrap-verifies-the-wrap-and-never-echoes-plaintext.md) | NIP-59 unwrap verifies the outer wrap first and never echoes decrypted bytes in an error | 2026-10-19 | accepted | complete | staged | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
+| [ADR-2026](ADR-2026-zone-key-recovery-master.md) | Derive zone epoch keys from a 12-word recovery master so a lost admin device does not lose a zone | 2026-10-19 | proposed | none | inactive | — | ADR-2028 | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
+| [ADR-2027](ADR-2027-nip17-overlay-for-nostr-chat-interop.md) | Reach the nostr.chat cluster by NIP-17 routing changes only; keep NIP-28 channels; consume, never port, the double ratchet | 2026-10-20 | proposed | none | inactive | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
+| [ADR-2028](ADR-2028-zones-adopt-nip171-key-plane.md) | Zones adopt the NIP-171 key plane and ticket format; board transport stays signed kind 42; one owner per zone | 2026-10-20 | proposed | none | inactive | ADR-2026 | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
+| [ADR-2029](ADR-2029-room-profile-deployment-type.md) | Offer a second deployment profile, "room", that speaks Anagram public rooms, NIP-171 private groups and NIP-17 DMs; the forum profile and the DreamLab board stay on NIP-28 | 2026-10-20 | proposed | none | inactive | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |

@@ -1,9 +1,9 @@
 ---
 title: Identity, Keys & Trust — nostr-rust-forum
 doc_id: NRF-IDENTITY
-version: 0.1.0
+version: 0.1.1
 status: draft-for-ratification
-verified_commit: 23be587
+verified_commit: fb9ef30 (working tree; ADR-2025 amendment)
 sources:
   - crates/nostr-bbs-core/src/keys.rs
   - crates/nostr-bbs-auth-worker/src/devices.rs
@@ -104,6 +104,15 @@ first, in the gift-wrap branch only (`crates/nostr-bbs-relay-worker/src/ingress.
 `crates/nostr-bbs-config/src/ingress.rs`). A missing or malformed binding fails closed to the
 whitelist rule above, and declaring a recipient grants it no cohort, admin right or zone key.
 
+On the **read** side (ADR-2025), every reader verifies the kind-1059's own id and signature
+before either NIP-44 layer is opened, then verifies the seal and binds `rumor.pubkey ==
+seal.pubkey` (`crates/nostr-bbs-core/src/gift_wrap.rs`, `unwrap_gift_kind` and
+`unwrap_gift_with_signer_kind`; the forum client's `zone_crypto::unwrap_any` and the
+migrator's `grants::open_gift_wrap` apply the same order). Every error on that path is a fixed
+string naming the layer, never serde's or the cipher's text. A rumor carrying a `sig`, or a seal
+with tags, is tolerated: the relay admits wraps from clients outside this workspace and stored
+DMs must keep opening.
+
 ### Onboarding & recovery
 
 - **Recovery/device-onboarding sheet** (legacy ADR-095) — additive to the one-time
@@ -155,7 +164,8 @@ at EOSE to drive promotion; the cron sweep drives demotion.
 3. **`DEVICE_KEYS_ENABLED` enables only on exact `"true"`** and is checked
    identically in both workers; any looser parse widens the auth surface.
 4. **Gift-wrap admission keys on the recipient `p` tag**, never the ephemeral
-   author (`nip_handlers.rs:103-110`).
+   author (`nip_handlers.rs:103-110`). On read, the wrap's own signature is verified before
+   decryption and no unwrap error ever carries decrypted bytes (ADR-2025).
    An `[[ingress]]` recipient widens only this branch; it is never consulted for
    the author of a non-gift-wrap event, and the `agent` cohort is never how it is
    named (ADR-2022).

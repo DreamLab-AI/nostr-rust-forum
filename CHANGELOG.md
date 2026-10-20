@@ -14,6 +14,49 @@ not `fcm.googleapis.com`; the endpoint allow-list only knew the latter, so "Turn
 failed with `endpoint host is not a known push service`. The exact host is now admitted; `google.com` is still
 not a suffix.
 
+### Changed: every gift-wrap reader verifies the wrap before decrypting and never echoes decrypted bytes (ADR-2025)
+
+From a review of lnbits/anagram. `nostr-bbs-core` 1.0.0-beta.18 verifies the kind-1059's own id and
+signature before either NIP-44 layer is opened (`WrapVerification`), and every decrypt or parse error on
+the unwrap path is a fixed string naming the layer, since serde quotes offending values and a malformed
+rumor could otherwise copy its decrypted bytes into a console line. The forum client's zone-grant unwrap
+and the zone migrator's `open_gift_wrap`, which never went through core, get the same check and the same
+fixed strings; the DM screen shows one fixed sentence per send-failure category and detects an extension
+without NIP-44 by the signer error variant and its text, never by core's text. Wire format unchanged: rumor, seal, wrap, the
+kind-21453 grant payload and the `zk` tag are byte-identical, and compatibility tests open a pre-`id`
+bare-rumor seal, a rumor signed by a foreign client, and non-DM rumor kinds through both paths.
+
+### Added: meta Content Security Policy and `no-referrer` on the forum client
+
+`object-src 'none'; base-uri 'none'; form-action 'self'` as a meta tag, first in `<head>`. No `script-src`:
+GitHub Pages sends no headers, Trunk's inline loader hash changes per build and the deploy step rewrites
+the `window.__ENV__` block. `frame-ancestors` cannot be set from a meta tag. `referrer: no-referrer` keeps
+the channel or thread URL out of linked sites' and image hosts' logs; the YouTube iframe opts back in with
+`referrerpolicy="strict-origin-when-cross-origin"` because YouTube refuses an embed with no Referer.
+
+### Proposed, not built: a 12-word recovery master for zone epoch keys (ADR-2026)
+
+Recorded with the advisor's corrections (bounded revision, length-prefixed zone id, no plaintext master
+in the shared IndexedDB) after the first design was found to re-derive a secret removed members still hold.
+
+### Proposed, not built: interoperability with nostr.chat, Anagram and Iris (ADR-2027, ADR-2028, ADR-2029)
+
+Three assessments under `docs/interop/` and three proposed ADRs, advisor-reviewed, no code. ADR-2027: reach
+the nostr.chat cluster by NIP-17 routing changes only (resolve the recipient's kind 10050, publish wraps to
+several relays, accept rumor kinds 7/5/15, indexer publication behind a per-member opt-in); public channels
+stay NIP-28; the double ratchet is consumed as a pinned crate if ever, never ported. ADR-2028, superseding
+ADR-2026: zones adopt the NIP-171 key plane and `kind:1014` tickets, legacy epochs are imported into a
+private record because ciphertext-signed posts cannot be re-sealed, the zone-to-group binding lives in
+`ZONE_CONFIG`, one owner per zone, board transport stays signed kind 42. ADR-2029: a second deployment
+profile, `room`, speaking Anagram public rooms (kind 34550 + kind 9, flat chat with quotes, world-read),
+NIP-171 private groups and the NIP-17 overlay, with the relay as the single authority for the dialect; the
+DreamLab board stays `forum`. Documentation written ahead of the code: `docs/deployment-profiles.md`
+(comparison, three diagrams, decision tree), `SETUP.md` step 0, the `[deployment] profile` key in
+`forum.example.toml`, README, baseline. Production backup verified read-only: all events live in D1, a
+full export succeeded, D1 Time Travel is enabled; a lossy reset is acceptable only for operational
+metadata, re-sealing of plaintext originals and the operator's own mirror DMs.
+
+
 ### Fixed: a fresh Durable Object isolate could hand a new connection a prior session's identity (`nostr-bbs-relay-worker`)
 
 Session auth and subscriptions persist in DO storage under `ws_auth:{id}` / `ws_sub:{id}`, but the in-memory

@@ -390,8 +390,15 @@ Then stand up a community from the vanilla kit:
 
 ```bash
 cp forum.example.toml forum.toml
-$EDITOR forum.toml          # set hostname, zones, cohorts, admin pubkey…
+$EDITOR forum.toml          # set profile, hostname, zones, cohorts, admin pubkey…
 ```
+
+The first key to set is `[deployment] profile`. `forum` is today's board: NIP-28 channels,
+nested threads, encrypted zones, members-only. `room` (proposed, ADR-2029) is the same kit
+speaking the nostr.chat cluster's wire shape: Anagram public rooms, NIP-171 private groups
+and NIP-17 DMs, readable and joinable from nostr.chat, Anagram and Iris. The two cannot be
+switched after the first post. [docs/deployment-profiles.md](docs/deployment-profiles.md)
+has the comparison and the decision tree.
 
 [`forum.example.toml`](forum.example.toml) documents **every** config section with safe
 generic defaults. See [SETUP.md](SETUP.md) for full deployment (Cloudflare resources, DNS,
@@ -408,6 +415,10 @@ client build).
 
 - [docs/architecture.md](docs/architecture.md) — architecture overview, request lifecycle,
   crate breakdown, NIP coverage matrix, calendar projection
+- [docs/deployment-profiles.md](docs/deployment-profiles.md) — the `forum` and `room`
+  deployment profiles: wire shape, who can read what, how to choose (ADR-2029, proposed)
+- [docs/interop/](docs/interop/) — interoperability with nostr.chat, Anagram and Iris:
+  wire delta, zone redesign, reset tolerance (ADR-2027, ADR-2028)
 - [docs/consumer-surface-map.md](docs/consumer-surface-map.md) — who consumes the governance
   surface today
 - [docs/diagrams/auth-governance-flows.md](docs/diagrams/auth-governance-flows.md) — auth
