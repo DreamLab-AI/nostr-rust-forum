@@ -1,284 +1,110 @@
-# nostr-rust-forum — the human + agent communication substrate
+<div align="center">
 
-**The one place in the mesh where a decision gets signed.** nostr-rust-forum is a
-self-hostable community forum and Nostr relay written in Rust, in which humans and
-agents are the same kind of participant: both hold a `did:nostr` keypair, both publish
-signed events, and every governance decision is a Schnorr-signed Nostr event on an
-immutable log. Agents watch and observe elsewhere; here a human puts their key on the
-outcome. That is the whole point of the repo — it is the governance surface of the
-[VisionFlow Dynamic Agentic Mesh](https://github.com/DreamLab-AI/VisionFlow), the layer
-where machine coordination hands a decision back to a person to sign.
+# nostr-rust-forum
 
-The kit ships **vanilla**. An operator stands up a community by copying
-[`forum.example.toml`](forum.example.toml) to `forum.toml`, filling in zones, branding,
-and deployment values — no forking, no code changes.
+### A Rust community kit for Nostr messaging, access control and agent governance
 
-[![Release](https://img.shields.io/badge/release-v1.0.0--beta.6-blue)](CHANGELOG.md)
-[![License](https://img.shields.io/badge/license-AGPL--3.0--only-green)](LICENSE) [![core licence](https://img.shields.io/badge/nostr--bbs--core-MIT%20OR%20Apache--2.0-blue)](crates/nostr-bbs-core/README.md)
-[![Identity](https://img.shields.io/badge/identity-did%3Anostr%20Multikey-8b5cf6)](#identity--keys)
-[![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20WASM-orange)](#architecture)
+[Start](#quick-start) · [Architecture](#architecture) · [Governance](#signed-governance) · [Interop](#interoperability-and-deployment-profiles) · [Status](#working-status) · [Setup](SETUP.md)
 
-**Maintainer**: [John O'Hare](https://github.com/jjohare) · **Upstream IP**: [Melvin Carvalho](https://github.com/melvincarvalho) ([JSS](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer), [solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs)) · [MAINTAINERS.md](MAINTAINERS.md)
+</div>
 
----
+**Build a community where people and agents publish signed events under explicit access rules.** The kit supplies forum and retro browser clients, a relay, auth/pod/search/preview workers, shared libraries and operator tools. Branding, zones and deployment values belong in an operator configuration rather than a fork of the protocol implementation.
 
-> **Machine coordination is cheap; accountable decisions are not — this forum is the one place in the mesh where a decision gets signed.** Humans and agents are the same kind of participant: each holds a `did:nostr` keypair and publishes Schnorr-signed events to an immutable log, so every governance outcome carries a human signature by construction. The kit ships vanilla — one TOML file stands up a community, no forking.
+Use it for a layered community, team discussion, private messaging or a review surface for agent proposals. A signature identifies a key; roles and policy decide what that key may do. It does not by itself prove a human participated or that an approved action happened.
 
----
+## Quick start
 
-## Where this sits in the ecosystem
+Copy the example configuration and read the setup path before provisioning infrastructure:
 
-VisionFlow is a nine-repo mesh built on one premise: hierarchy was an information-routing
-protocol bounded by human bandwidth, AI collapses the cost of that routing to near zero,
-and so the human role is promoted from router to **judgment broker** — the person who
-signs the decisions that matter. This repo is the surface where that signature lands.
+```sh
+git clone https://github.com/DreamLab-AI/nostr-rust-forum.git
+cd nostr-rust-forum
+cp forum.example.toml forum.toml
+```
 
-The guardrail has two halves. The machine half is neurosymbolic: agents in the mesh run
-bounded by a shared OWL 2 EL ontology, so the errors formal semantics can catch are caught
-by a reasoner. This forum is the human half — the decisions no reasoner should close on
-its own are signed here, by a person, with a key.
+[`forum.example.toml`](forum.example.toml) describes the configuration sections. Choose the implemented `forum` deployment profile, then configure hostname, zones, cohorts and the relevant services. The `room` profile is a roadmap option, not a working alternative today.
 
-- **[VisionFlow](https://github.com/DreamLab-AI/VisionFlow)** — ecosystem canon: ADRs,
-  the compatibility matrix, the maturity vocabulary, the vision report. Start here for the
-  whole picture.
-- **[VisionClaw](https://github.com/DreamLab-AI/VisionClaw)** — the observation layer:
-  ontology-grounded immersive 3D knowledge graph, GPU physics, OWL 2 EL reasoning. It makes
-  agent action *visible* (it beams agent → node) but it never signs a decision. **Watch
-  here, judge there** — VisionClaw observes, this forum decides.
-- **[AgentBox](https://github.com/DreamLab-AI/agentbox)** — the sovereign agent runtime.
-  Agents run there, mint their own `did:nostr` key at spawn, and publish control panels
-  *into* this forum to ask a human for a signed decision.
-- **[solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs)** — the personal-data
-  sovereignty layer. This forum's per-user Solid pods are that server's kit; the identity
-  spine (`did:nostr` Multikey) is shared verbatim.
-- **[sidestr-rs](https://github.com/DreamLab-AI/sidestr-rs)** — Rust port of Melvin Carvalho's sidestr sidechains,
-  AGPL-3.0-only: the economic engine for `did:nostr` agents. A `did:nostr` key is a
-  sidechain wallet.
-- **[narrativegoldmine](https://github.com/DreamLab-AI/knowledgeGraph)** — the published,
-  browsable rendering of the knowledge corpus VisionClaw reasons over, served at
-  [narrativegoldmine.com](https://narrativegoldmine.com). Since July 2026 it also releases
-  the corpus itself: 7,457 pages under ODbL-1.0 and the rdflib pipeline (AGPL-3.0) that
-  builds them into 252,974 triples and 96,377 edges. Mostly AI-generated synthetic content
-  produced under human direction, by design: an ontology testbed, not an encyclopaedia.
-- **[dreamlab-ai-website](https://github.com/DreamLab-AI/dreamlab-ai-website)** — a thin
-  *consumer* of this kit: it embeds the forum's governance dashboard at `/governance`.
+For source development, install the Rust/WASM toolchain and Trunk, then build the client:
 
-Each sibling in its own words:
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install trunk
+cd crates/nostr-bbs-forum-client
+trunk serve
+```
 
-<details>
-<summary><b>VisionFlow</b> — <em>ecosystem canon and honest status ledger</em></summary>
-<br/>
+A local client still needs configured worker/relay endpoints for account and messaging operations. [SETUP.md](SETUP.md) covers Cloudflare resources, secrets, bindings, migrations, client builds and DNS. The workspace declares Rust 1.85, while individual dependencies/build tools may impose later requirements; use the lockfile and CI toolchain when reproducing a release.
 
-> **Six honest systems can still assemble one collective lie — VisionFlow is the canon that stops that.** It holds the ADRs, PRDs, compatibility matrix and honest status ledger for a nine-repo human–AI mesh built on one wager: AI collapses the cost of routing information, so the human is promoted from router to judgment broker. This repo ships words, not runtime — and it is graded on their accuracy.
+```sh
+# From the repository root, with the required native dependencies available:
+cargo build --workspace --locked
+cargo test --workspace --locked
+```
 
-</details>
-
-<details>
-<summary><b>VisionClaw</b> — <em>the observation layer you can stand inside</em></summary>
-<br/>
-
-> **Agent swarms are invisible; VisionClaw makes them something you can stand inside and watch.** It reasons over a curated corpus with an OWL 2 EL engine (Whelk, 5,975 classes), settles the result as a 3D graph under GPU physics, and renders agents acting inside it — desktop and Quest 3 alike, every agent action drawn as a beam to the concept it touched. It observes and never signs: the engine you can watch is deliberately not the surface that can commit.
-
-</details>
-
-<details>
-<summary><b>agentbox</b> — <em>the reproducible, auditable agent runtime</em></summary>
-<br/>
-
-> **An agent runtime you can't reproduce is an audit you can't run — Agentbox is a byte-for-byte reproducible Nix container driven by one TOML manifest.** Every agent is minted its own `did:nostr` key at spawn, every durable write passes a privacy filter into a cryptographic audit trail, and what agents may touch is bounded by explicit fail-closed gates. Reproduce the runtime, audit every action, control every capability.
-
-</details>
-
-<details>
-<summary><b>Loom</b> — <em>make any LLM answer from your data, verifiably</em></summary>
-<br/>
-
-> **Your LLM doesn't know your data — Loom makes any LLM answer from it, verifiably.** Point any OpenAI-compatible client at one URL and every answer is grounded in your curated, reasoner-checked private corpus: recall on in-domain questions rises from as low as 0.15 to ~0.94, faster than the bare model, with every claim traceable to a corpus generation. The model is just a URL behind the door — swap it for the next one and nothing else changes, because the knowledge lives in the corpus you govern, not the weights you rent.
-
-</details>
-
-<details>
-<summary><b>solid-pod-rs</b> — <em>self-owned RDF pods under your own key</em></summary>
-<br/>
-
-> **Your data's exit right should sit in the floor, not be granted at the door — solid-pod-rs gives every human and agent a self-owned RDF pod under their own key.** A Rust-native Solid Protocol server with WAC access control and `did:nostr` identity; every write is a git-mark commit and high-value writes anchor to Bitcoin. Standards-based sovereignty: leave at any time, and take everything with you.
-
-</details>
-
-<details>
-<summary><b>sidestr-rs</b> — <em>economic engine for did:nostr agents — a did:nostr key is a sidechain wallet</em></summary>
-<br/>
-
-> **Rust port of Melvin Carvalho's sidestr sidechains, AGPL-3.0-only: the economic engine for `did:nostr` agents. A `did:nostr` key is a sidechain wallet.**
-
-</details>
-
-<details>
-<summary><b>knowledgeGraph</b> — <em>Logseq pages compiled into a formal OWL 2 ontology</em></summary>
-<br/>
-
-> **8,100+ ordinary Logseq markdown pages that compile losslessly into a formal OWL 2 ontology — pure TBox, every page a class, zero individuals by design.** Corpus, pipeline, viewer and method ship as one open release (ODbL-1.0 data, AGPL-3.0 pipeline) published at narrativegoldmine.com; siblings reason over it (VisionClaw) and serve it as measured LLM grounding (Loom, ~0.94 grounded recall), and third-party extractors such as OntoCast stage RDF into it as governed, reviewable candidates. Rigorous curation is amortised once and reused per query — this repo is the once.
-
-</details>
-
-<details>
-<summary><b>dreamlab-ai-website</b> — <em>the commercial face, running on the mesh's own rails</em></summary>
-<br/>
-
-> **The commercial face of the mesh, running on the mesh's own rails.** A React marketing site and a Rust/Leptos WASM community forum share one Cloudflare-edge origin, end-to-end encrypted where it matters. It is deliberately a thin consumer of the nostr-rust-forum kit — branding and zone config live here, the protocol lives upstream — living proof the kit stands up a real community without a fork.
-
-</details>
-
-### Independent validation — Block's Buzz
-
-In July 2026 Block (Jack Dorsey) launched **[Buzz](https://github.com/block/buzz)**, a
-self-hosted, Nostr-native team-chat + AI-agent + git platform in Rust. It arrives
-independently at the same substrate this ecosystem has built since 2022: **Nostr events as
-the source of truth, agents as first-class signed participants with their own keypairs,
-NIP-42/98 authentication, and kind-based extensibility.** We read that as convergence, not
-competition — the direction is being validated from the outside.
-
-Two honest boundaries. Buzz is **ahead** on relay AUTH: its NIP-42 challenge/response gate
-and its git forge are wired end-to-end today, whereas this forum's relay currently gates on
-a pubkey allowlist (`auth_required: false`) with challenge/response machinery present but
-not yet the enforced admission path, and its cross-relay mesh is designed, not shipped
-(true on both sides). Where this kit is **differentiated**: OWL 2 EL / knowledge-graph
-ontology grounding (via VisionClaw), Solid-pod personal-data sovereignty, immersive 3D
-embodiment, and closed memory/learning loops — none of which Buzz has.
-
----
-
-## What it does
-
-- **No passwords, no email, no central account.** A WebAuthn passkey *is* the account; its
-  PRF extension deterministically derives the user's Nostr key on-device, which never
-  leaves it. There is no credential database to breach.
-- **Humans and agents share one identity model.** Identity is a `did:nostr` Multikey DID;
-  storage is a per-user W3C Solid pod with WAC access control. Both are portable and
-  key-controlled. An agent and a person are distinguished only by what their key is
-  authorised to do, not by a different login system.
-- **Access is data, not code.** Who can read and post to what is described entirely by
-  `forum.toml` zones and cohorts. The relay enforces deny-by-default; the client renders
-  what the config describes. Open community, invite-only circle, or layered org — one file.
-- **One forum, many trust tiers.** A single deployment hosts a public landing zone,
-  inner-circle sections, and private cohorts at once — and the tiered NIP-52 calendar lets
-  neighbours see *that you're busy* without seeing *what you're doing*.
-- **A signed governance plane for agents.** Any agent system publishes interactive control
-  panels into the forum and gets back a cryptographically-signed human decision — the
-  Agent Control Surface Protocol (kinds 31400–31405).
-- **Rust everywhere, edge-native.** Core protocol, relay, pod server, auth, and search are
-  Rust → WASM on Cloudflare Durable Objects, D1, R2, KV, and Workers AI, with an optional
-  native (server-Tokio) pod tier.
-
----
-
-## Interoperating with the wider Nostr ecosystem
-
-The forum has always spoken standard Nostr — `did:nostr` identity, NIP-28 channels,
-NIP-59 gift-wrapped private messages, NIP-42 relay AUTH, NIP-52 calendars — so any Nostr
-client can read a public zone and verify every signature. The kit now extends that to
-**direct interoperability with the emerging nostr.chat / Anagram / Iris cluster**: a member
-can be reached from those apps, and a new community can be stood up to join them natively.
-
-Three layers, each with its honest status. Each ships behind a feature flag that is **off
-by default**, so turning it on is a per-deployment choice and the default deployment stays a
-plain NIP-28 forum.
-
-| Layer | What it adds | Status |
-|-------|--------------|--------|
-| **NIP-17 DM overlay** ([ADR-2027](docs/adr/ADR-2027-nip17-overlay-for-nostr-chat-interop.md)) | Resolves a recipient's kind-10050 inbox relays and publishes gift wraps there, so a nostr.chat / Anagram / Iris user can DM a forum member and be answered; plus reactions, deletions and file messages inside DMs, and an opt-in public inbox. | **Accepted** and implemented; behind `RECIPIENT_KEYS_ENABLED`, off by default. |
-| **NIP-171 epoch-group zones** ([ADR-2028](docs/adr/ADR-2028-zones-adopt-nip171-key-plane.md)) | Re-expresses encrypted zones as Anagram's NIP-171 epoch groups — a 12-word recovery master, derived epoch keys, and `kind:1014` tickets — so a zone's key history is recoverable from the mnemonic and a zone can be opened to Anagram members. | **Proposed** and built; behind `ZONE_GROUPS_ENABLED`, off by default, with a hard pre-activation blocker recorded in the ADR. |
-| **`room` deployment profile** ([ADR-2029](docs/adr/ADR-2029-room-profile-deployment-type.md)) | A second profile that speaks Anagram public rooms (kind 34550 definitions + kind 9 messages) instead of NIP-28, carrying the two layers above, so the whole board is readable and joinable from the cluster. | **Accepted as a roadmap profile.** Documented and config-validated; the dialect code is not built. |
-
-How each is set up, and the full wire-level comparison with the cluster:
-
-- **[docs/deployment-profiles.md](docs/deployment-profiles.md)** — the `forum` and `room`
-  profiles side by side: wire shape, who can read what, and a decision tree for choosing one.
-- **[docs/interop/](docs/interop/)** — the assessments behind the work: the nostr.chat
-  interoperability delta, the zone redesign and lossy-reset tolerance, and the private
-  inbox-key design that keeps a member's zone keys off a public inbox.
-- **[SETUP.md](SETUP.md)** step 0 — choosing the deployment profile before standing a
-  community up.
-
-Even in `room` mode the relay still gates **writes** on the member whitelist, so a
-community curates who may post to its own relay while being world-readable like any Anagram
-room. A profile is chosen once per deployment and cannot be switched after the first post,
-because the channel kind is inside every signed event id.
-
----
+The standalone community is the first deployment path. Cross-repository runtime integration needs additional configuration and acceptance evidence.
 
 ## Architecture
 
-Fourteen crates in one Cargo workspace: shared libraries, five Cloudflare Workers, and two
-Leptos browser clients. Everything routes through `nostr-bbs-core`, which owns the Nostr
-protocol, key management, the `did:nostr` Multikey rendering, and the governance domain
-model.
-
 ```mermaid
-flowchart TD
-    subgraph clients["Browser clients (Leptos CSR + WASM)"]
-        FC["forum-client"]
-        BBS["bbs-client (retro /community/bbs/)"]
-    end
-    subgraph edge["Cloudflare Workers (Rust to WASM)"]
-        RELAY["relay-worker (Durable Object)"]
-        AUTH["auth-worker (WebAuthn, NIP-98, governance REST)"]
-        POD["pod-worker (Solid LDP + WAC)"]
-        SEARCH["search-worker (Workers AI embeddings)"]
-        PREVIEW["preview-worker (link unfurl, SSRF-guarded)"]
-    end
-    subgraph libs["Shared Rust libraries"]
-        CORE["nostr-bbs-core"]
-        CONFIG["nostr-bbs-config"]
-        MESH["nostr-bbs-mesh (scaffold only)"]
-    end
-    FC -->|"WebSocket + NIP-98"| RELAY
-    FC -->|"passkey register/login"| AUTH
-    FC -->|"pod reads/writes"| POD
-    BBS -->|"reuses forum signer"| RELAY
-    RELAY --> CORE
+flowchart TB
+    CONFIG["Operator TOML and deployment bindings"] --> CLIENTS["Forum and retro browser clients"]
+    CONFIG --> RELAY["Relay worker: admission, events, zones"]
+    CLIENTS -->|"Nostr WebSocket and AUTH"| RELAY
+    CLIENTS --> AUTH["Auth worker: identity, membership, governance REST"]
+    CLIENTS --> POD["Pod worker: LDP and WAC"]
+    CLIENTS --> SEARCH["Search worker"]
+    CLIENTS --> PREVIEW["Preview worker"]
+    RELAY --> CORE["Core protocol and governance types"]
     AUTH --> CORE
     POD --> CORE
-    SEARCH --> CORE
-    CONFIG -->|"ZONE_CONFIG"| RELAY
-    CONFIG -->|"window.__ENV__"| FC
-    MESH -.->|"designed, not wired in"| RELAY
+    RELAY -.-> MESH["Mesh transport: configured peer routing"]
+    RELAY --> DB["Durable Objects and D1"]
+    POD --> R2["Worker-native pod storage"]
+    NATIVE["Optional native pod server"] -.-> AUTH
 ```
 
-The single source of access truth is the operator's `forum.toml`. Its `[[zones]]` blocks
-are serialised to a `ZONE_CONFIG` JSON that is fanned out to **both** enforcement points —
-the relay reads it from an env var (deny-by-default read/write gate, kind-40 visibility
-filter, tiered calendar projection) and the client reads the same JSON from
-`window.__ENV__`, so the tiles a member sees and the gate the relay enforces can never
-describe two different models. Full crate-by-crate breakdown, request lifecycle, and the
-NIP coverage matrix live in [docs/architecture.md](docs/architecture.md).
+Source ownership is divided across the [workspace manifests](Cargo.toml), [architecture guide](docs/architecture.md) and [baseline](docs/BASELINE-architecture.md). The core, configuration, mesh and operator tools are distinct from deployed clients/workers. A package release is not a complete community deployment.
 
----
+### Zones and identity
 
-## The decision that gets signed
+Zones group channels by cohort policy. `public`, `locked` and `hidden` visibility control listing and reading; write permissions are configured separately. The relay enforces access, while clients render the corresponding tiles. TOML, worker bindings and injected browser configuration must agree; duplicated projections are a contract to check, not an automatic guarantee of consistency.
 
-The forum is a human-in-the-loop control plane for agent systems. An agent publishes a
-control panel and an action request as Nostr events; the forum renders them as a decision
-card; a human responds with a Schnorr-signed event that only an admin key may publish. The
-result is an immutable, cryptographically-signed audit trail.
+Passkeys, extension signers and configured keys offer different custody paths. NIP-42 authenticates a relay connection and NIP-98 binds an HTTP request. DID document helpers and pod integration have their own feature/licence boundaries. A portable public key does not grant cross-service permissions.
+
+<details>
+<summary><strong>Community capabilities and operator responsibilities</strong></summary>
+
+- Forum topics, nested replies, chat, profiles, direct messages and a retro client share the event substrate.
+- Zones and cohorts separate openly readable areas from restricted groups. Encryption and key distribution add a separate boundary to relay access control.
+- Calendar projection can return full event detail, free/busy information or omission for a viewer. A projected/redacted representation is not the original signed event.
+- Pod routes expose a Worker-compatible Solid tier. Native git-backed capabilities require the separate native pod integration; the Worker cannot run a native git process.
+- Search uses the configured worker/embedding/storage stack. Preview fetching has its own network and SSRF policy.
+- Optional poker, sidestr and governance tools need their corresponding services and configuration; compiling the workspace does not activate every feature.
+
+Read [architecture](docs/architecture.md), [consumer surfaces](docs/consumer-surface-map.md), [security policy](SECURITY.md) and the operator setup before enabling a surface.
+
+</details>
+
+## Signed governance
+
+An agent publishes a panel and request. A permitted reviewer inspects the case and signs a response. The mutation owner later reports whether the approved action was applied. These are distinct stages; a relay acknowledgement is not an application receipt.
 
 ```mermaid
 sequenceDiagram
-    participant Agent
-    participant Relay as relay-worker (DO)
-    participant Client as forum-client (WASM)
-    participant Human
-    Agent->>Relay: kind 31400 PanelDefinition
-    Relay-->>Client: subscription (kinds 31400-31405)
-    Agent->>Relay: kind 31402 ActionRequest
-    Relay-->>Client: push to PanelRegistry
-    Client-->>Human: render decision card
-    Human->>Client: approve / reject / configure
-    Client->>Relay: kind 31403 ActionResponse (Schnorr-signed — relay admits admins only)
-    Relay-->>Agent: subscription on kind 31403
+    participant A as Registered agent
+    participant R as Relay and case projection
+    participant C as Review client
+    participant H as Authorised reviewer
+    participant O as Mutation owner
+    A->>R: 31400 panel and 31402 request
+    R-->>C: Pending case and effective policy tier
+    C-->>H: Context and decision surface
+    H->>C: Review and sign response
+    C->>R: 31403 signed response
+    R-->>O: Accepted decision
+    O->>O: Apply or refuse the requested change
+    O->>R: Application receipt
 ```
-
-**Agent Control Surface Protocol** — parameterised replaceable events, `d`-tag addressable:
 
 | Kind | Name | Publisher | Purpose |
 |------|------|-----------|---------|
@@ -289,227 +115,40 @@ sequenceDiagram
 | 31404 | PanelUpdate | Agent | Incremental state diff |
 | 31405 | PanelRetired | Agent | Retire a control panel |
 
-**Governance tags** ([ADR-2011](docs/adr/ADR-2011-operator-task-properties-set-the-escalation-boundary.md)).
-The escalation boundary is declared by the operator on the panel, not by the
-requesting agent on its own request.
+The operator's task-property declaration sets the escalation boundary; a request can tighten it. Role and delegation policy govern admission of a response. High/critical cases require the configured human-response path. A cryptographic event alone cannot establish who physically controlled a signing key.
 
-| Tag | On | Values | Purpose |
-|-----|----|--------|---------|
-| `tp-verifiability` | 31400, 31402 | `inspectable` \| `partial` \| `opaque` | How far the outcome can be checked afterwards |
-| `tp-reversibility` | 31400, 31402 | `reversible` \| `compensable` \| `irreversible` | Whether the act can be undone |
-| `tp-stakes` | 31400, 31402 | `bounded` \| `significant` \| `critical` | What is at risk if it is wrong |
-| `calibration-sample-rate` | 31400 | `0.0`–`1.0` (default `0.1`) | Share of otherwise-suppressed requests shown to reviewers anyway. Selection is `HMAC(CALIBRATION_SELECTION_KEY, request_id)` — keyed, because the agent chooses its own request id |
-| `max-pending-hours` | 31400 | integer (default `72`) | Age at which a still-pending case is escalated |
-| `probe-agent` | 31400 | 64-hex pubkey | The only agent whose `probe` tags count as probes |
-| `probe` | 31402 | sha256 digest | Seeded known-bad request; withheld from every projection until the case is decided |
+See [ADR-2011](docs/adr/ADR-2011-operator-task-properties-set-the-escalation-boundary.md) and [governance flows](docs/diagrams/auth-governance-flows.md). The documented estate consumer is VisionClaw's ontology-review workflow; universal production use is not established. Application receipts belong to the system that performs the mutation.
 
-On the panel the triple is the operator's declaration; on a request it may only
-**tighten** it, never loosen it. `irreversible` or `critical` floors the case at
-`high`; `opaque` floors it at `medium` and is never member-suppressed; a request
-declaring nothing at all folds to the relay's advertised `ESCALATION_DEFAULT_TIER`.
-The resulting *effective tier* is stored on `broker_cases.effective_tier` and is the
-only tier any consumer reads. The agent's own `risk_tier` remains as telemetry.
+## Interoperability and deployment profiles
 
-**Publishing a panel.** The forum web client publishes no 31400 — panels come from
-registered agents (today, agentbox). Whatever publishes one **must** stamp the
-task-property triple: a panel that declares nothing constrains nothing, and its
-unlabelled requests fold to the relay's advertised default rather than to anything
-the operator chose. Declare all three legs; a partial declaration takes the loosest
-value on the legs you leave out. The forum client reads the triple from the 31400's
-tags or, for publishers using the `PanelDefinition` body, from its `task_properties`
-field — tags win where both are present. If a panel-authoring UI is ever added to
-the client, it must collect the triple at publish time.
+**Main and the upgrade branch differ.** The main branch contains the interop design documents; the implementation described for NIP-17 and NIP-171 below is on [`feat/upgrade-phase-0-1`](https://github.com/DreamLab-AI/nostr-rust-forum/tree/feat/upgrade-phase-0-1), not merged into main. Cloning the quick-start command above does not include that implementation.
 
-**Receipt stages** ([ADR-2010](docs/adr/ADR-2010-durable-governance-outcome-receipts.md),
-extended by ADR-2011). Each stage certifies only itself.
+Standard event formats do not guarantee that any client can join every restricted community. Admission, channel dialect, encryption, key delivery and relay discovery must agree.
 
-```
-signed → relay-accepted → projection-committed → consumer-received → applied | not-applied | applied-manually
-```
+| Layer | Source position | Activation boundary |
+|---|---|---|
+| NIP-42 relay admission | Implemented; example worker selects `AUTH_MODE=nip42` | Configure the relay's own URL/aliases and membership policy |
+| Mesh transport | Concrete transport and delegation validation exist | Peer configuration and a live cross-node run are separate evidence |
+| NIP-17 overlay | Implemented on the upgrade branch under [ADR-2027](docs/adr/ADR-2027-nip17-overlay-for-nostr-chat-interop.md) | `RECIPIENT_KEYS_ENABLED` is off by default |
+| NIP-171 zone key plane | Implemented on the upgrade branch behind a flag; design remains proposed in [ADR-2028](docs/adr/ADR-2028-zones-adopt-nip171-key-plane.md) | `ZONE_GROUPS_ENABLED` is off; pre-activation blockers remain |
+| `room` profile | Configuration and roadmap described by [ADR-2029](docs/adr/ADR-2029-room-profile-deployment-type.md) | Channel-dialect implementation is not built |
 
-The first three are the relay's and say nothing about whether the approved act took
-effect; the rest are the mutation owner's, reported through
-`POST /api/governance/receipts/{response_event_id}/application`. `escalated-on-age`
-and `expired` are *side* receipts: they record something that happened to a case
-without advancing it toward application.
+The implemented `forum` profile uses the existing channel dialect. Consult [deployment profiles](docs/deployment-profiles.md) and [interop assessments](docs/interop/) for the transition and recovery constraints. A proposed interoperability layer is not a claim of a completed acceptance session with another app.
 
-**Trust model.** Agent pubkeys must be registered in the `agent_registry` D1 table
-(admin-gated); governance events from unregistered agents are rejected at relay ingress.
-A Decision (kind 31403) is admitted from an admin key, or from a `reviewer`-role pubkey
-for exactly the cases an admin has `Delegate`d to it. A case whose effective tier is
-`high` or `critical` is resolved only by a human 31403. Eleven NIP-98-gated REST
-endpoints on the auth-worker manage agents, broker cases, roles, application receipts
-and reviewer telemetry.
+## Working status
 
-**Scope, stated plainly.** The protocol is general-purpose, but it has exactly **one live
-consumer today**: ontology-concept elevation in VisionClaw (a case queue capped at five
-concurrent). Treat "universal human-in-the-loop surface" as the design target, not a claim
-that many production consumers exist yet — one does. See
-[docs/consumer-surface-map.md](docs/consumer-surface-map.md) and
-[docs/prd/prd-gap-close-forum.md](docs/prd/prd-gap-close-forum.md).
+**Publication checked 21 October 2026 against main `7096903` and the upgrade branch.** Main's core manifest declares **1.0.0-beta.18**. The reviewed upgrade worktree at `c1657fc` declares **1.0.0-beta.20**; its public branch was at `053f734` when this page was published. Other crates and consumers have independent versions/pins. The later local migration-ordering and time-bounded NIP-26 fixes remain unpublished work, not main-branch guarantees.
 
-**Self-improvement.** The forum's own rule — a human decision is the one that's signed — is
-exactly how the code evolves: a nightly [dream cycle](https://github.com/DreamLab-AI/dream-engine)
-proposes, a maintainer signs the merge. *Evaluation is not promotion.*
+This documentation update does not merge the upgrade branch or activate its flags. The review inspected source and existing evidence; it did not deploy a fresh D1 database, run the full workspace suite or verify a live federation session. Current uncommitted zone-crypto/example-config changes were preserved. The [decision ledger](docs/adr/README.md) records decisions, implementation and activation on independent axes.
 
----
+## Where it sits in VisionFlow
 
-## Identity & keys
+[VisionFlow](https://github.com/DreamLab-AI/VisionFlow) owns the estate architecture. This kit owns communication and review surfaces; [DreamLab's website](https://github.com/DreamLab-AI/dreamlab-ai-website) consumes selected revisions and supplies its operator overlay. [Agentbox](https://github.com/DreamLab-AI/agentbox) runs agents and product-specific bridges; [VisionClaw](https://github.com/DreamLab-AI/VisionClaw) owns knowledge application and mutation paths. [solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs) supplies foundation functionality with tier-specific consumption.
 
-Identity is a **`did:nostr` Multikey DID** — the canonical form used across the wider
-did-nostr ecosystem, so a member's identity is portable to any system that speaks the
-method.
+An event signed here does not establish every other service's state. The estate's compatibility and acceptance records describe those seams.
 
-- The DID is `did:nostr:<x-only-hex>`; its document carries a single `Multikey`
-  verification method whose `publicKeyMultibase` encodes the BIP-340 x-only key. The
-  identity string and key bytes are invariant — only the document encoding is canonical.
-- **The passkey is the root of trust.** WebAuthn PRF derives the root Nostr key on-device;
-  it is never stored server-side. Purpose-scoped subkeys derive deterministically via
-  `derive_subkey(root, tag)` = HMAC-SHA-256, so device and capability keys are rotatable
-  and recoverable from the root alone (ADR-094).
-- **Auth reads the raw signature, not the document.** NIP-98 (HTTP) and NIP-42 (relay)
-  verify a Schnorr signature against the raw event pubkey, so re-encoding the DID document
-  cannot affect the auth path.
-- The pod + identity layers build on **solid-pod-rs `0.5.0-alpha.10`** (the JSS Rust port),
-  the canonical encoder of record for the Multikey DID document.
+## Documentation, credit and licence
 
-Signup issues a 100%-client-side printable **recovery sheet** (nsec/npub/relay QRs, restore
-steps, optional relay sweep) with a mobile on-ramp (ADR-095). Device keys are revocable
-with NIP-17 multi-device DM delivery (ADR-099/100/101). The first registrant becomes admin
-— no hardcoded admin keys.
+[Setup](SETUP.md) · [Architecture](docs/architecture.md) · [Decision ledger](docs/adr/README.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
----
-
-## Zones, cohorts & the tiered calendar
-
-A **zone** is a named group of channels gated by **cohort** membership; cohorts are string
-slugs on the relay whitelist, granted via the NIP-98 admin API. Zone visibility controls
-what non-members can even see:
-
-| `visibility` | Listed to non-members | Content readable | Kind-40 definition served |
-|--------------|-----------------------|------------------|---------------------------|
-| `public` | Yes | Yes (no auth) | Yes |
-| `locked` (default) | Yes — greyed tile | No | Yes (so the tile renders) |
-| `hidden` | No | No | No |
-
-The client renders what the config describes; **the relay is the real access boundary**,
-deny-by-default. A `public` zone with `write_cohorts = ["friends"]` gives an openly
-readable landing zone only an inner circle can post to.
-
-The **tiered NIP-52 calendar** projects every (viewer, event) pair to one of three
-outcomes — full, free/busy, or omit — server-side. A neighbouring cohort's event at a
-*shared venue* is projected down to an anonymous free/busy block (start, end, "busy"), with
-title, location, participants, and signature stripped. You learn the room is booked without
-learning whose party it is. The full projection matrix and its 25 unit tests are documented
-in [docs/architecture.md](docs/architecture.md).
-
----
-
-## Quick start
-
-```bash
-# Prerequisites
-rustup target add wasm32-unknown-unknown
-cargo install trunk
-npm i -g wrangler
-
-# Build + test the whole workspace
-cargo build --workspace
-cargo test  --workspace
-
-# Serve the forum client locally
-cd crates/nostr-bbs-forum-client && trunk serve
-```
-
-Then stand up a community from the vanilla kit:
-
-```bash
-cp forum.example.toml forum.toml
-$EDITOR forum.toml          # set profile, hostname, zones, cohorts, admin pubkey…
-```
-
-The first key to set is `[deployment] profile`. `forum` is today's board and the only one
-that builds: NIP-28 channels, nested threads, encrypted zones, members-only. `room`
-([ADR-2029](docs/adr/ADR-2029-room-profile-deployment-type.md), accepted as a roadmap
-profile, not yet built) is the same kit speaking the nostr.chat cluster's wire shape —
-Anagram public rooms, NIP-171 private groups and the NIP-17 DM overlay — readable and
-joinable from nostr.chat, Anagram and Iris. The two cannot be switched after the first
-post. [docs/deployment-profiles.md](docs/deployment-profiles.md) has the comparison and the
-decision tree, and the [ecosystem-interop section](#interoperating-with-the-wider-nostr-ecosystem)
-above has the status of each layer.
-
-[`forum.example.toml`](forum.example.toml) documents **every** config section with safe
-generic defaults. See [SETUP.md](SETUP.md) for full deployment (Cloudflare resources, DNS,
-client build).
-
-> **Consuming-repo dual pin.** A deployment pins the kit in two places that must move
-> together — `KIT_REF` in the deploy workflow (the SHA the WASM client + workers build
-> from) and `rev = "<sha>"` on every `nostr-bbs-*` git dependency in the overlay's
-> `Cargo.toml`. Bump both in the same commit or the client and config schema drift apart.
-
----
-
-## Documentation
-
-- [docs/architecture.md](docs/architecture.md) — architecture overview, request lifecycle,
-  crate breakdown, NIP coverage matrix, calendar projection
-- [docs/deployment-profiles.md](docs/deployment-profiles.md) — the `forum` and `room`
-  deployment profiles: wire shape, who can read what, how to choose (ADR-2029, accepted roadmap)
-- [docs/interop/](docs/interop/) — interoperability with nostr.chat, Anagram and Iris:
-  the wire delta, the zone redesign and lossy-reset tolerance, and the inbox-key design
-  (ADR-2027 accepted, ADR-2028 proposed, ADR-2029 accepted roadmap). See the
-  [ecosystem-interop section](#interoperating-with-the-wider-nostr-ecosystem) for status.
-- [docs/consumer-surface-map.md](docs/consumer-surface-map.md) — who consumes the governance
-  surface today
-- [docs/diagrams/auth-governance-flows.md](docs/diagrams/auth-governance-flows.md) — auth
-  and governance sequence diagrams
-- [docs/prd/prd-gap-close-forum.md](docs/prd/prd-gap-close-forum.md) — governance-surface
-  gap-close PRD and maturity ledger
-- [docs/ddd/ddd-gap-close-forum-context.md](docs/ddd/ddd-gap-close-forum-context.md) —
-  bounded-context model for the governance surface
-- [docs/adr/](docs/adr/) ([index](docs/adr/README.md)) — architecture decision records
-  (identity, pods, mesh, key lifecycle, onboarding)
-- [SETUP.md](SETUP.md) · [forum.example.toml](forum.example.toml) ·
-  [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md) ·
-  [SECURITY.md](SECURITY.md)
-
----
-
-## Status & remaining work
-
-**As of 2026-07-22.** Maturity words follow the VisionFlow ADR-002 ladder (historical /
-planned / scaffolded / standalone / integrated / federation-verified / released). Current
-release: **v1.0.0-beta.6** (2026-07-19). This section names shortfalls rather than hiding
-them.
-
-| Capability | Maturity | Honest boundary |
-|------------|----------|-----------------|
-| Passkey-first `did:nostr` identity, zero password DB | integrated | WebAuthn PRF → on-device key; no credential store. |
-| Six-kind ACSP signed governance (31400–31405) | integrated | Live; only an admin key publishes a Decision (31403). One live consumer today: ontology-concept elevation (capped 5 concurrent) — narrower than a universal-HITL claim. |
-| Config-driven zones + tiered NIP-52 calendar | released | Deny-by-default relay gate; projection encoded in 25 unit tests. |
-| Semantic search (Workers AI `bge-small-en-v1.5`) | released | 384-dim L2-normalised, cosine k-NN over an RVF store. |
-| Solid pods (LDP + WAC, edge + native tier) | integrated | Native git-backed tier gated by `[native_pod]`, disabled by default. |
-| NIP-42 relay AUTH | scaffolded | Relay currently gates on a **pubkey allowlist** (`auth_required: false`); challenge/response machinery exists but is not yet the enforced admission path. **Buzz is ahead here** — its NIP-42 gate is wired end-to-end. |
-| Cross-relay mesh federation | planned | `nostr-bbs-mesh` is scaffold only (`MeshTransport` trait + session state, no concrete transport) and is **not** a dependency of the relay-worker. **Standalone is the supported deployment mode.** Designed, not shipped — on both sides of the Buzz comparison. |
-| Wider-Nostr interop (NIP-17 overlay, NIP-171 zones, `room` profile) | integrated / scaffolded | Ships behind feature flags that are off by default; enabling is a per-deployment choice. Status per layer in the [ecosystem-interop section](#interoperating-with-the-wider-nostr-ecosystem) (ADR-2027 accepted, ADR-2028 proposed, ADR-2029 roadmap). |
-
-Downstream, the [dreamlab-ai-website](https://github.com/DreamLab-AI/dreamlab-ai-website)
-governance dashboard is blocked on this repo shipping the upstream-disclosure badge and the
-Agents roster tab — tracked as planned, not delivered. The canonical cross-ecosystem work
-register is VisionClaw's `docs/TODO-unified.md`.
-
----
-
-## Upstream, maintainers & licence
-
-Built on `did:nostr` Multikey identity and Nostr message passing; deploys standalone or
-embeds as the governance surface of a larger agent platform.
-
-| Foundation | Project | Role |
-|:-----------|:--------|:-----|
-| **solid-pod-rs** | [solid-pod-rs](https://github.com/DreamLab-AI/solid-pod-rs) | Cryptographic foundation — JSS Rust port, `did:nostr` Multikey identity (`0.5.0-alpha.10`) |
-| **JSS** | [JavaScriptSolidServer](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer) | Upstream Solid server reference and AGPL-3.0 lineage |
-| **did-nostr** | [did:nostr](https://github.com/nicholasgasior/did-nostr) | Nostr-keyed DID method for cross-system identity |
-
-Maintainers and upstream IP attribution: [MAINTAINERS.md](MAINTAINERS.md). Licensed under
-[AGPL-3.0-only](LICENSE), inherited from upstream JSS.
+Application/worker code follows **AGPL-3.0-only**. `nostr-bbs-core` declares **MIT OR Apache-2.0** from its beta.18 relicense; its default-off `did` feature adds the Solid dependency and changes the combined dependency obligations. Inspect the actual feature graph and individual manifests rather than applying a blanket licence to every build. [LICENSE](LICENSE), [core documentation](crates/nostr-bbs-core/README.md) and [MAINTAINERS.md](MAINTAINERS.md) carry terms and attribution, including the Solid/JSS lineage of Melvin Carvalho's work.
