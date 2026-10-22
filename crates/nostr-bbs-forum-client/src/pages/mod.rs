@@ -46,6 +46,7 @@ pub use home::HomePage;
 pub use join::JoinPage;
 pub use knowledge::KnowledgePage;
 pub use login::LoginPage;
+pub(crate) use message_jump::edit_target_of;
 pub use message_jump::MessageJumpPage;
 pub use note_view::NoteViewPage;
 pub use pod_browser::PodBrowserPage;

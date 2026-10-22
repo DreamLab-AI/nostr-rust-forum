@@ -24,6 +24,33 @@ struct ImageAttachment {
     name: String,
 }
 
+/// The image on a paste event's clipboard, when the paste is an image and
+/// nothing else. Office and Docs copies carry the text AND a rendering of it
+/// as an image, and the text is what was meant, so an image is only taken
+/// when no plain text came with it. `items()` is read first (Safari exposes a
+/// pasted image reliably only there), `files()` as the fallback.
+pub(crate) fn pasted_image(ev: &web_sys::ClipboardEvent) -> Option<web_sys::File> {
+    let dt = ev.clipboard_data()?;
+    let has_text = dt
+        .get_data("text/plain")
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+    if has_text {
+        return None;
+    }
+    let items = dt.items();
+    let from_items = (0..items.length())
+        .filter_map(|i| items.get(i))
+        .filter(|it| it.kind() == "file" && it.type_().starts_with("image/"))
+        .find_map(|it| it.get_as_file().ok().flatten());
+    from_items.or_else(|| {
+        let files = dt.files()?;
+        (0..files.length())
+            .filter_map(|i| files.get(i))
+            .find(|f| f.type_().starts_with("image/"))
+    })
+}
+
 /// Maximum message length in characters.
 const MAX_CHARS: usize = 4096;
 
@@ -522,7 +549,17 @@ pub(crate) fn MessageInput(
     // the async upload-then-send path so both behave identically post-send.
     let finalize_send = Callback::new(move |text: String| {
         let text = text.trim().to_string();
-        if !text.is_empty() && text.len() <= MAX_CHARS {
+        if text.len() > MAX_CHARS {
+            // Over the limit once the image link was appended: keep the text
+            // in the composer (draft included) and say so, rather than drop
+            // the message and the draft on the floor.
+            content.set(text);
+            upload_error.set(Some(format!(
+                "Message is over {MAX_CHARS} characters with the image link; shorten it and send again"
+            )));
+            return;
+        }
+        if !text.is_empty() {
             // Determine which selected mentions actually appear in the final text
             // (the user may have backspaced past one).
             let mentions = selected_mentions.get_untracked();
@@ -675,6 +712,12 @@ pub(crate) fn MessageInput(
         }
         if key == "Enter" && !ev.shift_key() {
             ev.prevent_default();
+            // The Send button's own guards: an over-limit draft or a pending
+            // upload is not sent, and must not be wiped by the clear that
+            // follows a send either.
+            if is_empty() || is_over_limit() || uploading.get_untracked() {
+                return;
+            }
             do_send.run(());
         }
     });
@@ -688,40 +731,61 @@ pub(crate) fn MessageInput(
         }
     };
 
+    // Stage an image as the pending attachment: validated, previewed through
+    // a data URL, uploaded on send. One path for the file picker and paste.
+    let stage_image = move |file: web_sys::File| {
+        if !is_accepted_image(&file) {
+            return;
+        }
+        if file.size() as u64 > MAX_FILE_SIZE {
+            return;
+        }
+        let fname = file.name();
+        let file_clone = file.clone();
+        if let Ok(reader) = web_sys::FileReader::new() {
+            let onload = wasm_bindgen::closure::Closure::wrap(Box::new(move |ev: web_sys::Event| {
+                let r: web_sys::FileReader = ev.target().unwrap().unchecked_into();
+                if let Ok(res) = r.result() {
+                    if let Some(url) = res.as_string() {
+                        attachment.set(Some(ImageAttachment {
+                            file: file_clone.clone(),
+                            data_url: url,
+                            name: fname.clone(),
+                        }));
+                    }
+                }
+            })
+                as Box<dyn FnMut(web_sys::Event)>);
+            reader.set_onload(Some(onload.as_ref().unchecked_ref()));
+            let _ = reader.read_as_data_url(&file);
+            onload.forget();
+        }
+    };
+
     let on_image_selected = move |ev: leptos::ev::Event| {
         let input: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-        if let Some(files) = input.files() {
-            if let Some(file) = files.get(0) {
-                if !is_accepted_image(&file) {
-                    return;
-                }
-                if file.size() as u64 > MAX_FILE_SIZE {
-                    return;
-                }
-                let fname = file.name();
-                let file_clone = file.clone();
-                if let Ok(reader) = web_sys::FileReader::new() {
-                    let onload =
-                        wasm_bindgen::closure::Closure::wrap(Box::new(move |ev: web_sys::Event| {
-                            let r: web_sys::FileReader = ev.target().unwrap().unchecked_into();
-                            if let Ok(res) = r.result() {
-                                if let Some(url) = res.as_string() {
-                                    attachment.set(Some(ImageAttachment {
-                                        file: file_clone.clone(),
-                                        data_url: url,
-                                        name: fname.clone(),
-                                    }));
-                                }
-                            }
-                        })
-                            as Box<dyn FnMut(web_sys::Event)>);
-                    reader.set_onload(Some(onload.as_ref().unchecked_ref()));
-                    let _ = reader.read_as_data_url(&file);
-                    onload.forget();
-                }
-            }
+        if let Some(file) = input.files().and_then(|files| files.get(0)) {
+            stage_image(file);
         }
         input.set_value("");
+    };
+
+    // Paste-to-attach: an image on the clipboard (a screenshot, a copied
+    // picture) becomes the pending attachment. A text paste is left to the
+    // browser, so the default is only cancelled when an image was taken.
+    let on_paste = move |ev: web_sys::Event| {
+        if !has_image_support {
+            return;
+        }
+        // Leptos types `paste` as a plain Event (ClipboardEvent is unstable
+        // upstream); the clipboard is only reachable through the real type.
+        let Some(ev) = ev.dyn_ref::<web_sys::ClipboardEvent>() else {
+            return;
+        };
+        if let Some(file) = pasted_image(ev) {
+            ev.prevent_default();
+            stage_image(file);
+        }
     };
 
     let open_file_picker = move |_| {
@@ -846,6 +910,7 @@ pub(crate) fn MessageInput(
                         prop:value=move || content.get()
                         on:input=move |ev| on_input.run(ev)
                         on:keydown=move |ev| on_keydown.run(ev)
+                        on:paste=on_paste
                         on:click=move |_| update_mention_state()
                         on:keyup=move |ev: leptos::ev::KeyboardEvent| {
                             // Update token detection on caret-moving keys (left/right/home/end).

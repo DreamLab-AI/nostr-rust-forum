@@ -12,7 +12,7 @@
 //! component performs the topic/reply classification locally and adds no relay
 //! subscriptions of its own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -155,16 +155,44 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
     }
 
     // Pass 2: fold replies into their parent root.
+    // Lower-cased views for the parent walk: the root ids, and every event
+    // by id, so each hop is a lookup and not a scan of the channel.
+    let root_lower: HashSet<String> = roots.keys().map(|k| k.to_lowercase()).collect();
+    let by_id: HashMap<String, &NostrEvent> =
+        events.iter().map(|e| (e.id.to_lowercase(), e)).collect();
+
     for ev in events {
         if ev.kind != 42 && ev.kind != 1111 {
+            continue;
+        }
+        // An edit re-publishes an existing post: neither a reply nor a new
+        // participant, so it must not move the topic or name its byline.
+        if crate::pages::edit_target_of(ev).is_some() {
             continue;
         }
         let parent = match reply_parent(ev, &cid_lower) {
             Some(p) => p,
             None => continue, // a root (or unanchored) — not a reply
         };
-        // Match the parent against a known root (case-insensitive keys).
-        if let Some((_, summary)) = roots.iter_mut().find(|(k, _)| k.to_lowercase() == parent) {
+        // Match the parent against a known root (case-insensitive keys). A
+        // reply to a reply names its parent, not the topic; walk up to the
+        // root so it counts and can be the latest participant.
+        let mut root_key = parent;
+        let mut hops = 0;
+        while !root_lower.contains(&root_key) && hops < 64 {
+            hops += 1;
+            match by_id
+                .get(&root_key)
+                .and_then(|e| reply_parent(e, &cid_lower))
+            {
+                Some(p) => root_key = p,
+                None => break,
+            }
+        }
+        if !root_lower.contains(&root_key) {
+            continue; // orphaned reply: its chain never reaches a root here
+        }
+        if let Some((_, summary)) = roots.iter_mut().find(|(k, _)| k.to_lowercase() == root_key) {
             summary.reply_count += 1;
             if ev.created_at > summary.last_activity {
                 summary.last_activity = ev.created_at;
@@ -230,7 +258,14 @@ pub fn TopicList(
     }
 }
 
-/// A single topic row: title line, author, reply count, last-activity.
+/// A single topic row: title line, latest participant, reply count,
+/// last-activity.
+///
+/// The byline and avatar name the MOST RECENT participant, not the root
+/// author: a reader scanning the list wants to know who spoke last before
+/// opening the topic. `last_pubkey` already falls back to the root author
+/// when there are no replies, and the root author moves to the right-hand
+/// column ("started by") only when the two differ.
 #[component]
 fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
     let author_pk = topic.pubkey.clone();
@@ -247,8 +282,8 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
         format!("{reply_count} replies")
     };
     let activity = format_relative_time(topic.last_activity);
-    let has_replies = reply_count > 0;
-    let pk = topic.pubkey.clone();
+    let started_by_someone_else = reply_count > 0 && topic.last_pubkey != topic.pubkey;
+    let pk = topic.last_pubkey.clone();
 
     // "Stretched link" card: the title link's `::after` covers the whole card,
     // so the card stays one click target, while an author's abridged key (no
@@ -267,9 +302,9 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
                         </A>
                     </h3>
                     <div class="flex items-center gap-2 mt-1 text-xs text-gray-500 flex-wrap">
-                        <span>"by "</span>
-                        <span class="text-gray-400"><KeyName pubkey=author_pk key_class="relative z-10 font-mono" /></span>
-                        <AgentBadge pubkey=root_badge_pubkey compact=true />
+                        <span>"last by "</span>
+                        <span class="text-gray-400"><KeyName pubkey=last_pk key_class="relative z-10 font-mono" /></span>
+                        <AgentBadge pubkey=last_badge_pubkey compact=true />
                         <span class="text-gray-700">"\u{2022}"</span>
                         <span class="flex items-center gap-1">
                             <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -287,10 +322,10 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
                         </svg>
                         {activity}
                     </div>
-                    {has_replies.then(|| view! {
+                    {started_by_someone_else.then(|| view! {
                         <div class="mt-1 text-gray-600 flex items-center gap-1 justify-end">
-                            "last: "<span class="text-gray-400"><KeyName pubkey=last_pk key_class="relative z-10 font-mono" /></span>
-                            <AgentBadge pubkey=last_badge_pubkey compact=true />
+                            "started by "<span class="text-gray-400"><KeyName pubkey=author_pk key_class="relative z-10 font-mono" /></span>
+                            <AgentBadge pubkey=root_badge_pubkey compact=true />
                         </div>
                     })}
                 </div>
@@ -417,6 +452,60 @@ mod tests {
         assert_eq!(topics[1].id, t2);
         assert_eq!(topics[1].reply_count, 1);
         assert_eq!(topics[1].last_activity, 150);
+    }
+
+    #[test]
+    fn nested_replies_reach_the_topic_and_edits_do_not_move_it() {
+        let cid = "channel0000000000000000000000000000000000000000000000000000000000";
+        let t1 = "topic1111111111111111111111111111111111111111111111111111111111";
+        let r1 = "reply1111111111111111111111111111111111111111111111111111111111";
+        let r2 = "reply2222222222222222222222222222222222222222222222222222222222";
+        let e1 = "edit11111111111111111111111111111111111111111111111111111111111";
+        let events = vec![
+            ev(
+                t1,
+                "alice",
+                "First topic",
+                100,
+                42,
+                vec![vec!["e", cid, "", "root"]],
+            ),
+            ev(
+                r1,
+                "carol",
+                "A reply",
+                120,
+                42,
+                vec![vec!["e", cid, "", "root"], vec!["e", t1, "", "reply"]],
+            ),
+            ev(
+                r2,
+                "dave",
+                "A reply to the reply",
+                130,
+                42,
+                vec![vec!["e", cid, "", "root"], vec!["e", r1, "", "reply"]],
+            ),
+            ev(
+                e1,
+                "alice",
+                "First topic (edited)",
+                140,
+                42,
+                vec![vec!["e", cid, "", "root"], vec!["e", t1, "", "edit"]],
+            ),
+        ];
+        let topics = classify_topics(cid, &events);
+        assert_eq!(topics.len(), 1, "the edit is not a topic of its own");
+        assert_eq!(topics[0].reply_count, 2, "the nested reply counts");
+        assert_eq!(
+            topics[0].last_pubkey, "dave",
+            "the nested reply is the latest participant"
+        );
+        assert_eq!(
+            topics[0].last_activity, 130,
+            "the edit does not move the topic"
+        );
     }
 
     #[test]

@@ -173,6 +173,23 @@ pub fn DmChatPage() -> impl IntoView {
         message_input.set(input.value());
     };
 
+    // Paste-to-attach: an image on the clipboard opens the attach panel with
+    // that image staged for preview. Nothing is uploaded on paste; the panel's
+    // own Upload button writes it to the pod (media/public) only once the
+    // member has seen what they pasted.
+    let staged_image: RwSignal<Option<web_sys::File>> = RwSignal::new(None);
+    let on_paste = move |ev: web_sys::Event| {
+        let Some(cev) = ev.dyn_ref::<web_sys::ClipboardEvent>() else {
+            return;
+        };
+        let Some(file) = crate::components::message_input::pasted_image(cev) else {
+            return;
+        };
+        ev.prevent_default();
+        show_image_upload.set(true);
+        staged_image.set(Some(file));
+    };
+
     let is_loading = dm_store.is_loading();
     let my_pubkey = auth.pubkey();
 
@@ -325,7 +342,7 @@ pub fn DmChatPage() -> impl IntoView {
                     // Image upload panel (collapsed by default)
                     <Show when=move || show_image_upload.get()>
                         <div class="mb-3">
-                            <ImageUpload on_upload=Callback::new(move |url: String| {
+                            <ImageUpload staged=staged_image on_upload=Callback::new(move |url: String| {
                                 // Insert the image URL into the message input
                                 message_input.update(|v| {
                                     if !v.is_empty() { v.push(' '); }
@@ -362,6 +379,7 @@ pub fn DmChatPage() -> impl IntoView {
                             prop:value=move || message_input.get()
                             on:input=on_input
                             on:keydown=on_keydown
+                            on:paste=on_paste
                             prop:disabled=move || sending.get()
                         />
                         <button
