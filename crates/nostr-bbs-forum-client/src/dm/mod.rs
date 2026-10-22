@@ -45,6 +45,13 @@ pub struct DMConversation {
 #[derive(Clone, Debug, Default)]
 struct DMStateInner {
     conversations: HashMap<String, DMConversation>,
+    /// Per-counterparty "read up to" timestamps (seconds), persisted in
+    /// localStorage. Only a message newer than its conversation's mark counts
+    /// as unread, so the history re-streamed on the next visit does not count
+    /// every message ever received. Kept per local account.
+    read_marks: HashMap<String, u64>,
+    /// The local account `read_marks` were loaded for (empty until then).
+    marks_owner: String,
     current_conversation: Option<String>,
     messages: Vec<DMMessage>,
     /// O(1) dedup index for message IDs (avoids O(n) linear scan).
@@ -178,6 +185,7 @@ impl DMStore {
         signer: Rc<dyn Signer>,
         my_pubkey: &str,
     ) {
+        self.ensure_read_marks(my_pubkey);
         self.state.update(|s| {
             s.is_loading = true;
             s.error = None;
@@ -240,6 +248,7 @@ impl DMStore {
         signer: Rc<dyn Signer>,
         my_pubkey: &str,
     ) {
+        self.ensure_read_marks(my_pubkey);
         let my_pk = my_pubkey.to_string();
         let state = self.state;
         let now = (js_sys::Date::now() / 1000.0) as u64;
@@ -266,11 +275,31 @@ impl DMStore {
         );
     }
 
+    /// Load this account's read marks before any history reaches
+    /// [`apply_message`]: a replay that ran ahead of them would count every
+    /// message as unread. Idempotent per account.
+    fn ensure_read_marks(&self, my_pubkey: &str) {
+        if self.state.with_untracked(|s| s.marks_owner == my_pubkey) {
+            return;
+        }
+        let marks = load_read_marks(my_pubkey);
+        self.state.update(|s| {
+            s.marks_owner = my_pubkey.to_string();
+            s.read_marks = marks;
+        });
+    }
+
     /// Select a conversation and mark it as read.
     pub fn select_conversation(&self, pubkey: &str) {
         let pk = pubkey.to_string();
         self.state.update(|s| {
             s.current_conversation = Some(pk.clone());
+            // The read mark is not moved here: each page builds its own store,
+            // so nothing is loaded yet. It moves as the conversation's history
+            // (re)plays through `apply_message` with this conversation open,
+            // which lands it on the newest message actually seen, never on
+            // "now" (a gift-wrapped reply composed earlier can still be in
+            // flight and must stay unread if it lands after we leave).
             if let Some(convo) = s.conversations.get_mut(&pk) {
                 convo.unread_count = 0;
             }
@@ -299,6 +328,7 @@ impl DMStore {
         my_pubkey: &str,
         partner_pubkey: &str,
     ) {
+        self.ensure_read_marks(my_pubkey);
         let my_pk = my_pubkey.to_string();
         let partner_pk = partner_pubkey.to_string();
         let state = self.state;
@@ -365,6 +395,7 @@ impl DMStore {
         signer: Rc<dyn Signer>,
         my_pubkey: &str,
     ) -> Result<(), String> {
+        self.ensure_read_marks(my_pubkey);
         if content.trim().is_empty() {
             return Err("Message cannot be empty".into());
         }
@@ -430,6 +461,12 @@ impl DMStore {
                 });
             convo.last_message = truncate_message(content, 80);
             convo.last_timestamp = now;
+            // Sending is a read signal in this session too, not only when our
+            // own copy replays from the relay (which `seen_ids` discards).
+            if s.read_marks.get(recipient_pk_hex).is_none_or(|m| now > *m) {
+                s.read_marks.insert(recipient_pk_hex.to_string(), now);
+                save_read_marks(&s.marks_owner, &s.read_marks);
+            }
         });
 
         // Encrypt + sign + publish on a spawned task (the signer is async, and a
@@ -1058,8 +1095,9 @@ fn insert_dm_message(
     state: RwSignal<DMStateInner>,
 ) {
     let coach = crate::poker::PokerConfig::load().coach();
+    let mut marks_changed = false;
     state.update(|s| {
-        apply_message(
+        marks_changed = apply_message(
             s,
             msg,
             counterparty_pk,
@@ -1067,8 +1105,36 @@ fn insert_dm_message(
             timestamp,
             is_sent,
             coach.as_deref(),
-        )
+        );
     });
+    if marks_changed {
+        state.with_untracked(|s| save_read_marks(&s.marks_owner, &s.read_marks));
+    }
+}
+
+/// localStorage key of one account's per-counterparty DM read marks.
+fn read_marks_key(my_pubkey: &str) -> String {
+    format!("nbbs:dm-read-marks:{my_pubkey}")
+}
+
+fn load_read_marks(my_pubkey: &str) -> HashMap<String, u64> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(&read_marks_key(my_pubkey)).ok().flatten())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_read_marks(my_pubkey: &str, marks: &HashMap<String, u64>) {
+    if my_pubkey.is_empty() {
+        return;
+    }
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return;
+    };
+    if let Ok(raw) = serde_json::to_string(marks) {
+        let _ = storage.set_item(&read_marks_key(my_pubkey), &raw);
+    }
 }
 
 /// Whether `content` exchanged with `counterparty` is poker-table plumbing:
@@ -1105,15 +1171,15 @@ fn apply_message(
     timestamp: u64,
     is_sent: bool,
     coach: Option<&str>,
-) {
+) -> bool {
     // A re-streamed event (relay reconnect, overlapping subscriptions) must not
     // touch the summary a second time, or the unread badge inflates.
     if !s.seen_ids.insert(msg.id.clone()) {
-        return;
+        return false;
     }
     s.messages.push(msg);
     if is_coach_exchange_with(plaintext, counterparty_pk, coach) {
-        return;
+        return false;
     }
 
     let convo = s
@@ -1130,15 +1196,47 @@ fn apply_message(
         convo.last_message = truncate_message(plaintext, 80);
         convo.last_timestamp = timestamp;
     }
-    if !is_sent && s.current_conversation.as_deref() != Some(counterparty_pk) {
-        convo.unread_count += 1;
+    // Unread means newer than the conversation's read mark; without one, all
+    // of it is (a first visit on a new device).
+    let mark = s.read_marks.get(counterparty_pk).copied().unwrap_or(0);
+    if timestamp <= mark {
+        return false;
     }
+    if is_sent {
+        // Replying implies having read what came before, on any device: the
+        // mark follows our own messages too, which is read sync for free.
+        s.read_marks.insert(counterparty_pk.to_string(), timestamp);
+        // History replays in arbitrary order (wrap timestamps are randomised
+        // and each message decrypts on its own task), so received messages
+        // older than this reply may already be counted: recount against the
+        // moved mark.
+        convo.unread_count = unread_after(&s.messages, counterparty_pk, timestamp, coach);
+        return true;
+    }
+    if s.current_conversation.as_deref() == Some(counterparty_pk) {
+        // Read as it arrives: move the mark so a reload does not count it.
+        s.read_marks.insert(counterparty_pk.to_string(), timestamp);
+        return true;
+    }
+    convo.unread_count += 1;
+    false
 }
 
 /// One conversation's messages, oldest first, coach exchanges left out.
 ///
 /// The "other party" of a message is the recipient when we sent it and the
 /// sender when we received it.
+/// Received messages from `counterparty` newer than `mark`, coach exchanges
+/// left out: the unread count a conversation should show against that mark.
+fn unread_after(messages: &[DMMessage], counterparty: &str, mark: u64, coach: Option<&str>) -> u32 {
+    messages
+        .iter()
+        .filter(|m| !m.is_sent && m.timestamp > mark)
+        .filter(|m| m.sender_pubkey.eq_ignore_ascii_case(counterparty))
+        .filter(|m| !is_coach_exchange_with(&m.content, counterparty, coach))
+        .count() as u32
+}
+
 fn thread_of(messages: &[DMMessage], counterparty: &str, coach: Option<&str>) -> Vec<DMMessage> {
     // Pubkeys are lowercased at ingestion, so the only normalisation left is
     // the caller's argument (a UI route value or config string).
@@ -1544,6 +1642,148 @@ mod tests {
         apply_message(&mut s, again, COACH, "tampered", 99, false, None);
         assert_eq!(s.conversations[COACH].last_message, "hello");
         assert_eq!(s.conversations[COACH].last_timestamp, 10);
+    }
+
+    #[test]
+    fn history_at_or_before_the_read_mark_is_not_unread() {
+        let mut s = DMStateInner::default();
+        s.read_marks.insert(COACH.into(), 50);
+        apply_message(
+            &mut s,
+            received("a", "old", 10),
+            COACH,
+            "old",
+            10,
+            false,
+            None,
+        );
+        apply_message(
+            &mut s,
+            received("b", "edge", 50),
+            COACH,
+            "edge",
+            50,
+            false,
+            None,
+        );
+        assert_eq!(s.conversations[COACH].unread_count, 0);
+        apply_message(
+            &mut s,
+            received("c", "new", 60),
+            COACH,
+            "new",
+            60,
+            false,
+            None,
+        );
+        assert_eq!(s.conversations[COACH].unread_count, 1);
+        // the preview follows the newest message whatever the mark says
+        assert_eq!(s.conversations[COACH].last_message, "new");
+    }
+
+    #[test]
+    fn a_message_read_as_it_arrives_advances_the_mark() {
+        let mut s = DMStateInner {
+            current_conversation: Some(COACH.into()),
+            ..Default::default()
+        };
+        let changed = apply_message(
+            &mut s,
+            received("a", "hi", 70),
+            COACH,
+            "hi",
+            70,
+            false,
+            None,
+        );
+        assert!(changed, "the caller persists a moved mark");
+        assert_eq!(s.read_marks[COACH], 70);
+        assert_eq!(s.conversations[COACH].unread_count, 0);
+        // already covered by the mark: nothing to persist
+        let changed = apply_message(
+            &mut s,
+            received("b", "again", 65),
+            COACH,
+            "again",
+            65,
+            false,
+            None,
+        );
+        assert!(!changed);
+        // our own reply moves the mark (read sync across devices) but never the count
+        let mut sent = received("c", "mine", 90);
+        sent.is_sent = true;
+        assert!(apply_message(&mut s, sent, COACH, "mine", 90, true, None));
+        assert_eq!(s.read_marks[COACH], 90);
+        assert_eq!(s.conversations[COACH].unread_count, 0);
+    }
+
+    #[test]
+    fn a_reply_replayed_after_older_received_messages_recounts_them() {
+        // Fresh device, no mark; the relay streams the partner's two messages
+        // first and our reply last. The reply moves the mark past both, so
+        // the count they added must go, or a reload would disagree with it.
+        let mut s = DMStateInner::default();
+        apply_message(
+            &mut s,
+            received("a", "one", 10),
+            COACH,
+            "one",
+            10,
+            false,
+            None,
+        );
+        apply_message(
+            &mut s,
+            received("b", "two", 20),
+            COACH,
+            "two",
+            20,
+            false,
+            None,
+        );
+        assert_eq!(s.conversations[COACH].unread_count, 2);
+        let mut mine = received("c", "reply", 30);
+        mine.is_sent = true;
+        assert!(apply_message(&mut s, mine, COACH, "reply", 30, true, None));
+        assert_eq!(s.read_marks[COACH], 30);
+        assert_eq!(s.conversations[COACH].unread_count, 0);
+        // and a genuinely newer message counts again
+        apply_message(
+            &mut s,
+            received("d", "later", 40),
+            COACH,
+            "later",
+            40,
+            false,
+            None,
+        );
+        assert_eq!(s.conversations[COACH].unread_count, 1);
+    }
+
+    #[test]
+    fn a_late_message_older_than_the_mark_is_treated_as_read() {
+        // The mark is the newest message seen when the conversation was open;
+        // anything stamped before it is taken as read even if it only arrives
+        // now. That is the chosen trade-off against counting replays.
+        let mut s = DMStateInner::default();
+        s.read_marks.insert(COACH.into(), 80);
+        apply_message(
+            &mut s,
+            received("late", "late", 75),
+            COACH,
+            "late",
+            75,
+            false,
+            None,
+        );
+        assert_eq!(s.conversations[COACH].unread_count, 0);
+    }
+
+    #[test]
+    fn read_marks_are_kept_per_local_account() {
+        assert_ne!(read_marks_key("aaaa"), read_marks_key("bbbb"));
+        assert!(read_marks_key("aaaa").ends_with("aaaa"));
     }
 
     #[test]

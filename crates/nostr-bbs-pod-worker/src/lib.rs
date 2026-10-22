@@ -138,6 +138,14 @@ fn is_valid_worker_pod_name(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// The class of a NIP-98 verification failure for the 401 body: the error's
+/// own summary up to its first colon, so "URL mismatch" or "payload hash
+/// mismatch", never the token or request URLs the full text would carry.
+fn nip98_failure_class(e: &impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    text.split(':').next().unwrap_or("").trim().to_string()
+}
+
 /// Map a `worker::Method` enum to its string name.
 fn method_str(m: &Method) -> &'static str {
     match m {
@@ -196,11 +204,30 @@ fn cors_headers(env: &Env) -> Headers {
 /// loads. JSON-LD (`application/ld+json`) WebID data is unaffected — browsers
 /// and RDF consumers parse it rather than execute it.
 fn add_html_safety_headers(headers: &Headers, content_type: &str) {
-    if content_type.starts_with("text/html") {
+    if is_active_document_type(content_type) {
         headers
             .set("Content-Security-Policy", "default-src 'none'; sandbox")
             .ok();
     }
+}
+
+/// Whether a stored `Content-Type` is one a browser executes script from
+/// when the resource is opened directly: HTML, XHTML, SVG, and XML (which can
+/// carry an XSLT or an embedded SVG/XHTML island). The media type is compared
+/// case-insensitively and without parameters, since the uploader chose the
+/// spelling: `Text/HTML` is parsed as HTML all the same. An SVG shown through
+/// `<img>` is unaffected by the sandbox; only direct navigation is.
+fn is_active_document_type(content_type: &str) -> bool {
+    let media = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        media.as_str(),
+        "text/html" | "application/xhtml+xml" | "image/svg+xml" | "text/xml" | "application/xml"
+    ) || media.ends_with("+xml")
 }
 
 /// Recover an image `Content-Type` from a resource path extension when the
@@ -335,7 +362,21 @@ fn public_pod_base_url(env: &Env, fallback_origin: &str) -> String {
 
 /// Create a JSON error response with CORS headers.
 fn json_error(env: &Env, message: &str, status: u16) -> Result<Response> {
-    let body = serde_json::json!({ "error": message });
+    json_error_with_reason(env, message, status, None)
+}
+
+/// [`json_error`] with an optional `reason` field naming the specific
+/// failure, for errors a client could not otherwise tell apart.
+fn json_error_with_reason(
+    env: &Env,
+    message: &str,
+    status: u16,
+    reason: Option<&str>,
+) -> Result<Response> {
+    let mut body = serde_json::json!({ "error": message });
+    if let Some(reason) = reason {
+        body["reason"] = serde_json::Value::String(reason.to_string());
+    }
     let json_str = serde_json::to_string(&body).map_err(|e| Error::RustError(e.to_string()))?;
     let cors = cors_headers(env);
     let resp = Response::ok(json_str)?
@@ -760,6 +801,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .unwrap_or_else(|_| nip98_origin.clone());
     let request_url = url.to_string();
 
+    // Why a presented token failed, for the 401 body: a token that fails
+    // verification is treated as anonymous below, and without this every
+    // NIP-98 defect (URL mismatch, payload hash, clock) reads as the same
+    // "Authentication required" and cannot be told apart from the client.
+    let mut nip98_reason: Option<String> = None;
     let requester_pubkey: Option<String> = if let Some(ref header) = auth_header {
         let method_name = method_str(&method);
         let body_ref = body_bytes.as_deref();
@@ -775,7 +821,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
                 Some(token.pubkey)
             }
-            Err(_) => None,
+            Err(e) => {
+                nip98_reason = Some(nip98_failure_class(&e));
+                None
+            }
         }
     } else {
         None
@@ -977,7 +1026,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return if requester_pubkey.is_some() {
             json_error(&env, "Forbidden", 403)
         } else {
-            json_error(&env, "Authentication required", 401)
+            json_error_with_reason(
+                &env,
+                "Authentication required",
+                401,
+                nip98_reason.as_deref(),
+            )
         };
     }
 
@@ -2016,6 +2070,46 @@ async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_document_types_are_sandboxed_whatever_their_spelling() {
+        for t in [
+            "text/html",
+            "Text/HTML; charset=utf-8",
+            "TEXT/HTML",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "text/xml",
+            "application/xml",
+            "application/rss+xml",
+        ] {
+            assert!(super::is_active_document_type(t), "{t}");
+        }
+        for t in [
+            "image/png",
+            "image/jpeg",
+            "text/plain",
+            "application/ld+json",
+            "application/octet-stream",
+            "",
+        ] {
+            assert!(!super::is_active_document_type(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn nip98_failure_class_keeps_the_summary_and_drops_the_urls() {
+        assert_eq!(
+            super::nip98_failure_class(
+                &"URL mismatch: token=https://a/x y, expected=https://a/x%20y"
+            ),
+            "URL mismatch"
+        );
+        assert_eq!(
+            super::nip98_failure_class(&"payload hash mismatch"),
+            "payload hash mismatch"
+        );
+    }
+
     use super::*;
 
     #[test]

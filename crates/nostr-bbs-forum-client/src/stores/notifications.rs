@@ -693,11 +693,15 @@ impl NotificationStoreV2 {
 
                     let author = author_display(&event.pubkey);
                     let preview = post_preview(&event.content);
+                    // Deep-link to the post itself: `/go/:event_id` resolves it
+                    // to its thread and focuses it. `/chat/:channel_id` only
+                    // reached the section's topic list, so a reply or mention
+                    // landed the reader on a list and not the post.
                     store.add_at(
                         kind,
                         &title,
                         &format!("{}: {}", author, preview),
-                        Some(&format!("/chat/{}", cid)),
+                        Some(&format!("/go/{}", event.id)),
                         Origin {
                             timestamp: event.created_at,
                             dedup_id: Some(format!("post:{}", event.id)),
