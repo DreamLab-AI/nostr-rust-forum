@@ -42,4 +42,5 @@ getrandom = { workspace = true }
 p256 = { workspace = true }
 
 [dev-dependencies]
+nostr-bbs-jev = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true }

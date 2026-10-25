@@ -34,3 +34,6 @@ p256 = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+nostr-bbs-jev = { workspace = true, features = ["test-util"] }

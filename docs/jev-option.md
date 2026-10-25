@@ -66,6 +66,14 @@ demotion, request correlation, or seeded-probe enforcement. The probe digest, pu
 never sent. The estate shares one governance evidence-quality rubric (ES-05, agentbox); until it is
 published this uses a local version string, to be aligned. No forum-client UI is wired yet.
 
+## Snippet lifecycle (NF-07)
+
+With the flag on, every ingest entry rewrites its snippet: an edit overwrites it, and an un-publish
+(`public:false`) or a text-less re-ingest deletes it. With the flag off the worker does not touch the
+snippet store, so a post un-published meanwhile keeps a stale snippet in KV until the next flag-on
+re-ingest of that entry. It is never sent anyway, because rerank candidates come only from
+`visible_top_k`, which drops non-public labels.
+
 ## Operating it
 
 Enable per Worker with `wrangler.toml` `[vars]` (flag, endpoint, model) and `wrangler secret put` (key).

@@ -10,6 +10,8 @@ rust-version = "1.85"
 
 [features]
 default = []
+# Mock transport + executor for other crates' tests; never enabled in production builds.
+test-util = []
 # Cloudflare Workers `fetch` transport with an AbortController deadline.
 worker = ["dep:worker", "dep:futures-util"]
 

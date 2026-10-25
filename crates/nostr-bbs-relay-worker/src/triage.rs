@@ -173,7 +173,12 @@ pub async fn triage_batch<T: JevTransport + ?Sized>(
     for c in cands.iter().take(PER_TICK_CAP) {
         match triage_one(transport, cfg, c, queue_threshold).await {
             Ok(r) => rows.push(r),
-            Err(f @ (Fallback::Timeout | Fallback::Http(_) | Fallback::NoEndpoint)) => {
+            Err(
+                f @ (Fallback::Timeout
+                | Fallback::Transport
+                | Fallback::Http(_)
+                | Fallback::NoEndpoint),
+            ) => {
                 return (rows, Some(f));
             }
             Err(_) => {} // malformed/low-confidence: skip this post, keep going

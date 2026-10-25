@@ -147,6 +147,24 @@ pub fn apply_order<T: Clone>(items: &[T], order: &[usize]) -> Vec<T> {
     out
 }
 
+/// Apply one ingest entry to the snippet map: a public entry with non-empty
+/// text overwrites; anything else (un-publish, edit without text) deletes.
+pub fn apply_snippet(
+    map: &mut std::collections::HashMap<String, String>,
+    id: &str,
+    public: bool,
+    snippet: Option<&str>,
+) {
+    match (public, snippet.map(clip_snippet)) {
+        (true, Some(sn)) if !sn.is_empty() => {
+            map.insert(id.to_string(), sn);
+        }
+        _ => {
+            map.remove(id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +253,7 @@ mod tests {
         let sn = snips(3);
         let cases: Vec<(Result<(u16, String), TransportError>, Fallback)> = vec![
             (Err(TransportError::Timeout), Fallback::Timeout),
-            (Err(TransportError::Other), Fallback::Http(0)),
+            (Err(TransportError::Other), Fallback::Transport),
             (Ok((503, "".into())), Fallback::Http(503)),
             (Ok((200, "{".into())), Fallback::Malformed),
             (Ok((200, r#"{"answers":{}}"#.into())), Fallback::Malformed),

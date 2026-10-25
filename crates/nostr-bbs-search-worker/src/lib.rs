@@ -818,18 +818,12 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
             public_labels.remove(&label);
         }
         if jev_snippets {
-            match (
+            rerank::apply_snippet(
+                &mut snippets,
+                &entry.id,
                 entry.public,
-                entry.snippet.as_deref().map(rerank::clip_snippet),
-            ) {
-                (true, Some(sn)) if !sn.is_empty() => {
-                    snippets.insert(entry.id.clone(), sn);
-                }
-                // Un-published or snippet-less re-ingest drops any stale text.
-                _ => {
-                    snippets.remove(&entry.id);
-                }
-            }
+                entry.snippet.as_deref(),
+            );
         }
         accepted += 1;
     }
@@ -1151,6 +1145,23 @@ mod model_match_tests {
 #[cfg(test)]
 mod jev_rerank_tests {
     use super::*;
+
+    #[test]
+    fn reingest_overwrites_or_clears_the_snippet() {
+        let mut m = HashMap::new();
+        rerank::apply_snippet(&mut m, "a", true, Some("v1"));
+        assert_eq!(m.get("a").map(String::as_str), Some("v1"));
+        rerank::apply_snippet(&mut m, "a", true, Some("v2"));
+        assert_eq!(
+            m.get("a").map(String::as_str),
+            Some("v2"),
+            "edit overwrites"
+        );
+        rerank::apply_snippet(&mut m, "a", false, Some("v3"));
+        assert!(!m.contains_key("a"), "un-publish deletes");
+        rerank::apply_snippet(&mut m, "b", true, None);
+        assert!(!m.contains_key("b"));
+    }
     use nostr_bbs_jev::testutil::{block_on, Mock};
     use nostr_bbs_jev::{Fallback, JevConfig, TransportError};
     use std::collections::{HashMap, HashSet};

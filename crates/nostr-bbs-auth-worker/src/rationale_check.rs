@@ -378,7 +378,7 @@ mod tests {
     fn every_fallback_yields_unavailable_and_never_an_error() {
         let cases = vec![
             (Err(TransportError::Timeout), "timeout"),
-            (Err(TransportError::Other), "http-0"),
+            (Err(TransportError::Other), "transport"),
             (Ok((500, String::new())), "http-500"),
             (Ok((200, "bad".into())), "malformed"),
             (Ok((200, r#"{"answers":{}}"#.into())), "malformed"),

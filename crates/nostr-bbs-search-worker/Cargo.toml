@@ -29,3 +29,6 @@ nostr-bbs-jev = { workspace = true, features = ["worker"] }
 wasm-bindgen = { workspace = true }
 rvf-types = { version = "0.2", default-features = false }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+nostr-bbs-jev = { workspace = true, features = ["test-util"] }

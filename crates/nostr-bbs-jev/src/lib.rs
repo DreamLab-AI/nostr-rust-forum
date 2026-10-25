@@ -45,7 +45,9 @@ pub enum Fallback {
     NoEndpoint,
     /// The hard deadline elapsed.
     Timeout,
-    /// Transport failure or non-2xx status (`0` for a transport error).
+    /// Transport failure before any HTTP status was received.
+    Transport,
+    /// Non-2xx HTTP status.
     Http(u16),
     /// Unparseable body, missing answer IDs or keys, or a Choice key outside
     /// the offered set.
@@ -61,6 +63,7 @@ impl Fallback {
             Fallback::FlagOff => "flag-off".into(),
             Fallback::NoEndpoint => "no-endpoint".into(),
             Fallback::Timeout => "timeout".into(),
+            Fallback::Transport => "transport".into(),
             Fallback::Http(c) => format!("http-{c}"),
             Fallback::Malformed => "malformed".into(),
             Fallback::LowConfidence => "low-confidence".into(),
@@ -357,7 +360,7 @@ pub async fn ask<T: JevTransport + ?Sized>(
         .await
         .map_err(|e| match e {
             TransportError::Timeout => Fallback::Timeout,
-            TransportError::Other => Fallback::Http(0),
+            TransportError::Other => Fallback::Transport,
         })?;
     if !(200..300).contains(&status) {
         return Err(Fallback::Http(status));
@@ -368,6 +371,7 @@ pub async fn ask<T: JevTransport + ?Sized>(
 /// Minimal single-threaded executor for tests and doc examples, so the crate
 /// needs no async runtime dependency.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-util"))]
 pub mod testutil {
     use super::*;
     use std::future::Future;
@@ -610,7 +614,7 @@ mod tests {
         };
         let run = |reply| block_on(ask(&Mock::new(reply), &cfg, &json!({}), &qs())).unwrap_err();
         assert_eq!(run(Err(TransportError::Timeout)), Fallback::Timeout);
-        assert_eq!(run(Err(TransportError::Other)), Fallback::Http(0));
+        assert_eq!(run(Err(TransportError::Other)), Fallback::Transport);
         assert_eq!(run(Ok((429, "".into()))), Fallback::Http(429));
         assert_eq!(run(Ok((500, GOOD.into()))), Fallback::Http(500));
         assert_eq!(run(Ok((200, "not json".into()))), Fallback::Malformed);
@@ -629,6 +633,7 @@ mod tests {
     #[test]
     fn tags_are_stable() {
         assert_eq!(Fallback::Http(503).tag(), "http-503");
+        assert_eq!(Fallback::Transport.tag(), "transport");
         assert_eq!(Fallback::LowConfidence.tag(), "low-confidence");
     }
 }
