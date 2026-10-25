@@ -34,7 +34,7 @@ endpoint, or `AGENTBOX_SYSTEM_ONE_BACKEND_LOCAL=1`).
 | --- | --- | --- | --- | --- |
 | NF-07-S1-01 rerank visible search results | search-worker | `JEV_SEARCH_RERANK=1` | the trimmed query text plus up to 10 public snippets (<= 280 chars, stored at ingest only for `public: true` entries when the flag is on) | `forum-search-rerank/1` |
 | NF-03-S1-01 moderation triage | relay-worker (cron) | `JEV_TRIAGE=1` | plaintext of an already-admitted kind-42 post in a public-read, non-encrypted zone, plus the post it replies to in the same channel | `forum-moderation-triage/1` |
-| NF-06-S1-01 rationale/evidence check | auth-worker | `JEV_RATIONALE_CHECK=1` | case title, summary, effective tier, task properties and the reviewer's draft rationale; **local-only** | `forum-governance-evidence-quality/1-local` |
+| NF-06-S1-01 rationale/evidence check | auth-worker | `JEV_RATIONALE_CHECK=1` | case title, summary, effective tier, task properties and the reviewer's draft rationale; **local-only** | `governance-evidence-quality/1` (ES-05) |
 
 Tunables: `JEV_SEARCH_MIN_CONFIDENCE` (default 0.5), `JEV_TRIAGE_QUEUE_THRESHOLD` (default 0.5). Both
 are unfitted; fit on labelled data before relying on them.
@@ -63,8 +63,16 @@ because the zone config holds none.
 route does not exist while the flag is off. The answer is advice only (`advisory: true`) and nothing
 reads it: not `rationale_required`/`rationale_satisfied`, tier assignment, 31403 signing, promotion or
 demotion, request correlation, or seeded-probe enforcement. The probe digest, pubkeys and keys are
-never sent. The estate shares one governance evidence-quality rubric (ES-05, agentbox); until it is
-published this uses a local version string, to be aligned. No forum-client UI is wired yet.
+never sent. It uses the estate-shared ES-05 rubric `governance-evidence-quality` v1, vendored byte-for-byte at
+`crates/nostr-bbs-auth-worker/src/rubrics/governance-evidence-quality.v1.json` from agentbox
+(`management-api/lib/rubrics/governance-evidence-quality.v1.json`, branch `feat/jev-option-p1-b`).
+Its canonical-JSON sha256 is pinned (`3a338a77939ffec84e03413186619b6e58ad59f8d098543a9e127987fc9a6910`)
+and a test fails on drift; changing a question means a new version and digest. Card mapping: `title` =
+case title; `subject` = subject kind/id; `rationale` = the reviewer's draft (null if empty);
+`evidence` = summary, effective tier and typed task properties; `context_url` = null (the case row has
+none). Output: per-question signals in [0,1], a flag for any yes/no signal below 0.5, and a completeness
+score; `authority: "none"`. The rubric's request-digest binding is not recorded because this route
+reads a case row, not the unsigned event content/tags the digest covers. No forum-client UI yet.
 
 ## Snippet lifecycle (NF-07)
 
