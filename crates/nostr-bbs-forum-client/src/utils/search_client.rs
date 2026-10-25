@@ -274,6 +274,14 @@ pub async fn ingest_message_signer(
             "channel": channel,
             "timestamp": (js_sys::Date::now() / 1000.0) as u64,
             "public": public,
+            // Jev option (NF-07-S1-01): short text for the opt-in reranker.
+            // Sent ONLY for public entries; the worker ignores it (and stores
+            // nothing) unless its JEV_SEARCH_RERANK flag is on.
+            "snippet": if public {
+                Some(content.trim().chars().take(280).collect::<String>())
+            } else {
+                None
+            },
         }]
     });
     let body_str = body.to_string();

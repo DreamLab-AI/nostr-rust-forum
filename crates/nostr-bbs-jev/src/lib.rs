@@ -248,7 +248,7 @@ impl Question {
 pub enum Answer {
     /// Probability of yes, 0..=1.
     Noul(f64),
-    /// Expected score (may fall between integer levels) and confidence.
+    /// Expected score (0-based level index, may fall between levels) and confidence.
     Score {
         /// Probability-weighted level.
         score: f64,
@@ -307,9 +307,9 @@ pub fn parse_response(
                     .and_then(Value::as_f64)
                     .filter(|s| s.is_finite())
                     .ok_or(Fallback::Malformed)?;
-                // Levels are 0-based or 1-based depending on the rubric; allow
-                // either but reject anything outside [0, len].
-                if score < 0.0 || score > criteria.len() as f64 {
+                // Levels are 0-based by position (openapi: "starting at zero"),
+                // so the expected score lies in [0, len - 1].
+                if score < 0.0 || score > (criteria.len().saturating_sub(1)) as f64 {
                     return Err(Fallback::Malformed);
                 }
                 let confidence = a

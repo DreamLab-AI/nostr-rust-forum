@@ -45,13 +45,13 @@ surface a hidden or non-indexed candidate. Only the first 10 visible hits may be
 keeps cosine order. Any head candidate without a stored snippet, or any answer below the confidence
 floor, falls back. The "no useful match" Noul is an annotation (`jev.noUsefulMatch`); it never drops a
 result. An accepted rerank adds a `jev` object to the response; a fallback response has no `jev` key
-and is byte-identical to before. Ingest accepts an optional `snippet` per entry; it is persisted
+and is byte-identical to before. The forum client's `ingest_message_signer` sends `snippet` (first 280 chars) for `public: true` entries only; until the flag is on the worker ignores it, and until snippets have been ingested every flag-on search falls back with `malformed` (an expected state, not a Jev fault; re-ingest to populate). Ingest accepts an optional `snippet` per entry; it is persisted
 (KV `<RVF_STORE_KEY>:snippets`) only when the flag is on and the entry is `public: true`.
 
 ### NF-03-S1-01 — moderation triage
 A cron sweep, **after** the normal admission pipeline has stored the event. It does not touch
 admission, auth, trust, `reports` (which feeds the three-report auto-hide) or `hidden_events`. It
-writes advisory rows to `jev_triage` (migration `0011`), at most 5 posts per tick, stopping at the
+writes advisory rows to `jev_triage` (migration `0011` is the record; the table is created lazily by the sweep only once the flag is on, never by the relay boot path; the list route is likewise unmatched while the flag is off), at most 5 posts per tick, stopping at the
 first outage so an outage costs one deadline. Eligible posts are kind-42 events in channels whose zone
 is public-read and not encrypted, received in the last 24 h, not already hidden or triaged; zone
 ciphertext is never sent. Moderators read the queue at `GET /api/jev/triage?queued=1` (NIP-98 admin);

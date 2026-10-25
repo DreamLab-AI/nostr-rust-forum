@@ -4,8 +4,9 @@
 -- admitted and stored by the normal pipeline. A row never hides, deletes,
 -- bans or rejects anything and is never read by admission, auth, trust or the
 -- `reports` auto-hide. It is a queue for human moderators.
--- As with 0006 to 0010, the live schema comes from `ensure_schema()` in src/lib.rs,
--- which runs this same statement.
+-- Unlike 0006 to 0010 this table is NOT created by `ensure_schema()` (the boot
+-- path admission depends on). `src/triage.rs` runs this same statement lazily,
+-- only once `JEV_TRIAGE` is on. Apply it by hand if you prefer a migration.
 
 CREATE TABLE IF NOT EXISTS jev_triage (
     event_id TEXT PRIMARY KEY,

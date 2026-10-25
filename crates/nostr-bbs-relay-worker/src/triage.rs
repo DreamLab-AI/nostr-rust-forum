@@ -60,7 +60,7 @@ pub struct TriageRow {
     pub abuse: f64,
     /// P(contextual harm).
     pub harm: f64,
-    /// Expected severity level (0-based rubric, 0..=3).
+    /// Expected severity level (0-based rubric position, 0..=3).
     pub severity: f64,
     /// Confidence in the severity.
     pub severity_confidence: f64,
@@ -221,6 +221,30 @@ fn reply_target(tags: &[Vec<String>]) -> Option<&str> {
         .map(|t| t[1].as_str())
 }
 
+/// Whether the triage flag is on. When off the sweep is a no-op, the list
+/// route is not matched, and the table is never created.
+pub fn flag_on(env: &Env) -> bool {
+    env.var(FLAG)
+        .map(|v| matches!(v.to_string().trim(), "1" | "true"))
+        .unwrap_or(false)
+}
+
+/// Same statement as `migrations/0011_jev_triage.sql`. Created lazily, only
+/// once the flag is on, so the relay boot path (`ensure_schema`) is unchanged.
+const CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS jev_triage (\
+    event_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, zone TEXT NOT NULL, \
+    spam REAL NOT NULL, abuse REAL NOT NULL, harm REAL NOT NULL, \
+    severity REAL NOT NULL, severity_confidence REAL NOT NULL, \
+    queued INTEGER NOT NULL, model TEXT NOT NULL, question_set TEXT NOT NULL, \
+    created_at INTEGER NOT NULL)";
+
+async fn ensure_table(db: &worker::D1Database) -> bool {
+    match db.prepare(CREATE_SQL).run().await {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
 /// Run one triage tick. Never errors to the caller.
 pub async fn run_sweep(env: &Env) {
     let lookup = nostr_bbs_jev::fetch::env_lookup(env);
@@ -238,6 +262,9 @@ pub async fn run_sweep(env: &Env) {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(DEFAULT_QUEUE_THRESHOLD);
     let Ok(db) = env.d1("DB") else { return };
+    if !ensure_table(&db).await {
+        return;
+    }
     let zones = ZoneConfig::load(env);
     let zone_ids = eligible_zone_ids(&zones);
     if zone_ids.is_empty() {
@@ -325,10 +352,11 @@ pub async fn run_sweep(env: &Env) {
         }
     }
     console_log!(
-        "jev triage: examined={} annotated={} question_set={}",
+        "jev triage: examined={} annotated={} question_set={} model={}",
         cands.len(),
         rows.len(),
-        QUESTION_SET_VERSION
+        QUESTION_SET_VERSION,
+        cfg.model
     );
 }
 
@@ -385,6 +413,13 @@ pub async fn handle_list(req: &Request, env: &Env) -> Result<Response> {
         .unwrap_or(0);
     let only_queued = params.get("queued").map(|v| v == "1").unwrap_or(false);
     let db = env.d1("DB")?;
+    if !ensure_table(&db).await {
+        return crate::cors::json_response(
+            env,
+            &json!({ "error": "triage store unavailable" }),
+            503,
+        );
+    }
     let sql = format!(
         "SELECT event_id, channel_id, zone, spam, abuse, harm, severity, severity_confidence, \
          queued, model, question_set, created_at FROM jev_triage {} \

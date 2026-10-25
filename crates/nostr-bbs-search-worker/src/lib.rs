@@ -531,6 +531,11 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
     };
     if let Some(why) = jev_fallback {
         console_log!("jev search-rerank fallback: {}", why.tag());
+    } else if jev_note.is_some() {
+        console_log!(
+            "jev search-rerank accepted: question_set={}",
+            rerank::QUESTION_SET_VERSION
+        );
     }
 
     json_response(

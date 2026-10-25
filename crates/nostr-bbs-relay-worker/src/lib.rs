@@ -378,7 +378,7 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
     // --- Moderation endpoints (NIP-98 admin only) ---
 
     // Jev option (NF-03-S1-01): advisory triage queue (NIP-98 admin only).
-    if path == "/api/jev/triage" && method == Method::Get {
+    if path == "/api/jev/triage" && method == Method::Get && triage::flag_on(env) {
         return triage::handle_list(&req, env).await;
     }
 
@@ -928,22 +928,6 @@ async fn ensure_schema(env: &Env) -> bool {
             channel_id TEXT PRIMARY KEY, \
             zone TEXT NOT NULL DEFAULT 'home', \
             archived INTEGER NOT NULL DEFAULT 0\
-        )",
-        // Jev option (NF-03-S1-01): advisory triage rows; same statement as
-        // migrations/0011_jev_triage.sql. Never read by admission/auth/trust.
-        "CREATE TABLE IF NOT EXISTS jev_triage (\
-            event_id TEXT PRIMARY KEY, \
-            channel_id TEXT NOT NULL, \
-            zone TEXT NOT NULL, \
-            spam REAL NOT NULL, \
-            abuse REAL NOT NULL, \
-            harm REAL NOT NULL, \
-            severity REAL NOT NULL, \
-            severity_confidence REAL NOT NULL, \
-            queued INTEGER NOT NULL, \
-            model TEXT NOT NULL, \
-            question_set TEXT NOT NULL, \
-            created_at INTEGER NOT NULL\
         )",
         "CREATE TABLE IF NOT EXISTS admin_log (\
             id INTEGER PRIMARY KEY AUTOINCREMENT, \
