@@ -1,0 +1,21 @@
+[package]
+name = "nostr-bbs-jev"
+version = "1.0.0-beta.16"
+publish = false           # in-repo adapter shared by the Workers; not a crates.io dependency
+edition = "2021"
+description = "Opt-in Jev (TypeSafe System One) typed-decision adapter for the forum Workers: pure request/response core, injectable transport, fetch transport behind a feature"
+license = "AGPL-3.0-only"
+repository = "https://github.com/DreamLab-AI/nostr-rust-forum"
+rust-version = "1.85"
+
+[features]
+default = []
+# Cloudflare Workers `fetch` transport with an AbortController deadline.
+worker = ["dep:worker", "dep:futures-util"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+worker = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }

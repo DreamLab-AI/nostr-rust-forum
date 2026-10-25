@@ -2384,6 +2384,7 @@ dependencies = [
  "js-sys",
  "k256",
  "nostr-bbs-core",
+ "nostr-bbs-jev",
  "nostr-bbs-rate-limit",
  "p256",
  "serde",
@@ -2524,6 +2525,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr-bbs-jev"
+version = "1.0.0-beta.16"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "worker",
+]
+
+[[package]]
 name = "nostr-bbs-mesh"
 version = "1.0.0-beta.16"
 dependencies = [
@@ -2639,6 +2651,7 @@ dependencies = [
  "js-sys",
  "nostr-bbs-config",
  "nostr-bbs-core",
+ "nostr-bbs-jev",
  "nostr-bbs-mesh",
  "nostr-bbs-rate-limit",
  "p256",
@@ -2659,6 +2672,7 @@ dependencies = [
  "hex",
  "js-sys",
  "nostr-bbs-core",
+ "nostr-bbs-jev",
  "nostr-bbs-rate-limit",
  "rvf-types",
  "serde",

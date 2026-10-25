@@ -21,6 +21,7 @@ mod http;
 mod invites;
 mod moderation;
 mod pod;
+mod rationale_check;
 mod schema;
 mod username;
 mod webauthn;
@@ -533,6 +534,22 @@ async fn route_sprint_api(
         if *method == Method::Get && !case_id.is_empty() && !case_id.contains('/') {
             let resp = governance_api::handle_get_case(case_id, auth_header, env, origin).await?;
             return Ok(Some(resp));
+        }
+    }
+    // Jev option (NF-06-S1-01): advisory rationale/evidence-quality check.
+    // The route exists only while JEV_RATIONALE_CHECK is on; otherwise the
+    // request falls through exactly as it did before this option existed.
+    if *method == Method::Post && rationale_check::flag_on(env) {
+        if let Some(case_id) = path
+            .strip_prefix("/api/governance/cases/")
+            .and_then(|r| r.strip_suffix("/rationale-check"))
+        {
+            if !case_id.is_empty() && !case_id.contains('/') {
+                let resp =
+                    rationale_check::handle_check(case_id, body_bytes, auth_header, env, origin)
+                        .await?;
+                return Ok(Some(resp));
+            }
         }
     }
     if path == "/api/governance/decisions" && *method == Method::Get {

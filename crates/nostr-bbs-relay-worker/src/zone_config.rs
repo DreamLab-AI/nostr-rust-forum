@@ -115,6 +115,12 @@ impl ZoneConfig {
         }
     }
 
+    /// Ids of every configured zone (used by the opt-in Jev triage sweep to
+    /// build its public-zone allow-list; admission does not use this).
+    pub fn zone_ids(&self) -> impl Iterator<Item = &str> {
+        self.zones.iter().map(|z| z.id.as_str())
+    }
+
     /// Look up a zone definition by id.
     pub fn get(&self, id: &str) -> Option<&Zone> {
         self.zones.iter().find(|z| z.id == id)

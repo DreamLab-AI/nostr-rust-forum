@@ -28,7 +28,7 @@ use crate::http::{error_json, json_response};
 /// broker_roles) live in the relay worker's D1 (`nostr-bbs-relay`), bound
 /// as `RELAY_DB` in this worker. The relay DO reads these tables when
 /// gating governance event kinds (31400-31405).
-fn relay_db(env: &Env) -> Result<worker::D1Database> {
+pub(crate) fn relay_db(env: &Env) -> Result<worker::D1Database> {
     env.d1("RELAY_DB")
 }
 

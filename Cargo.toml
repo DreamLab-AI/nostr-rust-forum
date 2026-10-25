@@ -14,6 +14,9 @@ members = [
     # Shared Cloudflare Worker utilities.
     "crates/nostr-bbs-rate-limit",
 
+    # Opt-in Jev (System One typed-decision) adapter shared by the Workers.
+    "crates/nostr-bbs-jev",
+
     # On-theme ASCII-art image rendering (server-side decode in the workers;
     # pure phosphor-level HTML emit consumed by the retro BBS client).
     "crates/nostr-bbs-ascii",
@@ -66,7 +69,7 @@ rust-version = "1.85"
 [workspace.metadata.ci]
 # Crates verified to compile for wasm32-unknown-unknown without extra system
 # headers. Expand this list as secp256k1-sys cross-compile is resolved upstream.
-wasm-check-packages = ["nostr-bbs-config", "nostr-bbs-preview-worker"]
+wasm-check-packages = ["nostr-bbs-config", "nostr-bbs-preview-worker", "nostr-bbs-jev"]
 
 [workspace.dependencies]
 # Test-only: runs the shared whitelist SQL (nostr-bbs-core::whitelist_sql)
@@ -186,6 +189,7 @@ nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.18" }
 nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.16" }
 nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.16" }
 nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.16" }
+nostr-bbs-jev = { path = "crates/nostr-bbs-jev", version = "1.0.0-beta.16" }
 nostr-bbs-ascii = { path = "crates/nostr-bbs-ascii", version = "1.0.0-beta.10" }
 nostr-bbs-poker = { path = "crates/nostr-bbs-poker", version = "1.0.0-beta.15" }
 
