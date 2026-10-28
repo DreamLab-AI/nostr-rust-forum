@@ -813,39 +813,48 @@ impl AdminStore {
         let channels_for_eose = channels_sig;
         let loading_for_eose = loading_sig;
         let on_channel_eose = Rc::new(move || {
-            stats_for_eose.update(|s| {
-                s.total_channels = channels_for_eose.get_untracked().len() as u32;
-            });
+            // The list is for the Channels tab; the figure on the Overview
+            // comes from the relay's COUNT below, which the row cap on this
+            // REQ does not bound.
+            let _ = &channels_for_eose;
+            let _ = &stats_for_eose;
             loading_for_eose.set(false);
         });
-
         let relay_for_channels = relay.clone();
         relay_for_channels.subscribe(
             vec![Filter {
                 kinds: Some(vec![40]),
+                limit: Some(1000),
                 ..Default::default()
             }],
             on_channel_event,
             Some(on_channel_eose),
         );
 
-        // Subscribe for kind 42 (messages) to count them
+        // The Overview figures are counted on the relay (NIP-45 COUNT). They
+        // used to be counted here from a REQ without a limit, which the relay
+        // caps at 500 rows, so "posts" stalled at 500. Each callback may run
+        // twice (before and after NIP-42 AUTH); the later answer is the
+        // complete one and simply overwrites.
         let stats_for_msgs = stats_sig;
-        let msg_counter = RwSignal::new(0u32);
-        let on_msg_event = Rc::new(move |_event: nostr_bbs_core::NostrEvent| {
-            msg_counter.update(|c| *c += 1);
-            stats_for_msgs.update(|s| {
-                s.total_messages = msg_counter.get_untracked();
-            });
-        });
-
-        relay.subscribe(
+        relay.count(
             vec![Filter {
                 kinds: Some(vec![42]),
                 ..Default::default()
             }],
-            on_msg_event,
-            None,
+            Rc::new(move |n| {
+                stats_for_msgs.update(|s| s.total_messages = n.min(u32::MAX as u64) as u32);
+            }),
+        );
+        let stats_for_chans = stats_sig;
+        relay.count(
+            vec![Filter {
+                kinds: Some(vec![40]),
+                ..Default::default()
+            }],
+            Rc::new(move |n| {
+                stats_for_chans.update(|s| s.total_channels = n.min(u32::MAX as u64) as u32);
+            }),
         );
     }
 

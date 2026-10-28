@@ -88,6 +88,10 @@ pub type EventCallback = Rc<dyn Fn(NostrEvent)>;
 /// Callback type for EOSE (End of Stored Events) on a subscription.
 pub type EoseCallback = Rc<dyn Fn()>;
 
+/// Callback for a NIP-45 COUNT answer: the number of events matching the
+/// filters, as the relay counts them for this session.
+pub type CountCallback = Rc<dyn Fn(u64)>;
+
 /// Callback type for publish acknowledgement (accepted: bool, message: String).
 pub type PublishCallback = Rc<dyn Fn(bool, String)>;
 
@@ -101,6 +105,15 @@ struct Subscription {
     filters: Vec<Filter>,
     on_event: EventCallback,
     on_eose: Option<EoseCallback>,
+}
+
+/// A NIP-45 COUNT awaiting its answer. Kept (not removed on the first
+/// answer) because the frame is re-sent after NIP-42 AUTH like a REQ is: the
+/// relay answers an unauthenticated COUNT on protected kinds with 0, so the
+/// later, authenticated answer must still find its callback.
+struct PendingCount {
+    filters: Vec<Filter>,
+    on_count: CountCallback,
 }
 
 /// Synchronous signer for NIP-42 AUTH (nsec / passkey logins).
@@ -117,6 +130,7 @@ pub(crate) type AuthSignAsyncCallback = Rc<
 struct RelayInner {
     ws: Option<WebSocket>,
     subscriptions: HashMap<String, Subscription>,
+    counts: HashMap<String, PendingCount>,
     pending_publishes: HashMap<String, PendingPublish>,
     sub_counter: u32,
     reconnect_attempts: u32,
@@ -273,6 +287,7 @@ impl RelayConnection {
         let inner = Rc::new(RefCell::new(RelayInner {
             ws: None,
             subscriptions: HashMap::new(),
+            counts: HashMap::new(),
             pending_publishes: HashMap::new(),
             sub_counter: 0,
             reconnect_attempts: 0,
@@ -546,6 +561,29 @@ impl RelayConnection {
     }
 
     /// Unsubscribe from a subscription by ID.
+    /// Ask the relay how many events match `filters` (NIP-45 COUNT) and hand
+    /// the number to `on_count`. The count is made on the relay, so it is not
+    /// bounded by the row cap a REQ without a `limit` is given (500). The
+    /// callback may run more than once: the frame is replayed after NIP-42
+    /// AUTH, and the authenticated answer is the complete one.
+    pub fn count(&self, filters: Vec<Filter>, on_count: CountCallback) -> String {
+        let id = self.with_inner(|rc| {
+            let mut inner = rc.borrow_mut();
+            inner.sub_counter += 1;
+            let id = format!("count_{}", inner.sub_counter);
+            inner.counts.insert(
+                id.clone(),
+                PendingCount {
+                    filters: filters.clone(),
+                    on_count,
+                },
+            );
+            id
+        });
+        self.send_raw(&count_frame(&id, &filters));
+        id
+    }
+
     pub fn unsubscribe(&self, sub_id: &str) {
         self.with_inner(|rc| {
             rc.borrow_mut().subscriptions.remove(sub_id);
@@ -673,6 +711,17 @@ impl RelayConnection {
 }
 
 /// Parse and route incoming relay messages to the appropriate subscription callbacks.
+/// The wire frame of a NIP-45 COUNT request.
+fn count_frame(id: &str, filters: &[Filter]) -> String {
+    let mut req = vec![Value::String("COUNT".into()), Value::String(id.into())];
+    for filter in filters {
+        if let Ok(v) = serde_json::to_value(filter) {
+            req.push(v);
+        }
+    }
+    serde_json::to_string(&req).unwrap_or_default()
+}
+
 fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -763,6 +812,23 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             };
             if let Some(cb) = callback {
                 cb();
+            }
+        }
+        "COUNT" => {
+            // ["COUNT", <id>, {"count": n}]
+            if arr.len() < 3 {
+                return;
+            }
+            let Some(id) = arr[1].as_str() else { return };
+            let Some(n) = arr[2].get("count").and_then(|c| c.as_u64()) else {
+                return;
+            };
+            let callback = {
+                let inner = inner_rc.borrow();
+                inner.counts.get(id).map(|c| Rc::clone(&c.on_count))
+            };
+            if let Some(cb) = callback {
+                cb(n);
             }
         }
         "NOTICE" => {
@@ -884,6 +950,11 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                                     if let Ok(msg) = serde_json::to_string(&req) {
                                         frames.push(msg);
                                     }
+                                }
+                                // Pending COUNTs go again too: before AUTH the
+                                // relay answered them with 0 for protected kinds.
+                                for (id, pending) in inner.counts.iter() {
+                                    frames.push(count_frame(id, &pending.filters));
                                 }
                             }
                             // PRD-010 G4: drain writes deferred while this socket

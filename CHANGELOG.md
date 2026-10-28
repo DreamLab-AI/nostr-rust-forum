@@ -7,6 +7,57 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Fixed: image upload failed as "Authentication required" for most real filenames (`nostr-bbs-forum-client`, `nostr-bbs-pod-worker`)
+
+The forum client signed the NIP-98 `u` tag with the raw filename while the browser percent-encoded the request
+URL, so any name with a space, parentheses or a non-ASCII letter ("Screenshot 2026-10-20 at 12.00.00.png",
+"photo (1).png", "Café.png") failed verification and the pod-worker answered 401. The client now encodes the
+path segment it signs, and stores post and DM images under a stamped, URL-safe object name, which also stops
+two uploads with the same local name (every pasted image is "image.png") overwriting each other. The pod-worker's
+401 now carries a `reason` (URL mismatch, payload hash, clock) so this class is diagnosable from the client.
+
+### Fixed: Enter wiped an unsendable draft (`nostr-bbs-forum-client`)
+
+Enter in the composer bypassed the Send button's guards: an over-limit message or one with an upload still in
+flight was not sent, yet the text and the saved draft were cleared. Enter now obeys the same guards.
+A message that only went over the limit once its image link was appended was discarded the same way; it now
+stays in the composer with a message saying why.
+
+### Fixed: SVG, XHTML and XML pod resources were served without the script sandbox (`nostr-bbs-pod-worker`)
+
+The `Content-Security-Policy: sandbox` that neutralises stored HTML on the pod origin only matched a
+lower-case `text/html`. It now covers every document type a browser would execute script from, whatever the
+uploader's spelling. Images shown through `<img>` are unaffected.
+
+### Fixed: the admin Overview's post and channel counts stopped at 500 (`nostr-bbs-forum-client`)
+
+The figures were counted in the browser from a REQ without a `limit`, which the relay caps at 500 rows. They
+are now asked of the relay with NIP-45 `COUNT` (the client relay gained `count()`, replayed after NIP-42 AUTH
+like a REQ), so they are exact however large the board grows.
+
+### Added: paste an image into a post or a DM (`nostr-bbs-forum-client`)
+
+An image on the clipboard pasted into the thread, section or channel composer becomes the pending attachment
+(uploaded on send, as a picked file is); pasted into a DM it opens the attach panel with the image staged for
+preview, and nothing reaches the pod until Upload is pressed. A paste that carries text as well (Office, Docs)
+is left to the browser as text.
+
+### Changed: topic rows name the latest participant (`nostr-bbs-forum-client`)
+
+The byline and avatar on a topic row are the most recent poster, with "started by" demoted to the right-hand
+column when that is someone else; a reader scanning the list wants to know who spoke last. A reply to a reply
+now reaches its topic (it counts, and can be the latest participant), and an edit no longer moves a topic.
+
+### Fixed: the DM unread badge counted every message ever received (`nostr-bbs-forum-client`)
+
+Each conversation keeps a read mark (per account, in localStorage): only a message newer than the mark counts.
+Opening a conversation moves the mark to its newest message, a message read as it arrives moves it, and so does
+a reply of your own from any device.
+
+### Fixed: a post or mention notification opened the section list, not the post (`nostr-bbs-forum-client`)
+
+Those notifications now deep-link through `/go/:event_id`, which resolves the post to its thread and focuses it.
+
 ### Fixed: Web Push registration refused every non-branded Chromium browser (`nostr-bbs-relay-worker`)
 
 Vivaldi, Brave, Linux Chromium and some Edge channels subscribe on `jmt17.google.com`, Google's second FCM host,

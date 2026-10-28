@@ -86,7 +86,18 @@ async fn put_blob_signer(
     signer: &dyn nostr_bbs_core::signer::Signer,
     base_url: &str,
 ) -> Result<String, String> {
-    let url = format!("{}/pods/{}/media/public/{}", base_url, pubkey, filename);
+    // The object name is signed into the NIP-98 `u` tag AND sent as the request
+    // URL, and the browser percent-encodes the latter on the wire (space →
+    // %20, é → %C3%A9). A raw name with such characters therefore signed a `u`
+    // the pod-worker could never match, and the upload failed as
+    // "Authentication required". Encode the segment here so both carry the
+    // same string.
+    let url = format!(
+        "{}/pods/{}/media/public/{}",
+        base_url,
+        pubkey,
+        encode_path_segment(filename)
+    );
 
     // Read blob into bytes for NIP-98 payload hash. A raw JsValue debug dump
     // here (e.g. `NotFoundError`) is meaningless to a user, so surface a
@@ -164,6 +175,10 @@ async fn put_blob_signer(
 }
 
 /// Upload both a compressed image and its thumbnail via `Signer`, returning (image_url, thumb_url).
+///
+/// The object is stored under [`pod_object_name`] of `filename`: stamped, so
+/// two uploads with the same local name (every pasted image is "image.png")
+/// never overwrite each other, and reduced to URL-safe characters.
 pub async fn upload_image_with_thumbnail_signer(
     image_blob: &Blob,
     thumb_blob: &Blob,
@@ -171,10 +186,70 @@ pub async fn upload_image_with_thumbnail_signer(
     pubkey: &str,
     signer: &dyn nostr_bbs_core::signer::Signer,
 ) -> Result<(String, String), String> {
-    let thumb_name = thumb_filename(filename);
-    let image_url = upload_to_pod_signer(image_blob, filename, pubkey, signer, None).await?;
+    // Millisecond stamp plus a nonce: a multi-file pick or a double paste can
+    // land in the same millisecond.
+    let stamp = format!(
+        "{}-{:04x}",
+        js_sys::Date::now() as u64,
+        (js_sys::Math::random() * 65536.0) as u32
+    );
+    let name = pod_object_name(filename, &stamp);
+    let thumb_name = thumb_filename(&name);
+    let image_url = upload_to_pod_signer(image_blob, &name, pubkey, signer, None).await?;
     let thumb_url = upload_to_pod_signer(thumb_blob, &thumb_name, pubkey, signer, None).await?;
     Ok((image_url, thumb_url))
+}
+
+/// Percent-encode one URL path segment exactly as `encodeURIComponent` does.
+/// That is a superset of what the URL parser itself would encode, so the
+/// segment survives `Request::new` byte-for-byte and the NIP-98 `u` tag
+/// signed from the same string matches what the worker receives.
+fn encode_path_segment(segment: &str) -> String {
+    String::from(js_sys::encode_uri_component(segment))
+}
+
+/// Object name for a user-supplied filename: `{stamp}-{stem}.{ext}`, with
+/// every character outside `[A-Za-z0-9._]` folded to a single `-`, the stem
+/// trimmed and capped at 48 characters (`image` when nothing is left), and
+/// the extension lower-cased and reduced to alphanumerics.
+pub fn pod_object_name(filename: &str, stamp: &str) -> String {
+    let (stem, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) if !e.is_empty() => (s, Some(e)),
+        _ => (filename, None),
+    };
+    let mut folded = String::with_capacity(stem.len());
+    let mut last_dash = false;
+    for c in stem.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+            folded.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            folded.push('-');
+            last_dash = true;
+        }
+    }
+    let stem: String = folded
+        .trim_matches(|c| c == '-' || c == '.')
+        .chars()
+        .take(48)
+        .collect();
+    let stem = if stem.is_empty() {
+        "image".to_string()
+    } else {
+        stem
+    };
+    let ext: String = ext
+        .unwrap_or("")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if ext.is_empty() {
+        format!("{stamp}-{stem}")
+    } else {
+        format!("{stamp}-{stem}.{ext}")
+    }
 }
 
 /// Resolve the media `Content-Type` to send on upload. Prefer the blob's own
@@ -209,5 +284,44 @@ fn thumb_filename(filename: &str) -> String {
         format!("{}_thumb{}", &filename[..dot_pos], &filename[dot_pos..])
     } else {
         format!("{}_thumb", filename)
+    }
+}
+
+#[cfg(test)]
+mod object_name_tests {
+    use super::{pod_object_name, thumb_filename};
+
+    #[test]
+    fn folds_the_characters_that_broke_the_nip98_url_match() {
+        assert_eq!(
+            pod_object_name("Screenshot 2026-10-20 at 12.00.00.png", "1700"),
+            "1700-Screenshot-2026-10-20-at-12.00.00.png"
+        );
+        assert_eq!(pod_object_name("photo (1).png", "1"), "1-photo-1.png");
+        assert_eq!(pod_object_name("Café.PNG", "1"), "1-Caf.png");
+        assert_eq!(pod_object_name("archive.tar.gz", "1"), "1-archive.tar.gz");
+        assert_eq!(pod_object_name("😀.png", "1"), "1-image.png");
+    }
+
+    #[test]
+    fn a_name_with_nothing_safe_left_still_uploads() {
+        assert_eq!(pod_object_name("…", "7"), "7-image");
+        assert_eq!(pod_object_name(".png", "7"), "7-image.png");
+        assert_eq!(pod_object_name("", "7"), "7-image");
+    }
+
+    #[test]
+    fn stamp_keeps_repeated_pastes_apart_and_thumb_derives_from_it() {
+        let a = pod_object_name("image.png", "10");
+        let b = pod_object_name("image.png", "11");
+        assert_ne!(a, b);
+        assert_eq!(thumb_filename(&a), "10-image_thumb.png");
+    }
+
+    #[test]
+    fn long_stems_are_capped() {
+        let long = format!("{}.jpg", "a".repeat(200));
+        let name = pod_object_name(&long, "1");
+        assert_eq!(name.len(), "1-".len() + 48 + ".jpg".len());
     }
 }

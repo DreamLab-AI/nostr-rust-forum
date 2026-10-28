@@ -25,6 +25,11 @@ enum State {
 pub(crate) fn ImageUpload(
     on_upload: Callback<String>,
     #[prop(default = "image/*")] accept: &'static str,
+    /// A file handed in from outside (a paste in the host page): it is taken
+    /// into the preview state exactly as a dropped file is, and the signal
+    /// is cleared, so the host can stage the next one.
+    #[prop(optional)]
+    staged: Option<RwSignal<Option<web_sys::File>>>,
 ) -> impl IntoView {
     let state = RwSignal::new(State::Idle);
     let drag = RwSignal::new(false);
@@ -79,6 +84,14 @@ pub(crate) fn ImageUpload(
             el.click();
         }
     };
+    if let Some(staged) = staged {
+        Effect::new(move |_| {
+            if let Some(file) = staged.get() {
+                staged.set(None);
+                process(file);
+            }
+        });
+    }
     let on_file_change = move |ev: leptos::ev::Event| {
         let input: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
         if let Some(files) = input.files() {
