@@ -96,7 +96,6 @@ fn bip340_crate_public_key_verify_matches_published_results() {
             continue;
         };
         let expected = v["verification_result"].as_bool().unwrap();
-        let pk = PublicKey::from_hex(v["public_key_hex"].as_str().unwrap());
         let accepted = match (
             PublicKey::from_hex(v["public_key_hex"].as_str().unwrap()),
             <[u8; 64]>::try_from(hex::decode(v["signature_hex"].as_str().unwrap()).unwrap()),

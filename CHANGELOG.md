@@ -13,10 +13,10 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 RUSTSEC-2026-0387, patched only in >= 0.7.6. The workspace moves to `k256` 0.14.0 / `p256` 0.14.0, which
 bring `elliptic-curve` 0.14 and `crypto-bigint` 0.7. Source changes: `from_bytes` now takes the
 `hybrid-array` reference type; SEC1 encoding is `ToSec1Point::to_sec1_point`; `Reduce` takes a `U256`.
-`nostr-bbs-core` 1.0.0-beta.19 is breaking because `k256::PublicKey` is in its public `did` API.
-`getrandom` 0.4 (now in the k256 graph) needs its `wasm_js` feature on wasm32; core enables it. New
-`tests/bip340_vectors.rs` executes the 19 official BIP-340 vectors (verify all, reproduce all signatures
-that carry a secret key). Also fixes the clippy lints that blocked `main` (`Waker::noop`, dead code,
+`nostr-bbs-core` 1.0.0-beta.19 is breaking because k256 0.14 types (`SigningKey`, `VerifyingKey`, `Error`, and with `did` `PublicKey`) are in its public API; see its changelog.
+`getrandom` 0.4 (now in the k256 graph) needs its `wasm_js` feature on wasm32; core enables it. New `tests/nip01_vectors.rs` (NIP-01 ids, sign/verify, cross-check against the upstream `nostr` crate) and
+`tests/bip340_vectors.rs` (the 19 official BIP-340 vectors: verify all, reproduce every signature that carries a
+secret key). A P-256 high-S regression test guards passkey login against the ecdsa 0.17 low-S change. Also fixes the clippy lints that blocked `main` (`Waker::noop`, dead code,
 `type_complexity`, redundant match).
 
 ### Fixed: image upload failed as "Authentication required" for most real filenames (`nostr-bbs-forum-client`, `nostr-bbs-pod-worker`)
