@@ -9,10 +9,10 @@ command = "worker-build --release"
 
 # System One advisory integration. Errors retain the existing result.
 JEV_TRIAGE = "1"
-JEV_ENDPOINT = "https://api.subq.ai/v1/systemone"
-JEV_MODEL = "subq-snap-preview"
-JEV_API_KEY_NAME = "SUBQ_API_KEY"
-# Supply SUBQ_API_KEY as a Worker secret; never put its value in this file.
+JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+JEV_MODEL = "jev-latest"
+JEV_API_KEY_NAME = "TYPESAFE_API_KEY"
+# Supply TYPESAFE_API_KEY as a Worker secret; never put its value in this file.
 
 RELAY_NAME = "Nostr BBS Relay"
 # NOTE: the relay sources admin status from D1 (whitelist.is_admin), not from

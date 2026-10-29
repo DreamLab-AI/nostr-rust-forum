@@ -86,7 +86,7 @@ re-ingest of that entry. It is never sent anyway, because rerank candidates come
 
 Enable per Worker with `wrangler.toml` `[vars]` (flag, endpoint, model) and `wrangler secret put` (key).
 The committed `wrangler.toml` files enable all three flags. Search and moderation
-use SubQ (`subq-snap-preview`) and require a `SUBQ_API_KEY` Worker secret.
+use Typesafe Jev (`jev-latest`) and require a `TYPESAFE_API_KEY` Worker secret.
 The auth route remains local-only and returns unavailable until an authenticated,
 Worker-reachable sovereign inference ingress is configured. Cloudflare cannot
 reach agentbox loopback or Docker DNS; no false locality declaration is supplied.
