@@ -27,6 +27,14 @@ database_name = "nostr-bbs-auth"
 database_id = "e3981999-e8f0-4c07-9e4b-2e50859b8524"
 
 [vars]
+
+# System One advisory integration. Errors retain the existing result.
+JEV_SEARCH_RERANK = "1"
+JEV_ENDPOINT = "https://api.subq.ai/v1/systemone"
+JEV_MODEL = "subq-snap-preview"
+JEV_API_KEY_NAME = "SUBQ_API_KEY"
+# Supply SUBQ_API_KEY as a Worker secret; never put its value in this file.
+
 ALLOWED_ORIGIN = "https://example.com"
 ALLOWED_ORIGINS = "https://example.com"
 RVF_STORE_KEY = "nostr-bbs.rvf"

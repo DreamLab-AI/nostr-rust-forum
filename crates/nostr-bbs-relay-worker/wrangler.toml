@@ -6,6 +6,14 @@ compatibility_date = "2025-09-01"
 command = "worker-build --release"
 
 [vars]
+
+# System One advisory integration. Errors retain the existing result.
+JEV_TRIAGE = "1"
+JEV_ENDPOINT = "https://api.subq.ai/v1/systemone"
+JEV_MODEL = "subq-snap-preview"
+JEV_API_KEY_NAME = "SUBQ_API_KEY"
+# Supply SUBQ_API_KEY as a Worker secret; never put its value in this file.
+
 RELAY_NAME = "Nostr BBS Relay"
 # NOTE: the relay sources admin status from D1 (whitelist.is_admin), not from
 # an env var — there is no ADMIN_PUBKEYS reader in src/. A dead ADMIN_PUBKEYS=""

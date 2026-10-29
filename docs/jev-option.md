@@ -1,8 +1,8 @@
 # Jev option (opt-in typed decisions)
 
 Three forum Workers can optionally ask [Jev](https://api.typesafe.ai) (TypeSafe System One:
-Choice / Score / Noul over `POST /v1/systemone`) a bounded semantic question. **Every option is off by
-default.** With its flag off, no request is built, nothing leaves the Worker, and behaviour is
+Choice / Score / Noul over `POST /v1/systemone`) a bounded semantic question. **The checked-in Worker manifests opt all three options in.**
+The library remains off when the flag is absent. With its flag off, no request is built, nothing leaves the Worker, and behaviour is
 byte-for-byte the pre-change behaviour. On *any* failure (no endpoint, timeout, non-2xx, malformed
 body, missing answer, low confidence) the Worker falls back to the pre-change behaviour and logs one
 reason token (`flag-off`, `no-endpoint`, `timeout`, `http-<code>`, `malformed`, `low-confidence`),
@@ -85,4 +85,18 @@ re-ingest of that entry. It is never sent anyway, because rerank candidates come
 ## Operating it
 
 Enable per Worker with `wrangler.toml` `[vars]` (flag, endpoint, model) and `wrangler secret put` (key).
-No flag is set in the committed `wrangler.toml` files.
+The committed `wrangler.toml` files enable all three flags. Search and moderation
+use SubQ (`subq-snap-preview`) and require a `SUBQ_API_KEY` Worker secret.
+The auth route remains local-only and returns unavailable until an authenticated,
+Worker-reachable sovereign inference ingress is configured. Cloudflare cannot
+reach agentbox loopback or Docker DNS; no false locality declaration is supplied.
+
+On first activation, re-ingest existing public entries through the normal signed
+ingest path with snippets. Old vectors carry no source text; until that happens,
+searches containing them retain their original order. The relay deployment must
+retain its five-minute cron trigger, otherwise moderation triage never runs.
+
+The estate deployment overrides these kit manifests in
+`dreamlab-ai-website/forum-config/deploy/`; its kit pin must include commit
+`f8f14ab` or later for the flags to have a reader. Activation is distinct from
+measured uplift; no automatic approvals or moderation actions are added.

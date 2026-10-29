@@ -48,6 +48,14 @@ binding = "PODS"
 bucket_name = "nostr-bbs-pods"
 
 [vars]
+
+# System One advisory integration. Errors retain the existing result.
+JEV_RATIONALE_CHECK = "1"
+# Local-only: configure JEV_ENDPOINT, JEV_MODEL and JEV_LOCAL=1 only
+# for an authenticated, Worker-reachable sovereign inference ingress.
+# No such ingress is provisioned here. The route reports unavailable until then;
+# never point it at the cloud judge or an unreachable container/loopback URL.
+
 RP_ID = "example.com"
 RP_NAME = "Nostr BBS"
 EXPECTED_ORIGIN = "https://example.com"
