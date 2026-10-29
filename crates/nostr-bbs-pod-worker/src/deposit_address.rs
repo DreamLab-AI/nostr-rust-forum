@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn reduce_mod_n_matches_k256_reduce() {
         use k256::elliptic_curve::ops::Reduce;
-        use k256::{FieldBytes, U256};
+        use k256::U256;
         let n = hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
             .expect("hex");
         let mut cases: Vec<[u8; 32]> = Vec::new();
@@ -279,7 +279,7 @@ mod tests {
         push(&sha256::Hash::hash(b"deposit").to_byte_array());
         for h in cases {
             let ours = reduce_mod_n(h).to_be_bytes();
-            let theirs = <k256::Scalar as Reduce<U256>>::reduce_bytes(FieldBytes::from_slice(&h));
+            let theirs = <k256::Scalar as Reduce<U256>>::reduce(&U256::from_be_slice(&h));
             assert_eq!(
                 ours.as_slice(),
                 theirs.to_bytes().as_slice(),

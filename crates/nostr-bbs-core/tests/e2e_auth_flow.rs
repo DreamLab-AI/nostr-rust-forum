@@ -105,7 +105,7 @@ fn admin_sk_bytes() -> [u8; 32] {
 }
 
 fn admin_signing_key() -> SigningKey {
-    SigningKey::from_bytes(&admin_sk_bytes()).unwrap()
+    SigningKey::from_bytes((&admin_sk_bytes()).into()).unwrap()
 }
 
 fn admin_pubkey_hex() -> String {
@@ -121,7 +121,7 @@ fn user_sk_bytes() -> [u8; 32] {
 }
 
 fn user_signing_key() -> SigningKey {
-    SigningKey::from_bytes(&user_sk_bytes()).unwrap()
+    SigningKey::from_bytes((&user_sk_bytes()).into()).unwrap()
 }
 
 fn user_pubkey_hex() -> String {
@@ -537,7 +537,7 @@ fn e2e_nip44_encrypt_decrypt_roundtrip() {
     let (sender_sk, _) = random_keypair();
     let (recipient_sk, recipient_pk) = random_keypair();
     let sender_pk = {
-        let sk = SigningKey::from_bytes(&sender_sk).unwrap();
+        let sk = SigningKey::from_bytes((&sender_sk).into()).unwrap();
         hex::encode(sk.verifying_key().to_bytes())
     };
     let sender_pk_bytes = hex::decode(&sender_pk).unwrap();
@@ -565,7 +565,7 @@ fn e2e_nip44_wrong_key_cannot_decrypt() {
     let ciphertext = nip44_encrypt(&sender_sk, &recipient_pk_bytes, "secret").unwrap();
 
     let sender_pk = {
-        let sk = SigningKey::from_bytes(&sender_sk).unwrap();
+        let sk = SigningKey::from_bytes((&sender_sk).into()).unwrap();
         let pk_bytes = sk.verifying_key().to_bytes();
         let mut arr = [0u8; 32];
         arr.copy_from_slice(pk_bytes.as_slice());
@@ -585,7 +585,7 @@ fn e2e_nip04_encrypt_decrypt_roundtrip() {
     let (sender_sk, _) = random_keypair();
     let (recipient_sk, recipient_pk) = random_keypair();
     let sender_pk = {
-        let sk = SigningKey::from_bytes(&sender_sk).unwrap();
+        let sk = SigningKey::from_bytes((&sender_sk).into()).unwrap();
         hex::encode(sk.verifying_key().to_bytes())
     };
 
@@ -1009,7 +1009,7 @@ fn e2e_full_auth_relay_pod_flow() {
     let kp = generate_keypair().unwrap();
     let sk_bytes = *kp.secret.as_bytes();
     let pubkey_hex = kp.public.to_hex();
-    let signing_key = SigningKey::from_bytes(&sk_bytes).unwrap();
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into()).unwrap();
 
     // Step 2: Client authenticates to relay via NIP-98
     let relay_url = "https://relay.forum.example.com/api/events";

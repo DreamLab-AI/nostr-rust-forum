@@ -722,7 +722,7 @@ mod tests {
     use nostr_bbs_core::{build_ban, build_mute, build_report, build_unban, build_unmute};
 
     fn admin_sk() -> SigningKey {
-        SigningKey::from_bytes(&[0x02u8; 32]).unwrap()
+        SigningKey::from_bytes((&[0x02u8; 32]).into()).unwrap()
     }
     fn admin_pk() -> String {
         hex::encode(admin_sk().verifying_key().to_bytes())

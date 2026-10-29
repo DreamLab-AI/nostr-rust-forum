@@ -244,10 +244,7 @@ const CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS jev_triage (\
     created_at INTEGER NOT NULL)";
 
 async fn ensure_table(db: &worker::D1Database) -> bool {
-    match db.prepare(CREATE_SQL).run().await {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    db.prepare(CREATE_SQL).run().await.is_ok()
 }
 
 /// Run one triage tick. Never errors to the caller.
@@ -398,7 +395,7 @@ pub async fn handle_list(req: &Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
     let auth_header = req.headers().get("Authorization").ok().flatten();
     if let Err((body, status)) =
-        crate::auth::require_nip98_admin(auth_header.as_deref(), &url.to_string(), "GET", None, env)
+        crate::auth::require_nip98_admin(auth_header.as_deref(), url.as_ref(), "GET", None, env)
             .await
     {
         return crate::cors::json_response(env, &body, status);

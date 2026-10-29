@@ -22,7 +22,7 @@ fn main() {
             break key;
         }
     };
-    let public = signing.verifying_key().to_encoded_point(false);
+    let public = signing.verifying_key().to_sec1_point(false);
     println!("VAPID_PUBLIC_KEY={}", B64URL.encode(public.as_bytes()));
     println!("VAPID_PRIVATE_KEY={}", B64URL.encode(signing.to_bytes()));
 }

@@ -1697,7 +1697,7 @@ mod tests {
         use p256::ecdsa::SigningKey;
         let signing_key = SigningKey::from_bytes(&[0x42; 32].into()).unwrap();
         let verifying_key = signing_key.verifying_key();
-        let encoded_point = verifying_key.to_encoded_point(false);
+        let encoded_point = verifying_key.to_sec1_point(false);
         let x: [u8; 32] = encoded_point.x().unwrap().as_slice().try_into().unwrap();
         let y: [u8; 32] = encoded_point.y().unwrap().as_slice().try_into().unwrap();
 

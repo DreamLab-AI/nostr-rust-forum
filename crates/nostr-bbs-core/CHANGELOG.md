@@ -4,6 +4,20 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.19] - 2026-10-29
+
+### Changed (breaking)
+
+- **RustCrypto 0.14 line:** `k256` 0.14, `elliptic-curve` 0.14, `crypto-bigint` 0.7 (closes
+  RUSTSEC-2026-0387). `k256::PublicKey` in the `did` feature's public API (`XOnly::from_public_key`,
+  `to_even_public_key`, `parse_multibase_sec1`) is now the 0.14 type, so callers must be on `k256` 0.14.
+  Behaviour and wire output are unchanged; the existing fixtures pass byte for byte.
+- On wasm32 the crate enables `getrandom` 0.4's `wasm_js` feature, which the 0.14 line requires.
+
+### Added
+
+- `tests/bip340_vectors.rs`: the 19 official BIP-340 vectors executed against signing and verification.
+
 ## [1.0.0-beta.18] - 2026-10-19
 
 ### Licence (applies from 1.0.0-beta.18, merged 2026-10-20)

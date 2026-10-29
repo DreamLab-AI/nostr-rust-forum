@@ -6,7 +6,7 @@ use nostr_bbs_core::event::{sign_event, NostrEvent, UnsignedEvent};
 
 /// Generate N signed events as JSON strings for deserialization benchmarks.
 fn generate_event_jsons(n: usize) -> Vec<String> {
-    let sk = SigningKey::from_bytes(&[0x01u8; 32]).unwrap();
+    let sk = SigningKey::from_bytes((&[0x01u8; 32]).into()).unwrap();
     let pubkey = hex::encode(sk.verifying_key().to_bytes());
 
     (0..n)
@@ -40,7 +40,7 @@ fn bench_event_deserialize_1k(c: &mut Criterion) {
 }
 
 fn bench_event_id_computation(c: &mut Criterion) {
-    let sk = SigningKey::from_bytes(&[0x01u8; 32]).unwrap();
+    let sk = SigningKey::from_bytes((&[0x01u8; 32]).into()).unwrap();
     let pubkey = hex::encode(sk.verifying_key().to_bytes());
 
     let unsigned = UnsignedEvent {
@@ -60,7 +60,7 @@ fn bench_event_id_computation(c: &mut Criterion) {
 }
 
 fn bench_event_sign(c: &mut Criterion) {
-    let sk = SigningKey::from_bytes(&[0x01u8; 32]).unwrap();
+    let sk = SigningKey::from_bytes((&[0x01u8; 32]).into()).unwrap();
     let pubkey = hex::encode(sk.verifying_key().to_bytes());
 
     c.bench_function("event_sign", |b| {
@@ -78,7 +78,7 @@ fn bench_event_sign(c: &mut Criterion) {
 }
 
 fn bench_event_verify(c: &mut Criterion) {
-    let sk = SigningKey::from_bytes(&[0x01u8; 32]).unwrap();
+    let sk = SigningKey::from_bytes((&[0x01u8; 32]).into()).unwrap();
     let pubkey = hex::encode(sk.verifying_key().to_bytes());
 
     let unsigned = UnsignedEvent {

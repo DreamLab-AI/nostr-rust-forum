@@ -101,8 +101,8 @@ fn build_and_sign(
     tags: Vec<Vec<String>>,
     content: String,
 ) -> Result<NostrEvent, GroupError> {
-    let signing_key =
-        SigningKey::from_bytes(privkey).map_err(|e| GroupError::InvalidKey(e.to_string()))?;
+    let signing_key = SigningKey::from_bytes((privkey).into())
+        .map_err(|e| GroupError::InvalidKey(e.to_string()))?;
     let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
 
     let unsigned = UnsignedEvent {
@@ -328,7 +328,7 @@ mod tests {
     }
 
     fn test_pubkey_hex() -> String {
-        let sk = SigningKey::from_bytes(&test_key()).unwrap();
+        let sk = SigningKey::from_bytes((&test_key()).into()).unwrap();
         hex::encode(sk.verifying_key().to_bytes())
     }
 

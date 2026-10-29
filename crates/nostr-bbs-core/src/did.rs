@@ -485,10 +485,10 @@ mod tests {
         "fe70103124c0fa99407182ece5a24fad9b7f6674902fc422843d3128d38a0afbee0fdd2";
 
     fn public_key_with_parity(tag: u8) -> k256::PublicKey {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::elliptic_curve::sec1::ToSec1Point;
         (1u8..=255)
             .map(|b| k256::SecretKey::from_slice(&[b; 32]).unwrap().public_key())
-            .find(|pk| pk.to_encoded_point(true).as_bytes()[0] == tag)
+            .find(|pk| pk.to_sec1_point(true).as_bytes()[0] == tag)
             .unwrap()
     }
 
@@ -497,8 +497,8 @@ mod tests {
         for (input, parity) in [(DECODE_EVEN_PARITY, 0x02u8), (DECODE_ODD_PARITY, 0x03)] {
             assert_eq!(parse_multibase_schnorr(input).unwrap().to_hex(), SPEC_X);
             let point = parse_multibase_sec1(input).unwrap();
-            use k256::elliptic_curve::sec1::ToEncodedPoint;
-            assert_eq!(point.to_encoded_point(true).as_bytes()[0], parity);
+            use k256::elliptic_curve::sec1::ToSec1Point;
+            assert_eq!(point.to_sec1_point(true).as_bytes()[0], parity);
             assert_eq!(format_multibase_public_key(&point), input);
         }
     }
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn controller_published_document_carries_0x03_for_odd_key() {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::elliptic_curve::sec1::ToSec1Point;
         let pk = public_key_with_parity(0x03);
         let id = NostrPubkey::from_public_key(&pk);
         let doc = render_did_document_published(&pk);
@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(mb, format!("fe70103{}", id.to_hex()));
         assert_eq!(mb.len(), MULTIKEY_LEN);
         assert_eq!(
-            format_multibase_sec1(pk.to_encoded_point(true).as_bytes()).unwrap(),
+            format_multibase_sec1(pk.to_sec1_point(true).as_bytes()).unwrap(),
             mb
         );
         assert_eq!(parse_multibase_schnorr(mb).unwrap(), id);
@@ -565,7 +565,7 @@ mod tests {
     /// `fe701` + compressed hex and `basePoint(did)` is the 02 point.
     #[test]
     fn agrees_with_keys_mjs_multikey_and_base_point() {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::elliptic_curve::sec1::ToSec1Point;
         let mut d = [0u8; 32];
         d[31] = 6;
         let pk = k256::SecretKey::from_slice(&d).unwrap().public_key();
@@ -582,7 +582,7 @@ mod tests {
             hex::encode(
                 id.to_even_public_key()
                     .unwrap()
-                    .to_encoded_point(true)
+                    .to_sec1_point(true)
                     .as_bytes()
             ),
             "02fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556"

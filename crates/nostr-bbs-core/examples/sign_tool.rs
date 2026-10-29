@@ -19,7 +19,7 @@ fn main() {
         .expect("priv hex")
         .try_into()
         .expect("32 bytes");
-    let sk = SigningKey::from_bytes(&sk_bytes).expect("valid key");
+    let sk = SigningKey::from_bytes((&sk_bytes).into()).expect("valid key");
     let pubkey = hex::encode(sk.verifying_key().to_bytes());
     let kind: u64 = args[2].parse().expect("kind");
     let tags: Vec<Vec<String>> = serde_json::from_str(&args[3]).expect("tags json");

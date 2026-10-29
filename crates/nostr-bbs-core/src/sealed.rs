@@ -88,7 +88,7 @@
 //! let zone = SecretKey::from_bytes([0x33; 32]).unwrap();
 //! let channel = "c".repeat(64);
 //!
-//! let signing_key = k256::schnorr::SigningKey::from_bytes(author.as_bytes()).unwrap();
+//! let signing_key = k256::schnorr::SigningKey::from_bytes((author.as_bytes()).into()).unwrap();
 //! let original = sign_event(
 //!     UnsignedEvent {
 //!         pubkey: author.public_key().to_hex(),
@@ -486,7 +486,7 @@ fn build_envelope(
         ],
         content,
     };
-    let signing_key = SigningKey::from_bytes(migrator_sk.as_bytes())
+    let signing_key = SigningKey::from_bytes((migrator_sk.as_bytes()).into())
         .map_err(|e| SealError::Sign(e.to_string()))?;
     sign_event(unsigned, &signing_key).map_err(|e| SealError::Sign(e.to_string()))
 }
@@ -541,7 +541,7 @@ mod tests {
         tags: Vec<Vec<String>>,
         content: &str,
     ) -> NostrEvent {
-        let signing_key = SigningKey::from_bytes(sk.as_bytes()).unwrap();
+        let signing_key = SigningKey::from_bytes((sk.as_bytes()).into()).unwrap();
         sign_event(
             UnsignedEvent {
                 pubkey: sk.public_key().to_hex(),
@@ -1020,7 +1020,7 @@ mod proptests {
             let migrator = generate_keypair().unwrap();
             let zone = generate_keypair().unwrap();
             let channel = hex::encode(zone.public.as_bytes()).replace('0', "a");
-            let signing_key = SigningKey::from_bytes(author.secret.as_bytes()).unwrap();
+            let signing_key = SigningKey::from_bytes((author.secret.as_bytes()).into()).unwrap();
             let original = sign_event(
                 UnsignedEvent {
                     pubkey: author.public.to_hex(),

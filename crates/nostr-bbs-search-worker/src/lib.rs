@@ -1174,11 +1174,12 @@ mod jev_rerank_tests {
             deadline_ms: 10,
         }
     }
-    fn fixture() -> (
+    type Fixture = (
         Vec<(u64, f32)>,
         HashMap<u64, String>,
         HashMap<String, String>,
-    ) {
+    );
+    fn fixture() -> Fixture {
         let cands: Vec<(u64, f32)> = (1..=5).map(|l| (l, 1.0 - l as f32 * 0.1)).collect();
         let public: HashSet<u64> = [1, 2, 3, 5].into_iter().collect();
         let visible = visible_top_k(&cands, &public, 3);

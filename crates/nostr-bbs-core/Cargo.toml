@@ -1,6 +1,6 @@
 [package]
 name = "nostr-bbs-core"
-version = "1.0.0-beta.18"
+version = "1.0.0-beta.19"
 edition = "2021"
 description = "nostr-bbs community forum — core types"
 license = "MIT OR Apache-2.0"
@@ -53,6 +53,11 @@ wasm-bindgen = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { workspace = true }
 serde-wasm-bindgen = "0.6"
+# k256/crypto-bigint 0.14 pull getrandom 0.4 (the 0.2 line above is a separate
+# semver-incompatible crate). On wasm32-unknown-unknown 0.4 refuses to compile
+# unless `wasm_js` is on; it then routes to crypto.getRandomValues. Core is in
+# every wasm crate's k256 graph, so cargo feature unification covers them all.
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 wasm-bindgen-test = { workspace = true }

@@ -460,7 +460,7 @@ mod tests {
     use k256::schnorr::SigningKey;
 
     fn admin_key() -> SigningKey {
-        SigningKey::from_bytes(&[0x02u8; 32]).unwrap()
+        SigningKey::from_bytes((&[0x02u8; 32]).into()).unwrap()
     }
 
     fn admin_pk_hex() -> String {
@@ -574,7 +574,7 @@ mod tests {
         // field to the admin's pubkey to impersonate an admin. The id/signature
         // were bound to the attacker's key, so verification rejects it before
         // the admin-set check ever trusts `pubkey`.
-        let attacker = SigningKey::from_bytes(&[0x09u8; 32]).unwrap();
+        let attacker = SigningKey::from_bytes((&[0x09u8; 32]).into()).unwrap();
         let attacker_pk = hex::encode(attacker.verifying_key().to_bytes());
         let u = build_ban(&attacker_pk, &target_pk(), "forged", 1_700_000_000);
         let mut signed = sign_event_deterministic(u, &attacker).unwrap();

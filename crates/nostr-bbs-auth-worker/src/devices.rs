@@ -694,14 +694,14 @@ mod tests {
     const NOW: u64 = 1_700_000_000;
 
     fn device_sk() -> SigningKey {
-        SigningKey::from_bytes(&[0x11u8; 32]).unwrap()
+        SigningKey::from_bytes((&[0x11u8; 32]).into()).unwrap()
     }
     fn device_pk() -> String {
         hex::encode(device_sk().verifying_key().to_bytes())
     }
     fn owner_pk() -> String {
         // A distinct key's pubkey stands in for the NIP-98 author.
-        let sk = SigningKey::from_bytes(&[0x22u8; 32]).unwrap();
+        let sk = SigningKey::from_bytes((&[0x22u8; 32]).into()).unwrap();
         hex::encode(sk.verifying_key().to_bytes())
     }
 

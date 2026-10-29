@@ -207,7 +207,7 @@ impl AuthStore {
             }
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(v);
-            let signing_key = k256::schnorr::SigningKey::from_bytes(&key_bytes)
+            let signing_key = k256::schnorr::SigningKey::from_bytes((&key_bytes).into())
                 .map_err(|e| format!("Invalid signing key: {e}"))?;
             key_bytes.zeroize();
             // Auto-populate pubkey when caller left it blank. The relay's

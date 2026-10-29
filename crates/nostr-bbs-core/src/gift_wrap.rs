@@ -289,7 +289,7 @@ pub fn seal_rumor(
         .map_err(|e| GiftWrapError::Encryption(e.to_string()))?;
 
     // Build the signing key to derive the sender pubkey
-    let signing_key = SigningKey::from_bytes(sender_sk)
+    let signing_key = SigningKey::from_bytes((sender_sk).into())
         .map_err(|e| GiftWrapError::KeyError(format!("invalid sender secret key: {e}")))?;
     let sender_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
 
@@ -355,7 +355,7 @@ pub fn wrap_seal(seal: &NostrEvent, recipient_pubkey: &str) -> Result<NostrEvent
         content: encrypted,
     };
 
-    let throwaway_signing_key = SigningKey::from_bytes(&*throwaway_sk_bytes)
+    let throwaway_signing_key = SigningKey::from_bytes((&*throwaway_sk_bytes).into())
         .map_err(|e| GiftWrapError::KeyError(format!("throwaway signing key: {e}")))?;
 
     let wrapped = sign_event(unsigned_wrap, &throwaway_signing_key)
@@ -1443,7 +1443,7 @@ mod tests {
     fn seal_raw_json(sender_sk: &[u8; 32], recipient_pk: &str, rumor_json: &str) -> NostrEvent {
         let recipient_pk_bytes = hex_to_32(recipient_pk).unwrap();
         let encrypted = nip44::encrypt(sender_sk, &recipient_pk_bytes, rumor_json).unwrap();
-        let signing_key = SigningKey::from_bytes(sender_sk).unwrap();
+        let signing_key = SigningKey::from_bytes((sender_sk).into()).unwrap();
         let sender_pubkey = hex::encode(signing_key.verifying_key().to_bytes());
         sign_event(
             UnsignedEvent {
@@ -1582,7 +1582,7 @@ mod tests {
             &serde_json::to_string(&rumor).unwrap(),
         )
         .unwrap();
-        let signing_key = SigningKey::from_bytes(&sender_sk).unwrap();
+        let signing_key = SigningKey::from_bytes((&sender_sk).into()).unwrap();
         let seal = sign_event(
             UnsignedEvent {
                 pubkey: sender_pk.clone(),

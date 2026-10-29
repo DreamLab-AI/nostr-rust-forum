@@ -220,8 +220,12 @@ pub fn verify_event_strict(event: &NostrEvent) -> Result<(), EventError> {
         .filter(|b| b.len() == 32)
         .ok_or(EventError::InvalidPubkey)?;
 
-    let verifying_key =
-        VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| EventError::InvalidPubkeyPoint)?;
+    let pubkey_arr: [u8; 32] = pubkey_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EventError::InvalidPubkey)?;
+    let verifying_key = VerifyingKey::from_bytes((&pubkey_arr).into())
+        .map_err(|_| EventError::InvalidPubkeyPoint)?;
 
     // Decode signature
     let sig_bytes = hex::decode(&event.sig)
@@ -338,7 +342,7 @@ mod tests {
 
     fn test_signing_key() -> SigningKey {
         let secret = [0x01u8; 32];
-        SigningKey::from_bytes(&secret).unwrap()
+        SigningKey::from_bytes((&secret).into()).unwrap()
     }
 
     #[test]
