@@ -1,9 +1,9 @@
 ---
 title: Architecture Baseline — nostr-rust-forum
 doc_id: NRF-BASELINE
-version: 0.1.0
+version: 0.2.0
 status: draft-for-ratification
-verified_commit: 23be587
+verified_commit: 0065dd9 (ADR-2030 to ADR-2032 sections, crate count and NIP-29 divergence only; older sections keep their earlier stamp)
 sources:
   - Cargo.toml
   - crates/nostr-bbs-upstream-canary/src/lib.rs
@@ -34,8 +34,11 @@ delivery and trust levels live in the sibling doc `IDENTITY-keys-and-trust.md`.
 ### Workspace topology
 
 A Cargo workspace (`resolver = "2"`, `edition = "2021"`, `rust-version = "1.85"`,
-`Cargo.toml`) of 14 member crates in four layers (`Cargo.toml`
-`[workspace.members]`):
+`Cargo.toml`) of 20 member crates (counted at `0065dd9`; the layer list below
+names the original four layers and is not exhaustive: poker, sidestr-admin,
+zone-migrate, jev and governance-probe have since joined) (`Cargo.toml`
+`[workspace.members]`). A pure NIP-29 engine crate, `nostr-bbs-groups`, is
+proposed by ADR-2030 and is not a member (see "NIP-29 spaces" below):
 
 - **Foundation** — `nostr-bbs-core`: the hand-rolled Nostr protocol primitives
   (event, keys, signer, NIP-04/19/44/59/98, gift-wrap, governance, moderation).
@@ -172,6 +175,11 @@ from ban-gating because the recipient-whitelist gate already bounds them
   decision-as-originally-stated diverges from code.
 - **CF-Workers pod federation degenerate.** ADR-086's pod fallback returns only
   data D1 already holds because ADR-087's portable-cores decision is unresolved.
+- **NIP-29 is advertised but not implemented.** `supported_nips` lists 29
+  (`crates/nostr-bbs-relay-worker/src/nip11.rs:207`) while the relay only
+  admin-gates 9000-9020 and 39000-39002 on an `h` tag and stores them
+  (`relay_do/nip_handlers.rs:52-54,1298-1311`); kind 9 is world-readable
+  (`relay_do/nip42.rs:44`). Recorded at `0065dd9`; ADR-2030 proposes the fix.
 - **Sprint-resident ADRs.** ADR-090/091/092 keep their canonical full text under
   `docs/sprint/2026-05-17-ux-audit/`; the `docs/adr/` stubs reserve the numbers.
 
@@ -282,3 +290,111 @@ surfaces are `channel_zones`, the zone write gate (`nip_handlers.rs:1414`), the 
 abstraction must also cover the ban gate (`:69`), post counters (`:1556`), profile stats
 (`profile_stats.rs:11`) and, in the client, tag interpretation in `core/src/thread.rs:69` and
 `pages/message_jump.rs:68`, not only kind numbers.
+
+## NIP-29 spaces, federation and spatial descriptors — ADR-2030, ADR-2031, ADR-2032 (proposed)
+
+Nothing in this section is live behaviour. It records three proposed decisions so a reader
+can tell what the code does not yet do. Citations to current code were verified at `0065dd9`;
+the rest of this document's `verified_commit` stamp is not re-asserted for the older sections.
+
+- **Group engine (ADR-2030).** A new AGPL-3.0-only crate, `nostr-bbs-groups` (pure, no I/O,
+  `wasm32`, `?Send`), folds kinds 9000-9022 in the home's admission order and produces
+  relay-signed 39000-39003; the relay worker consumes it. `nostr-bbs-core` stays
+  `MIT OR Apache-2.0` and never depends on an AGPL crate or holds derived code. obelisk-relay
+  code may be ported into the engine with its notice and a `NOTICE` entry; every file is marked
+  `own` or `derived`, and derived files are never relicensed permissively. A group backed by a
+  zone is a projection of the zone cohort (ADR-2014): 9000, 9001, 9005, 9021 and 9022 are routed
+  through the cohort authority, 9009 is refused, and projection lag denies access. A standalone
+  group takes membership from the home's admitted NIP-29 event stream; either way the home signs
+  the 39002 that consumers read. The
+  VisionClaw bridge reads private groups under a forum-issued read grant, not membership.
+  End-to-end private groups remain NIP-171 zones (ADR-2028). In `forum` kind 9 carries `h`;
+  in `room` NIP-29 is off and an `h`-tagged kind 9 is refused (an amendment of ADR-2029).
+- **Federation (ADR-2031).** A space is `(home relay pubkey, group id)`; the operator pins the
+  key in configuration and NIP-11 `self` is discovery only. The home is the only writer: it
+  applies moderation in admission order (so backdating cannot reorder it), and stamps every 3900x
+  with a monotonic `["rev", <u64>]`; `created_at` is wall-clock only and is never bumped; it orders only equal-`rev` heartbeats.
+  Mirrors store the home's state verbatim, replace on a greater `rev` or an equal-`rev` heartbeat (identical content, later `created_at`), keep a
+  persisted watermark per group and per kind of `(rev, created_at, event id, content digest)`, enforce locally and forward
+  writes. The home re-signs 39002 every 30 s and publishes a removal at once. A 39002 is fresh
+  while `now − created_at ≤ L + S` (L = 60 s, S = 10 s), stale after it, and stale means deny,
+  including live sessions, which are re-checked every C = 10 s. The single end-to-end guarantee
+  is D = 90 s from removal at the home to closure of every presence session and dataspace stream
+  (rejoin refused). Voice is bound separately: it needs a reachable LiveKit API, and because an
+  issued token cannot be revoked it is D_voice = 2L + 2S + C = 150 s, with rejoins removed within
+  C until then; a LiveKit API partition is an accepted exception needing operator sign-off. For a zone-backed group the home
+  signs 39002 only while the projection is coherent with the cohort (`["proj", <cohort-rev>]`)
+  and stops signing when it lags. The signing key is separate from NIP-11 `pubkey`
+  and lives in Worker secrets. No `moved_to`: a fork is a new space. Transport is plain signed
+  events through `nostr-bbs-mesh`'s `PeerManager`. Prerequisites: an addressable-replacement
+  guard in `relay_do/storage.rs`, ordered by `rev` for 3900x, 30312 and kind 30078 only in the
+  `visionclaw:dataspace:*` d-tag namespace (a D1 `rev` migration; other kinds keep NIP-01 ordering;
+  today both replaceable branches keep a late older row, `storage.rs:97-139`), persisted dedup and watermark, and a
+  `PeerConnector` implementation (`relay-worker/src/mesh.rs:143`, no implementor today). The
+  30 s re-sign and the C re-check need a Durable Object alarm; the only alarm today is idle
+  eviction (`relay_do/mod.rs:371`). Activation order across the estate (round-2 C9): agentbox
+  2162; VisionClaw 2159 then 2161 (`public`, `dids`); forum 2030 then 2031 (with the ADR-2032
+  30312 publisher, which voice needs); VisionClaw 2157 then 2161 (`space:`); VisionClaw 2160.
+- **Spatial descriptor (ADR-2032).** Extra tags on the home-signed 39000 whose content
+  references come from a closed set (VisionClaw dataspace URN, Codescape URN, or a relative path
+  on the home's node); unknown refs are ignored. The descriptor's frame is the home's own; each
+  consumer applies its own placement transform. NIP-53 30312 per space, carrying `rev`, with
+  `service` equal to the configured SFU URL (a consumer refuses a mismatch); 10312 coarse
+  presence; NIP-78 30078 claims are advisory display state, the claimant must be a member, and
+  the d-tag includes the home key. No new kinds.
+- **Licence disclosure (ADR-2030 decision 10).** The forum client shows a footer and about-page
+  link to Corresponding Source for the exact deployed commit; the NIP-11 `nostr_bbs` block
+  (`source_url`, `licence`, commit) supplements it. Today NIP-11 carries only `software`
+  (`nip11.rs:208`).
+
+**Pending invariants** (this document has no convention for proposed invariants, so they
+are not numbered above; each becomes an Invariant when its ADR is accepted and implemented):
+`nostr-bbs-core` has no AGPL crate in `cargo tree`; a mirror never stores a 39000-39003 not
+signed by the pinned home key and never emits one; for kinds other than 3900x, 30312 and 30078 under `visionclaw:dataspace:*`, addressable replacement never lets a late
+older event or a same-second higher id replace a newer one; those three families instead never let a lower `rev` replace a higher one; 3900x orders by (`rev`, `created_at`) with equal-`rev` changes of content rejected as equivocation; `created_at` of a 3900x is never bumped; a group backed by a zone has
+no membership event applied directly (9000, 9001, 9005, 9009, 9021, 9022 are routed or refused);
+the home signs no 39002 while a zone-backed group's projection is incoherent with the cohort;
+a 39002 older than L + S = 70 s denies, including joined sessions, and a removal closes every presence session and dataspace
+stream within D = 90 s (voice: D_voice = 150 s with the LiveKit API reachable, no bound during a partition); a mirror never accepts a snapshot that does not order strictly after its persisted
+per-kind `(rev, created_at, event id, content digest)` watermark, though it may rehydrate the exact accepted event; no
+`<content-ref>` outside the closed set is honoured; a 30312 whose `service` differs from the
+configured SFU URL is refused; `29` is not in `supported_nips` until the whole applicable
+gate passes (the forum-applicable tests among E1 to E6 of PLAN §6 and the coherence test), not E1 alone and not the downstream presence or voice gates.
+
+## Nostr kinds in use
+
+This document owns the registry of Nostr kinds the forum reads or writes. It lists the kinds
+that have an owning decision; it is not exhaustive for client-only or test-only kinds. Status
+is `live` when the code at `0065dd9` handles the kind, `partial`, or `proposed` when only an
+ADR names it. Add a row in the same change as any ADR that introduces or reuses a kind.
+
+| Kind | Use | Status | Owner |
+|---|---|---|---|
+| 13, 14, 1059 | NIP-59 seal, rumor, gift wrap (`nostr-bbs-core/src/gift_wrap.rs:30,33`) | live | ADR-2005, ADR-2025 |
+| 40, 41, 42 | NIP-28 channels, ban gate at `nip_handlers.rs:69` | live | legacy, no ledger record (ADR-2029 context lists the call sites) |
+| 21453 | zone-key grant rumor | live (staged) | ADR-2016; replaced by 1014 in ADR-2028 |
+| 9, 9000-9022 | NIP-29 chat and moderation: only the admin gate exists; zone-backed groups route membership events through the cohort | partial | ADR-2030 (proposed) |
+| 39000-39003 | NIP-29 relay-signed group state; every event carries `rev`; 39002 re-signed every 30 s while the projection is coherent (`proj`); 39000 carries the ADR-2032 descriptor | proposed | ADR-2030, ADR-2031, ADR-2032 |
+| 34550 | Anagram room definition (`room` profile) | proposed | ADR-2029 |
+| 1014 | NIP-171 ticket | proposed | ADR-2028 |
+| 30301, 30302 | kanban board and card (`nostr-bbs-core/src/kanban.rs:54,56`) | live | `kanban.rs` (no ledger record) |
+| 31922, 31923, 31925 | calendar events and RSVPs (`nostr-bbs-core/src/calendar.rs:34-38`) | live | `calendar.rs` (no ledger record) |
+| 30910-30916 | moderation actions, protected-read (`nip42.rs:44`; `moderation_events.rs:27`) | live | legacy, no ledger record |
+| 31400-31405 | agent control surface (`governance.rs:27`) | live | ADR-2010, ADR-2011 |
+| 30033 | mesh service list; an entry in the default federated-kind list (`nostr-bbs-mesh/src/config.rs:37`) | partial | archived ADR-074 D9 |
+| 23500 | DREAM transfer or tip, delivered to the chain producer's relays (`nostr-bbs-poker-citizen/src/net.rs:322`) | live (staged) | ADR-2015, ADR-2021 |
+| 22242, 27235 | NIP-42 AUTH (`relay_do/nip42.rs:29`), NIP-98 HTTP auth (`nostr-bbs-core/src/nip98.rs:1`) | live | `IDENTITY-keys-and-trust.md` |
+| 30312 | NIP-53 interactive room, one per space; carries `rev`, stored by `rev` | proposed, **deferred with voice** | ADR-2032, ADR-2031 |
+| 10312 | NIP-53 room presence | proposed | ADR-2032 |
+| 30078 | NIP-78 application data; claims are advisory display state | proposed | see d-tag table |
+
+**Kind 30078 d-tag namespaces** (kind 30078 is addressable by `d`; a new namespace needs a row):
+
+| d-tag | Use | Status | Owner |
+|---|---|---|---|
+| zone recovery and imported-epoch records (own `d` namespace, NIP-44 self-encrypted) | zone key recovery | proposed | ADR-2028 |
+| `visionflow:claim:<home-key-hex>:<group>:<spot>` | spot or seat claim, NIP-40 expiry 90 s, plaintext, claimant must be a member, advisory only | proposed | ADR-2032 |
+| `visionclaw:dataspace:*` | VisionClaw dataspace catalogue, including endpoint-less withdrawal replacements; the only 30078 namespace stored by `rev` (D1 `rev` migration); every other 30078 `d` tag keeps NIP-01 ordering | proposed | VisionClaw ADR-2161, ADR-2031 decision 7 |
+
+Obelisk's private kinds (20390, 31313, 31314, 25050-25052) and its 30078 d-tags are not
+adopted (ADR-2030).

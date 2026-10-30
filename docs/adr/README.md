@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_28 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_31 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -60,3 +60,6 @@ _28 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2027](ADR-2027-nip17-overlay-for-nostr-chat-interop.md) | Reach the nostr.chat cluster by NIP-17 routing changes only; keep NIP-28 channels; consume, never port, the double ratchet | 2026-10-20 | accepted | partial | inactive | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
 | [ADR-2028](ADR-2028-zones-adopt-nip171-key-plane.md) | Zones adopt the NIP-171 key plane and ticket format; board transport stays signed kind 42; one owner per zone | 2026-10-20 | proposed | none | inactive | ADR-2026 | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
 | [ADR-2029](ADR-2029-room-profile-deployment-type.md) | Offer a second deployment profile, "room", that speaks Anagram public rooms, NIP-171 private groups and NIP-17 DMs; the forum profile and the DreamLab board stay on NIP-28 | 2026-10-20 | proposed | none | inactive | — | — | DreamLab-AI/nostr-rust-forum maintainers | nostr-rust-forum |
+| [ADR-2030](ADR-2030-nip29-group-engine-from-the-spec.md) | Serve NIP-29 groups from a relay-signed engine written from the spec in an AGPL crate, with zone cohorts as the one membership authority | 2026-10-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
+| [ADR-2031](ADR-2031-federated-groups-have-one-home-and-verbatim-mirrors.md) | Federated groups have one home relay, pinned by pubkey, and mirrors that replicate its signed state verbatim | 2026-10-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
+| [ADR-2032](ADR-2032-a-space-is-a-nip29-group-with-a-signed-spatial-descriptor.md) | A space is a NIP-29 group with a relay-signed spatial descriptor, a NIP-53 interactive room and NIP-78 claims, using no new event kinds | 2026-10-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |

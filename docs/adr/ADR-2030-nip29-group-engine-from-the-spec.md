@@ -1,0 +1,81 @@
+---
+id: ADR-2030
+title: Serve NIP-29 groups from a relay-signed engine written from the spec in an AGPL crate, with zone cohorts as the one membership authority
+date: 2026-10-30
+decision_status: proposed
+implementation_status: none
+activation_status: inactive
+supersedes: []
+superseded_by: []
+verified_commit: 0065dd9fb0e98ccacfd29e344a3d00bb80b58a69
+owner: jjohare
+review_trigger: Any commit that adds a nostr-bbs-groups crate or a NIP-29 write or read gate to the relay; a request to project an encrypted zone into a group; NIP-29 changing 39000-39003 or the visibility flags; a decision to publish the engine under a permissive licence; any code ported from obelisk-relay
+repo: nostr-rust-forum
+---
+
+# ADR-2030 — Serve NIP-29 groups from a relay-signed engine written from the spec in an AGPL crate, with zone cohorts as the one membership authority
+
+## Context
+
+The relay advertises NIP-29 and implements none of it: it admin-gates 9000-9020 and 39000-39002 on an `h` tag and stores them as ordinary events. There is no group state, no membership check on kind 9, no 9021 handler or 39003, and kind 9 is world-readable. NIP-29 state carries `d`, so the gate refuses spec-correct 3900x. The relay signs no Nostr events; its NIP-11 `pubkey` is empty.
+Membership lives in zone cohorts (ADR-2014). The admin Access tab publishes 9000 (`p`, `cohort`) and 9005 (`e`) without `h`, which the gate refuses; its 9021 carries a `section` tag. ADR-2029 gives kind 9 an Anagram meaning in `room`.
+obelisk-relay, the NIP-29 relay surveyed, is AGPL-3.0-only, single-node and LMDB-bound, so it cannot run on Workers as it stands.
+`nostr-bbs-core` is `MIT OR Apache-2.0` and published; CI runs `cargo deny` only, which allows both.
+The operator owns the copyright of our AGPL estate (not obelisk's), so porting obelisk-relay code into our AGPL crates is permitted with its notice kept.
+Evidence: VisionClaw `docs/proposals/spatial-rooms/PLAN.md` §2, `research/02`, `research/05`, `AUDIT-DECISIONS.md`.
+
+## Decision
+
+Proposed:
+
+1. **The engine is a new crate, `nostr-bbs-groups`.** It is licensed AGPL-3.0-only, pure (no I/O), builds for `wasm32-unknown-unknown`, and is `?Send`. Group state is a fold over kinds 9000-9022 in the home's admission order (ADR-2031 decision 2), not in `(created_at, id)` order. It produces relay-signed 39000-39003, each carrying a monotonic `["rev", <u64>]` that orders state changes (round-2 C1); `created_at` is wall-clock time and orders only equal-`rev` heartbeats, which repeat identical content (ADR-2031 decision 2), implements the `private`, `closed`, `hidden` and `restricted` flags, 9021 join and 9022 leave, 9009 invite codes, and the `previous` timeline check. `nostr-bbs-relay-worker` consumes it. New builders (39003, roles, 9009, 9022) live in this crate, never in `nostr-bbs-core`.
+2. **Client-submitted 3900x are refused.** Only the engine writes 39000-39003, signed by the relay's group key, whose custody is ADR-2031 decision 6. The `h`-tag admin gate at `nip_handlers.rs:1298-1311` is replaced, not extended.
+3. **One membership authority for zone-backed groups (audit B4).** A group backed by a zone is a projection of the zone cohort (ADR-2014 lifecycle). The group is never edited directly, and a group never feeds a zone. Every membership-changing event on such a group is handled as follows, with no exception:
+   - 9000 (including the Access tab's 9000 with `cohort`), 9001 and 9005 from the admin Access tab: routed through the cohort authority; the relay then re-projects the result as its own 9000 or 9001. The event itself is never applied to the group.
+   - 9021 join and 9022 leave: routed as a request to the cohort authority (join becomes a cohort access request, leave a cohort removal), never applied to the group.
+   - 9009 invite codes: refused, because a code would admit someone outside the cohort.
+   - Projection lag denies, locally and for consumers (round-2 C2). If the group's folded membership is behind the cohort's current revision, the relay denies access to that group's kind 9 and gated state until the re-projection lands. It also stops signing 39002 (ADR-2031 decision 10), so remote consumers go stale within L + S and deny; a lagging member set is never kept fresh by re-signing. 39002 records `["proj", <cohort-rev>]`.
+   There are two membership-authority layers (final audit 15). A zone-backed group takes membership from its zone cohort, which authors it. A standalone group (no zone) takes membership from the home's own admitted NIP-29 event stream. In both cases the home signs the authoritative 39002 projection, and that signed projection is what mirrors and VisionClaw consume.
+4. **Visibility follows the flags, for reads as well as writes.** Kind 9 and the 39001 and 39002 of a `private` or `hidden` group are served only to members and to the bridge's read grant (decision 5). This needs read-gating beyond `PROTECTED_READ_KINDS`, because 30000-39999 is otherwise open (`nip42.rs:44`). A projected group never publishes a member list that its zone's visibility would hide.
+5. **The VisionClaw bridge reads under a scoped read grant, not membership (audit M7).** The bridge key's read access to private or hidden groups is a read grant that is separate from membership. It never confers write, never appears in 39002, and the forum issues and revokes it (the grant check at the forum is immediate; consumers of the resulting membership state are bound by D = 90 s, ADR-2031 decision 4, with its one voice exception). Without a grant the bridge key sees only what a non-member sees. The read grant is never evidence of membership or administration: it adds no 39002 entry and no write authority. The bridge's kind 9 post still needs the bridge to be a member of the target group, a separately granted membership that is the forum's choice per group.
+6. **Dialect rule, amending ADR-2029.** In the `forum` profile NIP-29 groups are available, kind 9 carries `h`, and channels stay kind 42, so nothing collides. In the `room` profile NIP-29 is disabled in v1, the relay rejects `h`-tagged kind 9, and it never advertises 29. This keeps the D1 dialect pin of ADR-2029 decision 2 meaningful. The follow-up in ADR-2029 decision 7 that removes the NIP-29 builders does not proceed for the client-side builders, because the `forum` profile now claims them.
+7. **Encryption boundary, with ADR-2028.** A NIP-29 space is relay-gated: the relay reads its messages. End-to-end private groups remain NIP-171 zones (ADR-2028, ADR-2016). In this ADR "group" means a NIP-29 group; ADR-2028's "group identity" is a per-zone NIP-171 key and is unrelated. Spatial rooms in XR v1 do not depend on end-to-end encryption. **Deferred (operator, 2026-10-30):** how encrypted zones relate to NIP-29 spaces is decided when group federation is first used, not now. Until then an `encrypted = true` zone is not projected into a group, and the in-flight encrypted-zone work (ADR-2016, ADR-2028) continues unchanged; nothing here constrains it.
+8. **Phase-0 defects ship first, independent of the engine.**
+   - Remove `29` from `supported_nips` (`nip11.rs:207`) until the read and write gate exists. Restoring the advertisement needs the whole applicable gate (round-2 C9), not E1 alone: the forum-applicable tests among E1 to E6 of PLAN §6 (the expectations section), plus the cohort-coherence test of ADR-2031 decision 10. The gate is feature-specific: it does not require the presence, voice or dataspace tests (for example E4, E5 and E10), and it does not wait for any downstream VisionClaw service to be running. It is restored only when all of its tests pass.
+   - Fix or delete `create_group_metadata` (`groups.rs:137-152`) so no builder tags 39000 with `h`. It has no callers (repository grep at `0065dd9`). Core is published, so deletion is a breaking API change.
+   - Add a CI step that fails if any AGPL-licensed crate appears in `cargo tree -p nostr-bbs-core`. `cargo deny` cannot express this.
+9. **Licence and provenance (PLAN §2, revised 2026-10-30).**
+   - AGPL-3.0-only is the outbound licence of the engine. It is a policy choice by the owner of the copyright, not evidence of where the code came from.
+   - obelisk-relay code (AGPL-3.0-only) may be ported into `nostr-bbs-groups`. A ported file keeps the upstream copyright notice (Daniel Cadenas / verse-pbc) and is listed in a `NOTICE` entry giving its origin and upstream commit. The engine is still written against NIP-01, -11, -29, -40, -42, -53, -77 and -78, because obelisk's I/O is bound to LMDB and git-only crates. Pieces may be lifted where they help (visibility edge cases, invite-code policy, WoT breadth-first search). MIT code in obelisk-agents and obelisk-menhir may be lifted with its MIT notice.
+   - Every source file in the crate carries a header marking it `own` or `derived (obelisk-relay)`, and CI fails on an unmarked file. Derived code can never be relicensed permissively, because we do not hold its copyright. Own code may be, at the owner's decision. The read set recorded on 2026-10-30 (obelisk-relay `src/group.rs`, `groups.rs`, `wot*.rs`, `relay_invites.rs` at `6660585`; obelisk `src/services/wot/*` at `87db8e5`; research report 02's wider list) stays in the research record so a later permissive release of the `own` files can be judged.
+   - Unlicensed repositories (obelisk-sky, -sfu, -apps, -design) are ideas-only: protocol facts and patterns, never code, assets or copy. Obelisk's private kinds (20390, 31313, 31314, 25050-25052) and 30078 d-tags are not adopted.
+   - `nostr-bbs-core` never depends on an AGPL crate and never contains derived code.
+10. **The source offer is a user-facing link (audit M10, AGPL section 13).** The forum client shows a prominent link, in its footer and on its about page, to the Corresponding Source for the exact deployed commit. The `nostr_bbs` block of the NIP-11 document carries `source_url`, `licence` and that commit, built from the commit the Worker was built from, as a supplement. Today NIP-11 carries only `software` (`nip11.rs:208`). The test is that the link resolves to the deployed commit; field presence alone does not pass.
+11. **Activation is a gate, ordered across the estate (round-2 C9).** `depends_on` lists code dependencies only; activation prerequisites are listed here. This ADR activates at step 3 of the estate order (agentbox 2162; VisionClaw 2159 then 2161 for `public` and `dids`; forum 2030 then 2031; VisionClaw 2157 then 2161 for `space:`; VisionClaw 2160). It is not a prerequisite of VisionClaw 2161 `public` or `dids`, and VisionClaw ADR-2161 must not depend on ADRs 2030 to 2032 for activation.
+12. **Built in parallel, off by default (operator, 2026-10-30).** The engine and gates are built alongside the in-flight forum work and ship dark:
+    - `NIP29_GROUPS_ENABLED` (Worker env, default `"false"` in every deployed profile, like `PUSH_ENABLED`) switches the engine, the read and write gates, the zone projection and the 39000-39003 signer on together. While false the relay behaves exactly as today, apart from the phase-0 fixes in decision 8, which ship regardless.
+    - `29` appears in NIP-11 only while the switch is on *and* the decision 11 gate has passed.
+    - Turning it off again stops signing and gating at once; stored group events stay in place and are served under today's rules. No data migration runs either way except the ADR-2031 decision 7 schema change, which is additive.
+    - CI runs the full group test suite with the switch on, so the dark code is exercised continuously.
+
+## Consequences
+
+- Easy: the relay can state truthfully what it implements; a space is a standard NIP-29 group that other NIP-29 clients read; zone cohorts stay the single store (ADR-2014), so no second member table drifts; individual obelisk pieces can be reused with attribution.
+- Hard: the relay gains a long-lived signing key and the engine's folded state needs D1 tables and cache behaviour that fit ADR-2018. A bug in the cohort projection is an access bug, and projection lag now denies access and stops 39002 signing, so a slow projection is visible to users and to every remote consumer within L + S. The Access tab must be reworked to call the cohort path; today its 9000 and 9005 carry no `h` and the gate refuses them.
+- Foreclosed: manual membership edits, invite codes and direct join or leave on a zone-backed group; group membership feeding zone cohorts; relicensing derived files permissively; NIP-29 groups in the `room` profile in v1. Deferred, not foreclosed: projecting an encrypted zone (decision 7).
+- VisionClaw's bridge posts kind 9 with `["h","visionclaw-activity"]` (`src/services/nostr_bridge.rs` in the VisionClaw repository). Once kind 9 is membership-gated it is refused unless that group exists and the bridge key is a member; in a `room` deployment it is refused outright. Reading private groups needs the grant in decision 5.
+- Open questions, not decided here: the config shape of the zone-to-group binding and how a group's flags derive from zone visibility.
+- Rejected: (a) porting obelisk-relay's whole engine: LMDB and git-only dependencies and a rewrite of its I/O for Workers for little gain (individual pieces remain allowed); (b) a third `nip29` dialect in ADR-2029's `CHANNEL_DIALECT`: kind 9 with `h` and channels on kind 42 do not collide in `forum`; (c) a separate NIP-29 member table: double-store drift against ADR-2014; (d) putting the engine in `nostr-bbs-core`: it would put AGPL code in an MIT or Apache crate; (e) making the bridge a group member to read: membership appears in 39002 and implies write.
+- Revisit if NIP-29 changes the state kinds, if NIP-171 or NIP-EE offers end-to-end groups with relay moderation, if the owner decides to relicense `own` files, or if obelisk's team licenses its unlicensed repositories.
+
+## Verification
+
+None: no implementation. Present-state claims were checked against the working tree at `0065dd9fb0e98ccacfd29e344a3d00bb80b58a69` by reading these lines:
+- NIP-29 advertised: `crates/nostr-bbs-relay-worker/src/nip11.rs:207`; NIP-11 `pubkey` empty: `nip11.rs:140,191`; `software` only: `nip11.rs:208`.
+- Admin gate on `h`: `relay_do/nip_handlers.rs:52-54,1298-1311` (the `h` check is `:1303`; the TODO is `:1300`).
+- Kind 9 not protected-read: `relay_do/nip42.rs:44`.
+- Builders: `nostr-bbs-core/src/groups.rs:137-152` (the `h` tag is `:146`), `:254` (`d`). No callers outside the file, by repository-wide grep for `create_group_metadata`, `build_group_metadata` and `create_group_message`.
+- The relay signs no Nostr events: a grep of `nostr-bbs-relay-worker/src` finds only a VAPID JWT signer (`push.rs:347`) and test code.
+- Access tab: `nostr-bbs-forum-client/src/admin/section_requests.rs:68,88,337,383`.
+- Licences: `nostr-bbs-core/Cargo.toml:6`, `Cargo.toml:64`, `deny.toml`, `.github/workflows/ci.yml:235-257`.
+Adoption requires: a relay integration test that a non-member's kind 9 to a `closed` group is rejected (E1); a unit test that a client-submitted 39000 is refused and a `d`-tagged one from the relay key is served; a unit test that the fold follows admission order; for a zone-backed group, one test per event (9000 with and without `cohort`, 9001, 9005, 9009, 9021, 9022) showing it is refused or routed and never applied directly, and a test that a lagging projection denies access and that the home stops signing 39002 and records `proj` otherwise (the failing-projection test of ADR-2031 decision 10, with signer and network healthy); a unit test that every engine-signed 3900x carries a `rev` that increases on each state change; a test that a bridge key with a read grant reads a `private` group's kind 9 but cannot write and is absent from 39002, and that revoking the grant stops reads and ends any open read subscription within D; a test that `private` group kind 9 and 39002 are not served to a non-member; the `cargo tree` step failing on a deliberately added AGPL dependency; CI failing on a source file with no `own` or `derived` header; a NIP-11 test that `29` is absent until every applicable gate test passes and `source_url`, `licence` and `commit` are present after, and a client test that the footer link resolves to the deployed commit.
