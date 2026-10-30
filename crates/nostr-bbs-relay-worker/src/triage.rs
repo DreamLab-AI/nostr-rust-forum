@@ -18,6 +18,8 @@ use serde_json::json;
 
 /// Flag variable (default off).
 pub const FLAG: &str = "JEV_TRIAGE";
+/// Per-consumer privacy switch: when `1`/`true` triage refuses cloud endpoints.
+pub const LOCAL_ONLY_FLAG: &str = "JEV_TRIAGE_LOCAL_ONLY";
 /// Version of the question set; stored with every row and logged.
 pub const QUESTION_SET_VERSION: &str = "forum-moderation-triage/1";
 /// Posts examined per cron tick (each is one <=4 s call, sequential).
@@ -252,7 +254,11 @@ pub async fn run_sweep(env: &Env) {
     let lookup = nostr_bbs_jev::fetch::env_lookup(env);
     // Resolver is only consulted for the flag here; FlagOff is silent and
     // touches nothing.
-    let cfg = match nostr_bbs_jev::resolve(&lookup, FLAG, false) {
+    let cfg = match nostr_bbs_jev::resolve(
+        &lookup,
+        FLAG,
+        nostr_bbs_jev::local_only(&lookup, LOCAL_ONLY_FLAG),
+    ) {
         Ok(c) => c,
         Err(Fallback::FlagOff) => return,
         Err(why) => {

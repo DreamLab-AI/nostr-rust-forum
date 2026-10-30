@@ -155,3 +155,13 @@ the other dialect against a pinned database is refused; a client test that the c
 survives a definition edit; one scratch `room` deployment read by a nostr.chat tab with a room,
 a reply with quote, an edit older than a week, a reaction and a deletion each rendered as the
 profile says; and the documentation set in decision 9 present in the same change.
+
+## Amendment (ADR-2030, proposed)
+
+[ADR-2030](ADR-2030-nip29-group-engine-from-the-spec.md) adds NIP-29 groups to the `forum` profile, where kind 9 carries `h`, and disables them in `room`, where the relay rejects an `h`-tagged kind 9. This keeps the dialect pin of decision 2 meaningful and leaves decision 3's Anagram kind 9 (one `a` tag) untouched. Three statements here change:
+
+- Decision 5, last bullet: the relay advertises NIP-29 in `forum` only once the group read and write gate exists, and never in `room`. Until then it stays out of both.
+- Consequences, last bullet, "the relay keeps accepting plain kind 9 from members": in `room` an `h`-tagged kind 9 is refused.
+- Decision 7: the follow-up that removes the NIP-29 builders does not proceed for the client-side builders, because the `forum` profile claims them. ADR-2030 puts new engine builders in `nostr-bbs-groups`, not in core.
+
+Decisions 1 to 4, 6, 8 and 9 are unchanged.

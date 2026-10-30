@@ -1,9 +1,9 @@
 ---
 title: Identity, Keys & Trust — nostr-rust-forum
 doc_id: NRF-IDENTITY
-version: 0.1.1
+version: 0.1.2
 status: draft-for-ratification
-verified_commit: fb9ef30 (working tree; ADR-2025 amendment)
+verified_commit: 0065dd9 (pending-keys section only; older sections keep their earlier stamps)
 sources:
   - crates/nostr-bbs-core/src/keys.rs
   - crates/nostr-bbs-auth-worker/src/devices.rs
@@ -195,3 +195,41 @@ See the [forum review](../../VisionFlow/docs/estate-review/forum-decisions.md) f
 ## Source qualification — 2026-09-07
 
 Device keys remain default-off under the exact string `"true"`, with a gate at both worker entrypoints. The current implementation shares the pure `core_device_keys_enabled` predicate (`nostr-bbs-core/src/feature_gate.rs`) while the auth worker (`devices.rs:91-104`) and relay worker (`nip_handlers.rs:1649-1663`) independently read and enforce their environment value. Read older “duplicated rather than shared” descriptions in light of [ADR-2004's dated qualification](adr/ADR-2004-device-keys-default-off-dual-worker-gate.md#source-qualification--2026-09-07). Sharing the predicate does not prove live revocation, reconnect or session-cache behaviour; deployment acceptance remains separate.
+
+## Pending: relay group-signing key and group admission — ADR-2030, ADR-2031 (proposed)
+
+Not live. The relay worker holds no signing key at `0065dd9` and publishes an empty NIP-11
+`pubkey` (`crates/nostr-bbs-relay-worker/src/nip11.rs:140,191`). ADR-2030 has the relay sign
+NIP-29 39000-39003 and ADR-2031 pins a space to that key, so adopting them adds a long-lived
+relay key whose pubkey is the home identity of every space it homes. The proposed rules:
+
+- **Custody (ADR-2031 decision 6).** The signing key is separate from the administrator contact
+  (NIP-11 `pubkey`) and from the relay-to-relay federation AUTH key (archived ADR-073 D4). It is
+  held in Worker secrets, never in the repository or `wrangler.toml`.
+- **Pinning (decision 1).** The operator pins the home key in configuration, out of band. It is
+  never adopted on first use from NIP-11 `self`, which is advertised for discovery only; a
+  mismatch with the pin is an error.
+- **Rotation (decisions 6 and 8).** The key is rotated only by a deliberate re-home, which is a
+  fork: a new space with fresh membership. Compromise lets the holder sign state until the
+  operators re-home; there is no revocation or move.
+- **Freshness (decision 4).** Trust in a mirrored membership list lasts L + S = 70 s from the
+  home's `created_at` on its last 39002 (L = 60 s lease, S = 10 s clock-error budget); after that
+  the list is stale and access is denied. Presence sessions and dataspace streams close within
+  D = 90 s of removal at the home. Voice needs a reachable LiveKit API and is bound by
+  D_voice = 150 s, with a documented partition exception that needs operator sign-off.
+  State order uses the home's monotonic `rev`; `created_at` is wall-clock only and orders
+  only equal-`rev` heartbeats (identical content).
+- **Coherence (decision 10).** For a zone-backed group the home signs 39002 only while the
+  projection is coherent with the cohort authority (`["proj", <cohort-rev>]`); on lag or failure
+  it stops signing, so a removed cohort member cannot be kept fresh.
+- **One key per role.** The group-signing key is not the VisionClaw node federation key, which
+  agentbox holds (round-2 C5), and VisionClaw holds no group-signing key.
+- **Bridge read grant (ADR-2030 decision 5).** VisionClaw's bridge key reads private groups under
+  a forum-issued grant that is separate from membership: it confers no write, never appears in
+  39002, and is revoked by the forum.
+
+Group admission has two layers: for a zone-backed group it is derived from zone cohorts
+(ADR-2014); a standalone group takes membership from the home's admitted NIP-29 event stream. The
+home signs the authoritative 39002 either way. Neither adds a new trust level; gift-wrap
+admission (invariant 4) is unchanged. No invariant is added until the ADRs are accepted and
+implemented.

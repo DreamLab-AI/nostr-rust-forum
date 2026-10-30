@@ -119,6 +119,16 @@ impl std::fmt::Debug for JevConfig {
     }
 }
 
+/// Whether a consumer is local-only: its own `<flag>` var (for example
+/// `JEV_RATIONALE_CHECK_LOCAL_ONLY`) must equal `1`/`true`. Default off, so
+/// the shared proxy and the TypeSafe step are allowed unless an operator
+/// opts a consumer into private routing.
+pub fn local_only(lookup: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
+    lookup(name)
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false)
+}
+
 /// Resolve the endpoint (contract §2, first match wins).
 ///
 /// `lookup` reads a worker var or secret by name. `flag_var` is the
@@ -511,6 +521,34 @@ mod tests {
             ("AGENTBOX_SYSTEM_ONE_BACKEND_LOCAL", "1"),
         ]);
         assert!(resolve(&e, "JEV_X", true).is_ok());
+    }
+
+    #[test]
+    fn not_local_only_allows_proxy_and_vendor() {
+        let e = env(&[
+            ("JEV_X", "1"),
+            ("AGENTBOX_SYSTEM_ONE_PROXY", "1"),
+            ("AGENTBOX_SYSTEM_ONE_ENDPOINT", "http://p"),
+            ("AGENTBOX_SYSTEM_ONE_MODEL", "m"),
+            ("AGENTBOX_SYSTEM_ONE_BACKEND_LOCAL", "0"),
+        ]);
+        let c = resolve(&e, "JEV_X", false).unwrap();
+        assert_eq!((c.endpoint.as_str(), c.bearer), ("http://p", None));
+        assert_eq!(resolve(&e, "JEV_X", true), Err(Fallback::NoEndpoint));
+        let e = env(&[("JEV_X", "1"), ("TYPESAFE_API_KEY", "v")]);
+        assert!(resolve(&e, "JEV_X", false).is_ok());
+    }
+
+    #[test]
+    fn local_only_flag_is_env_driven_and_defaults_off() {
+        let e = env(&[]);
+        assert!(!local_only(&e, "JEV_X_LOCAL_ONLY"));
+        let e = env(&[("JEV_X_LOCAL_ONLY", "0")]);
+        assert!(!local_only(&e, "JEV_X_LOCAL_ONLY"));
+        let e = env(&[("JEV_X_LOCAL_ONLY", "1")]);
+        assert!(local_only(&e, "JEV_X_LOCAL_ONLY"));
+        let e = env(&[("JEV_X_LOCAL_ONLY", "true")]);
+        assert!(local_only(&e, "JEV_X_LOCAL_ONLY"));
     }
 
     #[test]

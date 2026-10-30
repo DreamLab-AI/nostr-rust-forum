@@ -18,6 +18,8 @@ use std::collections::HashMap;
 pub const QUESTION_SET_VERSION: &str = "forum-search-rerank/1";
 /// Flag variable (default off).
 pub const FLAG: &str = "JEV_SEARCH_RERANK";
+/// Per-consumer privacy switch: when `1`/`true` rerank refuses cloud endpoints.
+pub const LOCAL_ONLY_FLAG: &str = "JEV_SEARCH_RERANK_LOCAL_ONLY";
 /// Number of leading hits that may be reordered.
 pub const HEAD_CAP: usize = 10;
 /// Max characters of a stored snippet.
