@@ -197,7 +197,7 @@ mod tests {
                 tags,
                 content: content.into(),
             },
-            &SigningKey::from_bytes(&sk).unwrap(),
+            &SigningKey::from_bytes((&sk).into()).unwrap(),
         )
         .unwrap()
     }

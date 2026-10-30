@@ -253,7 +253,8 @@ mod tests {
     #[test]
     fn every_fallback_trigger() {
         let sn = snips(3);
-        let cases: Vec<(Result<(u16, String), TransportError>, Fallback)> = vec![
+        type Case = (Result<(u16, String), TransportError>, Fallback);
+        let cases: Vec<Case> = vec![
             (Err(TransportError::Timeout), Fallback::Timeout),
             (Err(TransportError::Other), Fallback::Transport),
             (Ok((503, "".into())), Fallback::Http(503)),

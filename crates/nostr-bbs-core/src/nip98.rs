@@ -219,7 +219,7 @@ pub fn create_token_at(
     body: Option<&[u8]>,
     created_at: u64,
 ) -> Result<String, Nip98Error> {
-    let sk = SigningKey::from_bytes(secret_key)?;
+    let sk = SigningKey::from_bytes((secret_key).into())?;
     let pubkey = hex::encode(sk.verifying_key().to_bytes());
 
     let mut tags = vec![
@@ -643,7 +643,7 @@ mod tests {
     }
 
     fn test_signing_key() -> SigningKey {
-        SigningKey::from_bytes(&test_secret_key()).unwrap()
+        SigningKey::from_bytes((&test_secret_key()).into()).unwrap()
     }
 
     // ── Roundtrip ──────────────────────────────────────────────────────

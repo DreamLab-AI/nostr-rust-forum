@@ -99,7 +99,9 @@ fn clip(s: &str) -> String {
     s.chars().take(TEXT_MAX_CHARS).collect()
 }
 
-/// Canonical JSON: object keys sorted recursively, compact.
+/// Canonical JSON: object keys sorted recursively, compact. Test-only: the
+/// worker itself hashes the vendored rubric bytes, not a re-serialisation.
+#[cfg(test)]
 pub fn canonical_json(v: &Value) -> String {
     fn sorted(v: &Value) -> Value {
         match v {

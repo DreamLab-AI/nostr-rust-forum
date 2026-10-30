@@ -48,13 +48,13 @@ impl SecretKey {
     /// secp256k1 scalar (i.e. zero or >= curve order).
     pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, KeyError> {
         // Validate by attempting to construct a k256 SigningKey
-        SigningKey::from_bytes(&bytes).map_err(|_| KeyError::InvalidSecretKey)?;
+        SigningKey::from_bytes((&bytes).into()).map_err(|_| KeyError::InvalidSecretKey)?;
         Ok(Self { bytes })
     }
 
     /// Derive the x-only public key (BIP-340).
     pub fn public_key(&self) -> PublicKey {
-        let sk = SigningKey::from_bytes(&self.bytes)
+        let sk = SigningKey::from_bytes((&self.bytes).into())
             .expect("SecretKey invariant: bytes are always valid");
         let vk = sk.verifying_key();
         let mut pk_bytes = [0u8; 32];
@@ -64,7 +64,7 @@ impl SecretKey {
 
     /// Sign a 32-byte message hash using Schnorr BIP-340.
     pub fn sign(&self, message: &[u8; 32]) -> Result<Signature, KeyError> {
-        let sk = SigningKey::from_bytes(&self.bytes)
+        let sk = SigningKey::from_bytes((&self.bytes).into())
             .expect("SecretKey invariant: bytes are always valid");
         let mut aux_rand = [0u8; 32];
         getrandom::getrandom(&mut aux_rand).expect("getrandom for aux_rand");
@@ -94,7 +94,7 @@ pub struct PublicKey {
 impl PublicKey {
     /// Construct from raw 32-byte x-only public key.
     pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, KeyError> {
-        VerifyingKey::from_bytes(&bytes).map_err(|_| KeyError::InvalidPublicKey)?;
+        VerifyingKey::from_bytes((&bytes).into()).map_err(|_| KeyError::InvalidPublicKey)?;
         Ok(Self { bytes })
     }
 
@@ -111,7 +111,7 @@ impl PublicKey {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&decoded);
         // Validate that the bytes represent a point on the curve
-        VerifyingKey::from_bytes(&bytes).map_err(|_| KeyError::InvalidPublicKey)?;
+        VerifyingKey::from_bytes((&bytes).into()).map_err(|_| KeyError::InvalidPublicKey)?;
         Ok(Self { bytes })
     }
 
@@ -122,7 +122,8 @@ impl PublicKey {
 
     /// Verify a BIP-340 Schnorr signature over a 32-byte message hash.
     pub fn verify(&self, message: &[u8; 32], sig: &Signature) -> Result<(), KeyError> {
-        let vk = VerifyingKey::from_bytes(&self.bytes).map_err(|_| KeyError::InvalidPublicKey)?;
+        let vk = VerifyingKey::from_bytes((&self.bytes).into())
+            .map_err(|_| KeyError::InvalidPublicKey)?;
         let k256_sig = k256::schnorr::Signature::try_from(sig.bytes.as_slice())
             .map_err(|_| KeyError::InvalidSignature)?;
         vk.verify_raw(message, &k256_sig)
@@ -175,7 +176,7 @@ pub fn pubkey_hex(secret_key: &[u8; 32]) -> Result<String, KeyError> {
 
 /// Create a [`SigningKey`] from a 32-byte secret.
 pub fn signing_key_from_bytes(secret_key: &[u8; 32]) -> Result<SigningKey, KeyError> {
-    SigningKey::from_bytes(secret_key).map_err(|_| KeyError::InvalidSecretKey)
+    SigningKey::from_bytes((secret_key).into()).map_err(|_| KeyError::InvalidSecretKey)
 }
 
 // ── Key derivation ──────────────────────────────────────────────────────────

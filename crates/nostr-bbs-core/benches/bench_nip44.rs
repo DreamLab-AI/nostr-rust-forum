@@ -1,7 +1,7 @@
 //! Benchmarks for NIP-44 v2 encrypt/decrypt at various payload sizes.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use k256::{elliptic_curve::sec1::ToEncodedPoint, SecretKey};
+use k256::{elliptic_curve::sec1::ToSec1Point, SecretKey};
 use nostr_bbs_core::nip44;
 
 fn random_keypair() -> ([u8; 32], [u8; 32]) {
@@ -13,7 +13,7 @@ fn random_keypair() -> ([u8; 32], [u8; 32]) {
     }
     let sk = SecretKey::from_bytes((&sk_bytes).into()).unwrap();
     let pk = sk.public_key();
-    let pk_point = pk.to_encoded_point(true);
+    let pk_point = pk.to_sec1_point(true);
     let pk_bytes: [u8; 32] = pk_point.as_bytes()[1..33].try_into().unwrap();
     let sk_bytes: [u8; 32] = sk.to_bytes().as_slice().try_into().unwrap();
     (sk_bytes, pk_bytes)

@@ -61,8 +61,8 @@ pub fn create_deletion_event(
         }
     }
 
-    let signing_key =
-        SigningKey::from_bytes(privkey).map_err(|e| DeletionError::InvalidKey(e.to_string()))?;
+    let signing_key = SigningKey::from_bytes((privkey).into())
+        .map_err(|e| DeletionError::InvalidKey(e.to_string()))?;
     let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
 
     let tags: Vec<Vec<String>> = target_ids
@@ -106,7 +106,7 @@ mod tests {
 
     fn test_signing_key() -> (SigningKey, [u8; 32]) {
         let secret = [0x01u8; 32];
-        let sk = SigningKey::from_bytes(&secret).unwrap();
+        let sk = SigningKey::from_bytes((&secret).into()).unwrap();
         (sk, secret)
     }
 

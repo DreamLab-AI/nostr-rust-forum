@@ -228,8 +228,8 @@ pub fn create_calendar_event(
         }
     }
 
-    let signing_key =
-        SigningKey::from_bytes(privkey).map_err(|e| CalendarError::InvalidKey(e.to_string()))?;
+    let signing_key = SigningKey::from_bytes((privkey).into())
+        .map_err(|e| CalendarError::InvalidKey(e.to_string()))?;
     let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
 
     let d_tag = random_d_tag();
@@ -299,8 +299,8 @@ pub fn create_date_calendar_event(
         }
     }
 
-    let signing_key =
-        SigningKey::from_bytes(privkey).map_err(|e| CalendarError::InvalidKey(e.to_string()))?;
+    let signing_key = SigningKey::from_bytes((privkey).into())
+        .map_err(|e| CalendarError::InvalidKey(e.to_string()))?;
     let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
 
     let d_tag = random_d_tag();
@@ -396,8 +396,8 @@ pub fn create_rsvp(
         return Err(CalendarError::InvalidEventId(event_id.to_string()));
     }
 
-    let signing_key =
-        SigningKey::from_bytes(privkey).map_err(|e| CalendarError::InvalidKey(e.to_string()))?;
+    let signing_key = SigningKey::from_bytes((privkey).into())
+        .map_err(|e| CalendarError::InvalidKey(e.to_string()))?;
     let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
 
     let tags = vec![

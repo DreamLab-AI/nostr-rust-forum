@@ -58,7 +58,7 @@ fn bench_schnorr_sign_hoisted(c: &mut Criterion) {
     let sk = keys::signing_key_from_bytes(kp.secret.as_bytes()).unwrap();
     let msg: [u8; 32] = Sha256::digest(b"benchmark message").into();
     c.bench_function("keys_schnorr_sign_hoisted", |b| {
-        b.iter(|| sk.sign_prehash_with_aux_rand(&msg, &[0u8; 32]).unwrap());
+        b.iter(|| sk.sign_raw(&msg, &[0u8; 32]).unwrap());
     });
 }
 
@@ -67,7 +67,7 @@ fn bench_schnorr_verify_hoisted(c: &mut Criterion) {
     let sk = keys::signing_key_from_bytes(kp.secret.as_bytes()).unwrap();
     let vk = sk.verifying_key();
     let msg: [u8; 32] = Sha256::digest(b"benchmark message").into();
-    let sig = sk.sign_prehash_with_aux_rand(&msg, &[0u8; 32]).unwrap();
+    let sig = sk.sign_raw(&msg, &[0u8; 32]).unwrap();
     c.bench_function("keys_schnorr_verify_hoisted", |b| {
         b.iter(|| vk.verify_prehash(&msg, &sig).unwrap());
     });

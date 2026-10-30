@@ -477,7 +477,7 @@ mod tests {
     use nostr_bbs_core::event::{sign_event_deterministic, UnsignedEvent};
 
     fn ref_sk() -> SigningKey {
-        SigningKey::from_bytes(&[0x07u8; 32]).unwrap()
+        SigningKey::from_bytes((&[0x07u8; 32]).into()).unwrap()
     }
     fn ref_pk() -> String {
         hex::encode(ref_sk().verifying_key().to_bytes())

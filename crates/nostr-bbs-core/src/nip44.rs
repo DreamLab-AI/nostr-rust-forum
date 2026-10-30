@@ -152,7 +152,7 @@ fn map_upstream_err(e: UpstreamError) -> Nip44Error {
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-    use k256::{elliptic_curve::sec1::ToEncodedPoint, SecretKey as K256SecretKey};
+    use k256::{elliptic_curve::sec1::ToSec1Point, SecretKey as K256SecretKey};
 
     /// Generate a random keypair for testing. Uses k256 for parity with the
     /// pre-absorption test harness so existing test bodies stay verbatim.
@@ -165,7 +165,7 @@ mod tests {
         }
         let sk = K256SecretKey::from_bytes((&sk_bytes).into()).unwrap();
         let pk = sk.public_key();
-        let pk_point = pk.to_encoded_point(true);
+        let pk_point = pk.to_sec1_point(true);
         let pk_bytes: [u8; 32] = pk_point.as_bytes()[1..33].try_into().unwrap();
         let sk_bytes: [u8; 32] = sk.to_bytes().as_slice().try_into().unwrap();
         (sk_bytes, pk_bytes)

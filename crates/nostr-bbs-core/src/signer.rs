@@ -164,7 +164,7 @@ impl Signer for PrfSigner {
     async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<NostrEvent, SignerError> {
         // Build the k256 signing key from raw bytes
         let sk_bytes = self.keypair.secret.as_bytes();
-        let signing_key = k256::schnorr::SigningKey::from_bytes(sk_bytes)
+        let signing_key = k256::schnorr::SigningKey::from_bytes((sk_bytes).into())
             .map_err(|e| SignerError::SigningFailed(e.to_string()))?;
 
         sign_event(unsigned, &signing_key).map_err(SignerError::from)

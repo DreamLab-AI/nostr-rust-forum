@@ -4,6 +4,28 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.19] - 2026-10-29
+
+### Changed (breaking)
+
+- **RustCrypto 0.14 line:** `k256` 0.14, `elliptic-curve` 0.14, `crypto-bigint` 0.7,
+  `signature` 3 (closes RUSTSEC-2026-0387). The public API exposes these types, so callers must be on
+  `k256` 0.14 (they cannot mix with 0.13 types):
+  - every signing entry point taking or returning `k256::schnorr::SigningKey`/`VerifyingKey`
+    (`event::sign_event`, `sign_event_deterministic`, `signing_key_to_upstream`, `keys::signing_key_from_bytes`,
+    the `nip98`, `gift_wrap`, `sealed`, `groups`, `deletion`, `calendar`, `kanban` builders);
+  - `nip98::Nip98Error::InvalidKey(#[from] k256::schnorr::Error)` now wraps the `signature` 3 error type;
+  - with the `did` feature: `did::XOnly::from_public_key`, `to_even_public_key` and `parse_multibase_sec1`
+    use `k256::PublicKey` 0.14.
+  Behaviour and wire output are unchanged; the existing fixtures pass byte for byte.
+- On wasm32 the crate enables `getrandom` 0.4's `wasm_js` feature, which the 0.14 line requires.
+
+### Added
+
+- `tests/bip340_vectors.rs`: the 19 official BIP-340 vectors executed against signing and verification.
+- `tests/nip01_vectors.rs`: NIP-01 id/serialisation vectors, sign/verify round trip, cross-check against the
+  upstream `nostr` crate (libsecp256k1), tamper rejection.
+
 ## [1.0.0-beta.18] - 2026-10-19
 
 ### Licence (applies from 1.0.0-beta.18, merged 2026-10-20)

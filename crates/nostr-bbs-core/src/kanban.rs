@@ -470,8 +470,8 @@ pub fn create_board(
     d_tag: Option<String>,
 ) -> Result<NostrEvent, KanbanError> {
     validate_board(title, columns, approval_columns)?;
-    let signing_key =
-        SigningKey::from_bytes(privkey).map_err(|e| KanbanError::InvalidKey(e.to_string()))?;
+    let signing_key = SigningKey::from_bytes((privkey).into())
+        .map_err(|e| KanbanError::InvalidKey(e.to_string()))?;
     let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
     let mut tags = board_tags(
         title,
@@ -568,8 +568,8 @@ fn validate_card(input: &CardInput) -> Result<(), KanbanError> {
 /// Create or republish a kanban card (kind 30302) with a private key.
 pub fn create_card(privkey: &[u8; 32], input: &CardInput) -> Result<NostrEvent, KanbanError> {
     validate_card(input)?;
-    let signing_key =
-        SigningKey::from_bytes(privkey).map_err(|e| KanbanError::InvalidKey(e.to_string()))?;
+    let signing_key = SigningKey::from_bytes((privkey).into())
+        .map_err(|e| KanbanError::InvalidKey(e.to_string()))?;
     let pubkey = hex::encode(signing_key.verifying_key().to_bytes());
     let unsigned = UnsignedEvent {
         pubkey,

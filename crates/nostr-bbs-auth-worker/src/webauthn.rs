@@ -1697,7 +1697,7 @@ mod tests {
         use p256::ecdsa::SigningKey;
         let signing_key = SigningKey::from_bytes(&[0x42; 32].into()).unwrap();
         let verifying_key = signing_key.verifying_key();
-        let encoded_point = verifying_key.to_encoded_point(false);
+        let encoded_point = verifying_key.to_sec1_point(false);
         let x: [u8; 32] = encoded_point.x().unwrap().as_slice().try_into().unwrap();
         let y: [u8; 32] = encoded_point.y().unwrap().as_slice().try_into().unwrap();
 
@@ -1747,6 +1747,30 @@ mod tests {
 
         // Verify (mirrors what login_verify does)
         assert!(verifying_key.verify(&signed_data, &signature).is_ok());
+    }
+
+    /// WebAuthn authenticators emit both the low-S and the high-S form of a
+    /// valid P-256 signature. ecdsa 0.17 moved low-S enforcement into
+    /// `verify_prehashed` for curves with `NORMALIZE_S`; P-256 is not one of
+    /// them, so both forms must keep verifying or passkey login breaks.
+    #[test]
+    fn ecdsa_p256_high_s_signature_still_verifies() {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[0x42; 32].into()).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let msg = b"authenticatorData||clientDataHash";
+
+        let sig: Signature = signing_key.sign(msg);
+        let low = sig.normalize_s();
+        let (r, s) = low.split_scalars();
+        let high = Signature::from_scalars(r.to_bytes(), (-*s).to_bytes()).unwrap();
+        assert_ne!(low.to_bytes(), high.to_bytes(), "constructed the other S");
+
+        assert!(verifying_key.verify(msg, &low).is_ok(), "low-S verifies");
+        assert!(verifying_key.verify(msg, &high).is_ok(), "high-S verifies");
+        // The DER form login_verify actually parses.
+        assert!(verifying_key.verify(msg, &high.to_der()).is_ok());
     }
 
     #[test]

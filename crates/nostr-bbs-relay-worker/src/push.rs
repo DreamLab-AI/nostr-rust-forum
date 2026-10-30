@@ -329,7 +329,7 @@ impl VapidKeys {
             .map_err(|_| "VAPID_PRIVATE_KEY is not base64url")?;
         let signing =
             SigningKey::from_slice(&raw).map_err(|_| "VAPID_PRIVATE_KEY is not a P-256 scalar")?;
-        let public_b64 = B64URL.encode(signing.verifying_key().to_encoded_point(false).as_bytes());
+        let public_b64 = B64URL.encode(signing.verifying_key().to_sec1_point(false).as_bytes());
         Ok(Self {
             signing,
             public_b64,

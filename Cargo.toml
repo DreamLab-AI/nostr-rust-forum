@@ -101,8 +101,8 @@ worker = "0.8"
 passkey-types = "0.3"
 
 # Cryptography (NCC audited, pinned to latest patch)
-k256 = { version = "0.13.4", features = ["schnorr", "ecdh"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { version = "0.14.0", features = ["schnorr", "ecdh"] }
+p256 = { version = "0.14.0", features = ["ecdsa"] }
 chacha20poly1305 = "0.10.1"
 hmac = "0.12.1"
 hkdf = "0.12.4"
@@ -182,10 +182,10 @@ wasm-bindgen-test = "0.3"
 # 2026-10-18). An exact pin here turned every solid-pod-rs security release into
 # a republish of nostr-bbs-core for its consumers. Cargo.lock still fixes what a
 # build resolves, so moving to a newer alpha remains a reviewed `cargo update`.
-solid-pod-rs = { version = "0.5.0-alpha.14", default-features = false, features = ["core"] }
+solid-pod-rs = { version = "0.5.0-alpha.18", default-features = false, features = ["core"] }
 
 # Internal crates (workspace path deps; published to crates.io as 1.0.0-beta.3).
-nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.18" }
+nostr-bbs-core = { path = "crates/nostr-bbs-core", version = "1.0.0-beta.19" }
 nostr-bbs-config = { path = "crates/nostr-bbs-config", version = "1.0.0-beta.16" }
 nostr-bbs-mesh = { path = "crates/nostr-bbs-mesh", version = "1.0.0-beta.16" }
 nostr-bbs-rate-limit = { path = "crates/nostr-bbs-rate-limit", version = "1.0.0-beta.16" }

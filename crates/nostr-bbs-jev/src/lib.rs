@@ -385,18 +385,11 @@ pub async fn ask<T: JevTransport + ?Sized>(
 pub mod testutil {
     use super::*;
     use std::future::Future;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
+    use std::task::{Context, Poll, Waker};
 
     /// Drive a future to completion (the mock transports never pend).
     pub fn block_on<F: Future>(fut: F) -> F::Output {
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = Box::pin(fut);
         loop {
             if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
