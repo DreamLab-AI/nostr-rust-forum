@@ -51,10 +51,11 @@ bucket_name = "nostr-bbs-pods"
 
 # System One advisory integration. Errors retain the existing result.
 JEV_RATIONALE_CHECK = "1"
-# Local-only: configure JEV_ENDPOINT, JEV_MODEL and JEV_LOCAL=1 only
-# for an authenticated, Worker-reachable sovereign inference ingress.
-# No such ingress is provisioned here. The route reports unavailable until then;
-# never point it at the cloud judge or an unreachable container/loopback URL.
+# Cloud by default (Typesafe Jev, TYPESAFE_API_KEY secret). To keep this route
+# private set JEV_RATIONALE_CHECK_LOCAL_ONLY = "1" and configure JEV_ENDPOINT,
+# JEV_MODEL and JEV_LOCAL=1 for an authenticated, Worker-reachable sovereign
+# inference ingress; until then it reports unavailable. Never point it at an
+# unreachable container/loopback URL.
 
 RP_ID = "example.com"
 RP_NAME = "Nostr BBS"

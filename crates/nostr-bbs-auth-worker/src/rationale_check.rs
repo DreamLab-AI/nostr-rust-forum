@@ -34,6 +34,8 @@ use crate::http::{error_json, json_response};
 
 /// Flag variable (default off).
 pub const FLAG: &str = "JEV_RATIONALE_CHECK";
+/// Per-consumer privacy switch: when `1`/`true` the check refuses cloud endpoints.
+pub const LOCAL_ONLY_FLAG: &str = "JEV_RATIONALE_CHECK_LOCAL_ONLY";
 /// Shared rubric id/version (ES-05).
 pub const QUESTION_SET_VERSION: &str = "governance-evidence-quality/1";
 /// Vendored copy of the shared rubric.
@@ -294,8 +296,10 @@ pub async fn handle_check(
     };
 
     let lookup = nostr_bbs_jev::fetch::env_lookup(env);
-    // local_only = true: this data class is not known to be public.
-    let out = match nostr_bbs_jev::resolve(&lookup, FLAG, true) {
+    // Locality is the operator's choice (JEV_RATIONALE_CHECK_LOCAL_ONLY=1);
+    // default off, so the proxy or TypeSafe may be used.
+    let local_only = nostr_bbs_jev::local_only(&lookup, LOCAL_ONLY_FLAG);
+    let out = match nostr_bbs_jev::resolve(&lookup, FLAG, local_only) {
         Ok(cfg) => {
             let r = check(
                 &nostr_bbs_jev::fetch::WorkersFetch,
@@ -464,6 +468,28 @@ mod tests {
         };
         assert_eq!(
             nostr_bbs_jev::resolve(&env, FLAG, true),
+            Err(Fallback::NoEndpoint)
+        );
+    }
+
+    #[test]
+    fn default_is_not_local_only_so_the_vendor_endpoint_resolves() {
+        let env = |k: &str| match k {
+            "JEV_RATIONALE_CHECK" => Some("1".to_string()),
+            "TYPESAFE_API_KEY" => Some("k".to_string()),
+            _ => None,
+        };
+        let local = nostr_bbs_jev::local_only(&env, LOCAL_ONLY_FLAG);
+        assert!(!local);
+        assert!(nostr_bbs_jev::resolve(&env, FLAG, local).is_ok());
+        let env = |k: &str| match k {
+            "JEV_RATIONALE_CHECK" | "JEV_RATIONALE_CHECK_LOCAL_ONLY" => Some("1".to_string()),
+            "TYPESAFE_API_KEY" => Some("k".to_string()),
+            _ => None,
+        };
+        let local = nostr_bbs_jev::local_only(&env, LOCAL_ONLY_FLAG);
+        assert_eq!(
+            nostr_bbs_jev::resolve(&env, FLAG, local),
             Err(Fallback::NoEndpoint)
         );
     }

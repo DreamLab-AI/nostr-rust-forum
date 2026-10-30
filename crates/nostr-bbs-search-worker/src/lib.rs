@@ -512,7 +512,11 @@ async fn handle_search(req: &Request, env: &Env) -> Result<Response> {
         (Some(q), true) => {
             let snippets = load_snippets(env).await;
             let lookup = nostr_bbs_jev::fetch::env_lookup(env);
-            let cfg = nostr_bbs_jev::resolve(&lookup, rerank::FLAG, false);
+            let cfg = nostr_bbs_jev::resolve(
+                &lookup,
+                rerank::FLAG,
+                nostr_bbs_jev::local_only(&lookup, rerank::LOCAL_ONLY_FLAG),
+            );
             let min_conf = lookup("JEV_SEARCH_MIN_CONFIDENCE")
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(rerank::DEFAULT_MIN_CONFIDENCE);

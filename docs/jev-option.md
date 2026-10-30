@@ -24,9 +24,12 @@ Shared adapter: `crates/nostr-bbs-jev` (pure request/response core, injectable t
    `[vars]`; it is held in a redacting config type and never logged.
 4. Otherwise Jev is unavailable and the Worker falls back.
 
-`JEV_DEADLINE_MS` may shorten the 4000 ms default (clamped to 100..4000). Local-only consumers
-(below) refuse steps 2 and 3 unless the backend is declared local (`JEV_LOCAL=1` with an explicit
-endpoint, or `AGENTBOX_SYSTEM_ONE_BACKEND_LOCAL=1`).
+`JEV_DEADLINE_MS` may shorten the 4000 ms default (clamped to 100..4000). A consumer is
+local-only only when its own `JEV_<CONSUMER>_LOCAL_ONLY=1` is set (`JEV_SEARCH_RERANK_LOCAL_ONLY`,
+`JEV_TRIAGE_LOCAL_ONLY`, `JEV_RATIONALE_CHECK_LOCAL_ONLY`; default off). A local-only consumer
+refuses steps 2 and 3 unless the backend is declared local (`JEV_LOCAL=1` with an explicit
+endpoint, or `AGENTBOX_SYSTEM_ONE_BACKEND_LOCAL=1`); a consumer that is not local-only may use the
+proxy and the TypeSafe step (the Cloudflare default: TypeSafe direct with `TYPESAFE_API_KEY`).
 
 ## Items
 
@@ -34,7 +37,7 @@ endpoint, or `AGENTBOX_SYSTEM_ONE_BACKEND_LOCAL=1`).
 | --- | --- | --- | --- | --- |
 | NF-07-S1-01 rerank visible search results | search-worker | `JEV_SEARCH_RERANK=1` | the trimmed query text plus up to 10 public snippets (<= 280 chars, stored at ingest only for `public: true` entries when the flag is on) | `forum-search-rerank/1` |
 | NF-03-S1-01 moderation triage | relay-worker (cron) | `JEV_TRIAGE=1` | plaintext of an already-admitted kind-42 post in a public-read, non-encrypted zone, plus the post it replies to in the same channel | `forum-moderation-triage/1` |
-| NF-06-S1-01 rationale/evidence check | auth-worker | `JEV_RATIONALE_CHECK=1` | case title, summary, effective tier, task properties and the reviewer's draft rationale; **local-only** | `governance-evidence-quality/1` (ES-05) |
+| NF-06-S1-01 rationale/evidence check | auth-worker | `JEV_RATIONALE_CHECK=1` | case title, summary, effective tier, task properties and the reviewer's draft rationale; cloud by default, local-only with `JEV_RATIONALE_CHECK_LOCAL_ONLY=1` | `governance-evidence-quality/1` (ES-05) |
 
 Tunables: `JEV_SEARCH_MIN_CONFIDENCE` (default 0.5), `JEV_TRIAGE_QUEUE_THRESHOLD` (default 0.5). Both
 are unfitted; fit on labelled data before relying on them.
@@ -87,8 +90,9 @@ re-ingest of that entry. It is never sent anyway, because rerank candidates come
 Enable per Worker with `wrangler.toml` `[vars]` (flag, endpoint, model) and `wrangler secret put` (key).
 The committed `wrangler.toml` files enable all three flags. Search and moderation
 use Typesafe Jev (`jev-latest`) and require a `TYPESAFE_API_KEY` Worker secret.
-The auth route remains local-only and returns unavailable until an authenticated,
-Worker-reachable sovereign inference ingress is configured. Cloudflare cannot
+The auth route now uses Typesafe Jev like the others (needs `TYPESAFE_API_KEY`). To keep it
+private, set `JEV_RATIONALE_CHECK_LOCAL_ONLY=1`; it then returns unavailable until an
+authenticated, Worker-reachable sovereign inference ingress is configured. Cloudflare cannot
 reach agentbox loopback or Docker DNS; no false locality declaration is supplied.
 
 On first activation, re-ingest existing public entries through the normal signed
