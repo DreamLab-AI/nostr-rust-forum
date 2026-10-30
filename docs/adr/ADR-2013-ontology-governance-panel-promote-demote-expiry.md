@@ -9,7 +9,7 @@ supersedes: []
 superseded_by: []
 verified_commit: b45c672b5bc73e5858f03490aa212d7e15526742
 owner: jjohare
-review_trigger: the `vault` binary (VisionClaw WS-C) landing, or the first real 31402 raised against the `ontology-governance` panel on the production relay
+review_trigger: `scripts/e2e-ontology-promotion.sh` passing in stub mode and with `E2E_REAL_VAULT=1`; an operator publishing the `ontology-governance` 31400 on the production relay (the activation step); the first real 31402 raised against that panel
 repo: nostr-rust-forum
 ---
 
@@ -50,3 +50,12 @@ At `verified_commit`:
 - `cargo clippy -p nostr-bbs-core -p nostr-bbs-relay-worker --all-targets` — no warnings. `cargo fmt --all` clean.
 - `scripts/e2e-ontology-promotion.sh` — 29 assertions, exit 0, including the expiry sweep closing the past-due fixture with an `expired` receipt and **zero** `broker_decisions` rows, the promoted case *not* being swept, and the sweep's idempotency.
 - Migration 0007 and its `ensure_schema()` mirror both add `broker_cases.stale_after`; the e2e loads every migration in `wrangler` order, so a column added to one and not the other fails there.
+
+## Close-out 2026-10-30
+
+No status change; `review_trigger` restated because its first clause has fired. The `vault` binary exists (`vault --version` → `vault 0.1.0`, from the Nix store in the agentbox image), but the apply path against it is not done:
+
+- `E2E_REAL_VAULT=1 E2E_VAULT_BIN=$(which vault) bash scripts/e2e-ontology-promotion.sh` at `a7e89dd`: **45 passed, 33 failed**. Among the failures: demote leaves the page `status: draft` instead of `deprecated`; the PatchProposal names `pages/Test E2E Promotion` where the test expects the title; elevation is refused `RELATION_TARGET_UNRESOLVED` where the test expects `UNKNOWN_KEY`; the ledger receives no entries.
+- Stub mode (`bash scripts/e2e-ontology-promotion.sh`) is also red at `a7e89dd`: **9 passed, 10 failed**. The relay step crashes with `sqlite3.OperationalError: no such column: d_tag`, so the script's SQL and the checked-in migrations have drifted since the 29-assertion green run recorded under Verification.
+
+The record stays accepted / partial / staged. The remaining gap is the e2e script (relay step SQL against current migrations) and agentbox's apply path against the real `vault` (ADR-2109). Activation remains an operator publishing the 31400.

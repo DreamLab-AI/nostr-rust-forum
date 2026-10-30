@@ -9,7 +9,7 @@ supersedes: []
 superseded_by: []
 verified_commit: 97a935e344b8a7c2ce66f0df5b32a04c3b4fd2ae
 owner: DreamLab-AI/nostr-rust-forum maintainers
-review_trigger: Any request to carry message text in a push payload (RFC 8291), or a second service worker (the BBS) wanting its own push subscription
+review_trigger: An operator setting `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT` on the production relay and a push round trip on a real device (the activation step); any request to carry message text in a push payload (RFC 8291), or a second service worker (the BBS) wanting its own push subscription
 repo: nostr-rust-forum
 ---
 
@@ -52,3 +52,7 @@ repo: nostr-rust-forum
 - At `verified_commit`: relay-worker, core and forum-client suites pass (1,737 Rust tests across the three crates), the service-worker suite passes (`node --test crates/nostr-bbs-forum-client/tests/sw-push.test.mjs`, 11 tests), clippy is clean, and both wasm32 builds succeed.
 - The release Trunk build (`trunk build --release --public-url /community/`) succeeds and emits `snippets/*/js/push.js` and the push handlers in `sw.js`. `deepsec revalidate` over the diff's findings leaves no unfixed HIGH or HIGH_BUG that this work introduced.
 - Not verified here: a live Cloudflare deploy, a real push service round trip, and device behaviour on iOS. `activation_status` stays `staged` until an operator sets the VAPID pair and tests on devices.
+
+## Close-out 2026-10-30
+
+No status change; `review_trigger` now names the activation event. The live client (`curl -sL https://dreamlab-ai.com/community/`, 2026-10-30T19:30Z) exposes no `VAPID_*` key in `window.__ENV__`, and the relay-side secrets cannot be read from here. `activation_status` stays staged until the VAPID pair is set and a device round trip is recorded.

@@ -4,10 +4,11 @@ title: A zone can be end-to-end encrypted with per-epoch zone keys granted by gi
 date: 2026-09-26
 decision_status: accepted
 implementation_status: complete
-activation_status: staged
+activation_status: live
 supersedes: []
 superseded_by: []
-verified_commit: cb86790
+verified_commit: a7e89dd
+verified_paths: [crates/nostr-bbs-forum-client/src/zone_crypto/mod.rs, crates/nostr-bbs-relay-worker/src/zone_config.rs, crates/nostr-bbs-forum-client/src/stores/zones.rs]
 owner: jjohare
 review_trigger: the first member removal that needs a rotation; an operator setting agent_keys = true; NIP-EE / MLS reaching a stable Nostr mapping
 repo: nostr-rust-forum
@@ -151,3 +152,13 @@ encrypted public zone rejected, locked/hidden accepted, gate defaults off);
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean;
 `cargo fmt --all -- --check` clean; `cargo check --target wasm32-unknown-unknown`
 for both client crates. Not yet exercised in a live browser.
+
+## Close-out 2026-10-30
+
+`activation_status` staged → live. The gate this record defines is on in production, and the code behind it is deployed.
+
+- Live endpoint: `curl -sL https://dreamlab-ai.com/community/` at 2026-10-30T19:30Z serves `window.__ENV__` with `ENCRYPTION_ENABLED:"true"`, the exact string `zone_crypto::GATE_ENV_KEY` (`crates/nostr-bbs-forum-client/src/zone_crypto/mod.rs:91`) treats as on.
+- Deployed config: dreamlab-ai-website `f653f58` `forum-config/dreamlab.toml` sets `[encryption] enabled = true` and `encrypted = true` on `zone2` (minimoonoir), `zone3` (family) and `zone4` (dreamlab); "Deploy Cloudflare Workers" run `41028875471` on `f653f58` succeeded (2026-10-30T08:47:55Z) with the kit pinned to forum `9c36b60`.
+- Ancestry: `git merge-base --is-ancestor cb86790 9c36b60` exits 0.
+
+Not established from here: the relay worker's own `ENCRYPTION_ENABLED` `[vars]` value (reading it needs Cloudflare credentials), and a member removal that forces an epoch rotation. The earlier verification line "not yet exercised in a live browser" still describes the test record; the review trigger already covers the first rotation.

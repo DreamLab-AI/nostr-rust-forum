@@ -4,10 +4,11 @@ title: NIP-59 unwrap verifies the outer wrap first and never echoes decrypted by
 date: 2026-10-19
 decision_status: accepted
 implementation_status: complete
-activation_status: staged
+activation_status: live
 supersedes: []
 superseded_by: []
-verified_commit: fb9ef30 (working tree on top of it; re-record on commit)
+verified_commit: a7e89dd
+verified_paths: [crates/nostr-bbs-core/src/gift_wrap.rs, crates/nostr-bbs-forum-client/src/zone_crypto/mod.rs]
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: Any proposal to refuse a rumor that carries a `sig` or a seal with tags, or to add a script-src to the client CSP
 repo: nostr-rust-forum
@@ -88,3 +89,11 @@ including `unwrap_rejects_tampered_outer_wrap`, `signer_unwrap_rejects_tampered_
 nostr-bbs-forum-client` clean; `cargo doc --no-deps -p nostr-bbs-core` no warnings. Full-suite
 results for the other unwrap callers (mesh, poker-citizen, bbs-client) and the deepsec gate are
 reported in the change that lands this record.
+
+## Close-out 2026-10-30
+
+`verified_commit` re-recorded: the change landed as `df76e57`, now on `main` (`a7e89dd`). `activation_status` staged → live: the decision has no deployment gate, and the served client carries it.
+
+- `git grep -c "gift wrap verification failed" df76e57^ -- crates` finds nothing; at `a7e89dd` it is `crates/nostr-bbs-core/src/gift_wrap.rs:83` and `:549` (`GiftWrapError::WrapVerification`, `SignerGiftWrapError::WrapVerification`). Tests at `a7e89dd`: `gift_wrap.rs:1462` `unwrap_rejects_tampered_outer_wrap`, `zone_crypto/mod.rs:926` `grant_unwrap_refuses_a_tampered_wrap_before_decrypting`.
+- Live artefact: `https://dreamlab-ai.com/community/nostr-bbs-forum-client-ddf91ea8605b2ae6_bg.wasm`, fetched 2026-10-30T19:30Z (6,782,374 bytes), contains the string `gift wrap verification failed` once (`grep -c -a`).
+- The edge runs forum kit `9c36b60` (dreamlab-ai-website `f653f58`, "Deploy Cloudflare Workers" run `41028875471`, success); `git merge-base --is-ancestor df76e57 9c36b60` exits 0.
