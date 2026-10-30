@@ -95,5 +95,5 @@ reported in the change that lands this record.
 `verified_commit` re-recorded: the change landed as `df76e57`, now on `main` (`a7e89dd`). `activation_status` staged → live: the decision has no deployment gate, and the served client carries it.
 
 - `git grep -c "gift wrap verification failed" df76e57^ -- crates` finds nothing; at `a7e89dd` it is `crates/nostr-bbs-core/src/gift_wrap.rs:83` and `:549` (`GiftWrapError::WrapVerification`, `SignerGiftWrapError::WrapVerification`). Tests at `a7e89dd`: `gift_wrap.rs:1462` `unwrap_rejects_tampered_outer_wrap`, `zone_crypto/mod.rs:926` `grant_unwrap_refuses_a_tampered_wrap_before_decrypting`.
-- Live artefact: `https://dreamlab-ai.com/community/nostr-bbs-forum-client-ddf91ea8605b2ae6_bg.wasm`, fetched 2026-10-30T19:30Z (6,782,374 bytes), contains the string `gift wrap verification failed` once (`grep -c -a`).
+- Live artefact: `https://dreamlab-ai.com/community/nostr-bbs-forum-client-ddf91ea8605b2ae6_bg.wasm`, fetched 2026-10-30T19:30Z (6,782,374 bytes), contains the string `gift wrap verification failed` on one matching line (`grep -c -a` counts lines, not occurrences). This shows the code shipped; it does not exercise the rejection path.
 - The edge runs forum kit `9c36b60` (dreamlab-ai-website `f653f58`, "Deploy Cloudflare Workers" run `41028875471`, success); `git merge-base --is-ancestor df76e57 9c36b60` exits 0.
