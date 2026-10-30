@@ -9,7 +9,7 @@ supersedes: []
 superseded_by: []
 verified_commit: d673708
 owner: jjohare
-review_trigger: a chain with value behind the table; a second operator running a house seat; mental poker or a hitch channel replacing the house as dealer; any proposal to add a forum event kind for hands or settlements; the daily cap or buy-ins moving above what the treasury's plain sats can settle
+review_trigger: a DREAM house seat running against the production relay with one recorded hand (the activation step; sidestr is parked by the owner); a chain with value behind the table; a second operator running a house seat; mental poker or a hitch channel replacing the house as dealer; any proposal to add a forum event kind for hands or settlements; the daily cap or buy-ins moving above what the treasury's plain sats can settle
 repo: nostr-rust-forum
 domain: BASELINE-architecture.md
 ---
@@ -78,3 +78,7 @@ pin moves them together. The practice table is unchanged for an instance without
   wasm32-unknown-unknown` for the two new crates clean.
 - `grep -rn RUMOR_KIND crates/` shows the one transport constant; `grep -rn citizen_pubkey
   crates/nostr-bbs-forum-client/src` shows the one extra gate.
+
+## Close-out 2026-10-30
+
+No status change; `review_trigger` now leads with the activation event. Sidestr work is parked by the owner, so this record stays staged until that event is recorded.

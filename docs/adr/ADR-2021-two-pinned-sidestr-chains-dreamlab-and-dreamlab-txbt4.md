@@ -9,7 +9,7 @@ supersedes: []
 superseded_by: []
 verified_commit: b1c6633b59e96c73d541baa47785e32bac7607ab
 owner: jjohare
-review_trigger: any proposal to pin a third chain or to let runtime config name a chain; a chain with value (a mainnet parent); BLAKES7's issue landing (its id goes into SIDESTR_CHAINS and the txbt4 house seat's --asset-id, not into the code); poker protocol 2 naming the asset on the wire; sidestr-agent gaining a family-generic ChainView (the client and house seat drop their ChainState)
+review_trigger: the `dreamlab-txbt4` house seat and its asset id running in production (the activation step; sidestr is parked by the owner); any proposal to pin a third chain or to let runtime config name a chain; a chain with value (a mainnet parent); BLAKES7's issue landing (its id goes into SIDESTR_CHAINS and the txbt4 house seat's --asset-id, not into the code); poker protocol 2 naming the asset on the wire; sidestr-agent gaining a family-generic ChainView (the client and house seat drop their ChainState)
 repo: nostr-rust-forum
 domain: BASELINE-architecture.md
 ---
@@ -121,3 +121,7 @@ wallet validates but cannot strengthen.
   nostr-bbs-forum-client --target wasm32-unknown-unknown` clean on branch `multichain`. The raw
   release wasm (no wasm-opt) grew 97,705 bytes (+1.1%) over `main` before the tip control's
   picker was added.
+
+## Close-out 2026-10-30
+
+No status change; `review_trigger` now leads with the activation event. Sidestr work is parked by the owner, so this record stays staged until that event is recorded.

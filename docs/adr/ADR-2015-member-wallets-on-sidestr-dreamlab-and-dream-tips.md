@@ -9,7 +9,7 @@ supersedes: []
 superseded_by: []
 verified_commit: b2d9e14407b5d3d768596fa970a709815602d424
 owner: jjohare
-review_trigger: any proposal to add a chain or asset to the lock; a chain with value (a mainnet parent); ADR-2101's derived spend key being implemented; DREAM moving to a chain whose document names the assets rule; JavaScriptSolidServer gaining sidestr support (then the wallet moves upstream)
+review_trigger: a live wallet chain read from the production origin with `SIDESTR_WALLET` on (the activation step; sidestr is parked by the owner); any proposal to add a chain or asset to the lock; a chain with value (a mainnet parent); ADR-2101's derived spend key being implemented; DREAM moving to a chain whose document names the assets rule; JavaScriptSolidServer gaining sidestr support (then the wallet moves upstream)
 repo: nostr-rust-forum
 domain: BASELINE-architecture.md
 ---
@@ -114,3 +114,7 @@ should follow it.
   `sidestr:dreamlab`.
 - `grep -rn "SIDESTR_WALLET" crates/nostr-bbs-forum-client/src` shows the one gate in
   `src/wallet/mod.rs`. Every surface goes through `wallet::enabled()` or `use_wallet()`.
+
+## Close-out 2026-10-30
+
+No status change; `review_trigger` now leads with the activation event. Sidestr work is parked by the owner, so this record stays staged until that event is recorded.

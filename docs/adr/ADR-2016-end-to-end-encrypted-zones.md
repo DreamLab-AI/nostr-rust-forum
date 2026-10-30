@@ -161,4 +161,6 @@ for both client crates. Not yet exercised in a live browser.
 - Deployed config: dreamlab-ai-website `f653f58` `forum-config/dreamlab.toml` sets `[encryption] enabled = true` and `encrypted = true` on `zone2` (minimoonoir), `zone3` (family) and `zone4` (dreamlab); "Deploy Cloudflare Workers" run `41028875471` on `f653f58` succeeded (2026-10-30T08:47:55Z) with the kit pinned to forum `9c36b60`.
 - Ancestry: `git merge-base --is-ancestor cb86790 9c36b60` exits 0.
 
-Not established from here: the relay worker's own `ENCRYPTION_ENABLED` `[vars]` value (reading it needs Cloudflare credentials), and a member removal that forces an epoch rotation. The earlier verification line "not yet exercised in a live browser" still describes the test record; the review trigger already covers the first rotation.
+- Relay side: the same run's "Deploy Rust Workers (nostr-bbs-relay-worker, relay-worker, dreamlab-nostr-relay)" step logs the binding `ENCRYPTION_ENABLED: "true"` (`gh run view 41028875471 -R DreamLab-AI/dreamlab-ai-website --log`, 08:50:46Z), and the pre-deploy gate reports `encryption-enabled 3 site(s) in sync` (dreamlab.toml, deploy.yml, `forum-config/deploy/relay-worker.wrangler.toml`).
+
+Not established from here: a member removal that forces an epoch rotation. The earlier verification line "not yet exercised in a live browser" still describes the test record; the review trigger already covers the first rotation.
