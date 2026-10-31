@@ -704,6 +704,8 @@ const pageIssues = () => {
   check('promote: the written page still validates --strict', pageIssues(), []);
 
   // ── Re-promote a stable page: a REPLAYED AMEND IS REFUSED ───
+  const shaBefore = sha();
+  const headBefore = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   res = await run(decision.promote);
   fm = front();
   // The fixture's 31402 is a diff-bearing amend, so since afc8a0ed6 a second
@@ -713,6 +715,8 @@ const pageIssues = () => {
   // management-api/tests/ontology-apply.test.js holds that path.)
   check('re-promote: a replayed amend is refused STALE, nothing written',
         [res.ontology.applied, res.ontology.code, res.ontology.attested || null], [false, 'STALE', null]);
+  check('re-promote: page bytes unchanged', sha(), shaBefore);
+  check('re-promote: no new commit', execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), headBefore);
   check('re-promote: status unchanged (stable)', fm.status, 'stable');
   check('re-promote: still exactly one verified entry', fm.verified && fm.verified.length, 1);
   check('re-promote: the page still validates --strict', pageIssues(), []);
