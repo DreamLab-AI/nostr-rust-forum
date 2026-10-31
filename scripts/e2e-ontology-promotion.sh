@@ -436,29 +436,33 @@ else
   # vault on PATH may be an older image build without `create`.
   VAULT_REAL="${E2E_VAULT_BIN:-/home/devuser/workspace/project/target/release/vault}"
   [[ -x "$VAULT_REAL" ]] || VAULT_REAL="$(command -v vault || true)"
+  # ontomark owns find/edit/create/apply/validate since 2026-10-31 (ADR-2109 re-point).
+  ONTOMARK_REAL="${E2E_ONTOMARK_BIN:-$(command -v ontomark || true)}"
   VAULT_SOURCE="${E2E_VAULT_SOURCE:-/home/devuser/workspace/visionGraph}"
   SCRATCH="$WORK/vault-repo"
 
   if [[ ! -x "$VAULT_REAL" ]]; then
     bad "E2E_REAL_VAULT=1 but no vault binary (set E2E_VAULT_BIN)"
+  elif [[ ! -x "$ONTOMARK_REAL" ]]; then
+    bad "E2E_REAL_VAULT=1 but no ontomark binary (set E2E_ONTOMARK_BIN)"
   elif [[ ! -f "$VAULT_SOURCE/ontology/vocabulary.yaml" || ! -f "$VAULT_SOURCE/vault.toml" ]]; then
     bad "E2E_VAULT_SOURCE=$VAULT_SOURCE holds no ontology/vocabulary.yaml + vault.toml"
   else
-    ok "using the REAL vault: $("$VAULT_REAL" --version) ($VAULT_REAL)"
+    ok "using the REAL vault: $("$VAULT_REAL" --version) ($VAULT_REAL); ontomark: $("$ONTOMARK_REAL" --version)"
 
     # (a) scratch repository: the governing files, copied read-only-source.
-    mkdir -p "$SCRATCH/ontology" "$SCRATCH/knowledge/pages" "$SCRATCH/working/pages"
+    mkdir -p "$SCRATCH/ontology" "$SCRATCH/knowledge" "$SCRATCH/working"
     cp "$VAULT_SOURCE/ontology/vocabulary.yaml" "$SCRATCH/ontology/"
     cp "$VAULT_SOURCE/vault.toml" "$SCRATCH/"
     if [[ "${E2E_FULL_CORPUS:-0}" == "1" ]]; then
-      cp -r "$VAULT_SOURCE/knowledge/pages/." "$SCRATCH/knowledge/pages/"
-      ok "scratch repo carries the full corpus ($(find "$SCRATCH/knowledge/pages" -name '*.md' | wc -l) pages)"
+      cp -r "$VAULT_SOURCE/knowledge/." "$SCRATCH/knowledge/"
+      ok "scratch repo carries the full corpus ($(find "$SCRATCH/knowledge" -name '*.md' | wc -l) pages)"
     fi
-    [[ -e "$SCRATCH/knowledge/pages/$TEST_PAGE.md" ]] \
+    [[ -e "$SCRATCH/knowledge/$TEST_PAGE.md" ]] \
       && bad "the source corpus already holds '$TEST_PAGE' — refusing to shadow it"
 
     # (b) the fixture page: a draft, private Class the proposal will promote.
-    cat > "$SCRATCH/knowledge/pages/$TEST_PAGE.md" <<EOF
+    cat > "$SCRATCH/knowledge/$TEST_PAGE.md" <<EOF
 ---
 type: Class
 resource: $TEST_IRI
@@ -472,13 +476,13 @@ generated:
 A fixture class used only by the ontology-promotion end-to-end test. It never
 exists in a real corpus; its IRI is namespaced \`test\` for that reason.
 EOF
-    sed 's/^status: draft$/status: stable/' "$SCRATCH/knowledge/pages/$TEST_PAGE.md" > "$WORK/proposed.md"
+    sed 's/^status: draft$/status: stable/' "$SCRATCH/knowledge/$TEST_PAGE.md" > "$WORK/proposed.md"
     git -C "$SCRATCH" init -q
     scratch_git add -A
     scratch_git -c user.email=e2e@localhost -c user.name=e2e commit -qm "seed $TEST_PAGE"
     ok "scratch repo seeded and committed at $SCRATCH"
 
-    "$VAULT_REAL" --repo "$SCRATCH" validate --strict --json > "$WORK/validate.json" || true
+    "$ONTOMARK_REAL" --repo "$SCRATCH" validate --strict --json > "$WORK/validate.json" || true
     check "vault validate --strict: the fixture page has no issues" \
       "$(python3 -c "
 import json,sys
@@ -494,6 +498,12 @@ print(len([i for i in d['issues'] if i['path']=='$TEST_PAGE']))")" "0"
 exec "$VAULT_REAL" "\$@"
 WRAP
     chmod +x "$WORK/bin/vault"
+    cat > "$WORK/bin/ontomark" <<WRAP
+#!/bin/sh
+{ printf 'ontomark\n'; for a in "\$@"; do printf '%s\n' "\$a"; done; printf -- '--\n'; } >> "$WORK/vault-calls.log"
+exec "$ONTOMARK_REAL" "\$@"
+WRAP
+    chmod +x "$WORK/bin/ontomark"
     : > "$WORK/vault-calls.log"
 
     # (c) propose, through agentbox's own runVaultPropose (so the --repo pin
@@ -608,7 +618,8 @@ PY
 
     # (d) apply, and assert OUTCOMES by reading the page back.
     AGENTBOX_ROOT="$AGENTBOX_ROOT" AGENTBOX_NPUB="" VAULT_BIN="$WORK/bin/vault" VAULT_REPO="$SCRATCH" \
-    LOOM_BASE_URL="http://127.0.0.1:$LEDGER_PORT" VAULT_REAL="$VAULT_REAL" \
+    LOOM_BASE_URL="http://127.0.0.1:$LEDGER_PORT" LOOM_FACADE_URL="http://127.0.0.1:$LEDGER_PORT" \
+    ONTOMARK_BIN="$WORK/bin/ontomark" ONTOMARK_REAL="$ONTOMARK_REAL" VAULT_REAL="$VAULT_REAL" \
     node - "$WORK" "$TEST_PAGE" <<'NODE' > "$WORK/apply.out" 2>&1 || true
 const fs = require('fs'), os = require('os'), path = require('path'), crypto = require('crypto');
 const { execFileSync, spawnSync } = require('child_process');
@@ -619,7 +630,7 @@ const { LocalProcessManagerOrchestratorAdapter: Adapter } =
 
 const [work, page] = process.argv.slice(2);
 const repo = process.env.VAULT_REPO;
-const file = path.join(repo, 'knowledge', 'pages', `${page}.md`);
+const file = path.join(repo, 'knowledge', `${page}.md`);
 const decision = JSON.parse(fs.readFileSync(path.join(work, 'decision-schema.json'), 'utf8'));
 const results = [];
 const check = (name, got, want) =>
@@ -627,15 +638,21 @@ const check = (name, got, want) =>
 
 const sha = () => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const front = () => yaml.load(fs.readFileSync(file, 'utf8').split(/^---$/m)[1]);
-const reset = () => execFileSync('git', ['-C', repo, 'checkout', '-q', '--', '.']);
-const dirty = () => execFileSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' })
-  .split('\n').filter(Boolean).map(l => l.slice(3).replace(/^"|"$/g, ''));
+// commitPage really commits each governed write in the scratch repo (a git top
+// level with no upstream, so it never pushes), so "what was written" is what
+// differs from the seed commit, and a reset is a hard reset to it.
+const seed = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const reset = () => execFileSync('git', ['-C', repo, 'reset', '-q', '--hard', seed]);
+const dirty = () => [
+  ...execFileSync('git', ['-C', repo, 'diff', '--name-only', seed, 'HEAD'], { encoding: 'utf8' }).split('\n'),
+  ...execFileSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' }).split('\n').map(l => l.slice(3)),
+].map(l => l.replace(/^"|"$/g, '')).filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
 const vaultCalls = () => fs.readFileSync(path.join(work, 'vault-calls.log'), 'utf8').split('--\n').filter(Boolean).length;
 // --strict exits non-zero on ANY corpus warning (E2E_FULL_CORPUS=1 carries the
 // real corpus's own), so read the report whatever the exit status and judge
 // only the fixture page.
 const pageIssues = () => {
-  const r = spawnSync(process.env.VAULT_REAL, ['--repo', repo, 'validate', '--strict', '--json'],
+  const r = spawnSync(process.env.ONTOMARK_REAL, ['--repo', repo, 'validate', '--strict', '--json'],
     { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
   return JSON.parse(r.stdout).knowledge.issues.filter(i => i.path === page);
 };
@@ -643,7 +660,14 @@ const pageIssues = () => {
 (async () => {
   const human = Adapter._hexToNpub(decision.human_pubkey);
   const decidedAt = (e) => new Date(e.created_at * 1000).toISOString();
+  // Roster gate: seat the human. Request lookup: the real 31402 the propose
+  // step built (the handler refuses a promote whose request it cannot find).
+  process.env.AGENTBOX_FORUM_GOVERNANCE_SIGNERS = decision.human_pubkey;
+  const rq = JSON.parse(fs.readFileSync(path.join(work, 'request-schema.json'), 'utf8')).event;
+  const storedReq = { event_id: rq.id, kind: 31402, d_tag: decision.case_id,
+                      content: rq.content, tags: rq.tags };
   const adapter = new Adapter({});
+  adapter._ontologyDeps = { fetchRequest: async (id) => (id === rq.id ? storedReq : null) };
   const run = async (event) => {
     const prev = process.cwd();
     // Never the scratch repo (--repo must carry it), and a throwaway dir: the
@@ -667,16 +691,21 @@ const pageIssues = () => {
         fm.verified && new Date(fm.verified[0].at).toISOString(), decidedAt(decision.promote));
   check('promote: nothing else on the page changed',
         Object.keys(fm).sort(), ['domain', 'generated', 'public', 'resource', 'status', 'type', 'verified']);
-  check('promote: only the fixture page was written', dirty(), [`knowledge/pages/${page}.md`]);
+  check('promote: only the fixture page was written', dirty(), [`knowledge/${page}.md`]);
   check('promote: the written page still validates --strict', pageIssues(), []);
 
   // ── Re-promote a stable page: a RE-ATTESTATION ─────────────────────────
   res = await run(decision.promote);
   fm = front();
-  check('re-promote: applied as a re-attestation of one block',
-        [res.ontology.applied, res.ontology.reattest, res.ontology.blocks, res.ontology.attested], [true, true, 1, true]);
+  // The fixture's 31402 is a diff-bearing amend, so since afc8a0ed6 a second
+  // Promote is `ontomark apply` of a diff already applied. It is refused STALE
+  // (hunk 1 expects `status: draft`): a signed amendment applies once, and a
+  // replay cannot stack attestations. (A diff-less promote still re-attests;
+  // management-api/tests/ontology-apply.test.js holds that path.)
+  check('re-promote: a replayed amend is refused STALE, nothing written',
+        [res.ontology.applied, res.ontology.code, res.ontology.attested || null], [false, 'STALE', null]);
   check('re-promote: status unchanged (stable)', fm.status, 'stable');
-  check('re-promote: exactly one more verified entry', fm.verified && fm.verified.length, 2);
+  check('re-promote: still exactly one verified entry', fm.verified && fm.verified.length, 1);
   check('re-promote: the page still validates --strict', pageIssues(), []);
 
   // ── Reject: writes nothing, spawns nothing ─────────────────────────────
@@ -715,7 +744,7 @@ NODE
 
     # (f) elevation: a seeded WORKING note is elevated through agentbox's
     #     gate — staged as a page, validated on its own, `vault propose --diff`.
-    cat > "$SCRATCH/working/pages/Test E2E Elevation Note.md" <<'NOTE_MD'
+    cat > "$SCRATCH/working/Test E2E Elevation Note.md" <<'NOTE_MD'
 ---
 type: Draft Concept
 title: Test E2E Elevation Note
@@ -791,7 +820,8 @@ NODE
          --example ontology_promotion_fixture -- --from-request "$WORK/request-elevation.json" \
          > "$WORK/decision-elevation.json" 2> "$WORK/decision-elevation.err" ); then
       AGENTBOX_ROOT="$AGENTBOX_ROOT" AGENTBOX_NPUB="" VAULT_BIN="$WORK/bin/vault" VAULT_REPO="$SCRATCH" \
-      LOOM_BASE_URL="http://127.0.0.1:$LEDGER_PORT" VAULT_REAL="$VAULT_REAL" \
+      LOOM_BASE_URL="http://127.0.0.1:$LEDGER_PORT" LOOM_FACADE_URL="http://127.0.0.1:$LEDGER_PORT" \
+    ONTOMARK_BIN="$WORK/bin/ontomark" ONTOMARK_REAL="$ONTOMARK_REAL" VAULT_REAL="$VAULT_REAL" \
       node - "$WORK" "$SCRATCH" <<'NODE' > "$WORK/create.out" 2>&1 || true
 const fs = require('fs'), path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
@@ -803,7 +833,7 @@ const [work, repo] = process.argv.slice(2);
 const req = JSON.parse(fs.readFileSync(path.join(work, 'request-elevation.json'), 'utf8'));
 const dec = JSON.parse(fs.readFileSync(path.join(work, 'decision-elevation.json'), 'utf8'));
 const page = req.proposal.page;
-const file = path.join(repo, 'knowledge', 'pages', `${page}.md`);
+const file = path.join(repo, 'knowledge', `${page}.md`);
 const results = [];
 const check = (name, got, want) =>
   results.push([name, JSON.stringify(got) === JSON.stringify(want), got, want]);
@@ -817,6 +847,7 @@ const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8'
   // The relay consumer's stored copy of the 31402, as the adapter looks it up.
   const stored = { event_id: req.event.id, kind: 31402, d_tag: dec.case_id,
                    content: req.event.content, tags: req.event.tags };
+  process.env.AGENTBOX_FORUM_GOVERNANCE_SIGNERS = dec.human_pubkey;
   const adapter = new Adapter({});
   adapter._ontologyDeps = { fetchRequest: async (id) => (id === req.event.id ? stored : null) };
   const cwd = path.join(work, 'cwd');
@@ -830,12 +861,13 @@ const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8'
         [o.applied, o.created, o.attested, o.error || null], [true, true, true, null]);
   check('create: ONE vault create, no edit',
         fs.readFileSync(path.join(work, 'vault-calls.log'), 'utf8').split('--\n').filter(Boolean)
-          .map(b => b.split('\n')).filter(a => a[2] === 'create' || (a[2] === 'edit' && a[3] === page))
+          .map(b => b.split('\n')).map(a => (a[0] === 'ontomark' ? a.slice(1) : a))
+          .filter(a => a[2] === 'create' || (a[2] === 'edit' && a[3] === page))
           .map(a => a[2]), ['create']);
 
   const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
   const fm = text ? yaml.load(text.split(/^---$/m)[1]) : {};
-  check('create: the page now exists at knowledge/pages/<title>.md', fs.existsSync(file), true);
+  check('create: the page now exists at knowledge/<title>.md', fs.existsSync(file), true);
   check('create: status: stable, stamped in the same write', fm.status, 'stable');
   check('create: one verified entry naming the human at the 31403 instant',
         (fm.verified || []).map(v => [v.by, new Date(v.at).toISOString()]),
@@ -850,13 +882,13 @@ const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8'
   check('create: resource and origin are the proposed ones',
         [fm.resource, (fm.sources || [])[0] && fm.sources[0].resource],
         [req.proposal.iri, '[[Test E2E Elevation Note]]']);
-  const r = spawnSync(process.env.VAULT_REAL, ['--repo', repo, 'validate', '--strict', '--json'],
+  const r = spawnSync(process.env.ONTOMARK_REAL, ['--repo', repo, 'validate', '--strict', '--json'],
     { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
   const issues = JSON.parse(r.stdout).knowledge.issues.filter(i => i.path === page);
   check('create: the created page passes vault validate --strict', issues, []);
   check('create: only the new page was written',
         git('status', '--porcelain').split('\n').filter(Boolean).map(l => l.slice(3).replace(/^"|"$/g, '')),
-        [`knowledge/pages/${page}.md`]);
+        [`knowledge/${page}.md`]);
 
   // Approving the same create again: the vault refuses (EXISTS), nothing is
   // written, nothing is ledgered.
@@ -904,13 +936,13 @@ else:
              r["body"]["digest"], r["body"]["signer"]) for r in rows]
 def check(name, got, want):
     print(("ok   " if got == want else "FAIL ") + name + ("" if got == want else f" — expected {want!r}, got {got!r}"))
-check(f"ledger ({kind}): five entries, in decision order",
-      [n[1] for n in norm], ["promote", "promote", "demote", "promote", "demote"])
+check(f"ledger ({kind}): four entries, in decision order",
+      [n[1] for n in norm], ["promote", "demote", "promote", "demote"])
 check(f"ledger ({kind}): every entry carries the real proposal's case id",
       sorted({n[0] for n in norm}), [case])
 check(f"ledger ({kind}): the digest is the canonical sha256: form of the same PatchProposal",
       sorted({n[3] for n in norm}), [digest])
-check(f"ledger ({kind}): only a promote admits content", [n[2] for n in norm], [True, True, False, True, False])
+check(f"ledger ({kind}): only a promote admits content", [n[2] for n in norm], [True, False, True, False])
 check(f"ledger ({kind}): the approved create is ledgered ONCE, under its own case id",
       [(case_of(r), r["predicate"] if kind == "loom" else r["body"]["outcome"]) for r in elev_rows],
       [(elev_case, "governance-decision:promote" if kind == "loom" else "promote")])
