@@ -12,12 +12,16 @@ on:
       - 'docs/adr/**'
       - 'scripts/adr-index-gen.js'
       - 'scripts/adr-ratchet.sh'
+      - 'scripts/tests/adr-ratchet-evidence.test.sh'
+      - 'scripts/tests/adr-evidence-class.test.sh'
       - '.github/workflows/adr.yml'
   pull_request:
     paths:
       - 'docs/adr/**'
       - 'scripts/adr-index-gen.js'
       - 'scripts/adr-ratchet.sh'
+      - 'scripts/tests/adr-ratchet-evidence.test.sh'
+      - 'scripts/tests/adr-evidence-class.test.sh'
       - '.github/workflows/adr.yml'
   workflow_dispatch: {}
 
@@ -40,6 +44,12 @@ jobs:
 
       - name: Validate ADR frontmatter
         run: node scripts/adr-index-gen.js docs/adr --check
+
+      - name: adr-ratchet evidence gate self-test (VisionFlow ADR-2007: closing transitions need evidence_class and acceptance_boundary)
+        run: bash scripts/tests/adr-ratchet-evidence.test.sh
+
+      - name: adr evidence_class value check (VisionFlow ADR-2007: enum, '+'-joined)
+        run: bash scripts/tests/adr-evidence-class.test.sh
 
       - name: adr-ratchet (planning cycle 2026-09-21 — a new proposal must close a proposed one)
         env:
