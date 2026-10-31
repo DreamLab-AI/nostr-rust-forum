@@ -12,6 +12,8 @@ verified_paths: [scripts/e2e-ontology-promotion.sh, crates/nostr-bbs-core/src/on
 owner: jjohare
 review_trigger: `scripts/e2e-ontology-promotion.sh` passing in stub mode and with `E2E_REAL_VAULT=1`; an operator publishing the `ontology-governance` 31400 on the production relay (the activation step); the first real 31402 raised against that panel
 repo: nostr-rust-forum
+evidence_class: source+test
+acceptance_boundary: scripts/e2e-ontology-promotion.sh at 64589c7 passes 30/30 in stub mode and 100/100 with the real vault 0.1.0 and ontomark 0.7.0 on a scratch corpus. The ledger was a local recording stub (no real Loom ledger run) and nothing was published to a relay; the ontology-governance 31400 is unpublished, so activation stays staged
 ---
 
 # ADR-2013 — The ontology-governance panel activates Promote, adds Demote, and expires proposals rather than re-surfacing them forever
