@@ -3,11 +3,12 @@ id: ADR-2013
 title: The ontology-governance panel activates Promote, adds Demote, and expires proposals rather than re-surfacing them forever
 date: 2026-09-22
 decision_status: accepted
-implementation_status: partial
+implementation_status: complete
 activation_status: staged
 supersedes: []
 superseded_by: []
-verified_commit: b45c672b5bc73e5858f03490aa212d7e15526742
+verified_commit: 64589c7af98571329499fde936d5a829c43fcd4e
+verified_paths: [scripts/e2e-ontology-promotion.sh, crates/nostr-bbs-core/src/ontology_governance.rs, crates/nostr-bbs-relay-worker/src/cron.rs, crates/nostr-bbs-relay-worker/src/relay_do/receipts.rs, crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs]
 owner: jjohare
 review_trigger: `scripts/e2e-ontology-promotion.sh` passing in stub mode and with `E2E_REAL_VAULT=1`; an operator publishing the `ontology-governance` 31400 on the production relay (the activation step); the first real 31402 raised against that panel
 repo: nostr-rust-forum
@@ -59,3 +60,22 @@ No status change; `review_trigger` restated because its first clause has fired: 
 - `bash scripts/e2e-ontology-promotion.sh` (stub mode): 9 passed, 10 failed. Step 3 stops with `sqlite3.OperationalError: no such column: d_tag`. Cause, reproduced: the script pre-creates an `events` shim without `d_tag`, so migration `0009_events.sql` (`66ca8d8`, 2026-10-12) skips its `CREATE TABLE IF NOT EXISTS events` and its `idx_events_replaceable (kind, pubkey, d_tag)` index fails. This is a defect in the test harness's shim, not in the relay migrations.
 
 The record stays accepted / partial / staged. Activation remains an operator publishing the 31400.
+
+## Close-out 2026-10-31
+
+Status moves to `accepted / complete / staged`. The forum's half was always green; what blocked completion was the end-to-end script, which had drifted from agentbox. It is now green in both modes at `64589c7` (commits `a0f33f4`, `64589c7`). Activation stays `staged`: the operator still has to publish the `ontology-governance` 31400, and nothing here published to a relay (every `vault propose` is `--dry-run`; the ledger is a local recording stub, with `LOOM_FACADE_URL` pinned to it so the live Loom is never reached).
+
+**Why the 2026-10-30 failures were not the ADR-2109 verb problem.** The 33 real-mode failures and the 9/19 stub run had four harness causes, none a rejected verb (`grep -r "unrecognized subcommand"` over the kept artefacts returned nothing):
+
+1. The `events` shim lacked `d_tag`/`received_at`, so migration `0009_events.sql`'s `idx_events_replaceable` failed. The shim now carries both columns.
+2. agentbox now refuses every ontology write without a signer roster (`AGENTBOX_FORUM_GOVERNANCE_SIGNERS`) and refuses a promote whose 31402 it cannot look up (`_ontologyDeps.fetchRequest`). The drivers now seat the human and supply the stored request.
+3. Corpus verbs moved to `ontomark` (agentbox `2d49681bf`) and the corpus layout is flat (`knowledge/<id>.md`). The script installs counting wrappers for both binaries, seeds the flat layout and validates with `ontomark`.
+4. `commitPage` commits each governed write, so the drivers reset to the seed SHA and judge "written" by diff against it.
+
+**One contract change, asserted rather than loosened.** The fixture's 31402 is a diff-bearing amend, so a human Promote is `ontomark apply <proposal.json>` (agentbox `afc8a0ed6`), not a status `edit`. Stub mode now asserts the `apply` argv (`docs=1`, the `verified+=` attestation as a YAML flow mapping, no `status=` edit). Real mode's "re-promote re-attests" case no longer holds for an amend: the replay is refused `STALE` (hunk 1 expects `status: draft`), the page is unchanged and the ledger holds four entries, not five. The replay is byte-checked: page sha256 and repo HEAD are asserted unchanged. A diff-less promote still re-attests: agentbox's `ontology-apply.test.js` covers the handler logic with a stub binary, and the real-binary path was probed separately on 2026-10-31 (reviewer R2: `ontomark 0.7.0 edit --set status=stable --set 'verified+=…' --expect docs=1,blocks=2` exit 0, then a second attestation at `blocks=1` exit 0). This script no longer exercises it.
+
+Executed (fixture binaries: `vault 0.1.0`, `ontomark 0.7.0`, scratch corpus copied from `visionGraph`'s vocabulary and manifest, read only):
+
+- `bash scripts/e2e-ontology-promotion.sh` → 30 passed, 0 failed.
+- `E2E_REAL_VAULT=1 E2E_LEDGER=stub E2E_VAULT_BIN=$(command -v vault) bash scripts/e2e-ontology-promotion.sh` → 100 passed, 0 failed.
+- Real Loom ledger (`E2E_LEDGER=loom`) was not run: no `loom-facade` build in this container, so the stub ledger stood in. The attest HTTP contract is held by agentbox ADR-2109.
