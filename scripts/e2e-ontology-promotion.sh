@@ -161,13 +161,15 @@ db = sqlite3.connect(":memory:")
 # `events` is the relay's envelope table. It lives in the Durable Object's own
 # SQLite, not in D1, so no D1 migration creates it — but 0004 backfills its
 # tag index FROM it. An empty shim with the columns 0004 reads is therefore
-# exactly right here: the backfill runs over zero rows, as it does against a
+# exactly right here (migration 0009 later creates the same table, so its
+# `d_tag` index needs `d_tag` and `received_at` on the shim too): the backfill runs over zero rows, as it does against a
 # fresh relay, and the governance tables under test are unaffected.
 db.executescript(
     "PRAGMA foreign_keys=ON;"
     "CREATE TABLE IF NOT EXISTS events ("
     "  id TEXT PRIMARY KEY, pubkey TEXT, created_at INTEGER, kind INTEGER,"
-    "  tags TEXT DEFAULT '[]', content TEXT, sig TEXT);"
+    "  tags TEXT DEFAULT '[]', content TEXT, sig TEXT,"
+    "  d_tag TEXT NOT NULL DEFAULT '', received_at INTEGER NOT NULL DEFAULT 0);"
 )
 db.executescript(ddl)
 
@@ -289,7 +291,7 @@ while IFS= read -r line; do
 done < "$WORK/relay.out"
 
 # ───────────────────────────────────────────────────────────────────────────
-step "4. Apply — agentbox handleGovernanceDecision → vault edit"
+step "4. Apply — agentbox handleGovernanceDecision → ontomark apply/edit"
 
 # Read an `ok …` / `FAIL …` stream produced by an embedded driver into the
 # counters. Anything else is echoed indented, so a traceback is visible.
@@ -316,9 +318,10 @@ elif [[ "${E2E_REAL_VAULT:-0}" != "1" ]]; then
   # the stub gets a minimal one: just the marker the resolver checks for.
   printf 'version: 1\n' > "$WORK/stub-repo/ontology/vocabulary.yaml"
   # apply reads the page's current status (read-only) to plan the key set.
-  mkdir -p "$WORK/stub-repo/knowledge/pages"
+  # Flat layout (ontomark, ADR-OM-007): knowledge/<id>.md.
+  mkdir -p "$WORK/stub-repo/knowledge"
   printf -- '---\ntype: Class\nresource: %s\nstatus: draft\n---\n' "$TEST_IRI" \
-    > "$WORK/stub-repo/knowledge/pages/$TEST_PAGE.md"
+    > "$WORK/stub-repo/knowledge/$TEST_PAGE.md"
   cat > "$STUB_DIR/vault" <<'STUB'
 #!/bin/sh
 # Stub `vault`. Records argv verbatim (including the --repo pin), answers C2.
@@ -331,9 +334,12 @@ case "$1" in
 esac
 STUB
   chmod +x "$STUB_DIR/vault"
-  ok "stub vault installed at $STUB_DIR/vault"
+  # agentbox (ADR-2109, 2026-10-31) spawns `ontomark` for find/edit/create/apply
+  # and keeps `vault` for propose/panel only; the same recorder serves both.
+  cp "$STUB_DIR/vault" "$STUB_DIR/ontomark"
+  ok "stub vault + ontomark installed at $STUB_DIR"
 
-  PATH="$STUB_DIR:$PATH" AGENTBOX_ROOT="$AGENTBOX_ROOT" AGENTBOX_NPUB="" VAULT_REPO="$WORK/stub-repo" VAULT_BIN="" \
+  PATH="$STUB_DIR:$PATH" AGENTBOX_ROOT="$AGENTBOX_ROOT" AGENTBOX_NPUB="" VAULT_REPO="$WORK/stub-repo" VAULT_BIN="" ONTOMARK_BIN="" \
   node - "$WORK/fixture.json" "$STUB_DIR/argv.log" <<'NODE' > "$WORK/apply.out" 2>&1 || true
 const fs = require('fs'), os = require('os'), path = require('path');
 const root = process.env.AGENTBOX_ROOT;
@@ -355,8 +361,16 @@ const check = (name, got, want) =>
     return { ok: false, status: 404 };
   };
 
+  // The signer-roster gate (local-process-manager `_ontologySignerRefusal`)
+  // refuses every ontology write when the roster is empty: seat the human.
+  process.env.AGENTBOX_FORUM_GOVERNANCE_SIGNERS = fixture.schema.response.pubkey;
   const adapter = new LocalProcessManagerOrchestratorAdapter({});
-  adapter._ontologyDeps = { fetchFn };
+  // The relay consumer's stored copy of the 31402 this promote answers; the
+  // handler refuses a promote whose request it cannot find.
+  const rq = fixture.schema.request;
+  const storedReq = { event_id: rq.id, kind: 31402, d_tag: fixture.schema.case_id,
+                      content: rq.content, tags: rq.tags };
+  adapter._ontologyDeps = { fetchFn, fetchRequest: async (id) => (id === rq.id ? storedReq : null) };
 
   // Run from an unrelated cwd: the --repo pin must not depend on it.
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-gov-'));
@@ -376,17 +390,23 @@ const check = (name, got, want) =>
   check('every vault call is pinned to the resolved repo with --repo',
         raw.length > 0 && raw.every(c => c[0] === '--repo' && c[1] === process.env.VAULT_REPO), true);
   const calls = raw.map(c => (c[0] === '--repo' ? c.slice(2) : c));
-  const edit = calls.find(c => c[0] === 'edit') || [];
+  // The fixture's 31402 carries a diff (a `kind: amend` proposal), so since
+  // afc8a0ed6 a human Promote is applied by `ontomark apply <proposal.json>`,
+  // not by a status `edit`: the signed diff IS the change, the human adds only
+  // the attestation. (`edit` remains the path for a diff-less promote.)
+  const edit = calls.find(c => c[0] === 'apply') || [];
 
-  check('vault edit names the resolved page', edit.slice(0, 2), ['edit', fixture.page]);
-  check('vault edit sets status=stable', edit.includes('status=stable'), true);
-  check('vault edit declares the blast radius docs=1,blocks=2 (status + verified)',
-        edit[edit.indexOf('--expect') + 1], 'docs=1,blocks=2');
+  check('ontomark apply is handed the staged proposal file', [edit[0], typeof edit[1]], ['apply', 'string']);
+  check('no status edit rides alongside the signed diff', calls.some(c => c[0] === 'edit'), false);
+  check('ontomark apply declares the blast radius docs=1 (the diff; the stamp is not a block)',
+        edit[edit.indexOf('--expect') + 1], 'docs=1');
 
   const verified = edit.find(a => a.startsWith('verified+='));
   check('vault edit APPENDS a human attestation', typeof verified, 'string');
   if (verified) {
-    const v = JSON.parse(verified.slice('verified+='.length));
+    // A YAML flow mapping (`{by: human:<npub>, at: <rfc3339>}`), not JSON.
+    const m = /^\{by: (\S+), at: (\S+)\}$/.exec(verified.slice('verified+='.length));
+    const v = m ? { by: m[1], at: m[2] } : { by: '', at: null };
     check('the attestation names the signing human', v.by.startsWith('human:'), true);
     check('the attestation instant is the 31403 created_at, not wall clock',
           v.at, new Date(fixture.schema.response.created_at * 1000).toISOString());
