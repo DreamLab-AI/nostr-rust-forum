@@ -11,6 +11,8 @@ verified_commit:                 # git sha at which implementation_status was ve
 owner:                           # accountable person/handle
 review_trigger:                  # the event/date that forces a re-review of this ADR
 repo: nostr-rust-forum           # nostr-rust-forum
+evidence_class:                  # required when implementation_status becomes complete or activation_status becomes live (adr-ratchet, ADR-2007): source | test | ci | deployment | runtime (join with +)
+acceptance_boundary:             # required with evidence_class: what the evidence does and does not establish
 ---
 
 # ADR-NNNN — Short imperative title
