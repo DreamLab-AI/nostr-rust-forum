@@ -330,6 +330,7 @@ elif [[ "${E2E_REAL_VAULT:-0}" != "1" ]]; then
 case "$1" in
   find) printf '%s' '[{"id":"Test E2E Promotion","title":"Test E2E Promotion","type":"Class","score":1}]' ;;
   edit) printf '%s' '{"ok":true,"docs":1,"blocks":2}' ;;
+  apply) cp "$2" "$(dirname "$0")/applied-proposal.json" 2>/dev/null; printf '%s' '{"ok":true,"docs":1,"blocks":2}' ;;
   *)    printf '%s' 'null' ;;
 esac
 STUB
@@ -340,7 +341,7 @@ STUB
   ok "stub vault + ontomark installed at $STUB_DIR"
 
   PATH="$STUB_DIR:$PATH" AGENTBOX_ROOT="$AGENTBOX_ROOT" AGENTBOX_NPUB="" VAULT_REPO="$WORK/stub-repo" VAULT_BIN="" ONTOMARK_BIN="" \
-  node - "$WORK/fixture.json" "$STUB_DIR/argv.log" <<'NODE' > "$WORK/apply.out" 2>&1 || true
+  node - "$WORK/fixture.json" "$STUB_DIR/argv.log" "$STUB_DIR/applied-proposal.json" <<'NODE' > "$WORK/apply.out" 2>&1 || true
 const fs = require('fs'), os = require('os'), path = require('path');
 const root = process.env.AGENTBOX_ROOT;
 const { LocalProcessManagerOrchestratorAdapter } =
@@ -348,6 +349,7 @@ const { LocalProcessManagerOrchestratorAdapter } =
 
 const fixture = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const logPath = process.argv[3];
+const stagedPath = process.argv[4];
 const results = [];
 const check = (name, got, want) =>
   results.push([name, JSON.stringify(got) === JSON.stringify(want), got, want]);
@@ -394,15 +396,22 @@ const check = (name, got, want) =>
   // afc8a0ed6 a human Promote is applied by `ontomark apply <proposal.json>`,
   // not by a status `edit`: the signed diff IS the change, the human adds only
   // the attestation. (`edit` remains the path for a diff-less promote.)
-  const edit = calls.find(c => c[0] === 'apply') || [];
+  const applyCall = calls.find(c => c[0] === 'apply') || [];
 
-  check('ontomark apply is handed the staged proposal file', [edit[0], typeof edit[1]], ['apply', 'string']);
+  check('ontomark apply is handed the staged proposal file', [applyCall[0], typeof applyCall[1]], ['apply', 'string']);
+  // The stub copied the staged file as ontomark received it: it must be the
+  // signed 31402's proposal, bound to the same page.
+  let staged = {};
+  try { staged = JSON.parse(fs.readFileSync(stagedPath, 'utf8')); } catch (_) {}
+  const signedProposal = (() => { try { return JSON.parse(rq.content); } catch (_) { return {}; } })();
+  check('the staged proposal file is the signed proposal (same page)', staged.page, fixture.page);
+  check('the staged proposal file carries the signed IRI', staged.iri, signedProposal.iri);
   check('no status edit rides alongside the signed diff', calls.some(c => c[0] === 'edit'), false);
   check('ontomark apply declares the blast radius docs=1 (the diff; the stamp is not a block)',
-        edit[edit.indexOf('--expect') + 1], 'docs=1');
+        applyCall[applyCall.indexOf('--expect') + 1], 'docs=1');
 
-  const verified = edit.find(a => a.startsWith('verified+='));
-  check('vault edit APPENDS a human attestation', typeof verified, 'string');
+  const verified = applyCall.find(a => a.startsWith('verified+='));
+  check('ontomark apply APPENDS a human attestation', typeof verified, 'string');
   if (verified) {
     // A YAML flow mapping (`{by: human:<npub>, at: <rfc3339>}`), not JSON.
     const m = /^\{by: (\S+), at: (\S+)\}$/.exec(verified.slice('verified+='.length));
@@ -483,7 +492,7 @@ EOF
     ok "scratch repo seeded and committed at $SCRATCH"
 
     "$ONTOMARK_REAL" --repo "$SCRATCH" validate --strict --json > "$WORK/validate.json" || true
-    check "vault validate --strict: the fixture page has no issues" \
+    check "ontomark validate --strict: the fixture page has no issues" \
       "$(python3 -c "
 import json,sys
 d=json.load(open('$WORK/validate.json'))['knowledge']
@@ -694,7 +703,7 @@ const pageIssues = () => {
   check('promote: only the fixture page was written', dirty(), [`knowledge/${page}.md`]);
   check('promote: the written page still validates --strict', pageIssues(), []);
 
-  // ── Re-promote a stable page: a RE-ATTESTATION ─────────────────────────
+  // ── Re-promote a stable page: a REPLAYED AMEND IS REFUSED ───
   res = await run(decision.promote);
   fm = front();
   // The fixture's 31402 is a diff-bearing amend, so since afc8a0ed6 a second
@@ -790,7 +799,7 @@ const clean = () => execFileSync('git', ['-C', repo, 'status', '--porcelain'], {
 
   // The sound candidate: staged, validated alone, proposed with --diff.
   const out = await gateElevation(descriptor(NOTE), { env, tmpRoot });
-  check('elevation: the staged page passes vault validate on its own', out.stage_issues, []);
+  check('elevation: the staged page passes ontomark validate on its own', out.stage_issues, []);
   check('elevation: vault propose accepted the staged NEW page', [out.proposable, out.error], [true, null]);
   const p = out.proposal || {}, e = out.event || {};
   check('elevation: the PatchProposal names the new class', [p.iri, p.page],
@@ -815,7 +824,7 @@ NODE
     # (g) the elevation's create proposal, APPROVED: a human-signed Promote of
     #     the real vault-built 31402, applied by agentbox through ONE
     #     `vault create` of the page the signed diff adds; the created page is
-    #     read back and must pass `vault validate`.
+    #     read back and must pass `ontomark validate`.
     if [[ -s "$WORK/request-elevation.json" ]] && ( cd "$REPO_ROOT" && cargo run -q -p nostr-bbs-core \
          --example ontology_promotion_fixture -- --from-request "$WORK/request-elevation.json" \
          > "$WORK/decision-elevation.json" 2> "$WORK/decision-elevation.err" ); then
@@ -859,7 +868,7 @@ const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8'
   const o = res.ontology || {};
   check('create: applied through vault create, and attested',
         [o.applied, o.created, o.attested, o.error || null], [true, true, true, null]);
-  check('create: ONE vault create, no edit',
+  check('create: ONE ontomark create, no edit',
         fs.readFileSync(path.join(work, 'vault-calls.log'), 'utf8').split('--\n').filter(Boolean)
           .map(b => b.split('\n')).map(a => (a[0] === 'ontomark' ? a.slice(1) : a))
           .filter(a => a[2] === 'create' || (a[2] === 'edit' && a[3] === page))
@@ -885,7 +894,7 @@ const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8'
   const r = spawnSync(process.env.ONTOMARK_REAL, ['--repo', repo, 'validate', '--strict', '--json'],
     { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
   const issues = JSON.parse(r.stdout).knowledge.issues.filter(i => i.path === page);
-  check('create: the created page passes vault validate --strict', issues, []);
+  check('create: the created page passes ontomark validate --strict', issues, []);
   check('create: only the new page was written',
         git('status', '--porcelain').split('\n').filter(Boolean).map(l => l.slice(3).replace(/^"|"$/g, '')),
         [`knowledge/${page}.md`]);
