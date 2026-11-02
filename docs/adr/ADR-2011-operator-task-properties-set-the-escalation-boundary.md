@@ -15,6 +15,12 @@ repo: nostr-rust-forum
 
 # ADR-2011 — Operator-declared task properties set the escalation boundary, not the requesting agent's self-tier
 
+## External review qualification — 2026-11-02
+
+The [dated source reconciliation](external-review-2026-11-02.md) records the current
+implementation evidence, open acceptance gaps and limits of the external review.
+It supplements this decision without changing its adoption or activation status.
+
 ## Context
 
 A 31402 `ActionRequest` carried one boundary signal, `risk_tier`, declared by the requesting agent, with the doc comment "the agent's declaration stands". No relay or human path re-tiered it. The relay advertised `ESCALATION_DEFAULT_TIER=medium` and `ESCALATION_DEFAULT_POSTURE=escalate_to_human` in NIP-11 (`wrangler.toml:48-49`) and enforced neither. The party with the strongest incentive to under-tier was the only party that tiered. arXiv 2609.12482 sets the human–agent boundary by three properties of the *task* — verifiability, reversibility, stakes — not by the actor's self-assessment. This ADR is the forum's implementation of canon [VisionFlow ADR-2011](https://github.com/DreamLab-AI/VisionFlow) and the FR3/FR4/FR6/FR7 substrate work of PRD-augmentation-conditions. It builds on [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md), whose receipt ladder it extends past `projection-committed`.

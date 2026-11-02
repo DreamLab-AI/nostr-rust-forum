@@ -17,6 +17,12 @@ lineage: distils legacy ADR-094 (deterministic subkey derivation) and the ADR-10
 
 # ADR-2003 — Derive purpose-scoped subkeys with raw HMAC-SHA256, not HKDF, for byte-for-byte JS parity
 
+## External review qualification — 2026-11-02
+
+The [dated source reconciliation](external-review-2026-11-02.md) records the current
+implementation evidence, open acceptance gaps and limits of the external review.
+It supplements this decision without changing its adoption or activation status.
+
 ## Context
 
 `derive_subkey(root, tag)` produces a purpose-scoped child secret shared across the

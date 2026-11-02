@@ -16,6 +16,12 @@ domain: BASELINE-architecture.md
 
 # ADR-2017 — Migrate plaintext history into encrypted zones as sealed originals, then purge the plaintext silently
 
+## External review qualification — 2026-11-02
+
+The [dated source reconciliation](external-review-2026-11-02.md) records the current
+implementation evidence, open acceptance gaps and limits of the external review.
+It supplements this decision without changing its adoption or activation status.
+
 ## Context
 
 ADR-2016 encrypts new kind-42 posts in encrypted zones and explicitly defers

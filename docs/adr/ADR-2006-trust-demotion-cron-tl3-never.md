@@ -17,6 +17,12 @@ lineage: distils legacy ADR-102 (inactivity-decay demotion sweep) and the TL0–
 
 # ADR-2006 — Run trust demotion time-driven on the cron trigger with hysteresis; never auto-demote TL3
 
+## External review qualification — 2026-11-02
+
+The [dated source reconciliation](external-review-2026-11-02.md) records the current
+implementation evidence, open acceptance gaps and limits of the external review.
+It supplements this decision without changing its adoption or activation status.
+
 ## Context
 
 Promotion up the TL0–TL3 ladder is driven by activity tallied at EOSE on the hot path.

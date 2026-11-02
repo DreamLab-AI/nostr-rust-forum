@@ -17,6 +17,12 @@ lineage: distils legacy ADR-105 §2.3 (BBS door-games/write architecture), amend
 
 # ADR-2008 — Let the retro BBS client hold its SecretKey directly, diverging from the ADR-105 `sign()` seam
 
+## External review qualification — 2026-11-02
+
+The [dated source reconciliation](external-review-2026-11-02.md) records the current
+implementation evidence, open acceptance gaps and limits of the external review.
+It supplements this decision without changing its adoption or activation status.
+
 ## Context
 
 ADR-105 §2.3 decided the retro BBS client would not custody key material: it would delegate

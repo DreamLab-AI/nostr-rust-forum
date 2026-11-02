@@ -16,6 +16,12 @@ domain: IDENTITY-keys-and-trust.md
 
 # ADR-2014 — One member lifecycle, one authoritative store, one admin surface
 
+## External review qualification — 2026-11-02
+
+The [dated source reconciliation](external-review-2026-11-02.md) records the current
+implementation evidence, open acceptance gaps and limits of the external review.
+It supplements this decision without changing its adoption or activation status.
+
 ## Context
 
 Membership is stored in two D1 databases that never reconcile: the auth worker's

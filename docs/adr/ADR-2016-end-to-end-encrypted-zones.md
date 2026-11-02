@@ -17,6 +17,12 @@ domain: BASELINE-architecture.md
 
 # ADR-2016 — A zone can be end-to-end encrypted with per-epoch zone keys granted by gift wrap, behind a deployment gate
 
+## External review qualification — 2026-11-02
+
+The [dated source reconciliation](external-review-2026-11-02.md) records the current
+implementation evidence, open acceptance gaps and limits of the external review.
+It supplements this decision without changing its adoption or activation status.
+
 ## Context
 
 `nostr_bbs_config::Zone.encrypted` existed and operators set it (the dreamlab

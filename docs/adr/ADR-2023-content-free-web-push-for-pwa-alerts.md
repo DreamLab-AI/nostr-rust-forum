@@ -15,6 +15,12 @@ repo: nostr-rust-forum
 
 # ADR-2023 — Content-free Web Push delivers reply, DM and new-message alerts to the PWA
 
+## External review qualification — 2026-11-02
+
+The [dated source reconciliation](external-review-2026-11-02.md) records the current
+implementation evidence, open acceptance gaps and limits of the external review.
+It supplements this decision without changing its adoption or activation status.
+
 ## Context
 - Alerts exist only in-app (`stores/notifications.rs`) and only while a tab holds the relay WebSocket. A closed or backgrounded PWA, the normal mobile state, gets nothing. `NotificationKind::DM` is rendered but nothing ever produces it.
 - `sw.js` has no `push` / `notificationclick` handler; the relay fans out to live sessions only (`relay_do/broadcast.rs`).
