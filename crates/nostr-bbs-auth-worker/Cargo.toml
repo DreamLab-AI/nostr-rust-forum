@@ -36,4 +36,5 @@ async-trait = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 nostr-bbs-jev = { workspace = true, features = ["test-util"] }

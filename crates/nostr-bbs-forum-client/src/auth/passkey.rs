@@ -170,8 +170,18 @@ pub async fn register_passkey(
         "pubkey": pubkey,
         "prfSalt": prf_salt_b64,
     });
+    let verify_url = if base.is_empty() {
+        let origin = window()
+            .map(|w| w.location().origin().unwrap_or_default())
+            .unwrap_or_default();
+        format!("{origin}/auth/register/verify")
+    } else {
+        format!("{base}/auth/register/verify")
+    };
     let verify_text =
-        fetch_json_post(&format!("{base}/auth/register/verify"), &verify_body).await?;
+        nip98::fetch_with_nip98_post(&verify_url, &verify_body.to_string(), &privkey_bytes)
+            .await
+            .map_err(|e| PasskeyError::Protocol(e.to_string()))?;
     if cfg!(debug_assertions) {
         web_sys::console::log_1(
             &format!(

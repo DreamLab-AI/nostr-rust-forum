@@ -17,6 +17,13 @@ lineage: extends the recipient-keyed gift-wrap admission rule (legacy ADR-104).
 
 # ADR-2022 — Declare gift-wrap recipients in config so the relay admits them without a whitelist row
 
+## Producer repair — 2026-11-03
+
+The [external-review repair receipt](external-fixes-2026-11-03.md) records the
+implemented ceremony, authority, concurrency and consumer-contract changes relevant
+to this decision, with their migration and deployment limits. These changes do not
+promote the whole decision's implementation or activation status.
+
 ## Context
 
 A static site can take contact enquiries, signups and chat messages with no database: the browser

@@ -351,9 +351,17 @@ pub async fn passkey_register(display_name: &str) -> Result<PasskeyOutcome, Pass
 
     let encoded = encode_attestation_response(&credential)?;
     let verify_body = register_verify_body(encoded, &pubkey, &prf_salt_b64);
-    // Register verify is a plain POST (the credential proves possession); the
-    // server records the credential and provisions the pod / whitelist entry.
-    fetch_json_post(&endpoint(&base, "/auth/register/verify"), &verify_body).await?;
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(keypair.secret.as_bytes());
+    let verify_result = fetch_with_nip98_post(
+        &endpoint(&base, "/auth/register/verify"),
+        &verify_body.to_string(),
+        &secret,
+    )
+    .await;
+    use zeroize::Zeroize;
+    secret.zeroize();
+    verify_result?;
 
     Ok(PasskeyOutcome { pubkey, keypair })
 }

@@ -141,7 +141,12 @@ pub async fn register_device(
     // 3. Register the device pubkey — NIP-98 signed by the MASTER.
     let signer = auth.get_signer().ok_or(DeviceError::NoSigner)?;
     let url = format!("{}/api/devices/register", auth_api_base());
-    let body = serde_json::json!({ "device_pubkey": device_pubkey, "label": label }).to_string();
+    let body = registration_body(
+        &device_sk,
+        &master_sk.public_key().to_hex(),
+        label,
+        (js_sys::Date::now() / 1000.0) as u64,
+    )?;
     fetch_with_nip98_post_signer(&url, &body, signer.as_ref())
         .await
         .map_err(|e| DeviceError::Request(e.to_string()))?;
@@ -183,7 +188,12 @@ pub async fn register_device_with_master(
         nostr_bbs_core::encode_nsec(&device_hex).map_err(|e| DeviceError::Encode(e.to_string()))?;
 
     let url = format!("{}/api/devices/register", auth_api_base());
-    let body = serde_json::json!({ "device_pubkey": device_pubkey, "label": label }).to_string();
+    let body = registration_body(
+        &device_sk,
+        &master_sk.public_key().to_hex(),
+        label,
+        (js_sys::Date::now() / 1000.0) as u64,
+    )?;
     fetch_with_nip98_post(&url, &body, &master_bytes)
         .await
         .map_err(|e| DeviceError::Request(e.to_string()))?;
@@ -257,6 +267,31 @@ pub fn device_connect_url(device_nsec: &str) -> Option<String> {
         "{origin}{}#k={device_nsec}",
         crate::app::base_href("/connect")
     ))
+}
+
+fn registration_body(
+    device: &nostr_bbs_core::SecretKey,
+    owner: &str,
+    label: &str,
+    now: u64,
+) -> Result<String, DeviceError> {
+    let key = k256::schnorr::SigningKey::from_bytes(device.as_bytes().into())
+        .map_err(|e| DeviceError::Derive(e.to_string()))?;
+    let proof = nostr_bbs_core::event::sign_event(
+        nostr_bbs_core::event::UnsignedEvent {
+            pubkey: device.public_key().to_hex(),
+            created_at: now,
+            kind: 27236,
+            tags: vec![
+                vec!["owner".into(), owner.into()],
+                vec!["exp".into(), (now + 60).to_string()],
+            ],
+            content: String::new(),
+        },
+        &key,
+    )
+    .map_err(|e| DeviceError::Derive(e.to_string()))?;
+    Ok(serde_json::json!({"device_pubkey": device.public_key().to_hex(), "label": label, "device_proof": proof}).to_string())
 }
 
 /// Parse a `GET /api/devices` body. Accepts either a bare JSON array or a

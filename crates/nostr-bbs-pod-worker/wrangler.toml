@@ -26,6 +26,13 @@ binding = "REPLAY_DB"
 database_name = "nostr-bbs-auth"
 database_id = "e3981999-e8f0-4c07-9e4b-2e50859b8524"
 
+# Dynamic admin authority is the relay whitelist, never auth members rows.
+# Instance overlays must supply their relay D1 database id.
+[[d1_databases]]
+binding = "RELAY_DB"
+database_name = "nostr-bbs-relay"
+database_id = "00000000-0000-0000-0000-000000000000"
+
 [vars]
 EXPECTED_ORIGIN = "https://example.com"
 PAY_ENABLED = "false"

@@ -67,13 +67,6 @@ struct InviteRow {
     zone_id: Option<String>,
 }
 
-/// Whitelist cohort projection read back from the relay's shared D1 before a
-/// merge-grant.
-#[derive(Deserialize)]
-struct WhitelistCohortsRow {
-    cohorts: String,
-}
-
 #[derive(Deserialize)]
 struct SettingsRow {
     min_days_active: i64,
@@ -257,24 +250,32 @@ async fn grant_zone_cohorts(env: &Env, pubkey: &str, zone_cohorts: &[String]) {
 
     // 2. Merge the zone cohorts into whatever row now exists. Covers the case
     //    where a concurrent claim-insert of ["members"] won step 1.
-    let existing = match db
-        .prepare("SELECT cohorts FROM whitelist WHERE pubkey = ?1")
-        .bind(&[js_str(pubkey)])
+    if let Ok(stmt) = db
+        .prepare(SQL_MERGE_COHORTS)
+        .bind(&[js_str(&seeded), js_str(pubkey)])
     {
-        Ok(stmt) => stmt.first::<WhitelistCohortsRow>(None).await.ok().flatten(),
-        Err(_) => None,
-    };
-    if let Some(row) = existing {
-        let merged = merge_cohorts_json(&row.cohorts, zone_cohorts);
-        if merged != row.cohorts {
-            if let Ok(stmt) = db
-                .prepare("UPDATE whitelist SET cohorts = ?1 WHERE pubkey = ?2")
-                .bind(&[js_str(&merged), js_str(pubkey)])
-            {
-                let _ = stmt.run().await;
-            }
+        if let Err(e) = stmt.run().await {
+            worker::console_error!("invite cohort merge failed: {e}");
         }
     }
+}
+
+const SQL_MERGE_COHORTS: &str = "UPDATE whitelist SET cohorts = (SELECT json_group_array(value) FROM (SELECT value FROM json_each(CASE WHEN json_valid(whitelist.cohorts) THEN whitelist.cohorts ELSE '[]' END) UNION SELECT value FROM json_each(?1))) WHERE pubkey = ?2";
+
+#[cfg(test)]
+#[test]
+fn cohort_grants_merge_atomically_without_losing_prior_grants() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE whitelist(pubkey TEXT PRIMARY KEY, cohorts TEXT); INSERT INTO whitelist VALUES('member', '[\"members\"]');").unwrap();
+    db.execute(SQL_MERGE_COHORTS, ["[\"zone-a\"]", "member"])
+        .unwrap();
+    db.execute(SQL_MERGE_COHORTS, ["[\"zone-b\",\"members\"]", "member"])
+        .unwrap();
+    let result: String = db
+        .query_row("SELECT cohorts FROM whitelist", [], |r| r.get(0))
+        .unwrap();
+    let got: Vec<String> = serde_json::from_str(&result).unwrap();
+    assert_eq!(got, ["members", "zone-a", "zone-b"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -730,7 +731,7 @@ pub async fn handle_revoke(
     };
 
     let row = db
-        .prepare("SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id FROM invitations WHERE id = ?1")
+        .prepare("SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id FROM invitations WHERE id = ?1 OR code = ?1")
         .bind(&[js_str(invite_id)])?
         .first::<InviteRow>(None)
         .await

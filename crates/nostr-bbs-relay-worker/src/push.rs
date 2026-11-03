@@ -152,9 +152,10 @@ const SQL_UPSERT_PREFS: &str = "INSERT INTO push_prefs (pubkey, replies, dms, ne
 /// Read a subscription's token hash, counters and links for the drain.
 const SQL_DRAIN_SELECT: &str =
     "SELECT token_hash, pending_dm, pending_reply, pending_topic, pending_post, \
-       link_reply, link_topic, link_post FROM push_subscriptions WHERE id = ?1";
+       link_reply, link_topic, link_post, bump_seq FROM push_subscriptions WHERE id = ?1";
 
 /// Subtract what the drain read (not "= 0") so a push that lands mid-drain is kept.
+#[cfg(test)]
 const SQL_DRAIN_SUBTRACT: &str =
     "UPDATE push_subscriptions SET pending_dm = MAX(pending_dm - ?2, 0), \
        pending_reply = MAX(pending_reply - ?3, 0), pending_topic = MAX(pending_topic - ?4, 0), \
@@ -194,7 +195,9 @@ const SQL_SWEEP_STALE: &str = "DELETE FROM push_subscriptions WHERE refreshed_at
 /// event so far as pushed about (`pushed_seq = bump_seq`). A bump that lands
 /// between the send and this statement is still covered, because the woken
 /// service worker drains the counters after it.
-const SQL_MARK_PUSHED: &str = "UPDATE push_subscriptions SET last_push_at = ?2, failures = 0, pushed_seq = bump_seq WHERE id = ?1";
+const SQL_MARK_PUSHED: &str = "UPDATE push_subscriptions SET last_push_at = MAX(last_push_at, ?2), failures = 0, pushed_seq = MAX(pushed_seq, ?3) WHERE id = ?1";
+
+const SQL_DRAIN_CLAIM: &str = "UPDATE push_subscriptions SET pending_dm = 0, pending_reply = 0, pending_topic = 0, pending_post = 0 WHERE id = ?1 AND pending_dm = ?2 AND pending_reply = ?3 AND pending_topic = ?4 AND pending_post = ?5 AND token_hash = ?6 AND bump_seq = ?7";
 
 /// Claim a device's push slot before sending. Succeeds (one row changed) only
 /// when its last push is at or before `?3` (`now` minus the shortest throttle of
@@ -615,6 +618,7 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>, bump_counters: bool) {
 
     let dm_budget = dm_hourly_budget(&env);
     let mut previous_push: HashMap<String, u64> = HashMap::new();
+    let mut claimed_seq: HashMap<String, f64> = HashMap::new();
     let mut auth_by_aud: HashMap<String, String> = HashMap::new();
     let mut results = Vec::new();
     for (id, (endpoint, last_push_at, mut cats)) in per_device {
@@ -679,6 +683,21 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>, bump_counters: bool) {
             };
             lead = next;
         }
+        #[derive(Deserialize)]
+        struct Sequence {
+            bump_seq: f64,
+        }
+        let sequence = db
+            .prepare("SELECT bump_seq FROM push_subscriptions WHERE id = ?1")
+            .bind(&[js_str(&id)]);
+        let sequence = match sequence {
+            Ok(s) => s.first::<Sequence>(None).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let Some(sequence) = sequence else {
+            continue;
+        };
+        claimed_seq.insert(id.clone(), sequence.bump_seq);
         let authorization = auth_by_aud
             .entry(aud.clone())
             .or_insert_with(|| vapid.authorization(&aud, now))
@@ -697,9 +716,11 @@ pub async fn deliver(env: Env, jobs: Vec<PushJob>, bump_counters: bool) {
     let mut stmts = Vec::new();
     for (id, outcome) in &results {
         let stmt = match outcome {
-            SendOutcome::Delivered => db
-                .prepare(SQL_MARK_PUSHED)
-                .bind(&[js_str(id), js_f64(now as f64)]),
+            SendOutcome::Delivered => db.prepare(SQL_MARK_PUSHED).bind(&[
+                js_str(id),
+                js_f64(now as f64),
+                js_f64(*claimed_seq.get(id).unwrap_or(&0.0)),
+            ]),
             SendOutcome::Gone => db
                 .prepare("DELETE FROM push_subscriptions WHERE id = ?1")
                 .bind(&[js_str(id)]),
@@ -1280,6 +1301,7 @@ struct DrainBody {
 #[derive(Deserialize)]
 struct DrainRow {
     token_hash: String,
+    bump_seq: f64,
     pending_dm: f64,
     pending_reply: f64,
     pending_topic: f64,
@@ -1296,41 +1318,57 @@ async fn drain(req: &Request, env: &Env, body: &[u8]) -> Result<Response> {
         Err(_) => return respond(req, env, &json!({ "error": "expected {id, token}" }), 400),
     };
     let db = env.d1("DB")?;
-    let row = db
-        .prepare(SQL_DRAIN_SELECT)
-        .bind(&[js_str(&parsed.id)])?
-        .first::<DrainRow>(None)
-        .await?;
-    let Some(row) = row else {
-        return respond(req, env, &json!({ "error": "unknown subscription" }), 404);
-    };
-    if !digests_equal(&row.token_hash, &sha256_hex(&parsed.token)) {
-        return respond(req, env, &json!({ "error": "invalid token" }), 401);
+    for _ in 0..8 {
+        let row = db
+            .prepare(SQL_DRAIN_SELECT)
+            .bind(&[js_str(&parsed.id)])?
+            .first::<DrainRow>(None)
+            .await?;
+        let Some(row) = row else {
+            return respond(req, env, &json!({ "error": "unknown subscription" }), 404);
+        };
+        if !digests_equal(&row.token_hash, &sha256_hex(&parsed.token)) {
+            return respond(req, env, &json!({ "error": "invalid token" }), 401);
+        }
+        // Claim exactly this snapshot. A racing drain or bump invalidates the
+        // comparison and is retried; only the winner returns these counters.
+        if !changed_one(
+            &db,
+            SQL_DRAIN_CLAIM,
+            &[
+                js_str(&parsed.id),
+                js_f64(row.pending_dm),
+                js_f64(row.pending_reply),
+                js_f64(row.pending_topic),
+                js_f64(row.pending_post),
+                js_str(&row.token_hash),
+                js_f64(row.bump_seq),
+            ],
+        )
+        .await
+        {
+            continue;
+        }
+        return respond(
+            req,
+            env,
+            &json!({
+                "dm": row.pending_dm as u64,
+                "reply": row.pending_reply as u64,
+                "topic": row.pending_topic as u64,
+                "post": row.pending_post as u64,
+                "link_reply": row.link_reply,
+                "link_topic": row.link_topic,
+                "link_post": row.link_post,
+            }),
+            200,
+        );
     }
-    // Subtract what was read (not "= 0") so a push that lands mid-drain is kept.
-    db.prepare(SQL_DRAIN_SUBTRACT)
-        .bind(&[
-            js_str(&parsed.id),
-            js_f64(row.pending_dm),
-            js_f64(row.pending_reply),
-            js_f64(row.pending_topic),
-            js_f64(row.pending_post),
-        ])?
-        .run()
-        .await?;
     respond(
         req,
         env,
-        &json!({
-            "dm": row.pending_dm as u64,
-            "reply": row.pending_reply as u64,
-            "topic": row.pending_topic as u64,
-            "post": row.pending_post as u64,
-            "link_reply": row.link_reply,
-            "link_topic": row.link_topic,
-            "link_post": row.link_post,
-        }),
-        200,
+        &json!({"error": "drain changed concurrently; retry"}),
+        503,
     )
 }
 
@@ -2237,7 +2275,7 @@ mod tests {
 
         // The flush pushes successfully. The app never drains (a visible tab, or
         // a stale token), so the counters stay above zero...
-        conn.execute(SQL_MARK_PUSHED, rusqlite::params!["s1", 1_000])
+        conn.execute(SQL_MARK_PUSHED, rusqlite::params!["s1", 1_000, 2])
             .unwrap();
         assert_eq!(count(&conn, "SELECT pending_dm FROM push_subscriptions"), 2);
         // ...but the device must NOT be woken again on later ticks.
@@ -2251,7 +2289,7 @@ mod tests {
         subscribe_row(&conn, "s1", PK_A, 1, "t");
         conn.execute(&bump_sql(Category::Reply), rusqlite::params!["s1", "/go/a"])
             .unwrap();
-        conn.execute(SQL_MARK_PUSHED, rusqlite::params!["s1", 1_000])
+        conn.execute(SQL_MARK_PUSHED, rusqlite::params!["s1", 1_000, 1])
             .unwrap();
         assert!(due(&conn, 2_000).is_empty());
 
@@ -2275,6 +2313,45 @@ mod tests {
         conn.execute(SQL_DRAIN_SUBTRACT, rusqlite::params!["s1", 1, 0, 0, 0])
             .unwrap();
         assert!(due(&conn, 5_000).is_empty(), "nothing left to say");
+    }
+
+    #[test]
+    fn concurrent_drains_cannot_return_the_same_counters() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute(&bump_sql(Category::Dm), ["s1"]).unwrap();
+        let token: String = conn
+            .query_row("SELECT token_hash FROM push_subscriptions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let claim = || {
+            conn.execute(
+                SQL_DRAIN_CLAIM,
+                rusqlite::params!["s1", 1, 0, 0, 0, token, 1],
+            )
+            .unwrap()
+        };
+        assert_eq!(claim(), 1);
+        assert_eq!(
+            claim(),
+            0,
+            "second stale snapshot must retry rather than duplicate delivery"
+        );
+        conn.execute(&bump_sql(Category::Dm), ["s1"]).unwrap();
+        assert_eq!(count(&conn, "SELECT pending_dm FROM push_subscriptions"), 1);
+    }
+
+    #[test]
+    fn a_bump_during_send_remains_owed_after_success() {
+        let conn = db();
+        subscribe_row(&conn, "s1", PK_A, 1, "t");
+        conn.execute(&bump_sql(Category::Dm), ["s1"]).unwrap();
+        let claimed = count(&conn, "SELECT bump_seq FROM push_subscriptions");
+        conn.execute(&bump_sql(Category::Dm), ["s1"]).unwrap();
+        conn.execute(SQL_MARK_PUSHED, rusqlite::params!["s1", 1_000, claimed])
+            .unwrap();
+        assert_eq!(due(&conn, 1_300), vec!["s1"]);
     }
 
     #[test]

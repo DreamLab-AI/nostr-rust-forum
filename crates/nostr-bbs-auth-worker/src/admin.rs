@@ -1,10 +1,8 @@
 //! NIP-98 verification + admin gate, shared across moderation / WoT /
 //! invites / welcome routes.
 //!
-//! Sprint admin model: a pubkey is an admin if `members.is_admin = 1`.
-//! We fall back to `whitelist.is_admin` when the `members` row is missing,
-//! so pre-sprint admins (tracked by the relay-worker) continue to work
-//! without manual backfill.
+//! Dynamic admin authority lives only in relay `whitelist.is_admin`.
+//! Auth-side legacy member rows never re-grant authority after demotion.
 //!
 //! ## Admin check algorithm
 //!
@@ -49,8 +47,6 @@ pub async fn verify(
 ///    three workers now agree on the static set (Gap 2).
 /// 2. The relay worker's D1 (`RELAY_DB` binding) — authority for dynamic
 ///    `whitelist.is_admin`, written by the relay's `/api/whitelist/*` handlers.
-/// 3. The auth worker's D1 (`DB` binding) — sprint-native `members.is_admin`
-///    rows created by the invite-redemption flow.
 ///
 /// Returns `false` on DB error or missing rows — never leaks ambient
 /// authority across error branches.
@@ -76,20 +72,6 @@ pub async fn is_admin(pubkey: &str, env: &Env) -> bool {
     if let Ok(relay_db) = env.d1("RELAY_DB") {
         if let Ok(stmt) = relay_db
             .prepare(nostr_bbs_core::WHITELIST_IS_ADMIN_SQL)
-            .bind(&[JsValue::from_str(pubkey)])
-        {
-            if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
-                if row.is_admin == 1 {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // DB (nostr-bbs-auth): members table from invite redemption flow
-    if let Ok(db) = env.d1("DB") {
-        if let Ok(stmt) = db
-            .prepare(nostr_bbs_core::MEMBERS_IS_ADMIN_SQL)
             .bind(&[JsValue::from_str(pubkey)])
         {
             if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {

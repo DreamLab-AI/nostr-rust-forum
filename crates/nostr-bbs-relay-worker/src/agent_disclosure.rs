@@ -32,13 +32,14 @@ struct AgentRegistryRow {
 }
 
 /// The minimal public disclosure shape rendered by the client badge. Carries
-/// only the three fields a reader needs to see who authorised an agent — no
+/// the public authorising principal and an explicit durable-registration bit; no
 /// `description`, `rate_limit_per_min` or `registered_at`.
 #[derive(Serialize, PartialEq, Debug)]
 struct AgentDisclosure {
     pubkey: String,
     name: String,
     registered_by: String,
+    registered: bool,
 }
 
 /// Pure projection: keep only active agents and drop every column the public
@@ -53,6 +54,7 @@ fn active_disclosures(rows: Vec<AgentRegistryRow>) -> Vec<AgentDisclosure> {
             pubkey: r.pubkey,
             name: r.name,
             registered_by: r.registered_by,
+            registered: true,
         })
         .collect()
 }
@@ -83,6 +85,7 @@ fn merge_ingress_disclosures(
             pubkey: entry.pubkey.clone(),
             name: entry.label.clone(),
             registered_by: entry.authorised_by.clone(),
+            registered: false,
         });
     }
     disclosed.sort_by(|a, b| a.name.cmp(&b.name));
@@ -92,7 +95,7 @@ fn merge_ingress_disclosures(
 /// `GET /api/agents/disclosure` (public).
 ///
 /// Lists the active agent set for the disclosure badge. No auth: the response
-/// carries only the three public fields, for agents the relay currently treats
+/// carries public disclosure fields, for agents the relay currently treats
 /// as active plus any config-declared ingress recipient that names an
 /// authorising principal (see [`merge_ingress_disclosures`]).
 pub async fn handle_agent_disclosure(env: &Env) -> Result<Response> {
@@ -167,11 +170,13 @@ mod tests {
             pubkey: "a".repeat(64),
             name: "scribe-bot".to_string(),
             registered_by: "b".repeat(64),
+            registered: true,
         };
         let v = serde_json::to_value(&d).unwrap();
         let obj = v.as_object().expect("object");
-        // Exactly the three public fields — nothing leaks from the wider row.
-        assert_eq!(obj.len(), 3);
+        // No private registry detail is exposed alongside registration provenance.
+        assert_eq!(obj.len(), 4);
+        assert_eq!(obj["registered"], true);
         assert!(obj.contains_key("pubkey"));
         assert!(obj.contains_key("name"));
         assert!(obj.contains_key("registered_by"));
@@ -222,6 +227,10 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "site-inbox");
+        assert!(
+            !out[0].registered,
+            "config disclosure is not durable registration"
+        );
         assert_eq!(out[0].registered_by, "b".repeat(64));
     }
 
@@ -239,6 +248,7 @@ mod tests {
             "no duplicate for the same key, case-insensitively"
         );
         assert_eq!(out[0].name, "registered-name");
+        assert!(out[0].registered);
         assert_eq!(out[0].registered_by, "c".repeat(64));
     }
 

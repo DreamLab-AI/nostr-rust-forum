@@ -78,7 +78,7 @@ const MAX_SAMPLED_FAILURES: usize = 32;
 /// Ordering is `(COALESCE(last_active_at, 0) ASC, pubkey ASC)`. Neither
 /// component is written by a demotion, which is what makes the cursor stable
 /// across the sweep's own mutations.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SweepCursor {
     /// `COALESCE(last_active_at, 0)` of the last consumed row.
     pub last_active_at: f64,
@@ -160,6 +160,9 @@ pub struct DemotionSweepResult {
     /// The pubkey of the last row consumed — where the next tick resumes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_pubkey: Option<String>,
+    /// Stable sort key persisted when a capped sweep must continue next tick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_cursor: Option<SweepCursor>,
 }
 
 impl DemotionSweepResult {
@@ -237,6 +240,7 @@ pub trait DemotionStore {
 /// commits — so a row that can never be written (a persistent constraint error,
 /// say) cannot wedge the sweep in a retry loop. Its failure is recorded and the
 /// sweep moves on.
+#[cfg(test)]
 pub async fn run_demotion_sweep<S>(
     store: &S,
     thresholds: &TrustThresholds,
@@ -247,10 +251,21 @@ pub async fn run_demotion_sweep<S>(
 where
     S: DemotionStore + ?Sized,
 {
+    run_demotion_sweep_from(store, thresholds, now, batch_size, max_rows, None).await
+}
+
+async fn run_demotion_sweep_from<S: DemotionStore + ?Sized>(
+    store: &S,
+    thresholds: &TrustThresholds,
+    now: i64,
+    batch_size: u32,
+    max_rows: u64,
+    after: Option<SweepCursor>,
+) -> DemotionSweepResult {
     let mut result = DemotionSweepResult::default();
     let cutoff = now.saturating_sub(thresholds.inactivity_demotion_secs);
     let batch_size = batch_size.max(1);
-    let mut cursor: Option<SweepCursor> = None;
+    let mut cursor = after;
 
     loop {
         let page = match store
@@ -274,6 +289,7 @@ where
             // Advance the cursor before doing anything that can fail, so the
             // sweep always makes forward progress.
             cursor = Some(SweepCursor::after(row));
+            result.resume_cursor = cursor.clone();
             result.resume_pubkey = Some(row.pubkey.clone());
             result.scanned += 1;
 
@@ -524,14 +540,37 @@ pub async fn sweep_inactive_demotions(env: &Env) -> Result<DemotionSweepResult, 
     let thresholds = TrustThresholds::load(env).await;
     let now = auth::js_now_secs() as i64;
 
-    let result = run_demotion_sweep(
+    store.db.prepare("CREATE TABLE IF NOT EXISTS trust_sweep_state (id INTEGER PRIMARY KEY CHECK(id=1), last_active_at REAL NOT NULL, pubkey TEXT NOT NULL)").run().await.map_err(|e| format!("trust cursor schema: {e}"))?;
+    let cursor = store
+        .db
+        .prepare("SELECT last_active_at, pubkey FROM trust_sweep_state WHERE id = 1")
+        .first::<SweepCursor>(None)
+        .await
+        .map_err(|e| format!("trust cursor read: {e}"))?;
+    let result = run_demotion_sweep_from(
         &store,
         &thresholds,
         now,
         DEMOTION_BATCH_SIZE,
         DEMOTION_MAX_ROWS,
+        cursor,
     )
     .await;
+
+    if result.truncated || result.aborted {
+        if let Some(cur) = &result.resume_cursor {
+            store.db.prepare("INSERT INTO trust_sweep_state(id,last_active_at,pubkey) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET last_active_at=excluded.last_active_at,pubkey=excluded.pubkey")
+                .bind(&[JsValue::from_f64(cur.last_active_at),JsValue::from_str(&cur.pubkey)]).map_err(|e| e.to_string())?
+                .run().await.map_err(|e| format!("trust cursor write: {e}"))?;
+        }
+    } else {
+        store
+            .db
+            .prepare("DELETE FROM trust_sweep_state WHERE id = 1")
+            .run()
+            .await
+            .map_err(|e| format!("trust cursor clear: {e}"))?;
+    }
 
     if result.aborted {
         console_warn!(
@@ -1064,6 +1103,48 @@ mod tests {
         assert_eq!(r.scanned, 25);
         assert!(r.resume_pubkey.is_some());
         assert!(r.is_balanced());
+    }
+
+    #[test]
+    fn capped_ticks_advance_past_permanently_held_rows() {
+        let rows = (0..3)
+            .map(|i| {
+                let mut row = idle_row(&format!("pk{i}"), 1, stale_ts());
+                row.days_active = 100;
+                row.posts_read = 100;
+                row.posts_created = 100;
+                row
+            })
+            .collect();
+        let store = FakeStore::new(rows);
+        let first = block_on(run_demotion_sweep_from(
+            &store,
+            &thresholds(),
+            NOW,
+            10,
+            1,
+            None,
+        ));
+        assert_eq!(first.held, 1);
+        let second = block_on(run_demotion_sweep_from(
+            &store,
+            &thresholds(),
+            NOW,
+            10,
+            1,
+            first.resume_cursor.clone(),
+        ));
+        assert_eq!(second.held, 1);
+        assert_ne!(first.resume_pubkey, second.resume_pubkey);
+        let third = block_on(run_demotion_sweep_from(
+            &store,
+            &thresholds(),
+            NOW,
+            10,
+            1,
+            second.resume_cursor,
+        ));
+        assert_ne!(second.resume_pubkey, third.resume_pubkey);
     }
 
     #[test]

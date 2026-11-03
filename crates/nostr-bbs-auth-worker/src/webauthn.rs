@@ -716,6 +716,50 @@ fn json_err(message: &str, status: u16) -> Result<Response> {
 // Handlers
 // ---------------------------------------------------------------------------
 
+const REGISTRATION_SALT_QUERY: &str = "SELECT s.prf_salt FROM challenges c JOIN registration_salts s ON s.challenge = c.challenge WHERE c.challenge = ?1 AND c.created_at > ?2 AND c.pubkey = ?3 AND s.created_at > ?2";
+
+#[cfg(test)]
+#[test]
+fn registration_and_login_use_the_same_server_issued_prf_input() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE challenges(pubkey TEXT, challenge TEXT, created_at INTEGER); CREATE TABLE registration_salts(challenge TEXT PRIMARY KEY, prf_salt TEXT, created_at INTEGER);").unwrap();
+    let salt = array_to_base64url(&[17u8; 32]);
+    db.execute(
+        "INSERT INTO challenges VALUES ('ceremony','ceremony',100)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO registration_salts VALUES ('ceremony',?1,100)",
+        [&salt],
+    )
+    .unwrap();
+    let persisted: String = db
+        .query_row(
+            REGISTRATION_SALT_QUERY,
+            rusqlite::params!["ceremony", 99, "ceremony"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let registered = nostr_bbs_core::derive_from_prf(&[23u8; 32], salt.as_bytes()).unwrap();
+    let login = nostr_bbs_core::derive_from_prf(&[23u8; 32], persisted.as_bytes()).unwrap();
+    assert_eq!(registered.public.to_hex(), login.public.to_hex());
+    assert!(db
+        .query_row(
+            REGISTRATION_SALT_QUERY,
+            rusqlite::params!["ceremony", 99, "another-account"],
+            |r| r.get::<_, String>(0)
+        )
+        .is_err());
+    assert!(db
+        .query_row(
+            REGISTRATION_SALT_QUERY,
+            rusqlite::params!["ceremony", 101, "ceremony"],
+            |r| r.get::<_, String>(0)
+        )
+        .is_err());
+}
+
 /// POST /auth/register/options
 ///
 /// Generate a WebAuthn PublicKeyCredentialCreationOptions with a
@@ -762,7 +806,20 @@ pub async fn register_options(body_bytes: &[u8], env: &Env) -> Result<Response> 
             js_str(&challenge_b64),
             js_u64(now_ms),
         ])?;
-    db.batch(vec![delete_stmt, insert_stmt]).await?;
+    let delete_salts = db
+        .prepare("DELETE FROM registration_salts WHERE created_at < ?1")
+        .bind(&[js_u64(five_min_ago)])?;
+    let insert_salt = db
+        .prepare(
+            "INSERT INTO registration_salts (challenge, prf_salt, created_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind(&[
+            js_str(&challenge_b64),
+            js_str(&prf_salt_b64),
+            js_u64(now_ms),
+        ])?;
+    db.batch(vec![delete_stmt, insert_stmt, delete_salts, insert_salt])
+        .await?;
 
     let rp_name = env
         .var("RP_NAME")
@@ -902,21 +959,22 @@ pub async fn register_verify(
     // from being consumed by a registration verify, and keeps challenges
     // single-use within their own ceremony.
     let db = env.d1("DB")?;
-    let challenge_check: Option<CheckRow> = db
-        .prepare(
-            "SELECT 1 as ok FROM challenges \
-             WHERE challenge = ?1 AND created_at > ?2 AND pubkey = ?3",
-        )
+    #[derive(Deserialize)]
+    struct RegistrationSalt {
+        prf_salt: String,
+    }
+    let challenge_check: Option<RegistrationSalt> = db
+        .prepare(REGISTRATION_SALT_QUERY)
         .bind(&[
             js_str(&challenge_str),
             js_u64(five_min_ago),
             js_str(&challenge_str),
         ])?
-        .first::<CheckRow>(None)
+        .first::<RegistrationSalt>(None)
         .await?;
-    if challenge_check.is_none() {
+    let Some(challenge_check) = challenge_check else {
         return json_err("Invalid or expired challenge", 400);
-    }
+    };
 
     // Step 2: Parse attestation object (CBOR)
     let attestation_b64 = match &inner.attestation_object {
@@ -1014,28 +1072,14 @@ pub async fn register_verify(
 
     // Step 7: Store credential in D1 and consume challenge
     //
-    // P0-01 fix: Generate the PRF salt server-side by deriving from a
-    // server secret and the credential ID. The client-supplied prfSalt
-    // field is ignored — accepting it would let an attacker supply their
-    // own salt to derive a different key, bypassing the passkey security
-    // model.
-    let prf_salt = {
-        let server_secret = env
-            .secret("PRF_SERVER_SECRET")
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        let mut h = Sha256::new();
-        h.update(b"nostr-bbs-prf-salt-v1\0");
-        h.update(server_secret.as_bytes());
-        h.update(credential_id_b64.as_bytes());
-        h.update(pubkey.as_bytes());
-        array_to_base64url(&h.finalize())
-    };
+    // Persist the exact server-issued PRF input used to derive this identity.
+    // Never accept a caller replacement or derive a different salt at verify.
+    let prf_salt = challenge_check.prf_salt;
 
     let insert_stmt = db
         .prepare(
             "INSERT INTO webauthn_credentials (pubkey, credential_id, public_key, prf_salt, counter, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM registration_salts WHERE challenge = ?7 AND prf_salt = ?4)",
         )
         .bind(&[
             js_str(&pubkey),
@@ -1044,11 +1088,25 @@ pub async fn register_verify(
             js_str(&prf_salt),
             js_u32(sign_count),
             js_u64(now_ms),
+            js_str(&challenge_str),
         ])?;
     let delete_stmt = db
         .prepare("DELETE FROM challenges WHERE challenge = ?1")
         .bind(&[js_str(&challenge_str)])?;
-    db.batch(vec![insert_stmt, delete_stmt]).await?;
+    let delete_salt = db
+        .prepare("DELETE FROM registration_salts WHERE challenge = ?1")
+        .bind(&[js_str(&challenge_str)])?;
+    let committed = db
+        .batch(vec![insert_stmt, delete_stmt, delete_salt])
+        .await?;
+    if committed
+        .first()
+        .and_then(|r| r.meta().ok().flatten())
+        .and_then(|m| m.changes)
+        != Some(1)
+    {
+        return json_err("Registration challenge already consumed", 409);
+    }
 
     let response_body = serde_json::json!({
         "verified": true,

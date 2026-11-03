@@ -24,6 +24,7 @@ pub async fn ensure_schema(env: &Env) {
 
     // --- Base tables that webauthn.rs depends on (existed pre-sprint) ----
     let base_stmts = [
+        "CREATE TABLE IF NOT EXISTS registration_salts (challenge TEXT PRIMARY KEY, prf_salt TEXT NOT NULL, created_at INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS challenges (\
             pubkey TEXT NOT NULL, \
             challenge TEXT NOT NULL, \

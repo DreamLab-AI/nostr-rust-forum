@@ -137,21 +137,9 @@ async fn admin_set(env: &Env) -> HashSet<String> {
         }
     }
 
-    let Ok(db) = env.d1("DB") else {
+    let Ok(db) = env.d1("RELAY_DB") else {
         return set;
     };
-
-    let members = db
-        .prepare(nostr_bbs_core::MEMBERS_ADMIN_LIST_SQL)
-        .all()
-        .await;
-    if let Ok(result) = members {
-        if let Ok(rows) = result.results::<PubkeyRow>() {
-            for r in rows {
-                set.insert(r.pubkey);
-            }
-        }
-    }
 
     let whitelist = db
         .prepare(nostr_bbs_core::WHITELIST_ADMIN_LIST_SQL)

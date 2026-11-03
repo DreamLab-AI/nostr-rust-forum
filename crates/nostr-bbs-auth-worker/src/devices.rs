@@ -322,8 +322,22 @@ struct DeviceRow {
     device_pubkey: String,
     owner_pubkey: String,
     label: Option<String>,
+    #[serde(serialize_with = "serialize_integer")]
     created_at: f64,
+    #[serde(serialize_with = "serialize_integer")]
     revoked: f64,
+}
+
+const DEVICE_REGISTER_SQL: &str = "INSERT INTO device_keys (device_pubkey, owner_pubkey, label, created_at, revoked) VALUES (?1, ?2, ?3, ?4, 0) ON CONFLICT (device_pubkey) DO UPDATE SET label = excluded.label WHERE device_keys.owner_pubkey = excluded.owner_pubkey AND device_keys.revoked = 0";
+
+fn serialize_integer<S: serde::Serializer>(
+    v: &f64,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    if !v.is_finite() || *v < 0.0 || v.fract() != 0.0 || *v > 9_007_199_254_740_991.0 {
+        return Err(serde::ser::Error::custom("invalid database integer"));
+    }
+    serializer.serialize_u64(*v as u64)
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -332,7 +346,8 @@ struct DeviceRow {
 ///
 /// Upserts a device subkey owned by the **NIP-98 author** (never a body field).
 /// `device_pubkey` is the PK, so re-registering the same device converges:
-/// owner re-asserted, `revoked` reset to 0, `created_at` refreshed. Returns the
+/// an active same-owner registration may update its label. Revocation and owner
+/// binding are immutable; re-enrolment requires a fresh derived key. Returns the
 /// resulting row projection `{device_pubkey, owner_pubkey, label, revoked}`.
 ///
 /// ## Security (ADR-099 hardening)
@@ -403,30 +418,30 @@ pub async fn handle_register(
         );
     }
 
-    // Upsert keyed on the device_pubkey PK. The owner is re-asserted from the
-    // NIP-98 author on every register, so a device can only ever belong to the
-    // pubkey that last registered it under auth — there is no owner-field to spoof.
+    // A proof of possession does not authorise ownership transfer or undo
+    // revocation. Conditional update keeps both properties atomic.
     let label_js = match &reg.label {
         Some(l) => JsValue::from_str(l),
         None => JsValue::NULL,
     };
-    db.prepare(
-        "INSERT INTO device_keys (device_pubkey, owner_pubkey, label, created_at, revoked) \
-         VALUES (?1, ?2, ?3, ?4, 0) \
-         ON CONFLICT (device_pubkey) DO UPDATE SET \
-           owner_pubkey = excluded.owner_pubkey, \
-           label = excluded.label, \
-           created_at = excluded.created_at, \
-           revoked = 0",
-    )
-    .bind(&[
-        JsValue::from_str(&reg.device_pubkey),
-        JsValue::from_str(&owner_pk),
-        label_js,
-        JsValue::from_f64(now as f64),
-    ])?
-    .run()
-    .await?;
+    let registered = db
+        .prepare(DEVICE_REGISTER_SQL)
+        .bind(&[
+            JsValue::from_str(&reg.device_pubkey),
+            JsValue::from_str(&owner_pk),
+            label_js,
+            JsValue::from_f64(now as f64),
+        ])?
+        .run()
+        .await?;
+
+    if registered.meta()?.is_none_or(|m| m.changes != Some(1)) {
+        return error_json(
+            env,
+            "device belongs to another owner or was revoked; use a fresh device key",
+            409,
+        );
+    }
 
     json_response(
         env,
@@ -703,6 +718,67 @@ mod tests {
         // A distinct key's pubkey stands in for the NIP-98 author.
         let sk = SigningKey::from_bytes((&[0x22u8; 32]).into()).unwrap();
         hex::encode(sk.verifying_key().to_bytes())
+    }
+
+    #[test]
+    fn device_list_wire_fields_are_json_integers() {
+        let row = DeviceRow {
+            device_pubkey: device_pk(),
+            owner_pubkey: owner_pk(),
+            label: None,
+            created_at: 123.0,
+            revoked: 1.0,
+        };
+        let v = serde_json::to_value(row).unwrap();
+        assert_eq!(v["created_at"].as_u64(), Some(123));
+        assert_eq!(v["revoked"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn registration_cannot_transfer_or_unrevoke_an_existing_device() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE device_keys(device_pubkey TEXT PRIMARY KEY,owner_pubkey TEXT,label TEXT,created_at INTEGER,revoked INTEGER);").unwrap();
+        assert_eq!(
+            db.execute(
+                DEVICE_REGISTER_SQL,
+                rusqlite::params!["d", "owner", "phone", 1]
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.execute(
+                DEVICE_REGISTER_SQL,
+                rusqlite::params!["d", "another", "phone", 2]
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.execute(
+                DEVICE_REGISTER_SQL,
+                rusqlite::params!["d", "owner", "renamed", 2]
+            )
+            .unwrap(),
+            1
+        );
+        db.execute("UPDATE device_keys SET revoked=1", []).unwrap();
+        assert_eq!(
+            db.execute(
+                DEVICE_REGISTER_SQL,
+                rusqlite::params!["d", "owner", "phone", 3]
+            )
+            .unwrap(),
+            0
+        );
+        let stored: (String, i64, i64) = db
+            .query_row(
+                "SELECT owner_pubkey,created_at,revoked FROM device_keys",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("owner".into(), 1, 1));
     }
 
     /// Build a signed device-link proof with overridable kind/owner/exp.

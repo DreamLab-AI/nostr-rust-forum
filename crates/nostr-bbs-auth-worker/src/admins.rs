@@ -46,22 +46,14 @@ use nostr_bbs_core::admin_shared::PubkeyRow;
 
 /// Fetch the admin pubkey list, using KV as a 60-second cache.
 ///
-/// On cache miss: queries D1 (both `members` and `whitelist` tables),
-/// serialises to JSON, stores in KV with `expirationTtl = 60`.
-/// On cache hit: deserialises and returns immediately.
+/// Queries relay D1 on every request so a legacy member grant or cache cannot
+/// undo demotion. A compatibility cache is written but never used for authority.
 pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
-    // Attempt KV cache read.
+    // Admin revocation must take effect at the next request; never reuse a
+    // legacy union cache after whitelist demotion.
     let kv = env.kv("KV")?;
-    if let Ok(Some(cached)) = kv.get(ADMIN_CACHE_KEY).text().await {
-        if let Ok(list) = serde_json::from_str::<Vec<String>>(&cached) {
-            return Ok(list);
-        }
-    }
 
-    // Cache miss — resolve static (ADMIN_PUBKEYS) ∪ D1, matching the
-    // canonical order in `admin::is_admin`. Check both RELAY_DB (relay's
-    // whitelist, the source of truth for dynamic admin flags) and DB (auth's
-    // members table, set by the invite-redemption flow).
+    // Resolve the explicit bootstrap set plus relay whitelist authority.
     let mut pubkeys: Vec<String> = Vec::new();
 
     // Static admin set (ADMIN_PUBKEYS): deploy-time bootstrap/fallback, so a
@@ -84,23 +76,6 @@ pub async fn get_admin_pubkeys(env: &Env) -> Result<Vec<String>> {
             .all()
             .await;
         if let Ok(result) = whitelist {
-            if let Ok(rows) = result.results::<PubkeyRow>() {
-                for r in rows {
-                    if !pubkeys.contains(&r.pubkey) {
-                        pubkeys.push(r.pubkey);
-                    }
-                }
-            }
-        }
-    }
-
-    // DB: members.is_admin (invite flow)
-    if let Ok(db) = env.d1("DB") {
-        let members = db
-            .prepare(nostr_bbs_core::MEMBERS_ADMIN_LIST_SQL)
-            .all()
-            .await;
-        if let Ok(result) = members {
             if let Ok(rows) = result.results::<PubkeyRow>() {
                 for r in rows {
                     if !pubkeys.contains(&r.pubkey) {

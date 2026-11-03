@@ -123,6 +123,37 @@ impl LedgerDb for D1Ledger<'_> {
 // Explorer
 // ---------------------------------------------------------------------------
 
+struct AuthorisedLedger<'a> {
+    ledger: D1Ledger<'a>,
+    authority: Option<&'a D1Database>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl LedgerDb for AuthorisedLedger<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> std::result::Result<Vec<u64>, String> {
+        self.ledger.batch(stmts).await
+    }
+    async fn all(&self, stmt: Stmt) -> std::result::Result<Vec<Value>, String> {
+        self.ledger.all(stmt).await
+    }
+    async fn first(&self, stmt: Stmt) -> std::result::Result<Option<Value>, String> {
+        if stmt.sql == nostr_bbs_core::WHITELIST_IS_ADMIN_SQL {
+            let authority = self
+                .authority
+                .ok_or("relay authority binding unavailable")?;
+            let params: Vec<JsValue> = stmt.params.iter().map(js_value).collect();
+            return authority
+                .prepare(stmt.sql)
+                .bind(&params)
+                .map_err(|e| e.to_string())?
+                .first::<Value>(None)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        self.ledger.first(stmt).await
+    }
+}
+
 /// [`TxSource`] over a mempool.space / esplora HTTP API.
 pub struct MempoolTxSource;
 
@@ -194,8 +225,12 @@ pub async fn handle_pay_route(
         master_secret: master_secret.as_deref(),
         job_expiry_secs: job_expiry_secs(env),
     };
+    let authority = env.d1("RELAY_DB").ok();
     let reply = pay_ledger::dispatch(
-        &D1Ledger(db),
+        &AuthorisedLedger {
+            ledger: D1Ledger(db),
+            authority: authority.as_ref(),
+        },
         &MempoolTxSource,
         &ctx,
         method,

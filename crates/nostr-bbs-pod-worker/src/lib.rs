@@ -2008,9 +2008,8 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
 
 /// Check if a pubkey is an admin user via the shared D1 database.
 ///
-/// Queries `members.is_admin` then falls back to `whitelist.is_admin`,
-/// matching the auth-worker's `admin::is_admin` logic. Uses the `REPLAY_DB`
-/// binding which points at the same D1 database as the auth-worker's `DB`.
+/// Queries the relay's `whitelist.is_admin` authority through `RELAY_DB`.
+/// Legacy auth-side member grants and replay state cannot authorise a pod op.
 ///
 /// Uses shared SQL constants and row types from [`nostr_bbs_core::admin_shared`]
 /// to prevent structural drift between workers (P2-01).
@@ -2019,10 +2018,7 @@ async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
 
     // Canonical source first: the relay's DB (dreamlab-relay, bound as RELAY_DB)
     // carries the whitelist `is_admin` bit set by the dynamic-admin / set-admin
-    // flow. The pod-worker's own REPLAY_DB (dreamlab-auth) does NOT hold it for
-    // relay-side admins, so without this check every admin-gated pod op
-    // (deprovision, admin provisioning) 403s. A missing binding falls through
-    // gracefully to the REPLAY_DB checks below.
+    // flow. A missing binding or failed authority read denies the operation.
     if let Ok(relay_db) = env.d1("RELAY_DB") {
         if let Ok(stmt) = relay_db
             .prepare(nostr_bbs_core::WHITELIST_IS_ADMIN_SQL)
@@ -2033,31 +2029,6 @@ async fn is_admin_user(env: &Env, pubkey: &str) -> bool {
                     return true;
                 }
             }
-        }
-    }
-
-    let db = match env.d1("REPLAY_DB") {
-        Ok(db) => db,
-        Err(_) => return false,
-    };
-
-    if let Ok(stmt) = db
-        .prepare(nostr_bbs_core::MEMBERS_IS_ADMIN_SQL)
-        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
-    {
-        if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
-            if row.is_admin == 1 {
-                return true;
-            }
-        }
-    }
-
-    if let Ok(stmt) = db
-        .prepare(nostr_bbs_core::WHITELIST_IS_ADMIN_SQL)
-        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
-    {
-        if let Ok(Some(row)) = stmt.first::<IsAdminRow>(None).await {
-            return row.is_admin == 1;
         }
     }
 

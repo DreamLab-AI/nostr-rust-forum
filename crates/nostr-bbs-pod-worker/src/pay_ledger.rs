@@ -1299,20 +1299,9 @@ pub async fn recover_orphaned_jobs<D: LedgerDb + ?Sized>(
     Ok(recovered)
 }
 
-/// Admin check: `members.is_admin`, then `whitelist.is_admin` (shared SQL
+/// Admin check: relay `whitelist.is_admin` (shared SQL
 /// from [`nostr_bbs_core::admin_shared`]).
 async fn is_admin<D: LedgerDb + ?Sized>(db: &D, pubkey: &str) -> bool {
-    let member = db
-        .first(Stmt::new(
-            nostr_bbs_core::MEMBERS_IS_ADMIN_SQL,
-            vec![pubkey.into()],
-        ))
-        .await;
-    if let Ok(Some(row)) = member {
-        if u64_field(&row, "is_admin") == 1 {
-            return true;
-        }
-    }
     let listed = db
         .first(Stmt::new(
             nostr_bbs_core::WHITELIST_IS_ADMIN_SQL,

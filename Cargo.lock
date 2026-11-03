@@ -2475,6 +2475,7 @@ dependencies = [
  "nostr-bbs-jev",
  "nostr-bbs-rate-limit",
  "p256",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

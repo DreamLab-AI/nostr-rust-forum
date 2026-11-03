@@ -311,6 +311,11 @@ async fn register(signer: &dyn Signer, vapid_public_key: &str, brand: &str) -> R
         brand,
     )))
     .await?;
+    LocalStorage::set(
+        CFG_KEY,
+        drain_cfg_json(&api, &reply.id, &reply.token, brand),
+    )
+    .map_err(|e| format!("Could not retain logout credentials: {e}"))?;
     set_active(true);
     Ok(())
 }

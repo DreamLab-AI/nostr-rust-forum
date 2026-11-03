@@ -823,6 +823,17 @@ fn orphan_recovery_returns_each_expired_hold_once() {
     .expect("release row");
     assert_eq!(row["request_id"], bob().request_id);
     assert_eq!(row["amount_sats"], 12);
+    w.db.exec(&format!(
+        "UPDATE members SET is_admin=1 WHERE pubkey='{BOB}'"
+    ));
+    w.db.exec(&format!(
+        "UPDATE whitelist SET is_admin=0 WHERE pubkey='{BOB}'"
+    ));
+    assert_eq!(
+        status(&w.post(".cleanup", bob(), "")),
+        403,
+        "legacy member grant must not undo relay demotion"
+    );
 }
 
 /// After a mixed run every credit row names an outpoint or a signed
