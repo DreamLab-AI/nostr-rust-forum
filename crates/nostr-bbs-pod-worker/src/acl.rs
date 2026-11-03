@@ -30,9 +30,35 @@
 // every WAC decision (the pod-worker's `.acl` handler AND
 // `coerce_required_mode_for_acl` below) funnels through one module and cannot
 // drift from upstream.
+use solid_pod_rs::wac::{
+    classify_policy_read, InvalidPolicyReason, PolicyOutcome, PolicyRead, PolicyStep,
+};
 pub use solid_pod_rs::wac::{
     effective_acl_target, method_to_mode, wac_allow_header, AccessMode, AclDocument,
 };
+
+fn classify_kit_policy(path: &str, read: PolicyRead<'_>, inherited: bool) -> PolicyStep {
+    if let PolicyRead::Present { body, .. } = &read {
+        if body.len() > MAX_ACL_DOC_BYTES {
+            return PolicyStep::Settled(PolicyOutcome::Invalid {
+                policy_path: path.into(),
+                reason: InvalidPolicyReason::TooLarge(format!(
+                    "{} bytes exceeds kit cap {}",
+                    body.len(),
+                    MAX_ACL_DOC_BYTES
+                )),
+            });
+        }
+    }
+    classify_policy_read(path, read, inherited)
+}
+
+fn settled_document(step: PolicyStep) -> Option<AclDocument> {
+    match step {
+        PolicyStep::Settled(PolicyOutcome::Found(doc)) => Some(doc),
+        _ => None,
+    }
+}
 
 /// All access modes, used for iterating when building WAC-Allow headers.
 /// `wac_allow_header` (re-exported above from `solid_pod_rs::wac`) does this
@@ -97,8 +123,8 @@ pub fn coerce_required_mode_for_acl(path: &str, method: &str) -> AccessMode {
 ///
 /// 64 KiB is far larger than any realistic policy graph and prevents an
 /// attacker from forcing the WAC evaluator to allocate or recurse into a
-/// pathologically large `@graph`. Sidecars beyond this size are treated as
-/// "no ACL found" so resolution falls back to the parent container.
+/// pathologically large `@graph`. A present sidecar beyond this size denies;
+/// only confirmed absence may inherit from the parent container.
 ///
 /// The upstream `solid_pod_rs::wac::MAX_ACL_BYTES` is 1 MiB; the kit chooses
 /// a tighter ceiling per audit C3 because the forum's pod surface area is
@@ -109,10 +135,14 @@ pub const MAX_ACL_DOC_BYTES: usize = 64 * 1024;
 ///
 /// Returns `Some(doc)` on success and `None` for any size or parse failure.
 pub fn parse_acl_with_cap(bytes: &[u8]) -> Option<AclDocument> {
-    if bytes.len() > MAX_ACL_DOC_BYTES {
-        return None;
-    }
-    serde_json::from_slice::<AclDocument>(bytes).ok()
+    settled_document(classify_kit_policy(
+        "candidate.acl",
+        PolicyRead::Present {
+            body: bytes,
+            content_type: "",
+        },
+        false,
+    ))
 }
 
 /// Return whether an ACL remains controllable by the pod owner.
@@ -134,11 +164,9 @@ pub fn preserves_owner_control(
 }
 
 /// Same as [`parse_acl_with_cap`] but operates on a `&str`.
+#[cfg(test)]
 fn parse_acl_text_with_cap(text: &str) -> Option<AclDocument> {
-    if text.len() > MAX_ACL_DOC_BYTES {
-        return None;
-    }
-    serde_json::from_str::<AclDocument>(text).ok()
+    parse_acl_with_cap(text.as_bytes())
 }
 
 /// Compute the ordered list of R2 sidecar keys to probe for a resource,
@@ -245,7 +273,7 @@ fn parent_dir(path: &str) -> String {
 
 /// Find the effective ACL for a resource by walking up the container tree.
 ///
-/// Resolution order (most-specific first; first parseable hit wins):
+/// Resolution order (most-specific first; only confirmed absence ascends):
 /// 1. R2 sidecar walk built by [`acl_probe_sequence`], which probes BOTH the
 ///    resource's own flat sidecar `{path}.acl` AND every enclosing container
 ///    sidecar `{dir}/.acl` (the container case the legacy resolver skipped —
@@ -279,9 +307,10 @@ fn parent_dir(path: &str) -> String {
 /// the pod root via `acl:accessTo`/`acl:default`).
 ///
 /// All ACL documents are parsed via [`parse_acl_with_cap`] so any single
-/// graph larger than [`MAX_ACL_DOC_BYTES`] is rejected (treated as missing).
+/// graph larger than [`MAX_ACL_DOC_BYTES`] is rejected. A malformed, oversized
+/// or unreadable policy terminates resolution with denial; it is never missing.
 ///
-/// Returns `None` if no ACL document is found at any level (deny-all).
+/// Returns `None` on invalid/unavailable policy or after an entirely absent walk (deny-all).
 pub async fn find_effective_acl(
     bucket: &worker::Bucket,
     kv: &worker::kv::KvStore,
@@ -289,19 +318,38 @@ pub async fn find_effective_acl(
     resource_path: &str,
 ) -> Option<AclDocument> {
     // (1) R2 sidecar walk — AUTHORITATIVE. Own sidecar, then each enclosing
-    // container sidecar, most-specific first. The first parseable hit wins, so
+    // container sidecar, most-specific first. The first present policy settles, so
     // a per-container delegation grant at `<container>/.acl` is honoured before
     // any broader (pod-level) ACL can apply.
     for (probe_path, inherited) in acl_probe_sequence(resource_path) {
         let acl_key = format!("pods/{owner_pubkey}{probe_path}");
-        if let Ok(Some(obj)) = bucket.get(&acl_key).execute().await {
-            if let Some(body) = obj.body() {
-                if let Ok(bytes) = body.bytes().await {
-                    if let Some(doc) = resolve_r2_sidecar(&bytes, inherited) {
-                        return Some(doc);
+        let step = match bucket.get(&acl_key).execute().await {
+            Ok(None) => classify_kit_policy(&acl_key, PolicyRead::Absent, inherited),
+            Ok(Some(obj)) => match obj.body() {
+                Some(body) => match body.bytes().await {
+                    Ok(bytes) => classify_kit_policy(
+                        &acl_key,
+                        PolicyRead::Present {
+                            body: &bytes,
+                            content_type: "",
+                        },
+                        inherited,
+                    ),
+                    Err(e) => {
+                        classify_kit_policy(&acl_key, PolicyRead::Failed(e.to_string()), inherited)
                     }
-                }
-            }
+                },
+                None => classify_kit_policy(
+                    &acl_key,
+                    PolicyRead::Failed("R2 object has no readable body".into()),
+                    inherited,
+                ),
+            },
+            Err(e) => classify_kit_policy(&acl_key, PolicyRead::Failed(e.to_string()), inherited),
+        };
+        match step {
+            PolicyStep::Ascend => {}
+            terminal => return settled_document(terminal),
         }
     }
 
@@ -309,33 +357,46 @@ pub async fn find_effective_acl(
     // the R2 walk resolved nothing, so it can never shadow a more-specific R2
     // sidecar (and therefore can never mask a delegation grant).
     let kv_key = format!("acl:{owner_pubkey}");
-    if let Ok(Some(text)) = kv.get(&kv_key).text().await {
-        if let Some(doc) = resolve_kv_fallback(&text) {
-            return Some(doc);
-        }
+    match kv.get(&kv_key).text().await {
+        Ok(Some(text)) => settled_document(classify_kit_policy(
+            &kv_key,
+            PolicyRead::Present {
+                body: text.as_bytes(),
+                content_type: "",
+            },
+            false,
+        )),
+        Ok(None) => None,
+        Err(e) => settled_document(classify_kit_policy(
+            &kv_key,
+            PolicyRead::Failed(e.to_string()),
+            false,
+        )),
     }
-
-    None
 }
 
 /// Parse an R2 sidecar's bytes into an [`AclDocument`], stamping the
 /// `inherited` flag the [`acl_probe_sequence`] entry carried. Returns `None`
-/// if the bytes are missing, oversized, or unparseable (so the walk falls
-/// through to the next, broader probe).
+/// if the bytes are oversized or unparseable. A caller must deny at this level.
 ///
 /// Split out from [`find_effective_acl`] so the runtime-agnostic resolution
 /// ordering (R2-authoritative, KV-fallback) is unit-testable without the
 /// worker R2/KV runtime types — see [`resolve_effective_acl`].
+#[cfg(test)]
 fn resolve_r2_sidecar(bytes: &[u8], inherited: bool) -> Option<AclDocument> {
-    let mut doc = parse_acl_with_cap(bytes)?;
-    // Mark inherited resolution so the evaluator applies only `acl:default`
-    // rules for ancestor containers.
-    doc.inherited = inherited;
-    Some(doc)
+    settled_document(classify_kit_policy(
+        "fixture.acl",
+        PolicyRead::Present {
+            body: bytes,
+            content_type: "",
+        },
+        inherited,
+    ))
 }
 
 /// Parse the legacy KV pod-level ACL text into an [`AclDocument`]. The KV ACL
 /// names the pod root directly, so it is non-inherited (the default).
+#[cfg(test)]
 fn resolve_kv_fallback(text: &str) -> Option<AclDocument> {
     parse_acl_text_with_cap(text)
 }
@@ -356,15 +417,13 @@ fn resolve_kv_fallback(text: &str) -> Option<AclDocument> {
 /// R2/KV bindings rather than delegating to this pure core. Kept (not
 /// deleted) as the tested source of truth for the precedence rule; flagged
 /// dead outside `cfg(test)` builds.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn resolve_effective_acl<'a>(
     r2_candidates: impl IntoIterator<Item = (&'a [u8], bool)>,
     kv_text: Option<&str>,
 ) -> Option<AclDocument> {
-    for (bytes, inherited) in r2_candidates {
-        if let Some(doc) = resolve_r2_sidecar(bytes, inherited) {
-            return Some(doc);
-        }
+    if let Some((bytes, inherited)) = r2_candidates.into_iter().next() {
+        return resolve_r2_sidecar(bytes, inherited);
     }
     kv_text.and_then(resolve_kv_fallback)
 }
@@ -1023,7 +1082,7 @@ mod tests {
     // is therefore not unit-testable on the native target. These tests
     // exercise the PURE probe-sequence builder that is the load-bearing
     // change — `find_effective_acl` is a thin loop over its output that
-    // returns the first parseable hit, so probe order == resolution order.
+    // settles the first present policy, so probe order == resolution order.
 
     /// Convenience: collect just the probe key paths in order.
     fn probe_keys(resource: &str) -> Vec<String> {
@@ -1443,5 +1502,30 @@ mod tests {
         let empty_r2: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         let candidates = r2_candidates_for("/foo", &empty_r2);
         assert!(resolve_effective_acl(candidates, None).is_none());
+    }
+
+    #[test]
+    fn invalid_child_policy_cannot_inherit_an_ancestor_or_kv_grant() {
+        let parent = legacy_kv_owner_acl();
+        let oversized = vec![b' '; MAX_ACL_DOC_BYTES + 1];
+        for child in [b"not an ACL".as_slice(), oversized.as_slice()] {
+            let candidates = vec![(child, false), (parent.as_bytes(), true)];
+            assert!(
+                resolve_effective_acl(candidates, Some(&parent)).is_none(),
+                "present invalid policy must deny"
+            );
+        }
+        assert!(matches!(
+            classify_kit_policy("child.acl", PolicyRead::Absent, false),
+            PolicyStep::Ascend
+        ));
+        assert!(matches!(
+            classify_kit_policy(
+                "child.acl",
+                PolicyRead::Failed("storage timeout".into()),
+                false
+            ),
+            PolicyStep::Settled(PolicyOutcome::Unavailable { .. })
+        ));
     }
 }

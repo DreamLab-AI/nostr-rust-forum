@@ -2725,7 +2725,9 @@ dependencies = [
  "hex",
  "js-sys",
  "nostr-bbs-core",
+ "rusqlite",
  "sha2 0.10.9",
+ "solid-pod-rs",
  "wasm-bindgen",
  "worker",
 ]
@@ -4224,9 +4226,9 @@ dependencies = [
 
 [[package]]
 name = "solid-pod-rs"
-version = "0.5.0-alpha.18"
+version = "0.5.0-alpha.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6adbe448f0bcf40a50106578f868499558485c7602ec666080966fc42121c09"
+checksum = "34d78d76e62681e6ae3f54ffd91f92e917ce5cf94342c889a21533bf1f2d3a27"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

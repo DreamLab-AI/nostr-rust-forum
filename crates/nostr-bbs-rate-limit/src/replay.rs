@@ -5,8 +5,12 @@
 
 use async_trait::async_trait;
 use nostr_bbs_core::nip98::{Nip98Error, Nip98ReplayStore, Nip98Token};
+use solid_pod_rs::auth::replay_store::{ReplayError, ReplayStore};
 use wasm_bindgen::JsValue;
 use worker::{D1Database, Env};
+
+const SQL_RECORD_NONCE: &str =
+    "INSERT OR IGNORE INTO nip98_replay (event_id, expires_at) VALUES (?1, ?2)";
 
 /// D1-backed replay store using `INSERT OR IGNORE` for atomic first-seen check.
 ///
@@ -17,14 +21,13 @@ pub struct D1ReplayStore<'a> {
     pub ttl_secs: u64,
 }
 
-#[async_trait(?Send)]
-impl<'a> Nip98ReplayStore for D1ReplayStore<'a> {
-    async fn seen_or_record(&self, event_id: &str) -> Result<bool, String> {
+impl D1ReplayStore<'_> {
+    async fn record(&self, event_id: &str) -> Result<bool, String> {
         let expires_at = (js_sys::Date::now() / 1000.0) as i64 + self.ttl_secs as i64;
 
         let result = self
             .db
-            .prepare("INSERT OR IGNORE INTO nip98_replay (event_id, expires_at) VALUES (?1, ?2)")
+            .prepare(SQL_RECORD_NONCE)
             .bind(&[
                 JsValue::from_str(event_id),
                 JsValue::from_f64(expires_at as f64),
@@ -35,8 +38,76 @@ impl<'a> Nip98ReplayStore for D1ReplayStore<'a> {
             .map_err(|e| format!("d1 run: {e:?}"))?;
 
         match result.meta() {
-            Ok(Some(meta)) => Ok(meta.rows_written.unwrap_or(0) > 0),
-            _ => Ok(true),
+            Ok(Some(meta)) => first_seen_from_metadata(meta.changes, meta.rows_written),
+            _ => Err("D1 replay metadata unavailable".into()),
+        }
+    }
+}
+
+fn first_seen_from_metadata(
+    changes: Option<usize>,
+    rows_written: Option<usize>,
+) -> Result<bool, String> {
+    changes
+        .or(rows_written)
+        .map(|n| n > 0)
+        .ok_or_else(|| "D1 replay metadata omitted changed-row count".into())
+}
+
+#[cfg(test)]
+#[test]
+fn replay_metadata_never_treats_an_unknown_write_as_first_seen() {
+    assert!(first_seen_from_metadata(Some(1), None).unwrap());
+    assert!(!first_seen_from_metadata(Some(0), Some(1)).unwrap());
+    assert!(first_seen_from_metadata(None, None).is_err());
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[test]
+fn duplicate_nonce_is_refused_without_refreshing_its_expiry() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE nip98_replay(event_id TEXT PRIMARY KEY,expires_at INTEGER NOT NULL)",
+    )
+    .unwrap();
+    let first = db
+        .execute(SQL_RECORD_NONCE, rusqlite::params!["signed-id", 100])
+        .unwrap();
+    let replay = db
+        .execute(SQL_RECORD_NONCE, rusqlite::params!["signed-id", 500])
+        .unwrap();
+    assert!(first_seen_from_metadata(Some(first), None).unwrap());
+    assert!(!first_seen_from_metadata(Some(replay), None).unwrap());
+    let expiry: i64 = db
+        .query_row("SELECT expires_at FROM nip98_replay", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(expiry, 100, "replays cannot extend a nonce lifetime");
+}
+
+#[async_trait]
+impl ReplayStore for D1ReplayStore<'_> {
+    async fn check_and_record(&self, event_id: &str) -> Result<(), ReplayError> {
+        // worker-rs owns the single-threaded Workers future bridge; no local unsafe marker.
+        worker::send::SendFuture::new(async {
+            match self.record(event_id).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(ReplayError::Replayed {
+                    ttl: std::time::Duration::from_secs(self.ttl_secs),
+                }),
+                Err(detail) => Err(ReplayError::Unavailable { detail }),
+            }
+        })
+        .await
+    }
+}
+
+#[async_trait(?Send)]
+impl Nip98ReplayStore for D1ReplayStore<'_> {
+    async fn seen_or_record(&self, event_id: &str) -> Result<bool, String> {
+        match self.check_and_record(event_id).await {
+            Ok(()) => Ok(true),
+            Err(ReplayError::Replayed { .. }) => Ok(false),
+            Err(error) => Err(error.to_string()),
         }
     }
 }

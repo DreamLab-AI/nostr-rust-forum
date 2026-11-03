@@ -10,6 +10,7 @@ keywords = ["nostr", "bbs", "rate-limit", "cloudflare-workers"]
 categories = ["web-programming"]
 
 [dependencies]
+solid-pod-rs = { workspace = true }
 worker = { workspace = true, features = ["d1"] }
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
@@ -17,3 +18,6 @@ async-trait = { workspace = true }
 nostr-bbs-core = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rusqlite = { workspace = true }
