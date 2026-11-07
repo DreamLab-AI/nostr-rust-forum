@@ -19,7 +19,7 @@ lineage: extends the recipient-keyed gift-wrap admission rule (legacy ADR-104).
 
 ## Producer repair — 2026-11-03
 
-The [external-review repair receipt](external-fixes-2026-11-03.md) records the
+The [external-review repair receipt](../audit/external-fixes-2026-11-03.md) records the
 implemented ceremony, authority, concurrency and consumer-contract changes relevant
 to this decision, with their migration and deployment limits. These changes do not
 promote the whole decision's implementation or activation status.

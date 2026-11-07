@@ -19,13 +19,13 @@ lineage: distils legacy ADR-094 (deterministic subkey derivation) and the ADR-10
 
 ## External review qualification — 2026-11-02
 
-The [dated source reconciliation](external-review-2026-11-02.md) records the current
+The [dated source reconciliation](../audit/external-review-2026-11-02.md) records the current
 implementation evidence, open acceptance gaps and limits of the external review.
 It supplements this decision without changing its adoption or activation status.
 
 ## Producer repair — 2026-11-03
 
-The [external-review repair receipt](external-fixes-2026-11-03.md) records the
+The [external-review repair receipt](../audit/external-fixes-2026-11-03.md) records the
 implemented ceremony, authority, concurrency and consumer-contract changes relevant
 to this decision, with their migration and deployment limits. These changes do not
 promote the whole decision's implementation or activation status.
@@ -121,3 +121,12 @@ the vectors cover it, but the production asymmetry stands and is worth an explic
 `crates/nostr-bbs-core/tests/identity_subkey_vectors.rs` (new), `scripts/identity-vector-parity.mjs` (new).
 No change to `keys.rs` — the construction is unaltered. Receipt:
 [`docs/estate-closeout/2026-09-05/adr-2003-vector-parity.json`](../estate-closeout/2026-09-05/adr-2003-vector-parity.json).
+
+## Pin refresh — 2026-11-07
+
+agentbox `31c16af` renamed the gateway's operator-key binding from `OP_HEX` to `operatorHex` and moved the
+derivation into the non-identity-port branch of `config/nostr-gateway/gateway.cjs`. The construction is
+unchanged (`crypto.createHmac('sha256', Buffer.from(operatorHex, 'hex')).update(tag).digest()`), so this is
+not a review trigger; the runner's pinned expression was updated to the new identifier at the same
+specificity. Under identity-port mode the gateway key is derived by agentbox's Rust `identity_port`, which
+this JS pin does not cover.

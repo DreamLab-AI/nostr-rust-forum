@@ -19,7 +19,7 @@ lineage: distils legacy ADR-105 §2.3 (BBS door-games/write architecture), amend
 
 ## External review qualification — 2026-11-02
 
-The [dated source reconciliation](external-review-2026-11-02.md) records the current
+The [dated source reconciliation](../audit/external-review-2026-11-02.md) records the current
 implementation evidence, open acceptance gaps and limits of the external review.
 It supplements this decision without changing its adoption or activation status.
 

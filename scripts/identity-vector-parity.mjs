@@ -14,7 +14,7 @@
  *
  *   config/hooks/nostr-live-mirror.cjs  :: deriveChildKey()
  *   config/nostr-gateway/nostr-send.cjs :: loadIdentity()  (child mode)
- *   config/nostr-gateway/gateway.cjs    :: module-level child identity
+ *   config/nostr-gateway/gateway.cjs    :: gateway-mode key (non-identity-port branch)
  *
  * None of them export the derivation. `nostr-live-mirror.cjs` exports only
  * `composeBody`/`mintActivityUrn`/`activityScopePubkey`/`bodyForEvent`/
@@ -81,8 +81,9 @@ const AGENTBOX_SOURCES = [
   },
   {
     file: 'config/nostr-gateway/gateway.cjs',
-    symbol: 'child identity constant',
-    expression: "crypto.createHmac('sha256', Buffer.from(OP_HEX, 'hex')).update(",
+    symbol: 'gateway-mode key (non-identity-port branch)',
+    // agentbox 31c16af renamed OP_HEX to operatorHex; the construction is unchanged.
+    expression: "crypto.createHmac('sha256', Buffer.from(operatorHex, 'hex')).update(",
   },
 ];
 
