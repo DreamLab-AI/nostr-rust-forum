@@ -7,6 +7,34 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.19] — 2026-11-08
+
+`nostr-bbs-core`, `nostr-bbs-config`, `nostr-bbs-mesh` and `nostr-bbs-rate-limit` are published together at
+1.0.0-beta.19, in lockstep. This section covers everything since 1.0.0-beta.15. All four were released together
+at 1.0.0-beta.16. Core 1.0.0-beta.17 was then published on its own, and core beta.18 never reached crates.io, so
+config, mesh and rate-limit move directly from beta.16 to beta.19. Core's own changes are itemised in
+`crates/nostr-bbs-core/CHANGELOG.md`.
+
+### Security: deepsec HIGH fixes ported from `feat/upgrade-phase-0-1` (`2047c1b`)
+
+Three of the four fixes in `2047c1b` apply to code on `main`. The fourth (inbox-key attestation) patches the
+Phase 2 inbox-key plane, which is not on `main`, and stays with that branch.
+
+- **Zone-key auto-grant no longer trusts the relay roster for first grants** (`nostr-bbs-forum-client`). The
+  sign-in sweep wrapped the zone key to every pubkey the relay's roster placed in a required cohort, so a
+  compromised relay could exfiltrate the key by injecting a row. The sweep now auto-grants only to members this
+  device has granted before or an admin has approved. A never-granted pubkey is held for one-time approval in
+  Admin → Encryption (Pending approvals). An explicit allocation still grants immediately. A device with no
+  record for a zone adopts the current roster as its baseline once; the residual risk (a relay compromised
+  before a device's first sweep) is recorded for ADR-2016. **Behaviour change:** a new member who arrives
+  without an allocation (invite redemption, `auto_approve` zones) needs one admin approval before the sweep
+  grants them a zone key.
+- **NIP-26 delegation expiry is enforced against the verifier's clock** (`nostr-bbs-mesh`, **breaking**).
+  `DelegationToken::verify_for_event` takes `now: Option<u64>` (passed from `ReceiveOptions::now`), so a
+  backdated rumor can no longer reuse an expired `created_at<` window. Dormant under `MESH_MODE=standalone`.
+- **Push notifications honour whitelist expiry** (`nostr-bbs-relay-worker`). `push.rs::is_whitelisted` now
+  uses the same `expires_at IS NULL OR expires_at > now` rule as admission.
+
 ### Security: RustCrypto 0.14 line (k256 0.14, p256 0.14, ecdsa 0.17) closes RUSTSEC-2026-0387 (breaking)
 
 `crypto-bigint` 0.5.5, reached through `elliptic-curve` 0.13 (`k256` 0.13, `p256` 0.13), is affected by

@@ -25,7 +25,7 @@ use crate::components::copy_key::CopyKey;
 use crate::relay::RelayConnection;
 use crate::stores::zones::{load_zones, Zone};
 use crate::utils::shorten_pubkey;
-use crate::zone_crypto::auto_grant::{grant_count, send_grants};
+use crate::zone_crypto::auto_grant::{grant_count, send_grants, AutoGrant};
 use crate::zone_crypto::store::{try_use_zone_key_store, ZoneKeyStore};
 use crate::zone_crypto::{generate_zone_key, grant_plan, grant_targets, ZoneKey, AGENT_COHORT};
 
@@ -84,8 +84,79 @@ pub fn ZoneEncryptionTab() -> impl IntoView {
                  when someone leaves so they cannot read anything posted afterwards. Agents get \
                  a key only in zones the operator configured with agent_keys."
             </p>
+            <PendingApprovals />
             {zones.into_iter().map(|z| view! { <ZoneKeyCard zone=z keys=keys members_ready=members_ready /> }).collect_view()}
         </div>
+    }
+    .into_any()
+}
+
+/// First-grant confirmation gate (deepsec #1). The sign-in sweep auto-grants
+/// the zone key only to members it has granted before or that an admin has
+/// approved; a pubkey the relay's roster newly places in a required cohort is
+/// held here for a one-time confirmation, so a hostile relay cannot make the
+/// sweep silently wrap the zone key to an injected pubkey. Approving a target
+/// records it and grants the key; rotation to already-known members stays
+/// automatic and never appears here.
+#[component]
+fn PendingApprovals() -> impl IntoView {
+    let Some(auto) = AutoGrant::capture() else {
+        return ().into_any();
+    };
+    // `StoredValue` is `Copy`, so the reactive list closure below stays `Fn`
+    // (the `Show` children must be) while still reaching the captured handles.
+    let auto = StoredValue::new(auto);
+    let pending: RwSignal<Vec<(String, String)>> = RwSignal::new(Vec::new());
+    let loaded = RwSignal::new(false);
+
+    spawn_local(async move {
+        let p = auto.get_value().pending_targets().await;
+        pending.set(p);
+        loaded.set(true);
+    });
+
+    let approve = move |zone: String, pubkey: String| {
+        auto.get_value().approve(&zone, &pubkey);
+        // Drop the row optimistically; the next sweep recomputes the set.
+        pending.update(|p| p.retain(|(z, pk)| !(z == &zone && pk == &pubkey)));
+    };
+
+    view! {
+        <Show when=move || loaded.get() && !pending.get().is_empty() fallback=|| ()>
+            <div class="rounded border border-amber-500/40 bg-amber-500/5 p-4 space-y-3">
+                <div>
+                    <h3 class="text-sm font-semibold text-amber-300">"New members awaiting approval"</h3>
+                    <p class="text-xs text-gray-400 max-w-3xl mt-1">
+                        "These pubkeys were added to an encrypted zone's cohort but have never held \
+                         its key. The sign-in sweep will not send the key until you confirm each one \
+                         here — this is the only way a brand-new member receives a key automatically, \
+                         and it stops a compromised relay from silently granting the key to an \
+                         injected pubkey. Confirm only members you recognise."
+                    </p>
+                </div>
+                <ul class="space-y-2">
+                    {move || {
+                        pending.get().into_iter().map(move |(zone, pubkey)| {
+                            let (z, pk) = (zone.clone(), pubkey.clone());
+                            view! {
+                                <li class="flex items-center justify-between gap-3 text-sm">
+                                    <span class="flex items-center gap-2">
+                                        <code class="text-xs text-gray-300">{zone.clone()}</code>
+                                        <CopyKey full=pubkey.clone() />
+                                    </span>
+                                    <button
+                                        class="px-2 py-1 text-xs rounded bg-amber-600 hover:bg-amber-500 text-white"
+                                        on:click=move |_| approve(z.clone(), pk.clone())
+                                    >
+                                        "Approve & send key"
+                                    </button>
+                                </li>
+                            }
+                        }).collect_view()
+                    }}
+                </ul>
+            </div>
+        </Show>
     }
     .into_any()
 }
