@@ -77,8 +77,7 @@ fn parse_relays(relays: &[String]) -> Result<Vec<RelayUrl>, Nip19Error> {
 pub fn encode_npub(pubkey_hex: &str) -> Result<String, Nip19Error> {
     let bytes = hex_to_bytes_exact(pubkey_hex, 32)?;
     let pk = PublicKey::from_slice(&bytes).map_err(|e| Nip19Error::Bech32(e.to_string()))?;
-    pk.to_bech32()
-        .map_err(|e| Nip19Error::Bech32(e.to_string()))
+    pk.to_bech32().map_err(|never| match never {})
 }
 
 /// Encode a 64-char hex secret key as `nsec1…`.
@@ -92,8 +91,7 @@ pub fn encode_nsec(sk_hex: &str) -> Result<String, Nip19Error> {
 pub fn encode_note(event_id_hex: &str) -> Result<String, Nip19Error> {
     let bytes = hex_to_bytes_exact(event_id_hex, 32)?;
     let id = EventId::from_slice(&bytes).map_err(|e| Nip19Error::Bech32(e.to_string()))?;
-    id.to_bech32()
-        .map_err(|e| Nip19Error::Bech32(e.to_string()))
+    id.to_bech32().map_err(|never| match never {})
 }
 
 /// Decode a simple bech32 entity (npub/nsec/note) to its 32-byte payload,
