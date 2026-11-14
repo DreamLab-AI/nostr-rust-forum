@@ -85,7 +85,7 @@ impl LedgerDb for Sqlite {
 
     async fn all(&self, stmt: Stmt) -> Result<Vec<Value>, String> {
         let mut q = self.0.prepare(stmt.sql).map_err(|e| e.to_string())?;
-        let names: Vec<String> = q.column_names().iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = q.column_names().map(|s| s.to_string()).collect();
         let rows = q
             .query_map(
                 rusqlite::params_from_iter(stmt.params.iter().map(to_sql)),
