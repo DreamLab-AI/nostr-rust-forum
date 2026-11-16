@@ -263,6 +263,31 @@ pub fn validate_config(cfg: &ForumConfig) -> Result<(), String> {
                     ));
                 }
             }
+            // ADR-2028: the NIP-171 group binding must be 64-char lowercase hex
+            // (it is compared byte-for-byte against event pubkeys, which are
+            // lowercase hex), and it only has meaning on an encrypted zone — a
+            // binding on a plaintext zone signals a config mistake, not an
+            // intent, so it is rejected rather than silently ignored.
+            if let Some(gp) = zone.group_pubkey.as_deref() {
+                if gp.len() != 64
+                    || !gp
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
+                    return Err(format!(
+                        "zone '{}' group_pubkey must be 64-char lowercase hex (got {})",
+                        zone.id, gp
+                    ));
+                }
+                if !zone.encrypted {
+                    return Err(format!(
+                        "zone '{}' has a group_pubkey but encrypted = false — the NIP-171 \
+                         group binding only applies to an end-to-end encrypted zone; remove \
+                         the binding or set encrypted = true",
+                        zone.id
+                    ));
+                }
+            }
             // Slug (issue #45): the client resolves a URL segment to a zone by
             // slug-or-id, so a slug must be a clean URL segment, unique, and must
             // not equal a *different* zone's id (which would make one URL resolve
@@ -746,6 +771,7 @@ operator = "tier-2"
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            group_pubkey: None,
         }
     }
 
@@ -755,6 +781,35 @@ operator = "tier-2"
         cfg.zones = vec![zone_for_encryption(ZoneVisibility::Public, true)];
         let err = validate_config(&cfg).unwrap_err();
         assert!(err.contains("cannot be end-to-end encrypted"), "{err}");
+    }
+
+    #[test]
+    fn zone_group_pubkey_validated() {
+        let hex64 = "a".repeat(64);
+        // Valid 64-char lowercase hex on an encrypted zone: accepted.
+        let mut cfg = baseline_cfg();
+        let mut z = zone_for_encryption(ZoneVisibility::Locked, true);
+        z.group_pubkey = Some(hex64.clone());
+        cfg.zones = vec![z];
+        assert!(validate_config(&cfg).is_ok());
+
+        // Uppercase hex: rejected (pubkeys are compared as lowercase hex).
+        let mut cfg = baseline_cfg();
+        let mut z = zone_for_encryption(ZoneVisibility::Locked, true);
+        z.group_pubkey = Some("A".repeat(64));
+        cfg.zones = vec![z];
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .contains("group_pubkey must be 64-char lowercase hex"));
+
+        // Binding on a plaintext zone: rejected as a config mistake.
+        let mut cfg = baseline_cfg();
+        let mut z = zone_for_encryption(ZoneVisibility::Locked, false);
+        z.group_pubkey = Some(hex64);
+        cfg.zones = vec![z];
+        assert!(validate_config(&cfg)
+            .unwrap_err()
+            .contains("encrypted = false"));
     }
 
     #[test]
@@ -791,6 +846,7 @@ operator = "tier-2"
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            group_pubkey: None,
         }];
         assert!(validate_config(&cfg).is_ok());
     }
@@ -811,6 +867,7 @@ operator = "tier-2"
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            group_pubkey: None,
         }];
         assert!(validate_config(&cfg).is_err());
     }
@@ -831,6 +888,7 @@ operator = "tier-2"
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            group_pubkey: None,
         }
     }
 

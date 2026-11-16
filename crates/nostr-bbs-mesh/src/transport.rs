@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use nostr_bbs_core::event::{sign_event, NostrEvent, UnsignedEvent};
-use nostr_bbs_core::gift_wrap::{gift_wrap, unwrap_gift};
+use nostr_bbs_core::gift_wrap::{gift_wrap, unwrap_gift_kind, RumorKind};
 use nostr_bbs_core::keys::{pubkey_hex, signing_key_from_bytes};
 
 use crate::config::MeshConfig;
@@ -471,8 +471,10 @@ pub fn decode_incoming_wrap(
     recipient_sk: &[u8; 32],
     opts: &ReceiveOptions,
 ) -> Result<ReceivedEnvelope, MeshError> {
-    let unwrapped =
-        unwrap_gift(wrap, recipient_sk).map_err(|e| MeshError::GiftWrap(e.to_string()))?;
+    // Exact kind 14: the generic unwrap also admits reaction, deletion and file
+    // rumors since core beta.19; an IS-Envelope only ever travels as chat.
+    let unwrapped = unwrap_gift_kind(wrap, recipient_sk, RumorKind::Chat.kind())
+        .map_err(|e| MeshError::GiftWrap(e.to_string()))?;
     let seal_pubkey = unwrapped.sender_pubkey.clone();
     let rumor = unwrapped.rumor;
 

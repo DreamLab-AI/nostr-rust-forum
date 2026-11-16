@@ -7,6 +7,81 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+### Merged from `feat/upgrade-phase-0-1` (ADR-2014 integration, 2026-11-16)
+
+Core, config, mesh and rate-limit stay at their released 1.0.0-beta.19 / beta.16 versions on this branch; the branch's own unreleased core "beta.19/beta.20" entries are folded into core's `[Unreleased]` section, because main already published a different beta.19. The inbox-key attestation fix (`2047c1b`) is now present with the feature it fixes.
+
+### Changed: relay ban gate and counters cover kind 9 and 34550; NIP-29 no longer advertised; `groups.rs` builders deprecated
+
+The ban gate now covers kind 9 and kind 34550; kind 9 counts towards `posts_created` and profile-stat posts.
+NIP-11 drops 29 from `supported_nips` (only admin kinds are gated). Every public builder in
+`nostr-bbs-core::groups` is `#[deprecated]` (no caller; ADR-2029 is a-scoped); removal is a later step.
+
+### Upgrade Phase 3: NIP-17 overlay, ADR-2027 accepted and implemented behind the flag (2026-10-20)
+
+ADR-2027 was accepted by the operator and decision 1 is implemented, all behind the same
+`RECIPIENT_KEYS_ENABLED` flag, default off. Forum client DMs: the recipient's kind 10050 (then
+NIP-65 read relays) is resolved from the public indexers and our relay concurrently, candidates
+verified by signature and author; the recipient copy goes to up to four `wss://` foreign relays and
+to our relay only for members or ingress recipients; the self-copy goes to our relay first and must
+be acknowledged before any recipient copy is sent; delivery is Sent, Partial or Failed and never
+Sent with zero acknowledgements; an empty route is Failed before anything is published. Replying
+to a non-member shows a one-time-per-recipient confirmation naming the relay hosts, because the
+member's browser connects to relays that recipient chose. Rumor kinds 7, 5 and 15 render as
+reaction, sender-only deletion and `https` attachment; outgoing rumors are validated so `p` tags
+name only the recipient and self and `e` tags reference known messages; replies carry the `reply`
+marker and media carries `imeta`. A Requests lane holds DMs from outsiders with no unread badge.
+The `public_inbox` opt-in publishes the member's relay lists to purplepag.es, indexer.coracle.social
+and relay.nos.social by merging over the newest list already there, keeps a local baseline so a
+stale indexer cannot shrink the list, needs two indexers or an agreeing baseline, retracts fully on
+opt-out, and shows the consent text fixed in ADR-2027 verbatim. BBS client: NIP-17 self-copy, an
+outbox state machine that queues until NIP-42 AUTH completes and marks Sent only when both wraps
+are acknowledged, and the same future-timestamp clamp as the forum client. Inbox-key attestation:
+the auth-worker stores and returns each key's kind-27237 registration proof (migration 0013) and
+grant issuers refuse any key whose proof does not bind it to the member. `nostr-bbs-core`
+1.0.0-beta.20 adds `gift_wrap_rumor_with_signer` and its pair form. Reviews: Opus seam review
+(outsider lookup never reached indexers, among seven confirmed findings), Codex gpt-6-astra
+cross-vendor audit (six findings, five fixed, one accepted and documented), deepsec over the
+pre-fix tree (one HIGH, fixed here); 3,043 workspace tests.
+
+### Upgrade Phase 2: private inbox keys for zone-key grants (ADR-2027 decision 2), flagged off (2026-10-20)
+
+Zone-key grants (rumor kind 21453) can now be addressed to a per-member inbox key instead of the
+identity key, so a member who later advertises this relay in a public kind 10050 does not hand
+their zone grants to every NIP-17 client they log into. Everything is behind
+`RECIPIENT_KEYS_ENABLED` (relay and auth-worker vars, client `window.__ENV__`), default off; with
+the flag off every path is byte-identical to before. Relay: `recipient_keys` table (migration
+0012), admission precedence ingress > registered row > raw whitelist, read set A = authed key plus
+its registered inbox keys applied per event on REQ, COUNT, broadcast and the protected-read gate,
+a kind-1059-only recipient deletion lane, 60 s positive-only caches. Auth-worker: register (proof
+kind 27237 signed by the new key), revoke, admin lookup, epoch registration for Phase 4. Client:
+random inbox key backed up as kind 30078 NIP-44 self-encrypted, backup before registration,
+restore on a fresh browser and generate nothing when the relay is unreachable or the backup will
+not decrypt; grant issuers look up inbox keys; v2 grant ledger keyed by recipient key. The
+old-grant sweep exists behind a second flag `GRANT_SWEEP_ENABLED`, off, and can only delete an
+identity-addressed grant whose `(zone, epoch)` has already arrived at the inbox key on that
+device. Zone migrator and the agentbox zone-key module read inbox-addressed grants when given the
+key. Design: `docs/interop/phase-2-inbox-keys-design-2026-10-20.md`. Four workers, Opus seam
+review (two blocking seam bugs fixed), Codex gpt-6-astra cross-vendor audit, deepsec PASS.
+
+### Upgrade Phase 0 and 1: backup discipline and interop hygiene (2026-10-20)
+
+Phase 0: `docs/runbooks/disaster-recovery.md` and `scripts/dr-export.sh`. One restore rehearsal
+was run into a scratch D1 and deleted; per-table counts matched production exactly (21 tables,
+7,987 rows). The runbook records that the live account names its D1 and R2 resources
+`dreamlab-*` while every config in this repo says `nostr-bbs-*`; D1 binds by UUID, R2 by name.
+
+Phase 1, all additive or correctness fixes, no wire change: core 1.0.0-beta.19 accepts NIP-17
+rumor kinds 7, 5 and 15 through the generic unwrap and exposes `RumorKind`; consumers that only
+expect chat (both DM inboxes, the mesh transport, the poker coach) now check or pin the kind, and
+the crate states the invariant that unwrapping authenticates but never authorises. Relay
+addressable (3xxxx) replacement is conditional on NIP-01 order (newer wins, equal timestamp lowest
+id) and `save_event` reports whether the row was kept so a refused stale event is neither
+broadcast nor projected into moderation and broker tables. The ban gate and post counters cover
+kinds 9 and 34550. NIP-29 is no longer advertised (never implemented); the unused `groups.rs`
+builders are deprecated. Baseline citations corrected. Cross-vendor audit by Codex gpt-6-astra and
+an Opus review were applied before commit.
+
 ## [1.0.0-beta.19] — 2026-11-08
 
 `nostr-bbs-core`, `nostr-bbs-config`, `nostr-bbs-mesh` and `nostr-bbs-rate-limit` are published together at

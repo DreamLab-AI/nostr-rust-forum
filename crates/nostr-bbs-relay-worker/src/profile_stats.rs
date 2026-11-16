@@ -36,9 +36,9 @@ use crate::cors::json_response as cors_json_response;
 use crate::trust;
 use crate::zone_config::ZoneConfig;
 
-/// Kinds counted as authored posts: NIP-01 notes, NIP-28 channel messages and
-/// NIP-22 comments.
-const POST_KINDS: [u32; 3] = [1, 42, 1111];
+/// Kinds counted as authored posts: NIP-01 notes, kind-9 chat, NIP-28
+/// channel messages and NIP-22 comments.
+const POST_KINDS: [u32; 4] = [1, 9, 42, 1111];
 
 /// Upper bound on rows scanned per identity. The response flags `truncated`
 /// when the cap is hit so the card can say "at least".
@@ -454,6 +454,12 @@ mod tests {
             ("biz".to_string(), "business".to_string()),
             ("pub".to_string(), "public".to_string()),
         ])
+    }
+
+    #[test]
+    fn kind_9_is_a_counted_post_kind() {
+        assert!(POST_KINDS.contains(&9));
+        assert!(POST_KINDS.contains(&42));
     }
 
     #[test]

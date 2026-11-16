@@ -10,6 +10,11 @@ use nostr_bbs_core::governance::{
 use serde_json::json;
 use worker::Env;
 
+/// NIPs advertised in the NIP-11 document. 29 is deliberately absent: the relay
+/// only gates NIP-29 admin kinds and implements no group semantics
+/// (ADR-2029 room dialect is a-scoped, not h-scoped).
+const SUPPORTED_NIPS: [u32; 13] = [1, 9, 11, 16, 33, 40, 42, 45, 50, 56, 59, 65, 98];
+
 /// Default escalation tier when `ESCALATION_DEFAULT_TIER` is unset (REC-6).
 const DEFAULT_ESCALATION_TIER: &str = "medium";
 /// Default authority posture when `ESCALATION_DEFAULT_POSTURE` is unset (REC-6).
@@ -185,7 +190,7 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         })
         .collect();
 
-    json!({
+    let mut info = json!({
         "name": relay_name,
         "description": "Private whitelist-only Nostr relay (nostr-bbs).",
         "pubkey": admin_pubkey,
@@ -204,7 +209,7 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
         // NIP-90 (DVM) is likewise NOT advertised: the `nip90` module was
         // removed in the R4 sweep (ADR-103 §2.3) and no DVM kinds are handled,
         // so listing 90 would be a phantom capability claim.
-        "supported_nips": [1, 9, 11, 16, 29, 33, 40, 42, 45, 50, 56, 59, 65, 98],
+        "supported_nips": SUPPORTED_NIPS,
         "software": "https://github.com/DreamLab-AI/nostr-rust-forum",
         "version": env!("CARGO_PKG_VERSION"),
         "limitation": {
@@ -277,12 +282,31 @@ pub fn relay_info(env: &Env) -> serde_json::Value {
                 &escalation_posture,
             ),
         },
-    })
+    });
+
+    // ADR-2028 decision 4: serve the zone-to-group binding. Only with the flag
+    // on, so the document is byte-identical to before when it is off.
+    if crate::zone_groups::zone_groups_enabled_var(
+        env.var(crate::zone_groups::ZONE_GROUPS_ENABLED_VAR)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    ) {
+        info["nostr_bbs"]["zone_groups"] =
+            crate::zone_config::ZoneConfig::load(env).zone_groups_block();
+    }
+    info
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nip_29_is_not_advertised() {
+        assert!(!SUPPORTED_NIPS.contains(&29));
+        assert!(SUPPORTED_NIPS.contains(&42));
+    }
 
     #[test]
     fn escalation_block_reflects_config_and_lists_all_risk_tiers() {

@@ -829,7 +829,7 @@ mod nip42_auth {
         let verdict = evaluate_auth_event(
             &ev,
             Some(CHALLENGE),
-            Some("wss://relay.example.com"),
+            &["wss://relay.example.com".to_string()],
             NOW,
             AUTH_MAX_SKEW_SECS,
         );
@@ -842,7 +842,7 @@ mod nip42_auth {
         let verdict = evaluate_auth_event(
             &ev,
             Some("a-different-challenge"),
-            Some(RELAY),
+            &[RELAY.to_string()],
             NOW,
             AUTH_MAX_SKEW_SECS,
         );
@@ -856,7 +856,7 @@ mod nip42_auth {
     fn missing_session_challenge_rejected() {
         // The session is gone (None expected challenge) — nothing can match.
         let ev = signed_auth(0x13, 22242, Some(RELAY), Some(CHALLENGE), NOW);
-        let verdict = evaluate_auth_event(&ev, None, Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        let verdict = evaluate_auth_event(&ev, None, &[RELAY.to_string()], NOW, AUTH_MAX_SKEW_SECS);
         assert_eq!(
             verdict,
             AuthVerdict::Rejected("invalid: challenge mismatch")
@@ -875,7 +875,7 @@ mod nip42_auth {
         let verdict = evaluate_auth_event(
             &ev,
             Some(CHALLENGE),
-            Some("wss://relay.example.com"),
+            &["wss://relay.example.com".to_string()],
             NOW,
             AUTH_MAX_SKEW_SECS,
         );
@@ -891,7 +891,7 @@ mod nip42_auth {
         let verdict = evaluate_auth_event(
             &ev,
             Some(CHALLENGE),
-            Some("wss://relay.example.com"),
+            &["wss://relay.example.com".to_string()],
             NOW,
             AUTH_MAX_SKEW_SECS,
         );
@@ -899,9 +899,11 @@ mod nip42_auth {
     }
 
     #[test]
-    fn relay_tag_check_skipped_when_own_url_unset() {
-        // Fail-open on the relay-tag check only: an unconfigured RELAY_URL means
-        // even an evil relay tag passes (challenge + signature still enforced).
+    fn auth_fails_closed_when_no_relay_url_configured() {
+        // An empty allowed set (RELAY_URL and RELAY_URL_ALIASES both unset)
+        // REFUSES every AUTH, even one whose relay tag would otherwise look
+        // valid. The relay never derives its identity from the request, so an
+        // unconfigured deploy is secure-but-broken, not silently open.
         let ev = signed_auth(
             0x16,
             22242,
@@ -909,8 +911,11 @@ mod nip42_auth {
             Some(CHALLENGE),
             NOW,
         );
-        let verdict = evaluate_auth_event(&ev, Some(CHALLENGE), None, NOW, AUTH_MAX_SKEW_SECS);
-        assert!(matches!(verdict, AuthVerdict::Ok(_)));
+        let verdict = evaluate_auth_event(&ev, Some(CHALLENGE), &[], NOW, AUTH_MAX_SKEW_SECS);
+        assert_eq!(
+            verdict,
+            AuthVerdict::Rejected("invalid: relay url unconfigured")
+        );
         // Canonicalisation is scheme/slash/case tolerant.
         assert!(relay_urls_match(RELAY, "wss://relay.example.com"));
     }
@@ -919,8 +924,13 @@ mod nip42_auth {
     fn stale_created_at_rejected() {
         let created = NOW - (AUTH_MAX_SKEW_SECS + 5);
         let ev = signed_auth(0x17, 22242, Some(RELAY), Some(CHALLENGE), created);
-        let verdict =
-            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some(CHALLENGE),
+            &[RELAY.to_string()],
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
         assert_eq!(
             verdict,
             AuthVerdict::Rejected("invalid: auth event too old")
@@ -931,8 +941,13 @@ mod nip42_auth {
     fn future_created_at_beyond_skew_rejected() {
         let created = NOW + (AUTH_MAX_SKEW_SECS + 5);
         let ev = signed_auth(0x18, 22242, Some(RELAY), Some(CHALLENGE), created);
-        let verdict =
-            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some(CHALLENGE),
+            &[RELAY.to_string()],
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
         assert_eq!(
             verdict,
             AuthVerdict::Rejected("invalid: auth event too old")
@@ -944,8 +959,13 @@ mod nip42_auth {
         let mut ev = signed_auth(0x19, 22242, Some(RELAY), Some(CHALLENGE), NOW);
         // Corrupt the signature after signing — strict verification must fail.
         ev.sig = "0".repeat(128);
-        let verdict =
-            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some(CHALLENGE),
+            &[RELAY.to_string()],
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
         assert_eq!(
             verdict,
             AuthVerdict::Rejected("invalid: signature verification failed")
@@ -957,8 +977,13 @@ mod nip42_auth {
         let mut ev = signed_auth(0x1a, 22242, Some(RELAY), Some(CHALLENGE), NOW);
         // Mutating content breaks the id→content hash binding checked strictly.
         ev.content = "injected".to_string();
-        let verdict =
-            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some(CHALLENGE),
+            &[RELAY.to_string()],
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
         assert_eq!(
             verdict,
             AuthVerdict::Rejected("invalid: signature verification failed")
@@ -969,8 +994,13 @@ mod nip42_auth {
     fn wrong_kind_rejected() {
         // A validly-signed kind-1 note is not an AUTH event.
         let ev = signed_auth(0x1b, 1, Some(RELAY), Some(CHALLENGE), NOW);
-        let verdict =
-            evaluate_auth_event(&ev, Some(CHALLENGE), Some(RELAY), NOW, AUTH_MAX_SKEW_SECS);
+        let verdict = evaluate_auth_event(
+            &ev,
+            Some(CHALLENGE),
+            &[RELAY.to_string()],
+            NOW,
+            AUTH_MAX_SKEW_SECS,
+        );
         assert_eq!(
             verdict,
             AuthVerdict::Rejected("invalid: expected kind 22242")
