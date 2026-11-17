@@ -18,6 +18,7 @@ pub mod identity;
 pub mod menu;
 pub mod nip07;
 pub mod notifications;
+pub mod outbox;
 pub mod passkey;
 pub mod pod;
 pub mod pwa;

@@ -5,7 +5,6 @@ git_sha: ef0c9aa207ba16618cb4a09195546ef317823ba8
 branch: feat/augmentation-conditions-client
 produced_by: agent:claude-opus
 produced_at: 2026-09-14T20:02:22Z
-audited_by:
 ---
 
 # Evidence — EXP-AC-006 (forum client)

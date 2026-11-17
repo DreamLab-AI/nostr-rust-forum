@@ -15,7 +15,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
-/// `zone_kv` id prefix: `grants_sent:<zone>:<epoch>`.
+/// `zone_kv` id prefix: `grants_sent:<zone>:<epoch>` (v1) and
+/// `grants_sent:v2:<zone>:<epoch>` (v2).
 pub const KV_GRANTS_SENT: &str = "grants_sent";
 
 /// `zone_kv` id prefix for the per-zone "approved targets" set:
@@ -29,9 +30,22 @@ pub fn approved_id(zone: &str) -> String {
     format!("{KV_APPROVED_TARGETS}:{zone}")
 }
 
-/// Storage id for the `(zone, epoch)` grant set.
+/// Storage id for the `(zone, epoch)` grant set (v2). Entries are
+/// `"<member>:<recipient key>"`: the key the wrap was addressed to, so a
+/// re-issue to a member's new inbox key is not mistaken for already granted.
 pub fn ledger_id(zone: &str, epoch: u32) -> String {
+    format!("{KV_GRANTS_SENT}:v2:{zone}:{epoch}")
+}
+
+/// The v1 id, read as a fallback only: its entries are member pubkeys, and
+/// each counts as a grant to that member's identity key.
+pub fn ledger_id_v1(zone: &str, epoch: u32) -> String {
     format!("{KV_GRANTS_SENT}:{zone}:{epoch}")
+}
+
+/// A v2 entry.
+pub fn entry(member: &str, recipient_key: &str) -> String {
+    format!("{member}:{recipient_key}")
 }
 
 /// Async key/value storage behind the ledger (IndexedDB in the browser).
@@ -90,16 +104,63 @@ impl GrantLedger {
         self.with(|i| i.sets.get(id).cloned().unwrap_or_default())
     }
 
-    /// Members `(zone, epoch)` was granted to from this device.
-    pub async fn sent<K: GrantKv>(&self, kv: &K, zone: &str, epoch: u32) -> HashSet<String> {
-        let id = ledger_id(zone, epoch);
-        self.ensure_loaded(kv, &id).await;
-        self.snapshot(&id).into_iter().collect()
+    async fn load_both<K: GrantKv>(&self, kv: &K, zone: &str, epoch: u32) -> (String, String) {
+        let (v2, v1) = (ledger_id(zone, epoch), ledger_id_v1(zone, epoch));
+        self.ensure_loaded(kv, &v2).await;
+        self.ensure_loaded(kv, &v1).await;
+        (v2, v1)
     }
 
-    /// Members this device has ever granted any of `epochs` of `zone` to. A
-    /// member granted a prior epoch is "known" and keeps auto-granting across
-    /// a rotation; a never-granted pubkey is "new" and held for approval.
+    /// Members `(zone, epoch)` was granted to from this device, whichever key
+    /// the wrap went to (v2 entries and v1 members alike).
+    pub async fn sent<K: GrantKv>(&self, kv: &K, zone: &str, epoch: u32) -> HashSet<String> {
+        let (v2, v1) = self.load_both(kv, zone, epoch).await;
+        let mut out: HashSet<String> = self.snapshot(&v1).into_iter().collect();
+        out.extend(
+            self.snapshot(&v2)
+                .iter()
+                .filter_map(|e| e.split_once(':').map(|(m, _)| m.to_string())),
+        );
+        out
+    }
+
+    /// Members already granted at the key they would be granted at now.
+    /// `targets` maps member to the key a wrap would be addressed to; a member
+    /// absent from it targets their own identity. A v1 entry only ever
+    /// satisfied an identity-addressed grant, so it does not cover a member
+    /// whose target is a different (inbox) key.
+    pub async fn sent_to<K: GrantKv>(
+        &self,
+        kv: &K,
+        zone: &str,
+        epoch: u32,
+        targets: &HashMap<String, String>,
+    ) -> HashSet<String> {
+        let (v2, v1) = self.load_both(kv, zone, epoch).await;
+        let (v2s, v1s) = (self.snapshot(&v2), self.snapshot(&v1));
+        let mut out: HashSet<String> = HashSet::new();
+        for e in &v2s {
+            if let Some((m, k)) = e.split_once(':') {
+                let want = targets.get(m).map_or(m, String::as_str);
+                if k == want {
+                    out.insert(m.to_string());
+                }
+            }
+        }
+        for m in &v1s {
+            if targets.get(m).is_none_or(|k| k == m) {
+                out.insert(m.clone());
+            }
+        }
+        out
+    }
+
+    /// Members this device has ever granted any of `epochs` of `zone` to,
+    /// whichever key each grant went to. Unlike [`sent_to`](Self::sent_to)
+    /// this ignores the recipient key: it answers "is this pubkey a target we
+    /// have granted before", the question the first-grant gate asks. A member
+    /// granted a prior epoch is "known" and keeps auto-granting across a
+    /// rotation; a never-granted pubkey is "new" and held for approval.
     pub async fn members_ever<K: GrantKv>(
         &self,
         kv: &K,
@@ -121,8 +182,9 @@ impl GrantLedger {
     }
 
     /// Record that an admin approved `pubkey` as a first-time grant target for
-    /// `zone`, and persist the set with the same grow-only,
-    /// re-write-until-matched discipline as [`record`](Self::record).
+    /// `zone`, and persist the set. Persisted with the same grow-only,
+    /// re-write-until-matched discipline as [`record`](Self::record), so a
+    /// concurrent approval is never lost.
     pub async fn approve<K: GrantKv>(&self, kv: &K, zone: &str, pubkey: &str) {
         let id = approved_id(zone);
         self.ensure_loaded(kv, &id).await;
@@ -146,15 +208,22 @@ impl GrantLedger {
         }
     }
 
-    /// Record that `(zone, epoch)` reached `recipients`, and persist the set.
-    pub async fn record<K: GrantKv>(&self, kv: &K, zone: &str, epoch: u32, recipients: &[String]) {
+    /// Record that `(zone, epoch)` reached each `(member, recipient key)`, and
+    /// persist the set.
+    pub async fn record<K: GrantKv>(
+        &self,
+        kv: &K,
+        zone: &str,
+        epoch: u32,
+        recipients: &[(String, String)],
+    ) {
         let id = ledger_id(zone, epoch);
         self.ensure_loaded(kv, &id).await;
         self.with(|i| {
             i.sets
                 .entry(id.clone())
                 .or_default()
-                .extend(recipients.iter().cloned());
+                .extend(recipients.iter().map(|(m, k)| entry(m, k)));
         });
         for _ in 0..MAX_PERSIST_ROUNDS {
             let snap = self.snapshot(&id);
@@ -233,6 +302,11 @@ mod tests {
         (0..n).map(|i| format!("{i:064x}")).collect()
     }
 
+    /// Identity-addressed grants: member and recipient key are the same.
+    fn ids(v: &[String]) -> Vec<(String, String)> {
+        v.iter().map(|m| (m.clone(), m.clone())).collect()
+    }
+
     /// The previous algorithm: read, add one, write back — with no ledger.
     async fn naive_record(kv: &SlowKv, id: &str, pk: &str) {
         let mut all: BTreeSet<String> = kv
@@ -265,11 +339,11 @@ mod tests {
         let kv = SlowKv::default();
         let ledger = GrantLedger::default();
         let all = pks(8);
+        let recs: Vec<_> = all.iter().map(|pk| ids(std::slice::from_ref(pk))).collect();
         futures::executor::block_on(futures::future::join_all(
-            all.iter()
-                .map(|pk| ledger.record(&kv, "zone2", 1, std::slice::from_ref(pk))),
+            recs.iter().map(|r| ledger.record(&kv, "zone2", 1, r)),
         ));
-        let want: BTreeSet<String> = all.iter().cloned().collect();
+        let want: BTreeSet<String> = all.iter().map(|m| entry(m, m)).collect();
         assert_eq!(kv.stored(&ledger_id("zone2", 1)), want);
         let sent = futures::executor::block_on(ledger.sent(&kv, "zone2", 1));
         assert_eq!(sent.len(), 8);
@@ -279,19 +353,20 @@ mod tests {
     fn load_unions_with_records_made_meanwhile() {
         let kv = SlowKv::default();
         let id = ledger_id("zone3", 1);
-        kv.data
-            .borrow_mut()
-            .insert(id.clone(), serde_json::to_string(&pks(2)).unwrap());
+        kv.data.borrow_mut().insert(
+            id.clone(),
+            serde_json::to_string(&pks(2).iter().map(|m| entry(m, m)).collect::<Vec<_>>()).unwrap(),
+        );
         let ledger = GrantLedger::default();
         let extra = format!("{:064x}", 99);
         let (sent, ()) = futures::executor::block_on(futures::future::join(
             ledger.sent(&kv, "zone3", 1),
-            ledger.record(&kv, "zone3", 1, std::slice::from_ref(&extra)),
+            ledger.record(&kv, "zone3", 1, &ids(std::slice::from_ref(&extra))),
         ));
         assert!(sent.len() >= 2);
         let stored = kv.stored(&id);
         assert_eq!(stored.len(), 3);
-        assert!(stored.contains(&extra));
+        assert!(stored.contains(&entry(&extra, &extra)));
     }
 
     #[test]
@@ -301,33 +376,14 @@ mod tests {
         let a = "ab".repeat(32);
         futures::executor::block_on(async {
             ledger
-                .record(&kv, "zone2", 1, std::slice::from_ref(&a))
+                .record(&kv, "zone2", 1, &ids(std::slice::from_ref(&a)))
                 .await;
-            ledger.record(&kv, "zone2", 2, &pks(1)).await;
+            ledger.record(&kv, "zone2", 2, &ids(&pks(1))).await;
         });
         let e1 = futures::executor::block_on(ledger.sent(&kv, "zone2", 1));
         assert_eq!(e1, HashSet::from([a]));
         assert_eq!(kv.stored(&ledger_id("zone2", 2)).len(), 1);
         assert!(kv.stored(&ledger_id("zone3", 1)).is_empty());
-    }
-
-    #[test]
-    fn members_ever_unions_the_epochs_asked() {
-        let kv = SlowKv::default();
-        let ledger = GrantLedger::default();
-        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
-        futures::executor::block_on(async {
-            ledger
-                .record(&kv, "zone3", 1, std::slice::from_ref(&a))
-                .await;
-            ledger
-                .record(&kv, "zone3", 2, std::slice::from_ref(&b))
-                .await;
-        });
-        let ever = futures::executor::block_on(ledger.members_ever(&kv, "zone3", &[1, 2]));
-        assert!(ever.contains(&a) && ever.contains(&b));
-        let ever1 = futures::executor::block_on(ledger.members_ever(&kv, "zone3", &[1]));
-        assert!(ever1.contains(&a) && !ever1.contains(&b));
     }
 
     #[test]
@@ -358,11 +414,74 @@ mod tests {
             }
         }
         let ledger = GrantLedger::default();
-        futures::executor::block_on(ledger.record(&FailKv, "zone4", 1, &pks(3)));
+        futures::executor::block_on(ledger.record(&FailKv, "zone4", 1, &ids(&pks(3))));
         // Memory still holds the record for this session.
         assert_eq!(
             futures::executor::block_on(ledger.sent(&FailKv, "zone4", 1)).len(),
             3
+        );
+    }
+
+    #[test]
+    fn ids_are_v2_and_v1_is_a_distinct_fallback() {
+        assert_eq!(ledger_id("z", 3), "grants_sent:v2:z:3");
+        assert_eq!(ledger_id_v1("z", 3), "grants_sent:z:3");
+        assert_eq!(approved_id("z"), "zone_approved_targets:z");
+    }
+
+    #[test]
+    fn members_ever_unions_every_epoch_target_independent() {
+        let kv = SlowKv::default();
+        let ledger = GrantLedger::default();
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        futures::executor::block_on(async {
+            // a granted at identity in epoch 1, b granted at an inbox key in 2.
+            ledger
+                .record(&kv, "zone3", 1, &[(a.clone(), a.clone())])
+                .await;
+            ledger
+                .record(&kv, "zone3", 2, &[(b.clone(), "ff".repeat(32))])
+                .await;
+        });
+        let ever = futures::executor::block_on(ledger.members_ever(&kv, "zone3", &[1, 2]));
+        assert!(ever.contains(&a) && ever.contains(&b));
+        // A member granted only epoch 2 is still "ever granted" when only
+        // epoch 1 is queried? No — the query is scoped to the epochs asked.
+        let ever1 = futures::executor::block_on(ledger.members_ever(&kv, "zone3", &[1]));
+        assert!(ever1.contains(&a) && !ever1.contains(&b));
+    }
+
+    #[test]
+    fn v2_does_not_skip_a_member_whose_v1_entry_exists_but_inbox_key_is_new() {
+        let kv = SlowKv::default();
+        let m = "aa".repeat(32);
+        let inbox = "bb".repeat(32);
+        kv.data.borrow_mut().insert(
+            ledger_id_v1("zone3", 1),
+            serde_json::to_string(&[&m]).unwrap(),
+        );
+        let ledger = GrantLedger::default();
+        // Flag off / no inbox key: the v1 record still counts.
+        let none = HashMap::new();
+        let s = futures::executor::block_on(ledger.sent_to(&kv, "zone3", 1, &none));
+        assert!(s.contains(&m));
+        // The member now has an inbox key: not yet granted at it.
+        let targets = HashMap::from([(m.clone(), inbox.clone())]);
+        let s = futures::executor::block_on(ledger.sent_to(&kv, "zone3", 1, &targets));
+        assert!(!s.contains(&m));
+        // After the re-issue is recorded it is, and a newer key is not.
+        futures::executor::block_on(ledger.record(&kv, "zone3", 1, &[(m.clone(), inbox.clone())]));
+        let s = futures::executor::block_on(ledger.sent_to(&kv, "zone3", 1, &targets));
+        assert!(s.contains(&m));
+        let newer = HashMap::from([(m.clone(), "cc".repeat(32))]);
+        let s = futures::executor::block_on(ledger.sent_to(&kv, "zone3", 1, &newer));
+        assert!(!s.contains(&m));
+        // The v1 key is still readable for display.
+        assert!(futures::executor::block_on(ledger.sent(&kv, "zone3", 1)).contains(&m));
+        // v1 is never rewritten.
+        assert_eq!(
+            kv.data.borrow().get(&ledger_id_v1("zone3", 1)).unwrap(),
+            &serde_json::to_string(&[&m]).unwrap()
         );
     }
 }
