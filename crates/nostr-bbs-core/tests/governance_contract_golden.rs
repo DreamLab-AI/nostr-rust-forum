@@ -144,7 +144,9 @@ fn panel_definition() -> NostrEvent {
 }
 
 fn panel_state() -> NostrEvent {
-    let state = json!({ "open_cases": 1, "decided_cases": 0, "last_scan": "2026-09-22T11:59:00Z" });
+    let state = canonical(
+        &json!({ "open_cases": 1, "decided_cases": 0, "last_scan": "2026-09-22T11:59:00Z" }),
+    );
     signed(
         AGENT_SECRET,
         governance::KIND_PANEL_STATE,
@@ -156,12 +158,12 @@ fn panel_state() -> NostrEvent {
 
 fn action_request() -> NostrEvent {
     let request = ActionRequest {
-        fields: json!({
+        fields: canonical(&json!({
             "term": "Golden example",
             "score": 0.92,
             "proposal_urn": CASE_ID,
             "propose_iri": IRI,
-        }),
+        })),
         reasoning: Some("Three independent notes define the term identically.".into()),
         context_url: Some(IRI.into()),
         risk_tier: Some(RiskTier::High),
@@ -200,7 +202,7 @@ fn action_response(request_id: &str) -> NostrEvent {
     let map = content.as_object_mut().unwrap();
     map.insert("case_id".into(), json!(CASE_ID));
     map.insert("reasoning".into(), json!(HUMAN_RATIONALE));
-    let content = content.to_string();
+    let content = canonical(&content).to_string();
 
     // The same rules the relay applies, run over what the fixture contains.
     let parsed = DecisionOutcome::from_response_content(&content).expect("outcome parses");
@@ -219,7 +221,7 @@ fn action_response(request_id: &str) -> NostrEvent {
 }
 
 fn panel_update() -> NostrEvent {
-    let diff = json!({ "open_cases": 0, "decided_cases": 1 });
+    let diff = canonical(&json!({ "open_cases": 0, "decided_cases": 1 }));
     signed(
         AGENT_SECRET,
         governance::KIND_PANEL_UPDATE,
@@ -239,9 +241,34 @@ fn panel_retired() -> NostrEvent {
     )
 }
 
-/// Render an event as the golden file's text: pretty JSON, trailing newline.
+/// Rebuild a JSON value with every object's keys in sorted order.
+///
+/// `serde_json` keeps object keys sorted by default, but any crate in the same
+/// build that turns on its `preserve_order` feature switches every `Map` to
+/// insertion order. Cargo unifies features across a workspace, so a
+/// `--workspace` test run would otherwise produce differently ordered files
+/// from a `-p nostr-bbs-core` run. Sorting here makes the golden text the same
+/// in every build.
+fn canonical(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for k in keys {
+                out.insert(k.clone(), canonical(&map[k]));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Render an event as the golden file's text: pretty JSON with sorted keys,
+/// trailing newline.
 fn render(value: &Value) -> String {
-    let mut text = serde_json::to_string_pretty(value).expect("serialisable");
+    let mut text = serde_json::to_string_pretty(&canonical(value)).expect("serialisable");
     text.push('\n');
     text
 }
