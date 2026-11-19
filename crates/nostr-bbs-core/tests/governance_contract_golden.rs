@@ -501,7 +501,7 @@ fn examples() -> Vec<(u64, &'static str, &'static str, NostrEvent)> {
 
 #[test]
 fn governance_golden_files_match_the_crate() {
-    let update = std::env::var("UPDATE_GOVERNANCE_CONTRACT").map_or(false, |v| v == "1");
+    let update = std::env::var("UPDATE_GOVERNANCE_CONTRACT").is_ok_and(|v| v == "1");
     let dir = contract_dir();
     let examples = examples();
 

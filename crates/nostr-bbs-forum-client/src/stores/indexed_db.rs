@@ -364,7 +364,7 @@ impl ForumDb {
     }
 
     /// One-way migration to the ADR-2028 key shape: an entry whose stored id
-    /// is not its [`ZoneKey::store_id`] (the old `"<zone>:<epoch>"`) is written
+    /// is not its [`ZoneKey::store_id`](crate::zone_crypto::ZoneKey::store_id) (the old `"<zone>:<epoch>"`) is written
     /// under the new id with `group` absent, then the old entry is deleted.
     /// The new row is written first, so an interruption never loses a key.
     pub async fn migrate_zone_keys(&self) -> Result<(), JsValue> {
