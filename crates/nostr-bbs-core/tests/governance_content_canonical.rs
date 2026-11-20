@@ -7,7 +7,7 @@
 //! different builds. This crate's dev-dependencies turn `preserve_order` on, so
 //! these tests always run in the worse of the two builds.
 
-use nostr_bbs_core::governance::ActionRequest;
+use nostr_bbs_core::governance::{canonical_json_string, ActionRequest};
 use serde_json::{json, Map, Value};
 
 fn request(fields: Value) -> ActionRequest {
@@ -58,4 +58,14 @@ fn action_request_content_is_independent_of_field_insertion_order() {
         ),
         "{ca}"
     );
+}
+
+/// Keys that look like integers sort as text, not numerically. A JavaScript
+/// object lists such keys first in numeric order whatever order they were
+/// inserted in, so a JavaScript producer must write keys from a sorted list and
+/// not rely on object enumeration (contract README, "Content key order").
+#[test]
+fn integer_like_keys_sort_as_text() {
+    let value = ordered(&[("a", json!(1)), ("9", json!(2)), ("10", json!(3))]);
+    assert_eq!(canonical_json_string(&value), r#"{"10":3,"9":2,"a":1}"#);
 }

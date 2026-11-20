@@ -26,6 +26,19 @@ content (a 31402's `fields`, a 31401 or 31404 body, a 31403 decision body):
   (JCS), not full JCS: number and string-escape text is not re-normalised, so
   keep numbers to forms both sides print identically (integers, short decimals).
 
+Two limits follow, and a producer in another language must respect both:
+
+* number text is not normalised. `serde_json` writes a float parsed from `1.0`
+  as `1.0` where JavaScript's `JSON.stringify` writes `1`; exponent forms and
+  integers above 2^53 also differ. Use integers below 2^53, or strings;
+* keys that look like integers sort as text (`"10"` before `"9"`). A JavaScript
+  object lists such keys first, in numeric order, whatever order they were
+  inserted in, so sorting keys into a new object and calling `JSON.stringify`
+  is not enough: write each object from its sorted key list.
+
+A signature still verifies when these are broken, because each producer signs
+its own bytes; what is lost is the same id for the same content.
+
 Content that is a typed struct (`PanelDefinition`, `ActionRequest` at its top
 level) keeps the struct's field declaration order, which is fixed in code and
 is unchanged by this rule; only free-form values inside it are sorted.

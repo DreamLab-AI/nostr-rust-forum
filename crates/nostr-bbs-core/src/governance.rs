@@ -196,14 +196,16 @@ impl ActionPriority {
 /// The numeric priority stored for a 31402's `priority` tag value.
 ///
 /// The contract's tag is a label ([`ActionPriority`]); the forum client and the
-/// probe publish labels. A legacy plain integer is still accepted as is. An
-/// absent or unrecognised value is 50, the same as `medium`.
+/// probe publish labels. A legacy plain integer is still accepted, capped at
+/// 100 so that no tag value outranks `critical`. An absent or unrecognised
+/// value is 50, the same as `medium`.
 ///
 /// ```
 /// use nostr_bbs_core::governance::priority_rank;
 /// assert_eq!(priority_rank(Some("critical")), 100);
 /// assert_eq!(priority_rank(Some("low")), 25);
 /// assert_eq!(priority_rank(Some("90")), 90);
+/// assert_eq!(priority_rank(Some("1000")), 100);
 /// assert_eq!(priority_rank(Some("urgent")), 50);
 /// assert_eq!(priority_rank(None), 50);
 /// ```
@@ -211,7 +213,7 @@ pub fn priority_rank(tag: Option<&str>) -> u32 {
     let Some(tag) = tag else { return 50 };
     ActionPriority::parse(tag)
         .map(|p| p.rank())
-        .or_else(|| tag.trim().parse().ok())
+        .or_else(|| tag.trim().parse::<u32>().ok().map(|n| n.min(100)))
         .unwrap_or(50)
 }
 
@@ -2144,6 +2146,14 @@ mod tests {
         }
         assert_eq!(priority_rank(Some("HIGH")), 75);
         assert_eq!(priority_rank(Some("7")), 7, "legacy integers pass through");
+        assert_eq!(priority_rank(Some("100")), 100);
+        assert_eq!(priority_rank(Some("101")), 100, "nothing outranks critical");
+        assert_eq!(priority_rank(Some("4294967295")), 100);
+        assert_eq!(
+            priority_rank(Some("4294967296")),
+            50,
+            "out of range is unrecognised"
+        );
         assert_eq!(priority_rank(Some("urgent")), 50);
         assert_eq!(priority_rank(None), 50);
     }
