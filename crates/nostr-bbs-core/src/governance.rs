@@ -168,6 +168,53 @@ pub enum ActionPriority {
     Low,
 }
 
+impl ActionPriority {
+    /// Parse the `priority` tag label (`critical`, `high`, `medium`, `low`),
+    /// case-insensitively.
+    pub fn parse(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "critical" => Some(Self::Critical),
+            "high" => Some(Self::High),
+            "medium" => Some(Self::Medium),
+            "low" => Some(Self::Low),
+            _ => None,
+        }
+    }
+
+    /// Numeric rank stored in `broker_cases.priority`; higher is more urgent.
+    /// `Medium` is 50, the column's default.
+    pub fn rank(&self) -> u32 {
+        match self {
+            Self::Critical => 100,
+            Self::High => 75,
+            Self::Medium => 50,
+            Self::Low => 25,
+        }
+    }
+}
+
+/// The numeric priority stored for a 31402's `priority` tag value.
+///
+/// The contract's tag is a label ([`ActionPriority`]); the forum client and the
+/// probe publish labels. A legacy plain integer is still accepted as is. An
+/// absent or unrecognised value is 50, the same as `medium`.
+///
+/// ```
+/// use nostr_bbs_core::governance::priority_rank;
+/// assert_eq!(priority_rank(Some("critical")), 100);
+/// assert_eq!(priority_rank(Some("low")), 25);
+/// assert_eq!(priority_rank(Some("90")), 90);
+/// assert_eq!(priority_rank(Some("urgent")), 50);
+/// assert_eq!(priority_rank(None), 50);
+/// ```
+pub fn priority_rank(tag: Option<&str>) -> u32 {
+    let Some(tag) = tag else { return 50 };
+    ActionPriority::parse(tag)
+        .map(|p| p.rank())
+        .or_else(|| tag.trim().parse().ok())
+        .unwrap_or(50)
+}
+
 /// Agent-declared risk tier for a governance action request (F7).
 ///
 /// Declared by the agent on the 31402 ActionRequest. It is the design answer to
@@ -2088,6 +2135,19 @@ pub mod broker {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn priority_labels_map_to_distinct_ranks_not_the_default() {
+        use super::{priority_rank, ActionPriority};
+        for (label, rank) in [("critical", 100), ("high", 75), ("medium", 50), ("low", 25)] {
+            assert_eq!(priority_rank(Some(label)), rank, "{label}");
+            assert_eq!(ActionPriority::parse(label).map(|p| p.rank()), Some(rank));
+        }
+        assert_eq!(priority_rank(Some("HIGH")), 75);
+        assert_eq!(priority_rank(Some("7")), 7, "legacy integers pass through");
+        assert_eq!(priority_rank(Some("urgent")), 50);
+        assert_eq!(priority_rank(None), 50);
+    }
+
     use super::broker::*;
     use super::*;
 

@@ -3137,9 +3137,10 @@ impl NostrRelayDO {
         let subject_kind = governance::extract_tag(&event.tags, "subject-kind").unwrap_or("opaque");
         let subject_id = governance::extract_tag(&event.tags, "subject-id").unwrap_or("");
         let title = governance::extract_tag(&event.tags, "title").unwrap_or("Untitled");
-        let priority: u32 = governance::extract_tag(&event.tags, "priority")
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(50);
+        // The tag is a label (`high`, ...); `priority_rank` maps it to the
+        // numeric column and still accepts a legacy integer.
+        let priority: u32 =
+            governance::priority_rank(governance::extract_tag(&event.tags, "priority"));
 
         let panel_tags = self.resolve_panel_tags(event).await;
         let calibration_key = self.calibration_selection_key();
