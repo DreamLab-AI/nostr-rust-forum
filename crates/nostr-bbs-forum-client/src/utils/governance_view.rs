@@ -84,7 +84,7 @@ pub fn decision_content(outcome: &DecisionOutcome, typed_rationale: &str) -> Str
             serde_json::Value::String(typed_rationale.to_string()),
         );
     }
-    value.to_string()
+    governance::canonical_json_string(&value)
 }
 
 // ── Panel resolution + boundary (FR3.2, invariant 3) ────────────────────────

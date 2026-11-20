@@ -61,6 +61,9 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 wasm-bindgen-test = { workspace = true }
+# Turns on insertion-ordered JSON objects for this crate's tests, so the
+# key-order tests exercise the build that a --workspace run produces.
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 # proptest + criterion use native-only deps (rusty-fork → wait-timeout)
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

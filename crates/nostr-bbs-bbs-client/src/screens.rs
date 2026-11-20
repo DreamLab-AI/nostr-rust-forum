@@ -1499,14 +1499,14 @@ fn action_button(
                         return;
                     }
                 };
-                let content = serde_json::json!({
-                    "action": action_id.clone(),
-                    "reasoning": format!(
-                        "Human selected '{}' via the BBS agent control plane",
-                        action_id
-                    ),
-                })
-                .to_string();
+                let content =
+                    nostr_bbs_core::governance::canonical_json_string(&serde_json::json!({
+                        "action": action_id.clone(),
+                        "reasoning": format!(
+                            "Human selected '{}' via the BBS agent control plane",
+                            action_id
+                        ),
+                    }));
                 let now = (js_sys::Date::now() / 1000.0) as u64;
                 let unsigned = nostr_bbs_core::UnsignedEvent {
                     pubkey,

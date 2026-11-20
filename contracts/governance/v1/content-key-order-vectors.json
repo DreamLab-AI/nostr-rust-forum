@@ -1,0 +1,38 @@
+{
+  "event": {
+    "event": {
+      "content": "{\"fields\":{\"Beta\":\"upper-case sorts first\",\"alpha\":{\"m\":{\"a\":1,\"b\":2},\"x\":null,\"y\":true},\"list\":[{\"a\":2,\"b\":1},[{\"c\":3,\"d\":4}]],\"zeta\":1},\"reasoning\":\"Key order must not change the event id.\",\"context_url\":null,\"risk_tier\":\"low\",\"confidence\":null,\"task_properties\":null,\"probe\":null}",
+      "created_at": 1790078700,
+      "id": "47008d30dc1ddd723ba52f9267169a1274018d920a793da5782bdb87df547d18",
+      "kind": 31402,
+      "pubkey": "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+      "sig": "b18aedfbfe2f48ae5050f723ae0aaa261eea732330124e86227434581815b1b3dc7f1d811a8165d3446947b2e472494aa91af5f4970d1f9b08fe005e27dc48b6",
+      "tags": [
+        [
+          "d",
+          "urn:agentbox:thing:golden:key-order-0123456789ab"
+        ]
+      ]
+    },
+    "fields_input": "{\"zeta\":1,\"alpha\":{\"y\":true,\"x\":null,\"m\":{\"b\":2,\"a\":1}},\"list\":[{\"b\":1,\"a\":2},[{\"d\":4,\"c\":3}]],\"Beta\":\"upper-case sorts first\"}",
+    "name": "action-request-with-unsorted-fields"
+  },
+  "rule": "Free-form JSON in event content (a request's fields, a state or update body, a decision body) is written compactly with every object's keys sorted recursively by UTF-16 code unit; arrays keep their order; scalars keep serde_json text. The result must not depend on input or build map order.",
+  "vectors": [
+    {
+      "canonical": "{\"Beta\":\"upper-case sorts first\",\"alpha\":{\"m\":{\"a\":1,\"b\":2},\"x\":null,\"y\":true},\"list\":[{\"a\":2,\"b\":1},[{\"c\":3,\"d\":4}]],\"zeta\":1}",
+      "input": "{\"zeta\":1,\"alpha\":{\"y\":true,\"x\":null,\"m\":{\"b\":2,\"a\":1}},\"list\":[{\"b\":1,\"a\":2},[{\"d\":4,\"c\":3}]],\"Beta\":\"upper-case sorts first\"}",
+      "name": "nested-objects-and-arrays"
+    },
+    {
+      "canonical": "{\"a\":[1,2.5,\"s\",false,null],\"b\":0.92,\"c\":\"\"}",
+      "input": "{\"b\":0.92,\"a\":[1,2.5,\"s\",false,null],\"c\":\"\"}",
+      "name": "scalars-keep-their-text"
+    },
+    {
+      "canonical": "{\"z\":3,\"𐀀\":2,\"｡\":1}",
+      "input": "{\"\\uff61\":1,\"\\ud800\\udc00\":2,\"z\":3}",
+      "name": "utf16-code-unit-order"
+    }
+  ]
+}

@@ -1105,8 +1105,81 @@ pub fn can_advance_stage(
     Ok(())
 }
 
+// ── Canonical free-form JSON ────────────────────────────────────────────────
+
+/// Serialise free-form JSON with every object's keys in sorted order.
+///
+/// `serde_json` writes object keys sorted unless any crate in the same build
+/// enables its `preserve_order` feature, which Cargo unifies across a
+/// workspace and which then switches every map to insertion order. Event
+/// content built from a `serde_json::Value` (a proposal's `fields`, a status
+/// diff) would get a different id in different builds. Content that carries
+/// such a value must be written through this function, or through
+/// [`serialize_canonical`] on a struct field, so the bytes are the same in
+/// every build and in every consumer.
+///
+/// The rule (governance contract v1, `contracts/governance/v1/README.md`):
+/// object keys are sorted recursively by UTF-16 code unit, the order RFC 8785
+/// (JCS) and a JavaScript default `sort()` both use; arrays keep their order;
+/// no whitespace is written. Scalars use `serde_json`'s own text. This is the
+/// JCS key order, not full JCS: number and string-escape text is not
+/// re-normalised.
+///
+/// ```
+/// use nostr_bbs_core::governance::canonical_json_string;
+/// let v = serde_json::json!({ "b": { "z": 1, "a": [ { "y": 1, "x": 2 } ] }, "a": null });
+/// assert_eq!(
+///     canonical_json_string(&v),
+///     r#"{"a":null,"b":{"a":[{"x":2,"y":1}],"z":1}}"#
+/// );
+/// ```
+pub fn canonical_json_string(value: &serde_json::Value) -> String {
+    serde_json::to_string(&Canonical(value)).expect("a JSON value always serialises")
+}
+
+/// Borrowed view of a JSON value that serialises with sorted object keys.
+struct Canonical<'a>(&'a serde_json::Value);
+
+impl Serialize for Canonical<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.encode_utf16().cmp(b.0.encode_utf16()));
+                let mut out = serializer.serialize_map(Some(entries.len()))?;
+                for (k, v) in entries {
+                    out.serialize_entry(k, &Canonical(v))?;
+                }
+                out.end()
+            }
+            serde_json::Value::Array(items) => {
+                let mut out = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    out.serialize_element(&Canonical(item))?;
+                }
+                out.end()
+            }
+            scalar => scalar.serialize(serializer),
+        }
+    }
+}
+
+/// `#[serde(serialize_with = "...")]` adapter that writes a free-form
+/// `serde_json::Value` with sorted keys. See [`canonical_json_string`].
+pub fn serialize_canonical<S: serde::Serializer>(
+    value: &serde_json::Value,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    Canonical(value).serialize(serializer)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionRequest {
+    /// Free-form case fields. Serialised with every object's keys sorted, so
+    /// the content (and so the event id) does not depend on the build's
+    /// `serde_json` map ordering; see [`canonical_json_string`].
+    #[serde(serialize_with = "serialize_canonical")]
     pub fields: serde_json::Value,
     pub reasoning: Option<String>,
     pub context_url: Option<String>,

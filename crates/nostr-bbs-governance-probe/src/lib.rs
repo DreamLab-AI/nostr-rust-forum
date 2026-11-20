@@ -260,12 +260,11 @@ pub fn response_event(
             vec!["a".into(), request_coordinate(pubkey, run)],
             vec!["t".into(), PROBE_TOPIC.into()],
         ],
-        content: json!({
+        content: nostr_bbs_core::governance::canonical_json_string(&json!({
             "action": "approve",
             "reasoning": "",
             "decided_by": PROBE_DECIDER,
-        })
-        .to_string(),
+        })),
     }
 }
 
@@ -284,12 +283,11 @@ pub fn system_response_event(
     created_at: u64,
 ) -> UnsignedEvent {
     let mut ev = response_event(pubkey, run, request_event_id, created_at);
-    ev.content = json!({
+    ev.content = nostr_bbs_core::governance::canonical_json_string(&json!({
         "action": "approve",
         "reasoning": SYSTEM_RATIONALE,
         "decided_by": PROBE_DECIDER,
-    })
-    .to_string();
+    }));
     ev
 }
 

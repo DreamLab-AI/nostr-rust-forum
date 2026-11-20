@@ -510,11 +510,10 @@ fn PanelCard(panel: PanelEntry) -> impl IntoView {
                             };
                             loading.set(true);
                             rejected.set(false);
-                            let content = serde_json::json!({
+                            let content = nostr_bbs_core::governance::canonical_json_string(&serde_json::json!({
                                 "action": action_id,
                                 "reasoning": format!("Human selected '{action_id}' on this panel via the governance UI"),
-                            })
-                            .to_string();
+                            }));
                             let now = (js_sys::Date::now() / 1000.0) as u64;
                             let unsigned = nostr_bbs_core::UnsignedEvent {
                                 pubkey,

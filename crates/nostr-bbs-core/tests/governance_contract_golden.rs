@@ -17,10 +17,10 @@
 use nostr_bbs_core::event::{sign_event_deterministic, verify_event, NostrEvent, UnsignedEvent};
 use nostr_bbs_core::governance::broker::{CaseCategory, DecisionOutcome, SubjectKind};
 use nostr_bbs_core::governance::{
-    self, check_rationale, extract_d_tag, extract_tag, outcome_requires_rationale,
-    validate_governance_event, ActionDef, ActionPriority, ActionRequest, ActionStyle, FieldDef,
-    FieldType, LayoutHint, PanelCapability, PanelDefinition, PanelSchema, ReceiptStage,
-    Reversibility, RiskTier, Stakes, TaskProperties, Verifiability,
+    self, canonical_json_string, check_rationale, extract_d_tag, extract_tag,
+    outcome_requires_rationale, validate_governance_event, ActionDef, ActionPriority,
+    ActionRequest, ActionStyle, FieldDef, FieldType, LayoutHint, PanelCapability, PanelDefinition,
+    PanelSchema, ReceiptStage, Reversibility, RiskTier, Stakes, TaskProperties, Verifiability,
 };
 use nostr_bbs_core::keys::signing_key_from_bytes;
 use serde::Serialize;
@@ -144,7 +144,7 @@ fn panel_definition() -> NostrEvent {
 }
 
 fn panel_state() -> NostrEvent {
-    let state = canonical(
+    let state = canonical_json_string(
         &json!({ "open_cases": 1, "decided_cases": 0, "last_scan": "2026-09-22T11:59:00Z" }),
     );
     signed(
@@ -152,18 +152,20 @@ fn panel_state() -> NostrEvent {
         governance::KIND_PANEL_STATE,
         NOW + 1,
         vec![tag(&["d", PANEL_ID])],
-        state.to_string(),
+        state,
     )
 }
 
 fn action_request() -> NostrEvent {
     let request = ActionRequest {
-        fields: canonical(&json!({
+        // Left in insertion order on purpose: `ActionRequest` itself writes
+        // `fields` with sorted keys, which is what the golden file proves.
+        fields: json!({
             "term": "Golden example",
             "score": 0.92,
             "proposal_urn": CASE_ID,
             "propose_iri": IRI,
-        })),
+        }),
         reasoning: Some("Three independent notes define the term identically.".into()),
         context_url: Some(IRI.into()),
         risk_tier: Some(RiskTier::High),
@@ -202,7 +204,7 @@ fn action_response(request_id: &str) -> NostrEvent {
     let map = content.as_object_mut().unwrap();
     map.insert("case_id".into(), json!(CASE_ID));
     map.insert("reasoning".into(), json!(HUMAN_RATIONALE));
-    let content = canonical(&content).to_string();
+    let content = canonical_json_string(&content);
 
     // The same rules the relay applies, run over what the fixture contains.
     let parsed = DecisionOutcome::from_response_content(&content).expect("outcome parses");
@@ -221,13 +223,13 @@ fn action_response(request_id: &str) -> NostrEvent {
 }
 
 fn panel_update() -> NostrEvent {
-    let diff = canonical(&json!({ "open_cases": 0, "decided_cases": 1 }));
+    let diff = canonical_json_string(&json!({ "open_cases": 0, "decided_cases": 1 }));
     signed(
         AGENT_SECRET,
         governance::KIND_PANEL_UPDATE,
         NOW + 120,
         vec![tag(&["d", PANEL_ID])],
-        diff.to_string(),
+        diff,
     )
 }
 
@@ -272,6 +274,71 @@ fn render(value: &Value) -> String {
     text.push('\n');
     text
 }
+
+/// Raw, deliberately unsorted inputs and the content text a producer must emit.
+/// The last two keys of the third input differ in UTF-16 and code point order.
+const CONTENT_ORDER_INPUTS: [(&str, &str); 3] = [
+    (
+        "nested-objects-and-arrays",
+        r#"{"zeta":1,"alpha":{"y":true,"x":null,"m":{"b":2,"a":1}},"list":[{"b":1,"a":2},[{"d":4,"c":3}]],"Beta":"upper-case sorts first"}"#,
+    ),
+    (
+        "scalars-keep-their-text",
+        r#"{"b":0.92,"a":[1,2.5,"s",false,null],"c":""}"#,
+    ),
+    (
+        "utf16-code-unit-order",
+        r#"{"\uff61":1,"\ud800\udc00":2,"z":3}"#,
+    ),
+];
+
+/// The content-ordering vectors: bare canonical strings, plus one signed 31402
+/// built from unsorted `fields`, so an id is pinned as well as the text.
+fn content_order_vectors() -> Value {
+    let vectors: Vec<Value> = CONTENT_ORDER_INPUTS
+        .iter()
+        .map(|(name, input)| {
+            let value: Value = serde_json::from_str(input).expect("vector input is JSON");
+            json!({ "name": name, "input": input, "canonical": canonical_json_string(&value) })
+        })
+        .collect();
+
+    let fields: Value = serde_json::from_str(CONTENT_ORDER_INPUTS[0].1).unwrap();
+    let request = ActionRequest {
+        fields,
+        reasoning: Some("Key order must not change the event id.".into()),
+        context_url: None,
+        risk_tier: Some(RiskTier::Low),
+        confidence: None,
+        task_properties: None,
+        probe: None,
+    };
+    let event = signed(
+        AGENT_SECRET,
+        governance::KIND_ACTION_REQUEST,
+        NOW + 300,
+        vec![tag(&[
+            "d",
+            "urn:agentbox:thing:golden:key-order-0123456789ab",
+        ])],
+        to_json(&request),
+    );
+    json!({
+        "rule": CONTENT_ORDER_RULE,
+        "vectors": vectors,
+        "event": {
+            "name": "action-request-with-unsorted-fields",
+            "fields_input": CONTENT_ORDER_INPUTS[0].1,
+            "event": event,
+        },
+    })
+}
+
+/// File name of the content-ordering vectors in the contract directory.
+const CONTENT_ORDER_FILE: &str = "content-key-order-vectors.json";
+
+/// The rule, repeated in `manifest.json` and in the contract README.
+const CONTENT_ORDER_RULE: &str = "Free-form JSON in event content (a request's fields, a state or update body, a decision body) is written compactly with every object's keys sorted recursively by UTF-16 code unit; arrays keep their order; scalars keep serde_json text. The result must not depend on input or build map order.";
 
 fn strings<T, F: Fn(&T) -> String>(items: &[T], f: F) -> Vec<String> {
     items.iter().map(f).collect()
@@ -434,6 +501,8 @@ fn manifest(files: &[(u64, &str, &str)]) -> Value {
             "default_calibration_sample_rate": governance::DEFAULT_CALIBRATION_SAMPLE_RATE.to_string().parse::<f64>().unwrap(),
             "default_max_pending_hours": governance::DEFAULT_MAX_PENDING_HOURS,
             "d_tag_required_non_empty": true,
+            "content_key_order": CONTENT_ORDER_RULE,
+            "content_key_order_vectors": CONTENT_ORDER_FILE,
             "response_binds_request_by": "e tag carrying the 31402 event id; d tag equals the 31402 d tag (the case id)",
         },
         "tag_names": {
@@ -514,6 +583,7 @@ fn governance_golden_files_match_the_crate() {
         .collect();
     let index: Vec<(u64, &str, &str)> = examples.iter().map(|(k, n, p, _)| (*k, *n, *p)).collect();
     expected.push(("manifest.json".into(), render(&manifest(&index))));
+    expected.push((CONTENT_ORDER_FILE.into(), render(&content_order_vectors())));
 
     if update {
         std::fs::create_dir_all(&dir).expect("create contracts dir");

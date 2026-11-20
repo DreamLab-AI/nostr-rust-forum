@@ -648,7 +648,7 @@ pub async fn create_card_approval_request_signer(
     // ActionRequest-shaped JSON so the governance panel registry ingests the
     // request into its actions list (a plain-string content is silently
     // dropped by `PanelRegistry::ingest_event`).
-    let content = serde_json::json!({
+    let content = crate::governance::canonical_json_string(&serde_json::json!({
         "fields": {
             "card_title": card.title,
             "card_d": card.d_tag,
@@ -657,8 +657,7 @@ pub async fn create_card_approval_request_signer(
         },
         "reasoning": summary,
         "risk_tier": "medium",
-    })
-    .to_string();
+    }));
     let unsigned = UnsignedEvent {
         pubkey: signer.public_key().to_string(),
         created_at: now_secs(),
