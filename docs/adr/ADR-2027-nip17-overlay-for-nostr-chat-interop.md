@@ -28,6 +28,8 @@ on the production databases, so the board can be backed up without a reset.
 
 ## Decision
 
+> Note 2026-11-20: the inbox-key relay change in decision 2 is on `main`. `8038b54` (Phase 2, flagged off) and `2047c1b` (inbox-key attestation) are ancestors of `main` since the `integrate/phase-0-1` merge (`2e8006b`); the relay side is in `crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` (inbox-key resolution at `:2332`, subscription keys at `:2161`) and the flag is `RECIPIENT_KEYS_ENABLED = "false"` (`crates/nostr-bbs-auth-worker/wrangler.toml:70`). The index row (`implementation partial`, `activation inactive`) is still right: decision 1 (the NIP-17 overlay, Phase 3) is not built and nothing is switched on.
+
 Proposed:
 
 1. **Option C, NIP-17 overlay.** Resolve the recipient's kind 10050 (fallback 10002) and publish
