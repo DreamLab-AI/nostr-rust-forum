@@ -77,6 +77,9 @@ pub struct StoredZoneKey {
     /// written before ADR-2028, which read back as a legacy key.
     #[serde(default)]
     pub group: Option<String>,
+    /// See [`ZoneKey::pending_delivery`](crate::zone_crypto::ZoneKey::pending_delivery).
+    #[serde(default)]
+    pub pending_delivery: bool,
 }
 
 impl From<&crate::zone_crypto::ZoneKey> for StoredZoneKey {
@@ -90,6 +93,7 @@ impl From<&crate::zone_crypto::ZoneKey> for StoredZoneKey {
             granted_by: k.granted_by.clone(),
             received_at: k.received_at,
             group: k.group.clone(),
+            pending_delivery: k.pending_delivery,
         }
     }
 }
@@ -104,6 +108,7 @@ impl From<StoredZoneKey> for crate::zone_crypto::ZoneKey {
             granted_by: r.granted_by,
             received_at: r.received_at,
             group: r.group,
+            pending_delivery: r.pending_delivery,
         }
     }
 }
@@ -793,6 +798,7 @@ mod tests {
             granted_by: "33".repeat(32),
             received_at: 1_790_000_000,
             group: None,
+            pending_delivery: false,
         }
     }
 

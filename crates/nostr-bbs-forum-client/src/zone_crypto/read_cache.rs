@@ -178,6 +178,7 @@ mod tests {
             granted_by: pk_hex(MIGRATOR),
             received_at: 0,
             group: None,
+            pending_delivery: false,
         }
     }
 

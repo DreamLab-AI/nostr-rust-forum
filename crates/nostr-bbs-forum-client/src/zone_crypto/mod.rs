@@ -160,6 +160,13 @@ pub struct ZoneKey {
     /// deserialise as `None`.
     #[serde(default)]
     pub group: Option<String>,
+    /// A key this device created (create or rotate) that has not yet been
+    /// delivered to its members and to the creator's own identity. It
+    /// decrypts, but is never chosen to send under (see
+    /// [`keyset::send_key`]), so a rotation whose grants fail cannot leave
+    /// new posts readable only on this device.
+    #[serde(default)]
+    pub pending_delivery: bool,
 }
 
 impl ZoneKey {
@@ -233,6 +240,7 @@ pub fn generate_zone_key(
         granted_by: creator.to_string(),
         received_at: now,
         group: None,
+        pending_delivery: false,
     })
 }
 
@@ -371,6 +379,7 @@ pub fn validate_grant(
         granted_by: sealer.to_string(),
         received_at: now,
         group: None,
+        pending_delivery: false,
     })
 }
 
