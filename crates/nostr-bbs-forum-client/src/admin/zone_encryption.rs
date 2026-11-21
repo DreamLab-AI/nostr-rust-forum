@@ -13,7 +13,8 @@
 //! Grants also go out without this tab: on allocation and at an admin's
 //! sign-in ([`crate::zone_crypto::auto_grant`]).
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use leptos::prelude::*;
@@ -281,6 +282,44 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 status.set(Some("Sign in again to grant keys.".into()));
                 return;
             };
+            // A key not yet delivered also goes to the admin's own identity, so
+            // this browser's storage is never its only copy.
+            let me_pk = me();
+            let mut plan = plan;
+            // A retry with nobody missing still has to deliver the pending key
+            // to the admin, then adopt it.
+            if let Some(k) = latest().filter(|k| k.pending_delivery) {
+                if !plan
+                    .iter()
+                    .any(|(p, _)| p.epoch == k.epoch && p.pubkey == k.pubkey)
+                {
+                    plan.push((k, Vec::new()));
+                }
+            }
+            let plan: Vec<(ZoneKey, Vec<String>)> = plan
+                .into_iter()
+                .map(|(k, mut r)| {
+                    if k.pending_delivery && me_pk.len() == 64 && !r.contains(&me_pk) {
+                        r.push(me_pk.clone());
+                    }
+                    (k, r)
+                })
+                .collect();
+            // Each pending key in this run, with the recipients whose wrap the
+            // relay has yet to accept. Emptied by the acks below.
+            let awaiting: HashMap<(u32, String), HashSet<String>> = plan
+                .iter()
+                .filter(|(k, _)| k.pending_delivery)
+                .map(|(k, r)| ((k.epoch, k.pubkey.clone()), r.iter().cloned().collect()))
+                .collect();
+            if !awaiting.is_empty() && me_pk.len() != 64 {
+                status.set(Some(
+                    "Sign in again: a new key has to reach your own account before it is used."
+                        .into(),
+                ));
+                return;
+            }
+            let awaiting = Rc::new(RefCell::new(awaiting));
             if plan.iter().all(|(_, r)| r.is_empty()) {
                 status.set(Some("Everyone eligible already has this key.".into()));
                 return;
@@ -297,10 +336,29 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             spawn_local(async move {
                 let total = grant_count(&plan);
                 // The tab may be closed by the time the relay acks.
-                let on_recorded = Rc::new(move |_: &ZoneKey, pk: &str| {
+                let on_recorded = Rc::new(move |key: &ZoneKey, pk: &str| {
                     let _ = sent.try_update(|s| {
                         s.insert(pk.to_string());
                     });
+                    // Adopt a pending key for sending only once the relay has
+                    // accepted (`OK true`) every wrap of it in this run, the
+                    // admin's own included. A queued or rejected wrap never
+                    // gets here, so the key stays pending and the card says so.
+                    let id = (key.epoch, key.pubkey.clone());
+                    let done = {
+                        let mut a = awaiting.borrow_mut();
+                        match a.get_mut(&id) {
+                            Some(left) => {
+                                left.remove(pk);
+                                left.is_empty()
+                            }
+                            None => false,
+                        }
+                    };
+                    if done {
+                        awaiting.borrow_mut().remove(&id);
+                        keys.mark_delivered(&key.zone, key.epoch, &key.pubkey);
+                    }
                 });
                 let report = send_grants(keys, &relay, &*signer, plan, on_recorded).await;
                 let _ = busy.try_set(false);
@@ -338,7 +396,10 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 let me = me();
                 let zone_id = zone.with_value(|z| z.id.clone());
                 match generate_zone_key(&zone_id, next_epoch, &me, now_secs()) {
-                    Ok(key) => {
+                    Ok(mut key) => {
+                        // Stored at once (it must survive a failed send), but not
+                        // sent under until its grants land: see `pending_delivery`.
+                        key.pending_delivery = true;
                         keys.insert(key.clone());
                         // A new key goes to everyone eligible; they already hold
                         // (or were already offered) the earlier ones.
@@ -368,6 +429,10 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                     <h3 class="text-white font-semibold">{title}</h3>
                     <p class="text-xs text-gray-400">
                         {move || match latest() {
+                            Some(k) if k.pending_delivery => format!(
+                                "Key epoch {} is not delivered yet · new messages still use the previous key until it reaches members. Grant to retry.",
+                                k.epoch
+                            ),
                             Some(k) => format!("Key epoch {} · created or received here", k.epoch),
                             None => "No key on this device yet".to_string(),
                         }}
@@ -385,7 +450,8 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                         view! {
                             <button
                                 class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-50"
-                                disabled=move || busy.get() || !members_ready.get() || missing().is_empty()
+                                disabled=move || busy.get() || !members_ready.get()
+                                    || (missing().is_empty() && !latest().is_some_and(|k| k.pending_delivery))
                                 on:click=move |_| fresh_roster.with_value(|f| f(Box::new(move || {
                                     let recipients = missing();
                                     let history = include_history.get_untracked();

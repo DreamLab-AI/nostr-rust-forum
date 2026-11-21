@@ -123,6 +123,7 @@ impl ZoneKeyStore {
     /// Add a key (persisted), then re-decrypt anything waiting for it.
     /// Returns `false` when the key was already held.
     pub fn insert(&self, key: ZoneKey) -> bool {
+        let key = self.keep_pending(key);
         let id = key.store_id();
         if self.keys.with_untracked(|m| m.get(&id) == Some(&key)) {
             return false;
@@ -138,6 +139,47 @@ impl ZoneKeyStore {
             }
         });
         self.redecrypt();
+        true
+    }
+
+    /// `key`, still pending when this device holds the same secret as a key
+    /// awaiting delivery. The creator's own grant comes back through the grant
+    /// sync (both insert paths come through here); that alone must not adopt
+    /// the key while members may lack it. Only [`mark_delivered`] clears it.
+    ///
+    /// [`mark_delivered`]: Self::mark_delivered
+    fn keep_pending(&self, key: ZoneKey) -> ZoneKey {
+        let id = key.store_id();
+        self.keys
+            .with_untracked(|m| keep_pending_against(key, m.get(&id)))
+    }
+
+    /// Mark the pending key for `(zone, epoch)` with `pubkey` delivered: it
+    /// becomes eligible to send under. Returns `false` when no such pending key
+    /// is held.
+    pub fn mark_delivered(&self, zone: &str, epoch: u32, pubkey: &str) -> bool {
+        let found = self.keys.with_untracked(|m| {
+            m.values()
+                .find(|k| {
+                    k.zone == zone && k.epoch == epoch && k.pubkey == pubkey && k.pending_delivery
+                })
+                .cloned()
+        });
+        let Some(mut key) = found else {
+            return false;
+        };
+        key.pending_delivery = false;
+        let id = key.store_id();
+        self.keys.update(|m| {
+            m.insert(id, key.clone());
+        });
+        spawn_local(async move {
+            if let Ok(db) = ForumDb::open().await {
+                if db.put_zone_key(&key).await.is_err() {
+                    web_sys::console::warn_1(&"[zone-key] persist failed (IndexedDB write)".into());
+                }
+            }
+        });
         true
     }
 
@@ -433,6 +475,7 @@ impl ZoneKeyStore {
     }
 
     async fn insert_persisted(&self, key: ZoneKey) -> bool {
+        let key = self.keep_pending(key);
         let persisted = match ForumDb::open().await {
             Ok(db) => match db.put_zone_key(&key).await {
                 Ok(()) => true,
@@ -444,6 +487,28 @@ impl ZoneKeyStore {
             Err(_) => false,
         };
         let id = key.store_id();
+        // Re-read after the awaits: an ack may have marked the key delivered
+        // meanwhile, and an echo must neither undo that nor re-pend it.
+        let mut key = key;
+        let wrote_pending = key.pending_delivery;
+        key.pending_delivery = self.keys.with_untracked(|m| {
+            m.get(&id)
+                .is_some_and(|k| k.pending_delivery && k.secret == key.secret)
+        });
+        if wrote_pending && !key.pending_delivery {
+            // Delivered during the awaits: the write above stored pending and
+            // may have landed after mark_delivered's. Store the settled state.
+            let settled = key.clone();
+            spawn_local(async move {
+                if let Ok(db) = ForumDb::open().await {
+                    if db.put_zone_key(&settled).await.is_err() {
+                        web_sys::console::warn_1(
+                            &"[zone-key] persist failed (IndexedDB write)".into(),
+                        );
+                    }
+                }
+            });
+        }
         if self.keys.with_untracked(|m| m.get(&id) != Some(&key)) {
             self.keys.update(|m| {
                 m.insert(id, key);
@@ -605,6 +670,15 @@ async fn fetch_is_admin(pubkey: &str) -> Option<bool> {
 
 /// Provide the zone-key store and load held keys. Call once at app root,
 /// after the channel store and before channel sync starts.
+/// Pure core of [`ZoneKeyStore::keep_pending`]: `key` stays pending when
+/// `existing` (the stored entry at the same id) is pending with the same secret.
+fn keep_pending_against(mut key: ZoneKey, existing: Option<&ZoneKey>) -> ZoneKey {
+    if existing.is_some_and(|k| k.pending_delivery && k.secret == key.secret) {
+        key.pending_delivery = true;
+    }
+    key
+}
+
 pub fn provide_zone_key_store(channels: crate::stores::channels::ChannelStore) {
     let store = ZoneKeyStore::new(channels);
     provide_context(store);
@@ -721,5 +795,39 @@ impl ZoneWriter {
             }
             None => Ok(unsigned),
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    fn k(pending: bool, secret: &str) -> ZoneKey {
+        ZoneKey {
+            zone: "zone3".into(),
+            epoch: 3,
+            secret: secret.into(),
+            pubkey: "p".repeat(64),
+            granted_by: "a".repeat(64),
+            received_at: 1,
+            group: None,
+            pending_delivery: pending,
+        }
+    }
+
+    #[test]
+    fn the_creators_own_grant_does_not_adopt_a_pending_key() {
+        let back = keep_pending_against(k(false, "s"), Some(&k(true, "s")));
+        assert!(
+            back.pending_delivery,
+            "the self-grant echo must not end pending"
+        );
+    }
+
+    #[test]
+    fn a_different_secret_or_a_delivered_key_is_not_held_back() {
+        assert!(!keep_pending_against(k(false, "other"), Some(&k(true, "s"))).pending_delivery);
+        assert!(!keep_pending_against(k(false, "s"), Some(&k(false, "s"))).pending_delivery);
+        assert!(!keep_pending_against(k(false, "s"), None).pending_delivery);
     }
 }

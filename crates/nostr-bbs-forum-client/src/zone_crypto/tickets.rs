@@ -415,6 +415,7 @@ pub fn accept_ticket(
         group: Some(t.group.clone()),
         granted_by: t.group,
         received_at: now,
+        pending_delivery: false,
     })
 }
 
@@ -913,6 +914,7 @@ mod tests {
             granted_by: "adm".into(),
             received_at: 1,
             group: None,
+            pending_delivery: false,
         }
     }
 

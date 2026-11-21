@@ -71,7 +71,23 @@ pub fn send_key<'a>(
     keys: impl IntoIterator<Item = &'a ZoneKey> + Clone,
     zone: &str,
 ) -> Result<Option<ZoneKey>, SendKeyError> {
-    let mine = || keys.clone().into_iter().filter(|k| k.zone == zone);
+    // A key still pending delivery decrypts but is never sent under: until its
+    // grants land, sending under it would make the post readable only here.
+    // A key pending in any row (a ticket copy of it lands under another store
+    // id) is held back as a whole, matched on epoch and key pubkey.
+    let pending: Vec<(u32, String)> = keys
+        .clone()
+        .into_iter()
+        .filter(|k| k.zone == zone && k.pending_delivery)
+        .map(|k| (k.epoch, k.pubkey.clone()))
+        .collect();
+    let mine = || {
+        keys.clone().into_iter().filter(|k| {
+            k.zone == zone
+                && !k.pending_delivery
+                && !pending.iter().any(|(e, p)| *e == k.epoch && *p == k.pubkey)
+        })
+    };
     let legacy_max = mine()
         .filter(|k| k.group.is_none())
         .map(|k| k.epoch)
@@ -107,6 +123,42 @@ pub fn read_key<'a>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_key_pending_delivery_is_never_the_send_key() {
+        let mut new = key("zone3", None, 3, "c");
+        new.pending_delivery = true;
+        let keys = [key("zone3", None, 2, "b"), new.clone()];
+        let sent = send_key(keys.iter(), "zone3").unwrap().unwrap();
+        assert_eq!(sent.epoch, 2, "the rotation is not adopted before delivery");
+        new.pending_delivery = false;
+        let keys = [key("zone3", None, 2, "b"), new];
+        assert_eq!(send_key(keys.iter(), "zone3").unwrap().unwrap().epoch, 3);
+    }
+
+    #[test]
+    fn a_ticket_copy_of_a_pending_key_is_held_back_too() {
+        let mut pending = key("zone3", None, 3, "c");
+        pending.pending_delivery = true;
+        let mut ticket_copy = key("zone3", Some("g"), 3, "c");
+        ticket_copy.pubkey = pending.pubkey.clone();
+        let keys = [key("zone3", None, 2, "b"), pending, ticket_copy];
+        assert_eq!(send_key(keys.iter(), "zone3").unwrap().unwrap().epoch, 2);
+    }
+
+    #[test]
+    fn a_zone_whose_only_key_is_pending_has_no_send_key() {
+        let mut only = key("zone3", None, 1, "a");
+        only.pending_delivery = true;
+        assert_eq!(send_key([only].iter(), "zone3").unwrap(), None);
+    }
+
+    #[test]
+    fn a_pending_key_still_reads() {
+        let mut k = key("zone3", None, 3, "c");
+        k.pending_delivery = true;
+        assert_eq!(read_key([k.clone()].iter(), "zone3", 3), Some(k));
+    }
+
     fn key(zone: &str, group: Option<&str>, epoch: u32, pk: &str) -> ZoneKey {
         ZoneKey {
             zone: zone.into(),
@@ -116,6 +168,7 @@ mod tests {
             granted_by: "ad".repeat(32),
             received_at: 0,
             group: group.map(|g| g.repeat(64)),
+            pending_delivery: false,
         }
     }
 
