@@ -562,6 +562,10 @@ fn UsersTab() -> impl IntoView {
 
     let admin_for_add = admin.clone();
     let default_cohort_for_reset = default_cohort.clone();
+    // Adding a member is an allocation like editing their cohorts: a cohort
+    // that opens an encrypted zone must send its key now, not wait for an
+    // admin to open Admin → Encryption.
+    let auto_grant_for_add = crate::zone_crypto::auto_grant::AutoGrant::capture();
     let on_add_user = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let pk = new_pubkey.get_untracked();
@@ -598,12 +602,16 @@ fn UsersTab() -> impl IntoView {
             let admin_clone = admin_for_add.clone();
             let pk_owned = pk_trimmed.to_string();
             let reset_cohort = default_cohort_for_reset.clone();
+            let auto_grant = auto_grant_for_add.clone();
             spawn_local(async move {
                 if (admin_clone
                     .add_to_whitelist_signer(&pk_owned, &cohorts, &*signer)
                     .await)
                     .is_ok()
                 {
+                    if let Some(g) = auto_grant {
+                        g.after_allocation(&pk_owned);
+                    }
                     // Optional alias link — inherits cohorts + display attribution.
                     if let Some(old_pk) = prior {
                         let _ = admin_clone
