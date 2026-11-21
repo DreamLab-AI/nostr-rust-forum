@@ -14,6 +14,7 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 use crate::relay::{Filter, RelayConnection};
+use crate::stores::zones::Zone;
 
 // -- Constants ----------------------------------------------------------------
 
@@ -338,16 +339,10 @@ impl ChannelStore {
             store_for_eose.save_cache();
         });
 
-        let id = relay.subscribe(
-            vec![Filter {
-                // kind-40 = channel creation, kind-41 = metadata edit (rename),
-                // kind-5 = post deletion (NIP-09).
-                kinds: Some(vec![5, 40, 41]),
-                ..Default::default()
-            }],
-            on_event,
-            Some(on_eose),
-        );
+        // kind-40 = channel creation, kind-41 = metadata edit (rename),
+        // kind-5 = post deletion (NIP-09). Separate filters: see
+        // `channel_sync_filters`.
+        let id = relay.subscribe(channel_sync_filters(), on_event, Some(on_eose));
         self.sub_id.set(Some(id));
 
         // Loading timeout fallback
@@ -470,12 +465,15 @@ impl ChannelStore {
             store_for_eose.save_cache();
         });
 
-        // Broad subscription: all kind-42 events, no e_tags restriction
+        // One filter per zone's known channels plus a broad catch-all, so no
+        // zone's history crowds out another's: see `message_sync_filters`.
+        let zones = crate::stores::zones::load_zones();
+        let known: Vec<(String, String)> = channels
+            .iter()
+            .map(|c| (c.id.clone(), c.section.clone()))
+            .collect();
         let id = relay.subscribe(
-            vec![Filter {
-                kinds: Some(vec![42]),
-                ..Default::default()
-            }],
+            message_sync_filters(&known, &zones),
             on_msg,
             Some(on_msg_eose),
         );
@@ -570,6 +568,7 @@ impl ChannelStore {
             vec![Filter {
                 kinds: Some(vec![42]),
                 e_tags: Some(vec![needle]),
+                limit: Some(RELAY_FILTER_LIMIT),
                 ..Default::default()
             }],
             on_event,
@@ -761,6 +760,107 @@ fn buffer_pending_meta(pending: &mut HashMap<String, MetaUpdate>, update: MetaUp
 
 // -- kind-5 deletion folding (post deletion) ----------------------------------
 
+/// Most rows the relay returns for one filter (`MAX_QUERY_LIMIT` in the relay
+/// worker's `relay_do/storage.rs`). A filter that leaves `limit` unset gets the
+/// relay's default of 500 instead, so every sync filter states it.
+pub const RELAY_FILTER_LIMIT: u64 = 1000;
+
+/// Filters the relay accepts in one REQ (`MAX_FILTERS` in the relay worker).
+pub const RELAY_MAX_FILTERS: usize = 10;
+
+/// Filters for the channel-list subscription.
+///
+/// The relay returns the newest `limit` rows of a filter across every kind in
+/// it. Kind-5 deletions keep accumulating while the channel definitions
+/// (kinds 40 and 41) are few and old, so one `[5, 40, 41]` filter eventually
+/// returns only deletions: once there were more than 500 of them, a device
+/// with no cached channel list saw no sections at all. Each set gets its own
+/// filter, channels first, so deletions can never displace a channel.
+pub fn channel_sync_filters() -> Vec<Filter> {
+    vec![
+        Filter {
+            kinds: Some(vec![40, 41]),
+            limit: Some(RELAY_FILTER_LIMIT),
+            ..Default::default()
+        },
+        Filter {
+            kinds: Some(vec![5]),
+            limit: Some(RELAY_FILTER_LIMIT),
+            ..Default::default()
+        },
+    ]
+}
+
+/// Filters for the reaction subscription: kind-7 reactions and kind-5
+/// deletions as separate filters, for the reason given in
+/// [`channel_sync_filters`].
+pub fn reaction_sync_filters() -> Vec<Filter> {
+    vec![
+        Filter {
+            kinds: Some(vec![7]),
+            limit: Some(RELAY_FILTER_LIMIT),
+            ..Default::default()
+        },
+        Filter {
+            kinds: Some(vec![5]),
+            limit: Some(RELAY_FILTER_LIMIT),
+            ..Default::default()
+        },
+    ]
+}
+
+/// Filters for the message-count subscription: one `#e` filter per zone over
+/// that zone's known channel ids, then a broad kind-42 catch-all for messages
+/// whose channel is not known yet (ADR-092).
+///
+/// A single broad filter shares one row budget between every zone the reader
+/// can see, so a busy zone pushes a quiet zone's history out of the result.
+/// Grouping by zone gives each zone its own `RELAY_FILTER_LIMIT`. Channels whose
+/// section maps to no zone share a group. When there are more groups than the
+/// relay accepts filters, the overflow groups are merged into the last one.
+/// `channels` is `(channel id, section)`.
+pub fn message_sync_filters(channels: &[(String, String)], zones: &[Zone]) -> Vec<Filter> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (id, section) in channels {
+        let zone = crate::stores::zones::section_to_zone(section, zones).unwrap_or_default();
+        match groups.iter_mut().find(|(z, _)| *z == zone) {
+            Some((_, ids)) => {
+                if !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
+            None => groups.push((zone, vec![id.clone()])),
+        }
+    }
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    let max_groups = RELAY_MAX_FILTERS - 1;
+    if groups.len() > max_groups {
+        let overflow: Vec<String> = groups
+            .split_off(max_groups)
+            .into_iter()
+            .flat_map(|(_, ids)| ids)
+            .collect();
+        if let Some((_, ids)) = groups.last_mut() {
+            ids.extend(overflow);
+        }
+    }
+    let mut filters: Vec<Filter> = groups
+        .into_iter()
+        .map(|(_, ids)| Filter {
+            kinds: Some(vec![42]),
+            e_tags: Some(ids),
+            limit: Some(RELAY_FILTER_LIMIT),
+            ..Default::default()
+        })
+        .collect();
+    filters.push(Filter {
+        kinds: Some(vec![42]),
+        limit: Some(RELAY_FILTER_LIMIT),
+        ..Default::default()
+    });
+    filters
+}
+
 /// Event ids referenced by a kind-5 deletion's `["e", <id>]` tags, lowercased.
 ///
 /// Non-kind-5 events, and kind-5s carrying no `e` tag, yield an empty list — a
@@ -832,6 +932,135 @@ pub fn admits_message(tombstones: &HashSet<String>, event_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- subscription shape (regression: deletions crowded out channels) ---
+
+    fn kinds(f: &Filter) -> Vec<u64> {
+        f.kinds.clone().unwrap_or_default()
+    }
+
+    /// No sync filter may share kind 5 with another kind, and every one states
+    /// its limit: the relay returns only the newest rows of a filter across
+    /// all its kinds, and an unset limit falls back to the relay's 500.
+    fn assert_isolated_and_limited(filters: &[Filter]) {
+        assert!(!filters.is_empty());
+        assert!(filters.len() <= RELAY_MAX_FILTERS);
+        for f in filters {
+            let k = kinds(f);
+            assert!(
+                !k.contains(&5) || k == vec![5],
+                "kind 5 shares a filter with {k:?}"
+            );
+            assert_eq!(
+                f.limit,
+                Some(RELAY_FILTER_LIMIT),
+                "filter {k:?} has no explicit limit"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_definitions_never_share_a_filter_with_deletions() {
+        let f = channel_sync_filters();
+        assert_isolated_and_limited(&f);
+        assert_eq!(kinds(&f[0]), vec![40, 41], "channels come first");
+        assert!(
+            f.iter().any(|x| kinds(x) == vec![5]),
+            "deletions still synced"
+        );
+    }
+
+    #[test]
+    fn reactions_never_share_a_filter_with_deletions() {
+        let f = reaction_sync_filters();
+        assert_isolated_and_limited(&f);
+        assert!(f.iter().any(|x| kinds(x) == vec![7]));
+        assert!(f.iter().any(|x| kinds(x) == vec![5]));
+    }
+
+    #[test]
+    fn the_channel_filter_serialises_with_its_own_limit() {
+        let json = serde_json::to_value(channel_sync_filters()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"kinds": [40, 41], "limit": RELAY_FILTER_LIMIT},
+                {"kinds": [5], "limit": RELAY_FILTER_LIMIT}
+            ])
+        );
+    }
+
+    fn zones() -> Vec<Zone> {
+        serde_json::from_str(
+            r#"[{"id":"zone1","display_name":"Welcome","required_cohorts":[]},
+                {"id":"zone2","display_name":"Two","required_cohorts":["zone2"]},
+                {"id":"zone3","display_name":"Family","required_cohorts":["family"]}]"#,
+        )
+        .unwrap()
+    }
+
+    fn chan(id: &str, section: &str) -> (String, String) {
+        (id.to_string(), section.to_string())
+    }
+
+    #[test]
+    fn message_sync_gives_each_zone_its_own_budget_plus_a_catch_all() {
+        let chans = [
+            chan("c-intro", "zone1-introductions"),
+            chan("c-rants", "zone2-rants"),
+            chan("c-family", "zone3-chat"),
+            chan("c-support", "zone1-support"),
+        ];
+        let f = message_sync_filters(&chans, &zones());
+        assert_isolated_and_limited(&f);
+        assert!(f.iter().all(|x| kinds(x) == vec![42]));
+        let groups: Vec<Vec<String>> = f.iter().filter_map(|x| x.e_tags.clone()).collect();
+        assert_eq!(
+            groups,
+            vec![
+                vec!["c-intro".to_string(), "c-support".to_string()],
+                vec!["c-rants".to_string()],
+                vec!["c-family".to_string()],
+            ]
+        );
+        let last = f.last().unwrap();
+        assert!(
+            last.e_tags.is_none(),
+            "the catch-all comes last and is broad"
+        );
+    }
+
+    #[test]
+    fn message_sync_with_no_known_channels_is_the_catch_all_alone() {
+        let f = message_sync_filters(&[], &zones());
+        assert_eq!(f.len(), 1);
+        assert!(f[0].e_tags.is_none());
+        assert_eq!(f[0].limit, Some(RELAY_FILTER_LIMIT));
+    }
+
+    #[test]
+    fn message_sync_never_exceeds_the_relay_filter_cap() {
+        let many: Vec<Zone> = serde_json::from_str(&format!(
+            "[{}]",
+            (0..15)
+                .map(|i| format!(r#"{{"id":"z{i:02}","display_name":"Z","required_cohorts":[]}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .unwrap();
+        let chans: Vec<(String, String)> = (0..15)
+            .map(|i| chan(&format!("c{i:02}"), &format!("z{i:02}-s")))
+            .collect();
+        let f = message_sync_filters(&chans, &many);
+        assert_isolated_and_limited(&f);
+        assert_eq!(f.len(), RELAY_MAX_FILTERS);
+        let covered: usize = f
+            .iter()
+            .filter_map(|x| x.e_tags.as_ref())
+            .map(Vec::len)
+            .sum();
+        assert_eq!(covered, 15, "every channel stays in some filter");
+    }
 
     /// Build a test event with string tags.
     fn ev(kind: u64, created_at: u64, tags: &[&[&str]], content: &str) -> NostrEvent {

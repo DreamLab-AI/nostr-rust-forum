@@ -33,7 +33,7 @@ use leptos::prelude::*;
 use nostr_bbs_core::NostrEvent;
 
 use crate::components::reaction_bar::Reaction;
-use crate::relay::{Filter, RelayConnection};
+use crate::relay::RelayConnection;
 use crate::stores::channels::deletion_targets;
 
 // -- Types --------------------------------------------------------------------
@@ -126,10 +126,9 @@ impl ReactionStore {
         });
 
         let id = relay.subscribe(
-            vec![Filter {
-                kinds: Some(vec![5, 7]),
-                ..Default::default()
-            }],
+            // Reactions and deletions as separate filters, so the growing set of
+            // kind-5 deletions cannot crowd reactions out of the result.
+            crate::stores::channels::reaction_sync_filters(),
             on_event,
             None,
         );
