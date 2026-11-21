@@ -814,7 +814,7 @@ pub async fn create_agent_intent_signer(
     if let Some(z) = &card.zone {
         tags.push(vec![crate::calendar::ZONE_TAG.to_string(), z.clone()]);
     }
-    let content = serde_json::json!({
+    let content = crate::governance::canonical_json_string(&serde_json::json!({
         "type": "kanban_card_task",
         "title": card.title,
         "description": card.description,
@@ -823,8 +823,7 @@ pub async fn create_agent_intent_signer(
         "column": card.column,
         "due": card.due,
         "instructions": instructions,
-    })
-    .to_string();
+    }));
     let unsigned = UnsignedEvent {
         pubkey: signer.public_key().to_string(),
         created_at: now_secs(),
@@ -1163,6 +1162,43 @@ mod tests {
             assert_eq!(body["type"], "kanban_card_task");
             assert_eq!(body["title"], "Fix the gate");
             assert_eq!(body["instructions"], "please fix");
+        });
+    }
+
+    /// The task envelope is signed content, so its bytes (and so the event id)
+    /// must not depend on whether a crate in the build turned on serde_json's
+    /// `preserve_order`. This crate's dev-dependencies turn it on, so this test
+    /// runs in the insertion-ordered build, where `json!(..).to_string()` would
+    /// write `type` first.
+    #[test]
+    fn agent_intent_content_is_key_sorted_in_every_build() {
+        block_on(async {
+            let signer = test_signer();
+            let board = KanbanBoard::from_event(&make_board()).unwrap();
+            let card = KanbanCard::from_event(&make_card(&board, None, "todo", 10)).unwrap();
+            let agent = "12".repeat(32);
+            let intent = create_agent_intent_signer(&signer, &card, &agent, "please fix")
+                .await
+                .unwrap();
+            let keys: Vec<&str> = intent
+                .content
+                .trim_matches(|c| c == '{' || c == '}')
+                .split(",\"")
+                .map(|kv| kv.trim_start_matches('"').split('"').next().unwrap())
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "board",
+                    "card_d",
+                    "column",
+                    "description",
+                    "due",
+                    "instructions",
+                    "title",
+                    "type"
+                ]
+            );
         });
     }
 
