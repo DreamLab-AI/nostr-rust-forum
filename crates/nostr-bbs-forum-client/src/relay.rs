@@ -22,8 +22,8 @@ use web_sys::WebSocket;
 mod receipt;
 use receipt::{
     classify_auth_ok, explain_write_refusal, logical_id, release_held_writes, req_watch_delay,
-    route, wire_id, AuthReply, HandshakeView, ReqLedger, Route, Watch, AUTH_ANSWER_TIMEOUT_MS,
-    AUTH_SIGN_TIMEOUT_MS,
+    req_wire_id, route, watch_due, wire_id, AuthReply, HandshakeView, ReqLedger, Route, Watch,
+    WatchDue, AUTH_ANSWER_TIMEOUT_MS, AUTH_SIGN_TIMEOUT_MS,
 };
 
 /// Default relay URL when VITE_RELAY_URL is not set.
@@ -230,6 +230,10 @@ struct RelayInner {
     /// on. Turns the relay's bare `auth-required:` refusal of a post into an
     /// explanation (see [`receipt::explain_write_refusal`]).
     auth_note: Option<String>,
+    /// When each wire subscription id's latest REQ actually left the paced
+    /// send queue on the current socket (epoch ms). A REQ's answer timeout
+    /// runs from this, not from when it was queued.
+    req_sent_at: HashMap<String, f64>,
     /// Bumped on every new socket, so a timer armed for the old one (AUTH
     /// retry, stall check, REQ answer timeout) can tell it is stale.
     conn_gen: u64,
@@ -309,6 +313,10 @@ fn drain_send_queue(inner_rc: Rc<RefCell<RelayInner>>) {
             match inner.send_queue.pop_front() {
                 Some(m) => {
                     inner.send_times.push(now);
+                    if let Some(wire) = req_wire_id(&m) {
+                        let wire = wire.to_string();
+                        inner.req_sent_at.insert(wire, now);
+                    }
                     batch.push(m);
                 }
                 None => break,
@@ -384,6 +392,7 @@ impl RelayConnection {
             auth_refused: false,
             auth_challenge_at: None,
             auth_note: None,
+            req_sent_at: HashMap::new(),
             conn_gen: 0,
             _on_open: None,
             _on_message: None,
@@ -500,6 +509,8 @@ impl RelayConnection {
                 inner.pending_auth = None;
                 inner.auth_refused = false;
                 inner.auth_note = None;
+                // Send times belong to the old socket's frames.
+                inner.req_sent_at.clear();
                 // The handshake clock starts at connect, so a relay that never
                 // sends a challenge cannot hold writes forever either; the
                 // challenge, when it arrives, restarts the clock.
@@ -739,11 +750,16 @@ impl RelayConnection {
         // Close the id the subscription is using on the wire now, which
         // differs from the logical id after an unanswered-REQ re-send.
         let wire = self.with_inner(|rc| {
-            rc.borrow_mut()
+            let mut inner = rc.borrow_mut();
+            let wire = inner
                 .subscriptions
                 .remove(sub_id)
                 .map(|s| s.wire_id)
-                .unwrap_or_else(|| sub_id.to_string())
+                .unwrap_or_else(|| sub_id.to_string());
+            // Its send time is no longer needed (the map would otherwise
+            // grow by one entry per REQ until the next socket).
+            inner.req_sent_at.remove(&wire);
+            wire
         });
 
         let close_msg = close_frame(&wire);
@@ -1099,52 +1115,104 @@ fn req_frame(sub_id: &str, filters: &[Filter]) -> Option<String> {
 /// NOTICE, which names no subscription; without this the ledger would wait
 /// for that answer until the next reconnect.
 fn arm_req_watch(inner_rc: &Rc<RefCell<RelayInner>>, sub_id: String, seq: u64, resends: u32) {
+    arm_req_watch_in(inner_rc, sub_id, seq, resends, req_watch_delay(resends));
+}
+
+/// [`arm_req_watch`] with an explicit first delay. When it fires before the
+/// REQ has been on the wire for the whole timeout (it may still be in the
+/// paced queue), it re-arms for the remainder instead of judging it
+/// (see [`receipt::watch_due`]).
+fn arm_req_watch_in(
+    inner_rc: &Rc<RefCell<RelayInner>>,
+    sub_id: String,
+    seq: u64,
+    resends: u32,
+    delay_ms: i32,
+) {
+    enum Next {
+        Nothing,
+        Recheck(i32),
+        Resend(String, String, u64, u32),
+    }
     let gen = inner_rc.borrow().conn_gen;
     let rc = inner_rc.clone();
     crate::utils::set_timeout_once(
         move || {
-            let resend = {
+            let next = {
                 let mut inner = rc.borrow_mut();
                 if inner.conn_gen != gen {
                     return; // the new socket re-sent and re-armed everything
                 }
                 let ws_open = matches!(&inner.ws, Some(ws) if ws.ready_state() == WebSocket::OPEN);
                 let accepted = inner.auth_accepted;
-                let Some(sub) = inner.subscriptions.get_mut(&sub_id) else {
+                let now = js_sys::Date::now();
+                let RelayInner {
+                    subscriptions,
+                    req_sent_at,
+                    ..
+                } = &mut *inner;
+                let Some(sub) = subscriptions.get_mut(&sub_id) else {
                     return; // unsubscribed meanwhile
                 };
-                match sub.ledger.on_watch(seq) {
-                    Watch::Settled => None,
-                    Watch::GiveUp => {
-                        web_sys::console::warn_1(
-                            &format!("[Relay] {sub_id} unanswered after re-sends; not waiting")
-                                .into(),
-                        );
-                        None
-                    }
-                    // A closed socket's on_open replays (and re-arms) it.
-                    Watch::Resend if !ws_open => None,
-                    // Retire the old wire id (CLOSE it) and re-send under a
-                    // fresh one, so a late answer to the abandoned REQ is
-                    // recognisably not this one's.
-                    Watch::Resend => {
-                        let old = sub.wire_id.clone();
-                        sub.wire_gen += 1;
-                        sub.wire_id = wire_id(&sub_id, sub.wire_gen);
-                        let seq = sub.ledger.sent(accepted);
-                        req_frame(&sub.wire_id, &sub.filters)
-                            .map(|frame| (close_frame(&old), frame, seq, sub.ledger.resends()))
+                if !sub.ledger.is_waiting_on(seq) {
+                    Next::Nothing
+                } else if let WatchDue::RecheckIn(ms) = watch_due(
+                    req_sent_at.get(&sub.wire_id).copied(),
+                    now,
+                    req_watch_delay(resends),
+                ) {
+                    Next::Recheck(ms)
+                } else {
+                    match sub.ledger.on_watch(seq) {
+                        Watch::Settled => Next::Nothing,
+                        Watch::GiveUp => {
+                            web_sys::console::warn_1(
+                                &format!("[Relay] {sub_id} unanswered after re-sends; not waiting")
+                                    .into(),
+                            );
+                            Next::Nothing
+                        }
+                        // A closed socket's on_open replays (and re-arms) it.
+                        Watch::Resend if !ws_open => Next::Nothing,
+                        // Retire the old wire id (CLOSE it) and re-send under a
+                        // fresh one, so a late answer to the abandoned REQ is
+                        // recognisably not this one's.
+                        Watch::Resend => {
+                            let old = sub.wire_id.clone();
+                            // The retired id's send time is dead weight now.
+                            req_sent_at.remove(&old);
+                            sub.wire_gen += 1;
+                            sub.wire_id = wire_id(&sub_id, sub.wire_gen);
+                            let seq = sub.ledger.sent(accepted);
+                            web_sys::console::log_1(
+                                &format!("[Relay] {old} unanswered; re-sending as {}", sub.wire_id)
+                                    .into(),
+                            );
+                            match req_frame(&sub.wire_id, &sub.filters) {
+                                Some(frame) => Next::Resend(
+                                    close_frame(&old),
+                                    frame,
+                                    seq,
+                                    sub.ledger.resends(),
+                                ),
+                                None => Next::Nothing,
+                            }
+                        }
                     }
                 }
             };
-            if let Some((close, frame, seq, resends)) = resend {
-                // FIFO: the relay frees the old slot before the new REQ.
-                queue_paced(&rc, close);
-                queue_paced(&rc, frame);
-                arm_req_watch(&rc, sub_id, seq, resends);
+            match next {
+                Next::Nothing => {}
+                Next::Recheck(ms) => arm_req_watch_in(&rc, sub_id, seq, resends, ms),
+                Next::Resend(close, frame, seq, resends) => {
+                    // FIFO: the relay frees the old slot before the new REQ.
+                    queue_paced(&rc, close);
+                    queue_paced(&rc, frame);
+                    arm_req_watch(&rc, sub_id, seq, resends);
+                }
             }
         },
-        req_watch_delay(resends),
+        delay_ms,
     );
 }
 
@@ -1168,6 +1236,18 @@ fn replay_after_auth(inner_rc: &Rc<RefCell<RelayInner>>) {
                     frames.push(msg);
                 }
                 watches.push((sub_id.clone(), seq, sub.ledger.resends()));
+            }
+            // The replay reuses each wire id, whose send time still belongs to
+            // the pre-AUTH REQ. Forget it, so the replay's timeout waits until
+            // the replay itself leaves the paced queue (it may sit behind the
+            // whole burst) instead of judging it by the older send.
+            let RelayInner {
+                subscriptions,
+                req_sent_at,
+                ..
+            } = &mut *inner;
+            for sub in subscriptions.values() {
+                req_sent_at.remove(&sub.wire_id);
             }
             // Pending COUNTs go again too: before AUTH the relay answered them
             // with 0 for protected kinds.

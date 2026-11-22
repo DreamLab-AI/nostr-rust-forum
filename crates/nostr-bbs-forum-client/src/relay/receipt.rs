@@ -115,6 +115,13 @@ impl ReqLedger {
         self.outstanding == 0 && self.last_req_authed
     }
 
+    /// Whether the timeout armed for REQ `seq` still has something to judge:
+    /// it is the latest REQ and its answer is outstanding. Read-only, so a
+    /// timeout can re-check later without spending a re-send.
+    pub fn is_waiting_on(&self, seq: u64) -> bool {
+        seq == self.seq && self.outstanding > 0
+    }
+
     /// Re-sends since the last answer (scales the next timeout).
     pub fn resends(&self) -> u32 {
         self.resends
@@ -231,6 +238,45 @@ pub fn explain_write_refusal(message: &str, auth_note: Option<&str>) -> String {
         ),
         _ => message.to_string(),
     }
+}
+
+/// How soon a REQ's timeout looks again while the REQ is still in the
+/// client's paced send queue (not yet on the wire).
+pub const QUEUED_RECHECK_MS: i32 = 1_000;
+
+/// What a REQ's answer timeout should do once it fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchDue {
+    /// The REQ has been on the wire for the whole timeout: judge it.
+    Due,
+    /// Look again in this many milliseconds.
+    RecheckIn(i32),
+}
+
+/// Whether a REQ's answer timeout is due. The clock runs from when the frame
+/// actually left the paced send queue (`sent_at`, epoch ms; `None` while it
+/// is still queued), not from when it was queued: at boot the queue holds
+/// every subscription plus the post-AUTH replay, paced at a few frames a
+/// second, so timing from the queue took REQs the relay had not even
+/// received yet as dropped, and each re-send lengthened the queue further.
+pub fn watch_due(sent_at: Option<f64>, now: f64, timeout_ms: i32) -> WatchDue {
+    let Some(sent) = sent_at else {
+        return WatchDue::RecheckIn(QUEUED_RECHECK_MS);
+    };
+    let elapsed = now - sent;
+    let timeout = f64::from(timeout_ms);
+    if elapsed >= timeout {
+        WatchDue::Due
+    } else {
+        // At least 1 ms, so a rounding remainder cannot spin.
+        WatchDue::RecheckIn(((timeout - elapsed).ceil() as i32).max(1))
+    }
+}
+
+/// The wire subscription id of a `["REQ", id, …]` frame, if it is one.
+pub fn req_wire_id(frame: &str) -> Option<&str> {
+    let rest = frame.strip_prefix("[\"REQ\",\"")?;
+    rest.split('"').next()
 }
 
 /// Delay before the answer timeout for a REQ fires: backs off with each
@@ -534,6 +580,62 @@ mod tests {
         }
         assert_eq!(l.on_watch(seq), Watch::GiveUp);
         assert!(!l.answered(), "nothing outstanding: no credit");
+    }
+
+    // -- Timeout runs from the send, not the queue ---------------------------
+
+    #[test]
+    fn queued_req_is_rechecked_not_judged() {
+        assert_eq!(
+            watch_due(None, 1e6, REQ_ANSWER_TIMEOUT_MS),
+            WatchDue::RecheckIn(QUEUED_RECHECK_MS)
+        );
+    }
+
+    /// The boot case: queued at t=0, sent at t=5 s after the paced backlog.
+    /// At t=8 s it has been on the wire 3 s, so it is not yet dropped.
+    #[test]
+    fn timeout_counts_from_the_send() {
+        let sent = 5_000.0;
+        assert_eq!(
+            watch_due(Some(sent), 8_000.0, REQ_ANSWER_TIMEOUT_MS),
+            WatchDue::RecheckIn(5_000)
+        );
+        assert_eq!(
+            watch_due(Some(sent), 13_000.0, REQ_ANSWER_TIMEOUT_MS),
+            WatchDue::Due
+        );
+    }
+
+    #[test]
+    fn recheck_never_spins_on_a_rounding_remainder() {
+        assert_eq!(
+            watch_due(Some(0.0), 7_999.999_9, REQ_ANSWER_TIMEOUT_MS),
+            WatchDue::RecheckIn(1)
+        );
+    }
+
+    #[test]
+    fn waiting_on_is_read_only_and_tracks_the_latest_req() {
+        let mut l = ReqLedger::default();
+        let old = l.sent(false);
+        let new = l.sent(true);
+        assert!(!l.is_waiting_on(old));
+        assert!(l.is_waiting_on(new));
+        assert!(l.is_waiting_on(new), "asking twice spends nothing");
+        l.answered();
+        l.answered();
+        assert!(!l.is_waiting_on(new));
+    }
+
+    #[test]
+    fn req_frames_yield_their_wire_id() {
+        assert_eq!(
+            req_wire_id(r#"["REQ","sub_3~1",{"kinds":[42]}]"#),
+            Some("sub_3~1")
+        );
+        assert_eq!(req_wire_id(r#"["CLOSE","sub_3"]"#), None);
+        assert_eq!(req_wire_id(r#"["EVENT",{}]"#), None);
     }
 
     // -- Held writes ---------------------------------------------------------

@@ -73,6 +73,7 @@
 //! zone's plaintext reaches the agent stack and whatever model it calls.
 
 pub mod auto_grant;
+pub mod grant_backlog;
 pub mod grant_ledger;
 pub mod inbox_key;
 pub mod key_owner;

@@ -29,6 +29,7 @@
 use leptos::prelude::*;
 
 use crate::stores::zones::{resolve_zone_param, Zone, ZoneVisibility};
+use crate::zone_crypto::grant_backlog::KeyPhase;
 
 /// How long a deep-linked page waits for a receipt before it gives up and
 /// reports the thing as unavailable. Generous because a NIP-07 extension can
@@ -82,6 +83,15 @@ pub enum Lookup {
     /// from [`Lookup::NotFound`] so the page does not claim an absence it has
     /// not observed.
     TimedOut,
+    /// The relay has answered, but in an encrypted zone the member's zone
+    /// keys are still arriving (the grant backlog is moving), so the thing
+    /// may yet appear when a key opens it. Shown as loading, with copy that
+    /// says keys are on their way rather than blaming the connection.
+    KeysLoading,
+    /// The relay answered but the member's zone keys stopped arriving (no
+    /// progress within the stall window, or the overall cap). Distinct from
+    /// [`Lookup::TimedOut`], which means no relay answer arrived at all.
+    KeysTimedOut,
 }
 
 impl Lookup {
@@ -112,8 +122,109 @@ impl Lookup {
 
     /// Whether the loading state is the honest thing to show.
     pub fn is_loading(self) -> bool {
-        self == Lookup::Loading
+        matches!(self, Lookup::Loading | Lookup::KeysLoading)
     }
+
+    /// Decide for a channel whose posts may need zone keys to recognise.
+    /// Identical to [`Lookup::decide`] while the relay has not answered (the
+    /// no-answer path keeps its deadline and connection copy) and in a zone
+    /// that needs no keys; otherwise "absent" waits on the keys:
+    /// still arriving reads as [`Lookup::KeysLoading`], stopped as
+    /// [`Lookup::KeysTimedOut`], settled as [`Lookup::NotFound`].
+    pub fn decide_with_keys(
+        found: bool,
+        relay_answered: bool,
+        keys: KeyState,
+        deadline_passed: bool,
+    ) -> Self {
+        if found {
+            return Lookup::Found;
+        }
+        if !relay_answered {
+            return Lookup::decide(false, false, deadline_passed);
+        }
+        match keys {
+            KeyState::NotNeeded | KeyState::Settled => Lookup::NotFound,
+            KeyState::Pending | KeyState::Progressing { .. } => Lookup::KeysLoading,
+            KeyState::Stalled => Lookup::KeysTimedOut,
+        }
+    }
+}
+
+/// Where the signed-in member's zone keys stand, as far as a page in this
+/// zone cares.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyState {
+    /// The zone is not encrypted (or nothing here can decrypt): keys do not
+    /// bear on whether something is absent.
+    NotNeeded,
+    /// Every key this member will get has arrived. A member who holds no key
+    /// for the zone settles too, and sees the locked posts.
+    Settled,
+    /// The grant sync has not started yet (stored keys loading, relay AUTH
+    /// in progress). Bounded by the page's ordinary deadline.
+    Pending,
+    /// The grant backlog is moving; look again at `until` (epoch ms).
+    Progressing {
+        /// When the stall window or cap next needs checking.
+        until: f64,
+    },
+    /// The grant backlog stopped moving, hit its cap, or never started
+    /// before the page deadline.
+    Stalled,
+}
+
+/// Fold the zone-key store's view into a [`KeyState`]. `phase` is `None`
+/// until the grant sync has started for the member.
+pub fn key_state(encrypted: bool, phase: Option<KeyPhase>, deadline_passed: bool) -> KeyState {
+    if !encrypted {
+        return KeyState::NotNeeded;
+    }
+    match phase {
+        Some(KeyPhase::Settled) => KeyState::Settled,
+        Some(KeyPhase::Progressing { until }) => KeyState::Progressing { until },
+        Some(KeyPhase::Stalled) => KeyState::Stalled,
+        None if deadline_passed => KeyState::Stalled,
+        None => KeyState::Pending,
+    }
+}
+
+/// A [`KeyState`] memo that re-evaluates itself when a moving backlog's
+/// stall window or cap comes due, since nothing else changes at that moment.
+/// `phase` reads the zone-key store at the given time (epoch ms).
+pub fn key_state_memo(
+    encrypted: impl Fn() -> bool + Send + Sync + 'static,
+    phase: impl Fn(f64) -> Option<KeyPhase> + Send + Sync + 'static,
+    deadline: Signal<bool>,
+) -> Memo<KeyState> {
+    let tick = RwSignal::new(0u64);
+    let pending = StoredValue::new(false);
+    let keys = Memo::new(move |_| {
+        tick.track();
+        key_state(encrypted(), phase(js_sys::Date::now()), deadline.get())
+    });
+    Effect::new(move |_| {
+        // Tracks the tick too, so a timer that fired early (the backlog moved
+        // on meanwhile) re-arms for the new `until` even when the state reads
+        // the same as before.
+        tick.track();
+        let KeyState::Progressing { until } = keys.get() else {
+            return;
+        };
+        if pending.try_get_value().unwrap_or(true) {
+            return;
+        }
+        pending.set_value(true);
+        let delay = (until - js_sys::Date::now()).max(0.0) as i32 + 50;
+        super::set_timeout_once(
+            move || {
+                let _ = pending.try_set_value(false);
+                let _ = tick.try_update(|t| *t = t.wrapping_add(1));
+            },
+            delay,
+        );
+    });
+    keys
 }
 
 /// Whether the zone a `:category` URL param names withholds content from
@@ -123,6 +234,15 @@ impl Lookup {
 pub fn zone_is_gated(category_param: &str, zones: &[Zone]) -> bool {
     resolve_zone_param(category_param, zones)
         .map(|z| z.visibility != ZoneVisibility::Public)
+        .unwrap_or(false)
+}
+
+/// Whether the zone a `:category` URL param names is encrypted for reading:
+/// the deployment's encryption gate (`gate_on`) and the zone's own flag. An
+/// unknown zone is not.
+pub fn zone_is_encrypted(category_param: &str, zones: &[Zone], gate_on: bool) -> bool {
+    resolve_zone_param(category_param, zones)
+        .map(|z| crate::zone_crypto::zone_is_encrypted(gate_on, z.encrypted))
         .unwrap_or(false)
 }
 
@@ -363,6 +483,136 @@ mod tests {
         assert_ne!(a1, a2);
         assert_eq!(c.fire(a1), None);
         assert_eq!(c.fire(a2), Some("a"));
+    }
+
+    // -- Encrypted zones: wait for the member's keys -------------------------
+
+    fn progressing() -> KeyState {
+        KeyState::Progressing { until: 1e12 }
+    }
+
+    /// The live cold-device case: the authenticated history answer has
+    /// arrived, the topic root is a sealed original still under its envelope
+    /// id, and the grants carrying the key are still being opened.
+    #[test]
+    fn keys_progressing_is_keys_loading() {
+        assert_eq!(
+            Lookup::decide_with_keys(false, true, progressing(), false),
+            KeysLoading
+        );
+        assert!(KeysLoading.is_loading());
+    }
+
+    /// Past the page's 15 s deadline the backlog is still moving: keep saying
+    /// the keys are on their way, not "check your connection".
+    #[test]
+    fn keys_progressing_outlives_the_page_deadline() {
+        assert_eq!(
+            Lookup::decide_with_keys(false, true, progressing(), true),
+            KeysLoading
+        );
+    }
+
+    #[test]
+    fn keys_stalled_is_keys_timed_out() {
+        assert_eq!(
+            Lookup::decide_with_keys(false, true, KeyState::Stalled, false),
+            KeysTimedOut
+        );
+        assert!(!KeysTimedOut.is_loading());
+    }
+
+    #[test]
+    fn keys_settled_and_root_absent_is_not_found() {
+        assert_eq!(
+            Lookup::decide_with_keys(false, true, KeyState::Settled, false),
+            NotFound
+        );
+    }
+
+    #[test]
+    fn keys_settled_and_root_present_is_found() {
+        assert_eq!(
+            Lookup::decide_with_keys(true, true, KeyState::Settled, false),
+            Found
+        );
+    }
+
+    #[test]
+    fn root_restored_after_a_keys_timeout_still_wins() {
+        assert_eq!(
+            Lookup::decide_with_keys(true, true, KeyState::Stalled, true),
+            Found
+        );
+    }
+
+    /// No relay answer at all keeps the existing path and copy: loading,
+    /// then the connection timeout at the deadline, whatever the keys do.
+    #[test]
+    fn no_relay_answer_path_is_unchanged() {
+        for keys in [KeyState::NotNeeded, progressing(), KeyState::Stalled] {
+            assert_eq!(Lookup::decide_with_keys(false, false, keys, false), Loading);
+            assert_eq!(Lookup::decide_with_keys(false, false, keys, true), TimedOut);
+        }
+    }
+
+    #[test]
+    fn unencrypted_zone_is_unaffected() {
+        for phase in [
+            None,
+            Some(KeyPhase::Stalled),
+            Some(KeyPhase::Progressing { until: 1.0 }),
+        ] {
+            let keys = key_state(false, phase, false);
+            assert_eq!(keys, KeyState::NotNeeded);
+            for (found, answered, deadline) in [
+                (false, true, false),
+                (true, true, false),
+                (false, false, false),
+                (false, false, true),
+            ] {
+                assert_eq!(
+                    Lookup::decide_with_keys(found, answered, keys, deadline),
+                    Lookup::decide(found, answered, deadline)
+                );
+            }
+        }
+    }
+
+    /// A member holding no key for the zone: the backlog settles at EOSE with
+    /// nothing in it, so the page settles too (locked posts show as before)
+    /// rather than spinning.
+    #[test]
+    fn keyless_member_settles() {
+        let mut b = crate::zone_crypto::grant_backlog::GrantBacklog::new(false, 0.0);
+        b.identity_eose(500.0);
+        let keys = key_state(true, Some(b.phase(600.0)), false);
+        assert_eq!(keys, KeyState::Settled);
+        assert_eq!(Lookup::decide_with_keys(false, true, keys, false), NotFound);
+        assert_eq!(Lookup::decide_with_keys(true, true, keys, false), Found);
+    }
+
+    #[test]
+    fn grant_sync_not_started_waits_only_until_the_deadline() {
+        assert_eq!(key_state(true, None, false), KeyState::Pending);
+        assert_eq!(key_state(true, None, true), KeyState::Stalled);
+        assert_eq!(
+            Lookup::decide_with_keys(false, true, KeyState::Pending, false),
+            KeysLoading
+        );
+    }
+
+    #[test]
+    fn zone_encryption_needs_the_gate_and_the_flag() {
+        let zones: Vec<Zone> = serde_json::from_value(serde_json::json!([
+            { "id": "family", "visibility": "locked", "encrypted": true },
+            { "id": "friends", "visibility": "locked" }
+        ]))
+        .expect("zones parse");
+        assert!(zone_is_encrypted("family", &zones, true));
+        assert!(!zone_is_encrypted("family", &zones, false), "gate off");
+        assert!(!zone_is_encrypted("friends", &zones, true));
+        assert!(!zone_is_encrypted("no-such-zone", &zones, true));
     }
 
     #[test]
