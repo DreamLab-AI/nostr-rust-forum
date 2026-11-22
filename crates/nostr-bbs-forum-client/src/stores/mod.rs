@@ -21,5 +21,6 @@ pub mod reactions;
 pub mod read_position;
 pub mod receipts;
 pub mod signer_admin;
+pub mod tombstones;
 pub mod zone_access;
 pub mod zones;

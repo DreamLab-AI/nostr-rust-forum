@@ -126,7 +126,9 @@ impl ReactionStore {
             5 => {
                 let deleted = deletion_targets(&event);
                 let now = deletion_sync::now_secs();
-                progress.update_value(|p| p.observe(event.created_at, &deleted, false, now));
+                let deleter = event.pubkey.to_lowercase();
+                progress
+                    .update_value(|p| p.observe(event.created_at, &deleter, &deleted, false, now));
                 if !deleted.is_empty() {
                     aggregate.update(|agg| {
                         index.update(|idx| {

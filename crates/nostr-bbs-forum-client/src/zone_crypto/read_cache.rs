@@ -75,14 +75,14 @@ impl ReadCache {
     /// event; if that original's id is already in the same list (a copy
     /// fetched before the plaintext was purged, or a second envelope of the
     /// same original), the placeholder is dropped rather than duplicated. A
-    /// restored original whose id `admits` refuses (a NIP-09 tombstone for
-    /// the original id) is dropped too, the same gate every insertion path
+    /// restored original that `admits` refuses (a NIP-09 tombstone for the
+    /// original id from its author or an admin) is dropped too, the same gate every insertion path
     /// applies. Returns whether any list changed length or content.
     pub fn redecrypt(
         &mut self,
         messages: &mut HashMap<String, Vec<NostrEvent>>,
         lookup: impl Fn(&str, u32) -> Option<ZoneKey>,
-        admits: impl Fn(&str) -> bool,
+        admits: impl Fn(&NostrEvent) -> bool,
     ) -> bool {
         let mut changed = false;
         for events in messages.values_mut() {
@@ -124,7 +124,7 @@ impl ReadCache {
             let mut seen: HashSet<String> = HashSet::with_capacity(events.len());
             let before = events.len();
             events.retain(|e| {
-                (!restored_now.contains(&e.id) || admits(&e.id)) && seen.insert(e.id.clone())
+                (!restored_now.contains(&e.id) || admits(e)) && seen.insert(e.id.clone())
             });
             changed |= events.len() != before;
         }
@@ -381,7 +381,7 @@ mod tests {
         let mut cache = ReadCache::default();
         let mut msgs = one_channel(vec![cache.prepare(&env, no_key)]);
         let deleted = orig.id.clone();
-        assert!(cache.redecrypt(&mut msgs, with_key, |id| id != deleted));
+        assert!(cache.redecrypt(&mut msgs, with_key, |e: &NostrEvent| e.id != deleted));
         assert!(msgs[&channel()].is_empty());
     }
 
