@@ -169,6 +169,34 @@ pub struct ZoneKey {
     pub pending_delivery: bool,
 }
 
+/// Whether `incoming` would replace `held` with a different key for the same
+/// slot. Keys are equal per `(zone, group, epoch)` for all time, so a different
+/// secret or epoch pubkey there is a conflicting mint, never an update.
+pub fn conflicts(held: &ZoneKey, incoming: &ZoneKey) -> bool {
+    held.store_id() == incoming.store_id()
+        && (held.secret != incoming.secret || held.pubkey != incoming.pubkey)
+}
+
+/// The channel a kind-42 belongs to: its `root`-marked `e` tag, else its first
+/// `e` tag (NIP-28).
+pub fn root_channel(tags: &[Vec<String>]) -> Option<String> {
+    let es = || {
+        tags.iter()
+            .filter(|t| t.first().map(String::as_str) == Some("e"))
+    };
+    es().find(|t| t.get(3).map(String::as_str) == Some("root"))
+        .or_else(|| es().next())
+        .and_then(|t| t.get(1).cloned())
+}
+
+/// The `(zone, epoch)` a zone-encrypted event's `zk` tag names, if any.
+pub fn zk_zone_epoch(tags: &[Vec<String>]) -> Option<(String, u32)> {
+    let t = tags
+        .iter()
+        .find(|t| t.first().map(String::as_str) == Some("zk"))?;
+    Some((t.get(1)?.clone(), t.get(2)?.parse().ok()?))
+}
+
 impl ZoneKey {
     /// Storage id: `"<zone>:<group|->:<epoch>:<pubkey>"` (ADR-2028 decision
     /// 6). The pubkey is part of it so two keys claiming one `(zone, epoch)`
@@ -800,6 +828,50 @@ mod tests {
     }
 
     use super::*;
+
+    fn zk(secret: &str, pubkey: &str) -> ZoneKey {
+        ZoneKey {
+            zone: "zone3".into(),
+            epoch: 3,
+            secret: secret.into(),
+            pubkey: pubkey.into(),
+            granted_by: "a".repeat(64),
+            received_at: 1,
+            group: None,
+            pending_delivery: false,
+        }
+    }
+
+    #[test]
+    fn a_second_key_for_a_held_epoch_conflicts_the_same_one_does_not() {
+        let held = zk("s1", "p1");
+        assert!(!conflicts(&held, &zk("s1", "p1")));
+        assert!(
+            conflicts(&held, &zk("s2", "p2")),
+            "a different mint at the same epoch"
+        );
+        assert!(conflicts(&held, &zk("s2", "p1")));
+        let mut other_epoch = zk("s2", "p2");
+        other_epoch.epoch = 4;
+        assert!(
+            !conflicts(&held, &other_epoch),
+            "another epoch is another slot"
+        );
+    }
+
+    #[test]
+    fn zk_tag_names_zone_and_epoch() {
+        let tags = vec![
+            vec!["e".into(), "x".into()],
+            vec!["zk".into(), "zone3".into(), "3".into(), "pk".into()],
+        ];
+        assert_eq!(zk_zone_epoch(&tags), Some(("zone3".into(), 3)));
+        assert_eq!(
+            zk_zone_epoch(&[vec!["zk".into(), "zone3".into(), "x".into()]]),
+            None
+        );
+        assert_eq!(zk_zone_epoch(&[]), None);
+    }
     use nostr_bbs_core::keys::generate_keypair;
     use nostr_bbs_core::signer::PrfSigner;
 
