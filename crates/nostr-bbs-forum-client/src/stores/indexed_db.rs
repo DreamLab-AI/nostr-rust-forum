@@ -82,6 +82,15 @@ pub struct StoredZoneKey {
     pub pending_delivery: bool,
 }
 
+/// Outcome of [`ForumDb::put_zone_key_unless_conflicting`].
+#[derive(Debug)]
+pub enum ZoneKeyPut {
+    /// Written (new, or the same secret again).
+    Stored,
+    /// Refused: this device holds a different secret for the same id.
+    Conflict(crate::zone_crypto::ZoneKey),
+}
+
 impl From<&crate::zone_crypto::ZoneKey> for StoredZoneKey {
     fn from(k: &crate::zone_crypto::ZoneKey) -> Self {
         Self {
@@ -351,6 +360,36 @@ impl ForumDb {
         let req = store.put(&to_js(&rec)?)?;
         idb_request_result(&req).await?;
         Ok(())
+    }
+
+    /// Store `key` unless this device already holds a different secret under
+    /// the same id, read and written in one transaction. An epoch's key never
+    /// changes: a second, different key for a held `(zone, epoch)` is a
+    /// conflicting mint (an admin rotating from a device that lacked the
+    /// newest epoch), and replacing the held one would make every post under
+    /// it unreadable here. Returns the held key on conflict.
+    ///
+    /// Should a browser commit the transaction between the read and the write,
+    /// the write fails and the error reaches the caller, which leaves the grant
+    /// to be retried: nothing is overwritten.
+    pub async fn put_zone_key_unless_conflicting(
+        &self,
+        key: &crate::zone_crypto::ZoneKey,
+    ) -> Result<ZoneKeyPut, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store(STORE_ZONE_KEYS)?;
+        let held = idb_request_result(&store.get(&JsValue::from_str(&key.store_id()))?).await?;
+        if !held.is_undefined() && !held.is_null() {
+            let held: crate::zone_crypto::ZoneKey = from_js::<StoredZoneKey>(held)?.into();
+            if crate::zone_crypto::conflicts(&held, key) {
+                return Ok(ZoneKeyPut::Conflict(held));
+            }
+        }
+        let rec = StoredZoneKey::from(key);
+        idb_request_result(&store.put(&to_js(&rec)?)?).await?;
+        Ok(ZoneKeyPut::Stored)
     }
 
     /// Every zone key held on this device.
