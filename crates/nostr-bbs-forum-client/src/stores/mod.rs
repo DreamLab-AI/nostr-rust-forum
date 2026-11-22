@@ -9,6 +9,7 @@ pub mod badges;
 pub mod case_projection;
 pub mod channels;
 pub mod custom_emoji;
+pub mod deletion_sync;
 #[allow(dead_code)]
 pub mod indexed_db;
 pub mod mute;

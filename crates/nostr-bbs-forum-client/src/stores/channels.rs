@@ -14,6 +14,7 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 use crate::relay::{Filter, RelayConnection};
+use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope};
 use crate::stores::zones::Zone;
 
 // -- Constants ----------------------------------------------------------------
@@ -93,10 +94,15 @@ pub struct ChannelStore {
     pending_meta: RwSignal<HashMap<String, MetaUpdate>>,
     /// Event ids deleted via kind-5 (NIP-09), lowercased. A tombstone both
     /// removes the target from `channel_messages` AND suppresses a kind-42 that
-    /// arrives AFTER its deletion (backfill order is not guaranteed). Transient
-    /// — rebuilt from the relay's replayed kind-5s each session. See
-    /// [`fold_deletions`].
+    /// arrives AFTER its deletion (backfill order is not guaranteed). Seeded
+    /// from the tombstones persisted by [`deletion_sync`] (the kind-5 sync
+    /// only fetches deletions newer than the device's marker, and a sealed
+    /// original restored from its envelope is hidden by nothing else), then
+    /// extended by this session's kind-5s. See [`fold_deletions`].
     tombstones: RwSignal<HashSet<String>>,
+    /// Marker and persisted tombstones for this store's kind-5 filter,
+    /// advanced and saved only when the channel subscription reaches EOSE.
+    deletion_progress: StoredValue<DeletionProgress>,
 }
 
 impl ChannelStore {
@@ -104,6 +110,8 @@ impl ChannelStore {
         // Hydrate from localStorage cache for instant render
         let cached = Self::load_cache();
         let has_cache = !cached.channels.is_empty();
+        let deletions = deletion_sync::load(DeletionScope::Channels);
+        let tombstones: HashSet<String> = deletions.tombstones.keys().cloned().collect();
 
         Self {
             channels: RwSignal::new(cached.channels),
@@ -118,7 +126,8 @@ impl ChannelStore {
             ensured: RwSignal::new(HashSet::new()),
             meta_updated_at: RwSignal::new(cached.meta_updated_at),
             pending_meta: RwSignal::new(HashMap::new()),
-            tombstones: RwSignal::new(HashSet::new()),
+            tombstones: RwSignal::new(tombstones),
+            deletion_progress: StoredValue::new(DeletionProgress::new(deletions)),
         }
     }
 
@@ -218,6 +227,7 @@ impl ChannelStore {
         let meta_ts_sig = self.meta_updated_at;
         let pending_meta_sig = self.pending_meta;
         let tombstones_sig = self.tombstones;
+        let deletion_progress = self.deletion_progress;
         let loading_sig = self.loading;
         let eose_sig = self.eose_received;
         let store = *self;
@@ -289,6 +299,12 @@ impl ChannelStore {
                 }
                 5 => {
                     let deleted = deletion_targets(&event);
+                    // Every kind-5 counts towards the marker, even one with no
+                    // `e` target: the marker tracks what the relay delivered.
+                    let now = deletion_sync::now_secs();
+                    deletion_progress.update_value(|p| {
+                        p.observe(event.created_at, &deleted, true, now);
+                    });
                     if !deleted.is_empty() {
                         channel_msgs_sig.update(|m| {
                             tombstones_sig.update(|t| {
@@ -321,7 +337,12 @@ impl ChannelStore {
                     store_for_eose.channel_messages.set(HashMap::new());
                     store_for_eose.last_active.set(HashMap::new());
                     store_for_eose.meta_updated_at.set(HashMap::new());
-                    store_for_eose.tombstones.set(HashSet::new());
+                    // Keep the persisted tombstones: their kind-5s may lie
+                    // below the marker and would not be fetched again.
+                    store_for_eose.tombstones.set(
+                        deletion_progress
+                            .with_value(|p| p.state.tombstones.keys().cloned().collect()),
+                    );
                 }
             } else {
                 channels_sig.update(|list| {
@@ -337,12 +358,20 @@ impl ChannelStore {
             eose_sig.set(true);
             // Cache the pruned result
             store_for_eose.save_cache();
+            // EOSE is the only proof the kind-5 backfill completed; a sync cut
+            // off before it writes nothing, so the next session re-asks from
+            // the old marker. Marker and tombstones go out in one record.
+            let now = deletion_sync::now_secs();
+            deletion_progress.update_value(|p| {
+                deletion_sync::save(DeletionScope::Channels, p.complete(now));
+            });
         });
 
         // kind-40 = channel creation, kind-41 = metadata edit (rename),
         // kind-5 = post deletion (NIP-09). Separate filters: see
         // `channel_sync_filters`.
-        let id = relay.subscribe(channel_sync_filters(), on_event, Some(on_eose));
+        let since = deletion_progress.with_value(|p| p.state.since);
+        let id = relay.subscribe(channel_sync_filters(since), on_event, Some(on_eose));
         self.sub_id.set(Some(id));
 
         // Loading timeout fallback
@@ -768,6 +797,21 @@ pub const RELAY_FILTER_LIMIT: u64 = 1000;
 /// Filters the relay accepts in one REQ (`MAX_FILTERS` in the relay worker).
 pub const RELAY_MAX_FILTERS: usize = 10;
 
+/// The kind-5 filter shared by the channel and reaction subscriptions.
+///
+/// `since` is the device's marker from [`deletion_sync`]; `None` (no completed
+/// sync yet) takes the newest [`RELAY_FILTER_LIMIT`] deletions. The limit
+/// stays either way: should more than that many deletions fall after the
+/// marker, the relay returns the same newest rows an unmarked sync would.
+fn deletion_filter(since: Option<u64>) -> Filter {
+    Filter {
+        kinds: Some(vec![5]),
+        since,
+        limit: Some(RELAY_FILTER_LIMIT),
+        ..Default::default()
+    }
+}
+
 /// Filters for the channel-list subscription.
 ///
 /// The relay returns the newest `limit` rows of a filter across every kind in
@@ -776,36 +820,33 @@ pub const RELAY_MAX_FILTERS: usize = 10;
 /// returns only deletions: once there were more than 500 of them, a device
 /// with no cached channel list saw no sections at all. Each set gets its own
 /// filter, channels first, so deletions can never displace a channel.
-pub fn channel_sync_filters() -> Vec<Filter> {
+///
+/// Only the deletion filter takes `deletions_since`: the channel definitions
+/// are fetched in full every session, because the EOSE handler prunes cached
+/// channels the relay did not return.
+pub fn channel_sync_filters(deletions_since: Option<u64>) -> Vec<Filter> {
     vec![
         Filter {
             kinds: Some(vec![40, 41]),
             limit: Some(RELAY_FILTER_LIMIT),
             ..Default::default()
         },
-        Filter {
-            kinds: Some(vec![5]),
-            limit: Some(RELAY_FILTER_LIMIT),
-            ..Default::default()
-        },
+        deletion_filter(deletions_since),
     ]
 }
 
 /// Filters for the reaction subscription: kind-7 reactions and kind-5
 /// deletions as separate filters, for the reason given in
-/// [`channel_sync_filters`].
-pub fn reaction_sync_filters() -> Vec<Filter> {
+/// [`channel_sync_filters`]. Reactions are not cached between sessions, so
+/// they are fetched in full; only the deletion filter takes `deletions_since`.
+pub fn reaction_sync_filters(deletions_since: Option<u64>) -> Vec<Filter> {
     vec![
         Filter {
             kinds: Some(vec![7]),
             limit: Some(RELAY_FILTER_LIMIT),
             ..Default::default()
         },
-        Filter {
-            kinds: Some(vec![5]),
-            limit: Some(RELAY_FILTER_LIMIT),
-            ..Default::default()
-        },
+        deletion_filter(deletions_since),
     ]
 }
 
@@ -959,33 +1000,71 @@ mod tests {
         }
     }
 
+    const MARKER: u64 = 1_790_000_000;
+
     #[test]
     fn channel_definitions_never_share_a_filter_with_deletions() {
-        let f = channel_sync_filters();
-        assert_isolated_and_limited(&f);
-        assert_eq!(kinds(&f[0]), vec![40, 41], "channels come first");
-        assert!(
-            f.iter().any(|x| kinds(x) == vec![5]),
-            "deletions still synced"
-        );
+        for since in [None, Some(MARKER)] {
+            let f = channel_sync_filters(since);
+            assert_isolated_and_limited(&f);
+            assert_eq!(kinds(&f[0]), vec![40, 41], "channels come first");
+            assert!(
+                f.iter().any(|x| kinds(x) == vec![5]),
+                "deletions still synced"
+            );
+        }
     }
 
     #[test]
     fn reactions_never_share_a_filter_with_deletions() {
-        let f = reaction_sync_filters();
-        assert_isolated_and_limited(&f);
-        assert!(f.iter().any(|x| kinds(x) == vec![7]));
-        assert!(f.iter().any(|x| kinds(x) == vec![5]));
+        for since in [None, Some(MARKER)] {
+            let f = reaction_sync_filters(since);
+            assert_isolated_and_limited(&f);
+            assert!(f.iter().any(|x| kinds(x) == vec![7]));
+            assert!(f.iter().any(|x| kinds(x) == vec![5]));
+        }
+    }
+
+    /// The marker narrows the deletion filter only: channel definitions and
+    /// reactions are always fetched in full.
+    #[test]
+    fn only_the_deletion_filters_carry_the_marker() {
+        for f in channel_sync_filters(Some(MARKER))
+            .into_iter()
+            .chain(reaction_sync_filters(Some(MARKER)))
+        {
+            let expected = (kinds(&f) == vec![5]).then_some(MARKER);
+            assert_eq!(f.since, expected, "filter {:?}", kinds(&f));
+            assert_eq!(f.until, None);
+        }
+    }
+
+    #[test]
+    fn without_a_marker_no_filter_has_since() {
+        for f in channel_sync_filters(None)
+            .into_iter()
+            .chain(reaction_sync_filters(None))
+        {
+            assert_eq!(f.since, None, "filter {:?}", kinds(&f));
+        }
     }
 
     #[test]
     fn the_channel_filter_serialises_with_its_own_limit() {
-        let json = serde_json::to_value(channel_sync_filters()).unwrap();
+        let json = serde_json::to_value(channel_sync_filters(None)).unwrap();
         assert_eq!(
             json,
             serde_json::json!([
                 {"kinds": [40, 41], "limit": RELAY_FILTER_LIMIT},
                 {"kinds": [5], "limit": RELAY_FILTER_LIMIT}
+            ])
+        );
+        let json = serde_json::to_value(channel_sync_filters(Some(MARKER))).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"kinds": [40, 41], "limit": RELAY_FILTER_LIMIT},
+                {"kinds": [5], "since": MARKER, "limit": RELAY_FILTER_LIMIT}
             ])
         );
     }
