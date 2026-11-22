@@ -451,6 +451,15 @@ pub async fn sweep_retention(env: &Env) -> Result<RetentionSweepResult, String> 
     })
 }
 
+/// No NIP-09 tombstone is recorded here, deliberately: retention and expiry are
+/// storage policy, not a decision that the content must never return, and a
+/// tombstone per pruned row would grow without bound. Neither needs one to stay
+/// gone in practice. An expired event is refused at ingest
+/// (`filter::expiration_admission`); a kind-1 or kind-7 event past its window
+/// (90 or 30 days) fails the seven-day timestamp drift check. Kind 9024's
+/// one-day window is shorter than that drift, so a copy between one and seven
+/// days old can be stored again; the next sweep prunes it again.
+///
 /// SELECT a bounded page of event ids with `sql`/`binds`, then batch-DELETE
 /// exactly those ids. Returns the page length (== rows deleted). A page shorter
 /// than the requested LIMIT means the candidate set is exhausted and the caller
