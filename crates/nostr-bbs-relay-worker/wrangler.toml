@@ -31,7 +31,7 @@ DEVICE_KEYS_ENABLED = "false"
 # NIP-42 AUTH enforcement mode (PRD-010 G4). The escape hatch:
 #   "nip42"     (default) — NIP-42 AUTH is the universal write gate: every EVENT
 #               requires a completed AUTH handshake, and reads of the protected
-#               kinds {4,13,14,1059,30910-39916} require AUTH. The pubkey
+#               kinds {4,13,14,1059,30910-30916} require AUTH. The pubkey
 #               allowlist becomes the authorisation layer on the authed identity.
 #   "allowlist" — legacy behaviour: writes gated on the allowlist alone, no AUTH
 #               round-trip forced. Recover the pre-G4 model here if needed.
@@ -39,11 +39,13 @@ DEVICE_KEYS_ENABLED = "false"
 AUTH_MODE = "nip42"
 # The relay's own canonical URL, used to verify the NIP-42 `["relay", <url>]`
 # tag on AUTH responses so a malicious relay cannot replay a client's AUTH here.
-# REQUIRED in nip42 mode: set this to the exact wss:// URL clients connect to.
-# When BLANK the relay FAILS CLOSED and refuses every authenticated write (it
-# never derives its identity from the request, which would let an attacker's
-# Host poison the check). So set it BEFORE deploying, or the board stops
-# accepting writes. The relay logs an error on every AUTH while it is blank.
+# MUST be set to this relay's public wss:// URL (the exact URL clients connect
+# to), or no client can authenticate. While it is BLANK (and RELAY_URL_ALIASES
+# is blank too) the relay FAILS CLOSED: it refuses every NIP-42 AUTH with
+# "invalid: relay url unconfigured", so in nip42 mode every write and every
+# protected-kind read is refused. It never derives its identity from the
+# request, which would let an attacker's Host poison the check. Set it BEFORE
+# deploying; the relay logs an error on every AUTH while it is blank.
 RELAY_URL = ""
 # Optional: extra wss:// URLs this relay also answers to, comma-separated, for a
 # relay reachable at more than one hostname (e.g. a custom domain plus the

@@ -205,13 +205,16 @@ impl ZoneKey {
     /// both survive and the conflict is visible instead of overwritten.
     pub fn store_id(&self) -> String {
         // Gated on ZONE_GROUPS_ENABLED (ADR-2028, Phase 4 blocker fix). With the
-        // flag OFF the id is the legacy `<zone>:<epoch>`, so a second grant for
-        // one epoch replaces the first (last-write-wins) exactly as before the
-        // NIP-171 work, and `migrate_zone_keys` is a no-op because a legacy row's
-        // id already equals its store_id. With the flag ON the pubkey and group
-        // join the id, so two keys claiming one epoch both persist and the
-        // inconsistency is detectable. The whole key plane is unreachable while
-        // the flag is off, so this keeps flag-off byte-identical to today.
+        // flag OFF the id is the legacy `<zone>:<epoch>`, and `migrate_zone_keys`
+        // is a no-op because a legacy row's id already equals its store_id. A
+        // second, different key for a held `(zone, epoch)` then shares the id,
+        // so `conflicts` fires and `put_zone_key_unless_conflicting` refuses it
+        // and keeps the held key (#84, #87); nothing is overwritten. With the
+        // flag ON the pubkey and group join the id, so two keys claiming one
+        // epoch get different ids and both persist: the inconsistency is
+        // visible, but the slot guard cannot fire. In both modes the IndexedDB
+        // row id is `<owner>/<store id>`, one row per signed-in identity (#92,
+        // `key_owner`).
         self.store_id_with(crate::zone_crypto::tickets::zone_groups_enabled())
     }
 

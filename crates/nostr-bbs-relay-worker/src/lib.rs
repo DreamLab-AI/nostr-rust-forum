@@ -1143,7 +1143,7 @@ async fn ensure_schema(env: &Env) -> bool {
                 ok = false;
             }
         }
-        // Migration 0012: a database created before the `proof` column existed.
+        // Migration 0013: a database created before the `proof` column existed.
         // A duplicate-column error is the expected outcome everywhere else and
         // does not count against `ok`, like the other ALTERs in this function.
         let _ = db

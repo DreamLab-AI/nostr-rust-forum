@@ -3,11 +3,11 @@ id: ADR-2028
 title: Zones adopt the NIP-171 key plane and ticket format; board transport stays signed kind 42; one owner per zone
 date: 2026-10-20
 decision_status: proposed
-implementation_status: none
+implementation_status: partial
 activation_status: inactive
 supersedes: [ADR-2026]
 superseded_by: []
-verified_commit: fb9ef30 plus the uncommitted ADR-2025 working tree (design only; nothing implemented to verify)
+verified_commit: fd31193 (source presence of Phase 4 steps 1 to 3 behind ZONE_GROUPS_ENABLED, read 2026-11-22; tests not run)
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: NIP-171 merging or changing its derivation; a zone owner leaving; a request to open a zone to Anagram or nostr.chat members; any proposal to move zone posts off kind 42
 repo: nostr-rust-forum
@@ -32,6 +32,19 @@ signed over their ciphertext, so re-sealing them is impossible; the ADR-2017 mig
 inner event that carries `zk`.
 
 ## Decision
+
+> Note 2026-11-22: `implementation_status` moves from `none` to `partial`. Phase 4 steps 1 to 3 are on `main`, flagged
+> off: `7df61ae` (Phase 4, NIP-171 zone key plane) is an ancestor of `main` through the `a80c572` merge. Present in source:
+> the NIP-171 derivation with the draft's test vector (`crates/nostr-bbs-forum-client/src/zone_crypto/nip171.rs`),
+> kind 1014 tickets beside the 21453 grant path (`crates/nostr-bbs-forum-client/src/zone_crypto/tickets.rs`), and the
+> relay's zone-group binding and first-write epoch uniqueness (`crates/nostr-bbs-relay-worker/src/zone_groups.rs`,
+> `migrations/0014_zone_epoch_keys.sql`). The relay reads `ZONE_GROUPS_ENABLED` as a worker var and the forum client from
+> `window.__ENV__`, both only on the exact string `"true"`; no wrangler template in this repository declares it, so it is
+> off. The hard blocker below is still open (the relay comment at `relay_do/nip_handlers.rs:1571` records that a cohort
+> member can still first-write-win future epochs), so the owner-only epoch binding of step 4 has not landed; this note does
+> not establish the state of the rest of step 4.
+> `decision_status` stays `proposed` and `activation_status` `inactive`. Checked by reading source at `fd31193`; no test
+> was run for this note.
 
 Proposed:
 
@@ -87,6 +100,9 @@ Proposed:
   acceptance ("seal author is admin") change to "seal author is the zone's bound group identity".
 
 ## Verification
+
+> Note 2026-11-22: "None: no implementation" below predates Phase 4; see the 2026-11-22 note under Decision for what
+> is on `main`. Whether each adoption test listed here exists and passes was not checked for that note.
 
 None: no implementation. Adoption requires, in order: the NIP-171 test vector green in the client
 crate; a relay test that a `zk` with a second pubkey for a stored zone and epoch is refused; a

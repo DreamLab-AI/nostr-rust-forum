@@ -156,11 +156,15 @@ Set the two secrets (`NATIVE_POD_ADMIN_KEY`, `WELCOME_MASTER_KEY`) with
 `wrangler secret put` -- never commit them to `wrangler.toml`.
 
 **`RELAY_URL` (relay-worker, REQUIRED in `nip42` mode).** The shipped
-`wrangler.toml` leaves it blank, and a blank value makes the relay skip the
-NIP-42 `["relay", <url>]` tag check on AUTH responses (it fails open; the
-per-session challenge still applies). Set it to the `wss://` URL clients connect
-to. While `AUTH_MODE` is `nip42` and `RELAY_URL` is blank the relay logs a
-console error on every AUTH.
+`wrangler.toml` leaves it blank, and the relay fails closed on a blank value: it
+refuses every NIP-42 AUTH with `invalid: relay url unconfigured` (it never
+derives its own URL from the request), so no client can authenticate, and in
+`nip42` mode every write and every protected-kind read is refused. Set it to
+the relay's public `wss://` URL, the exact one clients connect to, before the
+relay takes traffic; add `RELAY_URL_ALIASES` (comma-separated) if it answers at
+more than one hostname. While `AUTH_MODE` is `nip42` and no URL is configured
+the relay logs a console error on every AUTH. See also
+[`docs/runbooks/deploy-phase-0-4.md`](docs/runbooks/deploy-phase-0-4.md).
 
 **`CALIBRATION_SELECTION_KEY` (relay-worker secret).** Set it with
 `wrangler secret put CALIBRATION_SELECTION_KEY`. Unset, calibration sampling

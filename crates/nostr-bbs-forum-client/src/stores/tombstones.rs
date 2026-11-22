@@ -10,8 +10,10 @@
 //!   TL3 or admin, checked against the stored row.
 //! - **Restored sealed original** (ADR-2017: an original recovered from a
 //!   zone-encrypted envelope, whose plaintext row was purged): the relay has
-//!   no row to check, and the envelope is encrypted, so it accepts a kind-5
-//!   naming that id from anyone. Here a tombstone counts only when its
+//!   no row to check and cannot read the author inside the envelope, so since
+//!   #94 it refuses a kind-5 naming that id unless the signer is an admin or
+//!   TL3+; kind-5s stored before that gate can still name one. Here a
+//!   tombstone counts only when its
 //!   deleter is the verified inner (original) author, or a pubkey the relay
 //!   positively vouches is an admin (`/api/check-whitelist` `isAdmin`, see
 //!   [`crate::stores::signer_admin`]). TL3 moderators cannot be identified by

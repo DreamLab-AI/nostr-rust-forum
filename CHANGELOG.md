@@ -15,6 +15,18 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 [ADR-2034](docs/adr/ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md), and the 2026-11-22 section of
 [ADR-2016](docs/adr/ADR-2016-end-to-end-encrypted-zones.md).
 
+### Documentation: diagrams moved to VisionFlow; stale comments and records corrected (2026-11-22)
+
+- **Diagram corpus moved.** The five files under `docs/diagrams/` (the anomaly register and the relay, client, pod and
+  auth diagram sets) are removed; this repository's diagrams live in VisionFlow `docs/diagrams/nostr-rust-forum/`, and
+  `docs/diagrams/README.md` points there. Open findings stay in `docs/security/known-findings.md` under their KF ids.
+- **Stale statements corrected, no behaviour change.** Code comments (zone-key `store_id`, client tombstone scope, the
+  removed `fold_deletions`, the NIP-42 relay-URL docs, migration 0013 labels, the member-signed recipient-key proof),
+  the relay wrangler template's `RELAY_URL` note, `SETUP.md` (a blank `RELAY_URL` fails closed, not open), README
+  (the NIP-17 and NIP-171 work merged at `a80c572` and ships off), ADR-2027 and ADR-2028 implementation records, the
+  baseline's kit-version, `solid-pod-rs` requirement and gift-wrap paragraphs, and two new known-findings rows
+  (KF-29 the blank `RELAY_URL` template, KF-30 tombstone tables created only by `ensure_schema`).
+
 ### Relay: deleted events stay deleted, and members can no longer hide ids they do not own (2026-11-22)
 
 - **NIP-09 tombstones** (#89): the relay honoured a kind-5 by deleting the target row and kept no record, so anyone
@@ -2108,7 +2120,8 @@ panel (which caught and fixed a cross-account DM leak before release).
   whitelist membership**, never the ephemeral author, without decrypting. Privacy
   boundary (relay is a zero-knowledge router), device-key effective-pubkey
   attribution, and why DM `#p` is deliberately **not** rebound to the owner
-  (`relay_do/nip_handlers.rs:649-657`). References `docs/diagrams/relay-event-admission.md`.
+  (`relay_do/nip_handlers.rs:649-657`). References `docs/diagrams/relay-event-admission.md` (removed
+  2026-11-22; the admission diagrams are now VisionFlow NF-03 and NF-11).
 
 > ADR-102 (trust demotion, anomaly O1) is reserved and owned by concurrent
 > `relay-worker/src/trust.rs` work; it lands with that change.
