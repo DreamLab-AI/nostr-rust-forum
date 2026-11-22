@@ -989,7 +989,9 @@ fn on_auth_ok(inner_rc: &Rc<RefCell<RelayInner>>, accepted: bool, message: &str)
 fn refuse_auth(inner_rc: &Rc<RefCell<RelayInner>>, reason: &str) {
     let deferred = {
         let mut inner = inner_rc.borrow_mut();
-        inner.pending_auth = None;
+        // `pending_auth` is deliberately kept: if this was a stall and the
+        // relay's `OK true` arrives late, it must still match our AUTH event
+        // and take the Accepted path. A new socket resets it.
         inner.auth_challenge_at = None;
         inner.auth_refused = true;
         std::mem::take(&mut inner.deferred_writes)
