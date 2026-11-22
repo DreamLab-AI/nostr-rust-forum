@@ -627,6 +627,11 @@ impl RelayConnection {
             // NOTE: subscriptions are preserved so they can be replayed on reconnect.
             inner.pending_publishes.clear();
             inner.pending_messages.clear();
+            // Writes held for AUTH belong to the session being closed. Their
+            // ack callbacks are gone with `pending_publishes`, and the next
+            // session may be another account: they must not go out after its
+            // AUTH is accepted.
+            inner.deferred_writes.clear();
             // Stale queued frames must not double-send after a reconnect —
             // the on_open flush + replay rebuilds everything still relevant.
             inner.send_queue.clear();
