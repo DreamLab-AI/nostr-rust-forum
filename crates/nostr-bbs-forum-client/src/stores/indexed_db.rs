@@ -392,6 +392,22 @@ impl ForumDb {
         Ok(ZoneKeyPut::Stored)
     }
 
+    /// The stored zone key with `id`, if any.
+    pub async fn get_zone_key(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::zone_crypto::ZoneKey>, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readonly)?;
+        let store = tx.object_store(STORE_ZONE_KEYS)?;
+        let v = idb_request_result(&store.get(&JsValue::from_str(id))?).await?;
+        if v.is_undefined() || v.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(from_js::<StoredZoneKey>(v)?.into()))
+    }
+
     /// Every zone key held on this device.
     pub async fn get_all_zone_keys(&self) -> Result<Vec<crate::zone_crypto::ZoneKey>, JsValue> {
         let tx = self
