@@ -19,15 +19,24 @@
 //!   relay returned every stored kind-5 with `created_at >= M`: either fewer
 //!   than [`RELAY_FILTER_LIMIT`] came back before the first EOSE, or the
 //!   device paged downwards (`until` = the oldest `created_at` delivered,
-//!   inclusive) until a page came back short, within [`MAX_PAGES`] pages.
+//!   inclusive) until a page delivered nothing older than its `until`, within
+//!   [`MAX_PAGES`] pages (see [`next_page`] for why pages end on progress,
+//!   not on a short count).
 //! - **Unmarked first sync.** No `since`, so the device received the newest
 //!   [`RELAY_FILTER_LIMIT`] deletions only, exactly what every session got
 //!   before markers existed. Older deletions are not recovered, and there is
 //!   no paging: a first sync never walks the whole deletion history.
 //!
 //! When paging gives up, the old marker stays and the next session tries
-//! again. It gives up when it reaches [`MAX_PAGES`], or when a full page makes
-//! no progress, meaning more than a page of kind-5s share one `created_at`.
+//! again. It gives up when it reaches [`MAX_PAGES`], when a full page makes
+//! no progress (more than a page of kind-5s share one `created_at`), or when
+//! a page comes back empty (a failed query).
+//!
+//! One residue is accepted. The first step does count: a backfill that
+//! delivered fewer than [`RELAY_FILTER_LIMIT`] is taken as complete. If the
+//! relay's SQL page was full but it dropped rows after the `LIMIT` (expired
+//! NIP-40 kind-5s), deletions just above `since` could be skipped. That
+//! needs a page's worth of kind-5s carrying expiry tags.
 //! A sync cut off before it settles writes nothing. A failed `localStorage`
 //! write (quota, private mode) leaves the previous record, older marker
 //! included, so the next session re-fetches from there: slower, never wrong.
@@ -399,22 +408,34 @@ pub fn first_step(since: Option<u64>, rows: usize, oldest: Option<u64>) -> PageS
 
 /// After page `pages_done` (fetched with `until`, inclusive) reaches EOSE.
 ///
-/// `rows` counts every row the relay returned for that page, re-deliveries
-/// at the `until` boundary included, so a short page means the relay had no
-/// more. A full page whose oldest row is not older than `until` made no
-/// progress: more than a page shares one timestamp, and stepping past it
-/// would skip unseen rows, so the sync gives up instead.
+/// Termination is by progress, not by counting: the relay drops rows after
+/// its SQL `LIMIT` (NIP-40-expired events) and answers a failed query with an
+/// empty result and an EOSE, so a short page does not prove the relay had no
+/// more. `rows` counts every row delivered for the page, and `oldest` is the
+/// oldest `created_at` among them.
+///
+/// - No rows at all: the inclusive `until` boundary row should have come
+///   back, so the query failed or the row vanished. Give up.
+/// - No row older than `until`: nothing below the boundary is left, so the
+///   sync is complete. If such a page is full, though, more than a page
+///   shares the boundary timestamp and stepping past it would skip unseen
+///   rows. Give up.
+/// - Otherwise page on from the new oldest, up to [`MAX_PAGES`].
 pub fn next_page(rows: usize, oldest: Option<u64>, until: u64, pages_done: u32) -> PageStep {
-    if rows < RELAY_FILTER_LIMIT as usize {
-        return PageStep::Done;
+    let Some(oldest) = oldest.filter(|_| rows > 0) else {
+        return PageStep::GiveUp;
+    };
+    if oldest >= until {
+        return if rows >= RELAY_FILTER_LIMIT as usize {
+            PageStep::GiveUp
+        } else {
+            PageStep::Done
+        };
     }
     if pages_done >= MAX_PAGES {
         return PageStep::GiveUp;
     }
-    match oldest {
-        Some(o) if o < until => PageStep::Next { until: o },
-        _ => PageStep::GiveUp,
-    }
+    PageStep::Next { until: oldest }
 }
 
 /// What the caller must do after an EOSE.
@@ -445,9 +466,7 @@ enum Phase {
         rows: usize,
         oldest: Option<u64>,
     },
-    Settled {
-        advance: bool,
-    },
+    Settled,
 }
 
 impl Default for Phase {
@@ -518,11 +537,13 @@ impl DeletionProgress {
     }
 
     fn settle(&mut self, advance: bool, now: u64) -> EoseAction {
+        // A marked backfill with no kind-5 at all leaves the marker as it is
+        // (`next_marker` needs a delivery); that also covers a failed query.
         if advance {
             self.state.since = next_marker(self.state.since, self.newest_seen, now);
         }
         enforce_caps(&mut self.state);
-        self.phase = Phase::Settled { advance };
+        self.phase = Phase::Settled;
         EoseAction::Save
     }
 
@@ -554,7 +575,13 @@ impl DeletionProgress {
             }
             // The page chain settles the sync; a replayed EOSE changes nothing.
             Phase::Paging { .. } => EoseAction::Ignore,
-            Phase::Settled { advance } => self.settle(advance, now),
+            // Settled once: a replayed EOSE (AUTH, reconnect) saves the
+            // tombstones but never recomputes the marker from deliveries
+            // that were not part of the settled sync.
+            Phase::Settled => {
+                enforce_caps(&mut self.state);
+                EoseAction::Save
+            }
         }
     }
 
@@ -981,12 +1008,11 @@ mod tests {
 
     #[test]
     fn next_page_rules() {
-        assert_eq!(
-            next_page(LIMIT - 1, Some(1), 9, 1),
-            PageStep::Done,
-            "short page"
-        );
+        assert_eq!(next_page(3, Some(9), 9, 1), PageStep::Done, "boundary only");
         assert_eq!(next_page(LIMIT, Some(7), 9, 1), PageStep::Next { until: 7 });
+        // A short page with older rows is not proof of the end (post-LIMIT
+        // drops), so page on.
+        assert_eq!(next_page(10, Some(7), 9, 1), PageStep::Next { until: 7 });
         assert_eq!(
             next_page(LIMIT, Some(9), 9, 1),
             PageStep::GiveUp,
@@ -997,7 +1023,12 @@ mod tests {
             PageStep::GiveUp,
             "bound"
         );
-        assert_eq!(next_page(LIMIT, None, 9, 1), PageStep::GiveUp);
+        assert_eq!(
+            next_page(0, None, 9, 1),
+            PageStep::GiveUp,
+            "empty: failed query"
+        );
+        assert_eq!(next_page(0, Some(7), 9, 1), PageStep::GiveUp);
     }
 
     fn marked(since: u64) -> DeletionProgress {
@@ -1039,9 +1070,18 @@ mod tests {
         );
         // A stale EOSE for page 1 is ignored.
         assert_eq!(p.on_page_eose(1, NOW), EoseAction::Ignore);
-        // Page 2: short, so complete.
+        // Page 2: short but with older rows, so one more page.
         deliver(&mut p, 10, NOW - 9 * DAY, Source::Page(2));
-        assert_eq!(p.on_page_eose(2, NOW), EoseAction::Save);
+        assert_eq!(
+            p.on_page_eose(2, NOW),
+            EoseAction::Fetch {
+                until: NOW - 9 * DAY,
+                page: 3
+            }
+        );
+        // Page 3: only the boundary row comes back, so complete.
+        p.observe(NOW - 9 * DAY, &pk('a'), &[], true, NOW, Source::Page(3));
+        assert_eq!(p.on_page_eose(3, NOW), EoseAction::Save);
         let newest = NOW - 2 * DAY + LIMIT as u64 - 1;
         assert_eq!(p.state.since, Some(newest - DELETION_SINCE_MARGIN_SECS));
     }
@@ -1097,8 +1137,33 @@ mod tests {
         // Live deliveries on the main subscription, and a stale page.
         deliver(&mut p, LIMIT, NOW, Source::Main);
         deliver(&mut p, LIMIT, NOW - 3 * DAY, Source::Page(7));
-        deliver(&mut p, 3, NOW - 2 * DAY, Source::Page(1));
-        assert_eq!(p.on_page_eose(1, NOW), EoseAction::Save, "page 1 was short");
+        // Page 1 (until = NOW - DAY) brings back only boundary rows.
+        for _ in 0..3 {
+            p.observe(NOW - DAY, &pk('a'), &[], true, NOW, Source::Page(1));
+        }
+        assert_eq!(p.on_page_eose(1, NOW), EoseAction::Save);
+    }
+
+    #[test]
+    fn an_empty_page_gives_up_and_keeps_the_marker() {
+        let old = NOW - 40 * DAY;
+        let mut p = marked(old);
+        deliver(&mut p, LIMIT, NOW - DAY, Source::Main);
+        assert!(matches!(p.on_main_eose(NOW), EoseAction::Fetch { .. }));
+        assert_eq!(p.on_page_eose(1, NOW), EoseAction::Save);
+        assert_eq!(p.state.since, Some(old));
+    }
+
+    #[test]
+    fn a_marked_backfill_with_nothing_delivered_keeps_the_marker() {
+        let old = NOW - 40 * DAY;
+        let mut p = marked(old);
+        assert_eq!(p.on_main_eose(NOW), EoseAction::Save);
+        assert_eq!(p.state.since, Some(old));
+        // Live deliveries and a replayed EOSE do not move a settled marker.
+        p.observe(NOW, &pk('a'), &[], true, NOW, Source::Main);
+        assert_eq!(p.on_main_eose(NOW), EoseAction::Save);
+        assert_eq!(p.state.since, Some(old));
     }
 
     #[test]
