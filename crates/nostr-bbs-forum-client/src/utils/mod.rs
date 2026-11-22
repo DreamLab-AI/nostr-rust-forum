@@ -7,6 +7,7 @@ pub mod devices;
 pub mod freshness;
 pub mod governance_view;
 pub mod image_compress;
+pub mod lookup;
 pub mod paths;
 pub mod pod_client;
 pub mod push;

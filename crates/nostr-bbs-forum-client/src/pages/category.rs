@@ -42,6 +42,7 @@ use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::utils::capitalize;
+use crate::utils::lookup::{deadline_for, zone_is_gated, Lookup};
 use crate::utils::zone_theme::zone_accent_style_cfg;
 use wasm_bindgen_futures::spawn_local;
 
@@ -135,9 +136,26 @@ pub fn CategoryPage() -> impl IntoView {
         sections_for_zone(&chans, &category_slug(), &zones)
     });
 
-    // Loading is true while the store is still fetching AND no section resolved.
-    let store_loading = store.loading;
-    let loading = Memo::new(move |_| store_loading.get() && zone_sections.with(|s| s.is_empty()));
+    // Loading until a section shows up, the relay's channel-list EOSE says
+    // there are none, or the deadline passes. Not `store.loading`: that clears
+    // on the first EOSE, which before NIP-42 AUTH is an anonymous answer
+    // without a Hidden zone's sections, so "No sections yet" showed on a cold
+    // deep link before the authenticated replay had arrived.
+    // Re-armed per zone: the route component is reused across zones.
+    let deadline = deadline_for(category_slug);
+    let sections_lookup = Memo::new(move |_| {
+        let gated = zone_is_gated(&category_slug(), &load_zones());
+        Lookup::decide(
+            zone_sections.with(|s| !s.is_empty()),
+            store.channel_receipt.get().settles(gated),
+            deadline.get(),
+        )
+    });
+    let loading = Memo::new(move |_| sections_lookup.get().is_loading());
+    // Found, or authoritatively empty. A timeout is neither, so the
+    // "No sections exist" hint must not show for it.
+    let settled =
+        Memo::new(move |_| matches!(sections_lookup.get(), Lookup::Found | Lookup::NotFound));
 
     // -- New topic creation state --
     let show_new_topic = RwSignal::new(false);
@@ -340,8 +358,8 @@ pub fn CategoryPage() -> impl IntoView {
 
             // New Topic button + inline form. Discoverable on the page (not just
             // via direct URL): the trigger is always rendered for authed users
-            // once the store has finished loading.
-            <Show when=move || is_authed.get() && !loading.get()>
+            // once the zone's section list has settled.
+            <Show when=move || is_authed.get() && settled.get()>
                 <div class="mb-4">
                     <Show
                         when=move || !show_new_topic.get()
@@ -512,7 +530,18 @@ pub fn CategoryPage() -> impl IntoView {
                     };
                     let last_active = store.last_active.get();
 
-                    if secs.is_empty() {
+                    if secs.is_empty() && sections_lookup.get() == Lookup::TimedOut {
+                        // No receipt before the deadline: say so, rather than
+                        // claim the zone has no sections.
+                        view! {
+                            <div class="glass-card p-8 text-center">
+                                <h2 class="text-xl font-bold text-white mb-2">"Sections Unavailable"</h2>
+                                <p class="text-gray-400 text-sm">
+                                    "This zone's sections did not finish loading. Check your connection and try again."
+                                </p>
+                            </div>
+                        }.into_any()
+                    } else if secs.is_empty() {
                         let empty_icon: Box<dyn FnOnce() -> leptos::prelude::AnyView + Send> = Box::new(|| view! {
                             <svg class="w-7 h-7 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                                 <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" stroke-linecap="round" stroke-linejoin="round"/>
