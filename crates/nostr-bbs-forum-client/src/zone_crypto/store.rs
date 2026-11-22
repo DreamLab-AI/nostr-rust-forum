@@ -22,7 +22,7 @@ use nostr_bbs_core::NostrEvent;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
-use super::grant_backlog::{GrantBacklog, KeyPhase, WrapOutcome};
+use super::grant_backlog::{unwrap_failure_outcome, GrantBacklog, KeyPhase, WrapOutcome};
 use super::grant_ledger::{GrantKv, GrantLedger};
 use super::grant_paging::{
     grant_page_step, parse_marker, warm_marker, GrantScope, GrantStep, PageTally,
@@ -118,6 +118,8 @@ pub struct ZoneKeyStore {
     wrap_queue: StoredValue<std::collections::VecDeque<WrapJob>, LocalStorage>,
     /// Wraps being processed now.
     unwraps_active: StoredValue<usize>,
+    /// The grant sync's signer can refuse a decrypt (NIP-07).
+    signer_can_refuse: StoredValue<bool>,
     /// Wrap ids handed to the wrap handler this sign-in. Paging re-delivers
     /// the inclusive `until` boundary row, and a reconnect replays the
     /// long-lived subscriptions; neither should process a wrap twice.
@@ -184,6 +186,7 @@ impl ZoneKeyStore {
             markers_due: StoredValue::new(HashSet::new()),
             wrap_queue: StoredValue::new_local(std::collections::VecDeque::new()),
             unwraps_active: StoredValue::new(0),
+            signer_can_refuse: StoredValue::new(false),
             seen_wraps: StoredValue::new(HashSet::new()),
             device_epochs: RwSignal::new(HashMap::new()),
             session: StoredValue::new(Session::default()),
@@ -662,7 +665,16 @@ impl ZoneKeyStore {
     /// unwrapped at most once per device (ids remembered in IndexedDB), so
     /// ordinary DMs are not re-decrypted on every visit. Runs once per
     /// sign-in; `me` must be the identity the store has switched to.
-    pub fn start_grant_sync(&self, relay: &RelayConnection, signer: Rc<dyn Signer>, me: String) {
+    /// `signer_can_refuse` marks a signer whose decrypt can fail without the
+    /// wrap being unreadable (a NIP-07 extension); see
+    /// [`unwrap_failure_outcome`].
+    pub fn start_grant_sync(
+        &self,
+        relay: &RelayConnection,
+        signer: Rc<dyn Signer>,
+        me: String,
+        signer_can_refuse: bool,
+    ) {
         let Some(lease) = self.current_lease() else {
             return;
         };
@@ -673,6 +685,7 @@ impl ZoneKeyStore {
         }
         self.sync_for.set_value(Some(lease.clone()));
         self.grant_relay.set_value(Some(relay.clone()));
+        self.signer_can_refuse.set_value(signer_can_refuse);
         let _ = self.grant_backlog.try_set(Some((
             lease.owner().clone(),
             GrantBacklog::new(recipient_keys_enabled(), js_sys::Date::now()),
@@ -847,6 +860,10 @@ impl ZoneKeyStore {
                     return;
                 };
                 ctx.relay.unsubscribe(&id);
+                // Closed: `stop_grant_sync` need not CLOSE it again.
+                let _ = store
+                    .grant_subs
+                    .try_update_value(|v| v.retain(|s| s != &id));
                 let t = *tally.borrow();
                 store.after_page(&ctx, page, Some(until), t, boundary_retry);
             })
@@ -1038,9 +1055,15 @@ impl ZoneKeyStore {
             .is_some_and(|ipk| p_tags(wrap).any(|p| p == ipk));
         let (sealer, rumor) = match unwrap_inbox_then_identity(wrap, inbox_ref, signer).await {
             Ok(v) => v,
-            // Not for us to read (or the signer cannot NIP-44): leave it
-            // unmarked so a later session with a capable signer retries.
-            Err(_) => return WrapOutcome::Unreadable,
+            // Left unmarked so a later session with a capable signer
+            // retries. Whether it also holds this session's backfill marker
+            // depends on whether the failure can be transient.
+            Err(e) => {
+                return unwrap_failure_outcome(
+                    matches!(e, super::UnwrapError::Signer(_)),
+                    self.signer_can_refuse.get_value(),
+                );
+            }
         };
         match super::tickets::route(rumor.kind, super::tickets::zone_groups_enabled()) {
             super::tickets::Route::Grant => {}

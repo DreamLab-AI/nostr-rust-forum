@@ -757,30 +757,60 @@ pub async fn build_grant_wrap(
 pub async fn unwrap_any(
     gift: &NostrEvent,
     signer: &dyn Signer,
-) -> Result<(String, UnsignedEvent), String> {
+) -> Result<(String, UnsignedEvent), UnwrapError> {
+    let invalid = |m: &str| UnwrapError::Invalid(m.to_string());
+    let signer_failed = |m: &str| UnwrapError::Signer(m.to_string());
     if gift.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP {
-        return Err(format!("not a gift wrap (kind {})", gift.kind));
+        return Err(UnwrapError::Invalid(format!(
+            "not a gift wrap (kind {})",
+            gift.kind
+        )));
     }
-    verify_event_strict(gift).map_err(|_| "gift wrap id or signature does not verify")?;
+    verify_event_strict(gift).map_err(|_| invalid("gift wrap id or signature does not verify"))?;
     let seal_json = signer
         .nip44_decrypt(&gift.pubkey, &gift.content)
         .await
-        .map_err(|_| "gift wrap layer does not decrypt")?;
-    let seal: NostrEvent = serde_json::from_str(&seal_json).map_err(|_| "seal JSON malformed")?;
+        .map_err(|_| signer_failed("gift wrap layer does not decrypt"))?;
+    let seal: NostrEvent =
+        serde_json::from_str(&seal_json).map_err(|_| invalid("seal JSON malformed"))?;
     if seal.kind != SEAL_KIND {
-        return Err(format!("not a seal (kind {})", seal.kind));
+        return Err(UnwrapError::Invalid(format!(
+            "not a seal (kind {})",
+            seal.kind
+        )));
     }
-    verify_event_strict(&seal).map_err(|_| "seal id or signature does not verify")?;
+    verify_event_strict(&seal).map_err(|_| invalid("seal id or signature does not verify"))?;
     let rumor_json = signer
         .nip44_decrypt(&seal.pubkey, &seal.content)
         .await
-        .map_err(|_| "seal layer does not decrypt")?;
+        .map_err(|_| signer_failed("seal layer does not decrypt"))?;
     let rumor: UnsignedEvent =
-        serde_json::from_str(&rumor_json).map_err(|_| "rumor JSON malformed")?;
+        serde_json::from_str(&rumor_json).map_err(|_| invalid("rumor JSON malformed"))?;
     if rumor.pubkey != seal.pubkey {
-        return Err("rumor author does not match seal author".into());
+        return Err(invalid("rumor author does not match seal author"));
     }
     Ok((seal.pubkey, rumor))
+}
+
+/// Why a gift wrap could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnwrapError {
+    /// The wrap itself is not valid (wrong kind, bad id or signature,
+    /// malformed JSON, mismatched authors). Final whoever opens it.
+    Invalid(String),
+    /// The signer's NIP-44 decrypt failed. With a local key that is final
+    /// (the wrap was not encrypted to it); with a NIP-07 extension it may be
+    /// a refused prompt or an extension error, which the error type does not
+    /// distinguish (`auth::nip07` maps every failure to `DecryptionFailed`).
+    Signer(String),
+}
+
+impl std::fmt::Display for UnwrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnwrapError::Invalid(m) | UnwrapError::Signer(m) => f.write_str(m),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,7 +1085,11 @@ mod tests {
         let mut wrap = block_on(build_grant_wrap(&admin, member.public_key(), &key, 100)).unwrap();
         wrap.sig = "00".repeat(64);
         let err = block_on(unwrap_any(&wrap, &member)).unwrap_err();
-        assert!(err.contains("gift wrap id or signature"), "{err}");
+        assert!(matches!(err, UnwrapError::Invalid(_)), "{err}");
+        assert!(
+            err.to_string().contains("gift wrap id or signature"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1080,7 +1114,10 @@ mod tests {
         .unwrap();
         let wrap = nostr_bbs_core::gift_wrap::wrap_seal(&seal, member.public_key()).unwrap();
         let err = block_on(unwrap_any(&wrap, &member)).unwrap_err();
-        assert!(!err.contains(canary), "error echoed decrypted bytes: {err}");
+        assert!(
+            !err.to_string().contains(canary),
+            "error echoed decrypted bytes: {err}"
+        );
     }
 
     #[test]

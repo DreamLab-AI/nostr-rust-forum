@@ -73,6 +73,22 @@ pub enum WrapOutcome {
     Retry,
 }
 
+/// Classify a wrap that could not be opened. An invalid wrap is final for
+/// anyone. A signer-level decrypt failure is final with a local key (the
+/// wrap was not encrypted to it), but with a signer that can refuse (a
+/// NIP-07 extension: a denied prompt, a locked or erroring extension) it is
+/// worth a retry, and must hold the backfill marker: classing it as
+/// unreadable would let the next session's warm stop skip an old grant
+/// whose decrypt was merely refused. The NIP-07 error type does not tell a
+/// refusal from a genuine decrypt failure, so it errs towards retrying.
+pub fn unwrap_failure_outcome(signer_failed: bool, signer_can_refuse: bool) -> WrapOutcome {
+    if signer_failed && signer_can_refuse {
+        WrapOutcome::Retry
+    } else {
+        WrapOutcome::Unreadable
+    }
+}
+
 /// The inbox-key grant subscription's part in the backlog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InboxSub {
@@ -432,5 +448,26 @@ mod tests {
         b.wrap_done(1_000.0, WrapOutcome::Unreadable);
         b.identity_eose(2_000.0);
         assert!(b.marker_writable());
+    }
+
+    #[test]
+    fn invalid_wraps_are_unreadable_for_any_signer() {
+        assert_eq!(
+            unwrap_failure_outcome(false, false),
+            WrapOutcome::Unreadable
+        );
+        assert_eq!(unwrap_failure_outcome(false, true), WrapOutcome::Unreadable);
+    }
+
+    #[test]
+    fn a_local_key_decrypt_failure_is_unreadable() {
+        assert_eq!(unwrap_failure_outcome(true, false), WrapOutcome::Unreadable);
+    }
+
+    /// A refused or failed NIP-07 decrypt (indistinguishable by error type)
+    /// is retried and holds the marker, so an old grant is not skipped.
+    #[test]
+    fn a_nip07_decrypt_failure_is_retried() {
+        assert_eq!(unwrap_failure_outcome(true, true), WrapOutcome::Retry);
     }
 }

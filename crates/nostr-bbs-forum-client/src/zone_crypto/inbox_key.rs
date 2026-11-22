@@ -505,7 +505,7 @@ pub async fn unwrap_inbox_then_identity(
     wrap: &NostrEvent,
     inbox: Option<&dyn Signer>,
     identity: &dyn Signer,
-) -> Result<(String, UnsignedEvent), String> {
+) -> Result<(String, UnsignedEvent), super::UnwrapError> {
     if let Some(inbox) = inbox {
         if let Ok(v) = super::unwrap_any(wrap, inbox).await {
             return Ok(v);
