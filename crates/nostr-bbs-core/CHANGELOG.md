@@ -6,6 +6,8 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 
 ## [Unreleased]
 
+## [1.0.0-beta.20] — 2026-11-22
+
 ### Added (wider-Nostr interop, from feat/upgrade-phase-0-1)
 
 - `gift_wrap_rumor_with_signer` and `gift_wrap_rumor_pair_with_signer`: wrap a caller-built
