@@ -325,6 +325,8 @@ pub fn App() -> impl IntoView {
     provide_notifications();
     crate::stores::notifications::provide_notification_store();
     provide_bookmarks();
+    // Drafts are now per identity; drafts from before cannot be attributed.
+    crate::components::draft_indicator::drop_legacy_drafts();
     provide_name_cache();
     provide_profile_cache();
     provide_profile_modal_target();
@@ -785,8 +787,9 @@ pub fn App() -> impl IntoView {
     }
 
     // Zone-key grants (ADR-2016): once the relay session is NIP-42
-    // authenticated (kind-1059 REQs are AUTH-gated), pull grants out of the
-    // member's gift wraps. Idempotent; starts once per page load.
+    // authenticated (kind-1059 REQs are AUTH-gated) and the member's stored
+    // keys are loaded, pull grants out of the member's gift wraps. Idempotent;
+    // starts once per sign-in (the store stops it at sign-out).
     {
         let relay_authed = relay.authenticated();
         let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
@@ -807,29 +810,35 @@ pub fn App() -> impl IntoView {
             ) else {
                 return;
             };
+            if !store.ready_for(Some(&me)) {
+                return;
+            }
             store.start_grant_sync(&relay_for_keys, signer, me);
         });
     }
 
-    // Zone-key sweep (ADR-2016 follow-on): once per page load, an admin's
+    // Zone-key sweep (ADR-2016 follow-on): once per identity per page load, an admin's
     // browser grants each zone key it holds to every eligible member it has
     // no record of granting — members who joined by invite or auto-approve,
     // or were allocated from a device without the key. Waits for the relay
-    // session, the admin flag and this device's stored keys.
+    // session, the admin flag and the admin's stored keys.
     if let Some(auto_grant) = crate::zone_crypto::auto_grant::AutoGrant::capture() {
         let relay_authed = relay.authenticated();
         let access = use_zone_access();
         let keys_loaded = auto_grant.keys_loaded();
-        let swept = StoredValue::new(false);
+        let auth_for_sweep = use_auth();
+        let swept_for: StoredValue<Option<String>> = StoredValue::new(None);
         Effect::new(move |_| {
-            if swept.get_value()
+            let me = auth_for_sweep.pubkey().get();
+            if me.is_none()
+                || swept_for.get_value() == me
                 || !relay_authed.get()
                 || !access.is_admin.get()
                 || !keys_loaded.get()
             {
                 return;
             }
-            swept.set_value(true);
+            swept_for.set_value(me);
             auto_grant.sweep();
         });
     }

@@ -186,9 +186,19 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
     // late joiner can read older messages. On by default; the admin can opt out.
     let include_history = RwSignal::new(true);
 
-    let latest = move || zone.with_value(|z| keys.latest_tracked(&z.id));
+    let me = move || auth.pubkey().get().unwrap_or_default();
+    // The signed-in identity's keys, once loaded for that identity: never the
+    // previous account's, even in the moment before the store switches.
+    let keys_ready = move || keys.ready_for(auth.pubkey().get().as_deref());
+    let latest = move || {
+        if !keys_ready() {
+            return None;
+        }
+        zone.with_value(|z| keys.latest_tracked(&z.id))
+    };
     // Create and Rotate pick their epoch with `keyset::plan_mint`: never a
-    // second key for an epoch in use, and no single post can block them.
+    // second key for an epoch in use or held by another account on this
+    // browser, and no single post can block them.
     let channels = crate::stores::channels::use_channel_store();
     let mint_plan = move || {
         let zone_id = zone.with_value(|z| z.id.clone());
@@ -202,8 +212,14 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 .flat_map(|(_, epochs)| epochs.iter().map(|(e, id)| (*e, id.clone())))
                 .collect::<Vec<_>>()
         });
-        let ready = channels.msg_eose_received.get() && keys.hydrated.get();
-        crate::zone_crypto::keyset::plan_mint(latest().map(|k| k.epoch), &seen, ready)
+        let ready = channels.msg_eose_received.get() && keys_ready();
+        crate::zone_crypto::keyset::plan_mint(
+            &zone_id,
+            latest().map(|k| k.epoch),
+            &keys.device_epochs_for(&zone_id),
+            &seen,
+            ready,
+        )
     };
     let mint_waiting = move || {
         !matches!(
@@ -236,8 +252,6 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             sent.set(s);
         });
     });
-
-    let me = move || auth.pubkey().get().unwrap_or_default();
 
     // Grants and rotations go to whoever the roster says is in the zone, so
     // re-read it from the relay right before sending. An admin tab left open
@@ -357,6 +371,9 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 return;
             }
             let awaiting = Rc::new(RefCell::new(awaiting));
+            // The identity sending: its pending key is settled even if the
+            // acks land after it signed out.
+            let sender = me_pk.clone();
             if plan.iter().all(|(_, r)| r.is_empty()) {
                 status.set(Some("Everyone eligible already has this key.".into()));
                 return;
@@ -394,7 +411,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                     };
                     if done {
                         awaiting.borrow_mut().remove(&id);
-                        keys.mark_delivered(&key.zone, key.epoch, &key.pubkey);
+                        keys.mark_delivered(&sender, &key.zone, key.epoch, &key.pubkey);
                     }
                 });
                 let report = send_grants(keys, &relay, &*signer, plan, on_recorded).await;
@@ -412,15 +429,26 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         let grant = grant.clone();
         let fresh_roster = fresh_roster.clone();
         move |rotate: bool| {
+            let plan = mint_plan();
             let crate::zone_crypto::keyset::MintPlan::Mint {
                 epoch: next_epoch, ..
-            } = mint_plan()
+            } = plan
             else {
                 status.set(Some(
                     "A key cannot be created yet: see the note on this card.".into(),
                 ));
                 return;
             };
+            // Planned below an epoch the zone's posts use: never mint that
+            // silently, it may not take effect for members on the higher one.
+            if let Some(ask) = crate::zone_crypto::keyset::mint_confirmation(&plan) {
+                let ok = web_sys::window()
+                    .and_then(|w| w.confirm_with_message(&ask).ok())
+                    .unwrap_or(false);
+                if !ok {
+                    return;
+                }
+            }
             if rotate {
                 let ok = web_sys::window()
                     .and_then(|w| {
