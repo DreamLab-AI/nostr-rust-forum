@@ -217,7 +217,8 @@ from ban-gating because the recipient-whitelist gate already bounds them
 7. **A member's kind-5 is accepted only when the relay can vouch for every `e` target**
    (`member_deletion_gate`); a target with no stored row never counts as the signer's own, and a
    sealed original is never a member's to delete (ADR-2033). Every client folds every `e` tag of a
-   stored kind-5, so this gate is the only author check.
+   stored kind-5 into a tombstone on an ordinary post with no author check, so for ordinary posts this gate is the only one;
+   only a restored sealed original is also checked client-side (`stores/tombstones.rs:114`).
 8. **A deep-linked page never reports absence from `ChannelStore::loading`**, only from an
    authenticated receipt or the deadline (ADR-2034).
 

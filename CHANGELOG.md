@@ -73,8 +73,9 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
   complete. A backfill that hits the 1,000-row cap pages downwards on `until`, up to 20 pages, and keeps the old marker
   if it gives up. A device with no marker behaves as before.
 - **Tombstones are `(id, deleter)`** (#93): a restored sealed original is hidden only by a kind-5 from its inner author
-  or from a pubkey the relay vouches for as admin (`GET /api/check-whitelist`, `isAdmin`); every other tombstone hides
-  nothing. The client cannot identify TL3 moderators, so a moderator's deletion of a sealed original takes effect through
+  or from a pubkey the relay vouches for as admin (`GET /api/check-whitelist`, `isAdmin`); any other tombstone on a
+  restored sealed original hides nothing. A tombstone on an ordinary post counts whoever its deleter is, because the relay
+  gated that deletion. The client cannot identify TL3 moderators, so a moderator's deletion of a sealed original takes effect through
   the relay deleting the envelope (#94), not through the client.
 - **Persisted across sessions** (#93): only tombstones on restored sealed originals, in a `sealed` set (honoured
   deleters) and a `held` set (not yet resolved), with per-deleter and global fair-share caps.

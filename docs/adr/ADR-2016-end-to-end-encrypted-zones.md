@@ -212,10 +212,11 @@ how zone keys are keyed. This section adds what the paragraph does not say. `imp
   remain visible to every account on the browser; nothing on the device records which account received them. Keys load
   after sign-in, not at boot, so the first encrypted messages of a cold load can show placeholders briefly.
 
-Verification at `3c48e26`, by reading code; no cargo test or build was run. `grep -n "pub fn plan_mint\|pub fn
-mint_confirmation\|MintPlan::Blocked(format" crates/nostr-bbs-forum-client/src/zone_crypto/keyset.rs` returns `:169`,
-`:271`, `:220`, `:226`. `grep -n "pub fn draft_key\|pub fn drop_legacy_drafts" .../components/draft_indicator.rs` returns
-`:49`, `:84`. `grep -n "fn bookmarks_key\|fn redact_legacy" .../components/bookmarks_modal.rs` returns `:38`, `:57`.
-`grep -n "fn post_body\|fn redact_legacy_preview\|const LEGACY_POST_BODY" .../stores/notifications.rs` returns `:106`,
-`:1340`, `:100`. CI run 45056144222 on that commit concluded `success`. Not exercised in a browser: the PR thread records
-that the live test follows the repin.
+Verification at `3c48e26`, by reading code; no cargo test or build was run. Commands run from the repository root:
+`grep -n "pub fn plan_mint\|pub fn mint_confirmation\|MintPlan::Blocked(format" crates/nostr-bbs-forum-client/src/zone_crypto/keyset.rs` returned `:169`,
+`:220`, `:226`, `:271`; `grep -n "pub fn mint_decision" crates/nostr-bbs-forum-client/src/zone_crypto/key_owner.rs` returned `:131`;
+`grep -n "pub fn draft_key\|pub fn drop_legacy_drafts" crates/nostr-bbs-forum-client/src/components/draft_indicator.rs` returned `:49`, `:84`, and
+`grep -n "drop_legacy_drafts" crates/nostr-bbs-forum-client/src/app.rs` returned `:329`; `grep -n "fn bookmarks_key\|fn redact_legacy" crates/nostr-bbs-forum-client/src/components/bookmarks_modal.rs`
+returned `:38`, `:57`; `grep -n "fn post_body\|fn redact_legacy_preview\|const LEGACY_POST_BODY" crates/nostr-bbs-forum-client/src/stores/notifications.rs`
+returned `:100`, `:106`, `:1340`. CI run 45056144222 on that commit concluded `success` (its test step is
+`.github/workflows/ci.yml:113`). Not exercised in a browser: the thread of PR 92 records that the live test follows the repin.

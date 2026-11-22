@@ -19,7 +19,7 @@ Names: wrangler resolves `nostr-bbs-relay` only from a config that declares it (
   - `nip09_plain_addresses_rekeyed`: moves address tombstones for plain replaceable kinds (0, 3, 10000 to 19999) onto an
     empty d-tag. Only rows written by an earlier build of this feature have anything to move.
 - Check: `SELECT key, value FROM settings WHERE key LIKE 'nip09_%';` should return both keys, and `SELECT count(*) FROM
-  deleted_events;` should be non-zero if the relay holds any kind-5. A missing key means that job has not completed: a
+  deleted_events;` should be non-zero if the relay holds any kind-5 with an `e` tag of 64 lowercase hex (the backfill reads no other). A missing key means that job has not completed: a
   failing statement logs `ensure_schema: ... failed` and the job is retried on the next cold isolate, and nothing is lost
   meanwhile except the re-insert refusal. Ingest keeps working if the tables or the lookup fail.
 

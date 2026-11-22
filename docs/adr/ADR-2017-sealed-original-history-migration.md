@@ -255,6 +255,9 @@ around it. `verified_commit` above is not re-asserted; the points below were rea
   exists; clients fold a kind-5 through `tombstones::fold_deletion` (`stores/tombstones.rs:164`), which records
   `(id, deleter)` and honours a restored sealed original's tombstone only from its author or a relay-vouched admin. The
   reason the purge uses no kind-5 is unchanged: a kind-5 naming the id still hides the id the restored original carries.
-- Verified by `grep -rn "fn fold_deletions" crates` (no match), `grep -n "fn fold_deletion" crates/nostr-bbs-forum-client/src/stores/tombstones.rs`
-  (`:164`) and `grep -n "delete_sealed_envelopes" crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` (`:3404`,
-  `:3630`).
+- Verified at `3c48e26`, reading code only, by: `grep -rn "fn fold_deletions" crates | wc -l` (returned `0`);
+  `grep -n "fn fold_deletion" crates/nostr-bbs-forum-client/src/stores/tombstones.rs` (`:164`);
+  `grep -n "delete_sealed_envelopes" crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` (`:3404`, `:3630`); and
+  `grep -n "tombstone_before_delete" crates/nostr-bbs-relay-worker/src/admin_events.rs` (`:279`).
+  Two relay comments still say `fold_deletions` (`admin_events.rs:18`, `nip_handlers.rs:2942`); they were left alone because
+  the change that wrote this section changed no code.

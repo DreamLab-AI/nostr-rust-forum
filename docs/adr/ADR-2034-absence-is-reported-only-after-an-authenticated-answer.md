@@ -14,7 +14,7 @@ review_trigger: the zone-key wait on cold deep links landing (branch fix/cold-li
 repo: nostr-rust-forum
 domain: BASELINE-architecture.md
 evidence_class: source+ci
-acceptance_boundary: Established at 3c48e26 - the receipt logic and the page decisions exist as described (read by line) and the CI run for that commit concluded success. Not established - any browser run; the PR thread for #91 records that none had been made. implementation_status is partial because the operator observed on 2026-11-22 that in an encrypted zone a cold link can still show "Topic Not Found" for about 12 to 29 seconds before correcting itself; this ADR's rule does not yet cover the wait for zone keys.
+acceptance_boundary: Established at 3c48e26 - the receipt logic and the page decisions exist as described (read by line) and the CI run for that commit concluded success. Not established - any browser run; the thread of PR 91 records that none had been made. implementation_status is partial because the operator observed on 2026-11-22 that in an encrypted zone a cold link can still show "Topic Not Found" for about 12 to 29 seconds before correcting itself; this ADR's rule does not yet cover the wait for zone keys.
 ---
 
 # ADR-2034 — A deep-linked page reports "not found" only after an authenticated answer from the relay
@@ -68,11 +68,11 @@ discarded (`wire_id`, `:158`), so an answer is never credited to a REQ sent afte
 
 ## Verification
 
-Run in the worktree at `3c48e26`, reading code only; no cargo test or build was run.
+Run from the repository root of the worktree at `3c48e26`, reading code only; no cargo test or build was run.
 
-- `grep -n "pub fn settles\|pub fn decide\|pub const LOOKUP_DEADLINE_MS" crates/nostr-bbs-forum-client/src/utils/lookup.rs` returns `:62`, `:91`, `:37`.
-- `grep -n "pub const AUTH_RETRY_LIMIT\|REQ_ANSWER_TIMEOUT_MS\|REQ_RESEND_LIMIT\|AUTH_SIGN_TIMEOUT_MS\|AUTH_ANSWER_TIMEOUT_MS\|pub struct ReqLedger\|pub fn wire_id" crates/nostr-bbs-forum-client/src/relay/receipt.rs` returns the constants at `:42`, `:50`, `:55`, `:60`, `:67`, the ledger at `:71` and `wire_id` at `:158`.
-- `grep -n "Lookup::decide" crates/nostr-bbs-forum-client/src/pages/{thread,section,category}.rs` shows the three pages deciding from `settles(gated)` and the deadline; `thread.rs:638-655` has no zone-key input. `grep -n "Unavailable" crates/nostr-bbs-forum-client/src/pages/{thread,section,category}.rs` returns the messages at `thread.rs:1188`, `section.rs:574`, `:578`, `category.rs:538`.
-- `grep -n "subscription_cap_reached\|subscriptions.insert\|wrap_read_set(&session_pubkey)" crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` returns `:52`, `:1862`, `:1907`, and the `.insert(sub_id.to_string()` at `:1931`.
-- The line `crates/nostr-bbs-forum-client/src/relay.rs:507-536` flushes `pending_messages` on connect before the AUTH exchange; the comment at `:1021-1023` says so.
-- CI: run 45056144222, conclusion `success`, for `3c48e2656d7cabefa894a59b827f5f0d3a8b32b7`.
+- `grep -n "pub fn settles\|pub fn decide\|pub const LOOKUP_DEADLINE_MS" crates/nostr-bbs-forum-client/src/utils/lookup.rs` returned `:37`, `:62`, `:91`.
+- `grep -n "pub const AUTH_RETRY_LIMIT\|pub const REQ_ANSWER_TIMEOUT_MS\|pub const REQ_RESEND_LIMIT\|pub const AUTH_SIGN_TIMEOUT_MS\|pub const AUTH_ANSWER_TIMEOUT_MS\|pub struct ReqLedger\|pub fn wire_id" crates/nostr-bbs-forum-client/src/relay/receipt.rs` returned `:42`, `:50`, `:55`, `:60`, `:67`, `:71`, `:158`.
+- `grep -n "Lookup::decide" crates/nostr-bbs-forum-client/src/pages/thread.rs crates/nostr-bbs-forum-client/src/pages/section.rs crates/nostr-bbs-forum-client/src/pages/category.rs` returned `thread.rs:642`, `:649`, `section.rs:305`, `:315`, `category.rs:148`; the `Memo` at `thread.rs:638-655` takes the channel, `history_receipt` and the deadline, and no zone-key input. `grep -n "Unavailable\"" ...` over the same three files returned `thread.rs:1188`, `section.rs:574`, `:578`, `category.rs:538`.
+- `grep -n "subscription_cap_reached\|\.insert(sub_id.to_string()\|wrap_read_set(&session_pubkey)" crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` returned `:52` (definition), `:1862` (check), `:1907` (the await), `:1931` (insert), `:2787`, and tests at `:7666-7677`.
+- `sed -n 507,512p crates/nostr-bbs-forum-client/src/relay.rs` shows `pending_messages` drained on connect, and `sed -n 1021,1024p crates/nostr-bbs-forum-client/src/relay.rs` shows the comment that a closed socket's queue "is flushed on reconnect BEFORE the next AUTH".
+- CI: `.github/workflows/ci.yml:113` runs `cargo test --workspace --all-targets --all-features`; run 45056144222 for `3c48e2656d7cabefa894a59b827f5f0d3a8b32b7` concluded `success` (not inspected beyond that).
