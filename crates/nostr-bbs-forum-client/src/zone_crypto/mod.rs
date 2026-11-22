@@ -75,6 +75,7 @@
 pub mod auto_grant;
 pub mod grant_backlog;
 pub mod grant_ledger;
+pub mod grant_paging;
 pub mod inbox_key;
 pub mod key_owner;
 pub mod keyset;

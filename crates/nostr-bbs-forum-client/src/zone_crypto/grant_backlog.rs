@@ -8,8 +8,9 @@
 //! post under a placeholder) are still waiting to be decrypted, so a page
 //! must not yet conclude that a topic is absent.
 //!
-//! The backlog is through when every grant subscription has reached the end
-//! of stored events (EOSE) and every wrap received so far has finished
+//! The backlog is through when every grant subscription has delivered all
+//! its stored events (its last page reached EOSE, see
+//! [`super::grant_paging`]) and every wrap received so far has finished
 //! processing. Once through, it stays through for the sign-in (it is
 //! latched): a live DM or a reconnect retry arriving later is processed as
 //! usual, and a key it carries still re-decrypts the screen, but it does not
@@ -84,6 +85,9 @@ pub struct GrantBacklog {
     started_at: f64,
     /// When the backlog last advanced (epoch ms).
     last_progress_at: f64,
+    /// A scope's paging hit its bound or made no progress: some stored
+    /// wraps were never delivered, so the backlog can never honestly settle.
+    gave_up: bool,
     /// Reached settled once this sign-in; stays settled.
     latched: bool,
 }
@@ -102,6 +106,7 @@ impl GrantBacklog {
             in_flight: 0,
             started_at: now,
             last_progress_at: now,
+            gave_up: false,
             latched: false,
         }
     }
@@ -119,7 +124,8 @@ impl GrantBacklog {
         self.advance(now);
     }
 
-    /// The identity subscription reached EOSE at `now`.
+    /// The identity scope's last page reached EOSE at `now`: every stored
+    /// wrap addressed to the identity has been delivered.
     pub fn identity_eose(&mut self, now: f64) {
         self.identity_eose = true;
         self.advance(now);
@@ -131,7 +137,7 @@ impl GrantBacklog {
         self.advance(now);
     }
 
-    /// The inbox-key subscription reached EOSE at `now`.
+    /// The inbox scope's last page reached EOSE at `now`.
     pub fn inbox_eose(&mut self, now: f64) {
         self.inbox = InboxSub::Open { eose: true };
         self.advance(now);
@@ -140,6 +146,14 @@ impl GrantBacklog {
     /// The inbox key could not be set up (at `now`).
     pub fn inbox_failed(&mut self, now: f64) {
         self.inbox = InboxSub::Failed;
+        self.advance(now);
+    }
+
+    /// A scope's paging gave up (bound hit, or a page made no progress) at
+    /// `now`. The backlog then reads as stalled: a page waiting on a key
+    /// shows the keys-timed-out copy, never "not found".
+    pub fn paging_gave_up(&mut self, now: f64) {
+        self.gave_up = true;
         self.advance(now);
     }
 
@@ -155,7 +169,7 @@ impl GrantBacklog {
             self.inbox,
             InboxSub::NotUsed | InboxSub::Failed | InboxSub::Open { eose: true }
         );
-        self.identity_eose && inbox_done && self.in_flight == 0
+        !self.gave_up && self.identity_eose && inbox_done && self.in_flight == 0
     }
 
     /// Where the backlog stands at `now`: settled, still advancing (within
@@ -164,6 +178,9 @@ impl GrantBacklog {
     pub fn phase(&self, now: f64) -> KeyPhase {
         if self.settled() {
             return KeyPhase::Settled;
+        }
+        if self.gave_up {
+            return KeyPhase::Stalled;
         }
         let stall_at = self.last_progress_at + KEYS_STALL_MS;
         let cap_at = self.started_at + KEYS_CAP_MS;
@@ -335,5 +352,17 @@ mod tests {
         assert_eq!(b.phase(10.0 * KEYS_CAP_MS), KeyPhase::Settled);
         b.wrap_done(2_000.0);
         assert!(b.settled());
+    }
+
+    #[test]
+    fn paging_that_gave_up_never_settles() {
+        let mut b = GrantBacklog::new(false, 0.0);
+        b.paging_gave_up(1_000.0);
+        assert!(!b.settled());
+        assert_eq!(b.phase(1_001.0), KeyPhase::Stalled);
+        // Even if the other conditions are later met.
+        b.identity_eose(2_000.0);
+        assert!(!b.settled());
+        assert_eq!(b.phase(2_001.0), KeyPhase::Stalled);
     }
 }
