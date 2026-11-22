@@ -1303,16 +1303,13 @@ impl NostrRelayDO {
                 return;
             }
 
-            // kind-5 (deletion): own events always allowed; others' events require TL3+
-            if event.kind == 5 {
-                let targets_others = self.deletion_targets_others(&event).await;
-                if targets_others && trust_level < TrustLevel::Trusted {
-                    Self::send_ok(
-                        ws,
-                        &event.id,
-                        false,
-                        "restricted: TL3+ required to delete others' events",
-                    );
+            // kind-5 (deletion): below TL3, every `e` target must be the
+            // signer's own stored event (or a wrap to their recipient key, or a
+            // sealed original the client will author-check); TL3+ may delete
+            // anyone's, so the lookup is skipped for them altogether.
+            if event.kind == 5 && trust_level < TrustLevel::Trusted {
+                if let Some(reason) = self.member_deletion_gate(&event).await {
+                    Self::send_ok(ws, &event.id, false, reason);
                     return;
                 }
             }
@@ -2924,10 +2921,423 @@ mod a_ref_target_tests {
 }
 
 // ---------------------------------------------------------------------------
+// NIP-09: the member kind-5 gate — pure decisions
+// ---------------------------------------------------------------------------
+//
+// Every forum client folds EVERY `e` tag of a stored or broadcast kind-5 into
+// its tombstones with no author check (forum-client `stores/channels.rs`
+// `fold_deletions`): it trusts this gate to have decided who may delete what.
+// So for a member (no delete-any privilege) the gate must vouch for each `e`
+// tag before the kind-5 is accepted. Ignoring a bad tag relay-side and
+// accepting the rest is not an option: the event is signed, the relay cannot
+// strip a tag, and clients would still hide the id. A kind-5 with any target
+// the member cannot be shown to own is therefore refused whole.
+
+/// Refusal for a member's kind-5 naming another author's stored event.
+pub(crate) const DELETE_OTHERS_REFUSAL: &str = "restricted: TL3+ required to delete others' events";
+
+/// Refusal for a member's kind-5 naming an id this relay holds no event for
+/// (and no sealed envelope wraps). Pre-emptive deletion of an id not yet
+/// stored is given up: the relay cannot tell the signer's future event from
+/// someone else's purged or sealed one.
+pub(crate) const DELETE_UNKNOWN_REFUSAL: &str =
+    "restricted: deletion names an event this relay does not hold";
+
+/// Refusal when the targets could not be checked. The gate fails closed: an
+/// unchecked kind-5 would be broadcast and folded by every client.
+pub(crate) const DELETE_LOOKUP_REFUSAL: &str = "error: could not check deletion targets, try again";
+
+/// The distinct `e` targets of a kind-5, in tag order.
+pub(crate) fn deletion_e_targets(event: &NostrEvent) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for t in &event.tags {
+        if t.len() >= 2 && t[0] == "e" && !out.contains(&t[1].as_str()) {
+            out.push(t[1].as_str());
+        }
+    }
+    out
+}
+
+/// Whether `id` is in the form the relay stores ids: 64 lowercase hex.
+///
+/// Clients lowercase `e` values before folding, while D1 compares exactly, so
+/// an uppercase rendering of someone else's id would find no row yet still
+/// hide the event on every client. Anything non-canonical is unknown.
+pub(crate) fn is_canonical_event_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// One row of [`crate::DELETION_TARGETS_CLASSIFY_SQL`]: a target that is not
+/// a stored event of the signer's.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub(crate) struct DeletionTargetRow {
+    /// The `e` target as named.
+    pub target: String,
+    /// The stored row's author, `None` when there is no row.
+    pub pubkey: Option<String>,
+    /// The stored row's kind, `None` when there is no row.
+    pub kind: Option<f64>,
+    /// The stored row's tags JSON, returned for kind 1059 only.
+    pub tags: Option<String>,
+    /// Non-zero when there is no row and a stored kind-42 envelope's `sealed`
+    /// tag names the target.
+    pub sealed: f64,
+}
+
+/// How a member's target that is not their own stored event stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberTarget<'a> {
+    /// Another author's stored event: refused, unless it is a gift wrap
+    /// addressed to one of the signer's recipient keys.
+    Foreign {
+        /// The stored kind.
+        kind: u64,
+        /// The stored tags JSON (kind 1059 only).
+        tags: Option<&'a str>,
+    },
+    /// No row, but a sealed envelope wraps it (ADR-2017). Accepted: the
+    /// original's author is inside the ciphertext, so only a zone-key holder
+    /// (the client) can match it against the kind-5's signer.
+    SealedOriginal,
+    /// No row and no envelope: refused.
+    Unknown,
+}
+
+/// Classify one row. A stored row is judged by its author before any sealed
+/// flag is read, so a sealed value cannot launder another author's event.
+pub(crate) fn classify_member_target(row: &DeletionTargetRow) -> MemberTarget<'_> {
+    match (row.pubkey.as_deref(), row.kind) {
+        (Some(_), Some(kind)) => MemberTarget::Foreign {
+            kind: kind as u64,
+            tags: row.tags.as_deref(),
+        },
+        // A row without a kind cannot exist (`kind` is NOT NULL); treat the
+        // impossible shape as the refusal, never as an acceptance.
+        (Some(_), None) => MemberTarget::Unknown,
+        (None, _) if row.sealed != 0.0 => MemberTarget::SealedOriginal,
+        (None, _) => MemberTarget::Unknown,
+    }
+}
+
+/// Whether deciding `targets` needs the signer's recipient-key set: some
+/// foreign target is a gift wrap.
+pub(crate) fn needs_recipient_set(targets: &[MemberTarget<'_>]) -> bool {
+    targets
+        .iter()
+        .any(|t| matches!(t, MemberTarget::Foreign { kind, .. } if *kind == GIFT_WRAP_KIND))
+}
+
+/// The member gate's verdict over every target that is not the signer's own
+/// stored event (own rows never reach here). `own_keys` is the signer's
+/// recipient-key set, `None` when the feature is off or the lookup failed, in
+/// which case no foreign wrap counts as theirs.
+///
+/// A foreign target is reported before an unknown one, so a kind-5 that names
+/// another member's stored post keeps the message it always had.
+pub(crate) fn member_deletion_refusal(
+    targets: &[MemberTarget<'_>],
+    own_keys: Option<&[String]>,
+) -> Option<&'static str> {
+    let foreign = targets.iter().any(|t| match *t {
+        MemberTarget::Foreign { kind, tags } => !matches!(
+            (own_keys, tags),
+            (Some(set), Some(tags)) if crate::recipient_keys::wrap_addressed_to(kind, tags, set)
+        ),
+        _ => false,
+    });
+    if foreign {
+        return Some(DELETE_OTHERS_REFUSAL);
+    }
+    targets
+        .contains(&MemberTarget::Unknown)
+        .then_some(DELETE_UNKNOWN_REFUSAL)
+}
+
+#[cfg(test)]
+mod member_deletion_gate_tests {
+    use super::*;
+
+    const ME: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const THEM: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const INBOX: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn kind5(tags: Vec<Vec<&str>>) -> NostrEvent {
+        NostrEvent {
+            id: "0".repeat(64),
+            pubkey: ME.into(),
+            created_at: 1_700_000_000,
+            kind: 5,
+            tags: tags
+                .into_iter()
+                .map(|t| t.into_iter().map(String::from).collect())
+                .collect(),
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    fn row(
+        pubkey: Option<&str>,
+        kind: Option<f64>,
+        tags: Option<&str>,
+        sealed: bool,
+    ) -> DeletionTargetRow {
+        DeletionTargetRow {
+            target: "1".repeat(64),
+            pubkey: pubkey.map(String::from),
+            kind,
+            tags: tags.map(String::from),
+            sealed: if sealed { 1.0 } else { 0.0 },
+        }
+    }
+
+    #[test]
+    fn e_targets_are_distinct_and_ignore_other_tags() {
+        let a = "1".repeat(64);
+        let b = "2".repeat(64);
+        let ev = kind5(vec![
+            vec!["e", &a],
+            vec!["a", "30023:x:y"],
+            vec!["e", &b],
+            vec!["e", &a],
+            vec!["e"],
+            vec!["p", &b],
+        ]);
+        assert_eq!(deletion_e_targets(&ev), vec![a.as_str(), b.as_str()]);
+        assert!(deletion_e_targets(&kind5(vec![vec!["a", "0:x:"]])).is_empty());
+    }
+
+    #[test]
+    fn only_lowercase_64_hex_is_canonical() {
+        assert!(is_canonical_event_id(&"0123456789abcdef".repeat(4)));
+        for bad in [
+            "0123456789ABCDEF".repeat(4),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            String::new(),
+            format!("{} ", "a".repeat(63)),
+        ] {
+            assert!(!is_canonical_event_id(&bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stored_row_is_judged_by_its_author_before_the_sealed_flag() {
+        // The SQL never sets `sealed` for a stored row; even if it did, a
+        // foreign row stays foreign.
+        assert_eq!(
+            classify_member_target(&row(Some(THEM), Some(42.0), None, true)),
+            MemberTarget::Foreign {
+                kind: 42,
+                tags: None
+            }
+        );
+        assert_eq!(
+            classify_member_target(&row(None, None, None, true)),
+            MemberTarget::SealedOriginal
+        );
+        assert_eq!(
+            classify_member_target(&row(None, None, None, false)),
+            MemberTarget::Unknown
+        );
+        assert_eq!(
+            classify_member_target(&row(Some(THEM), None, None, true)),
+            MemberTarget::Unknown,
+            "an impossible row shape refuses"
+        );
+    }
+
+    #[test]
+    fn own_targets_only_and_no_targets_pass() {
+        // Own stored rows are not returned by the lookup at all.
+        assert_eq!(member_deletion_refusal(&[], None), None);
+    }
+
+    #[test]
+    fn an_unknown_target_refuses_the_whole_kind5() {
+        // Mixed with a sealed original (and, implicitly, own rows): still refused.
+        let targets = [MemberTarget::SealedOriginal, MemberTarget::Unknown];
+        assert_eq!(
+            member_deletion_refusal(&targets, None),
+            Some(DELETE_UNKNOWN_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn a_sealed_original_is_accepted() {
+        assert_eq!(
+            member_deletion_refusal(&[MemberTarget::SealedOriginal], None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_foreign_target_keeps_the_tl3_message_even_beside_an_unknown_one() {
+        let targets = [
+            MemberTarget::Unknown,
+            MemberTarget::Foreign {
+                kind: 1,
+                tags: None,
+            },
+        ];
+        assert_eq!(
+            member_deletion_refusal(&targets, None),
+            Some(DELETE_OTHERS_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn a_wrap_to_the_signers_recipient_key_is_theirs() {
+        let to_me = serde_json::json!([["p", INBOX]]).to_string();
+        let to_them = serde_json::json!([["p", THEM]]).to_string();
+        let set = vec![INBOX.to_string()];
+        let mine = [MemberTarget::Foreign {
+            kind: GIFT_WRAP_KIND,
+            tags: Some(&to_me),
+        }];
+        assert!(needs_recipient_set(&mine));
+        assert_eq!(member_deletion_refusal(&mine, Some(&set)), None);
+        assert_eq!(
+            member_deletion_refusal(&mine, None),
+            Some(DELETE_OTHERS_REFUSAL),
+            "no recipient set (feature off or lookup failed) refuses"
+        );
+        let theirs = [MemberTarget::Foreign {
+            kind: GIFT_WRAP_KIND,
+            tags: Some(&to_them),
+        }];
+        assert_eq!(
+            member_deletion_refusal(&theirs, Some(&set)),
+            Some(DELETE_OTHERS_REFUSAL)
+        );
+        // Only a wrap can be owned through a recipient key.
+        let post = [MemberTarget::Foreign {
+            kind: 42,
+            tags: Some(&to_me),
+        }];
+        assert!(!needs_recipient_set(&post));
+        assert_eq!(
+            member_deletion_refusal(&post, Some(&set)),
+            Some(DELETE_OTHERS_REFUSAL)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NIP-09: Deletion processing
 // ---------------------------------------------------------------------------
 
 impl NostrRelayDO {
+    /// The member kind-5 gate: `Some(reason)` when a signer without
+    /// delete-any privilege may not have this kind-5 accepted. See the
+    /// section comment above for why one bad target refuses the whole event.
+    ///
+    /// One D1 statement answers every `e` target (plus the signer's
+    /// recipient-key set only when a foreign gift wrap is named). Any failure
+    /// to look up refuses: this gate only ever runs for members, so failing
+    /// closed can never block a moderator.
+    pub(crate) async fn member_deletion_gate(&self, event: &NostrEvent) -> Option<&'static str> {
+        let targets = deletion_e_targets(event);
+        if targets.is_empty() {
+            // Nothing a client folds: an `a`-only kind-5 is scoped to the
+            // signer's own addresses by `a_ref_target`.
+            return None;
+        }
+        if !targets.iter().all(|t| is_canonical_event_id(t)) {
+            return Some(DELETE_UNKNOWN_REFUSAL);
+        }
+        let Ok(db) = self.env.d1("DB") else {
+            return Some(DELETE_LOOKUP_REFUSAL);
+        };
+        let Ok(ids) = serde_json::to_string(&targets) else {
+            return Some(DELETE_LOOKUP_REFUSAL);
+        };
+        let Ok(stmt) = db
+            .prepare(crate::DELETION_TARGETS_CLASSIFY_SQL)
+            .bind(&[JsValue::from_str(&ids), JsValue::from_str(&event.pubkey)])
+        else {
+            return Some(DELETE_LOOKUP_REFUSAL);
+        };
+        let rows = match stmt.all().await.map(|r| r.results::<DeletionTargetRow>()) {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) | Err(e) => {
+                console_error!("kind-5 gate: target lookup failed: {e}");
+                return Some(DELETE_LOOKUP_REFUSAL);
+            }
+        };
+        let classes: Vec<MemberTarget<'_>> = rows.iter().map(classify_member_target).collect();
+        let own_keys = if needs_recipient_set(&classes) && self.recipient_keys_enabled() {
+            self.recipient_read_set(&Some(event.pubkey.clone())).await
+        } else {
+            None
+        };
+        member_deletion_refusal(&classes, own_keys.as_deref())
+    }
+
+    /// A moderator's kind-5 naming a sealed original (ADR-2017): delete the
+    /// envelope rows that wrap it, each tombstoned first under its real
+    /// author, so the deletion is real (not only a client-side fold) and the
+    /// envelope cannot be published again. Ids are lowercased because clients
+    /// fold the lowercase form, so the relay removes what they hide.
+    ///
+    /// Fail-open: a failed lookup or statement only leaves the envelope in
+    /// place, exactly as before this existed; it never stops the rest of the
+    /// moderator's deletion.
+    async fn delete_sealed_envelopes(&self, db: &D1Database, target_ids: &[&str], now: u64) {
+        let mut originals: Vec<String> = Vec::new();
+        for id in target_ids {
+            let id = id.to_ascii_lowercase();
+            if is_canonical_event_id(&id) && !originals.contains(&id) {
+                originals.push(id);
+            }
+        }
+        if originals.is_empty() {
+            return;
+        }
+        let Ok(ids) = serde_json::to_string(&originals) else {
+            return;
+        };
+        #[derive(serde::Deserialize)]
+        struct EnvelopeRow {
+            id: String,
+        }
+        let Ok(stmt) = db
+            .prepare(crate::SEALED_ENVELOPES_FOR_SQL)
+            .bind(&[JsValue::from_str(&ids)])
+        else {
+            return;
+        };
+        let envelopes = match stmt.all().await.map(|r| r.results::<EnvelopeRow>()) {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) | Err(e) => {
+                console_error!("kind-5: sealed envelope lookup failed: {e}");
+                return;
+            }
+        };
+        for envelope in &envelopes {
+            // Separate statements, never one batch: a failed tombstone must
+            // not undo the deletion (see `tombstone_before_delete`).
+            let _ = crate::tombstone_before_delete(
+                db,
+                crate::TombstoneTarget::RegularEvent(&envelope.id),
+                now,
+            )
+            .await;
+            if let Ok(del) = db
+                .prepare(crate::SEALED_ENVELOPE_DELETE_SQL)
+                .bind(&[JsValue::from_str(&envelope.id)])
+            {
+                if let Err(e) = del.run().await {
+                    console_error!("kind-5: sealed envelope delete failed: {e}");
+                }
+            }
+        }
+    }
+
     /// Whether `event` is covered by a NIP-09 tombstone. Regular events are
     /// matched on `(id, author)` only; (parameterised) replaceable events also
     /// against their address. A failed lookup answers `false`: the tombstone is
@@ -2965,8 +3375,9 @@ impl NostrRelayDO {
 
     /// Process a kind-5 deletion event: delete targeted events by the same
     /// author, or — when `can_delete_any` (admin / TL3+, mirroring the EVENT
-    /// gate) — anyone's. Without the flag the SQL keeps the author constraint,
-    /// so a gate regression can never widen deletion via this path alone.
+    /// gate) — anyone's, including the sealed envelopes that wrap a named
+    /// original. Without the flag the SQL keeps the author constraint, so a
+    /// gate regression can never widen deletion via this path alone.
     pub(crate) async fn process_deletion(&self, deletion_event: &NostrEvent, can_delete_any: bool) {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
@@ -3079,6 +3490,14 @@ impl NostrRelayDO {
                     }
                 }
             }
+        }
+
+        // ADR-2017: an original whose plaintext row was purged lives on only
+        // inside its envelope. A moderator's deletion removes that too; a
+        // member's never does, because the relay cannot read the original's
+        // author (the client decides whether to honour it).
+        if can_delete_any {
+            self.delete_sealed_envelopes(&db, &target_ids, now).await;
         }
 
         // Collect "a" tags (parameterized replaceable targets: "kind:pubkey:d-tag")
@@ -4134,66 +4553,6 @@ impl NostrRelayDO {
         .await;
         Self::log_receipt_outcome(&event.id, &outcome);
         outcome
-    }
-
-    /// Check whether a kind-5 deletion event targets events by other authors.
-    ///
-    /// Returns `true` if any `e` tag references an event not authored by the
-    /// deletion event's pubkey.
-    pub(crate) async fn deletion_targets_others(&self, event: &NostrEvent) -> bool {
-        let db = match self.env.d1("DB") {
-            Ok(db) => db,
-            Err(_) => return false,
-        };
-
-        #[derive(serde::Deserialize)]
-        struct EventPubkeyRow {
-            pubkey: String,
-            kind: f64,
-            tags: String,
-        }
-
-        let target_ids: Vec<&str> = event
-            .tags
-            .iter()
-            .filter(|t| t.len() >= 2 && t[0] == "e")
-            .map(|t| t[1].as_str())
-            .collect();
-
-        // Phase 2: a wrap addressed to one of the deleter's own recipient keys is
-        // theirs to remove. Looked up lazily, once, on the raw signer.
-        let mut own_keys: Option<Vec<String>> = None;
-
-        for target_id in &target_ids {
-            let stmt = db.prepare("SELECT pubkey, kind, tags FROM events WHERE id = ?1 LIMIT 1");
-            match stmt.bind(&[JsValue::from_str(target_id)]) {
-                Ok(s) => {
-                    if let Ok(Some(row)) = s.first::<EventPubkeyRow>(None).await {
-                        if row.pubkey != event.pubkey {
-                            if row.kind as u64 == GIFT_WRAP_KIND && self.recipient_keys_enabled() {
-                                if own_keys.is_none() {
-                                    own_keys =
-                                        self.recipient_read_set(&Some(event.pubkey.clone())).await;
-                                }
-                                if own_keys.as_ref().is_some_and(|set| {
-                                    crate::recipient_keys::wrap_addressed_to(
-                                        row.kind as u64,
-                                        &row.tags,
-                                        set,
-                                    )
-                                }) {
-                                    continue;
-                                }
-                            }
-                            return true;
-                        }
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
-
-        false
     }
 }
 
@@ -7150,7 +7509,7 @@ mod recipient_key_read_tests {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap();
-            // deletion_targets_others: not "others" iff addressed to the signer's set.
+            // member_deletion_refusal: a foreign wrap is the signer's iff addressed to the signer's set.
             if wrap_addressed_to(kind as u64, &tags, &set) {
                 c.execute(
                     "DELETE FROM events WHERE id = ?1 AND kind = 1059",
@@ -7165,5 +7524,290 @@ mod recipient_key_read_tests {
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 1, "the wrap to another member survives");
+    }
+}
+
+#[cfg(test)]
+mod deletion_gate_sql_tests {
+    //! The kind-5 gate's batched lookup and the moderator's sealed-envelope
+    //! removal, run against the real `events` / `event_tags` schema (migration
+    //! 0004 plus the live v2 tag trigger) so the triggers behave as on D1.
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    const ME: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const THEM: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const ADMIN: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const MIGRATION_0004: &str = include_str!("../../migrations/0004_event_tags.sql");
+
+    fn id(n: u32) -> String {
+        format!("{n:064x}")
+    }
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(crate::DELETED_EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(crate::DELETED_ADDRESSES_CREATE_SQL)
+            .unwrap();
+        c.execute_batch(MIGRATION_0004).unwrap();
+        for s in crate::PROBE_BLIND_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+        c
+    }
+
+    fn store(c: &Connection, id: &str, author: &str, kind: i64, tags: serde_json::Value) {
+        c.execute(
+            "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?1, ?2, 1, ?3, ?4, 'c', 's')",
+            params![id, author, kind, tags.to_string()],
+        )
+        .unwrap();
+    }
+
+    /// A sealed envelope (ADR-2017) wrapping `original`, by the migrator.
+    fn envelope(c: &Connection, envelope_id: &str, original: &str) {
+        store(
+            c,
+            envelope_id,
+            ADMIN,
+            42,
+            serde_json::json!([
+                ["e", "c".repeat(64), "", "root"],
+                ["zk", "zone3", "1", "e".repeat(64)],
+                ["sealed", original, "1"]
+            ]),
+        );
+    }
+
+    /// The gate as `member_deletion_gate` runs it, minus the recipient set.
+    fn gate(c: &Connection, signer: &str, targets: &[&str]) -> Option<&'static str> {
+        if !targets.iter().all(|t| is_canonical_event_id(t)) {
+            return Some(DELETE_UNKNOWN_REFUSAL);
+        }
+        let rows = lookup(c, signer, targets);
+        let classes: Vec<MemberTarget<'_>> = rows.iter().map(classify_member_target).collect();
+        member_deletion_refusal(&classes, None)
+    }
+
+    fn lookup(c: &Connection, signer: &str, targets: &[&str]) -> Vec<DeletionTargetRow> {
+        let ids = serde_json::to_string(targets).unwrap();
+        c.prepare(crate::DELETION_TARGETS_CLASSIFY_SQL)
+            .unwrap()
+            .query_map(params![ids, signer], |r| {
+                Ok(DeletionTargetRow {
+                    target: r.get("target")?,
+                    pubkey: r.get("pubkey")?,
+                    kind: r.get("kind")?,
+                    tags: r.get("tags")?,
+                    sealed: r.get("sealed")?,
+                })
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// `delete_sealed_envelopes` against SQLite: look up, tombstone each
+    /// envelope from its row (what `TombstoneTarget::RegularEvent` runs),
+    /// then delete it.
+    fn moderator_removes_envelopes(c: &Connection, targets: &[&str], now: i64) -> Vec<String> {
+        let ids = serde_json::to_string(targets).unwrap();
+        let mut found: Vec<String> = c
+            .prepare(crate::SEALED_ENVELOPES_FOR_SQL)
+            .unwrap()
+            .query_map(params![ids], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        found.sort();
+        for e in &found {
+            c.execute(crate::TOMBSTONE_EVENT_ROW_SQL, params![e, now])
+                .unwrap();
+            c.execute(crate::SEALED_ENVELOPE_DELETE_SQL, params![e])
+                .unwrap();
+        }
+        found
+    }
+
+    fn count(c: &Connection, sql: &str) -> i64 {
+        c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn own_targets_pass_and_are_not_returned() {
+        let c = db();
+        store(&c, &id(1), ME, 42, serde_json::json!([]));
+        store(&c, &id(2), ME, 1, serde_json::json!([]));
+        assert!(lookup(&c, ME, &[&id(1), &id(2)]).is_empty());
+        assert_eq!(gate(&c, ME, &[&id(1), &id(2)]), None);
+    }
+
+    #[test]
+    fn an_id_with_no_row_refuses_even_beside_own_targets() {
+        let c = db();
+        store(&c, &id(1), ME, 42, serde_json::json!([]));
+        assert_eq!(gate(&c, ME, &[&id(9)]), Some(DELETE_UNKNOWN_REFUSAL));
+        assert_eq!(
+            gate(&c, ME, &[&id(1), &id(9)]),
+            Some(DELETE_UNKNOWN_REFUSAL),
+            "own plus junk is refused whole"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_rendering_of_an_own_or_foreign_id_refuses() {
+        let c = db();
+        store(&c, &id(0xab), THEM, 42, serde_json::json!([]));
+        let upper = id(0xab).to_ascii_uppercase();
+        assert_eq!(gate(&c, ME, &[&upper]), Some(DELETE_UNKNOWN_REFUSAL));
+    }
+
+    #[test]
+    fn another_authors_row_keeps_the_tl3_refusal() {
+        let c = db();
+        store(&c, &id(1), ME, 42, serde_json::json!([]));
+        store(&c, &id(2), THEM, 42, serde_json::json!([]));
+        assert_eq!(
+            gate(&c, ME, &[&id(1), &id(2), &id(9)]),
+            Some(DELETE_OTHERS_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn a_sealed_original_is_accepted_and_mixes_with_own_targets() {
+        let c = db();
+        store(&c, &id(1), ME, 42, serde_json::json!([]));
+        envelope(&c, &id(100), &id(2));
+        assert_eq!(gate(&c, ME, &[&id(2)]), None);
+        assert_eq!(gate(&c, ME, &[&id(1), &id(2)]), None);
+        assert_eq!(
+            gate(&c, ME, &[&id(1), &id(2), &id(9)]),
+            Some(DELETE_UNKNOWN_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn a_stored_foreign_row_named_by_an_envelope_stays_foreign() {
+        // The plaintext was not purged yet: its row decides, not the envelope.
+        let c = db();
+        store(&c, &id(2), THEM, 42, serde_json::json!([]));
+        envelope(&c, &id(100), &id(2));
+        let rows = lookup(&c, ME, &[&id(2)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sealed, 0.0);
+        assert_eq!(gate(&c, ME, &[&id(2)]), Some(DELETE_OTHERS_REFUSAL));
+    }
+
+    #[test]
+    fn a_sealed_tag_on_another_kind_vouches_for_nothing() {
+        let c = db();
+        store(
+            &c,
+            &id(100),
+            THEM,
+            1,
+            serde_json::json!([["sealed", id(2), "1"]]),
+        );
+        assert_eq!(gate(&c, ME, &[&id(2)]), Some(DELETE_UNKNOWN_REFUSAL));
+    }
+
+    #[test]
+    fn once_the_envelope_goes_the_original_is_unknown_again() {
+        // `trg_event_tags_ad` drops the envelope's tag rows with it.
+        let c = db();
+        envelope(&c, &id(100), &id(2));
+        c.execute("DELETE FROM events WHERE id = ?1", params![id(100)])
+            .unwrap();
+        assert_eq!(gate(&c, ME, &[&id(2)]), Some(DELETE_UNKNOWN_REFUSAL));
+    }
+
+    #[test]
+    fn a_foreign_wrap_returns_its_tags_and_nothing_else_does() {
+        let c = db();
+        let wrap_tags = serde_json::json!([["p", ME]]);
+        store(&c, &id(1), "e".repeat(64).as_str(), 1059, wrap_tags.clone());
+        store(&c, &id(2), THEM, 42, serde_json::json!([["p", ME]]));
+        let rows = lookup(&c, ME, &[&id(1), &id(2)]);
+        let by = |n: u32| rows.iter().find(|r| r.target == id(n)).unwrap();
+        assert_eq!(by(1).tags.as_deref(), Some(wrap_tags.to_string().as_str()));
+        assert_eq!(by(1).kind, Some(1059.0));
+        assert_eq!(by(2).tags, None);
+    }
+
+    #[test]
+    fn two_thousand_targets_are_one_statement() {
+        let c = db();
+        let owned: Vec<String> = (1..=2_000).map(id).collect();
+        for t in &owned[..1_999] {
+            store(&c, t, ME, 42, serde_json::json!([]));
+        }
+        let targets: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let rows = lookup(&c, ME, &targets);
+        assert_eq!(rows.len(), 1, "only the one id with no row comes back");
+        assert_eq!(rows[0].target, id(2_000));
+        assert_eq!(gate(&c, ME, &targets), Some(DELETE_UNKNOWN_REFUSAL));
+    }
+
+    #[test]
+    fn a_moderator_removes_and_tombstones_the_envelope_only() {
+        let c = db();
+        envelope(&c, &id(100), &id(2));
+        envelope(&c, &id(101), &id(3)); // an unrelated original
+        store(
+            &c,
+            &id(102),
+            THEM,
+            1,
+            serde_json::json!([["sealed", id(2), "1"]]),
+        ); // a non-envelope carrying the same tag
+        let removed = moderator_removes_envelopes(&c, &[&id(2), &id(9)], 1_000);
+        assert_eq!(removed, vec![id(100)]);
+        let remaining: Vec<String> = c
+            .prepare("SELECT id FROM events ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(remaining, vec![id(101), id(102)]);
+        let tombstones: Vec<(String, String, i64)> = c
+            .prepare("SELECT id, pubkey, deleted_at FROM deleted_events")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            tombstones,
+            vec![(id(100), ADMIN.to_string(), 1_000)],
+            "the envelope is tombstoned under its real author"
+        );
+        assert_eq!(
+            count(
+                &c,
+                &format!(
+                    "SELECT count(*) FROM event_tags WHERE event_id = '{}'",
+                    id(100)
+                )
+            ),
+            0,
+            "the delete trigger drops the envelope's tag rows"
+        );
+        // The re-insert guard now refuses the envelope from its author.
+        let refused: i64 = c
+            .query_row(crate::IS_DELETED_ID_SQL, params![id(100), ADMIN], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(refused, 1);
+    }
+
+    #[test]
+    fn the_moderator_lookup_finds_nothing_for_plain_targets() {
+        let c = db();
+        store(&c, &id(2), THEM, 42, serde_json::json!([]));
+        assert!(moderator_removes_envelopes(&c, &[&id(2)], 1_000).is_empty());
+        assert_eq!(count(&c, "SELECT count(*) FROM events"), 1);
     }
 }
