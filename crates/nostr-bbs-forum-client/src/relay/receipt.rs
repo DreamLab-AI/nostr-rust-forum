@@ -21,6 +21,17 @@
 //! such a drop from pinning the ledger: re-send a bounded number of times,
 //! then stop waiting.
 //!
+//! A re-send goes out under a FRESH wire subscription id ([`wire_id`]), and
+//! the old one is closed. That is what makes the ledger exact: under one
+//! shared id an EOSE cannot say which REQ it answers, so a dropped REQ and a
+//! merely slow one are indistinguishable. With a retired id, a late answer to
+//! the abandoned REQ arrives under that id, [`route`] reports it as
+//! [`Route::Retired`], and it never reaches the ledger.
+//!
+//! **Invariant: an answer is never credited to a REQ sent after it.** Within
+//! one wire id, the ledger only settles when every REQ sent under it is
+//! answered; across ids, answers under a retired id are discarded.
+//!
 //! The same module bounds the NIP-42 handshake itself ([`auth_stalled`]):
 //! writes are held until AUTH is accepted, so an AUTH that is never signed or
 //! never answered must not hold them forever.
@@ -90,10 +101,16 @@ impl ReqLedger {
         self.seq
     }
 
-    /// The relay answered one REQ (EOSE or CLOSED). Returns whether the
-    /// subscription is now fully answered on an authenticated REQ.
+    /// The relay answered one REQ (EOSE or CLOSED) under the CURRENT wire
+    /// id. Returns whether the subscription is now fully answered on an
+    /// authenticated REQ. An answer with nothing outstanding (e.g. a late one
+    /// after [`Watch::GiveUp`]) is never credited: it changes nothing and
+    /// returns `false`.
     pub fn answered(&mut self) -> bool {
-        self.outstanding = self.outstanding.saturating_sub(1);
+        if self.outstanding == 0 {
+            return false;
+        }
+        self.outstanding -= 1;
         self.resends = 0;
         self.outstanding == 0 && self.last_req_authed
     }
@@ -105,11 +122,12 @@ impl ReqLedger {
 
     /// The answer timeout armed for REQ `seq` fired.
     ///
-    /// Taking a REQ as dropped forgets every outstanding count, because a
-    /// dropped REQ will never answer. The cost is that a REQ which was only
-    /// slow — slower than [`REQ_ANSWER_TIMEOUT_MS`] — answers later and is
-    /// subtracted from the re-sent one; that requires a pathological relay
-    /// query and is the price of never sticking.
+    /// Taking the REQs as dropped zeroes the outstanding count. That is exact,
+    /// not a guess, because the caller retires their wire id: on
+    /// [`Watch::Resend`] it closes the old id and re-sends under a fresh one,
+    /// and on [`Watch::GiveUp`] any late answer is uncreditable (see
+    /// [`answered`](Self::answered)), so a slow answer to an abandoned REQ can
+    /// never be counted against a newer one.
     pub fn on_watch(&mut self, seq: u64) -> Watch {
         if seq != self.seq || self.outstanding == 0 {
             return Watch::Settled;
@@ -126,6 +144,92 @@ impl ReqLedger {
     /// A new socket: answers to REQs sent on the old one will never arrive.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// Separator between a logical subscription id and its re-send generation
+/// in a wire id. Logical ids are `sub_N` and never contain it.
+const WIRE_SEP: char = '~';
+
+/// The wire subscription id for re-send generation `generation` of logical
+/// subscription `sub_id`. Generation 0 is the logical id itself, so the
+/// common path (never re-sent) is unchanged on the wire. Stays well inside
+/// NIP-01's 64-character limit.
+pub fn wire_id(sub_id: &str, generation: u32) -> String {
+    if generation == 0 {
+        sub_id.to_string()
+    } else {
+        format!("{sub_id}{WIRE_SEP}{generation}")
+    }
+}
+
+/// The logical subscription id a wire id belongs to.
+pub fn logical_id(wire: &str) -> &str {
+    wire.split(WIRE_SEP).next().unwrap_or(wire)
+}
+
+/// How a frame's subscription id relates to a subscription.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// The subscription's current wire id: credit answers, deliver events.
+    Current,
+    /// An id the subscription has since re-sent under a new one: answers
+    /// belong to an abandoned REQ and are discarded.
+    Retired,
+}
+
+/// Classify `wire` against the subscription's `current` wire id. Callers
+/// look the subscription up by [`logical_id`] first; an unknown logical id
+/// has no route at all.
+pub fn route(wire: &str, current: &str) -> Route {
+    if wire == current {
+        Route::Current
+    } else {
+        Route::Retired
+    }
+}
+
+/// The NIP-42 state a held-writes release is judged on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandshakeView {
+    /// The check was armed for the socket that is current now.
+    pub same_socket: bool,
+    /// That socket is OPEN. Released writes go to the send queue, and a
+    /// closed socket's queue is flushed on reconnect BEFORE that socket's
+    /// AUTH, where the relay refuses them — so a dead socket must keep them
+    /// held for the next AUTH instead.
+    pub socket_open: bool,
+    /// A one-shot foreign connection, which never holds writes.
+    pub immediate_writes: bool,
+    pub accepted: bool,
+    pub refused: bool,
+    /// When the challenge arrived (or the socket opened), epoch ms.
+    pub challenge_at: Option<f64>,
+    /// When the pending AUTH (or its latest re-send) went out, epoch ms.
+    pub sent_at: Option<f64>,
+}
+
+/// Whether held writes should be released now because the handshake stalled
+/// on a live socket. See [`auth_stalled`] for the clocks.
+pub fn release_held_writes(v: HandshakeView, now: f64) -> bool {
+    let unresolved =
+        v.same_socket && v.socket_open && !v.immediate_writes && !v.accepted && !v.refused;
+    match (unresolved, v.challenge_at) {
+        (true, Some(challenge_at)) => auth_stalled(challenge_at, v.sent_at, now),
+        _ => false,
+    }
+}
+
+/// The error a post shows when the relay refused it. A bare
+/// `auth-required: …` reads as a relay fault; when it follows a sign-in that
+/// did not complete on this socket (`auth_note` is why), say that instead.
+/// Every other message is passed through unchanged.
+pub fn explain_write_refusal(message: &str, auth_note: Option<&str>) -> String {
+    match auth_note {
+        Some(note) if message.starts_with("auth-required:") => format!(
+            "Relay sign-in did not complete ({note}), so the relay refused this. Reload the page and try again."
+        ),
+        _ => message.to_string(),
     }
 }
 
@@ -331,6 +435,192 @@ mod tests {
         // A timer armed for the first send fires after a retry went out.
         let resent = t + 9_000.0;
         assert!(!auth_stalled(t, Some(resent), t + 10_000.0));
+    }
+
+    // -- Re-send under a fresh wire id ---------------------------------------
+
+    /// One logical subscription's ledger plus its current wire id, driven the
+    /// way relay.rs drives them, so the routing and the counting are tested
+    /// together.
+    struct Sim {
+        ledger: ReqLedger,
+        generation: u32,
+        current: String,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            Self {
+                ledger: ReqLedger::default(),
+                generation: 0,
+                current: wire_id("sub_1", 0),
+            }
+        }
+        /// Send a REQ under the current id; returns (wire id, seq).
+        fn send(&mut self, authed: bool) -> (String, u64) {
+            (self.current.clone(), self.ledger.sent(authed))
+        }
+        /// The answer timeout for `seq` fired; on Resend, retire the id.
+        fn watch(&mut self, seq: u64) -> Watch {
+            let w = self.ledger.on_watch(seq);
+            if w == Watch::Resend {
+                self.generation += 1;
+                self.current = wire_id("sub_1", self.generation);
+            }
+            w
+        }
+        /// An EOSE arrived under `wire`; returns the receipt verdict, or
+        /// `None` when it was not credited (retired id).
+        fn eose(&mut self, wire: &str) -> Option<bool> {
+            assert_eq!(logical_id(wire), "sub_1");
+            match route(wire, &self.current) {
+                Route::Current => Some(self.ledger.answered()),
+                Route::Retired => None,
+            }
+        }
+    }
+
+    #[test]
+    fn wire_ids_round_trip_to_the_logical_id() {
+        assert_eq!(wire_id("sub_7", 0), "sub_7");
+        assert_eq!(wire_id("sub_7", 2), "sub_7~2");
+        assert_eq!(logical_id("sub_7~2"), "sub_7");
+        assert_eq!(logical_id("sub_7"), "sub_7");
+        assert_eq!(logical_id("count_3"), "count_3");
+        assert!(wire_id("sub_18446744073709551615", u32::MAX).len() <= 64);
+    }
+
+    #[test]
+    fn routing_distinguishes_current_from_retired() {
+        assert_eq!(route("sub_1~1", "sub_1~1"), Route::Current);
+        assert_eq!(route("sub_1", "sub_1~1"), Route::Retired);
+    }
+
+    /// The reviewed sequence: anonymous #1 times out, anonymous #2 is
+    /// re-sent, AUTH is accepted and #3 replays authenticated; then #1's and
+    /// #2's anonymous EOSEs arrive. Neither may settle the ledger while #3 is
+    /// in flight.
+    #[test]
+    fn late_anonymous_answers_never_settle_ahead_of_the_authed_replay() {
+        let mut s = Sim::new();
+        let (w1, seq1) = s.send(false);
+        assert_eq!(s.watch(seq1), Watch::Resend);
+        let (w2, _) = s.send(false);
+        let (w3, _) = s.send(true);
+        assert_ne!(w1, w2, "the re-send uses a fresh wire id");
+        assert_eq!(w2, w3, "the replay reuses the current id");
+        assert_eq!(s.eose(&w1), None, "#1's late answer is not credited");
+        assert_eq!(s.eose(&w2), Some(false), "#2 answered, #3 still in flight");
+        assert_eq!(s.eose(&w3), Some(true), "#3 settles it, authenticated");
+    }
+
+    /// The dropped case: #1 never answers; the re-sent #2 settles alone.
+    #[test]
+    fn dropped_req_settles_on_the_resent_answer() {
+        let mut s = Sim::new();
+        let (_, seq1) = s.send(true);
+        assert_eq!(s.watch(seq1), Watch::Resend);
+        let (w2, _) = s.send(true);
+        assert_eq!(s.eose(&w2), Some(true));
+    }
+
+    #[test]
+    fn late_answer_after_give_up_is_not_credited() {
+        let mut l = ReqLedger::default();
+        let mut seq = l.sent(true);
+        for _ in 0..REQ_RESEND_LIMIT {
+            assert_eq!(l.on_watch(seq), Watch::Resend);
+            seq = l.sent(true);
+        }
+        assert_eq!(l.on_watch(seq), Watch::GiveUp);
+        assert!(!l.answered(), "nothing outstanding: no credit");
+    }
+
+    // -- Held writes ---------------------------------------------------------
+
+    fn stalled_view() -> HandshakeView {
+        HandshakeView {
+            same_socket: true,
+            socket_open: true,
+            immediate_writes: false,
+            accepted: false,
+            refused: false,
+            challenge_at: Some(0.0),
+            sent_at: Some(1_000.0),
+        }
+    }
+
+    #[test]
+    fn stalled_handshake_on_a_live_socket_releases() {
+        assert!(release_held_writes(stalled_view(), 20_000.0));
+    }
+
+    /// The reviewed case: the socket dropped mid-handshake and the reconnect
+    /// backoff outlasted the clock. Held writes must stay held for the next
+    /// socket's AUTH rather than be flushed before it and refused.
+    #[test]
+    fn dead_socket_never_releases() {
+        let v = HandshakeView {
+            socket_open: false,
+            ..stalled_view()
+        };
+        assert!(!release_held_writes(v, 20_000.0));
+    }
+
+    #[test]
+    fn old_socket_generation_never_releases() {
+        let v = HandshakeView {
+            same_socket: false,
+            ..stalled_view()
+        };
+        assert!(!release_held_writes(v, 20_000.0));
+    }
+
+    #[test]
+    fn resolved_or_foreign_handshakes_never_release() {
+        for v in [
+            HandshakeView {
+                accepted: true,
+                ..stalled_view()
+            },
+            HandshakeView {
+                refused: true,
+                ..stalled_view()
+            },
+            HandshakeView {
+                immediate_writes: true,
+                ..stalled_view()
+            },
+            HandshakeView {
+                challenge_at: None,
+                ..stalled_view()
+            },
+        ] {
+            assert!(!release_held_writes(v, 20_000.0), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn not_yet_stalled_does_not_release() {
+        assert!(!release_held_writes(stalled_view(), 5_000.0));
+    }
+
+    #[test]
+    fn auth_refusal_after_failed_sign_in_is_explained() {
+        let m = explain_write_refusal("auth-required: sign in first", Some("signing was denied"));
+        assert!(m.starts_with("Relay sign-in did not complete (signing was denied)"));
+    }
+
+    #[test]
+    fn other_refusals_pass_through() {
+        assert_eq!(
+            explain_write_refusal("blocked: spam", Some("stalled")),
+            "blocked: spam"
+        );
+        assert_eq!(
+            explain_write_refusal("auth-required: sign in first", None),
+            "auth-required: sign in first"
+        );
     }
 
     #[test]

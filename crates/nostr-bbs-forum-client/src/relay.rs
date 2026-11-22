@@ -21,8 +21,9 @@ use web_sys::WebSocket;
 
 mod receipt;
 use receipt::{
-    auth_stalled, classify_auth_ok, req_watch_delay, AuthReply, ReqLedger, Watch,
-    AUTH_ANSWER_TIMEOUT_MS, AUTH_SIGN_TIMEOUT_MS,
+    classify_auth_ok, explain_write_refusal, logical_id, release_held_writes, req_watch_delay,
+    route, wire_id, AuthReply, HandshakeView, ReqLedger, Route, Watch, AUTH_ANSWER_TIMEOUT_MS,
+    AUTH_SIGN_TIMEOUT_MS,
 };
 
 /// Default relay URL when VITE_RELAY_URL is not set.
@@ -125,6 +126,12 @@ struct Subscription {
     /// REQs sent for this subscription on the current socket and not yet
     /// answered, and whether the latest went out after AUTH was accepted.
     ledger: ReqLedger,
+    /// The id this subscription currently uses on the wire. Starts as the
+    /// logical id; a re-send after an unanswered REQ retires it for a fresh
+    /// one (see [`receipt::wire_id`]) so late answers to the abandoned REQ
+    /// can be told apart and discarded.
+    wire_id: String,
+    wire_gen: u32,
 }
 
 /// Our kind-22242 AUTH event, sent and awaiting the relay's `OK`.
@@ -219,6 +226,10 @@ struct RelayInner {
     /// When the current socket's NIP-42 challenge arrived (epoch ms), while
     /// the handshake is unresolved. Drives the stall bound.
     auth_challenge_at: Option<f64>,
+    /// Why this socket's sign-in did not complete, once it has been given up
+    /// on. Turns the relay's bare `auth-required:` refusal of a post into an
+    /// explanation (see [`receipt::explain_write_refusal`]).
+    auth_note: Option<String>,
     /// Bumped on every new socket, so a timer armed for the old one (AUTH
     /// retry, stall check, REQ answer timeout) can tell it is stale.
     conn_gen: u64,
@@ -372,6 +383,7 @@ impl RelayConnection {
             pending_auth: None,
             auth_refused: false,
             auth_challenge_at: None,
+            auth_note: None,
             conn_gen: 0,
             _on_open: None,
             _on_message: None,
@@ -487,6 +499,7 @@ impl RelayConnection {
                 inner.auth_accepted = false;
                 inner.pending_auth = None;
                 inner.auth_refused = false;
+                inner.auth_note = None;
                 // The handshake clock starts at connect, so a relay that never
                 // sends a challenge cannot hold writes forever either; the
                 // challenge, when it arrives, restarts the clock.
@@ -511,7 +524,7 @@ impl RelayConnection {
                 for (sub_id, sub) in inner.subscriptions.iter_mut() {
                     sub.ledger.reset();
                     let seq = sub.ledger.sent(false);
-                    if let Some(msg) = req_frame(sub_id, &sub.filters) {
+                    if let Some(msg) = req_frame(&sub.wire_id, &sub.filters) {
                         frames.push(msg);
                     }
                     watches.push((sub_id.clone(), seq, 0));
@@ -562,6 +575,11 @@ impl RelayConnection {
         let self_clone = self.clone();
         let on_close = Closure::wrap(Box::new(move |_e: web_sys::CloseEvent| {
             web_sys::console::log_1(&"[Relay] WebSocket closed".into());
+            // Invalidate every timer armed for this socket (AUTH retry, stall
+            // check, REQ timeouts) now, not at the next open: a stall check
+            // firing during the reconnect backoff would otherwise release held
+            // writes into a queue that the next socket flushes before its AUTH.
+            self_clone.with_inner(|rc| rc.borrow_mut().conn_gen += 1);
             let current = self_clone.state.get_untracked();
             if current != ConnectionState::Disconnected {
                 self_clone.state.set(ConnectionState::Reconnecting);
@@ -604,6 +622,7 @@ impl RelayConnection {
             inner.pending_auth = None;
             inner.auth_refused = false;
             inner.auth_challenge_at = None;
+            inner.auth_note = None;
             inner.conn_gen += 1;
             // NOTE: subscriptions are preserved so they can be replayed on reconnect.
             inner.pending_publishes.clear();
@@ -663,6 +682,8 @@ impl RelayConnection {
                     on_eose,
                     on_receipt,
                     ledger,
+                    wire_id: wire_id(&sub_id, 0),
+                    wire_gen: 0,
                 },
             );
             (sub_id, watch)
@@ -710,15 +731,17 @@ impl RelayConnection {
     }
 
     pub fn unsubscribe(&self, sub_id: &str) {
-        self.with_inner(|rc| {
-            rc.borrow_mut().subscriptions.remove(sub_id);
+        // Close the id the subscription is using on the wire now, which
+        // differs from the logical id after an unanswered-REQ re-send.
+        let wire = self.with_inner(|rc| {
+            rc.borrow_mut()
+                .subscriptions
+                .remove(sub_id)
+                .map(|s| s.wire_id)
+                .unwrap_or_else(|| sub_id.to_string())
         });
 
-        let close_msg = serde_json::to_string(&vec![
-            Value::String("CLOSE".into()),
-            Value::String(sub_id.into()),
-        ])
-        .unwrap_or_default();
+        let close_msg = close_frame(&wire);
         self.send_raw(&close_msg);
     }
 
@@ -943,6 +966,7 @@ fn on_auth_ok(inner_rc: &Rc<RefCell<RelayInner>>, accepted: bool, message: &str)
                 inner.auth_challenge_at = None;
                 // A late acceptance after a stall un-refuses the socket.
                 inner.auth_refused = false;
+                inner.auth_note = None;
             }
             replay_after_auth(inner_rc);
         }
@@ -975,7 +999,7 @@ fn on_auth_ok(inner_rc: &Rc<RefCell<RelayInner>>, accepted: bool, message: &str)
             );
         }
         AuthReply::Rejected => {
-            refuse_auth(inner_rc, &format!("rejected: {message}"));
+            refuse_auth(inner_rc, &format!("the relay rejected it: {message}"));
         }
     }
 }
@@ -989,6 +1013,15 @@ fn on_auth_ok(inner_rc: &Rc<RefCell<RelayInner>>, accepted: bool, message: &str)
 fn refuse_auth(inner_rc: &Rc<RefCell<RelayInner>>, reason: &str) {
     let deferred = {
         let mut inner = inner_rc.borrow_mut();
+        // Only on a live socket. Released writes go to the send queue, and a
+        // closed socket's queue is flushed on reconnect BEFORE the next AUTH,
+        // where the relay refuses them; held, they go out once that AUTH is
+        // accepted instead.
+        let open = matches!(&inner.ws, Some(ws) if ws.ready_state() == WebSocket::OPEN);
+        if !open {
+            return;
+        }
+        inner.auth_note = Some(reason.to_string());
         // `pending_auth` is deliberately kept: if this was a stall and the
         // relay's `OK true` arrives late, it must still match our AUTH event
         // and take the Accepted path. A new socket resets it.
@@ -999,7 +1032,7 @@ fn refuse_auth(inner_rc: &Rc<RefCell<RelayInner>>, reason: &str) {
     for msg in deferred {
         queue_paced(inner_rc, msg);
     }
-    web_sys::console::warn_1(&format!("[Relay] NIP-42 AUTH {reason}").into());
+    web_sys::console::warn_1(&format!("[Relay] NIP-42 AUTH not completed: {reason}").into());
 }
 
 /// Check, `delay_ms` from now, whether this socket's handshake has stalled
@@ -1012,30 +1045,37 @@ fn arm_auth_stall_check(inner_rc: &Rc<RefCell<RelayInner>>, delay_ms: i32) {
         move || {
             let stalled = {
                 let inner = rc.borrow();
-                // A one-shot foreign connection never defers writes, so it
-                // has nothing to release.
-                let unresolved = inner.conn_gen == gen
-                    && !inner.immediate_writes
-                    && !inner.auth_accepted
-                    && !inner.auth_refused;
-                match (unresolved, inner.auth_challenge_at) {
-                    (true, Some(challenge_at)) => auth_stalled(
-                        challenge_at,
-                        inner.pending_auth.as_ref().map(|p| p.sent_at),
-                        js_sys::Date::now(),
-                    ),
-                    _ => false,
-                }
+                release_held_writes(
+                    HandshakeView {
+                        same_socket: inner.conn_gen == gen,
+                        socket_open: matches!(
+                            &inner.ws,
+                            Some(ws) if ws.ready_state() == WebSocket::OPEN
+                        ),
+                        immediate_writes: inner.immediate_writes,
+                        accepted: inner.auth_accepted,
+                        refused: inner.auth_refused,
+                        challenge_at: inner.auth_challenge_at,
+                        sent_at: inner.pending_auth.as_ref().map(|p| p.sent_at),
+                    },
+                    js_sys::Date::now(),
+                )
             };
             if stalled {
-                refuse_auth(&rc, "unanswered: releasing held writes");
+                refuse_auth(&rc, "the relay did not answer in time");
             }
         },
         delay_ms,
     );
 }
 
-/// The `["REQ", sub_id, filter…]` frame for a subscription.
+/// The `["CLOSE", wire_id]` frame.
+fn close_frame(wire: &str) -> String {
+    serde_json::to_string(&[Value::String("CLOSE".into()), Value::String(wire.into())])
+        .unwrap_or_default()
+}
+
+/// The `["REQ", wire_id, filter…]` frame for a subscription.
 fn req_frame(sub_id: &str, filters: &[Filter]) -> Option<String> {
     let mut req = vec![
         serde_json::Value::String("REQ".into()),
@@ -1079,14 +1119,22 @@ fn arm_req_watch(inner_rc: &Rc<RefCell<RelayInner>>, sub_id: String, seq: u64, r
                     }
                     // A closed socket's on_open replays (and re-arms) it.
                     Watch::Resend if !ws_open => None,
+                    // Retire the old wire id (CLOSE it) and re-send under a
+                    // fresh one, so a late answer to the abandoned REQ is
+                    // recognisably not this one's.
                     Watch::Resend => {
+                        let old = sub.wire_id.clone();
+                        sub.wire_gen += 1;
+                        sub.wire_id = wire_id(&sub_id, sub.wire_gen);
                         let seq = sub.ledger.sent(accepted);
-                        req_frame(&sub_id, &sub.filters)
-                            .map(|frame| (frame, seq, sub.ledger.resends()))
+                        req_frame(&sub.wire_id, &sub.filters)
+                            .map(|frame| (close_frame(&old), frame, seq, sub.ledger.resends()))
                     }
                 }
             };
-            if let Some((frame, seq, resends)) = resend {
+            if let Some((close, frame, seq, resends)) = resend {
+                // FIFO: the relay frees the old slot before the new REQ.
+                queue_paced(&rc, close);
                 queue_paced(&rc, frame);
                 arm_req_watch(&rc, sub_id, seq, resends);
             }
@@ -1111,7 +1159,7 @@ fn replay_after_auth(inner_rc: &Rc<RefCell<RelayInner>>) {
         if ws_live {
             for (sub_id, sub) in inner.subscriptions.iter_mut() {
                 let seq = sub.ledger.sent(true);
-                if let Some(msg) = req_frame(sub_id, &sub.filters) {
+                if let Some(msg) = req_frame(&sub.wire_id, &sub.filters) {
                     frames.push(msg);
                 }
                 watches.push((sub_id.clone(), seq, sub.ledger.resends()));
@@ -1186,8 +1234,12 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             if arr.len() < 3 {
                 return;
             }
+            // The frame carries the WIRE id; dispatch by the logical id it
+            // encodes. Events under a retired id are still delivered: the
+            // dedup below is keyed by the logical id, so the re-sent REQ
+            // cannot deliver an event twice.
             let sub_id = match arr[1].as_str() {
-                Some(s) => s.to_string(),
+                Some(s) => logical_id(s).to_string(),
                 None => return,
             };
             let event: NostrEvent = match serde_json::from_value(arr[2].clone()) {
@@ -1234,17 +1286,20 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             if arr.len() < 2 {
                 return;
             }
-            let sub_id = match arr[1].as_str() {
-                Some(s) => s.to_string(),
-                None => return,
-            };
+            let Some(wire) = arr[1].as_str() else { return };
 
+            // An EOSE under a retired wire id answers an abandoned REQ: it is
+            // never credited to the ledger and fires no callback.
             let callbacks = {
                 let mut inner = inner_rc.borrow_mut();
-                inner.subscriptions.get_mut(&sub_id).map(|s| {
-                    let authed = s.ledger.answered();
-                    (s.on_eose.clone(), s.on_receipt.clone(), authed)
-                })
+                inner
+                    .subscriptions
+                    .get_mut(logical_id(wire))
+                    .filter(|s| route(wire, &s.wire_id) == Route::Current)
+                    .map(|s| {
+                        let authed = s.ledger.answered();
+                        (s.on_eose.clone(), s.on_receipt.clone(), authed)
+                    })
             };
             // Borrow released: callbacks may subscribe re-entrantly.
             if let Some((on_eose, on_receipt, authed)) = callbacks {
@@ -1260,8 +1315,14 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             // A refused REQ is still an answer to one REQ: count it so the
             // ledger is not left waiting forever. It is not a completeness
             // receipt, so no callback fires.
-            if let Some(sub_id) = arr.get(1).and_then(Value::as_str) {
-                if let Some(s) = inner_rc.borrow_mut().subscriptions.get_mut(sub_id) {
+            // Under a retired wire id it answers an abandoned REQ: ignored.
+            if let Some(wire) = arr.get(1).and_then(Value::as_str) {
+                if let Some(s) = inner_rc
+                    .borrow_mut()
+                    .subscriptions
+                    .get_mut(logical_id(wire))
+                    .filter(|s| route(wire, &s.wire_id) == Route::Current)
+                {
                     s.ledger.answered();
                 }
             }
@@ -1334,16 +1395,24 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                         &format!("[Relay] Event {} rejected: {}", event_id, message).into(),
                     );
                 }
-                // Dispatch to pending publish callback if registered
-                let callback = {
-                    inner_rc
-                        .borrow_mut()
+                // Dispatch to pending publish callback if registered. A
+                // refusal that follows a sign-in which did not complete on
+                // this socket is explained rather than shown bare.
+                let (callback, note) = {
+                    let mut inner = inner_rc.borrow_mut();
+                    let cb = inner
                         .pending_publishes
                         .remove(event_id)
-                        .and_then(|p| p.on_ok)
+                        .and_then(|p| p.on_ok);
+                    (cb, inner.auth_note.clone())
                 };
                 if let Some(cb) = callback {
-                    cb(accepted, message.to_string());
+                    let shown = if accepted {
+                        message.to_string()
+                    } else {
+                        explain_write_refusal(message, note.as_deref())
+                    };
+                    cb(accepted, shown);
                 }
             }
         }
@@ -1402,7 +1471,14 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                     // Start the handshake clock: a challenge left unsigned
                     // (e.g. a NIP-07 prompt never answered) releases held
                     // writes after AUTH_SIGN_TIMEOUT_MS.
-                    inner_rc.borrow_mut().auth_challenge_at = Some(js_sys::Date::now());
+                    {
+                        let mut inner = inner_rc.borrow_mut();
+                        inner.auth_challenge_at = Some(js_sys::Date::now());
+                        // A new challenge supersedes any AUTH still pending:
+                        // that one answered the old challenge, and its
+                        // `sent_at` must not drive this handshake's clock.
+                        inner.pending_auth = None;
+                    }
                     arm_auth_stall_check(inner_rc, AUTH_SIGN_TIMEOUT_MS);
 
                     if let Some(sign_fn) = sync_signer {
@@ -1410,7 +1486,7 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                         if let Some(signed) = sign_fn(unsigned) {
                             send_auth(&signed, &ws, inner_rc);
                         } else {
-                            refuse_auth(inner_rc, "sync signing failed");
+                            refuse_auth(inner_rc, "signing failed");
                         }
                     } else if let Some(async_sign) = async_signer {
                         let unsigned = make_unsigned(relay_url, challenge);
@@ -1432,12 +1508,12 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                                 // A denied extension prompt lands here.
                                 let current = rc.borrow().ws.clone();
                                 if ws.is_some() && ws == current {
-                                    refuse_auth(&rc, "async signing failed or was denied");
+                                    refuse_auth(&rc, "signing was denied or failed");
                                 }
                             }
                         });
                     } else {
-                        refuse_auth(inner_rc, "challenge received but no signer registered");
+                        refuse_auth(inner_rc, "no signing key was available");
                     }
                 }
             }
