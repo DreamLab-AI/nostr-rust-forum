@@ -213,6 +213,15 @@ pub async fn handle_delete_user(mut req: Request, env: &Env) -> Result<Response>
     if body.delete_events {
         // Purge the user's stored events AND their projected profile row. The
         // events table is the relay store; the profiles projection is derived.
+        // Tombstone them first: the whitelist row is gone, so the ingest gate
+        // refuses this author for now, but re-admission must not let anyone
+        // re-publish what the admin chose to remove. Fails open.
+        crate::tombstone_before_delete(
+            &db,
+            crate::TombstoneTarget::Author(&target),
+            auth::js_now_secs(),
+        )
+        .await;
         let _ = db
             .prepare("DELETE FROM events WHERE pubkey = ?1")
             .bind(&[js_str(&target)])?

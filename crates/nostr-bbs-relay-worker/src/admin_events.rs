@@ -23,6 +23,16 @@
 //! and no broadcast**, and it writes one `events.delete` row to the admin
 //! audit log so the purge is still accountable.
 //!
+//! It does record a relay-side NIP-09 tombstone for each deleted row, under
+//! the row's own author, before the row goes. That is not the client-side fold
+//! above: `deleted_events` lives only in D1, is read only by the relay's ingest
+//! refusal, and is never served to a client, so it cannot hide the restored
+//! inner event. What it does stop is the plaintext original coming back (from
+//! anyone holding the signed event, or an old client's outbox) once the purge
+//! has removed it, including after the zone's encryption is later turned off.
+//! A D1 backup taken before the purge predates the tombstones, so restoring it
+//! still restores the plaintext.
+//!
 //! ## Side tables
 //!
 //! `event_tags` is maintained by the `trg_event_tags_ad` `AFTER DELETE ON
@@ -197,9 +207,9 @@ struct KindRow {
 /// Body `{"ids":[<64-hex>, ...], "reason":"<text>"}` (1 to [`MAX_DELETE_IDS`]
 /// ids). For each id the stored row's kind is read first: absent ids go to
 /// `notFound`, rows of another kind go to `skipped` and are left untouched,
-/// and kind-42 rows are deleted with `DELETE FROM events WHERE id = ?1 AND
-/// kind = 42`. A row that vanishes between the read and the delete is
-/// reported as `notFound`.
+/// and kind-42 rows are tombstoned (fail-open) and then deleted with `DELETE
+/// FROM events WHERE id = ?1 AND kind = 42`. A row that vanishes between the
+/// read and the delete is reported as `notFound`.
 ///
 /// Responses: `200 {"deleted": n, "notFound": [...], "skipped": [...]}`;
 /// `400 {"error"}` for a malformed body; `401`/`403` from NIP-98. If D1 fails
@@ -237,6 +247,7 @@ pub async fn handle_delete_events(mut req: Request, env: &Env) -> Result<Respons
     };
 
     let db = env.d1("DB")?;
+    let now = auth::js_now_secs();
     let mut outcome = DeleteOutcome::default();
     let mut failure: Option<String> = None;
 
@@ -262,6 +273,9 @@ pub async fn handle_delete_events(mut req: Request, env: &Env) -> Result<Respons
             Disposition::NotFound => outcome.not_found.push(id.clone()),
             Disposition::Skipped => outcome.skipped.push(id.clone()),
             Disposition::Delete => {
+                // The relay-side re-insert guard (see "Why this is silent").
+                // Fails open: a tombstone error neither stops nor fails the purge.
+                crate::tombstone_before_delete(&db, crate::TombstoneTarget::Event(id), now).await;
                 let run = match db
                     .prepare("DELETE FROM events WHERE id = ?1 AND kind = 42")
                     .bind(&[js_str(id)])

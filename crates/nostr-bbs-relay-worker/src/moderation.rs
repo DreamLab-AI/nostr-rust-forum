@@ -330,7 +330,15 @@ pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Respon
                 .await;
         }
         "delete" => {
-            // Hard-delete the reported event from the events table (NIP-09 style)
+            // A moderator's decision that the content goes: tombstone it under
+            // its real author, read from the row (`reported_pubkey` is only the
+            // reporter's claim), so it cannot be published again. Fails open.
+            crate::tombstone_before_delete(
+                &db,
+                crate::TombstoneTarget::Event(&report.reported_event_id),
+                now,
+            )
+            .await;
             let _ = db
                 .prepare("DELETE FROM events WHERE id = ?1")
                 .bind(&[js_str(&report.reported_event_id)])?
