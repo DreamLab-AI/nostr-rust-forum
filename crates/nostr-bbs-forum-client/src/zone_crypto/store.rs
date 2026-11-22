@@ -5,7 +5,7 @@
 //! single place a zone-encrypted kind-42 is turned into readable text on its
 //! way into the [`ChannelStore`](crate::stores::channels::ChannelStore).
 //!
-//! Keys are scoped to the signed-in identity ([`key_owner`](super::key_owner)):
+//! Keys are scoped to the signed-in identity ([`super::key_owner`]):
 //! signing out drops every key from memory and turns decrypted messages back
 //! into placeholders; the next sign-in, with or without a page reload, loads
 //! that identity's keys before the Encryption card may offer Create or Rotate.

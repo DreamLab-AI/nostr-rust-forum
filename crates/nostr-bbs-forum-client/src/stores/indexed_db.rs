@@ -13,7 +13,7 @@
 //! - `zone_keys` — key `id`, zone end-to-end encryption keys (ADR-2016): rows
 //!   written now are `"<owner pubkey>/<store id>"` with an `owner` field;
 //!   older rows have no owner and are the bare store id (see
-//!   [`key_owner`](crate::zone_crypto::key_owner)). The store id is
+//!   [`crate::zone_crypto::key_owner`]). The store id is
 //!   `"<zone>:<epoch>"`, or `"<zone>:<group|->:<epoch>:<pubkey>"` with
 //!   `ZONE_GROUPS_ENABLED`; rows are moved to the current form on load.
 //! - `zone_kv`   — key `id`, small JSON values for zone encryption bookkeeping
