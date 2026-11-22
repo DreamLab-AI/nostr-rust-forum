@@ -183,6 +183,23 @@ pub fn visible_keys(
     best.into_iter().map(|(id, (_, _, _, k))| (id, k)).collect()
 }
 
+/// Merge a freshly loaded view into memory for the same lease. An entry
+/// already in memory was stored for this lease after the rows were read, so
+/// it is at least as current and is kept. Returns whether anything was added.
+pub fn merge_loaded(
+    memory: &mut HashMap<String, ZoneKey>,
+    loaded: HashMap<String, ZoneKey>,
+) -> bool {
+    let mut added = false;
+    for (id, k) in loaded {
+        if let std::collections::hash_map::Entry::Vacant(e) = memory.entry(id) {
+            e.insert(k);
+            added = true;
+        }
+    }
+    added
+}
+
 /// Highest epoch held per zone across every row on the device, whatever its
 /// owner. Epoch numbers only: [`keyset::plan_mint`](super::keyset::plan_mint)
 /// mints above them, and no secret crosses accounts.
@@ -321,6 +338,15 @@ mod tests {
 
     fn owned(o: &Owner, k: &ZoneKey) -> StoredZoneKey {
         StoredZoneKey::owned(o, k)
+    }
+
+    /// `owner`'s row as it would be written with the flag at `flag` (the
+    /// native flag is always off, so the id is built explicitly).
+    fn owned_with(o: &Owner, k: &ZoneKey, flag: bool) -> StoredZoneKey {
+        StoredZoneKey {
+            id: owned_row_id(o, &k.store_id_with(flag)),
+            ..StoredZoneKey::owned(o, k)
+        }
     }
 
     /// A row as written before rows had owners.
@@ -486,6 +512,51 @@ mod tests {
     }
 
     #[test]
+    fn with_the_flag_on_a_mint_goes_above_two_keys_claiming_one_epoch() {
+        let (a, b) = (owner('a'), owner('b'));
+        // Flag on: two different keys at epoch 3 live under separate ids.
+        let k1 = with_pk(key("zone3", 3, '1'), 'c');
+        let k2 = with_pk(key("zone3", 3, '2'), 'd');
+        assert_ne!(k1.store_id_with(true), k2.store_id_with(true));
+        let rows = vec![owned_with(&a, &k1, true), owned_with(&b, &k2, true)];
+        assert_eq!(
+            visible_keys(rows.clone(), &a, true).values().next(),
+            Some(&k1),
+            "each identity sees only its own claim"
+        );
+        let at3 = with_pk(key("zone3", 3, '9'), 'e');
+        assert_eq!(
+            mint_decision(&rows, &b, &at3, true),
+            MintDecision::Superseded(3)
+        );
+        let at4 = with_pk(key("zone3", 4, '9'), 'e');
+        assert_eq!(mint_decision(&rows, &b, &at4, true), MintDecision::Write);
+        assert!(matches!(
+            plan_mint(None, device_epochs(&rows).get("zone3").copied(), &[], true),
+            MintPlan::Mint { epoch: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn a_load_never_replaces_what_memory_already_holds() {
+        // Memory holds the key as delivered (an ack landed during the load);
+        // the rows read before it still say pending.
+        let a = key("zone3", 2, '1');
+        let newer = a.clone();
+        let mut mem = HashMap::from([(a.store_id_with(false), newer.clone())]);
+        let mut stale = a.clone();
+        stale.pending_delivery = true;
+        let loaded = HashMap::from([
+            (a.store_id_with(false), stale),
+            ("zone3:3".to_string(), key("zone3", 3, '3')),
+        ]);
+        assert!(merge_loaded(&mut mem, loaded));
+        assert_eq!(mem[&a.store_id_with(false)], newer, "memory wins");
+        assert_eq!(mem.len(), 2);
+        assert!(!merge_loaded(&mut mem, HashMap::new()));
+    }
+
+    #[test]
     fn a_mint_conflicting_in_the_slot_reports_the_held_key() {
         let a = owner('a');
         let held = key("zone3", 2, '1');
@@ -589,13 +660,17 @@ mod tests {
         assert!(s.is_current(&la2));
     }
 
-    /// The logout → login sequence without a reload, as the store runs it:
-    /// memory is cleared on every change, the next identity's view is loaded
-    /// from storage under a fresh lease, a load or write started for the old
-    /// identity is not applied to memory, and minting waits until the new
-    /// identity's view is ready. Finding 1 of the earlier attempt: after
-    /// logout and login, the store was empty and Create offered epoch 1 over
-    /// real keys.
+    /// The logout → login sequence without a reload: memory is cleared on
+    /// every change, the next identity's view is loaded from storage under a
+    /// fresh lease, a load or write started for the old identity is not
+    /// applied to memory, and minting waits until the new identity's view is
+    /// ready. Finding 1 of the earlier attempt: after logout and login, the
+    /// store was empty and Create offered epoch 1 over real keys.
+    ///
+    /// `Session`, `visible_keys`, `merge_loaded` and `plan_mint` are the
+    /// functions the store calls; the clearing of memory and readiness on a
+    /// switch is restated here from `ZoneKeyStore::switch_owner`, whose
+    /// reactive signals have no native test harness.
     #[test]
     fn logout_then_login_without_reload_reloads_the_right_keys_before_minting() {
         let (a, b) = (owner('a'), owner('b'));
@@ -608,7 +683,7 @@ mod tests {
         let mut memory: HashMap<String, ZoneKey> = HashMap::new();
         let mut ready_for: Option<Owner> = None;
 
-        // Mirrors ZoneKeyStore::switch_owner / load_for.
+        // Restates the clearing in ZoneKeyStore::switch_owner.
         let switch = |s: &mut Session,
                       mem: &mut HashMap<String, ZoneKey>,
                       ready: &mut Option<Owner>,
@@ -630,9 +705,10 @@ mod tests {
             if !s.is_current(lease) {
                 return;
             }
-            for (id, k) in visible_keys(rows.iter().cloned(), lease.owner(), false) {
-                mem.entry(id).or_insert(k);
-            }
+            merge_loaded(
+                mem,
+                visible_keys(rows.iter().cloned(), lease.owner(), false),
+            );
             *ready = Some(lease.owner().clone());
         };
         let can_mint = |ready: &Option<Owner>, me: &Owner, mem: &HashMap<String, ZoneKey>| {

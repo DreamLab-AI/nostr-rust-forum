@@ -515,14 +515,12 @@ impl ZoneKeyStore {
             let visible =
                 key_owner::visible_keys(rows, lease.owner(), super::tickets::zone_groups_enabled());
             if !visible.is_empty() {
-                // Anything already in memory was stored for this lease after
-                // the rows above were read, so it is at least as current.
-                self.keys.update(|m| {
-                    for (id, k) in visible {
-                        m.entry(id).or_insert(k);
-                    }
-                });
-                self.redecrypt();
+                let mut added = false;
+                self.keys
+                    .update(|m| added = key_owner::merge_loaded(m, visible));
+                if added {
+                    self.redecrypt();
+                }
             }
         }
         if let Ok(Some(json)) = processed {
