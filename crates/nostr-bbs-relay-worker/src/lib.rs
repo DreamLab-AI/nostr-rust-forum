@@ -786,6 +786,72 @@ pub const IS_DELETED_ADDRESSABLE_SQL: &str = "SELECT \
     OR EXISTS (SELECT 1 FROM deleted_addresses WHERE kind = ?3 AND pubkey = ?2 AND d_tag = ?4 AND deleted_until >= ?5) \
     AS deleted";
 
+/// The kind-5 gate's one lookup for a member's `e` targets (`?1` a JSON array
+/// of distinct canonical ids, `?2` the signer).
+///
+/// One row per target that is NOT a stored event of the signer's: either no
+/// row (`pubkey` NULL) or another author's. A kind-5 carries up to 2,000 `e`
+/// tags and D1 caps bound parameters near 100, so the ids travel as one JSON
+/// value through `json_each`, not as an `IN (?, …)` list. `tags` comes back
+/// only for kind 1059, the one kind whose foreign rows a member may still own
+/// (a wrap to their recipient key), so 2,000 tag blobs never cross the wire.
+///
+/// Two flags, read only for an id with no row (a row that exists is judged by
+/// its author, so neither can launder another author's stored event):
+/// - `sealed`: a stored kind-42 names the id in a `sealed` tag (ADR-2017).
+///   Deliberately looser than the moderator's envelope match
+///   ([`SEALED_ENVELOPES_FOR_SQL`]): for a member it only ever refuses.
+/// - `tombstoned`: `deleted_events` holds `(id, signer)`, so the signer's
+///   deletion of it was accepted before (a retry, a second device, a
+///   re-broadcast). `deleted_events`' primary key is `(id, pubkey)`, so the
+///   join adds at most one row per target.
+///
+/// The `sealed` probe is served by the covering `idx_event_tags_lookup (name,
+/// value, event_id)` index; the tombstone join by `deleted_events`' key.
+pub const DELETION_TARGETS_CLASSIFY_SQL: &str = "SELECT j.value AS target, \
+       e.pubkey AS pubkey, \
+       e.kind AS kind, \
+       CASE WHEN e.kind = 1059 THEN e.tags END AS tags, \
+       CASE WHEN e.id IS NULL THEN EXISTS ( \
+           SELECT 1 FROM event_tags t JOIN events s ON s.id = t.event_id \
+           WHERE t.name = 'sealed' AND t.value = j.value AND s.kind = 42 \
+       ) ELSE 0 END AS sealed, \
+       CASE WHEN e.id IS NULL AND d.id IS NOT NULL THEN 1 ELSE 0 END AS tombstoned \
+    FROM json_each(?1) j \
+    LEFT JOIN events e ON e.id = j.value \
+    LEFT JOIN deleted_events d ON d.id = j.value AND d.pubkey = ?2 \
+    WHERE e.id IS NULL OR e.pubkey <> ?2";
+
+/// The stored sealed-original envelopes (ADR-2017) that wrap any of the ids in
+/// `?1` (a JSON array of lowercase ids), with their authors. A moderator's
+/// kind-5 naming an original must remove these, or the original is hidden only
+/// on clients that fold the kind-5 while the envelope keeps serving it to
+/// everyone else.
+///
+/// Matched on the envelope's whole wire shape, not the `sealed` tag alone: a
+/// `kind = 42` row carrying a well-formed `sealed` tag (64-char value, decimal
+/// version) AND a `zk` tag. A kind-42 stored before the ADR-2017 ingest gate
+/// could carry a stray `sealed` tag naming any id; without the shape check a
+/// moderator deleting that id would take such a post with it. The caller
+/// further keeps only rows whose author is an admin, as the ingest gate
+/// requires of every envelope.
+pub const SEALED_ENVELOPES_FOR_SQL: &str = "SELECT DISTINCT s.id AS id, s.pubkey AS pubkey \
+    FROM json_each(?1) j \
+    JOIN event_tags t ON t.name = 'sealed' AND t.value = j.value \
+    JOIN events s ON s.id = t.event_id AND s.kind = 42 \
+    WHERE EXISTS ( \
+        SELECT 1 FROM json_each(s.tags) st \
+        WHERE json_extract(st.value, '$[0]') = 'sealed' \
+          AND json_extract(st.value, '$[1]') = j.value \
+          AND json_type(st.value, '$[2]') = 'text' \
+          AND json_extract(st.value, '$[2]') <> '' \
+          AND json_extract(st.value, '$[2]') NOT GLOB '*[^0-9]*' \
+    ) \
+    AND EXISTS (SELECT 1 FROM event_tags z WHERE z.event_id = s.id AND z.name = 'zk')";
+
+/// Delete one sealed envelope row (`?1`), and only while it is still kind 42.
+pub const SEALED_ENVELOPE_DELETE_SQL: &str = "DELETE FROM events WHERE id = ?1 AND kind = 42";
+
 // Tombstones taken from the stored rows themselves, for moderator and admin
 // deletions of someone else's events: report resolution, the ADR-2017 purge, a
 // user purge, and a moderator's kind-5 in `process_deletion`; an author's own
