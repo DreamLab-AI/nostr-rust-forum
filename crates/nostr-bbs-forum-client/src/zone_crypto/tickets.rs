@@ -575,6 +575,13 @@ pub fn register_group_identity(zone: &str, signer: Rc<dyn Signer>) {
     HELD.with(|h| h.borrow_mut().insert(zone.to_string(), signer));
 }
 
+/// Forget every group identity signer held: called when the signed-in
+/// identity changes, so the next account on this browser cannot issue tickets
+/// with signers the previous one loaded.
+pub fn clear_group_identities() {
+    HELD.with(|h| h.borrow_mut().clear());
+}
+
 impl GroupIdentities for HeldGroupIdentities {
     fn group_identity_for(&self, zone: &str) -> Option<Rc<dyn Signer>> {
         HELD.with(|h| h.borrow().get(zone).cloned())

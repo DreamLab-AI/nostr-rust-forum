@@ -599,7 +599,15 @@ pub struct LivePort {
     pub relay: crate::relay::RelayConnection,
     /// The member's identity signer (NIP-98 for registration).
     pub identity: Rc<dyn Signer>,
+    /// Whether that identity is still the one signed in. Once it is not,
+    /// nothing more reaches the relay or the auth-worker on its behalf: the
+    /// handshake fails and is retried at its next sign-in.
+    pub live: Rc<dyn Fn() -> bool>,
 }
+
+/// The error every [`LivePort`] network step returns once its identity has
+/// signed out.
+const SIGNED_OUT: &str = "signed out before the inbox key was ready";
 
 struct Idb;
 impl GrantKv for Idb {
@@ -634,6 +642,9 @@ impl InboxPort for LivePort {
     }
 
     async fn fetch_backups(&self) -> Result<Vec<NostrEvent>, String> {
+        if !(self.live)() {
+            return Err(SIGNED_OUT.into());
+        }
         let slot: Rc<Slot<Result<(), String>>> = Slot::new();
         let events: Rc<RefCell<Vec<NostrEvent>>> = Rc::default();
         let sink = events.clone();
@@ -660,6 +671,9 @@ impl InboxPort for LivePort {
     }
 
     async fn publish_backup(&self, event: &NostrEvent) -> Result<(), String> {
+        if !(self.live)() {
+            return Err(SIGNED_OUT.into());
+        }
         let slot: Rc<Slot<Result<(), String>>> = Slot::new();
         let done = slot.clone();
         self.relay.publish_with_ack(
@@ -681,6 +695,9 @@ impl InboxPort for LivePort {
         proof: &NostrEvent,
         possession: &NostrEvent,
     ) -> Result<(), String> {
+        if !(self.live)() {
+            return Err(SIGNED_OUT.into());
+        }
         let url = format!(
             "{}/api/recipient-keys/register",
             crate::utils::relay_url::relay_api_base()

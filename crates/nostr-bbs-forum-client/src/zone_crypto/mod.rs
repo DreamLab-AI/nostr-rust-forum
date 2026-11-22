@@ -75,6 +75,7 @@
 pub mod auto_grant;
 pub mod grant_ledger;
 pub mod inbox_key;
+pub mod key_owner;
 pub mod keyset;
 pub mod nip171;
 pub mod public_inbox;

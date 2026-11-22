@@ -11,7 +11,7 @@
 //! registration, sweep state), so the rules are tested natively; only the
 //! IndexedDB and WebSocket plumbing at the bottom needs a browser.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
@@ -574,7 +574,15 @@ pub fn finished_to_store(sweep_enabled: bool, verdict: bool) -> bool {
 
 thread_local! {
     static TRACKER: RefCell<SweepTracker> = RefCell::new(SweepTracker::default());
-    static TOPPED_UP: Cell<bool> = const { Cell::new(false) };
+    /// Identities whose indexer publication has been topped up this page load.
+    static TOPPED_UP: RefCell<std::collections::HashSet<String>> = RefCell::new(Default::default());
+}
+
+/// Start the old-grant cleanup count afresh: the signed-in identity changed,
+/// and the previous identity's in-flight wraps no longer report here (the
+/// store drops their hooks once their sign-in is over).
+pub fn reset_sweep_tracker() {
+    TRACKER.with(|t| *t.borrow_mut() = SweepTracker::default());
 }
 
 /// Sweep hook: a wrap began processing.
@@ -927,10 +935,14 @@ pub async fn set_opt_in(
 /// with the flag off. Callers run it as its own task so a send never waits on
 /// it.
 pub async fn top_up_if_opted_in(signer: &dyn Signer) {
-    if !super::inbox_key::recipient_keys_enabled() || TOPPED_UP.with(|c| c.replace(true)) {
+    let owner = signer.public_key().to_string();
+    // Once per identity per page load: a second account signing in on this
+    // browser is topped up too.
+    if !super::inbox_key::recipient_keys_enabled()
+        || !TOPPED_UP.with(|c| c.borrow_mut().insert(owner.clone()))
+    {
         return;
     }
-    let owner = signer.public_key().to_string();
     let want = opted_in(&owner).await;
     if !want && !pending(&owner).await {
         return;
@@ -945,6 +957,7 @@ pub async fn top_up_if_opted_in(signer: &dyn Signer) {
 mod tests {
     use super::*;
     use crate::zone_crypto::inbox_key::inbox_signer;
+    use std::cell::Cell;
 
     const SK: &str = "0000000000000000000000000000000000000000000000000000000000000003";
     const RELAY: &str = "wss://forum.example.org";

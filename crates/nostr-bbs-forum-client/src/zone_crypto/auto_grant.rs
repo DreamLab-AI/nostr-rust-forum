@@ -332,9 +332,11 @@ impl AutoGrant {
         })
     }
 
-    /// Whether this device's keys have been loaded from IndexedDB.
+    /// Whether the signed-in identity's keys have been loaded from IndexedDB,
+    /// tracked; `false` while signed out.
     pub fn keys_loaded(&self) -> Signal<bool> {
-        self.store.hydrated.into()
+        let (store, auth) = (self.store, self.auth);
+        Signal::derive(move || store.ready_for(auth.pubkey().get().as_deref()))
     }
 
     /// Work out the grants owed, from a fresh roster read, split by the
