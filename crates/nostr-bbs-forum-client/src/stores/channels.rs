@@ -79,7 +79,8 @@ pub struct ChannelStore {
     /// decide that an empty channel is authoritatively empty.
     pub msg_eose_received: RwSignal<bool>,
     /// EOSE receipts for the channel-list subscription, split by whether the
-    /// socket was NIP-42 authenticated. `eose_received` flips on the FIRST
+    /// relay's REQ ledger judged the answer authenticated (see
+    /// `relay::ReceiptCallback`). `eose_received` flips on the FIRST
     /// EOSE, which before AUTH is an anonymous answer that omits Hidden-zone
     /// channels; pages deciding "section not found" read this instead.
     pub channel_receipt: RwSignal<SyncReceipt>,
@@ -235,7 +236,6 @@ impl ChannelStore {
         let loading_sig = self.loading;
         let eose_sig = self.eose_received;
         let channel_receipt_sig = self.channel_receipt;
-        let relay_authed = relay.authenticated();
         let store = *self;
 
         // Track which channel IDs came from the relay (vs stale cache)
@@ -318,7 +318,9 @@ impl ChannelStore {
         });
 
         let store_for_eose = store;
-        let on_eose = Rc::new(move || {
+        // `authed` comes from the relay's per-subscription REQ ledger: true only
+        // when this answer cannot be the anonymous pre-AUTH one.
+        let on_eose = Rc::new(move |authed: bool| {
             // Prune channels that were in the cache but NOT received from relay
             // (they were deleted or the DB was wiped)
             let ids = relay_ids.borrow();
@@ -353,7 +355,6 @@ impl ChannelStore {
             eose_sig.set(true);
             // After the prune above, so a page reading the receipt never sees
             // "settled" alongside a channel list that is about to change.
-            let authed = relay_authed.get_untracked();
             channel_receipt_sig.update(|r| r.record(authed));
             // Cache the pruned result
             store_for_eose.save_cache();
@@ -362,7 +363,7 @@ impl ChannelStore {
         // kind-40 = channel creation, kind-41 = metadata edit (rename),
         // kind-5 = post deletion (NIP-09). Separate filters: see
         // `channel_sync_filters`.
-        let id = relay.subscribe(channel_sync_filters(), on_event, Some(on_eose));
+        let id = relay.subscribe_with_receipt(channel_sync_filters(), on_event, on_eose);
         self.sub_id.set(Some(id));
 
         // Loading timeout fallback
@@ -593,15 +594,14 @@ impl ChannelStore {
         });
 
         // Fires once for the first answer and again for the post-AUTH replay
-        // of this same subscription; `SyncReceipt` keeps the two apart.
+        // of this same subscription; `authed` (from the relay's REQ ledger)
+        // keeps the anonymous answer from counting for a gated zone.
         let history_receipts = self.history_receipts;
-        let relay_authed = relay.authenticated();
-        let on_eose = Rc::new(move || {
-            let authed = relay_authed.get_untracked();
+        let on_eose = Rc::new(move |authed: bool| {
             history_receipts.update(|m| m.entry(key.clone()).or_default().record(authed));
         });
 
-        let _ = relay.subscribe(
+        let _ = relay.subscribe_with_receipt(
             vec![Filter {
                 kinds: Some(vec![42]),
                 e_tags: Some(vec![needle]),
@@ -609,7 +609,7 @@ impl ChannelStore {
                 ..Default::default()
             }],
             on_event,
-            Some(on_eose),
+            on_eose,
         );
     }
 

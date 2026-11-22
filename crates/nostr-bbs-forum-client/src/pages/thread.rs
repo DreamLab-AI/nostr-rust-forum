@@ -51,7 +51,7 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_routes_to_zone, Zone, ZoneVisibility};
 use crate::utils::format_relative_time;
-use crate::utils::lookup::{arm_deadline, zone_is_gated, Lookup};
+use crate::utils::lookup::{deadline_for, zone_is_gated, Lookup};
 use crate::utils::slug_hash::{matches_section_slug, matches_topic_slug, section_slug};
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
@@ -633,7 +633,8 @@ pub fn ThreadPage() -> impl IntoView {
     // topic — or after the deadline. `store.loading` is NOT an input: it
     // clears on the channel list's first EOSE (or at once from cache), before
     // this channel's kind-42 history has even been requested.
-    let deadline = arm_deadline();
+    // Re-armed per topic: the route component is reused across topics.
+    let deadline = deadline_for(move || (category_slug(), section_param(), topic_param()));
     let lookup = Memo::new(move |_| {
         let gated = zone_is_gated(&category_slug(), &load_zones());
         let deadline_passed = deadline.get();

@@ -17,10 +17,14 @@
 //! yet authenticated with only what an anonymous reader may see, then the
 //! client replays every subscription once AUTH completes. For a members-only
 //! zone the first EOSE is therefore an anonymous answer, and an empty one is
-//! not evidence of absence. [`SyncReceipt`] records whether an EOSE arrived on
-//! an authenticated socket so [`SyncReceipt::settles`] can tell the two apart.
+//! not evidence of absence. [`SyncReceipt`] records whether an EOSE was an
+//! authenticated answer — decided by the relay layer's per-subscription REQ
+//! ledger (`relay::receipt`), not by the socket's state when the EOSE lands —
+//! so [`SyncReceipt::settles`] can tell the two apart.
 //!
-//! Pure apart from [`arm_deadline`], so the decision unit-tests natively.
+//! Pure apart from [`deadline_for`] and [`arm_deadline`], which only drive
+//! the pure [`DeadlineClock`] from a timer, so the decision unit-tests
+//! natively.
 
 use leptos::prelude::*;
 
@@ -37,13 +41,14 @@ pub const LOOKUP_DEADLINE_MS: i32 = 15_000;
 pub struct SyncReceipt {
     /// At least one EOSE arrived.
     pub any: bool,
-    /// At least one EOSE arrived while the socket was NIP-42 authenticated.
+    /// At least one EOSE was an authenticated answer: every REQ sent for the
+    /// subscription had been answered and the latest went out after the
+    /// relay accepted our NIP-42 AUTH.
     pub authed: bool,
 }
 
 impl SyncReceipt {
-    /// Record an EOSE that arrived while the socket's NIP-42 state was
-    /// `authed`. Receipts only accumulate: a reconnect that drops AUTH does
+    /// Record an EOSE; `authed` is the relay ledger's verdict on it. Receipts only accumulate: a reconnect that drops AUTH does
     /// not un-deliver history the store already holds.
     pub fn record(&mut self, authed: bool) {
         self.any = true;
@@ -121,9 +126,100 @@ pub fn zone_is_gated(category_param: &str, zones: &[Zone]) -> bool {
         .unwrap_or(false)
 }
 
-/// Start the page's [`LOOKUP_DEADLINE_MS`] clock and return the signal it
-/// flips. `try_set` because the page may have unmounted (and disposed the
-/// signal) by the time the timer fires.
+/// Whether the channel list is complete enough to build the broad message
+/// sync's per-zone filters from. Starting on the first channel to arrive
+/// would scope those filters to that one channel's zone.
+///
+/// `signed_in` is `None` while the auth store is still restoring. A signed-in
+/// viewer waits for an authenticated answer (the anonymous one omits Hidden
+/// zones); an anonymous viewer will never authenticate, so any answer is
+/// final. The deadline covers a relay that never challenges or rejects AUTH.
+pub fn channel_list_settled(
+    receipt: SyncReceipt,
+    signed_in: Option<bool>,
+    deadline_passed: bool,
+) -> bool {
+    receipt.authed || (signed_in == Some(false) && receipt.any) || deadline_passed
+}
+
+/// The failure clock for whichever target (zone, section, topic) a page is
+/// currently looking up. Leptos reuses a route component when only its params
+/// change, so one clock per mount would let the previous target's expiry
+/// apply to the next one at once. Each retarget starts a new generation, and
+/// a timer only expires the generation it was started for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeadlineClock<K> {
+    target: Option<K>,
+    generation: u64,
+}
+
+impl<K> Default for DeadlineClock<K> {
+    fn default() -> Self {
+        Self {
+            target: None,
+            generation: 0,
+        }
+    }
+}
+
+impl<K: PartialEq + Clone> DeadlineClock<K> {
+    /// Point the clock at `target`. Returns the generation to start a timer
+    /// for when the target changed, `None` when it is the same target.
+    pub fn retarget(&mut self, target: K) -> Option<u64> {
+        if self.target.as_ref() == Some(&target) {
+            return None;
+        }
+        self.target = Some(target);
+        self.generation += 1;
+        Some(self.generation)
+    }
+
+    /// A timer started for `generation` fired. Returns the target it expires,
+    /// or `None` if the page has moved on since (a stale timer).
+    pub fn fire(&self, generation: u64) -> Option<K> {
+        if generation == self.generation {
+            self.target.clone()
+        } else {
+            None
+        }
+    }
+}
+
+/// A [`LOOKUP_DEADLINE_MS`] deadline that follows `target`: `true` once the
+/// clock has expired for the target the page is showing *now*. Derived from
+/// the expired target rather than a bare flag, so a param change reads
+/// `false` immediately instead of waiting for the re-arming effect to run.
+pub fn deadline_for<K>(target: impl Fn() -> K + Send + Sync + 'static) -> Signal<bool>
+where
+    K: PartialEq + Clone + Send + Sync + 'static,
+{
+    let target = Signal::derive(target);
+    let clock = StoredValue::new(DeadlineClock::<K>::default());
+    let expired_for = RwSignal::new(Option::<K>::None);
+    Effect::new(move |_| {
+        let current = target.get();
+        let Some(generation) = clock.try_update_value(|c| c.retarget(current)).flatten() else {
+            return;
+        };
+        // Returning to a target that expired earlier must not read as
+        // expired before its new timer runs.
+        let _ = expired_for.try_set(None);
+        super::set_timeout_once(
+            move || {
+                // `try_*`: the page may have unmounted before the timer fired.
+                if let Some(expired) = clock.try_with_value(|c| c.fire(generation)).flatten() {
+                    let _ = expired_for.try_set(Some(expired));
+                }
+            },
+            LOOKUP_DEADLINE_MS,
+        );
+    });
+    Signal::derive(move || expired_for.with(|e| e.as_ref() == Some(&target.get())))
+}
+
+/// A one-shot [`LOOKUP_DEADLINE_MS`] clock for something that never changes
+/// target (the app-wide channel list). `try_set` because the owner may have
+/// been disposed by the time the timer fires.
 pub fn arm_deadline() -> RwSignal<bool> {
     let passed = RwSignal::new(false);
     super::set_timeout_once(
@@ -233,6 +329,66 @@ mod tests {
         r.record(true);
         r.record(false);
         assert!(r.settles(true));
+    }
+
+    #[test]
+    fn channel_list_settles_on_authed_receipt_for_signed_in() {
+        let mut r = SyncReceipt::default();
+        assert!(!channel_list_settled(r, Some(true), false));
+        r.record(false);
+        assert!(
+            !channel_list_settled(r, Some(true), false),
+            "anonymous answer is not the whole list for a member"
+        );
+        r.record(true);
+        assert!(channel_list_settled(r, Some(true), false));
+    }
+
+    #[test]
+    fn channel_list_settles_on_any_receipt_for_anonymous() {
+        let mut r = SyncReceipt::default();
+        assert!(!channel_list_settled(r, Some(false), false));
+        r.record(false);
+        assert!(channel_list_settled(r, Some(false), false));
+    }
+
+    #[test]
+    fn channel_list_waits_while_auth_restores() {
+        let mut r = SyncReceipt::default();
+        r.record(false);
+        assert!(!channel_list_settled(r, None, false));
+        assert!(
+            channel_list_settled(r, None, true),
+            "deadline still ends it"
+        );
+    }
+
+    #[test]
+    fn deadline_clock_starts_one_generation_per_target() {
+        let mut c = DeadlineClock::default();
+        assert_eq!(c.retarget("a"), Some(1));
+        assert_eq!(c.retarget("a"), None, "same target keeps its timer");
+        assert_eq!(c.retarget("b"), Some(2));
+    }
+
+    #[test]
+    fn stale_timer_cannot_expire_the_next_target() {
+        let mut c = DeadlineClock::default();
+        let first = c.retarget("topic-1").unwrap();
+        let second = c.retarget("topic-2").unwrap();
+        assert_eq!(c.fire(first), None, "topic-1's timer is stale");
+        assert_eq!(c.fire(second), Some("topic-2"));
+    }
+
+    #[test]
+    fn returning_to_a_target_rearms_it() {
+        let mut c = DeadlineClock::default();
+        let a1 = c.retarget("a").unwrap();
+        c.retarget("b");
+        let a2 = c.retarget("a").unwrap();
+        assert_ne!(a1, a2);
+        assert_eq!(c.fire(a1), None);
+        assert_eq!(c.fire(a2), Some("a"));
     }
 
     #[test]

@@ -875,15 +875,26 @@ pub fn App() -> impl IntoView {
         crate::stores::reactions::use_reaction_store().start_sync(&r);
     });
 
-    // Start message count sync after channel EOSE. Also tracks whether any
-    // channel is known: `start_msg_sync` bails on an empty list, and an empty
-    // first EOSE (a cold relay DO, or the anonymous pre-AUTH answer) is
-    // followed by channels arriving with no further change to `eose_received`,
-    // so without this the broad message sync never started.
+    // Start the broad message sync once the channel list has SETTLED, because
+    // `start_msg_sync` builds its per-zone filters from the channels known at
+    // that instant. The first EOSE before NIP-42 AUTH is the anonymous answer
+    // (no Hidden-zone channels), and an empty first EOSE is followed by
+    // channels trickling in, so starting on either would scope the filters to
+    // whatever had arrived. `channel_list_settled` waits for an authenticated
+    // answer when signed in, any answer when not, or the deadline. Still
+    // gated on a non-empty list, since `start_msg_sync` bails on an empty one.
+    let msg_sync_deadline = crate::utils::lookup::arm_deadline();
+    let auth_ready = auth.is_ready();
     Effect::new(move |_| {
         let store = use_channel_store();
+        let signed_in = auth_ready.get().then(|| is_authed.get());
+        let settled = crate::utils::lookup::channel_list_settled(
+            store.channel_receipt.get(),
+            signed_in,
+            msg_sync_deadline.get(),
+        );
         let has_channels = store.channels.with(|c| !c.is_empty());
-        if !store.eose_received.get() || !has_channels {
+        if !settled || !has_channels {
             return;
         }
         let r = expect_context::<RelayConnection>();

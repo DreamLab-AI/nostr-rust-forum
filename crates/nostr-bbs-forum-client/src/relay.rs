@@ -19,6 +19,9 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::WebSocket;
 
+mod receipt;
+use receipt::{classify_auth_ok, AuthReply, ReqLedger};
+
 /// Default relay URL when VITE_RELAY_URL is not set.
 const DEFAULT_RELAY_URL: &str = "wss://relay.example.com";
 
@@ -91,6 +94,13 @@ pub type EventCallback = Rc<dyn Fn(NostrEvent)>;
 /// Callback type for EOSE (End of Stored Events) on a subscription.
 pub type EoseCallback = Rc<dyn Fn()>;
 
+/// Callback for an EOSE that also says whether it is an *authenticated*
+/// "that is everything": `true` only once every REQ sent for the
+/// subscription has been answered and the latest went out after the relay
+/// accepted our NIP-42 AUTH (see [`receipt::ReqLedger`]). Pages that must not
+/// call a members-only thing "absent" on an anonymous answer use this.
+pub type ReceiptCallback = Rc<dyn Fn(bool)>;
+
 /// Callback for a NIP-45 COUNT answer: the number of events matching the
 /// filters, as the relay counts them for this session.
 pub type CountCallback = Rc<dyn Fn(u64)>;
@@ -108,6 +118,17 @@ struct Subscription {
     filters: Vec<Filter>,
     on_event: EventCallback,
     on_eose: Option<EoseCallback>,
+    on_receipt: Option<ReceiptCallback>,
+    /// REQs sent for this subscription on the current socket and not yet
+    /// answered, and whether the latest went out after AUTH was accepted.
+    ledger: ReqLedger,
+}
+
+/// Our kind-22242 AUTH event, sent and awaiting the relay's `OK`.
+struct PendingAuth {
+    event_id: String,
+    frame: String,
+    attempts: u32,
 }
 
 /// A NIP-45 COUNT awaiting its answer. Kept (not removed on the first
@@ -164,7 +185,7 @@ struct RelayInner {
     /// but has not yet completed NIP-42 AUTH. In `nip42` mode the relay rejects
     /// unauthenticated writes with `["OK", id, false, "auth-required: …"]`, so
     /// rather than fire-and-lose them we hold writes here and flush them the
-    /// instant AUTH completes (see the AUTH handler's `replay_subs`). Public
+    /// instant the relay accepts AUTH (see `replay_after_auth`). Public
     /// READ subscriptions are never deferred — they stay non-blocking.
     deferred_writes: Vec<String>,
     auth_signer: Option<AuthSignCallback>,
@@ -180,6 +201,16 @@ struct RelayInner {
     last_notice: Option<(String, f64)>,
     /// Monotonic counter so each surfaced notice has a distinct `seq`.
     notice_seq: u64,
+    /// The relay answered our AUTH with `OK true` on the current socket.
+    /// Distinct from the public `authenticated` signal's old meaning ("AUTH
+    /// frame sent"): a REQ the relay began before it accepted AUTH is
+    /// answered anonymously, so only REQs sent after this flips may produce an
+    /// authenticated receipt.
+    auth_accepted: bool,
+    pending_auth: Option<PendingAuth>,
+    /// The relay refused our AUTH on the current socket. Writes stop being
+    /// deferred, so the relay's refusal reaches each publish callback.
+    auth_refused: bool,
     _on_open: Option<Closure<dyn FnMut()>>,
     _on_message: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
     _on_error: Option<Closure<dyn FnMut(web_sys::ErrorEvent)>>,
@@ -210,7 +241,8 @@ pub struct RelayConnection {
     inner: SharedInner,
     state: RwSignal<ConnectionState>,
     /// Whether the current socket has completed NIP-42 AUTH. Flips `true` once
-    /// the AUTH response is signed + sent (and subscriptions replayed), and back
+    /// the relay ACCEPTS the AUTH response (its `OK true`) and subscriptions
+    /// have been replayed, and back
     /// to `false` whenever the socket (re)connects or disconnects. AUTH-gated
     /// REQs (kind-1059 DMs, gated zones) must wait for this to avoid racing the
     /// handshake — critical for slow NIP-07 extensions where signing the AUTH
@@ -325,6 +357,9 @@ impl RelayConnection {
             authed_sink: None,
             last_notice: None,
             notice_seq: 0,
+            auth_accepted: false,
+            pending_auth: None,
+            auth_refused: false,
             _on_open: None,
             _on_message: None,
             _on_error: None,
@@ -430,11 +465,14 @@ impl RelayConnection {
         let state = self.state;
         let on_open = Closure::wrap(Box::new(move || {
             web_sys::console::log_1(&"[Relay] WebSocket connected".into());
-            state.set(ConnectionState::Connected);
             let (frames, authed_sink) = {
                 let mut inner = inner_rc.borrow_mut();
                 inner.reconnect_attempts = 0;
                 inner.seen_events.clear();
+                // A fresh socket starts anonymous until the relay accepts AUTH.
+                inner.auth_accepted = false;
+                inner.pending_auth = None;
+                inner.auth_refused = false;
                 // Flush pending frames queued while the socket was down —
                 // EXCEPT REQs: every live subscription is replayed below, so
                 // flushing a queued REQ too double-sends it (observed at boot,
@@ -444,8 +482,16 @@ impl RelayConnection {
                     .drain(..)
                     .filter(|m| !m.starts_with("[\"REQ\""))
                     .collect();
-                // Replay subscriptions on (re)connect
-                for (sub_id, sub) in inner.subscriptions.iter() {
+                // Same for REQs still in the paced queue from the previous
+                // socket (a reconnect without `disconnect` keeps the queue):
+                // the replay below re-sends them, and an uncounted extra REQ
+                // would let the ledger call an anonymous answer authenticated.
+                inner.send_queue.retain(|m| !m.starts_with("[\"REQ\""));
+                // Replay subscriptions on (re)connect. Answers owed on the old
+                // socket will never arrive, so each ledger restarts here.
+                for (sub_id, sub) in inner.subscriptions.iter_mut() {
+                    sub.ledger.reset();
+                    sub.ledger.sent(false);
                     let mut req = vec![
                         serde_json::Value::String("REQ".into()),
                         serde_json::Value::String(sub_id.clone()),
@@ -465,6 +511,10 @@ impl RelayConnection {
             for msg in frames {
                 queue_paced(&inner_rc, msg);
             }
+            // Announce Connected only now: an effect that subscribes on it
+            // then sends (and counts) its own REQ after the replay above has
+            // reset and counted every ledger, so no REQ goes uncounted.
+            state.set(ConnectionState::Connected);
             // A fresh socket is not yet NIP-42 authenticated — gated REQs must
             // wait for the AUTH handshake to flip this back to true. Set after
             // the borrow ends so a reactive effect reading `authenticated`
@@ -534,6 +584,9 @@ impl RelayConnection {
             inner._on_message = None;
             inner._on_error = None;
             inner._on_close = None;
+            inner.auth_accepted = false;
+            inner.pending_auth = None;
+            inner.auth_refused = false;
             // NOTE: subscriptions are preserved so they can be replayed on reconnect.
             inner.pending_publishes.clear();
             inner.pending_messages.clear();
@@ -552,16 +605,48 @@ impl RelayConnection {
         on_event: EventCallback,
         on_eose: Option<EoseCallback>,
     ) -> String {
+        self.subscribe_inner(filters, on_event, on_eose, None)
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but the EOSE callback is told
+    /// whether the answer is authenticated — see [`ReceiptCallback`]. It may
+    /// fire more than once (the post-AUTH replay re-answers the same id).
+    pub fn subscribe_with_receipt(
+        &self,
+        filters: Vec<Filter>,
+        on_event: EventCallback,
+        on_receipt: ReceiptCallback,
+    ) -> String {
+        self.subscribe_inner(filters, on_event, None, Some(on_receipt))
+    }
+
+    fn subscribe_inner(
+        &self,
+        filters: Vec<Filter>,
+        on_event: EventCallback,
+        on_eose: Option<EoseCallback>,
+        on_receipt: Option<ReceiptCallback>,
+    ) -> String {
         let sub_id = self.with_inner(|rc| {
             let mut inner = rc.borrow_mut();
             inner.sub_counter += 1;
             let sub_id = format!("sub_{}", inner.sub_counter);
+            // Mirrors `send_raw`: a REQ only reaches this socket when it is
+            // open; otherwise it is dropped from the pending flush and the
+            // on_open replay sends (and counts) it instead.
+            let is_open = matches!(&inner.ws, Some(ws) if ws.ready_state() == WebSocket::OPEN);
+            let mut ledger = ReqLedger::default();
+            if is_open {
+                ledger.sent(inner.auth_accepted);
+            }
             inner.subscriptions.insert(
                 sub_id.clone(),
                 Subscription {
                     filters: filters.clone(),
                     on_event,
                     on_eose,
+                    on_receipt,
+                    ledger,
                 },
             );
             sub_id
@@ -630,7 +715,7 @@ impl RelayConnection {
     /// PRD-010 G4: while the socket is OPEN but not yet authenticated the relay
     /// rejects writes `auth-required`, so rather than fire-and-lose them we
     /// buffer the frame and flush it the instant AUTH completes (the AUTH
-    /// handler's `replay_subs`). When already authenticated it goes out
+    /// `replay_after_auth`). When already authenticated it goes out
     /// immediately; when disconnected `send_raw` buffers it in
     /// `pending_messages` and flushes on (re)connect. READ subscriptions never
     /// route through here, so public reads stay non-blocking.
@@ -639,6 +724,7 @@ impl RelayConnection {
             let mut inner = rc.borrow_mut();
             let is_open = matches!(&inner.ws, Some(ws) if ws.ready_state() == WebSocket::OPEN);
             let is_authed = inner.immediate_writes
+                || inner.auth_refused
                 || inner
                     .authed_sink
                     .map(|s| s.get_untracked())
@@ -819,6 +905,132 @@ fn count_frame(id: &str, filters: &[Filter]) -> String {
     serde_json::to_string(&req).unwrap_or_default()
 }
 
+/// The relay answered our AUTH event. On acceptance, replay every
+/// subscription (each REQ now counts as authenticated in its ledger), flush
+/// writes held back for AUTH, and only then flip the public `authenticated`
+/// signal. A rate-limited refusal re-sends the same frame a bounded number of
+/// times; any other refusal leaves the socket anonymous.
+fn on_auth_ok(inner_rc: &Rc<RefCell<RelayInner>>, accepted: bool, message: &str) {
+    let attempts = inner_rc
+        .borrow()
+        .pending_auth
+        .as_ref()
+        .map(|p| p.attempts)
+        .unwrap_or(0);
+    match classify_auth_ok(accepted, message, attempts) {
+        AuthReply::Accepted => {
+            inner_rc.borrow_mut().pending_auth = None;
+            replay_after_auth(inner_rc);
+        }
+        AuthReply::Retry => {
+            let rc = inner_rc.clone();
+            crate::utils::set_timeout_once(
+                move || {
+                    let frame = {
+                        let mut inner = rc.borrow_mut();
+                        let ws_open =
+                            matches!(&inner.ws, Some(ws) if ws.ready_state() == WebSocket::OPEN);
+                        match inner.pending_auth.as_mut() {
+                            Some(p) if ws_open => {
+                                p.attempts += 1;
+                                Some(p.frame.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(frame) = frame {
+                        queue_paced(&rc, frame);
+                    }
+                },
+                1_000 * attempts as i32,
+            );
+        }
+        AuthReply::Rejected => {
+            // Release writes held back for AUTH anyway: the relay's own
+            // `OK false "auth-required…"` then reaches each publish callback
+            // and surfaces as an error, instead of the post waiting forever.
+            // Subscriptions are not replayed and `authenticated` stays false.
+            let deferred = {
+                let mut inner = inner_rc.borrow_mut();
+                inner.pending_auth = None;
+                inner.auth_refused = true;
+                std::mem::take(&mut inner.deferred_writes)
+            };
+            for msg in deferred {
+                queue_paced(inner_rc, msg);
+            }
+            web_sys::console::warn_1(&format!("[Relay] NIP-42 AUTH rejected: {message}").into());
+        }
+    }
+}
+
+/// Re-send every subscription (and pending COUNT) now that the relay has
+/// accepted AUTH, so it re-evaluates them for the authenticated session.
+fn replay_after_auth(inner_rc: &Rc<RefCell<RelayInner>>) {
+    // Extract the authed signal, then drop the borrow BEFORE flipping it:
+    // `sig.set(true)` synchronously runs the DM Effect, which calls
+    // `relay.subscribe()` -> `inner.borrow_mut()`. Holding this borrow across
+    // the set would re-enter the same RefCell and panic ("already borrowed").
+    let (frames, deferred_writes, authed_sink) = {
+        let mut inner = inner_rc.borrow_mut();
+        let ws_live = inner.ws.is_some();
+        inner.auth_accepted = true;
+        let mut frames = Vec::new();
+        if ws_live {
+            for (sub_id, sub) in inner.subscriptions.iter_mut() {
+                sub.ledger.sent(true);
+                let mut req = vec![
+                    serde_json::Value::String("REQ".into()),
+                    serde_json::Value::String(sub_id.clone()),
+                ];
+                for filter in &sub.filters {
+                    if let Ok(v) = serde_json::to_value(filter) {
+                        req.push(v);
+                    }
+                }
+                if let Ok(msg) = serde_json::to_string(&req) {
+                    frames.push(msg);
+                }
+            }
+            // Pending COUNTs go again too: before AUTH the relay answered them
+            // with 0 for protected kinds.
+            for (id, pending) in inner.counts.iter() {
+                frames.push(count_frame(id, &pending.filters));
+            }
+        }
+        // PRD-010 G4: drain writes deferred while this socket was
+        // unauthenticated. Only when the socket is live.
+        let deferred_writes = if ws_live {
+            std::mem::take(&mut inner.deferred_writes)
+        } else {
+            Vec::new()
+        };
+        (frames, deferred_writes, inner.authed_sink)
+    };
+    // Paced: the boot replay is exactly the burst that tripped the relay's
+    // per-IP limit and dropped the message REQs ("0 messages" symptom).
+    if !frames.is_empty() {
+        for msg in frames {
+            queue_paced(inner_rc, msg);
+        }
+        web_sys::console::log_1(&"[Relay] replayed subscriptions post-AUTH (paced)".into());
+    }
+    let deferred_count = deferred_writes.len();
+    for msg in deferred_writes {
+        queue_paced(inner_rc, msg);
+    }
+    if deferred_count > 0 {
+        web_sys::console::log_1(
+            &format!("[Relay] flushed {deferred_count} deferred write(s) post-AUTH").into(),
+        );
+    }
+    // Mark the session authenticated so AUTH-gated consumers (DM store) can
+    // now safely (re-)issue their kind-1059 REQs.
+    if let Some(sig) = authed_sink {
+        sig.set(true);
+    }
+}
+
 fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -900,15 +1112,31 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                 None => return,
             };
 
-            let callback = {
-                let inner = inner_rc.borrow();
-                inner
-                    .subscriptions
-                    .get(&sub_id)
-                    .and_then(|s| s.on_eose.as_ref().map(Rc::clone))
+            let callbacks = {
+                let mut inner = inner_rc.borrow_mut();
+                inner.subscriptions.get_mut(&sub_id).map(|s| {
+                    let authed = s.ledger.answered();
+                    (s.on_eose.clone(), s.on_receipt.clone(), authed)
+                })
             };
-            if let Some(cb) = callback {
-                cb();
+            // Borrow released: callbacks may subscribe re-entrantly.
+            if let Some((on_eose, on_receipt, authed)) = callbacks {
+                if let Some(cb) = on_eose {
+                    cb();
+                }
+                if let Some(cb) = on_receipt {
+                    cb(authed);
+                }
+            }
+        }
+        "CLOSED" => {
+            // A refused REQ is still an answer to one REQ: count it so the
+            // ledger is not left waiting forever. It is not a completeness
+            // receipt, so no callback fires.
+            if let Some(sub_id) = arr.get(1).and_then(Value::as_str) {
+                if let Some(s) = inner_rc.borrow_mut().subscriptions.get_mut(sub_id) {
+                    s.ledger.answered();
+                }
             }
         }
         "COUNT" => {
@@ -965,6 +1193,15 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                 let event_id = arr[1].as_str().unwrap_or("unknown");
                 let accepted = arr[2].as_bool().unwrap_or(false);
                 let message = arr[3].as_str().unwrap_or("");
+                let is_auth_reply = inner_rc
+                    .borrow()
+                    .pending_auth
+                    .as_ref()
+                    .is_some_and(|p| p.event_id == event_id);
+                if is_auth_reply {
+                    on_auth_ok(inner_rc, accepted, message);
+                    return;
+                }
                 if !accepted {
                     web_sys::console::warn_1(
                         &format!("[Relay] Event {} rejected: {}", event_id, message).into(),
@@ -1005,115 +1242,55 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
                         content: String::new(),
                     };
 
-                    let send_auth = |signed: &NostrEvent, ws: &Option<WebSocket>| {
-                        if let Ok(msg) = serde_json::to_string(&serde_json::json!(["AUTH", signed]))
-                        {
-                            if let Some(ws) = ws {
-                                let _ = ws.send_with_str(&msg);
-                                web_sys::console::log_1(
-                                    &"[Relay] NIP-42 AUTH response sent".into(),
-                                );
-                            }
-                        }
-                    };
-
-                    // Replay all active subscriptions after AUTH so the relay
-                    // re-evaluates them with the authenticated session: REQs
-                    // opened before the NIP-42 handshake completed were zone-
-                    // filtered as unauthenticated. Same-socket ordering means
-                    // the relay processes AUTH before these re-REQs.
-                    let replay_rc = inner_rc.clone();
-                    let replay_subs = move |ws: &Option<WebSocket>| {
-                        // Extract the authed signal, then drop the borrow BEFORE
-                        // flipping it: `sig.set(true)` synchronously runs the
-                        // DM Effect, which calls `relay.subscribe()` ->
-                        // `inner.borrow_mut()`. Holding this borrow across the
-                        // set would re-enter the same RefCell and panic
-                        // ("already borrowed").
-                        let (frames, deferred_writes, authed_sink) = {
-                            let mut inner = replay_rc.borrow_mut();
-                            let mut frames = Vec::new();
-                            if ws.is_some() {
-                                for (sub_id, sub) in inner.subscriptions.iter() {
-                                    let mut req = vec![
-                                        serde_json::Value::String("REQ".into()),
-                                        serde_json::Value::String(sub_id.clone()),
-                                    ];
-                                    for filter in &sub.filters {
-                                        if let Ok(v) = serde_json::to_value(filter) {
-                                            req.push(v);
-                                        }
-                                    }
-                                    if let Ok(msg) = serde_json::to_string(&req) {
-                                        frames.push(msg);
-                                    }
-                                }
-                                // Pending COUNTs go again too: before AUTH the
-                                // relay answered them with 0 for protected kinds.
-                                for (id, pending) in inner.counts.iter() {
-                                    frames.push(count_frame(id, &pending.filters));
+                    // Send the AUTH response and remember it: subscriptions are
+                    // replayed only when the relay ACCEPTS it (its `OK true`,
+                    // see `on_auth_ok`). Replaying on send let the anonymous
+                    // answer to a REQ the relay began before AUTH be taken for
+                    // an authenticated one.
+                    let send_auth =
+                        |signed: &NostrEvent,
+                         ws: &Option<WebSocket>,
+                         rc: &Rc<RefCell<RelayInner>>| {
+                            if let Ok(msg) =
+                                serde_json::to_string(&serde_json::json!(["AUTH", signed]))
+                            {
+                                if let Some(ws) = ws {
+                                    rc.borrow_mut().pending_auth = Some(PendingAuth {
+                                        event_id: signed.id.clone(),
+                                        frame: msg.clone(),
+                                        attempts: 1,
+                                    });
+                                    let _ = ws.send_with_str(&msg);
+                                    web_sys::console::log_1(
+                                        &"[Relay] NIP-42 AUTH response sent".into(),
+                                    );
                                 }
                             }
-                            // PRD-010 G4: drain writes deferred while this socket
-                            // was unauthenticated, to flush them now that AUTH
-                            // has completed on the SAME socket (the relay
-                            // processes the AUTH frame before these, so ordering
-                            // holds). Only when the socket is live.
-                            let deferred_writes = if ws.is_some() {
-                                std::mem::take(&mut inner.deferred_writes)
-                            } else {
-                                Vec::new()
-                            };
-                            (frames, deferred_writes, inner.authed_sink)
                         };
-                        // Paced: the boot replay is exactly the burst that
-                        // tripped the relay's per-IP limit and dropped the
-                        // message REQs ("0 messages" symptom).
-                        if !frames.is_empty() {
-                            for msg in frames {
-                                queue_paced(&replay_rc, msg);
-                            }
-                            web_sys::console::log_1(
-                                &"[Relay] replayed subscriptions post-AUTH (paced)".into(),
-                            );
-                        }
-                        // Flush writes deferred until authentication (paced too).
-                        let deferred_count = deferred_writes.len();
-                        for msg in deferred_writes {
-                            queue_paced(&replay_rc, msg);
-                        }
-                        if deferred_count > 0 {
-                            web_sys::console::log_1(
-                                &format!(
-                                    "[Relay] flushed {deferred_count} deferred write(s) post-AUTH"
-                                )
-                                .into(),
-                            );
-                        }
-                        // Mark the session authenticated so AUTH-gated consumers
-                        // (DM store) can now safely (re-)issue their kind-1059
-                        // REQs. Doing this *after* the AUTH response is sent and
-                        // subscriptions are replayed is what lets slow NIP-07
-                        // extensions deliver DMs without racing a fixed timer.
-                        if let Some(sig) = authed_sink {
-                            sig.set(true);
-                        }
-                    };
 
                     if let Some(sign_fn) = sync_signer {
                         let unsigned = make_unsigned(relay_url, challenge);
                         if let Some(signed) = sign_fn(unsigned) {
-                            send_auth(&signed, &ws);
-                            replay_subs(&ws);
+                            send_auth(&signed, &ws, inner_rc);
                         } else {
                             web_sys::console::warn_1(&"[Relay] AUTH sync signing failed".into());
                         }
                     } else if let Some(async_sign) = async_signer {
                         let unsigned = make_unsigned(relay_url, challenge);
+                        let rc = inner_rc.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Some(signed) = async_sign(unsigned).await {
-                                send_auth(&signed, &ws);
-                                replay_subs(&ws);
+                                // The socket may have been replaced while the
+                                // extension was signing; answer only the one
+                                // that issued this challenge.
+                                let current = rc.borrow().ws.clone();
+                                let same = match (&ws, &current) {
+                                    (Some(a), Some(b)) => a == b,
+                                    _ => false,
+                                };
+                                if same {
+                                    send_auth(&signed, &ws, &rc);
+                                }
                             } else {
                                 web_sys::console::warn_1(
                                     &"[Relay] AUTH async signing failed".into(),

@@ -53,7 +53,7 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::utils::capitalize;
-use crate::utils::lookup::{arm_deadline, zone_is_gated, Lookup};
+use crate::utils::lookup::{deadline_for, zone_is_gated, Lookup};
 use crate::utils::slug_hash::matches_section_slug;
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
@@ -298,7 +298,8 @@ pub fn SectionPage() -> impl IntoView {
     // `store.loading`, which clears on the first channel-list EOSE (or at once
     // from cache) and so let "Section Not Found" and "No topics yet" show
     // before a cold deep link had synced.
-    let deadline = arm_deadline();
+    // Re-armed per section: the route component is reused across sections.
+    let deadline = deadline_for(move || (category_slug(), section_slug()));
     let section_lookup = Memo::new(move |_| {
         let gated = zone_is_gated(&category_slug(), &load_zones());
         Lookup::decide(
@@ -554,27 +555,33 @@ pub fn SectionPage() -> impl IntoView {
                             <span class="text-gray-400 text-sm">"Loading topics..."</span>
                         </div>
                     }.into_any()
-                } else if let Some(ch) = resolved_channel.get() {
+                } else if state != Lookup::TimedOut && resolved_channel.with(Option::is_some) {
+                    // Found or authoritatively empty: TopicList renders both.
+                    let ch_id = resolved_channel.get().map(|c| c.id).unwrap_or_default();
                     view! {
                         <TopicList
-                            channel_id=ch.id
+                            channel_id=ch_id
                             category=category_for_topics.get()
                             topics=topics
                         />
                     }.into_any()
                 } else {
-                    // The relay finished answering (or the deadline passed)
-                    // and no channel resolved for this slug.
-                    let (heading, detail) = if state == Lookup::TimedOut {
-                        (
+                    // Not found on a receipt, or no receipt before the
+                    // deadline. A timeout must not read as "empty", so it gets
+                    // its own wording rather than TopicList's "No topics yet".
+                    let (heading, detail) = match (state, resolved_channel.with(Option::is_some)) {
+                        (Lookup::TimedOut, true) => (
+                            "Topics Unavailable",
+                            "This section's topics did not finish loading. Check your connection and try again.",
+                        ),
+                        (Lookup::TimedOut, false) => (
                             "Section Unavailable",
                             "This section did not finish loading. Check your connection and try again.",
-                        )
-                    } else {
-                        (
+                        ),
+                        _ => (
                             "Section Not Found",
                             "This section could not be found in this zone.",
-                        )
+                        ),
                     };
                     view! {
                         <div class="glass-card p-8 text-center">
