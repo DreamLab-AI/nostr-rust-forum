@@ -21,20 +21,34 @@
 //! is what the relay orders by), but "oldest seen" is the wrap's timestamp,
 //! never the rumour's.
 //!
-//! A warm device must not re-page its whole history every session. Once a
-//! scope has completed a backfill on this device (persisted per identity and
-//! scope), a full page whose wraps were all already processed proves the
-//! sync has reached history it has handled before: wraps arrive newest
-//! first, so everything below that page was seen by the completed backfill.
-//! Paging stops there. Without the marker (a first backfill, or one that was
-//! interrupted) paging continues to the end, so an interrupted backfill
-//! resumes from the top next session, skipping the unwrap of every wrap it
-//! already processed.
+//! A warm device must not re-page its whole history every session. A scope
+//! that completes a backfill records WHEN (`completed_at`, persisted per
+//! identity and scope). A later session may stop at a full page whose wraps
+//! were all already processed, but only once that page lies entirely below
+//! `completed_at - NIP59_BACKDATE_SECS`: a wrap published after the last
+//! backfill carries a `created_at` at most two days before its publication,
+//! so it always sorts above such a page, and was delivered (and processed)
+//! on an earlier page of this session. Stopping on processed wraps alone
+//! would be unsafe: an account that received more than a page of wraps
+//! while offline could have a fresh grant backdated below a fully processed
+//! page. Without a marker (a first backfill, or one that was interrupted)
+//! paging continues to the end, so an interrupted backfill resumes from the
+//! top next session, skipping the unwrap of every wrap it already processed.
 //!
 //! Pure, so it unit-tests natively.
 
 use crate::stores::channels::RELAY_FILTER_LIMIT;
 use crate::stores::deletion_sync::{self as deletion_sync, PageStep};
+
+/// How far into the past NIP-59 lets a gift wrap's `created_at` be
+/// randomised: two days.
+pub const NIP59_BACKDATE_SECS: u64 = 2 * 24 * 60 * 60;
+
+/// Parse a stored marker: the completion time in seconds, or `None` for a
+/// missing, corrupt or zero value (treated as "no completed backfill").
+pub fn parse_marker(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok().filter(|&t| t > 0)
+}
 
 /// One grant subscription scope, for the persisted backfill marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -64,6 +78,8 @@ pub struct PageTally {
     pub rows: usize,
     /// Oldest wrap `created_at` among them.
     pub oldest: Option<u64>,
+    /// Newest wrap `created_at` among them.
+    pub newest: Option<u64>,
     /// Rows whose wrap was not yet in the processed set.
     pub unprocessed: usize,
 }
@@ -73,6 +89,7 @@ impl PageTally {
     pub fn observe(&mut self, created_at: u64, already_processed: bool) {
         self.rows += 1;
         self.oldest = Some(self.oldest.map_or(created_at, |o| o.min(created_at)));
+        self.newest = Some(self.newest.map_or(created_at, |n| n.max(created_at)));
         if !already_processed {
             self.unprocessed += 1;
         }
@@ -87,10 +104,11 @@ impl PageTally {
 ///
 /// `page` is 0 for the long-lived subscription's stored events (fetched with
 /// no `until`) and `n` for the `n`-th page subscription, fetched with `until`
-/// inclusive. `backfill_done_before` is the persisted marker for this
-/// identity and scope.
+/// inclusive. `completed_at` is the persisted marker for this identity and
+/// scope: when its last backfill completed (seconds), if one has.
 ///
-/// - **Warm stop:** with the marker, a full page with nothing unprocessed is
+/// - **Warm stop:** with a marker, a full page with nothing unprocessed whose
+///   newest wrap is older than `completed_at - NIP59_BACKDATE_SECS` is
 ///   history a completed backfill already handled: [`PageStep::Done`].
 /// - **First page:** full → page on from its oldest row; short → done.
 /// - **Later pages:** the deletion sync's rule ([`deletion_sync::next_page`]):
@@ -105,9 +123,13 @@ pub fn grant_page_step(
     page: u32,
     until: Option<u64>,
     tally: PageTally,
-    backfill_done_before: bool,
+    completed_at: Option<u64>,
 ) -> PageStep {
-    if backfill_done_before && tally.full() && tally.unprocessed == 0 {
+    let below_new_wraps = match (completed_at, tally.newest) {
+        (Some(done), Some(newest)) => newest < done.saturating_sub(NIP59_BACKDATE_SECS),
+        _ => false,
+    };
+    if below_new_wraps && tally.full() && tally.unprocessed == 0 {
         return PageStep::Done;
     }
     match until {
@@ -139,7 +161,7 @@ mod tests {
     fn full_first_page_pages_on_from_its_oldest_row() {
         let t = page(LIMIT, 0, 1_000_000);
         assert_eq!(
-            grant_page_step(0, None, t, false),
+            grant_page_step(0, None, t, None),
             PageStep::Next {
                 until: 1_000_000 - (LIMIT as u64 - 1)
             }
@@ -149,11 +171,11 @@ mod tests {
     #[test]
     fn short_first_page_is_done() {
         assert_eq!(
-            grant_page_step(0, None, page(37, 0, 500), false),
+            grant_page_step(0, None, page(37, 0, 500), None),
             PageStep::Done
         );
         assert_eq!(
-            grant_page_step(0, None, page(0, 0, 500), false),
+            grant_page_step(0, None, page(0, 0, 500), None),
             PageStep::Done
         );
     }
@@ -162,7 +184,7 @@ mod tests {
     fn full_later_page_pages_on() {
         let t = page(LIMIT, 0, 900_000);
         assert_eq!(
-            grant_page_step(1, Some(900_000), t, false),
+            grant_page_step(1, Some(900_000), t, None),
             PageStep::Next {
                 until: 900_000 - (LIMIT as u64 - 1)
             }
@@ -175,7 +197,7 @@ mod tests {
     #[test]
     fn short_later_page_with_older_rows_takes_one_more_page() {
         assert_eq!(
-            grant_page_step(1, Some(900_000), page(12, 1, 900_000), false),
+            grant_page_step(1, Some(900_000), page(12, 1, 900_000), None),
             PageStep::Next { until: 899_989 }
         );
     }
@@ -184,7 +206,7 @@ mod tests {
     fn page_with_nothing_older_than_until_is_done() {
         // Only the inclusive boundary row came back.
         assert_eq!(
-            grant_page_step(2, Some(800), page(1, 1, 800), false),
+            grant_page_step(2, Some(800), page(1, 1, 800), None),
             PageStep::Done
         );
     }
@@ -193,7 +215,7 @@ mod tests {
     fn page_that_made_no_progress_gives_up() {
         // Not even the boundary row: the query failed or the row vanished.
         assert_eq!(
-            grant_page_step(2, Some(800), PageTally::default(), false),
+            grant_page_step(2, Some(800), PageTally::default(), None),
             PageStep::GiveUp
         );
         // A full page all at the boundary timestamp: stepping past it would
@@ -202,22 +224,46 @@ mod tests {
         for _ in 0..LIMIT {
             t.observe(800, false);
         }
-        assert_eq!(grant_page_step(2, Some(800), t, false), PageStep::GiveUp);
+        assert_eq!(grant_page_step(2, Some(800), t, None), PageStep::GiveUp);
     }
 
     #[test]
     fn page_bound_gives_up() {
         let t = page(LIMIT, 0, 500_000);
         assert_eq!(
-            grant_page_step(deletion_sync::MAX_PAGES, Some(500_000), t, false),
+            grant_page_step(deletion_sync::MAX_PAGES, Some(500_000), t, None),
             PageStep::GiveUp
         );
     }
 
+    /// Marker written well after this page's wraps.
+    const DONE_AT: u64 = 1_000_000 + 3 * NIP59_BACKDATE_SECS;
+
     #[test]
-    fn warm_device_stops_at_a_fully_processed_full_page() {
+    fn warm_device_stops_at_a_fully_processed_old_full_page() {
         let t = page(LIMIT, LIMIT, 1_000_000);
-        assert_eq!(grant_page_step(0, None, t, true), PageStep::Done);
+        assert_eq!(grant_page_step(0, None, t, Some(DONE_AT)), PageStep::Done);
+    }
+
+    /// The NIP-59 hole: a grant received while offline can be backdated up
+    /// to two days, below a page of wraps that were all processed. A page
+    /// that recent must not stop the backfill.
+    #[test]
+    fn warm_device_pages_on_through_the_backdating_window() {
+        let recent = DONE_AT - NIP59_BACKDATE_SECS + 10;
+        let t = page(LIMIT, LIMIT, recent);
+        assert!(matches!(
+            grant_page_step(0, None, t, Some(DONE_AT)),
+            PageStep::Next { .. }
+        ));
+    }
+
+    #[test]
+    fn markers_parse_as_completion_times() {
+        assert_eq!(parse_marker(Some("1800000000")), Some(1_800_000_000));
+        assert_eq!(parse_marker(Some("0")), None);
+        assert_eq!(parse_marker(Some("yes")), None);
+        assert_eq!(parse_marker(None), None);
     }
 
     #[test]
@@ -226,7 +272,7 @@ mod tests {
         // (not unwrapped) but paging continues to the end.
         let t = page(LIMIT, LIMIT, 1_000_000);
         assert!(matches!(
-            grant_page_step(0, None, t, false),
+            grant_page_step(0, None, t, None),
             PageStep::Next { .. }
         ));
     }
@@ -235,7 +281,7 @@ mod tests {
     fn warm_device_pages_on_while_a_page_has_new_wraps() {
         let t = page(LIMIT, LIMIT - 1, 1_000_000);
         assert!(matches!(
-            grant_page_step(0, None, t, true),
+            grant_page_step(0, None, t, Some(DONE_AT)),
             PageStep::Next { .. }
         ));
     }

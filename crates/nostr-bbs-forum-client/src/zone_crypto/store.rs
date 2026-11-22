@@ -24,7 +24,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use super::grant_backlog::{GrantBacklog, KeyPhase};
 use super::grant_ledger::{GrantKv, GrantLedger};
-use super::grant_paging::{grant_page_step, GrantScope, PageTally};
+use super::grant_paging::{grant_page_step, parse_marker, GrantScope, PageTally};
 use super::inbox_key::{
     deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, recipient_keys_enabled,
     subscription_targets, sweep_targets, unwrap_inbox_then_identity, LivePort, SweepCandidate,
@@ -41,6 +41,10 @@ use crate::stores::indexed_db::{ForumDb, MintPut, ZoneKeyPut};
 /// by every identity on the device: the relay serves a wrap only to its
 /// addressee, so one identity's entries never cover another's wraps.
 const KV_PROCESSED: &str = "processed_wraps";
+
+/// Coalescing window for writing the processed-wrap set (see
+/// [`ZoneKeyStore::mark_processed`]).
+const PROCESSED_FLUSH_MS: i32 = 1_000;
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
@@ -70,9 +74,13 @@ pub struct ZoneKeyStore {
     /// identity it belongs to. Tracked, so pages re-judge "are this member's
     /// keys still arriving?" as it advances.
     grant_backlog: RwSignal<Option<(Owner, GrantBacklog)>>,
-    /// Ids of the persisted "backfill complete" markers loaded for the
-    /// signed-in identity (see [`super::grant_paging`]).
-    backfill_done: StoredValue<HashSet<String>>,
+    /// The persisted "backfill complete" markers loaded for the signed-in
+    /// identity: marker id to completion time in seconds (see
+    /// [`super::grant_paging`]).
+    backfill_done: StoredValue<HashMap<String, u64>>,
+    /// The processed-wrap set changed since it was last written to
+    /// IndexedDB, and a flush is scheduled.
+    processed_flush_pending: StoredValue<bool>,
     /// Wrap ids handed to the wrap handler this sign-in. Paging re-delivers
     /// the inclusive `until` boundary row, and a reconnect replays the
     /// long-lived subscriptions; neither should process a wrap twice.
@@ -134,7 +142,8 @@ impl ZoneKeyStore {
             encrypted_ids: RwSignal::new(HashSet::new()),
             loaded_for: RwSignal::new(None),
             grant_backlog: RwSignal::new(None),
-            backfill_done: StoredValue::new(HashSet::new()),
+            backfill_done: StoredValue::new(HashMap::new()),
+            processed_flush_pending: StoredValue::new(false),
             seen_wraps: StoredValue::new(HashSet::new()),
             device_epochs: RwSignal::new(HashMap::new()),
             session: StoredValue::new(Session::default()),
@@ -240,7 +249,7 @@ impl ZoneKeyStore {
         self.stop_grant_sync();
         let _ = self.loaded_for.try_set(None);
         let _ = self.grant_backlog.try_set(None);
-        self.backfill_done.set_value(HashSet::new());
+        self.backfill_done.set_value(HashMap::new());
         self.seen_wraps.set_value(HashSet::new());
         let _ = self.keys.try_set(HashMap::new());
         let _ = self.conflicts.try_set(Vec::new());
@@ -559,13 +568,12 @@ impl ZoneKeyStore {
         let inbox = db
             .get_zone_kv(&key_owner::inbox_granted_id(lease.owner()))
             .await;
-        let mut markers = HashSet::new();
+        let mut markers = HashMap::new();
         for scope in [GrantScope::Identity, GrantScope::Inbox] {
             let id = scope.marker_id(lease.owner().as_str());
-            if let Ok(Some(v)) = db.get_zone_kv(&id).await {
-                if v == "1" {
-                    markers.insert(id);
-                }
+            if let Some(done_at) = parse_marker(db.get_zone_kv(&id).await.ok().flatten().as_deref())
+            {
+                markers.insert(id, done_at);
             }
         }
         if !self.is_current(lease) {
@@ -729,8 +737,8 @@ impl ZoneKeyStore {
             return;
         }
         let marker = scope.marker_id(lease.owner().as_str());
-        let done_before = self.backfill_done.with_value(|s| s.contains(&marker));
-        match grant_page_step(page, until, tally, done_before) {
+        let completed_at = self.backfill_done.with_value(|m| m.get(&marker).copied());
+        match grant_page_step(page, until, tally, completed_at) {
             PageStep::Done => {
                 if scope == GrantScope::Identity {
                     // The end of stored events on the identity scope settles
@@ -741,16 +749,21 @@ impl ZoneKeyStore {
                 } else {
                     self.note_backlog(lease, GrantBacklog::inbox_eose);
                 }
-                if !done_before {
-                    self.backfill_done.update_value(|s| {
-                        s.insert(marker.clone());
-                    });
-                    spawn_local(async move {
-                        if let Ok(db) = ForumDb::open().await {
-                            let _ = db.put_zone_kv(&marker, "1").await;
-                        }
-                    });
-                }
+                // Record when this backfill completed (the warm-stop rule is
+                // relative to it), and write the processed set now rather
+                // than at the next coalesced flush, so the next session's
+                // warm stop sees every wrap this one handled.
+                let done_at = now_secs();
+                self.backfill_done.update_value(|m| {
+                    m.insert(marker.clone(), done_at);
+                });
+                let store = *self;
+                spawn_local(async move {
+                    store.flush_processed().await;
+                    if let Ok(db) = ForumDb::open().await {
+                        let _ = db.put_zone_kv(&marker, &done_at.to_string()).await;
+                    }
+                });
             }
             PageStep::GiveUp => {
                 web_sys::console::warn_1(
@@ -1176,11 +1189,41 @@ impl ZoneKeyStore {
         Ok(())
     }
 
+    /// Mark a wrap processed. Memory changes at once; the IndexedDB copy is
+    /// written at most once a second ([`PROCESSED_FLUSH_MS`]) and when a
+    /// scope's backfill completes. Writing the whole set per wrap made a
+    /// paged backfill quadratic (thousands of wraps, each rewriting every id
+    /// before it), inside the time the page waits for keys. A flush lost to a
+    /// closed tab only means those wraps are retried next session, which the
+    /// unmarked-wrap design already allows.
     async fn mark_processed(&self, wrap_id: &str) {
         self.processed.update_value(|s| {
             s.insert(wrap_id.to_string());
         });
-        let ids: Vec<String> = self.processed.with_value(|s| s.iter().cloned().collect());
+        if self.processed_flush_pending.try_get_value().unwrap_or(true) {
+            return;
+        }
+        self.processed_flush_pending.set_value(true);
+        let store = *self;
+        crate::utils::set_timeout_once(
+            move || {
+                spawn_local(async move {
+                    store.flush_processed().await;
+                });
+            },
+            PROCESSED_FLUSH_MS,
+        );
+    }
+
+    /// Write the processed-wrap set to IndexedDB now.
+    async fn flush_processed(&self) {
+        let _ = self.processed_flush_pending.try_set_value(false);
+        let Some(ids) = self
+            .processed
+            .try_with_value(|s| s.iter().cloned().collect::<Vec<String>>())
+        else {
+            return;
+        };
         if let (Ok(db), Ok(json)) = (ForumDb::open().await, serde_json::to_string(&ids)) {
             let _ = db.put_zone_kv(KV_PROCESSED, &json).await;
         }
