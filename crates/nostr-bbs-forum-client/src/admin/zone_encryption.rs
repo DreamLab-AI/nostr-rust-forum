@@ -187,6 +187,34 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
     let include_history = RwSignal::new(true);
 
     let latest = move || zone.with_value(|z| keys.latest_tracked(&z.id));
+    // Create and Rotate pick their epoch with `keyset::plan_mint`: never a
+    // second key for an epoch in use, and no single post can block them.
+    let channels = crate::stores::channels::use_channel_store();
+    let mint_plan = move || {
+        let zone_id = zone.with_value(|z| z.id.clone());
+        let seen = keys.epochs_seen.with(|m| {
+            m.iter()
+                .filter(|((z, channel), _)| {
+                    *z == zone_id
+                        && crate::zone_crypto::store::channel_zone(channels, channel)
+                            .is_some_and(|(cz, _, _)| cz == zone_id)
+                })
+                .flat_map(|(_, epochs)| epochs.iter().map(|(e, id)| (*e, id.clone())))
+                .collect::<Vec<_>>()
+        });
+        let ready = channels.msg_eose_received.get() && keys.hydrated.get();
+        crate::zone_crypto::keyset::plan_mint(latest().map(|k| k.epoch), &seen, ready)
+    };
+    let mint_waiting = move || mint_plan() == crate::zone_crypto::keyset::MintPlan::Wait;
+    let zone_conflicts = move || {
+        let zone_id = zone.with_value(|z| z.id.clone());
+        keys.conflicts.with(|v| {
+            v.iter()
+                .filter(|(z, _, _)| *z == zone_id)
+                .map(|(_, e, by)| (*e, by.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
 
     // Reload "granted from this device" whenever the current epoch changes.
     Effect::new(move |_| {
@@ -375,7 +403,13 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         let grant = grant.clone();
         let fresh_roster = fresh_roster.clone();
         move |rotate: bool| {
-            let next_epoch = latest().map(|k| k.epoch + 1).unwrap_or(1);
+            let crate::zone_crypto::keyset::MintPlan::Mint {
+                epoch: next_epoch, ..
+            } = mint_plan()
+            else {
+                status.set(Some("Waiting for keys and messages to load.".into()));
+                return;
+            };
             if rotate {
                 let ok = web_sys::window()
                     .and_then(|w| {
@@ -393,17 +427,34 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             }
             let grant = grant.clone();
             fresh_roster(Box::new(move || {
+                // Re-plan after the roster round trip: a key may have arrived.
+                let crate::zone_crypto::keyset::MintPlan::Mint { epoch, .. } = mint_plan() else {
+                    status.set(Some("Waiting for keys and messages to load.".into()));
+                    return;
+                };
+                if epoch != next_epoch {
+                    status.set(Some(format!(
+                        "Keys changed while loading members (now epoch {epoch} would be next). Nothing was created; try again."
+                    )));
+                    return;
+                }
                 let me = me();
                 let zone_id = zone.with_value(|z| z.id.clone());
                 match generate_zone_key(&zone_id, next_epoch, &me, now_secs()) {
                     Ok(mut key) => {
-                        // Stored at once (it must survive a failed send), but not
-                        // sent under until its grants land: see `pending_delivery`.
+                        // Saved before anything is sent, and refused if this device
+                        // holds a different key for the epoch; not sent under until
+                        // its grants land (see `pending_delivery`).
                         key.pending_delivery = true;
-                        keys.insert(key.clone());
-                        // A new key goes to everyone eligible; they already hold
-                        // (or were already offered) the earlier ones.
-                        grant(vec![(key, targets())]);
+                        let grant = grant.clone();
+                        spawn_local(async move {
+                            match keys.insert_local(key.clone()).await {
+                                // A new key goes to everyone eligible; they already
+                                // hold (or were offered) the earlier ones.
+                                Ok(()) => grant(vec![(key, targets())]),
+                                Err(why) => status.set(Some(why)),
+                            }
+                        });
                     }
                     Err(e) => status.set(Some(format!("Could not create a key: {e}"))),
                 }
@@ -442,7 +493,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                     {move || latest().is_none().then(|| view! {
                         <button
                             class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-50"
-                            disabled=move || busy.get() || !members_ready.get()
+                            disabled=move || busy.get() || !members_ready.get() || mint_waiting()
                             on:click=move |_| create_or_rotate.with_value(|f| f(false))
                         >"Create key (epoch 1)"</button>
                     })}
@@ -473,7 +524,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                             >{move || format!("Grant to members missing it ({})", missing().len())}</button>
                             <button
                                 class="px-3 py-1.5 rounded-lg border border-gray-600 text-gray-200 hover:bg-gray-700 text-sm disabled:opacity-50"
-                                disabled=move || busy.get() || !members_ready.get()
+                                disabled=move || busy.get() || !members_ready.get() || mint_waiting()
                                 on:click=move |_| create_or_rotate.with_value(|f| f(true))
                             >"Rotate key"</button>
                         }
@@ -491,6 +542,25 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                     "Also send earlier keys, so new members can read older messages"
                 </label>
             })}
+
+            {move || match mint_plan() {
+                crate::zone_crypto::keyset::MintPlan::Mint { note: Some(note), .. } => Some(view! {
+                    <p class="text-xs text-amber-300">{note}</p>
+                }),
+                _ => None,
+            }}
+
+            {move || {
+                let c = zone_conflicts();
+                (!c.is_empty()).then(|| view! {
+                    <p class="text-sm text-red-300" role="alert">
+                        {c.iter().map(|(e, by)| format!(
+                            "Refused a second, different key for epoch {e} from {}…: this device keeps the one it already holds. Someone created that epoch from a device without it.",
+                            by.get(..8).unwrap_or(by)
+                        )).collect::<Vec<_>>().join(" ")}
+                    </p>
+                })
+            }}
 
             {move || status.get().map(|s| view! {
                 <p class="text-sm text-amber-300" role="status">{s}</p>

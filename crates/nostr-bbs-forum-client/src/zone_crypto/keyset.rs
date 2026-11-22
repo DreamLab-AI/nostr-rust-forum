@@ -119,9 +119,142 @@ pub fn read_key<'a>(
         .cloned()
 }
 
+/// How far beyond the next local epoch a post's `zk` epoch may be and still
+/// be trusted when choosing a new key's epoch. Each rotation adds one; a
+/// device that missed a few is normal, a jump past this is not.
+pub const MAX_EPOCH_SKIP: u32 = 8;
+
+/// What Create / Rotate should do for a zone.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MintPlan {
+    /// The message sync has not finished: a cold device has seen no posts and
+    /// could otherwise mint an epoch number already in use.
+    Wait,
+    /// Mint `epoch`; `note` explains a choice the admin should know about.
+    Mint { epoch: u32, note: Option<String> },
+}
+
+/// Choose the epoch for a new key. `held_latest` is the newest epoch this
+/// device holds for the zone; `seen` is every epoch named by a post of the
+/// zone (with one post id each). A device behind the zone mints *above* what
+/// is in use, never a second key for an epoch members already hold, and a
+/// forged far-ahead epoch is reported and ignored rather than obeyed, so no
+/// single post can stop or steer a rotation.
+pub fn plan_mint(held_latest: Option<u32>, seen: &[(u32, String)], synced: bool) -> MintPlan {
+    if !synced {
+        return MintPlan::Wait;
+    }
+    let base = held_latest.map_or(1, |e| e.saturating_add(1));
+    let ceiling = base.saturating_add(MAX_EPOCH_SKIP);
+    // The highest believable epoch in use, and the highest ignored one: a
+    // far-ahead post must not hide a real epoch below it.
+    let in_use = seen
+        .iter()
+        .filter(|(e, _)| *e < ceiling)
+        .map(|(e, _)| *e)
+        .max();
+    let ignored = seen
+        .iter()
+        .filter(|(e, _)| *e >= ceiling)
+        .max_by_key(|(e, _)| *e);
+    let mut notes = Vec::new();
+    let epoch = match in_use {
+        Some(max) if max >= base => {
+            notes.push(format!(
+                "Messages here already use key epoch {max}, which this device does not hold. \
+                 The new key will be epoch {}, so it cannot clash with the one members have.",
+                max.saturating_add(1)
+            ));
+            max.saturating_add(1)
+        }
+        _ => base,
+    };
+    if let Some((e, ev)) = ignored {
+        notes.push(format!(
+            "Ignoring key epoch {e} named by post {}…: too far ahead of this device's keys to be genuine.",
+            ev.get(..12).unwrap_or(ev)
+        ));
+    }
+    MintPlan::Mint {
+        epoch,
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minting_waits_for_the_message_sync() {
+        assert_eq!(plan_mint(Some(2), &[], false), MintPlan::Wait);
+        assert_eq!(
+            plan_mint(None, &[], true),
+            MintPlan::Mint {
+                epoch: 1,
+                note: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_device_behind_the_zone_mints_above_the_epoch_in_use() {
+        // The house key held epochs 1-2 while posts used epoch 3.
+        match plan_mint(Some(2), &[(3, "ev".to_string())], true) {
+            MintPlan::Mint { epoch, note } => {
+                assert_eq!(epoch, 4, "never a second epoch 3");
+                assert!(note.unwrap().contains("epoch 3"));
+            }
+            p => panic!("{p:?}"),
+        }
+        // A cold device that holds nothing never mints epoch 1 over a used one.
+        assert!(matches!(
+            plan_mint(None, &[(3, "ev".to_string())], true),
+            MintPlan::Mint { epoch: 4, .. }
+        ));
+        assert_eq!(
+            plan_mint(Some(3), &[(3, "ev".to_string())], true),
+            MintPlan::Mint {
+                epoch: 4,
+                note: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_forged_far_ahead_epoch_is_ignored_not_obeyed() {
+        match plan_mint(Some(2), &[(u32::MAX, "forgedevent0001".to_string())], true) {
+            MintPlan::Mint { epoch, note } => {
+                assert_eq!(epoch, 3, "rotation still proceeds at the next real epoch");
+                assert!(note.unwrap().contains("forgedevent0"));
+            }
+            p => panic!("{p:?}"),
+        }
+        // Held 2, so the next epoch is 3: a post's epoch is trusted up to
+        // 3 + MAX_EPOCH_SKIP - 1 and ignored from 3 + MAX_EPOCH_SKIP.
+        let next = 3;
+        assert!(matches!(
+            plan_mint(Some(2), &[(next + MAX_EPOCH_SKIP, "e".to_string())], true),
+            MintPlan::Mint { epoch: 3, .. }
+        ));
+        assert!(
+            matches!(plan_mint(Some(2), &[(next + MAX_EPOCH_SKIP - 1, "e".to_string())], true), MintPlan::Mint { epoch, .. } if epoch == next + MAX_EPOCH_SKIP)
+        );
+    }
+
+    #[test]
+    fn a_far_ahead_post_cannot_hide_the_real_epoch_in_use() {
+        // A member posts a forged epoch 999 beside the real epoch 3.
+        let seen = [(3, "real".to_string()), (999, "forgedforged0".to_string())];
+        match plan_mint(Some(2), &seen, true) {
+            MintPlan::Mint { epoch, note } => {
+                assert_eq!(epoch, 4, "still above the real epoch in use");
+                let note = note.unwrap();
+                assert!(note.contains("epoch 3") && note.contains("forgedforged"));
+            }
+            p => panic!("{p:?}"),
+        }
+    }
 
     #[test]
     fn a_key_pending_delivery_is_never_the_send_key() {

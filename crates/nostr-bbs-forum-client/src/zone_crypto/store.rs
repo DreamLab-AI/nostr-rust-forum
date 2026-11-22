@@ -24,7 +24,7 @@ use super::keyset::{self, SendKeyError};
 use super::read_cache::ReadCache;
 use super::{is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKey};
 use crate::relay::{Filter, RelayConnection};
-use crate::stores::indexed_db::ForumDb;
+use crate::stores::indexed_db::{ForumDb, ZoneKeyPut};
 
 /// `zone_kv` id holding the ids of gift wraps already unwrapped here.
 const KV_PROCESSED: &str = "processed_wraps";
@@ -66,6 +66,14 @@ pub struct ZoneKeyStore {
     /// Secret of the active inbox key (hex), once registered. Always `None`
     /// with `RECIPIENT_KEYS_ENABLED` off.
     inbox_sk: StoredValue<Option<String>>,
+    /// Keys refused because this device holds a different key for the same
+    /// `(zone, epoch)` (see [`ForumDb::put_zone_key_unless_conflicting`]):
+    /// `(zone, epoch, granted_by)`, for the Encryption card to show.
+    pub conflicts: RwSignal<Vec<(String, u32, String)>>,
+    /// Highest `zk` epoch seen per `(zone named in the tag, channel)`, with the
+    /// post id. The Encryption card counts only channels that resolve to the
+    /// zone, so a tag in some other channel cannot steer a rotation.
+    pub epochs_seen: RwSignal<HashMap<(String, String), std::collections::BTreeMap<u32, String>>>,
     /// Captured at construction: relay callbacks and spawned tasks run
     /// without a reactive owner, so `use_context` is not available there.
     channels: crate::stores::channels::ChannelStore,
@@ -86,6 +94,8 @@ impl ZoneKeyStore {
             grants: StoredValue::new(Arc::new(GrantLedger::default())),
             sync_started: StoredValue::new(false),
             inbox_sk: StoredValue::new(None),
+            conflicts: RwSignal::new(Vec::new()),
+            epochs_seen: RwSignal::new(HashMap::new()),
         }
     }
 
@@ -120,31 +130,26 @@ impl ZoneKeyStore {
         self.keys.with(|m| latest_in(m, zone))
     }
 
-    /// Add a key (persisted), then re-decrypt anything waiting for it.
-    /// Returns `false` when the key was already held.
-    pub fn insert(&self, key: ZoneKey) -> bool {
-        let key = self.keep_pending(key);
-        let id = key.store_id();
-        if self.keys.with_untracked(|m| m.get(&id) == Some(&key)) {
-            return false;
-        }
-        self.keys.update(|m| {
-            m.insert(id, key.clone());
-        });
-        spawn_local(async move {
-            if let Ok(db) = ForumDb::open().await {
-                if db.put_zone_key(&key).await.is_err() {
-                    web_sys::console::warn_1(&"[zone-key] persist failed (IndexedDB write)".into());
-                }
+    /// Note a refused key: logged, and listed for the Encryption card.
+    fn record_conflict(&self, key: &ZoneKey) {
+        web_sys::console::warn_1(
+            &format!(
+                "[zone-key] refused a second key for {} epoch {} (from {}): this device already holds a different one",
+                key.zone, key.epoch, key.granted_by
+            )
+            .into(),
+        );
+        let entry = (key.zone.clone(), key.epoch, key.granted_by.clone());
+        self.conflicts.update(|v| {
+            if !v.contains(&entry) {
+                v.push(entry);
             }
         });
-        self.redecrypt();
-        true
     }
 
     /// `key`, still pending when this device holds the same secret as a key
     /// awaiting delivery. The creator's own grant comes back through the grant
-    /// sync (both insert paths come through here); that alone must not adopt
+    /// sync (both `insert_persisted` and `insert_local` paths); that alone must not adopt
     /// the key while members may lack it. Only [`mark_delivered`] clears it.
     ///
     /// [`mark_delivered`]: Self::mark_delivered
@@ -175,8 +180,12 @@ impl ZoneKeyStore {
         });
         spawn_local(async move {
             if let Ok(db) = ForumDb::open().await {
-                if db.put_zone_key(&key).await.is_err() {
-                    web_sys::console::warn_1(&"[zone-key] persist failed (IndexedDB write)".into());
+                match db.put_zone_key_unless_conflicting(&key).await {
+                    Ok(ZoneKeyPut::Stored) => {}
+                    Ok(ZoneKeyPut::Conflict(_)) => web_sys::console::warn_1(
+                        &"[zone-key] not marked delivered in storage: it holds a different key for this epoch".into(),
+                    ),
+                    Err(_) => web_sys::console::warn_1(&"[zone-key] persist failed (IndexedDB write)".into()),
                 }
             }
         });
@@ -192,6 +201,21 @@ impl ZoneKeyStore {
     pub fn prepare_incoming(&self, ev: NostrEvent) -> NostrEvent {
         if !is_zone_message(&ev) {
             return ev;
+        }
+        if let (Some((zone, epoch)), Some(channel)) = (
+            super::zk_zone_epoch(&ev.tags),
+            super::root_channel(&ev.tags),
+        ) {
+            let slot = (zone, channel);
+            if !self
+                .epochs_seen
+                .with_untracked(|m| m.get(&slot).is_some_and(|s| s.contains_key(&epoch)))
+            {
+                let id = ev.id.clone();
+                self.epochs_seen.update(|m| {
+                    m.entry(slot).or_default().insert(epoch, id);
+                });
+            }
         }
         let ev = self
             .cache
@@ -388,11 +412,13 @@ impl ZoneKeyStore {
             Some(is_admin) => match validate_grant(&rumor, &sealer, is_admin, now_secs()) {
                 Ok(key) => {
                     let id = super::key_id(&key.zone, key.epoch);
-                    let persisted = self.insert_persisted(key).await;
-                    if via_inbox && persisted {
+                    let outcome = self.insert_persisted(key).await;
+                    // A refused grant is settled, but the inbox copy did not
+                    // replace anything: never let the sweep treat it as such.
+                    if via_inbox && outcome == Persisted::Stored {
                         self.mark_inbox_granted(&id).await;
                     }
-                    (true, persisted, Some(id))
+                    (true, outcome.settled(), Some(id))
                 }
                 Err(e) => {
                     web_sys::console::warn_1(&format!("[zone-key] grant refused: {e}").into());
@@ -463,45 +489,75 @@ impl ZoneKeyStore {
             TicketVerdict::Accept(key) => {
                 let key = *key;
                 let id = super::key_id(&key.zone, key.epoch);
-                let persisted = self.insert_persisted(key).await;
-                if via_inbox && persisted {
+                let outcome = self.insert_persisted(key).await;
+                if via_inbox && outcome == Persisted::Stored {
                     self.mark_inbox_granted(&id).await;
                 }
-                if persisted {
+                if outcome.settled() {
                     self.mark_processed(&wrap.id).await;
                 }
             }
         }
     }
 
-    async fn insert_persisted(&self, key: ZoneKey) -> bool {
+    async fn insert_persisted(&self, key: ZoneKey) -> Persisted {
         let key = self.keep_pending(key);
-        let persisted = match ForumDb::open().await {
-            Ok(db) => match db.put_zone_key(&key).await {
-                Ok(()) => true,
+        let id = key.store_id();
+        if let Some(held) = self.keys.with_untracked(|m| m.get(&id).cloned()) {
+            if super::conflicts(&held, &key) {
+                self.record_conflict(&key);
+                return Persisted::Refused;
+            }
+        }
+        let outcome = match ForumDb::open().await {
+            Ok(db) => match db.put_zone_key_unless_conflicting(&key).await {
+                Ok(ZoneKeyPut::Stored) => Persisted::Stored,
+                Ok(ZoneKeyPut::Conflict(held)) => {
+                    // Final: the held key stands and this grant is settled (the
+                    // wrap is marked processed), so it is not retried forever.
+                    self.record_conflict(&key);
+                    if self.keys.with_untracked(|m| m.get(&id) != Some(&held)) {
+                        self.keys.update(|m| {
+                            m.insert(id, held);
+                        });
+                        self.redecrypt();
+                    }
+                    return Persisted::Refused;
+                }
                 Err(_) => {
                     web_sys::console::warn_1(&"[zone-key] persist failed (IndexedDB write)".into());
-                    false
+                    Persisted::Failed
                 }
             },
-            Err(_) => false,
+            Err(_) => Persisted::Failed,
         };
-        let id = key.store_id();
         // Re-read after the awaits: an ack may have marked the key delivered
-        // meanwhile, and an echo must neither undo that nor re-pend it.
+        // meanwhile, and an echo must neither undo that nor re-pend it; and a
+        // different key may have arrived, which this one must not replace.
         let mut key = key;
         let wrote_pending = key.pending_delivery;
-        key.pending_delivery = self.keys.with_untracked(|m| {
-            m.get(&id)
-                .is_some_and(|k| k.pending_delivery && k.secret == key.secret)
-        });
-        if wrote_pending && !key.pending_delivery {
+        let held_now = self.keys.with_untracked(|m| m.get(&id).cloned());
+        if let Some(held) = &held_now {
+            if super::conflicts(held, &key) {
+                self.record_conflict(&key);
+                if outcome == Persisted::Stored {
+                    // The incoming key reached IndexedDB before a different one
+                    // was held here: write the held key back so both agree.
+                    restore_held(held.clone());
+                }
+                return Persisted::Refused;
+            }
+        }
+        key.pending_delivery = held_now
+            .as_ref()
+            .is_some_and(|k| k.pending_delivery && k.secret == key.secret);
+        if wrote_pending && !key.pending_delivery && outcome == Persisted::Stored {
             // Delivered during the awaits: the write above stored pending and
             // may have landed after mark_delivered's. Store the settled state.
             let settled = key.clone();
             spawn_local(async move {
                 if let Ok(db) = ForumDb::open().await {
-                    if db.put_zone_key(&settled).await.is_err() {
+                    if db.put_zone_key_unless_conflicting(&settled).await.is_err() {
                         web_sys::console::warn_1(
                             &"[zone-key] persist failed (IndexedDB write)".into(),
                         );
@@ -509,13 +565,65 @@ impl ZoneKeyStore {
                 }
             });
         }
-        if self.keys.with_untracked(|m| m.get(&id) != Some(&key)) {
+        if held_now.as_ref() != Some(&key) {
             self.keys.update(|m| {
                 m.insert(id, key);
             });
             self.redecrypt();
         }
-        persisted
+        outcome
+    }
+
+    /// Save a key this device just created, refusing it if this device already
+    /// holds a different key for its epoch (in memory or in IndexedDB). Awaited
+    /// before any grant is sent, so a refused key is never distributed.
+    pub async fn insert_local(&self, key: ZoneKey) -> Result<(), String> {
+        let id = key.store_id();
+        if self
+            .keys
+            .with_untracked(|m| m.get(&id).is_some_and(|h| super::conflicts(h, &key)))
+        {
+            return Err(format!(
+                "This device already holds a different key for epoch {}.",
+                key.epoch
+            ));
+        }
+        let db = ForumDb::open().await.map_err(|_| {
+            "Could not open this browser's key storage; nothing was sent.".to_string()
+        })?;
+        match db.put_zone_key_unless_conflicting(&key).await {
+            Ok(ZoneKeyPut::Stored) => {}
+            Ok(ZoneKeyPut::Conflict(held)) => {
+                self.keys.update(|m| {
+                    m.insert(id, held);
+                });
+                self.redecrypt();
+                return Err(format!(
+                    "This device already holds a different key for epoch {}.",
+                    key.epoch
+                ));
+            }
+            Err(_) => {
+                return Err("Could not save the new key on this device; nothing was sent.".into())
+            }
+        }
+        if let Some(held) = self
+            .keys
+            .with_untracked(|m| m.get(&id).filter(|h| super::conflicts(h, &key)).cloned())
+        {
+            // The new key reached IndexedDB before a different one was held
+            // here: write the held key back so both agree; nothing is sent.
+            restore_held(held);
+            return Err(format!(
+                "A different key for epoch {} arrived meanwhile.",
+                key.epoch
+            ));
+        }
+        self.keys.update(|m| {
+            m.insert(id, key);
+        });
+        self.redecrypt();
+        Ok(())
     }
 
     async fn mark_processed(&self, wrap_id: &str) {
@@ -670,6 +778,39 @@ async fn fetch_is_admin(pubkey: &str) -> Option<bool> {
 
 /// Provide the zone-key store and load held keys. Call once at app root,
 /// after the channel store and before channel sync starts.
+/// Overwrite the stored row with `held`, the key this device keeps in memory,
+/// after a different key reached IndexedDB first. The one unguarded write: it
+/// only ever restores the key memory already uses.
+fn restore_held(held: ZoneKey) {
+    spawn_local(async move {
+        if let Ok(db) = ForumDb::open().await {
+            if db.put_zone_key(&held).await.is_err() {
+                web_sys::console::warn_1(
+                    &"[zone-key] could not restore the held key (IndexedDB write)".into(),
+                );
+            }
+        }
+    });
+}
+
+/// Outcome of storing a received key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Persisted {
+    /// Stored (or already held identically).
+    Stored,
+    /// Refused: this device holds a different key for the epoch. Settled, so
+    /// the wrap is not retried, but nothing was replaced.
+    Refused,
+    /// Not stored (IndexedDB unavailable or the write failed): retried later.
+    Failed,
+}
+
+impl Persisted {
+    fn settled(self) -> bool {
+        self != Persisted::Failed
+    }
+}
+
 /// Pure core of [`ZoneKeyStore::keep_pending`]: `key` stays pending when
 /// `existing` (the stored entry at the same id) is pending with the same secret.
 fn keep_pending_against(mut key: ZoneKey, existing: Option<&ZoneKey>) -> ZoneKey {
