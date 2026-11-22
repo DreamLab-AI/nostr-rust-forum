@@ -10,11 +10,18 @@
 //! - `profiles`  — key `pubkey`, index `updated` on `updated_at`
 //! - `deletions` — key `event_id`, index `target` on `target_id`
 //! - `outbox`    — autoIncrement key, index `created` on `created_at`
-//! - `zone_keys` — key `id` (`"<zone>:<group|->:<epoch>:<pubkey>"`; pre-ADR-2028 entries were `"<zone>:<epoch>"` and are rewritten on load), zone end-to-end encryption keys (ADR-2016)
+//! - `zone_keys` — key `id`, zone end-to-end encryption keys (ADR-2016): rows
+//!   written now are `"<owner pubkey>/<store id>"` with an `owner` field;
+//!   older rows have no owner and are the bare store id (see
+//!   [`crate::zone_crypto::key_owner`]). The store id is
+//!   `"<zone>:<epoch>"`, or `"<zone>:<group|->:<epoch>:<pubkey>"` with
+//!   `ZONE_GROUPS_ENABLED`; rows are moved to the current form on load.
 //! - `zone_kv`   — key `id`, small JSON values for zone encryption bookkeeping
 //!   (processed gift-wrap ids, grants this admin has sent)
 
 use serde::{Deserialize, Serialize};
+
+use crate::zone_crypto::key_owner::{self, MintDecision, Owner, PutDecision};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -57,8 +64,12 @@ pub struct CachedProfile {
     pub updated_at: u64,
 }
 
-/// A zone key at rest: the key's fields plus its storage id
-/// (`"<zone>:<epoch>"`), the store's key path.
+/// A zone key at rest: the key's fields plus its row id (the store's key
+/// path) and the identity that owns it.
+///
+/// Built for writing only by [`StoredZoneKey::owned`], so a written row always
+/// carries an owner; rows without one were written before keys had owners and
+/// are only ever read, or moved verbatim by [`ForumDb::migrate_zone_keys`].
 ///
 /// The fields are spelled out rather than `#[serde(flatten)]`ed from
 /// [`ZoneKey`](crate::zone_crypto::ZoneKey): `serde_wasm_bindgen` serialises a
@@ -80,6 +91,35 @@ pub struct StoredZoneKey {
     /// See [`ZoneKey::pending_delivery`](crate::zone_crypto::ZoneKey::pending_delivery).
     #[serde(default)]
     pub pending_delivery: bool,
+    /// Pubkey (hex) of the identity this row belongs to, or `None` for a row
+    /// written before rows had owners (visible to every signed-in identity).
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+impl StoredZoneKey {
+    /// `key` as `owner`'s row, under [`owned_row_id`].
+    ///
+    /// [`owned_row_id`]: crate::zone_crypto::key_owner::owned_row_id
+    pub fn owned(owner: &Owner, key: &crate::zone_crypto::ZoneKey) -> Self {
+        Self {
+            id: crate::zone_crypto::key_owner::owned_row_id(owner, &key.store_id()),
+            zone: key.zone.clone(),
+            epoch: key.epoch,
+            secret: key.secret.clone(),
+            pubkey: key.pubkey.clone(),
+            granted_by: key.granted_by.clone(),
+            received_at: key.received_at,
+            group: key.group.clone(),
+            pending_delivery: key.pending_delivery,
+            owner: Some(owner.as_str().to_string()),
+        }
+    }
+
+    /// The key this row holds.
+    pub fn to_zone_key(&self) -> crate::zone_crypto::ZoneKey {
+        crate::zone_crypto::ZoneKey::from(self.clone())
+    }
 }
 
 /// Outcome of [`ForumDb::put_zone_key_unless_conflicting`].
@@ -91,20 +131,16 @@ pub enum ZoneKeyPut {
     Conflict(crate::zone_crypto::ZoneKey),
 }
 
-impl From<&crate::zone_crypto::ZoneKey> for StoredZoneKey {
-    fn from(k: &crate::zone_crypto::ZoneKey) -> Self {
-        Self {
-            id: k.store_id(),
-            zone: k.zone.clone(),
-            epoch: k.epoch,
-            secret: k.secret.clone(),
-            pubkey: k.pubkey.clone(),
-            granted_by: k.granted_by.clone(),
-            received_at: k.received_at,
-            group: k.group.clone(),
-            pending_delivery: k.pending_delivery,
-        }
-    }
+/// Outcome of [`ForumDb::put_minted_zone_key`].
+#[derive(Debug)]
+pub enum MintPut {
+    /// Written.
+    Stored,
+    /// Refused: the slot holds a different key.
+    Conflict(crate::zone_crypto::ZoneKey),
+    /// Refused: a row on this device (any owner) holds a different key for
+    /// the zone at this epoch or the one named, which is above it.
+    Superseded(u32),
 }
 
 impl From<StoredZoneKey> for crate::zone_crypto::ZoneKey {
@@ -212,6 +248,46 @@ fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
 
 fn from_js<T: for<'de> Deserialize<'de>>(val: JsValue) -> Result<T, JsValue> {
     serde_wasm_bindgen::from_value(val).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Every row of the `zone_keys` store, within the caller's transaction.
+async fn rows_in(store: &web_sys::IdbObjectStore) -> Result<Vec<StoredZoneKey>, JsValue> {
+    let result = idb_request_result(&store.get_all()?).await?;
+    let arr: js_sys::Array = result.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
+    Ok((0..arr.length())
+        .filter_map(|i| from_js::<StoredZoneKey>(arr.get(i)).ok())
+        .collect())
+}
+
+/// The row at `id`, within the caller's transaction.
+async fn row_in(
+    store: &web_sys::IdbObjectStore,
+    id: &str,
+) -> Result<Option<StoredZoneKey>, JsValue> {
+    let v = idb_request_result(&store.get(&JsValue::from_str(id))?).await?;
+    if v.is_undefined() || v.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(from_js::<StoredZoneKey>(v)?))
+}
+
+/// The key `owner` sees for `store_id`, within the caller's transaction:
+/// [`key_owner::slot_view`] over their row and the legacy row. A row at the
+/// legacy id that carries an owner is not a legacy row and is ignored.
+async fn slot_view_in(
+    store: &web_sys::IdbObjectStore,
+    owner: &Owner,
+    store_id: &str,
+) -> Result<Option<crate::zone_crypto::ZoneKey>, JsValue> {
+    let owned = row_in(store, &key_owner::owned_row_id(owner, store_id))
+        .await?
+        .filter(|r| r.owner.as_deref() == Some(owner.as_str()))
+        .map(|r| r.to_zone_key());
+    let legacy = row_in(store, store_id)
+        .await?
+        .filter(|r| r.owner.is_none())
+        .map(|r| r.to_zone_key());
+    Ok(key_owner::slot_view(owned, legacy))
 }
 
 // ---------------------------------------------------------------------------
@@ -349,108 +425,130 @@ impl ForumDb {
     }
 
     // -- Zone keys (ADR-2016) ------------------------------------------------
+    //
+    // Every write goes through a guard that reads and writes in one
+    // transaction. Should a browser commit the transaction between the read
+    // and the write, the write fails and the error reaches the caller, which
+    // leaves the key to be retried: nothing is overwritten.
 
-    /// Store (or replace) a zone key.
-    pub async fn put_zone_key(&self, key: &crate::zone_crypto::ZoneKey) -> Result<(), JsValue> {
-        let tx = self
-            .db
-            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
-        let store = tx.object_store(STORE_ZONE_KEYS)?;
-        let rec = StoredZoneKey::from(key);
-        let req = store.put(&to_js(&rec)?)?;
-        idb_request_result(&req).await?;
-        Ok(())
-    }
-
-    /// Store `key` unless this device already holds a different secret under
-    /// the same id, read and written in one transaction. An epoch's key never
+    /// Store `key` as `owner`'s row unless the slot, as `owner` sees it (their
+    /// row, else the legacy row), holds a different key. An epoch's key never
     /// changes: a second, different key for a held `(zone, epoch)` is a
     /// conflicting mint (an admin rotating from a device that lacked the
     /// newest epoch), and replacing the held one would make every post under
     /// it unreadable here. Returns the held key on conflict.
     ///
-    /// Should a browser commit the transaction between the read and the write,
-    /// the write fails and the error reaches the caller, which leaves the grant
-    /// to be retried: nothing is overwritten.
+    /// Another identity's rows are never read or written: they live under
+    /// other ids.
     pub async fn put_zone_key_unless_conflicting(
         &self,
+        owner: &Owner,
         key: &crate::zone_crypto::ZoneKey,
     ) -> Result<ZoneKeyPut, JsValue> {
         let tx = self
             .db
             .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
         let store = tx.object_store(STORE_ZONE_KEYS)?;
-        let held = idb_request_result(&store.get(&JsValue::from_str(&key.store_id()))?).await?;
-        if !held.is_undefined() && !held.is_null() {
-            let held: crate::zone_crypto::ZoneKey = from_js::<StoredZoneKey>(held)?.into();
-            if crate::zone_crypto::conflicts(&held, key) {
-                return Ok(ZoneKeyPut::Conflict(held));
-            }
+        let view = slot_view_in(&store, owner, &key.store_id()).await?;
+        if let PutDecision::Conflict(held) = key_owner::put_decision(view.as_ref(), key) {
+            return Ok(ZoneKeyPut::Conflict(held));
         }
-        let rec = StoredZoneKey::from(key);
+        let rec = StoredZoneKey::owned(owner, key);
         idb_request_result(&store.put(&to_js(&rec)?)?).await?;
         Ok(ZoneKeyPut::Stored)
     }
 
-    /// The stored zone key with `id`, if any.
+    /// Store a key this device just created as `owner`'s row: the slot guard
+    /// of [`put_zone_key_unless_conflicting`](Self::put_zone_key_unless_conflicting),
+    /// plus a check over every row on the device, of every owner, so two
+    /// accounts on one browser never mint different keys for one epoch (see
+    /// [`key_owner::mint_decision`]). One transaction.
+    pub async fn put_minted_zone_key(
+        &self,
+        owner: &Owner,
+        key: &crate::zone_crypto::ZoneKey,
+    ) -> Result<MintPut, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store(STORE_ZONE_KEYS)?;
+        let rows = rows_in(&store).await?;
+        let flag = crate::zone_crypto::tickets::zone_groups_enabled();
+        match key_owner::mint_decision(&rows, owner, key, flag) {
+            MintDecision::Conflict(held) => return Ok(MintPut::Conflict(held)),
+            MintDecision::Superseded(e) => return Ok(MintPut::Superseded(e)),
+            MintDecision::Write => {}
+        }
+        let rec = StoredZoneKey::owned(owner, key);
+        idb_request_result(&store.put(&to_js(&rec)?)?).await?;
+        Ok(MintPut::Stored)
+    }
+
+    /// The key `owner` sees for `store_id`: their row, else the legacy row.
     pub async fn get_zone_key(
         &self,
-        id: &str,
+        owner: &Owner,
+        store_id: &str,
     ) -> Result<Option<crate::zone_crypto::ZoneKey>, JsValue> {
         let tx = self
             .db
             .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readonly)?;
         let store = tx.object_store(STORE_ZONE_KEYS)?;
-        let v = idb_request_result(&store.get(&JsValue::from_str(id))?).await?;
-        if v.is_undefined() || v.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(from_js::<StoredZoneKey>(v)?.into()))
+        slot_view_in(&store, owner, store_id).await
     }
 
-    /// Every zone key held on this device.
-    pub async fn get_all_zone_keys(&self) -> Result<Vec<crate::zone_crypto::ZoneKey>, JsValue> {
+    /// Every zone-key row on this device, of every owner. Callers narrow it
+    /// with [`key_owner::visible_keys`]; the whole set is needed only for the
+    /// device-wide epoch floor.
+    pub async fn zone_key_rows(&self) -> Result<Vec<StoredZoneKey>, JsValue> {
         let tx = self
             .db
             .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readonly)?;
         let store = tx.object_store(STORE_ZONE_KEYS)?;
-        let req = store.get_all()?;
-        let result = idb_request_result(&req).await?;
-        let arr: js_sys::Array = result.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
-        Ok((0..arr.length())
-            .filter_map(|i| from_js::<StoredZoneKey>(arr.get(i)).ok())
-            .map(crate::zone_crypto::ZoneKey::from)
-            .collect())
+        rows_in(&store).await
     }
 
-    /// One-way migration to the ADR-2028 key shape: an entry whose stored id
-    /// is not its [`ZoneKey::store_id`](crate::zone_crypto::ZoneKey::store_id) (the old `"<zone>:<epoch>"`) is written
-    /// under the new id with `group` absent, then the old entry is deleted.
-    /// The new row is written first, so an interruption never loses a key.
+    /// Move each row not stored under its expected id (the
+    /// `ZONE_GROUPS_ENABLED` flag changed since it was written) to that id,
+    /// owner kept, record copied verbatim. The new row is written first and
+    /// the old one deleted only once the new id holds the same key, so an
+    /// interruption never loses a key; when the new id holds a different key
+    /// the old row stays where it is.
     pub async fn migrate_zone_keys(&self) -> Result<(), JsValue> {
-        let tx = self
-            .db
-            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readonly)?;
-        let store = tx.object_store(STORE_ZONE_KEYS)?;
-        let req = store.get_all()?;
-        let result = idb_request_result(&req).await?;
-        let arr: js_sys::Array = result.dyn_into().unwrap_or_else(|_| js_sys::Array::new());
-        let stale: Vec<StoredZoneKey> = (0..arr.length())
-            .filter_map(|i| from_js::<StoredZoneKey>(arr.get(i)).ok())
-            .filter(|r| r.id != crate::zone_crypto::ZoneKey::from(r.clone()).store_id())
-            .collect();
-        for rec in stale {
-            let old_id = rec.id.clone();
-            let key = crate::zone_crypto::ZoneKey::from(rec);
-            self.put_zone_key(&key).await?;
-            let tx = self
-                .db
-                .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
-            let store = tx.object_store(STORE_ZONE_KEYS)?;
-            let req = store.delete(&JsValue::from_str(&old_id))?;
-            idb_request_result(&req).await?;
+        let rows = self.zone_key_rows().await?;
+        let flag = crate::zone_crypto::tickets::zone_groups_enabled();
+        for rename in key_owner::migration_plan(&rows, flag) {
+            if self.move_zone_key_row(&rename.row).await? {
+                let tx = self.db.transaction_with_str_and_mode(
+                    STORE_ZONE_KEYS,
+                    IdbTransactionMode::Readwrite,
+                )?;
+                let store = tx.object_store(STORE_ZONE_KEYS)?;
+                idb_request_result(&store.delete(&JsValue::from_str(&rename.old_id))?).await?;
+            }
         }
         Ok(())
+    }
+
+    /// Write `row` (already under its new id) unless that id holds a
+    /// different key. Returns whether the id now holds this key. The only
+    /// write that can produce a row without an owner, and only by copying one.
+    async fn move_zone_key_row(&self, row: &StoredZoneKey) -> Result<bool, JsValue> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode(STORE_ZONE_KEYS, IdbTransactionMode::Readwrite)?;
+        let store = tx.object_store(STORE_ZONE_KEYS)?;
+        let held = idb_request_result(&store.get(&JsValue::from_str(&row.id))?).await?;
+        if !held.is_undefined() && !held.is_null() {
+            let held = from_js::<StoredZoneKey>(held)?;
+            if held.owner != row.owner
+                || crate::zone_crypto::conflicts(&held.to_zone_key(), &row.to_zone_key())
+            {
+                return Ok(false);
+            }
+        }
+        idb_request_result(&store.put(&to_js(row)?)?).await?;
+        Ok(true)
     }
 
     /// Write a small JSON value to `zone_kv`.
@@ -859,24 +957,53 @@ mod tests {
 
     /// Regression: a flattened record serialised as a JS `Map`, so the
     /// `zone_keys` put failed and every zone key was lost on reload.
+    fn me() -> Owner {
+        Owner::parse(&"44".repeat(32)).expect("hex")
+    }
+
     #[test]
     fn stored_zone_key_serialises_as_a_plain_struct() {
-        let rec = StoredZoneKey::from(&key());
+        let rec = StoredZoneKey::owned(&me(), &key());
         assert_eq!(rec.serialize(TopLevelShape).map_err(|e| e.0), Ok("struct"));
     }
 
     #[test]
     fn stored_zone_key_has_its_id_at_the_top_level_and_round_trips() {
         let k = key();
-        let rec = StoredZoneKey::from(&k);
+        let rec = StoredZoneKey::owned(&me(), &k);
         let v = serde_json::to_value(&rec).unwrap();
-        // The id is the store key, which is flag-aware (legacy `<zone>:<epoch>`
-        // with ZONE_GROUPS_ENABLED off, the native test default; `<zone>:<group>:
-        // <epoch>:<pubkey>` with it on). Assert against store_id so the test is
-        // correct in either mode rather than pinning one form.
-        assert_eq!(v["id"], k.store_id());
+        // The id is the owner plus the store id, which is flag-aware (legacy
+        // `<zone>:<epoch>` with ZONE_GROUPS_ENABLED off, the native test
+        // default; `<zone>:<group>:<epoch>:<pubkey>` with it on). Assert
+        // against store_id so the test is correct in either mode.
+        assert_eq!(v["id"], format!("{}/{}", me(), k.store_id()));
+        assert_eq!(v["owner"], me().as_str());
         assert_eq!(v["secret"], k.secret);
         let back: StoredZoneKey = serde_json::from_value(v).unwrap();
         assert_eq!(ZoneKey::from(back), k);
+    }
+
+    /// A row written before rows had owners reads back as legacy: no owner,
+    /// its key intact.
+    #[test]
+    fn a_pre_owner_row_reads_back_as_legacy() {
+        let k = key();
+        let json = serde_json::json!({
+            "id": k.store_id(),
+            "zone": k.zone,
+            "epoch": k.epoch,
+            "secret": k.secret,
+            "pubkey": k.pubkey,
+            "granted_by": k.granted_by,
+            "received_at": k.received_at,
+        });
+        let row: StoredZoneKey = serde_json::from_value(json).unwrap();
+        assert_eq!(row.owner, None);
+        assert_eq!(row.to_zone_key(), k);
+        assert_eq!(
+            crate::zone_crypto::key_owner::expected_row_id(&row, false),
+            Some(row.id.clone()),
+            "a flag-off legacy row is already where it belongs: never moved"
+        );
     }
 }

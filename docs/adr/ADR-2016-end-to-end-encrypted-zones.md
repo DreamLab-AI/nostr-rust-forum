@@ -91,6 +91,20 @@ together, so the record is an in-memory set persisted by whole-set rewrites
 (`zone_crypto::grant_ledger`), never a per-ack read-modify-write, which lost a
 random subset of accepted grants and showed those members as missing.
 
+**Accounts sharing a browser.** Cached zone keys belong to the identity that
+received or created them (`zone_crypto::key_owner`): each IndexedDB row carries
+its owner in its `owner` field and in its id (`"<owner>/<store id>"`), so an
+identity sees only its own rows and two identities can never overwrite each
+other's. Signing out drops every key from memory and turns decrypted messages
+back into placeholders; the next sign-in, with or without a reload, loads that
+identity's keys before the Encryption card offers Create or Rotate, and a key
+is never minted at an epoch another account on the browser holds. Rows written
+before owners existed are not attributable to anyone, so they stay as a
+read-only layer every signed-in identity sees (as before) and none sees while
+signed out; they are never deleted, because a device can hold the only copy of
+an undelivered key. This is isolation between accounts in the UI, not access
+control: same-origin storage is readable by anyone with the device.
+
 **History.** Existing plaintext messages are left as they are. Re-publishing
 them as encrypted "sealed originals" (the full signed original event inside a
 zone-encrypted envelope, so ids, authorship and reply threading survive) is a
@@ -106,6 +120,7 @@ separate decision, taken in
 | | Reactions (kind 7), which stay plaintext |
 | | Forward secrecy within an epoch: a leaked epoch secret reads that whole epoch |
 | | A key at rest on a member's device (IndexedDB, unencrypted) |
+| | One account's keys against another account, script or person using the same browser profile (per-identity scoping is UI isolation only; keys stored before it are shared by every account there) |
 
 ### `agent_keys` trade-off
 

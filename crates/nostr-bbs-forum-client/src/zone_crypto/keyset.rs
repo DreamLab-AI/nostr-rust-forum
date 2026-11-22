@@ -134,20 +134,50 @@ pub enum MintPlan {
     /// its posts use an epoch too far ahead to place a new key safely.
     Blocked(String),
     /// Mint `epoch`; `note` explains a choice the admin should know about.
-    Mint { epoch: u32, note: Option<String> },
+    Mint {
+        /// The epoch to mint.
+        epoch: u32,
+        /// Explains a choice the admin should know about.
+        note: Option<String>,
+        /// The highest epoch named by any post of the zone, believed or not,
+        /// when it is above `epoch`. Set only when a far-ahead post was
+        /// ignored: the zone may really be on that epoch (this device is more
+        /// than [`MAX_EPOCH_SKIP`] behind), in which case members keep sending
+        /// under it and a rotation to `epoch` does not take effect for them.
+        /// The card asks for explicit confirmation before minting.
+        higher_seen: Option<u32>,
+    },
 }
 
-/// Choose the epoch for a new key. `held_latest` is the newest epoch this
-/// device holds for the zone; `seen` is every epoch named by a post of the
-/// zone (with one post id each). A device behind the zone mints *above* what
-/// is in use, never a second key for an epoch members already hold, and a
-/// forged far-ahead epoch is reported and ignored rather than obeyed, so no
-/// single post can stop or steer a rotation.
-pub fn plan_mint(held_latest: Option<u32>, seen: &[(u32, String)], synced: bool) -> MintPlan {
+/// Choose the epoch for a new key.
+///
+/// - `zone` names the zone in notes.
+/// - `held_latest` is the newest epoch the signed-in identity holds for it.
+/// - `device` is every epoch any row on this browser holds for it, whatever
+///   account it belongs to (epoch numbers only): another account's key may be
+///   pending delivery, so it is in no post yet.
+/// - `seen` is every epoch named by a post of the zone (with one post id each).
+///
+/// A device behind the zone mints *above* what is in use, never a second key
+/// for an epoch members or another account already hold. Neither a post nor
+/// another account's row is believed beyond [`MAX_EPOCH_SKIP`] past what this
+/// identity can vouch for (its own keys and the believable posts; another
+/// account's epochs extend that one step at a time, so a genuine run of
+/// rotations is followed): a far-ahead epoch is reported and ignored rather
+/// than obeyed, so no single post or grant can stop or steer a rotation. A
+/// grant to the identity's own account is trusted as before.
+pub fn plan_mint(
+    zone: &str,
+    held_latest: Option<u32>,
+    device: &[u32],
+    seen: &[(u32, String)],
+    synced: bool,
+) -> MintPlan {
     if !synced {
         return MintPlan::Wait;
     }
-    let base = held_latest.map_or(1, |e| e.saturating_add(1));
+    let next = |e: Option<u32>| e.map_or(1, |e| e.saturating_add(1));
+    let base = next(held_latest);
     let ceiling = base.saturating_add(MAX_EPOCH_SKIP);
     // The highest believable epoch in use, and the highest ignored one: a
     // far-ahead post must not hide a real epoch below it.
@@ -160,10 +190,38 @@ pub fn plan_mint(held_latest: Option<u32>, seen: &[(u32, String)], synced: bool)
         .iter()
         .filter(|(e, _)| *e >= ceiling)
         .max_by_key(|(e, _)| *e);
+    // Other accounts' epochs above what this identity vouches for, walked
+    // upwards: each is believed only within MAX_EPOCH_SKIP of the last one
+    // believed, so a single far-ahead row cannot hide a real one below it.
+    let vouched = held_latest.max(in_use);
+    let mut above: Vec<u32> = device
+        .iter()
+        .copied()
+        .filter(|e| vouched.is_none_or(|v| *e > v))
+        .collect();
+    above.sort_unstable();
+    above.dedup();
+    let mut other: Option<u32> = None;
+    let mut other_ignored: Option<u32> = None;
+    for e in above {
+        if e < next(vouched.max(other)).saturating_add(MAX_EPOCH_SKIP) {
+            other = Some(e);
+        } else {
+            other_ignored = Some(e);
+        }
+    }
     // A device with no key for the zone and only far-ahead epochs in sight
     // cannot tell a forgery from a zone that has rotated many times: minting
-    // epoch 1 there could clash with the zone's real epoch 1.
-    if held_latest.is_none() && in_use.is_none() {
+    // epoch 1 there could clash with the zone's real epoch 1. That holds for
+    // a far-ahead row of another account as much as for a far-ahead post. An
+    // identity that holds a key is never blocked: it mints above its own.
+    if held_latest.is_none() && in_use.is_none() && other.is_none() {
+        if let Some(e) = other_ignored {
+            return MintPlan::Blocked(format!(
+                "This account holds no key for zone {zone}, and another account on this browser holds key epoch {e} of it. \
+                 Create or rotate from an account that holds the zone's keys, or have its admin grant them to you."
+            ));
+        }
         if let Some((e, ev)) = ignored {
             return MintPlan::Blocked(format!(
                 "This device holds no key for this zone, and post {}… names key epoch {e}. \
@@ -173,28 +231,57 @@ pub fn plan_mint(held_latest: Option<u32>, seen: &[(u32, String)], synced: bool)
             ));
         }
     }
+    let epoch = base.max(next(in_use)).max(next(other));
     let mut notes = Vec::new();
-    let epoch = match in_use {
-        Some(max) if max >= base => {
-            notes.push(format!(
-                "Messages here already use key epoch {max}, which this device does not hold. \
-                 The new key will be epoch {}, so it cannot clash with the one members have.",
-                max.saturating_add(1)
-            ));
-            max.saturating_add(1)
-        }
-        _ => base,
-    };
+    if let Some(max) = in_use.filter(|m| *m >= base) {
+        notes.push(format!(
+            "Messages here already use key epoch {max}, which this device does not hold. \
+             The new key will be epoch {epoch}, so it cannot clash with the one members have."
+        ));
+    }
+    if let Some(d) = other {
+        notes.push(format!(
+            "Another account on this browser holds key epoch {d} of zone {zone}. \
+             The new key will be epoch {epoch}, so the two cannot clash."
+        ));
+    }
     if let Some((e, ev)) = ignored {
         notes.push(format!(
             "Ignoring key epoch {e} named by post {}…: too far ahead of this device's keys to be genuine.",
             ev.get(..12).unwrap_or(ev)
         ));
     }
+    if let Some(e) = other_ignored {
+        notes.push(format!(
+            "Ignoring key epoch {e} of zone {zone} held by another account on this browser: \
+             too far ahead of this account's keys and the zone's posts to be genuine."
+        ));
+    }
+    let higher_seen = seen.iter().map(|(e, _)| *e).max().filter(|e| *e > epoch);
     MintPlan::Mint {
         epoch,
         note: (!notes.is_empty()).then(|| notes.join(" ")),
+        higher_seen,
     }
+}
+
+/// The confirmation the card shows before minting under `plan`, or `None`
+/// when it may mint without one: the planned epoch is below an epoch the
+/// zone's posts use (see [`MintPlan::Mint::higher_seen`]).
+pub fn mint_confirmation(plan: &MintPlan) -> Option<String> {
+    let MintPlan::Mint {
+        epoch,
+        higher_seen: Some(seen),
+        ..
+    } = plan
+    else {
+        return None;
+    };
+    Some(format!(
+        "The new key would be epoch {epoch}, but posts in this zone name key epoch {seen}. \
+         If members really send under epoch {seen}, they keep doing so and this rotation does not take effect for them \
+         (anyone it is meant to remove can still read new posts). Mint epoch {epoch} anyway?"
+    ))
 }
 
 #[cfg(test)]
@@ -203,12 +290,13 @@ mod tests {
 
     #[test]
     fn minting_waits_for_the_message_sync() {
-        assert_eq!(plan_mint(Some(2), &[], false), MintPlan::Wait);
+        assert_eq!(plan_mint("zone3", Some(2), &[], &[], false), MintPlan::Wait);
         assert_eq!(
-            plan_mint(None, &[], true),
+            plan_mint("zone3", None, &[], &[], true),
             MintPlan::Mint {
                 epoch: 1,
-                note: None
+                note: None,
+                higher_seen: None
             }
         );
     }
@@ -216,8 +304,8 @@ mod tests {
     #[test]
     fn a_device_behind_the_zone_mints_above_the_epoch_in_use() {
         // The house key held epochs 1-2 while posts used epoch 3.
-        match plan_mint(Some(2), &[(3, "ev".to_string())], true) {
-            MintPlan::Mint { epoch, note } => {
+        match plan_mint("zone3", Some(2), &[], &[(3, "ev".to_string())], true) {
+            MintPlan::Mint { epoch, note, .. } => {
                 assert_eq!(epoch, 4, "never a second epoch 3");
                 assert!(note.unwrap().contains("epoch 3"));
             }
@@ -225,22 +313,29 @@ mod tests {
         }
         // A cold device that holds nothing never mints epoch 1 over a used one.
         assert!(matches!(
-            plan_mint(None, &[(3, "ev".to_string())], true),
+            plan_mint("zone3", None, &[], &[(3, "ev".to_string())], true),
             MintPlan::Mint { epoch: 4, .. }
         ));
         assert_eq!(
-            plan_mint(Some(3), &[(3, "ev".to_string())], true),
+            plan_mint("zone3", Some(3), &[], &[(3, "ev".to_string())], true),
             MintPlan::Mint {
                 epoch: 4,
-                note: None
+                note: None,
+                higher_seen: None
             }
         );
     }
 
     #[test]
     fn a_forged_far_ahead_epoch_is_ignored_not_obeyed() {
-        match plan_mint(Some(2), &[(u32::MAX, "forgedevent0001".to_string())], true) {
-            MintPlan::Mint { epoch, note } => {
+        match plan_mint(
+            "zone3",
+            Some(2),
+            &[],
+            &[(u32::MAX, "forgedevent0001".to_string())],
+            true,
+        ) {
+            MintPlan::Mint { epoch, note, .. } => {
                 assert_eq!(epoch, 3, "rotation still proceeds at the next real epoch");
                 assert!(note.unwrap().contains("forgedevent0"));
             }
@@ -250,11 +345,17 @@ mod tests {
         // 3 + MAX_EPOCH_SKIP - 1 and ignored from 3 + MAX_EPOCH_SKIP.
         let next = 3;
         assert!(matches!(
-            plan_mint(Some(2), &[(next + MAX_EPOCH_SKIP, "e".to_string())], true),
+            plan_mint(
+                "zone3",
+                Some(2),
+                &[],
+                &[(next + MAX_EPOCH_SKIP, "e".to_string())],
+                true
+            ),
             MintPlan::Mint { epoch: 3, .. }
         ));
         assert!(
-            matches!(plan_mint(Some(2), &[(next + MAX_EPOCH_SKIP - 1, "e".to_string())], true), MintPlan::Mint { epoch, .. } if epoch == next + MAX_EPOCH_SKIP)
+            matches!(plan_mint("zone3", Some(2), &[], &[(next + MAX_EPOCH_SKIP - 1, "e".to_string())], true), MintPlan::Mint { epoch, .. } if epoch == next + MAX_EPOCH_SKIP)
         );
     }
 
@@ -262,8 +363,8 @@ mod tests {
     fn a_far_ahead_post_cannot_hide_the_real_epoch_in_use() {
         // A member posts a forged epoch 999 beside the real epoch 3.
         let seen = [(3, "real".to_string()), (999, "forgedforged0".to_string())];
-        match plan_mint(Some(2), &seen, true) {
-            MintPlan::Mint { epoch, note } => {
+        match plan_mint("zone3", Some(2), &[], &seen, true) {
+            MintPlan::Mint { epoch, note, .. } => {
                 assert_eq!(epoch, 4, "still above the real epoch in use");
                 let note = note.unwrap();
                 assert!(note.contains("epoch 3") && note.contains("forgedforged"));
@@ -275,20 +376,169 @@ mod tests {
     #[test]
     fn a_keyless_device_never_mints_under_far_ahead_epochs() {
         let seen = [(12, "farpostid0001".to_string())];
-        match plan_mint(None, &seen, true) {
+        match plan_mint("zone3", None, &[], &seen, true) {
             MintPlan::Blocked(why) => assert!(why.contains("farpostid000"), "names the post"),
             p => panic!("{p:?}"),
         }
         // With a believable epoch in view it mints above it, as before.
         assert!(matches!(
-            plan_mint(None, &[(3, "e".to_string())], true),
+            plan_mint("zone3", None, &[], &[(3, "e".to_string())], true),
             MintPlan::Mint { epoch: 4, .. }
         ));
         // A device holding keys is never blocked by a far-ahead post.
         assert!(matches!(
-            plan_mint(Some(2), &seen, true),
+            plan_mint("zone3", Some(2), &[], &seen, true),
             MintPlan::Mint { epoch: 3, .. }
         ));
+    }
+
+    #[test]
+    fn another_accounts_epoch_on_this_browser_raises_the_mint() {
+        // A holds a pending epoch 4 (in no post yet); B holds epoch 3.
+        match plan_mint("zone3", Some(3), &[4], &[], true) {
+            MintPlan::Mint { epoch, note, .. } => {
+                assert_eq!(epoch, 5, "never a second epoch 4");
+                assert!(note.unwrap().contains("Another account"));
+            }
+            p => panic!("{p:?}"),
+        }
+        // B holds nothing: still above A's epoch, and not blocked as keyless.
+        assert!(matches!(
+            plan_mint("zone3", None, &[4], &[(40, "far".to_string())], true),
+            MintPlan::Mint { epoch: 5, .. }
+        ));
+        // The identity's own keys alone add no note.
+        assert_eq!(
+            plan_mint("zone3", Some(3), &[3], &[], true),
+            MintPlan::Mint {
+                epoch: 4,
+                note: None,
+                higher_seen: None
+            }
+        );
+        // A post above both still wins.
+        assert!(matches!(
+            plan_mint("zone3", Some(3), &[4], &[(6, "ev".to_string())], true),
+            MintPlan::Mint { epoch: 7, .. }
+        ));
+        assert_eq!(
+            plan_mint("zone3", Some(3), &[4], &[], false),
+            MintPlan::Wait
+        );
+    }
+
+    fn mint_epoch(plan: MintPlan) -> (u32, String) {
+        match plan {
+            MintPlan::Mint { epoch, note, .. } => (epoch, note.unwrap_or_default()),
+            p => panic!("{p:?}"),
+        }
+    }
+
+    /// Review finding: a grant at u32::MAX to another account on this browser
+    /// must not drive the mint to u32::MAX (and every later one to a refusal).
+    #[test]
+    fn a_far_ahead_epoch_of_another_account_is_ignored_and_reported() {
+        let (epoch, note) = mint_epoch(plan_mint("zone3", Some(3), &[u32::MAX], &[], true));
+        assert_eq!(epoch, 4);
+        assert!(
+            note.contains(&format!("Ignoring key epoch {} of zone zone3", u32::MAX)),
+            "{note}"
+        );
+        // Held 3: another account's epoch is believed up to 4 + MAX_EPOCH_SKIP - 1.
+        let inside = 4 + MAX_EPOCH_SKIP - 1;
+        let (epoch, note) = mint_epoch(plan_mint("zone3", Some(3), &[inside], &[], true));
+        assert_eq!(epoch, inside + 1, "just inside: minted above it");
+        assert!(note.contains("Another account"));
+        let outside = 4 + MAX_EPOCH_SKIP;
+        let (epoch, note) = mint_epoch(plan_mint("zone3", Some(3), &[outside], &[], true));
+        assert_eq!(epoch, 4, "just outside: ignored");
+        assert!(note.contains(&format!("Ignoring key epoch {outside} of zone zone3")));
+        // A keyless identity does not mint blind under it (review B-2 item A).
+        assert!(matches!(
+            plan_mint("zone3", None, &[u32::MAX], &[], true),
+            MintPlan::Blocked(_)
+        ));
+        assert_eq!(mint_epoch(plan_mint("zone3", None, &[], &[], true)).0, 1);
+    }
+
+    /// Second review, item A: `plan_mint(None, &[20], &[])` minted a second
+    /// epoch 1 for a zone whose members hold the real one.
+    #[test]
+    fn a_keyless_identity_is_blocked_by_a_far_ahead_row_of_another_account() {
+        match plan_mint("zone3", None, &[20], &[], true) {
+            MintPlan::Blocked(why) => {
+                assert!(
+                    why.contains("zone zone3") && why.contains("epoch 20"),
+                    "{why}"
+                )
+            }
+            p => panic!("{p:?}"),
+        }
+        // Within the bound it is believed, and the mint goes above it.
+        assert_eq!(mint_epoch(plan_mint("zone3", None, &[8], &[], true)).0, 9);
+        // An identity holding a key is never blocked by another account's row.
+        assert_eq!(
+            mint_epoch(plan_mint("zone3", Some(1), &[20], &[], true)).0,
+            2
+        );
+        // A believable post vouches for the zone: not blind, so no block.
+        let seen = [(3, "ev".to_string())];
+        assert_eq!(
+            mint_epoch(plan_mint("zone3", None, &[20], &seen, true)).0,
+            4
+        );
+    }
+
+    /// Second review, item B: a device more than MAX_EPOCH_SKIP behind
+    /// rotated to held + 1, below the epoch members send under, silently.
+    #[test]
+    fn a_mint_below_an_epoch_seen_in_posts_needs_confirmation() {
+        let seen = [(20, "realpost0001".to_string())];
+        let plan = plan_mint("zone3", Some(2), &[], &seen, true);
+        match &plan {
+            MintPlan::Mint {
+                epoch, higher_seen, ..
+            } => assert_eq!((*epoch, *higher_seen), (3, Some(20))),
+            p => panic!("{p:?}"),
+        }
+        let ask = mint_confirmation(&plan).expect("confirmation required");
+        assert!(ask.contains("epoch 3") && ask.contains("epoch 20"), "{ask}");
+        assert!(ask.contains("does not take effect"));
+        // Just inside the skip the post is believed: minted above, no question.
+        let inside = [(3 + MAX_EPOCH_SKIP - 1, "e".to_string())];
+        let plan = plan_mint("zone3", Some(2), &[], &inside, true);
+        assert!(mint_confirmation(&plan).is_none(), "{plan:?}");
+        // No posts above the plan: no question.
+        let plan = plan_mint("zone3", Some(5), &[], &[(5, "e".to_string())], true);
+        assert!(mint_confirmation(&plan).is_none());
+        assert!(mint_confirmation(&MintPlan::Wait).is_none());
+    }
+
+    #[test]
+    fn a_far_ahead_epoch_cannot_hide_a_real_one_or_an_epoch_in_use() {
+        // A real pending epoch 4 of another account beside a poisoned one.
+        assert_eq!(
+            mint_epoch(plan_mint("zone3", Some(3), &[4, u32::MAX], &[], true)).0,
+            5
+        );
+        // Posts at epoch 6 widen what is believable and are never reused.
+        let seen = [(6, "ev".to_string())];
+        assert_eq!(
+            mint_epoch(plan_mint("zone3", Some(3), &[u32::MAX], &seen, true)).0,
+            7
+        );
+        let (epoch, _) = mint_epoch(plan_mint("zone3", Some(3), &[13], &seen, true));
+        assert_eq!(epoch, 14, "13 is within the skip of the post at 6");
+        // A genuine run of rotations by another account is followed step by step.
+        assert_eq!(
+            mint_epoch(plan_mint("zone3", Some(2), &[5, 12, 19], &[], true)).0,
+            20
+        );
+        // The identity's own epochs are never second-guessed.
+        assert_eq!(
+            mint_epoch(plan_mint("zone3", Some(40), &[40], &[], true)).0,
+            41
+        );
     }
 
     #[test]

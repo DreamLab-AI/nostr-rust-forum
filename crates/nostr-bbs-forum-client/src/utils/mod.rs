@@ -65,6 +65,23 @@ where
     listener.forget();
 }
 
+/// [`on_cross_tab_storage_write`] for every key starting with `prefix`: for a
+/// store whose key carries the signed-in identity.
+pub fn on_cross_tab_storage_prefix_write<F>(prefix: &'static str, reload: F)
+where
+    F: Fn() + 'static,
+{
+    let listener = EventListener::new(&gloo::utils::window(), "storage", move |event| {
+        let changed = event
+            .dyn_ref::<web_sys::StorageEvent>()
+            .and_then(|e| e.key());
+        if changed.as_deref().is_none_or(|k| k.starts_with(prefix)) {
+            reload();
+        }
+    });
+    listener.forget();
+}
+
 /// Format a UNIX timestamp as a human-readable relative time string.
 ///
 /// Returns strings like "just now", "5m ago", "2h ago", "3d ago", or a

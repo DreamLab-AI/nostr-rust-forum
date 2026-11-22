@@ -87,6 +87,28 @@ pub struct Notification {
     /// this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<KeyRef>,
+    /// Set on every notification built since post previews stopped carrying
+    /// decrypted zone text. A post notification persisted before that (absent,
+    /// so `false`) may hold such text in its body, and has the body replaced
+    /// with [`LEGACY_POST_BODY`] when the list is loaded.
+    #[serde(default)]
+    pub preview_safe: bool,
+}
+
+/// Body given to a post notification persisted before previews stopped
+/// carrying decrypted zone text: it cannot be told which zone it came from.
+const LEGACY_POST_BODY: &str = "Open to read this message.";
+
+/// Body of a post notification. For a message from an encrypted zone neither
+/// its text (decrypted or not) nor its author reaches the notification list,
+/// which is kept in LocalStorage and shown to a locked session: only the
+/// channel name (also in the title) and, on the entry, the time.
+fn post_body(author: &str, content: &str, channel: &str, encrypted: bool) -> String {
+    if encrypted {
+        format!("New encrypted message in {channel}")
+    } else {
+        format!("{author}: {}", post_preview(content))
+    }
 }
 
 /// Where a notification came from: when, the stable dedup id of its source
@@ -370,6 +392,7 @@ impl NotificationStoreV2 {
             read: false,
             link: link.map(|s| s.to_string()),
             key,
+            preview_safe: true,
         };
 
         self.items.update(|list| {
@@ -480,6 +503,8 @@ impl NotificationStoreV2 {
         let read_positions = use_read_positions();
         let auth = use_auth();
         let my_pubkey = auth.pubkey();
+        // Captured here: the effects below cannot reach context later.
+        let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
 
         // Join-effect dedup state, declared up-front so the resolver below can
         // reset it on an account switch. `known_profiles` holds pubkeys already
@@ -692,7 +717,15 @@ impl NotificationStoreV2 {
                     }
 
                     let author = author_display(&event.pubkey);
-                    let preview = post_preview(&event.content);
+                    // A zone message (its tags, or a restored sealed original
+                    // the zone store recorded), or any post in an encrypted
+                    // zone's channel.
+                    let encrypted = crate::zone_crypto::is_zone_message(event)
+                        || zone_keys.is_some_and(|z| {
+                            z.encrypted_ids.with_untracked(|s| s.contains(&event.id))
+                        })
+                        || crate::zone_crypto::store::channel_zone(channels_store, cid)
+                            .is_some_and(|(_, _, enc)| enc);
                     // Deep-link to the post itself: `/go/:event_id` resolves it
                     // to its thread and focuses it. `/chat/:channel_id` only
                     // reached the section's topic list, so a reply or mention
@@ -700,12 +733,14 @@ impl NotificationStoreV2 {
                     store.add_at(
                         kind,
                         &title,
-                        &format!("{}: {}", author, preview),
+                        &post_body(&author, &event.content, &channel_name, encrypted),
                         Some(&format!("/go/{}", event.id)),
                         Origin {
                             timestamp: event.created_at,
                             dedup_id: Some(format!("post:{}", event.id)),
-                            key: Some(pubkey_ref(&event.pubkey)),
+                            // The author key is persisted with the entry:
+                            // left out for an encrypted zone, like the name.
+                            key: (!encrypted).then(|| pubkey_ref(&event.pubkey)),
                         },
                     );
                 }
@@ -1299,6 +1334,18 @@ fn load_from_storage(owner: &str) -> Vec<Notification> {
     items
 }
 
+/// A post notification persisted before [`Notification::preview_safe`]
+/// existed may carry decrypted zone text: its body is replaced. Others pass
+/// through.
+fn redact_legacy_preview(mut n: Notification) -> Notification {
+    if !n.preview_safe && n.link.as_deref().is_some_and(|l| l.starts_with("/go/")) {
+        n.body = LEGACY_POST_BODY.to_string();
+        n.key = None;
+    }
+    n.preview_safe = true;
+    n
+}
+
 /// Lenient, per-item parse of the persisted `{ "items": [...] }` blob.
 ///
 /// Each element is deserialized independently: entries that don't match the
@@ -1314,6 +1361,7 @@ fn parse_persisted_items(value: &serde_json::Value, now: u64) -> Vec<Notificatio
             arr.iter()
                 .filter_map(|item| serde_json::from_value::<Notification>(item.clone()).ok())
                 .filter(|n| now.saturating_sub(n.timestamp) < MAX_AGE_SECS)
+                .map(redact_legacy_preview)
                 .collect()
         })
         .unwrap_or_default()
@@ -1615,6 +1663,49 @@ mod tests {
         let items = parse_persisted_items(&value, now);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "fresh");
+    }
+
+    #[test]
+    fn an_encrypted_post_body_never_carries_its_text() {
+        let body = post_body("alice", "the family secret", "Family", true);
+        assert!(!body.contains("family secret"), "{body}");
+        assert!(
+            !body.contains("alice"),
+            "no author for an encrypted zone: {body}"
+        );
+        assert_eq!(body, "New encrypted message in Family");
+        assert_eq!(
+            post_body("bob", "  hi\n there ", "Lobby", false),
+            "bob: hi there"
+        );
+    }
+
+    #[test]
+    fn a_legacy_post_preview_is_redacted_on_load() {
+        let now = 1_000_000;
+        let value = json!({ "items": [
+            { "id": "post:1", "kind": "Message", "title": "New reply in Family",
+              "body": "alice: the family secret", "timestamp": now, "read": false,
+              "link": "/go/abc", "key": { "full": "aa", "display": "a…" } },
+            { "id": "t", "kind": "System", "title": "x", "body": "kept",
+              "timestamp": now, "read": false, "link": null },
+            { "id": "post:2", "kind": "Message", "title": "New reply in Family",
+              "body": "alice: new encrypted message", "timestamp": now, "read": false,
+              "link": "/go/def", "preview_safe": true }
+        ]});
+        let items = parse_persisted_items(&value, now);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].body, LEGACY_POST_BODY);
+        assert!(
+            items[0].key.is_none(),
+            "the author key goes with the preview"
+        );
+        assert_eq!(
+            items[1].body, "kept",
+            "only post notifications are redacted"
+        );
+        assert_eq!(items[2].body, "alice: new encrypted message");
+        assert!(items.iter().all(|n| n.preview_safe));
     }
 
     #[test]

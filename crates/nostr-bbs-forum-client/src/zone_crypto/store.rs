@@ -1,9 +1,16 @@
 //! Reactive zone-key store (ADR-2016).
 //!
-//! Holds the zone keys this device knows, persists them in IndexedDB, pulls
-//! key grants out of the member's gift wraps, and is the single place a
-//! zone-encrypted kind-42 is turned into readable text on its way into the
-//! [`ChannelStore`](crate::stores::channels::ChannelStore).
+//! Holds the zone keys the signed-in identity sees, persists them in
+//! IndexedDB, pulls key grants out of that identity's gift wraps, and is the
+//! single place a zone-encrypted kind-42 is turned into readable text on its
+//! way into the [`ChannelStore`](crate::stores::channels::ChannelStore).
+//!
+//! Keys are scoped to the signed-in identity ([`super::key_owner`]):
+//! signing out drops every key from memory and turns decrypted messages back
+//! into placeholders; the next sign-in, with or without a page reload, loads
+//! that identity's keys before the Encryption card may offer Create or Rotate.
+//! This keeps accounts that share a browser profile apart in the UI; it is not
+//! access control (see the module docs of `key_owner`).
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -20,16 +27,17 @@ use super::inbox_key::{
     deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, recipient_keys_enabled,
     subscription_targets, sweep_targets, unwrap_inbox_then_identity, LivePort, SweepCandidate,
 };
+use super::key_owner::{self, Lease, Owner, Session, Switch};
 use super::keyset::{self, SendKeyError};
 use super::read_cache::ReadCache;
 use super::{is_zone_message, read_outcome, resolve_event, validate_grant, ZoneKey};
-use crate::relay::{Filter, RelayConnection};
-use crate::stores::indexed_db::{ForumDb, ZoneKeyPut};
+use crate::relay::{EventCallback, Filter, RelayConnection};
+use crate::stores::indexed_db::{ForumDb, MintPut, ZoneKeyPut};
 
-/// `zone_kv` id holding the ids of gift wraps already unwrapped here.
+/// `zone_kv` id holding the ids of gift wraps already unwrapped here. Shared
+/// by every identity on the device: the relay serves a wrap only to its
+/// addressee, so one identity's entries never cover another's wraps.
 const KV_PROCESSED: &str = "processed_wraps";
-/// `(zone, epoch)` ids whose grant has arrived addressed to the inbox key.
-const KV_INBOX_GRANTED: &str = "inbox_granted";
 
 fn now_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
@@ -38,8 +46,10 @@ fn now_secs() -> u64 {
 /// Zone keys and the per-message decryption state.
 #[derive(Clone, Copy)]
 pub struct ZoneKeyStore {
-    /// Keys by [`ZoneKey::store_id`] (zone, group, epoch, pubkey), so two
-    /// keys claiming one epoch both stay visible (ADR-2028 decision 6).
+    /// The signed-in identity's view of the stored keys, by
+    /// [`ZoneKey::store_id`] (zone, group, epoch, pubkey with
+    /// `ZONE_GROUPS_ENABLED`), so two keys claiming one epoch both stay
+    /// visible (ADR-2028 decision 6). Empty while signed out.
     pub keys: RwSignal<HashMap<String, ZoneKey>>,
     /// Bumped whenever keys change or messages are re-decrypted.
     pub revision: RwSignal<u64>,
@@ -48,31 +58,53 @@ pub struct ZoneKeyStore {
     /// keep link previews off: a preview would send the URL to the preview
     /// worker, outside the zone.
     pub encrypted_ids: RwSignal<HashSet<String>>,
-    /// Set once the keys stored on this device have been loaded (or the
-    /// load has failed), so nothing judges "no key held" too early.
-    pub hydrated: RwSignal<bool>,
+    /// The identity whose keys have been loaded from IndexedDB (or whose load
+    /// has failed), so nothing judges "no key held" too early. Compared with
+    /// the current auth identity by [`ready_for`](Self::ready_for), so
+    /// readiness never depends on which effect ran first.
+    loaded_for: RwSignal<Option<Owner>>,
+    /// Every epoch held per zone by any row on this device, whatever its
+    /// owner (epoch numbers only), so a mint never reuses an epoch another
+    /// account on this browser holds but has not delivered.
+    /// [`keyset::plan_mint`] decides which of them are believable.
+    device_epochs: RwSignal<HashMap<String, std::collections::BTreeSet<u32>>>,
+    /// Which identity is signed in, and its generation: work started for an
+    /// earlier one touches memory, the relay and the UI only while its
+    /// [`Lease`] is current.
+    session: StoredValue<Session>,
     /// Ciphertexts and sealed-original envelopes seen, so a key that arrives
     /// later can decrypt what is already on screen, swapping an envelope's
     /// placeholder for the original event in place (ADR-2017).
     cache: StoredValue<ReadCache>,
     processed: StoredValue<HashSet<String>>,
-    /// `key_id`s that have been received through the inbox key on this device.
-    /// A copy addressed to the identity is only ever swept once its id is here.
+    /// Keys (by [`key_owner::inbox_granted_entry`], the full store id) that
+    /// have been received through the signed-in identity's inbox key on this
+    /// device. A copy addressed to the identity is only ever
+    /// swept once its id is here.
     inbox_granted: StoredValue<HashSet<String>>,
     admin_cache: StoredValue<HashMap<String, bool>>,
     /// "Granted from this device", shared by every Encryption-tab card.
     grants: StoredValue<Arc<GrantLedger>>,
-    sync_started: StoredValue<bool>,
-    /// Secret of the active inbox key (hex), once registered. Always `None`
-    /// with `RECIPIENT_KEYS_ENABLED` off.
+    /// The lease the grant sync is running for.
+    sync_for: StoredValue<Option<Lease>>,
+    /// The grant sync's relay subscriptions, closed when the identity
+    /// changes: the relay replays subscriptions on reconnect, and their
+    /// callbacks hold the identity's signer.
+    grant_subs: StoredValue<Vec<String>>,
+    grant_relay: StoredValue<Option<RelayConnection>>,
+    /// Secret of the signed-in identity's inbox key (hex), once registered.
+    /// Always `None` with `RECIPIENT_KEYS_ENABLED` off.
     inbox_sk: StoredValue<Option<String>>,
-    /// Keys refused because this device holds a different key for the same
-    /// `(zone, epoch)` (see [`ForumDb::put_zone_key_unless_conflicting`]):
-    /// `(zone, epoch, granted_by)`, for the Encryption card to show.
+    /// Keys refused because the signed-in identity's view holds a different
+    /// key for the same `(zone, epoch)` (see
+    /// [`ForumDb::put_zone_key_unless_conflicting`]): `(zone, epoch,
+    /// granted_by)`, for the Encryption card to show.
     pub conflicts: RwSignal<Vec<(String, u32, String)>>,
     /// Highest `zk` epoch seen per `(zone named in the tag, channel)`, with the
     /// post id. The Encryption card counts only channels that resolve to the
-    /// zone, so a tag in some other channel cannot steer a rotation.
+    /// zone, so a tag in some other channel cannot steer a rotation. Kept
+    /// across sign-ins: it records posts, not keys, and only ever raises the
+    /// epoch a mint picks.
     pub epochs_seen: RwSignal<HashMap<(String, String), std::collections::BTreeMap<u32, String>>>,
     /// Captured at construction: relay callbacks and spawned tasks run
     /// without a reactive owner, so `use_context` is not available there.
@@ -86,18 +118,107 @@ impl ZoneKeyStore {
             keys: RwSignal::new(HashMap::new()),
             revision: RwSignal::new(0),
             encrypted_ids: RwSignal::new(HashSet::new()),
-            hydrated: RwSignal::new(false),
+            loaded_for: RwSignal::new(None),
+            device_epochs: RwSignal::new(HashMap::new()),
+            session: StoredValue::new(Session::default()),
             cache: StoredValue::new(ReadCache::default()),
             processed: StoredValue::new(HashSet::new()),
             inbox_granted: StoredValue::new(HashSet::new()),
             admin_cache: StoredValue::new(HashMap::new()),
             grants: StoredValue::new(Arc::new(GrantLedger::default())),
-            sync_started: StoredValue::new(false),
+            sync_for: StoredValue::new(None),
+            grant_subs: StoredValue::new(Vec::new()),
+            grant_relay: StoredValue::new(None),
             inbox_sk: StoredValue::new(None),
             conflicts: RwSignal::new(Vec::new()),
             epochs_seen: RwSignal::new(HashMap::new()),
         }
     }
+
+    // -- Identity ---------------------------------------------------------
+
+    fn is_current(&self, lease: &Lease) -> bool {
+        self.session
+            .try_with_value(|s| s.is_current(lease))
+            .unwrap_or(false)
+    }
+
+    fn current_lease(&self) -> Option<Lease> {
+        self.session.try_with_value(Session::lease).flatten()
+    }
+
+    /// Whether the keys of `me` (a pubkey, as auth reports it) are loaded,
+    /// tracked. `false` while signed out, before the load finishes, and in the
+    /// moment between a sign-in and the store's switch to it.
+    pub fn ready_for(&self, me: Option<&str>) -> bool {
+        let Some(me) = me.and_then(Owner::parse) else {
+            return false;
+        };
+        self.loaded_for.with(|l| l.as_ref() == Some(&me))
+    }
+
+    /// Every epoch any row on this device holds for `zone`, whatever its
+    /// owner, ascending, tracked. Feeds [`keyset::plan_mint`].
+    pub fn device_epochs_for(&self, zone: &str) -> Vec<u32> {
+        self.device_epochs.with(|m| {
+            m.get(zone)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    fn note_device_epoch(&self, zone: &str, epoch: u32) {
+        if self
+            .device_epochs
+            .with_untracked(|m| m.get(zone).is_some_and(|s| s.contains(&epoch)))
+        {
+            return;
+        }
+        let _ = self.device_epochs.try_update(|m| {
+            m.entry(zone.to_string()).or_default().insert(epoch);
+        });
+    }
+
+    /// Make the store follow the signed-in identity. On any change (sign-out,
+    /// or another identity signing in) everything the previous identity
+    /// loaded or started is dropped: keys, conflicts, its inbox key, its grant
+    /// subscriptions, held group signers, and the plaintext on screen, which
+    /// goes back to placeholders. Then the new identity's keys are loaded.
+    pub fn switch_owner(&self, next: Option<Owner>) {
+        let Some(Switch::Changed(lease)) = self.session.try_update_value(|s| s.switch(next)) else {
+            return;
+        };
+        self.stop_grant_sync();
+        let _ = self.loaded_for.try_set(None);
+        let _ = self.keys.try_set(HashMap::new());
+        let _ = self.conflicts.try_set(Vec::new());
+        self.inbox_granted.set_value(HashSet::new());
+        self.inbox_sk.set_value(None);
+        super::tickets::clear_group_identities();
+        super::public_inbox::reset_sweep_tracker();
+        self.redecrypt();
+        if let Some(lease) = lease {
+            let store = *self;
+            spawn_local(async move {
+                store.load_for(lease).await;
+            });
+        }
+    }
+
+    fn stop_grant_sync(&self) {
+        self.sync_for.set_value(None);
+        let subs = self
+            .grant_subs
+            .try_update_value(std::mem::take)
+            .unwrap_or_default();
+        if let Some(relay) = self.grant_relay.get_value() {
+            for id in subs {
+                relay.unsubscribe(&id);
+            }
+        }
+    }
+
+    // -- Reads ------------------------------------------------------------
 
     /// Key for `(zone, epoch)`, untracked. Deterministic when an epoch is
     /// inconsistent (see [`keyset::read_key`]); the read path still checks
@@ -130,15 +251,34 @@ impl ZoneKeyStore {
         self.keys.with(|m| latest_in(m, zone))
     }
 
-    /// Make memory hold what IndexedDB holds for `id` (the side every write is
-    /// guarded on), dropping the in-memory entry if storage has none.
-    async fn adopt_stored(&self, id: &str) {
+    // -- Memory, for the current identity only ----------------------------
+
+    /// Put `key` in memory under `id` if `lease` is current. Returns whether
+    /// it did.
+    fn remember(&self, lease: &Lease, id: String, key: ZoneKey) -> bool {
+        if !self.is_current(lease) {
+            return false;
+        }
+        self.keys.update(|m| {
+            m.insert(id, key);
+        });
+        self.redecrypt();
+        true
+    }
+
+    /// Make memory hold what storage holds for `id` as the lease's identity
+    /// sees it (their row, else the legacy row; every write is guarded on that
+    /// view), dropping the in-memory entry only if storage has neither.
+    async fn adopt_stored(&self, lease: &Lease, id: &str) {
         let Ok(db) = ForumDb::open().await else {
             return;
         };
-        let Ok(stored) = db.get_zone_key(id).await else {
+        let Ok(stored) = db.get_zone_key(lease.owner(), id).await else {
             return;
         };
+        if !self.is_current(lease) {
+            return;
+        }
         let id = id.to_string();
         self.keys.update(|m| match stored {
             Some(k) => {
@@ -151,8 +291,9 @@ impl ZoneKeyStore {
         self.redecrypt();
     }
 
-    /// Note a refused key: logged, and listed for the Encryption card.
-    fn record_conflict(&self, key: &ZoneKey) {
+    /// Note a refused key: logged, and listed for the Encryption card while
+    /// its identity is signed in.
+    fn record_conflict(&self, lease: &Lease, key: &ZoneKey) {
         web_sys::console::warn_1(
             &format!(
                 "[zone-key] refused a second key for {} epoch {} (from {}): this device already holds a different one",
@@ -160,6 +301,9 @@ impl ZoneKeyStore {
             )
             .into(),
         );
+        if !self.is_current(lease) {
+            return;
+        }
         let entry = (key.zone.clone(), key.epoch, key.granted_by.clone());
         self.conflicts.update(|v| {
             if !v.contains(&entry) {
@@ -168,29 +312,74 @@ impl ZoneKeyStore {
         });
     }
 
-    /// `key`, still pending when this device holds the same secret as a key
+    /// `key`, still pending when the slot holds the same secret as a key
     /// awaiting delivery. The creator's own grant comes back through the grant
-    /// sync (both `insert_persisted` and `insert_local` paths); that alone must not adopt
-    /// the key while members may lack it. Only [`mark_delivered`] clears it.
+    /// sync (both `insert_persisted` and `insert_local` paths); that alone must
+    /// not adopt the key while members may lack it. Only [`mark_delivered`]
+    /// clears it. Memory is the view for the current identity; for an earlier
+    /// one, storage is asked.
     ///
     /// [`mark_delivered`]: Self::mark_delivered
-    fn keep_pending(&self, key: ZoneKey) -> ZoneKey {
+    async fn keep_pending(&self, lease: &Lease, key: ZoneKey) -> ZoneKey {
         let id = key.store_id();
-        self.keys
-            .with_untracked(|m| keep_pending_against(key, m.get(&id)))
+        if self.is_current(lease) {
+            return self
+                .keys
+                .with_untracked(|m| keep_pending_against(key, m.get(&id)));
+        }
+        let held = match ForumDb::open().await {
+            Ok(db) => db.get_zone_key(lease.owner(), &id).await.ok().flatten(),
+            Err(_) => None,
+        };
+        keep_pending_against(key, held.as_ref())
     }
 
-    /// Mark the pending key for `(zone, epoch)` with `pubkey` delivered: it
-    /// becomes eligible to send under. Returns `false` when no such pending key
-    /// is held.
-    pub fn mark_delivered(&self, zone: &str, epoch: u32, pubkey: &str) -> bool {
-        let found = self.keys.with_untracked(|m| {
-            m.values()
-                .find(|k| {
+    /// Mark `owner`'s pending key for `(zone, epoch)` with `pubkey` delivered:
+    /// it becomes eligible to send under. `owner` is the identity that sent
+    /// the grants, captured when they were sent, so an ack that lands after
+    /// that identity signed out still settles its key in storage. Returns
+    /// `false` when the key is not pending in the signed-in identity's memory
+    /// (storage is still updated for an earlier identity).
+    pub fn mark_delivered(&self, owner: &str, zone: &str, epoch: u32, pubkey: &str) -> bool {
+        let Some(owner) = Owner::parse(owner) else {
+            return false;
+        };
+        let matches = |k: &ZoneKey| {
+            k.zone == zone && k.epoch == epoch && k.pubkey == pubkey && k.pending_delivery
+        };
+        let lease = self.current_lease().filter(|l| *l.owner() == owner);
+        let Some(lease) = lease else {
+            // Signed out since: settle the key in storage only.
+            let (zone, pubkey) = (zone.to_string(), pubkey.to_string());
+            spawn_local(async move {
+                let Ok(db) = ForumDb::open().await else {
+                    return;
+                };
+                let Ok(rows) = db.zone_key_rows().await else {
+                    return;
+                };
+                let view =
+                    key_owner::visible_keys(rows, &owner, super::tickets::zone_groups_enabled());
+                let found = view.into_values().find(|k| {
                     k.zone == zone && k.epoch == epoch && k.pubkey == pubkey && k.pending_delivery
-                })
-                .cloned()
-        });
+                });
+                if let Some(mut key) = found {
+                    key.pending_delivery = false;
+                    if !matches!(
+                        db.put_zone_key_unless_conflicting(&owner, &key).await,
+                        Ok(ZoneKeyPut::Stored)
+                    ) {
+                        web_sys::console::warn_1(
+                            &"[zone-key] could not mark a key delivered in storage".into(),
+                        );
+                    }
+                }
+            });
+            return false;
+        };
+        let found = self
+            .keys
+            .with_untracked(|m| m.values().find(|k| matches(k)).cloned());
         let Some(mut key) = found else {
             return false;
         };
@@ -201,7 +390,7 @@ impl ZoneKeyStore {
         });
         spawn_local(async move {
             if let Ok(db) = ForumDb::open().await {
-                match db.put_zone_key_unless_conflicting(&key).await {
+                match db.put_zone_key_unless_conflicting(lease.owner(), &key).await {
                     Ok(ZoneKeyPut::Stored) => {}
                     Ok(ZoneKeyPut::Conflict(_)) => web_sys::console::warn_1(
                         &"[zone-key] not marked delivered in storage: it holds a different key for this epoch".into(),
@@ -212,6 +401,8 @@ impl ZoneKeyStore {
         });
         true
     }
+
+    // -- Read path --------------------------------------------------------
 
     /// Turn an incoming kind-42 into what the reader should see. Events
     /// without a `zk` or `sealed` tag pass through untouched; zone-encrypted
@@ -252,13 +443,14 @@ impl ZoneKeyStore {
     }
 
     /// Re-run decryption over every zone-encrypted message already in the
-    /// channel store (a key just arrived). Sealed-original placeholders that
-    /// now open become the original event in place; see
-    /// [`ReadCache::redecrypt`].
+    /// channel store (a key just arrived, or every key was just dropped).
+    /// Sealed-original placeholders that now open become the original event
+    /// in place, and restored originals whose key is gone go back to the
+    /// placeholder; see [`ReadCache::redecrypt`].
     pub fn redecrypt(&self) {
         let channels = self.channels;
         if self.cache.with_value(ReadCache::is_empty) {
-            self.revision.update(|r| *r += 1);
+            let _ = self.revision.try_update(|r| *r += 1);
             return;
         }
         let store = *self;
@@ -290,81 +482,100 @@ impl ZoneKeyStore {
         self.revision.update(|r| *r += 1);
     }
 
-    /// Load keys and the processed-wrap set from IndexedDB.
-    pub async fn hydrate(&self) {
-        self.load_stored().await;
-        let _ = self.hydrated.try_set(true);
+    // -- Loading ----------------------------------------------------------
+
+    /// Load the lease's identity's keys, its inbox-granted set and the
+    /// processed-wrap set from IndexedDB, then mark that identity ready. A
+    /// load that finishes after a switch is dropped.
+    async fn load_for(&self, lease: Lease) {
+        self.load_stored(&lease).await;
+        if self.is_current(&lease) {
+            let _ = self.loaded_for.try_set(Some(lease.owner().clone()));
+        }
     }
 
-    async fn load_stored(&self) {
+    async fn load_stored(&self, lease: &Lease) {
         let Ok(db) = ForumDb::open().await else {
             return;
         };
-        // One-way: rewrite entries stored under the old "<zone>:<epoch>" id.
+        // Moves rows left under an id from before the last flag change.
         if db.migrate_zone_keys().await.is_err() {
             web_sys::console::warn_1(&"[zone-key] store migration failed".into());
         }
-        if let Ok(keys) = db.get_all_zone_keys().await {
-            if !keys.is_empty() {
-                self.keys.update(|m| {
-                    for k in keys {
-                        m.insert(k.store_id(), k);
-                    }
-                });
-                self.redecrypt();
+        let rows = db.zone_key_rows().await;
+        let processed = db.get_zone_kv(KV_PROCESSED).await;
+        let inbox = db
+            .get_zone_kv(&key_owner::inbox_granted_id(lease.owner()))
+            .await;
+        if !self.is_current(lease) {
+            return;
+        }
+        if let Ok(rows) = rows {
+            let floor = key_owner::device_epochs(&rows);
+            let _ = self.device_epochs.try_update(|m| {
+                for (zone, epochs) in floor {
+                    m.entry(zone).or_default().extend(epochs);
+                }
+            });
+            let visible =
+                key_owner::visible_keys(rows, lease.owner(), super::tickets::zone_groups_enabled());
+            if !visible.is_empty() {
+                let mut added = false;
+                self.keys
+                    .update(|m| added = key_owner::merge_loaded(m, visible));
+                if added {
+                    self.redecrypt();
+                }
             }
         }
-        if let Ok(Some(json)) = db.get_zone_kv(KV_PROCESSED).await {
+        if let Ok(Some(json)) = processed {
             if let Ok(ids) = serde_json::from_str::<Vec<String>>(&json) {
                 self.processed.update_value(|s| s.extend(ids));
             }
         }
-        if let Ok(Some(json)) = db.get_zone_kv(KV_INBOX_GRANTED).await {
+        if let Ok(Some(json)) = inbox {
             if let Ok(ids) = serde_json::from_str::<Vec<String>>(&json) {
                 self.inbox_granted.update_value(|s| s.extend(ids));
             }
         }
     }
 
-    /// Subscribe to the member's gift wraps once the relay session is
-    /// authenticated and pull zone-key grants out of them. Each wrap is
+    // -- Grant sync -------------------------------------------------------
+
+    /// Subscribe to the signed-in identity's gift wraps once the relay session
+    /// is authenticated and pull zone-key grants out of them. Each wrap is
     /// unwrapped at most once per device (ids remembered in IndexedDB), so
-    /// ordinary DMs are not re-decrypted on every visit.
+    /// ordinary DMs are not re-decrypted on every visit. Runs once per
+    /// sign-in; `me` must be the identity the store has switched to.
     pub fn start_grant_sync(&self, relay: &RelayConnection, signer: Rc<dyn Signer>, me: String) {
-        if self.sync_started.get_value() || me.len() != 64 {
+        let Some(lease) = self.current_lease() else {
+            return;
+        };
+        if Owner::parse(&me).as_ref() != Some(lease.owner())
+            || self.sync_for.with_value(|l| l.as_ref() == Some(&lease))
+        {
             return;
         }
-        self.sync_started.set_value(true);
+        self.sync_for.set_value(Some(lease.clone()));
+        self.grant_relay.set_value(Some(relay.clone()));
+        let me = lease.owner().as_str().to_string();
         let store = *self;
-        let on_event = {
-            let (relay, signer, me) = (relay.clone(), signer.clone(), me.clone());
-            Rc::new(move |ev: NostrEvent| {
-                if ev.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP {
-                    return;
-                }
-                // With the sweep on, wraps already handled are looked at again
-                // when addressed to the identity: an old grant is deleted once
-                // its key is safe here.
-                let revisit = grant_sweep_enabled() && p_tags(&ev).any(|p| p == me);
-                if !revisit && store.processed.with_value(|s| s.contains(&ev.id)) {
-                    return;
-                }
-                let (relay, signer, me) = (relay.clone(), signer.clone(), me.clone());
-                super::public_inbox::sweep_wrap_started();
-                spawn_local(async move {
-                    store.process_wrap(&ev, &*signer, &me, &relay).await;
-                    super::public_inbox::sweep_wrap_done(&me);
-                });
-            })
-        };
         // The end of stored events on the identity subscription settles the
         // old-grant cleanup flag the public-inbox opt-in waits for.
-        let eose_me = me.clone();
-        relay.subscribe(
+        let eose = {
+            let (lease, me) = (lease.clone(), me.clone());
+            Rc::new(move || {
+                if store.is_current(&lease) {
+                    super::public_inbox::sweep_eose(&me);
+                }
+            })
+        };
+        let id = relay.subscribe(
             vec![wrap_filter(subscription_targets(&me, None))],
-            on_event.clone(),
-            Some(Rc::new(move || super::public_inbox::sweep_eose(&eose_me))),
+            self.wrap_handler(relay, signer.clone(), lease.clone(), false),
+            Some(eose),
         );
+        self.grant_subs.update_value(|v| v.push(id));
         if !recipient_keys_enabled() {
             return;
         }
@@ -373,15 +584,23 @@ impl ZoneKeyStore {
         // which the subscription above keeps covering.
         let relay = relay.clone();
         spawn_local(async move {
+            let live = {
+                let lease = lease.clone();
+                Rc::new(move || store.is_current(&lease))
+            };
             let port = LivePort {
                 relay: relay.clone(),
                 identity: signer.clone(),
+                live,
             };
             match ensure_inbox_key(&port, &*signer, now_secs()).await {
-                Ok(key) => {
+                Ok(key) if store.is_current(&lease) => {
                     store.inbox_sk.set_value(Some(key.sk_hex));
-                    relay.subscribe(vec![wrap_filter(vec![key.pubkey])], on_event, None);
+                    let handler = store.wrap_handler(&relay, signer.clone(), lease.clone(), true);
+                    let id = relay.subscribe(vec![wrap_filter(vec![key.pubkey])], handler, None);
+                    store.grant_subs.update_value(|v| v.push(id));
                 }
+                Ok(_) => {}
                 Err(e) => {
                     web_sys::console::warn_1(&format!("[zone-key] inbox key: {e}").into());
                 }
@@ -389,16 +608,57 @@ impl ZoneKeyStore {
         });
     }
 
+    /// The callback for one grant subscription. `inbox` marks the inbox-key
+    /// subscription: with the sweep on, its wraps are looked at again even
+    /// when processed, so the identity's inbox-granted set is rebuilt from
+    /// wraps provably addressed to it (it is not carried over from before
+    /// keys had owners). The inbox key is a local key, so this prompts no one.
+    fn wrap_handler(
+        &self,
+        relay: &RelayConnection,
+        signer: Rc<dyn Signer>,
+        lease: Lease,
+        inbox: bool,
+    ) -> EventCallback {
+        let store = *self;
+        let relay = relay.clone();
+        Rc::new(move |ev: NostrEvent| {
+            if ev.kind != nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP || !store.is_current(&lease) {
+                return;
+            }
+            let me = lease.owner().as_str();
+            // With the sweep on, wraps already handled are looked at again
+            // when addressed to the identity (an old grant is deleted once its
+            // key is safe here) or to its inbox key (see above).
+            let revisit = grant_sweep_enabled() && (inbox || p_tags(&ev).any(|p| p == me));
+            if !revisit && store.processed.with_value(|s| s.contains(&ev.id)) {
+                return;
+            }
+            let (relay, signer, lease) = (relay.clone(), signer.clone(), lease.clone());
+            super::public_inbox::sweep_wrap_started();
+            spawn_local(async move {
+                store.process_wrap(&lease, &ev, &*signer, &relay).await;
+                // A switch reset the tracker: an earlier identity's wrap no
+                // longer counts towards the new one's cleanup.
+                if store.is_current(&lease) {
+                    super::public_inbox::sweep_wrap_done(lease.owner().as_str());
+                }
+            });
+        })
+    }
+
     async fn process_wrap(
         &self,
+        lease: &Lease,
         wrap: &NostrEvent,
         signer: &dyn Signer,
-        me: &str,
         relay: &RelayConnection,
     ) {
+        let me = lease.owner().as_str();
         let inbox = self
             .inbox_sk
             .get_value()
+            .filter(|_| self.is_current(lease))
             .and_then(|sk| super::inbox_key::inbox_signer(&sk).ok());
         let inbox_ref = inbox.as_ref().map(|s| s as &dyn Signer);
         let inbox_pk = inbox.as_ref().map(|s| s.public_key().to_string());
@@ -418,7 +678,7 @@ impl ZoneKeyStore {
                 return;
             }
             super::tickets::Route::Ticket => {
-                self.process_ticket(wrap, inbox_ref, signer, me, via_inbox)
+                self.process_ticket(lease, wrap, inbox_ref, signer, via_inbox)
                     .await;
                 return;
             }
@@ -432,12 +692,13 @@ impl ZoneKeyStore {
             None => (false, false, None),
             Some(is_admin) => match validate_grant(&rumor, &sealer, is_admin, now_secs()) {
                 Ok(key) => {
-                    let id = super::key_id(&key.zone, key.epoch);
-                    let outcome = self.insert_persisted(key).await;
+                    let id =
+                        key_owner::inbox_granted_entry(&key, super::tickets::zone_groups_enabled());
+                    let outcome = self.insert_persisted(lease, key).await;
                     // A refused grant is settled, but the inbox copy did not
                     // replace anything: never let the sweep treat it as such.
                     if via_inbox && outcome == Persisted::Stored {
-                        self.mark_inbox_granted(&id).await;
+                        self.mark_inbox_granted(lease, &id).await;
                     }
                     (true, outcome.settled(), Some(id))
                 }
@@ -449,6 +710,12 @@ impl ZoneKeyStore {
         };
         if super::grant_settled(admin, valid, persisted) {
             self.mark_processed(&wrap.id).await;
+        }
+        // Nothing below runs once the identity has signed out: it publishes
+        // deletions signed by that identity, and reports to the cleanup
+        // tracker the next identity owns.
+        if !self.is_current(lease) {
+            return;
         }
         // Deleting the identity copy is safe only once the SAME (zone, epoch)
         // key has also arrived addressed to the inbox key on this device, so a
@@ -474,13 +741,13 @@ impl ZoneKeyStore {
         for id in doomed {
             let unsigned = deletion_for_wrap(me, &id, now_secs());
             if let Ok(del) = signer.sign_event(unsigned).await {
-                relay.publish(&del);
+                if self.is_current(lease) {
+                    relay.publish(&del);
+                }
             }
         }
     }
 
-    /// Add a key and wait for it to reach IndexedDB. The key is usable this
-    /// session either way; returns whether it was persisted.
     /// An NIP-171 epoch ticket (ADR-2028 decision 2): opened with its
     /// signature intact, accepted only from the zone's bound group identity,
     /// and stored as the same [`ZoneKey`] a 21453 grant yields. No admin
@@ -488,10 +755,10 @@ impl ZoneKeyStore {
     /// wrap unmarked so the next session retries; any other refusal is final.
     async fn process_ticket(
         &self,
+        lease: &Lease,
         wrap: &NostrEvent,
         inbox: Option<&dyn Signer>,
         identity: &dyn Signer,
-        me: &str,
         via_inbox: bool,
     ) {
         use super::tickets::{
@@ -501,6 +768,7 @@ impl ZoneKeyStore {
             web_sys::console::warn_1(&format!("[zone-key] bindings: {e}").into());
         }
         let opened = super::tickets::open_ticket(wrap, inbox, identity).await;
+        let me = lease.owner().as_str();
         match ticket_verdict(opened, me, loaded_bindings().as_ref(), now_secs()) {
             TicketVerdict::Retry => {}
             TicketVerdict::Refuse(why) => {
@@ -509,10 +777,11 @@ impl ZoneKeyStore {
             }
             TicketVerdict::Accept(key) => {
                 let key = *key;
-                let id = super::key_id(&key.zone, key.epoch);
-                let outcome = self.insert_persisted(key).await;
+                let id =
+                    key_owner::inbox_granted_entry(&key, super::tickets::zone_groups_enabled());
+                let outcome = self.insert_persisted(lease, key).await;
                 if via_inbox && outcome == Persisted::Stored {
-                    self.mark_inbox_granted(&id).await;
+                    self.mark_inbox_granted(lease, &id).await;
                 }
                 if outcome.settled() {
                     self.mark_processed(&wrap.id).await;
@@ -521,27 +790,37 @@ impl ZoneKeyStore {
         }
     }
 
-    async fn insert_persisted(&self, key: ZoneKey) -> Persisted {
-        let key = self.keep_pending(key);
+    // -- Writes -----------------------------------------------------------
+
+    /// Store a received key as the lease's identity's row and wait for it to
+    /// reach IndexedDB. Memory, the conflict list and the screen change only
+    /// while that identity is still signed in; a grant that finishes after a
+    /// sign-out is still stored, under its own identity, for its next sign-in.
+    async fn insert_persisted(&self, lease: &Lease, key: ZoneKey) -> Persisted {
+        let key = self.keep_pending(lease, key).await;
         let id = key.store_id();
-        if let Some(held) = self.keys.with_untracked(|m| m.get(&id).cloned()) {
-            if super::conflicts(&held, &key) {
-                self.record_conflict(&key);
-                return Persisted::Refused;
+        if self.is_current(lease) {
+            if let Some(held) = self.keys.with_untracked(|m| m.get(&id).cloned()) {
+                if super::conflicts(&held, &key) {
+                    self.record_conflict(lease, &key);
+                    return Persisted::Refused;
+                }
             }
         }
         let outcome = match ForumDb::open().await {
-            Ok(db) => match db.put_zone_key_unless_conflicting(&key).await {
+            Ok(db) => match db
+                .put_zone_key_unless_conflicting(lease.owner(), &key)
+                .await
+            {
                 Ok(ZoneKeyPut::Stored) => Persisted::Stored,
                 Ok(ZoneKeyPut::Conflict(held)) => {
                     // Final: the held key stands and this grant is settled (the
                     // wrap is marked processed), so it is not retried forever.
-                    self.record_conflict(&key);
-                    if self.keys.with_untracked(|m| m.get(&id) != Some(&held)) {
-                        self.keys.update(|m| {
-                            m.insert(id, held);
-                        });
-                        self.redecrypt();
+                    self.record_conflict(lease, &key);
+                    if self.is_current(lease)
+                        && self.keys.with_untracked(|m| m.get(&id) != Some(&held))
+                    {
+                        self.remember(lease, id, held);
                     }
                     return Persisted::Refused;
                 }
@@ -555,16 +834,17 @@ impl ZoneKeyStore {
                 // keep the key for this session only, as before, so the zone
                 // stays readable. The memory conflict check above still holds,
                 // and the grant stays unsettled so it is offered again.
-                self.keys.update(|m| {
-                    m.insert(id, key);
-                });
-                self.redecrypt();
+                self.remember(lease, id, key);
                 return Persisted::Failed;
             }
         };
+        self.note_device_epoch(&key.zone, key.epoch);
         // Stored from here on. A key storage did not accept never enters memory
         // (the grant stays unsettled and is retried), so memory only diverges
         // from storage briefly, and storage is the side to believe.
+        if !self.is_current(lease) {
+            return outcome;
+        }
         // Re-read after the awaits: an ack may have marked the key delivered
         // meanwhile, and an echo must neither undo that nor re-pend it; and a
         // different key may have arrived, which this one must not replace.
@@ -573,10 +853,10 @@ impl ZoneKeyStore {
         let held_now = self.keys.with_untracked(|m| m.get(&id).cloned());
         if let Some(held) = &held_now {
             if super::conflicts(held, &key) {
-                self.record_conflict(&key);
+                self.record_conflict(lease, &key);
                 // Storage accepted this key, yet memory holds another (another
                 // tab's write): make memory match storage, never the reverse.
-                self.adopt_stored(&id).await;
+                self.adopt_stored(lease, &id).await;
                 return Persisted::Refused;
             }
         }
@@ -587,9 +867,14 @@ impl ZoneKeyStore {
             // Delivered during the awaits: the write above stored pending and
             // may have landed after mark_delivered's. Store the settled state.
             let settled = key.clone();
+            let owner = lease.owner().clone();
             spawn_local(async move {
                 if let Ok(db) = ForumDb::open().await {
-                    if db.put_zone_key_unless_conflicting(&settled).await.is_err() {
+                    if db
+                        .put_zone_key_unless_conflicting(&owner, &settled)
+                        .await
+                        .is_err()
+                    {
                         web_sys::console::warn_1(
                             &"[zone-key] persist failed (IndexedDB write)".into(),
                         );
@@ -598,18 +883,22 @@ impl ZoneKeyStore {
             });
         }
         if held_now.as_ref() != Some(&key) {
-            self.keys.update(|m| {
-                m.insert(id, key);
-            });
-            self.redecrypt();
+            self.remember(lease, id, key);
         }
         outcome
     }
 
-    /// Save a key this device just created, refusing it if this device already
-    /// holds a different key for its epoch (in memory or in IndexedDB). Awaited
-    /// before any grant is sent, so a refused key is never distributed.
+    /// Save a key this device just created as the signed-in identity's row,
+    /// refusing it if that identity's view already holds a different key for
+    /// its epoch, or if any row on this device (any account) holds a different
+    /// key for the zone at that epoch or above. Awaited before any grant is
+    /// sent, so a refused key is never distributed. A sign-out during the save
+    /// leaves the key stored, still pending, under the identity that created
+    /// it, and nothing is sent.
     pub async fn insert_local(&self, key: ZoneKey) -> Result<(), String> {
+        let lease = self
+            .current_lease()
+            .ok_or_else(|| "Sign in to create a key; nothing was sent.".to_string())?;
         let id = key.store_id();
         if self
             .keys
@@ -623,39 +912,42 @@ impl ZoneKeyStore {
         let db = ForumDb::open().await.map_err(|_| {
             "Could not open this browser's key storage; nothing was sent.".to_string()
         })?;
-        match db.put_zone_key_unless_conflicting(&key).await {
-            Ok(ZoneKeyPut::Stored) => {}
-            Ok(ZoneKeyPut::Conflict(held)) => {
-                self.keys.update(|m| {
-                    m.insert(id, held);
-                });
-                self.redecrypt();
+        match db.put_minted_zone_key(lease.owner(), &key).await {
+            Ok(MintPut::Stored) => {}
+            Ok(MintPut::Conflict(held)) => {
+                self.remember(&lease, id, held);
                 return Err(format!(
                     "This device already holds a different key for epoch {}.",
                     key.epoch
+                ));
+            }
+            Ok(MintPut::Superseded(epoch)) => {
+                self.note_device_epoch(&key.zone, epoch);
+                return Err(format!(
+                    "This browser already holds key epoch {epoch} of this zone (possibly for another account). Nothing was created or sent; try again."
                 ));
             }
             Err(_) => {
                 return Err("Could not save the new key on this device; nothing was sent.".into())
             }
         }
-        if let Some(held) = self
+        self.note_device_epoch(&key.zone, key.epoch);
+        if !self.is_current(&lease) {
+            return Err("You signed out while the key was being saved; nothing was sent.".into());
+        }
+        if self
             .keys
-            .with_untracked(|m| m.get(&id).filter(|h| super::conflicts(h, &key)).cloned())
+            .with_untracked(|m| m.get(&id).is_some_and(|h| super::conflicts(h, &key)))
         {
             // Storage accepted the new key, yet memory holds another: make
             // memory match storage; nothing is sent.
-            let _ = held;
-            self.adopt_stored(&id).await;
+            self.adopt_stored(&lease, &id).await;
             return Err(format!(
                 "A different key for epoch {} arrived meanwhile.",
                 key.epoch
             ));
         }
-        self.keys.update(|m| {
-            m.insert(id, key);
-        });
-        self.redecrypt();
+        self.remember(&lease, id, key);
         Ok(())
     }
 
@@ -669,17 +961,42 @@ impl ZoneKeyStore {
         }
     }
 
-    async fn mark_inbox_granted(&self, id: &str) {
-        self.inbox_granted.update_value(|s| {
-            s.insert(id.to_string());
-        });
-        let ids: Vec<String> = self
-            .inbox_granted
-            .with_value(|s| s.iter().cloned().collect());
-        if let (Ok(db), Ok(json)) = (ForumDb::open().await, serde_json::to_string(&ids)) {
-            let _ = db.put_zone_kv(KV_INBOX_GRANTED, &json).await;
+    /// Record that `id` reached the lease's identity through its inbox key.
+    /// The in-memory set is the identity's while it is signed in, and is
+    /// written whole (acks arrive together; see [`GrantLedger`]); after a
+    /// sign-out the stored set is extended instead.
+    async fn mark_inbox_granted(&self, lease: &Lease, id: &str) {
+        let kv_id = key_owner::inbox_granted_id(lease.owner());
+        let Ok(db) = ForumDb::open().await else {
+            return;
+        };
+        let ids: Vec<String> = if self.is_current(lease) {
+            self.inbox_granted.update_value(|s| {
+                s.insert(id.to_string());
+            });
+            self.inbox_granted
+                .with_value(|s| s.iter().cloned().collect())
+        } else {
+            let mut stored: HashSet<String> = db
+                .get_zone_kv(&kv_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            stored.insert(id.to_string());
+            stored.into_iter().collect()
+        };
+        if let Ok(json) = serde_json::to_string(&ids) {
+            let _ = db.put_zone_kv(&kv_id, &json).await;
         }
     }
+
+    // -- Admin bookkeeping ------------------------------------------------
+    //
+    // Device-wide on purpose: the ledger records grants this browser's admins
+    // sent, and an approval is an admin's decision about zone membership,
+    // which holds whichever admin is signed in.
 
     /// Whether `pubkey` is a relay admin, or `None` when the relay could not
     /// be asked. Only definite answers are cached (per session).
@@ -837,13 +1154,20 @@ fn keep_pending_against(mut key: ZoneKey, existing: Option<&ZoneKey>) -> ZoneKey
     key
 }
 
-/// Provide the zone-key store and load held keys. Call once at app root,
-/// after the channel store and before channel sync starts.
+/// Provide the zone-key store and keep it on the signed-in identity's keys.
+/// Call once at app root, after auth and the channel store and before channel
+/// sync starts. Keys load when a session is authenticated (a restored but
+/// locked session loads none), are dropped at sign-out, and are reloaded for
+/// whoever signs in next, with or without a page reload.
 pub fn provide_zone_key_store(channels: crate::stores::channels::ChannelStore) {
     let store = ZoneKeyStore::new(channels);
     provide_context(store);
-    spawn_local(async move {
-        store.hydrate().await;
+    let auth = crate::auth::use_auth();
+    Effect::new(move |_| {
+        let owner = auth
+            .state
+            .with(|s| key_owner::owner_from_auth(s.is_authenticated, s.pubkey.as_deref()));
+        store.switch_owner(owner);
     });
 }
 
