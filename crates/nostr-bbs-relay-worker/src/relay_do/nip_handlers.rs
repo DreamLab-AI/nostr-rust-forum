@@ -1594,6 +1594,14 @@ impl NostrRelayDO {
             return;
         }
 
+        // NIP-09: a deleted event stays deleted. Without this, anyone holding the
+        // original signed copy could publish it again and every client whose
+        // deletion sync no longer reaches the kind-5 would show it.
+        if self.is_deleted(&event).await {
+            Self::send_ok(ws, &event.id, false, "blocked: this event was deleted");
+            return;
+        }
+
         // ADR-2023: `save_event` answers `true` for an id it already holds, so
         // note a repeat submission now (before the insert) and let it not alert
         // anyone a second time.
@@ -2806,6 +2814,38 @@ impl NostrRelayDO {
 // ---------------------------------------------------------------------------
 
 impl NostrRelayDO {
+    /// Whether `event` is covered by a NIP-09 tombstone. Regular events are
+    /// matched on `(id, author)` only; (parameterised) replaceable events also
+    /// against their address. A failed lookup answers `false`: the tombstone is
+    /// a re-insert guard, not an availability gate.
+    pub(crate) async fn is_deleted(&self, event: &NostrEvent) -> bool {
+        let Ok(db) = self.env.d1("DB") else {
+            return false;
+        };
+        #[derive(serde::Deserialize)]
+        struct Row {
+            deleted: f64,
+        }
+        let id = JsValue::from_str(&event.id);
+        let author = JsValue::from_str(&event.pubkey);
+        let bound = match event_treatment(event.kind) {
+            EventTreatment::Replaceable | EventTreatment::ParameterizedReplaceable => {
+                db.prepare(crate::IS_DELETED_ADDRESSABLE_SQL).bind(&[
+                    id,
+                    author,
+                    JsValue::from_f64(event.kind as f64),
+                    JsValue::from_str(&filter::d_tag_value(event)),
+                    JsValue::from_f64(event.created_at as f64),
+                ])
+            }
+            _ => db.prepare(crate::IS_DELETED_ID_SQL).bind(&[id, author]),
+        };
+        let Ok(sel) = bound else {
+            return false;
+        };
+        matches!(sel.first::<Row>(None).await, Ok(Some(r)) if r.deleted != 0.0)
+    }
+
     /// Process a kind-5 deletion event: delete targeted events by the same
     /// author, or — when `can_delete_any` (admin / TL3+, mirroring the EVENT
     /// gate) — anyone's. Without the flag the SQL keeps the author constraint,
@@ -2824,8 +2864,48 @@ impl NostrRelayDO {
             .map(|t| t[1].as_str())
             .collect();
 
+        let now = auth::js_now_secs();
         let mut own_keys: Option<Vec<String>> = None;
         for target_id in &target_ids {
+            // NIP-09 tombstone, so the target cannot be published again. The
+            // signer's own claim always; for a moderator deleting someone
+            // else's event, also under that event's real author, read before
+            // the row goes. A claim naming the wrong author blocks nothing:
+            // the id commits to its author.
+            let well_formed = target_id.len() == 64
+                && target_id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            let mut authors = if well_formed {
+                vec![deletion_event.pubkey.clone()]
+            } else {
+                Vec::new()
+            };
+            if well_formed && can_delete_any {
+                #[derive(serde::Deserialize)]
+                struct AuthorRow {
+                    pubkey: String,
+                }
+                if let Ok(sel) = db
+                    .prepare("SELECT pubkey FROM events WHERE id = ?1 LIMIT 1")
+                    .bind(&[JsValue::from_str(target_id)])
+                {
+                    if let Ok(Some(row)) = sel.first::<AuthorRow>(None).await {
+                        if row.pubkey != deletion_event.pubkey {
+                            authors.push(row.pubkey);
+                        }
+                    }
+                }
+            }
+            for author in &authors {
+                if let Ok(ins) = db.prepare(crate::DELETED_EVENT_INSERT_SQL).bind(&[
+                    JsValue::from_str(target_id),
+                    JsValue::from_str(author),
+                    JsValue::from_f64(now as f64),
+                ]) {
+                    let _ = ins.run().await;
+                }
+            }
             let result = if can_delete_any {
                 let stmt = db.prepare("DELETE FROM events WHERE id = ?1");
                 match stmt.bind(&[JsValue::from_str(target_id)]) {
@@ -2860,15 +2940,25 @@ impl NostrRelayDO {
                 struct WrapRow {
                     kind: f64,
                     tags: String,
+                    pubkey: String,
                 }
                 let Ok(sel) = db
-                    .prepare("SELECT kind, tags FROM events WHERE id = ?1 AND kind = 1059 LIMIT 1")
+                    .prepare("SELECT kind, tags, pubkey FROM events WHERE id = ?1 AND kind = 1059 LIMIT 1")
                     .bind(&[JsValue::from_str(target_id)])
                 else {
                     continue;
                 };
                 if let Ok(Some(row)) = sel.first::<WrapRow>(None).await {
                     if crate::recipient_keys::wrap_addressed_to(row.kind as u64, &row.tags, set) {
+                        // Tombstone under the wrap's own (ephemeral) author:
+                        // the recipient's claim alone would block nothing.
+                        if let Ok(ins) = db.prepare(crate::DELETED_EVENT_INSERT_SQL).bind(&[
+                            JsValue::from_str(target_id),
+                            JsValue::from_str(&row.pubkey),
+                            JsValue::from_f64(now as f64),
+                        ]) {
+                            let _ = ins.run().await;
+                        }
                         if let Ok(del) = db
                             .prepare("DELETE FROM events WHERE id = ?1 AND kind = 1059")
                             .bind(&[JsValue::from_str(target_id)])
@@ -2892,6 +2982,14 @@ impl NostrRelayDO {
             let Some((kind, pubkey, d_tag)) = filter::split_a_ref(a_ref) else {
                 continue;
             };
+            // A kind is a non-negative integer; anything else names no address
+            // (and `-1.0 as u64` would saturate to kind 0).
+            if !(kind >= 0.0 && kind.fract() == 0.0 && kind <= u32::MAX as f64) {
+                continue;
+            }
+            // NIP-09: versions up to the deletion stay deleted, but never past
+            // now (a kind-5 may be dated ahead within the drift allowance).
+            let until = deletion_event.created_at.min(now);
 
             // Own events only, unless the author holds delete-any privilege
             // (the a-ref names its owner, so the SQL below stays scoped to
@@ -2900,12 +2998,35 @@ impl NostrRelayDO {
                 continue;
             }
 
-            let stmt =
-                db.prepare("DELETE FROM events WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3");
+            // NIP-09: versions up to the deletion's created_at stay deleted.
+            // Addresses only exist for (parameterised) replaceable kinds; an
+            // `a` naming a regular kind records nothing.
+            let addressable = matches!(
+                event_treatment(kind as u64),
+                EventTreatment::Replaceable | EventTreatment::ParameterizedReplaceable
+            );
+            if addressable {
+                if let Ok(ins) = db.prepare(crate::DELETED_ADDRESS_UPSERT_SQL).bind(&[
+                    JsValue::from_f64(kind),
+                    JsValue::from_str(pubkey),
+                    JsValue::from_str(d_tag),
+                    JsValue::from_f64(until as f64),
+                ]) {
+                    let _ = ins.run().await;
+                }
+            }
+
+            // NIP-09: a version newer than the deletion stays. Bounded by the
+            // deletion's own created_at (not clamped to now), so a version
+            // pre-dated within the drift allowance cannot outlive it.
+            let stmt = db.prepare(
+                "DELETE FROM events WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3 AND created_at <= ?4",
+            );
             let _ = match stmt.bind(&[
                 JsValue::from_f64(kind),
                 JsValue::from_str(pubkey),
                 JsValue::from_str(d_tag),
+                JsValue::from_f64(deletion_event.created_at as f64),
             ]) {
                 Ok(s) => s.run().await,
                 Err(_) => continue,

@@ -737,6 +737,91 @@ pub const CHANNEL_CREATORS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS channe
     created_at INTEGER NOT NULL\
 )";
 
+/// NIP-09 tombstones for deleted event ids. A deletion is honoured by deleting
+/// the target row; without a record of it, anyone holding the original signed
+/// event could publish it again and the relay would store it as new. One row per
+/// `(id, author)`: an event id is a hash over the event, its author included, so
+/// a row naming the wrong author blocks nothing.
+pub const DELETED_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS deleted_events (\
+    id TEXT NOT NULL, \
+    pubkey TEXT NOT NULL, \
+    deleted_at INTEGER NOT NULL, \
+    PRIMARY KEY (id, pubkey)\
+)";
+
+/// NIP-09 tombstones for deleted addresses (`a` refs, `kind:pubkey:d`): versions
+/// created at or before `deleted_until` stay deleted; newer ones are accepted.
+pub const DELETED_ADDRESSES_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS deleted_addresses (\
+    kind INTEGER NOT NULL, \
+    pubkey TEXT NOT NULL, \
+    d_tag TEXT NOT NULL, \
+    deleted_until INTEGER NOT NULL, \
+    PRIMARY KEY (kind, pubkey, d_tag)\
+)";
+
+/// Record an event-id tombstone (`?1` id, `?2` author, `?3` deletion time).
+pub const DELETED_EVENT_INSERT_SQL: &str =
+    "INSERT OR IGNORE INTO deleted_events (id, pubkey, deleted_at) VALUES (?1, ?2, ?3)";
+
+/// Record an address tombstone, keeping the latest `deleted_until`
+/// (`?1` kind, `?2` author, `?3` d-tag, `?4` deletion `created_at`).
+pub const DELETED_ADDRESS_UPSERT_SQL: &str =
+    "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
+    VALUES (?1, ?2, ?3, ?4) \
+    ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
+    WHERE excluded.deleted_until > deleted_addresses.deleted_until";
+
+/// Whether a regular event is deleted (`?1` id, `?2` author): its id carries
+/// the author's tombstone.
+pub const IS_DELETED_ID_SQL: &str =
+    "SELECT EXISTS (SELECT 1 FROM deleted_events WHERE id = ?1 AND pubkey = ?2) AS deleted";
+
+/// Whether a (parameterised) replaceable event is deleted (`?1` id, `?2`
+/// author, `?3` kind, `?4` d-tag, `?5` created_at): its id is tombstoned, or it
+/// is a version no newer than its address's deletion. Only ever bound with a
+/// real replaceable kind; regular events use [`IS_DELETED_ID_SQL`].
+pub const IS_DELETED_ADDRESSABLE_SQL: &str = "SELECT \
+    EXISTS (SELECT 1 FROM deleted_events WHERE id = ?1 AND pubkey = ?2) \
+    OR EXISTS (SELECT 1 FROM deleted_addresses WHERE kind = ?3 AND pubkey = ?2 AND d_tag = ?4 AND deleted_until >= ?5) \
+    AS deleted";
+
+/// Backfill event-id tombstones from stored kind-5s, for deletions honoured
+/// before the tombstone tables existed. Own-deletion semantics only (the
+/// kind-5's author): a moderator's past deletion of someone else's event left
+/// no record of that author. Idempotent.
+pub const DELETED_EVENTS_BACKFILL_SQL: &str =
+    "INSERT OR IGNORE INTO deleted_events (id, pubkey, deleted_at) \
+    SELECT json_extract(t.value, '$[1]'), e.pubkey, e.created_at \
+    FROM events e, json_each(e.tags) t \
+    WHERE e.kind = 5 AND json_extract(t.value, '$[0]') = 'e' \
+      AND length(json_extract(t.value, '$[1]')) = 64 \
+      AND json_extract(t.value, '$[1]') NOT GLOB '*[^0-9a-f]*'";
+
+/// Backfill address tombstones from stored kind-5s' `a` tags naming their own
+/// author, for (parameterised) replaceable kinds only. Idempotent (keeps the
+/// latest deletion time).
+pub const DELETED_ADDRESSES_BACKFILL_SQL: &str = "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
+    SELECT CAST(substr(a, 1, instr(a, ':') - 1) AS INTEGER), \
+           substr(rest, 1, instr(rest, ':') - 1), \
+           substr(rest, instr(rest, ':') + 1), \
+           MIN(created_at, CAST(strftime('%s', 'now') AS INTEGER)) \
+    FROM (SELECT json_extract(t.value, '$[1]') AS a, \
+                 substr(json_extract(t.value, '$[1]'), instr(json_extract(t.value, '$[1]'), ':') + 1) AS rest, \
+                 e.pubkey AS author, e.created_at AS created_at \
+          FROM events e, json_each(e.tags) t \
+          WHERE e.kind = 5 AND json_extract(t.value, '$[0]') = 'a') \
+    WHERE instr(a, ':') > 1 AND instr(rest, ':') > 1 \
+      AND substr(rest, 1, instr(rest, ':') - 1) = author \
+      AND substr(a, 1, instr(a, ':') - 1) NOT GLOB '*[^0-9]*' \
+      AND (CAST(substr(a, 1, instr(a, ':') - 1) AS INTEGER) IN (0, 3) \
+           OR CAST(substr(a, 1, instr(a, ':') - 1) AS INTEGER) BETWEEN 10000 AND 19999 \
+           OR CAST(substr(a, 1, instr(a, ':') - 1) AS INTEGER) BETWEEN 30000 AND 39999) \
+    ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
+    WHERE excluded.deleted_until > deleted_addresses.deleted_until";
+
+/// `settings` key marking the tombstone backfill done for this database.
+pub const TOMBSTONE_BACKFILL_SETTING: &str = "nip09_tombstones_backfilled";
+
 /// Broker case aggregate (human-in-the-loop governance decisions). Created ahead
 /// of the `ALTER TABLE broker_cases` block so a fresh D1 has a table to alter;
 /// the ALTERs then add the ADR-2011 / ADR-2013 columns.
@@ -829,6 +914,17 @@ async fn ensure_schema(env: &Env) -> bool {
     if let Err(e) = db.prepare(CHANNEL_CREATORS_CREATE_SQL).run().await {
         console_error!("ensure_schema: channel_creators create failed: {e}");
         ok = false;
+    }
+    // NIP-09 tombstones, so a deleted event cannot be published again. The
+    // one-time backfill from stored kind-5s runs at the end, once per database.
+    // A failure here leaves ingest working, just without the re-insert refusal.
+    for (what, sql) in [
+        ("deleted_events create", DELETED_EVENTS_CREATE_SQL),
+        ("deleted_addresses create", DELETED_ADDRESSES_CREATE_SQL),
+    ] {
+        if let Err(e) = db.prepare(sql).run().await {
+            console_error!("ensure_schema: {what} failed: {e}");
+        }
     }
     for stmt in [
         "ALTER TABLE events ADD COLUMN d_tag TEXT NOT NULL DEFAULT ''",
@@ -1163,7 +1259,44 @@ async fn ensure_schema(env: &Env) -> bool {
     for stmt in index_stmts {
         let _ = db.prepare(stmt).run().await;
     }
+    backfill_tombstones_once(&db).await;
     ok
+}
+
+/// Backfill NIP-09 tombstones from the kind-5s already stored, once per
+/// database (marked in `settings`), so the scan is not repeated on every cold
+/// isolate. The marker is written only after both statements succeed.
+async fn backfill_tombstones_once(db: &worker::D1Database) {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        #[allow(dead_code)]
+        value: String,
+    }
+    let marked = match db
+        .prepare("SELECT value FROM settings WHERE key = ?1 LIMIT 1")
+        .bind(&[TOMBSTONE_BACKFILL_SETTING.into()])
+    {
+        Ok(s) => matches!(s.first::<Row>(None).await, Ok(Some(_))),
+        Err(_) => return,
+    };
+    if marked {
+        return;
+    }
+    for (what, sql) in [
+        ("deleted_events backfill", DELETED_EVENTS_BACKFILL_SQL),
+        ("deleted_addresses backfill", DELETED_ADDRESSES_BACKFILL_SQL),
+    ] {
+        if let Err(e) = db.prepare(sql).run().await {
+            console_error!("ensure_schema: {what} failed: {e}");
+            return;
+        }
+    }
+    if let Ok(s) = db
+        .prepare("INSERT OR IGNORE INTO settings (key, value, type, category) VALUES (?1, '1', 'string', 'system')")
+        .bind(&[TOMBSTONE_BACKFILL_SETTING.into()])
+    {
+        let _ = s.run().await;
+    }
 }
 
 /// Check whether the request's Accept header includes `application/nostr+json`.
@@ -1455,6 +1588,146 @@ mod probe_blinding_tests {
                 .count()
                 >= 3,
             "blinding must be enforced at the writer, the watcher and the purge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tombstone_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const ID1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(DELETED_EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(DELETED_ADDRESSES_CREATE_SQL).unwrap();
+        c
+    }
+
+    fn deleted(c: &Connection, id: &str, pk: &str, kind: i64, d: &str, at: i64) -> bool {
+        // kind < 0 stands for "a regular event", as the relay routes it.
+        let n: i64 = if kind < 0 {
+            c.query_row(IS_DELETED_ID_SQL, params![id, pk], |r| r.get(0))
+        } else {
+            c.query_row(
+                IS_DELETED_ADDRESSABLE_SQL,
+                params![id, pk, kind, d, at],
+                |r| r.get(0),
+            )
+        }
+        .unwrap();
+        n != 0
+    }
+
+    #[test]
+    fn a_tombstoned_id_is_deleted_for_its_author_only() {
+        let c = db();
+        c.execute(DELETED_EVENT_INSERT_SQL, params![ID1, A, 100])
+            .unwrap();
+        assert!(deleted(&c, ID1, A, -1, "", 50));
+        assert!(
+            !deleted(&c, ID1, B, -1, "", 50),
+            "a claim for another author blocks nothing"
+        );
+        assert!(!deleted(&c, &"2".repeat(64), A, -1, "", 50));
+        c.execute(DELETED_EVENT_INSERT_SQL, params![ID1, A, 200])
+            .unwrap();
+    }
+
+    #[test]
+    fn an_address_tombstone_covers_versions_up_to_the_deletion() {
+        let c = db();
+        c.execute(DELETED_ADDRESS_UPSERT_SQL, params![30023, A, "post", 100])
+            .unwrap();
+        assert!(
+            deleted(&c, ID1, A, 30023, "post", 100),
+            "same second is deleted"
+        );
+        assert!(deleted(&c, ID1, A, 30023, "post", 99));
+        assert!(
+            !deleted(&c, ID1, A, 30023, "post", 101),
+            "a newer version is accepted"
+        );
+        assert!(!deleted(&c, ID1, A, 30023, "other", 50));
+        assert!(!deleted(&c, ID1, B, 30023, "post", 50));
+        assert!(
+            !deleted(&c, ID1, A, -1, "post", 50),
+            "a regular event never matches an address"
+        );
+        // A later deletion extends it; an earlier one never shortens it.
+        c.execute(DELETED_ADDRESS_UPSERT_SQL, params![30023, A, "post", 300])
+            .unwrap();
+        c.execute(DELETED_ADDRESS_UPSERT_SQL, params![30023, A, "post", 10])
+            .unwrap();
+        assert!(deleted(&c, ID1, A, 30023, "post", 250));
+    }
+
+    #[test]
+    fn a_negative_kind_address_row_never_blocks_regular_events() {
+        // The relay refuses such a-refs before recording, but even a stray
+        // row cannot match: regular events are checked on (id, author) only.
+        let c = db();
+        c.execute(DELETED_ADDRESS_UPSERT_SQL, params![-1, A, "", 10_000])
+            .unwrap();
+        assert!(!deleted(&c, ID1, A, -1, "", 5));
+    }
+
+    #[test]
+    fn the_address_upsert_only_moves_forward() {
+        let c = db();
+        c.execute(DELETED_ADDRESS_UPSERT_SQL, params![30023, A, "p", 100])
+            .unwrap();
+        c.execute(DELETED_ADDRESS_UPSERT_SQL, params![30023, A, "p", 50])
+            .unwrap();
+        let until: i64 = c
+            .query_row("SELECT deleted_until FROM deleted_addresses", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(until, 100);
+    }
+
+    fn kind5(c: &Connection, id: &str, author: &str, at: i64, tags: &str) {
+        c.execute(
+            "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?1, ?2, ?3, 5, ?4, '', 's')",
+            params![id, author, at, tags],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn backfill_records_own_deletions_from_stored_kind5s_and_is_idempotent() {
+        let c = db();
+        let upper = ID1.replace('1', "F");
+        let tags = format!(
+            r#"[["e","{ID1}"],["e","short"],["e","{upper}"],["k","1"],["a","30023:{A}:post"],["a","30023:{B}:theirs"],["a","1:{A}:"],["a","-1:{A}:"],["a","3x:{A}:"]]"#
+        );
+        kind5(&c, &"5".repeat(64), A, 100, &tags);
+        for _ in 0..2 {
+            c.execute_batch(DELETED_EVENTS_BACKFILL_SQL).unwrap();
+            c.execute_batch(DELETED_ADDRESSES_BACKFILL_SQL).unwrap();
+        }
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM deleted_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "only the well-formed lowercase-hex e tag, once");
+        assert!(deleted(&c, ID1, A, -1, "", 1));
+        let addrs: Vec<(i64, String, String, i64)> = c
+            .prepare("SELECT kind, pubkey, d_tag, deleted_until FROM deleted_addresses")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            addrs,
+            vec![(30023, A.to_string(), "post".to_string(), 100)],
+            "own addressable refs only: not another author's, a regular kind, or a malformed kind"
         );
     }
 }

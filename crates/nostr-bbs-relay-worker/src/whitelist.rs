@@ -520,6 +520,9 @@ pub async fn handle_reset_db(mut req: Request, env: &Env) -> Result<Response> {
     let db = env.d1("DB")?;
     let _ = db.prepare("DELETE FROM events").run().await;
     let _ = db.prepare("DELETE FROM whitelist").run().await;
+    // A reset is a clean slate: earlier NIP-09 tombstones go with the events.
+    let _ = db.prepare("DELETE FROM deleted_events").run().await;
+    let _ = db.prepare("DELETE FROM deleted_addresses").run().await;
 
     json_response(
         env,
