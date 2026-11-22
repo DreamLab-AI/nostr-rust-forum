@@ -1,9 +1,9 @@
 ---
 title: Architecture Baseline — nostr-rust-forum
 doc_id: NRF-BASELINE
-version: 0.2.0
+version: 0.3.0
 status: draft-for-ratification
-verified_commit: 0065dd9 (ADR-2030 to ADR-2032 sections, crate count and NIP-29 divergence only; older sections keep their earlier stamp)
+verified_commit: 3c48e26 (ADR-2033 and ADR-2034 sections, invariants 7 and 8, and the deletion citations in the encrypted-zones section; ADR-2030 to ADR-2032 sections keep 0065dd9; older sections keep their earlier stamp)
 sources:
   - Cargo.toml
   - crates/nostr-bbs-upstream-canary/src/lib.rs
@@ -14,6 +14,11 @@ sources:
   - crates/nostr-bbs-bbs-client/src/app.rs
   - crates/nostr-bbs-bbs-client/src/signer.rs
   - crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs
+  - crates/nostr-bbs-relay-worker/src/lib.rs
+  - crates/nostr-bbs-forum-client/src/stores/deletion_sync.rs
+  - crates/nostr-bbs-forum-client/src/stores/tombstones.rs
+  - crates/nostr-bbs-forum-client/src/relay/receipt.rs
+  - crates/nostr-bbs-forum-client/src/utils/lookup.rs
 date: 2026-08-31
 ---
 
@@ -177,11 +182,19 @@ from ban-gating because the recipient-whitelist gate already bounds them
   decision-as-originally-stated diverges from code.
 - **CF-Workers pod federation degenerate.** ADR-086's pod fallback returns only
   data D1 already holds because ADR-087's portable-cores decision is unresolved.
-- **NIP-29 is advertised but not implemented.** `supported_nips` lists 29
-  (`crates/nostr-bbs-relay-worker/src/nip11.rs:207`) while the relay only
-  admin-gates 9000-9020 and 39000-39002 on an `h` tag and stores them
-  (`relay_do/nip_handlers.rs:52-54,1298-1311`); kind 9 is world-readable
-  (`relay_do/nip42.rs:44`). Recorded at `0065dd9`; ADR-2030 proposes the fix.
+- **NIP-29 group semantics are not implemented, and are no longer advertised.** The
+  relay only admin-gates 9000-9020 and 39000-39002 on an `h` tag and stores them
+  (`relay_do/nip_handlers.rs:60-61,1328-1340`); kind 9 is world-readable
+  (`relay_do/nip42.rs:44`). `supported_nips` dropped 29 on 2026-11-16
+  (`crates/nostr-bbs-relay-worker/src/nip11.rs:16`, asserted by the test at `:307`,
+  re-read at `3c48e26`); this bullet previously said it was advertised, and the
+  citations were from `0065dd9`. ADR-2030 proposes the group engine.
+- **Deletion and absence gaps (2026-11-22).** No un-tombstone route, a moderator's
+  envelope delete tied to current admin status, no record of original authors of
+  migrated posts, client cannot identify TL3 moderators, and a cold deep link into an
+  encrypted zone can still say "Topic Not Found" before zone keys load. Each is a row in
+  [`security/known-findings.md`](security/known-findings.md) (KF-14 to KF-28) with its
+  code citation; none is fixed. Decisions: ADR-2033, ADR-2034.
 - **Sprint-resident ADRs.** ADR-090/091/092 keep their canonical full text under
   `docs/sprint/2026-05-17-ux-audit/`; the `docs/adr/` stubs reserve the numbers.
 
@@ -201,6 +214,13 @@ from ban-gating because the recipient-whitelist gate already bounds them
    author must never be used for the admission decision.
 6. **`solid-pod-rs` stays an exact (`=`) pin** — a caret range would let a resolve
    pull a newer published alpha.
+7. **A member's kind-5 is accepted only when the relay can vouch for every `e` target**
+   (`member_deletion_gate`); a target with no stored row never counts as the signer's own, and a
+   sealed original is never a member's to delete (ADR-2033). Every client folds every `e` tag of a
+   stored kind-5 into a tombstone on an ordinary post with no author check, so for ordinary posts this gate is the only one;
+   only a restored sealed original is also checked client-side (`stores/tombstones.rs:114`).
+8. **A deep-linked page never reports absence from `ChannelStore::loading`**, only from an
+   authenticated receipt or the deadline (ADR-2034).
 
 ## Change process
 
@@ -249,7 +269,40 @@ The pay routes are live (`PAY_ENABLED = "true"` in production). `crates/nostr-bb
 
 ## Encrypted zones and sealed-original history — ADR-2016, ADR-2017
 
-[ADR-2016](adr/ADR-2016-end-to-end-encrypted-zones.md) encrypts new kind-42 posts in a zone with `encrypted = true` behind the exact-`"true"` `ENCRYPTION_ENABLED` gate: NIP-44 v2 to a per-epoch zone key, a `["zk", zone, epoch, pk]` tag, keys granted by NIP-59 gift wrap (rumor kind 21453) from an admin, and a relay write gate that refuses plaintext into such a channel (`relay_do/nip_handlers.rs:1100-1115`). [ADR-2017](adr/ADR-2017-sealed-original-history-migration.md) migrates the plaintext history that predates the gate: each original is re-published by an admin as a kind-42 envelope carrying a `["sealed", inner_id, "1"]` tag whose ciphertext is the full original signed event (`nostr_bbs_core::sealed`), keeping its id, author and `created_at`; readers substitute the verified inner event. The relay exempts sealed kind-42 from the seven-day drift check (`MAX_TIMESTAMP_DRIFT`, `nip_handlers.rs:44`) and accepts them only from admins into encrypted zones. The plaintext is then removed through the silent `POST /api/admin/events/delete`, never kind-5, because the forum client tombstones kind-5 targets (`fold_deletions`, `stores/channels.rs:779`) and those are the ids the envelopes restore. `nostr-bbs-zone-migrate` drives the run; the operator procedure is [`security/encrypted-zone-history-migration.md`](security/encrypted-zone-history-migration.md).
+[ADR-2016](adr/ADR-2016-end-to-end-encrypted-zones.md) encrypts new kind-42 posts in a zone with `encrypted = true` behind the exact-`"true"` `ENCRYPTION_ENABLED` gate: NIP-44 v2 to a per-epoch zone key, a `["zk", zone, epoch, pk]` tag, keys granted by NIP-59 gift wrap (rumor kind 21453) from an admin, and a relay write gate that refuses plaintext into such a channel (`relay_do/nip_handlers.rs:1485-1497`, checked at `3c48e26`). [ADR-2017](adr/ADR-2017-sealed-original-history-migration.md) migrates the plaintext history that predates the gate: each original is re-published by an admin as a kind-42 envelope carrying a `["sealed", inner_id, "1"]` tag whose ciphertext is the full original signed event (`nostr_bbs_core::sealed`), keeping its id, author and `created_at`; readers substitute the verified inner event. The relay exempts sealed kind-42 from the seven-day drift check (`MAX_TIMESTAMP_DRIFT`, `nip_handlers.rs:44`) and accepts them only from admins into encrypted zones. The plaintext is then removed through the silent `POST /api/admin/events/delete`, never kind-5, because the forum client tombstones kind-5 targets (`tombstones::fold_deletion`, `stores/tombstones.rs:164`) and those are the ids the envelopes restore; the purge records a relay-side tombstone that is never served to clients, and who may delete a migrated post is decided in the next section. `nostr-bbs-zone-migrate` drives the run; the operator procedure is [`security/encrypted-zone-history-migration.md`](security/encrypted-zone-history-migration.md).
+
+## Deletion: tombstones, the member gate, deleter-scoped client sync — ADR-2033
+
+[ADR-2033](adr/ADR-2033-nip09-tombstones-member-deletion-gate-and-deleter-scoped-sync.md) (verified at `3c48e26`). The relay keeps
+`deleted_events (id, pubkey)` and `deleted_addresses (kind, pubkey, d_tag, deleted_until)` (`relay-worker/src/lib.rs:746`, `:755`;
+created by `ensure_schema`, no migration file) and refuses a tombstoned event at ingest, after every other gate and before
+`save_event` (`relay_do/nip_handlers.rs:1607`), failing open if the lookup fails. Tombstones are written before the DELETE, never in the
+same D1 batch, on: a kind-5 `e` target (under the signer, and for a moderator also under the row's author), a report resolved as
+`delete` (`moderation.rs:349`), the ADR-2017 purge (`admin_events.rs:279`) and a user delete with `delete_events` (`user_admin.rs:225`).
+A report resolved as `hide` and kind retention record none. The tables are never served to clients. Two one-time passes mark `settings`:
+`nip09_tombstones_backfilled` and `nip09_plain_addresses_rekeyed` (`lib.rs:984`, `:981`); `reset-db` clears the tables, not the markers
+(`whitelist.rs:524-525`).
+
+Below TL3 a kind-5 is accepted only if every `e` target is 64 lowercase hex and is the signer's own stored event, a gift wrap addressed
+to one of their recipient keys, or an id they already deleted with no row left (`member_deletion_gate`, `nip_handlers.rs:3349`, called at
+`:1321`); otherwise the whole kind-5 is refused, and a D1 failure refuses it too. A member therefore cannot delete a migrated (sealed)
+post or an id the relay does not hold. An admin or TL3+ skips the gate, and their kind-5 naming a sealed original also deletes the
+envelope when its author is a current admin (`delete_sealed_envelopes`, `:3404`).
+
+On the client, `stores/deletion_sync.rs` asks for kind-5s with `since` = `min(newest delivered, local now) - 14 days` per scope,
+advancing the marker only when a sync settles complete and paging on `until` for at most 20 pages (`:119`, `:123`);
+`stores/tombstones.rs` holds `(id, deleter)` tombstones and honours a restored sealed original's only from its author or a pubkey
+`GET /api/check-whitelist` reports as `isAdmin` (`tombstones.rs:114`). Open gaps: `docs/security/known-findings.md` KF-14 to KF-21, KF-25
+and KF-27. Operator procedure: [`runbooks/relay-deletion-and-tombstones.md`](runbooks/relay-deletion-and-tombstones.md).
+
+## Absence is reported only after an authenticated answer — ADR-2034
+
+[ADR-2034](adr/ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md) (verified at `3c48e26`; implementation partial). A
+deep-linked zone, section or topic page says "not found" only on the relay's EOSE for the subscription that would have carried it, and
+for a zone that is not public only on an EOSE that followed the relay's `OK true` for the client's AUTH, judged by a per-subscription REQ
+ledger (`utils/lookup.rs:62`, `:91`; `relay/receipt.rs:71`). No receipt in 15 s shows an "Unavailable" message. The relay's
+20-subscription cap does not count a REQ that replaces a held id (`nip_handlers.rs:52`). Open gap: the decision does not wait for zone
+keys, so an encrypted zone can still show "Topic Not Found" briefly (`known-findings.md` KF-23).
 
 ## Rust toolchain floats on stable, deliberately — 2026-10-02
 

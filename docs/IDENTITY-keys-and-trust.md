@@ -1,9 +1,9 @@
 ---
 title: Identity, Keys & Trust — nostr-rust-forum
 doc_id: NRF-IDENTITY
-version: 0.1.2
+version: 0.1.3
 status: draft-for-ratification
-verified_commit: 0065dd9 (pending-keys section only; older sections keep their earlier stamps)
+verified_commit: 3c48e26 (trust-level deletion rights, zone keys at rest, and the admin-flag divergence only; pending-keys section keeps 0065dd9; older sections keep their earlier stamps)
 sources:
   - crates/nostr-bbs-core/src/keys.rs
   - crates/nostr-bbs-auth-worker/src/devices.rs
@@ -130,6 +130,24 @@ inactivity-decay sweep is inherently time-driven, so it runs on the **scheduled
 (`crates/nostr-bbs-relay-worker/src/cron.rs:264-272`; legacy ADR-102). Reads tally
 at EOSE to drive promotion; the cron sweep drives demotion.
 
+**What trust level decides about deletion** (ADR-2033, checked at `3c48e26`). An admin or TL3+ (`TrustLevel::Trusted`) may
+delete anyone's events with a kind-5, and a moderator's kind-5 naming a sealed original also deletes its envelope
+(`relay_do/nip_handlers.rs:1637-1640`, `:3630`). Below TL3 a member's kind-5 is accepted only if every `e` target is their own
+stored event, a gift wrap addressed to one of their recipient keys, or an id they already deleted
+(`member_deletion_gate`, `:3349`, called at `:1320-1321`); a member cannot delete a migrated post. Admin standing is not one
+thing: the relay's own check is the static `ADMIN_PUBKEYS` set plus the D1 `is_admin` flag (`auth.rs:182-188`), while
+`GET /api/check-whitelist` reports `isAdmin` from the D1 flag alone (`whitelist.rs:139-141`), and that endpoint is what the
+forum client uses to decide whose deletion of a sealed original to honour (`stores/signer_admin.rs:108`). The client cannot
+identify TL3 moderators at all (`known-findings.md` KF-27).
+
+### Zone keys at rest on a device
+
+A zone key received or created in the forum client is stored in the browser's IndexedDB `zone_keys` store under an id that
+begins with the owning identity's pubkey (`zone_crypto/key_owner.rs:69`), so accounts that share a browser profile do not see
+each other's keys; rows from before this scheme have no owner and stay visible to every signed-in identity. Keys load only
+for an authenticated session. This is isolation in the UI, not access control: the rows are unencrypted. Drafts, bookmarks and
+notification previews are scoped the same way. The decision is recorded in ADR-2016 (the 2026-11-22 section).
+
 ## Known divergences & open items
 
 - **Multi-device DM delivery not implemented.** Legacy ADR-101 is *Accepted* but
@@ -148,6 +166,10 @@ at EOSE to drive promotion; the cron sweep drives demotion.
   tally at EOSE and demotion runs from the cron sweep
   (`crates/nostr-bbs-relay-worker/src/cron.rs:264-272`). Kept here so a reader does
   not re-open a closed finding.
+- **Admin standing differs between the relay and `check-whitelist`.** The relay's admin
+  check includes the static `ADMIN_PUBKEYS`; `isAdmin` from `GET /api/check-whitelist` does
+  not (`auth.rs:182-188`, `whitelist.rs:139-141`). A static-only admin's deletion of a sealed
+  original is therefore not honoured by clients. Recorded as `known-findings.md` KF-27.
 - **BBS client holds key material directly.** The retro client's `BbsSigner` parses
   and holds a `SecretKey` (zeroized on drop) rather than delegating to a forum
   `sign()` seam (`crates/nostr-bbs-bbs-client/src/signer.rs:64,209,224`) — see

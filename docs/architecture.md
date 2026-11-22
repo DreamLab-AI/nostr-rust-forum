@@ -189,13 +189,13 @@ graph TD
 |-----|------|-------|-----|--------|---------|------|--------|
 | 01  |      | X     |     |        |         | X    | X      |
 | 07  |      |       |     |        |         |      | X      |
-| 09  |      | X     |     |        |         | X    |        |
+| 09  |      | X     |     |        |         | X    | X      |
 | 11  |      | X     |     |        |         |      |        |
 | 16  |      | X     |     |        |         |      |        |
 | 29  |      | X     |     |        |         | X    |        |
 | 33  |      | X     |     |        |         | X    |        |
 | 40  |      | X     |     |        |         | X    |        |
-| 42  |      | X     |     |        |         |      |        |
+| 42  |      | X     |     |        |         |      | X      |
 | 44  |      |       |     |        |         | X    |        |
 | 45  |      | X     |     |        |         |      |        |
 | 50  |      |       |     | X      |         |      |        |
@@ -226,7 +226,9 @@ NIP-17 kind-14 inbox routing — only the NIP-59 gift-wrap envelope.
 2. `auth-worker` stores credentials in D1, derives Nostr keypair via PRF
 3. Client receives session token (KV-backed) and NIP-98 bearer
 4. All subsequent worker requests include the NIP-98 bearer for verification
-5. `relay-worker` validates NIP-98 on WebSocket upgrade (NIP-42 AUTH)
+5. `relay-worker` forwards the WebSocket upgrade to its Durable Object without authenticating it (`relay-worker/src/lib.rs:231`);
+   the socket is authenticated afterwards by NIP-42: the DO issues a challenge and verifies the client's kind-22242 AUTH event
+   (`relay_do/nip42.rs:179`, `nip_handlers.rs:2124`). NIP-98 is used on the HTTP admin routes
 6. `pod-worker` validates NIP-98 on every LDP request, enforces WAC ACL
 
 ## Zone Enforcement
@@ -241,6 +243,19 @@ The relay worker enforces the config-driven zone access model (deny-by-default):
    `hidden` zones, kind-42 content is withheld from non-members of `locked`/`hidden` zones
 4. EVENT submissions are rejected if the user lacks write access to the target zone
 5. Unauthenticated readers are limited to `public` zones
+6. A REQ that began before the socket's AUTH was accepted is answered with the anonymous view and still ends in an EOSE; the
+   forum client therefore treats an EOSE as an authenticated answer only after the relay's `OK true` for its AUTH (ADR-2034).
+   Each socket may hold 20 subscriptions; a REQ reusing a held id replaces it and is not counted (`relay_do/nip_handlers.rs:52`).
+
+## Deletion (NIP-09)
+
+A kind-5 is stored, broadcast and then processed (`relay_do/nip_handlers.rs:3510`). Below TL3 it is accepted only if every `e`
+target is the signer's own stored event, a gift wrap addressed to one of their recipient keys, or an id they already deleted;
+admins and TL3+ may delete anyone's events, and their kind-5 naming a sealed original also deletes the envelope. The relay
+records tombstones in D1 (`deleted_events`, `deleted_addresses`) so a deleted event cannot be published again, from a kind-5 and
+from the report-delete, ADR-2017 purge and user-purge routes; they are never served to clients. Clients fold every `e` tag of a kind-5
+they receive into per-deleter tombstones and fetch kind-5s incrementally from a stored marker. Decision and gaps: ADR-2033;
+operator note: `runbooks/relay-deletion-and-tombstones.md`.
 
 ## Agent Control Surface Protocol
 
