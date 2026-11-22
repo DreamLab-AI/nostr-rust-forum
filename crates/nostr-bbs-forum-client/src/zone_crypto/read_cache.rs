@@ -68,9 +68,13 @@ impl ReadCache {
     }
 
     /// Re-run the read path over every message already on screen (a key just
-    /// arrived), grouped as the channel store holds them.
+    /// arrived, or every key was dropped at sign-out), grouped as the channel
+    /// store holds them.
     ///
-    /// A live encrypted post has its content recomputed. A sealed-envelope
+    /// A live encrypted post has its content recomputed. A restored original
+    /// whose envelope no longer opens (its key is gone) goes back to the
+    /// envelope's placeholder under the envelope's id, so no plaintext stays
+    /// on screen once the keys are dropped. A sealed-envelope
     /// placeholder that now opens is replaced **in place** by the original
     /// event; if that original's id is already in the same list (a copy
     /// fetched before the plaintext was purged, or a second envelope of the
@@ -87,6 +91,7 @@ impl ReadCache {
         let mut changed = false;
         for events in messages.values_mut() {
             let mut restored_now: HashSet<String> = HashSet::new();
+            let mut reverted_now = false;
             for ev in events.iter_mut() {
                 if let Some(ct) = self.ciphertexts.get(&ev.id) {
                     let mut original = ev.clone();
@@ -114,9 +119,22 @@ impl ReadCache {
                             }
                         }
                     }
+                } else if let Some(outer) = self
+                    .restored
+                    .get(&ev.id)
+                    .and_then(|outer_id| self.envelopes.get(outer_id))
+                {
+                    let outcome = read_outcome(outer, &lookup);
+                    if !matches!(outcome, ReadOutcome::Sealed(_)) {
+                        let inner_id = ev.id.clone();
+                        *ev = resolve_event(outer, outcome);
+                        self.restored.remove(&inner_id);
+                        reverted_now = true;
+                        changed = true;
+                    }
                 }
             }
-            if restored_now.is_empty() {
+            if restored_now.is_empty() && !reverted_now {
                 continue;
             }
             // First occurrence wins: the original keeps its created_at, so
@@ -372,6 +390,42 @@ mod tests {
             "dedupe sees the inner id"
         );
         assert_eq!(ids(&list), vec![orig.id.as_str()]);
+    }
+
+    #[test]
+    fn a_restored_original_reverts_to_the_placeholder_when_the_key_is_dropped() {
+        let orig = original(100, "family plans");
+        let env = seal(&orig);
+        let mut cache = ReadCache::default();
+        let mut msgs = one_channel(vec![cache.prepare(&env, with_key)]);
+        assert!(
+            same_event(&msgs[&channel()][0], &orig),
+            "opened with the key"
+        );
+        // Sign-out: every key dropped, the store re-runs the read path.
+        assert!(cache.redecrypt(&mut msgs, no_key, |_| true));
+        let shown = &msgs[&channel()];
+        assert_eq!(
+            ids(shown),
+            vec![env.id.as_str()],
+            "back under the envelope id"
+        );
+        assert_eq!(shown[0].content, PLACEHOLDER_MISSING_KEY);
+        assert!(cache.envelope_of(&orig.id).is_none());
+        assert!(!shown.iter().any(|e| e.content.contains("family plans")));
+        // Signing back in restores it in place again.
+        assert!(cache.redecrypt(&mut msgs, with_key, |_| true));
+        assert!(same_event(&msgs[&channel()][0], &orig));
+    }
+
+    #[test]
+    fn a_live_post_goes_back_to_the_placeholder_when_the_key_is_dropped() {
+        let ev = live_encrypted(ALICE, 100, "dinner at eight");
+        let mut cache = ReadCache::default();
+        let mut msgs = one_channel(vec![cache.prepare(&ev, with_key)]);
+        assert_eq!(msgs[&channel()][0].content, "dinner at eight");
+        assert!(cache.redecrypt(&mut msgs, no_key, |_| true));
+        assert_eq!(msgs[&channel()][0].content, PLACEHOLDER_MISSING_KEY);
     }
 
     #[test]
