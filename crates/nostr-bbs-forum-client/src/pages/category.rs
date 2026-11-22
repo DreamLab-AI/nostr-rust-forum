@@ -42,6 +42,7 @@ use crate::stores::channels::{use_channel_store, ChannelMeta};
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::utils::capitalize;
+use crate::utils::lookup::{arm_deadline, zone_is_gated, Lookup};
 use crate::utils::zone_theme::zone_accent_style_cfg;
 use wasm_bindgen_futures::spawn_local;
 
@@ -135,9 +136,21 @@ pub fn CategoryPage() -> impl IntoView {
         sections_for_zone(&chans, &category_slug(), &zones)
     });
 
-    // Loading is true while the store is still fetching AND no section resolved.
-    let store_loading = store.loading;
-    let loading = Memo::new(move |_| store_loading.get() && zone_sections.with(|s| s.is_empty()));
+    // Loading until a section shows up, the relay's channel-list EOSE says
+    // there are none, or the deadline passes. Not `store.loading`: that clears
+    // on the first EOSE, which before NIP-42 AUTH is an anonymous answer
+    // without a Hidden zone's sections, so "No sections yet" showed on a cold
+    // deep link before the authenticated replay had arrived.
+    let deadline = arm_deadline();
+    let loading = Memo::new(move |_| {
+        let gated = zone_is_gated(&category_slug(), &load_zones());
+        Lookup::decide(
+            zone_sections.with(|s| !s.is_empty()),
+            store.channel_receipt.get().settles(gated),
+            deadline.get(),
+        )
+        .is_loading()
+    });
 
     // -- New topic creation state --
     let show_new_topic = RwSignal::new(false);

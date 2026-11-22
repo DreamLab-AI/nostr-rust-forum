@@ -15,6 +15,7 @@ use wasm_bindgen::JsCast;
 
 use crate::relay::{Filter, RelayConnection};
 use crate::stores::zones::Zone;
+use crate::utils::lookup::SyncReceipt;
 
 // -- Constants ----------------------------------------------------------------
 
@@ -77,6 +78,17 @@ pub struct ChannelStore {
     /// is a real "store is ready" receipt, used by pages instead of a timer to
     /// decide that an empty channel is authoritatively empty.
     pub msg_eose_received: RwSignal<bool>,
+    /// EOSE receipts for the channel-list subscription, split by whether the
+    /// socket was NIP-42 authenticated. `eose_received` flips on the FIRST
+    /// EOSE, which before AUTH is an anonymous answer that omits Hidden-zone
+    /// channels; pages deciding "section not found" read this instead.
+    pub channel_receipt: RwSignal<SyncReceipt>,
+    /// EOSE receipts for each `ensure_subscribed` history query, keyed by the
+    /// id/slug it was called with. The authority for "this topic is not in
+    /// this channel": the broad kind-42 sync is capped and its per-zone filters
+    /// are a snapshot of the channels known when it started, so its EOSE can
+    /// arrive without a given topic in it.
+    history_receipts: RwSignal<HashMap<String, SyncReceipt>>,
     sub_id: RwSignal<Option<String>>,
     msg_sub_id: RwSignal<Option<String>>,
     /// Set of channel ids/slugs for which `ensure_subscribed` has been called.
@@ -113,6 +125,8 @@ impl ChannelStore {
             loading: RwSignal::new(!has_cache),
             eose_received: RwSignal::new(false),
             msg_eose_received: RwSignal::new(false),
+            channel_receipt: RwSignal::new(SyncReceipt::default()),
+            history_receipts: RwSignal::new(HashMap::new()),
             sub_id: RwSignal::new(None),
             msg_sub_id: RwSignal::new(None),
             ensured: RwSignal::new(HashSet::new()),
@@ -220,6 +234,8 @@ impl ChannelStore {
         let tombstones_sig = self.tombstones;
         let loading_sig = self.loading;
         let eose_sig = self.eose_received;
+        let channel_receipt_sig = self.channel_receipt;
+        let relay_authed = relay.authenticated();
         let store = *self;
 
         // Track which channel IDs came from the relay (vs stale cache)
@@ -335,6 +351,10 @@ impl ChannelStore {
             }
             loading_sig.set(false);
             eose_sig.set(true);
+            // After the prune above, so a page reading the receipt never sees
+            // "settled" alongside a channel list that is about to change.
+            let authed = relay_authed.get_untracked();
+            channel_receipt_sig.update(|r| r.record(authed));
             // Cache the pruned result
             store_for_eose.save_cache();
         });
@@ -495,6 +515,14 @@ impl ChannelStore {
         })
     }
 
+    /// EOSE receipts for the [`ensure_subscribed`](Self::ensure_subscribed)
+    /// history query opened for `cid_or_slug` (the default when none has
+    /// arrived yet, or none was opened). Reactive.
+    pub fn history_receipt(&self, cid_or_slug: &str) -> SyncReceipt {
+        self.history_receipts
+            .with(|m| m.get(cid_or_slug).copied().unwrap_or_default())
+    }
+
     /// Idempotent per-channel narrow subscription (ADR-092).
     ///
     /// Called from `ChannelPage::on_mount` so direct deep-links boot their
@@ -516,7 +544,7 @@ impl ChannelStore {
         // Resolve to a concrete id when possible — fall back to using the
         // raw value (the relay accepts either: kind-42 events may carry
         // slug-style e-tags from legacy data).
-        let needle = self.resolve_channel(cid_or_slug).unwrap_or(key);
+        let needle = self.resolve_channel(cid_or_slug).unwrap_or(key.clone());
 
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
@@ -564,6 +592,15 @@ impl ChannelStore {
             }
         });
 
+        // Fires once for the first answer and again for the post-AUTH replay
+        // of this same subscription; `SyncReceipt` keeps the two apart.
+        let history_receipts = self.history_receipts;
+        let relay_authed = relay.authenticated();
+        let on_eose = Rc::new(move || {
+            let authed = relay_authed.get_untracked();
+            history_receipts.update(|m| m.entry(key.clone()).or_default().record(authed));
+        });
+
         let _ = relay.subscribe(
             vec![Filter {
                 kinds: Some(vec![42]),
@@ -572,7 +609,7 @@ impl ChannelStore {
                 ..Default::default()
             }],
             on_event,
-            None,
+            Some(on_eose),
         );
     }
 

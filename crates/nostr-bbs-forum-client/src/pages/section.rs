@@ -53,6 +53,7 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::utils::capitalize;
+use crate::utils::lookup::{arm_deadline, zone_is_gated, Lookup};
 use crate::utils::slug_hash::matches_section_slug;
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
@@ -290,9 +291,34 @@ pub fn SectionPage() -> impl IntoView {
         });
     }
 
-    // Loading while the store is fetching AND no channel resolved yet.
-    let store_loading = store.loading;
-    let loading = Memo::new(move |_| store_loading.get() && resolved_channel.get().is_none());
+    // Found / loading / not found, for the section and then its topic list.
+    // Absence is only reported on the relay's EOSE for the subscription that
+    // would have carried the thing (the channel list for the section, this
+    // channel's history query for its topics) or after the deadline — never on
+    // `store.loading`, which clears on the first channel-list EOSE (or at once
+    // from cache) and so let "Section Not Found" and "No topics yet" show
+    // before a cold deep link had synced.
+    let deadline = arm_deadline();
+    let section_lookup = Memo::new(move |_| {
+        let gated = zone_is_gated(&category_slug(), &load_zones());
+        Lookup::decide(
+            resolved_channel.with(Option::is_some),
+            store.channel_receipt.get().settles(gated),
+            deadline.get(),
+        )
+    });
+    let topics_lookup = Memo::new(move |_| {
+        section_lookup.get().then(|| {
+            let gated = zone_is_gated(&category_slug(), &load_zones());
+            let cid = resolved_channel.get().map(|c| c.id).unwrap_or_default();
+            Lookup::decide(
+                topics.with(|t| !t.is_empty()),
+                store.history_receipt(&cid).settles(gated),
+                deadline.get(),
+            )
+        })
+    });
+    let section_loading = Memo::new(move |_| section_lookup.get().is_loading());
 
     let header_name = move || {
         resolved_channel
@@ -434,7 +460,7 @@ pub fn SectionPage() -> impl IntoView {
                     </span>
                 </div>
 
-                <Show when=move || is_authed.get() && !loading.get()>
+                <Show when=move || is_authed.get() && !section_loading.get()>
                     <button
                         type="button"
                         on:click=move |_| {
@@ -520,7 +546,8 @@ pub fn SectionPage() -> impl IntoView {
             </Show>
 
             {move || {
-                if loading.get() {
+                let state = topics_lookup.get();
+                if state.is_loading() {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">
                             <div class="animate-spin w-6 h-6 border-2 za-spinner rounded-full"></div>
@@ -536,13 +563,23 @@ pub fn SectionPage() -> impl IntoView {
                         />
                     }.into_any()
                 } else {
-                    // Store finished but no channel resolved for this slug.
+                    // The relay finished answering (or the deadline passed)
+                    // and no channel resolved for this slug.
+                    let (heading, detail) = if state == Lookup::TimedOut {
+                        (
+                            "Section Unavailable",
+                            "This section did not finish loading. Check your connection and try again.",
+                        )
+                    } else {
+                        (
+                            "Section Not Found",
+                            "This section could not be found in this zone.",
+                        )
+                    };
                     view! {
                         <div class="glass-card p-8 text-center">
-                            <h2 class="text-xl font-bold text-white mb-2">"Section Not Found"</h2>
-                            <p class="text-gray-400 text-sm mb-4">
-                                "This section could not be found in this zone."
-                            </p>
+                            <h2 class="text-xl font-bold text-white mb-2">{heading}</h2>
+                            <p class="text-gray-400 text-sm mb-4">{detail}</p>
                             <A href=base_href(&format!("/{}", category_url_slug())) attr:class="za-text hover:opacity-80 text-sm underline">
                                 "Back to zone"
                             </A>

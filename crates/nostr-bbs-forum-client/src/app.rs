@@ -875,10 +875,15 @@ pub fn App() -> impl IntoView {
         crate::stores::reactions::use_reaction_store().start_sync(&r);
     });
 
-    // Start message count sync after channel EOSE
+    // Start message count sync after channel EOSE. Also tracks whether any
+    // channel is known: `start_msg_sync` bails on an empty list, and an empty
+    // first EOSE (a cold relay DO, or the anonymous pre-AUTH answer) is
+    // followed by channels arriving with no further change to `eose_received`,
+    // so without this the broad message sync never started.
     Effect::new(move |_| {
         let store = use_channel_store();
-        if !store.eose_received.get() {
+        let has_channels = store.channels.with(|c| !c.is_empty());
+        if !store.eose_received.get() || !has_channels {
             return;
         }
         let r = expect_context::<RelayConnection>();

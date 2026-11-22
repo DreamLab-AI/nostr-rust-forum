@@ -51,6 +51,7 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_routes_to_zone, Zone, ZoneVisibility};
 use crate::utils::format_relative_time;
+use crate::utils::lookup::{arm_deadline, zone_is_gated, Lookup};
 use crate::utils::slug_hash::{matches_section_slug, matches_topic_slug, section_slug};
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
@@ -626,12 +627,32 @@ pub fn ThreadPage() -> impl IntoView {
         })
     });
 
-    let store_loading = store.loading;
-    // Loading while the store is still fetching and we have not located either
-    // the channel or the root post yet.
-    let loading = Memo::new(move |_| {
-        store_loading.get() && (resolved_channel.get().is_none() || topic_root.get().is_none())
+    // Found / loading / not found. Absence is only reported on the relay's
+    // EOSE for the subscription that would have carried the thing — the
+    // channel list for the section, this channel's history query for the
+    // topic — or after the deadline. `store.loading` is NOT an input: it
+    // clears on the channel list's first EOSE (or at once from cache), before
+    // this channel's kind-42 history has even been requested.
+    let deadline = arm_deadline();
+    let lookup = Memo::new(move |_| {
+        let gated = zone_is_gated(&category_slug(), &load_zones());
+        let deadline_passed = deadline.get();
+        let channel = resolved_channel.get();
+        Lookup::decide(
+            channel.is_some(),
+            store.channel_receipt.get().settles(gated),
+            deadline_passed,
+        )
+        .then(|| {
+            let cid = channel.map(|c| c.id).unwrap_or_default();
+            Lookup::decide(
+                topic_root.with(Option::is_some),
+                store.history_receipt(&cid).settles(gated),
+                deadline_passed,
+            )
+        })
     });
+    let loading = Memo::new(move |_| lookup.get().is_loading());
 
     // -- Landing position ---------------------------------------------------
     //
@@ -727,11 +748,6 @@ pub fn ThreadPage() -> impl IntoView {
         window_event_listener(leptos::ev::pointerdown, move |_| end_landing()),
     ];
     on_cleanup(move || input_listeners.into_iter().for_each(|h| h.remove()));
-
-    // Topic-not-found: store finished, channel resolved, but no matching root.
-    let not_found = Memo::new(move |_| {
-        !store_loading.get() && resolved_channel.get().is_some() && topic_root.get().is_none()
-    });
 
     // Section href (hashed) for breadcrumb back-link — REAL section name shown.
     let section_href = move || {
@@ -1162,14 +1178,22 @@ pub fn ThreadPage() -> impl IntoView {
                             <span class="text-gray-400 text-sm">"Loading topic..."</span>
                         </div>
                     }.into_any()
-                } else if not_found.get() {
+                } else if let Some((heading, detail)) = match lookup.get() {
+                    Lookup::NotFound => Some((
+                        "Topic Not Found",
+                        "This topic could not be found in this section.",
+                    )),
+                    Lookup::TimedOut => Some((
+                        "Topic Unavailable",
+                        "This topic did not finish loading. Check your connection and try again.",
+                    )),
+                    Lookup::Loading | Lookup::Found => None,
+                } {
                     let back = section_href();
                     view! {
                         <div class="glass-card p-8 text-center mt-4">
-                            <h2 class="text-xl font-bold text-white mb-2">"Topic Not Found"</h2>
-                            <p class="text-gray-400 text-sm mb-4">
-                                "This topic could not be found in this section."
-                            </p>
+                            <h2 class="text-xl font-bold text-white mb-2">{heading}</h2>
+                            <p class="text-gray-400 text-sm mb-4">{detail}</p>
                             <A href=base_href(&back) attr:class="text-[color:var(--zone-accent)] hover:opacity-80 text-sm underline">
                                 "Back to section"
                             </A>
