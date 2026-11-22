@@ -274,8 +274,14 @@ pub async fn handle_delete_events(mut req: Request, env: &Env) -> Result<Respons
             Disposition::Skipped => outcome.skipped.push(id.clone()),
             Disposition::Delete => {
                 // The relay-side re-insert guard (see "Why this is silent").
-                // Fails open: a tombstone error neither stops nor fails the purge.
-                crate::tombstone_before_delete(&db, crate::TombstoneTarget::Event(id), now).await;
+                // Kind 42 has no address, so the id statement alone. Fails
+                // open: a tombstone error neither stops nor fails the purge.
+                let _ = crate::tombstone_before_delete(
+                    &db,
+                    crate::TombstoneTarget::RegularEvent(id),
+                    now,
+                )
+                .await;
                 let run = match db
                     .prepare("DELETE FROM events WHERE id = ?1 AND kind = 42")
                     .bind(&[js_str(id)])

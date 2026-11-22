@@ -210,13 +210,16 @@ pub async fn handle_delete_user(mut req: Request, env: &Env) -> Result<Response>
         .await;
 
     let mut events_purged = false;
+    // Reported, never acted on: a failed tombstone cannot be retried once the
+    // rows are gone, so the admin must be told, but the purge still proceeds.
+    let mut tombstoned = false;
     if body.delete_events {
         // Purge the user's stored events AND their projected profile row. The
         // events table is the relay store; the profiles projection is derived.
         // Tombstone them first: the whitelist row is gone, so the ingest gate
         // refuses this author for now, but re-admission must not let anyone
         // re-publish what the admin chose to remove. Fails open.
-        crate::tombstone_before_delete(
+        tombstoned = crate::tombstone_before_delete(
             &db,
             crate::TombstoneTarget::Author(&target),
             auth::js_now_secs(),
@@ -246,14 +249,21 @@ pub async fn handle_delete_user(mut req: Request, env: &Env) -> Result<Response>
         Some(&target),
         None,
         None,
-        None,
+        events_purged
+            .then(|| json!({ "tombstoned": tombstoned }).to_string())
+            .as_deref(),
         body.reason.as_deref(),
     )
     .await;
 
     json_response(
         env,
-        &json!({ "success": true, "pubkey": target, "events_purged": events_purged }),
+        &json!({
+            "success": true,
+            "pubkey": target,
+            "events_purged": events_purged,
+            "tombstoned": tombstoned,
+        }),
         200,
     )
 }

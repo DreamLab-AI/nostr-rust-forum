@@ -310,6 +310,9 @@ pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Respon
     .run()
     .await?;
 
+    // What a "delete" actually removed, for the reply and the audit row.
+    let mut deletion: Option<DeletionRecord> = None;
+
     // Apply the resolution action on the reported event
     match resolution.as_str() {
         "hide" => {
@@ -330,15 +333,30 @@ pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Respon
                 .await;
         }
         "delete" => {
+            // The target id is the reporter's first `e` tag and
+            // `reported_pubkey` only their claim, so read what the row really
+            // is before it goes; the admin sees what was removed. A failed read
+            // is reported as nothing found and does not stop the deletion.
+            let stored = match db
+                .prepare("SELECT pubkey, kind FROM events WHERE id = ?1 LIMIT 1")
+                .bind(&[js_str(&report.reported_event_id)])
+            {
+                Ok(stmt) => stmt.first::<StoredEventRow>(None).await.ok().flatten(),
+                Err(_) => None,
+            };
             // A moderator's decision that the content goes: tombstone it under
-            // its real author, read from the row (`reported_pubkey` is only the
-            // reporter's claim), so it cannot be published again. Fails open.
-            crate::tombstone_before_delete(
+            // that real author, so it cannot be published again. Fails open.
+            let tombstoned = crate::tombstone_before_delete(
                 &db,
                 crate::TombstoneTarget::Event(&report.reported_event_id),
                 now,
             )
             .await;
+            deletion = Some(DeletionRecord {
+                event_id: report.reported_event_id.clone(),
+                stored: stored.map(|r| (r.pubkey, r.kind as u64)),
+                tombstoned,
+            });
             let _ = db
                 .prepare("DELETE FROM events WHERE id = ?1")
                 .bind(&[js_str(&report.reported_event_id)])?
@@ -356,14 +374,25 @@ pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Respon
         _ => "report_resolve",
     };
 
+    // A deletion names the real author where the row was found, and records
+    // the reporter's claim beside it in the details.
+    let details = deletion.as_ref().map(|d| {
+        d.audit_details(new_status, &report.reported_pubkey)
+            .to_string()
+    });
+    let audit_target = deletion
+        .as_ref()
+        .and_then(|d| d.stored.as_ref().map(|(author, _)| author.as_str()))
+        .unwrap_or(&report.reported_pubkey);
+
     let _ = audit::log_admin_action(
         env,
         &admin_pubkey,
         action,
-        Some(&report.reported_pubkey),
+        Some(audit_target),
         Some(&format!("{}", report_id as u64)),
         Some("pending"),
-        Some(new_status),
+        Some(details.as_deref().unwrap_or(new_status)),
         if reason.is_empty() {
             None
         } else {
@@ -372,9 +401,88 @@ pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Respon
     )
     .await;
 
-    json_response(
-        env,
-        &json!({ "success": true, "resolution": resolution }),
-        200,
-    )
+    let mut body = json!({ "success": true, "resolution": resolution });
+    if let Some(d) = &deletion {
+        body["removed"] = d.removed_json();
+        body["tombstoned"] = json!(d.tombstoned);
+    }
+    json_response(env, &body, 200)
+}
+
+#[derive(Deserialize)]
+struct StoredEventRow {
+    pubkey: String,
+    kind: f64,
+}
+
+/// What a report resolved as "delete" removed.
+#[derive(Debug, Clone, PartialEq)]
+struct DeletionRecord {
+    /// The id the report named.
+    event_id: String,
+    /// The stored row's real `(author, kind)`, or `None` when no row was found.
+    stored: Option<(String, u64)>,
+    /// Whether every tombstone statement ran.
+    tombstoned: bool,
+}
+
+impl DeletionRecord {
+    /// The reply's `removed`: the row actually deleted, or `null` if none was.
+    fn removed_json(&self) -> serde_json::Value {
+        match &self.stored {
+            Some((author, kind)) => json!({ "id": self.event_id, "author": author, "kind": kind }),
+            None => serde_json::Value::Null,
+        }
+    }
+
+    /// The `admin_log.new_value` details for a deletion.
+    fn audit_details(&self, status: &str, reported_pubkey: &str) -> serde_json::Value {
+        json!({
+            "status": status,
+            "removed": self.removed_json(),
+            "reportedPubkey": reported_pubkey,
+            "tombstoned": self.tombstoned,
+        })
+    }
+}
+
+#[cfg(test)]
+mod deletion_record_tests {
+    use super::*;
+
+    #[test]
+    fn a_found_row_reports_its_real_author_and_kind() {
+        let d = DeletionRecord {
+            event_id: "e1".into(),
+            stored: Some(("real".into(), 30023)),
+            tombstoned: true,
+        };
+        assert_eq!(
+            d.removed_json(),
+            json!({ "id": "e1", "author": "real", "kind": 30023 })
+        );
+        assert_eq!(
+            d.audit_details("resolved_approve", "claimed"),
+            json!({
+                "status": "resolved_approve",
+                "removed": { "id": "e1", "author": "real", "kind": 30023 },
+                "reportedPubkey": "claimed",
+                "tombstoned": true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_missing_row_reports_nothing_removed() {
+        let d = DeletionRecord {
+            event_id: "e1".into(),
+            stored: None,
+            tombstoned: false,
+        };
+        assert!(d.removed_json().is_null());
+        assert_eq!(
+            d.audit_details("resolved_approve", "claimed")["removed"],
+            serde_json::Value::Null
+        );
+    }
 }
