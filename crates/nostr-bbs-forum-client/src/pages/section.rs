@@ -53,7 +53,9 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_to_zone, Zone, ZoneVisibility};
 use crate::utils::capitalize;
-use crate::utils::lookup::{deadline_for, zone_is_gated, Lookup};
+use crate::utils::lookup::{
+    deadline_for, key_state_memo, zone_is_encrypted, zone_is_gated, Lookup,
+};
 use crate::utils::slug_hash::matches_section_slug;
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
@@ -308,13 +310,31 @@ pub fn SectionPage() -> impl IntoView {
             deadline.get(),
         )
     });
+    // An encrypted zone's list is not "empty" while the member's keys are
+    // still arriving. No zone-key store means nothing here can decrypt, so
+    // there is nothing to wait for.
+    let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
+    let auth_pubkey = auth.pubkey();
+    let keys = key_state_memo(
+        move || {
+            zone_keys.is_some()
+                && zone_is_encrypted(
+                    &category_slug(),
+                    &load_zones(),
+                    crate::zone_crypto::encryption_enabled(),
+                )
+        },
+        move |now| zone_keys.and_then(|z| z.key_phase_for(auth_pubkey.get().as_deref(), now)),
+        deadline,
+    );
     let topics_lookup = Memo::new(move |_| {
         section_lookup.get().then(|| {
             let gated = zone_is_gated(&category_slug(), &load_zones());
             let cid = resolved_channel.get().map(|c| c.id).unwrap_or_default();
-            Lookup::decide(
+            Lookup::decide_with_keys(
                 topics.with(|t| !t.is_empty()),
                 store.history_receipt(&cid).settles(gated),
+                keys.get(),
                 deadline.get(),
             )
         })
@@ -552,10 +572,16 @@ pub fn SectionPage() -> impl IntoView {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">
                             <div class="animate-spin w-6 h-6 border-2 za-spinner rounded-full"></div>
-                            <span class="text-gray-400 text-sm">"Loading topics..."</span>
+                            <span class="text-gray-400 text-sm">{if state == Lookup::KeysLoading {
+                                "Fetching your keys for this zone\u{2026}"
+                            } else {
+                                "Loading topics..."
+                            }}</span>
                         </div>
                     }.into_any()
-                } else if state != Lookup::TimedOut && resolved_channel.with(Option::is_some) {
+                } else if !matches!(state, Lookup::TimedOut | Lookup::KeysTimedOut)
+                    && resolved_channel.with(Option::is_some)
+                {
                     // Found or authoritatively empty: TopicList renders both.
                     let ch_id = resolved_channel.get().map(|c| c.id).unwrap_or_default();
                     view! {
@@ -573,6 +599,10 @@ pub fn SectionPage() -> impl IntoView {
                         (Lookup::TimedOut, true) => (
                             "Topics Unavailable",
                             "This section's topics did not finish loading. Check your connection and try again.",
+                        ),
+                        (Lookup::KeysTimedOut, _) => (
+                            "Topics Unavailable",
+                            "Your keys for this zone are taking too long to arrive. Reload to try again.",
                         ),
                         (Lookup::TimedOut, false) => (
                             "Section Unavailable",

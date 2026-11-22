@@ -51,7 +51,9 @@ use crate::stores::read_position::use_read_positions;
 use crate::stores::zone_access::use_zone_access;
 use crate::stores::zones::{load_zones, section_routes_to_zone, Zone, ZoneVisibility};
 use crate::utils::format_relative_time;
-use crate::utils::lookup::{deadline_for, zone_is_gated, Lookup};
+use crate::utils::lookup::{
+    deadline_for, key_state_memo, zone_is_encrypted, zone_is_gated, Lookup,
+};
 use crate::utils::slug_hash::{matches_section_slug, matches_topic_slug, section_slug};
 use crate::utils::zone_theme::zone_accent_style_cfg;
 
@@ -635,6 +637,23 @@ pub fn ThreadPage() -> impl IntoView {
     // this channel's kind-42 history has even been requested.
     // Re-armed per topic: the route component is reused across topics.
     let deadline = deadline_for(move || (category_slug(), section_param(), topic_param()));
+    // In an encrypted zone the root may be a sealed original still under its
+    // envelope id until the member's keys arrive. No zone-key store means
+    // nothing here can decrypt, so there is nothing to wait for.
+    let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
+    let auth_pubkey = auth.pubkey();
+    let keys = key_state_memo(
+        move || {
+            zone_keys.is_some()
+                && zone_is_encrypted(
+                    &category_slug(),
+                    &load_zones(),
+                    crate::zone_crypto::encryption_enabled(),
+                )
+        },
+        move |now| zone_keys.and_then(|z| z.key_phase_for(auth_pubkey.get().as_deref(), now)),
+        deadline,
+    );
     let lookup = Memo::new(move |_| {
         let gated = zone_is_gated(&category_slug(), &load_zones());
         let deadline_passed = deadline.get();
@@ -646,9 +665,10 @@ pub fn ThreadPage() -> impl IntoView {
         )
         .then(|| {
             let cid = channel.map(|c| c.id).unwrap_or_default();
-            Lookup::decide(
+            Lookup::decide_with_keys(
                 topic_root.with(Option::is_some),
                 store.history_receipt(&cid).settles(gated),
+                keys.get(),
                 deadline_passed,
             )
         })
@@ -1176,7 +1196,11 @@ pub fn ThreadPage() -> impl IntoView {
                     view! {
                         <div class="flex flex-col items-center justify-center py-20 gap-3">
                             <div class="animate-spin w-6 h-6 border-2 border-[color:var(--zone-accent)] border-t-transparent rounded-full"></div>
-                            <span class="text-gray-400 text-sm">"Loading topic..."</span>
+                            <span class="text-gray-400 text-sm">{move || if lookup.get() == Lookup::KeysLoading {
+                                "Fetching your keys for this zone\u{2026}"
+                            } else {
+                                "Loading topic..."
+                            }}</span>
                         </div>
                     }.into_any()
                 } else if let Some((heading, detail)) = match lookup.get() {
@@ -1188,7 +1212,11 @@ pub fn ThreadPage() -> impl IntoView {
                         "Topic Unavailable",
                         "This topic did not finish loading. Check your connection and try again.",
                     )),
-                    Lookup::Loading | Lookup::Found => None,
+                    Lookup::KeysTimedOut => Some((
+                        "Topic Unavailable",
+                        "Your keys for this zone are taking too long to arrive. Reload to try again.",
+                    )),
+                    Lookup::Loading | Lookup::KeysLoading | Lookup::Found => None,
                 } {
                     let back = section_href();
                     view! {

@@ -22,6 +22,7 @@ use nostr_bbs_core::NostrEvent;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
+use super::grant_backlog::{GrantBacklog, KeyPhase};
 use super::grant_ledger::{GrantKv, GrantLedger};
 use super::inbox_key::{
     deletion_for_wrap, ensure_inbox_key, grant_sweep_enabled, recipient_keys_enabled,
@@ -63,6 +64,10 @@ pub struct ZoneKeyStore {
     /// the current auth identity by [`ready_for`](Self::ready_for), so
     /// readiness never depends on which effect ran first.
     loaded_for: RwSignal<Option<Owner>>,
+    /// The current sign-in's grant backlog (see [`GrantBacklog`]), with the
+    /// identity it belongs to. Tracked, so pages re-judge "are this member's
+    /// keys still arriving?" as it advances.
+    grant_backlog: RwSignal<Option<(Owner, GrantBacklog)>>,
     /// Every epoch held per zone by any row on this device, whatever its
     /// owner (epoch numbers only), so a mint never reuses an epoch another
     /// account on this browser holds but has not delivered.
@@ -119,6 +124,7 @@ impl ZoneKeyStore {
             revision: RwSignal::new(0),
             encrypted_ids: RwSignal::new(HashSet::new()),
             loaded_for: RwSignal::new(None),
+            grant_backlog: RwSignal::new(None),
             device_epochs: RwSignal::new(HashMap::new()),
             session: StoredValue::new(Session::default()),
             cache: StoredValue::new(ReadCache::default()),
@@ -157,6 +163,38 @@ impl ZoneKeyStore {
         self.loaded_for.with(|l| l.as_ref() == Some(&me))
     }
 
+    /// Where `me`'s zone keys stand at `now` (epoch ms): settled (loaded
+    /// from IndexedDB and the grant backlog worked through), still arriving,
+    /// or stalled; `None` until the stored keys are loaded and the grant sync
+    /// has started for `me`. Each key that arrived has already re-decrypted
+    /// what is on screen, so once settled an encrypted post still locked is
+    /// locked for want of a key this member does not hold, not for want of
+    /// time. Tracked.
+    pub fn key_phase_for(&self, me: Option<&str>, now: f64) -> Option<KeyPhase> {
+        let me = me.and_then(Owner::parse)?;
+        if !self.loaded_for.with(|l| l.as_ref() == Some(&me)) {
+            return None;
+        }
+        self.grant_backlog.with(|b| match b {
+            Some((owner, backlog)) if *owner == me => Some(backlog.phase(now)),
+            _ => None,
+        })
+    }
+
+    /// Apply `f` to the backlog of `lease`'s sign-in at the current time. A
+    /// lease that is no longer current is ignored: its backlog has been
+    /// reset.
+    fn note_backlog(&self, lease: &Lease, f: impl FnOnce(&mut GrantBacklog, f64)) {
+        if !self.is_current(lease) {
+            return;
+        }
+        let now = js_sys::Date::now();
+        let _ = self.grant_backlog.try_update(|b| match b {
+            Some((owner, backlog)) if owner == lease.owner() => f(backlog, now),
+            _ => {}
+        });
+    }
+
     /// Every epoch any row on this device holds for `zone`, whatever its
     /// owner, ascending, tracked. Feeds [`keyset::plan_mint`].
     pub fn device_epochs_for(&self, zone: &str) -> Vec<u32> {
@@ -190,6 +228,7 @@ impl ZoneKeyStore {
         };
         self.stop_grant_sync();
         let _ = self.loaded_for.try_set(None);
+        let _ = self.grant_backlog.try_set(None);
         let _ = self.keys.try_set(HashMap::new());
         let _ = self.conflicts.try_set(Vec::new());
         self.inbox_granted.set_value(HashSet::new());
@@ -558,6 +597,10 @@ impl ZoneKeyStore {
         }
         self.sync_for.set_value(Some(lease.clone()));
         self.grant_relay.set_value(Some(relay.clone()));
+        let _ = self.grant_backlog.try_set(Some((
+            lease.owner().clone(),
+            GrantBacklog::new(recipient_keys_enabled(), js_sys::Date::now()),
+        )));
         let me = lease.owner().as_str().to_string();
         let store = *self;
         // The end of stored events on the identity subscription settles the
@@ -568,6 +611,7 @@ impl ZoneKeyStore {
                 if store.is_current(&lease) {
                     super::public_inbox::sweep_eose(&me);
                 }
+                store.note_backlog(&lease, GrantBacklog::identity_eose);
             })
         };
         let id = relay.subscribe(
@@ -597,11 +641,18 @@ impl ZoneKeyStore {
                 Ok(key) if store.is_current(&lease) => {
                     store.inbox_sk.set_value(Some(key.sk_hex));
                     let handler = store.wrap_handler(&relay, signer.clone(), lease.clone(), true);
-                    let id = relay.subscribe(vec![wrap_filter(vec![key.pubkey])], handler, None);
+                    store.note_backlog(&lease, GrantBacklog::inbox_opened);
+                    let eose = {
+                        let lease = lease.clone();
+                        Rc::new(move || store.note_backlog(&lease, GrantBacklog::inbox_eose))
+                    };
+                    let id =
+                        relay.subscribe(vec![wrap_filter(vec![key.pubkey])], handler, Some(eose));
                     store.grant_subs.update_value(|v| v.push(id));
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    store.note_backlog(&lease, GrantBacklog::inbox_failed);
                     web_sys::console::warn_1(&format!("[zone-key] inbox key: {e}").into());
                 }
             }
@@ -636,8 +687,10 @@ impl ZoneKeyStore {
             }
             let (relay, signer, lease) = (relay.clone(), signer.clone(), lease.clone());
             super::public_inbox::sweep_wrap_started();
+            store.note_backlog(&lease, |b, _| b.wrap_started());
             spawn_local(async move {
                 store.process_wrap(&lease, &ev, &*signer, &relay).await;
+                store.note_backlog(&lease, GrantBacklog::wrap_done);
                 // A switch reset the tracker: an earlier identity's wrap no
                 // longer counts towards the new one's cleanup.
                 if store.is_current(&lease) {
@@ -1082,10 +1135,17 @@ impl GrantKv for IdbGrantKv {
     }
 }
 
+/// The grant-sync filter: kind-1059 wraps to `p`, at most
+/// [`RELAY_FILTER_LIMIT`](crate::stores::channels::RELAY_FILTER_LIMIT) rows,
+/// the relay's maximum. Without an explicit limit the relay applies its
+/// default of 500, newest first, and DMs share the kind with grants. An
+/// account with more wraps than the limit still misses its oldest (often
+/// its grants) on a cold device; paging the backlog is separate work.
 fn wrap_filter(p: Vec<String>) -> Filter {
     Filter {
         kinds: Some(vec![nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP]),
         p_tags: Some(p),
+        limit: Some(crate::stores::channels::RELAY_FILTER_LIMIT),
         ..Default::default()
     }
 }
