@@ -482,7 +482,7 @@ pub fn ChannelPage() -> impl IntoView {
                         // gate a deleted post is replayed back into view through
                         // the deep-link path alone — the one entry point that
                         // used to skip the check.
-                        if store_for_replay.is_message_deleted(&ev.id) {
+                        if !store_for_replay.admits_message(zone_keys_for_replay, &ev) {
                             return;
                         }
                         let tag_val = ev
@@ -510,7 +510,7 @@ pub fn ChannelPage() -> impl IntoView {
                             crate::zone_crypto::store::prepare_incoming(zone_keys_for_replay, ev);
                         // A restored sealed original carries the original id,
                         // which a kind-5 may have tombstoned (ADR-2017).
-                        if store_for_replay.is_message_deleted(&ev.id) {
+                        if !store_for_replay.admits_message(zone_keys_for_replay, &ev) {
                             return;
                         }
                         let mut newly_added = false;

@@ -460,7 +460,7 @@ impl ZoneKeyStore {
                 c.redecrypt(
                     m,
                     |z, e| store.lookup(z, e),
-                    |id| !channels.is_message_deleted(id),
+                    |inner| channels.admits_restored_original(inner),
                 );
                 restored_ids = m
                     .values()
@@ -1169,6 +1169,16 @@ pub fn provide_zone_key_store(channels: crate::stores::channels::ChannelStore) {
             .with(|s| key_owner::owner_from_auth(s.is_authenticated, s.pubkey.as_deref()));
         store.switch_owner(owner);
     });
+}
+
+/// Whether `id` is an original this session restored from a sealed envelope
+/// (ADR-2017), for a store captured at subscription time. Without a store
+/// nothing has been restored.
+///
+/// Must not be called from inside the store's own cache update (the in-place
+/// restore of [`ZoneKeyStore::redecrypt`]), which already knows its answer.
+pub fn is_restored_original(store: Option<ZoneKeyStore>, id: &str) -> bool {
+    store.is_some_and(|s| s.cache.with_value(|c| c.envelope_of(id).is_some()))
 }
 
 /// The zone-key store, if provided.

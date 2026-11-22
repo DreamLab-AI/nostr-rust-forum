@@ -35,6 +35,7 @@ use nostr_bbs_core::NostrEvent;
 use crate::components::reaction_bar::Reaction;
 use crate::relay::RelayConnection;
 use crate::stores::channels::deletion_targets;
+use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope, Source};
 
 // -- Types --------------------------------------------------------------------
 
@@ -67,6 +68,11 @@ pub struct ReactionStore {
     index: RwSignal<ReactionIndex>,
     /// kind-7 ids deleted by a kind-5 (suppresses out-of-order arrival).
     tombstones: RwSignal<HashSet<String>>,
+    /// Marker for this store's kind-5 filter ([`deletion_sync`]). A field
+    /// rather than a local of `start_sync`: that runs inside the app's
+    /// connection-state effect, which would dispose a value it created on its
+    /// next run while the relay still replays this subscription's callbacks.
+    progress: StoredValue<DeletionProgress>,
     sub_id: RwSignal<Option<String>>,
 }
 
@@ -76,6 +82,9 @@ impl ReactionStore {
             aggregate: RwSignal::new(HashMap::new()),
             index: RwSignal::new(HashMap::new()),
             tombstones: RwSignal::new(HashSet::new()),
+            progress: StoredValue::new(DeletionProgress::new(deletion_sync::load(
+                DeletionScope::Reactions,
+            ))),
             sub_id: RwSignal::new(None),
         }
     }
@@ -88,6 +97,9 @@ impl ReactionStore {
     /// client rarely has the full id set up front, and a broad sub means a card
     /// scrolled into view already has its reactions cached. Idempotent: a second
     /// call while a sub is live is a no-op.
+    ///
+    /// The kind-5 filter asks only for deletions newer than this scope's
+    /// marker ([`deletion_sync`]); kind-7 reactions are fetched in full.
     pub(crate) fn start_sync(&self, relay: &RelayConnection) {
         if self.sub_id.get_untracked().is_some() {
             return;
@@ -96,6 +108,28 @@ impl ReactionStore {
         let aggregate = self.aggregate;
         let index = self.index;
         let tombstones = self.tombstones;
+        let progress = self.progress;
+
+        // Kind-5 deletions (un-reacts), from this subscription and its pages.
+        let on_kind5: deletion_sync::Kind5Handler =
+            Rc::new(move |event: NostrEvent, source: Source| {
+                let deleted = deletion_targets(&event);
+                let now = deletion_sync::now_secs();
+                let deleter = event.pubkey.to_lowercase();
+                progress.update_value(|p| {
+                    p.observe(event.created_at, &deleter, &deleted, false, now, source)
+                });
+                if !deleted.is_empty() {
+                    aggregate.update(|agg| {
+                        index.update(|idx| {
+                            tombstones.update(|tomb| {
+                                fold_remove(agg, idx, tomb, &deleted);
+                            });
+                        });
+                    });
+                }
+            });
+        let on_kind5_main = on_kind5.clone();
 
         let on_event = Rc::new(move |event: NostrEvent| match event.kind {
             7 => {
@@ -110,27 +144,36 @@ impl ReactionStore {
                     });
                 }
             }
-            5 => {
-                let deleted = deletion_targets(&event);
-                if !deleted.is_empty() {
-                    aggregate.update(|agg| {
-                        index.update(|idx| {
-                            tombstones.update(|tomb| {
-                                fold_remove(agg, idx, tomb, &deleted);
-                            });
-                        });
-                    });
-                }
-            }
+            5 => on_kind5_main(event, Source::Main),
             _ => {}
         });
 
+        // EOSE ends the kind-5 backfill: settle the marker, or page down when
+        // a marked filter hit the row cap (see `deletion_sync`). Kind-7
+        // targets are hard-deleted by the relay and reactions are not cached,
+        // so this scope persists the marker alone, no tombstones.
+        let relay_for_eose = relay.clone();
+        let on_eose = Rc::new(move || {
+            let now = deletion_sync::now_secs();
+            let action = progress
+                .try_update_value(|p| p.on_main_eose(now))
+                .unwrap_or(deletion_sync::EoseAction::Ignore);
+            deletion_sync::drive(
+                &relay_for_eose,
+                DeletionScope::Reactions,
+                progress,
+                on_kind5.clone(),
+                action,
+            );
+        });
+
+        let since = progress.with_value(|p| p.state.since);
         let id = relay.subscribe(
             // Reactions and deletions as separate filters, so the growing set of
             // kind-5 deletions cannot crowd reactions out of the result.
-            crate::stores::channels::reaction_sync_filters(),
+            crate::stores::channels::reaction_sync_filters(since),
             on_event,
-            None,
+            Some(on_eose),
         );
         self.sub_id.set(Some(id));
     }

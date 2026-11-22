@@ -40,6 +40,28 @@ impl SignerAdminCache {
             .unwrap_or(false)
     }
 
+    /// [`Self::is_admin`] without tracking, for decisions taken inside relay
+    /// callbacks and other untracked code.
+    pub fn is_admin_untracked(&self, pubkey: &str) -> bool {
+        self.known.with_untracked(|k| {
+            k.get(&pubkey.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(false)
+        })
+    }
+
+    /// The relay's answer for `pubkey`, untracked: `None` until it has given
+    /// one, so a caller can tell "not an admin" from "not asked yet".
+    pub fn answer_untracked(&self, pubkey: &str) -> Option<bool> {
+        self.known
+            .with_untracked(|k| k.get(&pubkey.to_ascii_lowercase()).copied())
+    }
+
+    /// Subscribe the running effect to new answers.
+    pub fn track(&self) {
+        self.known.track();
+    }
+
     /// Ask the relay about each pubkey not already asked about.
     pub fn request<'a>(&self, pubkeys: impl IntoIterator<Item = &'a str>) {
         for pk in pubkeys {

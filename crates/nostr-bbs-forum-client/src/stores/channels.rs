@@ -14,8 +14,12 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 use crate::relay::{Filter, RelayConnection};
+use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope, Source};
+use crate::stores::signer_admin::SignerAdminCache;
+use crate::stores::tombstones::{self, Target, Tombstones, LOCAL_DELETER};
 use crate::stores::zones::Zone;
 use crate::utils::lookup::SyncReceipt;
+use crate::zone_crypto::store::{is_restored_original, ZoneKeyStore};
 
 // -- Constants ----------------------------------------------------------------
 
@@ -104,12 +108,22 @@ pub struct ChannelStore {
     /// channel id, newest-wins. Applied when the kind-40 arrives (a kind-41 can
     /// outrun its kind-40 on the wire). Transient — not cached.
     pending_meta: RwSignal<HashMap<String, MetaUpdate>>,
-    /// Event ids deleted via kind-5 (NIP-09), lowercased. A tombstone both
-    /// removes the target from `channel_messages` AND suppresses a kind-42 that
-    /// arrives AFTER its deletion (backfill order is not guaranteed). Transient
-    /// — rebuilt from the relay's replayed kind-5s each session. See
-    /// [`fold_deletions`].
-    tombstones: RwSignal<HashSet<String>>,
+    /// Kind-5 (NIP-09) tombstones as `(id, deleter)`. A tombstone both
+    /// removes its target from `channel_messages` AND suppresses a kind-42
+    /// that arrives AFTER its deletion (backfill order is not guaranteed);
+    /// whether it counts depends on the deleter and the message, see
+    /// [`tombstones`]. Seeded from the tombstones persisted by
+    /// [`deletion_sync`] (the kind-5 sync only fetches deletions at or after
+    /// the device's marker, and a sealed original restored from its envelope
+    /// is hidden by nothing else), then extended by this session's kind-5s.
+    tombstones: RwSignal<Tombstones>,
+    /// The relay's answers on whether a deleter is an admin: the only
+    /// authority, besides the original author, for hiding a restored sealed
+    /// original. Fail-closed while unanswered.
+    signer_admin: SignerAdminCache,
+    /// Marker and persisted tombstones for this store's kind-5 filter,
+    /// advanced and saved only when the channel subscription reaches EOSE.
+    deletion_progress: StoredValue<DeletionProgress>,
 }
 
 impl ChannelStore {
@@ -117,8 +131,10 @@ impl ChannelStore {
         // Hydrate from localStorage cache for instant render
         let cached = Self::load_cache();
         let has_cache = !cached.channels.is_empty();
+        let deletions = deletion_sync::load(DeletionScope::Channels);
+        let tombstones = Tombstones::from_persisted(&[&deletions.sealed, &deletions.held]);
 
-        Self {
+        let store = Self {
             channels: RwSignal::new(cached.channels),
             last_active: RwSignal::new(cached.last_active),
             channel_messages: RwSignal::new(HashMap::new()),
@@ -133,7 +149,89 @@ impl ChannelStore {
             ensured: RwSignal::new(HashSet::new()),
             meta_updated_at: RwSignal::new(cached.meta_updated_at),
             pending_meta: RwSignal::new(HashMap::new()),
-            tombstones: RwSignal::new(HashSet::new()),
+            tombstones: RwSignal::new(tombstones),
+            signer_admin: SignerAdminCache::new(),
+            deletion_progress: StoredValue::new(DeletionProgress::new(deletions)),
+        };
+        store.prune_on_admin_answers();
+        store
+    }
+
+    /// When the relay vouches for a new admin, drop the restored sealed
+    /// originals that admin's held tombstones now hide. Tracks only the admin
+    /// answers: messages and tombstones are read untracked, so an insertion
+    /// does not re-run this over everything.
+    fn prune_on_admin_answers(&self) {
+        let store = *self;
+        Effect::new(move |_| {
+            store.signer_admin.track();
+            let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
+            let admin = store.signer_admin;
+            let is_sealed = |id: &str| is_restored_original(zone_keys, id);
+            let sealed = store.channel_messages.with_untracked(|m| {
+                store
+                    .tombstones
+                    .with_untracked(|t| tombstones::sealed_with_tombstones(m, t, is_sealed))
+            });
+            store.resolve_persisted(&sealed);
+            store.channel_messages.maybe_update(|m| {
+                store.tombstones.with_untracked(|t| {
+                    tombstones::prune(
+                        m,
+                        t,
+                        |id| is_restored_original(zone_keys, id),
+                        |d| admin.is_admin_untracked(d),
+                    )
+                })
+            });
+        });
+    }
+
+    /// Apply one kind-5 from `deleter` to the stored messages; see
+    /// [`tombstones::fold_deletion`]. When it names a restored sealed
+    /// original by someone else, ask the relay whether `deleter` is an admin;
+    /// the answer re-runs [`Self::prune_on_admin_answers`].
+    fn apply_deletion(&self, zone_keys: Option<ZoneKeyStore>, deleter: &str, targets: &[String]) {
+        let admin = self.signer_admin;
+        let tombstones_sig = self.tombstones;
+        let is_sealed = |id: &str| is_restored_original(zone_keys, id);
+        let mut ask = false;
+        let mut sealed_targets = Vec::new();
+        self.channel_messages.update(|m| {
+            ask = tombstones::needs_admin_answer(m, deleter, targets, is_sealed);
+            sealed_targets = tombstones::sealed_named(m, targets, is_sealed);
+            tombstones_sig.update(|t| {
+                tombstones::fold_deletion(m, t, deleter, targets, is_sealed, |d| {
+                    admin.is_admin_untracked(d)
+                });
+            });
+        });
+        if ask {
+            admin.request([deleter]);
+        }
+        self.resolve_persisted(&sealed_targets);
+    }
+
+    /// These `(id, author)` messages are restored sealed originals: resolve
+    /// the held tombstones on them (promote honoured, drop refused; see
+    /// [`deletion_sync::resolve_sealed`]) and persist if anything changed.
+    /// Saving here, outside EOSE, writes the last settled marker, so it never
+    /// advances the marker early.
+    fn resolve_persisted(&self, sealed: &[(String, String)]) {
+        if sealed.is_empty() {
+            return;
+        }
+        let admin = self.signer_admin;
+        let mut changed = false;
+        self.deletion_progress.update_value(|p| {
+            for (id, author) in sealed {
+                changed |= deletion_sync::resolve_sealed(&mut p.state, id, author, |d| {
+                    admin.answer_untracked(d)
+                });
+            }
+        });
+        if changed {
+            deletion_sync::persist(DeletionScope::Channels, self.deletion_progress);
         }
     }
 
@@ -141,31 +239,63 @@ impl ChannelStore {
     ///
     /// Used by the delete UI so the actor doesn't wait on the relay echo; it is
     /// idempotent with the kind-5 fold that runs when the deletion broadcast
-    /// arrives ([`fold_deletions`]).
+    /// arrives ([`tombstones::fold_deletion`]).
     pub fn remove_message(&self, event_id: &str) {
         let deleted = [event_id.to_lowercase()];
-        let tombstones = self.tombstones;
+        let tombstones_sig = self.tombstones;
         self.channel_messages.update(|m| {
-            tombstones.update(|t| {
-                fold_deletions(m, t, &deleted);
+            tombstones_sig.update(|t| {
+                // The reader's own action: honoured whatever the message is.
+                tombstones::fold_deletion(m, t, LOCAL_DELETER, &deleted, |_| false, |_| false);
             });
         });
     }
 
-    /// Whether `event_id` has been deleted (NIP-09 kind-5 tombstone).
+    /// Whether `event` may be shown: the single admission predicate for every
+    /// way a kind-42 gets in (ADR-092): the broad subscription,
+    /// `ensure_subscribed` and the deep-link replay in
+    /// [`crate::pages::ChannelPage`].
     ///
-    /// ADR-092 closeout: deletion semantics must be identical on EVERY
-    /// insertion path. The broad kind-42 subscription and `ensure_subscribed`
-    /// consult the tombstone set directly because they own it; the deep-link
-    /// replay in [`crate::pages::ChannelPage`] lives outside this
-    /// module and needs this accessor, or a deleted post walks back into view
-    /// through the one path that skipped the check.
+    /// Call it on the event as delivered (an envelope id is never a restored
+    /// original, so the ordinary rule applies) and again after
+    /// `zone_crypto::store::prepare_incoming` (a restored sealed original
+    /// carries the original's id and author, and only that author or a
+    /// relay-vouched admin may hide it; see [`tombstones`]).
     ///
     /// Untracked: it gates an insert inside an event callback, and subscribing
     /// that callback to the tombstone signal would be a reactive cycle.
-    pub fn is_message_deleted(&self, event_id: &str) -> bool {
-        self.tombstones
-            .with_untracked(|t| !admits_message(t, event_id))
+    pub fn admits_message(&self, zone_keys: Option<ZoneKeyStore>, event: &NostrEvent) -> bool {
+        self.admits_as(event, is_restored_original(zone_keys, &event.id))
+    }
+
+    /// [`Self::admits_message`] for an original the read path has just
+    /// restored from its envelope. Used by the in-place restore after a zone
+    /// key arrives, which runs inside the zone store's own cache update and
+    /// so must not query that store again.
+    pub fn admits_restored_original(&self, inner: &NostrEvent) -> bool {
+        self.admits_as(inner, true)
+    }
+
+    fn admits_as(&self, event: &NostrEvent, sealed: bool) -> bool {
+        let target = Target::of(event, sealed);
+        let admin = self.signer_admin;
+        let (admitted, to_verify) = self.tombstones.with_untracked(|t| {
+            (
+                tombstones::admits(t, &event.id, target, |d| admin.is_admin_untracked(d)),
+                tombstones::deleters_to_verify(t, &event.id, target),
+            )
+        });
+        // Shown for now; if the relay vouches for one of these deleters as an
+        // admin, `prune_on_admin_answers` removes it.
+        if admitted && !to_verify.is_empty() {
+            admin.request(to_verify.iter().map(String::as_str));
+        }
+        // A tombstone that landed before its target: now the target is known
+        // to be a sealed original, resolve what is held on it.
+        if sealed && self.tombstones.with_untracked(|t| t.names(&event.id)) {
+            self.resolve_persisted(&[(event.id.to_lowercase(), event.pubkey.to_lowercase())]);
+        }
+        admitted
     }
 
     // -- Derived count accessors (ADR-091) ------------------------------------
@@ -229,10 +359,10 @@ impl ChannelStore {
         }
 
         let channels_sig = self.channels;
-        let channel_msgs_sig = self.channel_messages;
         let meta_ts_sig = self.meta_updated_at;
         let pending_meta_sig = self.pending_meta;
-        let tombstones_sig = self.tombstones;
+        let deletion_progress = self.deletion_progress;
+        let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
         let loading_sig = self.loading;
         let eose_sig = self.eose_received;
         let channel_receipt_sig = self.channel_receipt;
@@ -242,10 +372,27 @@ impl ChannelStore {
         let relay_ids = Rc::new(std::cell::RefCell::new(HashSet::<String>::new()));
         let relay_ids_for_event = relay_ids.clone();
 
+        // Kind 5: NIP-09 deletion — removes the target post and tombstones its
+        // id. Shared by this subscription and its deletion pages.
+        let on_kind5: deletion_sync::Kind5Handler =
+            Rc::new(move |event: NostrEvent, source: Source| {
+                let deleted = deletion_targets(&event);
+                let deleter = event.pubkey.to_lowercase();
+                // Every kind-5 counts towards the marker, even one with no
+                // `e` target: the marker tracks what the relay delivered.
+                let now = deletion_sync::now_secs();
+                deletion_progress.update_value(|p| {
+                    p.observe(event.created_at, &deleter, &deleted, true, now, source);
+                });
+                if !deleted.is_empty() {
+                    store.apply_deletion(zone_keys, &deleter, &deleted);
+                }
+            });
+        let on_kind5_main = on_kind5.clone();
+
         // Kind 40: channel creation. Kind 41: channel metadata edit (admin
         // rename) — folded last-write-wins; pin/unpin control 41s are ignored
         // (they carry empty content, so [`parse_meta_update`] returns `None`).
-        // Kind 5: NIP-09 deletion — removes the target post and tombstones its id.
         let on_event = Rc::new(move |event: NostrEvent| {
             match event.kind {
                 40 => {
@@ -303,21 +450,13 @@ impl ChannelStore {
                         }
                     }
                 }
-                5 => {
-                    let deleted = deletion_targets(&event);
-                    if !deleted.is_empty() {
-                        channel_msgs_sig.update(|m| {
-                            tombstones_sig.update(|t| {
-                                fold_deletions(m, t, &deleted);
-                            });
-                        });
-                    }
-                }
+                5 => on_kind5_main(event, Source::Main),
                 _ => {}
             }
         });
 
         let store_for_eose = store;
+        let relay_for_eose = relay.clone();
         // `authed` comes from the relay's per-subscription REQ ledger: true only
         // when this answer cannot be the anonymous pre-AUTH one.
         let on_eose = Rc::new(move |authed: bool| {
@@ -339,7 +478,13 @@ impl ChannelStore {
                     store_for_eose.channel_messages.set(HashMap::new());
                     store_for_eose.last_active.set(HashMap::new());
                     store_for_eose.meta_updated_at.set(HashMap::new());
-                    store_for_eose.tombstones.set(HashSet::new());
+                    // Keep the persisted tombstones: their kind-5s may lie
+                    // below the marker and would not be fetched again.
+                    store_for_eose
+                        .tombstones
+                        .set(deletion_progress.with_value(|p| {
+                            Tombstones::from_persisted(&[&p.state.sealed, &p.state.held])
+                        }));
                 }
             } else {
                 channels_sig.update(|list| {
@@ -358,12 +503,27 @@ impl ChannelStore {
             channel_receipt_sig.update(|r| r.record(authed));
             // Cache the pruned result
             store_for_eose.save_cache();
+            // EOSE ends the kind-5 backfill: settle the marker, or page down
+            // when a marked filter hit the row cap (see `deletion_sync`). A
+            // sync cut off before it settles writes nothing.
+            let now = deletion_sync::now_secs();
+            let action = deletion_progress
+                .try_update_value(|p| p.on_main_eose(now))
+                .unwrap_or(deletion_sync::EoseAction::Ignore);
+            deletion_sync::drive(
+                &relay_for_eose,
+                DeletionScope::Channels,
+                deletion_progress,
+                on_kind5.clone(),
+                action,
+            );
         });
 
         // kind-40 = channel creation, kind-41 = metadata edit (rename),
         // kind-5 = post deletion (NIP-09). Separate filters: see
         // `channel_sync_filters`.
-        let id = relay.subscribe_with_receipt(channel_sync_filters(), on_event, on_eose);
+        let since = deletion_progress.with_value(|p| p.state.since);
+        let id = relay.subscribe_with_receipt(channel_sync_filters(since), on_event, on_eose);
         self.sub_id.set(Some(id));
 
         // Loading timeout fallback
@@ -410,7 +570,6 @@ impl ChannelStore {
         let channels_sig = self.channels;
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
-        let tombstones = self.tombstones;
         let store = *self;
         let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
 
@@ -418,7 +577,7 @@ impl ChannelStore {
             // Suppress a message that was already deleted — a kind-5 can land
             // before its target kind-42 in the same backfill (arrival order is
             // not guaranteed), so the tombstone is the durable gate.
-            if tombstones.with_untracked(|t| !admits_message(t, &event.id)) {
+            if !store.admits_message(zone_keys, &event) {
                 return;
             }
 
@@ -458,8 +617,9 @@ impl ChannelStore {
                 // event id is the ONLY counter — ADR-091. Last-active only
                 // advances when a genuinely new event is appended.
                 // A restored sealed original carries the original id, which
-                // a kind-5 may have tombstoned (ADR-2017).
-                if tombstones.with_untracked(|t| !admits_message(t, &event.id)) {
+                // a kind-5 may have tombstoned (ADR-2017); only its author
+                // or a relay-vouched admin may hide it.
+                if !store.admits_message(zone_keys, &event) {
                     return;
                 }
                 let mut newly_added = false;
@@ -549,7 +709,7 @@ impl ChannelStore {
 
         let last_active = self.last_active;
         let channel_msgs = self.channel_messages;
-        let tombstones = self.tombstones;
+        let store = *self;
         let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
 
         let on_event = Rc::new(move |event: NostrEvent| {
@@ -557,7 +717,7 @@ impl ChannelStore {
                 return;
             }
             // Skip messages already deleted via kind-5 (see `start_msg_sync`).
-            if tombstones.with_untracked(|t| !admits_message(t, &event.id)) {
+            if !store.admits_message(zone_keys, &event) {
                 return;
             }
             // Re-resolve here as well in case channel metadata arrived after
@@ -574,7 +734,7 @@ impl ChannelStore {
             };
             let event = crate::zone_crypto::store::prepare_incoming(zone_keys, event);
             // A restored sealed original carries the original id (ADR-2017).
-            if tombstones.with_untracked(|t| !admits_message(t, &event.id)) {
+            if !store.admits_message(zone_keys, &event) {
                 return;
             }
             let mut newly_added = false;
@@ -805,6 +965,32 @@ pub const RELAY_FILTER_LIMIT: u64 = 1000;
 /// Filters the relay accepts in one REQ (`MAX_FILTERS` in the relay worker).
 pub const RELAY_MAX_FILTERS: usize = 10;
 
+/// The kind-5 filter shared by the channel and reaction subscriptions.
+///
+/// `since` is the device's marker from [`deletion_sync`]; `None` (no completed
+/// sync yet) takes the newest [`RELAY_FILTER_LIMIT`] deletions. The limit
+/// stays either way: should more than that many deletions fall after the
+/// marker, the relay returns the same newest rows an unmarked sync would.
+fn deletion_filter(since: Option<u64>) -> Filter {
+    Filter {
+        kinds: Some(vec![5]),
+        since,
+        limit: Some(RELAY_FILTER_LIMIT),
+        ..Default::default()
+    }
+}
+
+/// One page of the kind-5 filter, for a marked sync that hit the row cap:
+/// `until` is the oldest `created_at` delivered so far, inclusive, so rows
+/// sharing that timestamp are not skipped (re-deliveries are idempotent).
+/// See [`deletion_sync`].
+pub fn deletion_page_filter(since: Option<u64>, until: u64) -> Filter {
+    Filter {
+        until: Some(until),
+        ..deletion_filter(since)
+    }
+}
+
 /// Filters for the channel-list subscription.
 ///
 /// The relay returns the newest `limit` rows of a filter across every kind in
@@ -813,36 +999,33 @@ pub const RELAY_MAX_FILTERS: usize = 10;
 /// returns only deletions: once there were more than 500 of them, a device
 /// with no cached channel list saw no sections at all. Each set gets its own
 /// filter, channels first, so deletions can never displace a channel.
-pub fn channel_sync_filters() -> Vec<Filter> {
+///
+/// Only the deletion filter takes `deletions_since`: the channel definitions
+/// are fetched in full every session, because the EOSE handler prunes cached
+/// channels the relay did not return.
+pub fn channel_sync_filters(deletions_since: Option<u64>) -> Vec<Filter> {
     vec![
         Filter {
             kinds: Some(vec![40, 41]),
             limit: Some(RELAY_FILTER_LIMIT),
             ..Default::default()
         },
-        Filter {
-            kinds: Some(vec![5]),
-            limit: Some(RELAY_FILTER_LIMIT),
-            ..Default::default()
-        },
+        deletion_filter(deletions_since),
     ]
 }
 
 /// Filters for the reaction subscription: kind-7 reactions and kind-5
 /// deletions as separate filters, for the reason given in
-/// [`channel_sync_filters`].
-pub fn reaction_sync_filters() -> Vec<Filter> {
+/// [`channel_sync_filters`]. Reactions are not cached between sessions, so
+/// they are fetched in full; only the deletion filter takes `deletions_since`.
+pub fn reaction_sync_filters(deletions_since: Option<u64>) -> Vec<Filter> {
     vec![
         Filter {
             kinds: Some(vec![7]),
             limit: Some(RELAY_FILTER_LIMIT),
             ..Default::default()
         },
-        Filter {
-            kinds: Some(vec![5]),
-            limit: Some(RELAY_FILTER_LIMIT),
-            ..Default::default()
-        },
+        deletion_filter(deletions_since),
     ]
 }
 
@@ -915,57 +1098,6 @@ pub fn deletion_targets(event: &NostrEvent) -> Vec<String> {
         .collect()
 }
 
-/// Fold deleted ids into the message store: record each as a tombstone and drop
-/// any matching event from every channel. Returns `true` when at least one
-/// stored message was removed.
-///
-/// The tombstone set is what makes deletion arrival-order independent: a kind-5
-/// landing BEFORE its target (same EOSE backfill or live) records the id, and
-/// the kind-42 handlers consult [`is_tombstoned`] before inserting, so the post
-/// never reappears; a kind-5 landing AFTER removes the already-stored copy here.
-///
-/// TRUST MODEL: identical to the kind-41 fold — the relay gates WHO may delete
-/// (own events always; others' events admin/TL3+, enforced by the relay's kind-5
-/// gate), so the client folds any stored/broadcast kind-5 unconditionally with
-/// no author check; re-checking here would duplicate — and could disagree with —
-/// the server's authority.
-pub fn fold_deletions(
-    channel_messages: &mut HashMap<String, Vec<NostrEvent>>,
-    tombstones: &mut HashSet<String>,
-    deleted: &[String],
-) -> bool {
-    let mut removed = false;
-    for id in deleted {
-        tombstones.insert(id.clone());
-        for events in channel_messages.values_mut() {
-            let before = events.len();
-            events.retain(|e| e.id.to_lowercase() != *id);
-            if events.len() != before {
-                removed = true;
-            }
-        }
-    }
-    removed
-}
-
-/// Whether `id` (any casing) has been deleted (tombstoned).
-pub fn is_tombstoned(tombstones: &HashSet<String>, id: &str) -> bool {
-    tombstones.contains(&id.to_lowercase())
-}
-
-/// Whether a kind-42 delivery may be inserted into `channel_messages`.
-///
-/// ADR-092 closeout: this is the SINGLE admission predicate, shared by every
-/// insertion path — the broad kind-42 subscription, the per-channel
-/// `ensure_subscribed` query and the deep-link replay in
-/// [`crate::pages::ChannelPage`] (through
-/// [`ChannelStore::is_message_deleted`]). Deletion semantics that live at only
-/// some of the entry points are deletion semantics that a deep link can walk
-/// around, which is exactly the defect this closes.
-pub fn admits_message(tombstones: &HashSet<String>, event_id: &str) -> bool {
-    !is_tombstoned(tombstones, event_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,33 +1128,80 @@ mod tests {
         }
     }
 
+    const MARKER: u64 = 1_790_000_000;
+
     #[test]
     fn channel_definitions_never_share_a_filter_with_deletions() {
-        let f = channel_sync_filters();
-        assert_isolated_and_limited(&f);
-        assert_eq!(kinds(&f[0]), vec![40, 41], "channels come first");
-        assert!(
-            f.iter().any(|x| kinds(x) == vec![5]),
-            "deletions still synced"
-        );
+        for since in [None, Some(MARKER)] {
+            let f = channel_sync_filters(since);
+            assert_isolated_and_limited(&f);
+            assert_eq!(kinds(&f[0]), vec![40, 41], "channels come first");
+            assert!(
+                f.iter().any(|x| kinds(x) == vec![5]),
+                "deletions still synced"
+            );
+        }
     }
 
     #[test]
     fn reactions_never_share_a_filter_with_deletions() {
-        let f = reaction_sync_filters();
-        assert_isolated_and_limited(&f);
-        assert!(f.iter().any(|x| kinds(x) == vec![7]));
-        assert!(f.iter().any(|x| kinds(x) == vec![5]));
+        for since in [None, Some(MARKER)] {
+            let f = reaction_sync_filters(since);
+            assert_isolated_and_limited(&f);
+            assert!(f.iter().any(|x| kinds(x) == vec![7]));
+            assert!(f.iter().any(|x| kinds(x) == vec![5]));
+        }
+    }
+
+    /// The marker narrows the deletion filter only: channel definitions and
+    /// reactions are always fetched in full.
+    #[test]
+    fn only_the_deletion_filters_carry_the_marker() {
+        for f in channel_sync_filters(Some(MARKER))
+            .into_iter()
+            .chain(reaction_sync_filters(Some(MARKER)))
+        {
+            let expected = (kinds(&f) == vec![5]).then_some(MARKER);
+            assert_eq!(f.since, expected, "filter {:?}", kinds(&f));
+            assert_eq!(f.until, None);
+        }
+    }
+
+    #[test]
+    fn a_deletion_page_is_isolated_limited_and_bounded_above() {
+        let f = deletion_page_filter(Some(MARKER), MARKER + 99);
+        assert_isolated_and_limited(std::slice::from_ref(&f));
+        assert_eq!(kinds(&f), vec![5]);
+        assert_eq!(f.since, Some(MARKER));
+        assert_eq!(f.until, Some(MARKER + 99));
+    }
+
+    #[test]
+    fn without_a_marker_no_filter_has_since() {
+        for f in channel_sync_filters(None)
+            .into_iter()
+            .chain(reaction_sync_filters(None))
+        {
+            assert_eq!(f.since, None, "filter {:?}", kinds(&f));
+        }
     }
 
     #[test]
     fn the_channel_filter_serialises_with_its_own_limit() {
-        let json = serde_json::to_value(channel_sync_filters()).unwrap();
+        let json = serde_json::to_value(channel_sync_filters(None)).unwrap();
         assert_eq!(
             json,
             serde_json::json!([
                 {"kinds": [40, 41], "limit": RELAY_FILTER_LIMIT},
                 {"kinds": [5], "limit": RELAY_FILTER_LIMIT}
+            ])
+        );
+        let json = serde_json::to_value(channel_sync_filters(Some(MARKER))).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"kinds": [40, 41], "limit": RELAY_FILTER_LIMIT},
+                {"kinds": [5], "since": MARKER, "limit": RELAY_FILTER_LIMIT}
             ])
         );
     }
@@ -1311,6 +1490,24 @@ mod tests {
     }
 
     // -- kind-5 deletion folding --------------------------------------------
+    //
+    // The authorisation rules live in `stores::tombstones` and are tested
+    // there; these cover the target extraction and the ordinary-post path.
+
+    fn fold(
+        msgs: &mut HashMap<String, Vec<NostrEvent>>,
+        t: &mut Tombstones,
+        del: &NostrEvent,
+    ) -> bool {
+        tombstones::fold_deletion(
+            msgs,
+            t,
+            &del.pubkey,
+            &deletion_targets(del),
+            |_| false,
+            |_| false,
+        )
+    }
 
     #[test]
     fn kind5_removes_target_message() {
@@ -1319,15 +1516,14 @@ mod tests {
         let tid = target.id.clone();
         let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
         msgs.insert("chan".into(), vec![target, keep]);
-        let mut tomb = HashSet::new();
+        let mut tomb = Tombstones::default();
 
         let del = ev(5, 300, &[&["e", tid.as_str()]], "");
-        let targets = deletion_targets(&del);
-        assert_eq!(targets, vec![tid.to_lowercase()]);
-        assert!(fold_deletions(&mut msgs, &mut tomb, &targets));
+        assert_eq!(deletion_targets(&del), vec![tid.to_lowercase()]);
+        assert!(fold(&mut msgs, &mut tomb, &del));
         assert_eq!(msgs["chan"].len(), 1);
         assert_eq!(msgs["chan"][0].content, "keep me");
-        assert!(is_tombstoned(&tomb, &tid));
+        assert!(tomb.names(&tid));
     }
 
     #[test]
@@ -1337,15 +1533,13 @@ mod tests {
         let late = ev(42, 100, &[&["e", "chan", "", "root"]], "arrives late");
         let lid = late.id.clone();
         let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
-        let mut tomb = HashSet::new();
+        let mut tomb = Tombstones::default();
 
         let del = ev(5, 90, &[&["e", lid.as_str()]], "");
-        assert!(!fold_deletions(
-            &mut msgs,
-            &mut tomb,
-            &deletion_targets(&del)
-        ));
-        assert!(is_tombstoned(&tomb, &lid));
+        assert!(!fold(&mut msgs, &mut tomb, &del));
+        assert!(!tombstones::admits(&tomb, &lid, Target::Ordinary, |_| {
+            false
+        }));
     }
 
     #[test]
@@ -1356,46 +1550,30 @@ mod tests {
         let keep = ev(42, 100, &[&["e", "chan", "", "root"]], "keep");
         let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
         msgs.insert("chan".into(), vec![keep]);
-        let mut tomb = HashSet::new();
-        assert!(!fold_deletions(
-            &mut msgs,
-            &mut tomb,
-            &deletion_targets(&del)
-        ));
+        let mut tomb = Tombstones::default();
+        assert!(!fold(&mut msgs, &mut tomb, &del));
         assert_eq!(msgs["chan"].len(), 1);
-        assert!(tomb.is_empty());
+        assert_eq!(tomb, Tombstones::default());
     }
 
     #[test]
-    fn admission_predicate_gates_every_insertion_path() {
+    fn kind5_targets_are_lowercased_for_a_casing_proof_gate() {
+        let del = ev(5, 100, &[&["e", "DEADBEEF"]], "");
         let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
-        let mut tombs: HashSet<String> = HashSet::new();
-        fold_deletions(&mut msgs, &mut tombs, &["DEADBEEF".to_lowercase()]);
-
-        // Every path — broad subscription, ensure_subscribed, deep-link replay
-        // — asks this one question before inserting.
-        assert!(!admits_message(&tombs, "deadbeef"));
-        assert!(
-            !admits_message(&tombs, "DEADBEEF"),
-            "casing bypassed the gate"
-        );
-        assert!(!admits_message(&tombs, "DeAdBeEf"));
-        assert!(admits_message(&tombs, "cafebabe"));
-    }
-
-    #[test]
-    fn admission_predicate_is_the_inverse_of_the_tombstone_test() {
-        let mut tombs: HashSet<String> = HashSet::new();
-        tombs.insert("abc".to_string());
-        for id in ["abc", "ABC", "def", ""] {
-            assert_eq!(admits_message(&tombs, id), !is_tombstoned(&tombs, id));
+        let mut tomb = Tombstones::default();
+        fold(&mut msgs, &mut tomb, &del);
+        for id in ["deadbeef", "DEADBEEF", "DeAdBeEf"] {
+            assert!(
+                !tombstones::admits(&tomb, id, Target::Ordinary, |_| false),
+                "casing bypassed the gate"
+            );
         }
-    }
-
-    #[test]
-    fn no_tombstones_admits_everything() {
-        let tombs: HashSet<String> = HashSet::new();
-        assert!(admits_message(&tombs, "anything"));
+        assert!(tombstones::admits(
+            &tomb,
+            "cafebabe",
+            Target::Ordinary,
+            |_| false
+        ));
     }
 
     #[test]
@@ -1403,16 +1581,12 @@ mod tests {
         let keep = ev(42, 100, &[&["e", "chan", "", "root"]], "keep");
         let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
         msgs.insert("chan".into(), vec![keep]);
-        let mut tomb = HashSet::new();
+        let mut tomb = Tombstones::default();
 
         let del = ev(5, 200, &[&["e", "nonexistent-id"]], "");
-        assert!(!fold_deletions(
-            &mut msgs,
-            &mut tomb,
-            &deletion_targets(&del)
-        ));
+        assert!(!fold(&mut msgs, &mut tomb, &del));
         assert_eq!(msgs["chan"].len(), 1);
         // Still recorded, so a message with that id could never appear later.
-        assert!(is_tombstoned(&tomb, "nonexistent-id"));
+        assert!(tomb.names("nonexistent-id"));
     }
 }

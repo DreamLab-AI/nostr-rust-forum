@@ -79,14 +79,14 @@ impl ReadCache {
     /// event; if that original's id is already in the same list (a copy
     /// fetched before the plaintext was purged, or a second envelope of the
     /// same original), the placeholder is dropped rather than duplicated. A
-    /// restored original whose id `admits` refuses (a NIP-09 tombstone for
-    /// the original id) is dropped too, the same gate every insertion path
+    /// restored original that `admits` refuses (a NIP-09 tombstone for the
+    /// original id from its author or an admin) is dropped too, the same gate every insertion path
     /// applies. Returns whether any list changed length or content.
     pub fn redecrypt(
         &mut self,
         messages: &mut HashMap<String, Vec<NostrEvent>>,
         lookup: impl Fn(&str, u32) -> Option<ZoneKey>,
-        admits: impl Fn(&str) -> bool,
+        admits: impl Fn(&NostrEvent) -> bool,
     ) -> bool {
         let mut changed = false;
         for events in messages.values_mut() {
@@ -142,7 +142,7 @@ impl ReadCache {
             let mut seen: HashSet<String> = HashSet::with_capacity(events.len());
             let before = events.len();
             events.retain(|e| {
-                (!restored_now.contains(&e.id) || admits(&e.id)) && seen.insert(e.id.clone())
+                (!restored_now.contains(&e.id) || admits(e)) && seen.insert(e.id.clone())
             });
             changed |= events.len() != before;
         }
@@ -435,8 +435,42 @@ mod tests {
         let mut cache = ReadCache::default();
         let mut msgs = one_channel(vec![cache.prepare(&env, no_key)]);
         let deleted = orig.id.clone();
-        assert!(cache.redecrypt(&mut msgs, with_key, |id| id != deleted));
+        assert!(cache.redecrypt(&mut msgs, with_key, |e: &NostrEvent| e.id != deleted));
         assert!(msgs[&channel()].is_empty());
+    }
+
+    /// The sealed-original rule hangs on the read path recording which
+    /// envelope an original came from: `envelope_of` must be set once it
+    /// opens, by `prepare` and by the in-place restore, and the restore must
+    /// then honour only the inner author's tombstone, not another member's.
+    #[test]
+    fn a_restored_original_is_hidden_only_by_its_authors_tombstone() {
+        use crate::stores::tombstones::{admits, Target, Tombstones};
+        let mallory = "d".repeat(64);
+
+        let orig = original(200, "mine to delete");
+        let env = seal(&orig);
+
+        // Opened at once by `prepare`.
+        let mut cache = ReadCache::default();
+        let restored = cache.prepare(&env, with_key);
+        assert_eq!(restored.id, orig.id);
+        assert_eq!(restored.pubkey, orig.pubkey, "author is the inner author");
+        assert_eq!(cache.envelope_of(&orig.id), Some(env.id.as_str()));
+
+        // Opened later, in place, after a key arrives.
+        for (deleter, kept) in [(mallory, true), (orig.pubkey.clone(), false)] {
+            let mut t = Tombstones::default();
+            t.record(&orig.id, &deleter);
+            let mut cache = ReadCache::default();
+            let mut msgs = one_channel(vec![cache.prepare(&env, no_key)]);
+            assert!(cache.envelope_of(&orig.id).is_none(), "not opened yet");
+            cache.redecrypt(&mut msgs, with_key, |e: &NostrEvent| {
+                admits(&t, &e.id, Target::of(e, true), |_| false)
+            });
+            assert_eq!(cache.envelope_of(&orig.id), Some(env.id.as_str()));
+            assert_eq!(!msgs[&channel()].is_empty(), kept, "deleter {deleter}");
+        }
     }
 
     #[test]
