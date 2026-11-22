@@ -44,6 +44,15 @@ const MAX_TAG_VALUE_SIZE: usize = 1024;
 const MAX_TIMESTAMP_DRIFT: u64 = 60 * 60 * 24 * 7;
 const MAX_SUBSCRIPTIONS: usize = 20;
 
+/// Whether a REQ must be refused for the per-session subscription cap. A REQ
+/// reusing an id the session already holds REPLACES that subscription
+/// (NIP-01), so the count does not grow and it must not be refused: a client
+/// replaying its subscriptions after NIP-42 AUTH re-sends every id it holds,
+/// and at a full session that replay was refused wholesale.
+fn subscription_cap_reached(held: usize, replaces_existing: bool) -> bool {
+    !replaces_existing && held >= MAX_SUBSCRIPTIONS
+}
+
 /// NIP-59: gift-wrap event kind. Signed by a fresh ephemeral key per message;
 /// recipient-gated via the first `["p", <hex>]` tag rather than the author.
 const GIFT_WRAP_KIND: u64 = 1059;
@@ -1850,7 +1859,10 @@ impl NostrRelayDO {
         {
             let sessions = self.sessions.borrow();
             if let Some(session) = sessions.get(&session_id) {
-                if session.subscriptions.len() >= MAX_SUBSCRIPTIONS {
+                if subscription_cap_reached(
+                    session.subscriptions.len(),
+                    session.subscriptions.contains_key(sub_id),
+                ) {
                     Self::send_notice(&ws, "too many subscriptions");
                     return;
                 }
@@ -7642,6 +7654,27 @@ mod recipient_key_read_tests {
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 1, "the wrap to another member survives");
+    }
+}
+
+#[cfg(test)]
+mod subscription_cap_tests {
+    use super::*;
+
+    #[test]
+    fn new_id_below_the_cap_is_admitted() {
+        assert!(!subscription_cap_reached(MAX_SUBSCRIPTIONS - 1, false));
+    }
+
+    #[test]
+    fn new_id_at_the_cap_is_refused() {
+        assert!(subscription_cap_reached(MAX_SUBSCRIPTIONS, false));
+    }
+
+    /// The post-AUTH replay at a full session: every REQ reuses a held id.
+    #[test]
+    fn replacing_a_held_id_at_the_cap_is_admitted() {
+        assert!(!subscription_cap_reached(MAX_SUBSCRIPTIONS, true));
     }
 }
 
