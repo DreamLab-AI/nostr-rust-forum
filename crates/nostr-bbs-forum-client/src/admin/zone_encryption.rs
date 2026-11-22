@@ -205,7 +205,16 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         let ready = channels.msg_eose_received.get() && keys.hydrated.get();
         crate::zone_crypto::keyset::plan_mint(latest().map(|k| k.epoch), &seen, ready)
     };
-    let mint_waiting = move || mint_plan() == crate::zone_crypto::keyset::MintPlan::Wait;
+    let mint_waiting = move || {
+        !matches!(
+            mint_plan(),
+            crate::zone_crypto::keyset::MintPlan::Mint { .. }
+        )
+    };
+    let mint_epoch = move || match mint_plan() {
+        crate::zone_crypto::keyset::MintPlan::Mint { epoch, .. } => epoch.to_string(),
+        _ => "…".into(),
+    };
     let zone_conflicts = move || {
         let zone_id = zone.with_value(|z| z.id.clone());
         keys.conflicts.with(|v| {
@@ -407,7 +416,9 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                 epoch: next_epoch, ..
             } = mint_plan()
             else {
-                status.set(Some("Waiting for keys and messages to load.".into()));
+                status.set(Some(
+                    "A key cannot be created yet: see the note on this card.".into(),
+                ));
                 return;
             };
             if rotate {
@@ -429,7 +440,9 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             fresh_roster(Box::new(move || {
                 // Re-plan after the roster round trip: a key may have arrived.
                 let crate::zone_crypto::keyset::MintPlan::Mint { epoch, .. } = mint_plan() else {
-                    status.set(Some("Waiting for keys and messages to load.".into()));
+                    status.set(Some(
+                        "A key cannot be created yet: see the note on this card.".into(),
+                    ));
                     return;
                 };
                 if epoch != next_epoch {
@@ -495,7 +508,7 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
                             class="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-900 text-sm font-semibold disabled:opacity-50"
                             disabled=move || busy.get() || !members_ready.get() || mint_waiting()
                             on:click=move |_| create_or_rotate.with_value(|f| f(false))
-                        >"Create key (epoch 1)"</button>
+                        >{move || format!("Create key (epoch {})", mint_epoch())}</button>
                     })}
                     {move || latest().map(|_| {
                         view! {
@@ -544,7 +557,8 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
             })}
 
             {move || match mint_plan() {
-                crate::zone_crypto::keyset::MintPlan::Mint { note: Some(note), .. } => Some(view! {
+                crate::zone_crypto::keyset::MintPlan::Mint { note: Some(note), .. }
+                | crate::zone_crypto::keyset::MintPlan::Blocked(note) => Some(view! {
                     <p class="text-xs text-amber-300">{note}</p>
                 }),
                 _ => None,

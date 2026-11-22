@@ -130,6 +130,9 @@ pub enum MintPlan {
     /// The message sync has not finished: a cold device has seen no posts and
     /// could otherwise mint an epoch number already in use.
     Wait,
+    /// Refused, with the reason: this device holds no key for the zone while
+    /// its posts use an epoch too far ahead to place a new key safely.
+    Blocked(String),
     /// Mint `epoch`; `note` explains a choice the admin should know about.
     Mint { epoch: u32, note: Option<String> },
 }
@@ -157,6 +160,19 @@ pub fn plan_mint(held_latest: Option<u32>, seen: &[(u32, String)], synced: bool)
         .iter()
         .filter(|(e, _)| *e >= ceiling)
         .max_by_key(|(e, _)| *e);
+    // A device with no key for the zone and only far-ahead epochs in sight
+    // cannot tell a forgery from a zone that has rotated many times: minting
+    // epoch 1 there could clash with the zone's real epoch 1.
+    if held_latest.is_none() && in_use.is_none() {
+        if let Some((e, ev)) = ignored {
+            return MintPlan::Blocked(format!(
+                "This device holds no key for this zone, and post {}… names key epoch {e}. \
+                 Create or rotate from a device that holds the zone's keys, or have its admin grant them to you. \
+                 If the zone has never had a key, that post is not genuine: delete it, then reload.",
+                ev.get(..12).unwrap_or(ev)
+            ));
+        }
+    }
     let mut notes = Vec::new();
     let epoch = match in_use {
         Some(max) if max >= base => {
@@ -254,6 +270,25 @@ mod tests {
             }
             p => panic!("{p:?}"),
         }
+    }
+
+    #[test]
+    fn a_keyless_device_never_mints_under_far_ahead_epochs() {
+        let seen = [(12, "farpostid0001".to_string())];
+        match plan_mint(None, &seen, true) {
+            MintPlan::Blocked(why) => assert!(why.contains("farpostid000"), "names the post"),
+            p => panic!("{p:?}"),
+        }
+        // With a believable epoch in view it mints above it, as before.
+        assert!(matches!(
+            plan_mint(None, &[(3, "e".to_string())], true),
+            MintPlan::Mint { epoch: 4, .. }
+        ));
+        // A device holding keys is never blocked by a far-ahead post.
+        assert!(matches!(
+            plan_mint(Some(2), &seen, true),
+            MintPlan::Mint { epoch: 3, .. }
+        ));
     }
 
     #[test]
