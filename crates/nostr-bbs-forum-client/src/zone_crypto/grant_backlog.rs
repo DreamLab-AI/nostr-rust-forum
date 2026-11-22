@@ -57,6 +57,22 @@ pub enum KeyPhase {
     Stalled,
 }
 
+/// How processing one wrap ended, as far as retrying it matters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WrapOutcome {
+    /// Final: marked processed (a key stored, a refusal, not a grant).
+    Settled,
+    /// Cannot be read by this member (not addressed to a key held here, or
+    /// the signer cannot decrypt it). Left unmarked so a later session with
+    /// a capable signer may try, but it is not a failure worth holding the
+    /// backfill marker for: it would hold it forever.
+    Unreadable,
+    /// A transient failure (the sealer's admin check unanswered, the key not
+    /// persisted, ticket bindings not loaded). Left unmarked to be retried,
+    /// and the backfill must not be recorded complete over it.
+    Retry,
+}
+
 /// The inbox-key grant subscription's part in the backlog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InboxSub {
@@ -90,6 +106,8 @@ pub struct GrantBacklog {
     gave_up: bool,
     /// Reached settled once this sign-in; stays settled.
     latched: bool,
+    /// A wrap this sign-in ended in [`WrapOutcome::Retry`].
+    retry_failed: bool,
 }
 
 impl GrantBacklog {
@@ -108,6 +126,7 @@ impl GrantBacklog {
             last_progress_at: now,
             gave_up: false,
             latched: false,
+            retry_failed: false,
         }
     }
 
@@ -117,11 +136,24 @@ impl GrantBacklog {
         self.in_flight += 1;
     }
 
-    /// A wrap finished processing (whatever its outcome; a grant's key is
-    /// stored before this) at `now`.
-    pub fn wrap_done(&mut self, now: f64) {
+    /// A wrap finished processing at `now`, with `outcome` (a grant's key is
+    /// stored before this).
+    pub fn wrap_done(&mut self, now: f64, outcome: WrapOutcome) {
         self.in_flight = self.in_flight.saturating_sub(1);
+        if outcome == WrapOutcome::Retry {
+            self.retry_failed = true;
+        }
         self.advance(now);
+    }
+
+    /// Whether a scope that has paged to the end may record its backfill as
+    /// complete now: every wrap delivered this sign-in (queued ones
+    /// included) has finished, and none ended in a failure worth retrying.
+    /// Recording it earlier would let the next session's warm stop skip the
+    /// very wraps still processing or waiting for a retry, typically the
+    /// oldest, where grants live. An unreadable wrap does not hold it.
+    pub fn marker_writable(&self) -> bool {
+        self.in_flight == 0 && !self.retry_failed
     }
 
     /// The identity scope's last page reached EOSE at `now`: every stored
@@ -223,9 +255,9 @@ mod tests {
         b.wrap_started();
         b.identity_eose(1.0);
         assert!(!b.settled());
-        b.wrap_done(1.0);
+        b.wrap_done(1.0, WrapOutcome::Settled);
         assert!(!b.settled());
-        b.wrap_done(1.0);
+        b.wrap_done(1.0, WrapOutcome::Settled);
         assert!(b.settled());
     }
 
@@ -251,7 +283,7 @@ mod tests {
     #[test]
     fn spurious_done_does_not_underflow() {
         let mut b = GrantBacklog::new(false, 0.0);
-        b.wrap_done(1.0);
+        b.wrap_done(1.0, WrapOutcome::Settled);
         b.identity_eose(1.0);
         assert!(b.settled());
     }
@@ -268,7 +300,7 @@ mod tests {
         );
         // A wrap finishes at 15 s: the window restarts from there.
         b.wrap_started();
-        b.wrap_done(15_000.0);
+        b.wrap_done(15_000.0, WrapOutcome::Settled);
         assert_eq!(
             b.phase(30_000.0),
             KeyPhase::Progressing {
@@ -300,7 +332,7 @@ mod tests {
         while t < KEYS_CAP_MS {
             t += 5_000.0;
             b.wrap_started();
-            b.wrap_done(t);
+            b.wrap_done(t, WrapOutcome::Settled);
         }
         assert_eq!(b.phase(KEYS_CAP_MS), KeyPhase::Stalled);
         assert!(matches!(
@@ -327,7 +359,7 @@ mod tests {
             // One every ~3 s, the last at 75.9 s.
             t = 2_000.0 + f64::from(i + 1) * (73_900.0 / f64::from(wraps));
             assert!(matches!(b.phase(t), KeyPhase::Progressing { .. }), "{t}");
-            b.wrap_done(t);
+            b.wrap_done(t, WrapOutcome::Settled);
         }
         assert!((t - 75_900.0).abs() < 1e-6);
         assert_eq!(b.phase(t), KeyPhase::Settled);
@@ -350,7 +382,7 @@ mod tests {
         b.wrap_started();
         assert!(b.settled(), "a live wrap does not reopen it");
         assert_eq!(b.phase(10.0 * KEYS_CAP_MS), KeyPhase::Settled);
-        b.wrap_done(2_000.0);
+        b.wrap_done(2_000.0, WrapOutcome::Settled);
         assert!(b.settled());
     }
 
@@ -364,5 +396,41 @@ mod tests {
         b.identity_eose(2_000.0);
         assert!(!b.settled());
         assert_eq!(b.phase(2_001.0), KeyPhase::Stalled);
+    }
+
+    #[test]
+    fn marker_waits_for_every_wrap_to_finish() {
+        let mut b = GrantBacklog::new(false, 0.0);
+        b.wrap_started();
+        b.wrap_started();
+        b.identity_eose(1_000.0);
+        assert!(
+            !b.marker_writable(),
+            "the last page's wraps are still opening"
+        );
+        b.wrap_done(2_000.0, WrapOutcome::Settled);
+        assert!(!b.marker_writable());
+        b.wrap_done(3_000.0, WrapOutcome::Settled);
+        assert!(b.marker_writable());
+    }
+
+    /// A transient failure (admin check unanswered, key not persisted) leaves
+    /// no marker, so the next session pages fully and retries the wrap.
+    #[test]
+    fn a_transient_failure_withholds_the_marker() {
+        let mut b = GrantBacklog::new(false, 0.0);
+        b.wrap_started();
+        b.wrap_done(1_000.0, WrapOutcome::Retry);
+        b.identity_eose(2_000.0);
+        assert!(!b.marker_writable());
+    }
+
+    #[test]
+    fn an_unreadable_wrap_does_not_withhold_the_marker() {
+        let mut b = GrantBacklog::new(false, 0.0);
+        b.wrap_started();
+        b.wrap_done(1_000.0, WrapOutcome::Unreadable);
+        b.identity_eose(2_000.0);
+        assert!(b.marker_writable());
     }
 }
