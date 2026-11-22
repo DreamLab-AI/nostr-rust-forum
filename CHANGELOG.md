@@ -7,6 +7,31 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.20] — 2026-11-22
+
+`nostr-bbs-core`, `nostr-bbs-config`, `nostr-bbs-mesh` and `nostr-bbs-rate-limit` are published together at
+1.0.0-beta.20, in lockstep. Core, config and mesh changed since 1.0.0-beta.19; rate-limit has no source change and
+moves with them so the four stay one version. Core's own changes are itemised in `crates/nostr-bbs-core/CHANGELOG.md`.
+The application crates (workers, forum and BBS clients) are not published; deployments build them from source.
+
+### Forum client and dependencies since the upgrade merge (2026-11-21 to 2026-11-22)
+
+- **Subscription caps** (#81): channel definitions, deletions, reactions and per-zone messages each get their own
+  filter with an explicit limit. One `[5, 40, 41]` filter with the relay's default limit of 500 returned only
+  deletions once they passed 500, so a device with no cached channel list saw no sections.
+- **Add User sends zone keys** (#82): the whitelist form calls the same allocation grant as the cohort editor.
+- **Rotated keys wait for delivery** (#83): a created or rotated zone key is not sent under until the relay has
+  accepted every grant of it, the admin's own included.
+- **No second key for an epoch in use** (#84, #87): receivers refuse a different key for a held `(zone, epoch)`,
+  read and written in one IndexedDB transaction, and memory adopts what storage holds; a device behind the zone
+  mints above the highest believable epoch its posts carry, a forged far-ahead epoch is named and ignored, and a
+  device with no key for the zone refuses to mint under only far-ahead epochs.
+- **solid-pod-rs 0.5.0-alpha.24** (#85): WAC, JSON-LD and conformance fixes. A differential over every ACL document
+  the pod worker writes found no changed access decision (744 cases).
+- **url 2.5.9** (#86) for RUSTSEC-2026-0592; RUSTSEC-2026-0543 (`chrono` unmaintained, via solid-pod-rs) recorded
+  as a reviewed exception.
+
+
 ### Merged from `feat/upgrade-phase-0-1` (ADR-2014 integration, 2026-11-16)
 
 Core, config, mesh and rate-limit stay at their released 1.0.0-beta.19 / beta.16 versions on this branch; the branch's own unreleased core "beta.19/beta.20" entries are folded into core's `[Unreleased]` section, because main already published a different beta.19. The inbox-key attestation fix (`2047c1b`) is now present with the feature it fixes.
