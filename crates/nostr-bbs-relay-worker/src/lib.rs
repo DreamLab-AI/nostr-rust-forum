@@ -371,8 +371,9 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
     }
 
     // ADR-2017: silent delete of kind-42 rows by id (NIP-98 admin only). No
-    // kind-5 and no broadcast: a kind-5 would tombstone the id that a sealed
-    // original restores on every forum client. See `admin_events`.
+    // kind-5 and no broadcast: clients fold a kind-5 into their own tombstones,
+    // hiding the id that a sealed original restores. The relay's D1 tombstone
+    // is recorded (it is never served to clients). See `admin_events`.
     if path == "/api/admin/events/delete" && method == Method::Post {
         return admin_events::handle_delete_events(req, env).await;
     }
@@ -785,6 +786,66 @@ pub const IS_DELETED_ADDRESSABLE_SQL: &str = "SELECT \
     OR EXISTS (SELECT 1 FROM deleted_addresses WHERE kind = ?3 AND pubkey = ?2 AND d_tag = ?4 AND deleted_until >= ?5) \
     AS deleted";
 
+// Tombstones taken from the stored rows themselves, for moderator and admin
+// deletions of someone else's events: report resolution, the ADR-2017 purge, a
+// user purge, and a moderator's kind-5 in `process_deletion`; an author's own
+// kind-5 there takes the address statement scoped to the signer.
+// Reading the author from the row inside the INSERT means the tombstone names
+// the event's real author by construction, with no gap between read and write;
+// an absent row records nothing. They must run before the row's DELETE.
+// `deleted_until` is the deleted version's own `created_at`, clamped to now: an
+// older signed version cannot come back as the current one, while the author's
+// next version (newer by definition) is accepted. A plain replaceable kind (0,
+// 3, 10000-19999) is replaced on `(kind, author)` alone, so its address is keyed
+// with an empty d-tag whatever `d` tag the event carried ([`address_d_tag`]).
+
+/// Tombstone the stored event `?1` under its own author (`?2` deletion time).
+/// Only a well-formed id (64 lowercase hex) is recorded.
+pub const TOMBSTONE_EVENT_ROW_SQL: &str =
+    "INSERT OR IGNORE INTO deleted_events (id, pubkey, deleted_at) \
+    SELECT id, pubkey, ?2 FROM events \
+    WHERE id = ?1 AND length(id) = 64 AND id NOT GLOB '*[^0-9a-f]*'";
+
+/// Address tombstone for the stored event `?1` when it is a (parameterised)
+/// replaceable kind (`?2` now, the clamp). Regular kinds record nothing.
+pub const TOMBSTONE_EVENT_ROW_ADDRESS_SQL: &str =
+    "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
+    SELECT kind, pubkey, CASE WHEN kind >= 30000 THEN d_tag ELSE '' END, MIN(created_at, ?2) FROM events \
+    WHERE id = ?1 \
+      AND (kind IN (0, 3) OR kind BETWEEN 10000 AND 19999 OR kind BETWEEN 30000 AND 39999) \
+    ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
+    WHERE excluded.deleted_until > deleted_addresses.deleted_until";
+
+/// [`TOMBSTONE_EVENT_ROW_ADDRESS_SQL`] for an author deleting their own event
+/// (`?3` the signer): a row by anyone else records nothing, so a member's
+/// kind-5 naming another author's replaceable event cannot tombstone its
+/// address.
+pub const TOMBSTONE_OWN_EVENT_ROW_ADDRESS_SQL: &str =
+    "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
+    SELECT kind, pubkey, CASE WHEN kind >= 30000 THEN d_tag ELSE '' END, MIN(created_at, ?2) FROM events \
+    WHERE id = ?1 AND pubkey = ?3 \
+      AND (kind IN (0, 3) OR kind BETWEEN 10000 AND 19999 OR kind BETWEEN 30000 AND 39999) \
+    ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
+    WHERE excluded.deleted_until > deleted_addresses.deleted_until";
+
+/// Tombstone every stored event by author `?1` (`?2` deletion time). Only
+/// well-formed ids are recorded.
+pub const TOMBSTONE_AUTHOR_ROWS_SQL: &str =
+    "INSERT OR IGNORE INTO deleted_events (id, pubkey, deleted_at) \
+    SELECT id, pubkey, ?2 FROM events \
+    WHERE pubkey = ?1 AND length(id) = 64 AND id NOT GLOB '*[^0-9a-f]*'";
+
+/// Address tombstones for every (parameterised) replaceable address author
+/// `?1` holds (`?2` now, the clamp), at the newest stored version of each.
+pub const TOMBSTONE_AUTHOR_ROWS_ADDRESS_SQL: &str =
+    "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
+    SELECT kind, pubkey, CASE WHEN kind >= 30000 THEN d_tag ELSE '' END AS addr_d, MIN(MAX(created_at), ?2) FROM events \
+    WHERE pubkey = ?1 \
+      AND (kind IN (0, 3) OR kind BETWEEN 10000 AND 19999 OR kind BETWEEN 30000 AND 39999) \
+    GROUP BY kind, pubkey, addr_d \
+    ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
+    WHERE excluded.deleted_until > deleted_addresses.deleted_until";
+
 /// Backfill event-id tombstones from stored kind-5s, for deletions honoured
 /// before the tombstone tables existed. Own-deletion semantics only (the
 /// kind-5's author): a moderator's past deletion of someone else's event left
@@ -798,12 +859,13 @@ pub const DELETED_EVENTS_BACKFILL_SQL: &str =
       AND json_extract(t.value, '$[1]') NOT GLOB '*[^0-9a-f]*'";
 
 /// Backfill address tombstones from stored kind-5s' `a` tags naming their own
-/// author, for (parameterised) replaceable kinds only. Idempotent (keeps the
-/// latest deletion time).
+/// author, for (parameterised) replaceable kinds only, with an empty d-tag for
+/// plain replaceable kinds. Idempotent (keeps the latest deletion time).
 pub const DELETED_ADDRESSES_BACKFILL_SQL: &str = "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
     SELECT CAST(substr(a, 1, instr(a, ':') - 1) AS INTEGER), \
            substr(rest, 1, instr(rest, ':') - 1), \
-           substr(rest, instr(rest, ':') + 1), \
+           CASE WHEN CAST(substr(a, 1, instr(a, ':') - 1) AS INTEGER) >= 30000 \
+                THEN substr(rest, instr(rest, ':') + 1) ELSE '' END, \
            MIN(created_at, CAST(strftime('%s', 'now') AS INTEGER)) \
     FROM (SELECT json_extract(t.value, '$[1]') AS a, \
                  substr(json_extract(t.value, '$[1]'), instr(json_extract(t.value, '$[1]'), ':') + 1) AS rest, \
@@ -818,6 +880,39 @@ pub const DELETED_ADDRESSES_BACKFILL_SQL: &str = "INSERT INTO deleted_addresses 
            OR CAST(substr(a, 1, instr(a, ':') - 1) AS INTEGER) BETWEEN 30000 AND 39999) \
     ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
     WHERE excluded.deleted_until > deleted_addresses.deleted_until";
+
+/// Re-key plain replaceable address tombstones recorded under a non-empty d-tag
+/// (before [`address_d_tag`] existed) onto the empty d-tag, keeping the latest
+/// deletion time. Run before [`DELETED_ADDRESSES_PRUNE_PLAIN_D_SQL`]; idempotent.
+pub const DELETED_ADDRESSES_REKEY_PLAIN_SQL: &str =
+    "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
+    SELECT kind, pubkey, '', MAX(deleted_until) FROM deleted_addresses \
+    WHERE kind < 30000 AND d_tag <> '' \
+    GROUP BY kind, pubkey \
+    ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
+    WHERE excluded.deleted_until > deleted_addresses.deleted_until";
+
+/// Drop the plain replaceable rows [`DELETED_ADDRESSES_REKEY_PLAIN_SQL`] has
+/// copied: no lookup reads them any more.
+pub const DELETED_ADDRESSES_PRUNE_PLAIN_D_SQL: &str =
+    "DELETE FROM deleted_addresses WHERE kind < 30000 AND d_tag <> ''";
+
+/// The d-tag an address tombstone is keyed on: the event's own `d` for a
+/// parameterised replaceable kind (30000-39999), empty for every other kind,
+/// because a plain replaceable event is replaced on `(kind, author)` alone and an
+/// old version carrying a different `d` tag must still be covered.
+pub fn address_d_tag(kind: u64, d_tag: &str) -> &str {
+    if (30_000..40_000).contains(&kind) {
+        d_tag
+    } else {
+        ""
+    }
+}
+
+/// `settings` key marking [`DELETED_ADDRESSES_REKEY_PLAIN_SQL`] done for this
+/// database. Separate from [`TOMBSTONE_BACKFILL_SETTING`], which deployed
+/// databases already carry.
+pub const PLAIN_ADDRESS_REKEY_SETTING: &str = "nip09_plain_addresses_rekeyed";
 
 /// `settings` key marking the tombstone backfill done for this database.
 pub const TOMBSTONE_BACKFILL_SETTING: &str = "nip09_tombstones_backfilled";
@@ -1260,7 +1355,61 @@ async fn ensure_schema(env: &Env) -> bool {
         let _ = db.prepare(stmt).run().await;
     }
     backfill_tombstones_once(&db).await;
+    rekey_plain_addresses_once(&db).await;
     ok
+}
+
+/// Whether the one-off `settings` marker `key` is already set. A failed read
+/// answers `true`, so a migration is skipped rather than run blind.
+async fn setting_marked(db: &worker::D1Database, key: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        #[allow(dead_code)]
+        value: String,
+    }
+    match db
+        .prepare("SELECT value FROM settings WHERE key = ?1 LIMIT 1")
+        .bind(&[key.into()])
+    {
+        Ok(s) => !matches!(s.first::<Row>(None).await, Ok(None)),
+        Err(_) => true,
+    }
+}
+
+/// Set the one-off `settings` marker `key`.
+async fn mark_setting(db: &worker::D1Database, key: &str) {
+    if let Ok(s) = db
+        .prepare("INSERT OR IGNORE INTO settings (key, value, type, category) VALUES (?1, '1', 'string', 'system')")
+        .bind(&[key.into()])
+    {
+        let _ = s.run().await;
+    }
+}
+
+/// Re-key plain replaceable address tombstones onto the empty d-tag, once per
+/// database: every write since keys them that way, so the scan is not worth
+/// repeating on each cold isolate. The prune runs only after the re-key has
+/// landed (or the rows would be lost), and the marker only after both.
+async fn rekey_plain_addresses_once(db: &worker::D1Database) {
+    if setting_marked(db, PLAIN_ADDRESS_REKEY_SETTING).await {
+        return;
+    }
+    for (what, sql) in [
+        (
+            "deleted_addresses re-key",
+            DELETED_ADDRESSES_REKEY_PLAIN_SQL,
+        ),
+        (
+            "deleted_addresses prune",
+            DELETED_ADDRESSES_PRUNE_PLAIN_D_SQL,
+        ),
+    ] {
+        if let Err(e) = db.prepare(sql).run().await {
+            console_error!("ensure_schema: {what} failed: {e}");
+            return;
+        }
+    }
+    mark_setting(db, PLAIN_ADDRESS_REKEY_SETTING).await;
 }
 
 /// Backfill NIP-09 tombstones from the kind-5s already stored, once per
@@ -1297,6 +1446,85 @@ async fn backfill_tombstones_once(db: &worker::D1Database) {
     {
         let _ = s.run().await;
     }
+}
+
+/// Stored rows a deletion route is about to remove.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TombstoneTarget<'a> {
+    /// One event, by id, of any kind.
+    Event(&'a str),
+    /// One event, by id, that the caller has already read as a regular kind:
+    /// it has no address, so only the id statement runs (one D1 query, not two,
+    /// which matters to a route deleting hundreds of ids per invocation).
+    RegularEvent(&'a str),
+    /// Every event by one author.
+    Author(&'a str),
+    /// The address of one event, by id, only if `author` wrote it: an
+    /// author's own kind-5, whose id tombstone the caller has already written
+    /// under the signer.
+    OwnEventAddress {
+        /// The event id.
+        id: &'a str,
+        /// The signer, who must be the stored row's author.
+        author: &'a str,
+    },
+}
+
+impl<'a> TombstoneTarget<'a> {
+    /// The statements for this target, the key they bind as `?1` (`?2` is the
+    /// deletion time), and the author they bind as `?3`, if any.
+    fn statements(&self) -> (&'a str, &'static [&'static str], Option<&'a str>) {
+        match *self {
+            TombstoneTarget::Event(id) => (
+                id,
+                &[TOMBSTONE_EVENT_ROW_SQL, TOMBSTONE_EVENT_ROW_ADDRESS_SQL],
+                None,
+            ),
+            TombstoneTarget::RegularEvent(id) => (id, &[TOMBSTONE_EVENT_ROW_SQL], None),
+            TombstoneTarget::Author(pubkey) => (
+                pubkey,
+                &[TOMBSTONE_AUTHOR_ROWS_SQL, TOMBSTONE_AUTHOR_ROWS_ADDRESS_SQL],
+                None,
+            ),
+            TombstoneTarget::OwnEventAddress { id, author } => {
+                (id, &[TOMBSTONE_OWN_EVENT_ROW_ADDRESS_SQL], Some(author))
+            }
+        }
+    }
+}
+
+/// Record NIP-09 tombstones for `target`'s stored rows, so deleted content
+/// cannot be published again. Call it before the DELETE (it
+/// reads the rows), and never in the same `batch` as the DELETE: D1 batches are
+/// transactional, and a failed tombstone must not undo the deletion.
+///
+/// Returns whether every statement ran. Callers report it but never act on it:
+/// the tombstone is a re-insert guard, so a failure must not block the deletion.
+pub(crate) async fn tombstone_before_delete(
+    db: &worker::D1Database,
+    target: TombstoneTarget<'_>,
+    now: u64,
+) -> bool {
+    let (key, statements, author) = target.statements();
+    let mut binds = vec![key.into(), wasm_bindgen::JsValue::from_f64(now as f64)];
+    binds.extend(author.map(wasm_bindgen::JsValue::from_str));
+    let mut all_ran = true;
+    for sql in statements {
+        let bound = db.prepare(*sql).bind(&binds);
+        match bound {
+            Ok(stmt) => {
+                if let Err(e) = stmt.run().await {
+                    console_error!("tombstone for {target:?} failed: {e}");
+                    all_ran = false;
+                }
+            }
+            Err(e) => {
+                console_error!("tombstone for {target:?} failed to bind: {e}");
+                all_ran = false;
+            }
+        }
+    }
+    all_ran
 }
 
 /// Check whether the request's Accept header includes `application/nostr+json`.
@@ -1698,6 +1926,354 @@ mod tombstone_tests {
             params![id, author, at, tags],
         )
         .unwrap();
+    }
+
+    fn store(c: &Connection, id: &str, author: &str, kind: i64, d: &str, at: i64) {
+        c.execute(
+            "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, d_tag) VALUES (?1, ?2, ?3, ?4, '[]', 'c', 's', ?5)",
+            params![id, author, at, kind, d],
+        )
+        .unwrap();
+    }
+
+    /// `deleted_events` rows as `(id, author, deleted_at)`.
+    type EventTombstones = Vec<(String, String, i64)>;
+    /// `deleted_addresses` rows as `(kind, author, d_tag, deleted_until)`.
+    type AddressTombstones = Vec<(i64, String, String, i64)>;
+
+    fn tombstone_rows(c: &Connection) -> (EventTombstones, AddressTombstones) {
+        let events = c
+            .prepare("SELECT id, pubkey, deleted_at FROM deleted_events ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let addresses = c
+            .prepare("SELECT kind, pubkey, d_tag, deleted_until FROM deleted_addresses ORDER BY kind, d_tag")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        (events, addresses)
+    }
+
+    /// What the deletion routes do: tombstone from the row, then delete it.
+    fn tombstone_then_delete(c: &Connection, target: TombstoneTarget<'_>, now: i64) {
+        let (key, statements, author) = target.statements();
+        for sql in statements {
+            match author {
+                Some(author) => c.execute(sql, params![key, now, author]),
+                None => c.execute(sql, params![key, now]),
+            }
+            .unwrap();
+        }
+        match target {
+            TombstoneTarget::Event(_) | TombstoneTarget::RegularEvent(_) => {
+                c.execute("DELETE FROM events WHERE id = ?1", params![key])
+            }
+            TombstoneTarget::Author(_) => {
+                c.execute("DELETE FROM events WHERE pubkey = ?1", params![key])
+            }
+            // The member's own DELETE is scoped to their pubkey, as in
+            // `process_deletion`.
+            TombstoneTarget::OwnEventAddress { id, author } => c.execute(
+                "DELETE FROM events WHERE id = ?1 AND pubkey = ?2",
+                params![id, author],
+            ),
+        }
+        .unwrap();
+    }
+
+    /// The ingest lookup as `is_deleted` binds it: the address d-tag, not the
+    /// event's raw `d`.
+    fn ingest_deleted(c: &Connection, id: &str, pk: &str, kind: u64, d: &str, at: i64) -> bool {
+        deleted(c, id, pk, kind as i64, address_d_tag(kind, d), at)
+    }
+
+    #[test]
+    fn the_address_d_tag_is_empty_below_the_parameterised_range() {
+        for kind in [0, 3, 10_002, 19_999, 1, 42, 29_999, 40_000] {
+            assert_eq!(address_d_tag(kind, "x"), "", "kind {kind}");
+        }
+        for kind in [30_000, 30_023, 39_999] {
+            assert_eq!(address_d_tag(kind, "x"), "x", "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn a_plain_replaceable_row_is_tombstoned_whatever_d_tag_it_carried() {
+        let c = db();
+        store(&c, ID1, A, 0, "stray", 500);
+        tombstone_then_delete(&c, TombstoneTarget::Event(ID1), 1_000);
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(addresses, vec![(0, A.to_string(), String::new(), 500)]);
+        let older = "2".repeat(64);
+        assert!(
+            ingest_deleted(&c, &older, A, 0, "", 400),
+            "an older version without a d tag"
+        );
+        assert!(
+            ingest_deleted(&c, &older, A, 0, "other", 400),
+            "an older version with a different d tag"
+        );
+        assert!(!ingest_deleted(&c, &older, A, 0, "other", 501));
+    }
+
+    #[test]
+    fn a_parameterised_replaceable_keeps_its_own_d_tag() {
+        let c = db();
+        store(&c, ID1, A, 30023, "post", 500);
+        tombstone_then_delete(&c, TombstoneTarget::Event(ID1), 1_000);
+        let older = "2".repeat(64);
+        assert!(ingest_deleted(&c, &older, A, 30023, "post", 400));
+        assert!(
+            !ingest_deleted(&c, &older, A, 30023, "other", 400),
+            "another address of the same kind is untouched"
+        );
+    }
+
+    #[test]
+    fn an_author_purge_folds_plain_replaceable_d_tags_into_one_address() {
+        let c = db();
+        store(&c, ID1, A, 10002, "", 100);
+        store(&c, &"2".repeat(64), A, 10002, "stray", 300);
+        tombstone_then_delete(&c, TombstoneTarget::Author(A), 1_000);
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(addresses, vec![(10002, A.to_string(), String::new(), 300)]);
+    }
+
+    #[test]
+    fn a_regular_event_target_runs_the_id_statement_only() {
+        let (key, statements, author) = TombstoneTarget::RegularEvent(ID1).statements();
+        assert_eq!(
+            (key, statements, author),
+            (ID1, &[TOMBSTONE_EVENT_ROW_SQL][..], None)
+        );
+        let c = db();
+        store(&c, ID1, B, 42, "", 50);
+        tombstone_then_delete(&c, TombstoneTarget::RegularEvent(ID1), 1_000);
+        assert_eq!(
+            tombstone_rows(&c),
+            (vec![(ID1.to_string(), B.to_string(), 1_000)], vec![])
+        );
+    }
+
+    #[test]
+    fn an_authors_own_deletion_tombstones_the_address_of_their_replaceable() {
+        let c = db();
+        store(&c, ID1, A, 30023, "post", 500);
+        // The signer's id claim, as `process_deletion` writes it first.
+        c.execute(DELETED_EVENT_INSERT_SQL, params![ID1, A, 1_000])
+            .unwrap();
+        tombstone_then_delete(
+            &c,
+            TombstoneTarget::OwnEventAddress { id: ID1, author: A },
+            1_000,
+        );
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(
+            addresses,
+            vec![(30023, A.to_string(), "post".to_string(), 500)]
+        );
+        let older = "2".repeat(64);
+        assert!(
+            ingest_deleted(&c, &older, A, 30023, "post", 400),
+            "an older signed version cannot be stored again"
+        );
+        assert!(!ingest_deleted(&c, &older, A, 30023, "post", 501));
+    }
+
+    #[test]
+    fn an_own_deletion_naming_another_authors_event_records_no_address() {
+        let c = db();
+        store(&c, ID1, B, 0, "", 500);
+        tombstone_then_delete(
+            &c,
+            TombstoneTarget::OwnEventAddress { id: ID1, author: A },
+            1_000,
+        );
+        assert_eq!(tombstone_rows(&c), (vec![], vec![]));
+        let left: i64 = c
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "and the row, not the signer's, stays");
+    }
+
+    #[test]
+    fn backfill_keys_plain_replaceable_a_refs_on_an_empty_d_tag() {
+        let c = db();
+        let tags = format!(r#"[["a","0:{A}:stray"],["a","10002:{A}:"],["a","30023:{A}:post"]]"#);
+        kind5(&c, &"5".repeat(64), A, 100, &tags);
+        c.execute_batch(DELETED_ADDRESSES_BACKFILL_SQL).unwrap();
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(
+            addresses,
+            vec![
+                (0, A.to_string(), String::new(), 100),
+                (10002, A.to_string(), String::new(), 100),
+                (30023, A.to_string(), "post".to_string(), 100),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_rekey_moves_plain_replaceable_rows_onto_the_empty_d_tag() {
+        let c = db();
+        for (kind, d, until) in [
+            (0, "x", 50),
+            (0, "y", 80),
+            (0, "", 60),
+            (3, "z", 20),
+            (30023, "post", 10),
+        ] {
+            c.execute(DELETED_ADDRESS_UPSERT_SQL, params![kind, A, d, until])
+                .unwrap();
+        }
+        for _ in 0..2 {
+            c.execute_batch(DELETED_ADDRESSES_REKEY_PLAIN_SQL).unwrap();
+            c.execute_batch(DELETED_ADDRESSES_PRUNE_PLAIN_D_SQL)
+                .unwrap();
+        }
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(
+            addresses,
+            vec![
+                (0, A.to_string(), String::new(), 80),
+                (3, A.to_string(), String::new(), 20),
+                (30023, A.to_string(), "post".to_string(), 10),
+            ],
+            "latest deletion kept, parameterised rows untouched, idempotent"
+        );
+    }
+
+    #[test]
+    fn a_row_tombstone_names_the_stored_author_and_blocks_the_republish() {
+        let c = db();
+        store(&c, ID1, B, 42, "", 50);
+        tombstone_then_delete(&c, TombstoneTarget::Event(ID1), 1_000);
+        assert_eq!(
+            tombstone_rows(&c),
+            (vec![(ID1.to_string(), B.to_string(), 1_000)], vec![]),
+            "the row's author, and no address for a regular kind"
+        );
+        assert!(deleted(&c, ID1, B, -1, "", 50));
+        assert!(!deleted(&c, ID1, A, -1, "", 50));
+    }
+
+    #[test]
+    fn a_row_tombstone_records_nothing_for_an_absent_or_malformed_id() {
+        let c = db();
+        let upper = ID1.replace('1', "F");
+        store(&c, &upper, A, 1, "", 50);
+        store(&c, "short", A, 1, "", 50);
+        for id in [ID1, upper.as_str(), "short"] {
+            tombstone_then_delete(&c, TombstoneTarget::Event(id), 1_000);
+        }
+        assert_eq!(tombstone_rows(&c), (vec![], vec![]));
+        let left: i64 = c
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "the deletion goes ahead regardless");
+    }
+
+    #[test]
+    fn a_replaceable_row_also_tombstones_its_address_up_to_that_version() {
+        let c = db();
+        store(&c, ID1, A, 30023, "post", 500);
+        tombstone_then_delete(&c, TombstoneTarget::Event(ID1), 1_000);
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(
+            addresses,
+            vec![(30023, A.to_string(), "post".to_string(), 500)]
+        );
+        let older = "2".repeat(64);
+        assert!(
+            deleted(&c, &older, A, 30023, "post", 400),
+            "an older signed version cannot come back as the current one"
+        );
+        assert!(
+            !deleted(&c, &older, A, 30023, "post", 501),
+            "the author's next version is accepted"
+        );
+        assert!(deleted(&c, ID1, A, 30023, "post", 500));
+    }
+
+    #[test]
+    fn a_future_dated_replaceable_row_clamps_its_address_to_now() {
+        let c = db();
+        store(&c, ID1, A, 0, "", 2_000);
+        tombstone_then_delete(&c, TombstoneTarget::Event(ID1), 1_000);
+        let (events, addresses) = tombstone_rows(&c);
+        assert_eq!(addresses, vec![(0, A.to_string(), String::new(), 1_000)]);
+        assert_eq!(events.len(), 1, "the exact version stays covered by its id");
+        assert!(deleted(&c, ID1, A, 0, "", 2_000));
+        assert!(!deleted(&c, &"2".repeat(64), A, 0, "", 1_500));
+    }
+
+    #[test]
+    fn an_address_row_tombstone_never_shortens_a_later_deletion() {
+        let c = db();
+        c.execute(DELETED_ADDRESS_UPSERT_SQL, params![30023, A, "post", 900])
+            .unwrap();
+        store(&c, ID1, A, 30023, "post", 500);
+        tombstone_then_delete(&c, TombstoneTarget::Event(ID1), 1_000);
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(
+            addresses,
+            vec![(30023, A.to_string(), "post".to_string(), 900)]
+        );
+    }
+
+    #[test]
+    fn an_author_purge_tombstones_every_row_of_that_author_only() {
+        let c = db();
+        let (id2, id3, id4) = ("2".repeat(64), "3".repeat(64), "4".repeat(64));
+        store(&c, ID1, A, 1, "", 10);
+        store(&c, &id2, A, 0, "", 20);
+        store(&c, &id3, A, 30023, "post", 30);
+        store(&c, "short", A, 1, "", 40);
+        store(&c, &id4, B, 1, "", 50);
+        tombstone_then_delete(&c, TombstoneTarget::Author(A), 1_000);
+        let (events, addresses) = tombstone_rows(&c);
+        let ids: Vec<&str> = events.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec![ID1, id2.as_str(), id3.as_str()]);
+        assert!(events.iter().all(|(_, pk, at)| pk == A && *at == 1_000));
+        assert_eq!(
+            addresses,
+            vec![
+                (0, A.to_string(), String::new(), 20),
+                (30023, A.to_string(), "post".to_string(), 30),
+            ]
+        );
+        assert!(deleted(&c, ID1, A, -1, "", 10));
+        assert!(
+            !deleted(&c, &id4, B, -1, "", 50),
+            "another author is untouched"
+        );
+        let left: i64 = c
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1);
+    }
+
+    #[test]
+    fn an_author_purge_takes_the_newest_version_per_address() {
+        let c = db();
+        // Supersession keeps one row per address, but a race can leave two.
+        store(&c, ID1, A, 30023, "post", 100);
+        store(&c, &"2".repeat(64), A, 30023, "post", 300);
+        store(&c, &"3".repeat(64), A, 30023, "other", 5_000);
+        tombstone_then_delete(&c, TombstoneTarget::Author(A), 1_000);
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(
+            addresses,
+            vec![
+                (30023, A.to_string(), "other".to_string(), 1_000),
+                (30023, A.to_string(), "post".to_string(), 300),
+            ]
+        );
     }
 
     #[test]
