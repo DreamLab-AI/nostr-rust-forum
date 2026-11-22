@@ -788,7 +788,8 @@ pub const IS_DELETED_ADDRESSABLE_SQL: &str = "SELECT \
 
 // Tombstones taken from the stored rows themselves, for moderator and admin
 // deletions of someone else's events: report resolution, the ADR-2017 purge, a
-// user purge, and a moderator's kind-5 in `process_deletion`.
+// user purge, and a moderator's kind-5 in `process_deletion`; an author's own
+// kind-5 there takes the address statement scoped to the signer.
 // Reading the author from the row inside the INSERT means the tombstone names
 // the event's real author by construction, with no gap between read and write;
 // an absent row records nothing. They must run before the row's DELETE.
@@ -811,6 +812,18 @@ pub const TOMBSTONE_EVENT_ROW_ADDRESS_SQL: &str =
     "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
     SELECT kind, pubkey, CASE WHEN kind >= 30000 THEN d_tag ELSE '' END, MIN(created_at, ?2) FROM events \
     WHERE id = ?1 \
+      AND (kind IN (0, 3) OR kind BETWEEN 10000 AND 19999 OR kind BETWEEN 30000 AND 39999) \
+    ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
+    WHERE excluded.deleted_until > deleted_addresses.deleted_until";
+
+/// [`TOMBSTONE_EVENT_ROW_ADDRESS_SQL`] for an author deleting their own event
+/// (`?3` the signer): a row by anyone else records nothing, so a member's
+/// kind-5 naming another author's replaceable event cannot tombstone its
+/// address.
+pub const TOMBSTONE_OWN_EVENT_ROW_ADDRESS_SQL: &str =
+    "INSERT INTO deleted_addresses (kind, pubkey, d_tag, deleted_until) \
+    SELECT kind, pubkey, CASE WHEN kind >= 30000 THEN d_tag ELSE '' END, MIN(created_at, ?2) FROM events \
+    WHERE id = ?1 AND pubkey = ?3 \
       AND (kind IN (0, 3) OR kind BETWEEN 10000 AND 19999 OR kind BETWEEN 30000 AND 39999) \
     ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET deleted_until = excluded.deleted_until \
     WHERE excluded.deleted_until > deleted_addresses.deleted_until";
@@ -1446,27 +1459,42 @@ pub(crate) enum TombstoneTarget<'a> {
     RegularEvent(&'a str),
     /// Every event by one author.
     Author(&'a str),
+    /// The address of one event, by id, only if `author` wrote it: an
+    /// author's own kind-5, whose id tombstone the caller has already written
+    /// under the signer.
+    OwnEventAddress {
+        /// The event id.
+        id: &'a str,
+        /// The signer, who must be the stored row's author.
+        author: &'a str,
+    },
 }
 
-impl TombstoneTarget<'_> {
-    /// The statements for this target, and the key they bind as `?1`.
-    fn statements(&self) -> (&str, &'static [&'static str]) {
+impl<'a> TombstoneTarget<'a> {
+    /// The statements for this target, the key they bind as `?1` (`?2` is the
+    /// deletion time), and the author they bind as `?3`, if any.
+    fn statements(&self) -> (&'a str, &'static [&'static str], Option<&'a str>) {
         match *self {
             TombstoneTarget::Event(id) => (
                 id,
                 &[TOMBSTONE_EVENT_ROW_SQL, TOMBSTONE_EVENT_ROW_ADDRESS_SQL],
+                None,
             ),
-            TombstoneTarget::RegularEvent(id) => (id, &[TOMBSTONE_EVENT_ROW_SQL]),
+            TombstoneTarget::RegularEvent(id) => (id, &[TOMBSTONE_EVENT_ROW_SQL], None),
             TombstoneTarget::Author(pubkey) => (
                 pubkey,
                 &[TOMBSTONE_AUTHOR_ROWS_SQL, TOMBSTONE_AUTHOR_ROWS_ADDRESS_SQL],
+                None,
             ),
+            TombstoneTarget::OwnEventAddress { id, author } => {
+                (id, &[TOMBSTONE_OWN_EVENT_ROW_ADDRESS_SQL], Some(author))
+            }
         }
     }
 }
 
-/// Record NIP-09 tombstones for `target`'s stored rows, so content removed by a
-/// moderator or admin cannot be published again. Call it before the DELETE (it
+/// Record NIP-09 tombstones for `target`'s stored rows, so deleted content
+/// cannot be published again. Call it before the DELETE (it
 /// reads the rows), and never in the same `batch` as the DELETE: D1 batches are
 /// transactional, and a failed tombstone must not undo the deletion.
 ///
@@ -1477,12 +1505,12 @@ pub(crate) async fn tombstone_before_delete(
     target: TombstoneTarget<'_>,
     now: u64,
 ) -> bool {
-    let (key, statements) = target.statements();
+    let (key, statements, author) = target.statements();
+    let mut binds = vec![key.into(), wasm_bindgen::JsValue::from_f64(now as f64)];
+    binds.extend(author.map(wasm_bindgen::JsValue::from_str));
     let mut all_ran = true;
     for sql in statements {
-        let bound = db
-            .prepare(*sql)
-            .bind(&[key.into(), wasm_bindgen::JsValue::from_f64(now as f64)]);
+        let bound = db.prepare(*sql).bind(&binds);
         match bound {
             Ok(stmt) => {
                 if let Err(e) = stmt.run().await {
@@ -1933,17 +1961,29 @@ mod tombstone_tests {
 
     /// What the deletion routes do: tombstone from the row, then delete it.
     fn tombstone_then_delete(c: &Connection, target: TombstoneTarget<'_>, now: i64) {
-        let (key, statements) = target.statements();
+        let (key, statements, author) = target.statements();
         for sql in statements {
-            c.execute(sql, params![key, now]).unwrap();
-        }
-        let delete = match target {
-            TombstoneTarget::Event(_) | TombstoneTarget::RegularEvent(_) => {
-                "DELETE FROM events WHERE id = ?1"
+            match author {
+                Some(author) => c.execute(sql, params![key, now, author]),
+                None => c.execute(sql, params![key, now]),
             }
-            TombstoneTarget::Author(_) => "DELETE FROM events WHERE pubkey = ?1",
-        };
-        c.execute(delete, params![key]).unwrap();
+            .unwrap();
+        }
+        match target {
+            TombstoneTarget::Event(_) | TombstoneTarget::RegularEvent(_) => {
+                c.execute("DELETE FROM events WHERE id = ?1", params![key])
+            }
+            TombstoneTarget::Author(_) => {
+                c.execute("DELETE FROM events WHERE pubkey = ?1", params![key])
+            }
+            // The member's own DELETE is scoped to their pubkey, as in
+            // `process_deletion`.
+            TombstoneTarget::OwnEventAddress { id, author } => c.execute(
+                "DELETE FROM events WHERE id = ?1 AND pubkey = ?2",
+                params![id, author],
+            ),
+        }
+        .unwrap();
     }
 
     /// The ingest lookup as `is_deleted` binds it: the address d-tag, not the
@@ -2006,8 +2046,11 @@ mod tombstone_tests {
 
     #[test]
     fn a_regular_event_target_runs_the_id_statement_only() {
-        let (key, statements) = TombstoneTarget::RegularEvent(ID1).statements();
-        assert_eq!((key, statements), (ID1, &[TOMBSTONE_EVENT_ROW_SQL][..]));
+        let (key, statements, author) = TombstoneTarget::RegularEvent(ID1).statements();
+        assert_eq!(
+            (key, statements, author),
+            (ID1, &[TOMBSTONE_EVENT_ROW_SQL][..], None)
+        );
         let c = db();
         store(&c, ID1, B, 42, "", 50);
         tombstone_then_delete(&c, TombstoneTarget::RegularEvent(ID1), 1_000);
@@ -2015,6 +2058,47 @@ mod tombstone_tests {
             tombstone_rows(&c),
             (vec![(ID1.to_string(), B.to_string(), 1_000)], vec![])
         );
+    }
+
+    #[test]
+    fn an_authors_own_deletion_tombstones_the_address_of_their_replaceable() {
+        let c = db();
+        store(&c, ID1, A, 30023, "post", 500);
+        // The signer's id claim, as `process_deletion` writes it first.
+        c.execute(DELETED_EVENT_INSERT_SQL, params![ID1, A, 1_000])
+            .unwrap();
+        tombstone_then_delete(
+            &c,
+            TombstoneTarget::OwnEventAddress { id: ID1, author: A },
+            1_000,
+        );
+        let (_, addresses) = tombstone_rows(&c);
+        assert_eq!(
+            addresses,
+            vec![(30023, A.to_string(), "post".to_string(), 500)]
+        );
+        let older = "2".repeat(64);
+        assert!(
+            ingest_deleted(&c, &older, A, 30023, "post", 400),
+            "an older signed version cannot be stored again"
+        );
+        assert!(!ingest_deleted(&c, &older, A, 30023, "post", 501));
+    }
+
+    #[test]
+    fn an_own_deletion_naming_another_authors_event_records_no_address() {
+        let c = db();
+        store(&c, ID1, B, 0, "", 500);
+        tombstone_then_delete(
+            &c,
+            TombstoneTarget::OwnEventAddress { id: ID1, author: A },
+            1_000,
+        );
+        assert_eq!(tombstone_rows(&c), (vec![], vec![]));
+        let left: i64 = c
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "and the row, not the signer's, stays");
     }
 
     #[test]

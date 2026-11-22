@@ -3003,13 +3003,19 @@ impl NostrRelayDO {
                     let _ = ins.run().await;
                 }
             }
-            if well_formed && can_delete_any {
-                let _ = crate::tombstone_before_delete(
-                    &db,
-                    crate::TombstoneTarget::Event(target_id),
-                    now,
-                )
-                .await;
+            // The address too, if the row is replaceable, so an older signed
+            // version cannot be stored again: any author's for a moderator, the
+            // signer's own only otherwise (their DELETE is scoped the same way).
+            if well_formed {
+                let target = if can_delete_any {
+                    crate::TombstoneTarget::Event(target_id)
+                } else {
+                    crate::TombstoneTarget::OwnEventAddress {
+                        id: target_id,
+                        author: &deletion_event.pubkey,
+                    }
+                };
+                let _ = crate::tombstone_before_delete(&db, target, now).await;
             }
             let result = if can_delete_any {
                 let stmt = db.prepare("DELETE FROM events WHERE id = ?1");

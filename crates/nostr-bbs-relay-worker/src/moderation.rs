@@ -352,16 +352,18 @@ pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Respon
                 now,
             )
             .await;
-            deletion = Some(DeletionRecord {
-                event_id: report.reported_event_id.clone(),
-                stored: stored.map(|r| (r.pubkey, r.kind as u64)),
-                tombstoned,
-            });
-            let _ = db
+            let run = db
                 .prepare("DELETE FROM events WHERE id = ?1")
                 .bind(&[js_str(&report.reported_event_id)])?
                 .run()
                 .await;
+            // Claim a removal only when the DELETE ran.
+            deletion = Some(DeletionRecord {
+                event_id: report.reported_event_id.clone(),
+                stored: stored.map(|r| (r.pubkey, r.kind as u64)),
+                tombstoned,
+                delete_error: run.err().map(|e| e.to_string()),
+            });
         }
         _ => {
             // "dismiss" -- no action on the content
@@ -402,9 +404,8 @@ pub async fn handle_resolve_report(mut req: Request, env: &Env) -> Result<Respon
     .await;
 
     let mut body = json!({ "success": true, "resolution": resolution });
-    if let Some(d) = &deletion {
-        body["removed"] = d.removed_json();
-        body["tombstoned"] = json!(d.tombstoned);
+    if let (Some(d), Some(fields)) = (&deletion, body.as_object_mut()) {
+        fields.extend(d.outcome_fields());
     }
     json_response(env, &body, 200)
 }
@@ -415,7 +416,7 @@ struct StoredEventRow {
     kind: f64,
 }
 
-/// What a report resolved as "delete" removed.
+/// What a report resolved as "delete" did.
 #[derive(Debug, Clone, PartialEq)]
 struct DeletionRecord {
     /// The id the report named.
@@ -424,25 +425,41 @@ struct DeletionRecord {
     stored: Option<(String, u64)>,
     /// Whether every tombstone statement ran.
     tombstoned: bool,
+    /// The DELETE's error, when it failed.
+    delete_error: Option<String>,
 }
 
 impl DeletionRecord {
-    /// The reply's `removed`: the row actually deleted, or `null` if none was.
+    /// `removed`: the row actually deleted, or `null` when no row was found or
+    /// the DELETE failed.
     fn removed_json(&self) -> serde_json::Value {
-        match &self.stored {
-            Some((author, kind)) => json!({ "id": self.event_id, "author": author, "kind": kind }),
-            None => serde_json::Value::Null,
+        match (&self.stored, &self.delete_error) {
+            (Some((author, kind)), None) => {
+                json!({ "id": self.event_id, "author": author, "kind": kind })
+            }
+            _ => serde_json::Value::Null,
         }
     }
 
-    /// The `admin_log.new_value` details for a deletion.
+    /// The fields a deletion adds to the reply: `removed`, `tombstoned`, and
+    /// `deleteError` when the DELETE failed.
+    fn outcome_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("removed".into(), self.removed_json());
+        fields.insert("tombstoned".into(), json!(self.tombstoned));
+        if let Some(e) = &self.delete_error {
+            fields.insert("deleteError".into(), json!(e));
+        }
+        fields
+    }
+
+    /// The `admin_log.new_value` details for a deletion: the reply's fields
+    /// plus the resolution status and the reporter's claimed author.
     fn audit_details(&self, status: &str, reported_pubkey: &str) -> serde_json::Value {
-        json!({
-            "status": status,
-            "removed": self.removed_json(),
-            "reportedPubkey": reported_pubkey,
-            "tombstoned": self.tombstoned,
-        })
+        let mut fields = self.outcome_fields();
+        fields.insert("status".into(), json!(status));
+        fields.insert("reportedPubkey".into(), json!(reported_pubkey));
+        serde_json::Value::Object(fields)
     }
 }
 
@@ -456,6 +473,7 @@ mod deletion_record_tests {
             event_id: "e1".into(),
             stored: Some(("real".into(), 30023)),
             tombstoned: true,
+            delete_error: None,
         };
         assert_eq!(
             d.removed_json(),
@@ -478,11 +496,31 @@ mod deletion_record_tests {
             event_id: "e1".into(),
             stored: None,
             tombstoned: false,
+            delete_error: None,
         };
         assert!(d.removed_json().is_null());
         assert_eq!(
             d.audit_details("resolved_approve", "claimed")["removed"],
             serde_json::Value::Null
         );
+        assert!(!d.outcome_fields().contains_key("deleteError"));
+    }
+
+    #[test]
+    fn a_failed_delete_claims_no_removal_and_says_why() {
+        let d = DeletionRecord {
+            event_id: "e1".into(),
+            stored: Some(("real".into(), 1)),
+            tombstoned: true,
+            delete_error: Some("D1_ERROR: busy".into()),
+        };
+        assert!(d.removed_json().is_null());
+        assert_eq!(
+            serde_json::Value::Object(d.outcome_fields()),
+            json!({ "removed": null, "tombstoned": true, "deleteError": "D1_ERROR: busy" })
+        );
+        let audit = d.audit_details("resolved_approve", "claimed");
+        assert_eq!(audit["removed"], serde_json::Value::Null);
+        assert_eq!(audit["deleteError"], "D1_ERROR: busy");
     }
 }

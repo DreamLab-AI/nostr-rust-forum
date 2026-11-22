@@ -212,19 +212,23 @@ pub async fn handle_delete_user(mut req: Request, env: &Env) -> Result<Response>
     let mut events_purged = false;
     // Reported, never acted on: a failed tombstone cannot be retried once the
     // rows are gone, so the admin must be told, but the purge still proceeds.
-    let mut tombstoned = false;
+    // `None` when no purge was asked for: nothing was attempted, so the reply
+    // and the audit row carry no `tombstoned` at all.
+    let mut tombstoned: Option<bool> = None;
     if body.delete_events {
         // Purge the user's stored events AND their projected profile row. The
         // events table is the relay store; the profiles projection is derived.
         // Tombstone them first: the whitelist row is gone, so the ingest gate
         // refuses this author for now, but re-admission must not let anyone
         // re-publish what the admin chose to remove. Fails open.
-        tombstoned = crate::tombstone_before_delete(
-            &db,
-            crate::TombstoneTarget::Author(&target),
-            auth::js_now_secs(),
-        )
-        .await;
+        tombstoned = Some(
+            crate::tombstone_before_delete(
+                &db,
+                crate::TombstoneTarget::Author(&target),
+                auth::js_now_secs(),
+            )
+            .await,
+        );
         let _ = db
             .prepare("DELETE FROM events WHERE pubkey = ?1")
             .bind(&[js_str(&target)])?
@@ -249,23 +253,22 @@ pub async fn handle_delete_user(mut req: Request, env: &Env) -> Result<Response>
         Some(&target),
         None,
         None,
-        events_purged
-            .then(|| json!({ "tombstoned": tombstoned }).to_string())
+        tombstoned
+            .map(|t| json!({ "tombstoned": t }).to_string())
             .as_deref(),
         body.reason.as_deref(),
     )
     .await;
 
-    json_response(
-        env,
-        &json!({
-            "success": true,
-            "pubkey": target,
-            "events_purged": events_purged,
-            "tombstoned": tombstoned,
-        }),
-        200,
-    )
+    let mut reply = json!({
+        "success": true,
+        "pubkey": target,
+        "events_purged": events_purged,
+    });
+    if let Some(t) = tombstoned {
+        reply["tombstoned"] = json!(t);
+    }
+    json_response(env, &reply, 200)
 }
 
 // ---------------------------------------------------------------------------
