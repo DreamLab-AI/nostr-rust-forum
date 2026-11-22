@@ -28,7 +28,7 @@ governing document **in the same change**, and regenerate this index
 
 The [historical closeout map](../adr-history-closeout.md) resolves each frozen record to its current governing surface and remaining acceptance work. [ADR-2010](ADR-2010-durable-governance-outcome-receipts.md) is a proposed governance receipt contract; its presence in this index does not ratify it.
 
-_31 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
+_33 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 
 | ID | Title | Date | Decision | Impl | Activation | Supersedes | Superseded by | Owner | Repo |
 |----|-------|------|----------|------|------------|------------|---------------|-------|------|
@@ -63,3 +63,5 @@ _31 record(s). Regenerate with_ `node scripts/adr-index-gen.js docs/adr`.
 | [ADR-2030](ADR-2030-nip29-group-engine-from-the-spec.md) | Serve NIP-29 groups from a relay-signed engine written from the spec in an AGPL crate, with zone cohorts as the one membership authority | 2026-10-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
 | [ADR-2031](ADR-2031-federated-groups-have-one-home-and-verbatim-mirrors.md) | Federated groups have one home relay, pinned by pubkey, and mirrors that replicate its signed state verbatim | 2026-10-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
 | [ADR-2032](ADR-2032-a-space-is-a-nip29-group-with-a-signed-spatial-descriptor.md) | A space is a NIP-29 group with a relay-signed spatial descriptor, a NIP-53 interactive room and NIP-78 claims, using no new event kinds | 2026-10-30 | proposed | none | inactive | — | — | jjohare | nostr-rust-forum |
+| [ADR-2033](ADR-2033-nip09-tombstones-member-deletion-gate-and-deleter-scoped-sync.md) | The relay keeps NIP-09 tombstones and gates members' kind-5s; clients sync deletions incrementally and scope each tombstone to its deleter | 2026-11-22 | accepted | complete | staged | — | — | jjohare | nostr-rust-forum |
+| [ADR-2034](ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md) | A deep-linked page reports "not found" only after an authenticated answer from the relay | 2026-11-22 | accepted | partial | staged | — | — | jjohare | nostr-rust-forum |

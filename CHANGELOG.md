@@ -7,6 +7,116 @@ and this project tracks its architecture decisions in [`docs/adr/`](docs/adr/).
 
 ## [Unreleased]
 
+Kit tags `v1.0.0-beta.21-rc.1` (da08b53, #89) and `v1.0.0-beta.21-rc.2` (3c48e26, #90 to #94). Only the relay worker and
+the forum client changed; the four published library crates are unchanged since 1.0.0-beta.20. None of this has been
+exercised in a browser or against a live relay at the time of writing: the PR threads record that the live test follows
+the repin. Operator procedure for the upgrade: [`docs/runbooks/relay-deletion-and-tombstones.md`](docs/runbooks/relay-deletion-and-tombstones.md).
+Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-and-deleter-scoped-sync.md),
+[ADR-2034](docs/adr/ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md), and the 2026-11-22 section of
+[ADR-2016](docs/adr/ADR-2016-end-to-end-encrypted-zones.md).
+
+### Relay: deleted events stay deleted, and members can no longer hide ids they do not own (2026-11-22)
+
+- **NIP-09 tombstones** (#89): the relay honoured a kind-5 by deleting the target row and kept no record, so anyone
+  holding the original signed event could publish it again and it was stored as new. Two new D1 tables, `deleted_events`
+  `(id, pubkey)` and `deleted_addresses` `(kind, pubkey, d_tag, deleted_until)`, are created by `ensure_schema` (there is
+  no migration file). Ingest refuses a tombstoned event with `blocked: this event was deleted`, after every other gate and
+  before `save_event`; a failed lookup lets the event through, because this is a re-insert guard, not an availability
+  gate. An event id commits to its author, so a tombstone naming the wrong author blocks nothing. An `a`-ref records an
+  address tombstone only for replaceable and addressable kinds and spares versions newer than the deletion.
+- **One-time backfill** (#89): the first `ensure_schema` pass after the upgrade rebuilds tombstones from the kind-5s already stored
+  (own-deletion semantics) and then writes the `settings` row `nip09_tombstones_backfilled`. A moderator's past deletion
+  of someone else's event left no record of that author, so it is not backfilled.
+- **Every deliberate deletion route tombstones** (#90): a report resolved as `delete`, the ADR-2017 purge
+  (`POST /api/admin/events/delete`), and a user delete with `delete_events` now record the tombstone under the row's real
+  author before the DELETE, through `tombstone_before_delete`. A tombstone failure is logged and never blocks the
+  deletion. Kind retention in `cron.rs` records none: it is storage policy. A report resolved as `hide` records none.
+- **Reply and audit fields** (#90): resolving a report as `delete` now answers `removed` (`{id, author, kind}` of the row
+  actually deleted, or `null`), `tombstoned`, and `deleteError` when the DELETE failed, and the audit row's
+  `target_pubkey` is the stored author. A user delete with `delete_events` answers `tombstoned`.
+- **`a`-refs of regular kinds are ignored** (#90): `["a","1:<pubkey>:"]` used to delete every kind-1 the author had
+  posted with an empty d-tag, with no tombstone, and a moderator could do it to anyone. Only a non-negative integer kind
+  that is replaceable or addressable acts, and without delete-any privilege only the signer's own address.
+- **Plain replaceable kinds (0, 3, 10000 to 19999) are keyed on `(kind, author)` alone** (#90): their address tombstone
+  and its lookup use an empty d-tag whatever `d` tag the event carried. A second one-time re-key moves rows written
+  under the earlier scheme and records itself as `nip09_plain_addresses_rekeyed`.
+- **Member deletion gate** (#94): `deletion_targets_others` counted an `e` target with no stored row as the signer's own,
+  so any whitelisted member could publish a kind-5 naming an id the relay did not hold, and every forum client folded it
+  into its tombstones and hid that id. Sealed originals (ADR-2017), whose plaintext rows are purged, were the main
+  casualty. Below TL3, every `e` target must now be the signer's own stored event, a gift wrap addressed to one of their
+  recipient keys, or an id they already deleted (a `deleted_events` row for `(id, signer)`). Otherwise the whole kind-5
+  is refused, because the event is signed and the relay cannot strip a tag: `restricted: TL3+ required to delete
+  others' events`, `restricted: migrated (sealed) posts can only be removed by a moderator`, `restricted: deletion
+  names an event this relay does not hold` (also for any id that is not 64 lowercase hex), or `error: could not check
+  deletion targets, try again` when D1 fails (the gate fails closed).
+- **Moderators delete sealed envelopes** (#94): a kind-5 from an admin or TL3+ that names a sealed original also deletes
+  the envelope row that wraps it, tombstoned first under its author. Only a row with the envelope's full wire shape
+  written by a current admin qualifies; a look-alike kind 42 is left.
+- **Subscription cap** (#91, relay half): a REQ that reuses a subscription id the session already holds replaces that
+  subscription, so it no longer counts towards the 20-subscription cap. At a full session the client's replay after
+  NIP-42 AUTH was refused wholesale.
+
+**What members and operators will notice**
+
+- Members cannot delete their own migrated (sealed) posts, and cannot delete an id the relay does not hold. Moderators
+  (admin or TL3+) remove migrated posts on their behalf. The relay does not record the original authors of migrated
+  posts, so it cannot tell whose post a sealed original was.
+- Tombstones live in D1. `POST /api/admin/reset-db` clears them with the events; a D1 restore returns the tombstones of
+  its restore point. Moderator and purge tombstones are permanent: there is no un-delete route.
+- A user delete with `delete_events` leaves that member's pubkey and event ids (no content) in `deleted_events`.
+
+### Forum client: deletions fetched incrementally, deleter-scoped tombstones (2026-11-22)
+
+- **Incremental kind-5 sync** (#93): instead of the newest 1,000 deletions every session, the kind-5 filters carry a
+  `since` marker, `min(newest kind-5 delivered, local now) - 14 days`, kept per scope (channels, reactions) under
+  `nostrbbs_deletion_sync_v3_*` in localStorage. The marker never moves backwards and advances only when a sync settles
+  complete. A backfill that hits the 1,000-row cap pages downwards on `until`, up to 20 pages, and keeps the old marker
+  if it gives up. A device with no marker behaves as before.
+- **Tombstones are `(id, deleter)`** (#93): a restored sealed original is hidden only by a kind-5 from its inner author
+  or from a pubkey the relay vouches for as admin (`GET /api/check-whitelist`, `isAdmin`); every other tombstone hides
+  nothing. The client cannot identify TL3 moderators, so a moderator's deletion of a sealed original takes effect through
+  the relay deleting the envelope (#94), not through the client.
+- **Persisted across sessions** (#93): only tombstones on restored sealed originals, in a `sealed` set (honoured
+  deleters) and a `held` set (not yet resolved), with per-deleter and global fair-share caps.
+
+### Forum client: cold deep links wait for an authenticated answer (2026-11-22)
+
+- **"Not found" is reported only on an authenticated EOSE** (#91): a cold link to a topic, section or zone showed "Topic
+  Not Found", "Section Not Found", "No topics yet" or "No sections yet" until the message sync finished, because the pages
+  decided from `ChannelStore::loading`, which clears on the channel list's first EOSE or after six seconds. Pages now
+  decide from the relay's EOSE for the subscription that would have carried the thing, and for a members-only zone only
+  from an EOSE that followed the relay's `OK true` for the client's AUTH. A sync that has not finished within 15 s
+  shows a separate "Unavailable" message instead.
+- **AUTH acceptance and a per-subscription REQ ledger** (#91): the client treats AUTH as accepted only on the relay's
+  `OK true` for the kind-22242 event it sent, then replays subscriptions and flushes held writes. A rate-limited AUTH is
+  re-sent up to 3 times; a rejected or stalled AUTH (60 s to sign, 10 s to answer) releases held writes so the relay's
+  refusal reaches each publish callback. Each subscription counts REQs sent and unanswered; a REQ unanswered after 8 s is
+  re-sent under a new subscription id, up to 2 times, and an answer under a retired id is discarded.
+- Known gap: in an encrypted zone a cold deep link can still say "Topic Not Found" for some seconds, between the
+  authenticated answer and the arrival of zone keys. See `docs/security/known-findings.md` KF-23.
+
+### Forum client: zone keys, drafts, bookmarks and notification previews are per identity (2026-11-22)
+
+- **Zone keys per identity** (#92): each IndexedDB row in `zone_keys` carries its owner in an `owner` field and in its id
+  (`<owner pubkey>/<store id>`), so two accounts on one browser profile no longer see or overwrite each other's keys.
+  Rows written before this change cannot be attributed to an account: they stay, are never rewritten, and every
+  signed-in identity still sees them. Signing out drops every key from memory; a locked session loads none. This is
+  isolation between accounts in the UI, not access control: same-origin IndexedDB is unencrypted.
+- **Create and Rotate guard** (#92): the Encryption card now plans a new epoch above every epoch any account on the
+  browser holds for the zone; a device that holds no key for the zone and sees only far-ahead epochs is blocked with an
+  explanation; when posts name an epoch above the one to be minted, the admin must confirm.
+- **Drafts** (#92): stored per identity as `draft:v2:<pubkey>:<channel>`; nothing is loaded or saved while signed out or
+  locked. Drafts saved before the change (`draft:<channel>`) are deleted once at start-up: unsent text is lost once.
+- **Bookmarks** (#92): stored per identity under `nostrbbs_bookmarks:v2:<pubkey>` (`anon` while signed out). A bookmark of a
+  message from an encrypted zone keeps no text preview. Bookmarks saved before the change stay visible to every account
+  and have their previews erased at start-up; the bookmarks themselves are kept.
+- **Notification previews** (#92): a notification for a post in an encrypted zone reads "New encrypted message in
+  <channel>" with no text and no author. A post notification saved before the change has its body replaced with "Open to
+  read this message." and its author key dropped when the list loads.
+- Behaviour change: keys load after sign-in rather than at boot (`key_owner::owner_from_auth`), so the first encrypted
+  messages of a cold load can show placeholders briefly.
+
+
 ## [1.0.0-beta.20] — 2026-11-22
 
 `nostr-bbs-core`, `nostr-bbs-config`, `nostr-bbs-mesh` and `nostr-bbs-rate-limit` are published together at

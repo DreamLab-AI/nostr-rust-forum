@@ -185,3 +185,37 @@ for both client crates. Not yet exercised in a live browser.
 - Relay side: the same run's "Deploy Rust Workers (nostr-bbs-relay-worker, relay-worker, dreamlab-nostr-relay)" step logs the binding `ENCRYPTION_ENABLED: "true"` (`gh run view 41028875471 -R DreamLab-AI/dreamlab-ai-website --log`, 08:50:46Z), and the pre-deploy gate reports `encryption-enabled 3 site(s) in sync` (dreamlab.toml, deploy.yml, `forum-config/deploy/relay-worker.wrangler.toml`).
 
 Not established from here: a member removal that forces an epoch rotation. The earlier verification line "not yet exercised in a live browser" still describes the test record; the review trigger already covers the first rotation.
+
+## Per-identity browser state — 2026-11-22
+
+Extends the "Accounts sharing a browser" paragraph above (PR #92); that paragraph is unchanged and still the statement of
+how zone keys are keyed. This section adds what the paragraph does not say. `implementation_status` and
+`activation_status` above are not re-verified here; this section is verified at `3c48e26` only.
+
+- **Create and Rotate plan above every epoch on the device.** `plan_mint` takes the epochs any row on this browser holds
+  for the zone, whatever account owns it, and mints above them, because another account's key may be pending delivery and
+  so be in no post yet. An epoch more than `MAX_EPOCH_SKIP` (8) beyond what this identity can vouch for is reported and
+  ignored, not obeyed. An identity that holds no key for the zone, with only far-ahead epochs in sight (in posts or in
+  another account's rows), is `Blocked` with an explanation, because epoch 1 could clash with the zone's real one. When
+  posts name an epoch above the one to be minted, `mint_confirmation` asks the admin to confirm, since members who send
+  under the higher epoch keep doing so and the rotation does not take effect for them
+  (`zone_crypto/keyset.rs:169`, `:220-226`, `:271`; `zone_crypto/key_owner.rs:131`).
+- **Unsent text and previews never cross accounts.** Drafts are stored as `draft:v2:<pubkey>:<channel>`
+  (`components/draft_indicator.rs:49`); nothing is loaded or saved while signed out or locked; drafts saved before the
+  change cannot be attributed and are all deleted once at start-up (`drop_legacy_drafts`, `:84`, called at `app.rs:329`).
+  Bookmarks are stored per identity under `nostrbbs_bookmarks:v2:<pubkey>` (`anon` when signed out); a bookmark of a
+  message from an encrypted zone keeps no text; bookmarks saved before the change stay visible to every account, with
+  their previews erased (`bookmarks_modal.rs:38`, `:57`). A notification for a post in an encrypted zone reads "New
+  encrypted message in <channel>" with no text and no author; one saved before the change has its body replaced when the
+  list loads (`stores/notifications.rs:106`, `:1340`).
+- **Costs.** An unsent draft from before the change is lost once. Bookmarks and zone keys written before the change
+  remain visible to every account on the browser; nothing on the device records which account received them. Keys load
+  after sign-in, not at boot, so the first encrypted messages of a cold load can show placeholders briefly.
+
+Verification at `3c48e26`, by reading code; no cargo test or build was run. `grep -n "pub fn plan_mint\|pub fn
+mint_confirmation\|MintPlan::Blocked(format" crates/nostr-bbs-forum-client/src/zone_crypto/keyset.rs` returns `:169`,
+`:271`, `:220`, `:226`. `grep -n "pub fn draft_key\|pub fn drop_legacy_drafts" .../components/draft_indicator.rs` returns
+`:49`, `:84`. `grep -n "fn bookmarks_key\|fn redact_legacy" .../components/bookmarks_modal.rs` returns `:38`, `:57`.
+`grep -n "fn post_body\|fn redact_legacy_preview\|const LEGACY_POST_BODY" .../stores/notifications.rs` returns `:106`,
+`:1340`, `:100`. CI run 45056144222 on that commit concluded `success`. Not exercised in a browser: the PR thread records
+that the live test follows the repin.

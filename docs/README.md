@@ -11,5 +11,6 @@ This directory holds the deeper reference material for the forum kit.
 - [prd/](prd/) — product requirement docs (BBS client, gap-close forum, zone-bound PWA)
 - [ddd/](ddd/) — domain-driven-design bounded-context models
 - [diagrams/](diagrams/) — auth, governance, pod/ACL, and relay-admission flow diagrams
+- [runbooks/](runbooks/) — operator procedures: disaster recovery, phased deploy, [relay deletion and tombstones](runbooks/relay-deletion-and-tombstones.md)
 - [sprint/](sprint/) — sprint and milestone notes
 - [audit/](audit/) — audit records

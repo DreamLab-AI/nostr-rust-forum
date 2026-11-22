@@ -238,3 +238,23 @@ long as its zone-key grants exist on the relay, and admins bypass cohort
 gating; rotating the zone key protects new posts only. Operators who want the
 migrator excluded afterwards must use a dedicated, revocable admin key (see
 the runbook).
+
+## Deletion handling since 2026-11-22
+
+This record's `review_trigger` includes "a relay change to ... kind-5 handling", and that has happened. The decision above
+stands; [ADR-2033](ADR-2033-nip09-tombstones-member-deletion-gate-and-deleter-scoped-sync.md) records what changed
+around it. `verified_commit` above is not re-asserted; the points below were read at `3c48e26`.
+
+- The purge still emits no kind-5 and no broadcast. It now also writes a relay-side tombstone for each deleted row, under
+  the row's author, which is never served to clients (`admin_events.rs:279`).
+- A member's kind-5 naming a sealed original is refused (`restricted: migrated (sealed) posts can only be removed by a
+  moderator`), because the relay cannot read the original's author and the purge does not record it. A moderator's
+  kind-5 naming one also deletes the envelope that wraps it (`relay_do/nip_handlers.rs:3404`). Before this, the only
+  effect was each client's own tombstone.
+- The Context and Decision text above cite `fold_deletions` and `channels.rs:345` and `:779`. That function no longer
+  exists; clients fold a kind-5 through `tombstones::fold_deletion` (`stores/tombstones.rs:164`), which records
+  `(id, deleter)` and honours a restored sealed original's tombstone only from its author or a relay-vouched admin. The
+  reason the purge uses no kind-5 is unchanged: a kind-5 naming the id still hides the id the restored original carries.
+- Verified by `grep -rn "fn fold_deletions" crates` (no match), `grep -n "fn fold_deletion" crates/nostr-bbs-forum-client/src/stores/tombstones.rs`
+  (`:164`) and `grep -n "delete_sealed_envelopes" crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` (`:3404`,
+  `:3630`).

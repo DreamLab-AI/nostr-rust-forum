@@ -120,7 +120,11 @@ If any fails, that chunk is not deleted, its entries are marked `failed`, and
 purge stops. It deletes the original plaintext rows through `POST /api/admin/events/delete` in chunks of at
 most 200, authenticated with NIP-98. No kind-5 is published and nothing is
 broadcast, so clients do not tombstone the ids the envelopes restore. Each call
-is recorded in the relay's admin audit log as `events.delete`.
+is recorded in the relay's admin audit log as `events.delete`. The relay also records
+a tombstone for each deleted row under its author (`deleted_events`; never served to
+clients), so the plaintext original cannot be published again, from anyone holding
+the signed event, after the purge (ADR-2033). A D1 backup taken before the purge
+predates those tombstones: restoring it restores the plaintext and nothing refuses it.
 
 `status` prints the state file's counts and failed entries at any point. It
 needs only `--state`, with no relay or key.
@@ -172,6 +176,15 @@ A single `failed` or unverified entry blocks `purge` for the whole run, by desig
   away. If the migrator must not be able to read the zone afterwards, run it
   with a dedicated admin key created for the migration, then remove that key
   from the whitelist and delete its grants.
+- **Removing a migrated post later.** A member's kind-5 naming a sealed original is
+  refused (`restricted: migrated (sealed) posts can only be removed by a moderator`):
+  the relay cannot read the original author, and the purge does not record it, so
+  members cannot delete their own migrated posts. An admin or TL3+ can: their kind-5
+  also deletes the envelope row, but only if the envelope's author (the migrator) is
+  still a current admin. A client that already shows the post hides it only for a
+  deleter who is the original's author or has `is_admin = 1` in the whitelist table,
+  so remove migrated posts from such an account, and keep the migrator an admin until
+  the posts that matter are handled (`known-findings.md` KF-18, KF-19, KF-27).
 - **Member caches:** members' devices that already showed the plaintext keep
   their cached copy until the cache is cleared. The forum client shows one
   message, not two.

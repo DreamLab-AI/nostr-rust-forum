@@ -149,6 +149,10 @@ prefer a D1 export restore whenever one exists.
   arguments: list, nostr-bbs-pods`). Bulk R2 backup needs the S3 API (for example
   `rclone`), which is not set up. Counts come from `wrangler r2 bucket info`.
 - Secrets (`wrangler secret`) cannot be read back; keep them in the secret store.
+- **NIP-09 tombstones after the restore point.** `deleted_events` and `deleted_addresses` live in the relay D1 only. An export
+  includes them, but a restore returns only those of its restore point, so a deletion or purge made after that point can be published again. They
+  are not rebuilt from signed events for deletions that published no kind-5 (report-delete, the ADR-2017 purge, user
+  purge). See [relay-deletion-and-tombstones.md](relay-deletion-and-tombstones.md).
 
 ## 8. Schedule recommendation
 
