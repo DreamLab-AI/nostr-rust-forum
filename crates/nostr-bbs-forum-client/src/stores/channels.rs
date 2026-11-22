@@ -14,7 +14,7 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 use crate::relay::{Filter, RelayConnection};
-use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope};
+use crate::stores::deletion_sync::{self, DeletionProgress, DeletionScope, Source};
 use crate::stores::signer_admin::SignerAdminCache;
 use crate::stores::tombstones::{self, Target, Tombstones, LOCAL_DELETER};
 use crate::stores::zones::Zone;
@@ -119,7 +119,7 @@ impl ChannelStore {
         let cached = Self::load_cache();
         let has_cache = !cached.channels.is_empty();
         let deletions = deletion_sync::load(DeletionScope::Channels);
-        let tombstones = Tombstones::from_persisted(&deletions.tombstones);
+        let tombstones = Tombstones::from_persisted(&[&deletions.sealed, &deletions.held]);
 
         let store = Self {
             channels: RwSignal::new(cached.channels),
@@ -152,6 +152,13 @@ impl ChannelStore {
             store.signer_admin.track();
             let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
             let admin = store.signer_admin;
+            let is_sealed = |id: &str| is_restored_original(zone_keys, id);
+            let sealed = store.channel_messages.with_untracked(|m| {
+                store
+                    .tombstones
+                    .with_untracked(|t| tombstones::sealed_with_tombstones(m, t, is_sealed))
+            });
+            store.resolve_persisted(&sealed);
             store.channel_messages.maybe_update(|m| {
                 store.tombstones.with_untracked(|t| {
                     tombstones::prune(
@@ -174,8 +181,10 @@ impl ChannelStore {
         let tombstones_sig = self.tombstones;
         let is_sealed = |id: &str| is_restored_original(zone_keys, id);
         let mut ask = false;
+        let mut sealed_targets = Vec::new();
         self.channel_messages.update(|m| {
             ask = tombstones::needs_admin_answer(m, deleter, targets, is_sealed);
+            sealed_targets = tombstones::sealed_named(m, targets, is_sealed);
             tombstones_sig.update(|t| {
                 tombstones::fold_deletion(m, t, deleter, targets, is_sealed, |d| {
                     admin.is_admin_untracked(d)
@@ -184,6 +193,30 @@ impl ChannelStore {
         });
         if ask {
             admin.request([deleter]);
+        }
+        self.resolve_persisted(&sealed_targets);
+    }
+
+    /// These `(id, author)` messages are restored sealed originals: resolve
+    /// the held tombstones on them (promote honoured, drop refused; see
+    /// [`deletion_sync::resolve_sealed`]) and persist if anything changed.
+    /// Saving here, outside EOSE, writes the last settled marker, so it never
+    /// advances the marker early.
+    fn resolve_persisted(&self, sealed: &[(String, String)]) {
+        if sealed.is_empty() {
+            return;
+        }
+        let admin = self.signer_admin;
+        let mut changed = false;
+        self.deletion_progress.update_value(|p| {
+            for (id, author) in sealed {
+                changed |= deletion_sync::resolve_sealed(&mut p.state, id, author, |d| {
+                    admin.answer_untracked(d)
+                });
+            }
+        });
+        if changed {
+            deletion_sync::persist(DeletionScope::Channels, self.deletion_progress);
         }
     }
 
@@ -241,6 +274,11 @@ impl ChannelStore {
         // admin, `prune_on_admin_answers` removes it.
         if admitted && !to_verify.is_empty() {
             admin.request(to_verify.iter().map(String::as_str));
+        }
+        // A tombstone that landed before its target: now the target is known
+        // to be a sealed original, resolve what is held on it.
+        if sealed && self.tombstones.with_untracked(|t| t.names(&event.id)) {
+            self.resolve_persisted(&[(event.id.to_lowercase(), event.pubkey.to_lowercase())]);
         }
         admitted
     }
@@ -318,10 +356,27 @@ impl ChannelStore {
         let relay_ids = Rc::new(std::cell::RefCell::new(HashSet::<String>::new()));
         let relay_ids_for_event = relay_ids.clone();
 
+        // Kind 5: NIP-09 deletion — removes the target post and tombstones its
+        // id. Shared by this subscription and its deletion pages.
+        let on_kind5: deletion_sync::Kind5Handler =
+            Rc::new(move |event: NostrEvent, source: Source| {
+                let deleted = deletion_targets(&event);
+                let deleter = event.pubkey.to_lowercase();
+                // Every kind-5 counts towards the marker, even one with no
+                // `e` target: the marker tracks what the relay delivered.
+                let now = deletion_sync::now_secs();
+                deletion_progress.update_value(|p| {
+                    p.observe(event.created_at, &deleter, &deleted, true, now, source);
+                });
+                if !deleted.is_empty() {
+                    store.apply_deletion(zone_keys, &deleter, &deleted);
+                }
+            });
+        let on_kind5_main = on_kind5.clone();
+
         // Kind 40: channel creation. Kind 41: channel metadata edit (admin
         // rename) — folded last-write-wins; pin/unpin control 41s are ignored
         // (they carry empty content, so [`parse_meta_update`] returns `None`).
-        // Kind 5: NIP-09 deletion — removes the target post and tombstones its id.
         let on_event = Rc::new(move |event: NostrEvent| {
             match event.kind {
                 40 => {
@@ -379,24 +434,13 @@ impl ChannelStore {
                         }
                     }
                 }
-                5 => {
-                    let deleted = deletion_targets(&event);
-                    let deleter = event.pubkey.to_lowercase();
-                    // Every kind-5 counts towards the marker, even one with no
-                    // `e` target: the marker tracks what the relay delivered.
-                    let now = deletion_sync::now_secs();
-                    deletion_progress.update_value(|p| {
-                        p.observe(event.created_at, &deleter, &deleted, true, now);
-                    });
-                    if !deleted.is_empty() {
-                        store.apply_deletion(zone_keys, &deleter, &deleted);
-                    }
-                }
+                5 => on_kind5_main(event, Source::Main),
                 _ => {}
             }
         });
 
         let store_for_eose = store;
+        let relay_for_eose = relay.clone();
         let on_eose = Rc::new(move || {
             // Prune channels that were in the cache but NOT received from relay
             // (they were deleted or the DB was wiped)
@@ -418,10 +462,11 @@ impl ChannelStore {
                     store_for_eose.meta_updated_at.set(HashMap::new());
                     // Keep the persisted tombstones: their kind-5s may lie
                     // below the marker and would not be fetched again.
-                    store_for_eose.tombstones.set(
-                        deletion_progress
-                            .with_value(|p| Tombstones::from_persisted(&p.state.tombstones)),
-                    );
+                    store_for_eose
+                        .tombstones
+                        .set(deletion_progress.with_value(|p| {
+                            Tombstones::from_persisted(&[&p.state.sealed, &p.state.held])
+                        }));
                 }
             } else {
                 channels_sig.update(|list| {
@@ -437,13 +482,20 @@ impl ChannelStore {
             eose_sig.set(true);
             // Cache the pruned result
             store_for_eose.save_cache();
-            // EOSE is the only proof the kind-5 backfill completed; a sync cut
-            // off before it writes nothing, so the next session re-asks from
-            // the old marker. Marker and tombstones go out in one record.
+            // EOSE ends the kind-5 backfill: settle the marker, or page down
+            // when a marked filter hit the row cap (see `deletion_sync`). A
+            // sync cut off before it settles writes nothing.
             let now = deletion_sync::now_secs();
-            deletion_progress.update_value(|p| {
-                deletion_sync::save(DeletionScope::Channels, p.complete(now));
-            });
+            let action = deletion_progress
+                .try_update_value(|p| p.on_main_eose(now))
+                .unwrap_or(deletion_sync::EoseAction::Ignore);
+            deletion_sync::drive(
+                &relay_for_eose,
+                DeletionScope::Channels,
+                deletion_progress,
+                on_kind5.clone(),
+                action,
+            );
         });
 
         // kind-40 = channel creation, kind-41 = metadata edit (rename),
@@ -891,6 +943,17 @@ fn deletion_filter(since: Option<u64>) -> Filter {
     }
 }
 
+/// One page of the kind-5 filter, for a marked sync that hit the row cap:
+/// `until` is the oldest `created_at` delivered so far, inclusive, so rows
+/// sharing that timestamp are not skipped (re-deliveries are idempotent).
+/// See [`deletion_sync`].
+pub fn deletion_page_filter(since: Option<u64>, until: u64) -> Filter {
+    Filter {
+        until: Some(until),
+        ..deletion_filter(since)
+    }
+}
+
 /// Filters for the channel-list subscription.
 ///
 /// The relay returns the newest `limit` rows of a filter across every kind in
@@ -1065,6 +1128,15 @@ mod tests {
             assert_eq!(f.since, expected, "filter {:?}", kinds(&f));
             assert_eq!(f.until, None);
         }
+    }
+
+    #[test]
+    fn a_deletion_page_is_isolated_limited_and_bounded_above() {
+        let f = deletion_page_filter(Some(MARKER), MARKER + 99);
+        assert_isolated_and_limited(std::slice::from_ref(&f));
+        assert_eq!(kinds(&f), vec![5]);
+        assert_eq!(f.since, Some(MARKER));
+        assert_eq!(f.until, Some(MARKER + 99));
     }
 
     #[test]

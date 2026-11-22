@@ -86,19 +86,21 @@ impl Tombstones {
             .map(String::as_str)
     }
 
-    /// Whether any tombstone names `id`, whoever its deleter. Only tests ask:
-    /// production code always decides through [`admits`], against a deleter.
-    #[cfg(test)]
+    /// Whether any tombstone names `id`, whoever its deleter. Not a
+    /// deletion decision (that is [`admits`], against a deleter); used to
+    /// find held tombstones that a newly known target can resolve.
     pub fn names(&self, id: &str) -> bool {
         self.deleters(id).next().is_some()
     }
 
-    /// Build from persisted `deleter -> {id -> deleted_at}` entries.
-    pub fn from_persisted(persisted: &HashMap<String, HashMap<String, u64>>) -> Self {
+    /// Build from persisted `deleter -> {id -> deleted_at}` maps.
+    pub fn from_persisted(persisted: &[&HashMap<String, HashMap<String, u64>>]) -> Self {
         let mut t = Self::default();
-        for (deleter, ids) in persisted {
-            for id in ids.keys() {
-                t.record(id, deleter);
+        for map in persisted {
+            for (deleter, ids) in *map {
+                for id in ids.keys() {
+                    t.record(id, deleter);
+                }
             }
         }
         t
@@ -204,6 +206,36 @@ pub fn prune(
         removed |= events.len() != before;
     }
     removed
+}
+
+/// `(id, author)` of each stored restored sealed original named by
+/// `targets`, lowercased, for resolving the held tombstones on them.
+pub fn sealed_named(
+    messages: &HashMap<String, Vec<NostrEvent>>,
+    targets: &[String],
+    is_sealed: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    messages
+        .values()
+        .flatten()
+        .filter(|e| targets.iter().any(|t| e.id.eq_ignore_ascii_case(t)) && is_sealed(&e.id))
+        .map(|e| (e.id.to_lowercase(), e.pubkey.to_lowercase()))
+        .collect()
+}
+
+/// `(id, author)` of each stored restored sealed original that any tombstone
+/// names, lowercased.
+pub fn sealed_with_tombstones(
+    messages: &HashMap<String, Vec<NostrEvent>>,
+    tombstones: &Tombstones,
+    is_sealed: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    messages
+        .values()
+        .flatten()
+        .filter(|e| tombstones.names(&e.id) && is_sealed(&e.id))
+        .map(|e| (e.id.to_lowercase(), e.pubkey.to_lowercase()))
+        .collect()
 }
 
 /// Stored sealed originals named by `targets` whose author is not `deleter`:
@@ -422,6 +454,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn sealed_lookups_find_only_restored_originals() {
+        let m = store(vec![post("s1", ALICE), post("p1", ALICE)]);
+        let mut t = Tombstones::default();
+        t.record("s1", MALLORY);
+        t.record("p1", MALLORY);
+        let want = vec![("s1".to_string(), ALICE.to_string())];
+        assert_eq!(
+            sealed_named(&m, &["S1".into(), "p1".into()], sealed("s1")),
+            want
+        );
+        assert_eq!(sealed_with_tombstones(&m, &t, sealed("s1")), want);
+        assert!(sealed_with_tombstones(&m, &Tombstones::default(), sealed("s1")).is_empty());
+    }
+
     // --- ordinary posts keep the relay as the authority ---
 
     #[test]
@@ -479,7 +526,7 @@ mod tests {
             (MALLORY.to_string(), HashMap::from([("s1".to_string(), 5)])),
             (ALICE.to_string(), HashMap::from([("s2".to_string(), 6)])),
         ]);
-        let t = Tombstones::from_persisted(&persisted);
+        let t = Tombstones::from_persisted(&[&persisted]);
         // After a reload: Mallory's entry naming Alice's sealed original does
         // not hide it; Alice's own entry does.
         let s1 = post("s1", ALICE);

@@ -50,6 +50,13 @@ impl SignerAdminCache {
         })
     }
 
+    /// The relay's answer for `pubkey`, untracked: `None` until it has given
+    /// one, so a caller can tell "not an admin" from "not asked yet".
+    pub fn answer_untracked(&self, pubkey: &str) -> Option<bool> {
+        self.known
+            .with_untracked(|k| k.get(&pubkey.to_ascii_lowercase()).copied())
+    }
+
     /// Subscribe the running effect to new answers.
     pub fn track(&self) {
         self.known.track();
