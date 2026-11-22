@@ -99,12 +99,13 @@ pub struct Notification {
 /// carrying decrypted zone text: it cannot be told which zone it came from.
 const LEGACY_POST_BODY: &str = "Open to read this message.";
 
-/// Body of a post notification. A message from an encrypted zone names its
-/// author only: its text, decrypted or not, never reaches the notification
-/// list, which is kept in LocalStorage and shown to a locked session.
-fn post_body(author: &str, content: &str, encrypted: bool) -> String {
+/// Body of a post notification. For a message from an encrypted zone neither
+/// its text (decrypted or not) nor its author reaches the notification list,
+/// which is kept in LocalStorage and shown to a locked session: only the
+/// channel name (also in the title) and, on the entry, the time.
+fn post_body(author: &str, content: &str, channel: &str, encrypted: bool) -> String {
     if encrypted {
-        format!("{author}: new encrypted message")
+        format!("New encrypted message in {channel}")
     } else {
         format!("{author}: {}", post_preview(content))
     }
@@ -732,12 +733,14 @@ impl NotificationStoreV2 {
                     store.add_at(
                         kind,
                         &title,
-                        &post_body(&author, &event.content, encrypted),
+                        &post_body(&author, &event.content, &channel_name, encrypted),
                         Some(&format!("/go/{}", event.id)),
                         Origin {
                             timestamp: event.created_at,
                             dedup_id: Some(format!("post:{}", event.id)),
-                            key: Some(pubkey_ref(&event.pubkey)),
+                            // The author key is persisted with the entry:
+                            // left out for an encrypted zone, like the name.
+                            key: (!encrypted).then(|| pubkey_ref(&event.pubkey)),
                         },
                     );
                 }
@@ -1337,6 +1340,7 @@ fn load_from_storage(owner: &str) -> Vec<Notification> {
 fn redact_legacy_preview(mut n: Notification) -> Notification {
     if !n.preview_safe && n.link.as_deref().is_some_and(|l| l.starts_with("/go/")) {
         n.body = LEGACY_POST_BODY.to_string();
+        n.key = None;
     }
     n.preview_safe = true;
     n
@@ -1663,10 +1667,17 @@ mod tests {
 
     #[test]
     fn an_encrypted_post_body_never_carries_its_text() {
-        let body = post_body("alice", "the family secret", true);
+        let body = post_body("alice", "the family secret", "Family", true);
         assert!(!body.contains("family secret"), "{body}");
-        assert!(body.starts_with("alice"));
-        assert_eq!(post_body("bob", "  hi\n there ", false), "bob: hi there");
+        assert!(
+            !body.contains("alice"),
+            "no author for an encrypted zone: {body}"
+        );
+        assert_eq!(body, "New encrypted message in Family");
+        assert_eq!(
+            post_body("bob", "  hi\n there ", "Lobby", false),
+            "bob: hi there"
+        );
     }
 
     #[test]
@@ -1675,7 +1686,7 @@ mod tests {
         let value = json!({ "items": [
             { "id": "post:1", "kind": "Message", "title": "New reply in Family",
               "body": "alice: the family secret", "timestamp": now, "read": false,
-              "link": "/go/abc" },
+              "link": "/go/abc", "key": { "full": "aa", "display": "a…" } },
             { "id": "t", "kind": "System", "title": "x", "body": "kept",
               "timestamp": now, "read": false, "link": null },
             { "id": "post:2", "kind": "Message", "title": "New reply in Family",
@@ -1685,6 +1696,10 @@ mod tests {
         let items = parse_persisted_items(&value, now);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].body, LEGACY_POST_BODY);
+        assert!(
+            items[0].key.is_none(),
+            "the author key goes with the preview"
+        );
         assert_eq!(
             items[1].body, "kept",
             "only post notifications are redacted"

@@ -261,6 +261,15 @@ pub(crate) fn MessageInput(
     let selected_mentions: RwSignal<Vec<(String, String)>> = RwSignal::new(Vec::new());
 
     // -- Draft persistence ------------------------------------------------
+    // Per signed-in identity: no drafts are kept while signed out or locked,
+    // and a draft is written only while the identity that typed it is still
+    // the one signed in.
+    let draft_owner = move || {
+        auth.state.with_untracked(|s| {
+            crate::zone_crypto::key_owner::owner_from_auth(s.is_authenticated, s.pubkey.as_deref())
+        })
+    };
+    let owner_at_open = draft_owner();
     let cid_for_draft = channel_id.clone();
     let has_draft = Memo::new({
         let cid = channel_id.clone();
@@ -272,8 +281,8 @@ pub(crate) fn MessageInput(
         }
     });
 
-    if let Some(ref cid) = channel_id {
-        if let Some(draft) = load_draft(cid) {
+    if let (Some(cid), Some(owner)) = (channel_id.as_ref(), owner_at_open.as_ref()) {
+        if let Some(draft) = load_draft(owner, cid) {
             content.set(draft);
         }
     }
@@ -293,9 +302,16 @@ pub(crate) fn MessageInput(
                 }
             }
             let cid_inner = cid.clone();
+            let owner = owner_at_open.clone();
             let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+                let Some(owner) = owner
+                    .as_ref()
+                    .filter(|o| draft_owner().as_ref() == Some(*o))
+                else {
+                    return;
+                };
                 let text = content.get_untracked();
-                save_draft(&cid_inner, &text);
+                save_draft(owner, &cid_inner, &text);
             }) as Box<dyn FnMut()>);
             if let Some(w) = web_sys::window() {
                 if let Ok(tid) = w.set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -579,8 +595,8 @@ pub(crate) fn MessageInput(
         mention_open.set(false);
         show_preview.set(false);
         cid_for_clear.with_value(|cid_opt| {
-            if let Some(ref cid) = cid_opt {
-                clear_draft(cid);
+            if let (Some(cid), Some(owner)) = (cid_opt.as_ref(), draft_owner()) {
+                clear_draft(&owner, cid);
             }
         });
         if let Some(el) = textarea_ref.get() {

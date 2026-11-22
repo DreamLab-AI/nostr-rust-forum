@@ -102,6 +102,10 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
     let content_bm = StoredValue::new(content.clone());
     let pk_bm = StoredValue::new(msg_pubkey.clone());
     let ts_bm = message.created_at;
+    // A message from an encrypted zone is bookmarked without its text: the
+    // zone store records every zone-encrypted id it has shown.
+    let encrypted_bm = crate::zone_crypto::store::try_use_zone_key_store()
+        .is_some_and(|z| z.encrypted_ids.with_untracked(|s| s.contains(&event_id)));
 
     let toggle_bookmark = move |_: leptos::ev::MouseEvent| {
         let store = use_bookmarks();
@@ -109,7 +113,14 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
         if store.is_bookmarked(&eid) {
             store.remove(&eid);
         } else {
-            store.add(&eid, &content_bm.get_value(), &pk_bm.get_value(), ts_bm, "");
+            store.add(
+                &eid,
+                &content_bm.get_value(),
+                encrypted_bm,
+                &pk_bm.get_value(),
+                ts_bm,
+                "",
+            );
         }
     };
 

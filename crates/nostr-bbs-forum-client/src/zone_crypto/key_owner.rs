@@ -530,7 +530,8 @@ mod tests {
             plan_mint("zone3", Some(3), &device, &[], true),
             MintPlan::Mint {
                 epoch: 5,
-                note: Some(_)
+                note: Some(_),
+                ..
             }
         ));
     }

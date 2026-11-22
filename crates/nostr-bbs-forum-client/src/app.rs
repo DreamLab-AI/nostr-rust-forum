@@ -325,6 +325,8 @@ pub fn App() -> impl IntoView {
     provide_notifications();
     crate::stores::notifications::provide_notification_store();
     provide_bookmarks();
+    // Drafts are now per identity; drafts from before cannot be attributed.
+    crate::components::draft_indicator::drop_legacy_drafts();
     provide_name_cache();
     provide_profile_cache();
     provide_profile_modal_target();

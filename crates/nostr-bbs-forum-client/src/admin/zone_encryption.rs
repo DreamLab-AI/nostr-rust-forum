@@ -429,15 +429,26 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         let grant = grant.clone();
         let fresh_roster = fresh_roster.clone();
         move |rotate: bool| {
+            let plan = mint_plan();
             let crate::zone_crypto::keyset::MintPlan::Mint {
                 epoch: next_epoch, ..
-            } = mint_plan()
+            } = plan
             else {
                 status.set(Some(
                     "A key cannot be created yet: see the note on this card.".into(),
                 ));
                 return;
             };
+            // Planned below an epoch the zone's posts use: never mint that
+            // silently, it may not take effect for members on the higher one.
+            if let Some(ask) = crate::zone_crypto::keyset::mint_confirmation(&plan) {
+                let ok = web_sys::window()
+                    .and_then(|w| w.confirm_with_message(&ask).ok())
+                    .unwrap_or(false);
+                if !ok {
+                    return;
+                }
+            }
             if rotate {
                 let ok = web_sys::window()
                     .and_then(|w| {
