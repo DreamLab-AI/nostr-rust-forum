@@ -149,4 +149,6 @@ validator only parses `forum.toml`; it cannot see the database and does not clai
 - ADR-2029, the decision. ADR-2027 (DM overlay) and ADR-2028 (NIP-171 zones) are prerequisites of
   `room`.
 - `docs/interop/nostr-chat-interop-assessment-2026-10-20.md` for the wire comparison that led
-  here, and `docs/diagrams/relay-event-admission.md` for the admission path both profiles share.
+  here, and VisionFlow's NF-03 (`docs/diagrams/nostr-rust-forum/03-relay-worker-admission-auth-and-trust.md`
+  in [DreamLab-AI/VisionFlow](https://github.com/DreamLab-AI/VisionFlow/tree/main/docs/diagrams/nostr-rust-forum))
+  for the admission path both profiles share.

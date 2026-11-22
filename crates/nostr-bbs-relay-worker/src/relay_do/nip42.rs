@@ -184,11 +184,13 @@ pub fn relay_urls_match(a: &str, b: &str) -> bool {
 /// `relay` tag names THIS relay (canonicalised); and `created_at` is within
 /// `±max_skew` of `now`.
 ///
-/// `own_relay_url = None` (or blank) REJECTS the AUTH with
+/// An empty `allowed_relay_urls` REJECTS the AUTH with
 /// `invalid: relay url unconfigured`: the relay-tag check is never skipped, or
 /// a malicious relay could pass our challenge to a victim as its own and relay
-/// the victim's signed AUTH back. The caller derives the URL from the host the
-/// upgrade request arrived at when `RELAY_URL` is blank (see [`resolve_own_url`]).
+/// the victim's signed AUTH back. The caller builds the set with
+/// [`allowed_relay_urls`] from the `RELAY_URL` and `RELAY_URL_ALIASES` vars
+/// only, never from the host the request arrived at, so a blank `RELAY_URL`
+/// (and no aliases) refuses every AUTH.
 ///
 /// Pure over its inputs (the Schnorr verify is itself a pure function of the
 /// event), so the full verdict table is unit-testable without a DO.
@@ -270,8 +272,9 @@ pub fn allowed_relay_urls(var: Option<&str>, aliases: Option<&str>) -> Vec<Strin
 }
 
 /// Whether `AUTH_MODE` is `nip42` but no relay URL is configured, so
-/// [`evaluate_auth_event`] fails closed and refuses every AUTH. The predicate
-/// exists so the relay can say so, loudly, at startup and in NIP-11.
+/// [`evaluate_auth_event`] fails closed and refuses every AUTH. Its one
+/// production caller is [`warn_if_relay_url_unconfigured`], which the AUTH
+/// handler runs on every AUTH; nothing reports it at startup or in NIP-11.
 pub fn relay_url_unconfigured_in_nip42(mode: AuthMode, allowed: &[String]) -> bool {
     mode == AuthMode::Nip42 && allowed.is_empty()
 }

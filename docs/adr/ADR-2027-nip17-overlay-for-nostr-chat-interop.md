@@ -7,7 +7,7 @@ implementation_status: partial
 activation_status: inactive
 supersedes: []
 superseded_by: []
-verified_commit: fb9ef30 plus the uncommitted ADR-2025 working tree (assessment only; nothing implemented to verify)
+verified_commit: fd31193 (source presence of decisions 1 and 2 behind RECIPIENT_KEYS_ENABLED, read 2026-11-22; tests not run)
 owner: DreamLab-AI/nostr-rust-forum maintainers
 review_trigger: A member asking to DM a nostr.chat or Iris user; nostr-double-ratchet reaching a stable minor; any proposal to move public channels off kind 42
 repo: nostr-rust-forum
@@ -29,6 +29,17 @@ on the production databases, so the board can be backed up without a reset.
 ## Decision
 
 > Note 2026-11-20: the inbox-key relay change in decision 2 is on `main`. `8038b54` (Phase 2, flagged off) and `2047c1b` (inbox-key attestation) are ancestors of `main` since the `integrate/phase-0-1` merge (`2e8006b`); the relay side is in `crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs` (inbox-key resolution at `:2332`, subscription keys at `:2161`) and the flag is `RECIPIENT_KEYS_ENABLED = "false"` (`crates/nostr-bbs-auth-worker/wrangler.toml:70`). The index row (`implementation partial`, `activation inactive`) is still right: decision 1 (the NIP-17 overlay, Phase 3) is not built and nothing is switched on.
+
+> Note 2026-11-22: the 2026-11-20 note above is wrong about decision 1. The Phase 3 NIP-17 overlay is on `main`: `36b7272`
+> (Phase 3, flagged off) is an ancestor of `main` through the `a80c572` merge. Its source is
+> `crates/nostr-bbs-forum-client/src/dm/routing.rs` (kind 10050, falling back to 10002),
+> `crates/nostr-bbs-forum-client/src/zone_crypto/public_inbox.rs` (the `public_inbox` opt-in),
+> `crates/nostr-bbs-forum-client/src/dm/requests.rs` (the requests inbox) and the consent text in
+> `crates/nostr-bbs-forum-client/src/pages/settings.rs` (`CONSENT_TITLE`, `CONSENT_CONFIRM`). All of it is behind
+> `RECIPIENT_KEYS_ENABLED`, which every reader enables only on the exact string `"true"` and which the auth-worker
+> template sets `"false"`. `implementation_status: partial` still holds, because decision 4 (the double ratchet) is
+> deliberately not adopted yet; `activation_status: inactive` holds because the flag is off. Checked by reading source at
+> `fd31193`; the tests named under Verification were not run for this note.
 
 Proposed:
 
@@ -73,6 +84,10 @@ Proposed:
 - Blossom media and Negentropy sync have no counterpart and are not planned.
 
 ## Verification
+
+> Note 2026-11-22: "None: no implementation" below predates Phase 3. Decisions 1 and 2 are present on `main` behind
+> `RECIPIENT_KEYS_ENABLED` (see the 2026-11-22 note under Decision); whether each adoption test listed here exists and
+> passes was not checked for this note.
 
 None: no implementation. Adoption requires a test that a wrap published to a foreign relay is
 byte-identical to the one published to ours, a test that a kind 21453 grant is never addressed to a

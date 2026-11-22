@@ -2938,8 +2938,10 @@ mod a_ref_target_tests {
 // ---------------------------------------------------------------------------
 //
 // Every forum client folds EVERY `e` tag of a stored or broadcast kind-5 into
-// its tombstones with no author check (forum-client `stores/channels.rs`
-// `fold_deletions`): it trusts this gate to have decided who may delete what.
+// its tombstones (forum-client `stores/tombstones.rs` `fold_deletion`), and for
+// an ordinary post it honours the tombstone with no author check: it trusts
+// this gate to have decided who may delete what. Only a restored sealed
+// original is also checked client-side (its author, or a relay-vouched admin).
 // So for a member (no delete-any privilege) the gate must vouch for each `e`
 // tag before the kind-5 is accepted. Ignoring a bad tag relay-side and
 // accepting the rest is not an option: the event is signed, the relay cannot

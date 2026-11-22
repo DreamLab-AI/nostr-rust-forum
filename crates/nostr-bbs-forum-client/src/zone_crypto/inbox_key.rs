@@ -44,7 +44,8 @@ pub const GRANT_SWEEP_ENV: &str = "GRANT_SWEEP_ENABLED";
 pub const KIND_APP_DATA: u64 = 30078;
 /// `d` tag of the backup event.
 pub const BACKUP_D_TAG: &str = "nostr-bbs/zone-inbox/v1";
-/// Kind of the proof event signed by the inbox key (NIP-98 style).
+/// Kind of the inbox-key authorization, signed by the member's identity key
+/// (see [`build_proof`]).
 pub const KIND_PROOF: u64 = 27237;
 /// Kind of the possession proof, signed by the inbox key itself, naming its
 /// owner. Distinct from [`KIND_PROOF`] so the two cannot be interchanged: the
@@ -408,8 +409,7 @@ pub enum Lookup {
 /// Read a lookup reply: `{"keys":[{"key","role","revoked","created_at"}]}`.
 /// The newest unrevoked `inbox` entry wins; an empty list is a definite none.
 /// Whether `proof` binds `key` to `member`: a kind-27237 event signed by the
-/// inbox key itself, carrying an `owner` tag naming the member, with a valid
-/// signature. Freshness (`exp`) is not checked here: the proof was time-bound
+/// member, carrying a `k` tag naming the inbox key, with a valid signature. Freshness (`exp`) is not checked here: the proof was time-bound
 /// when the auth-worker accepted it, and the issuer verifies binding, not age.
 /// Without this check an issuer would wrap zone keys to whatever key a
 /// lookup reply named, so a wrong or hostile row could redirect them.

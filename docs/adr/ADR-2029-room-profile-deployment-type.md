@@ -46,6 +46,10 @@ enforces `blocked` on read and uses `trusted` to gate links and media only (`app
 
 ## Decision
 
+> Note 2026-11-22: decision 9's "diagrams corpus" is now VisionFlow's estate corpus,
+> `docs/diagrams/nostr-rust-forum/` in DreamLab-AI/VisionFlow; this repository no longer keeps diagram files
+> (`docs/diagrams/README.md`). The citation-verified room-dialect sequence lands there.
+
 Proposed:
 
 1. **Two named deployment profiles.** `forum` (today's behaviour, the default) and `room`. The

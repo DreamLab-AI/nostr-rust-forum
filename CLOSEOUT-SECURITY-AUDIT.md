@@ -4,6 +4,11 @@
 **Method:** Fable-orchestrated Opus ruflo mesh — 9 comparison dimensions, each analysed by an Opus agent and adversarially verified by a second Opus agent (39 CONFIRMED / 6 ADJUSTED / **0 REFUTED** + 20 verifier-surfaced misses). Fable confined to orchestration + synthesis; all analysis and remediation by Opus agents.  
 **Consumes:** `solid-pod-rs = 0.5.0-alpha.3` (crates.io, `core` feature) — several findings are consumption-boundary issues inherited from the pinned (pre-closeout-fix) version.
 
+> Note 2026-11-22: evidence lines below that cite `docs/diagrams/00-anomaly-register.md` (O2, O3, O6, R4) name a file
+> removed on 2026-11-22; read it at this audit's date from git history. O2, O3 and O6 are carried, with diagrammed
+> context, by VisionFlow `docs/diagrams/nostr-rust-forum/10-invariants-and-anomaly-register.md` (NF-10); R4 (the NIP-26
+> removal) has no VisionFlow entry. Open kit findings are in `docs/security/known-findings.md`.
+
 ## Severity tally (verified, non-refuted)
 
 | Severity | Count |

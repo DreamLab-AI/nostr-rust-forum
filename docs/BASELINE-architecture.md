@@ -1,9 +1,9 @@
 ---
 title: Architecture Baseline — nostr-rust-forum
 doc_id: NRF-BASELINE
-version: 0.3.0
+version: 0.3.1
 status: draft-for-ratification
-verified_commit: 3c48e26 (ADR-2033 and ADR-2034 sections, invariants 7 and 8, and the deletion citations in the encrypted-zones section; ADR-2030 to ADR-2032 sections keep 0065dd9; older sections keep their earlier stamp)
+verified_commit: fd31193 (kit-version, solid-pod-rs and relay-admission paragraphs, and the invariant 6 note); 3c48e26 (ADR-2033 and ADR-2034 sections, invariants 7 and 8, and the deletion citations in the encrypted-zones section; ADR-2030 to ADR-2032 sections keep 0065dd9; older sections keep their earlier stamp)
 sources:
   - Cargo.toml
   - crates/nostr-bbs-upstream-canary/src/lib.rs
@@ -121,11 +121,18 @@ path uses upsert-with-`DO NOTHING` to survive the SELECT-then-branch race
 ### Kit publishing & versioning
 
 The `nostr-bbs-*` crates are the publishable kit surface (legacy ADR-103). The
-current in-tree version is **`1.0.0-beta.19`** (`crates/nostr-bbs-core/Cargo.toml:3`;
-workspace path deps are pinned to `1.0.0-beta.19` in `Cargo.toml`). `solid-pod-rs`
-is an **exact** pin (`=0.5.0-alpha.7`, `default-features = false`, `features =
-["core"]`) so a caret range cannot silently pull a newer published alpha at resolve
-time (`Cargo.toml`).
+current in-tree version is **`1.0.0-beta.20`** (`crates/nostr-bbs-core/Cargo.toml:3`;
+workspace path deps are pinned to `1.0.0-beta.20` in `Cargo.toml:191-194`).
+`solid-pod-rs` is a **caret** requirement, `0.5.0-alpha.24` with `default-features =
+false` and `features = ["core"]` (`Cargo.toml:188`); `Cargo.lock` still fixes what a
+build resolves, so a newer alpha arrives only through a reviewed `cargo update`.
+
+> Note 2026-11-22: this paragraph previously said `solid-pod-rs` was an exact pin at
+> `=0.5.0-alpha.7`. The manifest moved to a caret range under estate register ER-35, an
+> owner decision of 2026-10-18 recorded in the comment at `Cargo.toml:184-187`, so that each
+> `solid-pod-rs` security release no longer forces a `nostr-bbs-core` republish. No ledger
+> record in `docs/adr/` carries that decision; ADR-2007 still records the exact pin. See the
+> note under invariant 6.
 
 ### Client surfaces
 
@@ -153,11 +160,15 @@ time (`Cargo.toml`).
 
 The relay worker (`nostr-bbs-relay-worker`) gates events by trust level and kind.
 Gift-wraps (kind 1059) are recipient-gated on the first `["p", <hex>]` tag rather
-than the ephemeral author, and are accepted only if that recipient is a
-whitelisted member (`crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs:1148-1166`; recipient extraction `gift_wrap_recipient` at `:151`).
-Ban-gating covers user-authored content kinds explicitly; gift-wraps are excluded
-from ban-gating because the recipient-whitelist gate already bounds them
-(`nip_handlers.rs:58-64`).
+than the ephemeral author (`crates/nostr-bbs-relay-worker/src/relay_do/nip_handlers.rs:1175-1185`;
+recipient extraction `gift_wrap_recipient` at `:160`; verdict `gift_wrap_recipient_verdict`
+at `:2352`). The recipient is admitted when it is a configured `INGRESS_RECIPIENTS` key
+(config, no flag), a registered zone epoch key (only with `ZONE_GROUPS_ENABLED`), or a
+registered inbox key judged by its owner's membership (only with `RECIPIENT_KEYS_ENABLED`);
+otherwise the recipient itself must be a whitelisted member. With both flags off, as the
+templates ship, that is ingress or whitelist. Ban-gating covers user-authored content kinds
+explicitly; gift-wraps are excluded from ban-gating because the recipient gate already
+bounds them (`nip_handlers.rs:71-77`).
 
 ## Known divergences & open items
 
@@ -214,6 +225,10 @@ from ban-gating because the recipient-whitelist gate already bounds them
    author must never be used for the admission decision.
 6. **`solid-pod-rs` stays an exact (`=`) pin** — a caret range would let a resolve
    pull a newer published alpha.
+   > Note 2026-11-22: this invariant does not hold at `fd31193`. `Cargo.toml:188` declares a
+   > caret requirement at `0.5.0-alpha.24`, changed under ER-35 (owner decision 2026-10-18,
+   > `Cargo.toml:184-187`); `Cargo.lock` fixes the resolved version. The invariant and ADR-2007
+   > need a ledger record of that decision before the text is changed.
 7. **A member's kind-5 is accepted only when the relay can vouch for every `e` target**
    (`member_deletion_gate`); a target with no stored row never counts as the signer's own, and a
    sealed original is never a member's to delete (ADR-2033). Every client folds every `e` tag of a
