@@ -2809,6 +2809,120 @@ impl NostrRelayDO {
     }
 }
 
+/// A kind-5 `a` reference that names a real address the signer may delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ARefTarget<'a> {
+    pub kind: u64,
+    pub pubkey: &'a str,
+    pub d_tag: &'a str,
+    /// Always [`EventTreatment::Replaceable`] or
+    /// [`EventTreatment::ParameterizedReplaceable`].
+    pub treatment: EventTreatment,
+}
+
+/// Whether a kind-5 `a` reference should act, and on what.
+///
+/// An address only exists for (parameterised) replaceable kinds. For any other
+/// kind the reference is ignored entirely, neither deleted nor tombstoned:
+/// `kind = 1 AND pubkey = ? AND d_tag = ''` would otherwise match every kind-1
+/// that author ever posted, so one `["a","1:<pubkey>:"]` was a mass delete. A
+/// kind must be a non-negative integer (`-1.0 as u64` would saturate to kind 0),
+/// and without delete-any privilege the address must be the signer's own.
+pub(crate) fn a_ref_target<'a>(
+    a_ref: &'a str,
+    signer: &str,
+    can_delete_any: bool,
+) -> Option<ARefTarget<'a>> {
+    let (kind, pubkey, d_tag) = filter::split_a_ref(a_ref)?;
+    if !(kind >= 0.0 && kind.fract() == 0.0 && kind <= u32::MAX as f64) {
+        return None;
+    }
+    if !can_delete_any && pubkey != signer {
+        return None;
+    }
+    let kind = kind as u64;
+    let treatment = event_treatment(kind);
+    matches!(
+        treatment,
+        EventTreatment::Replaceable | EventTreatment::ParameterizedReplaceable
+    )
+    .then_some(ARefTarget {
+        kind,
+        pubkey,
+        d_tag,
+        treatment,
+    })
+}
+
+#[cfg(test)]
+mod a_ref_target_tests {
+    use super::*;
+
+    const ME: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const THEM: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn a_regular_kind_a_ref_never_acts() {
+        for kind in [1, 5, 7, 42, 1059, 9024, 29_999, 40_000] {
+            for privileged in [false, true] {
+                assert_eq!(
+                    a_ref_target(&format!("{kind}:{ME}:"), ME, privileged),
+                    None,
+                    "kind {kind}, delete-any {privileged}"
+                );
+            }
+        }
+        assert_eq!(a_ref_target(&format!("1:{THEM}:"), ME, true), None);
+    }
+
+    #[test]
+    fn replaceable_and_addressable_kinds_act() {
+        for (kind, treatment) in [
+            (0, EventTreatment::Replaceable),
+            (3, EventTreatment::Replaceable),
+            (10_002, EventTreatment::Replaceable),
+            (30_023, EventTreatment::ParameterizedReplaceable),
+            (39_999, EventTreatment::ParameterizedReplaceable),
+        ] {
+            let a = format!("{kind}:{ME}:post:with:colons");
+            assert_eq!(
+                a_ref_target(&a, ME, false),
+                Some(ARefTarget {
+                    kind,
+                    pubkey: ME,
+                    d_tag: "post:with:colons",
+                    treatment,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn ephemeral_kinds_never_act() {
+        assert_eq!(a_ref_target(&format!("20000:{ME}:"), ME, true), None);
+    }
+
+    #[test]
+    fn another_authors_address_needs_delete_any() {
+        let a = format!("30023:{THEM}:post");
+        assert_eq!(a_ref_target(&a, ME, false), None);
+        assert_eq!(a_ref_target(&a, ME, true).map(|t| t.pubkey), Some(THEM));
+    }
+
+    #[test]
+    fn a_malformed_kind_never_acts() {
+        for a in [
+            format!("-1:{ME}:"),
+            format!("0.5:{ME}:"),
+            format!("x:{ME}:"),
+            format!("99999999999:{ME}:"),
+            format!("30023:{ME}"),
+        ] {
+            assert_eq!(a_ref_target(&a, ME, true), None, "{a}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NIP-09: Deletion processing
 // ---------------------------------------------------------------------------
@@ -2970,42 +3084,26 @@ impl NostrRelayDO {
             .collect();
 
         for a_ref in &a_targets {
-            let Some((kind, pubkey, d_tag)) = filter::split_a_ref(a_ref) else {
+            // A regular kind names no address and is ignored: see `a_ref_target`.
+            let Some(ARefTarget {
+                kind,
+                pubkey,
+                d_tag,
+                treatment,
+            }) = a_ref_target(a_ref, &deletion_event.pubkey, can_delete_any)
+            else {
                 continue;
             };
-            // A kind is a non-negative integer; anything else names no address
-            // (and `-1.0 as u64` would saturate to kind 0).
-            if !(kind >= 0.0 && kind.fract() == 0.0 && kind <= u32::MAX as f64) {
-                continue;
-            }
             // NIP-09: versions up to the deletion stay deleted, but never past
             // now (a kind-5 may be dated ahead within the drift allowance).
             let until = deletion_event.created_at.min(now);
-
-            // Own events only, unless the author holds delete-any privilege
-            // (the a-ref names its owner, so the SQL below stays scoped to
-            // exactly that pubkey's replaceable event either way).
-            if !can_delete_any && pubkey != deletion_event.pubkey {
-                continue;
-            }
-
-            // NIP-09: versions up to the deletion's created_at stay deleted.
-            // Addresses only exist for (parameterised) replaceable kinds; an
-            // `a` naming a regular kind records nothing.
-            let treatment = event_treatment(kind as u64);
-            let addressable = matches!(
-                treatment,
-                EventTreatment::Replaceable | EventTreatment::ParameterizedReplaceable
-            );
-            if addressable {
-                if let Ok(ins) = db.prepare(crate::DELETED_ADDRESS_UPSERT_SQL).bind(&[
-                    JsValue::from_f64(kind),
-                    JsValue::from_str(pubkey),
-                    JsValue::from_str(crate::address_d_tag(kind as u64, d_tag)),
-                    JsValue::from_f64(until as f64),
-                ]) {
-                    let _ = ins.run().await;
-                }
+            if let Ok(ins) = db.prepare(crate::DELETED_ADDRESS_UPSERT_SQL).bind(&[
+                JsValue::from_f64(kind as f64),
+                JsValue::from_str(pubkey),
+                JsValue::from_str(crate::address_d_tag(kind, d_tag)),
+                JsValue::from_f64(until as f64),
+            ]) {
+                let _ = ins.run().await;
             }
 
             // NIP-09: a version newer than the deletion stays. Bounded by the
@@ -3013,7 +3111,7 @@ impl NostrRelayDO {
             // pre-dated within the drift allowance cannot outlive it. A plain
             // replaceable is one slot per (kind, author): a stored version
             // carrying a stray `d` tag is the same address, so match it too.
-            let (kind_js, author_js) = (JsValue::from_f64(kind), JsValue::from_str(pubkey));
+            let (kind_js, author_js) = (JsValue::from_f64(kind as f64), JsValue::from_str(pubkey));
             let until_js = JsValue::from_f64(deletion_event.created_at as f64);
             let bound = if treatment == EventTreatment::Replaceable {
                 db.prepare(
