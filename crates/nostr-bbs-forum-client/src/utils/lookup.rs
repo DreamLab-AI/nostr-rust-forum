@@ -22,8 +22,8 @@
 //! ledger (`relay::receipt`), not by the socket's state when the EOSE lands —
 //! so [`SyncReceipt::settles`] can tell the two apart.
 //!
-//! Pure apart from [`deadline_for`] and [`arm_deadline`], which only drive
-//! the pure [`DeadlineClock`] from a timer, so the decision unit-tests
+//! Pure apart from [`deadline_for`], which only drives the pure
+//! [`DeadlineClock`] from a timer, so the decision unit-tests
 //! natively.
 
 use leptos::prelude::*;
@@ -130,16 +130,15 @@ pub fn zone_is_gated(category_param: &str, zones: &[Zone]) -> bool {
 /// sync's per-zone filters from. Starting on the first channel to arrive
 /// would scope those filters to that one channel's zone.
 ///
-/// `signed_in` is `None` while the auth store is still restoring. A signed-in
-/// viewer waits for an authenticated answer (the anonymous one omits Hidden
-/// zones); an anonymous viewer will never authenticate, so any answer is
-/// final. The deadline covers a relay that never challenges or rejects AUTH.
-pub fn channel_list_settled(
-    receipt: SyncReceipt,
-    signed_in: Option<bool>,
-    deadline_passed: bool,
-) -> bool {
-    receipt.authed || (signed_in == Some(false) && receipt.any) || deadline_passed
+/// Only an authenticated answer counts: the anonymous one omits Hidden-zone
+/// channels. There is no anonymous case to settle for, because the client
+/// only connects to the relay while signed in (`App`'s connect effect), so a
+/// logged-out visitor produces no receipts at all — and the forum routes
+/// that read this list are auth-gated and send them to sign-in instead. The
+/// deadline covers a relay that never challenges, or an AUTH that is refused
+/// or stalls.
+pub fn channel_list_settled(receipt: SyncReceipt, deadline_passed: bool) -> bool {
+    receipt.authed || deadline_passed
 }
 
 /// The failure clock for whichever target (zone, section, topic) a page is
@@ -215,20 +214,6 @@ where
         );
     });
     Signal::derive(move || expired_for.with(|e| e.as_ref() == Some(&target.get())))
-}
-
-/// A one-shot [`LOOKUP_DEADLINE_MS`] clock for something that never changes
-/// target (the app-wide channel list). `try_set` because the owner may have
-/// been disposed by the time the timer fires.
-pub fn arm_deadline() -> RwSignal<bool> {
-    let passed = RwSignal::new(false);
-    super::set_timeout_once(
-        move || {
-            let _ = passed.try_set(true);
-        },
-        LOOKUP_DEADLINE_MS,
-    );
-    passed
 }
 
 #[cfg(test)]
@@ -332,35 +317,24 @@ mod tests {
     }
 
     #[test]
-    fn channel_list_settles_on_authed_receipt_for_signed_in() {
+    fn channel_list_settles_only_on_an_authenticated_answer() {
         let mut r = SyncReceipt::default();
-        assert!(!channel_list_settled(r, Some(true), false));
+        assert!(!channel_list_settled(r, false));
         r.record(false);
         assert!(
-            !channel_list_settled(r, Some(true), false),
+            !channel_list_settled(r, false),
             "anonymous answer is not the whole list for a member"
         );
         r.record(true);
-        assert!(channel_list_settled(r, Some(true), false));
+        assert!(channel_list_settled(r, false));
     }
 
     #[test]
-    fn channel_list_settles_on_any_receipt_for_anonymous() {
+    fn channel_list_deadline_ends_the_wait() {
         let mut r = SyncReceipt::default();
-        assert!(!channel_list_settled(r, Some(false), false));
+        assert!(channel_list_settled(r, true), "no answer at all");
         r.record(false);
-        assert!(channel_list_settled(r, Some(false), false));
-    }
-
-    #[test]
-    fn channel_list_waits_while_auth_restores() {
-        let mut r = SyncReceipt::default();
-        r.record(false);
-        assert!(!channel_list_settled(r, None, false));
-        assert!(
-            channel_list_settled(r, None, true),
-            "deadline still ends it"
-        );
+        assert!(channel_list_settled(r, true), "AUTH refused or stalled");
     }
 
     #[test]

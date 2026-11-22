@@ -881,16 +881,18 @@ pub fn App() -> impl IntoView {
     // (no Hidden-zone channels), and an empty first EOSE is followed by
     // channels trickling in, so starting on either would scope the filters to
     // whatever had arrived. `channel_list_settled` waits for an authenticated
-    // answer when signed in, any answer when not, or the deadline. Still
-    // gated on a non-empty list, since `start_msg_sync` bails on an empty one.
-    let msg_sync_deadline = crate::utils::lookup::arm_deadline();
-    let auth_ready = auth.is_ready();
+    // answer or the deadline, which is armed when the relay connects (not at
+    // app start: sign-in can take longer than the deadline). Still gated on
+    // a non-empty list, since `start_msg_sync` bails on an empty one.
+    let msg_sync_deadline =
+        crate::utils::lookup::deadline_for(move || relay_conn.get() == ConnectionState::Connected);
     Effect::new(move |_| {
         let store = use_channel_store();
-        let signed_in = auth_ready.get().then(|| is_authed.get());
+        if relay_conn.get() != ConnectionState::Connected {
+            return;
+        }
         let settled = crate::utils::lookup::channel_list_settled(
             store.channel_receipt.get(),
-            signed_in,
             msg_sync_deadline.get(),
         );
         let has_channels = store.channels.with(|c| !c.is_empty());
