@@ -214,8 +214,9 @@ fn ZoneKeyCard(zone: Zone, keys: ZoneKeyStore, members_ready: RwSignal<bool>) ->
         });
         let ready = channels.msg_eose_received.get() && keys_ready();
         crate::zone_crypto::keyset::plan_mint(
+            &zone_id,
             latest().map(|k| k.epoch),
-            keys.device_epoch(&zone_id),
+            &keys.device_epochs_for(&zone_id),
             &seen,
             ready,
         )

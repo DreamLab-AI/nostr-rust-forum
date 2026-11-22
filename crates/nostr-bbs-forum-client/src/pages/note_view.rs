@@ -84,9 +84,24 @@ pub fn NoteViewPage() -> impl IntoView {
     let copied = RwSignal::new(false);
     let sub_id: RwSignal<Option<String>> = RwSignal::new(None);
 
+    // The event as the relay sent it, before decryption: the shown note is
+    // re-derived from it whenever the zone keys change (a key arrives, or the
+    // identity signs out and every key is dropped), so no decrypted text
+    // outlives the keys that produced it.
+    let raw: StoredValue<Option<NostrEvent>> = StoredValue::new(None);
+
     let relay_for_sub = relay.clone();
     // Captured during setup: the relay callback below has no reactive owner.
     let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
+    if let Some(store) = zone_keys {
+        Effect::new(move |_| {
+            store.revision.track();
+            if let Some(ev) = raw.get_value() {
+                let shown = crate::zone_crypto::store::prepare_incoming(Some(store), ev);
+                note.set(Some(NoteData::from_event(&shown)));
+            }
+        });
+    }
     let relay_for_cleanup = relay;
 
     // Subscribe to fetch the single event
@@ -112,6 +127,7 @@ pub fn NoteViewPage() -> impl IntoView {
         let loading_sig = loading;
         let on_event = Rc::new(move |event: NostrEvent| {
             // A zone-encrypted post shows its text only to key holders (ADR-2016).
+            raw.set_value(Some(event.clone()));
             let event = crate::zone_crypto::store::prepare_incoming(zone_keys, event);
             note_sig.set(Some(NoteData::from_event(&event)));
             loading_sig.set(false);

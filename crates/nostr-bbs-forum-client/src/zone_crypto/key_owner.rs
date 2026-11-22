@@ -26,7 +26,7 @@
 //! Kept free of reactive and browser types so every rule runs under plain
 //! `cargo test`; the IndexedDB layer and the store call these functions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::ZoneKey;
 use crate::stores::indexed_db::StoredZoneKey;
@@ -109,6 +109,8 @@ pub fn put_decision(view: Option<&ZoneKey>, key: &ZoneKey) -> PutDecision {
     }
 }
 
+use super::keyset::MAX_EPOCH_SKIP;
+
 /// Whether a freshly minted key may be stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MintDecision {
@@ -116,9 +118,10 @@ pub enum MintDecision {
     Write,
     /// The slot holds a different key (see [`put_decision`]).
     Conflict(ZoneKey),
-    /// Some row on this device, of any owner, holds a different key for the
-    /// zone at this epoch or above: minting here could clash with a key
-    /// another account on this browser holds but has not delivered yet.
+    /// The identity holds a different key for the zone at this epoch or
+    /// above, or another account on this browser does within
+    /// [`MAX_EPOCH_SKIP`] of it: minting here could clash with a key that
+    /// account holds but has not delivered yet.
     Superseded(u32),
 }
 
@@ -137,11 +140,24 @@ pub fn mint_decision(
     {
         return MintDecision::Conflict(held);
     }
-    let clash = rows
+    // A different key at this epoch or above that the identity itself holds
+    // (its rows and the legacy rows it sees) always refuses. Another
+    // account's counts only within MAX_EPOCH_SKIP of the mint, the bound
+    // `plan_mint` believes it to: one far-ahead grant to some other account
+    // must not refuse every mint for good (rows are never deleted).
+    let bound = key.epoch.saturating_add(MAX_EPOCH_SKIP);
+    let different = |zone: &str, epoch: u32, pubkey: &str| {
+        zone == key.zone && epoch >= key.epoch && pubkey != key.pubkey
+    };
+    let own = view
+        .values()
+        .filter(|k| different(&k.zone, k.epoch, &k.pubkey))
+        .map(|k| k.epoch);
+    let others = rows
         .iter()
-        .filter(|r| r.zone == key.zone && r.epoch >= key.epoch && r.pubkey != key.pubkey)
-        .map(|r| r.epoch)
-        .max();
+        .filter(|r| different(&r.zone, r.epoch, &r.pubkey) && r.epoch < bound)
+        .map(|r| r.epoch);
+    let clash = own.chain(others).max();
     match clash {
         Some(epoch) => MintDecision::Superseded(epoch),
         None => MintDecision::Write,
@@ -205,11 +221,10 @@ pub fn merge_loaded(
 /// mints above them, and no secret crosses accounts.
 pub fn device_epochs<'a>(
     rows: impl IntoIterator<Item = &'a StoredZoneKey>,
-) -> HashMap<String, u32> {
-    let mut out: HashMap<String, u32> = HashMap::new();
+) -> HashMap<String, BTreeSet<u32>> {
+    let mut out: HashMap<String, BTreeSet<u32>> = HashMap::new();
     for r in rows {
-        let e = out.entry(r.zone.clone()).or_insert(r.epoch);
-        *e = (*e).max(r.epoch);
+        out.entry(r.zone.clone()).or_default().insert(r.epoch);
     }
     out
 }
@@ -246,6 +261,15 @@ pub fn migration_plan(rows: &[StoredZoneKey], zone_groups: bool) -> Vec<Rename> 
 /// only relay copy of a key, so it is rebuilt from the inbox wraps themselves.
 pub fn inbox_granted_id(owner: &Owner) -> String {
     format!("inbox_granted:{owner}")
+}
+
+/// The entry recording that `key` arrived through the inbox key: its full
+/// store id, so with `ZONE_GROUPS_ENABLED` two different keys claiming one
+/// epoch never share an entry, and the inbox copy of one can never count as
+/// the replacement that lets the sweep delete the identity copy of the other.
+/// With the flag off this is `<zone>:<epoch>`, the form entries had before.
+pub fn inbox_granted_entry(key: &ZoneKey, zone_groups: bool) -> String {
+    key.store_id_with(zone_groups)
 }
 
 /// The identity whose keys the store holds in memory, and a counter bumped on
@@ -501,9 +525,9 @@ mod tests {
         let other = with_pk(key("zone9", 1, '8'), 'd');
         assert_eq!(mint_decision(&rows, &b, &other, false), MintDecision::Write);
         // The device floor makes the card plan epoch 5 in the first place.
-        let floor = device_epochs(&rows).get("zone3").copied();
+        let device: Vec<u32> = device_epochs(&rows)["zone3"].iter().copied().collect();
         assert!(matches!(
-            plan_mint(Some(3), floor, &[], true),
+            plan_mint("zone3", Some(3), &device, &[], true),
             MintPlan::Mint {
                 epoch: 5,
                 note: Some(_)
@@ -532,7 +556,16 @@ mod tests {
         let at4 = with_pk(key("zone3", 4, '9'), 'e');
         assert_eq!(mint_decision(&rows, &b, &at4, true), MintDecision::Write);
         assert!(matches!(
-            plan_mint(None, device_epochs(&rows).get("zone3").copied(), &[], true),
+            plan_mint(
+                "zone3",
+                None,
+                &device_epochs(&rows)["zone3"]
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                &[],
+                true
+            ),
             MintPlan::Mint { epoch: 4, .. }
         ));
     }
@@ -556,6 +589,43 @@ mod tests {
         assert!(!merge_loaded(&mut mem, HashMap::new()));
     }
 
+    /// Review finding: one valid grant at u32::MAX to any account that ever
+    /// signed in here must not stop Create/Rotate for good.
+    #[test]
+    fn a_far_ahead_row_of_another_account_does_not_refuse_a_mint() {
+        let (a, b) = (owner('a'), owner('b'));
+        let poison = with_pk(key("zone3", u32::MAX, '9'), 'f');
+        let rows = vec![owned(&a, &poison), owned(&b, &key("zone3", 3, '3'))];
+        let b4 = with_pk(key("zone3", 4, '8'), 'd');
+        assert_eq!(mint_decision(&rows, &b, &b4, false), MintDecision::Write);
+        // Just inside the bound (4 + MAX_EPOCH_SKIP - 1) still refuses; just
+        // outside it does not.
+        for (epoch, refused) in [(4 + MAX_EPOCH_SKIP - 1, true), (4 + MAX_EPOCH_SKIP, false)] {
+            let rows = vec![
+                owned(&a, &with_pk(key("zone3", epoch, '9'), 'f')),
+                owned(&b, &key("zone3", 3, '3')),
+            ];
+            let got = mint_decision(&rows, &b, &b4, false);
+            assert_eq!(
+                got == MintDecision::Superseded(epoch),
+                refused,
+                "epoch {epoch}: {got:?}"
+            );
+        }
+        // The identity's own far-ahead key still refuses: it can see it.
+        let own = vec![owned(&b, &poison), owned(&b, &key("zone3", 3, '3'))];
+        assert_eq!(
+            mint_decision(&own, &b, &b4, false),
+            MintDecision::Superseded(u32::MAX)
+        );
+        // A legacy row the identity sees counts as its own.
+        let legacy_rows = vec![legacy(&poison, false), owned(&b, &key("zone3", 3, '3'))];
+        assert_eq!(
+            mint_decision(&legacy_rows, &b, &b4, false),
+            MintDecision::Superseded(u32::MAX)
+        );
+    }
+
     #[test]
     fn a_mint_conflicting_in_the_slot_reports_the_held_key() {
         let a = owner('a');
@@ -576,7 +646,8 @@ mod tests {
             legacy(&key("zone5", 7, '7'), false),
         ];
         let d = device_epochs(&rows);
-        assert_eq!((d["zone3"], d["zone5"]), (4, 7));
+        assert_eq!(d["zone3"].iter().copied().collect::<Vec<_>>(), vec![2, 4]);
+        assert_eq!(d["zone5"].iter().copied().collect::<Vec<_>>(), vec![7]);
     }
 
     #[test]
@@ -625,6 +696,23 @@ mod tests {
             v2.values().next().unwrap().pubkey,
             k.pubkey,
             "order-independent"
+        );
+    }
+
+    #[test]
+    fn an_inbox_copy_of_one_key_never_replaces_another_at_the_same_epoch() {
+        let k1 = with_pk(key("zone3", 3, '1'), 'c');
+        let k2 = with_pk(key("zone3", 3, '2'), 'd');
+        // Flag on: the inbox copy of k2 is recorded; the identity copy of k1
+        // must not find a replacement.
+        let granted: std::collections::HashSet<String> =
+            [inbox_granted_entry(&k2, true)].into_iter().collect();
+        assert!(!granted.contains(&inbox_granted_entry(&k1, true)));
+        assert!(granted.contains(&inbox_granted_entry(&k2, true)));
+        // Flag off: one key per epoch, and the entry is the old `<zone>:<epoch>`.
+        assert_eq!(
+            inbox_granted_entry(&k1, false),
+            crate::zone_crypto::key_id("zone3", 3)
         );
     }
 
@@ -714,7 +802,7 @@ mod tests {
         let can_mint = |ready: &Option<Owner>, me: &Owner, mem: &HashMap<String, ZoneKey>| {
             let held = mem.values().map(|k| k.epoch).max();
             let synced = ready.as_ref() == Some(me);
-            plan_mint(held, None, &[], synced)
+            plan_mint("zone3", held, &[], &[], synced)
         };
 
         let la = switch(&mut session, &mut memory, &mut ready_for, Some(a.clone())).unwrap();

@@ -63,10 +63,11 @@ pub struct ZoneKeyStore {
     /// the current auth identity by [`ready_for`](Self::ready_for), so
     /// readiness never depends on which effect ran first.
     loaded_for: RwSignal<Option<Owner>>,
-    /// Highest epoch held per zone by any row on this device, whatever its
+    /// Every epoch held per zone by any row on this device, whatever its
     /// owner (epoch numbers only), so a mint never reuses an epoch another
     /// account on this browser holds but has not delivered.
-    device_epochs: RwSignal<HashMap<String, u32>>,
+    /// [`keyset::plan_mint`] decides which of them are believable.
+    device_epochs: RwSignal<HashMap<String, std::collections::BTreeSet<u32>>>,
     /// Which identity is signed in, and its generation: work started for an
     /// earlier one touches memory, the relay and the UI only while its
     /// [`Lease`] is current.
@@ -76,8 +77,9 @@ pub struct ZoneKeyStore {
     /// placeholder for the original event in place (ADR-2017).
     cache: StoredValue<ReadCache>,
     processed: StoredValue<HashSet<String>>,
-    /// `key_id`s that have been received through the signed-in identity's
-    /// inbox key on this device. A copy addressed to the identity is only ever
+    /// Keys (by [`key_owner::inbox_granted_entry`], the full store id) that
+    /// have been received through the signed-in identity's inbox key on this
+    /// device. A copy addressed to the identity is only ever
     /// swept once its id is here.
     inbox_granted: StoredValue<HashSet<String>>,
     admin_cache: StoredValue<HashMap<String, bool>>,
@@ -155,21 +157,25 @@ impl ZoneKeyStore {
         self.loaded_for.with(|l| l.as_ref() == Some(&me))
     }
 
-    /// Highest epoch any row on this device holds for `zone`, whatever its
-    /// owner, tracked. Feeds [`keyset::plan_mint`].
-    pub fn device_epoch(&self, zone: &str) -> Option<u32> {
-        self.device_epochs.with(|m| m.get(zone).copied())
+    /// Every epoch any row on this device holds for `zone`, whatever its
+    /// owner, ascending, tracked. Feeds [`keyset::plan_mint`].
+    pub fn device_epochs_for(&self, zone: &str) -> Vec<u32> {
+        self.device_epochs.with(|m| {
+            m.get(zone)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
+        })
     }
 
-    fn note_device_epoch(&self, key: &ZoneKey) {
+    fn note_device_epoch(&self, zone: &str, epoch: u32) {
         if self
             .device_epochs
-            .with_untracked(|m| m.get(&key.zone).is_some_and(|e| *e >= key.epoch))
+            .with_untracked(|m| m.get(zone).is_some_and(|s| s.contains(&epoch)))
         {
             return;
         }
         let _ = self.device_epochs.try_update(|m| {
-            m.insert(key.zone.clone(), key.epoch);
+            m.entry(zone.to_string()).or_default().insert(epoch);
         });
     }
 
@@ -507,9 +513,8 @@ impl ZoneKeyStore {
         if let Ok(rows) = rows {
             let floor = key_owner::device_epochs(&rows);
             let _ = self.device_epochs.try_update(|m| {
-                for (zone, epoch) in floor {
-                    let e = m.entry(zone).or_insert(epoch);
-                    *e = (*e).max(epoch);
+                for (zone, epochs) in floor {
+                    m.entry(zone).or_default().extend(epochs);
                 }
             });
             let visible =
@@ -687,7 +692,8 @@ impl ZoneKeyStore {
             None => (false, false, None),
             Some(is_admin) => match validate_grant(&rumor, &sealer, is_admin, now_secs()) {
                 Ok(key) => {
-                    let id = super::key_id(&key.zone, key.epoch);
+                    let id =
+                        key_owner::inbox_granted_entry(&key, super::tickets::zone_groups_enabled());
                     let outcome = self.insert_persisted(lease, key).await;
                     // A refused grant is settled, but the inbox copy did not
                     // replace anything: never let the sweep treat it as such.
@@ -771,7 +777,8 @@ impl ZoneKeyStore {
             }
             TicketVerdict::Accept(key) => {
                 let key = *key;
-                let id = super::key_id(&key.zone, key.epoch);
+                let id =
+                    key_owner::inbox_granted_entry(&key, super::tickets::zone_groups_enabled());
                 let outcome = self.insert_persisted(lease, key).await;
                 if via_inbox && outcome == Persisted::Stored {
                     self.mark_inbox_granted(lease, &id).await;
@@ -831,7 +838,7 @@ impl ZoneKeyStore {
                 return Persisted::Failed;
             }
         };
-        self.note_device_epoch(&key);
+        self.note_device_epoch(&key.zone, key.epoch);
         // Stored from here on. A key storage did not accept never enters memory
         // (the grant stays unsettled and is retried), so memory only diverges
         // from storage briefly, and storage is the side to believe.
@@ -915,10 +922,7 @@ impl ZoneKeyStore {
                 ));
             }
             Ok(MintPut::Superseded(epoch)) => {
-                let _ = self.device_epochs.try_update(|m| {
-                    let e = m.entry(key.zone.clone()).or_insert(epoch);
-                    *e = (*e).max(epoch);
-                });
+                self.note_device_epoch(&key.zone, epoch);
                 return Err(format!(
                     "This browser already holds key epoch {epoch} of this zone (possibly for another account). Nothing was created or sent; try again."
                 ));
@@ -927,7 +931,7 @@ impl ZoneKeyStore {
                 return Err("Could not save the new key on this device; nothing was sent.".into())
             }
         }
-        self.note_device_epoch(&key);
+        self.note_device_epoch(&key.zone, key.epoch);
         if !self.is_current(&lease) {
             return Err("You signed out while the key was being saved; nothing was sent.".into());
         }
