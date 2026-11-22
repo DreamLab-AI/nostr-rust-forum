@@ -12,6 +12,7 @@ this workspace. The security maintainers own the list. It must be reviewed by
 | RUSTSEC-2026-0173 | `proc-macro-error2 2.0.1` is a compile-time Leptos macro dependency; unmaintained and absent at runtime. | Remove with the next Leptos upgrade that drops it. |
 | RUSTSEC-2026-0097 | `rand 0.8/0.9` is affected only with a custom logger invoking RNG recursively; this workspace defines no such logger. | Remove once all parent crates resolve a patched Rand release. |
 | RUSTSEC-2026-0221 | `event-listener 5.4.1` enters through Leptos reactive state. The reported cross-thread `!Send` issue is not reachable in the single-threaded browser WASM client. | Remove with a Leptos/reactive-graph release using a fixed event-listener. |
+| RUSTSEC-2026-0543 | `chrono 0.4.45` enters through `solid-pod-rs` (date handling in its WAC/JSON-LD and provisioning code); informational "unmaintained" advisory with no known vulnerability and no patched release. Not a direct dependency of this workspace. | Remove when `solid-pod-rs` moves to `jiff` or `time`. |
 
 Exceptions suppress CI warnings, not vulnerabilities in application-owned
 code. A newly published vulnerability or a change in deployment target must
