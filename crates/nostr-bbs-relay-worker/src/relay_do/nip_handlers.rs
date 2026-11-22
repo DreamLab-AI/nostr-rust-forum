@@ -1304,9 +1304,10 @@ impl NostrRelayDO {
             }
 
             // kind-5 (deletion): below TL3, every `e` target must be the
-            // signer's own stored event (or a wrap to their recipient key, or a
-            // sealed original the client will author-check); TL3+ may delete
-            // anyone's, so the lookup is skipped for them altogether.
+            // signer's own stored event, a wrap to their recipient key, or an
+            // id whose deletion by them was already accepted; never a sealed
+            // original (moderators only). TL3+ may delete anyone's, so the
+            // lookup is skipped for them altogether.
             if event.kind == 5 && trust_level < TrustLevel::Trusted {
                 if let Some(reason) = self.member_deletion_gate(&event).await {
                     Self::send_ok(ws, &event.id, false, reason);
@@ -2932,14 +2933,28 @@ mod a_ref_target_tests {
 // accepting the rest is not an option: the event is signed, the relay cannot
 // strip a tag, and clients would still hide the id. A kind-5 with any target
 // the member cannot be shown to own is therefore refused whole.
+//
+// A member may name: their own stored event; a gift wrap addressed to one of
+// their recipient keys; or an id whose deletion by them the relay already
+// accepted (a `deleted_events` row for `(id, signer)`), so retries and
+// re-broadcasts keep working. They may NOT name a sealed original (ADR-2017):
+// its author is inside the envelope's ciphertext, the relay cannot check it,
+// and clients would hide it on the member's say-so. Only a moderator removes
+// migrated posts, and their deletion also removes the envelope.
 
 /// Refusal for a member's kind-5 naming another author's stored event.
 pub(crate) const DELETE_OTHERS_REFUSAL: &str = "restricted: TL3+ required to delete others' events";
 
-/// Refusal for a member's kind-5 naming an id this relay holds no event for
-/// (and no sealed envelope wraps). Pre-emptive deletion of an id not yet
-/// stored is given up: the relay cannot tell the signer's future event from
-/// someone else's purged or sealed one.
+/// Refusal for a member's kind-5 naming a sealed original (ADR-2017). The
+/// relay cannot read the original's author, so a member cannot be shown to own
+/// it; the purge does not yet record original authors.
+pub(crate) const DELETE_SEALED_REFUSAL: &str =
+    "restricted: migrated (sealed) posts can only be removed by a moderator";
+
+/// Refusal for a member's kind-5 naming an id this relay holds no event for,
+/// has no record of the signer deleting, and no envelope wraps. Pre-emptive
+/// deletion of an id not yet stored is given up: the relay cannot tell the
+/// signer's future event from someone else's purged one.
 pub(crate) const DELETE_UNKNOWN_REFUSAL: &str =
     "restricted: deletion names an event this relay does not hold";
 
@@ -2982,9 +2997,12 @@ pub(crate) struct DeletionTargetRow {
     pub kind: Option<f64>,
     /// The stored row's tags JSON, returned for kind 1059 only.
     pub tags: Option<String>,
-    /// Non-zero when there is no row and a stored kind-42 envelope's `sealed`
-    /// tag names the target.
+    /// Non-zero when there is no row and a stored kind-42's `sealed` tag
+    /// names the target.
     pub sealed: f64,
+    /// Non-zero when there is no row and `deleted_events` holds
+    /// `(target, signer)`.
+    pub tombstoned: f64,
 }
 
 /// How a member's target that is not their own stored event stands.
@@ -2998,16 +3016,20 @@ pub(crate) enum MemberTarget<'a> {
         /// The stored tags JSON (kind 1059 only).
         tags: Option<&'a str>,
     },
-    /// No row, but a sealed envelope wraps it (ADR-2017). Accepted: the
-    /// original's author is inside the ciphertext, so only a zone-key holder
-    /// (the client) can match it against the kind-5's signer.
+    /// No row, but the signer's deletion of it was accepted before: already
+    /// deleted, so naming it again hides nothing new. Accepted.
+    AlreadyDeleted,
+    /// No row, but a sealed envelope wraps it (ADR-2017): refused for members.
     SealedOriginal,
-    /// No row and no envelope: refused.
+    /// No row, no record, no envelope: refused.
     Unknown,
 }
 
-/// Classify one row. A stored row is judged by its author before any sealed
-/// flag is read, so a sealed value cannot launder another author's event.
+/// Classify one row. A stored row is judged by its author before either flag
+/// is read, so neither can launder another author's stored event. With no
+/// row, a sealed original refuses even when the signer holds a tombstone for
+/// the id: claims written before this gate existed (any id a member once named,
+/// and the backfill from stored kind-5s) must not reopen sealed originals.
 pub(crate) fn classify_member_target(row: &DeletionTargetRow) -> MemberTarget<'_> {
     match (row.pubkey.as_deref(), row.kind) {
         (Some(_), Some(kind)) => MemberTarget::Foreign {
@@ -3018,6 +3040,7 @@ pub(crate) fn classify_member_target(row: &DeletionTargetRow) -> MemberTarget<'_
         // impossible shape as the refusal, never as an acceptance.
         (Some(_), None) => MemberTarget::Unknown,
         (None, _) if row.sealed != 0.0 => MemberTarget::SealedOriginal,
+        (None, _) if row.tombstoned != 0.0 => MemberTarget::AlreadyDeleted,
         (None, _) => MemberTarget::Unknown,
     }
 }
@@ -3035,8 +3058,8 @@ pub(crate) fn needs_recipient_set(targets: &[MemberTarget<'_>]) -> bool {
 /// recipient-key set, `None` when the feature is off or the lookup failed, in
 /// which case no foreign wrap counts as theirs.
 ///
-/// A foreign target is reported before an unknown one, so a kind-5 that names
-/// another member's stored post keeps the message it always had.
+/// Reported in order foreign, sealed, unknown: a kind-5 that names another
+/// member's stored post keeps the message it always had.
 pub(crate) fn member_deletion_refusal(
     targets: &[MemberTarget<'_>],
     own_keys: Option<&[String]>,
@@ -3051,9 +3074,23 @@ pub(crate) fn member_deletion_refusal(
     if foreign {
         return Some(DELETE_OTHERS_REFUSAL);
     }
+    if targets.contains(&MemberTarget::SealedOriginal) {
+        return Some(DELETE_SEALED_REFUSAL);
+    }
     targets
         .contains(&MemberTarget::Unknown)
         .then_some(DELETE_UNKNOWN_REFUSAL)
+}
+
+/// The envelopes a moderator's deletion may remove: those written by an admin,
+/// as the ADR-2017 ingest gate requires of every envelope. `admins` holds the
+/// distinct envelope authors found to be admins. A kind-42 by anyone else that
+/// merely looks like an envelope (stored before the gate existed) is left.
+pub(crate) fn admin_envelopes<'a>(rows: &'a [(String, String)], admins: &[&str]) -> Vec<&'a str> {
+    rows.iter()
+        .filter(|(_, author)| admins.contains(&author.as_str()))
+        .map(|(id, _)| id.as_str())
+        .collect()
 }
 
 #[cfg(test)]
@@ -3091,7 +3128,13 @@ mod member_deletion_gate_tests {
             kind,
             tags: tags.map(String::from),
             sealed: if sealed { 1.0 } else { 0.0 },
+            tombstoned: 0.0,
         }
+    }
+
+    fn tombstoned(mut r: DeletionTargetRow) -> DeletionTargetRow {
+        r.tombstoned = 1.0;
+        r
     }
 
     #[test]
@@ -3158,9 +3201,38 @@ mod member_deletion_gate_tests {
     }
 
     #[test]
+    fn a_signers_earlier_deletion_counts_as_their_own() {
+        assert_eq!(
+            classify_member_target(&tombstoned(row(None, None, None, false))),
+            MemberTarget::AlreadyDeleted
+        );
+        assert_eq!(
+            member_deletion_refusal(&[MemberTarget::AlreadyDeleted], None),
+            None
+        );
+        // A tombstone never turns another author's stored row into the signer's.
+        assert_eq!(
+            classify_member_target(&tombstoned(row(Some(THEM), Some(1.0), None, false))),
+            MemberTarget::Foreign {
+                kind: 1,
+                tags: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_tombstone_never_reopens_a_sealed_original() {
+        // Claims written before this gate (any id once named, the kind-5
+        // backfill) must not let a member delete a migrated post.
+        assert_eq!(
+            classify_member_target(&tombstoned(row(None, None, None, true))),
+            MemberTarget::SealedOriginal
+        );
+    }
+
+    #[test]
     fn an_unknown_target_refuses_the_whole_kind5() {
-        // Mixed with a sealed original (and, implicitly, own rows): still refused.
-        let targets = [MemberTarget::SealedOriginal, MemberTarget::Unknown];
+        let targets = [MemberTarget::AlreadyDeleted, MemberTarget::Unknown];
         assert_eq!(
             member_deletion_refusal(&targets, None),
             Some(DELETE_UNKNOWN_REFUSAL)
@@ -3168,17 +3240,39 @@ mod member_deletion_gate_tests {
     }
 
     #[test]
-    fn a_sealed_original_is_accepted() {
+    fn a_sealed_original_is_refused_for_a_member() {
         assert_eq!(
             member_deletion_refusal(&[MemberTarget::SealedOriginal], None),
-            None
+            Some(DELETE_SEALED_REFUSAL)
         );
+        let mixed = [
+            MemberTarget::Unknown,
+            MemberTarget::AlreadyDeleted,
+            MemberTarget::SealedOriginal,
+        ];
+        assert_eq!(
+            member_deletion_refusal(&mixed, None),
+            Some(DELETE_SEALED_REFUSAL),
+            "the sealed message wins over the unknown one"
+        );
+    }
+
+    #[test]
+    fn only_admin_authored_envelopes_are_removed() {
+        let rows = vec![
+            ("e1".to_string(), "admin".to_string()),
+            ("e2".to_string(), "member".to_string()),
+            ("e3".to_string(), "admin".to_string()),
+        ];
+        assert_eq!(admin_envelopes(&rows, &["admin"]), vec!["e1", "e3"]);
+        assert!(admin_envelopes(&rows, &[]).is_empty());
     }
 
     #[test]
     fn a_foreign_target_keeps_the_tl3_message_even_beside_an_unknown_one() {
         let targets = [
             MemberTarget::Unknown,
+            MemberTarget::SealedOriginal,
             MemberTarget::Foreign {
                 kind: 1,
                 tags: None,
@@ -3284,6 +3378,14 @@ impl NostrRelayDO {
     /// envelope cannot be published again. Ids are lowercased because clients
     /// fold the lowercase form, so the relay removes what they hide.
     ///
+    /// Only rows with an envelope's full wire shape
+    /// ([`crate::SEALED_ENVELOPES_FOR_SQL`]) written by an admin
+    /// ([`admin_envelopes`]) are removed: a kind-42 that merely carries a
+    /// `sealed` tag naming the id (possible before the ADR-2017 ingest gate)
+    /// is not what the moderator named, so it stays. An envelope whose
+    /// migrator has since lost admin standing therefore also stays, which is
+    /// the pre-existing client-side-only outcome, not a wider deletion.
+    ///
     /// Fail-open: a failed lookup or statement only leaves the envelope in
     /// place, exactly as before this existed; it never stops the rest of the
     /// moderator's deletion.
@@ -3304,6 +3406,7 @@ impl NostrRelayDO {
         #[derive(serde::Deserialize)]
         struct EnvelopeRow {
             id: String,
+            pubkey: String,
         }
         let Ok(stmt) = db
             .prepare(crate::SEALED_ENVELOPES_FOR_SQL)
@@ -3318,18 +3421,32 @@ impl NostrRelayDO {
                 return;
             }
         };
-        for envelope in &envelopes {
+        let rows: Vec<(String, String)> = envelopes.into_iter().map(|e| (e.id, e.pubkey)).collect();
+        // One admin check per distinct author (normally the single migrator),
+        // through the cache the ingest gate already uses.
+        let mut admins: Vec<&str> = Vec::new();
+        let mut checked: Vec<&str> = Vec::new();
+        for (_, author) in &rows {
+            if checked.contains(&author.as_str()) {
+                continue;
+            }
+            checked.push(author);
+            if self.admin_cache.is_admin(author, &self.env).await {
+                admins.push(author);
+            }
+        }
+        for envelope in admin_envelopes(&rows, &admins) {
             // Separate statements, never one batch: a failed tombstone must
             // not undo the deletion (see `tombstone_before_delete`).
             let _ = crate::tombstone_before_delete(
                 db,
-                crate::TombstoneTarget::RegularEvent(&envelope.id),
+                crate::TombstoneTarget::RegularEvent(envelope),
                 now,
             )
             .await;
             if let Ok(del) = db
                 .prepare(crate::SEALED_ENVELOPE_DELETE_SQL)
-                .bind(&[JsValue::from_str(&envelope.id)])
+                .bind(&[JsValue::from_str(envelope)])
             {
                 if let Err(e) = del.run().await {
                     console_error!("kind-5: sealed envelope delete failed: {e}");
@@ -3493,9 +3610,10 @@ impl NostrRelayDO {
         }
 
         // ADR-2017: an original whose plaintext row was purged lives on only
-        // inside its envelope. A moderator's deletion removes that too; a
-        // member's never does, because the relay cannot read the original's
-        // author (the client decides whether to honour it).
+        // inside its envelope. A moderator's deletion removes that too. A
+        // member's kind-5 never names a sealed original (the gate refuses it,
+        // as the relay cannot read the original's author), and this branch is
+        // moderator-only besides.
         if can_delete_any {
             self.delete_sealed_envelopes(&db, &target_ids, now).await;
         }
@@ -7565,12 +7683,12 @@ mod deletion_gate_sql_tests {
         .unwrap();
     }
 
-    /// A sealed envelope (ADR-2017) wrapping `original`, by the migrator.
-    fn envelope(c: &Connection, envelope_id: &str, original: &str) {
+    /// A sealed envelope (ADR-2017) wrapping `original`, by `author`.
+    fn envelope_by(c: &Connection, envelope_id: &str, original: &str, author: &str) {
         store(
             c,
             envelope_id,
-            ADMIN,
+            author,
             42,
             serde_json::json!([
                 ["e", "c".repeat(64), "", "root"],
@@ -7578,6 +7696,18 @@ mod deletion_gate_sql_tests {
                 ["sealed", original, "1"]
             ]),
         );
+    }
+
+    /// A sealed envelope by the migrator (an admin).
+    fn envelope(c: &Connection, envelope_id: &str, original: &str) {
+        envelope_by(c, envelope_id, original, ADMIN);
+    }
+
+    /// What `process_deletion` records for each well-formed target it is
+    /// handed: the signer's claim.
+    fn claim(c: &Connection, id: &str, signer: &str) {
+        c.execute(crate::DELETED_EVENT_INSERT_SQL, params![id, signer, 500])
+            .unwrap();
     }
 
     /// The gate as `member_deletion_gate` runs it, minus the recipient set.
@@ -7601,6 +7731,7 @@ mod deletion_gate_sql_tests {
                     kind: r.get("kind")?,
                     tags: r.get("tags")?,
                     sealed: r.get("sealed")?,
+                    tombstoned: r.get("tombstoned")?,
                 })
             })
             .unwrap()
@@ -7608,19 +7739,28 @@ mod deletion_gate_sql_tests {
             .collect()
     }
 
-    /// `delete_sealed_envelopes` against SQLite: look up, tombstone each
-    /// envelope from its row (what `TombstoneTarget::RegularEvent` runs),
-    /// then delete it.
-    fn moderator_removes_envelopes(c: &Connection, targets: &[&str], now: i64) -> Vec<String> {
+    /// `delete_sealed_envelopes` against SQLite: look up, keep admin-authored
+    /// rows (`admins` stands in for the admin cache), tombstone each envelope
+    /// from its row (what `TombstoneTarget::RegularEvent` runs), then delete it.
+    fn moderator_removes_envelopes(
+        c: &Connection,
+        targets: &[&str],
+        admins: &[&str],
+        now: i64,
+    ) -> Vec<String> {
         let ids = serde_json::to_string(targets).unwrap();
-        let mut found: Vec<String> = c
+        let mut rows: Vec<(String, String)> = c
             .prepare(crate::SEALED_ENVELOPES_FOR_SQL)
             .unwrap()
-            .query_map(params![ids], |r| r.get(0))
+            .query_map(params![ids], |r| Ok((r.get("id")?, r.get("pubkey")?)))
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        found.sort();
+        rows.sort();
+        let found: Vec<String> = admin_envelopes(&rows, admins)
+            .into_iter()
+            .map(String::from)
+            .collect();
         for e in &found {
             c.execute(crate::TOMBSTONE_EVENT_ROW_SQL, params![e, now])
                 .unwrap();
@@ -7632,6 +7772,15 @@ mod deletion_gate_sql_tests {
 
     fn count(c: &Connection, sql: &str) -> i64 {
         c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn ids_left(c: &Connection) -> Vec<String> {
+        c.prepare("SELECT id FROM events ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     }
 
     #[test]
@@ -7675,16 +7824,56 @@ mod deletion_gate_sql_tests {
     }
 
     #[test]
-    fn a_sealed_original_is_accepted_and_mixes_with_own_targets() {
+    fn re_deleting_an_already_deleted_own_event_is_accepted() {
+        // First deletion: own row, accepted; process_deletion claims and deletes.
+        let c = db();
+        store(&c, &id(1), ME, 42, serde_json::json!([]));
+        assert_eq!(gate(&c, ME, &[&id(1)]), None);
+        claim(&c, &id(1), ME);
+        c.execute("DELETE FROM events WHERE id = ?1", params![id(1)])
+            .unwrap();
+        // A retry, a second device or a re-broadcast of the same kind-5.
+        assert_eq!(gate(&c, ME, &[&id(1)]), None);
+        // Mixed with a live own event.
+        store(&c, &id(2), ME, 42, serde_json::json!([]));
+        assert_eq!(gate(&c, ME, &[&id(1), &id(2)]), None);
+        // Still refused beside junk.
+        assert_eq!(
+            gate(&c, ME, &[&id(1), &id(9)]),
+            Some(DELETE_UNKNOWN_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn another_signers_tombstone_vouches_for_nothing() {
+        let c = db();
+        claim(&c, &id(1), THEM);
+        assert_eq!(gate(&c, ME, &[&id(1)]), Some(DELETE_UNKNOWN_REFUSAL));
+    }
+
+    #[test]
+    fn a_tombstone_never_makes_a_stored_foreign_row_the_signers() {
+        let c = db();
+        store(&c, &id(1), THEM, 42, serde_json::json!([]));
+        claim(&c, &id(1), ME);
+        let rows = lookup(&c, ME, &[&id(1)]);
+        assert_eq!(rows[0].tombstoned, 0.0);
+        assert_eq!(gate(&c, ME, &[&id(1)]), Some(DELETE_OTHERS_REFUSAL));
+    }
+
+    #[test]
+    fn a_sealed_original_is_refused_for_a_member_even_with_a_tombstone() {
         let c = db();
         store(&c, &id(1), ME, 42, serde_json::json!([]));
         envelope(&c, &id(100), &id(2));
-        assert_eq!(gate(&c, ME, &[&id(2)]), None);
-        assert_eq!(gate(&c, ME, &[&id(1), &id(2)]), None);
-        assert_eq!(
-            gate(&c, ME, &[&id(1), &id(2), &id(9)]),
-            Some(DELETE_UNKNOWN_REFUSAL)
-        );
+        assert_eq!(gate(&c, ME, &[&id(2)]), Some(DELETE_SEALED_REFUSAL));
+        assert_eq!(gate(&c, ME, &[&id(1), &id(2)]), Some(DELETE_SEALED_REFUSAL));
+        // A claim written before this gate (or by the kind-5 backfill) does
+        // not reopen it.
+        claim(&c, &id(2), ME);
+        let rows = lookup(&c, ME, &[&id(2)]);
+        assert_eq!((rows[0].sealed, rows[0].tombstoned), (1.0, 1.0));
+        assert_eq!(gate(&c, ME, &[&id(2)]), Some(DELETE_SEALED_REFUSAL));
     }
 
     #[test]
@@ -7747,6 +7936,8 @@ mod deletion_gate_sql_tests {
         assert_eq!(rows.len(), 1, "only the one id with no row comes back");
         assert_eq!(rows[0].target, id(2_000));
         assert_eq!(gate(&c, ME, &targets), Some(DELETE_UNKNOWN_REFUSAL));
+        claim(&c, &id(2_000), ME);
+        assert_eq!(gate(&c, ME, &targets), None);
     }
 
     #[test]
@@ -7760,17 +7951,10 @@ mod deletion_gate_sql_tests {
             THEM,
             1,
             serde_json::json!([["sealed", id(2), "1"]]),
-        ); // a non-envelope carrying the same tag
-        let removed = moderator_removes_envelopes(&c, &[&id(2), &id(9)], 1_000);
+        ); // another kind carrying the same tag
+        let removed = moderator_removes_envelopes(&c, &[&id(2), &id(9)], &[ADMIN], 1_000);
         assert_eq!(removed, vec![id(100)]);
-        let remaining: Vec<String> = c
-            .prepare("SELECT id FROM events ORDER BY id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(remaining, vec![id(101), id(102)]);
+        assert_eq!(ids_left(&c), vec![id(101), id(102)]);
         let tombstones: Vec<(String, String, i64)> = c
             .prepare("SELECT id, pubkey, deleted_at FROM deleted_events")
             .unwrap()
@@ -7804,10 +7988,62 @@ mod deletion_gate_sql_tests {
     }
 
     #[test]
+    fn a_moderator_leaves_kind42s_that_only_look_like_envelopes() {
+        // Stored before the ADR-2017 ingest gate: a kind-42 carrying a
+        // `sealed` tag naming the target but not an envelope's shape.
+        let c = db();
+        let chan = serde_json::json!(["e", "c".repeat(64), "", "root"]);
+        store(
+            &c,
+            &id(100),
+            THEM,
+            42,
+            serde_json::json!([chan, ["sealed", id(2), "1"]]),
+        ); // no `zk` tag
+        store(
+            &c,
+            &id(101),
+            THEM,
+            42,
+            serde_json::json!([
+                chan,
+                ["zk", "zone3", "1", "e".repeat(64)],
+                ["sealed", id(2)]
+            ]),
+        ); // no version
+        store(
+            &c,
+            &id(102),
+            THEM,
+            42,
+            serde_json::json!([
+                chan,
+                ["zk", "zone3", "1", "e".repeat(64)],
+                ["sealed", id(2), "v1"]
+            ]),
+        ); // non-decimal version
+        envelope_by(&c, &id(103), &id(2), THEM); // full shape, but not by an admin
+        let removed = moderator_removes_envelopes(&c, &[&id(2)], &[ADMIN], 1_000);
+        assert!(removed.is_empty());
+        assert_eq!(ids_left(&c), vec![id(100), id(101), id(102), id(103)]);
+        assert_eq!(count(&c, "SELECT count(*) FROM deleted_events"), 0);
+        // The full-shape row is matched; only the admin filter keeps it.
+        let ids = serde_json::to_string(&[id(2)]).unwrap();
+        let matched: Vec<String> = c
+            .prepare(crate::SEALED_ENVELOPES_FOR_SQL)
+            .unwrap()
+            .query_map(params![ids], |r| r.get("id"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(matched, vec![id(103)]);
+    }
+
+    #[test]
     fn the_moderator_lookup_finds_nothing_for_plain_targets() {
         let c = db();
         store(&c, &id(2), THEM, 42, serde_json::json!([]));
-        assert!(moderator_removes_envelopes(&c, &[&id(2)], 1_000).is_empty());
+        assert!(moderator_removes_envelopes(&c, &[&id(2)], &[ADMIN], 1_000).is_empty());
         assert_eq!(count(&c, "SELECT count(*) FROM events"), 1);
     }
 }
