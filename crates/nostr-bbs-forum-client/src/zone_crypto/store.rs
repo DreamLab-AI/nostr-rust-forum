@@ -1379,6 +1379,7 @@ fn keep_pending_against(mut key: ZoneKey, existing: Option<&ZoneKey>) -> ZoneKey
 pub fn provide_zone_key_store(channels: crate::stores::channels::ChannelStore) {
     let store = ZoneKeyStore::new(channels);
     store.app_relay.set_value(use_context::<RelayConnection>());
+    channels.set_zone_store(store);
     provide_context(store);
     let auth = crate::auth::use_auth();
     Effect::new(move |_| {

@@ -131,6 +131,11 @@ pub struct ChannelStore {
     /// The most messages one channel's history window holds
     /// ([`HISTORY_WINDOW`], or `window.__ENV__.HISTORY_WINDOW`).
     window_max: usize,
+    /// The zone-key store, set when it is provided
+    /// (`provide_zone_key_store`). Relay callbacks run without a reactive
+    /// owner, so `use_context` there returns `None`: eviction must reach the
+    /// decrypt cache through this handle, never a context lookup.
+    zone_keys: StoredValue<Option<crate::zone_crypto::store::ZoneKeyStore>>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -175,6 +180,7 @@ impl ChannelStore {
             deletion_progress: StoredValue::new(DeletionProgress::new(deletions)),
             history: RwSignal::new(HashMap::new()),
             window_max: configured_window(),
+            zone_keys: StoredValue::new(None),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -926,7 +932,7 @@ impl ChannelStore {
             .partition(|(cid, ev)| self.window_admits(cid, ev.created_at));
         if !refused.is_empty() {
             let ids: Vec<String> = refused.into_iter().map(|(_, ev)| ev.id).collect();
-            if let Some(z) = crate::zone_crypto::store::try_use_zone_key_store() {
+            if let Some(z) = self.zone_store() {
                 z.forget(&ids);
             }
         }
@@ -953,6 +959,20 @@ impl ChannelStore {
                 }
             });
         }
+    }
+
+    /// Record the zone-key store (called once by `provide_zone_key_store`).
+    pub fn set_zone_store(&self, z: crate::zone_crypto::store::ZoneKeyStore) {
+        self.zone_keys.set_value(Some(z));
+    }
+
+    /// The zone-key store: the recorded handle, else (before it is recorded,
+    /// and only where a reactive owner exists) the context.
+    pub fn zone_store(&self) -> Option<crate::zone_crypto::store::ZoneKeyStore> {
+        self.zone_keys
+            .try_get_value()
+            .flatten()
+            .or_else(crate::zone_crypto::store::try_use_zone_key_store)
     }
 
     /// Whether channel `cid`'s history window holds a message from `ts`
@@ -997,7 +1017,7 @@ impl ChannelStore {
             }
         });
         let ids: Vec<String> = gone.into_iter().map(|e| e.id).collect();
-        if let Some(z) = crate::zone_crypto::store::try_use_zone_key_store() {
+        if let Some(z) = self.zone_store() {
             z.forget(&ids);
         }
     }
@@ -1011,7 +1031,7 @@ impl ChannelStore {
                 gone = list.drain(..).map(|e| e.id).collect();
             }
         });
-        if let Some(z) = crate::zone_crypto::store::try_use_zone_key_store() {
+        if let Some(z) = self.zone_store() {
             z.forget(&gone);
         }
         self.history.update(|m| {
@@ -1061,7 +1081,7 @@ impl ChannelStore {
             on_done: Some(on_done),
         }));
         let store = *self;
-        let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
+        let zone_keys = self.zone_store();
         let key = cid.to_string();
 
         let on_event = {
