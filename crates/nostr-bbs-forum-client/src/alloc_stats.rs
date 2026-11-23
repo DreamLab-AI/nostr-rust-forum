@@ -1,7 +1,8 @@
 //! Opt-in heap accounting for memory investigations (`--features alloc-stats`).
 //!
 //! Wraps the default allocator and counts live bytes and allocations, and
-//! installs `window.__allocStats()` returning `{live, peak, count}`. Wasm
+//! installs `window.__allocStats()` returning `{live, peak, count, hist}`
+//! (`hist[b]`: live allocations of size `[2^(b-1), 2^b)`). Wasm
 //! linear memory never shrinks, so its page count shows only the high-water
 //! mark: comparing it with `live` tells a true leak (live bytes climb) from
 //! allocator fragmentation (live bytes flat while pages climb). Off by
@@ -13,6 +14,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Live allocations per size class: bucket `b` holds sizes in
+/// `[2^(b-1), 2^b)` (bucket 0: size 0), the last bucket everything larger.
+const BUCKETS: usize = 24;
+static HIST: [AtomicUsize; BUCKETS] = [const { AtomicUsize::new(0) }; BUCKETS];
+
+fn bucket(size: usize) -> usize {
+    ((usize::BITS - size.leading_zeros()) as usize).min(BUCKETS - 1)
+}
 
 struct Counting;
 
@@ -29,6 +38,7 @@ unsafe impl GlobalAlloc for Counting {
         if !p.is_null() {
             grew(layout.size());
             COUNT.fetch_add(1, Ordering::Relaxed);
+            HIST[bucket(layout.size())].fetch_add(1, Ordering::Relaxed);
         }
         p
     }
@@ -36,12 +46,15 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(ptr, layout) };
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
         COUNT.fetch_sub(1, Ordering::Relaxed);
+        HIST[bucket(layout.size())].fetch_sub(1, Ordering::Relaxed);
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let p = unsafe { System.realloc(ptr, layout, new_size) };
         if !p.is_null() {
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             grew(new_size);
+            HIST[bucket(layout.size())].fetch_sub(1, Ordering::Relaxed);
+            HIST[bucket(new_size)].fetch_add(1, Ordering::Relaxed);
         }
         p
     }
@@ -62,6 +75,11 @@ pub fn install() {
         ] {
             let _ = js_sys::Reflect::set(&o, &k.into(), &(v as f64).into());
         }
+        let hist = js_sys::Array::new();
+        for b in &HIST {
+            hist.push(&(b.load(Ordering::Relaxed) as f64).into());
+        }
+        let _ = js_sys::Reflect::set(&o, &"hist".into(), &hist);
         o.into()
     });
     if let Some(w) = web_sys::window() {
