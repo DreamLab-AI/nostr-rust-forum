@@ -498,11 +498,19 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
         _ => None,
     };
-    let resp = fetch_inner(req, env).await?;
-    Ok(match zone_acao {
-        Some(acao) => finalise_zone_response(resp, acao),
-        None => resp,
-    })
+    match zone_acao {
+        None => fetch_inner(req, env).await,
+        Some(acao) => {
+            let err_env = env.clone();
+            // An internal error on a zone path still leaves through the
+            // finaliser (no-store, origin-scoped CORS), as a plain 500.
+            let resp = match fetch_inner(req, env).await {
+                Ok(resp) => resp,
+                Err(_) => json_error(&err_env, "Internal error", 500)?,
+            };
+            Ok(finalise_zone_response(resp, acao))
+        }
+    }
 }
 
 /// Whether a request path addresses a zone media container or object.
@@ -555,11 +563,14 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
     // Idempotent schema bootstrap plus replay-table prune: five D1 statements,
     // so run them at most once per `SCHEMA_RECHECK_MS` per isolate rather than
     // on every request. The replay table stays bounded by its 120 s TTL.
+    // The timestamp is set only once both have run, so a request that
+    // arrives during a cold isolate's first bootstrap runs it too rather than
+    // racing ahead of the tables (both are idempotent).
     let now_ms = js_sys::Date::now();
     if SCHEMA_CHECKED_AT.with(|t| schema_check_due(t.get(), now_ms)) {
-        SCHEMA_CHECKED_AT.with(|t| t.set(now_ms));
         nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
         payments::ensure_payment_schema(&env, "REPLAY_DB").await;
+        SCHEMA_CHECKED_AT.with(|t| t.set(now_ms));
     }
 
     let url = req.url()?;
@@ -2232,11 +2243,9 @@ async fn zone_media_gate(
 
     if access == Access::Write {
         // Objects in a zone container are written whole (PUT) or removed
-        // (DELETE); POST/PATCH have no meaning on a single image.
-        match method {
-            Method::Put => {}
-            Method::Delete => return Ok(None),
-            _ => return json_error(env, "Method not allowed; use PUT or DELETE", 405).map(Some),
+        // (DELETE, its own access class); POST/PATCH have no meaning here.
+        if *method != Method::Put {
+            return json_error(env, "Method not allowed; use PUT or DELETE", 405).map(Some);
         }
         if !zone_media::is_allowed_upload_type(content_type) {
             return json_error(

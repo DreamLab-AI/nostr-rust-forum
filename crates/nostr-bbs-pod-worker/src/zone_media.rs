@@ -122,12 +122,15 @@ pub fn is_valid_object_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
-/// The two request classes a zone path distinguishes.
+/// The request classes a zone path distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     /// `GET` / `HEAD`.
     Read,
-    /// `PUT` / `POST` / `PATCH` / `DELETE`.
+    /// `DELETE`: the owner's raw key, whatever their membership, so a former
+    /// member can always withdraw their own images.
+    Delete,
+    /// `PUT` / `POST` / `PATCH` and anything unexpected.
     Write,
 }
 
@@ -136,6 +139,7 @@ pub enum Access {
 pub fn access_for_method(method: &str) -> Access {
     match method {
         "GET" | "HEAD" => Access::Read,
+        "DELETE" => Access::Delete,
         _ => Access::Write,
     }
 }
@@ -272,6 +276,7 @@ pub fn needs_whitelist(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> boo
     match req.access {
         Access::Read => req.requester.is_some_and(|r| r != req.owner),
         Access::Write => req.requester == Some(req.owner),
+        Access::Delete => false,
     }
 }
 
@@ -296,6 +301,13 @@ pub fn decide(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> Decision {
             Decision::Forbidden
         };
     };
+    if req.access == Access::Delete {
+        return if is_owner {
+            Decision::Allow
+        } else {
+            Decision::Forbidden
+        };
+    }
     if req.access == Access::Write {
         if !is_owner {
             return Decision::Forbidden;
@@ -649,6 +661,22 @@ mod tests {
     }
 
     #[test]
+    fn a_lapsed_owner_can_still_delete_and_nobody_else_can() {
+        let z = zones();
+        let mut lapsed = row(&["members"]);
+        lapsed.suspended_until = Some(NOW + 100);
+        let mut del = read(Some(OWNER), Some(&lapsed), &z);
+        del.access = Access::Delete;
+        assert!(!needs_whitelist(&Z2, &del));
+        assert_eq!(decide(&Z2, &del), Decision::Allow);
+        del.requester = Some(OTHER);
+        del.static_admin = true;
+        assert_eq!(decide(&Z2, &del), Decision::Forbidden);
+        del.requester = None;
+        assert_eq!(decide(&Z2, &del), Decision::Unauthenticated);
+    }
+
+    #[test]
     fn suspended_and_expired_members_are_refused() {
         let z = zones();
         let mut suspended = row(&["zone2"]);
@@ -815,7 +843,8 @@ mod tests {
     fn methods_other_than_get_and_head_are_writes() {
         assert_eq!(access_for_method("GET"), Access::Read);
         assert_eq!(access_for_method("HEAD"), Access::Read);
-        for m in ["PUT", "POST", "PATCH", "DELETE", "OPTIONS", "TRACE"] {
+        assert_eq!(access_for_method("DELETE"), Access::Delete);
+        for m in ["PUT", "POST", "PATCH", "OPTIONS", "TRACE"] {
             assert_eq!(access_for_method(m), Access::Write, "{m}");
         }
     }
