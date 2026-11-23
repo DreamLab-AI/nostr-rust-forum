@@ -79,6 +79,10 @@ pub struct Filter {
     /// `#d` filter, for addressable events such as kind-30078 app data.
     #[serde(rename = "#d", skip_serializing_if = "Option::is_none")]
     pub d_tags: Option<Vec<String>>,
+    /// `#sealed` filter: a sealed original by its INNER (original) id, which
+    /// the envelope names in its `["sealed", <inner id>, "1"]` tag.
+    #[serde(rename = "#sealed", skip_serializing_if = "Option::is_none")]
+    pub sealed_tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

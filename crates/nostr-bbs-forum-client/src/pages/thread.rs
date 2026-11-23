@@ -689,14 +689,31 @@ pub fn ThreadPage() -> impl IntoView {
     }
 
     // All kind-42/kind-1111 events for the resolved channel from the store.
+    // The topic's own paged list (`topic:<root>`), once the root is known.
+    // A topic is paged on its own (`#e:[root]`): sealed replies carry the
+    // root as an outer `reply` tag. Live posts still arrive through the
+    // channel's subscription, into the channel list.
+    let topic_list = RwSignal::new(None::<String>);
     let channel_events = Signal::derive(move || {
         let cid = match resolved_channel.get() {
             Some(ch) => ch.id,
             None => return Vec::<NostrEvent>::new(),
         };
-        store
-            .channel_messages
-            .with(|m| m.get(&cid).cloned().unwrap_or_default())
+        let channel = store.list_events(&cid);
+        let Some(key) = topic_list.get() else {
+            return channel;
+        };
+        let mut events = store.list_events(&key);
+        // While the topic window is detached in older replies, newer live
+        // posts wait for its reload (as the channel window does).
+        let cutoff = store.history_cursor(&key).newer_from;
+        let held: std::collections::HashSet<String> = events.iter().map(|e| e.id.clone()).collect();
+        events.extend(
+            channel
+                .into_iter()
+                .filter(|e| !held.contains(&e.id) && cutoff.is_none_or(|t| e.created_at < t)),
+        );
+        events
     });
 
     // Mark the channel read when a topic in it is opened (BBS reading flow).
@@ -788,6 +805,27 @@ pub fn ThreadPage() -> impl IntoView {
         channel_events.with(|events| thread_replies(&root, events))
     });
 
+    // Start the topic's own paged list once its root is known: register it,
+    // load its newest page, and ask the relay for its true reply count.
+    {
+        let relay = relay.clone();
+        Effect::new(move |_| {
+            let (Some(ch), Some(root)) = (resolved_channel.get(), topic_root.get()) else {
+                return;
+            };
+            let key = store.register_topic(&ch.id, &root.id);
+            if topic_list.get_untracked().as_deref() != Some(key.as_str()) {
+                topic_list.set(Some(key.clone()));
+            }
+            let gated = zone_is_gated(&category_slug(), &load_zones());
+            let cursor = store.history_cursor(&key);
+            if !cursor.started && !cursor.loading {
+                store.reload_newest(&relay, &key, vec![root.id.to_lowercase()], gated);
+            }
+            store.request_total_of(&relay, &key, &root.id.to_lowercase());
+        });
+    }
+
     // The root post's latest content + edited flag, folding in any author edits.
     let root_view = Signal::derive(move || {
         let root = topic_root.get()?;
@@ -857,11 +895,19 @@ pub fn ThreadPage() -> impl IntoView {
     });
     let loading = Memo::new(move |_| lookup.get().is_loading());
 
-    // A deep link to a topic older than the pages loaded so far: page back
-    // through the channel's history (newest first, one page at a time) until
-    // the root appears or the start of history is reached. A topic slug is a
-    // prefix of the root's id (and a sealed root's id is the original's, not
-    // the stored envelope's), so it cannot be fetched by id.
+    // Deep links into history not loaded yet.
+    //
+    // - A `?focus=<reply>` in a known topic: page the TOPIC's own list back
+    //   (restarting from its newest page once if it is detached) until that
+    //   reply is loaded or the topic's history is exhausted.
+    // - A missing root: a topic slug is a prefix of the root's id, which the
+    //   relay cannot match, but any loaded reply names the full root id in
+    //   its topic (`reply`) tag; fetch the root by that id (a sealed root by
+    //   the inner id in its `sealed` tag). Failing that, page the CHANNEL
+    //   back until the root appears (slow on a channel holding many topics:
+    //   roots carry no outer marker).
+    let fetched_root = StoredValue::new(None::<String>);
+    let topic_restarted = StoredValue::new(false);
     {
         let relay = relay.clone();
         let focus_query = use_query_map();
@@ -869,20 +915,46 @@ pub fn ThreadPage() -> impl IntoView {
             let Some(cid) = resolved_channel.get().map(|c| c.id) else {
                 return;
             };
-            // Keep walking while the root is missing, or while a `?focus`
-            // reply is not loaded yet (a deep link into a long topic).
+            let gated = zone_is_gated(&category_slug(), &load_zones());
             let focus = focus_query.read().get("focus");
-            let focus_missing = match (topic_root.get(), focus) {
-                (Some(root), Some(f)) => {
-                    !f.eq_ignore_ascii_case(&root.id)
-                        && !replies.with(|rs| rs.iter().any(|r| r.id.eq_ignore_ascii_case(&f)))
+            if let Some(root) = topic_root.get() {
+                let Some(f) = focus else {
+                    return;
+                };
+                let loaded = f.eq_ignore_ascii_case(&root.id)
+                    || replies.with(|rs| rs.iter().any(|r| r.id.eq_ignore_ascii_case(&f)));
+                let Some(key) = topic_list.get() else {
+                    return;
+                };
+                if loaded {
+                    return;
                 }
-                _ => false,
-            };
-            if topic_root.with(Option::is_some) && !focus_missing {
+                let cursor = store.history_cursor(&key);
+                let needles = vec![root.id.to_lowercase()];
+                if cursor.newer_from.is_some() && !cursor.loading && !topic_restarted.get_value() {
+                    topic_restarted.set_value(true);
+                    store.reload_newest(&relay, &key, needles, gated);
+                } else if cursor.next_request().is_some() {
+                    store.load_older(&relay, &key, needles, gated, Rc::new(|| {}), Rc::new(|| {}));
+                }
                 return;
             }
-            let gated = zone_is_gated(&category_slug(), &load_zones());
+            // The root is missing. A loaded reply may name it in full.
+            let slug = topic_param();
+            let named = channel_events.with(|events| {
+                events.iter().find_map(|e| {
+                    nostr_bbs_core::sealed::reply_root_of(e)
+                        .filter(|r| matches_topic_slug(r, &slug))
+                        .map(str::to_lowercase)
+                })
+            });
+            if let Some(root_id) = named {
+                if fetched_root.get_value().as_deref() != Some(root_id.as_str()) {
+                    fetched_root.set_value(Some(root_id.clone()));
+                    store.fetch_by_id(&relay, &root_id);
+                }
+                return;
+            }
             if !store.history_receipt(&cid).settles(gated) {
                 return;
             }
@@ -911,8 +983,33 @@ pub fn ThreadPage() -> impl IntoView {
     }
 
     // The channel whose history window holds this topic, for the loaders.
-    let history_cid = Signal::derive(move || resolved_channel.get().map(|c| c.id));
+    // The loaders page the topic's own list by its root (`#e:[root]`).
+    let history_cid = Signal::derive(move || topic_list.get());
+    let history_needles = Signal::derive(move || {
+        topic_root
+            .get()
+            .map(|r| vec![r.id.to_lowercase()])
+            .unwrap_or_default()
+    });
     let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
+    // The topic's true reply count: the relay's count plus replies seen since
+    // (live posts arrive through the channel list, so note them here).
+    Effect::new(move |_| {
+        let Some(key) = topic_list.get() else {
+            return;
+        };
+        replies.with(|rs| {
+            for r in rs {
+                store.note_inserted(&key, &r.id, r.created_at);
+            }
+        });
+    });
+    let reply_total = Signal::derive(move || {
+        let shown = replies.with(Vec::len) as u32;
+        topic_list
+            .get()
+            .map_or(shown, |key| store.total_for(&key).max(shown))
+    });
 
     // -- Landing position ---------------------------------------------------
     //
@@ -1491,7 +1588,7 @@ pub fn ThreadPage() -> impl IntoView {
                 <div class="mt-6">
                     <h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">
                         {move || {
-                            let n = replies.get().len();
+                            let n = reply_total.get();
                             if n == 0 {
                                 "No replies yet".to_string()
                             } else if n == 1 {
@@ -1512,6 +1609,7 @@ pub fn ThreadPage() -> impl IntoView {
                             channel_id=history_cid
                             gated=history_gated
                             label="Load older replies"
+                            needles=history_needles
                         />
                         <For
                             each=move || replies.get()
@@ -1535,6 +1633,7 @@ pub fn ThreadPage() -> impl IntoView {
                             gated=history_gated
                             label="Load newer replies"
                             direction=crate::components::history_loader::HistoryDirection::Newer
+                            needles=history_needles
                         />
                     </div>
                 </div>

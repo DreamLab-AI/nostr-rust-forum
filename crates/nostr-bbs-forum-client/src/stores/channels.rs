@@ -138,6 +138,10 @@ pub struct ChannelStore {
     zone_keys: StoredValue<Option<crate::zone_crypto::store::ZoneKeyStore>>,
     /// True message totals per channel (see [`ChannelTotal`]).
     totals: RwSignal<HashMap<String, ChannelTotal>>,
+    /// Topic lists: list key (`topic_key`) -> (channel id, topic root id,
+    /// lower-case). A topic is paged on its own (`#e:[root]`, sealed replies
+    /// carry the root as an outer `reply` tag) into its own list and window.
+    topic_targets: StoredValue<HashMap<String, (String, String)>>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -184,6 +188,7 @@ impl ChannelStore {
             window_max: configured_window(),
             zone_keys: StoredValue::new(None),
             totals: RwSignal::new(HashMap::new()),
+            topic_targets: StoredValue::new(HashMap::new()),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -358,6 +363,15 @@ impl ChannelStore {
     /// exact single-channel COUNT). Messages newer than that are added as
     /// they are inserted ([`Self::note_inserted`]).
     pub fn request_total(&self, relay: &RelayConnection, cid: &str) {
+        self.request_total_of(relay, cid, cid);
+    }
+
+    /// [`Self::request_total`] for list `key` counted by `#e:[value]`: a
+    /// topic list (`topic_key(root)`) is counted by its root, which sealed
+    /// replies carry as an outer `reply` tag (the relay gates the count by
+    /// each reply's channel).
+    pub fn request_total_of(&self, relay: &RelayConnection, key: &str, value: &str) {
+        let cid = key;
         if self.totals.with_untracked(|m| m.contains_key(cid)) {
             return;
         }
@@ -377,7 +391,7 @@ impl ChannelStore {
         relay.count(
             vec![Filter {
                 kinds: Some(vec![42]),
-                e_tags: Some(vec![cid.to_string()]),
+                e_tags: Some(vec![value.to_string()]),
                 until: Some(as_of),
                 ..Default::default()
             }],
@@ -395,7 +409,7 @@ impl ChannelStore {
 
     /// Record a message newly inserted into channel `cid`'s list for its
     /// true total (only messages newer than the count matter).
-    fn note_inserted(&self, cid: &str, id: &str, created_at: u64) {
+    pub fn note_inserted(&self, cid: &str, id: &str, created_at: u64) {
         let newer = self.totals.with_untracked(|m| {
             m.get(cid)
                 .is_some_and(|t| created_at > t.as_of && !t.newer_ids.contains(id))
@@ -1076,6 +1090,94 @@ impl ChannelStore {
         ]
     }
 
+    // -- Topic lists ---------------------------------------------------------
+
+    /// Register topic `root` of `channel` for its own paged list and return
+    /// the list key (also the key of its history cursor). Idempotent.
+    pub fn register_topic(&self, channel: &str, root: &str) -> String {
+        let key = topic_key(root);
+        self.topic_targets.update_value(|m| {
+            m.entry(key.clone())
+                .or_insert_with(|| (channel.to_string(), root.to_lowercase()));
+        });
+        key
+    }
+
+    /// Where an ingested page event belongs. For a channel list, its own
+    /// channel. For a topic list, the topic list, but only if the event is
+    /// in the topic's channel (resolved from its root-marked channel tag,
+    /// like the relay's gate) and replies to that topic: anything else a
+    /// `#e:[root]` answer returns (a crafted event naming the root without
+    /// being in the channel) is dropped, decrypt state and all.
+    fn route_to_list(
+        &self,
+        key: &str,
+        cid: String,
+        ev: NostrEvent,
+    ) -> Option<(String, NostrEvent)> {
+        let Some((channel, topic)) = self.topic_targets.with_value(|m| m.get(key).cloned()) else {
+            return Some((cid, ev));
+        };
+        let replies_to_topic = nostr_bbs_core::sealed::reply_root_of(&ev)
+            .is_some_and(|r| r.eq_ignore_ascii_case(&topic));
+        if cid == channel && replies_to_topic {
+            Some((key.to_string(), ev))
+        } else {
+            if let Some(z) = self.zone_store() {
+                z.forget(std::slice::from_ref(&ev.id));
+            }
+            None
+        }
+    }
+
+    /// The events of list `key` (a channel id or a [`topic_key`]). Reactive.
+    pub fn list_events(&self, key: &str) -> Vec<NostrEvent> {
+        self.channel_messages
+            .with(|m| m.get(key).cloned().unwrap_or_default())
+    }
+
+    /// Fetch one event by its id: a live event by `ids`, a sealed one by the
+    /// inner id in its `sealed` tag (`#sealed:[id]`, which the relay indexes
+    /// like any tag). Used for a topic root known only from its replies.
+    /// The event enters the store through the usual admission and decrypt
+    /// path (into its own channel's list).
+    pub fn fetch_by_id(&self, relay: &RelayConnection, id: &str) {
+        let store = *self;
+        let zone_keys = self.zone_store();
+        let on_event = Rc::new(move |ev: NostrEvent| {
+            if let Some(x) = store.ingest(zone_keys, ev, "") {
+                store.apply_page(vec![x]);
+            }
+        });
+        let sub: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let relay_close = relay.clone();
+        let sub_close = sub.clone();
+        let on_receipt = Rc::new(move |_authed: bool| {
+            if let Some(id) = sub_close.borrow_mut().take() {
+                relay_close.unsubscribe(&id);
+            }
+        });
+        let mut sealed = Filter {
+            kinds: Some(vec![42]),
+            limit: Some(1),
+            ..Default::default()
+        };
+        sealed.sealed_tags = Some(vec![id.to_lowercase()]);
+        let id_sub = relay.subscribe_with_receipt(
+            vec![
+                Filter {
+                    ids: Some(vec![id.to_lowercase()]),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                sealed,
+            ],
+            on_event,
+            on_receipt,
+        );
+        *sub.borrow_mut() = Some(id_sub);
+    }
+
     /// Record the zone-key store (called once by `provide_zone_key_store`).
     pub fn set_zone_store(&self, z: crate::zone_crypto::store::ZoneKeyStore) {
         self.zone_keys.set_value(Some(z));
@@ -1207,7 +1309,9 @@ impl ChannelStore {
                     return;
                 }
                 let ts = ev.created_at;
-                let ingested = store.ingest(zone_keys, ev, &key);
+                let ingested = store
+                    .ingest(zone_keys, ev, &key)
+                    .and_then(|(cid, ev)| store.route_to_list(&key, cid, ev));
                 let mut b = buf.borrow_mut();
                 b.delivered += 1;
                 b.oldest = Some(b.oldest.map_or(ts, |o| o.min(ts)));
@@ -1687,6 +1791,11 @@ impl ChannelTotal {
     pub fn total(&self) -> Option<u64> {
         self.counted.map(|n| n + self.newer_ids.len() as u64)
     }
+}
+
+/// The list (and history-cursor) key of topic `root`'s own paged list.
+pub fn topic_key(root: &str) -> String {
+    format!("topic:{}", root.to_lowercase())
 }
 
 /// Which end of a channel's window to evict.

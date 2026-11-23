@@ -42,6 +42,10 @@ pub fn HistoryLoader(
     gated: Signal<bool>,
     #[prop(into)] label: String,
     #[prop(optional)] direction: HistoryDirection,
+    /// The `#e` values pages are requested for; `[channel_id]` when absent.
+    /// A topic list is keyed `topic:<root>` but paged by `#e:[root]`.
+    #[prop(optional, into)]
+    needles: Option<Signal<Vec<String>>>,
 ) -> impl IntoView {
     let store = expect_context::<ChannelStore>();
     let relay = expect_context::<RelayConnection>();
@@ -76,7 +80,9 @@ pub fn HistoryLoader(
                     scroll_anchor::restore(a, None);
                 }
             });
-            let needles = vec![cid.clone()];
+            let needles = needles
+                .map(|n| n.get_untracked())
+                .unwrap_or_else(|| vec![cid.clone()]);
             let g = gated.get_untracked();
             match direction {
                 HistoryDirection::Older => {
