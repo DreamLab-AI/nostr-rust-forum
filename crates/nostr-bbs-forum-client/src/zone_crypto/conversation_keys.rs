@@ -14,9 +14,12 @@
 //! never be served another secret's conversation key, and no extra copy of
 //! the secret is held. A conversation key opens everything between that
 //! secret and that peer, so it is treated like the secret: memory only, never
-//! persisted, zeroised and dropped by [`clear`], which
+//! persisted, and dropped by [`clear`] (the cache's own copies are
+//! `Zeroizing`; transient copies made while decrypting, inside upstream's
+//! `ConversationKey`, are not wiped, as before this cache), which
 //! [`ZoneKeyStore::switch_owner`](super::store::ZoneKeyStore::switch_owner)
-//! calls on every sign-out and identity change, and bounded to
+//! calls on every sign-out and identity change and the key-conflict path
+//! calls whenever a key is removed or replaced, and bounded to
 //! [`CAPACITY`] entries (cleared whole when full).
 
 use std::cell::RefCell;

@@ -455,6 +455,24 @@ mod conversation_key_decrypt_tests {
             Err(Nip44Error::InvalidBase64)
         ));
         assert!(decrypt_with_conversation_key(&ck, "").is_err());
+
+        // The size bound sits exactly at upstream's: a well-formed payload of
+        // MAX_ENCODED_PAYLOAD_LEN characters is decoded (and fails only the
+        // MAC), one base64 group more is refused before decoding.
+        // The largest v2 payload is 65,603 bytes, 87,472 base64 characters.
+        let mut at_limit_raw = vec![0u8; 65_603];
+        at_limit_raw[0] = 2;
+        let at_limit = base64::engine::general_purpose::STANDARD.encode(&at_limit_raw);
+        assert_eq!(at_limit.len(), MAX_ENCODED_PAYLOAD_LEN);
+        assert!(!matches!(
+            decrypt_with_conversation_key(&ck, &at_limit),
+            Err(Nip44Error::PlaintextTooLong)
+        ));
+        let over = at_limit.clone() + "AAAA";
+        assert!(matches!(
+            decrypt_with_conversation_key(&ck, &over),
+            Err(Nip44Error::PlaintextTooLong)
+        ));
         assert!(
             decrypt_with_conversation_key(&ck, &"A".repeat(MAX_ENCODED_PAYLOAD_LEN + 4)).is_err()
         );

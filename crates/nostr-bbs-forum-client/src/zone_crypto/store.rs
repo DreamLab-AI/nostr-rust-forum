@@ -336,7 +336,12 @@ impl ZoneKeyStore {
                 m.remove(&id);
             }
         });
-        self.redecrypt_chunked();
+        // This path can REMOVE a key or REPLACE its secret (storage disagreed
+        // with memory), so plaintext opened under the old key must go at once:
+        // synchronous re-decryption, never the chunked pass, and conversation
+        // keys derived from a secret that may no longer be held are dropped.
+        super::conversation_keys::clear();
+        self.redecrypt();
     }
 
     /// Note a refused key: logged, and listed for the Encryption card while
@@ -532,7 +537,8 @@ impl ZoneKeyStore {
         self.revision.update(|r| *r += 1);
     }
 
-    /// [`redecrypt`](Self::redecrypt) for a key that just ARRIVED, spread
+    /// [`redecrypt`](Self::redecrypt) for a key that was ADDED (never one
+    /// removed or replaced: those revert synchronously), spread
     /// over the event loop so a cold-key join does not freeze the page: the
     /// messages to open are taken newest first, opened
     /// [`REDECRYPT_CHUNK`] at a time with a yield (`setTimeout(0)`) between
@@ -588,15 +594,17 @@ impl ZoneKeyStore {
     /// Apply precomputed read-path outcomes (by the id of the event opened)
     /// to the channel store in one update, as [`redecrypt`](Self::redecrypt)
     /// does for all of them.
-    fn apply_outcomes(&self, mut outcomes: HashMap<String, super::ReadOutcome>) {
+    fn apply_outcomes(&self, outcomes: HashMap<String, super::ReadOutcome>) {
         let channels = self.channels;
         let store = *self;
         let mut restored_ids: Vec<String> = Vec::new();
         let _ = channels.channel_messages.try_update(|m| {
             store.cache.update_value(|c| {
+                // `get(..).cloned()`, not `remove`: one event id can sit in
+                // more than one channel list, and every copy takes the outcome.
                 c.redecrypt_with(
                     m,
-                    |ev| outcomes.remove(&ev.id),
+                    |ev| outcomes.get(&ev.id).cloned(),
                     |inner| channels.admits_restored_original(inner),
                 );
                 restored_ids = m

@@ -427,6 +427,29 @@ mod tests {
             .any(|e| e.content == PLACEHOLDER_MISSING_KEY));
     }
 
+    /// One event id can sit in two channel lists (the history paths resolve
+    /// the list key differently). A chunked apply must reach every copy, as
+    /// `apply_outcomes` does by cloning each outcome instead of taking it.
+    #[test]
+    fn a_chunk_outcome_reaches_every_copy_of_an_event() {
+        let mut cache = ReadCache::default();
+        let env = seal(&original(100, "twice"));
+        let placeholder = cache.prepare(&env, no_key);
+        let mut msgs: HashMap<String, Vec<NostrEvent>> = HashMap::new();
+        msgs.insert("by-id".into(), vec![placeholder.clone()]);
+        msgs.insert("by-name".into(), vec![placeholder]);
+        let outcomes: HashMap<String, ReadOutcome> = cache
+            .open_targets(&msgs)
+            .iter()
+            .map(|ev| (ev.id.clone(), read_outcome(ev, with_key)))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "one source to open");
+        cache.redecrypt_with(&mut msgs, |ev| outcomes.get(&ev.id).cloned(), |_| true);
+        for list in msgs.values() {
+            assert_eq!(list[0].content, "twice");
+        }
+    }
+
     #[test]
     fn placeholder_becomes_the_original_in_place_when_the_key_arrives() {
         let before = original(100, "earlier plaintext");
