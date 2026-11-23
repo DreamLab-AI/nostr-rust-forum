@@ -38,7 +38,10 @@ use crate::zone_config::ZoneConfig;
 
 /// Kinds counted as authored posts: NIP-01 notes, kind-9 chat, NIP-28
 /// channel messages and NIP-22 comments.
-const POST_KINDS: [u32; 4] = [1, 9, 42, 1111];
+// Kind 1111 (comments) is not counted: a comment on a zone message would be
+// counted as public activity (review finding 6); its target's zone is not
+// resolved here.
+const POST_KINDS: [u32; 3] = [1, 9, 42];
 
 /// Upper bound on rows scanned per identity. The response flags `truncated`
 /// when the cap is hit so the card can say "at least".

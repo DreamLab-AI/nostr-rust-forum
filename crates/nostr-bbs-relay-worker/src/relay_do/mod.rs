@@ -32,7 +32,7 @@ mod storage;
 
 use crate::auth::AdminCache;
 pub(crate) use mod_cache::ModCache;
-use read_cache::{ActivityLedger, TtlCache, LOOKUP_TTL_SECS};
+use read_cache::{ActivityLedger, TtlCache, LOOKUP_TTL_SECS, NEGATIVE_LOOKUP_TTL_SECS};
 
 #[cfg(feature = "test-exports")]
 #[doc(hidden)]
@@ -103,7 +103,11 @@ pub struct NostrRelayDO {
     /// F4: 60s-TTL memo of a referenced event id -> its channel (`None`: the
     /// target is stored but not channel-scoped). Unknown targets are not
     /// cached (they may arrive later).
-    pub(crate) ref_target_cache: TtlCache<Option<String>>,
+    pub(crate) ref_target_cache: TtlCache<Vec<String>>,
+    /// F4: short-TTL memo of referenced ids that resolved to nothing stored.
+    pub(crate) ref_unknown_cache: TtlCache<()>,
+    /// Short-TTL memo of channels with no channel_zones row (finding 4).
+    pub(crate) channel_zone_none_cache: TtlCache<()>,
     /// ADR-2018: 60s-TTL memo of pubkey → (cohorts, whitelist is_admin).
     pub(crate) cohort_cache: TtlCache<(Vec<String>, bool)>,
     /// ADR-2018: 60s-TTL memo of device pubkey → owner (None = not a device key).
@@ -137,6 +141,8 @@ impl DurableObject for NostrRelayDO {
             admin_cache: AdminCache::new(),
             channel_zone_cache: TtlCache::new(LOOKUP_TTL_SECS),
             ref_target_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            ref_unknown_cache: TtlCache::new(NEGATIVE_LOOKUP_TTL_SECS),
+            channel_zone_none_cache: TtlCache::new(NEGATIVE_LOOKUP_TTL_SECS),
             cohort_cache: TtlCache::new(LOOKUP_TTL_SECS),
             device_owner_cache: TtlCache::new(LOOKUP_TTL_SECS),
             recipient_row_cache: TtlCache::new(LOOKUP_TTL_SECS),

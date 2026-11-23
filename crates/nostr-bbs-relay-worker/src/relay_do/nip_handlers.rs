@@ -1440,6 +1440,28 @@ impl NostrRelayDO {
             return;
         }
 
+        // A `sealed` tag belongs only on a kind-42 envelope (finding 1: any
+        // other kind carrying one could steer sealed-target resolution), and
+        // the topic marker only on a topic root, never beside a reply tag.
+        if event.kind != 42 && nostr_bbs_core::sealed::has_sealed_tag(&event.tags) {
+            Self::send_ok(
+                ws,
+                &event.id,
+                false,
+                "invalid: sealed tag on a non-channel-message kind",
+            );
+            return;
+        }
+        if event.kind == 42
+            && nostr_bbs_core::sealed::reply_root_of(&event).is_some()
+            && event.tags.iter().any(|t| {
+                t.len() >= 2 && t[0] == "t" && t[1] == nostr_bbs_core::sealed::TOPIC_MARKER
+            })
+        {
+            Self::send_ok(ws, &event.id, false, "invalid: topic marker on a reply");
+            return;
+        }
+
         // Zone enforcement for channel messages (kind-42)
         if event.kind == 42 {
             let Some(channel_id) = filter::channel_tag(&event) else {
@@ -1450,14 +1472,13 @@ impl NostrRelayDO {
             // must be a stored message in that same channel, so nothing can
             // be filed under a zone topic (`#e:[topic]`) from outside it, or
             // posted into a made-up "channel" (which would read as unscoped).
-            let channel_known = self
-                .reference_target_channel(&channel_id.to_ascii_lowercase(), 0)
-                .await;
+            //
+            // Ids are matched EXACTLY (stored ids are lowercase hex): a
+            // mixed-case alias of a zone channel would miss its channel_zones
+            // row and read as unscoped (review finding 3).
+            let channel_known = self.reference_target_channels(&channel_id, 0).await;
             let reply_target = match nostr_bbs_core::sealed::reply_root_of(&event) {
-                Some(root) => Some(
-                    self.reference_target_channel(&root.to_ascii_lowercase(), 1)
-                        .await,
-                ),
+                Some(root) => Some(self.reply_topic_channels(root).await),
                 None => None,
             };
             if let Some(reason) =
@@ -1539,10 +1560,17 @@ impl NostrRelayDO {
                 }
             }
             let cfg = ZoneConfig::load(&self.env);
+            let (author_cohorts, author_cohort_admin) =
+                self.cached_viewer_cohorts(&principal).await;
             if let Some(reason) = reference_write_rejection(
                 &scope,
                 event.kind,
                 is_admin,
+                |z| {
+                    author_cohort_admin
+                        || cfg.is_public_read(z)
+                        || cfg.cohorts_can_read(z, &author_cohorts)
+                },
                 |z| writable.iter().any(|w| w == z),
                 |z| cfg.is_encrypted(z),
                 |z| crate::zone_config::is_zone_ciphertext(z, &event.tags, &event.content),
@@ -2287,6 +2315,25 @@ pub(crate) fn is_reference_kind(kind: u64) -> bool {
     matches!(kind, 7 | 1111 | 1984)
 }
 
+/// Sealed envelopes wrapping the original whose id is `?1`, by their whole
+/// wire shape (kind 42, a well-formed `sealed` tag naming `?1` with a decimal
+/// version, a `zk` tag) and an admin author, as the ingest gate requires of
+/// every envelope. A bare `sealed` tag on any other event never matches
+/// (review finding 1; mirrors `SEALED_ENVELOPES_FOR_SQL`).
+const SEALED_TARGET_SQL: &str =
+    "SELECT s.id AS id, s.pubkey AS pubkey, s.created_at AS created_at, \
+     s.kind AS kind, s.tags AS tags, s.content AS content, s.sig AS sig \
+     FROM event_tags t JOIN events s ON s.id = t.event_id AND s.kind = 42 \
+     WHERE t.name = 'sealed' AND t.value = ?1 \
+       AND EXISTS (SELECT 1 FROM json_each(s.tags) st \
+                   WHERE json_extract(st.value, '$[0]') = 'sealed' \
+                     AND json_extract(st.value, '$[1]') = ?1 \
+                     AND json_type(st.value, '$[2]') = 'text' \
+                     AND json_extract(st.value, '$[2]') <> '' \
+                     AND json_extract(st.value, '$[2]') NOT GLOB '*[^0-9]*') \
+       AND EXISTS (SELECT 1 FROM event_tags z WHERE z.event_id = s.id AND z.name = 'zk') \
+       AND s.pubkey IN (SELECT pubkey FROM whitelist WHERE is_admin = 1)";
+
 /// The most targets one reference-kind event may name; more is treated as
 /// unknown (gated), which bounds the lookups per event.
 pub(crate) const MAX_REFERENCE_TARGETS: usize = 8;
@@ -2362,6 +2409,7 @@ pub(crate) fn reference_write_rejection(
     scope: &RefScope,
     kind: u64,
     is_admin: bool,
+    can_read: impl Fn(&str) -> bool,
     can_write: impl Fn(&str) -> bool,
     encrypted: impl Fn(&str) -> bool,
     is_ciphertext: impl Fn(&str) -> bool,
@@ -2372,7 +2420,14 @@ pub(crate) fn reference_write_rejection(
         RefScope::Unknown => Some("blocked: referenced event unknown"),
         RefScope::Zones(zs) => {
             for z in zs {
-                if !is_admin && !can_write(z) {
+                // A report needs only to see what it reports (finding 5): a
+                // read-only member of a zone can still flag abuse in it.
+                let permitted = if kind == 1984 {
+                    can_read(z)
+                } else {
+                    can_write(z)
+                };
+                if !is_admin && !permitted {
                     return Some("zone access denied");
                 }
                 if kind == 1111 && encrypted(z) && !is_ciphertext(z) {
@@ -2398,16 +2453,17 @@ pub(crate) fn stored_target_channel(target: &NostrEvent) -> Option<String> {
 /// channel `c`). Unknown or failed lookups refuse (fail closed).
 pub(crate) fn channel_write_rejection(
     channel_id: &str,
-    channel_known: &Result<Option<String>, ()>,
-    reply_target: Option<&Result<Option<String>, ()>>,
+    channel_known: &Result<Vec<String>, ()>,
+    reply_target: Option<&Result<Vec<String>, ()>>,
 ) -> Option<&'static str> {
+    // A stored kind-40 resolves to exactly its own id.
     match channel_known {
-        Ok(Some(c)) if c.eq_ignore_ascii_case(channel_id) => {}
+        Ok(cs) if cs.len() == 1 && cs[0] == channel_id => {}
         _ => return Some("invalid: channel is not a known channel"),
     }
     match reply_target {
         None => None,
-        Some(Ok(Some(c))) if c.eq_ignore_ascii_case(channel_id) => None,
+        Some(Ok(cs)) if !cs.is_empty() && cs.iter().all(|c| c == channel_id) => None,
         Some(_) => Some("invalid: reply target is not a message in this channel"),
     }
 }
@@ -2576,18 +2632,23 @@ impl NostrRelayDO {
         if let Some(zone) = self.channel_zone_cache.get(channel_id, now) {
             return Ok(Some(zone));
         }
+        // "No zone" is memoised for a few seconds only (review finding 4: a
+        // REQ of reactions on public channels re-queried every one), so a new
+        // binding takes effect within NEGATIVE_LOOKUP_TTL_SECS.
+        if self.channel_zone_none_cache.get(channel_id, now).is_some() {
+            return Ok(None);
+        }
         let zone = trust::get_channel_zone(channel_id, &self.env).await?;
-        if let Some(z) = &zone {
-            self.channel_zone_cache.insert(channel_id, z.clone(), now);
+        match &zone {
+            Some(z) => self.channel_zone_cache.insert(channel_id, z.clone(), now),
+            None => self.channel_zone_none_cache.insert(channel_id, (), now),
         }
         Ok(zone)
     }
 
     /// Where a reference-kind event's targets live (see [`RefScope`]). Each
-    /// target is resolved from D1, never from tags the event mirrors: by id,
-    /// or a sealed envelope by the inner id in its `sealed` tag; a target
-    /// that is itself a reference kind (a reaction to a comment) is followed
-    /// one more hop. Lookups fail closed.
+    /// target is resolved from D1, never from tags the event mirrors (see
+    /// [`Self::reference_target_channels`]). Lookups fail closed.
     pub(crate) async fn resolve_reference_scope(&self, event: &NostrEvent) -> RefScope {
         let targets = reference_targets(event);
         if targets.is_empty() {
@@ -2598,11 +2659,10 @@ impl NostrRelayDO {
         }
         let mut zones: Vec<String> = Vec::new();
         for target in &targets {
-            let channel = match self.reference_target_channel(target, 1).await {
-                Ok(c) => c,
-                Err(()) => return RefScope::Unknown,
+            let Ok(channels) = self.reference_target_channels(target, 1).await else {
+                return RefScope::Unknown;
             };
-            if let Some(channel) = channel {
+            for channel in channels {
                 match self.cached_channel_zone(&channel).await {
                     Ok(Some(zone)) => {
                         if !zones.contains(&zone) {
@@ -2621,21 +2681,17 @@ impl NostrRelayDO {
         }
     }
 
-    /// The channel of stored event `id` (`Ok(None)`: stored, not
-    /// channel-scoped; `Err`: not stored or D1 failed). Memoised 60 s.
-    async fn reference_target_channel(&self, id: &str, hops: u8) -> Result<Option<String>, ()> {
-        let now = auth::js_now_secs();
-        if let Some(hit) = self.ref_target_cache.get(id, now) {
-            return Ok(hit);
-        }
+    /// The stored event(s) id `id` names: the event with that id if stored;
+    /// otherwise the sealed envelopes wrapping an original of that id, matched
+    /// on the whole envelope shape and an admin author (never a bare `sealed`
+    /// tag, which any kind can carry: review finding 1). `Err` when nothing
+    /// is stored, on a D1 failure, or for more than `MAX_REFERENCE_TARGETS`
+    /// envelope matches.
+    async fn lookup_target_events(&self, id: &str) -> Result<Vec<NostrEvent>, ()> {
         let db = self.env.d1("DB").map_err(|_| ())?;
-        let rows: Vec<super::storage::EventRow> = db
+        let by_id: Vec<super::storage::EventRow> = db
             .prepare(
-                "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1 \
-                 UNION ALL SELECT events.id, events.pubkey, events.created_at, events.kind, \
-                 events.tags, events.content, events.sig FROM event_tags d \
-                 CROSS JOIN events ON events.id = d.event_id \
-                 WHERE d.name = 'sealed' AND d.value = ?1 LIMIT 1",
+                "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1",
             )
             .bind(&[JsValue::from_str(id)])
             .map_err(|_| ())?
@@ -2644,32 +2700,117 @@ impl NostrRelayDO {
             .map_err(|_| ())?
             .results()
             .map_err(|_| ())?;
-        let target = rows
+        let found: Vec<NostrEvent> = by_id
             .into_iter()
-            .next()
-            .and_then(super::storage::EventRow::into_nostr_event)
-            .ok_or(())?;
-        let channel = if is_reference_kind(target.kind) {
-            if hops == 0 {
+            .filter_map(super::storage::EventRow::into_nostr_event)
+            .collect();
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        let sealed: Vec<super::storage::EventRow> = db
+            .prepare(format!(
+                "{SEALED_TARGET_SQL} LIMIT {}",
+                MAX_REFERENCE_TARGETS + 1
+            ))
+            .bind(&[JsValue::from_str(id)])
+            .map_err(|_| ())?
+            .all()
+            .await
+            .map_err(|_| ())?
+            .results()
+            .map_err(|_| ())?;
+        let found: Vec<NostrEvent> = sealed
+            .into_iter()
+            .filter_map(super::storage::EventRow::into_nostr_event)
+            .collect();
+        if found.is_empty() || found.len() > MAX_REFERENCE_TARGETS {
+            return Err(());
+        }
+        Ok(found)
+    }
+
+    /// The channels stored target `id` belongs to (empty: stored, not
+    /// channel-scoped). A target that is itself a reference kind (a reaction
+    /// to a comment) contributes the channels of ALL its own targets, one hop
+    /// deep (review finding 2). Several envelope matches that disagree on
+    /// their channel, an unknown target at any depth, or a D1 failure ->
+    /// `Err`. Only direct resolutions are memoised (60 s positive, 5 s
+    /// unknown), so a result never depends on the hop budget left.
+    pub(crate) async fn reference_target_channels(
+        &self,
+        id: &str,
+        hops: u8,
+    ) -> Result<Vec<String>, ()> {
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.ref_target_cache.get(id, now) {
+            return Ok(hit);
+        }
+        if self.ref_unknown_cache.get(id, now).is_some() {
+            return Err(());
+        }
+        let targets = match self.lookup_target_events(id).await {
+            Ok(t) => t,
+            Err(()) => {
+                self.ref_unknown_cache.insert(id, (), now);
                 return Err(());
             }
-            // A reaction/report on a comment: the comment's own targets.
-            let mut found = None;
-            for next in reference_targets(&target)
-                .into_iter()
-                .take(MAX_REFERENCE_TARGETS)
-            {
-                if let Some(c) = Box::pin(self.reference_target_channel(&next, hops - 1)).await? {
-                    found = Some(c);
-                    break;
+        };
+        let mut channels: Vec<String> = Vec::new();
+        let mut direct = true;
+        let mut direct_channels: Vec<Option<String>> = Vec::new();
+        for target in &targets {
+            if is_reference_kind(target.kind) {
+                direct = false;
+                if hops == 0 {
+                    return Err(());
+                }
+                let next_targets = reference_targets(target);
+                if next_targets.is_empty() || next_targets.len() > MAX_REFERENCE_TARGETS {
+                    return Err(());
+                }
+                for next in next_targets {
+                    for c in Box::pin(self.reference_target_channels(&next, hops - 1)).await? {
+                        if !channels.contains(&c) {
+                            channels.push(c);
+                        }
+                    }
+                }
+            } else {
+                let c = stored_target_channel(target);
+                direct_channels.push(c.clone());
+                if let Some(c) = c {
+                    if !channels.contains(&c) {
+                        channels.push(c);
+                    }
                 }
             }
-            found
-        } else {
-            stored_target_channel(&target)
-        };
-        self.ref_target_cache.insert(id, channel.clone(), now);
-        Ok(channel)
+        }
+        // Several envelopes for one original must agree on where it lives.
+        if direct_channels.windows(2).any(|w| w[0] != w[1]) {
+            return Err(());
+        }
+        if direct {
+            self.ref_target_cache.insert(id, channels.clone(), now);
+        }
+        Ok(channels)
+    }
+
+    /// The channel(s) a reply's topic `root` lives in, for the F2 placement
+    /// check: every stored match must be a kind-42 (a live root, or a sealed
+    /// envelope wrapping it). `Err` otherwise.
+    async fn reply_topic_channels(&self, root: &str) -> Result<Vec<String>, ()> {
+        let targets = self.lookup_target_events(root).await?;
+        if targets.iter().any(|t| t.kind != 42) {
+            return Err(());
+        }
+        let mut channels: Vec<String> = Vec::new();
+        for t in &targets {
+            let c = stored_target_channel(t).ok_or(())?;
+            if !channels.contains(&c) {
+                channels.push(c);
+            }
+        }
+        Ok(channels)
     }
 
     /// Whitelist `(cohorts, is_admin)` through the 60s per-DO memo. A missing
@@ -8855,43 +8996,47 @@ mod reference_kind_gate_tests {
     fn writes_need_zone_access_and_comments_in_encrypted_zones_need_ciphertext() {
         let z = RefScope::Zones(vec!["zone2".into()]);
         let enc = |zone: &str| zone == "zone2";
-        // Non-member: refused for every kind.
+        let yes = |_: &str| true;
+        let no = |_: &str| false;
+        // Neither reader nor writer: refused for every kind.
         for kind in [7u64, 1111, 1984] {
             assert_eq!(
-                reference_write_rejection(&z, kind, false, |_| false, enc, |_| true),
+                reference_write_rejection(&z, kind, false, no, no, enc, yes),
                 Some("zone access denied")
             );
         }
-        // Member: a reaction or report passes; a plaintext comment does not.
+        // Read-only member: may report (finding 5), may not react or comment.
         assert_eq!(
-            reference_write_rejection(&z, 7, false, |_| true, enc, |_| false),
+            reference_write_rejection(&z, 1984, false, yes, no, enc, no),
+            None
+        );
+        assert!(reference_write_rejection(&z, 7, false, yes, no, enc, yes).is_some());
+        assert!(reference_write_rejection(&z, 1111, false, yes, no, enc, yes).is_some());
+        // Writer: a reaction passes; a plaintext comment does not.
+        assert_eq!(
+            reference_write_rejection(&z, 7, false, yes, yes, enc, no),
             None
         );
         assert_eq!(
-            reference_write_rejection(&z, 1984, false, |_| true, enc, |_| false),
-            None
-        );
-        assert_eq!(
-            reference_write_rejection(&z, 1111, false, |_| true, enc, |_| false),
+            reference_write_rejection(&z, 1111, false, yes, yes, enc, no),
             Some("blocked: encrypted zone requires zone-key ciphertext")
         );
         assert_eq!(
-            reference_write_rejection(&z, 1111, false, |_| true, enc, |_| true),
+            reference_write_rejection(&z, 1111, false, yes, yes, enc, yes),
             None
         );
         // Admins skip the access check but not the ciphertext rule.
-        assert!(reference_write_rejection(&z, 1111, true, |_| false, enc, |_| false).is_some());
+        assert!(reference_write_rejection(&z, 1111, true, no, no, enc, no).is_some());
         // Unknown targets: refused unless admin.
         assert!(
-            reference_write_rejection(&RefScope::Unknown, 7, false, |_| true, enc, |_| true)
-                .is_some()
+            reference_write_rejection(&RefScope::Unknown, 7, false, yes, yes, enc, yes).is_some()
         );
         assert_eq!(
-            reference_write_rejection(&RefScope::Unknown, 7, true, |_| true, enc, |_| true),
+            reference_write_rejection(&RefScope::Unknown, 7, true, yes, yes, enc, yes),
             None
         );
         assert_eq!(
-            reference_write_rejection(&RefScope::Unscoped, 1111, false, |_| false, enc, |_| false),
+            reference_write_rejection(&RefScope::Unscoped, 1111, false, no, no, enc, no),
             None
         );
     }
@@ -8918,24 +9063,27 @@ mod reference_kind_gate_tests {
 
 #[cfg(test)]
 mod channel_placement_tests {
-    //! Security review F2: a kind-42 must be placed in a real channel, and a
-    //! reply's topic must live in that same channel.
+    //! Security review F2 (and finding 3): a kind-42 must be placed in a real
+    //! channel named by its exact id, and a reply's topic must be a kind-42
+    //! in that same channel.
     use super::channel_write_rejection;
+
+    fn ok(c: &[&str]) -> Result<Vec<String>, ()> {
+        Ok(c.iter().map(|s| s.to_string()).collect())
+    }
 
     #[test]
     fn a_message_in_a_known_channel_with_a_same_channel_topic_is_accepted() {
-        let c = Ok(Some("chan".to_string()));
-        assert_eq!(channel_write_rejection("chan", &c, None), None);
+        assert_eq!(channel_write_rejection("chan", &ok(&["chan"]), None), None);
         assert_eq!(
-            channel_write_rejection("chan", &c, Some(&Ok(Some("chan".into())))),
+            channel_write_rejection("chan", &ok(&["chan"]), Some(&ok(&["chan"]))),
             None
         );
     }
 
     #[test]
     fn an_unknown_or_non_channel_target_is_refused() {
-        // Not stored, a lookup error, a stored non-channel event, another id.
-        for known in [Err(()), Ok(None), Ok(Some("other".to_string()))] {
+        for known in [Err(()), ok(&[]), ok(&["other"]), ok(&["chan", "other"])] {
             assert!(
                 channel_write_rejection("chan", &known, None).is_some(),
                 "{known:?}"
@@ -8944,13 +9092,96 @@ mod channel_placement_tests {
     }
 
     #[test]
+    fn a_mixed_case_alias_of_a_channel_is_refused() {
+        // The stored kind-40 id is lowercase; the tag must equal it exactly.
+        assert!(channel_write_rejection("CHAN", &ok(&["chan"]), None).is_some());
+    }
+
+    #[test]
     fn a_topic_outside_the_channel_or_unknown_is_refused() {
-        let c = Ok(Some("chan".to_string()));
-        for target in [Err(()), Ok(None), Ok(Some("other".to_string()))] {
+        for target in [Err(()), ok(&[]), ok(&["other"]), ok(&["chan", "other"])] {
             assert!(
-                channel_write_rejection("chan", &c, Some(&target)).is_some(),
+                channel_write_rejection("chan", &ok(&["chan"]), Some(&target)).is_some(),
                 "{target:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sealed_target_sql_tests {
+    //! Review finding 1: resolving a reference by an original's inner id must
+    //! match only real sealed envelopes (kind 42, well-formed sealed tag, zk
+    //! tag, admin author), never a planted `sealed` tag.
+    use super::SEALED_TARGET_SQL;
+    use rusqlite::{params, Connection};
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(include_str!("../../migrations/0004_event_tags.sql"))
+            .unwrap();
+        let _ = c.execute_batch(crate::EVENT_TAGS_TIME_COLUMN_SQL);
+        for s in crate::PROBE_BLIND_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+        c.execute_batch(
+            "CREATE TABLE whitelist (pubkey TEXT PRIMARY KEY, is_admin INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO whitelist VALUES ('admin', 1), ('member', 0);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn put(c: &Connection, id: &str, pubkey: &str, kind: i64, tags: serde_json::Value) {
+        c.execute(
+            "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) VALUES (?1, ?2, 1, ?3, ?4, 'x', 'sig')",
+            params![id, pubkey, kind, tags.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn matches(c: &Connection, inner: &str) -> Vec<String> {
+        let mut s = c.prepare(SEALED_TARGET_SQL).unwrap();
+        s.query_map([inner], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn only_a_real_admin_envelope_resolves_an_inner_id() {
+        let c = db();
+        let inner = "a".repeat(64);
+        let env_tags = serde_json::json!([
+            ["e", "chan", "", "root"],
+            ["zk", "zone2", "1", "pk"],
+            ["sealed", inner, "1"]
+        ]);
+        put(&c, "real", "admin", 42, env_tags.clone());
+        // Planted: a kind-1 by a member, a kind-42 by a member, a kind-42 by
+        // an admin without zk, and one with a malformed version.
+        put(&c, "planted-k1", "member", 1, env_tags.clone());
+        put(&c, "planted-member", "member", 42, env_tags);
+        put(
+            &c,
+            "planted-nozk",
+            "admin",
+            42,
+            serde_json::json!([["e", "evil", "", "root"], ["sealed", inner, "1"]]),
+        );
+        put(
+            &c,
+            "planted-ver",
+            "admin",
+            42,
+            serde_json::json!([
+                ["e", "evil", "", "root"],
+                ["zk", "z", "1", "p"],
+                ["sealed", inner, "v1"]
+            ]),
+        );
+        assert_eq!(matches(&c, &inner), vec!["real".to_string()]);
+        assert!(matches(&c, &"b".repeat(64)).is_empty());
     }
 }

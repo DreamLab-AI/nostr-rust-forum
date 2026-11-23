@@ -579,8 +579,10 @@ async fn handle_channel_zone_upsert(mut req: Request, env: &Env) -> Result<Respo
     };
 
     let channel_id = match &body.channel_id {
+        // Stored ids are lowercase hex and zone lookups match exactly
+        // (finding 3): store the binding lowercased.
         Some(c) if !c.is_empty() && c.len() <= 128 && c.bytes().all(|b| b.is_ascii_hexdigit()) => {
-            c.clone()
+            c.to_ascii_lowercase()
         }
         _ => {
             return json_response(
