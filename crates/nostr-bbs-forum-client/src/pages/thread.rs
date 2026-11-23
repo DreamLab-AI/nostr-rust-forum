@@ -737,13 +737,17 @@ pub fn ThreadPage() -> impl IntoView {
     }
 
     // The topic root event whose id maps to the :topic slug.
+    // The root, once seen, is kept: the bounded history window evicts the
+    // channel's oldest messages as the reader pages towards newer replies,
+    // and a topic root is usually the oldest message of its topic.
+    let pinned_root = StoredValue::new(None::<NostrEvent>);
     let topic_root = Signal::derive(move || {
         let cid = match resolved_channel.get() {
             Some(ch) => ch.id.to_lowercase(),
             None => return Option::<NostrEvent>::None,
         };
         let slug = topic_param();
-        channel_events.with(|events| {
+        let found = channel_events.with(|events| {
             events
                 .iter()
                 .find(|e| {
@@ -757,7 +761,16 @@ pub fn ThreadPage() -> impl IntoView {
                     is_root && matches_topic_slug(&e.id, &slug)
                 })
                 .cloned()
-        })
+        });
+        match found {
+            Some(root) => {
+                pinned_root.set_value(Some(root.clone()));
+                Some(root)
+            }
+            None => pinned_root
+                .get_value()
+                .filter(|r| matches_topic_slug(&r.id, &slug)),
+        }
     });
 
     // Replies: kind-42 / kind-1111 events that reference the topic root id.
@@ -851,11 +864,22 @@ pub fn ThreadPage() -> impl IntoView {
     // the stored envelope's), so it cannot be fetched by id.
     {
         let relay = relay.clone();
+        let focus_query = use_query_map();
         Effect::new(move |_| {
             let Some(cid) = resolved_channel.get().map(|c| c.id) else {
                 return;
             };
-            if topic_root.with(Option::is_some) {
+            // Keep walking while the root is missing, or while a `?focus`
+            // reply is not loaded yet (a deep link into a long topic).
+            let focus = focus_query.read().get("focus");
+            let focus_missing = match (topic_root.get(), focus) {
+                (Some(root), Some(f)) => {
+                    !f.eq_ignore_ascii_case(&root.id)
+                        && !replies.with(|rs| rs.iter().any(|r| r.id.eq_ignore_ascii_case(&f)))
+                }
+                _ => false,
+            };
+            if topic_root.with(Option::is_some) && !focus_missing {
                 return;
             }
             let gated = zone_is_gated(&category_slug(), &load_zones());
@@ -885,6 +909,10 @@ pub fn ThreadPage() -> impl IntoView {
             }
         });
     }
+
+    // The channel whose history window holds this topic, for the loaders.
+    let history_cid = Signal::derive(move || resolved_channel.get().map(|c| c.id));
+    let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
 
     // -- Landing position ---------------------------------------------------
     //
@@ -1477,6 +1505,14 @@ pub fn ThreadPage() -> impl IntoView {
                         // Keyed: a new page or post renders only its own
                         // cards, and a card re-renders when what it shows
                         // changes (an edit, a decrypt, a resolved quote).
+                        // Bounded history window: older replies load above
+                        // the list as the reader scrolls up, evicted newer
+                        // ones below it on the way back down.
+                        <crate::components::history_loader::HistoryLoader
+                            channel_id=history_cid
+                            gated=history_gated
+                            label="Load older replies"
+                        />
                         <For
                             each=move || replies.get()
                             key=|r| (r.id.clone(), view_key(r))
@@ -1493,6 +1529,12 @@ pub fn ThreadPage() -> impl IntoView {
                                     on_delete=publish_delete
                                 />
                             }
+                        />
+                        <crate::components::history_loader::HistoryLoader
+                            channel_id=history_cid
+                            gated=history_gated
+                            label="Load newer replies"
+                            direction=crate::components::history_loader::HistoryDirection::Newer
                         />
                     </div>
                 </div>
@@ -1882,6 +1924,7 @@ fn ReplyCard(
     view! {
         <div
             id=post_anchor_id(&post_id)
+            data-anchor-id=post_id.clone()
             class="bg-gray-800/40 border border-gray-700/50 rounded-lg p-4 scroll-mt-20 transition-shadow"
         >
             <div class="flex items-start gap-3">
