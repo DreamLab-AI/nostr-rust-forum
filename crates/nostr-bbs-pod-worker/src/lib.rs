@@ -29,6 +29,7 @@ mod provision;
 mod quota;
 mod remote_storage;
 mod webid;
+mod zone_media;
 
 // JSS Phase 1 staging (ADR-086/087): inert re-export shim for the upstream
 // `export-jsonld` feature. Compiles to an empty surface today; activation is
@@ -323,7 +324,9 @@ fn add_wac_allow(
 /// `max-age=300` with `must-revalidate` since they are mutable Solid pod
 /// resources (profile cards, ACLs, type indexes, etc.).
 fn add_cache_control(headers: &Headers, resource_path: &str) {
-    let value = if resource_path.starts_with("/media/") {
+    let value = if zone_media::classify(resource_path).is_some() {
+        zone_media::ZONE_CACHE_CONTROL
+    } else if resource_path.starts_with("/media/") {
         "public, max-age=31536000, immutable"
     } else {
         "public, max-age=300, must-revalidate"
@@ -475,7 +478,67 @@ fn schema_check_due(last_ms: f64, now_ms: f64) -> bool {
 // nothing calls it directly, so it would otherwise be flagged dead-code there.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
-async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // Zone media paths get their serving rules applied to EVERY response,
+    // preflights and errors included, so no early return can miss them.
+    let zone_acao = match req.url() {
+        Ok(u) if is_zone_media_route(u.path()) => {
+            let allowed = zone_media::allowed_origins(
+                env.var("ALLOWED_ORIGINS").ok().map(|v| v.to_string()).as_deref(),
+                env.var("EXPECTED_ORIGIN").ok().map(|v| v.to_string()).as_deref(),
+            );
+            let origin = req.headers().get("Origin").ok().flatten();
+            Some(zone_media::select_origin(&allowed, origin.as_deref()))
+        }
+        _ => None,
+    };
+    let resp = fetch_inner(req, env).await?;
+    Ok(match zone_acao {
+        Some(acao) => finalise_zone_response(resp, acao),
+        None => resp,
+    })
+}
+
+/// Whether a request path addresses a zone media container or object.
+fn is_zone_media_route(path: &str) -> bool {
+    parse_pod_route(path).is_some_and(|(_, rp)| zone_media::classify(rp).is_some())
+}
+
+/// Apply the zone serving rules to a response: never cached by anyone but the
+/// requesting browser's memory, varied on the credentials and origin, CORS
+/// reflected only to an allowed origin (no wildcard), no sniffing, no active
+/// content, no cross-site no-cors embedding, and anything that is not an
+/// allow-listed raster type downloaded rather than rendered.
+fn finalise_zone_response(resp: Response, acao: Option<String>) -> Response {
+    let h = resp.headers();
+    h.set("Cache-Control", zone_media::ZONE_CACHE_CONTROL).ok();
+    h.set("Vary", zone_media::ZONE_VARY).ok();
+    h.set("X-Content-Type-Options", "nosniff").ok();
+    h.set("Content-Security-Policy", "default-src 'none'; sandbox")
+        .ok();
+    h.set("Cross-Origin-Resource-Policy", "same-site").ok();
+    match acao {
+        Some(origin) => {
+            h.set("Access-Control-Allow-Origin", &origin).ok();
+        }
+        None => {
+            h.delete("Access-Control-Allow-Origin").ok();
+            h.delete("Access-Control-Allow-Credentials").ok();
+        }
+    }
+    let is_octet = h
+        .get("Content-Type")
+        .ok()
+        .flatten()
+        .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/octet-stream"));
+    if is_octet {
+        h.set("Content-Disposition", "attachment").ok();
+    }
+    resp
+}
+
+/// The request handler proper; [`fetch`] wraps it with the zone serving rules.
+async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
     // CORS preflight: answered before any D1 work. A preflight never touches
     // storage, and every authenticated pod GET (zone media) is preceded by one.
     if req.method() == Method::Options {
@@ -1010,6 +1073,30 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 
     // -----------------------------------------------------------------------
+    // Zone media gate: `/media/zones/<zone>/<name>` (see `zone_media`).
+    //
+    // Authoritative for the whole prefix and evaluated before any R2 read:
+    // the WAC walk below is skipped for these paths, and a refused requester
+    // gets the same answer whether or not the object exists.
+    // -----------------------------------------------------------------------
+    let zone_path = zone_media::classify(&resource_path);
+    if let Some(ref zp) = zone_path {
+        if let Some(resp) = zone_media_gate(
+            &env,
+            zp,
+            &method,
+            &owner_pubkey,
+            requester_pubkey.as_deref(),
+            nip98_reason.as_deref(),
+            &content_type,
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // ACL CRUD: paths ending with .acl
     // -----------------------------------------------------------------------
     if is_acl_path(&resource_path) {
@@ -1035,15 +1122,20 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // For `.acl` sidecars we coerce write-class methods up to acl:Control so
     // a principal with mere acl:Write cannot escalate by overwriting the
     // sidecar (audit C3). Non-acl resources retain the standard mapping.
-    let required_mode = coerce_required_mode_for_acl(&resource_path, method_str(&method));
-    let acl_doc = find_effective_acl(&bucket, &kv, &owner_pubkey, &resource_path).await;
-
-    let has_access = evaluate_access(
-        acl_doc.as_ref(),
-        agent_uri.as_deref(),
-        &resource_path,
-        required_mode,
-    );
+    let (acl_doc, has_access) = if zone_path.is_some() {
+        // Already decided by the zone gate above; no ACL document applies.
+        (None, true)
+    } else {
+        let required_mode = coerce_required_mode_for_acl(&resource_path, method_str(&method));
+        let acl_doc = find_effective_acl(&bucket, &kv, &owner_pubkey, &resource_path).await;
+        let has_access = evaluate_access(
+            acl_doc.as_ref(),
+            agent_uri.as_deref(),
+            &resource_path,
+            required_mode,
+        );
+        (acl_doc, has_access)
+    };
 
     if !has_access {
         return if requester_pubkey.is_some() {
@@ -1134,8 +1226,14 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or_else(|| "application/octet-stream".to_string());
             // Recover a real image type for legacy octet-stream uploads so they
             // render in `<img>` (nosniff) and reach the image→ASCII transform.
-            let stored_content_type =
-                refine_image_content_type(&resource_path, stored_content_type);
+            let stored_content_type = match &zone_path {
+                // Zone objects: allow-listed rasters only, never SVG; anything
+                // else is octet-stream (the wrapper adds the attachment header).
+                Some(zone_media::ZoneMediaPath::Object { name, .. }) => {
+                    zone_media::served_content_type(&stored_content_type, name).0
+                }
+                _ => refine_image_content_type(&resource_path, stored_content_type),
+            };
             let obj_content_type = match content_negotiation::negotiate(
                 accept_header.as_deref(),
                 &stored_content_type,
@@ -2023,6 +2121,179 @@ fn load_pay_config(env: &Env) -> payments::PayConfig {
             payments::ChainConfig::bitcoin_signet(),
         ],
     }
+}
+
+// ---------------------------------------------------------------------------
+// Zone media gate
+// ---------------------------------------------------------------------------
+
+/// Decide a request on a zone media path. `Ok(None)` lets the request through
+/// to the ordinary resource handling (with the WAC walk skipped); `Ok(Some)` is
+/// the refusal to return.
+#[allow(clippy::too_many_arguments)]
+async fn zone_media_gate(
+    env: &Env,
+    path: &zone_media::ZoneMediaPath<'_>,
+    method: &Method,
+    owner_pubkey: &str,
+    requester: Option<&str>,
+    nip98_reason: Option<&str>,
+    content_type: &str,
+) -> Result<Option<Response>> {
+    use zone_media::{Access, AccessRequest, Decision};
+
+    let method_name = method_str(method);
+    let access = zone_media::access_for_method(method_name);
+    let zones = zone_media::parse_zone_config(
+        env.var("ZONE_CONFIG").ok().map(|v| v.to_string()).as_deref(),
+    );
+    let static_admin = requester.is_some_and(|pk| {
+        zone_media::is_static_admin(
+            env.var("ADMIN_PUBKEYS").ok().map(|v| v.to_string()).as_deref(),
+            pk,
+        )
+    });
+    let now = (js_sys::Date::now() / 1000.0) as i64;
+
+    let mut req = AccessRequest {
+        access,
+        owner: owner_pubkey,
+        requester,
+        static_admin,
+        requester_row: None,
+        device_owner_row: None,
+        zones: zones.as_deref(),
+        now,
+    };
+
+    // Rows only when the decision can depend on them; a failed authority read
+    // refuses (503) rather than guessing.
+    let requester_row;
+    let device_owner_row;
+    if zone_media::needs_whitelist(path, &req) {
+        let Ok(db) = env.d1("RELAY_DB") else {
+            return json_error(env, "Membership authority unavailable", 503).map(Some);
+        };
+        let pk = requester.unwrap_or_default();
+        requester_row = match load_whitelist_row(&db, pk).await {
+            Ok(r) => r,
+            Err(_) => {
+                return json_error(env, "Membership authority unavailable", 503).map(Some)
+            }
+        };
+        let device_keys_enabled = env
+            .var("DEVICE_KEYS_ENABLED")
+            .map(|v| v.to_string().trim() == "true")
+            .unwrap_or(false);
+        device_owner_row = if device_keys_enabled {
+            match device_owner_of(&db, pk).await {
+                Some(owner) => match load_whitelist_row(&db, &owner).await {
+                    Ok(r) => Some(r),
+                    Err(_) => {
+                        return json_error(env, "Membership authority unavailable", 503)
+                            .map(Some)
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        req.requester_row = requester_row.as_ref();
+        req.device_owner_row = device_owner_row.as_ref().map(|r| r.as_ref());
+    }
+
+    match zone_media::decide(path, &req) {
+        Decision::Allow => {}
+        Decision::Unauthenticated => {
+            return json_error_with_reason(env, "Authentication required", 401, nip98_reason)
+                .map(Some)
+        }
+        Decision::Forbidden => return json_error(env, "Forbidden", 403).map(Some),
+        Decision::NotFound => return json_error(env, "Not found", 404).map(Some),
+    }
+
+    if access == Access::Write {
+        // Objects in a zone container are written whole (PUT) or removed
+        // (DELETE); POST/PATCH have no meaning on a single image.
+        match method {
+            Method::Put => {}
+            Method::Delete => return Ok(None),
+            _ => return json_error(env, "Method not allowed; use PUT or DELETE", 405).map(Some),
+        }
+        if !zone_media::is_allowed_upload_type(content_type) {
+            return json_error(
+                env,
+                "Zone media accepts image/jpeg, image/png, image/webp, image/gif or image/avif",
+                415,
+            )
+            .map(Some);
+        }
+        let zone_known = match path {
+            zone_media::ZoneMediaPath::Object { zone, .. } => zones
+                .as_deref()
+                .is_some_and(|zs| zs.iter().any(|z| z.id == *zone)),
+            _ => false,
+        };
+        if !zone_known {
+            return json_error(env, "Unknown zone", 400).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The relay `whitelist` row for `pubkey` (via `RELAY_DB`), or `None` when
+/// there is none. A D1 error is an `Err`, which the gate turns into a 503.
+async fn load_whitelist_row(
+    db: &D1Database,
+    pubkey: &str,
+) -> std::result::Result<Option<zone_media::WhitelistRow>, String> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        cohorts: Option<String>,
+        is_admin: Option<f64>,
+        suspended_until: Option<f64>,
+        expires_at: Option<f64>,
+    }
+    let stmt = db
+        .prepare(
+            "SELECT cohorts, is_admin, suspended_until, expires_at FROM whitelist WHERE pubkey = ?1",
+        )
+        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+        .map_err(|e| e.to_string())?;
+    let row = stmt.first::<Row>(None).await.map_err(|e| e.to_string())?;
+    Ok(row.map(|r| zone_media::WhitelistRow {
+        cohorts: r
+            .cohorts
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or_default(),
+        is_admin: r.is_admin.is_some_and(|v| v as i64 == 1),
+        suspended_until: r.suspended_until.map(|v| v as i64),
+        expires_at: r.expires_at.map(|v| v as i64),
+    }))
+}
+
+/// The owner of a registered, unrevoked device key (relay `device_keys`), as
+/// the relay's `device_owner`. A missing table or query error reads as "not a
+/// device", which then needs the key's own whitelist row (fail-safe).
+async fn device_owner_of(db: &D1Database, pubkey: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct OwnerRow {
+        owner_pubkey: String,
+    }
+    let stmt = db
+        .prepare(
+            "SELECT owner_pubkey FROM device_keys WHERE device_pubkey = ?1 AND revoked = 0 LIMIT 1",
+        )
+        .bind(&[wasm_bindgen::JsValue::from_str(pubkey)])
+        .ok()?;
+    stmt.first::<OwnerRow>(None)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.owner_pubkey)
+        .filter(|o| o.len() == 64 && o.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 // ---------------------------------------------------------------------------
