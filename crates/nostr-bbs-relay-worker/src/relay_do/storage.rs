@@ -78,7 +78,7 @@ WHERE pubkey = ?2 AND kind = ?4 AND id <> ?1 \
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct EventRow {
+pub(crate) struct EventRow {
     id: String,
     pubkey: String,
     created_at: f64,
@@ -89,7 +89,7 @@ struct EventRow {
 }
 
 impl EventRow {
-    fn into_nostr_event(self) -> Option<NostrEvent> {
+    pub(crate) fn into_nostr_event(self) -> Option<NostrEvent> {
         let tags: Vec<Vec<String>> = serde_json::from_str(&self.tags).ok()?;
         Some(NostrEvent {
             id: self.id,

@@ -67,6 +67,7 @@ type DeliveryCandidate = (Option<String>, WebSocket, Vec<(String, Vec<NostrFilte
 /// metadata but the live push served it to any `{"kinds":[41]}` subscriber.
 pub(crate) fn needs_read_gate(kind: u64) -> bool {
     matches!(kind, 40..=42)
+        || super::nip_handlers::is_reference_kind(kind)
         || calendar_projection::is_projected_calendar_kind(kind)
         || nostr_bbs_core::is_kanban_kind(kind)
 }
@@ -566,6 +567,9 @@ mod read_gate_kind_tests {
     fn every_zone_scoped_channel_kind_is_gated_live() {
         for kind in [40, 41, 42] {
             assert!(needs_read_gate(kind), "kind {kind}");
+        }
+        for kind in [7, 1111, 1984] {
+            assert!(needs_read_gate(kind), "reference kind {kind} (F4)");
         }
         assert!(!needs_read_gate(1), "an ordinary note is not zone-scoped");
     }

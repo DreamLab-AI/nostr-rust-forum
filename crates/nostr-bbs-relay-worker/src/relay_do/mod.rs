@@ -100,6 +100,10 @@ pub struct NostrRelayDO {
     pub(crate) admin_cache: AdminCache,
     /// ADR-2018: 60s-TTL memo of channel → zone (positive results only).
     pub(crate) channel_zone_cache: TtlCache<String>,
+    /// F4: 60s-TTL memo of a referenced event id -> its channel (`None`: the
+    /// target is stored but not channel-scoped). Unknown targets are not
+    /// cached (they may arrive later).
+    pub(crate) ref_target_cache: TtlCache<Option<String>>,
     /// ADR-2018: 60s-TTL memo of pubkey → (cohorts, whitelist is_admin).
     pub(crate) cohort_cache: TtlCache<(Vec<String>, bool)>,
     /// ADR-2018: 60s-TTL memo of device pubkey → owner (None = not a device key).
@@ -132,6 +136,7 @@ impl DurableObject for NostrRelayDO {
             mod_cache: ModCache::new(),
             admin_cache: AdminCache::new(),
             channel_zone_cache: TtlCache::new(LOOKUP_TTL_SECS),
+            ref_target_cache: TtlCache::new(LOOKUP_TTL_SECS),
             cohort_cache: TtlCache::new(LOOKUP_TTL_SECS),
             device_owner_cache: TtlCache::new(LOOKUP_TTL_SECS),
             recipient_row_cache: TtlCache::new(LOOKUP_TTL_SECS),

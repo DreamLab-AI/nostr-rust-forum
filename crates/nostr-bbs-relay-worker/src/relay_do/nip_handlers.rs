@@ -1505,6 +1505,33 @@ impl NostrRelayDO {
             }
         }
 
+        // F4 (write side): a reaction, comment or report on a message needs
+        // write access to that message's zone, and an encrypted zone takes no
+        // plaintext comment. The target is resolved from D1.
+        if is_reference_kind(event.kind) {
+            let scope = self.resolve_reference_scope(&event).await;
+            let mut writable: Vec<String> = Vec::new();
+            if let RefScope::Zones(zs) = &scope {
+                for z in zs {
+                    if is_admin || trust::has_zone_write_access(&principal, z, &self.env).await {
+                        writable.push(z.clone());
+                    }
+                }
+            }
+            let cfg = ZoneConfig::load(&self.env);
+            if let Some(reason) = reference_write_rejection(
+                &scope,
+                event.kind,
+                is_admin,
+                |z| writable.iter().any(|w| w == z),
+                |z| cfg.is_encrypted(z),
+                |z| crate::zone_config::is_zone_ciphertext(z, &event.tags, &event.content),
+            ) {
+                Self::send_ok(ws, &event.id, false, reason);
+                return;
+            }
+        }
+
         // Phase C (write side): NIP-52 calendar kinds carry their access binding
         // natively, not via a channel-id lookup. The READ path projects them
         // per-tier; the WRITE path must validate the author against the SAME
@@ -2232,6 +2259,118 @@ pub(crate) fn channel_read_decision_for(
     }
 }
 
+/// Kinds whose visibility follows the message they reference (security
+/// review F4): NIP-25 reactions (7), NIP-22 comments (1111) and NIP-56
+/// reports (1984). They name their target in `e`/`E` tags, and a reaction,
+/// comment or report on an encrypted-zone post was served to anyone.
+pub(crate) fn is_reference_kind(kind: u64) -> bool {
+    matches!(kind, 7 | 1111 | 1984)
+}
+
+/// The most targets one reference-kind event may name; more is treated as
+/// unknown (gated), which bounds the lookups per event.
+pub(crate) const MAX_REFERENCE_TARGETS: usize = 8;
+
+/// The ids a reference-kind event points at: every `e` and `E` tag value,
+/// lower-cased and deduplicated (NIP-25 puts the target last, NIP-22 the
+/// root in `E` and the parent in `e`, NIP-56 the reported event in `e`;
+/// gating on all of them is never weaker than on any one).
+pub(crate) fn reference_targets(event: &NostrEvent) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in &event.tags {
+        if t.len() >= 2 && (t[0] == "e" || t[0] == "E") && !t[1].is_empty() {
+            let id = t[1].to_ascii_lowercase();
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Where a reference-kind event's targets live, as far as reading goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefScope {
+    /// No target, or every target is stored and not in a zone-bound channel.
+    Unscoped,
+    /// The zones of the targets' channels (each must be readable).
+    Zones(Vec<String>),
+    /// A target is not stored, a lookup failed, or there are too many
+    /// targets: treated as gated (F4, fail closed).
+    Unknown,
+}
+
+/// The read decision for a reference-kind event given where its targets
+/// live: unscoped is delivered; zone targets need read access to every zone
+/// (the kind-42 rule, `channel_read_decision`); an unknown target is served
+/// only to its author and admins.
+pub(crate) fn reference_read_decision(
+    scope: &RefScope,
+    zones: &ZoneConfig,
+    ctx: &ViewerContext,
+    is_author: bool,
+) -> ReadDecision {
+    match scope {
+        RefScope::Unscoped => ReadDecision::Deliver,
+        RefScope::Unknown => {
+            if ctx.is_admin || is_author {
+                ReadDecision::Deliver
+            } else {
+                ReadDecision::Withhold
+            }
+        }
+        RefScope::Zones(zs) => {
+            if zs.iter().all(|z| {
+                matches!(
+                    channel_read_decision(42, Some(z), zones, ctx),
+                    ReadDecision::Deliver
+                )
+            }) {
+                ReadDecision::Deliver
+            } else {
+                ReadDecision::Withhold
+            }
+        }
+    }
+}
+
+/// Why a reference-kind write is refused, if it is: an unknown target, a
+/// zone the author may not write, or a plaintext comment (kind 1111) into an
+/// encrypted zone (which stores no readable text). Admins pass the access
+/// check but not the ciphertext rule, as for kind 42.
+pub(crate) fn reference_write_rejection(
+    scope: &RefScope,
+    kind: u64,
+    is_admin: bool,
+    can_write: impl Fn(&str) -> bool,
+    encrypted: impl Fn(&str) -> bool,
+    is_ciphertext: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    match scope {
+        RefScope::Unscoped => None,
+        RefScope::Unknown if is_admin => None,
+        RefScope::Unknown => Some("blocked: referenced event unknown"),
+        RefScope::Zones(zs) => {
+            for z in zs {
+                if !is_admin && !can_write(z) {
+                    return Some("zone access denied");
+                }
+                if kind == 1111 && encrypted(z) && !is_ciphertext(z) {
+                    return Some("blocked: encrypted zone requires zone-key ciphertext");
+                }
+            }
+            None
+        }
+    }
+}
+
+/// The channel a stored target event belongs to (`None`: not
+/// channel-scoped): a kind-40 is its own channel, kind 41/42 name theirs
+/// through the root-marked tag.
+pub(crate) fn stored_target_channel(target: &NostrEvent) -> Option<String> {
+    filter::zone_channel_id(target)
+}
+
 /// The zone a write is gated by, or the rejection when the lookup could not
 /// be answered (F3: a write is never treated as going to an unscoped channel
 /// because D1 failed).
@@ -2401,6 +2540,95 @@ impl NostrRelayDO {
             self.channel_zone_cache.insert(channel_id, z.clone(), now);
         }
         Ok(zone)
+    }
+
+    /// Where a reference-kind event's targets live (see [`RefScope`]). Each
+    /// target is resolved from D1, never from tags the event mirrors: by id,
+    /// or a sealed envelope by the inner id in its `sealed` tag; a target
+    /// that is itself a reference kind (a reaction to a comment) is followed
+    /// one more hop. Lookups fail closed.
+    pub(crate) async fn resolve_reference_scope(&self, event: &NostrEvent) -> RefScope {
+        let targets = reference_targets(event);
+        if targets.is_empty() {
+            return RefScope::Unscoped;
+        }
+        if targets.len() > MAX_REFERENCE_TARGETS {
+            return RefScope::Unknown;
+        }
+        let mut zones: Vec<String> = Vec::new();
+        for target in &targets {
+            let channel = match self.reference_target_channel(target, 1).await {
+                Ok(c) => c,
+                Err(()) => return RefScope::Unknown,
+            };
+            if let Some(channel) = channel {
+                match self.cached_channel_zone(&channel).await {
+                    Ok(Some(zone)) => {
+                        if !zones.contains(&zone) {
+                            zones.push(zone);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => return RefScope::Unknown,
+                }
+            }
+        }
+        if zones.is_empty() {
+            RefScope::Unscoped
+        } else {
+            RefScope::Zones(zones)
+        }
+    }
+
+    /// The channel of stored event `id` (`Ok(None)`: stored, not
+    /// channel-scoped; `Err`: not stored or D1 failed). Memoised 60 s.
+    async fn reference_target_channel(&self, id: &str, hops: u8) -> Result<Option<String>, ()> {
+        let now = auth::js_now_secs();
+        if let Some(hit) = self.ref_target_cache.get(id, now) {
+            return Ok(hit);
+        }
+        let db = self.env.d1("DB").map_err(|_| ())?;
+        let rows: Vec<super::storage::EventRow> = db
+            .prepare(
+                "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE id = ?1 \
+                 UNION ALL SELECT events.id, events.pubkey, events.created_at, events.kind, \
+                 events.tags, events.content, events.sig FROM event_tags d \
+                 CROSS JOIN events ON events.id = d.event_id \
+                 WHERE d.name = 'sealed' AND d.value = ?1 LIMIT 1",
+            )
+            .bind(&[JsValue::from_str(id)])
+            .map_err(|_| ())?
+            .all()
+            .await
+            .map_err(|_| ())?
+            .results()
+            .map_err(|_| ())?;
+        let target = rows
+            .into_iter()
+            .next()
+            .and_then(super::storage::EventRow::into_nostr_event)
+            .ok_or(())?;
+        let channel = if is_reference_kind(target.kind) {
+            if hops == 0 {
+                return Err(());
+            }
+            // A reaction/report on a comment: the comment's own targets.
+            let mut found = None;
+            for next in reference_targets(&target)
+                .into_iter()
+                .take(MAX_REFERENCE_TARGETS)
+            {
+                if let Some(c) = Box::pin(self.reference_target_channel(&next, hops - 1)).await? {
+                    found = Some(c);
+                    break;
+                }
+            }
+            found
+        } else {
+            stored_target_channel(&target)
+        };
+        self.ref_target_cache.insert(id, channel.clone(), now);
+        Ok(channel)
     }
 
     /// Whitelist `(cohorts, is_admin)` through the 60s per-DO memo. A missing
@@ -2774,6 +3002,15 @@ impl NostrRelayDO {
             } else {
                 ReadDecision::Withhold
             };
+        }
+
+        // Reactions, comments and reports follow the message they reference
+        // (F4), resolved from D1 by the target's own channel.
+        if is_reference_kind(event.kind) {
+            let scope = self.resolve_reference_scope(event).await;
+            let is_author = ctx.access_pubkey.as_deref() == Some(event.pubkey.as_str())
+                || ctx.session_pubkey.as_deref() == Some(event.pubkey.as_str());
+            return reference_read_decision(&scope, zones, ctx, is_author);
         }
 
         // Zone-scoped channel kinds: kind-40 defs (channel id == event id),
@@ -8410,5 +8647,188 @@ mod zone_lookup_failure_tests {
             zone_for_write(Ok(Some("zone2".into()))),
             Ok(Some("zone2".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod reference_kind_gate_tests {
+    //! Security review F4: reactions (7), comments (1111) and reports (1984)
+    //! on zone messages follow the referenced message's zone.
+    use super::*;
+    use crate::zone_config::ZoneConfig;
+
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(
+            r#"[{"id":"zone2","required_cohorts":["m"],"visibility":"locked","encrypted":true},
+                {"id":"pub","required_cohorts":[],"visibility":"public"}]"#,
+        )
+    }
+
+    fn viewer(cohorts: &[&str], authed: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: authed.then(|| "s".repeat(64)),
+            access_pubkey: authed.then(|| "s".repeat(64)),
+            is_admin: false,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: false,
+            recipient_keys: vec![],
+        }
+    }
+
+    fn ev(kind: u64, tags: Vec<Vec<&str>>) -> NostrEvent {
+        NostrEvent {
+            id: "1".repeat(64),
+            pubkey: "a".repeat(64),
+            created_at: 1,
+            kind,
+            tags: tags
+                .into_iter()
+                .map(|t| t.into_iter().map(String::from).collect())
+                .collect(),
+            content: "x".into(),
+            sig: "0".repeat(128),
+        }
+    }
+
+    #[test]
+    fn reference_targets_cover_e_and_uppercase_e_deduplicated() {
+        let target = "B".repeat(64);
+        let c = ev(
+            1111,
+            vec![
+                vec!["E", &target],
+                vec!["e", &"b".repeat(64)],
+                vec!["e", &"c".repeat(64)],
+                vec!["p", "x"],
+            ],
+        );
+        assert_eq!(reference_targets(&c), vec!["b".repeat(64), "c".repeat(64)]);
+        assert!(reference_targets(&ev(1984, vec![vec!["p", "x", "spam"]])).is_empty());
+        for kind in [7, 1111, 1984] {
+            assert!(is_reference_kind(kind));
+        }
+        assert!(!is_reference_kind(42));
+    }
+
+    #[test]
+    fn each_reference_kind_on_a_zone_message_is_read_by_members_only() {
+        let scope = RefScope::Zones(vec!["zone2".into()]);
+        for _kind in [7u64, 1111, 1984] {
+            let d = |ctx: &ViewerContext| reference_read_decision(&scope, &zones(), ctx, false);
+            assert!(
+                matches!(d(&viewer(&[], false)), ReadDecision::Withhold),
+                "anonymous"
+            );
+            assert!(
+                matches!(d(&viewer(&["x"], true)), ReadDecision::Withhold),
+                "non-member"
+            );
+            assert!(
+                matches!(d(&viewer(&["m"], true)), ReadDecision::Deliver),
+                "member"
+            );
+        }
+        // Every referenced zone must be readable.
+        let two = RefScope::Zones(vec!["pub".into(), "zone2".into()]);
+        assert!(matches!(
+            reference_read_decision(&two, &zones(), &viewer(&[], false), false),
+            ReadDecision::Withhold
+        ));
+        // Public and unscoped targets stay readable to anyone.
+        let public = RefScope::Zones(vec!["pub".into()]);
+        assert!(matches!(
+            reference_read_decision(&public, &zones(), &viewer(&[], false), false),
+            ReadDecision::Deliver
+        ));
+        assert!(matches!(
+            reference_read_decision(&RefScope::Unscoped, &zones(), &viewer(&[], false), false),
+            ReadDecision::Deliver
+        ));
+    }
+
+    #[test]
+    fn an_unknown_target_is_gated_except_for_its_author_and_admins() {
+        let u = RefScope::Unknown;
+        assert!(matches!(
+            reference_read_decision(&u, &zones(), &viewer(&["m"], true), false),
+            ReadDecision::Withhold
+        ));
+        assert!(
+            matches!(
+                reference_read_decision(&u, &zones(), &viewer(&[], true), true),
+                ReadDecision::Deliver
+            ),
+            "author"
+        );
+        let mut admin = viewer(&[], true);
+        admin.is_admin = true;
+        assert!(matches!(
+            reference_read_decision(&u, &zones(), &admin, false),
+            ReadDecision::Deliver
+        ));
+    }
+
+    #[test]
+    fn writes_need_zone_access_and_comments_in_encrypted_zones_need_ciphertext() {
+        let z = RefScope::Zones(vec!["zone2".into()]);
+        let enc = |zone: &str| zone == "zone2";
+        // Non-member: refused for every kind.
+        for kind in [7u64, 1111, 1984] {
+            assert_eq!(
+                reference_write_rejection(&z, kind, false, |_| false, enc, |_| true),
+                Some("zone access denied")
+            );
+        }
+        // Member: a reaction or report passes; a plaintext comment does not.
+        assert_eq!(
+            reference_write_rejection(&z, 7, false, |_| true, enc, |_| false),
+            None
+        );
+        assert_eq!(
+            reference_write_rejection(&z, 1984, false, |_| true, enc, |_| false),
+            None
+        );
+        assert_eq!(
+            reference_write_rejection(&z, 1111, false, |_| true, enc, |_| false),
+            Some("blocked: encrypted zone requires zone-key ciphertext")
+        );
+        assert_eq!(
+            reference_write_rejection(&z, 1111, false, |_| true, enc, |_| true),
+            None
+        );
+        // Admins skip the access check but not the ciphertext rule.
+        assert!(reference_write_rejection(&z, 1111, true, |_| false, enc, |_| false).is_some());
+        // Unknown targets: refused unless admin.
+        assert!(
+            reference_write_rejection(&RefScope::Unknown, 7, false, |_| true, enc, |_| true)
+                .is_some()
+        );
+        assert_eq!(
+            reference_write_rejection(&RefScope::Unknown, 7, true, |_| true, enc, |_| true),
+            None
+        );
+        assert_eq!(
+            reference_write_rejection(&RefScope::Unscoped, 1111, false, |_| false, enc, |_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stored_target_resolves_to_its_root_marked_channel() {
+        let chan = "c".repeat(64);
+        let msg = ev(
+            42,
+            vec![
+                vec!["e", &"t".repeat(64), "", "reply"],
+                vec!["e", &chan, "", "root"],
+            ],
+        );
+        assert_eq!(stored_target_channel(&msg).as_deref(), Some(chan.as_str()));
+        let def = ev(40, vec![]);
+        assert_eq!(
+            stored_target_channel(&def).as_deref(),
+            Some("1".repeat(64).as_str())
+        );
+        assert_eq!(stored_target_channel(&ev(1, vec![])), None);
     }
 }
