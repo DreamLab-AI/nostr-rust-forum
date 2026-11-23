@@ -60,7 +60,7 @@ use crate::utils::zone_theme::zone_accent_style_cfg;
 use super::section::{category_display_name, resolve_channel};
 
 /// A single rendered reply within a thread.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplyView {
     /// The ORIGINAL event id (the reply users reply to / thread against). Stays
     /// stable across edits so reply threading and the edit target never drift.
@@ -84,7 +84,7 @@ struct ReplyView {
 }
 
 /// A quoted parent shown inline above a quote-reply.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct QuotedRef {
     pubkey: String,
     snippet: String,
@@ -178,6 +178,7 @@ fn latest_version(original: &NostrEvent, events: &[NostrEvent]) -> (String, u64,
 /// Every event id in the edit-chain rooted at `original` (the original plus all
 /// transitive edits by its author). Used to exclude edit events from the reply
 /// list so an edit never shows up as its own reply.
+#[cfg(test)]
 fn edit_chain_ids(original: &NostrEvent, events: &[NostrEvent]) -> Vec<String> {
     let mut ids = vec![original.id.to_lowercase()];
     let mut frontier = vec![original.id.to_lowercase()];
@@ -374,6 +375,246 @@ fn resolve_section_channel(
     resolve_channel(channels, category_slug, section_slug_param, zones)
 }
 
+/// The replies of the topic `root` among `events`, oldest first, in one
+/// O(n) pass with id, edit-target and reverse-reference indexes:
+///
+/// - candidates: kind-42/1111 that are not the root, not in the root's edit
+///   chain, and not themselves edits;
+/// - membership is transitive: a candidate referencing the root or any reply
+///   already in the topic (a reply to a reply, as JunkieJarvis threads);
+/// - each reply shows its author's latest edit, and a `quote` marker to a
+///   sibling resolves the sibling's author and first line.
+///
+/// Same result as the previous fixpoint (kept as the test reference
+/// `thread_replies_reference`), which rescanned all events per pass and per
+/// reply.
+fn thread_replies(root: &NostrEvent, events: &[NostrEvent]) -> Vec<ReplyView> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let lower = |s: &str| s.to_lowercase();
+    let mut by_id: HashMap<String, &NostrEvent> = HashMap::with_capacity(events.len());
+    let mut edits_of: HashMap<String, Vec<&NostrEvent>> = HashMap::new();
+    for e in events {
+        by_id.entry(lower(&e.id)).or_insert(e);
+        if let Some(target) = edit_target(e) {
+            edits_of.entry(target).or_default().push(e);
+        }
+    }
+    // The newest same-author edit of `id`, as `latest_version` picks it.
+    let newest_edit = |id: &str, author: &str| -> Option<&NostrEvent> {
+        edits_of.get(id).and_then(|v| {
+            v.iter()
+                .copied()
+                .filter(|e| e.pubkey.eq_ignore_ascii_case(author))
+                .max_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then_with(|| a.id.cmp(&b.id))
+                })
+        })
+    };
+    let latest = |original: &NostrEvent| -> (String, u64, bool) {
+        let mut current = lower(&original.id);
+        let mut content = &original.content;
+        let mut edited = false;
+        for _ in 0..64 {
+            match newest_edit(&current, &original.pubkey) {
+                Some(e) => {
+                    content = &e.content;
+                    edited = true;
+                    current = lower(&e.id);
+                }
+                None => break,
+            }
+        }
+        (content.clone(), original.created_at, edited)
+    };
+    // The root's edit chain (every transitive same-author edit).
+    let mut root_chain: HashSet<String> = HashSet::new();
+    root_chain.insert(lower(&root.id));
+    let mut frontier = vec![lower(&root.id)];
+    for _ in 0..64 {
+        let mut next = Vec::new();
+        for target in &frontier {
+            for e in edits_of.get(target).into_iter().flatten() {
+                if e.pubkey.eq_ignore_ascii_case(&root.pubkey) && root_chain.insert(lower(&e.id)) {
+                    next.push(lower(&e.id));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    let is_candidate = |e: &NostrEvent| -> bool {
+        !e.id.eq_ignore_ascii_case(&root.id)
+            && (e.kind == 42 || e.kind == 1111)
+            && !root_chain.contains(&lower(&e.id))
+            && edit_target(e).is_none()
+    };
+    // Reverse references: id -> candidates that reference it.
+    let mut referenced_by: HashMap<String, Vec<String>> = HashMap::new();
+    for e in events.iter().filter(|e| is_candidate(e)) {
+        let id = lower(&e.id);
+        for r in referenced_event_ids(e) {
+            referenced_by.entry(r).or_default().push(id.clone());
+        }
+    }
+    let root_id = lower(&root.id);
+    let mut thread: HashSet<String> = HashSet::new();
+    thread.insert(root_id.clone());
+    let mut queue: VecDeque<String> = VecDeque::from([root_id.clone()]);
+    while let Some(id) = queue.pop_front() {
+        for child in referenced_by.get(&id).into_iter().flatten() {
+            if thread.insert(child.clone()) {
+                queue.push_back(child.clone());
+            }
+        }
+    }
+    let mut out: Vec<ReplyView> = events
+        .iter()
+        .filter(|e| !e.id.eq_ignore_ascii_case(&root.id) && thread.contains(&lower(&e.id)))
+        .map(|e| {
+            let (content, created_at, edited) = latest(e);
+            let quote = quoted_e_tag(e)
+                .map(|id| lower(&id))
+                .filter(|id| *id != root_id)
+                .and_then(|target| by_id.get(&target).copied())
+                .map(|tgt| QuotedRef {
+                    pubkey: tgt.pubkey.clone(),
+                    snippet: first_line(&latest(tgt).0),
+                });
+            ReplyView {
+                id: e.id.clone(),
+                pubkey: e.pubkey.clone(),
+                content,
+                created_at,
+                edited,
+                quote,
+                tags: e.tags.clone(),
+            }
+        })
+        .collect();
+    out.sort_by_key(|r| r.created_at);
+    out
+}
+
+/// A fingerprint of what a reply card shows, for its list key.
+fn view_key(r: &ReplyView) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    r.content.hash(&mut h);
+    r.edited.hash(&mut h);
+    r.quote
+        .as_ref()
+        .map(|q| (&q.pubkey, &q.snippet))
+        .hash(&mut h);
+    h.finish()
+}
+
+/// The previous O(n^2) derivation, kept verbatim as the reference
+/// `thread_replies` is tested against.
+#[cfg(test)]
+fn thread_replies_reference(root: &NostrEvent, events: &[NostrEvent]) -> Vec<ReplyView> {
+    let root = root.clone();
+    let channel_events: &[NostrEvent] = events;
+    let mut out: Vec<ReplyView> = {
+        let events = channel_events;
+        let root_id_lower = root.id.to_lowercase();
+        // Ids that belong to the ROOT's edit chain — never replies.
+        let root_chain = edit_chain_ids(&root, events);
+        // First pass: the genuine replies (reference the root, are not edits
+        // of anything, and are not part of the root's edit chain).
+        // A reply candidate: a kind-42/1111 that is neither the root, an edit
+        // of the root, nor an edit of another reply.
+        let is_candidate = |e: &NostrEvent| -> bool {
+            if e.id.eq_ignore_ascii_case(&root.id) {
+                return false; // the root itself is not a reply
+            }
+            if e.kind != 42 && e.kind != 1111 {
+                return false;
+            }
+            if root_chain.contains(&e.id.to_lowercase()) {
+                return false; // an edit of the root
+            }
+            edit_target(e).is_none() // an edit of another reply is not a reply
+        };
+        // Transitive thread membership. A reply belongs to this topic if it
+        // references the ROOT *or any event already in the topic*. The old
+        // one-level test (references-root-directly) silently dropped nested
+        // replies — a reply to a reply — most visibly JunkieJarvis, which
+        // (per standard NIP-10) threads under the specific message that tagged
+        // it rather than the topic root, so its answers never rendered.
+        // Fixpoint over the channel's candidate events; converges in
+        // max-reply-depth passes.
+        let mut thread_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        thread_ids.insert(root_id_lower.clone());
+        loop {
+            let mut added = false;
+            for e in events.iter() {
+                let lid = e.id.to_lowercase();
+                if thread_ids.contains(&lid) || !is_candidate(e) {
+                    continue;
+                }
+                if referenced_event_ids(e)
+                    .iter()
+                    .any(|r| thread_ids.contains(r))
+                {
+                    thread_ids.insert(lid);
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        let originals: Vec<&NostrEvent> = events
+            .iter()
+            .filter(|e| {
+                !e.id.eq_ignore_ascii_case(&root.id) && thread_ids.contains(&e.id.to_lowercase())
+            })
+            .collect();
+
+        originals
+            .into_iter()
+            .map(|e| {
+                let (content, created_at, edited) = latest_version(e, events);
+                // Quote target: a "reply" e-tag pointing at a SIBLING reply
+                // (not the topic root). Resolve the quoted author + snippet so
+                // the card can show what it is answering, inline, no nesting.
+                let quote = quoted_e_tag(e)
+                    .map(|id| id.to_lowercase())
+                    .filter(|id| *id != root_id_lower)
+                    .and_then(|target_id| {
+                        events
+                            .iter()
+                            .find(|ev| ev.id.to_lowercase() == target_id)
+                            .map(|tgt| {
+                                let (tgt_content, _, _) = latest_version(tgt, events);
+                                QuotedRef {
+                                    pubkey: tgt.pubkey.clone(),
+                                    snippet: first_line(&tgt_content),
+                                }
+                            })
+                    });
+                ReplyView {
+                    id: e.id.clone(),
+                    pubkey: e.pubkey.clone(),
+                    content,
+                    created_at,
+                    edited,
+                    quote,
+                    tags: e.tags.clone(),
+                }
+            })
+            .collect()
+    };
+
+    out.sort_by_key(|r| r.created_at);
+    out
+}
+
 /// Thread page: topic root + threaded replies + reply composer.
 #[component]
 pub fn ThreadPage() -> impl IntoView {
@@ -524,105 +765,14 @@ pub fn ThreadPage() -> impl IntoView {
     // Edit events are folded into the post they replace rather than shown as
     // their own replies: the root's edits are dropped outright, and each
     // surviving reply renders its latest authored version (see `latest_version`).
-    let replies = Signal::derive(move || {
-        let root = match topic_root.get() {
-            Some(r) => r,
-            None => return Vec::<ReplyView>::new(),
+    // A Memo over one O(n) pass (see `thread_replies`): with paged history a
+    // topic can hold thousands of replies, and the derivation used to rescan
+    // every event per reply (O(n^2)) once per reader per store change.
+    let replies = Memo::new(move |_| {
+        let Some(root) = topic_root.get() else {
+            return Vec::<ReplyView>::new();
         };
-        let root_id_lower = root.id.to_lowercase();
-        let mut out: Vec<ReplyView> = channel_events.with(|events| {
-            // Ids that belong to the ROOT's edit chain — never replies.
-            let root_chain = edit_chain_ids(&root, events);
-            // First pass: the genuine replies (reference the root, are not edits
-            // of anything, and are not part of the root's edit chain).
-            // A reply candidate: a kind-42/1111 that is neither the root, an edit
-            // of the root, nor an edit of another reply.
-            let is_candidate = |e: &NostrEvent| -> bool {
-                if e.id.eq_ignore_ascii_case(&root.id) {
-                    return false; // the root itself is not a reply
-                }
-                if e.kind != 42 && e.kind != 1111 {
-                    return false;
-                }
-                if root_chain.contains(&e.id.to_lowercase()) {
-                    return false; // an edit of the root
-                }
-                edit_target(e).is_none() // an edit of another reply is not a reply
-            };
-            // Transitive thread membership. A reply belongs to this topic if it
-            // references the ROOT *or any event already in the topic*. The old
-            // one-level test (references-root-directly) silently dropped nested
-            // replies — a reply to a reply — most visibly JunkieJarvis, which
-            // (per standard NIP-10) threads under the specific message that tagged
-            // it rather than the topic root, so its answers never rendered.
-            // Fixpoint over the channel's candidate events; converges in
-            // max-reply-depth passes.
-            let mut thread_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            thread_ids.insert(root_id_lower.clone());
-            loop {
-                let mut added = false;
-                for e in events.iter() {
-                    let lid = e.id.to_lowercase();
-                    if thread_ids.contains(&lid) || !is_candidate(e) {
-                        continue;
-                    }
-                    if referenced_event_ids(e)
-                        .iter()
-                        .any(|r| thread_ids.contains(r))
-                    {
-                        thread_ids.insert(lid);
-                        added = true;
-                    }
-                }
-                if !added {
-                    break;
-                }
-            }
-            let originals: Vec<&NostrEvent> = events
-                .iter()
-                .filter(|e| {
-                    !e.id.eq_ignore_ascii_case(&root.id)
-                        && thread_ids.contains(&e.id.to_lowercase())
-                })
-                .collect();
-
-            originals
-                .into_iter()
-                .map(|e| {
-                    let (content, created_at, edited) = latest_version(e, events);
-                    // Quote target: a "reply" e-tag pointing at a SIBLING reply
-                    // (not the topic root). Resolve the quoted author + snippet so
-                    // the card can show what it is answering, inline, no nesting.
-                    let quote = quoted_e_tag(e)
-                        .map(|id| id.to_lowercase())
-                        .filter(|id| *id != root_id_lower)
-                        .and_then(|target_id| {
-                            events
-                                .iter()
-                                .find(|ev| ev.id.to_lowercase() == target_id)
-                                .map(|tgt| {
-                                    let (tgt_content, _, _) = latest_version(tgt, events);
-                                    QuotedRef {
-                                        pubkey: tgt.pubkey.clone(),
-                                        snippet: first_line(&tgt_content),
-                                    }
-                                })
-                        });
-                    ReplyView {
-                        id: e.id.clone(),
-                        pubkey: e.pubkey.clone(),
-                        content,
-                        created_at,
-                        edited,
-                        quote,
-                        tags: e.tags.clone(),
-                    }
-                })
-                .collect()
-        });
-        out.sort_by_key(|r| r.created_at);
-        out
+        channel_events.with(|events| thread_replies(&root, events))
     });
 
     // The root post's latest content + edited flag, folding in any author edits.
@@ -1324,8 +1474,13 @@ pub fn ThreadPage() -> impl IntoView {
                         }}
                     </h3>
                     <div class="space-y-3">
-                        {move || replies.get().into_iter().map(|r| {
-                            view! {
+                        // Keyed: a new page or post renders only its own
+                        // cards, and a card re-renders when what it shows
+                        // changes (an edit, a decrypt, a resolved quote).
+                        <For
+                            each=move || replies.get()
+                            key=|r| (r.id.clone(), view_key(r))
+                            children=move |r| view! {
                                 <ReplyCard
                                     reply=r
                                     media_target=thread_media_target
@@ -1338,7 +1493,7 @@ pub fn ThreadPage() -> impl IntoView {
                                     on_delete=publish_delete
                                 />
                             }
-                        }).collect_view()}
+                        />
                     </div>
                 </div>
             </Show>
@@ -1943,6 +2098,126 @@ mod tests {
             content: content.to_string(),
             sig: String::new(),
         }
+    }
+
+    /// The O(n) derivation agrees with the previous fixpoint on a topic with
+    /// every case it handles: root edits (author's and another's), direct and
+    /// nested replies, reply edits and edits of edits, quotes of siblings and
+    /// of the root, kind-1111 comments, mixed-case ids, unrelated topics.
+    #[test]
+    fn thread_replies_match_the_reference_derivation() {
+        let ch = "c".repeat(64);
+        let root = ev(
+            "ROOT",
+            "alice",
+            100,
+            "topic",
+            vec![vec!["e", &ch, "", "root"]],
+        );
+        let mut events = vec![root.clone()];
+        let id = |i: usize| format!("r{i:04}");
+        for i in 0..400usize {
+            let mut tags = vec![vec![
+                "e".to_string(),
+                ch.clone(),
+                String::new(),
+                "root".to_string(),
+            ]];
+            let parent = match i % 7 {
+                0..=2 => "root".to_string(),
+                3 if i > 10 => id(i - 5),       // reply to a reply
+                4 if i > 3 => id(i - 3),        // reply to a reply
+                5 => "OTHER-TOPIC".to_string(), // not in this topic
+                _ => "ROOT".to_string(),        // upper-case root ref
+            };
+            tags.push(vec!["e".into(), parent, String::new(), "reply".into()]);
+            if i % 11 == 0 && i > 20 {
+                tags.push(vec![
+                    "e".into(),
+                    id(i - 13),
+                    String::new(),
+                    QUOTE_MARKER.into(),
+                ]);
+            }
+            if i % 13 == 0 {
+                tags.push(vec![
+                    "e".into(),
+                    "root".into(),
+                    String::new(),
+                    QUOTE_MARKER.into(),
+                ]);
+            }
+            let author = ["alice", "bob", "carol"][i % 3];
+            let mut e = ev(
+                &id(i),
+                author,
+                200 + (i as u64 / 3),
+                &format!("line {i}\nmore"),
+                vec![],
+            );
+            e.tags = tags;
+            if i % 17 == 0 {
+                e.kind = 1111;
+            }
+            events.push(e);
+            // Edits: by the author (and an edit of that edit), and by someone else.
+            if i % 5 == 0 {
+                let ed = ev(
+                    &format!("e{i:04}"),
+                    author,
+                    900 + i as u64,
+                    &format!("edited {i}"),
+                    vec![edit_tag(&id(i))],
+                );
+                events.push(ed);
+                if i % 10 == 0 {
+                    events.push(ev(
+                        &format!("f{i:04}"),
+                        author,
+                        1900 + i as u64,
+                        &format!("edited twice {i}"),
+                        vec![edit_tag(&format!("e{i:04}"))],
+                    ));
+                }
+                events.push(ev(
+                    &format!("x{i:04}"),
+                    "mallory",
+                    950 + i as u64,
+                    "not yours",
+                    vec![edit_tag(&id(i))],
+                ));
+            }
+        }
+        events.push(ev(
+            "rootedit",
+            "alice",
+            3000,
+            "topic v2",
+            vec![edit_tag("root")],
+        ));
+        events.push(ev(
+            "rootedit2",
+            "alice",
+            3001,
+            "topic v3",
+            vec![edit_tag("rootedit")],
+        ));
+        events.push(ev(
+            "rootforge",
+            "bob",
+            3002,
+            "forged",
+            vec![edit_tag("root")],
+        ));
+        let root = events[0].clone();
+        assert_eq!(
+            thread_replies(&root, &events),
+            thread_replies_reference(&root, &events)
+        );
+        assert!(
+            thread_replies(&root, &events).len() > 200,
+            "the fixture exercises many replies"
+        );
     }
 
     fn edit_tag(target: &str) -> Vec<&str> {
