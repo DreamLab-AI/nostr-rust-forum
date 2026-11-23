@@ -104,8 +104,7 @@ pub fn is_valid_zone_id(zone: &str) -> bool {
     !b.is_empty()
         && b.len() <= 64
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
-        && b
-            .iter()
+        && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
 }
 
@@ -119,8 +118,7 @@ pub fn is_valid_object_name(name: &str) -> bool {
         && b[0] != b'.'
         && !name.ends_with(".acl")
         && !name.ends_with(".meta")
-        && b
-            .iter()
+        && b.iter()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
@@ -161,9 +159,8 @@ pub struct ZoneRule {
 
 impl ZoneRule {
     fn is_public(&self) -> bool {
-        self.visibility
-            .as_deref()
-            .is_some_and(|v| v.eq_ignore_ascii_case("public"))
+        // Exact match, as the relay's serde enum: `"Public"` is not public.
+        self.visibility.as_deref() == Some("public")
     }
 
     /// Read rule for an ACTIVE, non-admin member with `cohorts`.
@@ -331,7 +328,10 @@ pub fn decide(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> Decision {
         return Decision::Forbidden;
     }
     // Admin is the raw signing key's own flag, never a device owner's.
-    if req.requester_row.is_some_and(|r| r.is_admin && r.is_active(now)) {
+    if req
+        .requester_row
+        .is_some_and(|r| r.is_admin && r.is_active(now))
+    {
         return Decision::Allow;
     }
 
@@ -514,7 +514,10 @@ mod tests {
     #[test]
     fn anonymous_is_unauthenticated_everywhere_valid() {
         let z = zones();
-        assert_eq!(decide(&Z2, &read(None, None, &z)), Decision::Unauthenticated);
+        assert_eq!(
+            decide(&Z2, &read(None, None, &z)),
+            Decision::Unauthenticated
+        );
         assert_eq!(
             decide(&ZoneMediaPath::Root, &read(None, None, &z)),
             Decision::Unauthenticated
@@ -530,13 +533,19 @@ mod tests {
         let z = zones();
         let member = row(&["members", "minimoonoir"]);
         let outsider = row(&["members"]);
-        assert_eq!(decide(&Z2, &read(Some(OTHER), Some(&member), &z)), Decision::Allow);
+        assert_eq!(
+            decide(&Z2, &read(Some(OTHER), Some(&member), &z)),
+            Decision::Allow
+        );
         assert_eq!(
             decide(&Z2, &read(Some(OTHER), Some(&outsider), &z)),
             Decision::Forbidden
         );
         // A valid Nostr key with no whitelist row at all.
-        assert_eq!(decide(&Z2, &read(Some(OTHER), None, &z)), Decision::Forbidden);
+        assert_eq!(
+            decide(&Z2, &read(Some(OTHER), None, &z)),
+            Decision::Forbidden
+        );
     }
 
     #[test]
@@ -546,8 +555,14 @@ mod tests {
             decide(&Z1, &read(Some(OTHER), Some(&row(&["members"])), &z)),
             Decision::Allow
         );
-        assert_eq!(decide(&Z1, &read(Some(OTHER), None, &z)), Decision::Forbidden);
-        assert_eq!(decide(&Z1, &read(None, None, &z)), Decision::Unauthenticated);
+        assert_eq!(
+            decide(&Z1, &read(Some(OTHER), None, &z)),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            decide(&Z1, &read(None, None, &z)),
+            Decision::Unauthenticated
+        );
     }
 
     #[test]
@@ -566,8 +581,27 @@ mod tests {
             );
             let mut admin = row(&[]);
             admin.is_admin = true;
-            assert_eq!(decide(&p, &read(Some(OTHER), Some(&admin), &z)), Decision::Allow);
+            assert_eq!(
+                decide(&p, &read(Some(OTHER), Some(&admin), &z)),
+                Decision::Allow
+            );
         }
+    }
+
+    #[test]
+    fn visibility_matches_the_relay_exactly() {
+        let z = parse_zone_config(Some(
+            r#"[{"id":"zone7","required_cohorts":[],"visibility":"Public"}]"#,
+        ))
+        .unwrap();
+        let p = ZoneMediaPath::Object {
+            zone: "zone7",
+            name: "a.png",
+        };
+        assert_eq!(
+            decide(&p, &read(Some(OTHER), Some(&row(&["members"])), &z)),
+            Decision::Forbidden
+        );
     }
 
     #[test]
@@ -578,7 +612,11 @@ mod tests {
         w.access = Access::Write;
         assert!(needs_whitelist(&Z2, &w));
         assert_eq!(decide(&Z2, &w), Decision::Allow);
-        assert_eq!(decide(&Z1, &w), Decision::Allow, "zone1 write_cohorts = members");
+        assert_eq!(
+            decide(&Z1, &w),
+            Decision::Allow,
+            "zone1 write_cohorts = members"
+        );
 
         let outsider = row(&["members"]);
         w.requester_row = Some(&outsider);
@@ -621,10 +659,22 @@ mod tests {
         expired.expires_at = Some(NOW);
         let mut future = row(&["zone2"]);
         future.expires_at = Some(NOW + 1);
-        assert_eq!(decide(&Z2, &read(Some(OTHER), Some(&suspended), &z)), Decision::Forbidden);
-        assert_eq!(decide(&Z2, &read(Some(OTHER), Some(&lifted), &z)), Decision::Allow);
-        assert_eq!(decide(&Z2, &read(Some(OTHER), Some(&expired), &z)), Decision::Forbidden);
-        assert_eq!(decide(&Z2, &read(Some(OTHER), Some(&future), &z)), Decision::Allow);
+        assert_eq!(
+            decide(&Z2, &read(Some(OTHER), Some(&suspended), &z)),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            decide(&Z2, &read(Some(OTHER), Some(&lifted), &z)),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(&Z2, &read(Some(OTHER), Some(&expired), &z)),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            decide(&Z2, &read(Some(OTHER), Some(&future), &z)),
+            Decision::Allow
+        );
     }
 
     #[test]
@@ -632,9 +682,15 @@ mod tests {
         let z = zones();
         let mut admin = row(&[]);
         admin.is_admin = true;
-        assert_eq!(decide(&Z2, &read(Some(OTHER), Some(&admin), &z)), Decision::Allow);
+        assert_eq!(
+            decide(&Z2, &read(Some(OTHER), Some(&admin), &z)),
+            Decision::Allow
+        );
         admin.suspended_until = Some(NOW + 10);
-        assert_eq!(decide(&Z2, &read(Some(OTHER), Some(&admin), &z)), Decision::Forbidden);
+        assert_eq!(
+            decide(&Z2, &read(Some(OTHER), Some(&admin), &z)),
+            Decision::Forbidden
+        );
         let mut static_admin = read(Some(OTHER), None, &z);
         static_admin.static_admin = true;
         assert_eq!(decide(&Z2, &static_admin), Decision::Allow);
@@ -686,7 +742,10 @@ mod tests {
             zone: "zone9",
             name: "a.png",
         };
-        assert_eq!(decide(&unknown, &read(Some(OTHER), Some(&member), &z)), Decision::Forbidden);
+        assert_eq!(
+            decide(&unknown, &read(Some(OTHER), Some(&member), &z)),
+            Decision::Forbidden
+        );
         let mut no_cfg = read(Some(OTHER), Some(&member), &z);
         no_cfg.zones = None;
         assert_eq!(decide(&Z2, &no_cfg), Decision::Forbidden);
@@ -709,7 +768,11 @@ mod tests {
         assert_eq!(decide(&Z2, &req), Decision::Allow);
 
         req.device_owner_row = Some(Some(&owner_admin));
-        assert_eq!(decide(&Z2, &req), Decision::Forbidden, "admin is not inherited");
+        assert_eq!(
+            decide(&Z2, &req),
+            Decision::Forbidden,
+            "admin is not inherited"
+        );
 
         req.device_owner_row = Some(None);
         assert_eq!(decide(&Z2, &req), Decision::Forbidden);
@@ -733,13 +796,19 @@ mod tests {
         assert!(needs_whitelist(&Z2, &read(Some(OTHER), None, &z)));
         assert!(!needs_whitelist(&Z2, &read(Some(OWNER), None, &z)));
         assert!(!needs_whitelist(&Z2, &read(None, None, &z)));
-        assert!(!needs_whitelist(&ZoneMediaPath::Root, &read(Some(OTHER), None, &z)));
+        assert!(!needs_whitelist(
+            &ZoneMediaPath::Root,
+            &read(Some(OTHER), None, &z)
+        ));
         let mut s = read(Some(OTHER), None, &z);
         s.static_admin = true;
         assert!(!needs_whitelist(&Z2, &s));
         s.static_admin = false;
         s.access = Access::Write;
-        assert!(!needs_whitelist(&Z2, &s), "a non-owner write is refused without a lookup");
+        assert!(
+            !needs_whitelist(&Z2, &s),
+            "a non-owner write is refused without a lookup"
+        );
     }
 
     #[test]
@@ -753,17 +822,32 @@ mod tests {
 
     #[test]
     fn upload_types_are_rasters_only() {
-        for ok in ["image/webp", "IMAGE/PNG", "image/jpeg; q=1", "image/gif", "image/avif"] {
+        for ok in [
+            "image/webp",
+            "IMAGE/PNG",
+            "image/jpeg; q=1",
+            "image/gif",
+            "image/avif",
+        ] {
             assert!(is_allowed_upload_type(ok), "{ok}");
         }
-        for bad in ["image/svg+xml", "text/html", "application/octet-stream", "", "image/bmp"] {
+        for bad in [
+            "image/svg+xml",
+            "text/html",
+            "application/octet-stream",
+            "",
+            "image/bmp",
+        ] {
             assert!(!is_allowed_upload_type(bad), "{bad}");
         }
     }
 
     #[test]
     fn served_type_never_upgrades_to_svg_and_attaches_the_rest() {
-        assert_eq!(served_content_type("image/png", "a.png"), ("image/png".into(), false));
+        assert_eq!(
+            served_content_type("image/png", "a.png"),
+            ("image/png".into(), false)
+        );
         assert_eq!(
             served_content_type("application/octet-stream", "a.JPG"),
             ("image/jpeg".into(), false)

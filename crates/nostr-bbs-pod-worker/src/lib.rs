@@ -484,8 +484,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let zone_acao = match req.url() {
         Ok(u) if is_zone_media_route(u.path()) => {
             let allowed = zone_media::allowed_origins(
-                env.var("ALLOWED_ORIGINS").ok().map(|v| v.to_string()).as_deref(),
-                env.var("EXPECTED_ORIGIN").ok().map(|v| v.to_string()).as_deref(),
+                env.var("ALLOWED_ORIGINS")
+                    .ok()
+                    .map(|v| v.to_string())
+                    .as_deref(),
+                env.var("EXPECTED_ORIGIN")
+                    .ok()
+                    .map(|v| v.to_string())
+                    .as_deref(),
             );
             let origin = req.headers().get("Origin").ok().flatten();
             Some(zone_media::select_origin(&allowed, origin.as_deref()))
@@ -526,11 +532,10 @@ fn finalise_zone_response(resp: Response, acao: Option<String>) -> Response {
             h.delete("Access-Control-Allow-Credentials").ok();
         }
     }
-    let is_octet = h
-        .get("Content-Type")
-        .ok()
-        .flatten()
-        .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/octet-stream"));
+    let is_octet = h.get("Content-Type").ok().flatten().is_some_and(|ct| {
+        ct.to_ascii_lowercase()
+            .starts_with("application/octet-stream")
+    });
     if is_octet {
         h.set("Content-Disposition", "attachment").ok();
     }
@@ -2154,11 +2159,17 @@ async fn zone_media_gate(
     let method_name = method_str(method);
     let access = zone_media::access_for_method(method_name);
     let zones = zone_media::parse_zone_config(
-        env.var("ZONE_CONFIG").ok().map(|v| v.to_string()).as_deref(),
+        env.var("ZONE_CONFIG")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
     );
     let static_admin = requester.is_some_and(|pk| {
         zone_media::is_static_admin(
-            env.var("ADMIN_PUBKEYS").ok().map(|v| v.to_string()).as_deref(),
+            env.var("ADMIN_PUBKEYS")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
             pk,
         )
     });
@@ -2186,9 +2197,7 @@ async fn zone_media_gate(
         let pk = requester.unwrap_or_default();
         requester_row = match load_whitelist_row(&db, pk).await {
             Ok(r) => r,
-            Err(_) => {
-                return json_error(env, "Membership authority unavailable", 503).map(Some)
-            }
+            Err(_) => return json_error(env, "Membership authority unavailable", 503).map(Some),
         };
         let device_keys_enabled = env
             .var("DEVICE_KEYS_ENABLED")
@@ -2199,8 +2208,7 @@ async fn zone_media_gate(
                 Some(owner) => match load_whitelist_row(&db, &owner).await {
                     Ok(r) => Some(r),
                     Err(_) => {
-                        return json_error(env, "Membership authority unavailable", 503)
-                            .map(Some)
+                        return json_error(env, "Membership authority unavailable", 503).map(Some)
                     }
                 },
                 None => None,
