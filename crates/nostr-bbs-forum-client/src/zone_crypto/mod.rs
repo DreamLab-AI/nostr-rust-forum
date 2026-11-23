@@ -73,6 +73,7 @@
 //! zone's plaintext reaches the agent stack and whatever model it calls.
 
 pub mod auto_grant;
+pub mod conversation_keys;
 pub mod grant_backlog;
 pub mod grant_ledger;
 pub mod inbox_key;
@@ -84,7 +85,7 @@ pub mod read_cache;
 pub mod store;
 pub mod tickets;
 
-use nostr_bbs_core::sealed::{has_sealed_tag, open_sealed};
+use nostr_bbs_core::sealed::{has_sealed_tag, open_sealed_with_conversation_key};
 use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::{verify_event_strict, NostrEvent, UnsignedEvent};
 use serde::{Deserialize, Serialize};
@@ -538,11 +539,13 @@ pub fn is_zone_message(ev: &NostrEvent) -> bool {
     ev.kind == 42 && (has_zk_tag(&ev.tags) || has_sealed_tag(&ev.tags))
 }
 
-/// Decrypt `ev` with `key` (zone secret × event author).
+/// Decrypt `ev` with `key` (zone secret × event author), through the
+/// session's conversation-key cache ([`conversation_keys`]).
 pub fn decrypt_with(ev: &NostrEvent, key: &ZoneKey) -> Result<String, String> {
     let sk = key.secret_bytes().ok_or("bad zone secret")?;
     let author = hex32(&ev.pubkey).ok_or("bad author pubkey")?;
-    nostr_bbs_core::nip44::decrypt(&sk, &author, &ev.content)
+    let ck = conversation_keys::conversation_key(&sk, &author).ok_or("bad author pubkey")?;
+    nostr_bbs_core::nip44::decrypt_with_conversation_key(&ck, &ev.content)
         .map_err(|_| "ciphertext does not open with this zone key".to_string())
 }
 
@@ -570,7 +573,14 @@ pub fn read_outcome(ev: &NostrEvent, lookup: impl Fn(&str, u32) -> Option<ZoneKe
         let Some(sk) = key.secret_bytes() else {
             return ReadOutcome::Failed;
         };
-        return match open_sealed(ev, &sk) {
+        // The envelope's author (the migrator) is the NIP-44 peer; its
+        // conversation key with the zone secret is derived once per session.
+        // All six open checks, the inner signature included, still run.
+        let Some(ck) = hex32(&ev.pubkey).and_then(|p| conversation_keys::conversation_key(&sk, &p))
+        else {
+            return ReadOutcome::Failed;
+        };
+        return match open_sealed_with_conversation_key(ev, &ck) {
             Ok(inner) => ReadOutcome::Sealed(inner),
             Err(_) => ReadOutcome::Failed,
         };

@@ -81,6 +81,10 @@ pub struct ZoneKeyStore {
     /// later can decrypt what is already on screen, swapping an envelope's
     /// placeholder for the original event in place (ADR-2017).
     cache: StoredValue<ReadCache>,
+    /// Bumped by every re-decryption pass; a chunked pass stops as soon as a
+    /// newer pass (a key arrived or was replaced, or the keys were dropped)
+    /// has started, so it can never apply outcomes computed with stale keys.
+    redecrypt_gen: StoredValue<u64>,
     processed: StoredValue<HashSet<String>>,
     /// Keys (by [`key_owner::inbox_granted_entry`], the full store id) that
     /// have been received through the signed-in identity's inbox key on this
@@ -128,6 +132,7 @@ impl ZoneKeyStore {
             device_epochs: RwSignal::new(HashMap::new()),
             session: StoredValue::new(Session::default()),
             cache: StoredValue::new(ReadCache::default()),
+            redecrypt_gen: StoredValue::new(0),
             processed: StoredValue::new(HashSet::new()),
             inbox_granted: StoredValue::new(HashSet::new()),
             admin_cache: StoredValue::new(HashMap::new()),
@@ -235,6 +240,10 @@ impl ZoneKeyStore {
         self.inbox_sk.set_value(None);
         super::tickets::clear_group_identities();
         super::public_inbox::reset_sweep_tracker();
+        super::conversation_keys::clear();
+        // Synchronous on purpose: with the keys gone this pass does no
+        // cryptography, and it must revert every plaintext on screen before
+        // anything else runs (it also stops any chunked pass in flight).
         self.redecrypt();
         if let Some(lease) = lease {
             let store = *self;
@@ -301,7 +310,7 @@ impl ZoneKeyStore {
         self.keys.update(|m| {
             m.insert(id, key);
         });
-        self.redecrypt();
+        self.redecrypt_chunked();
         true
     }
 
@@ -327,7 +336,7 @@ impl ZoneKeyStore {
                 m.remove(&id);
             }
         });
-        self.redecrypt();
+        self.redecrypt_chunked();
     }
 
     /// Note a refused key: logged, and listed for the Encryption card while
@@ -487,6 +496,8 @@ impl ZoneKeyStore {
     /// in place, and restored originals whose key is gone go back to the
     /// placeholder; see [`ReadCache::redecrypt`].
     pub fn redecrypt(&self) {
+        // Supersedes any chunked pass in flight (see `redecrypt_chunked`).
+        self.redecrypt_gen.update_value(|g| *g += 1);
         let channels = self.channels;
         if self.cache.with_value(ReadCache::is_empty) {
             let _ = self.revision.try_update(|r| *r += 1);
@@ -519,6 +530,93 @@ impl ZoneKeyStore {
             self.encrypted_ids.update(|s| s.extend(missing));
         }
         self.revision.update(|r| *r += 1);
+    }
+
+    /// [`redecrypt`](Self::redecrypt) for a key that just ARRIVED, spread
+    /// over the event loop so a cold-key join does not freeze the page: the
+    /// messages to open are taken newest first, opened
+    /// [`REDECRYPT_CHUNK`] at a time with a yield (`setTimeout(0)`) between
+    /// chunks, and each chunk's outcomes are applied to the channel store at
+    /// once (the reader sees the newest messages decrypt first).
+    ///
+    /// The pass belongs to the identity and generation it started under. It
+    /// stops when a newer pass starts (`redecrypt_gen`; every key change runs
+    /// one) or the identity changes, checked after every yield and right
+    /// before each apply, with no await in between: outcomes computed with
+    /// keys that have since been replaced or dropped are never applied.
+    /// Messages that arrive meanwhile are decrypted on arrival by
+    /// `prepare_incoming`; a message the pass has not reached is left as is.
+    pub fn redecrypt_chunked(&self) {
+        let gen = self.redecrypt_gen.try_update_value(|g| {
+            *g += 1;
+            *g
+        });
+        let Some(gen) = gen else {
+            return;
+        };
+        let channels = self.channels;
+        if self.cache.with_value(ReadCache::is_empty) {
+            let _ = self.revision.try_update(|r| *r += 1);
+            return;
+        }
+        let lease = self.current_lease();
+        let targets: Vec<NostrEvent> = channels
+            .channel_messages
+            .with_untracked(|m| self.cache.with_value(|c| c.open_targets(m)));
+        let store = *self;
+        spawn_local(async move {
+            let still_current = |s: &ZoneKeyStore| {
+                s.redecrypt_gen.try_get_value() == Some(gen) && s.current_lease() == lease
+            };
+            for chunk in targets.chunks(REDECRYPT_CHUNK) {
+                if !still_current(&store) {
+                    return;
+                }
+                let outcomes: HashMap<String, super::ReadOutcome> = chunk
+                    .iter()
+                    .map(|ev| (ev.id.clone(), read_outcome(ev, |z, e| store.lookup(z, e))))
+                    .collect();
+                if !still_current(&store) {
+                    return;
+                }
+                store.apply_outcomes(outcomes);
+                yield_to_event_loop().await;
+            }
+        });
+    }
+
+    /// Apply precomputed read-path outcomes (by the id of the event opened)
+    /// to the channel store in one update, as [`redecrypt`](Self::redecrypt)
+    /// does for all of them.
+    fn apply_outcomes(&self, mut outcomes: HashMap<String, super::ReadOutcome>) {
+        let channels = self.channels;
+        let store = *self;
+        let mut restored_ids: Vec<String> = Vec::new();
+        let _ = channels.channel_messages.try_update(|m| {
+            store.cache.update_value(|c| {
+                c.redecrypt_with(
+                    m,
+                    |ev| outcomes.remove(&ev.id),
+                    |inner| channels.admits_restored_original(inner),
+                );
+                restored_ids = m
+                    .values()
+                    .flatten()
+                    .filter(|ev| c.envelope_of(&ev.id).is_some())
+                    .map(|ev| ev.id.clone())
+                    .collect();
+            });
+        });
+        let missing: Vec<String> = self.encrypted_ids.with_untracked(|s| {
+            restored_ids
+                .into_iter()
+                .filter(|id| !s.contains(id))
+                .collect()
+        });
+        if !missing.is_empty() {
+            self.encrypted_ids.update(|s| s.extend(missing));
+        }
+        let _ = self.revision.try_update(|r| *r += 1);
     }
 
     // -- Loading ----------------------------------------------------------
@@ -563,7 +661,7 @@ impl ZoneKeyStore {
                 self.keys
                     .update(|m| added = key_owner::merge_loaded(m, visible));
                 if added {
-                    self.redecrypt();
+                    self.redecrypt_chunked();
                 }
             }
         }
@@ -1141,6 +1239,26 @@ impl GrantKv for IdbGrantKv {
 /// default of 500, newest first, and DMs share the kind with grants. An
 /// account with more wraps than the limit still misses its oldest (often
 /// its grants) on a cold device; paging the backlog is separate work.
+/// Envelopes opened per slice of a chunked re-decryption: ~25 × ~0.6 ms
+/// (cached conversation key, inner verify) keeps each slice near 15 ms in
+/// desktop wasm, under one frame.
+pub const REDECRYPT_CHUNK: usize = 25;
+
+/// Yield to the browser's event loop (a `setTimeout(0)` macrotask), so input
+/// and rendering run between slices of work.
+async fn yield_to_event_loop() {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let scheduled = web_sys::window().is_some_and(|w| {
+            w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .is_ok()
+        });
+        if !scheduled {
+            let _ = resolve.call0(&wasm_bindgen::JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
 fn wrap_filter(p: Vec<String>) -> Filter {
     Filter {
         kinds: Some(vec![nostr_bbs_core::gift_wrap::KIND_GIFT_WRAP]),
