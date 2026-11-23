@@ -295,7 +295,9 @@ pub async fn handle_profile_stats(req: &Request, env: &Env) -> Result<Response> 
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let channel_zone = load_channel_zones(&db, &channel_ids).await;
+    let Ok(channel_zone) = load_channel_zones(&db, &channel_ids).await else {
+        return cors_json_response(env, &json!({ "error": "Zone lookup failed" }), 503);
+    };
 
     // Viewer scope.
     let viewer = resolve_viewer(req, env).await;
@@ -345,7 +347,12 @@ pub async fn handle_profile_stats(req: &Request, env: &Env) -> Result<Response> 
     )
 }
 
-async fn load_channel_zones(db: &D1Database, ids: &[String]) -> HashMap<String, String> {
+/// Zone bindings for `ids`. `Err` if any chunk could not be read: the caller
+/// fails closed rather than counting a zone channel as unbound/public (F3).
+async fn load_channel_zones(
+    db: &D1Database,
+    ids: &[String],
+) -> Result<HashMap<String, String>, ()> {
     #[derive(Deserialize)]
     struct Row {
         channel_id: String,
@@ -358,15 +365,13 @@ async fn load_channel_zones(db: &D1Database, ids: &[String]) -> HashMap<String, 
             placeholders(1, chunk.len())
         );
         let binds: Vec<JsValue> = chunk.iter().map(|s| JsValue::from_str(s)).collect();
-        if let Ok(stmt) = db.prepare(&sql).bind(&binds) {
-            if let Ok(r) = stmt.all().await {
-                for row in r.results::<Row>().unwrap_or_default() {
-                    out.insert(row.channel_id, row.zone);
-                }
-            }
+        let stmt = db.prepare(&sql).bind(&binds).map_err(|_| ())?;
+        let r = stmt.all().await.map_err(|_| ())?;
+        for row in r.results::<Row>().map_err(|_| ())? {
+            out.insert(row.channel_id, row.zone);
         }
     }
-    out
+    Ok(out)
 }
 
 async fn load_channel_names(db: &D1Database, ids: &[String]) -> HashMap<String, String> {

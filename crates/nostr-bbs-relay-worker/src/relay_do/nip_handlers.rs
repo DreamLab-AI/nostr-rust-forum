@@ -1462,7 +1462,14 @@ impl NostrRelayDO {
             // own new channel. Writes route through the write gate
             // (write_cohorts ?? required_cohorts) so a public zone can still be
             // read-by-all yet write-restricted.
-            let zone = self.cached_channel_zone(&channel_id).await;
+            // F3: an unanswered lookup refuses the write (fail closed).
+            let zone = match zone_for_write(self.cached_channel_zone(&channel_id).await) {
+                Ok(zone) => zone,
+                Err(reason) => {
+                    Self::send_ok(ws, &event.id, false, reason);
+                    return;
+                }
+            };
             // ADR-2017: sealed originals are admin-only and belong to encrypted
             // zones. They are exempt from the drift check in `validate_event`,
             // so this gate must reject every other shape, including a sealed
@@ -1578,7 +1585,13 @@ impl NostrRelayDO {
         {
             let bound: Option<String> = if event.kind == 42 {
                 match filter::channel_tag(&event) {
-                    Some(cid) => self.cached_channel_zone(&cid).await,
+                    Some(cid) => match zone_for_write(self.cached_channel_zone(&cid).await) {
+                        Ok(zone) => zone,
+                        Err(reason) => {
+                            Self::send_ok(ws, &event.id, false, reason);
+                            return;
+                        }
+                    },
                     None => None,
                 }
             } else {
@@ -2205,6 +2218,30 @@ pub(crate) enum ReadDecision {
 ///
 /// ADR-2018: membership comes from the cohorts already resolved into `ctx`;
 /// `zone_read_permitted` is the same rule `trust::has_zone_access` applies.
+pub(crate) fn channel_read_decision_for(
+    kind: u64,
+    lookup: &Result<Option<String>, trust::ZoneLookupError>,
+    zones: &ZoneConfig,
+    ctx: &ViewerContext,
+) -> ReadDecision {
+    match lookup {
+        // F3: an unanswered zone lookup withholds (fail closed). "No zone"
+        // is only ever a successful lookup that found no row.
+        Err(_) => ReadDecision::Withhold,
+        Ok(zone) => channel_read_decision(kind, zone.as_deref(), zones, ctx),
+    }
+}
+
+/// The zone a write is gated by, or the rejection when the lookup could not
+/// be answered (F3: a write is never treated as going to an unscoped channel
+/// because D1 failed).
+pub(crate) fn zone_for_write(
+    lookup: Result<Option<String>, trust::ZoneLookupError>,
+) -> Result<Option<String>, &'static str> {
+    lookup.map_err(|_| "error: zone lookup failed, try again")
+}
+
+/// [`channel_read_decision_for`] once the lookup has answered.
 pub(crate) fn channel_read_decision(
     kind: u64,
     zone: Option<&str>,
@@ -2348,15 +2385,22 @@ impl NostrRelayDO {
     /// `channel_zones` lookup through the 60s per-DO memo. Only a bound zone is
     /// remembered: an unbound channel goes back to D1 every time, so a channel
     /// bound moments after its first read is never served as unscoped.
-    pub(crate) async fn cached_channel_zone(&self, channel_id: &str) -> Option<String> {
+    /// The zone `channel_id` is bound to, through the 60 s per-DO memo
+    /// (bound channels only). `Err` when D1 could not answer: callers fail
+    /// closed (see [`trust::ZoneLookupError`]).
+    pub(crate) async fn cached_channel_zone(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<String>, trust::ZoneLookupError> {
         let now = auth::js_now_secs();
         if let Some(zone) = self.channel_zone_cache.get(channel_id, now) {
-            return Some(zone);
+            return Ok(Some(zone));
         }
         let zone = trust::get_channel_zone(channel_id, &self.env).await?;
-        self.channel_zone_cache
-            .insert(channel_id, zone.clone(), now);
-        Some(zone)
+        if let Some(z) = &zone {
+            self.channel_zone_cache.insert(channel_id, z.clone(), now);
+        }
+        Ok(zone)
     }
 
     /// Whitelist `(cohorts, is_admin)` through the 60s per-DO memo. A missing
@@ -2753,7 +2797,7 @@ impl NostrRelayDO {
             // admin, or a required cohort); `ctx.viewer_is_admin` carries the
             // whitelist admin flag that function used to re-read.
             let zone = self.cached_channel_zone(&cid).await;
-            return channel_read_decision(event.kind, zone.as_deref(), zones, ctx);
+            return channel_read_decision_for(event.kind, &zone, zones, ctx);
         }
 
         ReadDecision::Deliver
@@ -2847,7 +2891,7 @@ impl NostrRelayDO {
                 for (channel, n) in groups {
                     let zone = self.cached_channel_zone(&channel).await;
                     if matches!(
-                        channel_read_decision(42, zone.as_deref(), &zones, &ctx),
+                        channel_read_decision_for(42, &zone, &zones, &ctx),
                         ReadDecision::Deliver
                     ) {
                         count += n;
@@ -8296,5 +8340,75 @@ mod topic_tag_gate_tests {
             channel_read_decision(42, Some("locked"), &z, &anon),
             ReadDecision::Withhold
         ));
+    }
+}
+
+#[cfg(test)]
+mod zone_lookup_failure_tests {
+    //! Security review F3: an unanswered channel_zones lookup must fail
+    //! closed. "No row" (unscoped, public) is only ever a lookup that ran.
+    use super::*;
+    use crate::trust::ZoneLookupError;
+    use crate::zone_config::ZoneConfig;
+
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(r#"[{"id":"zone2","required_cohorts":["m"],"visibility":"locked"}]"#)
+    }
+
+    fn viewer(cohorts: &[&str], authed: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: authed.then(|| "s".repeat(64)),
+            access_pubkey: authed.then(|| "s".repeat(64)),
+            is_admin: false,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: false,
+            recipient_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn an_injected_lookup_error_withholds_every_channel_kind_from_everyone() {
+        let failed: Result<Option<String>, ZoneLookupError> = Err(ZoneLookupError);
+        for kind in [40, 41, 42] {
+            for ctx in [
+                viewer(&[], false),
+                viewer(&["x"], true),
+                viewer(&["m"], true),
+            ] {
+                assert!(
+                    matches!(
+                        channel_read_decision_for(kind, &failed, &zones(), &ctx),
+                        ReadDecision::Withhold
+                    ),
+                    "kind {kind}"
+                );
+            }
+        }
+        // Whereas a lookup that ran and found no row is unscoped, and one
+        // that found zone2 gates by membership.
+        let none: Result<Option<String>, ZoneLookupError> = Ok(None);
+        assert!(matches!(
+            channel_read_decision_for(42, &none, &zones(), &viewer(&[], false)),
+            ReadDecision::Deliver
+        ));
+        let bound: Result<Option<String>, ZoneLookupError> = Ok(Some("zone2".into()));
+        assert!(matches!(
+            channel_read_decision_for(42, &bound, &zones(), &viewer(&["m"], true)),
+            ReadDecision::Deliver
+        ));
+        assert!(matches!(
+            channel_read_decision_for(42, &bound, &zones(), &viewer(&[], false)),
+            ReadDecision::Withhold
+        ));
+    }
+
+    #[test]
+    fn an_injected_lookup_error_refuses_the_write() {
+        assert!(zone_for_write(Err(ZoneLookupError)).is_err());
+        assert_eq!(zone_for_write(Ok(None)), Ok(None));
+        assert_eq!(
+            zone_for_write(Ok(Some("zone2".into()))),
+            Ok(Some("zone2".into()))
+        );
     }
 }
