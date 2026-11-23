@@ -1951,11 +1951,20 @@ impl NostrRelayDO {
                     session.subscriptions.len(),
                     session.subscriptions.contains_key(sub_id),
                 ) {
-                    Self::send_notice(&ws, "too many subscriptions");
+                    // CLOSED, not only a NOTICE: NIP-01 clients treat CLOSED
+                    // as the answer to this REQ; a bare NOTICE left them
+                    // waiting for an EOSE that never came.
+                    Self::send_closed(
+                        &ws,
+                        sub_id,
+                        "error: too many subscriptions on this connection",
+                    );
                     return;
                 }
             }
         }
+        // Before the first await: a CLOSE for this id from now on cancels it.
+        let pending_token = self.pending_reqs.borrow_mut().begin(session_id, sub_id);
 
         // Determine the requesting session's pubkey and zone access for filtering
         let session_pubkey = {
@@ -2007,6 +2016,16 @@ impl NostrRelayDO {
                 return;
             }
         };
+
+        // The client may have CLOSEd this id while we awaited (a page request
+        // it gave up on), or reused it in a newer REQ: then store nothing.
+        if !self
+            .pending_reqs
+            .borrow_mut()
+            .finish(session_id, sub_id, pending_token)
+        {
+            return;
+        }
 
         // Store the AUTHORISED subscription — never the raw client filter — so
         // the live broadcast path matches against exactly what the gates above
@@ -2186,6 +2205,8 @@ impl NostrRelayDO {
     }
 
     pub(crate) async fn handle_close(&self, session_id: u64, sub_id: &str) {
+        // A REQ for this id still awaiting must not store it afterwards.
+        self.pending_reqs.borrow_mut().cancel(session_id, sub_id);
         {
             let mut sessions = self.sessions.borrow_mut();
             if let Some(session) = sessions.get_mut(&session_id) {

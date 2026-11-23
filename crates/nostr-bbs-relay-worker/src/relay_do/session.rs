@@ -363,6 +363,7 @@ impl NostrRelayDO {
                 sessions.get(&session_id).map(|s| s.ip.clone())
             };
             self.sessions.borrow_mut().remove(&session_id);
+            self.pending_reqs.borrow_mut().drop_session(session_id);
 
             // Clean up persisted session state from DO storage
             self.clear_session_storage(session_id).await;
@@ -551,5 +552,131 @@ mod session_id_tests {
         // be matched by a new, unauthenticated connection.
         assert_eq!(next_session_id_from_mark(42), 42);
         assert_eq!(next_session_id_from_mark(u64::MAX), u64::MAX);
+    }
+}
+
+/// REQs in flight between their subscription-cap check and storing their
+/// subscription, one token per `(session, sub id)`.
+///
+/// `handle_req` awaits (the kind-1059 read set) before it stores the
+/// subscription. A CLOSE for that id arriving meanwhile found nothing to
+/// remove, and the REQ then stored it: an orphan that counted against the
+/// 20-subscription cap for the rest of the connection. A client whose page
+/// requests time out (and so CLOSE early) filled the cap this way, and every
+/// later REQ was refused (production stall seen on a 50k-reply thread).
+///
+/// Now: `begin` before the first await; `cancel` on CLOSE (and on a newer
+/// REQ reusing the id, which supersedes the token); `finish` right before
+/// storing returns whether this REQ still owns the id.
+#[derive(Debug, Default)]
+pub(crate) struct PendingReqs {
+    next: u64,
+    live: HashMap<(u64, String), u64>,
+}
+
+impl PendingReqs {
+    /// Start a REQ; returns its token (supersedes any pending REQ for the id).
+    pub(crate) fn begin(&mut self, session_id: u64, sub_id: &str) -> u64 {
+        self.next += 1;
+        self.live
+            .insert((session_id, sub_id.to_string()), self.next);
+        self.next
+    }
+
+    /// A CLOSE for the id: any pending REQ for it must not store.
+    pub(crate) fn cancel(&mut self, session_id: u64, sub_id: &str) {
+        self.live.remove(&(session_id, sub_id.to_string()));
+    }
+
+    /// Whether the REQ holding `token` may store its subscription (it was
+    /// neither closed nor superseded). Clears the entry either way it owns.
+    pub(crate) fn finish(&mut self, session_id: u64, sub_id: &str, token: u64) -> bool {
+        let key = (session_id, sub_id.to_string());
+        if self.live.get(&key) == Some(&token) {
+            self.live.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Forget every pending REQ of a closed connection.
+    pub(crate) fn drop_session(&mut self, session_id: u64) {
+        self.live.retain(|(sid, _), _| *sid != session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.live.len()
+    }
+}
+
+#[cfg(test)]
+mod pending_req_tests {
+    //! The CLOSE-vs-REQ race, replayed against a subscription map the way
+    //! `handle_req` / `handle_close` drive it.
+    use super::PendingReqs;
+    use std::collections::HashMap;
+
+    /// `handle_req` up to its await, then `handle_close`, then the rest of
+    /// `handle_req`; returns the subscriptions left.
+    fn race_close_during_await(close_mid: bool) -> (usize, usize) {
+        let mut pending = PendingReqs::default();
+        let mut subs: HashMap<String, ()> = HashMap::new();
+        let token = pending.begin(1, "page");
+        // ... awaiting wrap_read_set ...
+        if close_mid {
+            pending.cancel(1, "page");
+            subs.remove("page");
+        }
+        if pending.finish(1, "page", token) {
+            subs.insert("page".into(), ());
+        }
+        (subs.len(), pending.len())
+    }
+
+    #[test]
+    fn a_close_during_the_await_leaves_no_orphan() {
+        assert_eq!(race_close_during_await(true), (0, 0));
+    }
+
+    #[test]
+    fn without_a_close_the_subscription_is_stored_and_a_later_close_removes_it() {
+        let (stored, pending) = race_close_during_await(false);
+        assert_eq!((stored, pending), (1, 0));
+    }
+
+    #[test]
+    fn a_newer_req_for_the_same_id_supersedes_the_older_one() {
+        let mut pending = PendingReqs::default();
+        let older = pending.begin(1, "s");
+        let newer = pending.begin(1, "s");
+        assert!(
+            !pending.finish(1, "s", older),
+            "the older REQ must not store"
+        );
+        assert!(pending.finish(1, "s", newer));
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn many_timed_out_pages_do_not_accumulate() {
+        // The stall: page REQs closed by the client while still awaiting.
+        let mut pending = PendingReqs::default();
+        let mut subs: HashMap<String, ()> = HashMap::new();
+        for i in 0..100 {
+            let id = format!("page{i}");
+            let t = pending.begin(7, &id);
+            pending.cancel(7, &id);
+            subs.remove(&id);
+            if pending.finish(7, &id, t) {
+                subs.insert(id, ());
+            }
+        }
+        assert_eq!(subs.len(), 0, "the subscription count returns to 0");
+        assert_eq!(pending.len(), 0);
+        pending.begin(7, "x");
+        pending.drop_session(7);
+        assert_eq!(pending.len(), 0);
     }
 }

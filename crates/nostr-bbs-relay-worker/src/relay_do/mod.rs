@@ -86,6 +86,10 @@ pub struct NostrRelayDO {
     pub(crate) state: State,
     pub(crate) env: Env,
     pub(crate) sessions: RefCell<HashMap<u64, SessionInfo>>,
+    /// REQs between their cap check and storing their subscription (see
+    /// [`session::PendingReqs`]): a CLOSE that lands while one awaits
+    /// cancels it, so no orphan subscription is left behind.
+    pub(crate) pending_reqs: RefCell<session::PendingReqs>,
     pub(crate) next_session_id: RefCell<u64>,
     pub(crate) rate_limits: RefCell<HashMap<String, Vec<f64>>>,
     /// Lazily-resolved per-IP message budget per rolling second (EVENT/REQ/
@@ -133,6 +137,7 @@ impl DurableObject for NostrRelayDO {
             state,
             env,
             sessions: RefCell::new(HashMap::new()),
+            pending_reqs: RefCell::new(session::PendingReqs::default()),
             next_session_id: RefCell::new(1),
             rate_limits: RefCell::new(HashMap::new()),
             rate_limit_per_sec: std::cell::Cell::new(None),
