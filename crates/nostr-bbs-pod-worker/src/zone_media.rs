@@ -13,7 +13,11 @@
 //! a refused requester learns nothing about which objects exist.
 //!
 //! Rules (mirroring the relay where the relay has a rule):
-//! - Writes (`PUT`/`POST`/`PATCH`/`DELETE`): the pod owner's raw key only.
+//! - Writes (`PUT`/`DELETE`; `POST`/`PATCH` are refused by the caller): the pod
+//!   owner's raw key only, and only while the owner may post in the zone: an
+//!   active whitelist row and either admin or the zone's effective write
+//!   cohorts (`write_cohorts ?? required_cohorts`, the relay's
+//!   `cohorts_can_write`; empty denies non-admins).
 //! - Container reads (listing): the pod owner only.
 //! - Object reads: the owner; a static `ADMIN_PUBKEYS` key; a raw key whose
 //!   own active whitelist row has `is_admin = 1`; or an active whitelisted
@@ -24,10 +28,12 @@
 //!   device's owner; suspension of the device key OR its owner denies; admin
 //!   status is never inherited from the owner (relay ADR-099 semantics).
 //! - Zone rule: non-empty `required_cohorts` needs an intersecting cohort, as
-//!   the relay's `cohorts_can_read`. Empty `required_cohorts` (zone1/Welcome)
-//!   needs any active whitelisted member. This deliberately deviates from
-//!   message visibility, where an empty-cohort public zone is anonymous-read:
-//!   no zone image sits in a public folder.
+//!   the relay's `cohorts_can_read`. Empty `required_cohorts` with
+//!   `visibility = "public"` (zone1/Welcome) needs any active whitelisted
+//!   member. This deliberately deviates from message visibility, where such a
+//!   zone is anonymous-read: no zone image sits in a public folder. Empty
+//!   `required_cohorts` with any other visibility (default `locked`) reads as
+//!   admin-only, exactly as the relay's `cohorts_can_read`.
 //! - Unknown zone, or `ZONE_CONFIG` missing or malformed: owner and admins only.
 
 use serde::Deserialize;
@@ -136,15 +142,49 @@ pub fn access_for_method(method: &str) -> Access {
     }
 }
 
-/// One zone's read rule as parsed from `ZONE_CONFIG`. Unknown fields of the
+/// One zone's access rule as parsed from `ZONE_CONFIG`. Unknown fields of the
 /// full zone schema are ignored.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ZoneRule {
     /// Zone id (`"zone2"`).
     pub id: String,
-    /// Cohorts that may read the zone; empty means any active member here.
+    /// Cohorts that may read the zone.
     #[serde(default)]
     pub required_cohorts: Vec<String>,
+    /// Cohorts that may post; falls back to `required_cohorts`.
+    #[serde(default)]
+    pub write_cohorts: Option<Vec<String>>,
+    /// `"public"`, `"locked"` (the default) or `"hidden"`.
+    #[serde(default)]
+    pub visibility: Option<String>,
+}
+
+impl ZoneRule {
+    fn is_public(&self) -> bool {
+        self.visibility
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("public"))
+    }
+
+    /// Read rule for an ACTIVE, non-admin member with `cohorts`.
+    pub fn member_can_read(&self, cohorts: &[String]) -> bool {
+        if self.required_cohorts.is_empty() {
+            // Relay: empty requirement reads only when Public. Here Public
+            // still needs an active member (no anonymous zone images).
+            self.is_public()
+        } else {
+            cohorts.iter().any(|c| self.required_cohorts.contains(c))
+        }
+    }
+
+    /// Write rule for an ACTIVE, non-admin member (relay `cohorts_can_write`).
+    pub fn member_can_write(&self, cohorts: &[String]) -> bool {
+        let req = self
+            .write_cohorts
+            .as_deref()
+            .unwrap_or(&self.required_cohorts);
+        !req.is_empty() && cohorts.iter().any(|c| req.contains(c))
+    }
 }
 
 /// Parse `ZONE_CONFIG`. `None` for absent, blank or malformed input, which the
@@ -226,10 +266,16 @@ pub enum Decision {
 /// Whether the decision needs whitelist rows at all (the caller skips the D1
 /// read for owners, static admins, anonymous requests and non-object paths).
 pub fn needs_whitelist(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> bool {
-    matches!(path, ZoneMediaPath::Object { .. })
-        && req.access == Access::Read
-        && req.requester.is_some_and(|r| r != req.owner)
-        && !req.static_admin
+    let ZoneMediaPath::Object { .. } = path else {
+        return false;
+    };
+    if req.static_admin {
+        return false;
+    }
+    match req.access {
+        Access::Read => req.requester.is_some_and(|r| r != req.owner),
+        Access::Write => req.requester == Some(req.owner),
+    }
 }
 
 /// Decide a request on a zone path.
@@ -254,10 +300,23 @@ pub fn decide(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> Decision {
         };
     };
     if req.access == Access::Write {
-        return if is_owner {
-            Decision::Allow
-        } else {
-            Decision::Forbidden
+        if !is_owner {
+            return Decision::Forbidden;
+        }
+        if req.static_admin {
+            return Decision::Allow;
+        }
+        // The owner writes only while they may post in this zone.
+        let Some(row) = req.requester_row.filter(|r| r.is_active(req.now)) else {
+            return Decision::Forbidden;
+        };
+        if row.is_admin {
+            return Decision::Allow;
+        }
+        let rule = req.zones.and_then(|zs| zs.iter().find(|z| z.id == *zone));
+        return match rule {
+            Some(rule) if rule.member_can_write(&row.cohorts) => Decision::Allow,
+            _ => Decision::Forbidden,
         };
     }
 
@@ -288,12 +347,7 @@ pub fn decide(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> Decision {
     let Some(rule) = req.zones.and_then(|zs| zs.iter().find(|z| z.id == *zone)) else {
         return Decision::Forbidden;
     };
-    let readable = if rule.required_cohorts.is_empty() {
-        true
-    } else {
-        row.cohorts.iter().any(|c| rule.required_cohorts.contains(c))
-    };
-    if readable {
+    if rule.member_can_read(&row.cohorts) {
         Decision::Allow
     } else {
         Decision::Forbidden
@@ -368,14 +422,10 @@ pub fn select_origin(allowed: &[String], request_origin: Option<&str>) -> Option
     allowed.iter().find(|o| *o == origin).cloned()
 }
 
-/// Parse the relay's static `ADMIN_PUBKEYS` (comma-separated hex) and test
-/// membership, case-insensitively.
+/// Whether `pubkey` is in the static `ADMIN_PUBKEYS` list, parsed exactly as
+/// the relay parses it (hex or npub, via `nostr_bbs_core`).
 pub fn is_static_admin(admin_pubkeys: Option<&str>, pubkey: &str) -> bool {
-    admin_pubkeys
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .any(|k| k.len() == 64 && k.eq_ignore_ascii_case(pubkey))
+    admin_pubkeys.is_some_and(|raw| nostr_bbs_core::admin_shared::is_static_admin(pubkey, raw))
 }
 
 #[cfg(test)]
@@ -388,8 +438,10 @@ mod tests {
 
     fn zones() -> Vec<ZoneRule> {
         parse_zone_config(Some(
-            r#"[{"id":"zone1","required_cohorts":[],"visibility":"public"},
-                {"id":"zone2","required_cohorts":["zone2","minimoonoir"],"encrypted":true}]"#,
+            r#"[{"id":"zone1","required_cohorts":[],"write_cohorts":["members"],"visibility":"public"},
+                {"id":"zone2","required_cohorts":["zone2","minimoonoir"],"encrypted":true},
+                {"id":"zone5","required_cohorts":[],"visibility":"locked"},
+                {"id":"zone6","required_cohorts":[]}]"#,
         ))
         .unwrap()
     }
@@ -499,6 +551,66 @@ mod tests {
     }
 
     #[test]
+    fn empty_cohorts_without_public_visibility_is_admin_only() {
+        let z = zones();
+        let member = row(&["members", "zone2"]);
+        for zone in ["zone5", "zone6"] {
+            let p = ZoneMediaPath::Object {
+                zone,
+                name: "a.png",
+            };
+            assert_eq!(
+                decide(&p, &read(Some(OTHER), Some(&member), &z)),
+                Decision::Forbidden,
+                "{zone}"
+            );
+            let mut admin = row(&[]);
+            admin.is_admin = true;
+            assert_eq!(decide(&p, &read(Some(OTHER), Some(&admin), &z)), Decision::Allow);
+        }
+    }
+
+    #[test]
+    fn owner_writes_only_while_they_may_post_in_the_zone() {
+        let z = zones();
+        let poster = row(&["members", "zone2"]);
+        let mut w = read(Some(OWNER), Some(&poster), &z);
+        w.access = Access::Write;
+        assert!(needs_whitelist(&Z2, &w));
+        assert_eq!(decide(&Z2, &w), Decision::Allow);
+        assert_eq!(decide(&Z1, &w), Decision::Allow, "zone1 write_cohorts = members");
+
+        let outsider = row(&["members"]);
+        w.requester_row = Some(&outsider);
+        assert_eq!(decide(&Z2, &w), Decision::Forbidden);
+
+        let mut suspended = row(&["zone2"]);
+        suspended.suspended_until = Some(NOW + 1);
+        w.requester_row = Some(&suspended);
+        assert_eq!(decide(&Z2, &w), Decision::Forbidden);
+
+        w.requester_row = None;
+        assert_eq!(decide(&Z2, &w), Decision::Forbidden, "no whitelist row");
+
+        let locked_empty = ZoneMediaPath::Object {
+            zone: "zone5",
+            name: "a.png",
+        };
+        w.requester_row = Some(&poster);
+        assert_eq!(decide(&locked_empty, &w), Decision::Forbidden);
+
+        let mut admin = row(&[]);
+        admin.is_admin = true;
+        w.requester_row = Some(&admin);
+        assert_eq!(decide(&locked_empty, &w), Decision::Allow);
+
+        w.requester_row = None;
+        w.static_admin = true;
+        assert!(!needs_whitelist(&Z2, &w));
+        assert_eq!(decide(&Z2, &w), Decision::Allow);
+    }
+
+    #[test]
     fn suspended_and_expired_members_are_refused() {
         let z = zones();
         let mut suspended = row(&["zone2"]);
@@ -537,7 +649,8 @@ mod tests {
     #[test]
     fn owner_always_reads_own_and_alone_writes_and_lists() {
         let z = zones();
-        let mut owner = read(Some(OWNER), None, &z);
+        let poster = row(&["zone2"]);
+        let mut owner = read(Some(OWNER), Some(&poster), &z);
         assert_eq!(decide(&Z2, &owner), Decision::Allow);
         assert_eq!(decide(&ZoneMediaPath::Root, &owner), Decision::Allow);
         assert_eq!(
@@ -626,7 +739,7 @@ mod tests {
         assert!(!needs_whitelist(&Z2, &s));
         s.static_admin = false;
         s.access = Access::Write;
-        assert!(!needs_whitelist(&Z2, &s));
+        assert!(!needs_whitelist(&Z2, &s), "a non-owner write is refused without a lookup");
     }
 
     #[test]
@@ -691,9 +804,8 @@ mod tests {
     fn static_admin_list_matches_exact_keys() {
         let list = format!("{OWNER}, {}", "c".repeat(64));
         assert!(is_static_admin(Some(&list), OWNER));
-        assert!(is_static_admin(Some(&list), &OWNER.to_uppercase()));
         assert!(!is_static_admin(Some(&list), OTHER));
         assert!(!is_static_admin(None, OWNER));
-        assert!(!is_static_admin(Some("aaaa"), "aaaa"));
+        assert!(!is_static_admin(Some(""), OWNER));
     }
 }

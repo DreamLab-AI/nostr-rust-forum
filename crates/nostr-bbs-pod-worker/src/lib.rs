@@ -1081,6 +1081,11 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
     // -----------------------------------------------------------------------
     let zone_path = zone_media::classify(&resource_path);
     if let Some(ref zp) = zone_path {
+        // One canonical spelling per zone object: lower-case owner hex (a
+        // mixed-case pubkey would otherwise be a separate R2 namespace).
+        if owner_pubkey.bytes().any(|b| b.is_ascii_uppercase()) {
+            return json_error(&env, "Not found", 404);
+        }
         if let Some(resp) = zone_media_gate(
             &env,
             zp,
@@ -1320,7 +1325,11 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                     }
                 }
 
-                if ascii_requested(format_param.as_deref(), accept_header.as_deref()) {
+                // Never on zone media: a member viewing a post would otherwise
+                // render server-side ASCII of an image on the poster's terms.
+                if zone_path.is_none()
+                    && ascii_requested(format_param.as_deref(), accept_header.as_deref())
+                {
                     if let Ok(art) = nostr_bbs_ascii::render_bytes(&bytes, &opts) {
                         // We are now emitting HTML built from pod bytes, so apply
                         // the same active-content neutralization the worker uses
