@@ -19,6 +19,8 @@ path = "src/main.rs"
 [features]
 default = []
 dev-auth = []
+# Heap accounting for memory investigations (src/alloc_stats.rs). Never in release.
+alloc-stats = []
 
 [dependencies]
 nostr-bbs-core = { workspace = true }

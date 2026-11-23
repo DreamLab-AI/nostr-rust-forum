@@ -767,6 +767,21 @@ impl RelayConnection {
         }
     }
 
+    /// Sizes of the per-id collections (`alloc-stats` diagnostics).
+    #[cfg(feature = "alloc-stats")]
+    pub fn debug_sizes(&self) -> Vec<(&'static str, usize)> {
+        let inner = self.inner.borrow();
+        vec![
+            ("relay.subscriptions", inner.subscriptions.len()),
+            ("relay.seen_events", inner.seen_events.len()),
+            ("relay.verified", inner.verified.len()),
+            ("relay.verified_queue", inner.verified.queue_len()),
+            ("relay.req_sent_at", inner.req_sent_at.len()),
+            ("relay.counts", inner.counts.len()),
+            ("relay.pending_publishes", inner.pending_publishes.len()),
+        ]
+    }
+
     pub fn unsubscribe(&self, sub_id: &str) {
         // Close the id the subscription is using on the wire now, which
         // differs from the logical id after an unanswered-REQ re-send.

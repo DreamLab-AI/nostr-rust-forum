@@ -223,8 +223,9 @@ impl ReadCache {
         }
     }
 
-    /// Entries held (ciphertexts, envelopes, restored mappings), for tests.
-    #[cfg(test)]
+    /// Entries held (ciphertexts, envelopes, restored mappings), for tests
+    /// and the `alloc-stats` diagnostics.
+    #[cfg(any(test, feature = "alloc-stats"))]
     pub fn len(&self) -> usize {
         self.ciphertexts.len() + self.envelopes.len() + self.restored.len()
     }

@@ -451,6 +451,12 @@ pub fn App() -> impl IntoView {
     // Zone end-to-end encryption (ADR-2016): keys load from IndexedDB now,
     // before channel sync, so held keys decrypt the first messages to arrive.
     crate::zone_crypto::store::provide_zone_key_store(use_channel_store());
+    #[cfg(feature = "alloc-stats")]
+    crate::alloc_stats::install_store_stats(
+        relay.clone(),
+        use_channel_store(),
+        crate::zone_crypto::store::try_use_zone_key_store().expect("zone-key store provided above"),
+    );
     crate::stores::reactions::provide_reaction_store();
 
     let auth = use_auth();

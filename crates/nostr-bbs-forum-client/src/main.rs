@@ -1,6 +1,8 @@
 //! nostr-bbs community forum -- Leptos CSR application entry point.
 
 mod admin;
+#[cfg(feature = "alloc-stats")]
+mod alloc_stats;
 mod app;
 mod auth;
 mod components;
@@ -18,6 +20,8 @@ use app::App;
 fn main() {
     // Surface WASM panics as console.error instead of swallowing them silently.
     console_error_panic_hook::set_once();
+    #[cfg(feature = "alloc-stats")]
+    alloc_stats::install();
 
     web_sys::console::log_1(&"[nostr-bbs] WASM main() started".into());
 

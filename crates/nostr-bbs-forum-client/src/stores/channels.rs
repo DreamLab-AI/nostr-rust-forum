@@ -961,6 +961,39 @@ impl ChannelStore {
         }
     }
 
+    /// Sizes of the per-id collections (`alloc-stats` diagnostics).
+    #[cfg(feature = "alloc-stats")]
+    pub fn debug_sizes(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            (
+                "channels.messages",
+                self.channel_messages
+                    .with_untracked(|m| m.values().map(Vec::len).sum()),
+            ),
+            (
+                "channels.lists",
+                self.channel_messages.with_untracked(HashMap::len),
+            ),
+            (
+                "channels.segments",
+                self.history
+                    .with_untracked(|m| m.values().map(|c| c.newer.len()).sum()),
+            ),
+            (
+                "channels.ensured",
+                self.ensured.with_untracked(HashSet::len),
+            ),
+            (
+                "channels.meta_updated_at",
+                self.meta_updated_at.with_untracked(HashMap::len),
+            ),
+            (
+                "channels.first_pages",
+                self.first_pages.with_value(HashMap::len),
+            ),
+        ]
+    }
+
     /// Record the zone-key store (called once by `provide_zone_key_store`).
     pub fn set_zone_store(&self, z: crate::zone_crypto::store::ZoneKeyStore) {
         self.zone_keys.set_value(Some(z));

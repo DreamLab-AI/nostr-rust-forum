@@ -81,9 +81,15 @@ impl VerifiedIds {
         self.evict();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "alloc-stats"))]
     pub(crate) fn len(&self) -> usize {
         self.by_id.len()
+    }
+
+    /// Recency-queue length (diagnostics).
+    #[cfg(feature = "alloc-stats")]
+    pub(crate) fn queue_len(&self) -> usize {
+        self.order.len()
     }
 
     fn touch(&mut self, id: &str) {

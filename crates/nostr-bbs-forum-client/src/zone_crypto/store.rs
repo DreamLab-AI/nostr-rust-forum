@@ -544,6 +544,23 @@ impl ZoneKeyStore {
         self.revision.update(|r| *r += 1);
     }
 
+    /// Sizes of the per-id collections (`alloc-stats` diagnostics).
+    #[cfg(feature = "alloc-stats")]
+    pub fn debug_sizes(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("zone.read_cache", self.cache.with_value(ReadCache::len)),
+            (
+                "zone.encrypted_ids",
+                self.encrypted_ids.with_untracked(HashSet::len),
+            ),
+            ("zone.processed", self.processed.with_value(HashSet::len)),
+            (
+                "zone.admin_cache",
+                self.admin_cache.with_value(HashMap::len),
+            ),
+        ]
+    }
+
     /// Forget messages history paging has evicted from the channel store:
     /// their ciphertexts, envelopes and restored mappings
     /// ([`ReadCache::evict`]) and their encrypted marks, in one update each,
