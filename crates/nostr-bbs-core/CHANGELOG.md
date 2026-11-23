@@ -6,6 +6,16 @@ All notable changes to `nostr-bbs-core` are recorded here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- `nip44::decrypt_with_conversation_key`: NIP-44 v2 decryption with a conversation key the
+  caller already derived, for readers decrypting many messages from one peer. Same payload
+  checks as `nip44::decrypt` (size bound, base64, version `0x02`), then upstream
+  `nip44::v2::decrypt_to_bytes`; no new cryptography.
+- `sealed::open_sealed_with_conversation_key`: `open_sealed` with a precomputed
+  `conversation_key(zone_sk, outer.pubkey)`. Shares all six checks with `open_sealed`
+  (including the inner id and BIP-340 signature) and returns the identical result.
+
 ## [1.0.0-beta.20] — 2026-11-22
 
 ### Added (wider-Nostr interop, from feat/upgrade-phase-0-1)

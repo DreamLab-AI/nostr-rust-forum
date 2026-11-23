@@ -373,6 +373,71 @@ pub fn seal_original(
 /// to showing partial data. The outer signature is not verified here; see the
 /// module-level *Trust boundary* section.
 pub fn open_sealed(outer: &NostrEvent, zone_sk: &[u8; 32]) -> Result<NostrEvent, SealError> {
+    open_with(outer, |migrator_pk, content| {
+        nip44::decrypt(zone_sk, migrator_pk, content).map_err(|_| SealError::Decrypt)
+    })
+}
+
+/// [`open_sealed`] with the NIP-44 conversation key of the zone secret and
+/// the envelope's author already derived ([`nip44::conversation_key`]`(zone_sk,
+/// outer.pubkey)`), so a reader opening many envelopes from one migrator
+/// pays the ECDH once instead of per envelope.
+///
+/// The result is identical to [`open_sealed`]'s for the same envelope and
+/// key, and **all six checks** run the same way, including the inner
+/// event's id and BIP-340 signature. A conversation key derived for any
+/// other secret or author fails the NIP-44 MAC ([`SealError::Decrypt`]), so
+/// the caller must key its cache by both. The outer signature is, as for
+/// [`open_sealed`], not verified here.
+///
+/// # Example
+///
+/// ```
+/// use nostr_bbs_core::keys::SecretKey;
+/// use nostr_bbs_core::nip44::conversation_key;
+/// use nostr_bbs_core::sealed::{open_sealed, open_sealed_with_conversation_key, seal_original};
+/// use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
+///
+/// let author = k256::schnorr::SigningKey::from_bytes(&[0x11u8; 32].into()).unwrap();
+/// let original = sign_event_deterministic(
+///     UnsignedEvent {
+///         pubkey: hex::encode(author.verifying_key().to_bytes()),
+///         created_at: 1_600_000_000,
+///         kind: 42,
+///         tags: vec![vec!["e".into(), "c".repeat(64), "".into(), "root".into()]],
+///         content: "hello".into(),
+///     },
+///     &author,
+/// )
+/// .unwrap();
+/// let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+/// let zone_sk = [0x33u8; 32];
+/// let zone_pk = SecretKey::from_bytes(zone_sk).unwrap().public_key().to_hex();
+/// let outer = seal_original(&original, "zone2", 1, &zone_pk, &migrator).unwrap();
+///
+/// let ck = conversation_key(&zone_sk, migrator.public_key().as_bytes()).unwrap();
+/// let opened = open_sealed_with_conversation_key(&outer, &ck).unwrap();
+/// let plain = open_sealed(&outer, &zone_sk).unwrap();
+/// assert_eq!(serde_json::to_string(&opened).unwrap(), serde_json::to_string(&plain).unwrap());
+/// assert_eq!(opened.id, original.id);
+/// ```
+pub fn open_sealed_with_conversation_key(
+    outer: &NostrEvent,
+    conversation_key: &[u8; 32],
+) -> Result<NostrEvent, SealError> {
+    open_with(outer, |_, content| {
+        nip44::decrypt_with_conversation_key(conversation_key, content)
+            .map_err(|_| SealError::Decrypt)
+    })
+}
+
+/// The shared body of [`open_sealed`] and [`open_sealed_with_conversation_key`]:
+/// outer shape checks, `decrypt(migrator_pk, content)`, strict inner parse,
+/// then the six checks.
+fn open_with(
+    outer: &NostrEvent,
+    decrypt: impl FnOnce(&[u8; 32], &str) -> Result<String, SealError>,
+) -> Result<NostrEvent, SealError> {
     if outer.kind != KIND_CHANNEL_MESSAGE {
         return Err(SealError::WrongKind(outer.kind));
     }
@@ -383,8 +448,7 @@ pub fn open_sealed(outer: &NostrEvent, zone_sk: &[u8; 32]) -> Result<NostrEvent,
     let outer_channel = channel_of(outer).ok_or(SealError::MissingChannel)?;
     let migrator_pk = decode_hex32(&outer.pubkey).ok_or(SealError::Decrypt)?;
 
-    let text =
-        nip44::decrypt(zone_sk, &migrator_pk, &outer.content).map_err(|_| SealError::Decrypt)?;
+    let text = decrypt(&migrator_pk, &outer.content)?;
     let inner: NostrEvent = serde_json::from_str::<InnerWire>(&text)
         .map_err(|_| SealError::MalformedInner)?
         .into();
@@ -561,6 +625,54 @@ mod tests {
 
     /// A threaded reply with a `p` tag, so the test proves the inner tags
     /// survive while only the channel tag is exposed.
+    /// The conversation-key path agrees with `open_sealed` on a good envelope
+    /// and on every rejection: same result, same check failing.
+    #[test]
+    fn opening_with_a_conversation_key_matches_open_sealed() {
+        let zone_sk = *zone().as_bytes();
+        let ck =
+            crate::nip44::conversation_key(&zone_sk, migrator().public_key().as_bytes()).unwrap();
+        let good = seal_original(&original(), "zone2", 1, &zone_pk_hex(), &migrator()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&open_sealed_with_conversation_key(&good, &ck).unwrap()).unwrap(),
+            serde_json::to_string(&open_sealed(&good, &zone_sk).unwrap()).unwrap()
+        );
+
+        let mut variants: Vec<NostrEvent> = Vec::new();
+        let mut v = good.clone();
+        v.kind = 1;
+        variants.push(v);
+        let mut v = good.clone();
+        v.tags.retain(|t| t[0] != "sealed");
+        variants.push(v);
+        let mut v = good.clone();
+        v.created_at += 1;
+        variants.push(v);
+        let mut v = good.clone();
+        v.content = v.content.replacen('A', "B", 1);
+        variants.push(v);
+        let mut v = good.clone();
+        for t in v.tags.iter_mut().filter(|t| t[0] == "sealed") {
+            t[1] = "0".repeat(64);
+        }
+        variants.push(v);
+        for v in &variants {
+            assert_eq!(
+                format!("{:?}", open_sealed_with_conversation_key(v, &ck)),
+                format!("{:?}", open_sealed(v, &zone_sk)),
+                "{v:?}"
+            );
+        }
+
+        // A key for another author or another zone secret never opens it.
+        let other =
+            crate::nip44::conversation_key(&zone_sk, key(0x77).public_key().as_bytes()).unwrap();
+        assert!(matches!(
+            open_sealed_with_conversation_key(&good, &other),
+            Err(SealError::Decrypt)
+        ));
+    }
+
     fn original() -> NostrEvent {
         sign(
             &author(),
