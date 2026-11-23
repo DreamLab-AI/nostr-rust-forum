@@ -13,10 +13,14 @@
 -- All tag names are indexed (not just single-letter): the table is tiny and
 -- it lets the expiry sweep use the same index via name='expiration'.
 
+-- `created_at` (the event's time, for paged reads) is added to deployed
+-- databases by the relay's `ensure_schema`; a fresh database gets it here so
+-- the boot-time writer `trg_event_tags_ai_v3` never meets a table without it.
 CREATE TABLE IF NOT EXISTS event_tags (
-  event_id TEXT NOT NULL,
-  name     TEXT NOT NULL,
-  value    TEXT NOT NULL DEFAULT ''
+  event_id   TEXT NOT NULL,
+  name       TEXT NOT NULL,
+  value      TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL DEFAULT 0
 );
 
 -- (name, value, event_id) serves tag-filter EXISTS probes; covering, so the

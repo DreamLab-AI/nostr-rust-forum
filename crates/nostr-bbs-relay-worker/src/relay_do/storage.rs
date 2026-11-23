@@ -357,45 +357,26 @@ impl NostrRelayDO {
                 break;
             }
 
-            let mut conditions: Vec<String> = Vec::new();
-            let mut params: Vec<JsValue> = Vec::new();
-            let mut param_idx = 1u32;
-
-            let tag_driver =
-                Self::build_filter_conditions(filter, &mut conditions, &mut params, &mut param_idx);
-
-            let where_clause = if conditions.is_empty() {
-                String::new()
-            } else {
-                format!("WHERE {}", conditions.join(" AND "))
-            };
-
             let limit = filter
                 .limit
                 .unwrap_or(500)
                 .min(MAX_QUERY_LIMIT)
                 .min(rows_budget);
             rows_budget -= limit;
-            let limit_placeholder = format!("?{param_idx}");
-            params.push(JsValue::from_f64(limit as f64));
 
-            // With a tag filter, drive from the event_tags subquery: CROSS
-            // JOIN pins it as the outer loop, so cost is O(tag matches) — one
-            // covering-index read per match plus a PK lookup — instead of
-            // walking the whole kind per REQ (see build_filter_conditions).
-            let sql = match &tag_driver {
-                Some(driver) => format!(
-                    "SELECT id, pubkey, created_at, kind, tags, content, sig \
-                     FROM {driver} m CROSS JOIN events ON events.id = m.event_id \
-                     {where_clause} \
-                     ORDER BY created_at DESC LIMIT {limit_placeholder}"
-                ),
-                None => format!(
-                    "SELECT id, pubkey, created_at, kind, tags, content, sig \
-                     FROM events {where_clause} \
-                     ORDER BY created_at DESC LIMIT {limit_placeholder}"
-                ),
-            };
+            // One statement per filter; see `filter::build_filter_query` for
+            // how a tag filter walks `idx_event_tags_time` newest-first so a
+            // page costs about `limit` rows, not the whole channel.
+            let query = filter::build_filter_query(filter, limit);
+            let sql = query.sql;
+            let params: Vec<JsValue> = query
+                .params
+                .iter()
+                .map(|p| match p {
+                    filter::SqlParam::Text(s) => JsValue::from_str(s),
+                    filter::SqlParam::Int(n) => JsValue::from_f64(*n as f64),
+                })
+                .collect();
 
             let result = match db.prepare(&sql).bind(&params) {
                 Ok(stmt) => match stmt.all().await {

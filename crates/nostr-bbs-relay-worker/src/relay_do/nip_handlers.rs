@@ -7682,7 +7682,7 @@ mod subscription_cap_tests {
 mod deletion_gate_sql_tests {
     //! The kind-5 gate's batched lookup and the moderator's sealed-envelope
     //! removal, run against the real `events` / `event_tags` schema (migration
-    //! 0004 plus the live v2 tag trigger) so the triggers behave as on D1.
+    //! 0004 plus the live v3 tag trigger) so the triggers behave as on D1.
     use super::*;
     use rusqlite::{params, Connection};
 
@@ -7702,6 +7702,8 @@ mod deletion_gate_sql_tests {
         c.execute_batch(crate::DELETED_ADDRESSES_CREATE_SQL)
             .unwrap();
         c.execute_batch(MIGRATION_0004).unwrap();
+        // As `ensure_schema`: the column the v3 writer fills, then the writer.
+        let _ = c.execute_batch(crate::EVENT_TAGS_TIME_COLUMN_SQL);
         for s in crate::PROBE_BLIND_STMTS {
             c.execute_batch(s).unwrap();
         }

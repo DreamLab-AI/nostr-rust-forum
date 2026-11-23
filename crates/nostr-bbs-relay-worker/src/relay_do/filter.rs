@@ -7,9 +7,6 @@ use std::collections::HashMap;
 
 use nostr_bbs_core::event::NostrEvent;
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::JsValue;
-
-use super::NostrRelayDO;
 
 // ---------------------------------------------------------------------------
 // NIP-01 filter type
@@ -41,137 +38,230 @@ pub struct NostrFilter {
 // SQL query builder
 // ---------------------------------------------------------------------------
 
-impl NostrRelayDO {
-    /// Build WHERE conditions from a NIP-01 filter (shared by REQ and COUNT).
-    ///
-    /// Returns an optional "tag driver" FROM-clause fragment: a
-    /// `(SELECT DISTINCT event_id FROM event_tags WHERE …)` subquery built
-    /// from the FIRST tag filter (#e/#p/#t…). The caller CROSS JOINs it ahead
-    /// of `events` so SQLite reads only the matching tag rows plus one PK
-    /// lookup each — O(matches) — instead of walking the whole kind and
-    /// probing per row, which is O(history) and was ~80% of all D1 rows read
-    /// (measured live: sparse-channel REQ 422→4 rows, gift-wrap poll 169→42).
-    /// Any additional tag filters become EXISTS conditions. Placeholders are
-    /// numbered (?N), so the driver's params order-mix freely with the rest.
-    pub(crate) fn build_filter_conditions(
-        filter: &NostrFilter,
-        conditions: &mut Vec<String>,
-        params: &mut Vec<JsValue>,
-        param_idx: &mut u32,
-    ) -> Option<String> {
-        let mut tag_driver: Option<String> = None;
-        if let Some(ref ids) = filter.ids {
-            if !ids.is_empty() {
-                let placeholders: Vec<String> = ids
-                    .iter()
-                    .map(|id| {
-                        let p = format!("?{}", *param_idx);
-                        params.push(JsValue::from_str(id));
-                        *param_idx += 1;
-                        p
-                    })
-                    .collect();
-                conditions.push(format!("id IN ({})", placeholders.join(",")));
-            } else {
-                conditions.push("1 = 0".to_string());
+/// A value bound to one numbered `?N` placeholder of a [`FilterQuery`].
+///
+/// Kept free of `JsValue` so the exact SQL the relay sends to D1 can be run
+/// against SQLite in native tests; `storage.rs` converts at the call site.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlParam {
+    /// A TEXT value.
+    Text(String),
+    /// An INTEGER value (kinds, timestamps, limits).
+    Int(i64),
+}
+
+/// One filter compiled to a single D1 statement: SQL with numbered
+/// placeholders, and the values they bind in order (`?1` is `params[0]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterQuery {
+    /// The statement. Selects `id, pubkey, created_at, kind, tags, content,
+    /// sig`, newest first, at most `limit` rows, never the same id twice.
+    pub sql: String,
+    /// Values for `?1..?N`.
+    pub params: Vec<SqlParam>,
+}
+
+/// The most values of one tag filter answered as a `UNION ALL` of per-value
+/// index walks. Above it the query falls back to a single `IN` driver, which
+/// scans every match but keeps the statement small: SQLite caps compound
+/// SELECTs at 500 terms and D1 a statement at 100 bound parameters.
+pub const MAX_UNION_BRANCHES: usize = 32;
+
+/// The selected columns, qualified: `event_tags` also has `created_at`, so an
+/// unqualified name in a joined query is ambiguous.
+const EVENT_COLUMNS: &str = "events.id AS id, events.pubkey AS pubkey, \
+     events.created_at AS created_at, events.kind AS kind, events.tags AS tags, \
+     events.content AS content, events.sig AS sig";
+
+/// Numbered placeholders and their values, built up in order.
+struct Binds {
+    params: Vec<SqlParam>,
+}
+
+impl Binds {
+    fn push(&mut self, p: SqlParam) -> String {
+        self.params.push(p);
+        format!("?{}", self.params.len())
+    }
+
+    fn text(&mut self, s: &str) -> String {
+        self.push(SqlParam::Text(s.to_string()))
+    }
+
+    fn int(&mut self, n: i64) -> String {
+        self.push(SqlParam::Int(n))
+    }
+}
+
+/// Compile one NIP-01 filter, shared by REQ and COUNT, to one statement that
+/// returns at most `limit` rows, newest first.
+///
+/// **Tag filters drive the query.** The first tag filter (in key order) is
+/// read from `event_tags` through `idx_event_tags_time (name, value,
+/// created_at, event_id)`, which hands rows over already in `created_at`
+/// order. Each value gets its own branch, `CROSS JOIN`ed ahead of `events` so
+/// SQLite walks the index newest-first, looks up each event by primary key,
+/// applies the remaining conditions and stops after `limit` survivors. A
+/// single-channel page therefore visits about `limit` rows whatever the
+/// channel's size; the previous `SELECT DISTINCT event_id … IN (…)` driver
+/// visited every match and sorted them in a temp B-tree before the LIMIT.
+///
+/// Several values become a `UNION ALL` of per-value branches, each limited,
+/// under an outer `SELECT DISTINCT … ORDER BY … LIMIT`. SQLite cannot merge
+/// per-value index order for an `IN` list, so this is what keeps a zone-wide
+/// filter at about `values × limit` rows. The outer `DISTINCT` drops an event
+/// that matches two values before the LIMIT, so such a page is never short:
+/// every event in the true newest `limit` is among the newest `limit` of a
+/// branch it matches. Within one branch an event appears once per identical
+/// `(name, value)` tag row; the v3 writer inserts each distinct pair once and
+/// migration 0015 removes older duplicates, so branches carry no repeats.
+///
+/// `since`/`until` bound the driver's `created_at` (inclusive, as before), so
+/// they narrow the index range instead of filtering after it. That relies on
+/// `event_tags.created_at` mirroring `events.created_at`, which the
+/// `trg_event_tags_ai_v3` writer guarantees for new rows and migration 0015
+/// backfills for old ones. Other tag filters become `EXISTS` probes.
+///
+/// Without a tag filter the query reads `events` directly; with a single kind
+/// `idx_events_kind_time (kind, created_at)` serves the ORDER BY.
+pub fn build_filter_query(filter: &NostrFilter, limit: u32) -> FilterQuery {
+    let mut b = Binds { params: Vec::new() };
+    let mut conds: Vec<String> = Vec::new();
+
+    if let Some(ref ids) = filter.ids {
+        if ids.is_empty() {
+            conds.push("1 = 0".to_string());
+        } else {
+            let ph: Vec<String> = ids.iter().map(|id| b.text(id)).collect();
+            conds.push(format!("events.id IN ({})", ph.join(",")));
+        }
+    }
+    if let Some(ref authors) = filter.authors {
+        if authors.is_empty() {
+            conds.push("1 = 0".to_string());
+        } else {
+            let ph: Vec<String> = authors.iter().map(|a| b.text(a)).collect();
+            conds.push(format!("events.pubkey IN ({})", ph.join(",")));
+        }
+    }
+    if let Some(ref kinds) = filter.kinds {
+        if kinds.is_empty() {
+            conds.push("1 = 0".to_string());
+        } else {
+            let ph: Vec<String> = kinds.iter().map(|k| b.int(*k as i64)).collect();
+            conds.push(format!("events.kind IN ({})", ph.join(",")));
+        }
+    }
+
+    // Tag filters, in key order so the driver choice is deterministic.
+    let mut keys: Vec<&String> = filter.extra.keys().collect();
+    keys.sort();
+    let mut driver: Option<(String, Vec<String>)> = None;
+    for key in keys {
+        let (tag_name, values) = match tag_filter_plan(key, &filter.extra[key]) {
+            TagFilterPlan::Ignore => continue,
+            TagFilterPlan::MatchNothing => {
+                conds.push("1 = 0".to_string());
+                continue;
             }
+            TagFilterPlan::Values(name, values) => (name, values),
+        };
+        let name_ph = b.text(tag_name);
+        let value_ph: Vec<String> = values.iter().map(|v| b.text(v)).collect();
+        if driver.is_none() {
+            driver = Some((name_ph, value_ph));
+        } else {
+            conds.push(format!(
+                "EXISTS (SELECT 1 FROM event_tags x WHERE x.event_id = events.id \
+                 AND x.name = {name_ph} AND x.value IN ({}))",
+                value_ph.join(",")
+            ));
         }
+    }
 
-        if let Some(ref authors) = filter.authors {
-            if !authors.is_empty() {
-                let placeholders: Vec<String> = authors
-                    .iter()
-                    .map(|a| {
-                        let p = format!("?{}", *param_idx);
-                        params.push(JsValue::from_str(a));
-                        *param_idx += 1;
-                        p
-                    })
-                    .collect();
-                conditions.push(format!("pubkey IN ({})", placeholders.join(",")));
-            } else {
-                conditions.push("1 = 0".to_string());
+    // NIP-50: full-text search on content.
+    if let Some(search) = search_term(filter) {
+        let ph = b.text(&like_pattern(search));
+        conds.push(format!("events.content LIKE {ph} ESCAPE '\\'"));
+    }
+
+    let since = filter.since.map(|s| b.int(s as i64));
+    let until = filter.until.map(|u| b.int(u as i64));
+    let limit_ph = b.int(i64::from(limit));
+
+    let sql = match driver {
+        Some((name_ph, values)) if values.len() <= MAX_UNION_BRANCHES => {
+            let mut where_tail = String::new();
+            if let Some(s) = &since {
+                where_tail.push_str(&format!(" AND d.created_at >= {s}"));
             }
-        }
-
-        if let Some(ref kinds) = filter.kinds {
-            if !kinds.is_empty() {
-                let placeholders: Vec<String> = kinds
-                    .iter()
-                    .map(|k| {
-                        let p = format!("?{}", *param_idx);
-                        params.push(JsValue::from_f64(*k as f64));
-                        *param_idx += 1;
-                        p
-                    })
-                    .collect();
-                conditions.push(format!("kind IN ({})", placeholders.join(",")));
-            } else {
-                conditions.push("1 = 0".to_string());
+            if let Some(u) = &until {
+                where_tail.push_str(&format!(" AND d.created_at <= {u}"));
             }
-        }
-
-        if let Some(since) = filter.since {
-            conditions.push(format!("created_at >= ?{}", *param_idx));
-            params.push(JsValue::from_f64(since as f64));
-            *param_idx += 1;
-        }
-
-        if let Some(until) = filter.until {
-            conditions.push(format!("created_at <= ?{}", *param_idx));
-            params.push(JsValue::from_f64(until as f64));
-            *param_idx += 1;
-        }
-
-        // Tag filters (#e, #p, #t, etc.)
-        for (key, values) in &filter.extra {
-            let (tag_name, tag_values) = match tag_filter_plan(key, values) {
-                TagFilterPlan::Ignore => continue,
-                TagFilterPlan::MatchNothing => {
-                    conditions.push("1 = 0".to_string());
-                    continue;
-                }
-                TagFilterPlan::Values(name, values) => (name, values),
-            };
-
-            let nonempty = &tag_values;
-            {
-                let name_placeholder = format!("?{}", *param_idx);
-                params.push(JsValue::from_str(tag_name));
-                *param_idx += 1;
-                let value_placeholders: Vec<String> = nonempty
-                    .iter()
-                    .map(|v| {
-                        let p = format!("?{}", *param_idx);
-                        params.push(JsValue::from_str(v));
-                        *param_idx += 1;
-                        p
-                    })
-                    .collect();
-                let values = value_placeholders.join(",");
-                if tag_driver.is_none() {
-                    tag_driver = Some(format!(
-                        "(SELECT DISTINCT event_id FROM event_tags \
-                         WHERE name = {name_placeholder} AND value IN ({values}))"
-                    ));
-                } else {
-                    conditions.push(format!(
-                        "EXISTS (SELECT 1 FROM event_tags t WHERE t.event_id = events.id \
-                         AND t.name = {name_placeholder} AND t.value IN ({values}))"
-                    ));
-                }
+            for c in &conds {
+                where_tail.push_str(" AND ");
+                where_tail.push_str(c);
             }
+            let branches: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    format!(
+                        "SELECT * FROM (SELECT {EVENT_COLUMNS} \
+                         FROM event_tags d CROSS JOIN events ON events.id = d.event_id \
+                         WHERE d.name = {name_ph} AND d.value = {v}{where_tail} \
+                         ORDER BY d.created_at DESC, d.event_id DESC LIMIT {limit_ph})"
+                    )
+                })
+                .collect();
+            format!(
+                "SELECT DISTINCT id, pubkey, created_at, kind, tags, content, sig \
+                 FROM ({}) ORDER BY created_at DESC, id DESC LIMIT {limit_ph}",
+                branches.join(" UNION ALL ")
+            )
         }
-
-        // NIP-50: Full-text search on content
-        if let Some(search) = search_term(filter) {
-            let pattern = like_pattern(search);
-            conditions.push(format!("content LIKE ?{} ESCAPE '\\'", *param_idx));
-            params.push(JsValue::from_str(&pattern));
-            *param_idx += 1;
+        Some((name_ph, values)) => {
+            // Too many values for a compound statement: one IN driver, as before.
+            if let Some(s) = &since {
+                conds.push(format!("events.created_at >= {s}"));
+            }
+            if let Some(u) = &until {
+                conds.push(format!("events.created_at <= {u}"));
+            }
+            format!(
+                "SELECT {EVENT_COLUMNS} FROM (SELECT DISTINCT event_id FROM event_tags \
+                 WHERE name = {name_ph} AND value IN ({})) m \
+                 CROSS JOIN events ON events.id = m.event_id{} \
+                 ORDER BY events.created_at DESC, events.id DESC LIMIT {limit_ph}",
+                values.join(","),
+                where_clause(&conds)
+            )
         }
+        None => {
+            if let Some(s) = &since {
+                conds.push(format!("events.created_at >= {s}"));
+            }
+            if let Some(u) = &until {
+                conds.push(format!("events.created_at <= {u}"));
+            }
+            format!(
+                "SELECT {EVENT_COLUMNS} FROM events{} \
+                 ORDER BY events.created_at DESC LIMIT {limit_ph}",
+                where_clause(&conds)
+            )
+        }
+    };
 
-        tag_driver
+    FilterQuery {
+        sql,
+        params: b.params,
+    }
+}
+
+fn where_clause(conds: &[String]) -> String {
+    if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
     }
 }
 
@@ -1094,5 +1184,340 @@ mod tests {
             .extra
             .insert("#e".to_string(), serde_json::json!("not_an_array"));
         assert!(event_matches_filters(&event, &[filter]));
+    }
+}
+
+#[cfg(test)]
+mod query_builder_tests {
+    //! The SQL `build_filter_query` emits, run against SQLite with the real
+    //! schema (0009 + 0004 + the boot-time writer and indexes): same rows as
+    //! the live matcher would select, newest first, no duplicates, `until`
+    //! paging that loses nothing across equal timestamps, and a single-channel
+    //! page that no longer visits the whole channel.
+    use super::*;
+    use rusqlite::{types::Value, Connection};
+
+    const MIGRATION_0004: &str = include_str!("../../migrations/0004_event_tags.sql");
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(crate::EVENTS_CREATE_SQL).unwrap();
+        c.execute_batch(MIGRATION_0004).unwrap();
+        let _ = c.execute_batch(crate::EVENT_TAGS_TIME_COLUMN_SQL);
+        for s in crate::PROBE_BLIND_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+        for s in crate::PAGING_INDEX_STMTS {
+            c.execute_batch(s).unwrap();
+        }
+        c
+    }
+
+    fn ev(id: usize, kind: u64, created_at: u64, tags: Vec<Vec<&str>>) -> NostrEvent {
+        NostrEvent {
+            id: format!("{id:064x}"),
+            pubkey: format!("{:064x}", id % 7),
+            created_at,
+            kind,
+            tags: tags
+                .into_iter()
+                .map(|t| t.into_iter().map(String::from).collect())
+                .collect(),
+            content: format!("message {id}"),
+            sig: "00".repeat(64),
+        }
+    }
+
+    fn store(c: &Connection, events: &[NostrEvent]) {
+        let mut s = c
+            .prepare(
+                "INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .unwrap();
+        for e in events {
+            s.execute(rusqlite::params![
+                e.id,
+                e.pubkey,
+                e.created_at as i64,
+                e.kind as i64,
+                serde_json::to_string(&e.tags).unwrap(),
+                e.content,
+                e.sig
+            ])
+            .unwrap();
+        }
+    }
+
+    fn bind(params: &[SqlParam]) -> Vec<Value> {
+        params
+            .iter()
+            .map(|p| match p {
+                SqlParam::Text(s) => Value::Text(s.clone()),
+                SqlParam::Int(n) => Value::Integer(*n),
+            })
+            .collect()
+    }
+
+    /// Run the compiled filter; returns `(id, created_at)` in result order and
+    /// the statement's VM step count.
+    fn run(c: &Connection, filter: &NostrFilter, limit: u32) -> (Vec<(String, u64)>, i32) {
+        let q = build_filter_query(filter, limit);
+        run_sql(c, &q.sql, &bind(&q.params))
+    }
+
+    fn run_sql(c: &Connection, sql: &str, params: &[Value]) -> (Vec<(String, u64)>, i32) {
+        let mut s = c.prepare(sql).unwrap();
+        let rows: Vec<(String, u64)> = s
+            .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                Ok((
+                    r.get::<_, String>("id")?,
+                    r.get::<_, i64>("created_at")? as u64,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let steps = s.get_status(rusqlite::StatementStatus::VmStep);
+        (rows, steps)
+    }
+
+    /// What the relay must return: every event the live matcher accepts,
+    /// newest first, ties by id descending, at most `limit`.
+    fn reference(events: &[NostrEvent], filter: &NostrFilter, limit: u32) -> Vec<(String, u64)> {
+        let mut v: Vec<&NostrEvent> = events
+            .iter()
+            .filter(|e| event_matches_filters(e, std::slice::from_ref(filter)))
+            .collect();
+        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        v.into_iter()
+            .take(limit as usize)
+            .map(|e| (e.id.clone(), e.created_at))
+            .collect()
+    }
+
+    fn filter(json: serde_json::Value) -> NostrFilter {
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// Three channels; `a` is busy and has runs of up to 7 messages sharing a
+    /// second (imported history keeps Keybase's one-second timestamps). Every
+    /// 10th message of `a` also names `b`, and kind-7s and a kind-41 share the
+    /// `e` values, so the kind condition is exercised inside the walk.
+    fn fixture() -> Vec<NostrEvent> {
+        let mut v = Vec::new();
+        for i in 0..600 {
+            let mut tags = vec![vec!["e", "a", "", "root"]];
+            if i % 10 == 0 {
+                tags.push(vec!["e", "b"]);
+            }
+            v.push(ev(i, 42, 1_000 + (i as u64 / 7), tags));
+        }
+        for i in 600..700 {
+            v.push(ev(
+                i,
+                42,
+                900 + i as u64,
+                vec![vec!["e", "b", "", "root"], vec!["p", "bob"]],
+            ));
+        }
+        for i in 700..720 {
+            v.push(ev(i, 42, 1_050 + i as u64, vec![vec!["e", "c"]]));
+        }
+        for i in 720..760 {
+            v.push(ev(i, 7, 1_020 + i as u64, vec![vec!["e", "a"]]));
+        }
+        v.push(ev(760, 41, 1_100, vec![vec!["e", "a"]]));
+        v
+    }
+
+    #[test]
+    fn a_single_channel_page_matches_the_live_matcher_exactly() {
+        let c = db();
+        let events = fixture();
+        store(&c, &events);
+        for f in [
+            filter(serde_json::json!({"kinds": [42], "#e": ["a"], "limit": 50})),
+            filter(serde_json::json!({"kinds": [42], "#e": ["a"], "until": 1_040, "limit": 100})),
+            filter(
+                serde_json::json!({"kinds": [42], "#e": ["a"], "since": 1_010, "until": 1_020, "limit": 1000}),
+            ),
+            filter(serde_json::json!({"kinds": [42, 7], "#e": ["a"], "limit": 30})),
+            filter(serde_json::json!({"#e": ["a"], "limit": 1000})),
+        ] {
+            let limit = f.limit.unwrap();
+            assert_eq!(run(&c, &f, limit).0, reference(&events, &f, limit), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn since_and_until_stay_inclusive() {
+        let c = db();
+        let events = fixture();
+        store(&c, &events);
+        let f =
+            filter(serde_json::json!({"kinds": [42], "#e": ["a"], "since": 1_010, "until": 1_010}));
+        let rows = run(&c, &f, 500).0;
+        assert_eq!(rows.len(), 7, "all seven messages of second 1010");
+        assert!(rows.iter().all(|(_, t)| *t == 1_010));
+    }
+
+    #[test]
+    fn several_values_union_without_duplicates_or_short_pages() {
+        let c = db();
+        let events = fixture();
+        store(&c, &events);
+        for f in [
+            filter(serde_json::json!({"kinds": [42], "#e": ["a", "b", "c"], "limit": 100})),
+            filter(
+                serde_json::json!({"kinds": [42], "#e": ["b", "a"], "until": 1_030, "limit": 40}),
+            ),
+            filter(serde_json::json!({"kinds": [42], "#e": ["a", "b"], "limit": 1000})),
+        ] {
+            let limit = f.limit.unwrap();
+            let got = run(&c, &f, limit).0;
+            let ids: std::collections::HashSet<&String> = got.iter().map(|(id, _)| id).collect();
+            assert_eq!(ids.len(), got.len(), "no event twice");
+            assert_eq!(got, reference(&events, &f, limit), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn a_second_tag_filter_is_applied_as_a_condition() {
+        let c = db();
+        let events = fixture();
+        store(&c, &events);
+        let f = filter(serde_json::json!({"kinds": [42], "#e": ["b"], "#p": ["bob"], "limit": 25}));
+        assert_eq!(run(&c, &f, 25).0, reference(&events, &f, 25));
+    }
+
+    #[test]
+    fn paging_by_inclusive_until_reaches_the_first_message_without_loss() {
+        // The client's walk: page `until = oldest seen`, drop ids already
+        // held, stop when a page is short. Runs of equal timestamps straddle
+        // page boundaries (page 25, runs of 7).
+        let c = db();
+        let events = fixture();
+        store(&c, &events);
+        let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut until: Option<u64> = None;
+        for _ in 0..1000 {
+            let mut f = filter(serde_json::json!({"kinds": [42], "#e": ["a"], "limit": 25}));
+            f.until = until;
+            let page = run(&c, &f, 25).0;
+            let oldest = page.iter().map(|(_, t)| *t).min();
+            let fresh = page
+                .iter()
+                .filter(|(id, _)| held.insert(id.clone()))
+                .count();
+            if page.len() < 25 {
+                break;
+            }
+            // A full page with nothing new would stall; step past the second.
+            until = match (fresh, oldest) {
+                (0, Some(t)) => Some(t - 1),
+                (_, t) => t,
+            };
+        }
+        let all: std::collections::HashSet<String> = events
+            .iter()
+            .filter(|e| e.kind == 42 && e.tags.iter().any(|t| t[0] == "e" && t[1] == "a"))
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(held, all, "every message of the channel, once");
+    }
+
+    #[test]
+    fn a_tagless_filter_reads_events_newest_first() {
+        let c = db();
+        let events = fixture();
+        store(&c, &events);
+        let f = filter(serde_json::json!({"kinds": [42], "limit": 60}));
+        let got: Vec<u64> = run(&c, &f, 60).0.into_iter().map(|(_, t)| t).collect();
+        let want: Vec<u64> = reference(&events, &f, 60)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(got, want, "same timestamps in the same order");
+    }
+
+    #[test]
+    fn too_many_values_fall_back_to_one_in_driver() {
+        let c = db();
+        let events = fixture();
+        store(&c, &events);
+        let mut values: Vec<String> = (0..MAX_UNION_BRANCHES + 5)
+            .map(|i| format!("x{i}"))
+            .collect();
+        values.push("c".into());
+        let f = filter(serde_json::json!({"kinds": [42], "#e": values, "limit": 10}));
+        let q = build_filter_query(&f, 10);
+        assert!(!q.sql.contains("UNION ALL"));
+        assert_eq!(run(&c, &f, 10).0, reference(&events, &f, 10));
+    }
+
+    #[test]
+    fn a_single_channel_page_walks_the_time_index_not_the_channel() {
+        // 20k messages in one channel. The previous driver visited every one
+        // of them and sorted them before the LIMIT; the time index stops
+        // after the page. Measured as SQLite VM steps for the same page.
+        let c = db();
+        let events: Vec<NostrEvent> = (0..20_000)
+            .map(|i| {
+                ev(
+                    i,
+                    42,
+                    1_000_000 + i as u64,
+                    vec![vec!["e", "busy", "", "root"]],
+                )
+            })
+            .collect();
+        store(&c, &events);
+        let f = filter(
+            serde_json::json!({"kinds": [42], "#e": ["busy"], "until": 1_015_000, "limit": 100}),
+        );
+        let (rows, new_steps) = run(&c, &f, 100);
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0].1, 1_015_000);
+
+        let legacy = "SELECT id, pubkey, created_at, kind, tags, content, sig \
+             FROM (SELECT DISTINCT event_id FROM event_tags WHERE name = ?1 AND value IN (?2)) m \
+             CROSS JOIN events ON events.id = m.event_id \
+             WHERE events.kind IN (?3) AND events.created_at <= ?4 \
+             ORDER BY events.created_at DESC LIMIT ?5";
+        let (legacy_rows, legacy_steps) = run_sql(
+            &c,
+            legacy,
+            &[
+                Value::Text("e".into()),
+                Value::Text("busy".into()),
+                Value::Integer(42),
+                Value::Integer(1_015_000),
+                Value::Integer(100),
+            ],
+        );
+        assert_eq!(rows, legacy_rows, "same page as the old query");
+        assert!(
+            new_steps * 50 < legacy_steps,
+            "time-index walk took {new_steps} VM steps, legacy {legacy_steps}"
+        );
+
+        let plan: Vec<String> = c
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                build_filter_query(&f, 100).sql
+            ))
+            .unwrap()
+            .query_map(
+                rusqlite::params_from_iter(bind(&build_filter_query(&f, 100).params).iter()),
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|l| l.contains("idx_event_tags_time")),
+            "plan: {plan:?}"
+        );
     }
 }
