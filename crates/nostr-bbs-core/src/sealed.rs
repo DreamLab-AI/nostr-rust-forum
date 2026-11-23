@@ -520,31 +520,14 @@ fn open_with(
     if inner.created_at != outer.created_at {
         return Err(SealError::CreatedAtMismatch);
     }
-    // 7. thread placement: the outer envelope may name the topic the inner
-    //    event replies to, and nothing else. An outer topic tag must be the
+    // 7. thread placement and outer shape: the outer envelope may name the
+    //    topic the inner event replies to, and nothing else. An outer topic tag must be the
     //    inner `reply` root, and an inner event that replies to nothing (a
     //    topic root) carries none. No other outer `e` tag and no `p` tag, so
     //    quote targets and mentions never leave the ciphertext and a relay
     //    query cannot file the envelope under another thread. Envelopes
     //    sealed before the topic tag existed (no outer topic) still open.
-    let mut outer_topics = 0usize;
-    for tag in &outer.tags {
-        match tag.first().map(String::as_str) {
-            Some("p") => return Err(SealError::ChannelMismatch),
-            Some("e") => {
-                let is_channel = tag.get(1).map(String::as_str) == Some(outer_channel)
-                    && tag.get(3).map(String::as_str) == Some("root");
-                let is_topic = tag.len() >= 4 && tag[3] == "reply";
-                if is_topic {
-                    outer_topics += 1;
-                } else if !is_channel {
-                    return Err(SealError::ChannelMismatch);
-                }
-            }
-            _ => {}
-        }
-    }
-    if outer_topics > 1 {
+    if !outer_shape_ok(outer, outer_channel) {
         return Err(SealError::ChannelMismatch);
     }
     if let Some(topic) = reply_root_of(outer) {
@@ -638,6 +621,36 @@ fn build_envelope(
     let signing_key = SigningKey::from_bytes((migrator_sk.as_bytes()).into())
         .map_err(|e| SealError::Sign(e.to_string()))?;
     sign_event(unsigned, &signing_key).map_err(|e| SealError::Sign(e.to_string()))
+}
+
+/// The outer tags are exactly what [`build_envelope`] writes: the channel
+/// `["e", channel, "", "root"]`, the `zk` and `sealed` tags, and at most one
+/// topic `["e", topic, "", "reply"]`, each with exactly those elements (empty
+/// relay hint). Any other tag, hint or extra element is metadata the format
+/// does not expose (check 7).
+fn outer_shape_ok(outer: &NostrEvent, channel: &str) -> bool {
+    let mut channels = 0usize;
+    let mut topics = 0usize;
+    for tag in &outer.tags {
+        match tag.first().map(String::as_str) {
+            Some("e")
+                if tag.len() == 4 && tag[2].is_empty() && tag[3] == "root" && tag[1] == channel =>
+            {
+                channels += 1
+            }
+            Some("e")
+                if tag.len() == 4
+                    && tag[2].is_empty()
+                    && tag[3] == "reply"
+                    && is_hex64(&tag[1]) =>
+            {
+                topics += 1
+            }
+            Some(ZK_TAG) | Some(SEALED_TAG) => {}
+            _ => return false,
+        }
+    }
+    channels == 1 && topics <= 1
 }
 
 fn has_zk_tag(tags: &[Vec<String>]) -> bool {
@@ -1309,6 +1322,41 @@ mod tests {
             ),
         ];
         for (what, outer) in cases {
+            assert_eq!(
+                open(&outer).unwrap_err(),
+                SealError::ChannelMismatch,
+                "{what}"
+            );
+        }
+        // Outer shape is exact (review H1): no other tag kinds, no relay hint,
+        // no extra elements on the channel or topic tag.
+        let shape_cases: Vec<(&str, NostrEvent)> = vec![
+            (
+                "an outer t tag",
+                reseal_tags(&good, |t| t.push(tag(&["t", "x"]))),
+            ),
+            (
+                "an outer q tag",
+                reseal_tags(&good, |t| t.push(tag(&["q", &"b".repeat(64)]))),
+            ),
+            (
+                "a relay hint on the topic",
+                reseal_tags(&good, |t| t[3][2] = "wss://x".into()),
+            ),
+            (
+                "an extra element on the topic",
+                reseal_tags(&good, |t| t[3].push("x".into())),
+            ),
+            (
+                "a relay hint on the channel",
+                reseal_tags(&good, |t| t[0][2] = "wss://x".into()),
+            ),
+            (
+                "a non-hex topic",
+                reseal_tags(&good, |t| t[3][1] = "not-an-id".into()),
+            ),
+        ];
+        for (what, outer) in shape_cases {
             assert_eq!(
                 open(&outer).unwrap_err(),
                 SealError::ChannelMismatch,
