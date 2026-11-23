@@ -26,7 +26,7 @@
 //! | `tags[0]`    | `["e", <channel_id>, "", "root"]`, the same channel as the inner event's root `e` tag |
 //! | `tags[1]`    | `["zk", <zone>, "<epoch>", <zone_pk_hex>]`, the existing zone-key tag |
 //! | `tags[2]`    | `["sealed", <inner.id>, "1"]`: marker, inner id and format version |
-//! | `tags[3]`    | only when the inner event replies to a topic: `["e", <topic_root>, "", "reply"]`, copied from the inner event's `reply`-marked `e` tag (see [`reply_root_of`]) |
+//! | `tags[3]`    | only when the inner event replies to a topic: `["e", <topic_root>, "", "reply"]`, copied from the inner event's `reply`-marked `e` tag (see [`reply_root_of`]); only when the inner event IS a topic root (a `root` channel tag and no `reply` tag): the marker `["t", "topic"]` (see [`TOPIC_MARKER`]) |
 //! | `content`    | `nip44_v2_encrypt(migrator_sk, zone_pk, inner_json)` |
 //! | `sig`        | the migrator's Schnorr signature |
 //!
@@ -69,7 +69,11 @@
 //!   learn which envelopes share a topic, and each topic's volume and timing,
 //!   not its name or content (the root is sealed too). `quote` targets, any
 //!   other `e` tags and all `p` tags stay inside the ciphertext. A topic
-//!   root carries no outer topic tag. Additive: the version marker stays
+//!   root carries no outer topic tag; it carries the outer marker
+//!   `["t", "topic"]` instead, so one `{"#t":["topic"],"#e":[channel]}`
+//!   query lists a section's topics. The relay could already derive the set
+//!   of roots (and their dates to the second) from the replies' topic tags,
+//!   so the marker adds essentially nothing. Additive: the version marker stays
 //!   `1`, and envelopes sealed without the topic tag still open.
 //!
 //! # Trust boundary
@@ -300,6 +304,21 @@ pub fn channel_of(ev: &NostrEvent) -> Option<&str> {
         .map(|t| t[1].as_str())
 }
 
+/// The value of the outer `t` tag that marks a sealed topic root
+/// (`["t", "topic"]`), set by [`seal_original`] when the original is a topic
+/// root: a channel `root` tag and no `reply` tag.
+pub const TOPIC_MARKER: &str = "topic";
+
+/// Whether `ev` is shaped as a topic root: a `root`-marked `e` tag and no
+/// `reply`-marked one.
+pub fn is_topic_root(ev: &NostrEvent) -> bool {
+    reply_root_of(ev).is_none()
+        && ev
+            .tags
+            .iter()
+            .any(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
+}
+
 /// The topic root a kind-42 replies to: the value of its first `e` tag whose
 /// marker is exactly `reply` (`["e", <root>, <relay>, "reply"]`), chosen by
 /// marker, never by position. A `quote` or unmarked `e` tag is never a topic.
@@ -368,6 +387,7 @@ pub fn seal_original(
         &inner_json,
         channel,
         topic,
+        is_topic_root(original),
         original.created_at,
         &original.id,
         zone,
@@ -535,6 +555,14 @@ fn open_with(
             return Err(SealError::ChannelMismatch);
         }
     }
+    // A topic-root marker only on a root-shaped inner event.
+    let marked = outer
+        .tags
+        .iter()
+        .any(|t| t.len() == 2 && t[0] == "t" && t[1] == TOPIC_MARKER);
+    if marked && !is_topic_root(&inner) {
+        return Err(SealError::ChannelMismatch);
+    }
     Ok(inner)
 }
 
@@ -575,6 +603,7 @@ fn build_envelope(
     inner_json: &str,
     channel: &str,
     topic: Option<&str>,
+    root_marker: bool,
     created_at: u64,
     inner_id: &str,
     zone: &str,
@@ -603,6 +632,9 @@ fn build_envelope(
             SEALED_VERSION.to_string(),
         ],
     ];
+    if root_marker && topic.is_none() {
+        tags.push(vec!["t".to_string(), TOPIC_MARKER.to_string()]);
+    }
     if let Some(topic) = topic {
         tags.push(vec![
             "e".to_string(),
@@ -625,12 +657,13 @@ fn build_envelope(
 
 /// The outer tags are exactly what [`build_envelope`] writes: the channel
 /// `["e", channel, "", "root"]`, the `zk` and `sealed` tags, and at most one
-/// topic `["e", topic, "", "reply"]`, each with exactly those elements (empty
+/// of: a topic `["e", topic, "", "reply"]` or the root marker `["t", "topic"]`, each with exactly those elements (empty
 /// relay hint). Any other tag, hint or extra element is metadata the format
 /// does not expose (check 7).
 fn outer_shape_ok(outer: &NostrEvent, channel: &str) -> bool {
     let mut channels = 0usize;
     let mut topics = 0usize;
+    let mut markers = 0usize;
     for tag in &outer.tags {
         match tag.first().map(String::as_str) {
             Some("e")
@@ -646,11 +679,12 @@ fn outer_shape_ok(outer: &NostrEvent, channel: &str) -> bool {
             {
                 topics += 1
             }
+            Some("t") if tag.len() == 2 && tag[1] == TOPIC_MARKER => markers += 1,
             Some(ZK_TAG) | Some(SEALED_TAG) => {}
             _ => return false,
         }
     }
-    channels == 1 && topics <= 1
+    channels == 1 && topics <= 1 && markers <= 1 && !(topics == 1 && markers == 1)
 }
 
 fn has_zk_tag(tags: &[Vec<String>]) -> bool {
@@ -818,6 +852,7 @@ mod tests {
             inner_json,
             channel,
             None,
+            false,
             created_at,
             inner_id,
             "zone3",
@@ -1276,12 +1311,16 @@ mod tests {
     }
 
     #[test]
-    fn a_topic_root_carries_no_outer_topic_tag() {
+    fn a_topic_root_carries_the_marker_and_no_topic_tag() {
         let root = inner_with(vec![tag(&["e", &channel(), "", "root"])]);
         let outer = seal_original(&root, "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
         assert_eq!(outer.tags.iter().filter(|t| t[0] == "e").count(), 1);
         assert_eq!(reply_root_of(&outer), None);
+        assert!(outer.tags.contains(&tag(&["t", TOPIC_MARKER])));
         assert!(open(&outer).is_ok());
+        // A reply never gets the marker.
+        let reply = seal_original(&original(), "zone3", 1, &zone_pk_hex(), &migrator()).unwrap();
+        assert!(reply.tags.iter().all(|t| t[0] != "t"));
     }
 
     #[test]
@@ -1350,6 +1389,21 @@ mod tests {
             (
                 "a relay hint on the channel",
                 reseal_tags(&good, |t| t[0][2] = "wss://x".into()),
+            ),
+            (
+                "a root marker on a reply",
+                reseal_tags(&good, |t| {
+                    t.truncate(3);
+                    t.push(tag(&["t", TOPIC_MARKER]));
+                }),
+            ),
+            (
+                "a root marker beside the topic tag",
+                reseal_tags(&good, |t| t.push(tag(&["t", TOPIC_MARKER]))),
+            ),
+            (
+                "a second root marker",
+                reseal_tags(&good_root, |t| t.push(tag(&["t", TOPIC_MARKER]))),
             ),
             (
                 "a non-hex topic",
