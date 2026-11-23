@@ -310,8 +310,10 @@ fn TopicRow(topic: TopicSummary, href: String) -> impl IntoView {
     // so the card stays one click target, while an author's abridged key (no
     // profile name) sits above that overlay as its own click-to-copy button —
     // never a button nested inside a link.
+    // Scroll anchor for history paging (utils/scroll_anchor.rs).
+    let anchor_id = topic.id.clone();
     view! {
-        <div class="relative block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 hover:border-amber-500/30 rounded-lg p-4 text-inherit transition-colors group">
+        <div data-anchor-id=anchor_id class="relative block bg-gray-800/60 hover:bg-gray-800 border border-gray-700/60 hover:border-amber-500/30 rounded-lg p-4 text-inherit transition-colors group">
             <div class="flex items-start gap-3">
                 <div class="flex-shrink-0 mt-0.5">
                     <Avatar pubkey=pk size=AvatarSize::Md />

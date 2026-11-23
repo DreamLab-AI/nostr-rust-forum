@@ -599,7 +599,15 @@ pub fn SectionPage() -> impl IntoView {
                     // back until the start of the channel.
                     let history_cid = Signal::derive(move || resolved_channel.get().map(|c| c.id));
                     let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
+                    // Bounded window: once older pages have evicted the
+                    // newest topics, a loader above the list brings them back.
                     view! {
+                        <crate::components::history_loader::HistoryLoader
+                            channel_id=history_cid
+                            gated=history_gated
+                            label="Load newer topics"
+                            direction=crate::components::history_loader::HistoryDirection::Newer
+                        />
                         <TopicList
                             channel_id=ch_id
                             category=category_for_topics.get()
@@ -608,7 +616,7 @@ pub fn SectionPage() -> impl IntoView {
                         <crate::components::history_loader::HistoryLoader
                             channel_id=history_cid
                             gated=history_gated
-                            older_label="Load older topics"
+                            label="Load older topics"
                         />
                     }.into_any()
                 } else {

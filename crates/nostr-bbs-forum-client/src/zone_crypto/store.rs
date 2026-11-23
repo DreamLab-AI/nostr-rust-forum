@@ -544,6 +544,30 @@ impl ZoneKeyStore {
         self.revision.update(|r| *r += 1);
     }
 
+    /// Forget messages history paging has evicted from the channel store:
+    /// their ciphertexts, envelopes and restored mappings
+    /// ([`ReadCache::evict`]) and their encrypted marks, in one update each,
+    /// so evicted plaintext is not kept anywhere. Conversation keys stay
+    /// (they belong to the zone secret and author, not to a message), as do
+    /// verified event ids.
+    pub fn forget(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.cache
+            .update_value(|c| c.evict(ids.iter().map(String::as_str)));
+        if self
+            .encrypted_ids
+            .with_untracked(|s| ids.iter().any(|id| s.contains(id)))
+        {
+            self.encrypted_ids.update(|s| {
+                for id in ids {
+                    s.remove(id);
+                }
+            });
+        }
+    }
+
     /// [`redecrypt`](Self::redecrypt) for a key that was ADDED (never one
     /// removed or replaced: those revert synchronously), spread
     /// over the event loop so a cold-key join does not freeze the page: the

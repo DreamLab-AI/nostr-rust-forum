@@ -425,6 +425,11 @@ pub fn ThreadPage() -> impl IntoView {
         resolve_section_channel(&chans, &category_slug(), &section_param(), &zones)
     });
 
+    // Whether the deep-link walk has restarted the channel's history window
+    // from the newest page (see the walk below). Absence is only concluded
+    // after the walk covered the newest messages too.
+    let restarted = StoredValue::new(false);
+
     // Pod container for images attached in this thread: the channel's zone.
     let thread_media_target = Signal::derive(move || {
         crate::stores::zones::media_target_for_section(
@@ -675,8 +680,10 @@ pub fn ThreadPage() -> impl IntoView {
             // With paged history a receipt only means the NEWEST page is in:
             // the topic is absent only once the walk below has reached the
             // start of the channel's history.
-            let settled =
-                store.history_receipt(&cid).settles(gated) && store.history_cursor(&cid).exhausted;
+            let cursor = store.history_cursor(&cid);
+            let settled = store.history_receipt(&cid).settles(gated)
+                && cursor.exhausted
+                && (cursor.newer_from.is_none() || restarted.get_value());
             Lookup::decide_with_keys(
                 topic_root.with(Option::is_some),
                 settled,
@@ -706,8 +713,25 @@ pub fn ThreadPage() -> impl IntoView {
                 return;
             }
             store.settle_first_page(&cid, gated);
-            if store.history_cursor(&cid).next_request().is_some() {
-                store.load_older(&relay, &cid, vec![cid.clone()], gated, Rc::new(|| {}));
+            let cursor = store.history_cursor(&cid);
+            // The window may be detached in older history (the section view
+            // paged far back and evicted the newest topics): a topic newer
+            // than the window would never be found walking older, so start
+            // again from the newest page first, once.
+            if cursor.newer_from.is_some() && !cursor.loading && !restarted.get_value() {
+                restarted.set_value(true);
+                store.reload_newest(&relay, &cid, vec![cid.clone()], gated);
+                return;
+            }
+            if cursor.next_request().is_some() {
+                store.load_older(
+                    &relay,
+                    &cid,
+                    vec![cid.clone()],
+                    gated,
+                    Rc::new(|| {}),
+                    Rc::new(|| {}),
+                );
             }
         });
     }

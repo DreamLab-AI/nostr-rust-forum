@@ -735,20 +735,46 @@ pub fn ChannelPage() -> impl IntoView {
         retry_nonce.update(|n| *n = n.wrapping_add(1));
     };
 
-    // -- Scroll: follow new posts, keep the reader's place on older pages ---
+    // -- Scroll: follow new posts, keep the reader's place across pages ----
     //
     // `near_bottom` is kept by the scroll handler: a new post at the bottom
-    // pulls the view down only when the reader was already there (or on the
-    // first render), never while they are reading older history. When an
-    // older page is prepended, `scroll_anchor` (scroll height and offset
-    // taken just before the page entered the store) puts the same messages
-    // back under the reader: new offset = old offset + height added above.
-    // The container sets `overflow-anchor: none` so the browser's own scroll
-    // anchoring cannot add a second correction.
+    // pulls the view down only when the reader was already there and the
+    // window holds the newest messages, never while they read history.
+    //
+    // A history page lands at one end and the bounded window evicts at the
+    // other, so the height above the reader can grow or shrink in the same
+    // update. `utils::scroll_anchor` notes a visible row before the page is
+    // applied and scrolls by however far it moved afterwards; `paging` keeps
+    // the follow-new-posts scroll out of the way meanwhile. The container
+    // sets `overflow-anchor: none` so the browser's own anchoring does not
+    // fight it.
     let near_bottom = StoredValue::new(true);
-    let scroll_anchor = StoredValue::new(None::<(i32, i32)>);
-    let last_ends = StoredValue::new((None::<String>, None::<String>));
+    let paging = StoredValue::new(false);
+    let row_anchor = StoredValue::new_local(None::<crate::utils::scroll_anchor::Anchor>);
     let store_for_history = use_context::<ChannelStore>();
+    type PageHooks = (Rc<dyn Fn()>, Rc<dyn Fn()>);
+    let page_hooks = move || -> PageHooks {
+        let before: Rc<dyn Fn()> = Rc::new(move || {
+            paging.set_value(true);
+            let container = messages_container
+                .get_untracked()
+                .map(web_sys::Element::from);
+            row_anchor.set_value(crate::utils::scroll_anchor::capture(container.as_ref()));
+        });
+        let after: Rc<dyn Fn()> = Rc::new(move || {
+            let anchor = row_anchor.try_update_value(Option::take).flatten();
+            let container = messages_container
+                .get_untracked()
+                .map(web_sys::HtmlElement::from);
+            if let Some(a) = anchor {
+                crate::utils::scroll_anchor::restore(a, container);
+            }
+            // After the restore's zero-delay timeout.
+            set_timeout_once(move || paging.set_value(false), 0);
+        });
+        (before, after)
+    };
+    let relay_for_newer = relay_for_history.clone();
     let request_older = StoredValue::new_local(Rc::new(move || {
         let Some(store) = store_for_history else {
             return;
@@ -756,29 +782,49 @@ pub fn ChannelPage() -> impl IntoView {
         let Some((cid, needles)) = history_needles.get_value() else {
             return;
         };
-        let before_apply: Rc<dyn Fn()> = Rc::new(move || {
-            if let Some(c) = messages_container.get_untracked() {
-                let el: web_sys::HtmlElement = c.into();
-                scroll_anchor.set_value(Some((el.scroll_height(), el.scroll_top())));
-            }
-        });
+        let (before, after) = page_hooks();
         store.load_older(
             &relay_for_history,
             &cid,
             needles,
             signed_in.get_untracked(),
-            before_apply,
+            before,
+            after,
         );
     }) as Rc<dyn Fn()>);
+    let request_newer = {
+        let relay = relay_for_newer;
+        StoredValue::new_local(Rc::new(move || {
+            let Some(store) = store_for_history else {
+                return;
+            };
+            let Some((cid, needles)) = history_needles.get_value() else {
+                return;
+            };
+            let (before, after) = page_hooks();
+            store.load_newer(
+                &relay,
+                &cid,
+                needles,
+                signed_in.get_untracked(),
+                before,
+                after,
+            );
+        }) as Rc<dyn Fn()>)
+    };
     let on_messages_scroll = move |_: leptos::ev::Event| {
         let Some(c) = messages_container.get_untracked() else {
             return;
         };
         let el: web_sys::HtmlElement = c.into();
         let top = el.scroll_top();
-        near_bottom.set_value(el.scroll_height() - top - el.client_height() < 120);
+        let from_bottom = el.scroll_height() - top - el.client_height();
+        near_bottom.set_value(from_bottom < 120);
         if top < 400 {
             request_older.with_value(|f| f());
+        } else if from_bottom < 400 {
+            // Only does anything while the window is detached from the newest.
+            request_newer.with_value(|f| f());
         }
     };
     // The history state of this channel, for the indicator above the list.
@@ -801,39 +847,32 @@ pub fn ChannelPage() -> impl IntoView {
         })
     });
 
+    let last_newest = StoredValue::new(None::<String>);
     Effect::new(move |_| {
-        let (count, oldest, newest, last) = messages.with(|m| {
+        let (count, newest, last) = messages.with(|m| {
             (
                 m.len(),
-                m.first().map(|x| x.id.clone()),
                 m.last().map(|x| x.id.clone()),
                 m.last().map(|x| (x.id.clone(), x.created_at)),
             )
         });
-        let (prev_oldest, prev_newest) = last_ends.get_value();
-        last_ends.set_value((oldest.clone(), newest.clone()));
+        let prev_newest = last_newest.get_value();
+        last_newest.set_value(newest.clone());
+        let attached =
+            history_state.with_untracked(|c| c.as_ref().is_none_or(|c| c.newer_from.is_none()));
         if let Some(container) = messages_container.get() {
             let el: web_sys::HtmlElement = container.into();
-            if newest != prev_newest && near_bottom.get_value() {
+            if newest != prev_newest && near_bottom.get_value() && attached && !paging.get_value() {
                 set_timeout_once(
                     move || {
                         el.set_scroll_top(el.scroll_height());
                     },
                     50,
                 );
-            } else if oldest != prev_oldest {
-                if let Some((height, top)) = scroll_anchor.try_update_value(Option::take).flatten()
-                {
-                    set_timeout_once(
-                        move || {
-                            el.set_scroll_top(top + el.scroll_height() - height);
-                        },
-                        0,
-                    );
-                }
             }
         }
-        // Mark channel as read when messages load or new ones arrive
+        // Mark channel as read when messages load or new ones arrive (never
+        // backwards: `mark_read` only advances).
         if count > 0 {
             if let Some((id, created_at)) = last {
                 let cid = channel_id();
@@ -1268,6 +1307,7 @@ pub fn ChannelPage() -> impl IntoView {
                                             key=|m| (m.id.clone(), content_key(&m.content))
                                             children=move |msg| {
                                                 let id = msg.id.clone();
+                                                let anchor_id = msg.id.clone();
                                                 view! {
                                                     <>
                                                         {move || (divider_before.get().as_deref() == Some(id.as_str())).then(|| view! {
@@ -1277,11 +1317,29 @@ pub fn ChannelPage() -> impl IntoView {
                                                                 <div class="flex-1 h-px" style="background:color-mix(in srgb, var(--zone-accent) 35%, transparent)"></div>
                                                             </div>
                                                         })}
-                                                        <MessageBubble message=msg/>
+                                                        <div data-anchor-id=anchor_id>
+                                                            <MessageBubble message=msg/>
+                                                        </div>
                                                     </>
                                                 }
                                             }
                                         />
+                                        {move || history_state.get().filter(|h| h.newer_from.is_some()).map(|h| view! {
+                                            <div class="flex justify-center py-2 text-xs text-gray-500" data-history-direction="newer" data-history-state=if h.loading { "loading" } else { "newer" }>
+                                                {if h.loading {
+                                                    view! { <span>"Loading\u{2026}"</span> }.into_any()
+                                                } else {
+                                                    view! {
+                                                        <button
+                                                            class="text-xs text-gray-400 hover:text-gray-200 underline"
+                                                            on:click=move |_| request_newer.with_value(|f| f())
+                                                        >
+                                                            "Load newer messages"
+                                                        </button>
+                                                    }.into_any()
+                                                }}
+                                            </div>
+                                        })}
                                     </div>
                                 }.into_any()
                             }

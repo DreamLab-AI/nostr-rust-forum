@@ -46,8 +46,19 @@ impl ReadPositionStore {
         }
     }
 
-    /// Mark a channel as read up to the given event.
+    /// Mark a channel as read up to the given event. Never moves back in time
+    /// (as [`Self::mark_many_read`]; within one second the id may change): with paged history a view can show an older
+    /// window whose newest message is behind the read position, and marking
+    /// that must not bring the unread badge back.
     pub fn mark_read(&self, channel_id: &str, event_id: &str, timestamp: u64) {
+        let newer = self.inner.with_untracked(|rp| {
+            rp.positions.get(channel_id).is_none_or(|p| {
+                timestamp > p.timestamp || (timestamp == p.timestamp && p.last_event_id != event_id)
+            })
+        });
+        if !newer {
+            return;
+        }
         self.inner.update(|rp| {
             rp.positions.insert(
                 channel_id.to_string(),

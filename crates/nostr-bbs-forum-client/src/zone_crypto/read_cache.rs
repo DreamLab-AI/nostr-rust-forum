@@ -207,6 +207,28 @@ impl ReadCache {
         self.restored.get(inner_id).map(String::as_str)
     }
 
+    /// Forget the messages `ids` (ids as they appear in the channel lists),
+    /// as history paging evicts them: a live post's ciphertext, a
+    /// placeholder's envelope, and for a restored sealed original both the
+    /// id mapping and the envelope it came from. The cache then holds no
+    /// trace of an evicted message, so nothing of it can be re-opened or
+    /// re-displayed until the relay delivers it again.
+    pub fn evict<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            self.ciphertexts.remove(id);
+            self.envelopes.remove(id);
+            if let Some(outer) = self.restored.remove(id) {
+                self.envelopes.remove(&outer);
+            }
+        }
+    }
+
+    /// Entries held (ciphertexts, envelopes, restored mappings), for tests.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.ciphertexts.len() + self.envelopes.len() + self.restored.len()
+    }
+
     /// Whether nothing has been cached yet (no zone-encrypted message seen).
     pub fn is_empty(&self) -> bool {
         self.ciphertexts.is_empty() && self.envelopes.is_empty()
@@ -448,6 +470,37 @@ mod tests {
         for list in msgs.values() {
             assert_eq!(list[0].content, "twice");
         }
+    }
+
+    /// Evicting a page leaves no cache entry behind: a restored original's
+    /// envelope is reached through the restored mapping, a live post's
+    /// ciphertext and a placeholder's envelope by their own ids.
+    #[test]
+    fn evict_drops_every_trace_of_the_evicted_messages() {
+        let mut cache = ReadCache::default();
+        let mut msgs = one_channel(Vec::new());
+        let list = msgs.get_mut(&channel()).unwrap();
+        let sealed = seal(&original(100, "sealed"));
+        let live = live_encrypted(ALICE, 101, "live");
+        let locked = seal(&original(102, "locked"));
+        assert!(insert_message(list, cache.prepare(&sealed, with_key)));
+        assert!(insert_message(list, cache.prepare(&live, with_key)));
+        assert!(insert_message(list, cache.prepare(&locked, no_key)));
+        assert!(
+            cache.len() >= 4,
+            "restored + envelope, ciphertext, envelope"
+        );
+        let ids: Vec<String> = msgs[&channel()].iter().map(|e| e.id.clone()).collect();
+        assert_ne!(
+            ids[0], sealed.id,
+            "the list holds the restored original's id"
+        );
+        cache.evict(ids.iter().map(String::as_str));
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        // The same envelopes delivered again are prepared afresh.
+        let again = cache.prepare(&sealed, with_key);
+        assert_eq!(again.content, "sealed");
     }
 
     #[test]

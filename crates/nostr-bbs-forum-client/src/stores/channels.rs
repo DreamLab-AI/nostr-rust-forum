@@ -128,6 +128,9 @@ pub struct ChannelStore {
     /// Paged history per channel id (see [`HistoryCursor`]). Reactive, so the
     /// channel page can show "loading older" and "start of history".
     history: RwSignal<HashMap<String, HistoryCursor>>,
+    /// The most messages one channel's history window holds
+    /// ([`HISTORY_WINDOW`], or `window.__ENV__.HISTORY_WINDOW`).
+    window_max: usize,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -171,6 +174,7 @@ impl ChannelStore {
             signer_admin: SignerAdminCache::new(),
             deletion_progress: StoredValue::new(DeletionProgress::new(deletions)),
             history: RwSignal::new(HashMap::new()),
+            window_max: configured_window(),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -634,6 +638,13 @@ impl ChannelStore {
             });
 
             if let Some(cid) = resolved {
+                // Not while the channel's history window is detached in older
+                // history: a newer post here would open a gap; the window's
+                // own reload brings it. Checked before decrypting, so a
+                // dropped post leaves nothing in the decrypt cache.
+                if !store.window_admits(&cid, event.created_at) {
+                    return;
+                }
                 // Zone-encrypted messages become readable text (or a
                 // placeholder) here, once, for every view (ADR-2016).
                 let event = crate::zone_crypto::store::prepare_incoming(zone_keys, event);
@@ -766,6 +777,10 @@ impl ChannelStore {
                 Some(v) => v,
                 None => return,
             };
+            // As in `start_msg_sync`: nothing newer than a detached window.
+            if !store.window_admits(&cid, event.created_at) {
+                return;
+            }
             let event = crate::zone_crypto::store::prepare_incoming(zone_keys, event);
             // A restored sealed original carries the original id (ADR-2017).
             if !store.admits_message(zone_keys, &event) {
@@ -897,7 +912,24 @@ impl ChannelStore {
     /// Insert a batch of ingested messages in ONE store update (a page of
     /// 100 would otherwise notify every subscriber 100 times), advancing
     /// each channel's last activity for genuinely new messages.
+    ///
+    /// Messages the channel's history window does not hold
+    /// ([`HistoryCursor::admits`]: newer than the window while it is detached
+    /// from the newest) are dropped, and their decrypt-cache entries with
+    /// them; the window's own reload brings them back in order.
     pub fn apply_page(&self, events: Vec<(String, NostrEvent)>) {
+        if events.is_empty() {
+            return;
+        }
+        let (events, refused): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|(cid, ev)| self.window_admits(cid, ev.created_at));
+        if !refused.is_empty() {
+            let ids: Vec<String> = refused.into_iter().map(|(_, ev)| ev.id).collect();
+            if let Some(z) = crate::zone_crypto::store::try_use_zone_key_store() {
+                z.forget(&ids);
+            }
+        }
         if events.is_empty() {
             return;
         }
@@ -923,47 +955,111 @@ impl ChannelStore {
         }
     }
 
-    /// Fetch the next older page of channel `cid` (see [`HistoryCursor`]) as
-    /// a one-shot REQ over the channel's `#e` `needles`, closed on its
-    /// answer. Returns whether a request went out (`false` before the first
-    /// page, while one is in flight, or at the start of history).
+    /// Whether channel `cid`'s history window holds a message from `ts`
+    /// (always, unless the window is detached from the newest messages).
+    pub fn window_admits(&self, cid: &str, ts: u64) -> bool {
+        self.history
+            .with_untracked(|m| m.get(cid).is_none_or(|c| c.admits(ts)))
+    }
+
+    /// Bring channel `cid` back within [`Self::window_max`] after a page
+    /// landed, evicting from the side away from the reader: the NEWEST
+    /// messages after an older page (the cursor records the evicted range
+    /// as a newer segment to reload), the OLDEST after a newer page (older
+    /// paging reloads them). Evicted messages leave the store in one update
+    /// and their decrypt-cache entries and plaintext go with them
+    /// ([`ZoneKeyStore::forget`](crate::zone_crypto::store::ZoneKeyStore::forget)).
+    fn enforce_window(&self, cid: &str, side: EvictSide) {
+        let max = self.window_max;
+        if self
+            .channel_messages
+            .with_untracked(|m| m.get(cid).is_none_or(|l| l.len() <= max))
+        {
+            return;
+        }
+        let mut evicted: Option<(u64, Vec<NostrEvent>)> = None;
+        self.channel_messages.update(|m| {
+            if let Some(list) = m.get_mut(cid) {
+                evicted = match side {
+                    EvictSide::Newest => evict_newest(list, max),
+                    EvictSide::Oldest => evict_oldest(list, max),
+                };
+            }
+        });
+        let Some((cut, gone)) = evicted else {
+            return;
+        };
+        self.history.update(|m| {
+            let c = m.entry(cid.to_string()).or_default();
+            match side {
+                EvictSide::Newest => c.on_evicted_newest(cut),
+                EvictSide::Oldest => c.on_evicted_oldest(cut),
+            }
+        });
+        let ids: Vec<String> = gone.into_iter().map(|e| e.id).collect();
+        if let Some(z) = crate::zone_crypto::store::try_use_zone_key_store() {
+            z.forget(&ids);
+        }
+    }
+
+    /// Replace channel `cid`'s window with `events` (a newest page) and
+    /// restart its cursor from that page, forgetting everything it held.
+    fn reset_to_newest(&self, cid: &str, events: Vec<(String, NostrEvent)>, page: PageOutcome) {
+        let mut gone: Vec<String> = Vec::new();
+        self.channel_messages.update(|m| {
+            if let Some(list) = m.get_mut(cid) {
+                gone = list.drain(..).map(|e| e.id).collect();
+            }
+        });
+        if let Some(z) = crate::zone_crypto::store::try_use_zone_key_store() {
+            z.forget(&gone);
+        }
+        self.history.update(|m| {
+            let mut c = HistoryCursor::default();
+            c.record_first(page);
+            m.insert(cid.to_string(), c);
+        });
+        self.apply_page(events);
+    }
+
+    /// One history page as a one-shot REQ for `filter`, closed on its
+    /// answer; `on_done` gets what was ingested and what was delivered.
     ///
     /// With `wait_auth` (a signed-in reader), only an authenticated answer
     /// counts: before NIP-42 AUTH the relay withholds gated zones, and an
     /// empty anonymous answer must not read as the start of history; the
-    /// relay replays the REQ after AUTH. `before_apply` runs just before the
-    /// page enters the store, so the page can anchor its scroll position.
-    /// A request with no answer within [`PAGE_TIMEOUT_MS`] is abandoned and
-    /// the cursor released, so the next scroll retries.
-    pub fn load_older(
+    /// relay replays the REQ after AUTH. A request with no answer within
+    /// [`PAGE_TIMEOUT_MS`] is abandoned: the cursor is released (the next
+    /// scroll retries; nothing was popped or recorded) and the decrypt-cache
+    /// entries of what was buffered are forgotten.
+    fn one_shot_page(
         &self,
         relay: &RelayConnection,
         cid: &str,
-        needles: Vec<String>,
+        filter: Filter,
         wait_auth: bool,
-        before_apply: Rc<dyn Fn()>,
-    ) -> bool {
-        let Some(req) = self
-            .history
-            .with_untracked(|m| m.get(cid).and_then(HistoryCursor::next_request))
-        else {
-            return false;
-        };
+        on_done: PageDone,
+    ) {
         self.history.update(|m| {
-            if let Some(c) = m.get_mut(cid) {
-                c.loading = true;
-            }
+            m.entry(cid.to_string()).or_default().loading = true;
         });
 
-        #[derive(Default)]
         struct Buf {
             delivered: u64,
             oldest: Option<u64>,
             events: Vec<(String, NostrEvent)>,
             done: bool,
             sub: Option<String>,
+            on_done: Option<PageDone>,
         }
-        let buf = Rc::new(RefCell::new(Buf::default()));
+        let buf = Rc::new(RefCell::new(Buf {
+            delivered: 0,
+            oldest: None,
+            events: Vec::new(),
+            done: false,
+            sub: None,
+            on_done: Some(on_done),
+        }));
         let store = *self;
         let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
         let key = cid.to_string();
@@ -993,7 +1089,7 @@ impl ChannelStore {
                 if !authed && wait_auth {
                     return;
                 }
-                let (events, page, sub) = {
+                let (events, page, sub, done) = {
                     let mut b = buf.borrow_mut();
                     if b.done {
                         return;
@@ -1003,39 +1099,46 @@ impl ChannelStore {
                         delivered: b.delivered,
                         oldest: b.oldest,
                     };
-                    (std::mem::take(&mut b.events), page, b.sub.take())
+                    (
+                        std::mem::take(&mut b.events),
+                        page,
+                        b.sub.take(),
+                        b.on_done.take(),
+                    )
                 };
                 if let Some(id) = sub {
                     relay.unsubscribe(&id);
                 }
-                before_apply();
-                store.apply_page(events);
                 let _ = store.history.try_update(|m| {
                     if let Some(c) = m.get_mut(&key) {
-                        c.record(req, page);
+                        c.loading = false;
                     }
                 });
+                if let Some(f) = done {
+                    f(events, page);
+                }
             })
         };
-        let id = relay.subscribe_with_receipt(
-            vec![HistoryCursor::filter(req, &needles)],
-            on_event,
-            on_receipt,
-        );
+        let id = relay.subscribe_with_receipt(vec![filter], on_event, on_receipt);
         buf.borrow_mut().sub = Some(id);
 
         let relay = relay.clone();
         gloo::timers::callback::Timeout::new(PAGE_TIMEOUT_MS, move || {
-            let sub = {
+            let (sub, buffered) = {
                 let mut b = buf.borrow_mut();
                 if b.done {
                     return;
                 }
                 b.done = true;
-                b.sub.take()
+                b.on_done = None;
+                (b.sub.take(), std::mem::take(&mut b.events))
             };
             if let Some(id) = sub {
                 relay.unsubscribe(&id);
+            }
+            if let Some(z) = zone_keys {
+                let ids: Vec<String> = buffered.into_iter().map(|(_, ev)| ev.id).collect();
+                z.forget(&ids);
             }
             let _ = store.history.try_update(|m| {
                 if let Some(c) = m.get_mut(&key) {
@@ -1044,6 +1147,136 @@ impl ChannelStore {
             });
         })
         .forget();
+    }
+
+    /// Fetch the next older page of channel `cid` (see [`HistoryCursor`])
+    /// over the channel's `#e` `needles`. Returns whether a request went out
+    /// (`false` before the first page, while one is in flight, or at the
+    /// start of history). `before_apply` runs just before the page enters
+    /// the store and `after_apply` just after (the page anchors its scroll
+    /// position around them); the window is then brought back within bounds
+    /// by evicting its newest messages.
+    pub fn load_older(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        needles: Vec<String>,
+        wait_auth: bool,
+        before_apply: Rc<dyn Fn()>,
+        after_apply: Rc<dyn Fn()>,
+    ) -> bool {
+        let Some(req) = self
+            .history
+            .with_untracked(|m| m.get(cid).and_then(HistoryCursor::next_request))
+        else {
+            return false;
+        };
+        let store = *self;
+        let key = cid.to_string();
+        self.one_shot_page(
+            relay,
+            cid,
+            HistoryCursor::filter(req, &needles),
+            wait_auth,
+            Box::new(move |events, page| {
+                before_apply();
+                store.apply_page(events);
+                let _ = store.history.try_update(|m| {
+                    if let Some(c) = m.get_mut(&key) {
+                        c.record(req, page);
+                    }
+                });
+                store.enforce_window(&key, EvictSide::Newest);
+                after_apply();
+            }),
+        );
+        true
+    }
+
+    /// Reload the evicted messages next newer than channel `cid`'s window
+    /// (the top of [`HistoryCursor::newer`]), then evict its oldest messages
+    /// to stay within bounds. Returns whether a request went out (`false`
+    /// while the window holds the newest messages, before the first page or
+    /// while a request is in flight). The segment leaves the stack only when
+    /// its page is applied, so a timed-out reload leaves no gap. Should the
+    /// open-ended newest segment hold a full relay page (more live posts
+    /// arrived while the window was detached than one request returns), the
+    /// window restarts from that newest page instead.
+    pub fn load_newer(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        needles: Vec<String>,
+        wait_auth: bool,
+        before_apply: Rc<dyn Fn()>,
+        after_apply: Rc<dyn Fn()>,
+    ) -> bool {
+        let Some(seg) = self
+            .history
+            .with_untracked(|m| m.get(cid).and_then(HistoryCursor::next_newer))
+        else {
+            return false;
+        };
+        let store = *self;
+        let key = cid.to_string();
+        self.one_shot_page(
+            relay,
+            cid,
+            HistoryCursor::newer_filter(seg, &needles),
+            wait_auth,
+            Box::new(move |events, page| {
+                let mut outcome = NewerOutcome::Applied;
+                let _ = store.history.try_update(|m| {
+                    if let Some(c) = m.get_mut(&key) {
+                        outcome = c.record_newer(seg, page);
+                    }
+                });
+                before_apply();
+                match outcome {
+                    NewerOutcome::Applied => {
+                        store.apply_page(events);
+                        store.enforce_window(&key, EvictSide::Oldest);
+                    }
+                    NewerOutcome::Reset => store.reset_to_newest(&key, events, page),
+                }
+                after_apply();
+            }),
+        );
+        true
+    }
+
+    /// Restart channel `cid`'s window from its newest page (a one-shot REQ
+    /// of [`HISTORY_PAGE`]), dropping what it held. For a view that needs the
+    /// newest messages while the window is detached in older history, such
+    /// as a deep link to a topic newer than the window. Returns whether a
+    /// request went out.
+    pub fn reload_newest(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        needles: Vec<String>,
+        wait_auth: bool,
+    ) -> bool {
+        if self
+            .history
+            .with_untracked(|m| m.get(cid).is_some_and(|c| c.loading))
+        {
+            return false;
+        }
+        let store = *self;
+        let key = cid.to_string();
+        self.one_shot_page(
+            relay,
+            cid,
+            Filter {
+                kinds: Some(vec![42]),
+                e_tags: Some(needles),
+                limit: Some(HISTORY_PAGE),
+                ..Default::default()
+            },
+            wait_auth,
+            Box::new(move |events, page| store.reset_to_newest(&key, events, page)),
+        );
         true
     }
 
@@ -1251,6 +1484,108 @@ pub const RELAY_MAX_FILTERS: usize = 10;
 /// How long a history page request may go unanswered before it is abandoned.
 pub const PAGE_TIMEOUT_MS: u32 = 20_000;
 
+/// Default size of a channel's history window: the most messages kept in
+/// the store (and so in the DOM) for one channel. Paging past it evicts the
+/// far end, which is reloaded on the way back. At ~13 KB of wasm heap per
+/// loaded message (measured on a 50k-message channel), 3,000 keeps a
+/// channel's history around 40 MB however long it is.
+pub const HISTORY_WINDOW: usize = 3_000;
+
+/// The smallest window accepted: ten pages, so the older and newer loaders
+/// are never both on screen evicting each other's pages.
+pub const HISTORY_WINDOW_MIN: usize = 10 * HISTORY_PAGE as usize;
+
+/// `n` clamped to at least [`HISTORY_WINDOW_MIN`].
+pub fn clamp_window(n: usize) -> usize {
+    n.max(HISTORY_WINDOW_MIN)
+}
+
+/// The window size for this deployment: `window.__ENV__.HISTORY_WINDOW`
+/// (a number or numeric string) when set, else [`HISTORY_WINDOW`]; clamped.
+fn configured_window() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let configured = web_sys::window()
+            .and_then(|w| js_sys::Reflect::get(&w, &"__ENV__".into()).ok())
+            .filter(|env| env.is_object())
+            .and_then(|env| js_sys::Reflect::get(&env, &"HISTORY_WINDOW".into()).ok())
+            .and_then(|v| {
+                v.as_f64()
+                    .map(|f| f as usize)
+                    .or_else(|| v.as_string().and_then(|s| s.trim().parse().ok()))
+            });
+        if let Some(n) = configured {
+            return clamp_window(n);
+        }
+    }
+    clamp_window(HISTORY_WINDOW)
+}
+
+/// What a history page request hands back once answered: the ingested
+/// messages and what the relay delivered.
+type PageDone = Box<dyn FnOnce(Vec<(String, NostrEvent)>, PageOutcome)>;
+
+/// Which end of a channel's window to evict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictSide {
+    /// The newest messages (after an older page landed).
+    Newest,
+    /// The oldest messages (after a newer page was reloaded).
+    Oldest,
+}
+
+/// Evict the newest messages of `events` (sorted by `created_at`) so at most
+/// `max` remain, cutting only between seconds: every message from the cut
+/// second on goes, so a run of equal timestamps is never split. Returns the
+/// cut second and what was evicted; `None` when nothing needs to go, or when
+/// the cut would empty the window (one second holding more than `max`).
+pub fn evict_newest(events: &mut Vec<NostrEvent>, max: usize) -> Option<(u64, Vec<NostrEvent>)> {
+    if events.len() <= max {
+        return None;
+    }
+    let cut = events[max].created_at;
+    let keep = events.partition_point(|e| e.created_at < cut);
+    if keep == 0 {
+        return None;
+    }
+    Some((cut, events.split_off(keep)))
+}
+
+/// Evict the oldest messages of `events` (sorted) so at most `max` remain,
+/// cutting only between seconds: every message up to and including the
+/// returned second goes. `None` as for [`evict_newest`].
+pub fn evict_oldest(events: &mut Vec<NostrEvent>, max: usize) -> Option<(u64, Vec<NostrEvent>)> {
+    let len = events.len();
+    if len <= max {
+        return None;
+    }
+    let cut = events[len - max - 1].created_at;
+    let drop = events.partition_point(|e| e.created_at <= cut);
+    if drop == len {
+        return None;
+    }
+    Some((cut, events.drain(..drop).collect()))
+}
+
+/// A range of evicted messages newer than a channel's window: every message
+/// with `from <= created_at`, and `created_at < to` unless `to` is `None`
+/// (the range runs to the newest message, live posts included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub from: u64,
+    pub to: Option<u64>,
+}
+
+/// What [`HistoryCursor::record_newer`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewerOutcome {
+    /// The segment's messages are back in the window.
+    Applied,
+    /// The open-ended newest segment overflowed one relay page: restart the
+    /// window from the page returned (the newest messages).
+    Reset,
+}
+
 /// Messages per history page: the newest page a channel opens with, and each
 /// older page fetched when the reader scrolls to the top.
 pub const HISTORY_PAGE: u64 = 100;
@@ -1281,6 +1616,14 @@ pub struct HistoryCursor {
     pub loading: bool,
     /// The first (newest) page has been recorded.
     pub started: bool,
+    /// `None` while the window holds the newest messages. `Some(t)` once
+    /// newer messages were evicted: the window holds only messages older
+    /// than `t`, and live posts from `t` on are not inserted (the reload of
+    /// the newest segment brings them).
+    pub newer_from: Option<u64>,
+    /// Evicted ranges newer than the window, nearest last; reloaded by
+    /// [`ChannelStore::load_newer`] in that order.
+    pub newer: Vec<Segment>,
 }
 
 /// What one page request delivered: every event the relay sent for it,
@@ -1327,6 +1670,70 @@ impl HistoryCursor {
             limit: Some(limit),
             ..Default::default()
         }
+    }
+
+    /// Whether the window holds a message from `ts`.
+    pub fn admits(&self, ts: u64) -> bool {
+        self.newer_from.is_none_or(|t| ts < t)
+    }
+
+    /// The evicted range to reload next (nearest the window), or `None`
+    /// while the window holds the newest messages, before the first page,
+    /// or while a request (either direction) is in flight.
+    pub fn next_newer(&self) -> Option<Segment> {
+        if self.loading || !self.started {
+            return None;
+        }
+        self.newer.last().copied()
+    }
+
+    /// The filter reloading `seg`: `since = from`, `until = to - 1` (both
+    /// inclusive), up to [`RELAY_FILTER_LIMIT`]. A closed segment holds what
+    /// was evicted from it, about a page; the open one may also hold live
+    /// posts that arrived while the window was detached.
+    pub fn newer_filter(seg: Segment, needles: &[String]) -> Filter {
+        Filter {
+            kinds: Some(vec![42]),
+            e_tags: Some(needles.to_vec()),
+            since: Some(seg.from),
+            until: seg.to.map(|t| t.saturating_sub(1)),
+            limit: Some(RELAY_FILTER_LIMIT),
+            ..Default::default()
+        }
+    }
+
+    /// Record the reload of `seg` (the stack's top): it leaves the stack and
+    /// the window now reaches its end. An open segment that came back full
+    /// may have lost messages between `from` and the oldest returned: the
+    /// caller restarts the window ([`NewerOutcome::Reset`]).
+    pub fn record_newer(&mut self, seg: Segment, page: PageOutcome) -> NewerOutcome {
+        self.loading = false;
+        if seg.to.is_none() && page.delivered >= RELAY_FILTER_LIMIT {
+            return NewerOutcome::Reset;
+        }
+        if self.newer.last() == Some(&seg) {
+            self.newer.pop();
+            self.newer_from = seg.to;
+        }
+        NewerOutcome::Applied
+    }
+
+    /// The newest messages from second `cut` on were evicted: remember them
+    /// as the segment nearest the window.
+    pub fn on_evicted_newest(&mut self, cut: u64) {
+        self.newer.push(Segment {
+            from: cut,
+            to: self.newer_from,
+        });
+        self.newer_from = Some(cut);
+    }
+
+    /// The oldest messages up to second `cut` were evicted: older paging
+    /// resumes from there (inclusive, so `cut` is fetched again and deduped).
+    pub fn on_evicted_oldest(&mut self, cut: u64) {
+        self.until = Some(cut);
+        self.sweep = None;
+        self.exhausted = false;
     }
 
     /// Record the newest page (the channel's first REQ, `limit` [`HISTORY_PAGE`]).
@@ -1782,6 +2189,298 @@ mod tests {
         let ts: Vec<(String, u64)> = (0..300).map(|i| (format!("m{i}"), 100 + i)).collect();
         let (held, _) = walk(&ts);
         assert_eq!(held.len(), 300);
+    }
+
+    // --- bounded history window ---
+
+    /// A channel walked through a bounded window against a relay holding
+    /// `relay` (ascending): the store as a sorted list, the cursor, and every
+    /// id the window has held.
+    struct WindowSim {
+        relay: Vec<(String, u64)>,
+        store: Vec<NostrEvent>,
+        cursor: HistoryCursor,
+        max: usize,
+        held: std::collections::HashSet<String>,
+        peak: usize,
+    }
+
+    impl WindowSim {
+        fn new(relay: Vec<(String, u64)>, max: usize) -> Self {
+            let mut s = WindowSim {
+                relay,
+                store: Vec::new(),
+                cursor: HistoryCursor::default(),
+                max,
+                held: Default::default(),
+                peak: 0,
+            };
+            let first = answer(
+                &s.relay,
+                &Filter {
+                    limit: Some(HISTORY_PAGE),
+                    ..Default::default()
+                },
+            );
+            s.insert(&first);
+            s.cursor.record_first(outcome(&first));
+            s
+        }
+
+        /// Insert as `apply_page` does: only what the window admits.
+        fn insert(&mut self, page: &[(String, u64)]) {
+            for (id, ts) in page {
+                if self.cursor.admits(*ts) && insert_message(&mut self.store, evt(id, *ts)) {
+                    self.held.insert(id.clone());
+                }
+            }
+            self.check();
+        }
+
+        fn check(&mut self) {
+            let ids: std::collections::HashSet<&String> =
+                self.store.iter().map(|e| &e.id).collect();
+            assert_eq!(
+                ids.len(),
+                self.store.len(),
+                "no message twice in the window"
+            );
+            assert!(self
+                .store
+                .windows(2)
+                .all(|w| w[0].created_at <= w[1].created_at));
+            self.peak = self.peak.max(self.store.len());
+        }
+
+        fn older_step(&mut self) -> bool {
+            let Some(req) = self.cursor.next_request() else {
+                return false;
+            };
+            let page = answer(&self.relay, &HistoryCursor::filter(req, &["c".into()]));
+            self.insert(&page);
+            self.cursor.record(req, outcome(&page));
+            if let Some((cut, _)) = evict_newest(&mut self.store, self.max) {
+                self.cursor.on_evicted_newest(cut);
+            }
+            self.check();
+            true
+        }
+
+        fn newer_step(&mut self) -> bool {
+            let Some(seg) = self.cursor.next_newer() else {
+                return false;
+            };
+            let page = answer(
+                &self.relay,
+                &HistoryCursor::newer_filter(seg, &["c".into()]),
+            );
+            match self.cursor.record_newer(seg, outcome(&page)) {
+                NewerOutcome::Applied => {
+                    self.insert(&page);
+                    if let Some((cut, _)) = evict_oldest(&mut self.store, self.max) {
+                        self.cursor.on_evicted_oldest(cut);
+                    }
+                }
+                NewerOutcome::Reset => {
+                    self.store.clear();
+                    self.cursor = HistoryCursor::default();
+                    self.cursor.record_first(outcome(&page));
+                    self.insert(&page);
+                }
+            }
+            self.check();
+            true
+        }
+
+        /// A live post: on the relay at once, in the window only if admitted.
+        fn live(&mut self, id: String, ts: u64) {
+            self.relay.push((id.clone(), ts));
+            self.insert(&[(id, ts)]);
+        }
+
+        fn ids_in_window(&self) -> std::collections::HashSet<String> {
+            self.store.iter().map(|e| e.id.clone()).collect()
+        }
+    }
+
+    /// 3,000 messages with runs of equal seconds straddling page and cut
+    /// boundaries, and one 250-message second (longer than a page).
+    fn tied_history() -> Vec<(String, u64)> {
+        let mut v = Vec::new();
+        let mut t = 10_000;
+        for i in 0..3_000 {
+            if i % 4 != 0 && !(1_200..1_450).contains(&i) {
+                t += 1;
+            }
+            v.push((format!("m{i:05}"), t));
+        }
+        v
+    }
+
+    fn all_ids(relay: &[(String, u64)]) -> std::collections::HashSet<String> {
+        relay.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    #[test]
+    fn evicting_cuts_only_between_seconds() {
+        let mut v: Vec<NostrEvent> = [(1, "a"), (2, "b"), (2, "c"), (2, "d"), (3, "e")]
+            .iter()
+            .map(|(t, id)| evt(id, *t))
+            .collect();
+        let (cut, gone) = evict_newest(&mut v.clone(), 2).unwrap();
+        assert_eq!(
+            (cut, gone.len()),
+            (2, 4),
+            "the whole second 2 goes, not half of it"
+        );
+        let (cut, gone) = evict_oldest(&mut v, 2).unwrap();
+        assert_eq!(cut, 2);
+        assert_eq!(gone.len(), 4);
+        assert_eq!(v.len(), 1);
+        let mut one_second: Vec<NostrEvent> = (0..5).map(|i| evt(&format!("x{i}"), 7)).collect();
+        assert!(
+            evict_newest(&mut one_second, 2).is_none(),
+            "never empty the window"
+        );
+        assert!(evict_oldest(&mut one_second, 2).is_none());
+    }
+
+    #[test]
+    fn the_window_walks_to_the_first_message_and_back_without_loss() {
+        let relay = tied_history();
+        let max = 300;
+        let mut s = WindowSim::new(relay.clone(), max);
+        let mut steps = 0;
+        while s.older_step() {
+            steps += 1;
+            assert!(steps < 1_000);
+        }
+        assert!(s.cursor.exhausted);
+        assert!(
+            s.ids_in_window().contains("m00000"),
+            "the first message is in the window"
+        );
+        assert_eq!(
+            s.held,
+            all_ids(&relay),
+            "every message passed through the window"
+        );
+        assert!(
+            s.cursor.newer_from.is_some(),
+            "detached at the start of history"
+        );
+
+        s.held.clear();
+        while s.newer_step() {
+            steps += 1;
+            assert!(steps < 2_000);
+        }
+        assert_eq!(s.cursor.newer_from, None, "back to the newest");
+        assert!(s.cursor.newer.is_empty());
+        assert!(
+            s.ids_in_window().contains("m02999"),
+            "the newest message is back"
+        );
+        let newer_half: std::collections::HashSet<String> = relay
+            .iter()
+            .filter(|(_, t)| *t > relay[1_000].1)
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert!(
+            newer_half.is_subset(&s.held),
+            "every evicted page came back"
+        );
+        // Bounded: each page lands, then the window is cut back to `max`; a
+        // page plus the 250-message second is the most it ever briefly holds.
+        assert!(
+            s.peak <= max + 250 + HISTORY_PAGE as usize,
+            "peak {}",
+            s.peak
+        );
+        assert!(s.store.len() <= max);
+    }
+
+    #[test]
+    fn live_posts_while_detached_wait_for_the_reload() {
+        let relay = tied_history();
+        let mut s = WindowSim::new(relay, 300);
+        for _ in 0..10 {
+            s.older_step();
+        }
+        assert!(s.cursor.newer_from.is_some());
+        let before = s.store.len();
+        for i in 0..20 {
+            s.live(format!("live{i:02}"), 50_000 + i);
+        }
+        assert_eq!(
+            s.store.len(),
+            before,
+            "nothing newer than a detached window is inserted"
+        );
+        while s.newer_step() {}
+        let w = s.ids_in_window();
+        assert!(
+            (0..20).all(|i| w.contains(&format!("live{i:02}"))),
+            "the newest segment brings them"
+        );
+    }
+
+    #[test]
+    fn an_overflowing_newest_segment_restarts_from_the_newest_page() {
+        let relay = tied_history();
+        let mut s = WindowSim::new(relay, 300);
+        for _ in 0..10 {
+            s.older_step();
+        }
+        for i in 0..1_500u64 {
+            s.live(format!("live{i:04}"), 50_000 + i);
+        }
+        while s.newer_step() {}
+        assert_eq!(s.cursor.newer_from, None);
+        let w = s.ids_in_window();
+        assert!(w.contains("live1499"), "the newest post is shown");
+        // The restart dropped the window; older paging covers the gap.
+        s.held.clear();
+        let mut n = 0;
+        while s.older_step() {
+            n += 1;
+            if s.held.contains("live0000") {
+                break;
+            }
+            assert!(n < 100);
+        }
+        assert!(
+            s.held.contains("live0000"),
+            "older paging reaches the posts the restart skipped"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_newer_reload_keeps_its_segment() {
+        let relay = tied_history();
+        let mut s = WindowSim::new(relay, 300);
+        for _ in 0..10 {
+            s.older_step();
+        }
+        let seg = s.cursor.next_newer().expect("a segment to reload");
+        // The request goes out and is abandoned after PAGE_TIMEOUT_MS: the
+        // store only releases `loading`, nothing is recorded or popped.
+        s.cursor.loading = true;
+        assert_eq!(s.cursor.next_newer(), None, "one request at a time");
+        assert_eq!(s.cursor.next_request(), None, "in either direction");
+        s.cursor.loading = false;
+        assert_eq!(
+            s.cursor.next_newer(),
+            Some(seg),
+            "the same segment is retried"
+        );
+    }
+
+    #[test]
+    fn the_window_size_is_clamped() {
+        assert_eq!(clamp_window(10), HISTORY_WINDOW_MIN);
+        assert_eq!(clamp_window(5_000), 5_000);
+        const { assert!(HISTORY_WINDOW >= HISTORY_WINDOW_MIN) };
     }
 
     #[test]
