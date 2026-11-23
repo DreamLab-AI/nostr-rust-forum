@@ -1125,9 +1125,15 @@ impl ChannelStore {
         if let Some(channel) = self.roots_targets.with_value(|m| m.get(key).cloned()) {
             // A root list holds root-shaped messages of its channel only (a
             // sealed root still locked shows its outer marker instead).
-            let marked = ev.tags.iter().any(|t| {
-                t.len() == 2 && t[0] == "t" && t[1] == nostr_bbs_core::sealed::TOPIC_MARKER
-            });
+            // The outer marker counts only on a still-locked SEALED envelope
+            // (whose inner shape check 7 binds); an unsealed event must be
+            // root-shaped itself, so a marker planted on a plaintext reply
+            // never lists it as a topic.
+            let sealed = nostr_bbs_core::sealed::parse_sealed(&ev.tags).is_some();
+            let marked = sealed
+                && ev.tags.iter().any(|t| {
+                    t.len() == 2 && t[0] == "t" && t[1] == nostr_bbs_core::sealed::TOPIC_MARKER
+                });
             let rooty = nostr_bbs_core::sealed::is_topic_root(&ev) || marked;
             if cid == channel && rooty {
                 return Some((key.to_string(), ev));
