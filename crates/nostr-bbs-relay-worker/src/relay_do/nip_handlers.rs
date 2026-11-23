@@ -1446,6 +1446,26 @@ impl NostrRelayDO {
                 Self::send_ok(ws, &event.id, false, "invalid: missing channel tag");
                 return;
             };
+            // F2: the channel must be a stored kind-40 and a reply's topic
+            // must be a stored message in that same channel, so nothing can
+            // be filed under a zone topic (`#e:[topic]`) from outside it, or
+            // posted into a made-up "channel" (which would read as unscoped).
+            let channel_known = self
+                .reference_target_channel(&channel_id.to_ascii_lowercase(), 0)
+                .await;
+            let reply_target = match nostr_bbs_core::sealed::reply_root_of(&event) {
+                Some(root) => Some(
+                    self.reference_target_channel(&root.to_ascii_lowercase(), 1)
+                        .await,
+                ),
+                None => None,
+            };
+            if let Some(reason) =
+                channel_write_rejection(&channel_id, &channel_known, reply_target.as_ref())
+            {
+                Self::send_ok(ws, &event.id, false, reason);
+                return;
+            }
             // Only a channel EXPLICITLY bound to a zone (a `channel_zones` row,
             // written solely by the admin-only /api/admin/channel-zone endpoint)
             // is write-gated. An undeclared channel is UNSCOPED: it belongs to no
@@ -2369,6 +2389,27 @@ pub(crate) fn reference_write_rejection(
 /// through the root-marked tag.
 pub(crate) fn stored_target_channel(target: &NostrEvent) -> Option<String> {
     filter::zone_channel_id(target)
+}
+
+/// Why a kind-42 write is refused on its placement (security review F2), if
+/// it is. `channel_known` is the stored-event lookup of the channel tag's
+/// target (a kind-40 resolves to its own id); `reply_target` that of the
+/// reply topic, when the event replies to one (`Ok(Some(c))`: stored, in
+/// channel `c`). Unknown or failed lookups refuse (fail closed).
+pub(crate) fn channel_write_rejection(
+    channel_id: &str,
+    channel_known: &Result<Option<String>, ()>,
+    reply_target: Option<&Result<Option<String>, ()>>,
+) -> Option<&'static str> {
+    match channel_known {
+        Ok(Some(c)) if c.eq_ignore_ascii_case(channel_id) => {}
+        _ => return Some("invalid: channel is not a known channel"),
+    }
+    match reply_target {
+        None => None,
+        Some(Ok(Some(c))) if c.eq_ignore_ascii_case(channel_id) => None,
+        Some(_) => Some("invalid: reply target is not a message in this channel"),
+    }
 }
 
 /// The zone a write is gated by, or the rejection when the lookup could not
@@ -8830,5 +8871,44 @@ mod reference_kind_gate_tests {
             Some("1".repeat(64).as_str())
         );
         assert_eq!(stored_target_channel(&ev(1, vec![])), None);
+    }
+}
+
+#[cfg(test)]
+mod channel_placement_tests {
+    //! Security review F2: a kind-42 must be placed in a real channel, and a
+    //! reply's topic must live in that same channel.
+    use super::channel_write_rejection;
+
+    #[test]
+    fn a_message_in_a_known_channel_with_a_same_channel_topic_is_accepted() {
+        let c = Ok(Some("chan".to_string()));
+        assert_eq!(channel_write_rejection("chan", &c, None), None);
+        assert_eq!(
+            channel_write_rejection("chan", &c, Some(&Ok(Some("chan".into())))),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_non_channel_target_is_refused() {
+        // Not stored, a lookup error, a stored non-channel event, another id.
+        for known in [Err(()), Ok(None), Ok(Some("other".to_string()))] {
+            assert!(
+                channel_write_rejection("chan", &known, None).is_some(),
+                "{known:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_topic_outside_the_channel_or_unknown_is_refused() {
+        let c = Ok(Some("chan".to_string()));
+        for target in [Err(()), Ok(None), Ok(Some("other".to_string()))] {
+            assert!(
+                channel_write_rejection("chan", &c, Some(&target)).is_some(),
+                "{target:?}"
+            );
+        }
     }
 }
