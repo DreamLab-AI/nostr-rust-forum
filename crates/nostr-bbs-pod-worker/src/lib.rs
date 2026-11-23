@@ -456,19 +456,42 @@ fn json_ok(env: &Env, body: &serde_json::Value, status: u16) -> Result<Response>
     Ok(resp)
 }
 
+/// How often (per isolate) the schema bootstrap and replay prune run.
+const SCHEMA_RECHECK_MS: f64 = 60_000.0;
+
+thread_local! {
+    /// When this isolate last ran the schema bootstrap (ms since epoch).
+    static SCHEMA_CHECKED_AT: std::cell::Cell<f64> =
+        const { std::cell::Cell::new(f64::NEG_INFINITY) };
+}
+
+/// Whether the schema bootstrap is due: never run yet in this isolate, or
+/// last run at least [`SCHEMA_RECHECK_MS`] ago (or the clock went backwards).
+fn schema_check_due(last_ms: f64, now_ms: f64) -> bool {
+    !(now_ms >= last_ms && now_ms - last_ms < SCHEMA_RECHECK_MS)
+}
+
 // Invoked via wasm-bindgen as the worker's wasm entry point; on native builds
 // nothing calls it directly, so it would otherwise be flagged dead-code there.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
-    payments::ensure_payment_schema(&env, "REPLAY_DB").await;
-
-    // CORS preflight
+    // CORS preflight: answered before any D1 work. A preflight never touches
+    // storage, and every authenticated pod GET (zone media) is preceded by one.
     if req.method() == Method::Options {
         return Ok(Response::empty()?
             .with_status(204)
             .with_headers(cors_headers(&env)));
+    }
+
+    // Idempotent schema bootstrap plus replay-table prune: five D1 statements,
+    // so run them at most once per `SCHEMA_RECHECK_MS` per isolate rather than
+    // on every request. The replay table stays bounded by its 120 s TTL.
+    let now_ms = js_sys::Date::now();
+    if SCHEMA_CHECKED_AT.with(|t| schema_check_due(t.get(), now_ms)) {
+        SCHEMA_CHECKED_AT.with(|t| t.set(now_ms));
+        nostr_bbs_rate_limit::ensure_replay_schema(&env, "REPLAY_DB").await;
+        payments::ensure_payment_schema(&env, "REPLAY_DB").await;
     }
 
     let url = req.url()?;
@@ -2082,6 +2105,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn schema_bootstrap_runs_once_per_window() {
+        assert!(schema_check_due(f64::NEG_INFINITY, 1_000.0));
+        assert!(!schema_check_due(1_000.0, 1_000.0));
+        assert!(!schema_check_due(1_000.0, 60_999.0));
+        assert!(schema_check_due(1_000.0, 61_000.0));
+        // A clock that steps backwards re-arms the check.
+        assert!(schema_check_due(61_000.0, 1_000.0));
+    }
 
     #[test]
     fn refine_image_content_type_recovers_from_octet_stream() {
