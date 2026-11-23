@@ -276,34 +276,39 @@ const SQL_HAS_EXPIRATION: &str = "EXISTS (SELECT 1 FROM json_each(events.tags) j
      WHERE json_type(j.value) = 'array' AND json_array_length(j.value) >= 2 \
        AND json_extract(j.value, '$[0]') = 'expiration')";
 
-/// The two statements of a channel message count (NIP-45 COUNT fast path for
-/// `{"kinds":[42], "#e":[<channel>], since?, until?}`).
+/// The two statements of a tag-scoped message count (NIP-45 COUNT fast path
+/// for `{"kinds":[42], "#e":[<value>], since?, until?}`, where the value is a
+/// channel id or a topic root id).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelCountQueries {
-    /// `SELECT COUNT(*) AS n`: the plain case, kind-42s whose own channel
-    /// ([`channel_tag`]) IS this channel and that carry no `expiration` tag.
-    /// Every one of them gets the same read decision (this channel's zone
-    /// gate), so the caller decides it once and adds `n` or nothing.
-    pub plain: FilterQuery,
-    /// Full rows of every other match (a different own channel, or an
-    /// `expiration` tag): normally none. The caller runs the per-event path
-    /// on them (NIP-40 expiry, then `authorize_event`), so the total equals
-    /// what the generic COUNT path would return without its row cap.
+    /// `SELECT ch, COUNT(*) AS n ... GROUP BY ch`: the matching kind-42s
+    /// without an `expiration` tag, grouped by each event's OWN channel
+    /// ([`channel_tag`]: the root-marked `e` tag, else the first). Every
+    /// event in a group gets the same read decision, that channel's zone gate
+    /// (the exact branch `authorize_event` takes per event), so the caller
+    /// decides once per group. For a channel count there is one group; for a
+    /// topic count (`#e:[topic_root]`, sealed replies carry the topic as an
+    /// outer `reply` tag) the group is the topic's channel, and the topic id
+    /// itself is never used to look up a zone.
+    pub grouped: FilterQuery,
+    /// Full rows of the matches that DO carry an `expiration` tag: normally
+    /// none. The caller applies NIP-40 expiry and `authorize_event` per event,
+    /// as the generic path does.
     pub exceptions: FilterQuery,
 }
 
-/// Build the channel count statements. Both read `idx_event_tags_time` for
-/// the channel and look up each event by primary key: about two rows read per
-/// message, one statement, no rows shipped back for the plain case. The
-/// generic COUNT path materialised every matching event (and was capped at
-/// the filter's `limit`, default 500, so it could never report a large total).
+/// Build the count statements. Both read `idx_event_tags_time` for the value
+/// and look up each event by primary key: about two rows read per message,
+/// one statement, no rows shipped back for the grouped part. The generic
+/// COUNT path materialised every matching event (and was capped at the
+/// filter's `limit`, default 500, so it could never report a large total).
 pub fn build_channel_count(
-    channel: &str,
+    value: &str,
     since: Option<u64>,
     until: Option<u64>,
 ) -> ChannelCountQueries {
     let mut b = Binds { params: Vec::new() };
-    let ch = b.text(channel);
+    let v = b.text(value);
     let mut range = String::new();
     if let Some(s) = since {
         range.push_str(&format!(" AND d.created_at >= {}", b.int(s as i64)));
@@ -313,23 +318,25 @@ pub fn build_channel_count(
     }
     let from = format!(
         "FROM event_tags d CROSS JOIN events ON events.id = d.event_id \
-         WHERE d.name = 'e' AND d.value = {ch} AND events.kind = 42{range}"
+         WHERE d.name = 'e' AND d.value = {v} AND events.kind = 42{range}"
     );
-    let plain_cond = format!("({SQL_CHANNEL_TAG}) = {ch} AND NOT {SQL_HAS_EXPIRATION}");
     let params = b.params;
     ChannelCountQueries {
-        plain: FilterQuery {
-            sql: format!("SELECT COUNT(*) AS n {from} AND {plain_cond}"),
+        grouped: FilterQuery {
+            sql: format!(
+                "SELECT ({SQL_CHANNEL_TAG}) AS ch, COUNT(*) AS n {from} \
+                 AND NOT {SQL_HAS_EXPIRATION} GROUP BY ch"
+            ),
             params: params.clone(),
         },
         exceptions: FilterQuery {
-            sql: format!("SELECT {EVENT_COLUMNS} {from} AND NOT ({plain_cond})"),
+            sql: format!("SELECT {EVENT_COLUMNS} {from} AND {SQL_HAS_EXPIRATION}"),
             params,
         },
     }
 }
 
-/// The channel a COUNT filter set asks about, when it has the fast-path
+/// The `#e` value a COUNT filter set asks about, when it has the fast-path
 /// shape: exactly one filter, `kinds` exactly `[42]`, exactly one `#e`
 /// value, and nothing else but `since`/`until` (`limit` is ignored by COUNT).
 pub fn channel_count_target(filters: &[NostrFilter]) -> Option<(String, Option<u64>, Option<u64>)> {
@@ -1557,12 +1564,12 @@ mod query_builder_tests {
     }
 
     #[test]
-    fn the_channel_count_splits_exactly_like_the_per_event_path() {
+    fn the_count_groups_by_own_channel_exactly_like_the_per_event_path() {
         let c = db();
         let mut events = fixture();
-        // Edge cases the per-event path treats differently from the plain case:
-        // a decoy first `e` with the root marker elsewhere, an `e` to the
-        // channel that is not the event's own channel, and expiration tags.
+        // A decoy first `e` with the root marker elsewhere, an `e` to "a"
+        // that is not the event's own channel, expiration tags, and sealed-
+        // style replies whose outer `reply` tag names topic "t1" in channel b.
         events.push(ev(
             800,
             42,
@@ -1590,45 +1597,79 @@ mod query_builder_tests {
                 vec!["expiration", "99999999999"],
             ],
         ));
-        store(&c, &events);
-        for (since, until) in [
-            (None, None),
-            (Some(1_010), None),
-            (None, Some(1_050)),
-            (Some(1_020), Some(1_202)),
-        ] {
-            let q = build_channel_count("a", since, until);
-            let plain: i64 = c
-                .query_row(
-                    &q.plain.sql,
-                    rusqlite::params_from_iter(bind(&q.plain.params).iter()),
-                    |r| r.get(0),
-                )
-                .unwrap();
-            let (mut exc, _) = run_sql(&c, &q.exceptions.sql, &bind(&q.exceptions.params));
-            let in_range = |e: &&NostrEvent| {
-                e.kind == 42
-                    && e.tags
-                        .iter()
-                        .any(|t| t.len() >= 2 && t[0] == "e" && t[1] == "a")
-                    && since.is_none_or(|s| e.created_at >= s)
-                    && until.is_none_or(|u| e.created_at <= u)
-            };
-            let is_plain = |e: &&NostrEvent| {
-                channel_tag(e).as_deref() == Some("a") && tag_value(e, "expiration").is_none()
-            };
-            let want_plain = events.iter().filter(in_range).filter(is_plain).count();
-            let mut want_exc: Vec<(String, u64)> = events
-                .iter()
-                .filter(in_range)
-                .filter(|e| !is_plain(e))
-                .map(|e| (e.id.clone(), e.created_at))
-                .collect();
-            exc.sort();
-            want_exc.sort();
-            assert_eq!(plain as usize, want_plain, "plain {since:?}..{until:?}");
-            assert_eq!(exc, want_exc, "exceptions {since:?}..{until:?}");
+        for i in 0..40 {
+            events.push(ev(
+                900 + i,
+                42,
+                1_300 + i as u64,
+                vec![vec!["e", "b", "", "root"], vec!["e", "t1", "", "reply"]],
+            ));
         }
+        store(&c, &events);
+        for value in ["a", "t1"] {
+            for (since, until) in [
+                (None, None),
+                (Some(1_010), None),
+                (None, Some(1_310)),
+                (Some(1_020), Some(1_330)),
+            ] {
+                let q = build_channel_count(value, since, until);
+                let mut s = c.prepare(&q.grouped.sql).unwrap();
+                let mut got: Vec<(String, i64)> = s
+                    .query_map(
+                        rusqlite::params_from_iter(bind(&q.grouped.params).iter()),
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                    )
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                let (mut exc, _) = run_sql(&c, &q.exceptions.sql, &bind(&q.exceptions.params));
+                let in_range = |e: &&NostrEvent| {
+                    e.kind == 42
+                        && e.tags
+                            .iter()
+                            .any(|t| t.len() >= 2 && t[0] == "e" && t[1] == value)
+                        && since.is_none_or(|s| e.created_at >= s)
+                        && until.is_none_or(|u| e.created_at <= u)
+                };
+                let mut want: std::collections::BTreeMap<String, i64> = Default::default();
+                for e in events
+                    .iter()
+                    .filter(in_range)
+                    .filter(|e| tag_value(e, "expiration").is_none())
+                {
+                    *want.entry(channel_tag(e).unwrap()).or_default() += 1;
+                }
+                let mut want_exc: Vec<(String, u64)> = events
+                    .iter()
+                    .filter(in_range)
+                    .filter(|e| tag_value(e, "expiration").is_some())
+                    .map(|e| (e.id.clone(), e.created_at))
+                    .collect();
+                got.sort();
+                exc.sort();
+                want_exc.sort();
+                assert_eq!(
+                    got,
+                    want.into_iter().collect::<Vec<_>>(),
+                    "groups {value} {since:?}..{until:?}"
+                );
+                assert_eq!(exc, want_exc, "exceptions {value} {since:?}..{until:?}");
+            }
+        }
+        // A topic count is grouped under the topic's CHANNEL, never the topic.
+        let q = build_channel_count("t1", None, None);
+        let groups: Vec<String> = c
+            .prepare(&q.grouped.sql)
+            .unwrap()
+            .query_map(
+                rusqlite::params_from_iter(bind(&q.grouped.params).iter()),
+                |r| r.get(0),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(groups, vec!["b".to_string()]);
     }
 
     #[test]

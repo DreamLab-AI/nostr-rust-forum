@@ -338,8 +338,9 @@ impl NostrRelayDO {
         }
     }
 
-    /// Run a channel message count (`filter::build_channel_count`): the plain
-    /// count, and the exception rows with NIP-40 expiry already applied as in
+    /// Run a tag-scoped message count (`filter::build_channel_count`): the
+    /// per-channel groups `(own channel, n)`, and the exception rows (those
+    /// with an `expiration` tag) with NIP-40 expiry already applied as in
     /// [`Self::query_events`]. Exception rows are capped at
     /// `MAX_ROWS_PER_FRAME` (the same DoS bound as every read); they are
     /// normally none. `None` when D1 is unavailable or a statement fails, so
@@ -347,9 +348,10 @@ impl NostrRelayDO {
     pub(crate) async fn count_channel_messages(
         &self,
         q: &filter::ChannelCountQueries,
-    ) -> Option<(u64, Vec<NostrEvent>)> {
+    ) -> Option<(Vec<(String, u64)>, Vec<NostrEvent>)> {
         #[derive(Deserialize)]
-        struct N {
+        struct Group {
+            ch: Option<String>,
             n: f64,
         }
         let db = self.env.d1("DB").ok()?;
@@ -361,14 +363,19 @@ impl NostrRelayDO {
                 })
                 .collect()
         };
-        let plain: Option<N> = db
-            .prepare(&q.plain.sql)
-            .bind(&bind(&q.plain.params))
+        let groups: Vec<Group> = db
+            .prepare(&q.grouped.sql)
+            .bind(&bind(&q.grouped.params))
             .ok()?
-            .first(None)
+            .all()
             .await
+            .ok()?
+            .results()
             .ok()?;
-        let plain = plain.map_or(0, |n| n.n as u64);
+        let groups = groups
+            .into_iter()
+            .filter_map(|g| g.ch.map(|ch| (ch, g.n as u64)))
+            .collect();
 
         let sql = format!("{} LIMIT {}", q.exceptions.sql, MAX_ROWS_PER_FRAME);
         let rows: Vec<EventRow> = db
@@ -390,7 +397,7 @@ impl NostrRelayDO {
                     .is_some_and(|exp_ts| exp_ts < now)
             })
             .collect();
-        Some((plain, exceptions))
+        Some((groups, exceptions))
     }
 
     pub(crate) async fn query_events(&self, filters: &[NostrFilter]) -> Vec<NostrEvent> {

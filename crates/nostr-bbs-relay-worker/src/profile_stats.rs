@@ -84,9 +84,17 @@ pub fn channel_of(kind: u32, tags_json: &str) -> Option<String> {
         return None;
     }
     let tags: Vec<Vec<String>> = serde_json::from_str(tags_json).ok()?;
-    tags.into_iter()
-        .find(|t| t.len() >= 2 && t[0] == "e")
-        .map(|mut t| t.swap_remove(1))
+    // The same rule as the read gate (`relay_do::filter::channel_tag`): the
+    // root-marked `e` tag, else the first. Taking the first `e` tag alone
+    // would read a reply whose topic (`reply`) tag comes first as posted in
+    // an unbound, public "channel" named by the topic id, and count zone
+    // activity for viewers who may not read the zone.
+    let is_e = |t: &&Vec<String>| t.len() >= 2 && t[0] == "e";
+    tags.iter()
+        .filter(is_e)
+        .find(|t| t.get(3).map(String::as_str) == Some("root"))
+        .or_else(|| tags.iter().find(is_e))
+        .map(|t| t[1].clone())
 }
 
 /// Aggregate `rows` into viewer-visible activity.
@@ -460,6 +468,15 @@ mod tests {
     fn kind_9_is_a_counted_post_kind() {
         assert!(POST_KINDS.contains(&9));
         assert!(POST_KINDS.contains(&42));
+    }
+
+    #[test]
+    fn channel_of_prefers_the_root_marker_like_the_read_gate() {
+        assert_eq!(
+            channel_of(42, r#"[["e","topic","","reply"],["e","chan","","root"]]"#),
+            Some("chan".into()),
+            "a topic tag listed first never stands in for the channel"
+        );
     }
 
     #[test]

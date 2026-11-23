@@ -2198,6 +2198,46 @@ pub(crate) enum ReadDecision {
 /// open to everyone (including an unauthenticated viewer, whose cohorts are
 /// empty); otherwise the viewer needs the whitelist admin flag or one of the
 /// zone's required cohorts. Unknown zones deny, as `cohorts_can_read` does.
+/// The read decision for channel-scoped content (kind 40/41/42) in a channel
+/// bound to `zone` (`None`: the channel is not bound to a zone, so it is
+/// unscoped, public read). This is the whole channel branch of
+/// `authorize_event`, factored out so COUNT can apply it once per channel and
+/// tests can pin it:
+///
+/// - admins and members of the zone read everything;
+/// - for a non-member, kind-40 definitions and kind-41 metadata are served
+///   only when the zone's definitions are visible (Locked/Public tiles);
+/// - kind-42 content is withheld from non-members of Locked/Hidden zones.
+///
+/// ADR-2018: membership comes from the cohorts already resolved into `ctx`;
+/// `zone_read_permitted` is the same rule `trust::has_zone_access` applies.
+pub(crate) fn channel_read_decision(
+    kind: u64,
+    zone: Option<&str>,
+    zones: &ZoneConfig,
+    ctx: &ViewerContext,
+) -> ReadDecision {
+    let Some(zone) = zone else {
+        // Only a channel EXPLICITLY bound to a zone is read-gated. An
+        // undeclared channel is UNSCOPED (public read), mirroring the write
+        // path that lets any whitelisted member post to it (Finding-5 fix).
+        return ReadDecision::Deliver;
+    };
+    if ctx.is_admin || zone_read_permitted(zones, zone, ctx) {
+        return ReadDecision::Deliver;
+    }
+    if matches!(kind, 40 | 41) {
+        // Channel definition or its metadata update (a rename must agree with
+        // the definition the tile shows).
+        if zones.defs_visible_to_nonmember(zone) {
+            return ReadDecision::Deliver;
+        }
+        return ReadDecision::Withhold;
+    }
+    // Channel content (kind-42): withheld from non-members of Locked/Hidden zones.
+    ReadDecision::Withhold
+}
+
 pub(crate) fn zone_read_permitted(zones: &ZoneConfig, zone: &str, ctx: &ViewerContext) -> bool {
     zones.is_public_read(zone)
         || ctx.viewer_is_admin
@@ -2712,26 +2752,8 @@ impl NostrRelayDO {
             // `trust::has_zone_access` applies (public read, or whitelist
             // admin, or a required cohort); `ctx.viewer_is_admin` carries the
             // whitelist admin flag that function used to re-read.
-            if let Some(zone) = self.cached_channel_zone(&cid).await {
-                if !ctx.is_admin {
-                    let is_member = zone_read_permitted(zones, &zone, ctx);
-                    if !is_member {
-                        if matches!(event.kind, 40 | 41) {
-                            // Channel definition or its metadata update (a rename
-                            // must agree with the definition the tile shows):
-                            // served only if the zone is not Hidden
-                            // (Locked/Public tiles render).
-                            if !zones.defs_visible_to_nonmember(&zone) {
-                                return ReadDecision::Withhold;
-                            }
-                        } else {
-                            // Channel content (kind-42): withheld from non-members
-                            // of Locked/Hidden zones.
-                            return ReadDecision::Withhold;
-                        }
-                    }
-                }
-            }
+            let zone = self.cached_channel_zone(&cid).await;
+            return channel_read_decision(event.kind, zone.as_deref(), zones, ctx);
         }
 
         ReadDecision::Deliver
@@ -2800,23 +2822,31 @@ impl NostrRelayDO {
         let zones = ZoneConfig::load(&self.env);
         let ctx = self.resolve_viewer_context(session_pubkey.clone()).await;
 
-        // Fast path for one channel's messages (`{"kinds":[42],"#e":[cid]}`),
-        // which the forum asks for every section's true total. The generic
-        // path below materialises every match and is capped at the filter's
-        // `limit` (500 by default), so it cannot report a large channel. Here
-        // SQL counts the plain case, kind-42s whose own channel is `cid`
-        // with no expiration tag, and all of those get one read decision:
-        // `cid`'s zone gate, exactly the branch `authorize_event` takes for
-        // each of them. Anything else that matched (another own channel, an
-        // expiration tag) goes through the per-event path as before.
-        if let Some((cid, since, until)) = filter::channel_count_target(&filters) {
-            let q = filter::build_channel_count(&cid, since, until);
-            if let Some((plain, exceptions)) = self.count_channel_messages(&q).await {
-                let channel_readable = match self.cached_channel_zone(&cid).await {
-                    None => true,
-                    Some(zone) => ctx.is_admin || zone_read_permitted(&zones, &zone, &ctx),
-                };
-                let mut count = if channel_readable { plain } else { 0 };
+        // Fast path for one channel's or one topic's messages
+        // (`{"kinds":[42],"#e":[value]}`), which the forum asks for every
+        // section's and topic's true total. The generic path below
+        // materialises every match and is capped at the filter's `limit`
+        // (500 by default), so it cannot report a large channel. Here SQL
+        // groups the matches without an expiration tag by each event's OWN
+        // channel (root-marked `e` tag, else the first), and each group gets
+        // one read decision, `channel_read_decision` on that channel's zone:
+        // exactly what `authorize_event` decides per event. The `#e` value
+        // itself never selects a zone, so a topic root (which has no
+        // channel_zones row) cannot open its replies. Expiring events go
+        // through the per-event path as before.
+        if let Some((value, since, until)) = filter::channel_count_target(&filters) {
+            let q = filter::build_channel_count(&value, since, until);
+            if let Some((groups, exceptions)) = self.count_channel_messages(&q).await {
+                let mut count = 0u64;
+                for (channel, n) in groups {
+                    let zone = self.cached_channel_zone(&channel).await;
+                    if matches!(
+                        channel_read_decision(42, zone.as_deref(), &zones, &ctx),
+                        ReadDecision::Deliver
+                    ) {
+                        count += n;
+                    }
+                }
                 for event in &exceptions {
                     if matches!(
                         self.authorize_event(event, &ctx, &zones).await,
@@ -8111,5 +8141,153 @@ mod deletion_gate_sql_tests {
         store(&c, &id(2), THEM, 42, serde_json::json!([]));
         assert!(moderator_removes_envelopes(&c, &[&id(2)], &[ADMIN], 1_000).is_empty());
         assert_eq!(count(&c, "SELECT count(*) FROM events"), 1);
+    }
+}
+
+#[cfg(test)]
+mod topic_tag_gate_tests {
+    //! Sealed replies carry their topic as an outer `["e", topic, "", "reply"]`
+    //! tag (nostr-bbs-core sealed.rs, check 7). A `#e:[topic]` REQ or COUNT
+    //! therefore selects them, and these tests pin that every read decision
+    //! still comes from the root-marked CHANNEL tag, never from the topic id
+    //! (which has no channel_zones row and would be "unscoped", i.e. open).
+    use super::*;
+    use crate::zone_config::ZoneConfig;
+    use nostr_bbs_core::keys::SecretKey;
+    use nostr_bbs_core::sealed::{reply_root_of, seal_original};
+    use nostr_bbs_core::{sign_event, UnsignedEvent};
+
+    fn tag(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn zones() -> ZoneConfig {
+        ZoneConfig::from_json(
+            r#"[{"id":"zone2","required_cohorts":["minimoonoir"],"visibility":"locked","encrypted":true}]"#,
+        )
+    }
+
+    fn viewer(cohorts: &[&str], authed: bool) -> ViewerContext {
+        ViewerContext {
+            session_pubkey: authed.then(|| "s".repeat(64)),
+            access_pubkey: authed.then(|| "s".repeat(64)),
+            is_admin: false,
+            viewer_cohorts: cohorts.iter().map(|c| c.to_string()).collect(),
+            viewer_is_admin: false,
+            recipient_keys: vec![],
+        }
+    }
+
+    /// A real sealed reply: channel `chan`, topic `topic`, plus a quote and a
+    /// mention that must stay inside.
+    fn sealed_reply(chan: &str, topic: &str) -> NostrEvent {
+        let author = SecretKey::from_bytes([0x11; 32]).unwrap();
+        let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+        let zone = SecretKey::from_bytes([0x33; 32]).unwrap();
+        let signing_key = nostr_bbs_core::keys::signing_key_from_bytes(author.as_bytes()).unwrap();
+        let original = sign_event(
+            UnsignedEvent {
+                pubkey: author.public_key().to_hex(),
+                created_at: 1_700_000_000,
+                kind: 42,
+                tags: vec![
+                    tag(&["e", chan, "", "root"]),
+                    tag(&["e", &"b".repeat(64), "", "quote"]),
+                    tag(&["e", topic, "", "reply"]),
+                    tag(&["p", &"f".repeat(64)]),
+                ],
+                content: "a reply".into(),
+            },
+            &signing_key,
+        )
+        .unwrap();
+        seal_original(
+            &original,
+            "zone2",
+            1,
+            &zone.public_key().to_hex(),
+            &migrator,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_sealed_reply_is_governed_by_its_channel_never_its_topic() {
+        let chan = "c".repeat(64);
+        let topic = "a".repeat(64);
+        let env = sealed_reply(&chan, &topic);
+        assert_eq!(
+            reply_root_of(&env),
+            Some(topic.as_str()),
+            "the topic is outside"
+        );
+        // Read path (authorize_event) and COUNT grouping use channel_tag.
+        assert_eq!(
+            filter::zone_channel_id(&env).as_deref(),
+            Some(chan.as_str())
+        );
+        assert_eq!(filter::channel_tag(&env).as_deref(), Some(chan.as_str()));
+        // Write path keys on the first `e` tag: the channel comes first.
+        assert_eq!(filter::tag_value(&env, "e").as_deref(), Some(chan.as_str()));
+    }
+
+    #[test]
+    fn a_topic_req_matches_the_reply_and_the_channel_gate_decides() {
+        let chan = "c".repeat(64);
+        let topic = "a".repeat(64);
+        let env = sealed_reply(&chan, &topic);
+        let f: NostrFilter =
+            serde_json::from_value(serde_json::json!({"kinds": [42], "#e": [topic]})).unwrap();
+        assert!(
+            filter::event_matches_filters(&env, &[f]),
+            "#e:[topic] selects it"
+        );
+
+        // Its channel is bound to zone2 (Locked): the decision per viewer.
+        let zone = Some("zone2");
+        let decide = |ctx: &ViewerContext| {
+            matches!(
+                channel_read_decision(env.kind, zone, &zones(), ctx),
+                ReadDecision::Deliver
+            )
+        };
+        assert!(!decide(&viewer(&[], false)), "anonymous: withheld");
+        assert!(!decide(&viewer(&["other"], true)), "non-member: withheld");
+        assert!(decide(&viewer(&["minimoonoir"], true)), "member: delivered");
+        let mut admin = viewer(&[], true);
+        admin.is_admin = true;
+        assert!(decide(&admin), "admin: delivered");
+    }
+
+    #[test]
+    fn the_topic_id_would_fail_open_which_is_why_it_is_never_looked_up() {
+        // Documents the hazard the tests above exclude: a channel id with no
+        // channel_zones row is unscoped, so deciding by the TOPIC id would
+        // deliver zone content to anyone.
+        assert!(matches!(
+            channel_read_decision(42, None, &zones(), &viewer(&[], false)),
+            ReadDecision::Deliver
+        ));
+    }
+
+    #[test]
+    fn channel_definitions_follow_zone_visibility_for_non_members() {
+        let z = ZoneConfig::from_json(
+            r#"[{"id":"locked","required_cohorts":["m"],"visibility":"locked"},
+                {"id":"hidden","required_cohorts":["m"],"visibility":"hidden"}]"#,
+        );
+        let anon = viewer(&[], false);
+        assert!(matches!(
+            channel_read_decision(40, Some("locked"), &z, &anon),
+            ReadDecision::Deliver
+        ));
+        assert!(matches!(
+            channel_read_decision(40, Some("hidden"), &z, &anon),
+            ReadDecision::Withhold
+        ));
+        assert!(matches!(
+            channel_read_decision(42, Some("locked"), &z, &anon),
+            ReadDecision::Withhold
+        ));
     }
 }
