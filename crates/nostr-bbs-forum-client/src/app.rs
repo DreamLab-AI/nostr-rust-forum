@@ -892,7 +892,8 @@ pub fn App() -> impl IntoView {
     // whatever had arrived. `channel_list_settled` waits for an authenticated
     // answer or the deadline, which is armed when the relay connects (not at
     // app start: sign-in can take longer than the deadline). Still gated on
-    // a non-empty list, since `start_msg_sync` bails on an empty one.
+    // a non-empty list, since `start_msg_sync` bails on an empty one (the
+    // empty case is covered by `history_known_empty` below).
     let msg_sync_deadline =
         crate::utils::lookup::deadline_for(move || relay_conn.get() == ConnectionState::Connected);
     Effect::new(move |_| {
@@ -904,8 +905,17 @@ pub fn App() -> impl IntoView {
             store.channel_receipt.get(),
             msg_sync_deadline.get(),
         );
-        let has_channels = store.channels.with(|c| !c.is_empty());
-        if !settled || !has_channels {
+        let channel_count = store.channels.with(|c| c.len());
+        // A relay with no channels never starts the message sync (nothing to
+        // scope its filters to), so its EOSE would never arrive and readiness
+        // checks waiting on it (the admin zone-key mint plan) would hang on a
+        // fresh database. An authenticated empty list is the relay's answer
+        // that there is no history to see; if channels appear later,
+        // `start_msg_sync` clears the flag and re-earns it on its own EOSE.
+        if crate::utils::lookup::history_known_empty(store.channel_receipt.get(), channel_count) {
+            store.msg_eose_received.set(true);
+        }
+        if !settled || channel_count == 0 {
             return;
         }
         let r = expect_context::<RelayConnection>();

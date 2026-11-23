@@ -566,6 +566,10 @@ impl ChannelStore {
         if channels.is_empty() {
             return;
         }
+        // Readiness may have been granted early for an empty relay (see
+        // `history_known_empty`). Channels now exist, so their history is
+        // unseen until this subscription's own EOSE: withdraw it.
+        self.msg_eose_received.set(false);
 
         let channels_sig = self.channels;
         let last_active = self.last_active;
