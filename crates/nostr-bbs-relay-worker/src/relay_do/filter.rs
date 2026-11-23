@@ -297,6 +297,12 @@ pub struct ChannelCountQueries {
     pub exceptions: FilterQuery,
 }
 
+/// The most own-channel groups a fast COUNT resolves (one zone lookup each).
+/// A channel count has one group and a topic count one per channel its
+/// replies sit in (one); more means events crafted to spread over made-up
+/// channels, and the caller falls back to the generic, row-capped path.
+pub const COUNT_MAX_GROUPS: usize = 8;
+
 /// Build the count statements. Both read `idx_event_tags_time` for the value
 /// and look up each event by primary key: about two rows read per message,
 /// one statement, no rows shipped back for the grouped part. The generic
@@ -324,8 +330,9 @@ pub fn build_channel_count(
     ChannelCountQueries {
         grouped: FilterQuery {
             sql: format!(
-                "SELECT ({SQL_CHANNEL_TAG}) AS ch, COUNT(*) AS n {from} \
-                 AND NOT {SQL_HAS_EXPIRATION} GROUP BY ch"
+                "SELECT ({SQL_CHANNEL_TAG}) AS ch, COUNT(DISTINCT events.id) AS n {from} \
+                 AND NOT {SQL_HAS_EXPIRATION} GROUP BY ch LIMIT {}",
+                COUNT_MAX_GROUPS + 1
             ),
             params: params.clone(),
         },
@@ -1657,6 +1664,31 @@ mod query_builder_tests {
                 assert_eq!(exc, want_exc, "exceptions {value} {since:?}..{until:?}");
             }
         }
+        // Crafted spread over made-up channels is cut at COUNT_MAX_GROUPS + 1
+        // rows, which the caller reads as "fall back to the generic path".
+        let spread: Vec<NostrEvent> = (0..30)
+            .map(|i| {
+                let fake = format!("fake{i}");
+                ev(
+                    2_000 + i,
+                    42,
+                    5_000,
+                    vec![vec!["e", fake.as_str(), "", "root"], vec!["e", "spread"]],
+                )
+            })
+            .collect();
+        store(&c, &spread);
+        let q = build_channel_count("spread", None, None);
+        let n = c
+            .prepare(&q.grouped.sql)
+            .unwrap()
+            .query_map(
+                rusqlite::params_from_iter(bind(&q.grouped.params).iter()),
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+            .count();
+        assert_eq!(n, COUNT_MAX_GROUPS + 1);
         // A topic count is grouped under the topic's CHANNEL, never the topic.
         let q = build_channel_count("t1", None, None);
         let groups: Vec<String> = c

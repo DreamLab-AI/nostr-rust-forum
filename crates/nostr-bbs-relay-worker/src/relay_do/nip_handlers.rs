@@ -2192,12 +2192,6 @@ pub(crate) enum ReadDecision {
     Withhold,
 }
 
-/// Zone read rule shared by the REQ, COUNT and broadcast gates (ADR-2018).
-///
-/// Mirrors `trust::has_zone_access` without the D1 read: a public-read zone is
-/// open to everyone (including an unauthenticated viewer, whose cohorts are
-/// empty); otherwise the viewer needs the whitelist admin flag or one of the
-/// zone's required cohorts. Unknown zones deny, as `cohorts_can_read` does.
 /// The read decision for channel-scoped content (kind 40/41/42) in a channel
 /// bound to `zone` (`None`: the channel is not bound to a zone, so it is
 /// unscoped, public read). This is the whole channel branch of
@@ -2238,6 +2232,12 @@ pub(crate) fn channel_read_decision(
     ReadDecision::Withhold
 }
 
+/// Zone read rule shared by the REQ, COUNT and broadcast gates (ADR-2018).
+///
+/// Mirrors `trust::has_zone_access` without the D1 read: a public-read zone is
+/// open to everyone (including an unauthenticated viewer, whose cohorts are
+/// empty); otherwise the viewer needs the whitelist admin flag or one of the
+/// zone's required cohorts. Unknown zones deny, as `cohorts_can_read` does.
 pub(crate) fn zone_read_permitted(zones: &ZoneConfig, zone: &str, ctx: &ViewerContext) -> bool {
     zones.is_public_read(zone)
         || ctx.viewer_is_admin
@@ -2836,7 +2836,13 @@ impl NostrRelayDO {
         // through the per-event path as before.
         if let Some((value, since, until)) = filter::channel_count_target(&filters) {
             let q = filter::build_channel_count(&value, since, until);
-            if let Some((groups, exceptions)) = self.count_channel_messages(&q).await {
+            // More own channels than COUNT_MAX_GROUPS (one zone lookup each)
+            // means crafted spread; the generic path's row cap bounds that.
+            if let Some((groups, exceptions)) = self
+                .count_channel_messages(&q)
+                .await
+                .filter(|(g, _)| g.len() <= filter::COUNT_MAX_GROUPS)
+            {
                 let mut count = 0u64;
                 for (channel, n) in groups {
                     let zone = self.cached_channel_zone(&channel).await;
@@ -8227,7 +8233,8 @@ mod topic_tag_gate_tests {
             Some(chan.as_str())
         );
         assert_eq!(filter::channel_tag(&env).as_deref(), Some(chan.as_str()));
-        // Write path keys on the first `e` tag: the channel comes first.
+        // Readers that take the first `e` tag still see the channel: the
+        // topic tag is appended last. (The write gate uses channel_tag.)
         assert_eq!(filter::tag_value(&env, "e").as_deref(), Some(chan.as_str()));
     }
 

@@ -77,8 +77,8 @@ pub struct Activity {
     pub top_channels: Vec<ChannelActivity>,
 }
 
-/// Channel id of a kind-42 message: its first `e` tag, matching
-/// `filter::tag_value(event, "e")` on the REQ read path.
+/// Channel id of a kind-42 message: its root-marked `e` tag, else its first,
+/// matching `filter::channel_tag` on the read path.
 pub fn channel_of(kind: u32, tags_json: &str) -> Option<String> {
     if kind != 42 {
         return None;
