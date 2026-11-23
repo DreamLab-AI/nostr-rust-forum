@@ -343,7 +343,7 @@ fn RestrictedImage(
                         cache_blob(&owner, &url, &blob);
                         show(&blob);
                     }
-                    Err(RestrictedFetchError::Locked | RestrictedFetchError::Unauthorised) => {
+                    Err(RestrictedFetchError::Locked) => {
                         state.try_set(RestrictedState::Locked);
                     }
                     Err(RestrictedFetchError::Failed(e)) => {
