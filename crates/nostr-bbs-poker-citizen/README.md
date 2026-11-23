@@ -53,9 +53,16 @@ never printed. Testnet only: coins on these chains carry no value.
 The relay must admit each house key (whitelisted, so members' wraps to it are
 accepted), and each key must hold its chain's asset to cover buy-ins and plain
 sats to pay transfer fees. Until the chain shows the asset's issue the house
-seat says so at start and members cannot buy in. The ledger (`--state`)
-remembers what members owe, what the house owes, and what it paid out today,
-across restarts. The forum learns each house seat's key from
+seat says so at start and members cannot buy in. The state file (`--state`, mode 0600: it holds live hands' secrets)
+remembers what members owe, what the house owes, what it paid out today and the hands in play,
+across restarts. A payout debt that halts (rejected twice, or replaced too
+often) is paid by the operator on-chain with the memo `hand:<root>`; there is
+no unhalt command. Set `--alert-pubkey` (`POKER_CITIZEN_ALERT_PUBKEY`, 64 hex
+or npub1…) and halted debts and repeated producer refusals also arrive as a
+gift-wrapped NIP-17 DM, once per debt and cause per window, with one summary
+at startup; the relay must admit that key as a gift-wrap recipient (use the operator's forum
+account), and the operator's client must read the forum relay. Without it,
+alerts go to stderr only. The forum learns each house seat's key from
 `[poker] citizens` (`POKER_CONFIG.citizens`).
 
 Licence: AGPL-3.0-only.

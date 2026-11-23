@@ -8,13 +8,14 @@ use std::time::Duration;
 use bitcoin::{OutPoint, Txid};
 use clap::Parser;
 use nostr_bbs_core::event::compute_event_id;
-use nostr_bbs_core::gift_wrap::{gift_wrap_kind, unwrap_gift_kind};
+use nostr_bbs_core::gift_wrap::{gift_wrap, gift_wrap_kind, unwrap_gift_kind};
 use nostr_bbs_poker::protocol::{ToCitizen, ToHero, RUMOR_KIND};
 use sidestr_agent::AgentKey;
 use sidestr_core::document::ChainDocument;
 use tokio::time::{sleep, Instant};
 use zeroize::Zeroizing;
 
+use nostr_bbs_poker_citizen::alert::{Alert, Alerter};
 use nostr_bbs_poker_citizen::chain::{self, Facts};
 use nostr_bbs_poker_citizen::ledger::{Cause, Pending, Resume, TxOnChain};
 use nostr_bbs_poker_citizen::net::{now_secs, publish_once, Frame, Relay};
@@ -89,6 +90,9 @@ pub struct Cli {
     /// How long a member's own report of a payment is trusted before the chain must show it, seconds.
     #[arg(long, default_value_t = 1_800)]
     claim_grace_secs: u64,
+    /// An operator's pubkey (64 hex, or npub1…) to send alerts to as a gift-wrapped direct message on the forum relay: halted payout debts and a producer that keeps refusing. Each debt and cause is sent once per window. The relay must admit this key as a gift-wrap recipient (whitelisted, e.g. the operator's forum account) or it refuses the DM. Unset, alerts go to stderr only.
+    #[arg(long, env = "POKER_CITIZEN_ALERT_PUBKEY", value_name = "PUBKEY")]
+    alert_pubkey: Option<String>,
     /// How often the chain is re-read, seconds.
     #[arg(long, default_value_t = 15)]
     poll_secs: u64,
@@ -119,6 +123,25 @@ struct Runner {
     http: reqwest::Client,
     bot_turns: VecDeque<(Instant, String)>,
     seen: Seen,
+    /// Where alerts beyond stderr go, and how often.
+    alerter: Alerter,
+}
+
+/// The alert recipient as 64 hex: hex as given, or an `npub1…`; an empty value is none.
+fn parse_alert_pubkey(text: Option<&str>) -> Result<Option<String>, String> {
+    let Some(t) = text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let hex_text = if t.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("npub1")) {
+        nostr_bbs_core::nip19::decode_npub(t).map_err(|e| format!("--alert-pubkey: {e}"))?
+    } else {
+        t.to_ascii_lowercase()
+    };
+    if hex_text.len() == 64 && hex_text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(Some(hex_text))
+    } else {
+        Err("--alert-pubkey is not 64 hex characters or an npub1…".into())
+    }
 }
 
 fn read_key(path: &PathBuf) -> Result<(AgentKey, Zeroizing<[u8; 32]>), String> {
@@ -146,6 +169,7 @@ pub async fn main() -> Result<(), String> {
         cli.ticker.as_deref(),
     )?;
     let (key, sk) = read_key(&cli.key_file)?;
+    let alert_to = parse_alert_pubkey(cli.alert_pubkey.as_deref())?;
     let pubkey = hex::encode(key.pubkey().serialize());
     let stakes_bb: Vec<u64> = cli
         .stakes_bb
@@ -191,6 +215,7 @@ pub async fn main() -> Result<(), String> {
             &root[..12.min(root.len())]
         );
     }
+    let startup_summary = Alert::summary(&citizen.halted());
     for commit in &recovered.resumed {
         eprintln!("recovered hand {}…", &commit[..12]);
     }
@@ -244,7 +269,15 @@ pub async fn main() -> Result<(), String> {
         http,
         bot_turns: VecDeque::new(),
         seen: Seen::from_entries(recovered.seen),
+        alerter: Alerter::new(alert_to),
     };
+    if !runner.alerter.is_configured() {
+        eprintln!("alerts: no --alert-pubkey; alerts go to stderr only");
+    }
+    // one summary of the debts that are halted, said on the first connection
+    if let Some(summary) = startup_summary {
+        runner.startup.push(Effect::Alert(summary));
+    }
     for e in recovered.effects {
         if let Effect::BotTurn(commit) = e {
             let at = Instant::now() + Duration::from_millis(runner.cli.bot_delay_ms);
@@ -387,6 +420,20 @@ impl Runner {
         };
         if let Err(e) = relay.publish(&wrap).await {
             eprintln!("publish to {}…: {e}", &to[..8]);
+        }
+    }
+
+    /// Send the operator a NIP-17 direct message, gift-wrapped (NIP-59).
+    async fn send_dm(&mut self, relay: &mut Relay, to: &str, text: &str) {
+        let wrap = match gift_wrap(&self.sk, &self.pubkey, to, text) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("alert DM: wrap: {e}");
+                return;
+            }
+        };
+        if let Err(e) = relay.publish(&wrap).await {
+            eprintln!("alert DM: publish: {e}");
         }
     }
 
@@ -567,7 +614,14 @@ impl Runner {
                     }
                 }
                 Effect::Persist => self.checkpoint(),
-                Effect::Alert(what) => eprintln!("ALERT: {what}"),
+                Effect::Alert(alert) => {
+                    eprintln!("ALERT: {}", alert.text);
+                    // a due DM goes ahead of the rest of the queue
+                    if let Some(dm) = self.alerter.route(&alert, now_secs()) {
+                        queue.push_front(dm);
+                    }
+                }
+                Effect::Dm { to, text } => self.send_dm(relay, &to, &text).await,
             }
         }
     }
@@ -664,5 +718,26 @@ impl Runner {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_alert_pubkey;
+
+    #[test]
+    fn the_alert_pubkey_is_hex_an_npub_or_nothing() {
+        let hex = "ab".repeat(32);
+        assert_eq!(parse_alert_pubkey(None), Ok(None));
+        assert_eq!(parse_alert_pubkey(Some("  ")), Ok(None));
+        assert_eq!(parse_alert_pubkey(Some(&hex)), Ok(Some(hex.clone())));
+        assert_eq!(
+            parse_alert_pubkey(Some(&hex.to_uppercase())),
+            Ok(Some(hex.clone()))
+        );
+        let npub = nostr_bbs_core::nip19::encode_npub(&hex).unwrap();
+        assert_eq!(parse_alert_pubkey(Some(&npub)), Ok(Some(hex)));
+        assert!(parse_alert_pubkey(Some("abcd")).is_err());
+        assert!(parse_alert_pubkey(Some(&"zz".repeat(32))).is_err());
     }
 }

@@ -19,6 +19,7 @@ use nostr_bbs_poker::protocol::{Asset, Debt, TableOffer, ToCitizen, ToHero, VERS
 use nostr_bbs_poker::record::record_of;
 use nostr_bbs_poker::rules::{self, Settlement, Side};
 
+use crate::alert::{Alert, AlertCause};
 use crate::ledger::{Cause, Ledger, Owed, Owing, Pending, Replaced, REFUSALS_PER_ALERT};
 use crate::state::{SavedHand, SeenEntry, State};
 
@@ -100,8 +101,17 @@ pub enum Effect {
     },
     /// The ledger changed; save it.
     Persist,
-    /// Something an operator must look at: say it loudly.
-    Alert(String),
+    /// Something an operator must look at: say it loudly. The runner prints
+    /// it to stderr and, with an alert pubkey set, sends it as a [`Effect::Dm`]
+    /// ([`crate::alert::Alerter`]).
+    Alert(Alert),
+    /// A direct message (NIP-17, gift-wrapped) to the operator.
+    Dm {
+        /// The operator's pubkey (64 hex).
+        to: String,
+        /// The message.
+        text: String,
+    },
 }
 
 /// Balances the runner read from the chain for one request.
@@ -1423,10 +1433,14 @@ impl Citizen {
         self.dirty = true;
         let mut out = vec![Effect::Persist];
         if replaced == Replaced::Halted {
-            out.push(Effect::Alert(format!(
-                "HALTED hand {}…: {}",
-                &root[..root.len().min(12)],
-                self.ledger.halted(root).unwrap_or("replaced too often")
+            out.push(Effect::Alert(Alert::new(
+                root,
+                AlertCause::Halted,
+                format!(
+                    "HALTED hand {}…: {}",
+                    &root[..root.len().min(12)],
+                    self.ledger.halted(root).unwrap_or("replaced too often")
+                ),
             )));
         }
         out
@@ -1456,9 +1470,13 @@ impl Citizen {
         self.dirty = true;
         let mut out = vec![Effect::Persist];
         if n > 0 && n % REFUSALS_PER_ALERT == 0 {
-            out.push(Effect::Alert(format!(
-                "the producer has refused the payout for hand {}… {n} times: {why}",
-                &root[..root.len().min(12)]
+            out.push(Effect::Alert(Alert::new(
+                root,
+                AlertCause::Refused,
+                format!(
+                    "the producer has refused the payout for hand {}… {n} times: {why}",
+                    &root[..root.len().min(12)]
+                ),
             )));
         }
         out
@@ -2390,7 +2408,7 @@ mod tests {
         p
     }
 
-    fn alerts(effects: &[Effect]) -> Vec<&String> {
+    fn alerts(effects: &[Effect]) -> Vec<&Alert> {
         effects
             .iter()
             .filter_map(|e| match e {
@@ -2431,6 +2449,8 @@ mod tests {
         // the same thing happens again: systematic, so halt for an operator
         let out = c.replace_payout(&root, Cause::Invalid, tomorrow + 200);
         assert_eq!(alerts(&out).len(), 1, "{out:?}");
+        assert_eq!(alerts(&out)[0].debt, root, "the alert names its debt");
+        assert_eq!(alerts(&out)[0].cause, AlertCause::Halted);
         assert!(c.is_halted(&root));
         assert_eq!(c.halted().len(), 1);
         assert_eq!(c.ledger.paid_today(tomorrow), 3_000, "still not refunded");
