@@ -300,7 +300,18 @@ pub fn ChannelPage() -> impl IntoView {
     let signed_in = auth.is_authenticated();
 
     // Derived signals for ChannelStats
-    let message_count = Signal::derive(move || messages.get().len() as u32);
+    // The channel's true total (relay COUNT + live since), not the size of
+    // the history window on screen.
+    let store_for_count = use_context::<ChannelStore>();
+    let message_count = Signal::derive(move || {
+        let held = messages.with(Vec::len) as u32;
+        let Some(store) = store_for_count else {
+            return held;
+        };
+        history_needles
+            .with_value(|n| n.as_ref().map(|(cid, _)| cid.clone()))
+            .map_or(held, |cid| store.total_for(&cid).max(held))
+    });
     let member_count = Signal::derive(move || {
         let msgs = messages.get();
         let mut unique = std::collections::HashSet::new();
@@ -522,6 +533,7 @@ pub fn ChannelPage() -> impl IntoView {
                         needles.push(section);
                     }
                     history_needles.set_value(Some((cid_for_replay.clone(), needles.clone())));
+                    store_for_replay.request_total(&relay_for_retry, &cid_for_replay);
                     // EOSE on the narrow history query is the relay's own
                     // receipt that it has sent the newest page it holds for
                     // this channel — the real bootstrap-success signal (ADR-092).

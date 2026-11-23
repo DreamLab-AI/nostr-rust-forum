@@ -136,6 +136,8 @@ pub struct ChannelStore {
     /// owner, so `use_context` there returns `None`: eviction must reach the
     /// decrypt cache through this handle, never a context lookup.
     zone_keys: StoredValue<Option<crate::zone_crypto::store::ZoneKeyStore>>,
+    /// True message totals per channel (see [`ChannelTotal`]).
+    totals: RwSignal<HashMap<String, ChannelTotal>>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -181,6 +183,7 @@ impl ChannelStore {
             history: RwSignal::new(HashMap::new()),
             window_max: configured_window(),
             zone_keys: StoredValue::new(None),
+            totals: RwSignal::new(HashMap::new()),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -335,6 +338,75 @@ impl ChannelStore {
     pub fn count_for(&self, cid: &str) -> u32 {
         self.channel_messages
             .with(|m| m.get(cid).map(|v| v.len() as u32).unwrap_or(0))
+    }
+
+    /// The channel's true message count (see [`ChannelTotal`]): the relay's
+    /// count plus what arrived since, never less than what the store holds
+    /// (which, with the history window, may be a fraction of the channel).
+    /// Falls back to [`Self::count_for`] until [`Self::request_total`] has
+    /// an answer. Reactive.
+    pub fn total_for(&self, cid: &str) -> u32 {
+        let held = self.count_for(cid);
+        let total = self
+            .totals
+            .with(|m| m.get(cid).and_then(ChannelTotal::total));
+        total.map_or(held, |t| (t.min(u32::MAX as u64) as u32).max(held))
+    }
+
+    /// Ask the relay for channel `cid`'s message count, once per session
+    /// (`{"kinds":[42], "#e":[cid], "until": now}`, answered by the relay's
+    /// exact single-channel COUNT). Messages newer than that are added as
+    /// they are inserted ([`Self::note_inserted`]).
+    pub fn request_total(&self, relay: &RelayConnection, cid: &str) {
+        if self.totals.with_untracked(|m| m.contains_key(cid)) {
+            return;
+        }
+        let as_of = (js_sys::Date::now() / 1000.0) as u64;
+        self.totals.update(|m| {
+            m.insert(
+                cid.to_string(),
+                ChannelTotal {
+                    counted: None,
+                    as_of,
+                    newer_ids: HashSet::new(),
+                },
+            );
+        });
+        let totals = self.totals;
+        let key = cid.to_string();
+        relay.count(
+            vec![Filter {
+                kinds: Some(vec![42]),
+                e_tags: Some(vec![cid.to_string()]),
+                until: Some(as_of),
+                ..Default::default()
+            }],
+            // May answer twice (before and after AUTH); the later, authorised
+            // answer is the complete one and replaces the first.
+            Rc::new(move |n: u64| {
+                let _ = totals.try_update(|m| {
+                    if let Some(t) = m.get_mut(&key) {
+                        t.counted = Some(n);
+                    }
+                });
+            }),
+        );
+    }
+
+    /// Record a message newly inserted into channel `cid`'s list for its
+    /// true total (only messages newer than the count matter).
+    fn note_inserted(&self, cid: &str, id: &str, created_at: u64) {
+        let newer = self.totals.with_untracked(|m| {
+            m.get(cid)
+                .is_some_and(|t| created_at > t.as_of && !t.newer_ids.contains(id))
+        });
+        if newer {
+            self.totals.update(|m| {
+                if let Some(t) = m.get_mut(cid) {
+                    t.newer_ids.insert(id.to_string());
+                }
+            });
+        }
     }
 
     /// Newest message per channel as `(channel_id, event_id, created_at)`.
@@ -665,11 +737,13 @@ impl ChannelStore {
                 }
                 let mut newly_added = false;
                 let event_ts = event.created_at;
+                let event_id = event.id.clone();
                 channel_msgs.update(|m| {
                     let events = m.entry(cid.clone()).or_insert_with(Vec::new);
                     newly_added = insert_message(events, event);
                 });
                 if newly_added {
+                    store.note_inserted(&cid, &event_id, event_ts);
                     last_active.update(|m| {
                         let ts = m.entry(cid).or_insert(0);
                         if event_ts > *ts {
@@ -794,11 +868,13 @@ impl ChannelStore {
             }
             let mut newly_added = false;
             let event_ts = event.created_at;
+            let event_id = event.id.clone();
             channel_msgs.update(|m| {
                 let events = m.entry(cid.clone()).or_insert_with(Vec::new);
                 newly_added = insert_message(events, event);
             });
             if newly_added {
+                store.note_inserted(&cid, &event_id, event_ts);
                 last_active.update(|m| {
                     let ts = m.entry(cid).or_insert(0);
                     if event_ts > *ts {
@@ -940,15 +1016,21 @@ impl ChannelStore {
             return;
         }
         let mut newest: HashMap<String, u64> = HashMap::new();
+        let mut inserted: Vec<(String, String, u64)> = Vec::new();
         self.channel_messages.update(|m| {
             for (cid, ev) in events {
                 let ts = ev.created_at;
+                let id = ev.id.clone();
                 if insert_message(m.entry(cid.clone()).or_default(), ev) {
+                    inserted.push((cid.clone(), id, ts));
                     let n = newest.entry(cid).or_insert(0);
                     *n = (*n).max(ts);
                 }
             }
         });
+        for (cid, id, ts) in inserted {
+            self.note_inserted(&cid, &id, ts);
+        }
         if !newest.is_empty() {
             self.last_active.update(|m| {
                 for (cid, ts) in newest {
@@ -1582,6 +1664,30 @@ fn configured_window() -> usize {
 /// What a history page request hands back once answered: the ingested
 /// messages and what the relay delivered.
 type PageDone = Box<dyn FnOnce(Vec<(String, NostrEvent)>, PageOutcome)>;
+
+/// A channel's true message total: the relay's NIP-45 COUNT of its kind-42s
+/// up to `as_of` (inclusive), plus the distinct messages newer than `as_of`
+/// seen since. The two parts never overlap, and the second is keyed by id,
+/// so a page evicted and reloaded by the history window is not counted
+/// twice. A deletion lowers the relay's figure only on the next count (the
+/// next session); a gated channel counts 0 for a non-member, and the
+/// displayed total never drops below what the store holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChannelTotal {
+    /// The COUNT answer, once in.
+    pub counted: Option<u64>,
+    /// The COUNT's `until`.
+    pub as_of: u64,
+    /// Ids of messages newer than `as_of` inserted since the count.
+    pub newer_ids: HashSet<String>,
+}
+
+impl ChannelTotal {
+    /// The total, when the count has answered.
+    pub fn total(&self) -> Option<u64> {
+        self.counted.map(|n| n + self.newer_ids.len() as u64)
+    }
+}
 
 /// Which end of a channel's window to evict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2532,6 +2638,21 @@ mod tests {
             Some(seg),
             "the same segment is retried"
         );
+    }
+
+    #[test]
+    fn a_channel_total_is_the_count_plus_distinct_newer_messages() {
+        let mut t = ChannelTotal {
+            counted: None,
+            as_of: 100,
+            newer_ids: HashSet::new(),
+        };
+        assert_eq!(t.total(), None, "no figure before the count answers");
+        t.newer_ids.insert("x".into());
+        t.newer_ids.insert("x".into());
+        t.newer_ids.insert("y".into());
+        t.counted = Some(210_000);
+        assert_eq!(t.total(), Some(210_002), "newer ids counted once each");
     }
 
     #[test]

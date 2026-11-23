@@ -90,6 +90,7 @@ pub fn CategoryPage() -> impl IntoView {
     // Copy for the zone-first breadcrumb (ADR-107); `ZoneAccess` is `Copy`.
     let za_breadcrumb = zone_access;
     let store = use_channel_store();
+    let relay_for_totals = StoredValue::new(expect_context::<RelayConnection>());
     let toasts = use_toasts();
 
     let params = use_params_map();
@@ -594,7 +595,10 @@ pub fn CategoryPage() -> impl IntoView {
                         // modal seeded with that section's current metadata.
                         let is_admin = za_admin.get();
                         let cards: Vec<_> = secs.iter().map(|s| {
-                            let mc = store.count_for(&s.id);
+                            // True total (relay COUNT + live since), not
+                            // the size of the history window held.
+                            relay_for_totals.with_value(|r| store.request_total(r, &s.id));
+                            let mc = store.total_for(&s.id);
                             let la = last_active.get(&s.id).copied().unwrap_or(0);
                             let on_edit = if is_admin {
                                 let meta = s.clone();
