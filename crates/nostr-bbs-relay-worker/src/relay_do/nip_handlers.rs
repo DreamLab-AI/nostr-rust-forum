@@ -1963,8 +1963,6 @@ impl NostrRelayDO {
                 }
             }
         }
-        // Before the first await: a CLOSE for this id from now on cancels it.
-        let pending_token = self.pending_reqs.borrow_mut().begin(session_id, sub_id);
 
         // Determine the requesting session's pubkey and zone access for filtering
         let session_pubkey = {
@@ -2001,6 +1999,9 @@ impl NostrRelayDO {
         // NIP-59: kind-1059 (Sealed DM) read gate + mandatory #p rewrite. Shared
         // with the COUNT path so both reject unauthenticated kind-1059 reads and
         // bind results to the authed recipient identically.
+        //
+        // Before the first await: a CLOSE for this id from now on cancels it.
+        let pending_token = self.pending_reqs.borrow_mut().begin(session_id, sub_id);
         let read_set = self.wrap_read_set(&session_pubkey).await;
         let filters = match Self::gate_kind_1059_filters_with(
             filters,
@@ -2009,6 +2010,9 @@ impl NostrRelayDO {
         ) {
             Some(f) => f,
             None => {
+                self.pending_reqs
+                    .borrow_mut()
+                    .finish(session_id, sub_id, pending_token);
                 Self::send_notice(
                     &ws,
                     "auth-required: must authenticate to receive kind-1059 DMs",
