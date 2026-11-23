@@ -236,9 +236,10 @@ pub fn SectionPage() -> impl IntoView {
     }
 
     // Topics: the kind-42 ROOTS in this channel, with reply counts + last
-    // activity, derived from the shared store. `Signal::derive` because
-    // `TopicSummary` is not `PartialEq`.
-    let topics = Signal::derive(move || {
+    // activity, derived from the shared store. A `Memo`, so the list is
+    // classified once per store change however many views read it (with
+    // paged history a channel can hold tens of thousands of messages).
+    let topics_memo = Memo::new(move |_| {
         let cid = match resolved_channel.get() {
             Some(ch) => ch.id,
             None => return Vec::<TopicSummary>::new(),
@@ -248,6 +249,7 @@ pub fn SectionPage() -> impl IntoView {
             None => Vec::new(),
         })
     });
+    let topics: Signal<Vec<TopicSummary>> = topics_memo.into();
 
     // Mark this channel read when its topic list is viewed (BBS reading flow).
     //

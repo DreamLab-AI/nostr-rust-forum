@@ -26,7 +26,7 @@ use crate::utils::format_relative_time;
 use crate::utils::slug_hash::{section_slug, topic_slug};
 
 /// A single topic (kind-42 root) plus its derived thread stats.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopicSummary {
     /// The kind-42 root event id (the thread anchor).
     pub id: String,
@@ -235,10 +235,15 @@ pub fn TopicList(
     let category = StoredValue::new(category);
     let section_hash = StoredValue::new(section_hash);
 
+    // The outer view tracks only EMPTINESS, so it re-renders when the list
+    // becomes empty or non-empty, never per change: re-running it per change
+    // built a fresh <For> and re-rendered every row on each page of history.
+    let is_empty = Memo::new(move |_| topics.with(Vec::is_empty));
+
     view! {
         <div class="space-y-2">
             {move || {
-                if topics.with(Vec::is_empty) {
+                if is_empty.get() {
                     view! {
                         <div class="flex flex-col items-center justify-center py-16 text-center">
                             <div class="w-14 h-14 rounded-full bg-gray-800 flex items-center justify-center mb-4 animate-gentle-float">
