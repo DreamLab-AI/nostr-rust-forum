@@ -285,7 +285,7 @@ pub fn warn_if_relay_url_unconfigured(mode: AuthMode, allowed: &[String]) {
     if relay_url_unconfigured_in_nip42(mode, allowed) {
         #[cfg(target_arch = "wasm32")]
         worker::console_error!(
-            "nip42: RELAY_URL is unset, so every authenticated write is REFUSED. Set RELAY_URL to this relay's wss:// URL (and RELAY_URL_ALIASES for extra hostnames)."
+            "nip42: RELAY_URL and RELAY_URL_ALIASES are unset, so every NIP-42 AUTH is REFUSED (no client can authenticate; every write and every protected-kind read is refused). Set RELAY_URL to this relay's wss:// URL (and RELAY_URL_ALIASES for extra hostnames)."
         );
     }
 }

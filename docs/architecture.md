@@ -203,7 +203,6 @@ graph TD
 | 56  |      | X     |     |        |         |      |        |
 | 59  |      | X     |     |        |         | X    |        |
 | 65  |      | X     |     |        |         |      |        |
-| 90  |      | X     |     |        |         |      |        |
 | 98  | X    | X     | X   | X      |         | X    |        |
 | app:31400-31405 | X | X |  |     |         | X    | X      |
 
@@ -213,9 +212,16 @@ governance tables; the relay-worker validates agent events at ingress and projec
 action requests to D1; the core crate defines the domain model; the client renders
 panels and signs action responses.
 
-**Note (NIP-56/65/90):** Reporting (kind-1984, relay-enforced moderation), relay
-list metadata, and data vending machines are validated at ingress by the
-relay-worker. **NIP-59 gift wrap (kind-1059)** carries the only direct-message
+**Note (NIP-56/65/90):** NIP-56 reports (kind-1984) are relay-enforced: below TL1
+the relay refuses them, and an accepted report is projected into the `reports`
+table for the moderation queue and auto-hide (`relay_do/nip_handlers.rs`,
+`moderation.rs`). NIP-65 relay lists (kind-10002) are stored as replaceable events
+with no NIP-65-specific validation. NIP-90 (data vending machines) is not
+implemented: the `nip90` module was removed in the R4 sweep, no DVM kind gets
+special handling (such events meet the same write gates as any other kind), and
+neither NIP-11 nor `/health` advertises 90 (`relay-worker/src/nip11.rs:209-211`,
+`lib.rs:299-301`; corrected 2026-11-23, this note previously said all three were
+validated at ingress). **NIP-59 gift wrap (kind-1059)** carries the only direct-message
 transport: the relay-worker enforces a recipient-whitelist admission gate on
 kind-1059 events (see `relay-worker/src/relay_do/nip_handlers.rs`). There is no
 NIP-17 kind-14 inbox routing — only the NIP-59 gift-wrap envelope.

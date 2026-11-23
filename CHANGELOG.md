@@ -15,6 +15,41 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 [ADR-2034](docs/adr/ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md), and the 2026-11-22 section of
 [ADR-2016](docs/adr/ADR-2016-end-to-end-encrypted-zones.md).
 
+> Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
+> encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
+
+### Documentation and comment drift corrected (2026-11-23)
+
+No behaviour change. Corrections found while re-verifying the VisionFlow corpus at `4a73a7a`:
+
+- **KF-23 closed** in `docs/security/known-findings.md`, with the fix (#98, `fd31193`) and the operator's live check;
+  ADR-2034 gets a dated note and `implementation_status: complete`; the baseline, the deletion runbook and the earlier
+  changelog bullet get dated notes. KF-29's `wrangler.toml` and call-site lines re-derived.
+- **Relay AUTH log** (`relay_do/nip42.rs`): with `RELAY_URL` and `RELAY_URL_ALIASES` blank the console error now says
+  every NIP-42 AUTH is refused (no client can authenticate), not only authenticated writes; the call-site comment in
+  `nip_handlers.rs` says the same.
+- **`SECURITY.md`** names the current versions (library crates 1.0.0-beta.20, tag `v1.0.0-beta.21-rc.3`) instead of
+  1.0.0-beta.3, and the root `Cargo.toml` comment over the internal path deps no longer says they are published as
+  1.0.0-beta.3.
+- **`docs/architecture.md`** no longer claims NIP-90 events are validated at ingress (the module was removed; the relay
+  handles no DVM kind and does not advertise 90), and the NIP coverage table drops its NIP-90 row.
+- **Pod worker**: the `solid-pod-rs-phase1` feature comment and `docs/consumer-surface-map.md` no longer name the
+  `key_provisioning` and `nip05_endpoint` shims removed on 2026-07-03; the feature still gates `src/export.rs`.
+- **README** working status dated 23 November against `4a73a7a`.
+- **ADR-2017** dated note: #99 corrected the two relay comments that still said `fold_deletions`.
+- **`zone_crypto/inbox_key.rs`**: the lookup-reply sentence that sat on top of `proof_binds` moved into
+  `parse_lookup`'s doc comment, where it belongs.
+
+### Forum client: cold encrypted-zone links wait for zone keys (#98, 2026-11-22; recorded 2026-11-23)
+
+- In an encrypted zone a cold deep link showed "Topic Not Found" between the relay's authenticated answer and the arrival
+  of zone keys (KF-23; live, about 12 s to 29 s). `Lookup::decide_with_keys` now also takes the zone-key grant backlog's
+  phase: while it is pending or moving the topic page and section topic list show "Fetching your keys for this zone…",
+  once it stalls (20 s without progress, 120 s cap) "Your keys for this zone are taking too long to arrive. Reload to try
+  again.", and only once keys have settled an absence. The grant filter asks for `limit` 1000. The REQ answer timeout
+  now runs from when the frame leaves the paced queue. Live check 2026-11-22 on a cold device: "Fetching your keys for
+  this zone…" from 9.2 s, the topic at 28.4 s, no "Topic Not Found".
+
 ### Documentation: diagrams moved to VisionFlow; stale comments and records corrected (2026-11-22)
 
 - **Diagram corpus moved.** The five files under `docs/diagrams/` (the anomaly register and the relay, client, pod and
@@ -107,6 +142,7 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
   re-sent under a new subscription id, up to 2 times, and an answer under a retired id is discarded.
 - Known gap: in an encrypted zone a cold deep link can still say "Topic Not Found" for some seconds, between the
   authenticated answer and the arrival of zone keys. See `docs/security/known-findings.md` KF-23.
+  Note 2026-11-23: closed by #98 (`fd31193`, tag `v1.0.0-beta.21-rc.3`); see the #98 entry above.
 
 ### Forum client: zone keys, drafts, bookmarks and notification previews are per identity (2026-11-22)
 

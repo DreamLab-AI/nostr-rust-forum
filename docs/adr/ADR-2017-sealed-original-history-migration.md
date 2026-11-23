@@ -261,3 +261,7 @@ around it. `verified_commit` above is not re-asserted; the points below were rea
   `grep -n "tombstone_before_delete" crates/nostr-bbs-relay-worker/src/admin_events.rs` (`:279`).
   Two relay comments still say `fold_deletions` (`admin_events.rs:18`, `nip_handlers.rs:2942`); they were left alone because
   the change that wrote this section changed no code.
+
+  > Note 2026-11-23: kit PR #99 (`4a73a7a`) corrected both comments; they now name `tombstones::fold_deletion`
+  > (`admin_events.rs:18`, `nip_handlers.rs:2941`). Checked at `4a73a7a` by
+  > `grep -rn "fold_deletions" crates | wc -l` (returned `0`).
