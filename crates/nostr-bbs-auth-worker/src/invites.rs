@@ -708,6 +708,22 @@ pub async fn handle_redeem(
 // POST /api/invites/:id/revoke
 // ---------------------------------------------------------------------------
 
+/// Look up an invite by id or by code for the revoke endpoint.
+const SQL_FIND_INVITE_FOR_REVOKE: &str = "SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id FROM invitations WHERE id = ?1 OR code = ?1";
+
+/// Mark one invite revoked, keyed on its row id (`?3`).
+const SQL_REVOKE_INVITE: &str =
+    "UPDATE invitations SET revoked_at = ?1, revoked_by = ?2 WHERE id = ?3";
+
+/// Fail unless the revoke `UPDATE` changed exactly one row, so a statement
+/// that matched nothing is never reported to the caller as success.
+fn require_revoked(changes: Option<usize>) -> std::result::Result<(), &'static str> {
+    match changes {
+        Some(1) => Ok(()),
+        _ => Err("Revoke changed no rows"),
+    }
+}
+
 pub async fn handle_revoke(
     invite_id: &str,
     body_bytes: &[u8],
@@ -731,7 +747,7 @@ pub async fn handle_revoke(
     };
 
     let row = db
-        .prepare("SELECT id, code, issued_by, max_uses, uses, expires_at, revoked_at, revoked_by, created_at, zone_id FROM invitations WHERE id = ?1 OR code = ?1")
+        .prepare(SQL_FIND_INVITE_FOR_REVOKE)
         .bind(&[js_str(invite_id)])?
         .first::<InviteRow>(None)
         .await
@@ -757,13 +773,20 @@ pub async fn handle_revoke(
     }
 
     let now = now_secs() as i64;
+    // Bind the selected row's id, not the raw path segment: the path may be
+    // the invite code, which `WHERE id = ?3` would never match.
     let update = db
-        .prepare("UPDATE invitations SET revoked_at = ?1, revoked_by = ?2 WHERE id = ?3")
-        .bind(&[js_i64(now), js_str(&caller), js_str(invite_id)])?
+        .prepare(SQL_REVOKE_INVITE)
+        .bind(&[js_i64(now), js_str(&caller), js_str(&row.id)])?
         .run()
         .await;
-    if let Err(e) = update {
-        return error_json(env, &format!("Revoke failed: {e}"), 500);
+    let update = match update {
+        Ok(result) => result,
+        Err(e) => return error_json(env, &format!("Revoke failed: {e}"), 500),
+    };
+    let changes = update.meta().ok().flatten().and_then(|m| m.changes);
+    if let Err(msg) = require_revoked(changes) {
+        return error_json(env, msg, 500);
     }
 
     json_response(
@@ -905,6 +928,75 @@ pub async fn consume_for_registration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- revoke (NF-25.4) ----------------------------------------------------
+
+    fn revoke_db() -> rusqlite::Connection {
+        let db = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        db.execute_batch(
+            "CREATE TABLE invitations(id TEXT PRIMARY KEY, code TEXT UNIQUE NOT NULL, \
+             issued_by TEXT NOT NULL, max_uses INTEGER NOT NULL DEFAULT 1, \
+             uses INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL, \
+             revoked_at INTEGER, revoked_by TEXT, created_at INTEGER NOT NULL, zone_id TEXT); \
+             INSERT INTO invitations(id, code, issued_by, expires_at, created_at) \
+             VALUES ('inv-id-1', 'CODE-abc123', 'issuer', 9999999999, 1);",
+        )
+        .expect("seed invitations");
+        db
+    }
+
+    /// Run the handler's select-then-update sequence for a path segment and
+    /// return the number of rows the UPDATE changed.
+    fn revoke_like_handler(db: &rusqlite::Connection, path_segment: &str) -> Option<usize> {
+        let id: String = db
+            .query_row(SQL_FIND_INVITE_FOR_REVOKE, [path_segment], |r| r.get("id"))
+            .ok()?;
+        Some(
+            db.execute(SQL_REVOKE_INVITE, rusqlite::params![42_i64, "caller", id])
+                .expect("update"),
+        )
+    }
+
+    fn revoked_at(db: &rusqlite::Connection) -> Option<i64> {
+        db.query_row("SELECT revoked_at FROM invitations", [], |r| r.get(0))
+            .expect("read revoked_at")
+    }
+
+    #[test]
+    fn revoke_by_code_revokes_the_row() {
+        let db = revoke_db();
+        let changed = revoke_like_handler(&db, "CODE-abc123");
+        assert_eq!(changed, Some(1), "revoke by code must update the row");
+        assert_eq!(revoked_at(&db), Some(42));
+    }
+
+    #[test]
+    fn revoke_by_id_still_revokes_the_row() {
+        let db = revoke_db();
+        let changed = revoke_like_handler(&db, "inv-id-1");
+        assert_eq!(changed, Some(1));
+        assert_eq!(revoked_at(&db), Some(42));
+    }
+
+    #[test]
+    fn revoke_update_bound_to_raw_code_changes_nothing() {
+        // Pins the NF-25.4 defect: keying the UPDATE on the code matches no row.
+        let db = revoke_db();
+        let n = db
+            .execute(
+                SQL_REVOKE_INVITE,
+                rusqlite::params![42_i64, "caller", "CODE-abc123"],
+            )
+            .expect("update");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn zero_rows_changed_is_an_error() {
+        assert!(require_revoked(Some(1)).is_ok());
+        assert!(require_revoked(Some(0)).is_err());
+        assert!(require_revoked(None).is_err());
+    }
 
     #[test]
     fn generate_code_has_expected_length() {
