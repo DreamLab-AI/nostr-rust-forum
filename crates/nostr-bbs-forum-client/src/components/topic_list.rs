@@ -158,6 +158,12 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
     // Lower-cased views for the parent walk: the root ids, and every event
     // by id, so each hop is a lookup and not a scan of the channel.
     let root_lower: HashSet<String> = roots.keys().map(|k| k.to_lowercase()).collect();
+    // Lower-cased id -> stored id, so attributing a reply is a lookup rather
+    // than a scan of every root (quadratic over a paged-in channel).
+    let root_by_lower: HashMap<String, String> = roots
+        .keys()
+        .map(|k| (k.to_lowercase(), k.clone()))
+        .collect();
     let by_id: HashMap<String, &NostrEvent> =
         events.iter().map(|e| (e.id.to_lowercase(), e)).collect();
 
@@ -192,7 +198,10 @@ pub fn classify_topics(channel_id: &str, events: &[NostrEvent]) -> Vec<TopicSumm
         if !root_lower.contains(&root_key) {
             continue; // orphaned reply: its chain never reaches a root here
         }
-        if let Some((_, summary)) = roots.iter_mut().find(|(k, _)| k.to_lowercase() == root_key) {
+        if let Some(summary) = root_by_lower
+            .get(&root_key)
+            .and_then(|id| roots.get_mut(id))
+        {
             summary.reply_count += 1;
             if ev.created_at > summary.last_activity {
                 summary.last_activity = ev.created_at;
@@ -229,8 +238,7 @@ pub fn TopicList(
     view! {
         <div class="space-y-2">
             {move || {
-                let rows = topics.get();
-                if rows.is_empty() {
+                if topics.with(Vec::is_empty) {
                     view! {
                         <div class="flex flex-col items-center justify-center py-16 text-center">
                             <div class="w-14 h-14 rounded-full bg-gray-800 flex items-center justify-center mb-4 animate-gentle-float">
@@ -243,15 +251,23 @@ pub fn TopicList(
                         </div>
                     }.into_any()
                 } else {
-                    rows.into_iter().map(|t| {
-                        let href = base_href(&format!(
-                            "/forums/{}/{}/{}",
-                            category.get_value(),
-                            section_hash.get_value(),
-                            topic_slug(&t.id),
-                        ));
-                        view! { <TopicRow topic=t href=href /> }
-                    }).collect_view().into_any()
+                    // Keyed: a page of older topics renders only its own
+                    // rows; a row re-renders when what it shows changes.
+                    view! {
+                        <For
+                            each=move || topics.get()
+                            key=|t| (t.id.clone(), t.reply_count, t.last_activity, t.content.len(), t.last_pubkey.clone())
+                            children=move |t| {
+                                let href = base_href(&format!(
+                                    "/forums/{}/{}/{}",
+                                    category.get_value(),
+                                    section_hash.get_value(),
+                                    topic_slug(&t.id),
+                                ));
+                                view! { <TopicRow topic=t href=href /> }
+                            }
+                        />
+                    }.into_any()
                 }
             }}
         </div>

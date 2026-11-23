@@ -128,6 +128,20 @@ pub struct ChannelStore {
     /// Paged history per channel id (see [`HistoryCursor`]). Reactive, so the
     /// channel page can show "loading older" and "start of history".
     history: RwSignal<HashMap<String, HistoryCursor>>,
+    /// What each `ensure_subscribed` REQ delivered by its receipts, so the
+    /// page that knows whether the channel is gated can record its first
+    /// page ([`ChannelStore::settle_first_page`]).
+    first_pages: StoredValue<HashMap<String, FirstPageSnapshot>>,
+}
+
+/// Deliveries of a channel's `ensure_subscribed` REQ, snapshotted at its
+/// first receipt and at its first authenticated receipt.
+#[derive(Clone, Copy, Debug, Default)]
+struct FirstPageSnapshot {
+    delivered: u64,
+    oldest: Option<u64>,
+    any: Option<PageOutcome>,
+    authed: Option<PageOutcome>,
 }
 
 impl ChannelStore {
@@ -157,6 +171,7 @@ impl ChannelStore {
             signer_admin: SignerAdminCache::new(),
             deletion_progress: StoredValue::new(DeletionProgress::new(deletions)),
             history: RwSignal::new(HashMap::new()),
+            first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
         store
@@ -721,7 +736,17 @@ impl ChannelStore {
         let store = *self;
         let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
 
+        let first_pages = self.first_pages;
+        let key_for_count = key.clone();
         let on_event = Rc::new(move |event: NostrEvent| {
+            // Count every delivery before admission: a page is short (the
+            // start of history) only by what the relay sent.
+            let ts = event.created_at;
+            first_pages.update_value(|m| {
+                let s = m.entry(key_for_count.clone()).or_default();
+                s.delivered += 1;
+                s.oldest = Some(s.oldest.map_or(ts, |o| o.min(ts)));
+            });
             if event.kind != 42 {
                 return;
             }
@@ -767,6 +792,17 @@ impl ChannelStore {
         // keeps the anonymous answer from counting for a gated zone.
         let history_receipts = self.history_receipts;
         let on_eose = Rc::new(move |authed: bool| {
+            first_pages.update_value(|m| {
+                let s = m.entry(key.clone()).or_default();
+                let page = PageOutcome {
+                    delivered: s.delivered,
+                    oldest: s.oldest,
+                };
+                s.any.get_or_insert(page);
+                if authed {
+                    s.authed.get_or_insert(page);
+                }
+            });
             history_receipts.update(|m| m.entry(key.clone()).or_default().record(authed));
         });
 
@@ -788,6 +824,20 @@ impl ChannelStore {
     pub fn history_cursor(&self, cid: &str) -> HistoryCursor {
         self.history
             .with(|m| m.get(cid).cloned().unwrap_or_default())
+    }
+
+    /// Record channel `cid`'s first page from its `ensure_subscribed` REQ
+    /// once the answer counts: the authenticated one for a `gated` zone,
+    /// else the first (the rule of `SyncReceipt::settles`). Idempotent; a
+    /// no-op until that receipt is in.
+    pub fn settle_first_page(&self, cid: &str, gated: bool) {
+        let page = self.first_pages.with_value(|m| {
+            m.get(cid)
+                .and_then(|s| if gated { s.authed } else { s.any })
+        });
+        if let Some(page) = page {
+            self.record_first_page(cid, page);
+        }
     }
 
     /// Record the channel's newest page (the channel page's first kind-42

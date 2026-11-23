@@ -665,15 +665,45 @@ pub fn ThreadPage() -> impl IntoView {
         )
         .then(|| {
             let cid = channel.map(|c| c.id).unwrap_or_default();
+            // With paged history a receipt only means the NEWEST page is in:
+            // the topic is absent only once the walk below has reached the
+            // start of the channel's history.
+            let settled =
+                store.history_receipt(&cid).settles(gated) && store.history_cursor(&cid).exhausted;
             Lookup::decide_with_keys(
                 topic_root.with(Option::is_some),
-                store.history_receipt(&cid).settles(gated),
+                settled,
                 keys.get(),
                 deadline_passed,
             )
         })
     });
     let loading = Memo::new(move |_| lookup.get().is_loading());
+
+    // A deep link to a topic older than the pages loaded so far: page back
+    // through the channel's history (newest first, one page at a time) until
+    // the root appears or the start of history is reached. A topic slug is a
+    // prefix of the root's id (and a sealed root's id is the original's, not
+    // the stored envelope's), so it cannot be fetched by id.
+    {
+        let relay = relay.clone();
+        Effect::new(move |_| {
+            let Some(cid) = resolved_channel.get().map(|c| c.id) else {
+                return;
+            };
+            if topic_root.with(Option::is_some) {
+                return;
+            }
+            let gated = zone_is_gated(&category_slug(), &load_zones());
+            if !store.history_receipt(&cid).settles(gated) {
+                return;
+            }
+            store.settle_first_page(&cid, gated);
+            if store.history_cursor(&cid).next_request().is_some() {
+                store.load_older(&relay, &cid, vec![cid.clone()], gated, Rc::new(|| {}));
+            }
+        });
+    }
 
     // -- Landing position ---------------------------------------------------
     //

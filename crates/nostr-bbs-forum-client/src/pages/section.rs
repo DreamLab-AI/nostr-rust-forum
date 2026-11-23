@@ -584,11 +584,21 @@ pub fn SectionPage() -> impl IntoView {
                 {
                     // Found or authoritatively empty: TopicList renders both.
                     let ch_id = resolved_channel.get().map(|c| c.id).unwrap_or_default();
+                    // Topics are newest first, so older history loads at the
+                    // END of the list: scrolling there (or the control) pages
+                    // back until the start of the channel.
+                    let history_cid = Signal::derive(move || resolved_channel.get().map(|c| c.id));
+                    let history_gated = Signal::derive(move || zone_is_gated(&category_slug(), &load_zones()));
                     view! {
                         <TopicList
                             channel_id=ch_id
                             category=category_for_topics.get()
                             topics=topics
+                        />
+                        <crate::components::history_loader::HistoryLoader
+                            channel_id=history_cid
+                            gated=history_gated
+                            older_label="Load older topics"
                         />
                     }.into_any()
                 } else {
