@@ -158,18 +158,28 @@ impl Zone {
 /// legacy fallback list when the key is absent or unparseable so navigation
 /// never regresses.
 pub fn load_zones() -> Vec<Zone> {
+    configured_zones().unwrap_or_else(fallback_zones)
+}
+
+/// The zones the deployment actually configured, or `None` when
+/// `ZONE_CONFIG` is absent, empty or unparseable (the generic kit default,
+/// where [`load_zones`] substitutes the built-in fallback list).
+///
+/// Admin tooling that must tell "this deployment declares its own zones" from
+/// "no config, using placeholders" reads this rather than [`load_zones`].
+pub fn configured_zones() -> Option<Vec<Zone>> {
     match read_zone_config_json() {
         Some(json) => match serde_json::from_str::<Vec<Zone>>(&json) {
-            Ok(zones) if !zones.is_empty() => zones,
-            Ok(_) => fallback_zones(),
+            Ok(zones) if !zones.is_empty() => Some(zones),
+            Ok(_) => None,
             Err(e) => {
                 web_sys::console::warn_1(
                     &format!("[zones] ZONE_CONFIG parse failed ({e}); using fallback").into(),
                 );
-                fallback_zones()
+                None
             }
         },
-        None => fallback_zones(),
+        None => None,
     }
 }
 
@@ -267,6 +277,25 @@ pub fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
     }
     // Catch-all: first zone so unrouted channels remain visible.
     zones.first().map(|z| z.id.clone())
+}
+
+/// Strict counterpart of [`section_to_zone`]: the id of the configured zone a
+/// section id belongs to by exact match or `<zone-id>-` prefix, and `None`
+/// otherwise.
+///
+/// [`section_to_zone`] falls back to the first zone so a stray channel never
+/// vanishes from the index. That is right for display and wrong for anything
+/// that writes: binding a channel on the relay (`channel_zones`) changes who may
+/// read and write it, so only a section that names its zone may be bound.
+pub fn zone_id_for_section(section: &str, zones: &[Zone]) -> Option<String> {
+    let sec = section.to_lowercase();
+    zones
+        .iter()
+        .find(|z| {
+            let id = z.id.to_lowercase();
+            sec == id || sec.starts_with(&format!("{id}-"))
+        })
+        .map(|z| z.id.clone())
 }
 
 /// Compare two section ids for zone-tile ordering. An operator-pinned section
@@ -456,6 +485,27 @@ mod tests {
             zone("family"),
             zone("business"),
         ]
+    }
+
+    #[test]
+    fn zone_id_for_section_is_strict_where_section_to_zone_falls_back() {
+        let zones = sample_zones();
+        assert_eq!(
+            zone_id_for_section("family-events", &zones),
+            Some("family".to_string())
+        );
+        assert_eq!(
+            zone_id_for_section("Family", &zones),
+            Some("family".to_string())
+        );
+        // A legacy section names no configured zone: no binding.
+        assert_eq!(zone_id_for_section("home-lobby", &zones), None);
+        assert_eq!(zone_id_for_section("familyevents", &zones), None);
+        // The display resolver still catches it, by design.
+        assert_eq!(
+            section_to_zone("home-lobby", &zones),
+            Some("public".to_string())
+        );
     }
 
     #[test]

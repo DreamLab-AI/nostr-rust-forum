@@ -2,28 +2,30 @@
 //!
 //! Provides a form with name, description, and section dropdown. Validates that
 //! the name is at least 3 characters before enabling submission.
+//!
+//! ## Sections
+//!
+//! When the deployment declares zones (`window.__ENV__.ZONE_CONFIG`) the section
+//! choices are derived from them (see [`crate::admin::section_options`]): pick a
+//! zone, then one of its `section_order` sections or a new slug, giving
+//! `<zone-id>-<slug>`. Without zone config the historic legacy list is offered.
+//!
+//! ## The numeric "Access Zone" tag
+//!
+//! The kind-40 `["zone", n]` tag is not read by the relay (zone gating comes
+//! from the `channel_zones` binding, written after creation) nor by the client
+//! (routing uses the `section` tag). With configured zones the Access Zone and
+//! Cohort inputs are therefore hidden and the tag keeps its default `0`; they
+//! remain for the legacy (no zone config) form so other deployments see no change.
 
 use leptos::prelude::*;
 
+use crate::admin::section_options::{
+    compose_section, validate_slug, zone_sections, SectionOption, ZoneSections, LEGACY_SECTIONS,
+    NEW_SECTION,
+};
 use crate::admin::use_admin;
-
-/// Predefined channel sections.
-/// Format: (section_id, display_label).
-const SECTIONS: &[(&str, &str)] = &[
-    // Home
-    ("home-lobby", "Home Lobby"),
-    // Members
-    ("members-training", "Members Training"),
-    ("members-projects", "Members Projects"),
-    ("members-bookings", "Members Bookings"),
-    ("ai-general", "AI General"),
-    ("ai-claude-flow", "AI Claude Flow"),
-    ("ai-visionflow", "AI VisionFlow"),
-    // Minimoonoir
-    ("private-welcome", "Minimoonoir Welcome"),
-    ("private-events", "Minimoonoir Events"),
-    ("private-booking", "Minimoonoir Booking"),
-];
+use crate::stores::zones::configured_zones;
 
 /// Data submitted from the channel creation form.
 #[derive(Clone, Debug)]
@@ -45,7 +47,47 @@ where
     let name = RwSignal::new(String::new());
     let description = RwSignal::new(String::new());
     let picture = RwSignal::new(String::new());
-    let section = RwSignal::new(SECTIONS[0].0.to_string());
+    // Zone-driven sections when the deployment configures zones, else legacy.
+    let zone_groups: Vec<ZoneSections> = configured_zones()
+        .map(|z| zone_sections(&z))
+        .unwrap_or_default();
+    let config_mode = !zone_groups.is_empty();
+    let zone_groups = StoredValue::new(zone_groups);
+    let sel_zone = RwSignal::new(
+        zone_groups.with_value(|g| g.first().map(|z| z.zone_id.clone()).unwrap_or_default()),
+    );
+    // Either an existing section id or `NEW_SECTION`.
+    let sel_section = RwSignal::new(String::new());
+    let new_slug = RwSignal::new(String::new());
+    let section = RwSignal::new(LEGACY_SECTIONS[0].0.to_string());
+    // Zone choices for the current zone (config mode).
+    let options_for_zone = move || -> Vec<SectionOption> {
+        let z = sel_zone.get();
+        zone_groups.with_value(|g| {
+            g.iter()
+                .find(|x| x.zone_id == z)
+                .map(|x| x.sections.clone())
+                .unwrap_or_default()
+        })
+    };
+    // The section id the form would submit, or why it cannot yet (config mode).
+    let resolved_section = Memo::new(move |_| -> Result<String, String> {
+        if !config_mode {
+            return Ok(section.get());
+        }
+        let choice = sel_section.get();
+        let use_new = choice == NEW_SECTION || (choice.is_empty() && options_for_zone().is_empty());
+        if use_new {
+            compose_section(&sel_zone.get(), &new_slug.get()).map_err(str::to_string)
+        } else if choice.is_empty() {
+            options_for_zone()
+                .first()
+                .map(|o| o.id.clone())
+                .ok_or_else(|| "Choose a section.".to_string())
+        } else {
+            Ok(choice)
+        }
+    });
     let zone = RwSignal::new(0u8);
     let cohort = RwSignal::new(String::new());
     let validation_error = RwSignal::new(Option::<String>::None);
@@ -56,7 +98,7 @@ where
 
     let is_valid = Memo::new(move |_| {
         let n = name.get();
-        n.trim().len() >= 3
+        n.trim().len() >= 3 && resolved_section.with(|r| r.is_ok())
     });
 
     let on_name_input = move |ev: leptos::ev::Event| {
@@ -78,6 +120,17 @@ where
     let on_section_change = move |ev: leptos::ev::Event| {
         let target = event_target_value(&ev);
         section.set(target);
+    };
+    let on_zone_pick = move |ev: leptos::ev::Event| {
+        sel_zone.set(event_target_value(&ev));
+        sel_section.set(String::new());
+        new_slug.set(String::new());
+    };
+    let on_section_pick = move |ev: leptos::ev::Event| {
+        sel_section.set(event_target_value(&ev));
+    };
+    let on_slug_input = move |ev: leptos::ev::Event| {
+        new_slug.set(event_target_value(&ev));
     };
 
     let on_zone_change = move |ev: leptos::ev::Event| {
@@ -108,7 +161,14 @@ where
             return;
         }
 
-        let z = zone.get_untracked();
+        let section_id = match resolved_section.get_untracked() {
+            Ok(id) => id,
+            Err(msg) => {
+                validation_error.set(Some(msg));
+                return;
+            }
+        };
+        let z = if config_mode { 0 } else { zone.get_untracked() };
         let c = cohort.get_untracked();
         // The create handler owns `is_submitting` (state.channel_creating): it
         // flips it true on entry and resets it on relay ack, rejection, or the
@@ -116,7 +176,7 @@ where
         on_submit(ChannelFormData {
             name: n.trim().to_string(),
             description: description.get_untracked().trim().to_string(),
-            section: section.get_untracked(),
+            section: section_id,
             picture: picture.get_untracked().trim().to_string(),
             zone: z,
             cohort: if z >= 2 && !c.trim().is_empty() {
@@ -195,43 +255,124 @@ where
                 <p class="text-xs text-gray-500">"Optional cover image URL for the channel card."</p>
             </div>
 
-            // Section dropdown
-            <div class="space-y-1">
-                <label for="channel-section" class="block text-sm font-medium text-gray-300">
-                    "Section"
-                </label>
-                <select
-                    id="channel-section"
-                    on:change=on_section_change
-                    class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-colors"
-                >
-                    {SECTIONS.iter().map(|&(id, label)| {
-                        let value = id.to_string();
-                        let display = label.to_string();
-                        view! {
-                            <option value=value.clone() selected=move || section.get() == value>
-                                {display}
-                            </option>
-                        }
-                    }).collect_view()}
-                </select>
-                // Color indicator for selected section
-                <div class="flex items-center gap-1.5 mt-1">
-                    <span class=move || section_color_dot_class(&section.get())></span>
-                    <span class="text-xs text-gray-500">
-                        {move || {
-                            let s = section.get();
-                            let label = SECTIONS.iter()
-                                .find(|&&(id, _)| id == s)
-                                .map(|&(_, l)| l)
-                                .unwrap_or(&s);
-                            format!("Section: {}", label)
-                        }}
-                    </span>
-                </div>
-            </div>
+            // Section: zone-driven when zones are configured, else the legacy list
+            {if config_mode {
+                view! {
+                    <div class="space-y-2">
+                        <label for="channel-zone-pick" class="block text-sm font-medium text-gray-300">
+                            "Zone"
+                        </label>
+                        <select
+                            id="channel-zone-pick"
+                            on:change=on_zone_pick
+                            class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-colors"
+                        >
+                            {zone_groups.with_value(|g| g.clone()).into_iter().map(|g| {
+                                let id = g.zone_id.clone();
+                                let sel_id = g.zone_id.clone();
+                                view! {
+                                    <option value=id selected=move || sel_zone.get() == sel_id>
+                                        {format!("{} ({})", g.zone_label, g.zone_id)}
+                                    </option>
+                                }
+                            }).collect_view()}
+                        </select>
+                        <label for="channel-section" class="block text-sm font-medium text-gray-300">
+                            "Section"
+                        </label>
+                        <select
+                            id="channel-section"
+                            on:change=on_section_pick
+                            class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-colors"
+                        >
+                            {move || {
+                                let current = sel_section.get();
+                                let opts = options_for_zone();
+                                let first_id = opts.first().map(|o| o.id.clone());
+                                let mut views = opts.into_iter().map(|o| {
+                                    let value = o.id.clone();
+                                    let selected = current == o.id
+                                        || (current.is_empty() && first_id.as_deref() == Some(o.id.as_str()));
+                                    view! { <option value=value selected=selected>{o.label}</option> }
+                                }).collect::<Vec<_>>();
+                                views.push(view! {
+                                    <option value=NEW_SECTION.to_string() selected=current == NEW_SECTION>
+                                        {"New section\u{2026}".to_string()}
+                                    </option>
+                                });
+                                views
+                            }}
+                        </select>
+                        <Show when=move || {
+                            sel_section.get() == NEW_SECTION
+                                || (sel_section.get().is_empty() && options_for_zone().is_empty())
+                        }>
+                            <input
+                                id="channel-section-slug"
+                                type="text"
+                                maxlength="48"
+                                prop:value=move || new_slug.get()
+                                on:input=on_slug_input
+                                placeholder="new-section-name"
+                                class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-500 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-colors"
+                            />
+                            {move || {
+                                let slug = new_slug.get();
+                                (!slug.is_empty())
+                                    .then(|| validate_slug(&slug).err())
+                                    .flatten()
+                                    .map(|m| view! { <p class="text-red-400 text-xs">{m}</p> })
+                            }}
+                        </Show>
+                        <p class="text-xs text-gray-500">
+                            {move || match resolved_section.get() {
+                                Ok(id) => format!("Section id: {id}"),
+                                Err(_) => "Lowercase letters, digits and hyphens.".to_string(),
+                            }}
+                        </p>
+                    </div>
+                }.into_any()
+            } else {
+                view! {
+                    <div class="space-y-1">
+                        <label for="channel-section" class="block text-sm font-medium text-gray-300">
+                            "Section"
+                        </label>
+                        <select
+                            id="channel-section"
+                            on:change=on_section_change
+                            class="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-colors"
+                        >
+                            {LEGACY_SECTIONS.iter().map(|&(id, label)| {
+                                let value = id.to_string();
+                                let display = label.to_string();
+                                view! {
+                                    <option value=value.clone() selected=move || section.get() == value>
+                                        {display}
+                                    </option>
+                                }
+                            }).collect_view()}
+                        </select>
+                        // Color indicator for selected section
+                        <div class="flex items-center gap-1.5 mt-1">
+                            <span class=move || section_color_dot_class(&section.get())></span>
+                            <span class="text-xs text-gray-500">
+                                {move || {
+                                    let s = section.get();
+                                    let label = LEGACY_SECTIONS.iter()
+                                        .find(|&&(id, _)| id == s)
+                                        .map(|&(_, l)| l)
+                                        .unwrap_or(&s);
+                                    format!("Section: {}", label)
+                                }}
+                            </span>
+                        </div>
+                    </div>
+                }.into_any()
+            }}
 
-            // Zone dropdown
+            // Zone dropdown (legacy numeric tag; hidden with configured zones)
+            <Show when=move || !config_mode>
             <div class="space-y-1">
                 <label for="channel-zone" class="block text-sm font-medium text-gray-300">
                     "Access Zone"
@@ -253,9 +394,10 @@ where
                     </span>
                 </div>
             </div>
+            </Show>
 
-            // Cohort input (shown only for zone >= 2)
-            <Show when=move || { zone.get() >= 2 }>
+            // Cohort input (legacy form only, shown for zone >= 2)
+            <Show when=move || { !config_mode && zone.get() >= 2 }>
                 <div class="space-y-1">
                     <label for="channel-cohort" class="block text-sm font-medium text-gray-300">
                         "Required Cohort"
