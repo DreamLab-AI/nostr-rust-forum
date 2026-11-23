@@ -20,6 +20,7 @@ use wasm_bindgen::JsCast;
 use web_sys::WebSocket;
 
 mod receipt;
+mod verified;
 use receipt::{
     classify_auth_ok, explain_write_refusal, logical_id, release_held_writes, req_watch_delay,
     req_wire_id, route, watch_due, wire_id, AuthReply, HandshakeView, ReqLedger, Route, Watch,
@@ -193,6 +194,9 @@ struct RelayInner {
     /// subscription also needs). Scoping the key to the subscription keeps the
     /// replay/reconnect dedup while delivering each event to every sub once.
     seen_events: HashSet<String>,
+    /// Events whose signature has been verified this session (see
+    /// [`verified`]); a re-delivery skips only the Schnorr check.
+    verified: verified::VerifiedIds,
     /// PRD-010 G4: EVENT (write) frames deferred because the socket is connected
     /// but has not yet completed NIP-42 AUTH. In `nip42` mode the relay rejects
     /// unauthenticated writes with `["OK", id, false, "auth-required: …"]`, so
@@ -380,6 +384,7 @@ impl RelayConnection {
             relay_url,
             immediate_writes,
             seen_events: HashSet::new(),
+            verified: verified::VerifiedIds::default(),
             deferred_writes: Vec::new(),
             auth_signer: None,
             auth_signer_async: None,
@@ -1339,11 +1344,20 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
 
             // Verify event-id integrity and Schnorr signature before dedup or
             // dispatch. Never hand forged authorship to callbacks — drop it.
-            if let Err(e) = nostr_bbs_core::verify_event_strict(&event) {
-                web_sys::console::warn_1(
-                    &format!("[Relay] Dropping event failing verification: {:?}", e).into(),
-                );
-                return;
+            // An event already verified this session (same id and signature,
+            // id recomputed from its fields) skips only the Schnorr check: see
+            // `relay/verified.rs` for why that is safe. Every new event, and
+            // any re-delivery that differs in a single field, is verified in
+            // full.
+            let known = inner_rc.borrow_mut().verified.already_verified(&event);
+            if !known {
+                if let Err(e) = nostr_bbs_core::verify_event_strict(&event) {
+                    web_sys::console::warn_1(
+                        &format!("[Relay] Dropping event failing verification: {:?}", e).into(),
+                    );
+                    return;
+                }
+                inner_rc.borrow_mut().verified.insert(&event);
             }
 
             {
