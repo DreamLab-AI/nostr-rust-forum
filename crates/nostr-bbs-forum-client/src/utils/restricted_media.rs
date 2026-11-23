@@ -247,8 +247,12 @@ pub fn cache_blob(owner: &str, url: &str, blob: &web_sys::Blob) {
 /// Why a restricted fetch produced no image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RestrictedFetchError {
-    /// 401/403: the viewer may not read this zone (or is signed out).
+    /// 403 (or a 401 that survived the retry): the viewer may not read this
+    /// zone.
     Locked,
+    /// 401 on a single attempt (token refused, e.g. a same-second replay);
+    /// [`fetch_restricted_blob`] retries it once.
+    Unauthorised,
     /// Anything else (network, CORS, 404, 5xx, signer refusal).
     Failed(String),
 }
@@ -257,15 +261,55 @@ pub enum RestrictedFetchError {
 pub fn classify_status(status: u16) -> Result<(), RestrictedFetchError> {
     match status {
         200..=299 => Ok(()),
-        401 | 403 => Err(RestrictedFetchError::Locked),
+        401 => Err(RestrictedFetchError::Unauthorised),
+        403 => Err(RestrictedFetchError::Locked),
         s => Err(RestrictedFetchError::Failed(format!("HTTP {s}"))),
     }
 }
 
-/// GET a zone-restricted image with a fresh NIP-98 token bound to this exact
-/// URL. CORS mode, no credentials (the token is the only credential), no HTTP
-/// cache (the pod answers `no-store` anyway).
+/// GET a zone-restricted image (see [`fetch_restricted_blob_once`]), retrying
+/// a 401 once with a fresh token a little over a second later.
+///
+/// A NIP-98 event's id covers `u`, `method` and the second-resolution
+/// `created_at`, so two GETs of the same URL by the same key within one second
+/// (the same image on screen twice, or two tabs) sign the same id, and the
+/// pod's replay store refuses the second. The retry signs a new second.
 pub async fn fetch_restricted_blob(
+    url: &str,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+) -> Result<web_sys::Blob, RestrictedFetchError> {
+    match fetch_restricted_blob_once(url, signer).await {
+        Err(RestrictedFetchError::Unauthorised) => {
+            sleep_ms(1_100).await;
+            fetch_restricted_blob_once(url, signer)
+                .await
+                .map_err(|e| match e {
+                    RestrictedFetchError::Unauthorised => RestrictedFetchError::Locked,
+                    other => other,
+                })
+        }
+        other => other,
+    }
+}
+
+/// Resolve after `ms` milliseconds (immediately when there is no window).
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let scheduled = web_sys::window().is_some_and(|w| {
+            w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms)
+                .is_ok()
+        });
+        if !scheduled {
+            let _ = resolve.call0(&wasm_bindgen::JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// One GET of a zone-restricted image with a fresh NIP-98 token bound to this
+/// exact URL. CORS mode, no credentials (the token is the only credential), no
+/// HTTP cache (the pod answers `no-store` anyway).
+async fn fetch_restricted_blob_once(
     url: &str,
     signer: &dyn nostr_bbs_core::signer::Signer,
 ) -> Result<web_sys::Blob, RestrictedFetchError> {
@@ -429,7 +473,10 @@ mod tests {
     #[test]
     fn status_classes() {
         assert_eq!(classify_status(200), Ok(()));
-        assert_eq!(classify_status(401), Err(RestrictedFetchError::Locked));
+        assert_eq!(
+            classify_status(401),
+            Err(RestrictedFetchError::Unauthorised)
+        );
         assert_eq!(classify_status(403), Err(RestrictedFetchError::Locked));
         assert!(matches!(
             classify_status(404),
