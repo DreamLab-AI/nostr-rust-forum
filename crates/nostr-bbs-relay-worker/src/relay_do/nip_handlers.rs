@@ -2797,9 +2797,40 @@ impl NostrRelayDO {
             }
         };
 
-        let events = self.query_events(&filters).await;
         let zones = ZoneConfig::load(&self.env);
         let ctx = self.resolve_viewer_context(session_pubkey.clone()).await;
+
+        // Fast path for one channel's messages (`{"kinds":[42],"#e":[cid]}`),
+        // which the forum asks for every section's true total. The generic
+        // path below materialises every match and is capped at the filter's
+        // `limit` (500 by default), so it cannot report a large channel. Here
+        // SQL counts the plain case, kind-42s whose own channel is `cid`
+        // with no expiration tag, and all of those get one read decision:
+        // `cid`'s zone gate, exactly the branch `authorize_event` takes for
+        // each of them. Anything else that matched (another own channel, an
+        // expiration tag) goes through the per-event path as before.
+        if let Some((cid, since, until)) = filter::channel_count_target(&filters) {
+            let q = filter::build_channel_count(&cid, since, until);
+            if let Some((plain, exceptions)) = self.count_channel_messages(&q).await {
+                let channel_readable = match self.cached_channel_zone(&cid).await {
+                    None => true,
+                    Some(zone) => ctx.is_admin || zone_read_permitted(&zones, &zone, &ctx),
+                };
+                let mut count = if channel_readable { plain } else { 0 };
+                for event in &exceptions {
+                    if matches!(
+                        self.authorize_event(event, &ctx, &zones).await,
+                        ReadDecision::Deliver | ReadDecision::DeliverAs(_)
+                    ) {
+                        count += 1;
+                    }
+                }
+                Self::send_count(ws, sub_id, count);
+                return;
+            }
+        }
+
+        let events = self.query_events(&filters).await;
 
         let mut count: u64 = 0;
         for event in &events {

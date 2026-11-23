@@ -257,6 +257,106 @@ pub fn build_filter_query(filter: &NostrFilter, limit: u32) -> FilterQuery {
     }
 }
 
+/// The channel a channel-scoped kind-42 belongs to, in SQL over `events.tags`:
+/// the same rule as [`channel_tag`] (the first `e` tag marked `root`, else the
+/// first `e` tag), so a count can apply that channel's read gate exactly as
+/// `authorize_event` does per event.
+const SQL_CHANNEL_TAG: &str = "COALESCE(\
+     (SELECT json_extract(j.value, '$[1]') FROM json_each(events.tags) j \
+      WHERE json_type(j.value) = 'array' AND json_array_length(j.value) >= 2 \
+        AND json_extract(j.value, '$[0]') = 'e' AND json_extract(j.value, '$[3]') = 'root' \
+      ORDER BY j.key LIMIT 1), \
+     (SELECT json_extract(j.value, '$[1]') FROM json_each(events.tags) j \
+      WHERE json_type(j.value) = 'array' AND json_array_length(j.value) >= 2 \
+        AND json_extract(j.value, '$[0]') = 'e' \
+      ORDER BY j.key LIMIT 1))";
+
+/// Whether the event carries any NIP-40 `expiration` tag, in SQL.
+const SQL_HAS_EXPIRATION: &str = "EXISTS (SELECT 1 FROM json_each(events.tags) j \
+     WHERE json_type(j.value) = 'array' AND json_array_length(j.value) >= 2 \
+       AND json_extract(j.value, '$[0]') = 'expiration')";
+
+/// The two statements of a channel message count (NIP-45 COUNT fast path for
+/// `{"kinds":[42], "#e":[<channel>], since?, until?}`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelCountQueries {
+    /// `SELECT COUNT(*) AS n`: the plain case, kind-42s whose own channel
+    /// ([`channel_tag`]) IS this channel and that carry no `expiration` tag.
+    /// Every one of them gets the same read decision (this channel's zone
+    /// gate), so the caller decides it once and adds `n` or nothing.
+    pub plain: FilterQuery,
+    /// Full rows of every other match (a different own channel, or an
+    /// `expiration` tag): normally none. The caller runs the per-event path
+    /// on them (NIP-40 expiry, then `authorize_event`), so the total equals
+    /// what the generic COUNT path would return without its row cap.
+    pub exceptions: FilterQuery,
+}
+
+/// Build the channel count statements. Both read `idx_event_tags_time` for
+/// the channel and look up each event by primary key: about two rows read per
+/// message, one statement, no rows shipped back for the plain case. The
+/// generic COUNT path materialised every matching event (and was capped at
+/// the filter's `limit`, default 500, so it could never report a large total).
+pub fn build_channel_count(
+    channel: &str,
+    since: Option<u64>,
+    until: Option<u64>,
+) -> ChannelCountQueries {
+    let mut b = Binds { params: Vec::new() };
+    let ch = b.text(channel);
+    let mut range = String::new();
+    if let Some(s) = since {
+        range.push_str(&format!(" AND d.created_at >= {}", b.int(s as i64)));
+    }
+    if let Some(u) = until {
+        range.push_str(&format!(" AND d.created_at <= {}", b.int(u as i64)));
+    }
+    let from = format!(
+        "FROM event_tags d CROSS JOIN events ON events.id = d.event_id \
+         WHERE d.name = 'e' AND d.value = {ch} AND events.kind = 42{range}"
+    );
+    let plain_cond = format!("({SQL_CHANNEL_TAG}) = {ch} AND NOT {SQL_HAS_EXPIRATION}");
+    let params = b.params;
+    ChannelCountQueries {
+        plain: FilterQuery {
+            sql: format!("SELECT COUNT(*) AS n {from} AND {plain_cond}"),
+            params: params.clone(),
+        },
+        exceptions: FilterQuery {
+            sql: format!("SELECT {EVENT_COLUMNS} {from} AND NOT ({plain_cond})"),
+            params,
+        },
+    }
+}
+
+/// The channel a COUNT filter set asks about, when it has the fast-path
+/// shape: exactly one filter, `kinds` exactly `[42]`, exactly one `#e`
+/// value, and nothing else but `since`/`until` (`limit` is ignored by COUNT).
+pub fn channel_count_target(filters: &[NostrFilter]) -> Option<(String, Option<u64>, Option<u64>)> {
+    let [f] = filters else {
+        return None;
+    };
+    if f.ids.is_some() || f.authors.is_some() || search_term(f).is_some() {
+        return None;
+    }
+    if f.kinds.as_deref() != Some(&[42][..]) {
+        return None;
+    }
+    let mut channel = None;
+    for (key, value) in &f.extra {
+        match tag_filter_plan(key, value) {
+            TagFilterPlan::Ignore => {}
+            TagFilterPlan::Values(name, values)
+                if name == "e" && values.len() == 1 && channel.is_none() =>
+            {
+                channel = Some(values[0].to_string());
+            }
+            _ => return None,
+        }
+    }
+    channel.map(|c| (c, f.since, f.until))
+}
+
 fn where_clause(conds: &[String]) -> String {
     if conds.is_empty() {
         String::new()
@@ -1454,6 +1554,105 @@ mod query_builder_tests {
         let q = build_filter_query(&f, 10);
         assert!(!q.sql.contains("UNION ALL"));
         assert_eq!(run(&c, &f, 10).0, reference(&events, &f, 10));
+    }
+
+    #[test]
+    fn the_channel_count_splits_exactly_like_the_per_event_path() {
+        let c = db();
+        let mut events = fixture();
+        // Edge cases the per-event path treats differently from the plain case:
+        // a decoy first `e` with the root marker elsewhere, an `e` to the
+        // channel that is not the event's own channel, and expiration tags.
+        events.push(ev(
+            800,
+            42,
+            1_200,
+            vec![vec!["e", "decoy"], vec!["e", "a", "", "root"]],
+        ));
+        events.push(ev(
+            801,
+            42,
+            1_201,
+            vec![vec!["e", "b", "", "root"], vec!["e", "a"]],
+        ));
+        events.push(ev(
+            802,
+            42,
+            1_202,
+            vec![vec!["e", "a", "", "root"], vec!["expiration", "1"]],
+        ));
+        events.push(ev(
+            803,
+            42,
+            1_203,
+            vec![
+                vec!["e", "a", "", "root"],
+                vec!["expiration", "99999999999"],
+            ],
+        ));
+        store(&c, &events);
+        for (since, until) in [
+            (None, None),
+            (Some(1_010), None),
+            (None, Some(1_050)),
+            (Some(1_020), Some(1_202)),
+        ] {
+            let q = build_channel_count("a", since, until);
+            let plain: i64 = c
+                .query_row(
+                    &q.plain.sql,
+                    rusqlite::params_from_iter(bind(&q.plain.params).iter()),
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let (mut exc, _) = run_sql(&c, &q.exceptions.sql, &bind(&q.exceptions.params));
+            let in_range = |e: &&NostrEvent| {
+                e.kind == 42
+                    && e.tags
+                        .iter()
+                        .any(|t| t.len() >= 2 && t[0] == "e" && t[1] == "a")
+                    && since.is_none_or(|s| e.created_at >= s)
+                    && until.is_none_or(|u| e.created_at <= u)
+            };
+            let is_plain = |e: &&NostrEvent| {
+                channel_tag(e).as_deref() == Some("a") && tag_value(e, "expiration").is_none()
+            };
+            let want_plain = events.iter().filter(in_range).filter(is_plain).count();
+            let mut want_exc: Vec<(String, u64)> = events
+                .iter()
+                .filter(in_range)
+                .filter(|e| !is_plain(e))
+                .map(|e| (e.id.clone(), e.created_at))
+                .collect();
+            exc.sort();
+            want_exc.sort();
+            assert_eq!(plain as usize, want_plain, "plain {since:?}..{until:?}");
+            assert_eq!(exc, want_exc, "exceptions {since:?}..{until:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_single_channel_message_shape_takes_the_count_fast_path() {
+        let f = |j: serde_json::Value| -> Vec<NostrFilter> { vec![filter(j)] };
+        assert_eq!(
+            channel_count_target(&f(
+                serde_json::json!({"kinds": [42], "#e": ["a"], "since": 5, "limit": 1})
+            )),
+            Some(("a".to_string(), Some(5), None))
+        );
+        for j in [
+            serde_json::json!({"kinds": [42, 7], "#e": ["a"]}),
+            serde_json::json!({"#e": ["a"]}),
+            serde_json::json!({"kinds": [42], "#e": ["a", "b"]}),
+            serde_json::json!({"kinds": [42], "#e": ["a"], "#p": ["x"]}),
+            serde_json::json!({"kinds": [42], "#e": ["a"], "authors": ["x"]}),
+            serde_json::json!({"kinds": [42], "#e": ["a"], "search": "x"}),
+            serde_json::json!({"kinds": [42], "#e": []}),
+        ] {
+            assert_eq!(channel_count_target(&f(j.clone())), None, "{j}");
+        }
+        let two = vec![filter(serde_json::json!({"kinds": [42], "#e": ["a"]})); 2];
+        assert_eq!(channel_count_target(&two), None);
     }
 
     #[test]

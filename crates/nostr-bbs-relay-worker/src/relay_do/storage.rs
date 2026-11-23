@@ -338,6 +338,61 @@ impl NostrRelayDO {
         }
     }
 
+    /// Run a channel message count (`filter::build_channel_count`): the plain
+    /// count, and the exception rows with NIP-40 expiry already applied as in
+    /// [`Self::query_events`]. Exception rows are capped at
+    /// `MAX_ROWS_PER_FRAME` (the same DoS bound as every read); they are
+    /// normally none. `None` when D1 is unavailable or a statement fails, so
+    /// the caller can fall back to the generic path.
+    pub(crate) async fn count_channel_messages(
+        &self,
+        q: &filter::ChannelCountQueries,
+    ) -> Option<(u64, Vec<NostrEvent>)> {
+        #[derive(Deserialize)]
+        struct N {
+            n: f64,
+        }
+        let db = self.env.d1("DB").ok()?;
+        let bind = |p: &[filter::SqlParam]| -> Vec<JsValue> {
+            p.iter()
+                .map(|p| match p {
+                    filter::SqlParam::Text(s) => JsValue::from_str(s),
+                    filter::SqlParam::Int(n) => JsValue::from_f64(*n as f64),
+                })
+                .collect()
+        };
+        let plain: Option<N> = db
+            .prepare(&q.plain.sql)
+            .bind(&bind(&q.plain.params))
+            .ok()?
+            .first(None)
+            .await
+            .ok()?;
+        let plain = plain.map_or(0, |n| n.n as u64);
+
+        let sql = format!("{} LIMIT {}", q.exceptions.sql, MAX_ROWS_PER_FRAME);
+        let rows: Vec<EventRow> = db
+            .prepare(&sql)
+            .bind(&bind(&q.exceptions.params))
+            .ok()?
+            .all()
+            .await
+            .ok()?
+            .results()
+            .ok()?;
+        let now = auth::js_now_secs();
+        let exceptions = rows
+            .into_iter()
+            .filter_map(EventRow::into_nostr_event)
+            .filter(|event| {
+                !filter::tag_value(event, "expiration")
+                    .and_then(|exp| exp.parse::<u64>().ok())
+                    .is_some_and(|exp_ts| exp_ts < now)
+            })
+            .collect();
+        Some((plain, exceptions))
+    }
+
     pub(crate) async fn query_events(&self, filters: &[NostrFilter]) -> Vec<NostrEvent> {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
