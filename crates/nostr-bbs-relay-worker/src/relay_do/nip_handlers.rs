@@ -2133,7 +2133,8 @@ impl NostrRelayDO {
             self.relay_url_aliases().as_deref(),
         );
         // Loud when unconfigured: in nip42 mode an empty allowlist refuses every
-        // authenticated write. Operators must set RELAY_URL before deploy.
+        // AUTH, so no client can authenticate. Operators must set RELAY_URL
+        // before deploy.
         nip42::warn_if_relay_url_unconfigured(self.auth_mode(), &allowed);
         let now = auth::js_now_secs();
 

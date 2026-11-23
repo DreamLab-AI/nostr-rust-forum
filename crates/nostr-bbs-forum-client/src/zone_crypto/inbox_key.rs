@@ -406,8 +406,6 @@ pub enum Lookup {
     Unknown(String),
 }
 
-/// Read a lookup reply: `{"keys":[{"key","role","revoked","created_at"}]}`.
-/// The newest unrevoked `inbox` entry wins; an empty list is a definite none.
 /// Whether `proof` binds `key` to `member`: a kind-27237 event signed by the
 /// member, carrying a `k` tag naming the inbox key, with a valid signature. Freshness (`exp`) is not checked here: the proof was time-bound
 /// when the auth-worker accepted it, and the issuer verifies binding, not age.
@@ -432,10 +430,13 @@ pub fn proof_binds(proof: &serde_json::Value, key: &str, member: &str) -> bool {
         && verify_event_strict(&ev).is_ok()
 }
 
-/// Parse an admin lookup reply for `member`. Only entries whose stored
-/// registration proof binds the key to `member` are considered; a reply whose
-/// every entry fails that check is `Unknown`, never `None`, so the issuer
-/// retries rather than falling back to the identity key.
+/// Parse an admin lookup reply for `member`:
+/// `{"keys":[{"key","role","revoked","created_at","proof"}]}`. Only entries
+/// whose stored registration proof binds the key to `member` are considered;
+/// of those, the newest unrevoked `inbox` entry wins. An empty list is a
+/// definite `None`; a reply whose every entry fails the proof check is
+/// `Unknown`, never `None`, so the issuer retries rather than falling back to
+/// the identity key.
 pub fn parse_lookup(body: &str, member: &str) -> Lookup {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Lookup::Unknown("lookup reply is not JSON".into());

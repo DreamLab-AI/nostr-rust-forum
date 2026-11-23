@@ -3,7 +3,7 @@ title: Architecture Baseline — nostr-rust-forum
 doc_id: NRF-BASELINE
 version: 0.3.1
 status: draft-for-ratification
-verified_commit: fd31193 (kit-version, solid-pod-rs and relay-admission paragraphs, and the invariant 6 note); 3c48e26 (ADR-2033 and ADR-2034 sections, invariants 7 and 8, and the deletion citations in the encrypted-zones section; ADR-2030 to ADR-2032 sections keep 0065dd9; older sections keep their earlier stamp)
+verified_commit: fd31193 (kit-version, solid-pod-rs and relay-admission paragraphs, and the invariant 6 note); 4a73a7a (ADR-2034 section, re-read 2026-11-23 for the zone-key wait); 3c48e26 (ADR-2033 section, invariants 7 and 8, and the deletion citations in the encrypted-zones section; ADR-2030 to ADR-2032 sections keep 0065dd9; older sections keep their earlier stamp)
 sources:
   - Cargo.toml
   - crates/nostr-bbs-upstream-canary/src/lib.rs
@@ -122,7 +122,7 @@ path uses upsert-with-`DO NOTHING` to survive the SELECT-then-branch race
 
 The `nostr-bbs-*` crates are the publishable kit surface (legacy ADR-103). The
 current in-tree version is **`1.0.0-beta.20`** (`crates/nostr-bbs-core/Cargo.toml:3`;
-workspace path deps are pinned to `1.0.0-beta.20` in `Cargo.toml:191-194`).
+workspace path deps are pinned to `1.0.0-beta.20` in `Cargo.toml:193-196`, re-derived 2026-11-23 after the comment above them grew).
 `solid-pod-rs` is a **caret** requirement, `0.5.0-alpha.24` with `default-features =
 false` and `features = ["core"]` (`Cargo.toml:188`); `Cargo.lock` still fixes what a
 build resolves, so a newer alpha arrives only through a reviewed `cargo update`.
@@ -182,6 +182,8 @@ bounds them (`nip_handlers.rs:71-77`).
   `Cargo.toml` comment ("published to crates.io as 1.0.0-beta.3") is stale — the
   workspace is on `1.0.0-beta.19` (`crates/nostr-bbs-core/Cargo.toml:3`). Reconcile
   the published/registry version before the next release.
+  > Note 2026-11-23: the `Cargo.toml` comment no longer names 1.0.0-beta.3; it says core, config, mesh and
+  > rate-limit are published together at 1.0.0-beta.20, which crates.io serves as their newest version.
 - **ADR-109 index/file disagreement.** `docs/adr/README.md:50` lists ADR-109 as
   "implementation pending" while the ADR file header states it shipped in
   `1.0.0-beta.5` (`docs/archive/adr/ADR-109-zone-bound-bbs-pwa-install.md:3`). The file is
@@ -206,6 +208,8 @@ bounds them (`nip_handlers.rs:71-77`).
   encrypted zone can still say "Topic Not Found" before zone keys load. Each is a row in
   [`security/known-findings.md`](security/known-findings.md) (KF-14 to KF-28) with its
   code citation; none is fixed. Decisions: ADR-2033, ADR-2034.
+  > Note 2026-11-23: the "Topic Not Found" before zone keys gap (KF-23) is now fixed (kit PR #98,
+  > `fd31193`) and closed in the known-findings table; the other gaps in this bullet remain open.
 - **Sprint-resident ADRs.** ADR-090/091/092 keep their canonical full text under
   `docs/sprint/2026-05-17-ux-audit/`; the `docs/adr/` stubs reserve the numbers.
 
@@ -312,12 +316,18 @@ and KF-27. Operator procedure: [`runbooks/relay-deletion-and-tombstones.md`](run
 
 ## Absence is reported only after an authenticated answer — ADR-2034
 
-[ADR-2034](adr/ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md) (verified at `3c48e26`; implementation partial). A
+[ADR-2034](adr/ADR-2034-absence-is-reported-only-after-an-authenticated-answer.md) (verified at `3c48e26`, re-read at `4a73a7a`; implementation complete since `fd31193`). A
 deep-linked zone, section or topic page says "not found" only on the relay's EOSE for the subscription that would have carried it, and
 for a zone that is not public only on an EOSE that followed the relay's `OK true` for the client's AUTH, judged by a per-subscription REQ
 ledger (`utils/lookup.rs:62`, `:91`; `relay/receipt.rs:71`). No receipt in 15 s shows an "Unavailable" message. The relay's
-20-subscription cap does not count a REQ that replaces a held id (`nip_handlers.rs:52`). Open gap: the decision does not wait for zone
-keys, so an encrypted zone can still show "Topic Not Found" briefly (`known-findings.md` KF-23).
+20-subscription cap does not count a REQ that replaces a held id (`nip_handlers.rs:52`). In an encrypted zone the topic page and the
+section topic list also wait for zone keys before reporting an absence (`Lookup::decide_with_keys`, `utils/lookup.rs:134`;
+`pages/thread.rs:645-675`, `section.rs:318-340`): while the grant backlog is pending or moving they show "Fetching your keys for this
+zone…", and once it stalls (20 s without progress, 120 s cap, `zone_crypto/grant_backlog.rs:35`, `:42`) a reload message.
+
+> Note 2026-11-23: this paragraph used to end "Open gap: the decision does not wait for zone keys, so an encrypted zone can still
+> show 'Topic Not Found' briefly (KF-23)". Kit PR #98 (`fd31193`) closed that gap; KF-23 is closed with the operator's live check
+> of 2026-11-22. Re-read at `4a73a7a`.
 
 ## Rust toolchain floats on stable, deliberately — 2026-10-02
 
