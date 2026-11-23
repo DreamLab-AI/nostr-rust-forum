@@ -9,6 +9,7 @@ use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use nostr_bbs_core::NostrEvent;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -124,6 +125,9 @@ pub struct ChannelStore {
     /// Marker and persisted tombstones for this store's kind-5 filter,
     /// advanced and saved only when the channel subscription reaches EOSE.
     deletion_progress: StoredValue<DeletionProgress>,
+    /// Paged history per channel id (see [`HistoryCursor`]). Reactive, so the
+    /// channel page can show "loading older" and "start of history".
+    history: RwSignal<HashMap<String, HistoryCursor>>,
 }
 
 impl ChannelStore {
@@ -152,6 +156,7 @@ impl ChannelStore {
             tombstones: RwSignal::new(tombstones),
             signer_admin: SignerAdminCache::new(),
             deletion_progress: StoredValue::new(DeletionProgress::new(deletions)),
+            history: RwSignal::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
         store
@@ -769,12 +774,227 @@ impl ChannelStore {
             vec![Filter {
                 kinds: Some(vec![42]),
                 e_tags: Some(vec![needle]),
-                limit: Some(RELAY_FILTER_LIMIT),
+                limit: Some(HISTORY_PAGE),
                 ..Default::default()
             }],
             on_event,
             on_eose,
         );
+    }
+
+    // -- Paged history -----------------------------------------------------
+
+    /// The paged-history state of channel `cid`. Reactive.
+    pub fn history_cursor(&self, cid: &str) -> HistoryCursor {
+        self.history
+            .with(|m| m.get(cid).cloned().unwrap_or_default())
+    }
+
+    /// Record the channel's newest page (the channel page's first kind-42
+    /// REQ, `limit` [`HISTORY_PAGE`]) once its authoritative answer is in.
+    /// A channel already paged this session keeps its cursor, so re-opening
+    /// it does not walk back over pages already held.
+    pub fn record_first_page(&self, cid: &str, page: PageOutcome) {
+        self.history.update(|m| {
+            let c = m.entry(cid.to_string()).or_default();
+            if !c.started {
+                c.record_first(page);
+            }
+        });
+    }
+
+    /// Admit, place and decrypt one delivered kind-42, exactly as every other
+    /// history path does: the kind-5 gate on the delivered event, channel
+    /// resolution by its root `e` tag (falling back to `fallback_cid`),
+    /// `prepare_incoming`, then the gate again on what it became (a restored
+    /// sealed original carries the original's id, ADR-2017). `None` when the
+    /// event is not to be shown.
+    pub fn ingest(
+        &self,
+        zone_keys: Option<ZoneKeyStore>,
+        event: NostrEvent,
+        fallback_cid: &str,
+    ) -> Option<(String, NostrEvent)> {
+        if event.kind != 42 || !self.admits_message(zone_keys, &event) {
+            return None;
+        }
+        let tag_val = event
+            .tags
+            .iter()
+            .find(|t| t.len() >= 4 && t[0] == "e" && t[3] == "root")
+            .or_else(|| event.tags.iter().find(|t| t.len() >= 2 && t[0] == "e"))
+            .map(|t| t[1].clone())?;
+        let tag_lower = tag_val.to_lowercase();
+        let cid = self
+            .channels
+            .with_untracked(|list| {
+                list.iter()
+                    .find(|c| {
+                        c.id == tag_val
+                            || c.name.to_lowercase() == tag_lower
+                            || c.section.to_lowercase() == tag_lower
+                    })
+                    .map(|c| c.id.clone())
+            })
+            .unwrap_or_else(|| fallback_cid.to_string());
+        let event = crate::zone_crypto::store::prepare_incoming(zone_keys, event);
+        if !self.admits_message(zone_keys, &event) {
+            return None;
+        }
+        Some((cid, event))
+    }
+
+    /// Insert a batch of ingested messages in ONE store update (a page of
+    /// 100 would otherwise notify every subscriber 100 times), advancing
+    /// each channel's last activity for genuinely new messages.
+    pub fn apply_page(&self, events: Vec<(String, NostrEvent)>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut newest: HashMap<String, u64> = HashMap::new();
+        self.channel_messages.update(|m| {
+            for (cid, ev) in events {
+                let ts = ev.created_at;
+                if insert_message(m.entry(cid.clone()).or_default(), ev) {
+                    let n = newest.entry(cid).or_insert(0);
+                    *n = (*n).max(ts);
+                }
+            }
+        });
+        if !newest.is_empty() {
+            self.last_active.update(|m| {
+                for (cid, ts) in newest {
+                    let cur = m.entry(cid).or_insert(0);
+                    if ts > *cur {
+                        *cur = ts;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Fetch the next older page of channel `cid` (see [`HistoryCursor`]) as
+    /// a one-shot REQ over the channel's `#e` `needles`, closed on its
+    /// answer. Returns whether a request went out (`false` before the first
+    /// page, while one is in flight, or at the start of history).
+    ///
+    /// With `wait_auth` (a signed-in reader), only an authenticated answer
+    /// counts: before NIP-42 AUTH the relay withholds gated zones, and an
+    /// empty anonymous answer must not read as the start of history; the
+    /// relay replays the REQ after AUTH. `before_apply` runs just before the
+    /// page enters the store, so the page can anchor its scroll position.
+    /// A request with no answer within [`PAGE_TIMEOUT_MS`] is abandoned and
+    /// the cursor released, so the next scroll retries.
+    pub fn load_older(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        needles: Vec<String>,
+        wait_auth: bool,
+        before_apply: Rc<dyn Fn()>,
+    ) -> bool {
+        let Some(req) = self
+            .history
+            .with_untracked(|m| m.get(cid).and_then(HistoryCursor::next_request))
+        else {
+            return false;
+        };
+        self.history.update(|m| {
+            if let Some(c) = m.get_mut(cid) {
+                c.loading = true;
+            }
+        });
+
+        #[derive(Default)]
+        struct Buf {
+            delivered: u64,
+            oldest: Option<u64>,
+            events: Vec<(String, NostrEvent)>,
+            done: bool,
+            sub: Option<String>,
+        }
+        let buf = Rc::new(RefCell::new(Buf::default()));
+        let store = *self;
+        let zone_keys = crate::zone_crypto::store::try_use_zone_key_store();
+        let key = cid.to_string();
+
+        let on_event = {
+            let buf = buf.clone();
+            let key = key.clone();
+            Rc::new(move |ev: NostrEvent| {
+                if buf.borrow().done {
+                    return;
+                }
+                let ts = ev.created_at;
+                let ingested = store.ingest(zone_keys, ev, &key);
+                let mut b = buf.borrow_mut();
+                b.delivered += 1;
+                b.oldest = Some(b.oldest.map_or(ts, |o| o.min(ts)));
+                if let Some(x) = ingested {
+                    b.events.push(x);
+                }
+            })
+        };
+        let on_receipt = {
+            let buf = buf.clone();
+            let relay = relay.clone();
+            let key = key.clone();
+            Rc::new(move |authed: bool| {
+                if !authed && wait_auth {
+                    return;
+                }
+                let (events, page, sub) = {
+                    let mut b = buf.borrow_mut();
+                    if b.done {
+                        return;
+                    }
+                    b.done = true;
+                    let page = PageOutcome {
+                        delivered: b.delivered,
+                        oldest: b.oldest,
+                    };
+                    (std::mem::take(&mut b.events), page, b.sub.take())
+                };
+                if let Some(id) = sub {
+                    relay.unsubscribe(&id);
+                }
+                before_apply();
+                store.apply_page(events);
+                let _ = store.history.try_update(|m| {
+                    if let Some(c) = m.get_mut(&key) {
+                        c.record(req, page);
+                    }
+                });
+            })
+        };
+        let id = relay.subscribe_with_receipt(
+            vec![HistoryCursor::filter(req, &needles)],
+            on_event,
+            on_receipt,
+        );
+        buf.borrow_mut().sub = Some(id);
+
+        let relay = relay.clone();
+        gloo::timers::callback::Timeout::new(PAGE_TIMEOUT_MS, move || {
+            let sub = {
+                let mut b = buf.borrow_mut();
+                if b.done {
+                    return;
+                }
+                b.done = true;
+                b.sub.take()
+            };
+            if let Some(id) = sub {
+                relay.unsubscribe(&id);
+            }
+            let _ = store.history.try_update(|m| {
+                if let Some(c) = m.get_mut(&key) {
+                    c.loading = false;
+                }
+            });
+        })
+        .forget();
+        true
     }
 
     /// Cleanup subscriptions.
@@ -803,17 +1023,26 @@ pub fn use_channel_store() -> ChannelStore {
 // -- Helpers ------------------------------------------------------------------
 
 /// Insert a prepared kind-42 into a channel's list: dedupe by event id (the
-/// only counter, ADR-091), then keep the list sorted by `created_at`. Returns
+/// only counter, ADR-091), keeping the list sorted by `created_at`. Returns
 /// whether the event was new.
 ///
 /// Callers pass the event *after* `zone_crypto::store::prepare_incoming`, so a
 /// restored sealed original (ADR-2017) is deduped by the original's id.
+///
+/// The list is kept sorted, so the insert is a binary search plus one move
+/// rather than a re-sort per event (which made loading `n` messages cost
+/// `O(n² log n)`). An event id is the hash of the event, `created_at`
+/// included, so an event already held sits in the run of equal timestamps:
+/// only that run is checked for the id. A new event goes after its equals,
+/// the order the stable sort used to give.
 pub fn insert_message(events: &mut Vec<NostrEvent>, event: NostrEvent) -> bool {
-    if events.iter().any(|e| e.id == event.id) {
+    let ts = event.created_at;
+    let start = events.partition_point(|e| e.created_at < ts);
+    let end = start + events[start..].partition_point(|e| e.created_at <= ts);
+    if events[start..end].iter().any(|e| e.id == event.id) {
         return false;
     }
-    events.push(event);
-    events.sort_by_key(|e| e.created_at);
+    events.insert(end, event);
     true
 }
 
@@ -969,6 +1198,128 @@ pub const RELAY_FILTER_LIMIT: u64 = 1000;
 /// Filters the relay accepts in one REQ (`MAX_FILTERS` in the relay worker).
 pub const RELAY_MAX_FILTERS: usize = 10;
 
+/// How long a history page request may go unanswered before it is abandoned.
+pub const PAGE_TIMEOUT_MS: u32 = 20_000;
+
+/// Messages per history page: the newest page a channel opens with, and each
+/// older page fetched when the reader scrolls to the top.
+pub const HISTORY_PAGE: u64 = 100;
+
+/// Boot-sync budget per known channel (home view: last activity, unread).
+/// A channel's full history is paged in by the channel page, not here.
+pub const SYNC_PER_CHANNEL: u64 = 20;
+
+/// Where a channel's paged history stands (see [`ChannelStore::load_older`]).
+///
+/// Pages walk back with an inclusive `until` = the oldest timestamp delivered
+/// so far: the boundary second is fetched again (a one-second overlap) and
+/// the ids already held are dropped, so messages sharing that second are
+/// neither skipped nor duplicated. A page shorter than the limit is the
+/// start of history. If a full page comes back entirely at the `until`
+/// second, more than a page shares that second: the next request fetches
+/// that whole second (`since = until = t`, up to the relay's row cap), and
+/// the walk then continues below it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryCursor {
+    /// `until` of the next older page; `None` until the first page has landed.
+    pub until: Option<u64>,
+    /// A second to fetch whole before paging on (see above).
+    pub sweep: Option<u64>,
+    /// The relay has returned the oldest message.
+    pub exhausted: bool,
+    /// A page request is in flight.
+    pub loading: bool,
+    /// The first (newest) page has been recorded.
+    pub started: bool,
+}
+
+/// What one page request delivered: every event the relay sent for it,
+/// counted before any client-side admission, and the oldest `created_at`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageOutcome {
+    pub delivered: u64,
+    pub oldest: Option<u64>,
+}
+
+/// The request a [`HistoryCursor`] makes next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageRequest {
+    /// `until` (inclusive), `limit` [`HISTORY_PAGE`].
+    Older { until: u64 },
+    /// `since = until = second`, `limit` [`RELAY_FILTER_LIMIT`].
+    Sweep { second: u64 },
+}
+
+impl HistoryCursor {
+    /// The next older page to ask for, or `None` when there is nothing to ask
+    /// (not started, exhausted, or a request already in flight).
+    pub fn next_request(&self) -> Option<PageRequest> {
+        if self.loading || self.exhausted || !self.started {
+            return None;
+        }
+        if let Some(second) = self.sweep {
+            return Some(PageRequest::Sweep { second });
+        }
+        self.until.map(|until| PageRequest::Older { until })
+    }
+
+    /// The filter for `req` over the channel's `#e` needles.
+    pub fn filter(req: PageRequest, needles: &[String]) -> Filter {
+        let (since, until, limit) = match req {
+            PageRequest::Older { until } => (None, until, HISTORY_PAGE),
+            PageRequest::Sweep { second } => (Some(second), second, RELAY_FILTER_LIMIT),
+        };
+        Filter {
+            kinds: Some(vec![42]),
+            e_tags: Some(needles.to_vec()),
+            since,
+            until: Some(until),
+            limit: Some(limit),
+            ..Default::default()
+        }
+    }
+
+    /// Record the newest page (the channel's first REQ, `limit` [`HISTORY_PAGE`]).
+    pub fn record_first(&mut self, page: PageOutcome) {
+        self.started = true;
+        self.loading = false;
+        self.record_older(None, page);
+    }
+
+    /// Record the answer to `req` (`None` for the first page).
+    pub fn record(&mut self, req: PageRequest, page: PageOutcome) {
+        self.loading = false;
+        match req {
+            PageRequest::Older { until } => self.record_older(Some(until), page),
+            PageRequest::Sweep { second } => {
+                self.sweep = None;
+                // Everything at `second` is now held; page on below it.
+                match second.checked_sub(1) {
+                    Some(below) => self.until = Some(below),
+                    None => self.exhausted = true,
+                }
+            }
+        }
+    }
+
+    fn record_older(&mut self, asked_until: Option<u64>, page: PageOutcome) {
+        if page.delivered < HISTORY_PAGE {
+            self.exhausted = true;
+            if let Some(o) = page.oldest {
+                self.until = Some(o);
+            }
+            return;
+        }
+        let oldest = page.oldest.expect("a full page has an oldest event");
+        if asked_until == Some(oldest) {
+            // A full page, all at the boundary second: fetch that second whole.
+            self.sweep = Some(oldest);
+        } else {
+            self.until = Some(oldest);
+        }
+    }
+}
+
 /// The kind-5 filter shared by the channel and reaction subscriptions.
 ///
 /// `since` is the device's marker from [`deletion_sync`]; `None` (no completed
@@ -1072,17 +1423,27 @@ pub fn message_sync_filters(channels: &[(String, String)], zones: &[Zone]) -> Ve
         .into_iter()
         .map(|(_, ids)| Filter {
             kinds: Some(vec![42]),
+            limit: Some(zone_sync_limit(ids.len())),
             e_tags: Some(ids),
-            limit: Some(RELAY_FILTER_LIMIT),
             ..Default::default()
         })
         .collect();
     filters.push(Filter {
         kinds: Some(vec![42]),
-        limit: Some(RELAY_FILTER_LIMIT),
+        limit: Some(HISTORY_PAGE),
         ..Default::default()
     });
     filters
+}
+
+/// Row budget of one zone's boot-sync filter: [`SYNC_PER_CHANNEL`] per
+/// channel, at most [`RELAY_FILTER_LIMIT`]. History beyond it is paged in by
+/// the channel page ([`ChannelStore::load_older`]); the boot sync only feeds
+/// the home view, and every envelope it fetches is decrypted on arrival.
+pub fn zone_sync_limit(channels: usize) -> u64 {
+    (channels as u64)
+        .saturating_mul(SYNC_PER_CHANNEL)
+        .clamp(SYNC_PER_CHANNEL, RELAY_FILTER_LIMIT)
 }
 
 /// Event ids referenced by a kind-5 deletion's `["e", <id>]` tags, lowercased.
@@ -1124,10 +1485,10 @@ mod tests {
                 !k.contains(&5) || k == vec![5],
                 "kind 5 shares a filter with {k:?}"
             );
-            assert_eq!(
-                f.limit,
-                Some(RELAY_FILTER_LIMIT),
-                "filter {k:?} has no explicit limit"
+            let limit = f.limit.expect("every sync filter states its limit");
+            assert!(
+                (1..=RELAY_FILTER_LIMIT).contains(&limit),
+                "filter {k:?} has limit {limit}"
             );
         }
     }
@@ -1255,7 +1616,135 @@ mod tests {
         let f = message_sync_filters(&[], &zones());
         assert_eq!(f.len(), 1);
         assert!(f[0].e_tags.is_none());
-        assert_eq!(f[0].limit, Some(RELAY_FILTER_LIMIT));
+        assert_eq!(f[0].limit, Some(HISTORY_PAGE));
+    }
+
+    #[test]
+    fn a_zone_sync_filter_budgets_per_channel_within_the_relay_cap() {
+        assert_eq!(zone_sync_limit(1), SYNC_PER_CHANNEL);
+        assert_eq!(zone_sync_limit(3), 3 * SYNC_PER_CHANNEL);
+        assert_eq!(zone_sync_limit(10_000), RELAY_FILTER_LIMIT);
+        let chans = [chan("a", "zone2-rants"), chan("b", "zone2-rants")];
+        let f = message_sync_filters(&chans, &zones());
+        assert_eq!(f[0].limit, Some(2 * SYNC_PER_CHANNEL));
+    }
+
+    // --- paged history ---
+
+    fn evt(id: &str, created_at: u64) -> NostrEvent {
+        NostrEvent {
+            id: id.into(),
+            pubkey: "p".into(),
+            created_at,
+            kind: 42,
+            tags: vec![],
+            content: String::new(),
+            sig: String::new(),
+        }
+    }
+
+    #[test]
+    fn ordered_insert_keeps_time_order_dedupes_and_appends_after_equals() {
+        let mut v = Vec::new();
+        for (id, t) in [("c", 30), ("a", 10), ("b2", 20), ("b1", 20), ("d", 40)] {
+            assert!(insert_message(&mut v, evt(id, t)));
+        }
+        assert!(!insert_message(&mut v, evt("b1", 20)), "duplicate id");
+        let order: Vec<&str> = v.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(order, vec!["a", "b2", "b1", "c", "d"]);
+    }
+
+    /// A relay holding `ts` (ascending) for one channel, answering the
+    /// cursor's filters like the relay does: newest first, inclusive bounds.
+    fn answer(ts: &[(String, u64)], f: &Filter) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = ts
+            .iter()
+            .filter(|(_, t)| f.since.is_none_or(|s| *t >= s) && f.until.is_none_or(|u| *t <= u))
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+        v.truncate(f.limit.unwrap() as usize);
+        v
+    }
+
+    fn outcome(page: &[(String, u64)]) -> PageOutcome {
+        PageOutcome {
+            delivered: page.len() as u64,
+            oldest: page.iter().map(|(_, t)| *t).min(),
+        }
+    }
+
+    /// Walk a channel to its first message the way the channel page does.
+    fn walk(ts: &[(String, u64)]) -> (std::collections::HashSet<String>, usize) {
+        let mut held = std::collections::HashSet::new();
+        let mut c = HistoryCursor::default();
+        let first = answer(
+            ts,
+            &Filter {
+                limit: Some(HISTORY_PAGE),
+                ..Default::default()
+            },
+        );
+        held.extend(first.iter().map(|(id, _)| id.clone()));
+        c.record_first(outcome(&first));
+        let mut requests = 1;
+        while let Some(req) = c.next_request() {
+            requests += 1;
+            assert!(requests < 10_000, "the walk must terminate");
+            c.loading = true;
+            let page = answer(ts, &HistoryCursor::filter(req, &["c".into()]));
+            held.extend(page.iter().map(|(id, _)| id.clone()));
+            c.record(req, outcome(&page));
+        }
+        assert!(c.exhausted);
+        (held, requests)
+    }
+
+    #[test]
+    fn paging_reaches_the_first_message_across_ties_without_loss() {
+        // Runs of equal seconds straddling page boundaries, and one run of
+        // 250 messages in a single second (more than a page).
+        let mut ts = Vec::new();
+        let mut t = 1_000;
+        for i in 0..2_000 {
+            if i % 3 != 0 && !(900..1_150).contains(&i) {
+                t += 1;
+            }
+            ts.push((format!("m{i:05}"), t));
+        }
+        let (held, requests) = walk(&ts);
+        assert_eq!(held.len(), ts.len(), "every message, once");
+        assert!(
+            requests <= 2_000 / HISTORY_PAGE as usize + 5,
+            "{requests} requests"
+        );
+    }
+
+    #[test]
+    fn a_short_first_page_is_the_whole_history() {
+        let ts: Vec<(String, u64)> = (0..42).map(|i| (format!("m{i}"), 100 + i)).collect();
+        let (held, requests) = walk(&ts);
+        assert_eq!((held.len(), requests), (42, 1));
+    }
+
+    #[test]
+    fn an_exact_multiple_of_the_page_ends_on_an_empty_page() {
+        let ts: Vec<(String, u64)> = (0..300).map(|i| (format!("m{i}"), 100 + i)).collect();
+        let (held, _) = walk(&ts);
+        assert_eq!(held.len(), 300);
+    }
+
+    #[test]
+    fn nothing_is_requested_before_the_first_page_or_while_loading() {
+        let mut c = HistoryCursor::default();
+        assert_eq!(c.next_request(), None);
+        c.record_first(PageOutcome {
+            delivered: HISTORY_PAGE,
+            oldest: Some(500),
+        });
+        assert_eq!(c.next_request(), Some(PageRequest::Older { until: 500 }));
+        c.loading = true;
+        assert_eq!(c.next_request(), None);
     }
 
     #[test]
