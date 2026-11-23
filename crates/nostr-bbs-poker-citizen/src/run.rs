@@ -1,12 +1,13 @@
 //! The runner: the command line, the clock, the relay, the producer, and the
 //! loop that joins them to the table ([`crate::table::Citizen`]).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use bitcoin::{OutPoint, Txid};
 use clap::Parser;
+use nostr_bbs_core::event::compute_event_id;
 use nostr_bbs_core::gift_wrap::{gift_wrap_kind, unwrap_gift_kind};
 use nostr_bbs_poker::protocol::{ToCitizen, ToHero, RUMOR_KIND};
 use sidestr_agent::AgentKey;
@@ -15,8 +16,9 @@ use tokio::time::{sleep, Instant};
 use zeroize::Zeroizing;
 
 use nostr_bbs_poker_citizen::chain::{self, Facts};
-use nostr_bbs_poker_citizen::ledger::Ledger;
+use nostr_bbs_poker_citizen::ledger::{Cause, Pending, Resume, TxOnChain};
 use nostr_bbs_poker_citizen::net::{now_secs, publish_once, Frame, Relay};
+use nostr_bbs_poker_citizen::state::{self, Seen, State};
 use nostr_bbs_poker_citizen::table::{Balances, Citizen, Config, Effect, House};
 
 /// The house seat of the nostr-bbs poker table.
@@ -64,7 +66,7 @@ pub struct Cli {
         value_name = "URLS"
     )]
     sidestr_relays: String,
-    /// Where the ledger is kept.
+    /// Where the house keeps its state: the ledger, the hands in play and the events acted on (private to its owner).
     #[arg(long, env = "POKER_CITIZEN_STATE", value_name = "PATH")]
     state: PathBuf,
     /// Big blinds on offer, in base units of the table's asset, comma-separated.
@@ -95,22 +97,10 @@ pub struct Cli {
     bot_delay_ms: u64,
 }
 
-/// A transfer the producer accepted but the chain has not shown yet: its
-/// coins are held back from the next build.
-struct Held {
-    txid: String,
-    outpoints: Vec<OutPoint>,
-    at: u64,
-}
-
-/// Held coins are released after this long if the chain never shows them.
-const HELD_TTL: u64 = 30 * 60;
 /// A failed payout is retried after this long.
 const PAY_RETRY_SECS: u64 = 120;
 /// The inbox looks back this far, covering NIP-59's timestamp jitter.
 const INBOX_LOOKBACK: u64 = 2 * 24 * 60 * 60 + 3_600;
-/// Event ids remembered for de-duplication.
-const SEEN_CAP: usize = 4_096;
 
 struct Runner {
     cli: Cli,
@@ -124,11 +114,11 @@ struct Runner {
     facts: Option<Facts>,
     /// The producer's `/tip` hash at the last full scan; an unchanged tip skips the re-download and replay.
     scanned_tip: Option<String>,
-    held: Vec<Held>,
+    /// What the house said it would do on its first connection: tell members of hands it voided.
+    startup: Vec<Effect>,
     http: reqwest::Client,
     bot_turns: VecDeque<(Instant, String)>,
-    seen: HashSet<String>,
-    seen_order: VecDeque<String>,
+    seen: Seen,
 }
 
 fn read_key(path: &PathBuf) -> Result<(AgentKey, Zeroizing<[u8; 32]>), String> {
@@ -165,9 +155,9 @@ pub async fn main() -> Result<(), String> {
     if stakes_bb.is_empty() {
         return Err("--stakes-bb lists no big blind".into());
     }
-    let ledger = match std::fs::read_to_string(&cli.state) {
-        Ok(json) => Ledger::parse(&json)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ledger::default(),
+    let state = match std::fs::read_to_string(&cli.state) {
+        Ok(json) => State::parse(&json)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
         Err(e) => return Err(format!("{}: {e}", cli.state.display())),
     };
     let cfg = Config {
@@ -182,16 +172,31 @@ pub async fn main() -> Result<(), String> {
         pubkey: pubkey.clone(),
         script_hex: key.script().to_hex_string(),
     };
-    let citizen = Citizen::new(
+    // Hands in play when the house stopped are resumed where they stood
+    // (see `Citizen::restore`); one that no longer proves itself is voided.
+    let (citizen, recovered) = Citizen::restore(
         cfg,
         house,
-        ledger,
+        state,
         Box::new(|| {
             let mut b = [0u8; 32];
             getrandom::getrandom(&mut b).expect("the OS random source");
             b
         }),
+        now_secs(),
     );
+    for (root, why) in citizen.halted() {
+        eprintln!(
+            "HALTED debt for hand {}…: {why}",
+            &root[..12.min(root.len())]
+        );
+    }
+    for commit in &recovered.resumed {
+        eprintln!("recovered hand {}…", &commit[..12]);
+    }
+    for (commit, why) in &recovered.voided {
+        eprintln!("voided hand {}…: {why}", &commit[..12.min(commit.len())]);
+    }
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent(concat!(
@@ -235,14 +240,21 @@ pub async fn main() -> Result<(), String> {
         ticker: served.ticker,
         facts: None,
         scanned_tip: None,
-        held: Vec::new(),
+        startup: Vec::new(),
         http,
         bot_turns: VecDeque::new(),
-        seen: HashSet::new(),
-        seen_order: VecDeque::new(),
+        seen: Seen::from_entries(recovered.seen),
     };
+    for e in recovered.effects {
+        if let Effect::BotTurn(commit) = e {
+            let at = Instant::now() + Duration::from_millis(runner.cli.bot_delay_ms);
+            runner.bot_turns.push_back((at, commit));
+        } else {
+            runner.startup.push(e);
+        }
+    }
     runner.refresh_chain().await;
-    runner.persist();
+    runner.checkpoint();
     let mut backoff = 2u64;
     loop {
         match Relay::connect(&runner.cli.relay, &runner.sk, &runner.pubkey).await {
@@ -273,26 +285,34 @@ pub async fn main() -> Result<(), String> {
 }
 
 impl Runner {
-    fn persist(&self) {
-        let tmp = self.cli.state.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, self.citizen.ledger.to_json())
-            .and_then(|()| std::fs::rename(&tmp, &self.cli.state))
-        {
-            eprintln!("ledger: could not save {}: {e}", self.cli.state.display());
+    /// Save what changed. Called after every step of the table and before
+    /// its effects are carried out, so nothing is sent or paid on the
+    /// strength of a change a restart would forget. If the state cannot be
+    /// saved the house stops: the process restarts from the last good file,
+    /// which no member has been told anything beyond.
+    fn checkpoint(&mut self) {
+        let path = self.cli.state.clone();
+        let seen = self.seen.to_entries();
+        let saved = self
+            .citizen
+            .checkpoint(seen, |st| state::save(&path, st).map_err(|e| e.to_string()));
+        if let Err(e) = saved {
+            eprintln!(
+                "state: could not save {}: {e}; stopping rather than act on unsaved state",
+                path.display()
+            );
+            std::process::exit(1);
         }
     }
 
-    fn remember(&mut self, id: &str) -> bool {
-        if !self.seen.insert(id.to_string()) {
-            return false;
-        }
-        self.seen_order.push_back(id.to_string());
-        while self.seen_order.len() > SEEN_CAP {
-            if let Some(old) = self.seen_order.pop_front() {
-                self.seen.remove(&old);
-            }
-        }
-        true
+    /// The coins held back from the house's balance and coin selection:
+    /// those of payouts sent and of payouts signed and about to be.
+    fn held_outpoints(&self) -> Vec<OutPoint> {
+        self.citizen
+            .held_outpoints()
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect()
     }
 
     /// The producer's tip hash, or `None` when `/tip` cannot be read (then the chain is rescanned in full).
@@ -339,10 +359,6 @@ impl Runner {
                         self.asset
                     );
                 }
-                let now = now_secs();
-                self.held.retain(|h| {
-                    !facts.txids.contains(&h.txid) && now.saturating_sub(h.at) < HELD_TTL
-                });
                 self.facts = Some(facts);
                 self.scanned_tip = tip;
             }
@@ -354,7 +370,7 @@ impl Runner {
         let Some(f) = &self.facts else {
             return Balances::default();
         };
-        let held: Vec<OutPoint> = self.held.iter().flat_map(|h| h.outpoints.clone()).collect();
+        let held = self.held_outpoints();
         Balances {
             hero_asset: f.units_of(hero),
             house_asset: f.units_of_script(&self.key.script(), &held),
@@ -374,44 +390,120 @@ impl Runner {
         }
     }
 
+    /// Sign the house's payout for a hand.
+    fn sign_payout(
+        &self,
+        hero: &str,
+        root: &str,
+        amount: u64,
+        now: u64,
+    ) -> Result<(Pending, sidestr_nostr::event::Event), String> {
+        let facts = self.facts.as_ref().ok_or("the chain is not loaded")?;
+        let held = self.held_outpoints();
+        let payment = chain::build_payment(&self.key, facts, &held, hero, amount, root, now)?;
+        let pending = Pending {
+            hex: payment.spend.hex.clone(),
+            txid: payment.spend.txid.to_string(),
+            outpoints: payment
+                .spend
+                .tx
+                .input
+                .iter()
+                .map(|i| i.previous_output.to_string())
+                .collect(),
+        };
+        Ok((pending, payment.event))
+    }
+
     /// Pay a settlement; the effects that follow (the `Paid` message, the
     /// ledger save) are returned for the caller's queue.
+    ///
+    /// A transfer is signed once per hand and kept with the debt (saved
+    /// before it is sent); every retry sends those same bytes. A new one is
+    /// signed only when the chain shows the old one's coins spent by
+    /// something else and the old one nowhere.
     async fn pay(&mut self, hero: &str, root: &str, amount: u64) -> Vec<Effect> {
         let now = now_secs();
-        let Some(facts) = &self.facts else {
-            return self
-                .citizen
-                .house_pay_failed(root, "the chain is not loaded", now);
-        };
-        let held: Vec<OutPoint> = self.held.iter().flat_map(|h| h.outpoints.clone()).collect();
-        let payment = match chain::build_payment(&self.key, facts, &held, hero, amount, root, now) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "pay {amount} {} to {}… for {}…: {e}",
-                    self.ticker,
-                    &hero[..8],
-                    &root[..8]
-                );
-                return self.citizen.house_pay_failed(root, &e, now);
+        if self.citizen.is_halted(root) {
+            return Vec::new(); // waiting for an operator
+        }
+        // the signed transfer is the ledger's, read now, not a copy that
+        // travelled in an effect
+        let (pending, event) = match self.citizen.pending_of(root) {
+            Some(p) => {
+                let (on_chain, unspent) = match &self.facts {
+                    Some(f) => (
+                        f.tx_state(&p.txid),
+                        f.all_unspent(&self.key.script(), &p.outpoints),
+                    ),
+                    None => (TxOnChain::NotSeen, true),
+                };
+                match p.resume(on_chain, unspent) {
+                    Resume::OnChain => return Vec::new(),
+                    Resume::Resend => (p, None),
+                    Resume::Rebuild => {
+                        // never signed here: the debt goes back to being
+                        // unsent and comes up again through `payable`,
+                        // which holds it to the daily cap; a second
+                        // rejection halts it for an operator
+                        let cause = if on_chain == TxOnChain::Invalid {
+                            eprintln!(
+                                "PAYOUT REJECTED: transfer {} for hand {}… is on the chain but the assets rule rejected it; its coins are spent and {amount} {} did not move.",
+                                p.txid,
+                                &root[..8],
+                                self.ticker
+                            );
+                            Cause::Invalid
+                        } else {
+                            eprintln!(
+                                "pay for hand {}…: the coins of {} were spent by something else and it never landed",
+                                &root[..8],
+                                p.txid
+                            );
+                            Cause::SpentElsewhere
+                        };
+                        let follow = self.citizen.replace_payout(root, cause, now);
+                        self.checkpoint();
+                        return follow;
+                    }
+                }
             }
+            None => match self.sign_payout(hero, root, amount, now) {
+                Ok((p, ev)) => (p, Some(ev)),
+                Err(e) => {
+                    eprintln!(
+                        "pay {amount} {} to {}… for {}…: {e}",
+                        self.ticker,
+                        &hero[..8],
+                        &root[..8]
+                    );
+                    return self.citizen.house_pay_failed(root, &e, now);
+                }
+            },
         };
-        let txid = payment.spend.txid.to_string();
+        let txid = pending.txid.clone();
+        // kept and saved before the transfer leaves: see `Citizen::pay_prepared`
+        if !self.citizen.pay_prepared(root, pending.clone(), now) {
+            return Vec::new(); // no longer owed: send nothing
+        }
+        self.checkpoint();
         let post = self
             .http
             .post(format!("{}/tx", self.cli.producer.trim_end_matches('/')))
-            .body(payment.spend.hex.clone())
+            .body(pending.hex.clone())
             .send()
             .await;
+        // the flag is true for the producer's own refusal, false for not
+        // having reached it
         let accepted = match post {
             Ok(r) => {
                 let text = r.text().await.unwrap_or_default();
                 match sidestr_wallet::deliver::parse_tx_response(&text) {
                     Ok(_) => Ok(()),
-                    Err(e) => Err(format!("the producer refused: {e}")),
+                    Err(e) => Err((true, format!("the producer refused: {e}"))),
                 }
             }
-            Err(e) => Err(format!("producer: {e}")),
+            Err(e) => Err((false, format!("producer: {e}"))),
         };
         match accepted {
             Ok(()) => {
@@ -421,38 +513,37 @@ impl Runner {
                     &hero[..8],
                     &root[..8]
                 );
-                self.held.push(Held {
-                    txid: txid.clone(),
-                    outpoints: payment
-                        .spend
-                        .tx
-                        .input
-                        .iter()
-                        .map(|i| i.previous_output)
-                        .collect(),
-                    at: now,
-                });
                 // the producer follows the public relays too: let them see it
-                if let Ok(json) = serde_json::to_string(&payment.event) {
-                    let id = payment.event.id.clone();
-                    let relays: Vec<String> = self
-                        .cli
-                        .sidestr_relays
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| s.starts_with("wss://"))
-                        .collect();
-                    tokio::spawn(async move {
-                        for r in relays {
-                            publish_once(&r, &json, &id).await;
-                        }
-                    });
+                if let Some(event) = event {
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        let id = event.id.clone();
+                        let relays: Vec<String> = self
+                            .cli
+                            .sidestr_relays
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| s.starts_with("wss://"))
+                            .collect();
+                        tokio::spawn(async move {
+                            for r in relays {
+                                publish_once(&r, &json, &id).await;
+                            }
+                        });
+                    }
                 }
-                self.citizen.house_paid(hero, root, &txid, now)
+                let follow = self.citizen.house_paid(hero, root, &txid, now);
+                self.checkpoint();
+                follow
             }
-            Err(e) => {
+            Err((refused, e)) => {
                 eprintln!("pay for hand {}…: {e}", &root[..8]);
-                self.citizen.house_pay_failed(root, &e, now)
+                let follow = if refused {
+                    self.citizen.house_pay_refused(root, &e, now)
+                } else {
+                    self.citizen.house_pay_failed(root, &e, now)
+                };
+                self.checkpoint();
+                follow
             }
         }
     }
@@ -466,27 +557,44 @@ impl Runner {
                     let at = Instant::now() + Duration::from_millis(self.cli.bot_delay_ms);
                     self.bot_turns.push_back((at, commit));
                 }
-                Effect::Pay { hero, root, amount } => {
+                Effect::Pay {
+                    hero, root, amount, ..
+                } => {
                     // what follows a payment goes ahead of the rest of the queue
                     let follow = self.pay(&hero, &root, amount).await;
                     for (i, f) in follow.into_iter().enumerate() {
                         queue.insert(i, f);
                     }
                 }
-                Effect::Persist => self.persist(),
+                Effect::Persist => self.checkpoint(),
+                Effect::Alert(what) => eprintln!("ALERT: {what}"),
             }
         }
     }
 
     async fn on_event(&mut self, relay: &mut Relay, ev: nostr_bbs_core::NostrEvent) {
-        if !self.remember(&ev.id) {
-            return;
-        }
         let unwrapped = match unwrap_gift_kind(&ev, &self.sk, RUMOR_KIND) {
             Ok(u) => u,
             Err(_) => return, // a DM or someone else's wrap: not for the table
         };
+        // the relay re-streams history: a message too old, or dated ahead of
+        // the clock, is dropped unread
+        let now = now_secs();
+        let at = unwrapped.rumor.created_at;
+        if !state::fresh(at, now) {
+            return;
+        }
+        // de-duplicate on what only a member can make (their key and the
+        // rumor's id), after a wrap has opened and its content parsed; what
+        // is remembered is forgotten by age, a sender's share is bounded,
+        // and only senders the house holds a session for are remembered at
+        // all, so junk cannot grow the set or what is saved
         let hero = unwrapped.sender_pubkey;
+        let key = hex::encode(compute_event_id(&unwrapped.rumor));
+        self.seen.expire(now);
+        if self.seen.contains(&hero, &key) {
+            return;
+        }
         let msg = match ToCitizen::parse(&unwrapped.rumor.content) {
             Ok(m) => m,
             Err(e) => {
@@ -494,19 +602,22 @@ impl Runner {
                 return;
             }
         };
-        // a stale replay of the inbox (the relay re-streams history) must
-        // not re-play old actions: anything older than the hand's possible
-        // life is dropped
-        let now = now_secs();
-        if now.saturating_sub(unwrapped.rumor.created_at) > 600 {
-            return;
-        }
         let balances = self.balances_for(&hero);
         let effects = self.citizen.handle(&hero, msg, now, balances);
+        // a message that changed the table is saved with its id before
+        // anything it produced is sent; one that changed nothing writes
+        // nothing, and is remembered in memory only
+        let changed = self.citizen.is_dirty();
+        if self.citizen.has_standing(&hero) {
+            self.seen.remember(&hero, &key, at, changed);
+        }
+        self.checkpoint();
         self.run_effects(relay, effects).await;
     }
 
     async fn serve(&mut self, relay: &mut Relay) {
+        let startup = std::mem::take(&mut self.startup);
+        self.run_effects(relay, startup).await;
         let mut poll = tokio::time::interval(Duration::from_secs(self.cli.poll_secs.max(5)));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -536,6 +647,7 @@ impl Runner {
                 } => {
                     if let Some((_, commit)) = self.bot_turns.pop_front() {
                         let effects = self.citizen.bot_turn(&commit, now_secs());
+                        self.checkpoint();
                         self.run_effects(relay, effects).await;
                     }
                 },
@@ -544,9 +656,10 @@ impl Runner {
                     let now = now_secs();
                     let mut effects = self.citizen.tick(now);
                     if let Some(f) = &self.facts {
-                        effects.extend(self.citizen.payments_seen(&f.hand_payments));
+                        effects.extend(self.citizen.payments_seen(&f.hand_payments, now));
                     }
                     effects.extend(self.citizen.payable(now, PAY_RETRY_SECS));
+                    self.checkpoint();
                     self.run_effects(relay, effects).await;
                 },
             }

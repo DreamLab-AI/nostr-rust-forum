@@ -19,7 +19,8 @@ use nostr_bbs_poker::protocol::{Asset, Debt, TableOffer, ToCitizen, ToHero, VERS
 use nostr_bbs_poker::record::record_of;
 use nostr_bbs_poker::rules::{self, Settlement, Side};
 
-use crate::ledger::{Ledger, Owed, Owing};
+use crate::ledger::{Cause, Ledger, Owed, Owing, Pending, Replaced, REFUSALS_PER_ALERT};
+use crate::state::{SavedHand, SeenEntry, State};
 
 /// The member's seat in a hand against the house.
 pub const HERO: u32 = 0;
@@ -29,6 +30,10 @@ pub const HOUSE: u32 = 1;
 pub const PRESENCE_TTL: u64 = 180;
 /// A challenge lapses after this long, seconds.
 pub const CHALLENGE_TTL: u64 = 120;
+/// A member who has not acted for this long on their own turn folds the
+/// hand, seconds. Without it an abandoned hand would hold the house's
+/// buy-in back from the bankroll and the daily cap for ever.
+pub const HAND_IDLE_SECS: u64 = 30 * 60;
 
 /// The table's parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,9 +93,15 @@ pub enum Effect {
         root: String,
         /// Base units.
         amount: u64,
+        /// The payout already signed for this hand, if any: it is sent
+        /// again as it is, or replaced only when the chain shows its coins
+        /// went elsewhere ([`Pending::resume`]).
+        pending: Option<Pending>,
     },
     /// The ledger changed; save it.
     Persist,
+    /// Something an operator must look at: say it loudly.
+    Alert(String),
 }
 
 /// Balances the runner read from the chain for one request.
@@ -114,6 +125,16 @@ struct Live {
     seed: String,
     buyin: u64,
     hand: Hand,
+    /// When the hand last moved (or was recovered), unix seconds.
+    updated: u64,
+}
+
+/// What a voided hand shows of its deal.
+struct Reveal {
+    secret: String,
+    nonces: Vec<String>,
+    seed: String,
+    log: Vec<engine::LogEntry>,
 }
 
 /// A challenge waiting for its opponent.
@@ -151,6 +172,24 @@ pub struct Citizen {
     /// The book.
     pub ledger: Ledger,
     secrets: Box<dyn FnMut() -> [u8; 32]>,
+    /// State a saved copy does not yet show.
+    dirty: bool,
+}
+
+/// What came back from a saved state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recovered {
+    /// What to do now: the house's turn in each recovered hand that waits
+    /// on it.
+    pub effects: Vec<Effect>,
+    /// Hands resumed, by commitment.
+    pub resumed: Vec<String>,
+    /// Hands that could not be trusted and were voided, by commitment, with
+    /// why. A void moves no funds: a hand's stakes are notional until it
+    /// settles.
+    pub voided: Vec<(String, String)>,
+    /// Messages already processed.
+    pub seen: Vec<SeenEntry>,
 }
 
 impl std::fmt::Debug for Citizen {
@@ -192,7 +231,294 @@ impl Citizen {
             challenges: HashMap::new(),
             ledger,
             secrets,
+            dirty: false,
         }
+    }
+
+    /// A house seat carrying on from `state`.
+    ///
+    /// Every hand in the state is resumed where it stood, provided it still
+    /// proves itself: the secret must match the commitment, the seed must be
+    /// the one the secret and nonces fix, and replaying the saved actions
+    /// from the deal must reproduce the saved hand exactly. A hand that does
+    /// not is voided (see [`Recovered::voided`]), never played on. `now`
+    /// restarts each resumed hand's idle clock, so downtime is not held
+    /// against the member.
+    pub fn restore(
+        cfg: Config,
+        house: House,
+        state: State,
+        secrets: Box<dyn FnMut() -> [u8; 32]>,
+        now: u64,
+    ) -> (Self, Recovered) {
+        let State { ledger, live, seen } = state;
+        let mut c = Self::new(cfg, house, ledger, secrets);
+        let mut effects = Vec::new();
+        let mut resumed = Vec::new();
+        let mut voided = Vec::new();
+        for saved in live {
+            let commit = saved.commit.clone();
+            let (saved_seats, saved_house) = (saved.seats.clone(), saved.house);
+            let (saved_secret, saved_nonces) = (saved.secret.clone(), saved.nonces.clone());
+            let (saved_seed, saved_log) = (saved.seed.clone(), saved.hand.log.clone());
+            match c.resume(saved, now) {
+                Ok(()) => {
+                    if c.hands[&commit].house && c.hands[&commit].hand.to_act == HOUSE as i32 {
+                        effects.push(Effect::BotTurn(commit.clone()));
+                    }
+                    resumed.push(commit);
+                }
+                Err(why) => {
+                    // the member is told, with the deal revealed so it can
+                    // be checked, and the book records it
+                    effects.extend(c.void(
+                        &commit,
+                        &saved_seats,
+                        saved_house,
+                        Reveal {
+                            secret: saved_secret,
+                            nonces: saved_nonces,
+                            seed: saved_seed,
+                            log: saved_log,
+                        },
+                        &why,
+                        now,
+                    ));
+                    voided.push((commit, why));
+                }
+            }
+        }
+        if !voided.is_empty() {
+            c.dirty = true;
+        }
+        (
+            c,
+            Recovered {
+                effects,
+                resumed,
+                voided,
+                seen,
+            },
+        )
+    }
+
+    /// End a hand the house cannot carry on. No funds move: a hand's stakes
+    /// are notional until it settles, so nothing is owed either way. Each
+    /// member is told why and given the deal to check, the book records it,
+    /// and each gets a fresh offer.
+    fn void(
+        &mut self,
+        commit: &str,
+        seats: &[String; 2],
+        house: bool,
+        reveal: Reveal,
+        why: &str,
+        now: u64,
+    ) -> Vec<Effect> {
+        self.dirty = true;
+        let mut out = Vec::new();
+        for (i, pk) in seats.iter().enumerate() {
+            if house && i == HOUSE as usize {
+                continue;
+            }
+            if let Some(s) = self.sessions.get_mut(pk) {
+                if s.live.as_deref() == Some(commit) {
+                    s.live = None;
+                }
+            }
+            self.ledger.voided(pk, commit, why, now);
+            out.push(Effect::Send(
+                pk.clone(),
+                ToHero::Voided {
+                    commit: commit.to_string(),
+                    why: why.to_string(),
+                    secret: reveal.secret.clone(),
+                    nonces: reveal.nonces.clone(),
+                    seed: reveal.seed.clone(),
+                    log: reveal.log.clone(),
+                },
+            ));
+            let offer = self.offer(pk, now);
+            out.push(Effect::Send(pk.clone(), offer));
+        }
+        out
+    }
+
+    /// The coins of every payout signed and not yet shown on the chain, as
+    /// `txid:vout`: held back from the bankroll and from coin selection. A
+    /// payout's coins stay held as long as its debt does, whether or not the
+    /// producer has accepted it, and are free again only when the debt
+    /// clears (the chain shows the payment) or its signed transfer is
+    /// dropped (the chain shows its coins went elsewhere).
+    pub fn held_outpoints(&self) -> Vec<String> {
+        self.ledger
+            .owing
+            .iter()
+            .filter_map(|o| o.pending.as_ref())
+            .flat_map(|p| p.outpoints.iter())
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the house holds a session for `member`: they have said hello,
+    /// or are in a hand.
+    pub fn has_standing(&self, member: &str) -> bool {
+        self.sessions.contains_key(member)
+    }
+
+    fn resume(&mut self, saved: SavedHand, now: u64) -> Result<(), String> {
+        let hand = self.rebuild(&saved)?;
+        if self.hands.contains_key(&saved.commit) {
+            return Err("the commitment is already in play".into());
+        }
+        for pk in &saved.seats {
+            if self.sessions.get(pk).is_some_and(|s| s.live.is_some()) {
+                return Err(format!("{}… is already in another hand", &pk[..8]));
+            }
+        }
+        for (i, pk) in saved.seats.iter().enumerate() {
+            if saved.house && i == HOUSE as usize {
+                continue;
+            }
+            self.sessions.entry(pk.clone()).or_default().live = Some(saved.commit.clone());
+        }
+        self.hands.insert(
+            saved.commit,
+            Live {
+                seats: saved.seats,
+                house: saved.house,
+                secret: saved.secret,
+                nonces: saved.nonces,
+                seed: saved.seed,
+                buyin: saved.buyin,
+                hand,
+                updated: now,
+            },
+        );
+        Ok(())
+    }
+
+    /// The saved hand, if it proves itself: see [`Citizen::restore`].
+    fn rebuild(&self, s: &SavedHand) -> Result<Hand, String> {
+        if !fair::is_hex64(&s.commit) || !fair::check_commit(&s.secret, &s.commit) {
+            return Err("the secret does not match the commitment".into());
+        }
+        let nonces: Vec<&str> = s.nonces.iter().map(String::as_str).collect();
+        if nonces.len() != if s.house { 1 } else { 2 }
+            || fair::seed_of_many(&s.secret, &nonces) != s.seed
+        {
+            return Err("the seed is not the one the secret and nonces fix".into());
+        }
+        let house = &self.house.pubkey;
+        let seats_ok = s.seats.iter().enumerate().all(|(i, pk)| {
+            if s.house && i == HOUSE as usize {
+                pk == house
+            } else {
+                fair::is_hex64(pk) && pk != house
+            }
+        }) && s.seats[0] != s.seats[1];
+        if !seats_ok {
+            return Err("the seats are not a member and the house, or two members".into());
+        }
+        if s.buyin == 0 {
+            return Err("the buy-in is zero".into());
+        }
+        let saved = &s.hand;
+        let cfg = HandConfig {
+            seats: s
+                .seats
+                .iter()
+                .map(|pk| SeatConfig {
+                    name: pk.clone(),
+                    stack: s.buyin,
+                })
+                .collect(),
+            button: saved.button,
+            sb: saved.sb,
+            bb: saved.bb,
+            ante: saved.ante,
+            seed_hex: s.seed.clone(),
+            limit: saved.limit,
+        };
+        let mut hand = engine::new_hand(&cfg).map_err(|e| format!("the deal failed: {e}"))?;
+        for entry in &saved.log {
+            if !matches!(
+                entry.ev.as_str(),
+                "fold" | "check" | "call" | "bet" | "raise"
+            ) {
+                continue;
+            }
+            let Some(seat) = entry.seat else {
+                return Err("an action in the log has no seat".into());
+            };
+            let action = Action {
+                seat,
+                action: entry.ev.clone(),
+                amount: entry.to,
+            };
+            hand = engine::act(&hand, &action).map_err(|e| format!("replay: {}", e.0))?;
+        }
+        if hand != *saved {
+            return Err("replaying the saved actions does not give the saved hand".into());
+        }
+        if !hand.in_play() {
+            return Err("the hand is already over".into());
+        }
+        Ok(hand)
+    }
+
+    /// Everything that must survive a restart, for the runner to save:
+    /// the book, the hands in play and `seen`, the relay events already
+    /// acted on. Hands are ordered by commitment, so equal states give
+    /// equal files.
+    pub fn state(&self, seen: Vec<SeenEntry>) -> State {
+        let mut live: Vec<SavedHand> = self
+            .hands
+            .iter()
+            .map(|(commit, l)| SavedHand {
+                commit: commit.clone(),
+                seats: l.seats.clone(),
+                house: l.house,
+                secret: l.secret.clone(),
+                nonces: l.nonces.clone(),
+                seed: l.seed.clone(),
+                buyin: l.buyin,
+                hand: l.hand.clone(),
+            })
+            .collect();
+        live.sort_by(|a, b| a.commit.cmp(&b.commit));
+        State {
+            ledger: self.ledger.clone(),
+            live,
+            seen,
+        }
+    }
+
+    /// Save what changed, through `save`. The runner calls this after every
+    /// step of the table and sends nothing the step produced unless it
+    /// returns `Ok`: a hand's cards, a settlement's secret and a payout
+    /// must never leave on the strength of a change a restart would forget.
+    /// On `Err` the state stays dirty, so the next call tries again.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `save` reports.
+    pub fn checkpoint(
+        &mut self,
+        seen: Vec<SeenEntry>,
+        save: impl FnOnce(&State) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !self.dirty {
+            return Ok(());
+        }
+        save(&self.state(seen))?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Whether the table has changes not yet saved.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// The tables on offer.
@@ -220,6 +546,23 @@ impl Citizen {
             .and_then(|s| s.live.as_ref())
             .and_then(|c| self.hands.get(c))
             .is_some_and(|l| l.hand.in_play())
+    }
+
+    /// Base units the house stands behind in the hands it is playing: the
+    /// most it can lose in a hand is the buy-in, so each house hand holds
+    /// one back from the bankroll and the daily cap until it settles.
+    /// Hands between two members hold nothing: the house moves no funds.
+    pub fn reserved(&self) -> u64 {
+        self.hands
+            .values()
+            .filter(|l| l.house)
+            .fold(0u64, |sum, l| sum.saturating_add(l.buyin))
+    }
+
+    /// Everything the house is already bound to pay: hands in play and
+    /// settled hands not yet paid.
+    fn committed(&self) -> u64 {
+        self.reserved().saturating_add(self.ledger.owing_total())
     }
 
     fn cap_left(&self, now: u64) -> u64 {
@@ -395,12 +738,17 @@ impl Citizen {
                 bb,
                 nonce,
             } => self.sit(from, v, &commit, asset, bb, &nonce, now, balances),
-            ToCitizen::Act { commit, action } => self.member_act(from, &commit, action, now),
+            ToCitizen::Act {
+                commit,
+                action,
+                log_len,
+            } => self.member_act(from, &commit, action, log_len, now),
             ToCitizen::Paid { root, txid } => {
                 if !fair::is_hex64(&root) || txid.len() != 64 {
                     return Vec::new();
                 }
                 if self.ledger.claim(from, &root, &txid, now) {
+                    self.dirty = true;
                     vec![Effect::Persist]
                 } else {
                     Vec::new()
@@ -424,7 +772,7 @@ impl Citizen {
                                 action: "fold".into(),
                                 amount: None,
                             };
-                            out = self.member_act(from, &c, fold, now);
+                            out = self.member_act(from, &c, fold, None, now);
                         }
                     }
                 }
@@ -521,17 +869,21 @@ impl Citizen {
         if let Some(why) = self.refusal(member, stake.buyin, balances.hero_asset, now) {
             return err(member, Some(commit), why);
         }
-        let house_free = balances
-            .house_asset
-            .saturating_sub(self.ledger.owing_total());
-        if house_free < stake.buyin {
+        // Acceptance reserves the buy-in: the house may lose all of it, so
+        // it is set against the bankroll and the day's cap together with
+        // every hand already dealt and every payout already owed. All of it
+        // is derived from the state this `&mut self` call holds, so two
+        // sits answered from one chain read cannot both claim the same
+        // coins.
+        let committed = self.committed();
+        if balances.house_asset < committed.saturating_add(stake.buyin) {
             return err(
                 member,
                 Some(commit),
                 "The house cannot cover this buy-in right now.",
             );
         }
-        if self.cap_left(now) < stake.buyin {
+        if self.cap_left(now) < committed.saturating_add(stake.buyin) {
             return err(
                 member,
                 Some(commit),
@@ -604,6 +956,7 @@ impl Citizen {
                 seed,
                 buyin: stake.buyin,
                 hand,
+                updated: now,
             },
         );
         self.after_change(commit, now)
@@ -763,7 +1116,14 @@ impl Citizen {
         )
     }
 
-    fn member_act(&mut self, from: &str, commit: &str, action: Action, now: u64) -> Vec<Effect> {
+    fn member_act(
+        &mut self,
+        from: &str,
+        commit: &str,
+        action: Action,
+        log_len: Option<usize>,
+        now: u64,
+    ) -> Vec<Effect> {
         let Some(live) = self.hands.get_mut(commit) else {
             return err(from, Some(commit), "That is not a hand in play.");
         };
@@ -776,8 +1136,18 @@ impl Citizen {
         if !live.hand.in_play() || live.hand.to_act != seat as i32 {
             return err(from, Some(commit), "It is not your turn.");
         }
+        if log_len.is_some_and(|n| n != live.hand.log.len()) {
+            return err(
+                from,
+                Some(commit),
+                "That action answers an earlier state of the hand.",
+            );
+        }
         match engine::act(&live.hand, &action) {
-            Ok(h) => live.hand = h,
+            Ok(h) => {
+                live.hand = h;
+                live.updated = now;
+            }
             Err(e) => return err(from, Some(commit), e.0),
         }
         self.after_change(commit, now)
@@ -805,7 +1175,10 @@ impl Citizen {
             },
         };
         match engine::act(&live.hand, &action) {
-            Ok(h) => live.hand = h,
+            Ok(h) => {
+                live.hand = h;
+                live.updated = now;
+            }
             Err(e) => {
                 let member = live.seats[0].clone();
                 return err(
@@ -821,6 +1194,7 @@ impl Citizen {
     /// After the hand moved: tell the players, queue the house's turn, or
     /// settle.
     fn after_change(&mut self, commit: &str, now: u64) -> Vec<Effect> {
+        self.dirty = true;
         let Some(live) = self.hands.get(commit) else {
             return Vec::new();
         };
@@ -935,12 +1309,19 @@ impl Citizen {
                         attempts: 0,
                         last_attempt: 0,
                         last_error: None,
+                        pending: None,
+                        accepted_at: None,
+                        rebuilds: 0,
+                        invalid_rebuilds: 0,
+                        refusals: 0,
+                        halted: None,
                     });
                     if self.cap_left(now) >= amount {
                         out.push(Effect::Pay {
                             hero: seat0.clone(),
                             root: root.clone(),
                             amount,
+                            pending: None,
                         });
                     }
                 } else {
@@ -973,20 +1354,25 @@ impl Citizen {
     pub fn payments_seen(
         &mut self,
         paid: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+        now: u64,
     ) -> Vec<Effect> {
-        let cleared = self.ledger.payments_seen(paid);
+        let cleared = self.ledger.payments_seen(paid, now);
         if cleared.is_empty() {
             Vec::new()
         } else {
+            self.dirty = true;
             vec![Effect::Persist]
         }
     }
 
     /// The house's transfer for a hand was accepted by the producer.
     pub fn house_paid(&mut self, hero: &str, root: &str, txid: &str, now: u64) -> Vec<Effect> {
+        // the debt stays, with its signed transfer and the coins it spends,
+        // until the chain shows the payment
         if self.ledger.house_paid(root, txid, now).is_none() {
             return Vec::new();
         }
+        self.dirty = true;
         vec![
             Effect::Send(
                 hero.to_string(),
@@ -1002,7 +1388,80 @@ impl Citizen {
     /// The house's transfer for a hand failed; it stays owed.
     pub fn house_pay_failed(&mut self, root: &str, why: &str, now: u64) -> Vec<Effect> {
         self.ledger.house_pay_failed(root, why, now);
+        self.dirty = true;
         vec![Effect::Persist]
+    }
+
+    /// The house has signed its payout for `root` and is about to send it.
+    /// Kept with the debt, and saved by the runner first, so that a lost
+    /// response, a retry or a crash between the producer accepting it and
+    /// the ledger learning of it all send these same bytes and never a
+    /// second transfer for the hand. `false` when `root` is no longer owed:
+    /// send nothing.
+    pub fn pay_prepared(&mut self, root: &str, pending: Pending, now: u64) -> bool {
+        if !self.ledger.pay_prepared(root, pending, now) {
+            return false;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// The signed payout kept for `root`, if any.
+    pub fn pending_of(&self, root: &str) -> Option<Pending> {
+        self.ledger.pending_of(root).cloned()
+    }
+
+    /// Replace the signed payout for `root`: the chain shows its coins went
+    /// elsewhere, or that it was included and rejected. Nothing is signed
+    /// here; the debt comes up again through [`Citizen::payable`], and so
+    /// through the daily-cap check. A debt replaced after rejection more
+    /// than once, or replaced too often, is halted and an alert is raised.
+    pub fn replace_payout(&mut self, root: &str, cause: Cause, now: u64) -> Vec<Effect> {
+        let Some(replaced) = self.ledger.rebuild(root, cause, now) else {
+            return Vec::new();
+        };
+        self.dirty = true;
+        let mut out = vec![Effect::Persist];
+        if replaced == Replaced::Halted {
+            out.push(Effect::Alert(format!(
+                "HALTED hand {}…: {}",
+                &root[..root.len().min(12)],
+                self.ledger.halted(root).unwrap_or("replaced too often")
+            )));
+        }
+        out
+    }
+
+    /// Debts no payout is signed for until an operator looks: hand root and
+    /// why.
+    pub fn halted(&self) -> Vec<(String, String)> {
+        self.ledger
+            .owing
+            .iter()
+            .filter_map(|o| Some((o.root.clone(), o.halted.clone()?)))
+            .collect()
+    }
+
+    /// Whether the debt for `root` is halted.
+    pub fn is_halted(&self, root: &str) -> bool {
+        self.ledger.halted(root).is_some()
+    }
+
+    /// The producer definitely refused the payout for `root` (as opposed to
+    /// not being reached). The same bytes are tried again later and no
+    /// replacement is signed; every [`REFUSALS_PER_ALERT`] refusals an
+    /// alert is raised for an operator.
+    pub fn house_pay_refused(&mut self, root: &str, why: &str, now: u64) -> Vec<Effect> {
+        let n = self.ledger.pay_refused(root, why, now);
+        self.dirty = true;
+        let mut out = vec![Effect::Persist];
+        if n > 0 && n % REFUSALS_PER_ALERT == 0 {
+            out.push(Effect::Alert(format!(
+                "the producer has refused the payout for hand {}… {n} times: {why}",
+                &root[..root.len().min(12)]
+            )));
+        }
+        out
     }
 
     /// Settlements the house owes and may pay now: within the daily cap and
@@ -1011,14 +1470,22 @@ impl Citizen {
         let mut left = self.cap_left(now);
         let mut out = Vec::new();
         for o in &self.ledger.owing {
-            if o.amount > left || now.saturating_sub(o.last_attempt) < retry_after {
+            if o.halted.is_some() || now.saturating_sub(o.last_attempt) < retry_after {
                 continue;
             }
-            left -= o.amount;
+            // a payout the producer accepted is already counted against the
+            // day; one not yet sent must fit what is left of it
+            if o.accepted_at.is_none() {
+                if o.amount > left {
+                    continue;
+                }
+                left -= o.amount;
+            }
             out.push(Effect::Pay {
                 hero: o.hero.clone(),
                 root: o.root.clone(),
                 amount: o.amount,
+                pending: o.pending.clone(),
             });
         }
         out
@@ -1044,6 +1511,61 @@ impl Citizen {
                 },
             ));
         }
+        // a member who left a hand waiting on them folds it, so it settles
+        // and releases what it holds
+        let mut idle: Vec<(String, String, u32)> = self
+            .hands
+            .iter()
+            .filter(|(_, l)| {
+                l.hand.in_play()
+                    && now.saturating_sub(l.updated) > HAND_IDLE_SECS
+                    && !(l.house && l.hand.to_act == HOUSE as i32)
+            })
+            .filter_map(|(commit, l)| {
+                let seat = u32::try_from(l.hand.to_act).ok()?;
+                Some((commit.clone(), l.seats.get(seat as usize)?.clone(), seat))
+            })
+            .collect();
+        idle.sort();
+        // a house turn that cannot be taken must not hold its reservation
+        // for ever
+        let mut stuck: Vec<String> = self
+            .hands
+            .iter()
+            .filter(|(_, l)| {
+                l.house
+                    && l.hand.in_play()
+                    && l.hand.to_act == HOUSE as i32
+                    && now.saturating_sub(l.updated) > HAND_IDLE_SECS
+            })
+            .map(|(c, _)| c.clone())
+            .collect();
+        stuck.sort();
+        for commit in stuck {
+            if let Some(l) = self.hands.remove(&commit) {
+                out.extend(self.void(
+                    &commit,
+                    &l.seats,
+                    l.house,
+                    Reveal {
+                        secret: l.secret,
+                        nonces: l.nonces,
+                        seed: l.seed,
+                        log: l.hand.log,
+                    },
+                    "the house could not take its turn",
+                    now,
+                ));
+            }
+        }
+        for (commit, member, seat) in idle {
+            let fold = Action {
+                seat,
+                action: "fold".into(),
+                amount: None,
+            };
+            out.extend(self.member_act(&member, &commit, fold, None, now));
+        }
         self.sessions
             .retain(|_, s| s.live.is_some() || now.saturating_sub(s.seen) <= PRESENCE_TTL * 10);
         out
@@ -1053,30 +1575,52 @@ impl Citizen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::{Resume, TxOnChain};
     use nostr_bbs_poker::verify::{verify, Claim, RustEngine};
+
+    fn config() -> Config {
+        Config {
+            stakes_bb: vec![2, 20],
+            buyin_bb: 100,
+            profile: "tag".into(),
+            daily_cap: 5_000,
+            claim_grace_secs: 600,
+            // a BLAKES7 house seat: every member-facing figure names it
+            ticker: "BLAKES7".into(),
+        }
+    }
+
+    fn house() -> House {
+        House {
+            pubkey: "c".repeat(64),
+            script_hex: format!("5120{}", "c".repeat(64)),
+        }
+    }
 
     fn citizen() -> Citizen {
         let mut n = 0u8;
         Citizen::new(
-            Config {
-                stakes_bb: vec![2, 20],
-                buyin_bb: 100,
-                profile: "tag".into(),
-                daily_cap: 5_000,
-                claim_grace_secs: 600,
-                // a BLAKES7 house seat: every member-facing figure names it
-                ticker: "BLAKES7".into(),
-            },
-            House {
-                pubkey: "c".repeat(64),
-                script_hex: format!("5120{}", "c".repeat(64)),
-            },
+            config(),
+            house(),
             Ledger::default(),
             Box::new(move || {
                 n = n.wrapping_add(1);
                 [n; 32]
             }),
         )
+    }
+
+    /// The house after a restart: what it saved, read back from the file.
+    fn restarted(c: &Citizen, now: u64) -> (Citizen, Recovered) {
+        let saved = c
+            .state(vec![SeenEntry {
+                sender: HERO_PK.into(),
+                key: "e1".into(),
+                at: 7,
+            }])
+            .to_json();
+        let state = State::parse(&saved).expect("the saved state reads back");
+        Citizen::restore(config(), house(), state, Box::new(|| [0x77; 32]), now)
     }
 
     const HERO_PK: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1152,6 +1696,7 @@ mod tests {
                         next.extend(c.handle(
                             to,
                             ToCitizen::Act {
+                                log_len: None,
                                 commit: commit.clone(),
                                 action: Action {
                                     seat: *seat,
@@ -1262,6 +1807,963 @@ mod tests {
         assert!(
             matches!(&out[0], Effect::Send(_, ToHero::Error { message, .. }) if message.contains("house cannot cover"))
         );
+    }
+
+    /// A distinct member key, 64 lowercase hex.
+    fn member(n: u64) -> String {
+        format!("{n:064x}")
+    }
+
+    /// Sit `who` at the 20-big-blind table, as the runner would: every
+    /// request in one poll reads the same chain balances.
+    fn sit_member(c: &mut Citizen, who: &str, bal: Balances, now: u64) -> Vec<Effect> {
+        let commit = offer_commit(&c.handle(who, ToCitizen::Hello { v: VERSION }, now, bal));
+        c.handle(
+            who,
+            ToCitizen::Sit {
+                v: VERSION,
+                commit,
+                asset: Asset::Dream,
+                bb: 20,
+                nonce: "ab".repeat(32),
+            },
+            now,
+            bal,
+        )
+    }
+
+    /// Play `who`'s hand against the house to its end, checking or calling.
+    fn play_out(c: &mut Citizen, who: &str, bal: Balances) -> Vec<Effect> {
+        let commit = c.sessions[who].live.clone().expect("in a hand");
+        let mut all = Vec::new();
+        for _ in 0..200 {
+            let Some(live) = c.hands.get(&commit) else {
+                break;
+            };
+            let effects = if live.hand.to_act == HERO as i32 {
+                let l = engine::legal(&live.hand).expect("in play");
+                let a = if l.allows("check") { "check" } else { "call" };
+                c.handle(
+                    who,
+                    ToCitizen::Act {
+                        log_len: None,
+                        commit: commit.clone(),
+                        action: Action {
+                            seat: HERO,
+                            action: a.into(),
+                            amount: None,
+                        },
+                    },
+                    1_002,
+                    bal,
+                )
+            } else {
+                c.bot_turn(&commit, 1_002)
+            };
+            all.extend(effects);
+        }
+        all
+    }
+
+    fn seated(out: &[Effect]) -> bool {
+        out.iter()
+            .any(|e| matches!(e, Effect::Send(_, ToHero::State { .. })))
+    }
+
+    fn refused_with(out: &[Effect], needle: &str) -> bool {
+        out.iter().any(
+            |e| matches!(e, Effect::Send(_, ToHero::Error { message, .. }) if message.contains(needle)),
+        )
+    }
+
+    #[test]
+    fn concurrent_buy_ins_cannot_overdraw_the_house_bankroll() {
+        let mut c = citizen();
+        // the chain shows the house with exactly three buy-ins (2 000 each)
+        // of free coins; the daily cap is out of the way
+        c.cfg.daily_cap = 1_000_000;
+        let bal = Balances {
+            hero_asset: 10_000,
+            house_asset: 6_000,
+        };
+        let mut accepted = 0;
+        for n in 1..=6 {
+            let out = sit_member(&mut c, &member(n), bal, 1_000);
+            if seated(&out) {
+                accepted += 1;
+            } else {
+                assert!(refused_with(&out, "house cannot cover"), "{out:?}");
+            }
+        }
+        assert_eq!(accepted, 3, "the house can stand behind three buy-ins");
+        assert_eq!(c.reserved(), 6_000);
+    }
+
+    #[test]
+    fn concurrent_buy_ins_cannot_exceed_the_daily_cap() {
+        let mut c = citizen(); // cap 5 000, buy-in 2 000
+        let mut accepted = 0;
+        for n in 1..=4 {
+            let out = sit_member(&mut c, &member(n), RICH, 1_000);
+            if seated(&out) {
+                accepted += 1;
+            } else {
+                assert!(refused_with(&out, "daily limit"), "{out:?}");
+            }
+        }
+        assert_eq!(
+            accepted, 2,
+            "two buy-ins fit under a 5 000 cap, three do not"
+        );
+        assert!(c.reserved() <= c.cfg.daily_cap);
+    }
+
+    #[test]
+    fn what_the_house_already_owes_counts_against_new_buy_ins() {
+        let mut c = citizen();
+        c.cfg.daily_cap = 1_000_000;
+        c.ledger.owing.push(Owing {
+            hero: member(9),
+            root: "7".repeat(64),
+            amount: 1_500,
+            since: 900,
+            attempts: 0,
+            last_attempt: 0,
+            last_error: None,
+            pending: None,
+            accepted_at: None,
+            rebuilds: 0,
+            invalid_rebuilds: 0,
+            refusals: 0,
+            halted: None,
+        });
+        let bal = Balances {
+            hero_asset: 10_000,
+            house_asset: 3_400,
+        };
+        // 3 400 - 1 500 owed = 1 900 free: not enough for a 2 000 buy-in
+        let out = sit_member(&mut c, &member(1), bal, 1_000);
+        assert!(refused_with(&out, "house cannot cover"), "{out:?}");
+    }
+
+    #[test]
+    fn settlement_releases_the_reservation() {
+        let mut c = citizen();
+        c.cfg.daily_cap = 1_000_000;
+        let bal = Balances {
+            hero_asset: 10_000,
+            house_asset: 2_000,
+        };
+        let out = sit_member(&mut c, HERO_PK, bal, 1_000);
+        assert!(seated(&out));
+        assert_eq!(c.reserved(), 2_000);
+        // a second member is refused while the first hand holds the bankroll
+        let out = sit_member(&mut c, OTHER_PK, bal, 1_001);
+        assert!(refused_with(&out, "house cannot cover"), "{out:?}");
+        play_out(&mut c, HERO_PK, bal);
+        assert!(!c.in_hand(HERO_PK), "the hand ran to its end");
+        assert_eq!(c.reserved(), 0, "settled hands hold nothing back");
+    }
+
+    #[test]
+    fn member_versus_member_hands_reserve_nothing() {
+        let mut c = citizen();
+        hello(&mut c, HERO_PK, 1_000);
+        hello(&mut c, OTHER_PK, 1_000);
+        let out = challenge(&mut c, HERO_PK, OTHER_PK, 20, 1_000);
+        let Effect::Send(_, ToHero::Challenged { commit, .. }) = &out[0] else {
+            panic!("{out:?}")
+        };
+        let accepted = c.handle(
+            OTHER_PK,
+            ToCitizen::Accept {
+                commit: commit.clone(),
+                nonce: "22".repeat(32),
+            },
+            1_001,
+            RICH,
+        );
+        assert!(seated(&accepted));
+        assert_eq!(c.reserved(), 0, "the house stands behind neither stack");
+    }
+
+    /// One move in `who`'s house hand: theirs if it is their turn, else
+    /// the house's.
+    fn step(c: &mut Citizen, who: &str, bal: Balances, now: u64) -> Vec<Effect> {
+        let commit = c.sessions[who].live.clone().expect("in a hand");
+        let live = &c.hands[&commit];
+        if live.hand.to_act == HERO as i32 {
+            let l = engine::legal(&live.hand).expect("in play");
+            let a = if l.allows("check") { "check" } else { "call" };
+            c.handle(
+                who,
+                ToCitizen::Act {
+                    log_len: None,
+                    commit,
+                    action: Action {
+                        seat: HERO,
+                        action: a.into(),
+                        amount: None,
+                    },
+                },
+                now,
+                bal,
+            )
+        } else {
+            c.bot_turn(&commit, now)
+        }
+    }
+
+    /// What a hand left on the books, whoever ran it.
+    fn books(c: &Citizen) -> (Vec<Owed>, Vec<Owing>, u64, u64) {
+        (
+            c.ledger.owed.clone(),
+            c.ledger.owing.clone(),
+            c.ledger.hands,
+            c.reserved(),
+        )
+    }
+
+    #[test]
+    fn a_restart_mid_hand_resumes_it_and_no_funds_are_lost_or_counted_twice() {
+        for moves in 0..3 {
+            let mut live = citizen();
+            let mut twin = citizen();
+            for c in [&mut live, &mut twin] {
+                assert!(seated(&sit_member(c, HERO_PK, RICH, 1_000)));
+            }
+            for _ in 0..moves {
+                step(&mut live, HERO_PK, RICH, 1_001);
+                step(&mut twin, HERO_PK, RICH, 1_001);
+            }
+            assert!(live.in_hand(HERO_PK), "{moves} moves in, the hand is open");
+            // the twin never stops; `live` is killed and restarted
+            let (mut live, rec) = restarted(&live, 5_000);
+            assert_eq!(rec.resumed.len(), 1);
+            assert!(rec.voided.is_empty(), "{:?}", rec.voided);
+            assert_eq!(rec.seen.len(), 1);
+            assert_eq!(rec.seen[0].key, "e1");
+            assert!(live.in_hand(HERO_PK));
+            assert_eq!(live.reserved(), twin.reserved(), "the buy-in is still held");
+            // the member's reload shows the hand exactly as it stood
+            let before = hello(&mut twin, HERO_PK, 1_002);
+            let after = hello(&mut live, HERO_PK, 5_001);
+            assert_eq!(before, after);
+            // both play on to the end
+            let a = play_out(&mut twin, HERO_PK, RICH);
+            let b = play_out(&mut live, HERO_PK, RICH);
+            assert_eq!(done_for(&a, HERO_PK), done_for(&b, HERO_PK));
+            assert_eq!(books(&twin), books(&live));
+            assert_eq!(live.reserved(), 0);
+            assert_eq!(live.ledger.hands, 1, "one hand, counted once");
+            let ToHero::Done {
+                settlement, buyin, ..
+            } = done_for(&b, HERO_PK)
+            else {
+                unreachable!()
+            };
+            let owed: u64 = live.ledger.owed.iter().map(|o| o.amount).sum();
+            let owing: u64 = live.ledger.owing.iter().map(|o| o.amount).sum();
+            match settlement {
+                Some(Settlement {
+                    from: Side::Hero,
+                    amount,
+                    ..
+                }) => assert_eq!((owed, owing), (*amount, 0)),
+                Some(Settlement { amount, .. }) => assert_eq!((owed, owing), (0, *amount)),
+                None => assert_eq!((owed, owing), (0, 0)),
+            }
+            assert!(owed <= *buyin && owing <= *buyin);
+        }
+    }
+
+    #[test]
+    fn a_restart_between_the_deal_and_the_first_message_loses_nothing() {
+        // the state is saved when sit returns, before its effects are sent
+        let mut c = citizen();
+        let out = sit_member(&mut c, HERO_PK, RICH, 1_000);
+        assert!(seated(&out));
+        assert!(c.is_dirty(), "a deal is a change to save");
+        c.checkpoint(Vec::new(), |_| Ok(())).unwrap();
+        assert!(!c.is_dirty());
+        let (mut r, rec) = restarted(&c, 2_000);
+        assert_eq!(rec.resumed.len(), 1);
+        let shown = hello(&mut r, HERO_PK, 2_001);
+        assert!(matches!(&shown[0], Effect::Send(_, ToHero::State { .. })));
+        let all = play_out(&mut r, HERO_PK, RICH);
+        let ToHero::Done {
+            commit,
+            secret,
+            nonces,
+            seed,
+            record,
+            ..
+        } = done_for(&all, HERO_PK)
+        else {
+            unreachable!()
+        };
+        // the resumed hand still verifies against the commitment shown
+        // before the restart
+        let claim = Claim {
+            commit,
+            secret,
+            nonces: nonces.clone(),
+            seed,
+            record,
+            house_seat: Some(HOUSE),
+            profile: "tag",
+        };
+        verify(&RustEngine, &claim).unwrap();
+    }
+
+    #[test]
+    fn a_hand_between_two_members_survives_a_restart() {
+        let mut c = citizen();
+        hello(&mut c, HERO_PK, 1_000);
+        hello(&mut c, OTHER_PK, 1_000);
+        let out = challenge(&mut c, HERO_PK, OTHER_PK, 20, 1_000);
+        let Effect::Send(_, ToHero::Challenged { commit, .. }) = &out[0] else {
+            panic!("{out:?}")
+        };
+        let commit = commit.clone();
+        c.handle(
+            OTHER_PK,
+            ToCitizen::Accept {
+                commit: commit.clone(),
+                nonce: "22".repeat(32),
+            },
+            1_001,
+            RICH,
+        );
+        let (r, rec) = restarted(&c, 2_000);
+        assert_eq!(rec.resumed, [commit]);
+        assert!(r.in_hand(HERO_PK) && r.in_hand(OTHER_PK));
+        assert_eq!(r.reserved(), 0);
+    }
+
+    #[test]
+    fn a_saved_hand_that_does_not_prove_itself_is_voided_and_moves_no_funds() {
+        let mut c = citizen();
+        assert!(seated(&sit_member(&mut c, HERO_PK, RICH, 1_000)));
+        c.checkpoint(Vec::new(), |_| Ok(())).unwrap();
+        let good = c.state(Vec::new());
+        let mut cases: Vec<(&str, State)> = Vec::new();
+        let mut s = good.clone();
+        s.live[0].hand.seats[0].stack += 1;
+        cases.push(("a stack altered", s));
+        let mut s = good.clone();
+        s.live[0].secret = "9".repeat(64);
+        cases.push(("another secret", s));
+        let mut s = good.clone();
+        s.live[0].seed = "8".repeat(64);
+        cases.push(("another seed", s));
+        let mut s = good.clone();
+        s.live[0].hand.log.truncate(2);
+        cases.push(("a log cut short", s));
+        let mut s = good.clone();
+        s.live[0].seats[1] = "d".repeat(64);
+        cases.push(("another house", s));
+        let mut s = good.clone();
+        s.live[0].buyin = 0;
+        cases.push(("no buy-in", s));
+        for (what, state) in cases {
+            let ledger = state.ledger.clone();
+            let (mut r, rec) =
+                Citizen::restore(config(), house(), state, Box::new(|| [1; 32]), 2_000);
+            assert_eq!(rec.voided.len(), 1, "{what}");
+            assert!(rec.resumed.is_empty(), "{what}");
+            assert!(!r.in_hand(HERO_PK), "{what}");
+            assert_eq!(r.reserved(), 0, "{what}");
+            assert_eq!(
+                (&r.ledger.owed, &r.ledger.owing, r.ledger.hands),
+                (&ledger.owed, &ledger.owing, ledger.hands),
+                "{what}: a void owes nothing either way"
+            );
+            assert!(
+                r.ledger.history[0]
+                    .txid
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with("voided")),
+                "{what}: the void is on the record"
+            );
+            assert!(
+                rec.effects.iter().any(|e| matches!(
+                    e,
+                    Effect::Send(to, ToHero::Voided { why, secret, .. })
+                        if to == HERO_PK && !why.is_empty() && !secret.is_empty()
+                )),
+                "{what}: {:?}",
+                rec.effects
+            );
+            assert!(r.is_dirty(), "{what}: the void is to be saved");
+            // the member simply gets a fresh offer
+            let out = hello(&mut r, HERO_PK, 2_001);
+            assert!(
+                matches!(&out[0], Effect::Send(_, ToHero::Offer { .. })),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovered_hand_waiting_on_the_house_queues_its_turn() {
+        let mut c = citizen();
+        // the house has the button, so it acts first
+        c.sessions.entry(HERO_PK.into()).or_default().next_button = HOUSE;
+        let out = sit_member(&mut c, HERO_PK, RICH, 1_000);
+        assert!(
+            out.iter().any(|e| matches!(e, Effect::BotTurn(_))),
+            "{out:?}"
+        );
+        let (_, rec) = restarted(&c, 2_000);
+        let commit = c.sessions[HERO_PK].live.clone().unwrap();
+        assert_eq!(rec.effects, [Effect::BotTurn(commit)]);
+    }
+
+    #[test]
+    fn a_member_who_walks_away_folds_after_the_idle_limit_and_releases_the_bankroll() {
+        let mut c = citizen();
+        assert!(seated(&sit_member(&mut c, HERO_PK, RICH, 1_000)));
+        assert_eq!(c.reserved(), 2_000);
+        assert!(c.tick(1_000 + HAND_IDLE_SECS).is_empty(), "not yet");
+        assert!(c.in_hand(HERO_PK));
+        let out = c.tick(1_000 + HAND_IDLE_SECS + 1);
+        assert!(out
+            .iter()
+            .any(|e| matches!(e, Effect::Send(to, ToHero::Done { .. }) if to == HERO_PK)));
+        assert!(!c.in_hand(HERO_PK));
+        assert_eq!(c.reserved(), 0);
+        assert_eq!(c.ledger.hands, 1);
+        assert_eq!(c.ledger.owed.len() + c.ledger.owing.len(), 1);
+    }
+
+    #[test]
+    fn downtime_is_not_held_against_a_member() {
+        let mut c = citizen();
+        assert!(seated(&sit_member(&mut c, HERO_PK, RICH, 1_000)));
+        let (mut r, _) = restarted(&c, 1_000 + 10 * HAND_IDLE_SECS);
+        assert!(r.tick(1_000 + 10 * HAND_IDLE_SECS + 1).is_empty());
+        assert!(r.in_hand(HERO_PK));
+    }
+
+    fn owing_for(c: &mut Citizen, root: &str, amount: u64) {
+        c.ledger.owing.push(Owing {
+            hero: HERO_PK.into(),
+            root: root.into(),
+            amount,
+            since: 100,
+            attempts: 0,
+            last_attempt: 0,
+            last_error: None,
+            pending: None,
+            accepted_at: None,
+            rebuilds: 0,
+            invalid_rebuilds: 0,
+            refusals: 0,
+            halted: None,
+        });
+    }
+
+    fn signed(txid: &str) -> Pending {
+        Pending {
+            hex: format!("0200{txid}"),
+            txid: txid.into(),
+            outpoints: vec![format!("{}:1", "e".repeat(64))],
+        }
+    }
+
+    fn pay_effect(effects: &[Effect]) -> Pending {
+        match effects {
+            [Effect::Pay {
+                pending: Some(p), ..
+            }] => p.clone(),
+            other => panic!("one payout with its signed transfer: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_retry_with_no_chain_evidence_sends_the_same_signed_payout() {
+        let root = "3".repeat(64);
+        let mut c = citizen();
+        owing_for(&mut c, &root, 100);
+        assert!(matches!(
+            c.payable(1_000, 120).as_slice(),
+            [Effect::Pay { pending: None, .. }]
+        ));
+        let first = signed("aa");
+        assert!(c.pay_prepared(&root, first.clone(), 1_000));
+        // the response was lost: before the interval, nothing; after it,
+        // t+121 s with the chain silent, the very same bytes
+        assert!(c.payable(1_119, 120).is_empty());
+        assert_eq!(pay_effect(&c.payable(1_121, 120)), first);
+        // and across a restart (killed after the producer accepted it)
+        let (r, _) = restarted(&c, 1_010);
+        assert!(r.payable(1_010, 120).is_empty());
+        assert_eq!(pay_effect(&r.payable(1_121, 120)), first);
+        // its coins are not the house's to spend or count while it is out
+        assert_eq!(r.held_outpoints(), first.outpoints);
+        // the chain shows the payment: cleared, never paid again
+        let mut r = r;
+        let mut paid = std::collections::BTreeMap::new();
+        paid.insert(
+            root.clone(),
+            std::collections::BTreeMap::from([(HERO_PK.to_string(), 100u64)]),
+        );
+        assert_eq!(r.payments_seen(&paid, 1_200), [Effect::Persist]);
+        assert!(r.payable(9_999, 120).is_empty());
+    }
+
+    type Paid = std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>;
+
+    fn chain_pays(root: &str, hero: &str, amount: u64) -> Paid {
+        Paid::from([(
+            root.to_string(),
+            std::collections::BTreeMap::from([(hero.to_string(), amount)]),
+        )])
+    }
+
+    #[test]
+    fn an_accepted_payout_stays_a_debt_until_the_chain_shows_it() {
+        let root = "3".repeat(64);
+        let mut c = citizen();
+        owing_for(&mut c, &root, 100);
+        let p = signed("bb");
+        assert!(c.pay_prepared(&root, p.clone(), 1_000));
+        // the producer accepts it; the member is told
+        let told = c.house_paid(HERO_PK, &root, &p.txid, 1_001);
+        assert!(matches!(&told[0], Effect::Send(_, ToHero::Paid { .. })));
+        // the debt, its signed transfer and its coins all stay
+        assert_eq!(c.ledger.owing.len(), 1);
+        assert_eq!(c.pending_of(&root), Some(p.clone()));
+        assert_eq!(c.held_outpoints(), p.outpoints);
+        assert_eq!(c.ledger.paid_today(1_001), 100, "counted against the day");
+        assert!(
+            c.house_paid(HERO_PK, &root, &p.txid, 1_002).is_empty(),
+            "once"
+        );
+        // the transfer never appears on the chain: long past any holding
+        // period nothing is lost, and the same bytes are sent again
+        let much_later = 1_001 + 24 * 3_600;
+        assert_eq!(pay_effect(&c.payable(much_later, 120)), p);
+        let (r, _) = restarted(&c, much_later);
+        assert_eq!(r.ledger.owing.len(), 1);
+        assert_eq!(r.held_outpoints(), p.outpoints, "still not free bankroll");
+        assert_eq!(pay_effect(&r.payable(much_later, 120)), p);
+        // the chain shows the coins went elsewhere and no transfer of ours:
+        // a new one is signed for the same debt, and the day's count is
+        // given back
+        let mut r = r;
+        assert_eq!(p.resume(TxOnChain::NotSeen, false), Resume::Rebuild);
+        r.replace_payout(&root, Cause::SpentElsewhere, much_later);
+        assert!(r.held_outpoints().is_empty());
+        assert_eq!(r.ledger.paid_today(1_001), 0);
+        assert!(matches!(
+            r.payable(much_later + 121, 120).as_slice(),
+            [Effect::Pay {
+                pending: None,
+                amount: 100,
+                ..
+            }]
+        ));
+        // and when it does land, the debt clears exactly once
+        let second = signed("cc");
+        assert!(r.pay_prepared(&root, second.clone(), much_later));
+        r.house_paid(HERO_PK, &root, &second.txid, much_later + 1);
+        assert_eq!(
+            r.payments_seen(&chain_pays(&root, HERO_PK, 100), much_later + 60),
+            [Effect::Persist]
+        );
+        assert!(r.ledger.owing.is_empty() && r.held_outpoints().is_empty());
+        assert_eq!(r.ledger.paid_today(much_later), 100, "paid once, not twice");
+        assert!(r.payable(much_later + 999, 120).is_empty());
+    }
+
+    /// A debt of `amount` whose payout was signed, accepted and sits on the
+    /// books as paid out.
+    fn accepted_debt(c: &mut Citizen, root: &str, amount: u64, txid: &str, now: u64) -> Pending {
+        let p = signed(txid);
+        if c.ledger.owing.iter().all(|o| o.root != root) {
+            owing_for(c, root, amount);
+        }
+        assert!(c.pay_prepared(root, p.clone(), now));
+        c.house_paid(HERO_PK, root, txid, now + 1);
+        p
+    }
+
+    fn alerts(effects: &[Effect]) -> Vec<&String> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Alert(a) => Some(a),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rejected_payout_is_replaced_once_through_the_cap_and_then_the_debt_halts() {
+        let root = "3".repeat(64);
+        let mut c = citizen(); // daily cap 5 000
+        let t0 = 1_000;
+        accepted_debt(&mut c, &root, 3_000, "aa", t0);
+        assert_eq!(c.ledger.paid_today(t0), 3_000);
+        // the chain includes it and the assets rule rejects it: the coins
+        // were really spent, so the day's count is NOT given back
+        let out = c.replace_payout(&root, Cause::Invalid, t0 + 200);
+        assert!(alerts(&out).is_empty(), "the first replacement is routine");
+        assert_eq!(c.ledger.paid_today(t0), 3_000);
+        assert!(c.pending_of(&root).is_none() && c.held_outpoints().is_empty());
+        // nothing is signed here, and the replacement goes through the cap:
+        // 3 000 spent leaves 2 000, which does not cover 3 000
+        assert!(c.payable(t0 + 400, 120).is_empty(), "the cap is respected");
+        // tomorrow it fits, and exactly one replacement is asked for
+        let tomorrow = t0 + 86_400;
+        assert!(matches!(
+            c.payable(tomorrow, 120).as_slice(),
+            [Effect::Pay {
+                pending: None,
+                amount: 3_000,
+                ..
+            }]
+        ));
+        accepted_debt(&mut c, &root, 3_000, "bb", tomorrow);
+        assert_eq!(c.ledger.paid_today(tomorrow), 3_000);
+        // the same thing happens again: systematic, so halt for an operator
+        let out = c.replace_payout(&root, Cause::Invalid, tomorrow + 200);
+        assert_eq!(alerts(&out).len(), 1, "{out:?}");
+        assert!(c.is_halted(&root));
+        assert_eq!(c.halted().len(), 1);
+        assert_eq!(c.ledger.paid_today(tomorrow), 3_000, "still not refunded");
+        // no more automatic signing, on any day, and the debt stays
+        for day in 2..6 {
+            assert!(c.payable(t0 + day * 86_400, 120).is_empty());
+        }
+        assert!(!c.pay_prepared(&root, signed("cc"), t0 + 9 * 86_400));
+        assert_eq!(c.ledger.owing.len(), 1, "the debt stays visible");
+        // and a restart does not forget it
+        let (r, _) = restarted(&c, t0 + 9 * 86_400);
+        assert!(r.is_halted(&root));
+        assert!(r.payable(t0 + 10 * 86_400, 120).is_empty());
+        let offer = {
+            let mut r = r;
+            hello(&mut r, HERO_PK, t0 + 10 * 86_400)
+        };
+        assert!(matches!(
+            &offer[0],
+            Effect::Send(_, ToHero::Offer { owing, .. }) if owing.len() == 1
+        ));
+    }
+
+    #[test]
+    fn a_systematic_rejection_makes_at_most_one_replacement() {
+        let root = "3".repeat(64);
+        let mut c = citizen();
+        let mut signed_payouts = 0;
+        let mut now = 1_000;
+        // every payout the house signs is rejected by the chain; the
+        // supervisor polls every 120 s for a week
+        for _ in 0..(7 * 86_400 / 120) {
+            now += 120;
+            if c.ledger.owing.is_empty() {
+                owing_for(&mut c, &root, 100);
+            }
+            if let Some(p) = c.pending_of(&root) {
+                // on the chain, rejected
+                let _ = p;
+                c.replace_payout(&root, Cause::Invalid, now);
+                continue;
+            }
+            for e in c.payable(now, 120) {
+                if let Effect::Pay { root: r, .. } = e {
+                    signed_payouts += 1;
+                    let p = accepted_debt(&mut c, &r, 100, &format!("tx{signed_payouts}"), now);
+                    let _ = p;
+                }
+            }
+        }
+        assert_eq!(signed_payouts, 2, "the first, and one replacement");
+        assert!(c.is_halted(&root));
+    }
+
+    #[test]
+    fn a_replacement_after_coins_spent_elsewhere_also_goes_through_the_cap() {
+        let root = "3".repeat(64);
+        let mut c = citizen(); // cap 5 000
+        let t0 = 1_000;
+        // 3 000 already paid to others today
+        c.ledger.paid.insert(crate::ledger::day_of(t0), 3_000);
+        accepted_debt(&mut c, &root, 3_000, "aa", t0);
+        // a payout that never landed gives its count back: 3 000 paid, 2 000
+        // left, which does not cover the 3 000 debt
+        let out = c.replace_payout(&root, Cause::SpentElsewhere, t0 + 200);
+        assert!(alerts(&out).is_empty());
+        assert_eq!(c.ledger.paid_today(t0), 3_000);
+        assert!(c.payable(t0 + 400, 120).is_empty(), "the cap is checked");
+        // with room, it is asked for through `payable`, not signed inline
+        c.ledger.paid.insert(crate::ledger::day_of(t0), 0);
+        assert!(matches!(
+            c.payable(t0 + 400, 120).as_slice(),
+            [Effect::Pay { pending: None, .. }]
+        ));
+        // being spent elsewhere again and again also ends in a halt
+        for i in 0..3u64 {
+            accepted_debt(&mut c, &root, 3_000, &format!("x{i}"), t0 + 500 + i * 10);
+            c.replace_payout(&root, Cause::SpentElsewhere, t0 + 505 + i * 10);
+        }
+        assert!(c.is_halted(&root));
+    }
+
+    #[test]
+    fn repeated_refusals_of_the_same_bytes_alert_an_operator_and_never_rebuild() {
+        let root = "3".repeat(64);
+        let mut c = citizen();
+        owing_for(&mut c, &root, 100);
+        let p = signed("aa");
+        assert!(c.pay_prepared(&root, p.clone(), 1_000));
+        let mut raised = Vec::new();
+        for i in 1..=REFUSALS_PER_ALERT * 2 {
+            let out = c.house_pay_refused(&root, "the producer refused: bad fee", 1_000 + i as u64);
+            raised.push((i, alerts(&out).len()));
+        }
+        let at: Vec<u32> = raised
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(i, _)| *i)
+            .collect();
+        assert_eq!(at, [REFUSALS_PER_ALERT, REFUSALS_PER_ALERT * 2]);
+        // the same bytes remain; no replacement, no halt
+        assert_eq!(c.pending_of(&root), Some(p));
+        assert!(!c.is_halted(&root));
+        // a refusal of a payout already accepted is the producer
+        // recognising it, not a failure
+        c.house_paid(HERO_PK, &root, "aa", 2_000);
+        let out = c.house_pay_refused(&root, "already known", 2_100);
+        assert!(alerts(&out).is_empty());
+        assert_eq!(c.ledger.owing[0].refusals, REFUSALS_PER_ALERT * 2);
+    }
+
+    #[test]
+    fn a_payout_is_prepared_only_for_a_hand_still_owed() {
+        let root = "3".repeat(64);
+        let mut c = citizen();
+        owing_for(&mut c, &root, 100);
+        assert!(c.pay_prepared(&root, signed("cc"), 1_000));
+        c.house_paid(HERO_PK, &root, "cc", 1_001);
+        assert!(
+            c.pay_prepared(&root, signed("cc"), 1_200),
+            "unconfirmed is still owed"
+        );
+        c.payments_seen(&chain_pays(&root, HERO_PK, 100), 1_300);
+        assert!(!c.pay_prepared(&root, signed("dd"), 1_400), "already paid");
+        assert!(c.pending_of(&root).is_none());
+    }
+
+    #[test]
+    fn only_a_member_the_house_holds_a_session_for_has_standing() {
+        let mut c = citizen();
+        assert!(!c.has_standing(HERO_PK));
+        hello(&mut c, HERO_PK, 1_000);
+        assert!(c.has_standing(HERO_PK));
+        assert!(!c.has_standing(OTHER_PK));
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_table_dirty_and_is_retried() {
+        let mut c = citizen();
+        assert!(seated(&sit_member(&mut c, HERO_PK, RICH, 1_000)));
+        assert!(c.is_dirty());
+        let failed = c.checkpoint(Vec::new(), |_| Err("disk full".into()));
+        assert_eq!(failed, Err("disk full".to_string()));
+        assert!(c.is_dirty(), "the change is still unsaved");
+        let mut saved = None;
+        c.checkpoint(Vec::new(), |s| {
+            saved = Some(s.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!c.is_dirty());
+        assert_eq!(
+            saved.unwrap().live.len(),
+            1,
+            "the hand is in what was saved"
+        );
+        // nothing to save is not a write
+        c.checkpoint(Vec::new(), |_| Err("must not be called".into()))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_stale_or_replayed_act_is_refused_by_the_log_length_it_answers() {
+        let mut c = citizen();
+        let out = sit_member(&mut c, HERO_PK, RICH, 1_000);
+        assert!(seated(&out));
+        let commit = c.sessions[HERO_PK].live.clone().unwrap();
+        let len = c.hands[&commit].hand.log.len();
+        let act = |c: &mut Citizen, log_len: Option<usize>| {
+            let l = engine::legal(&c.hands[&commit].hand).unwrap();
+            let a = if l.allows("check") { "check" } else { "call" };
+            c.handle(
+                HERO_PK,
+                ToCitizen::Act {
+                    commit: commit.clone(),
+                    action: Action {
+                        seat: HERO,
+                        action: a.into(),
+                        amount: None,
+                    },
+                    log_len,
+                },
+                1_001,
+                RICH,
+            )
+        };
+        let wrong = act(&mut c, Some(len + 3));
+        assert!(refused_with(&wrong, "earlier state"), "{wrong:?}");
+        assert_eq!(c.hands[&commit].hand.log.len(), len, "nothing applied");
+        let ok = act(&mut c, Some(len));
+        assert!(!refused_with(&ok, "earlier state"));
+        assert!(c.hands[&commit].hand.log.len() > len);
+        // the same message again, a turn later, is a copy of the past
+        while c.in_hand(HERO_PK) && c.hands[&commit].hand.to_act != HERO as i32 {
+            c.bot_turn(&commit, 1_002);
+        }
+        if c.in_hand(HERO_PK) {
+            let again = act(&mut c, Some(len));
+            assert!(refused_with(&again, "earlier state"), "{again:?}");
+        }
+    }
+
+    #[test]
+    fn a_house_turn_that_cannot_be_taken_is_voided_and_releases_the_bankroll() {
+        let mut c = citizen();
+        c.sessions.entry(HERO_PK.into()).or_default().next_button = HOUSE;
+        assert!(seated(&sit_member(&mut c, HERO_PK, RICH, 1_000)));
+        assert_eq!(c.reserved(), 2_000);
+        // the BotTurn is never run
+        assert!(c.tick(1_000 + HAND_IDLE_SECS).is_empty());
+        let out = c.tick(1_000 + HAND_IDLE_SECS + 1);
+        assert!(out
+            .iter()
+            .any(|e| matches!(e, Effect::Send(to, ToHero::Voided { .. }) if to == HERO_PK)));
+        assert_eq!(c.reserved(), 0);
+        assert!(!c.in_hand(HERO_PK));
+        assert!(c.ledger.owed.is_empty() && c.ledger.owing.is_empty());
+        assert_eq!(c.ledger.hands, 0);
+    }
+
+    #[test]
+    fn a_restart_replays_a_members_raise() {
+        let mut c = citizen();
+        assert!(seated(&sit_member(&mut c, HERO_PK, RICH, 1_000)));
+        let commit = c.sessions[HERO_PK].live.clone().unwrap();
+        let l = engine::legal(&c.hands[&commit].hand).unwrap();
+        assert!(l.allows("raise"), "the button may raise: {l:?}");
+        let out = c.handle(
+            HERO_PK,
+            ToCitizen::Act {
+                commit: commit.clone(),
+                action: Action {
+                    seat: HERO,
+                    action: "raise".into(),
+                    amount: Some(l.min_raise_to),
+                },
+                log_len: None,
+            },
+            1_001,
+            RICH,
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, Effect::Send(_, ToHero::Error { .. }))),
+            "{out:?}"
+        );
+        assert!(c.hands[&commit]
+            .hand
+            .log
+            .iter()
+            .any(|e| e.ev == "raise" || e.ev == "bet"));
+        let (r, rec) = restarted(&c, 2_000);
+        assert!(rec.voided.is_empty(), "{:?}", rec.voided);
+        assert_eq!(r.hands[&commit].hand, c.hands[&commit].hand);
+    }
+
+    #[test]
+    fn a_done_the_house_sent_binds_to_its_replay_and_a_tampered_one_does_not() {
+        use nostr_bbs_poker::bind::{bind_settlement, Agreed, BindError, Reported};
+        let mut c = citizen();
+        let commit = offer_commit(&hello(&mut c, HERO_PK, 1_000));
+        assert!(seated(&sit(&mut c, &commit, 20, &"ab".repeat(32), RICH)));
+        // the member folds on their turn: they owe the house
+        let out = c.handle(
+            HERO_PK,
+            ToCitizen::Leave {
+                commit: Some(commit.clone()),
+            },
+            1_003,
+            RICH,
+        );
+        let ToHero::Done {
+            seat,
+            opponent,
+            house,
+            secret,
+            nonces,
+            seed,
+            record,
+            root,
+            buyin,
+            settlement,
+            ..
+        } = done_for(&out, HERO_PK).clone()
+        else {
+            unreachable!()
+        };
+        let owed = c.ledger.owed[0].amount;
+        let claim = Claim {
+            commit: &commit,
+            secret: &secret,
+            nonces,
+            seed: &seed,
+            record: &record,
+            house_seat: Some(HOUSE),
+            profile: "tag",
+        };
+        let replayed = verify(&RustEngine, &claim).unwrap();
+        let agreed = Agreed {
+            house: true,
+            opponent: "c".repeat(64),
+            bb: 20,
+            sb: 10,
+            buyin,
+        };
+        let honest = Reported {
+            seat,
+            opponent: &opponent,
+            house,
+            buyin,
+            root: &root,
+            settlement,
+        };
+        let house_pk = "c".repeat(64);
+        let bound =
+            bind_settlement(&replayed, &record, HERO_PK, &house_pk, &agreed, &honest).unwrap();
+        assert_eq!(bound.settlement.map(|s| s.amount), Some(owed));
+        assert_eq!(bound.payee.as_deref(), Some(house_pk.as_str()));
+        // the amount raised by one unit, or paid to another key
+        let mut greedy = honest.clone();
+        greedy.settlement.as_mut().unwrap().amount += 1;
+        assert!(matches!(
+            bind_settlement(&replayed, &record, HERO_PK, &house_pk, &agreed, &greedy),
+            Err(BindError::Settlement { .. })
+        ));
+        let thief = "d".repeat(64);
+        let mut elsewhere = honest.clone();
+        elsewhere.opponent = &thief;
+        assert!(
+            bind_settlement(&replayed, &record, HERO_PK, &house_pk, &agreed, &elsewhere).is_err()
+        );
+        // a house that is not the pinned one
+        assert!(bind_settlement(&replayed, &record, HERO_PK, &thief, &agreed, &honest).is_err());
     }
 
     #[test]
@@ -1609,7 +3111,7 @@ mod tests {
         let mut to = std::collections::BTreeMap::new();
         to.insert("c".repeat(64), 40u64);
         paid.insert("1".repeat(64), to);
-        assert_eq!(c.payments_seen(&paid), [Effect::Persist]);
+        assert_eq!(c.payments_seen(&paid, 2_001), [Effect::Persist]);
         assert!(c.ledger.owed.iter().all(|o| o.root != "1".repeat(64)));
     }
 
@@ -1625,6 +3127,12 @@ mod tests {
                 attempts: 0,
                 last_attempt: 0,
                 last_error: None,
+                pending: None,
+                accepted_at: None,
+                rebuilds: 0,
+                invalid_rebuilds: 0,
+                refusals: 0,
+                halted: None,
             });
         }
         assert_eq!(c.payable(1_000, 60).len(), 1);
@@ -1632,6 +3140,9 @@ mod tests {
         assert!(matches!(&out[0], Effect::Send(_, ToHero::Paid { .. })));
         assert_eq!(c.ledger.paid_today(1_000), 4_000);
         assert!(c.payable(1_000, 60).is_empty());
+        // the chain shows the first payout; the second may go out tomorrow
+        c.payments_seen(&chain_pays(&"3".repeat(64), HERO_PK, 4_000), 50_000);
+        assert_eq!(c.ledger.paid_today(1_000), 4_000, "counted once");
         assert_eq!(c.payable(90_000, 60).len(), 1);
         c.house_pay_failed(&"4".repeat(64), "no coins", 90_000);
         assert!(c.payable(90_010, 60).is_empty());
@@ -1667,6 +3178,7 @@ mod tests {
         let bad = c.handle(
             HERO_PK,
             ToCitizen::Act {
+                log_len: None,
                 commit: commit.clone(),
                 action: fold(HOUSE),
             },
@@ -1679,6 +3191,7 @@ mod tests {
         let bad = c.handle(
             HERO_PK,
             ToCitizen::Act {
+                log_len: None,
                 commit: "9".repeat(64),
                 action: fold(HERO),
             },
@@ -1691,6 +3204,7 @@ mod tests {
         let bad = c.handle(
             OTHER_PK,
             ToCitizen::Act {
+                log_len: None,
                 commit: commit.clone(),
                 action: fold(HERO),
             },

@@ -27,6 +27,7 @@ use crate::utils::relay_url::env_override;
 use crate::wallet::chain;
 use crate::wallet::profile::{self, ChainProfile};
 
+pub mod choices;
 pub mod coach;
 pub mod live;
 

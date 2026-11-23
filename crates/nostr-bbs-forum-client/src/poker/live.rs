@@ -18,11 +18,13 @@ use leptos::prelude::*;
 use nostr_bbs_core::gift_wrap::{gift_wrap_with_signer_kind, unwrap_gift_with_signer_kind};
 use nostr_bbs_core::signer::Signer;
 use nostr_bbs_core::NostrEvent;
+use nostr_bbs_poker::bind::{bind_settlement, Agreed, Bound, Reported};
 use nostr_bbs_poker::protocol::{Asset, Debt, TableOffer, ToCitizen, ToHero, RUMOR_KIND, VERSION};
 use nostr_bbs_poker::rules::{HandRecord, Settlement, Side};
 use nostr_bbs_poker::verify::{verify, Claim};
 use send_wrapper::SendWrapper;
 
+use super::choices::{BrowserStorage, Choices};
 use super::{
     action_for, fresh_seed, hand_name, legal_of_view, summarise_named, Choice, HandOutcome,
     HistoryRow, JsEngine, LogEntry, SeatView,
@@ -146,6 +148,9 @@ pub enum Pay {
     Received(String),
     /// A split pot: nothing moves.
     Split,
+    /// What the house reported does not match the verified hand, so
+    /// nothing is paid. Carries why.
+    Refused(String),
 }
 
 /// The last finished hand.
@@ -217,10 +222,74 @@ pub struct LiveStore {
     sub: StoredValue<Option<String>>,
     seen: StoredValue<HashSet<String>>,
     nonces: StoredValue<HashMap<String, String>>,
+    /// What we chose to play, by the hand's commitment (or, until the
+    /// house names it, `challenge:<opponent>`): the table, the opponent and
+    /// the kind of hand. A finished hand's payment is held to this.
+    agreed: StoredValue<HashMap<String, Agreed>>,
     /// Hands whose end this table has read.
     done: StoredValue<HashSet<String>>,
     /// The hand state shown, by when the house sent it.
     shown: StoredValue<Option<Shown>>,
+}
+
+/// Whether an offer sent at `at` shows that the hand last shown (sent at
+/// `shown.at`) is over. A copy the relay replays from before the hand's
+/// last state does not.
+fn offer_ends_hand(shown: Option<&Shown>, at: u64) -> bool {
+    shown.is_some_and(|s| at > s.at)
+}
+
+/// What playing at `bb` against `opponent` means, from the tables the house
+/// offered: its blinds and buy-in, and whether the opponent is the house.
+/// `None` when the offer has no such table.
+fn agreed_for(tables: &[TableOffer], bb: u64, house: bool, opponent: &str) -> Option<Agreed> {
+    tables.iter().find(|t| t.bb == bb).map(|t| Agreed {
+        house,
+        opponent: opponent.to_string(),
+        bb: t.bb,
+        sb: t.sb,
+        buyin: t.buyin,
+    })
+}
+
+/// The settlement of a hand from what the replay bound, as the table shows
+/// and pays it. The payee's script is the one its pubkey pays on every
+/// chain; for the house the script it offered must be that same one, or
+/// the offer is refused.
+fn pay_from(bound: Result<Bound, String>, house: bool, offered_script: Option<&str>) -> Pay {
+    let b = match bound {
+        Ok(b) => b,
+        Err(why) => return Pay::Refused(why),
+    };
+    match b.settlement {
+        None => Pay::Split,
+        Some(Settlement {
+            from: Side::Hero,
+            amount,
+            ..
+        }) => {
+            let Some(payee) = b.payee.as_deref() else {
+                return Pay::Refused("the verified hand names no one to pay".into());
+            };
+            let Some(script) = chain::script_of(payee) else {
+                return Pay::Refused("the winner's key is not a valid pubkey".into());
+            };
+            let to_script = script.to_hex_string();
+            if house
+                && offered_script
+                    .filter(|s| !s.is_empty())
+                    .is_some_and(|s| !s.eq_ignore_ascii_case(&to_script))
+            {
+                return Pay::Refused("the house's offered script is not its key's".into());
+            }
+            Pay::Owed {
+                to_script,
+                amount,
+                error: None,
+            }
+        }
+        Some(Settlement { amount, .. }) => Pay::Awaiting { amount },
+    }
 }
 
 /// The hand state on screen, for ordering what the relay replays.
@@ -293,7 +362,16 @@ impl LiveStore {
         me: &str,
         citizen: &str,
     ) -> Self {
-        Self {
+        // what we chose for hands still in flight survives a reload
+        let (kept_nonces, kept_agreed, unreadable) =
+            match Choices::load(&BrowserStorage, me, Self::now()) {
+                Ok(c) => {
+                    let (n, a) = c.maps();
+                    (n, a, None)
+                }
+                Err(e) => (HashMap::new(), HashMap::new(), Some(e)),
+            };
+        let store = Self {
             offer: RwSignal::new(None),
             hand: RwSignal::new(None),
             finished: RwSignal::new(None),
@@ -315,10 +393,54 @@ impl LiveStore {
             wallet: StoredValue::new(wallet),
             sub: StoredValue::new(None),
             seen: StoredValue::new(HashSet::new()),
-            nonces: StoredValue::new(HashMap::new()),
+            nonces: StoredValue::new(kept_nonces),
+            agreed: StoredValue::new(kept_agreed),
             done: StoredValue::new(HashSet::new()),
             shown: StoredValue::new(None),
+        };
+        if let Some(why) = unreadable {
+            store.notice.set(Some(format!(
+                "This browser cannot keep the table's records ({why}). Play on, but do not reload during a hand: a reloaded table cannot check or pay for it."
+            )));
         }
+        store
+    }
+
+    /// Keep what we chose for the hands in flight, so a reload does not
+    /// lose it. Says so, in words, when the browser will not keep it.
+    fn remember_choices(&self) {
+        self.remember_choices_dropping(&[]);
+    }
+
+    /// As [`LiveStore::remember_choices`], dropping the hands in `removed`
+    /// from what is kept. Entries other tabs keep are left alone.
+    fn remember_choices_dropping(&self, removed: &[&str]) {
+        let (Some(me), Some(nonces), Some(agreed)) = (
+            self.me.try_get_value(),
+            self.nonces.try_get_value(),
+            self.agreed.try_get_value(),
+        ) else {
+            return;
+        };
+        let now = Self::now();
+        let mut kept = Choices::load(&BrowserStorage, &me, now).unwrap_or_default();
+        kept.sync(&nonces, &agreed, removed, now);
+        if let Err(why) = kept.save(&BrowserStorage, &me) {
+            self.error.try_set(Some(format!(
+                "This browser will not keep the table's records ({why}). If you reload during this hand you will not be able to pay for it from here."
+            )));
+        }
+    }
+
+    /// Drop what we chose for `commit`: the hand is paid, split or voided.
+    fn forget_choices(&self, commit: &str) {
+        self.nonces.update_value(|n| {
+            n.remove(commit);
+        });
+        self.agreed.update_value(|a| {
+            a.remove(commit);
+        });
+        self.remember_choices_dropping(&[commit]);
     }
 
     /// The house's pubkey.
@@ -436,10 +558,19 @@ impl LiveStore {
             ));
             return;
         };
+        let Some(agreed) = agreed_for(&offer.tables, bb, true, &self.citizen()) else {
+            self.error
+                .set(Some("The house offers no table at that stake.".into()));
+            return;
+        };
         self.nonces.update_value(|n| {
             n.insert(offer.commit.clone(), nonce.clone());
         });
+        self.agreed.update_value(|a| {
+            a.insert(offer.commit.clone(), agreed);
+        });
         self.error.set(None);
+        self.remember_choices();
         self.busy.set(true);
         self.send(ToCitizen::Sit {
             v: VERSION,
@@ -465,20 +596,35 @@ impl LiveStore {
         self.send(ToCitizen::Act {
             commit: h.commit,
             action,
+            log_len: Some(h.log.len()),
         });
     }
 
     /// Challenge a member present at the table.
     pub fn challenge(&self, opponent: &str) {
         let bb = self.stake_bb.get_untracked();
+        let Some(agreed) = self
+            .offer
+            .get_untracked()
+            .and_then(|o| agreed_for(&o.tables, bb, false, opponent))
+        else {
+            self.error
+                .set(Some("The house offers no table at that stake.".into()));
+            return;
+        };
         let Some(nonce) = fresh_seed() else {
             return;
         };
         // the commitment is not known until the house answers: remember the
-        // nonce by opponent until the Waiting message names the hand
+        // nonce and what we chose by opponent until the Waiting message
+        // names the hand
         self.nonces.update_value(|n| {
             n.insert(format!("challenge:{opponent}"), nonce.clone());
         });
+        self.agreed.update_value(|a| {
+            a.insert(format!("challenge:{opponent}"), agreed);
+        });
+        self.remember_choices();
         self.error.set(None);
         self.send(ToCitizen::Challenge {
             v: VERSION,
@@ -490,12 +636,37 @@ impl LiveStore {
 
     /// Accept a challenge.
     pub fn accept(&self, commit: &str) {
+        // what we are agreeing to is what the challenge said, checked
+        // against a table the house really offers
+        let Some(incoming) = self
+            .challenges
+            .get_untracked()
+            .into_iter()
+            .find(|i| i.commit == commit)
+        else {
+            return;
+        };
+        let agreed = self
+            .offer
+            .get_untracked()
+            .and_then(|o| agreed_for(&o.tables, incoming.bb, false, &incoming.from))
+            .filter(|a| a.buyin == incoming.buyin);
+        let Some(agreed) = agreed else {
+            self.error.set(Some(
+                "That challenge is not for a table the house offers.".into(),
+            ));
+            return;
+        };
         let Some(nonce) = fresh_seed() else {
             return;
         };
         self.nonces.update_value(|n| {
             n.insert(commit.to_string(), nonce.clone());
         });
+        self.agreed.update_value(|a| {
+            a.insert(commit.to_string(), agreed);
+        });
+        self.remember_choices();
         self.challenges.update(|c| c.retain(|i| i.commit != commit));
         self.error.set(None);
         self.busy.set(true);
@@ -597,6 +768,15 @@ impl LiveStore {
             }
         });
         if let Ok(txid) = outcome {
+            // paid: what we chose for the hand has done its work
+            if let Some(commit) = self
+                .finished
+                .get_untracked()
+                .filter(|f| f.root == root)
+                .map(|f| f.commit)
+            {
+                self.forget_choices(&commit);
+            }
             self.send(ToCitizen::Paid { root, txid });
         }
     }
@@ -738,6 +918,14 @@ impl LiveStore {
                         self.stake_bb.set(t.bb);
                     }
                 }
+                // an offer newer than the hand on screen means the house has
+                // no hand of ours in play (it answers a hello with the hand
+                // itself when there is one)
+                if self.hand.get_untracked().is_some()
+                    && self.shown.with_value(|s| offer_ends_hand(s.as_ref(), at))
+                {
+                    self.hand.set(None);
+                }
                 self.house_quiet.set(false);
                 self.offer.set(Some(Offer {
                     citizen,
@@ -782,6 +970,12 @@ impl LiveStore {
                         n.insert(commit.clone(), nonce);
                     }
                 });
+                self.agreed.update_value(|a| {
+                    if let Some(g) = a.remove(&format!("challenge:{opponent}")) {
+                        a.insert(commit.clone(), g);
+                    }
+                });
+                self.remember_choices();
                 self.waiting.set(Some(Waiting {
                     commit,
                     opponent,
@@ -878,6 +1072,25 @@ impl LiveStore {
                     }
                 });
             }
+            ToHero::Voided { commit, why, .. } => {
+                // no funds move for a voided hand; the deal it reveals is
+                // not needed to know that, so the table just clears it
+                self.done.update_value(|d| {
+                    d.insert(commit.clone());
+                });
+                if self
+                    .hand
+                    .get_untracked()
+                    .is_some_and(|h| h.commit == commit)
+                {
+                    self.hand.set(None);
+                }
+                self.forget_choices(&commit);
+                self.notice.set(Some(format!(
+                    "The house voided that hand ({why}). Nothing is owed either way."
+                )));
+                self.busy.set(false);
+            }
             ToHero::Error { message, .. } => {
                 self.error.set(Some(message));
                 self.busy.set(false);
@@ -965,31 +1178,43 @@ impl LiveStore {
                 }
             }
         };
-        let pay = match settlement {
-            None => Pay::Split,
-            Some(Settlement {
-                from: Side::Hero,
-                amount,
-                ..
-            }) => {
-                let to_script = if house {
-                    self.offer
-                        .get_untracked()
-                        .map(|o| o.script)
-                        .unwrap_or_default()
-                } else {
-                    chain::script_of(&opponent)
-                        .map(|s| s.to_hex_string())
-                        .unwrap_or_default()
-                };
-                Pay::Owed {
-                    to_script,
-                    amount,
-                    error: None,
-                }
-            }
-            Some(Settlement { amount, .. }) => Pay::Awaiting { amount },
+        // Nothing in the house's message is trusted for the payment: the
+        // amount, the payee and the memo's root are derived from the
+        // verified replay, and the message must agree with them.
+        let me = self.me.try_get_value().unwrap_or_default();
+        let citizen = self.citizen.try_get_value().unwrap_or_default();
+        let agreed = self.agreed.with_value(|a| a.get(&commit).cloned());
+        let bound: Result<Bound, String> = match (&replay, nonce_ok, agreed) {
+            (Ok(_), true, None) => Err(
+                "this browser no longer holds what you chose for this hand (it was reloaded without its records), so the payment cannot be checked"
+                    .to_string(),
+            ),
+            (Ok(hand), true, Some(agreed)) => bind_settlement(
+                hand,
+                &record,
+                &me,
+                &citizen,
+                &agreed,
+                &Reported {
+                    seat,
+                    opponent: &opponent,
+                    house,
+                    buyin,
+                    root: &root,
+                    settlement,
+                },
+            )
+            .map_err(|e| e.to_string()),
+            _ => Err(verified
+                .clone()
+                .err()
+                .unwrap_or_else(|| "the hand did not verify".to_string())),
         };
+        let offered_script = self.offer.get_untracked().map(|o| o.script);
+        let pay = pay_from(bound, house, offered_script.as_deref());
+        if matches!(pay, Pay::Split) {
+            self.forget_choices(&commit);
+        }
         let n = self.hands_played.get_untracked() + 1;
         self.hands_played.set(n);
         self.session_net.update(|v| *v += outcome.hero_net);
@@ -1052,6 +1277,116 @@ mod tests {
             at,
             log_len,
         }
+    }
+
+    #[test]
+    fn only_an_offer_newer_than_the_shown_hand_ends_it() {
+        let shown = shown("a", 100, 5);
+        assert!(offer_ends_hand(Some(&shown), 101));
+        // a replayed older offer, or one sent in the same second, does not
+        assert!(!offer_ends_hand(Some(&shown), 100));
+        assert!(!offer_ends_hand(Some(&shown), 90));
+        assert!(!offer_ends_hand(None, 500));
+    }
+
+    const HOUSE_PK: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn owe(amount: u64) -> Result<Bound, String> {
+        Ok(Bound {
+            root: "r".repeat(64),
+            buyin: 2_000,
+            settlement: Some(Settlement {
+                from: Side::Hero,
+                to: Side::Citizen,
+                amount,
+            }),
+            payee: Some(HOUSE_PK.to_string()),
+        })
+    }
+
+    fn tables() -> Vec<TableOffer> {
+        vec![
+            TableOffer {
+                bb: 20,
+                sb: 10,
+                buyin: 2_000,
+                label: "20".into(),
+            },
+            TableOffer {
+                bb: 200,
+                sb: 100,
+                buyin: 20_000,
+                label: "200".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn what_we_agree_to_is_the_table_we_chose_and_the_opponent_we_named() {
+        let a = agreed_for(&tables(), 200, false, &"f".repeat(64)).unwrap();
+        assert_eq!(
+            (a.house, a.bb, a.sb, a.buyin, a.opponent.as_str()),
+            (false, 200, 100, 20_000, "f".repeat(64).as_str())
+        );
+        let h = agreed_for(&tables(), 20, true, HOUSE_PK).unwrap();
+        assert!(h.house && h.opponent == HOUSE_PK && h.buyin == 2_000);
+        // a stake the house does not offer is no agreement
+        assert!(agreed_for(&tables(), 7, true, HOUSE_PK).is_none());
+    }
+
+    #[test]
+    fn what_we_pay_and_to_whom_comes_from_the_bound_hand() {
+        let script = chain::script_of(HOUSE_PK).unwrap().to_hex_string();
+        assert_eq!(
+            pay_from(owe(75), true, Some(&script)),
+            Pay::Owed {
+                to_script: script.clone(),
+                amount: 75,
+                error: None
+            }
+        );
+        // an offer that names no script is no reason to pay elsewhere
+        assert!(matches!(
+            pay_from(owe(75), true, None),
+            Pay::Owed { to_script, .. } if to_script == script
+        ));
+    }
+
+    #[test]
+    fn an_offer_naming_another_script_for_the_house_is_refused() {
+        let thief = chain::script_of(&"d".repeat(64)).unwrap().to_hex_string();
+        assert!(matches!(
+            pay_from(owe(75), true, Some(&thief)),
+            Pay::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn a_hand_that_did_not_bind_is_never_paid() {
+        let refused = pay_from(Err("amount".into()), true, None);
+        assert_eq!(refused, Pay::Refused("amount".into()));
+        let mut b = owe(75).unwrap();
+        b.payee = None;
+        assert!(matches!(pay_from(Ok(b), false, None), Pay::Refused(_)));
+        let mut b = owe(75).unwrap();
+        b.payee = Some("not a key".into());
+        assert!(matches!(pay_from(Ok(b), false, None), Pay::Refused(_)));
+    }
+
+    #[test]
+    fn a_split_or_a_win_pays_nothing() {
+        let mut b = owe(75).unwrap();
+        b.settlement = None;
+        b.payee = None;
+        assert_eq!(pay_from(Ok(b), true, None), Pay::Split);
+        let mut b = owe(75).unwrap();
+        b.settlement = Some(Settlement {
+            from: Side::Citizen,
+            to: Side::Hero,
+            amount: 75,
+        });
+        b.payee = None;
+        assert_eq!(pay_from(Ok(b), true, None), Pay::Awaiting { amount: 75 });
     }
 
     #[test]

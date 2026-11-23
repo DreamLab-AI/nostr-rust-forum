@@ -1387,6 +1387,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
         };
         let pay = match &f.pay {
             Pay::Split => view! { <p class="text-xs text-gray-400">"Split pot: nothing moves."</p> }.into_any(),
+            Pay::Refused(why) => view! { <p class="text-xs text-red-400">"Nothing was paid: what the house reported does not match the verified hand ("{why.clone()}")."</p> }.into_any(),
             Pay::Sent(txid) => view! { <p class="text-xs text-gray-300">"You paid "<span class="font-mono">{f.net.unsigned_abs()}</span>" "{unit}" — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
             Pay::Received(txid) => view! { <p class="text-xs text-green-300">"Paid to you — transfer "<span class="font-mono break-all">{txid.clone()}</span></p> }.into_any(),
             Pay::Awaiting { amount } => view! { <p class="text-xs text-amber-300">"You are owed "{*amount}" "{unit}"; waiting for the chain to show it."</p> }.into_any(),
