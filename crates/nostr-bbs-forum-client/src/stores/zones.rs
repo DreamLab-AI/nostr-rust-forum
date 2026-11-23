@@ -279,6 +279,18 @@ pub fn section_to_zone(section: &str, zones: &[Zone]) -> Option<String> {
     zones.first().map(|z| z.id.clone())
 }
 
+/// Pod container for images attached in a channel with this `section`: the
+/// strict zone ([`zone_id_for_section`]) when the deployment declares zones,
+/// `Unzoned` (upload refused) when it declares zones but the section names
+/// none, and `Public` when it declares no zones at all.
+pub fn media_target_for_section(
+    section: Option<&str>,
+) -> crate::utils::restricted_media::MediaTarget {
+    let ids: Option<Vec<String>> =
+        configured_zones().map(|zs| zs.into_iter().map(|z| z.id).collect());
+    crate::utils::restricted_media::media_target_for(section, ids.as_deref())
+}
+
 /// Strict counterpart of [`section_to_zone`]: the id of the configured zone a
 /// section id belongs to by exact match or `<zone-id>-` prefix, and `None`
 /// otherwise.

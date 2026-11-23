@@ -225,6 +225,13 @@ pub fn SectionPage() -> impl IntoView {
         resolve_section(&chans, &category_slug(), &section_slug(), &zones)
     });
 
+    // Pod container for images attached to a new topic: this channel's zone.
+    let topic_media_target = Signal::derive(move || {
+        crate::stores::zones::media_target_for_section(
+            resolved_channel.get().map(|c| c.section).as_deref(),
+        )
+    });
+
     // Top up the per-channel subscription once the channel id is known.
     {
         let relay = relay.clone();
@@ -511,6 +518,7 @@ pub fn SectionPage() -> impl IntoView {
             <Show when=move || show_new_topic.get()>
                 <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-5 space-y-2">
                     <MessageInput
+                        media_target=topic_media_target
                         placeholder="Start a new topic — the first line becomes the title"
                         // Attach an image when starting a topic (parity with replies,
                         // which already set this). Without it the composer renders no

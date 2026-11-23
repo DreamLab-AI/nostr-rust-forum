@@ -168,6 +168,9 @@ pub(crate) fn ImageUpload(
                 &fname,
                 &pk,
                 signer.as_ref(),
+                // DM attachments only: DMs are not zones, so they keep the
+                // public media container (zone media is for zone channels).
+                &crate::utils::restricted_media::MediaTarget::Public,
             )
             .await
             {

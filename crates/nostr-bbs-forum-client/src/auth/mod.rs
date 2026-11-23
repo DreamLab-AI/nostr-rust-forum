@@ -676,6 +676,8 @@ impl AuthStore {
     pub fn logout(&self) {
         // ADR-2023: this device must stop waking for the account that signs out.
         crate::utils::push::teardown_on_logout();
+        // Zone images fetched for this account must not outlive it.
+        crate::utils::restricted_media::clear_media_cache();
         // The visible notification list is per-account; drop it so the next
         // account on this browser does not inherit it.
         crate::stores::notifications::clear_persisted_for_logout(

@@ -425,6 +425,13 @@ pub fn ThreadPage() -> impl IntoView {
         resolve_section_channel(&chans, &category_slug(), &section_param(), &zones)
     });
 
+    // Pod container for images attached in this thread: the channel's zone.
+    let thread_media_target = Signal::derive(move || {
+        crate::stores::zones::media_target_for_section(
+            resolved_channel.get().map(|c| c.section).as_deref(),
+        )
+    });
+
     // Top up the per-channel history once the channel id is known (idempotent).
     {
         let relay = relay.clone();
@@ -1232,6 +1239,7 @@ pub fn ThreadPage() -> impl IntoView {
                     view! {
                         <RootPost
                             post=root
+                            media_target=thread_media_target
                             my_pubkey=my_pubkey
                             editing_id=editing_id
                             on_save_edit=publish_edit
@@ -1266,6 +1274,7 @@ pub fn ThreadPage() -> impl IntoView {
                             view! {
                                 <ReplyCard
                                     reply=r
+                                    media_target=thread_media_target
                                     my_pubkey=my_pubkey
                                     editing_id=editing_id
                                     on_save_edit=publish_edit
@@ -1300,6 +1309,7 @@ pub fn ThreadPage() -> impl IntoView {
                         on_send=noop_send
                         on_send_with_mentions=send_callback
                         enable_image_upload=true
+                        media_target=thread_media_target
                         restore_failed=restore_failed
                     />
                 </div>
@@ -1373,7 +1383,11 @@ fn PostBody(
     view! {
         <>
             {(!text.is_empty()).then(|| view! { <MentionText content=text tags=tags /> })}
-            {media_urls.into_iter().map(|u| view! { <MediaEmbed url=u /> }).collect_view()}
+            {media_urls
+                .into_iter()
+                .enumerate()
+                .map(|(position, u)| view! { <MediaEmbed url=u position=position /> })
+                .collect_view()}
             {first_link.map(|u| view! { <LinkPreview url=u /> })}
         </>
     }
@@ -1484,6 +1498,8 @@ fn RootPost(
     can_reply: Signal<bool>,
     is_admin: Signal<bool>,
     on_delete: Callback<String>,
+    /// Pod container for an image attached while editing (the channel zone).
+    media_target: Signal<crate::utils::restricted_media::MediaTarget>,
 ) -> impl IntoView {
     let author_pk = post.pubkey.clone();
     // The name as a string, for the composer's quote line.
@@ -1589,6 +1605,7 @@ fn RootPost(
                                 initial_content=edit_initial.clone()
                                 is_editing=true
                                 enable_image_upload=true
+                                media_target=media_target
                                 on_cancel_edit=cancel_edit
                             />
                         </div>
@@ -1612,6 +1629,8 @@ fn ReplyCard(
     can_reply: Signal<bool>,
     is_admin: Signal<bool>,
     on_delete: Callback<String>,
+    /// Pod container for an image attached while editing (the channel zone).
+    media_target: Signal<crate::utils::restricted_media::MediaTarget>,
 ) -> impl IntoView {
     let author_pk = reply.pubkey.clone();
     // The name as a string, for the composer's quote line.
@@ -1724,6 +1743,7 @@ fn ReplyCard(
                                 initial_content=edit_initial.clone()
                                 is_editing=true
                                 enable_image_upload=true
+                                media_target=media_target
                                 on_cancel_edit=cancel_edit
                             />
                         </div>

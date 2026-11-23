@@ -12,8 +12,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::Blob;
 
+use crate::utils::restricted_media::MediaTarget;
+
 /// Default pod API URL (overridden by VITE_POD_API_URL at compile time).
-const POD_API: &str = match option_env!("VITE_POD_API_URL") {
+pub(crate) const POD_API: &str = match option_env!("VITE_POD_API_URL") {
     Some(u) => u,
     None => "https://pod.example.com",
 };
@@ -33,11 +35,27 @@ pub async fn upload_to_pod_signer(
     signer: &dyn nostr_bbs_core::signer::Signer,
     pod_api_url: Option<&str>,
 ) -> Result<String, String> {
+    upload_to_pod_container_signer(blob, filename, pubkey, signer, pod_api_url, "media/public")
+        .await
+}
+
+/// [`upload_to_pod_signer`] into an explicit pod container (`media/public` or
+/// `media/zones/<zone-id>`, see [`MediaTarget::container_path`]).
+///
+/// [`MediaTarget::container_path`]: crate::utils::restricted_media::MediaTarget::container_path
+pub async fn upload_to_pod_container_signer(
+    blob: &Blob,
+    filename: &str,
+    pubkey: &str,
+    signer: &dyn nostr_bbs_core::signer::Signer,
+    pod_api_url: Option<&str>,
+    container: &str,
+) -> Result<String, String> {
     let base_url = pod_api_url.unwrap_or(POD_API);
-    match put_blob_signer(blob, filename, pubkey, signer, base_url).await {
+    match put_blob_signer(blob, filename, pubkey, signer, base_url, container).await {
         Err(e) if e.starts_with("HTTP 403") || e.starts_with("HTTP 404") => {
             provision_pod_signer(pubkey, signer, base_url).await?;
-            put_blob_signer(blob, filename, pubkey, signer, base_url).await
+            put_blob_signer(blob, filename, pubkey, signer, base_url, container).await
         }
         other => other,
     }
@@ -85,6 +103,7 @@ async fn put_blob_signer(
     pubkey: &str,
     signer: &dyn nostr_bbs_core::signer::Signer,
     base_url: &str,
+    container: &str,
 ) -> Result<String, String> {
     // The object name is signed into the NIP-98 `u` tag AND sent as the request
     // URL, and the browser percent-encodes the latter on the wire (space →
@@ -93,9 +112,10 @@ async fn put_blob_signer(
     // "Authentication required". Encode the segment here so both carry the
     // same string.
     let url = format!(
-        "{}/pods/{}/media/public/{}",
+        "{}/pods/{}/{}/{}",
         base_url,
         pubkey,
+        container,
         encode_path_segment(filename)
     );
 
@@ -176,6 +196,10 @@ async fn put_blob_signer(
 
 /// Upload both a compressed image and its thumbnail via `Signer`, returning (image_url, thumb_url).
 ///
+/// Both go to the container `target` names: `media/public` for DMs and
+/// deployments without zones, `media/zones/<zone-id>` for a zone channel. An
+/// [`MediaTarget::Unzoned`] target is refused before anything is uploaded.
+///
 /// The object is stored under [`pod_object_name`] of `filename`: stamped, so
 /// two uploads with the same local name (every pasted image is "image.png")
 /// never overwrite each other, and reduced to URL-safe characters.
@@ -185,7 +209,11 @@ pub async fn upload_image_with_thumbnail_signer(
     filename: &str,
     pubkey: &str,
     signer: &dyn nostr_bbs_core::signer::Signer,
+    target: &MediaTarget,
 ) -> Result<(String, String), String> {
+    let container = target.container_path().ok_or_else(|| {
+        "This channel is not in a zone, so images cannot be attached here".to_string()
+    })?;
     // Millisecond stamp plus a nonce: a multi-file pick or a double paste can
     // land in the same millisecond.
     let stamp = format!(
@@ -195,8 +223,11 @@ pub async fn upload_image_with_thumbnail_signer(
     );
     let name = pod_object_name(filename, &stamp);
     let thumb_name = thumb_filename(&name);
-    let image_url = upload_to_pod_signer(image_blob, &name, pubkey, signer, None).await?;
-    let thumb_url = upload_to_pod_signer(thumb_blob, &thumb_name, pubkey, signer, None).await?;
+    let image_url =
+        upload_to_pod_container_signer(image_blob, &name, pubkey, signer, None, &container).await?;
+    let thumb_url =
+        upload_to_pod_container_signer(thumb_blob, &thumb_name, pubkey, signer, None, &container)
+            .await?;
     Ok((image_url, thumb_url))
 }
 

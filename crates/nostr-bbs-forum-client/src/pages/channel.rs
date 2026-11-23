@@ -894,6 +894,16 @@ pub fn ChannelPage() -> impl IntoView {
     };
 
     let send_callback = Callback::new(do_send_text);
+    // Pod container for attached images: this channel's zone (strict).
+    let store_for_media = use_context::<ChannelStore>();
+    let channel_media_target = Signal::derive(move || {
+        let cid = channel_id();
+        let section = store_for_media.and_then(|st| {
+            st.channels
+                .with(|cs| cs.iter().find(|c| c.id == cid).map(|c| c.section.clone()))
+        });
+        crate::stores::zones::media_target_for_section(section.as_deref())
+    });
     // MessageInput fires `on_send` alongside `on_send_with_mentions`; all
     // publish work lives in the mentions path, so the plain path is a no-op.
     let noop_send = Callback::new(|_: String| {});
@@ -1183,6 +1193,7 @@ pub fn ChannelPage() -> impl IntoView {
                             on_send=noop_send
                             on_send_with_mentions=send_callback
                             enable_image_upload=true
+                            media_target=channel_media_target
                             channel_id=channel_id()
                             restore_failed=restore_failed
                         />

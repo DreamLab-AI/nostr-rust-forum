@@ -87,6 +87,10 @@ web-sys = { workspace = true, features = [
     "RequestInit",
     # The wallet fetches the mirror's block file with the cache bypassed.
     "RequestCache",
+    # Zone media: CORS fetch without credentials (utils/restricted_media.rs).
+    "RequestMode",
+    "RequestCredentials",
+    "RequestRedirect",
     "Request",
     "Response",
     "PageTransitionEvent",
