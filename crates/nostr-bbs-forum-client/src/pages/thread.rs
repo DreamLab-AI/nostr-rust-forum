@@ -699,7 +699,15 @@ pub fn ThreadPage() -> impl IntoView {
             Some(ch) => ch.id,
             None => return Vec::<NostrEvent>::new(),
         };
-        let channel = store.list_events(&cid);
+        let mut channel = store.list_events(&cid);
+        // The section's topic roots (one root-list REQ, not windowed), so a
+        // root found there survives eviction from the channel window.
+        let roots = store.list_events(&crate::stores::channels::roots_key(&cid));
+        if !roots.is_empty() {
+            let held: std::collections::HashSet<String> =
+                channel.iter().map(|e| e.id.clone()).collect();
+            channel.extend(roots.into_iter().filter(|r| !held.contains(&r.id)));
+        }
         let Some(key) = topic_list.get() else {
             return channel;
         };
@@ -939,7 +947,15 @@ pub fn ThreadPage() -> impl IntoView {
                 }
                 return;
             }
-            // The root is missing. A loaded reply may name it in full.
+            // The root is missing. First the section's root list: one REQ,
+            // then the slug (an id prefix) matches against it client-side.
+            if !store.topic_roots_answered(&cid) {
+                if store.history_receipt(&cid).settles(gated) {
+                    store.request_topic_roots(&relay, &cid, gated);
+                }
+                return;
+            }
+            // Not a marked root: a loaded reply may name it in full.
             let slug = topic_param();
             let named = channel_events.with(|events| {
                 events.iter().find_map(|e| {

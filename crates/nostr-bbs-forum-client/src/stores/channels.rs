@@ -142,6 +142,11 @@ pub struct ChannelStore {
     /// lower-case). A topic is paged on its own (`#e:[root]`, sealed replies
     /// carry the root as an outer `reply` tag) into its own list and window.
     topic_targets: StoredValue<HashMap<String, (String, String)>>,
+    /// Topic-root lists: list key (`roots_key`) -> channel id. Filled by
+    /// one `{"#t":["topic"],"#e":[channel]}` REQ per channel; not windowed.
+    roots_targets: StoredValue<HashMap<String, String>>,
+    /// Channels whose root list has been answered (reactive).
+    roots_answered: RwSignal<HashSet<String>>,
     /// What each `ensure_subscribed` REQ delivered by its receipts, so the
     /// page that knows whether the channel is gated can record its first
     /// page ([`ChannelStore::settle_first_page`]).
@@ -189,6 +194,8 @@ impl ChannelStore {
             zone_keys: StoredValue::new(None),
             totals: RwSignal::new(HashMap::new()),
             topic_targets: StoredValue::new(HashMap::new()),
+            roots_targets: StoredValue::new(HashMap::new()),
+            roots_answered: RwSignal::new(HashSet::new()),
             first_pages: StoredValue::new(HashMap::new()),
         };
         store.prune_on_admin_answers();
@@ -1115,6 +1122,21 @@ impl ChannelStore {
         cid: String,
         ev: NostrEvent,
     ) -> Option<(String, NostrEvent)> {
+        if let Some(channel) = self.roots_targets.with_value(|m| m.get(key).cloned()) {
+            // A root list holds root-shaped messages of its channel only (a
+            // sealed root still locked shows its outer marker instead).
+            let marked = ev.tags.iter().any(|t| {
+                t.len() == 2 && t[0] == "t" && t[1] == nostr_bbs_core::sealed::TOPIC_MARKER
+            });
+            let rooty = nostr_bbs_core::sealed::is_topic_root(&ev) || marked;
+            if cid == channel && rooty {
+                return Some((key.to_string(), ev));
+            }
+            if let Some(z) = self.zone_store() {
+                z.forget(std::slice::from_ref(&ev.id));
+            }
+            return None;
+        }
         let Some((channel, topic)) = self.topic_targets.with_value(|m| m.get(key).cloned()) else {
             return Some((cid, ev));
         };
@@ -1128,6 +1150,48 @@ impl ChannelStore {
             }
             None
         }
+    }
+
+    /// Fetch channel `cid`'s topic roots once per session: one REQ
+    /// `{"kinds":[42], "#t":["topic"], "#e":[cid]}` (sealed roots carry the
+    /// outer marker; the relay drives it from the marker and gates it by the
+    /// channel) into the unwindowed list [`roots_key`]`(cid)`. A section can
+    /// then list every topic, dormant ones included, and a deep link's slug
+    /// (an id prefix) is matched against it.
+    pub fn request_topic_roots(&self, relay: &RelayConnection, cid: &str, wait_auth: bool) {
+        let key = roots_key(cid);
+        let fresh = self.roots_targets.with_value(|m| !m.contains_key(&key));
+        if !fresh {
+            return;
+        }
+        self.roots_targets.update_value(|m| {
+            m.insert(key.clone(), cid.to_string());
+        });
+        let store = *self;
+        let channel = cid.to_string();
+        self.one_shot_page(
+            relay,
+            &key,
+            Filter {
+                kinds: Some(vec![42]),
+                t_tags: Some(vec![nostr_bbs_core::sealed::TOPIC_MARKER.to_string()]),
+                e_tags: Some(vec![cid.to_string()]),
+                limit: Some(RELAY_FILTER_LIMIT),
+                ..Default::default()
+            },
+            wait_auth,
+            Box::new(move |events, _page| {
+                store.apply_page(events);
+                store.roots_answered.update(|s| {
+                    s.insert(channel);
+                });
+            }),
+        );
+    }
+
+    /// Whether channel `cid`'s root list has been answered. Reactive.
+    pub fn topic_roots_answered(&self, cid: &str) -> bool {
+        self.roots_answered.with(|s| s.contains(cid))
     }
 
     /// The events of list `key` (a channel id or a [`topic_key`]). Reactive.
@@ -1791,6 +1855,11 @@ impl ChannelTotal {
     pub fn total(&self) -> Option<u64> {
         self.counted.map(|n| n + self.newer_ids.len() as u64)
     }
+}
+
+/// The list key of channel `cid`'s topic roots.
+pub fn roots_key(cid: &str) -> String {
+    format!("roots:{cid}")
 }
 
 /// The list (and history-cursor) key of topic `root`'s own paged list.

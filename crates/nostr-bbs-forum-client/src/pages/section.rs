@@ -251,12 +251,43 @@ pub fn SectionPage() -> impl IntoView {
             Some(ch) => ch.id,
             None => return Vec::<TopicSummary>::new(),
         };
-        store.channel_messages.with(|m| match m.get(&cid) {
-            Some(events) => classify_topics(&cid, events),
-            None => Vec::new(),
+        // Every topic root (one root-list REQ, not windowed) plus the
+        // channel's history window (replies, live posts, roots of older
+        // channels without the marker).
+        let roots_key = crate::stores::channels::roots_key(&cid);
+        store.channel_messages.with(|m| {
+            let roots = m.get(&roots_key).map(Vec::as_slice).unwrap_or(&[]);
+            let window = m.get(&cid).map(Vec::as_slice).unwrap_or(&[]);
+            if roots.is_empty() {
+                return classify_topics(&cid, window);
+            }
+            let held: std::collections::HashSet<&str> =
+                window.iter().map(|e| e.id.as_str()).collect();
+            let mut all: Vec<nostr_bbs_core::NostrEvent> = window.to_vec();
+            all.extend(
+                roots
+                    .iter()
+                    .filter(|r| !held.contains(r.id.as_str()))
+                    .cloned(),
+            );
+            classify_topics(&cid, &all)
         })
     });
     let topics: Signal<Vec<TopicSummary>> = topics_memo.into();
+
+    // Fetch the section's topic roots once (decision ii: sealed roots carry
+    // ["t","topic"]), so dormant topics are listed without paging the channel.
+    {
+        let relay_for_roots = expect_context::<RelayConnection>();
+        Effect::new(move |_| {
+            if let Some(ch) = resolved_channel.get() {
+                let gated = zone_is_gated(&category_slug(), &load_zones());
+                if store.history_receipt(&ch.id).settles(gated) {
+                    store.request_topic_roots(&relay_for_roots, &ch.id, gated);
+                }
+            }
+        });
+    }
 
     // Mark this channel read when its topic list is viewed (BBS reading flow).
     //
