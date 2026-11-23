@@ -380,22 +380,32 @@ pub fn open_sealed(outer: &NostrEvent, zone_sk: &[u8; 32]) -> Result<NostrEvent,
 
 /// [`open_sealed`] with the NIP-44 conversation key of the zone secret and
 /// the envelope's author already derived ([`nip44::conversation_key`]`(zone_sk,
-/// outer.pubkey)`), so a reader opening many envelopes from one migrator
-/// pays the ECDH once instead of per envelope.
+/// author_pk)`), so a reader opening many envelopes from one migrator pays
+/// the ECDH once instead of per envelope.
 ///
-/// The result is identical to [`open_sealed`]'s for the same envelope and
-/// key, and **all six checks** run the same way, including the inner
-/// event's id and BIP-340 signature. A conversation key derived for any
-/// other secret or author fails the NIP-44 MAC ([`SealError::Decrypt`]), so
-/// the caller must key its cache by both. The outer signature is, as for
-/// [`open_sealed`], not verified here.
+/// `author_pk` is the x-only public key the conversation key was derived
+/// for. The envelope is refused with [`SealError::Decrypt`] unless its outer
+/// `pubkey` is exactly that key, before any decryption, so the key is bound
+/// to its author by the API rather than left to each caller. (A key derived
+/// for another author would also fail the NIP-44 MAC; the explicit check
+/// keeps the binding even if a caller pairs the wrong cached key.)
+///
+/// The result is otherwise identical to [`open_sealed`]'s for the same
+/// envelope and key, and **all six checks** run the same way, including the
+/// inner event's id and BIP-340 signature. As for [`open_sealed`], the outer
+/// signature is not verified here.
+///
+/// # Errors
+///
+/// [`SealError::Decrypt`] when `outer.pubkey` is not `author_pk` or the key
+/// does not open the envelope; otherwise the same errors as [`open_sealed`].
 ///
 /// # Example
 ///
 /// ```
 /// use nostr_bbs_core::keys::SecretKey;
 /// use nostr_bbs_core::nip44::conversation_key;
-/// use nostr_bbs_core::sealed::{open_sealed, open_sealed_with_conversation_key, seal_original};
+/// use nostr_bbs_core::sealed::{open_sealed, open_sealed_with_conversation_key, seal_original, SealError};
 /// use nostr_bbs_core::{sign_event_deterministic, UnsignedEvent};
 ///
 /// let author = k256::schnorr::SigningKey::from_bytes(&[0x11u8; 32].into()).unwrap();
@@ -411,21 +421,30 @@ pub fn open_sealed(outer: &NostrEvent, zone_sk: &[u8; 32]) -> Result<NostrEvent,
 /// )
 /// .unwrap();
 /// let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+/// let migrator_pk = *migrator.public_key().as_bytes();
 /// let zone_sk = [0x33u8; 32];
 /// let zone_pk = SecretKey::from_bytes(zone_sk).unwrap().public_key().to_hex();
 /// let outer = seal_original(&original, "zone2", 1, &zone_pk, &migrator).unwrap();
 ///
-/// let ck = conversation_key(&zone_sk, migrator.public_key().as_bytes()).unwrap();
-/// let opened = open_sealed_with_conversation_key(&outer, &ck).unwrap();
+/// let ck = conversation_key(&zone_sk, &migrator_pk).unwrap();
+/// let opened = open_sealed_with_conversation_key(&outer, &migrator_pk, &ck).unwrap();
 /// let plain = open_sealed(&outer, &zone_sk).unwrap();
 /// assert_eq!(serde_json::to_string(&opened).unwrap(), serde_json::to_string(&plain).unwrap());
 /// assert_eq!(opened.id, original.id);
+///
+/// // The key is bound to its author: naming anyone else is refused.
+/// let other = *SecretKey::from_bytes([0x44; 32]).unwrap().public_key().as_bytes();
+/// assert_eq!(open_sealed_with_conversation_key(&outer, &other, &ck).unwrap_err(), SealError::Decrypt);
 /// ```
 pub fn open_sealed_with_conversation_key(
     outer: &NostrEvent,
+    author_pk: &[u8; 32],
     conversation_key: &[u8; 32],
 ) -> Result<NostrEvent, SealError> {
-    open_with(outer, |_, content| {
+    open_with(outer, |migrator_pk, content| {
+        if migrator_pk != author_pk {
+            return Err(SealError::Decrypt);
+        }
         nip44::decrypt_with_conversation_key(conversation_key, content)
             .map_err(|_| SealError::Decrypt)
     })
@@ -630,11 +649,12 @@ mod tests {
     #[test]
     fn opening_with_a_conversation_key_matches_open_sealed() {
         let zone_sk = *zone().as_bytes();
-        let ck =
-            crate::nip44::conversation_key(&zone_sk, migrator().public_key().as_bytes()).unwrap();
+        let mpk = *migrator().public_key().as_bytes();
+        let ck = crate::nip44::conversation_key(&zone_sk, &mpk).unwrap();
         let good = seal_original(&original(), "zone2", 1, &zone_pk_hex(), &migrator()).unwrap();
         assert_eq!(
-            serde_json::to_string(&open_sealed_with_conversation_key(&good, &ck).unwrap()).unwrap(),
+            serde_json::to_string(&open_sealed_with_conversation_key(&good, &mpk, &ck).unwrap())
+                .unwrap(),
             serde_json::to_string(&open_sealed(&good, &zone_sk).unwrap()).unwrap()
         );
 
@@ -658,19 +678,44 @@ mod tests {
         variants.push(v);
         for v in &variants {
             assert_eq!(
-                format!("{:?}", open_sealed_with_conversation_key(v, &ck)),
+                format!("{:?}", open_sealed_with_conversation_key(v, &mpk, &ck)),
                 format!("{:?}", open_sealed(v, &zone_sk)),
                 "{v:?}"
             );
         }
 
         // A key for another author or another zone secret never opens it.
-        let other =
-            crate::nip44::conversation_key(&zone_sk, key(0x77).public_key().as_bytes()).unwrap();
+        let other_pk = *key(0x77).public_key().as_bytes();
+        let other = crate::nip44::conversation_key(&zone_sk, &other_pk).unwrap();
         assert!(matches!(
-            open_sealed_with_conversation_key(&good, &other),
+            open_sealed_with_conversation_key(&good, &mpk, &other),
             Err(SealError::Decrypt)
         ));
+    }
+
+    /// The conversation key is bound to `author_pk`: an envelope whose outer
+    /// pubkey is anyone else is refused before decryption, even when the
+    /// caller hands over the right key for that envelope.
+    #[test]
+    fn opening_with_a_conversation_key_refuses_a_mismatched_author() {
+        let zone_sk = *zone().as_bytes();
+        let mpk = *migrator().public_key().as_bytes();
+        let ck = crate::nip44::conversation_key(&zone_sk, &mpk).unwrap();
+        let good = seal_original(&original(), "zone2", 1, &zone_pk_hex(), &migrator()).unwrap();
+        let other_pk = *key(0x77).public_key().as_bytes();
+        assert_eq!(
+            open_sealed_with_conversation_key(&good, &other_pk, &ck).unwrap_err(),
+            SealError::Decrypt,
+            "right key, wrong stated author"
+        );
+        let mut relabelled = good.clone();
+        relabelled.pubkey = hex::encode(other_pk);
+        assert_eq!(
+            open_sealed_with_conversation_key(&relabelled, &mpk, &ck).unwrap_err(),
+            SealError::Decrypt,
+            "envelope claims another author"
+        );
+        assert!(open_sealed_with_conversation_key(&good, &mpk, &ck).is_ok());
     }
 
     fn original() -> NostrEvent {

@@ -576,11 +576,13 @@ pub fn read_outcome(ev: &NostrEvent, lookup: impl Fn(&str, u32) -> Option<ZoneKe
         // The envelope's author (the migrator) is the NIP-44 peer; its
         // conversation key with the zone secret is derived once per session.
         // All six open checks, the inner signature included, still run.
-        let Some(ck) = hex32(&ev.pubkey).and_then(|p| conversation_keys::conversation_key(&sk, &p))
-        else {
+        let Some(author) = hex32(&ev.pubkey) else {
             return ReadOutcome::Failed;
         };
-        return match open_sealed_with_conversation_key(ev, &ck) {
+        let Some(ck) = conversation_keys::conversation_key(&sk, &author) else {
+            return ReadOutcome::Failed;
+        };
+        return match open_sealed_with_conversation_key(ev, &author, &ck) {
             Ok(inner) => ReadOutcome::Sealed(inner),
             Err(_) => ReadOutcome::Failed,
         };
