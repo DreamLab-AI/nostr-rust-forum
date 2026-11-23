@@ -101,6 +101,9 @@ pub struct ZoneKeyStore {
     /// callbacks hold the identity's signer.
     grant_subs: StoredValue<Vec<String>>,
     grant_relay: StoredValue<Option<RelayConnection>>,
+    /// The app's relay connection, whose verified-id cache is cleared on
+    /// every identity switch (security review H6).
+    app_relay: StoredValue<Option<RelayConnection>>,
     /// Secret of the signed-in identity's inbox key (hex), once registered.
     /// Always `None` with `RECIPIENT_KEYS_ENABLED` off.
     inbox_sk: StoredValue<Option<String>>,
@@ -140,6 +143,7 @@ impl ZoneKeyStore {
             sync_for: StoredValue::new(None),
             grant_subs: StoredValue::new(Vec::new()),
             grant_relay: StoredValue::new(None),
+            app_relay: StoredValue::new(None),
             inbox_sk: StoredValue::new(None),
             conflicts: RwSignal::new(Vec::new()),
             epochs_seen: RwSignal::new(HashMap::new()),
@@ -241,6 +245,9 @@ impl ZoneKeyStore {
         super::tickets::clear_group_identities();
         super::public_inbox::reset_sweep_tracker();
         super::conversation_keys::clear();
+        if let Some(relay) = self.app_relay.get_value() {
+            relay.clear_verified();
+        }
         // Synchronous on purpose: with the keys gone this pass does no
         // cryptography, and it must revert every plaintext on screen before
         // anything else runs (it also stops any chunked pass in flight).
@@ -1347,6 +1354,7 @@ fn keep_pending_against(mut key: ZoneKey, existing: Option<&ZoneKey>) -> ZoneKey
 /// whoever signs in next, with or without a page reload.
 pub fn provide_zone_key_store(channels: crate::stores::channels::ChannelStore) {
     let store = ZoneKeyStore::new(channels);
+    store.app_relay.set_value(use_context::<RelayConnection>());
     provide_context(store);
     let auth = crate::auth::use_auth();
     Effect::new(move |_| {

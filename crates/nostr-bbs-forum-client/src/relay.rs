@@ -751,6 +751,22 @@ impl RelayConnection {
         id
     }
 
+    /// Forget every verified event id (see `relay/verified.rs`), so the next
+    /// identity's deliveries are all verified afresh and the cache's hit
+    /// pattern says nothing about what the previous identity fetched.
+    /// Called on every identity switch (`ZoneKeyStore::switch_owner`).
+    pub fn clear_verified(&self) {
+        // `switch_owner` runs from an Effect, never inside the socket
+        // handler, so the borrow is free; if it ever is not, say so rather
+        // than panic in the middle of a sign-out.
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner.verified = verified::VerifiedIds::default(),
+            Err(_) => web_sys::console::warn_1(
+                &"[Relay] verified-id cache busy at identity switch; not cleared".into(),
+            ),
+        }
+    }
+
     pub fn unsubscribe(&self, sub_id: &str) {
         // Close the id the subscription is using on the wire now, which
         // differs from the logical id after an unanswered-REQ re-send.
