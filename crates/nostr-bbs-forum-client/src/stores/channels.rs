@@ -1175,31 +1175,36 @@ impl ChannelStore {
         let id = relay.subscribe_with_receipt(vec![filter], on_event, on_receipt);
         buf.borrow_mut().sub = Some(id);
 
+        // `set_timeout_once` frees its closure once it has run (gloo's
+        // `Timeout::forget` would leak it, and the `Buf` it holds, per page).
+        // When the receipt came first the timeout finds `done` and returns.
         let relay = relay.clone();
-        gloo::timers::callback::Timeout::new(PAGE_TIMEOUT_MS, move || {
-            let (sub, buffered) = {
-                let mut b = buf.borrow_mut();
-                if b.done {
-                    return;
+        crate::utils::set_timeout_once(
+            move || {
+                let (sub, buffered) = {
+                    let mut b = buf.borrow_mut();
+                    if b.done {
+                        return;
+                    }
+                    b.done = true;
+                    b.on_done = None;
+                    (b.sub.take(), std::mem::take(&mut b.events))
+                };
+                if let Some(id) = sub {
+                    relay.unsubscribe(&id);
                 }
-                b.done = true;
-                b.on_done = None;
-                (b.sub.take(), std::mem::take(&mut b.events))
-            };
-            if let Some(id) = sub {
-                relay.unsubscribe(&id);
-            }
-            if let Some(z) = zone_keys {
-                let ids: Vec<String> = buffered.into_iter().map(|(_, ev)| ev.id).collect();
-                z.forget(&ids);
-            }
-            let _ = store.history.try_update(|m| {
-                if let Some(c) = m.get_mut(&key) {
-                    c.loading = false;
+                if let Some(z) = zone_keys {
+                    let ids: Vec<String> = buffered.into_iter().map(|(_, ev)| ev.id).collect();
+                    z.forget(&ids);
                 }
-            });
-        })
-        .forget();
+                let _ = store.history.try_update(|m| {
+                    if let Some(c) = m.get_mut(&key) {
+                        c.loading = false;
+                    }
+                });
+            },
+            PAGE_TIMEOUT_MS as i32,
+        );
     }
 
     /// Fetch the next older page of channel `cid` (see [`HistoryCursor`])
