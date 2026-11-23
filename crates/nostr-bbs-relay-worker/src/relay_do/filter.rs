@@ -153,9 +153,13 @@ pub fn build_filter_query(filter: &NostrFilter, limit: u32) -> FilterQuery {
         }
     }
 
-    // Tag filters, in key order so the driver choice is deterministic.
+    // Tag filters, in key order so the driver choice is deterministic, except
+    // that `#e` drives last: an `e` value is usually a channel (every message
+    // in it), so a rarer tag beside it (`#t:["topic"]` listing a section's
+    // topic roots) reads far fewer rows as the driver. The result is the same
+    // either way; only the plan differs.
     let mut keys: Vec<&String> = filter.extra.keys().collect();
-    keys.sort();
+    keys.sort_by_key(|k| (k.as_str() == "#e", k.as_str()));
     let mut driver: Option<(String, Vec<String>)> = None;
     for key in keys {
         let (tag_name, values) = match tag_filter_plan(key, &filter.extra[key]) {
@@ -1539,6 +1543,38 @@ mod query_builder_tests {
             .map(|e| e.id.clone())
             .collect();
         assert_eq!(held, all, "every message of the channel, once");
+    }
+
+    #[test]
+    fn a_topic_root_list_drives_from_the_marker_and_matches_the_matcher() {
+        let c = db();
+        let mut events = fixture();
+        for i in 0..5 {
+            events.push(ev(
+                950 + i,
+                42,
+                2_000 + i as u64,
+                vec![vec!["e", "a", "", "root"], vec!["t", "topic"]],
+            ));
+        }
+        events.push(ev(
+            960,
+            42,
+            2_100,
+            vec![vec!["e", "b", "", "root"], vec!["t", "topic"]],
+        ));
+        store(&c, &events);
+        let f =
+            filter(serde_json::json!({"kinds": [42], "#t": ["topic"], "#e": ["a"], "limit": 500}));
+        assert_eq!(run(&c, &f, 500).0, reference(&events, &f, 500));
+        assert_eq!(run(&c, &f, 500).0.len(), 5, "only channel a's roots");
+        let q = build_filter_query(&f, 500);
+        assert!(
+            q.sql.contains("d.name = ?2"),
+            "the #t filter drives: {}",
+            q.sql
+        );
+        assert_eq!(q.params[1], SqlParam::Text("t".into()));
     }
 
     #[test]

@@ -8589,6 +8589,48 @@ mod topic_tag_gate_tests {
     }
 
     #[test]
+    fn a_topic_root_list_query_is_gated_by_the_roots_channel() {
+        // A sealed root carries ["t","topic"] (decision ii); the section's
+        // root list is {"kinds":[42],"#t":["topic"],"#e":[channel]}.
+        let chan = "c".repeat(64);
+        let author = SecretKey::from_bytes([0x11; 32]).unwrap();
+        let migrator = SecretKey::from_bytes([0x22; 32]).unwrap();
+        let zone = SecretKey::from_bytes([0x33; 32]).unwrap();
+        let signing_key = nostr_bbs_core::keys::signing_key_from_bytes(author.as_bytes()).unwrap();
+        let root = sign_event(
+            UnsignedEvent {
+                pubkey: author.public_key().to_hex(),
+                created_at: 1_700_000_000,
+                kind: 42,
+                tags: vec![tag(&["e", &chan, "", "root"])],
+                content: "#economics".into(),
+            },
+            &signing_key,
+        )
+        .unwrap();
+        let env = seal_original(&root, "zone2", 1, &zone.public_key().to_hex(), &migrator).unwrap();
+        assert!(env.tags.contains(&tag(&["t", "topic"])));
+        let f: NostrFilter = serde_json::from_value(
+            serde_json::json!({"kinds": [42], "#t": ["topic"], "#e": [chan]}),
+        )
+        .unwrap();
+        assert!(filter::event_matches_filters(&env, &[f]));
+        assert_eq!(
+            filter::zone_channel_id(&env).as_deref(),
+            Some(chan.as_str())
+        );
+        let decide = |ctx: &ViewerContext| {
+            matches!(
+                channel_read_decision(env.kind, Some("zone2"), &zones(), ctx),
+                ReadDecision::Deliver
+            )
+        };
+        assert!(!decide(&viewer(&[], false)), "anonymous: no roots");
+        assert!(!decide(&viewer(&["other"], true)), "non-member: no roots");
+        assert!(decide(&viewer(&["minimoonoir"], true)), "member: the roots");
+    }
+
+    #[test]
     fn the_topic_id_would_fail_open_which_is_why_it_is_never_looked_up() {
         // Documents the hazard the tests above exclude: a channel id with no
         // channel_zones row is unscoped, so deciding by the TOPIC id would
