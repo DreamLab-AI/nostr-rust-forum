@@ -14,6 +14,7 @@ pub mod push;
 pub mod pwa_install;
 pub mod reconcile;
 pub mod relay_url;
+pub mod restricted_media;
 pub mod sanitize;
 pub mod search_client;
 pub mod slug_hash;

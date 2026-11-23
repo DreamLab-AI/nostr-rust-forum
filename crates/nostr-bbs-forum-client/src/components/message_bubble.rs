@@ -264,8 +264,8 @@ pub fn MessageBubble(message: MessageData) -> impl IntoView {
                 })}
 
                 // Media embeds (images, YouTube)
-                {media_urls.into_iter().map(|url| {
-                    view! { <MediaEmbed url=url /> }
+                {media_urls.into_iter().enumerate().map(|(position, url)| {
+                    view! { <MediaEmbed url=url position=position /> }
                 }).collect_view()}
 
                 // Link preview (first non-media URL only)
