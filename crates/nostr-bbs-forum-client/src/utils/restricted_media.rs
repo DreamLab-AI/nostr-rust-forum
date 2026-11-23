@@ -93,6 +93,11 @@ pub fn is_restricted_media_url_for(url: &str, pod_base: &str) -> bool {
     if path.contains(['?', '#', '@', '%', '\\']) {
         return false;
     }
+    // Dot segments are normalised away by the browser before sending, so the
+    // signed `u` would never match what the pod receives.
+    if path.split('/').any(|seg| seg == "." || seg == "..") {
+        return false;
+    }
     let Some((owner, tail)) = path.split_once('/') else {
         return false;
     };
@@ -334,6 +339,8 @@ mod tests {
             format!("{POD}/pods/{PK}/media/zones/zone2/a.webp?x=1"),
             format!("{POD}/pods/{PK}/media/zones/zone2/a.webp#f"),
             format!("{POD}/pods/{PK}/media/zones/zone2/a%2Fb.webp"),
+            format!("{POD}/pods/{PK}/media/zones/../../x.webp"),
+            format!("{POD}/pods/{PK}/media/zones/zone2/./a.webp"),
         ] {
             assert!(!is_restricted_media_url_for(&no, POD), "{no}");
         }

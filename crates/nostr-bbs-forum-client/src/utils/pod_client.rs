@@ -52,8 +52,11 @@ pub async fn upload_to_pod_container_signer(
     container: &str,
 ) -> Result<String, String> {
     let base_url = pod_api_url.unwrap_or(POD_API);
+    // Zone containers need no provisioning: a 403 there is the membership
+    // rule (not a missing pod), so it is reported, not retried.
+    let self_heal = !container.starts_with("media/zones/");
     match put_blob_signer(blob, filename, pubkey, signer, base_url, container).await {
-        Err(e) if e.starts_with("HTTP 403") || e.starts_with("HTTP 404") => {
+        Err(e) if self_heal && (e.starts_with("HTTP 403") || e.starts_with("HTTP 404")) => {
             provision_pod_signer(pubkey, signer, base_url).await?;
             put_blob_signer(blob, filename, pubkey, signer, base_url, container).await
         }
