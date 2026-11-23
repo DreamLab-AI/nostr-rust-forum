@@ -22,14 +22,17 @@ use std::collections::{HashMap, VecDeque};
 
 use nostr_bbs_core::NostrEvent;
 
-/// Verified ids kept at most; least recently seen evicted first.
-pub(crate) const VERIFIED_CAPACITY: usize = 20_000;
+/// Verified ids kept at most; least recently seen evicted first. The cache
+/// only has to span re-deliveries close in time (one envelope on the zone
+/// sync, the channel REQ and a history page), and each entry costs ~0.7 KB
+/// of wasm heap (measured), so 5,000 keeps it near 3.5 MB.
+pub(crate) const VERIFIED_CAPACITY: usize = 5_000;
 
 /// A bounded least-recently-used set of verified `(id, sig)` pairs.
 ///
 /// Recency is kept with a queue of `(id, tick)` and lazy deletion: a hit
 /// pushes a fresh tick, and eviction skips queue entries whose tick is stale.
-/// The queue is compacted when it outgrows four times the capacity.
+/// The queue is compacted when it outgrows twice the capacity.
 pub(crate) struct VerifiedIds {
     capacity: usize,
     tick: u64,
@@ -101,7 +104,7 @@ impl VerifiedIds {
                 self.by_id.remove(&id);
             }
         }
-        if self.order.len() > self.capacity * 4 {
+        if self.order.len() > self.capacity * 2 {
             let by_id = &self.by_id;
             self.order
                 .retain(|(id, tick)| by_id.get(id).is_some_and(|(_, t)| t == tick));
@@ -192,6 +195,6 @@ mod tests {
         for _ in 0..100 {
             assert!(v.already_verified(&ev));
         }
-        assert!(v.order.len() <= 8);
+        assert!(v.order.len() <= 4);
     }
 }
