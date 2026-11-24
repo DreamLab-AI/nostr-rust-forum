@@ -176,8 +176,26 @@ impl VectorStore {
     }
 
     /// Deserialize from RVF binary format. Returns None on invalid data.
+    ///
+    /// Test-only convenience; the worker decodes only for ingest, through
+    /// [`Self::from_rvf_bytes_with_spare`].
+    #[cfg(test)]
     pub fn from_rvf_bytes(data: &[u8]) -> Option<Self> {
+        Self::from_rvf_bytes_with_spare(data, 0)
+    }
+
+    /// Like [`Self::from_rvf_bytes`], reserving room for `spare` more vectors.
+    ///
+    /// Capacity is reserved once, for the stored count plus `spare`, so an
+    /// ingest of `spare` new vectors never reallocates. Growing by doubling
+    /// (the old behaviour) peaked at about 2x the decoded size, and a
+    /// realloc on the first append copies old and new buffers side by side;
+    /// either is what ran ingest out of the 256 MiB wasm memory first.
+    pub fn from_rvf_bytes_with_spare(data: &[u8], spare: usize) -> Option<Self> {
         let mut store = Self::new();
+        let n = vec_payloads(data).iter().map(|p| p.len() / ENTRY_SIZE).sum::<usize>();
+        store.entries.reserve_exact(n.saturating_add(spare));
+        store.index.reserve(n.saturating_add(spare));
         let mut offset = 0;
 
         while offset + SEGMENT_HEADER_SIZE <= data.len() {
@@ -909,6 +927,25 @@ mod tests {
         // New labels still append.
         store.insert(7, &unit_vec(4));
         assert_eq!(store.count(), 4);
+    }
+
+    #[test]
+    fn spare_capacity_avoids_realloc_on_ingest() {
+        let entries = lcg_vecs(1_000, 9);
+        let bytes = build_rvf_bytes_for_test(&entries);
+        let mut store = VectorStore::from_rvf_bytes_with_spare(&bytes, 500).unwrap();
+        assert_eq!(store.count(), 1_000);
+        let cap = store.entries.capacity();
+        assert!(cap >= 1_500);
+        for (l, v) in lcg_vecs(500, 10) {
+            store.insert(l + 1_000_000, &v);
+        }
+        assert_eq!(store.count(), 1_500);
+        assert_eq!(store.entries.capacity(), cap, "no reallocation within the spare");
+        // Same content as a plain decode.
+        let plain = VectorStore::from_rvf_bytes(&bytes).unwrap();
+        assert_eq!(plain.count(), 1_000);
+        assert_eq!(plain.entries[..], store.entries[..1_000]);
     }
 
     #[test]

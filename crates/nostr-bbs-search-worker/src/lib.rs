@@ -314,13 +314,15 @@ async fn load_store_bytes(env: &Env) -> Result<Vec<u8>> {
     }
 }
 
-/// Load the vector store from R2, or create empty if none exists.
+/// Load the vector store from R2, or create empty if none exists, with room
+/// for `spare` more vectors (the ingest batch) so inserting never reallocates.
 ///
 /// Decodes every vector (a second in-memory copy of the object). Only ingest
-/// needs that; `/search` and `/status` work on the bytes directly.
-async fn load_store(env: &Env) -> Result<VectorStore> {
+/// needs that; `/search` and `/status` work on the bytes directly. The raw
+/// bytes are dropped before this returns.
+async fn load_store(env: &Env, spare: usize) -> Result<VectorStore> {
     let bytes = load_store_bytes(env).await?;
-    Ok(VectorStore::from_rvf_bytes(&bytes).unwrap_or_else(VectorStore::new))
+    Ok(VectorStore::from_rvf_bytes_with_spare(&bytes, spare).unwrap_or_else(VectorStore::new))
 }
 
 /// Persist the vector store to R2 as RVF binary + mapping to KV.
@@ -752,7 +754,7 @@ async fn handle_ingest(req: &Request, env: &Env) -> Result<Response> {
         );
     }
 
-    let mut store = load_store(env).await?;
+    let mut store = load_store(env, body.entries.len()).await?;
     let (mut id_to_label, _, mut next_label, indexed_model, mut public_labels) =
         load_mapping(env).await?;
 
