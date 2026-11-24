@@ -146,6 +146,8 @@ pub struct FakeRelay {
     pub tamper_next_store: bool,
     /// Accept the next event with OK true but do not store it.
     pub drop_next_store: bool,
+    /// Pretend NIP-42 AUTH did not happen.
+    pub unauthenticated: bool,
 }
 
 impl FakeRelay {
@@ -177,11 +179,16 @@ impl FakeRelay {
             && f.kinds.as_ref().is_none_or(|k| k.contains(&ev.kind))
             && tag_match("e", &f.e_tags)
             && tag_match("p", &f.p_tags)
+            && tag_match("zk", &f.zk_tags)
             && f.until.is_none_or(|u| ev.created_at <= u)
     }
 }
 
 impl Relay for FakeRelay {
+    fn session_authenticated(&self) -> bool {
+        !self.unauthenticated
+    }
+
     async fn query(&mut self, filter: &Filter) -> Result<Vec<NostrEvent>, RelayError> {
         self.queries.push(filter.clone());
         let limit = filter.limit.unwrap_or(500).min(MAX_REQ_LIMIT) as usize;

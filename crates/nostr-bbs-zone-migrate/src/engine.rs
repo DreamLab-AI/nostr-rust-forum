@@ -127,9 +127,30 @@ pub struct SealReport {
     pub limit_reached: bool,
     /// State counts after the run.
     pub counts: Counts,
+    /// Zones sealed under `--allow-unanchored-first-encryption` in this run.
+    pub unanchored: Vec<(String, crate::state::UnanchoredZone)>,
+}
+
+/// Options for [`seal_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SealOptions<'a> {
+    /// Seal at most this many originals in this run.
+    pub limit: Option<usize>,
+    /// `--allow-unanchored-first-encryption`: permit the FIRST encryption of
+    /// an all-plaintext zone, whose key no live encrypted post can confirm.
+    /// See [`first_encryption_refusal`] for every condition; a zone with live
+    /// ciphertext must still match it, flag or not. Logged as a warning,
+    /// recorded in the report and the state file, and `purge` refuses the
+    /// zone until a live member post at the sealed key exists.
+    pub allow_unanchored_first_encryption: bool,
+    /// `--expect-zone-key ZONE=EPOCH:PUBKEY`: required with the flag. The key
+    /// the operator distributed out of band; the zone's current key must be
+    /// exactly this.
+    pub expect_zone_keys: &'a [(String, u32, String)],
 }
 
 /// Seal every planned original (resumable). See the crate docs for the flow.
+/// Same as [`seal_with`] with default options and `limit`.
 ///
 /// Newly found plaintext originals are added to `state` as `planned`. Then
 /// each `planned` entry, and each entry that failed at `seal` or `verify`, is
@@ -155,6 +176,24 @@ pub async fn seal<R: Relay>(
     limit: Option<usize>,
     hooks: &mut Hooks<'_>,
 ) -> Result<SealReport, EngineError> {
+    let opts = SealOptions {
+        limit,
+        ..SealOptions::default()
+    };
+    seal_with(relay, migrator, channels, keys, state, opts, hooks).await
+}
+
+/// [`seal`] with [`SealOptions`].
+pub async fn seal_with<R: Relay>(
+    relay: &mut R,
+    migrator: &SecretKey,
+    channels: &[ChannelSpec],
+    keys: &KeyRing,
+    state: &mut State,
+    opts: SealOptions<'_>,
+    hooks: &mut Hooks<'_>,
+) -> Result<SealReport, EngineError> {
+    let limit = opts.limit;
     let (plan, scans) = scan(relay, channels, keys).await?;
     let mut report = SealReport {
         plan,
@@ -221,7 +260,74 @@ pub async fn seal<R: Relay>(
         .map(|(id, _)| state.entries[id].zone.clone())
         .collect();
     for zone in &zones_to_seal {
-        check_anchor(zone, keys, &scans)?;
+        match check_anchor(zone, keys, &scans) {
+            Ok(()) => {}
+            Err(refusal) if opts.allow_unanchored_first_encryption => {
+                let current = keys.current(zone).expect("checked above");
+                let migrator_pk = migrator.public_key().to_hex();
+                // Every event the relay holds that names this zone in a zk
+                // tag, any kind, relay-wide.
+                let zone_events = fetch_all(
+                    relay,
+                    &Filter {
+                        zk_tags: Some(vec![zone.clone()]),
+                        ..Filter::default()
+                    },
+                )
+                .await?;
+                let listed_encrypted: usize = scans
+                    .iter()
+                    .filter(|s| s.plan.zone == *zone)
+                    .map(|s| s.plan.encrypted_posts)
+                    .sum();
+                let ctx = FirstEncryption {
+                    zone,
+                    current,
+                    other_keys: keys
+                        .keys_for(zone)
+                        .filter(|k| k.epoch() != current.epoch())
+                        .count(),
+                    migrator_pk: &migrator_pk,
+                    authenticated: relay.session_authenticated(),
+                    expected: opts
+                        .expect_zone_keys
+                        .iter()
+                        .find(|(z, _, _)| z == zone)
+                        .map(|(_, e, p)| (*e, p.as_str())),
+                    listed_encrypted,
+                };
+                if let Some(why) = first_encryption_refusal(
+                    &ctx,
+                    &zone_events.events,
+                    !zone_events.ambiguous_seconds.is_empty(),
+                ) {
+                    return Err(EngineError::Refused(format!(
+                        "{refusal} --allow-unanchored-first-encryption does not apply: {why}."
+                    )));
+                }
+                let granted_by = match current.source() {
+                    crate::keys::KeySource::Grant { granted_by } => granted_by.clone(),
+                    _ => unreachable!("first_encryption_refusal requires a grant"),
+                };
+                (hooks.progress)(&format!(
+                    "WARNING: UNANCHORED FIRST ENCRYPTION of zone {zone} with its epoch {} key \
+                     (pubkey {}, granted by {granted_by}): no encrypted post on the relay confirms \
+                     this key. Every member must hold this key to read the sealed history; purge \
+                     stays refused until a member posts with it.",
+                    current.epoch(),
+                    current.pubkey()
+                ));
+                let rec = crate::state::UnanchoredZone {
+                    epoch: current.epoch(),
+                    pubkey: current.pubkey().to_string(),
+                    granted_by,
+                };
+                state.unanchored_zones.insert(zone.clone(), rec.clone());
+                report.unanchored.push((zone.clone(), rec));
+                (hooks.persist)(state)?;
+            }
+            Err(refusal) => return Err(refusal),
+        }
     }
 
     let total = work.len();
@@ -475,6 +581,32 @@ pub async fn purge<R: Relay>(
         .collect();
     require_keys(state, keys, &todo)?;
 
+    // Zones sealed without an anchor: only once a member has posted with the
+    // sealed key (members provably hold it) may their plaintext go.
+    let todo_zones: BTreeSet<String> = todo
+        .iter()
+        .filter_map(|id| state.entries.get(id).map(|e| e.zone.clone()))
+        .collect();
+    for (zone, sealed) in state.unanchored_zones.clone() {
+        if !todo_zones.contains(&zone) {
+            continue;
+        }
+        let events = fetch_all(
+            relay,
+            &Filter {
+                zk_tags: Some(vec![zone.clone()]),
+                ..Filter::default()
+            },
+        )
+        .await?;
+        if let Some(why) = unanchored_purge_refusal(&zone, &sealed, &state.migrator, &events.events)
+        {
+            return Err(EngineError::Refused(format!("{why}. Nothing was deleted.")));
+        }
+        state.unanchored_zones.remove(&zone);
+        (hooks.persist)(state)?;
+    }
+
     let mut report = PurgeReport::default();
     let chunks = todo.len().div_ceil(MAX_DELETE_IDS);
     for (n, chunk) in todo.chunks(MAX_DELETE_IDS).enumerate() {
@@ -646,6 +778,158 @@ fn check_anchor(zone: &str, keys: &KeyRing, scans: &[ChannelScan]) -> Result<(),
         ));
     }
     Ok(())
+}
+
+/// What [`first_encryption_refusal`] decides on.
+#[derive(Debug)]
+pub struct FirstEncryption<'a> {
+    /// The zone.
+    pub zone: &'a str,
+    /// The zone's current (highest-epoch) key in the ring.
+    pub current: &'a crate::keys::ZoneKey,
+    /// How many OTHER keys (other epochs) the ring holds for the zone.
+    pub other_keys: usize,
+    /// The sealer's pubkey (hex).
+    pub migrator_pk: &'a str,
+    /// Whether the relay session is NIP-42 authenticated as the sealer.
+    pub authenticated: bool,
+    /// The operator's `--expect-zone-key` for this zone, if given.
+    pub expected: Option<(u32, &'a str)>,
+    /// Live encrypted posts the channel scans counted in the zone's channels.
+    pub listed_encrypted: usize,
+}
+
+/// Why `--allow-unanchored-first-encryption` may not seal, if it may not.
+/// `zone_events` are every event the relay returned for `#zk:[zone]` (any
+/// kind); `incomplete` means paging could not guarantee all of them. Every
+/// condition fails closed:
+///
+/// - the session is NIP-42 authenticated (an anonymous read omits gated
+///   zones, so "nothing came back" would mean nothing);
+/// - the operator named this exact key with `--expect-zone-key`;
+/// - the key came from a grant by another admin (not a self-grant, not the
+///   key file), and the ring holds no other key for the zone (an earlier
+///   epoch means the zone was encrypted before; a second key means
+///   conflicting grants);
+/// - the listed channels hold no live encrypted post, and the relay listing
+///   is complete;
+/// - every event naming the zone is this sealer's own sealed envelope at
+///   exactly the current epoch and pubkey (a resumed first run). Any other
+///   event, including one whose zone tag cannot be read, refuses.
+pub fn first_encryption_refusal(
+    ctx: &FirstEncryption<'_>,
+    zone_events: &[NostrEvent],
+    incomplete: bool,
+) -> Option<String> {
+    let current = ctx.current;
+    if !ctx.authenticated {
+        return Some(
+            "the relay session is not NIP-42 authenticated, so gated zones may be invisible".into(),
+        );
+    }
+    match ctx.expected {
+        None => {
+            return Some(format!(
+                "pass --expect-zone-key {}={}:{} to confirm the key distributed to members",
+                ctx.zone,
+                current.epoch(),
+                current.pubkey()
+            ))
+        }
+        Some((e, p)) if e != current.epoch() || !p.eq_ignore_ascii_case(current.pubkey()) => {
+            return Some(format!(
+                "--expect-zone-key names epoch {e} key {p}, but the zone's current key is epoch {} {}",
+                current.epoch(),
+                current.pubkey()
+            ))
+        }
+        Some(_) => {}
+    }
+    match current.source() {
+        crate::keys::KeySource::Grant { granted_by }
+            if granted_by.eq_ignore_ascii_case(ctx.migrator_pk) =>
+        {
+            return Some("the key was granted by the sealer itself".into())
+        }
+        crate::keys::KeySource::Grant { .. } => {}
+        _ => {
+            return Some(format!(
+                "the zone's epoch {} key comes from the key file, not a grant this sealer received",
+                current.epoch()
+            ))
+        }
+    }
+    if ctx.other_keys > 0 {
+        return Some(format!(
+            "the key ring holds {} other key(s) for the zone: an earlier epoch means it was encrypted before",
+            ctx.other_keys
+        ));
+    }
+    if ctx.listed_encrypted > 0 {
+        return Some(format!(
+            "the listed channels hold {} live encrypted post(s)",
+            ctx.listed_encrypted
+        ));
+    }
+    if incomplete {
+        return Some("the relay could not list every encrypted event of the zone".to_string());
+    }
+    for ev in zone_events {
+        // The zk tag that names THIS zone (the relay matched on it).
+        let zk = ev
+            .tags
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == "zk" && t[1] == ctx.zone);
+        let parsed = zk.and_then(|t| {
+            let epoch = t.get(2)?.parse::<u32>().ok()?;
+            let pk = t.get(3)?.to_ascii_lowercase();
+            Some((epoch, pk))
+        });
+        let ours = nostr_bbs_core::sealed::has_sealed_tag(&ev.tags)
+            && ev.kind == 42
+            && ev.pubkey.eq_ignore_ascii_case(ctx.migrator_pk)
+            && parsed
+                .as_ref()
+                .is_some_and(|(e, p)| *e == current.epoch() && p == current.pubkey());
+        if ours {
+            continue;
+        }
+        return Some(if !nostr_bbs_core::sealed::has_sealed_tag(&ev.tags) {
+            format!("the relay holds a live encrypted event of the zone (kind {}): seal against it instead", ev.kind)
+        } else {
+            "the relay holds a sealed envelope of the zone that is not this sealer's at the current key".into()
+        });
+    }
+    None
+}
+
+/// Why `purge` must not delete the plaintext of a zone sealed without an
+/// anchor yet: no live, member-authored (not the sealer's) zone-encrypted
+/// post at the sealed epoch and pubkey, i.e. no proof members hold the key.
+pub fn unanchored_purge_refusal(
+    zone: &str,
+    sealed: &crate::state::UnanchoredZone,
+    migrator_pk: &str,
+    zone_events: &[NostrEvent],
+) -> Option<String> {
+    let anchored = zone_events.iter().any(|ev| {
+        !nostr_bbs_core::sealed::has_sealed_tag(&ev.tags)
+            && !ev.pubkey.eq_ignore_ascii_case(migrator_pk)
+            && ev.tags.iter().any(|t| {
+                t.len() >= 4
+                    && t[0] == "zk"
+                    && t[1] == zone
+                    && t[2] == sealed.epoch.to_string()
+                    && t[3].eq_ignore_ascii_case(&sealed.pubkey)
+            })
+    });
+    (!anchored).then(|| {
+        format!(
+            "zone {zone} was first encrypted without an anchor (epoch {} key {}); purge stays refused \
+             until a member posts an encrypted message with that key, proving members hold it",
+            sealed.epoch, sealed.pubkey
+        )
+    })
 }
 
 /// `(zone, epoch)` from an envelope's `zk` tag.

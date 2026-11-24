@@ -128,6 +128,23 @@ pub struct State {
     pub migrator: String,
     /// Entries keyed by original event id.
     pub entries: BTreeMap<String, Entry>,
+    /// Zones first encrypted with `--allow-unanchored-first-encryption`:
+    /// zone -> the key sealed to. `purge` refuses these zones until a live,
+    /// member-authored post at that key proves members hold it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unanchored_zones: BTreeMap<String, UnanchoredZone>,
+}
+
+/// A zone sealed without an anchoring encrypted post (see
+/// [`State::unanchored_zones`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnanchoredZone {
+    /// Epoch sealed to.
+    pub epoch: u32,
+    /// Zone pubkey (x-only hex) sealed to.
+    pub pubkey: String,
+    /// Admin that granted the key to the sealer.
+    pub granted_by: String,
 }
 
 /// Why a state file could not be used.
@@ -186,6 +203,7 @@ impl State {
             relay: relay.to_string(),
             migrator: migrator.to_string(),
             entries: BTreeMap::new(),
+            unanchored_zones: BTreeMap::new(),
         }
     }
 

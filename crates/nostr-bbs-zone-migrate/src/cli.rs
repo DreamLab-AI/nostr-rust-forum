@@ -90,7 +90,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Subcommand, Clone, Copy)]
+#[derive(Subcommand, Clone)]
 enum Command {
     /// Dry run (default): per channel, plaintext count, already-sealed count and ids to seal. Writes nothing.
     Plan,
@@ -99,6 +99,16 @@ enum Command {
         /// Seal at most this many originals in this run.
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
+        /// Allow the FIRST encryption of an all-plaintext zone (no encrypted
+        /// post on the relay to anchor the key). Refused unless the relay holds
+        /// no zone-encrypted post of the zone and the key is the latest grant
+        /// this sealer received.
+        #[arg(long)]
+        allow_unanchored_first_encryption: bool,
+        /// With --allow-unanchored-first-encryption: the key distributed to
+        /// members, ZONE=EPOCH:PUBKEY (repeatable). Required.
+        #[arg(long, value_name = "ZONE=EPOCH:PUBKEY", value_parser = parse_expect_zone_key)]
+        expect_zone_key: Vec<(String, u32, String)>,
     },
     /// Re-fetch and re-open every recorded envelope.
     Verify,
@@ -113,7 +123,7 @@ enum Command {
 }
 
 impl Command {
-    fn name(self) -> &'static str {
+    fn name(&self) -> &'static str {
         match self {
             Command::Plan => "plan",
             Command::Seal { .. } => "seal",
@@ -155,7 +165,7 @@ pub fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Failure> {
-    let command = cli.command.unwrap_or(Command::Plan);
+    let command = cli.command.clone().unwrap_or(Command::Plan);
 
     if !cli.print_channels {
         if let Command::Status = command {
@@ -206,13 +216,27 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             out["plan"] = serde_json::to_value(&plan)?;
             ExitCode::SUCCESS
         }
-        Command::Seal { limit } => {
+        Command::Seal {
+            limit,
+            allow_unanchored_first_encryption,
+            expect_zone_key,
+        } => {
             let channels = channels(&cli)?;
             let path = state_path(&cli)?;
             let mut st = load_or_new(path, &relay_url, &me_pk)?;
             hooks!(hooks, path);
-            let report = engine::seal(
-                &mut relay, &me, &channels, &keys, &mut st, limit, &mut hooks,
+            let report = engine::seal_with(
+                &mut relay,
+                &me,
+                &channels,
+                &keys,
+                &mut st,
+                engine::SealOptions {
+                    limit,
+                    allow_unanchored_first_encryption,
+                    expect_zone_keys: &expect_zone_key,
+                },
+                &mut hooks,
             )
             .await?;
             print_plan(&report.plan);
@@ -502,6 +526,17 @@ fn print_failures(failed: &[(String, String)]) {
     }
 }
 
+/// Parse `ZONE=EPOCH:PUBKEY` for `--expect-zone-key`.
+fn parse_expect_zone_key(s: &str) -> Result<(String, u32, String), String> {
+    let (zone, rest) = s.split_once('=').ok_or("expected ZONE=EPOCH:PUBKEY")?;
+    let (epoch, pk) = rest.split_once(':').ok_or("expected ZONE=EPOCH:PUBKEY")?;
+    let epoch = epoch.parse::<u32>().map_err(|_| "EPOCH must be a number")?;
+    if zone.is_empty() || pk.len() != 64 || !pk.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("ZONE must be non-empty and PUBKEY 64 hex characters".into());
+    }
+    Ok((zone.to_string(), epoch, pk.to_ascii_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,12 +562,34 @@ mod tests {
         assert!(cli.fetch_grants);
         assert!(matches!(
             parse(&format!("{m} seal --limit 20")).command,
-            Some(Command::Seal { limit: Some(20) })
+            Some(Command::Seal {
+                limit: Some(20),
+                allow_unanchored_first_encryption: false,
+                ..
+            })
         ));
         assert!(matches!(
             parse(&format!("{m} seal")).command,
-            Some(Command::Seal { limit: None })
+            Some(Command::Seal {
+                limit: None,
+                allow_unanchored_first_encryption: false,
+                ..
+            })
         ));
+        assert!(matches!(
+            parse(&format!(
+                "{m} seal --allow-unanchored-first-encryption --expect-zone-key zone3=2:{}",
+                "a".repeat(64)
+            ))
+            .command,
+            Some(Command::Seal {
+                limit: None,
+                allow_unanchored_first_encryption: true,
+                ref expect_zone_key,
+            }) if expect_zone_key.len() == 1 && expect_zone_key[0].1 == 2
+        ));
+        assert!(parse_expect_zone_key("zone3=x:abc").is_err());
+        assert!(parse_expect_zone_key("zone3:2").is_err());
         assert!(matches!(
             parse(&format!("{m} verify")).command,
             Some(Command::Verify)
