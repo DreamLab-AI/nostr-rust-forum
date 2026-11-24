@@ -44,6 +44,8 @@ raw source lines are never copied.
 ```sh
 nostr-bbs-import plan --work W --zone zone2     # first run: writes templates
 $EDITOR W/identities.json W/structure.json
+nostr-bbs-import titles --work W                # titles for channels the edited structure maps
+$EDITOR W/titles.json
 echo '{"name":"production","pod":{"http":"https://pods.example.org"}}' > W/target.json
 nostr-bbs-import plan --work W                  # validates, prints counts and the keys needed
 ```
@@ -57,10 +59,14 @@ nostr-bbs-import plan --work W                  # validates, prints counts and t
   and nothing is published). Without a proof, `"trust": "operator"` writes the alias but leaves
   whitelisting to your normal invite flow.
 * `structure.json`: zones (in the deployment's config order), threads (kind-40 channels: an
-  existing id, or a new one the archivist signs), and one entry per source channel (`thread`, an
-  optional `topic` title, or `"skip": true`). Each source channel becomes one topic. A section
+  existing id, or a new one the archivist signs), and one entry per source channel (`thread`, or
+  `"skip": true`). Each source channel becomes one topic. A section
   must be `<zone id>` or `<zone id>-…`, or the client files it under the first zone; the planner
   refuses anything else.
+* `titles.json`: source channel id → topic title. A topic root is exactly this one line (at most
+  90 characters, what the client shows): no `#`, no source, no dates. Defaults are the humanised
+  source names (`kids_and_shit` → `Kids and shit`); `titles` adds defaults for newly mapped
+  channels and never changes an entry you edited. Provenance is kept in tags, not in the text.
 * `target.json`: the pod URL that image links will embed. It is frozen into signed and then
   sealed content, so a pilot build cannot be reused for production: build again with the
   production target. One work directory (archive, plan files, keys, media) serves both: pass

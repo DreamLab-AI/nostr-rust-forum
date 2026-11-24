@@ -172,14 +172,21 @@ following symlinks, owner and mode checked) for the run only.
 { "zones": [{"id":"zone2","cohorts":["zone2","minimoonoir"],"encrypted":true}],
   "threads": { "rants": {"zone":"zone2","section":"zone2-rants",
                           "channel": {"existing":"<kind-40 id>"} | {"new":{"name":"Rants","about":"…"}}} },
-  "channels": { "<source channel id>": {"thread":"rants","topic":"#economics"} },
+  "channels": { "<source channel id>": {"thread":"rants"} },
   "archivist_label": "archivist" }
 ```
 
 * One **topic per source channel**: a kind-42 root signed by the archivist,
   `created_at` = the channel's first imported message − 1 s (the sealer works in
-  `(created_at, id)` order, so a root seals before its replies), content
-  `#<topic> — archived from <source> <source_id> (<first> – <last>, <n> messages)`.
+  `(created_at, id)` order, so a root seals before its replies). **Its content is
+  exactly the topic's title** and nothing else (operator rule, 2026-11-24): no `#`, no
+  "archived from …", no dates or counts. The client takes a topic's title from the
+  root's first non-empty line clipped at 90 characters (`first_line`,
+  `pages/thread.rs`; there is no subject tag), so a title is one line of at most 90
+  characters. Titles come from the reviewable `titles.json` (source channel id →
+  title); `titles` fills the humanised source name (`kids_and_shit` → `Kids and
+  shit`) for channels without an entry and never changes an existing one.
+  Provenance lives only in tags (`["import","<source>:<source_id>#root:<channel>"]`).
   Several source channels may fold into one thread (section).
 * **Section rule.** The forum client routes a kind-40 by its `section` tag: equal to a
   zone id or `<zone-id>-…`, otherwise it falls through to the first zone silently.

@@ -13,7 +13,7 @@
 //!   },
 //!   "channels": {
 //!     "<source channel id>": {"thread": "rants"},
-//!     "<another id>":        {"thread": "rants", "topic": "economics"},
+//!     "<another id>":        {"thread": "rants"},
 //!     "<ignored id>":        {"skip": true}
 //!   }
 //! }
@@ -86,9 +86,6 @@ pub struct ChannelMap {
     /// Thread key in [`Structure::threads`].
     #[serde(default)]
     pub thread: Option<String>,
-    /// Topic title (default: the source channel name).
-    #[serde(default)]
-    pub topic: Option<String>,
     /// Leave this channel out.
     #[serde(default)]
     pub skip: bool,
@@ -203,7 +200,6 @@ impl Structure {
                 c.id.clone(),
                 ChannelMap {
                     thread: Some(key),
-                    topic: None,
                     skip: false,
                 },
             );

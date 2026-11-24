@@ -62,9 +62,10 @@ are refused. All times are **unix seconds**.
 {"id":"0f3a…","name":"general","topic":"Anything goes","created_at":1500000000}
 ```
 
-`id` is required and unique; `structure.json` maps channels **by id**, never by name (names can be
-missing or repeated). `name` is required (no leading `#`). `topic` and `created_at` are optional.
-Each channel becomes one forum topic.
+`id` is required and unique; `structure.json` and `titles.json` map channels **by id**, never by
+name (names can be missing or repeated). `name` is required (no leading `#`); its humanised form
+is the topic's default title. `topic` (the source's channel headline) and `created_at` are
+optional. Each channel becomes one forum topic whose root is exactly its title.
 
 ## `messages.jsonl`
 

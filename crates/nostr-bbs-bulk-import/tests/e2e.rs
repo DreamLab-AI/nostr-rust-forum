@@ -268,7 +268,7 @@ fn keybase_archive_to_sealed_upload_plan() {
           "threads": {
             "rants": {"zone": "zone2", "section": "zone2-rants", "channel": {"new": {"name": "Rants", "about": "Archived"}}},
             "photos": {"zone": "zone2", "section": "zone2-photos", "channel": {"new": {"name": "Photos"}}}},
-          "channels": {C1: {"thread": "rants"}, C2: {"thread": "photos", "topic": "pictures"}}})
+          "channels": {C1: {"thread": "rants"}, C2: {"thread": "photos"}}})
         .to_string(),
     )
     .unwrap();
@@ -277,6 +277,22 @@ fn keybase_archive_to_sealed_upload_plan() {
         r#"{"name":"pilot","pod":{"http":"http://127.0.0.1:8789"}}"#,
     )
     .unwrap();
+
+    // ── titles: humanised defaults, one operator edit that a re-run keeps
+    assert!(pipeline::load(&w).is_err(), "no titles.json yet");
+    let (t, added) = pipeline::write_titles(&w).unwrap();
+    assert_eq!(added.len(), 2);
+    assert_eq!(t.get(C1), Some("General"));
+    let mut edited = t.clone();
+    edited.titles.insert(C2.into(), "Pictures of cats".into());
+    std::fs::write(w.titles(), serde_json::to_vec(&edited).unwrap()).unwrap();
+    let (t, added) = pipeline::write_titles(&w).unwrap();
+    assert!(added.is_empty());
+    assert_eq!(
+        t.get(C2),
+        Some("Pictures of cats"),
+        "operator edits survive"
+    );
 
     // ── keys (posters + archivist), operator public key recorded from its file
     let l = pipeline::load(&w).unwrap();
@@ -337,6 +353,14 @@ fn keybase_archive_to_sealed_upload_plan() {
     {
         let c = Connection::open(&db_path).unwrap();
         // shapes and content
+        // topic roots are exactly their titles; provenance only in the import tag
+        assert_eq!(by_import(&c, &format!("#root:{C1}")).content, "General");
+        let root2 = by_import(&c, &format!("#root:{C2}"));
+        assert_eq!(root2.content, "Pictures of cats");
+        assert!(root2
+            .tags
+            .iter()
+            .any(|t| t[0] == "import" && t[1] == format!("keybase:testteam#root:{C2}")));
         let hello = by_import(&c, &format!("#m:{C1}:1"));
         assert!(
             hello

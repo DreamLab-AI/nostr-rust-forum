@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! source export --adapt--> intermediate archive (JSONL v1)          adapter, format
-//!   --plan--> identities.json + structure.json                      identity, structure, plan
+//!   --plan/titles--> identities.json + structure.json + titles.json  identity, structure, titles, plan
 //!   --keys--> keys.json (atomic, refuse-to-change)                  keystore
 //!   --media--> optimised, content-addressed images                  media
 //!   --build--> local D1 with full ingest parity + ledger            events, d1, pipeline
@@ -66,10 +66,16 @@
 //! let ids = identity::plan(&archive, &IdentityFile::template(&archive)).unwrap();
 //! let structure = Structure::template(&archive, "zone1");
 //! structure.validate(&archive).unwrap();
-//! let p = plan::build(&archive, &ids, &structure);
+//! let titles = nostr_bbs_bulk_import::titles::Titles {
+//!     version: 1,
+//!     titles: [("c1".to_string(), "General".to_string())].into(),
+//! };
+//! titles.validate(&archive, &structure).unwrap();
+//! let p = plan::build(&archive, &ids, &structure, &titles);
 //! assert_eq!(p.roots.len(), 1, "one topic per source channel");
 //! assert_eq!(p.messages.len(), 1);
 //! assert_eq!(p.roots[0].created_at, 1_600_000_000 - 1, "a root seals before its replies");
+//! assert_eq!(p.roots[0].content, "General", "a topic root is exactly its title");
 //! # std::fs::remove_dir_all(&dir).unwrap();
 //! ```
 //!
@@ -77,7 +83,8 @@
 //!
 //! - [`format`](mod@format), [`adapter`]: the intermediate archive and its producers.
 //! - [`identity`], [`keystore`]: who signs what, and the keys.
-//! - [`structure`], [`plan`]: channels to threads and topics; the pure plan.
+//! - [`structure`], [`titles`], [`plan`]: channels to threads and topic
+//!   titles; the pure plan.
 //! - [`media`], [`target`]: image optimisation and the embedded URLs.
 //! - [`events`], `d1`, `pipeline`: signing, the D1 writer and the CLI steps
 //!   (`d1` and `pipeline` are native only).
@@ -101,5 +108,6 @@ pub mod pipeline;
 pub mod plan;
 pub mod structure;
 pub mod target;
+pub mod titles;
 
 pub use error::ImportError;

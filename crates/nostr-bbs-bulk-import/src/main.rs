@@ -142,6 +142,11 @@ mod cli {
             #[command(subcommand)]
             cmd: KeysCmd,
         },
+        /// Add humanised default titles for imported channels missing from titles.json (never changes an entry) and list them.
+        Titles {
+            #[arg(long)]
+            work: PathBuf,
+        },
         /// Print the text a live key signs to prove it belongs to an author.
         LinkStatement {
             #[arg(long)]
@@ -364,6 +369,15 @@ mod cli {
                         (json!({"keys": rows}), true)
                     }
                 }
+            }
+            Cmd::Titles { work } => {
+                let w = Work::new(&work);
+                let (t, added) = pipeline::write_titles(&w)?;
+                (
+                    json!({"file": w.titles(), "added": added, "titles": t.titles,
+                           "note": "a topic root is exactly its title: edit any value, then build (run `reset` first if the topics are already built)"}),
+                    true,
+                )
             }
             Cmd::LinkStatement { work, author } => {
                 let a = nostr_bbs_bulk_import::format::Archive::open(&Work::new(&work).archive())?;

@@ -5,7 +5,8 @@
 //! the text, the reply links and the attachments, exactly as the forum
 //! client would have published them (`pages/thread.rs` shapes):
 //!
-//! - each source channel is ONE topic: a root dated one second before the
+//! - each source channel is ONE topic: a root whose content is exactly the
+//!   channel's title from [`crate::titles`], dated one second before the
 //!   channel's first imported message (the sealer works in
 //!   `(created_at, id)` order, so a root seals before its replies);
 //! - every message replies to its topic root; a source reply to an imported
@@ -31,6 +32,7 @@ use serde::Serialize;
 use crate::format::{Archive, AttachmentStatus, Message};
 use crate::identity::{IdentityPlan, Signer, ARCHIVIST};
 use crate::structure::Structure;
+use crate::titles::{default_title, Titles};
 
 /// Longest text kept (the relay caps a whole event at 64 KiB).
 pub const MAX_CONTENT: usize = 60_000;
@@ -281,7 +283,12 @@ enum St {
 
 /// Build the plan. The structure must already be validated against the
 /// archive ([`Structure::validate`]).
-pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> ImportPlan {
+pub fn build(
+    archive: &Archive,
+    ids: &IdentityPlan,
+    structure: &Structure,
+    titles: &Titles,
+) -> ImportPlan {
     let prov = format!("{}:{}", archive.manifest.source, archive.manifest.source_id);
     let key_of = |id: &str| format!("{prov}#m:{id}");
     let mut plan = ImportPlan {
@@ -389,25 +396,19 @@ pub fn build(archive: &Archive, ids: &IdentityPlan, structure: &Structure) -> Im
         let Some(first) = live.iter().map(|m| m.created_at).min() else {
             continue;
         };
-        let last = live.iter().map(|m| m.created_at).max().unwrap_or(first);
-        let topic = structure.channels[&c.id]
-            .topic
-            .clone()
-            .unwrap_or_else(|| c.name.clone());
+        // The root's content is exactly the title (the client's topic title
+        // is the root's first line); provenance stays in the `import` tag.
+        let title = titles
+            .get(&c.id)
+            .map(str::to_string)
+            .unwrap_or_else(|| default_title(&c.name));
         let root_key = format!("{prov}#root:{}", c.id);
         plan.roots.push(RootPlan {
             key: root_key.clone(),
             channel: c.id.clone(),
             thread: thread.clone(),
             created_at: first.saturating_sub(1),
-            content: format!(
-                "#{topic} — archived from {} {} ({} – {}, {} messages)",
-                archive.manifest.source,
-                archive.manifest.source_id,
-                iso_date(first),
-                iso_date(last),
-                live.len()
-            ),
+            content: title,
         });
         plan.stats.topics += 1;
 

@@ -31,6 +31,7 @@ use crate::media::MediaManifest;
 use crate::plan::{self, ImportPlan, Part};
 use crate::structure::{Structure, ThreadChannel};
 use crate::target::Target;
+use crate::titles::{self, Titles};
 
 /// Paths inside a work directory.
 ///
@@ -96,6 +97,10 @@ impl Work {
     pub fn structure(&self) -> PathBuf {
         self.dir.join("structure.json")
     }
+    /// `titles.json`.
+    pub fn titles(&self) -> PathBuf {
+        self.dir.join("titles.json")
+    }
     /// `target.json`, or the `--target` file.
     pub fn target(&self) -> PathBuf {
         self.target
@@ -151,8 +156,10 @@ pub fn load(work: &Work) -> Result<Loaded, ImportError> {
     let ids_file = IdentityFile::parse(&read(&work.identities())?)?;
     let structure = Structure::parse(&read(&work.structure())?)?;
     structure.validate(&archive)?;
+    let titles = Titles::load(&work.titles())?;
+    titles.validate(&archive, &structure)?;
     let ids = identity::plan(&archive, &ids_file)?;
-    let plan = plan::build(&archive, &ids, &structure);
+    let plan = plan::build(&archive, &ids, &structure, &titles);
     Ok(Loaded {
         archive,
         ids,
@@ -183,7 +190,18 @@ pub fn write_templates(work: &Work, zone: &str) -> Result<(), ImportError> {
         }
         fsutil::write_private_atomic(&path, &bytes)?;
     }
+    write_titles(work)?;
     Ok(())
+}
+
+/// Add the default (humanised) title for every imported channel that has
+/// none in `titles.json`; existing entries are never changed. Returns the
+/// titles and the channel ids added.
+pub fn write_titles(work: &Work) -> Result<(Titles, Vec<String>), ImportError> {
+    let archive = Archive::open(&work.archive())?;
+    let structure = Structure::parse(&read(&work.structure())?)?;
+    structure.validate(&archive)?;
+    titles::ensure(&work.titles(), &archive, &structure)
 }
 
 /// Keystore labels this import needs keys for: the signers of planned
