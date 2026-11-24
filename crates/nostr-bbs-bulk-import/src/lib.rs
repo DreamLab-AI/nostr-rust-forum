@@ -16,6 +16,8 @@ pub mod fsutil;
 pub mod identity;
 pub mod keystore;
 pub mod media;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pipeline;
 pub mod plan;
 pub mod structure;
 pub mod target;
