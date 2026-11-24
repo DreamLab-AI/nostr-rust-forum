@@ -323,7 +323,14 @@ ledger (`utils/lookup.rs:62`, `:91`; `relay/receipt.rs:71`). No receipt in 15 s 
 20-subscription cap does not count a REQ that replaces a held id (`nip_handlers.rs:52`). In an encrypted zone the topic page and the
 section topic list also wait for zone keys before reporting an absence (`Lookup::decide_with_keys`, `utils/lookup.rs:134`;
 `pages/thread.rs:645-675`, `section.rs:318-340`): while the grant backlog is pending or moving they show "Fetching your keys for this
-zone…", and once it stalls (20 s without progress, 120 s cap, `zone_crypto/grant_backlog.rs:35`, `:42`) a reload message.
+zone…", and once it stalls (20 s without progress, 120 s cap, `zone_crypto/grant_backlog.rs:40`, `:49`) a reload message.
+
+> Note 2026-11-24 (kit PR #95): the grant sync now pages past the relay's 1,000-row cap, page 0 plus 50 pages per scope
+> (`zone_crypto/grant_paging.rs:99`, `ScopePager` at `:291`), with a per-identity, per-scope, per-key backfill marker and
+> a warm stop three days below it (off while `GRANT_SWEEP_ENABLED` is on). A wrap left to retry (unanswered admin check,
+> refused NIP-07 decrypt) now holds the backlog open, the 120 s cap runs from the last scope's delivery
+> (`grant_backlog.rs:49`), and wraps are unwrapped newest-queued first, four at a time (`zone_crypto/wrap_queue.rs`).
+> Open limits: KF-31 (the relay answers a failed query as empty) and KF-32 (the page bound).
 
 > Note 2026-11-23: this paragraph used to end "Open gap: the decision does not wait for zone keys, so an encrypted zone can still
 > show 'Topic Not Found' briefly (KF-23)". Kit PR #98 (`fd31193`) closed that gap; KF-23 is closed with the operator's live check
