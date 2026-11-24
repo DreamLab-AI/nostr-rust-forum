@@ -232,27 +232,35 @@ impl ProfileCache {
     /// reactively once the response arrives.
     pub fn lookup(&self, pubkey: &str) -> Option<ProfileEntry> {
         let key = self.canonical(pubkey, false);
-        let pubkey = key.as_str();
-        let entries = self.entries.get_untracked();
-        if let Some(entry) = entries.get(pubkey) {
-            return Some(entry.clone());
+        let found = self
+            .entries
+            .with_untracked(|e| display_entry(e, pubkey, &key));
+        if found.is_none() {
+            self.schedule_missing(pubkey, &key);
         }
-        // Schedule a fetch for the missing pubkey
-        self.schedule_fetch(pubkey);
-        None
+        found
     }
 
     /// Reactive lookup — re-evaluates whenever the underlying entries change.
     pub fn lookup_reactive(&self, pubkey: &str) -> Option<ProfileEntry> {
         let key = self.canonical(pubkey, true);
-        let pubkey = key.as_str();
-        let entries = self.entries.get();
-        if let Some(entry) = entries.get(pubkey) {
-            return Some(entry.clone());
+        let found = self.entries.with(|e| display_entry(e, pubkey, &key));
+        let successor_shown = found.as_ref().is_some_and(|f| f.pubkey == key);
+        if !successor_shown {
+            // Schedule fetch but do not subscribe to pending/in_flight signals.
+            self.schedule_missing(pubkey, &key);
         }
-        // Schedule fetch but do not subscribe to pending/in_flight signals.
-        self.schedule_fetch(pubkey);
-        None
+        found
+    }
+
+    /// Queue the profiles [`display_entry`] would read for `pubkey`: the
+    /// successor's and, for a replaced key, its own as the fallback. Both
+    /// ride the same debounced batch request, never one request per card.
+    fn schedule_missing(&self, pubkey: &str, key: &str) {
+        self.schedule_fetch(key);
+        if key != pubkey {
+            self.schedule_fetch(pubkey);
+        }
     }
 
     /// Tracked read of a profile's `picture` URL by pubkey.
@@ -577,6 +585,23 @@ fn persist_one(entry: &ProfileEntry) {
 }
 
 // --- Successor map ------------------------------------------------------------
+
+/// The profile shown for `pubkey`, whose displayed identity is `canonical`
+/// (its successor, one hop, or itself): the successor's profile when it has
+/// one, else, for a replaced key, the key's OWN profile (its name and
+/// picture rather than a blank). Colour, links and the copyable key still use
+/// `canonical`. Reactive callers re-run when the successor's profile arrives
+/// and switch to it.
+pub fn display_entry(
+    entries: &HashMap<String, ProfileEntry>,
+    pubkey: &str,
+    canonical: &str,
+) -> Option<ProfileEntry> {
+    entries
+        .get(canonical)
+        .or_else(|| (canonical != pubkey).then(|| entries.get(pubkey)).flatten())
+        .cloned()
+}
 
 /// `pubkey`'s displayed identity given its successor lookup: the successor
 /// (one hop, never chained further), else the key itself.
@@ -993,7 +1018,7 @@ mod missing_retry_tests {
 
 #[cfg(test)]
 mod successor_tests {
-    use super::resolve_one_hop;
+    use super::{display_entry, resolve_one_hop, ProfileEntry};
     use std::collections::HashMap;
 
     #[test]
@@ -1007,5 +1032,32 @@ mod successor_tests {
         );
         assert_eq!(resolve_one_hop("plain", get("plain")), "plain");
         assert_eq!(resolve_one_hop("x", Some(String::new())), "x");
+    }
+
+    fn entry(pk: &str, name: &str) -> ProfileEntry {
+        ProfileEntry {
+            pubkey: pk.into(),
+            name: Some(name.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_replaced_key_falls_back_to_its_own_profile_until_the_successor_has_one() {
+        let mut e = HashMap::new();
+        e.insert("archive".to_string(), entry("archive", "Old Name"));
+        // Successor without a kind-0: the archive key's own profile.
+        assert_eq!(
+            display_entry(&e, "archive", "live").map(|p| p.pubkey),
+            Some("archive".into())
+        );
+        // The successor's profile arrives: it wins.
+        e.insert("live".to_string(), entry("live", "Live Name"));
+        assert_eq!(
+            display_entry(&e, "archive", "live").and_then(|p| p.name),
+            Some("Live Name".into())
+        );
+        // An unaliased key never borrows another's profile.
+        assert!(display_entry(&e, "solo", "solo").is_none());
     }
 }
