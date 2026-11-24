@@ -76,6 +76,8 @@ pub mod auto_grant;
 pub mod grant_backlog;
 pub mod grant_ledger;
 pub mod grant_paging;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod grant_paging_local_relay;
 #[cfg(test)]
 mod grant_sync_sim;
 pub mod inbox_key;

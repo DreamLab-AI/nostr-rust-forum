@@ -118,6 +118,28 @@ fn fixture() -> &'static Fixture {
     })
 }
 
+/// Where a session's pages come from: `until` (inclusive, none for page 0)
+/// in, the page's wraps out with the timestamp the relay ordered them by.
+pub(super) trait PageSource {
+    fn page(&mut self, until: Option<u64>) -> Vec<(NostrEvent, u64)>;
+}
+
+/// A [`FakeRelay`] over real wraps.
+struct SimRelay<'a> {
+    relay: FakeRelay,
+    events: &'a HashMap<String, NostrEvent>,
+}
+
+impl PageSource for SimRelay<'_> {
+    fn page(&mut self, until: Option<u64>) -> Vec<(NostrEvent, u64)> {
+        self.relay
+            .query(until)
+            .into_iter()
+            .map(|(id, ts)| (self.events[&id].clone(), ts))
+            .collect()
+    }
+}
+
 /// Decides whether decrypt call `n` (with this sender pubkey) is denied.
 type DenyFn = Box<dyn Fn(u64, &str) -> bool>;
 
@@ -125,14 +147,14 @@ type DenyFn = Box<dyn Fn(u64, &str) -> bool>;
 /// `deny(n, sender)` decides call `n` (from 0) with the outer or inner
 /// sender pubkey; a denial is the same `DecryptionFailed` the real NIP-07
 /// glue returns for a refused prompt.
-struct Ext {
+pub(super) struct Ext {
     key: PrfSigner,
-    calls: Cell<u64>,
+    pub(super) calls: Cell<u64>,
     deny: DenyFn,
 }
 
 impl Ext {
-    fn new(key: PrfSigner, deny: impl Fn(u64, &str) -> bool + 'static) -> Self {
+    pub(super) fn new(key: PrfSigner, deny: impl Fn(u64, &str) -> bool + 'static) -> Self {
         Self {
             key,
             calls: Cell::new(0),
@@ -175,23 +197,25 @@ impl Signer for Ext {
 
 /// What one simulated sign-in ended with.
 #[derive(Debug)]
-struct Outcome {
-    keys: HashSet<(String, u32)>,
-    backlog: GrantBacklog,
-    end: PagerAction,
-    markers: Vec<GrantScope>,
-    pages: u32,
+pub(super) struct Outcome {
+    pub(super) keys: HashSet<(String, u32)>,
+    pub(super) backlog: GrantBacklog,
+    pub(super) end: PagerAction,
+    pub(super) markers: Vec<GrantScope>,
+    pub(super) pages: u32,
+    /// Distinct wraps delivered.
+    pub(super) delivered: usize,
     /// Fake clock at the end (ms).
-    now: f64,
+    pub(super) now: f64,
 }
 
 /// One sign-in's grant sync for the identity scope, the way the store runs
 /// it: wraps queued as pages deliver them, at most the queue's limit
 /// running between deliveries, then the queue drained.
-struct Session<'a> {
+pub(super) struct Session<'a> {
     signer: &'a dyn Signer,
     kind: SignerKind,
-    events: &'a HashMap<String, NostrEvent>,
+    events: HashMap<String, NostrEvent>,
     admin: &'a dyn Fn(&str) -> Option<bool>,
     processed: &'a RefCell<HashSet<String>>,
     queue: WrapQueue<String>,
@@ -202,10 +226,9 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    fn new(
+    pub(super) fn new(
         signer: &'a dyn Signer,
         kind: SignerKind,
-        events: &'a HashMap<String, NostrEvent>,
         admin: &'a dyn Fn(&str) -> Option<bool>,
         processed: &'a RefCell<HashSet<String>>,
     ) -> Self {
@@ -214,7 +237,7 @@ impl<'a> Session<'a> {
         Self {
             signer,
             kind,
-            events,
+            events: HashMap::new(),
             admin,
             processed,
             queue,
@@ -231,12 +254,14 @@ impl<'a> Session<'a> {
     }
 
     /// `ZoneKeyStore::wrap_handler`.
-    fn deliver(&mut self, id: &str) {
-        if !self.seen.insert(id.to_string()) || self.processed.borrow().contains(id) {
+    fn deliver(&mut self, ev: NostrEvent) {
+        let id = ev.id.clone();
+        self.events.entry(id.clone()).or_insert(ev);
+        if !self.seen.insert(id.clone()) || self.processed.borrow().contains(&id) {
             return;
         }
         self.backlog.wrap_started();
-        self.queue.push(id.to_string());
+        self.queue.push(id);
     }
 
     /// Run up to `budget` queued wraps (`ZoneKeyStore::run_wrap`).
@@ -266,8 +291,8 @@ impl<'a> Session<'a> {
 
     /// `ZoneKeyStore::process_wrap`, minus IndexedDB.
     fn process(&mut self, id: &str, attempt: Attempt) -> WrapOutcome {
-        let ev = &self.events[id];
-        let opened = block_on(open_for_sync(ev, None, self.signer, self.kind, attempt));
+        let ev = self.events[id].clone();
+        let opened = block_on(open_for_sync(&ev, None, self.signer, self.kind, attempt));
         let (sealer, rumor, opener) = match opened {
             Ok(v) => v,
             Err(outcome) => return outcome,
@@ -295,16 +320,16 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn sync(mut self, relay: &mut FakeRelay, marker: Option<u64>) -> Outcome {
+    pub(super) fn sync(mut self, relay: &mut dyn PageSource, marker: Option<u64>) -> Outcome {
         let mut pager = ScopePager::new();
         let mut until = None;
         let mut pages = 1;
         let end = loop {
             let page = pager.current_page().expect("pager running");
-            for (id, ts) in relay.query(until) {
-                let processed = self.processed.borrow().contains(&id);
-                pager.observe(page, &id, ts, processed);
-                self.deliver(&id);
+            for (ev, ts) in relay.page(until) {
+                let processed = self.processed.borrow().contains(&ev.id);
+                pager.observe(page, &ev.id, ts, processed);
+                self.deliver(ev);
             }
             // Wraps open while the next page is in flight.
             self.run(25);
@@ -330,6 +355,7 @@ impl<'a> Session<'a> {
         self.run(usize::MAX);
         let markers = self.backlog.take_due_markers();
         Outcome {
+            delivered: self.events.len(),
             keys: self.keys,
             backlog: self.backlog,
             end,
@@ -338,6 +364,10 @@ impl<'a> Session<'a> {
             now: self.now,
         }
     }
+}
+
+fn sim(relay: FakeRelay, events: &HashMap<String, NostrEvent>) -> SimRelay<'_> {
+    SimRelay { relay, events }
 }
 
 fn all_admin(f: &'static Fixture) -> impl Fn(&str) -> Option<bool> {
@@ -359,8 +389,8 @@ fn a_local_key_settles_every_grant_past_the_first_page() {
     let (events, admin) = (f.events(), all_admin(f));
     let processed = RefCell::new(HashSet::new());
     let member = f.member();
-    let o = Session::new(&member, SignerKind::Local, &events, &admin, &processed)
-        .sync(&mut f.relay(), None);
+    let o = Session::new(&member, SignerKind::Local, &admin, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     settled_with_every_key(&o, f);
     assert!(o.pages >= 3, "{} pages", o.pages);
 }
@@ -381,8 +411,8 @@ fn a_cooperative_nip07_signer_settles_every_grant() {
     let (events, admin) = (f.events(), all_admin(f));
     let processed = RefCell::new(HashSet::new());
     let ext = Ext::new(f.member(), |_, _| false);
-    let o = Session::new(&ext, SignerKind::CanRefuse, &events, &admin, &processed)
-        .sync(&mut f.relay(), None);
+    let o = Session::new(&ext, SignerKind::CanRefuse, &admin, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     settled_with_every_key(&o, f);
     // Two decrypts per wrap (wrap layer, seal layer), nothing repeated.
     assert_eq!(ext.calls.get(), 2 * (DMS + GRANTS) as u64);
@@ -397,8 +427,8 @@ fn denied_prompts_then_an_approval_recover_every_wrap() {
     let (events, admin) = (f.events(), all_admin(f));
     let processed = RefCell::new(HashSet::new());
     let ext = Ext::new(f.member(), |n, _| n < 4);
-    let o = Session::new(&ext, SignerKind::CanRefuse, &events, &admin, &processed)
-        .sync(&mut f.relay(), None);
+    let o = Session::new(&ext, SignerKind::CanRefuse, &admin, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     settled_with_every_key(&o, f);
     assert_eq!(o.backlog.retrying(), 0);
 }
@@ -412,8 +442,8 @@ fn an_extension_locked_mid_backlog_recovers_after_unlock() {
     let (events, admin) = (f.events(), all_admin(f));
     let processed = RefCell::new(HashSet::new());
     let ext = Ext::new(f.member(), |n, _| (1_000..1_400).contains(&n));
-    let o = Session::new(&ext, SignerKind::CanRefuse, &events, &admin, &processed)
-        .sync(&mut f.relay(), None);
+    let o = Session::new(&ext, SignerKind::CanRefuse, &admin, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     settled_with_every_key(&o, f);
 }
 
@@ -428,8 +458,8 @@ fn a_junk_wrap_under_nip07_is_unreadable_after_one_retry() {
     let processed = RefCell::new(HashSet::new());
     let junk_sender = f.wraps[7].1.pubkey.clone();
     let ext = Ext::new(f.member(), move |_, sender| sender == junk_sender);
-    let o = Session::new(&ext, SignerKind::CanRefuse, &events, &admin, &processed)
-        .sync(&mut f.relay(), None);
+    let o = Session::new(&ext, SignerKind::CanRefuse, &admin, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     settled_with_every_key(&o, f);
     assert!(!processed.borrow().contains(&f.wraps[7].0), "left unmarked");
     // Every other wrap: two decrypts. The junk wrap: two attempts at its
@@ -445,8 +475,8 @@ fn every_prompt_denied_leaves_the_backlog_open_without_a_marker() {
     let (events, admin) = (f.events(), all_admin(f));
     let processed = RefCell::new(HashSet::new());
     let ext = Ext::new(f.member(), |_, _| true);
-    let o = Session::new(&ext, SignerKind::CanRefuse, &events, &admin, &processed)
-        .sync(&mut f.relay(), None);
+    let o = Session::new(&ext, SignerKind::CanRefuse, &admin, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     assert!(o.keys.is_empty());
     assert!(!o.backlog.settled());
     assert_eq!(o.backlog.phase(o.now + 30_000.0), KeyPhase::Stalled);
@@ -464,8 +494,8 @@ fn a_local_key_never_parks_a_wrap() {
     let other = PrfSigner::new(generate_keypair().unwrap());
     // Wraps are addressed to the member, not to `other`: not a key held
     // here, so nothing is even decrypted, and nothing is held.
-    let o = Session::new(&other, SignerKind::Local, &events, &admin, &processed)
-        .sync(&mut f.relay(), None);
+    let o = Session::new(&other, SignerKind::Local, &admin, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     assert!(o.keys.is_empty());
     assert!(o.backlog.settled());
 }
@@ -481,8 +511,8 @@ fn a_retry_mid_backlog_writes_no_marker_and_the_next_session_recovers() {
     let processed = RefCell::new(HashSet::new());
     let member = f.member();
     let down = |_: &str| None;
-    let first = Session::new(&member, SignerKind::Local, &events, &down, &processed)
-        .sync(&mut f.relay(), None);
+    let first = Session::new(&member, SignerKind::Local, &down, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     assert_eq!(first.end, PagerAction::Done { verified: true });
     assert!(first.keys.is_empty());
     assert_eq!(first.backlog.retrying(), GRANTS);
@@ -491,8 +521,8 @@ fn a_retry_mid_backlog_writes_no_marker_and_the_next_session_recovers() {
     assert_eq!(processed.borrow().len(), DMS, "DMs settled, grants left");
 
     let admin = all_admin(f);
-    let second = Session::new(&member, SignerKind::Local, &events, &admin, &processed)
-        .sync(&mut f.relay(), None);
+    let second = Session::new(&member, SignerKind::Local, &admin, &processed)
+        .sync(&mut sim(f.relay(), &events), None);
     settled_with_every_key(&second, f);
     assert_eq!(second.pages, first.pages, "no marker: walked to the end");
 }
@@ -502,21 +532,28 @@ fn a_retry_mid_backlog_writes_no_marker_and_the_next_session_recovers() {
 #[test]
 fn a_warm_session_stops_early_and_still_finds_a_new_grant() {
     let f = fixture();
-    let events = f.events();
+    let mut events = f.events();
     let processed = RefCell::new(HashSet::new());
     let member = f.member();
     let admin = all_admin(f);
     // Below the fixture, 3,000 older wraps an earlier session processed
-    // (skipped before any decrypt, so they need no crypto here).
+    // (skipped before any decrypt, so placeholders stand in for them).
     let mut history = f.relay();
     let bottom = history.rows.last().unwrap().1;
     for i in 0..3_000u64 {
         let id = format!("old{i:05}");
         processed.borrow_mut().insert(id.clone());
+        events.insert(
+            id.clone(),
+            NostrEvent {
+                id: id.clone(),
+                ..f.wraps[0].1.clone()
+            },
+        );
         history.rows.push((id, bottom - 1 - i));
     }
-    let cold = Session::new(&member, SignerKind::Local, &events, &admin, &processed)
-        .sync(&mut history.clone(), None);
+    let cold = Session::new(&member, SignerKind::Local, &admin, &processed)
+        .sync(&mut sim(history.clone(), &events), None);
     settled_with_every_key(&cold, f);
     // The marker is written well after every stored wrap...
     let marker = 1_900_000_000 + super::grant_paging::WARM_STOP_MARGIN_SECS + 1;
@@ -531,14 +568,13 @@ fn a_warm_session_stops_early_and_still_finds_a_new_grant() {
         100,
     ))
     .unwrap();
-    let mut events = events.clone();
     events.insert(fresh.id.clone(), fresh.clone());
     let mut relay = history;
     relay.rows.insert(0, (fresh.id.clone(), marker - 3_600));
     let fresh_admin = admin_signer.public_key().to_string();
     let admin2 = move |pk: &str| Some(pk == fresh_admin);
-    let warm = Session::new(&member, SignerKind::Local, &events, &admin2, &processed)
-        .sync(&mut relay, Some(marker));
+    let warm = Session::new(&member, SignerKind::Local, &admin2, &processed)
+        .sync(&mut sim(relay, &events), Some(marker));
     assert_eq!(warm.keys, HashSet::from([("fresh".to_string(), 1)]));
     assert!(warm.backlog.settled());
     assert!(warm.pages < cold.pages, "{} < {}", warm.pages, cold.pages);
