@@ -551,6 +551,7 @@ mod tests {
             agent_keys: false,
             auto_approve: false,
             kanban: false,
+            search: None,
         }
     }
 
