@@ -150,5 +150,14 @@ step 4): add an `epoch` column to the admin epoch-registration, have the relay a
 `current+1`. `ZONE_GROUPS_ENABLED` MUST NOT be enabled on any deployment until that lands. Until
 then the flag stays off and the squat is unreachable (the gate only runs with the flag on).
 
+> Note 2026-11-24: a second prerequisite, from the security re-review of kit PR #95, recorded as KF-34 in
+> `docs/security/known-findings.md`. A ticket whose signer the session's bindings bind to no zone
+> (`TicketVerdict::Unbound`, `crates/nostr-bbs-forum-client/src/zone_crypto/tickets.rs:580`) is left unmarked without
+> holding the grant backlog, so a forged ticket cannot force a full walk every session; but a genuine ticket whose
+> binding becomes visible only later (a Hidden zone omitted from NIP-11, a stale cache, a binding published after the
+> ticket) is then lost on a warm device. Before `ZONE_GROUPS_ENABLED` is turned on, Unbound ticket wraps must be kept
+> (a small capped per-owner store) and re-judged when bindings load. Not live: the flag defaults off and the owner
+> flow has no caller. No front-matter status changes.
+
 Interim defence-in-depth shipped flagged-off: a per-event cap on honoured `zk` tags, and an
 admin reset path for `zone_epoch_keys`.

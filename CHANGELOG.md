@@ -26,7 +26,7 @@ Forum client only. Not yet exercised in a browser or on a live relay; see "Not v
   most 1,000 rows, newest first; zone-key grants are usually the oldest. Each grant scope (identity, and inbox with
   `RECIPIENT_KEYS_ENABLED`) now pages with an inclusive `until` at the oldest wrap seen, one page subscription at a time,
   each closed at its EOSE, by the deletion sync's rule (`deletion_sync::next_page_within`). The state is
-  `zone_crypto::grant_paging::ScopePager` (`grant_paging.rs:352`); `ZoneKeyStore::run_scope` and `after_page`
+  `zone_crypto::grant_paging::ScopePager` (`grant_paging.rs:357`); `ZoneKeyStore::run_scope` and `after_page`
   (`store.rs:784`, `:841`) only open and close what it asks for. Bound: page 0 plus `GRANT_MAX_PAGES` = 50 pages
   (51,000 wraps, `grant_paging.rs:108`), separate from the deletion sync's 20; giving up leaves the backlog unsettled
   (keys-timed-out copy, never "not found") and writes no marker (KF-32). An empty later page is asked again with the
@@ -77,8 +77,16 @@ Forum client only. Not yet exercised in a browser or on a live relay; see "Not v
      generation they ran in, the signer kind travels with each queued wrap, and `note_signer_success` checks the
      lease. Test: `a_success_from_before_a_switch_does_not_count`.
   Recorded, not fixed here: KF-33 (junk wraps sharing one timestamp can make grant paging give up).
+- **Security re-review fix (2026-11-24, review of `76f1184`).** An empty page 0 ended the walk verified, but a failed D1
+  query looks the same (KF-31): the backlog settled and a fresh marker was written, which could put a wrap that landed
+  since below the next warm stop. An empty page 0 is now done but unverified (no marker; a member with no wraps loses
+  nothing). Tests: `empty_first_page_is_done_but_unverified`, and
+  `a_failed_page_zero_writes_no_marker_and_a_late_grant_is_still_reached` (two sessions, with a fresh-marker control).
+  The relay's `tests/nip_handlers_tests.rs` now takes its drift constant from core. Recorded: KF-34 (an Unbound
+  ticket whose binding appears later is lost on warm devices; blocks enabling `ZONE_GROUPS_ENABLED`) and KF-35 (a
+  junk wrap pins the floor, so NIP-07 members walk all newer history each session).
 - **Tests.** 1,119 forum-client tests on the rebased base, 1,157 after (one more ignored); 1,166 after the security
-  review fixes. New: `ScopePager` against a fake
+  review fixes, 1,167 after the re-review fix. New: `ScopePager` against a fake
   relay (just over a page, multi-page, shared timestamps at boundaries, a page of one timestamp, inside and beyond the
   bound, 21 pages, deleted boundary, one and two failed queries, warm stop, a replayed page, live wraps);
   `WrapQueue`; `GrantBacklog`; `grant_sync_sim` with real NIP-59 wraps and mock NIP-07 signers (cooperative, denied then
