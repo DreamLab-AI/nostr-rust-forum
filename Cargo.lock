@@ -3284,6 +3284,7 @@ dependencies = [
  "nostr",
  "nostr-bbs-core",
  "nostr-bbs-poker",
+ "nostr-bbs-sealed-search",
  "qrcode",
  "send_wrapper",
  "serde",
@@ -3483,6 +3484,20 @@ dependencies = [
  "unicode-general-category",
  "unicode-normalization",
  "zeroize",
+]
+
+[[package]]
+name = "nostr-bbs-sealed-search-worker"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "js-sys",
+ "nostr-bbs-sealed-search",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

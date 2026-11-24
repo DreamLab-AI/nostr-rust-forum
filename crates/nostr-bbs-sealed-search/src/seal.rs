@@ -26,11 +26,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::str::FromStr;
 
 use bech32::{ToBase32, Variant};
-use hkdf::Hkdf;
-use sha2::Sha256;
 use zeroize::Zeroizing;
 
-const SALT: &[u8] = b"nostr-bbs/sealed-search/v1";
+pub use crate::kdf::SearchKey;
 /// age STREAM plaintext chunk size.
 pub const CHUNK: usize = 64 * 1024;
 /// age STREAM ciphertext chunk size (plaintext + 16-byte tag).
@@ -38,56 +36,23 @@ pub const CT_CHUNK: usize = CHUNK + 16;
 /// Length of the payload nonce that follows the age header.
 const NONCE_LEN: usize = 16;
 
-/// The derived per-(zone, epoch) search key (`okm`). Zeroised on drop.
-#[derive(Clone)]
-pub struct SearchKey(Zeroizing<[u8; 32]>);
+fn identity(key: &SearchKey) -> age::x25519::Identity {
+    let s = Zeroizing::new(
+        bech32::encode("age-secret-key-", key.bytes().to_base32(), Variant::Bech32)
+            .expect("valid hrp")
+            .to_uppercase(),
+    );
+    age::x25519::Identity::from_str(&s).expect("32-byte bech32 identity")
+}
 
-impl SearchKey {
-    /// Derive from the zone epoch secret. `zone_pk` is the x-only public key
-    /// of that secret, so builder and client can only agree when they hold
-    /// the same epoch key (review M3).
-    pub fn derive(zone_secret: &[u8; 32], zone: &str, epoch: u32, zone_pk: &[u8; 32]) -> Self {
-        let mut info = Vec::with_capacity(48 + zone.len());
-        info.extend_from_slice(b"age-x25519\0");
-        info.extend_from_slice(zone.as_bytes());
-        info.push(0);
-        info.extend_from_slice(&epoch.to_be_bytes());
-        info.extend_from_slice(zone_pk);
-        let mut okm = Zeroizing::new([0u8; 32]);
-        Hkdf::<Sha256>::new(Some(SALT), zone_secret)
-            .expand(&info, okm.as_mut())
-            .expect("32 bytes is a valid HKDF-SHA256 length");
-        Self(okm)
-    }
-
-    /// Wrap raw `okm` bytes (as received by the worker).
-    pub fn from_bytes(b: [u8; 32]) -> Self {
-        Self(Zeroizing::new(b))
-    }
-
-    /// Raw `okm` bytes (to post to the worker).
-    pub fn bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    fn identity(&self) -> age::x25519::Identity {
-        let s = Zeroizing::new(
-            bech32::encode("age-secret-key-", self.0.to_base32(), Variant::Bech32)
-                .expect("valid hrp")
-                .to_uppercase(),
-        );
-        age::x25519::Identity::from_str(&s).expect("32-byte bech32 identity")
-    }
-
-    /// The age recipient this key opens.
-    pub fn recipient(&self) -> age::x25519::Recipient {
-        self.identity().to_public()
-    }
+/// The age recipient a search key opens.
+pub fn recipient(key: &SearchKey) -> age::x25519::Recipient {
+    identity(key).to_public()
 }
 
 /// Seal `plain` to the key's recipient (one fresh file key per object).
 pub fn seal(key: &SearchKey, plain: &[u8]) -> Result<Vec<u8>, String> {
-    let r = key.recipient();
+    let r = recipient(key);
     let enc = age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient))
         .map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(plain.len() + plain.len() / CHUNK * 16 + 256);
@@ -98,7 +63,7 @@ pub fn seal(key: &SearchKey, plain: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn decryptor<R: Read>(key: &SearchKey, r: R) -> Result<age::stream::StreamReader<R>, String> {
-    let id = key.identity();
+    let id = identity(key);
     age::Decryptor::new(r)
         .map_err(|e| e.to_string())?
         .decrypt(std::iter::once(&id as &dyn age::Identity))
@@ -128,12 +93,20 @@ pub fn chunk_range(header_len: usize, total: usize, i: usize) -> (usize, usize) 
 }
 
 /// The ciphertext ranges needed to read plaintext `[off, off + len)`: the
-/// header plus nonce, and every chunk the range touches.
+/// header plus nonce, every chunk the range touches, and the **final** chunk
+/// (age's `StreamReader` reads it on a forward seek to learn the plaintext
+/// length).
 pub fn ranges_for(header_len: usize, total: usize, off: usize, len: usize) -> Vec<(usize, usize)> {
     let mut v = vec![(0, header_len + NONCE_LEN)];
     let (a, b) = (off / CHUNK, (off + len.max(1) - 1) / CHUNK);
     for i in a..=b {
         v.push(chunk_range(header_len, total, i));
+    }
+    let payload = total.saturating_sub(header_len + NONCE_LEN);
+    let last = payload.saturating_sub(1) / CT_CHUNK;
+    let r = chunk_range(header_len, total, last);
+    if !v.contains(&r) {
+        v.push(r);
     }
     v
 }
@@ -222,29 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn derivation_is_domain_separated() {
-        let a = key("zone2", 1);
-        assert_eq!(a.bytes(), key("zone2", 1).bytes());
-        assert_ne!(a.bytes(), key("zone2", 2).bytes());
-        assert_ne!(a.bytes(), key("zone3", 1).bytes());
-        assert_ne!(a.bytes(), SearchKey::derive(&[8u8; 32], "zone2", 1, &[1u8; 32]).bytes());
-        assert_ne!(a.bytes(), SearchKey::derive(&[9u8; 32], "zone2", 1, &[2u8; 32]).bytes());
-        // okm is not the zone secret.
-        assert_ne!(a.bytes(), &[9u8; 32]);
-    }
-
-    #[test]
-    fn hkdf_known_answer() {
-        // RFC 5869 test case 1, through the same hkdf crate path.
-        let ikm = [0x0bu8; 22];
-        let salt: Vec<u8> = (0x00..=0x0c).collect();
-        let info: Vec<u8> = (0xf0..=0xf9).collect();
-        let mut okm = [0u8; 42];
-        Hkdf::<Sha256>::new(Some(&salt), &ikm).expand(&info, &mut okm).unwrap();
-        assert_eq!(hex::encode(okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
-    }
-
-    #[test]
     fn seal_open_roundtrip_and_wrong_key_fails() {
         let k = key("zone2", 1);
         let plain: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
@@ -261,6 +211,30 @@ mod tests {
         let hl = header_len(&s).unwrap();
         let cut = chunk_range(hl, s.len(), 2).0;
         assert!(open(&k, &s[..cut]).is_err());
+    }
+
+    #[test]
+    fn many_seeks_in_a_large_object_need_only_planned_chunks() {
+        // 2 MB object, rows read out of order with one decryptor: the shape
+        // of a real rescore (this failed in the browser before the final
+        // chunk was planned).
+        let k = key("zone2", 1);
+        let plain: Vec<u8> = (0..2_000_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        let s = seal(&k, &plain).unwrap();
+        let hl = header_len(&s).unwrap();
+        let wanted = [(1_500_000usize, 388usize), (70_000, 388), (1_999_000, 388), (0, 388), (900_123, 388)];
+        let mut parts: Vec<(usize, Vec<u8>)> = Vec::new();
+        for &(o, l) in &wanted {
+            for (a, b) in ranges_for(hl, s.len(), o, l) {
+                if !parts.iter().any(|p| p.0 == a) {
+                    parts.push((a, s[a..b].to_vec()));
+                }
+            }
+        }
+        let got = open_ranges(&k, SparseReader::new(s.len(), parts), &wanted).unwrap();
+        for ((o, l), g) in wanted.iter().zip(got) {
+            assert_eq!(g, plain[*o..o + l]);
+        }
     }
 
     #[test]

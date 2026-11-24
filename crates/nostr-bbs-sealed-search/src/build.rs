@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::format::{encode_bin, encode_int8, Header, Kind, Scope, MAX_ROWS};
 use crate::manifest::{object_name, Content, ObjectRef};
-use crate::model::DIM;
+use crate::DIM;
 use crate::quant::{encode_i8, sign_code};
 use crate::search::sha256_hex;
 use crate::seal::{seal, SearchKey};

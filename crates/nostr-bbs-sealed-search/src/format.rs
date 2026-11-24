@@ -16,7 +16,7 @@
 //!
 //! All integers little-endian.
 
-use crate::model::DIM;
+use crate::DIM;
 use crate::quant::{CODE_BYTES, I8_ROW_BYTES};
 
 const MAGIC: &[u8; 4] = b"NBSS";

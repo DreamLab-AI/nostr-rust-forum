@@ -5,7 +5,7 @@
 //! Same sign-code convention and lookup-table scorer as the search worker's
 //! RVF v2 index (`nostr-bbs-search-worker/src/shard.rs`).
 
-use crate::model::DIM;
+use crate::DIM;
 
 /// Bytes per sign code.
 pub const CODE_BYTES: usize = DIM / 8;

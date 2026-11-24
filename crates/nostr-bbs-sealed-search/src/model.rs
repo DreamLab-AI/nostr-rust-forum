@@ -22,8 +22,7 @@ use candle_core::{Device, Module, Tensor};
 
 use crate::wordpiece::WordPiece;
 
-/// Embedding dimension.
-pub const DIM: usize = 384;
+pub use crate::DIM;
 const LAYERS: usize = 12;
 const HEADS: usize = 12;
 const HEAD_DIM: usize = DIM / HEADS;

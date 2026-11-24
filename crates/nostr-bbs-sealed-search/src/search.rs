@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::format::{int8_row_offset, BinLayer, Header, Kind, Scope};
 use crate::manifest::{Content, ObjectRef};
-use crate::model::DIM;
+use crate::DIM;
 use crate::quant::{dot_i8, top_r, Candidate, QueryLut, I8_ROW_BYTES};
 use crate::seal::{self, header_len, open_range, ranges_for, SearchKey, SparseReader};
 
@@ -172,7 +172,9 @@ impl Index {
         check_sealed(&o, prefix, total, None)?;
         let key = self.keys.get(&(o.epoch, o.zone_pk.to_lowercase())).ok_or("no key")?;
         let hl = header_len(prefix).ok_or("no age header")?;
-        let want = ranges_for(hl, total, 0, 1);
+        // Header + nonce + chunk 0: reading from the start involves no
+        // forward seek, so the final chunk is not needed here.
+        let want = [(0, hl + 16), seal::chunk_range(hl, total, 0)];
         let parts: Vec<(usize, Vec<u8>)> = want
             .iter()
             .map(|&(a, b)| prefix.get(a..b).map(|x| (a, x.to_vec())).ok_or("prefix too short"))
