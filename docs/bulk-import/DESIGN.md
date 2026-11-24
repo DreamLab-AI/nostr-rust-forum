@@ -1,6 +1,6 @@
 # Bulk import: design
 
-Status: **draft for review** (2026-11-24). Reviews are appended in §15.
+Status: **revised after the architecture review** (2026-11-24); security review in §15.
 
 A kit-native pipeline that loads an external chat archive (Keybase today; Discord,
 Slack or Matrix through new adapters) into a forum deployment **offline**, seals the
@@ -25,12 +25,15 @@ Goals
 * Every step is offline, resumable and idempotent. Re-running any step with the same
   inputs changes nothing.
 * Nothing the tool does can reach a production service. **The crate makes no network
-  calls at all** (no HTTP or WebSocket client in its dependency tree). Remote steps
-  (D1 upload, R2 copy, admin calls) are written out as a plan and a runbook for the
-  operator to run.
-* Reuse kit crates (`nostr-bbs-core` for events, keys, NIP-44, gift wraps and the
-  whitelist SQL; `nostr-bbs-zone-migrate` for sealing; `nostr-bbs-search-build` for
-  the sealed search index) instead of copying them.
+  calls at all**: no HTTP or WebSocket client in its runtime dependency tree (it does
+  not link `nostr-bbs-zone-migrate`, whose library carries one; that crate is a
+  dev-dependency for the end-to-end test only). Remote steps (D1 upload, R2 copy,
+  admin calls) are written out as a plan and a runbook for the operator to run.
+* Reuse kit tools instead of copying them: `nostr-bbs-core` (events, keys, NIP-19,
+  gift wraps, the whitelist SQL) as a library; `nostr-bbs-zone-migrate` (sealing) and
+  `nostr-bbs-search-build` (sealed search) through their CLIs, whose contracts are
+  documented; their file formats (channels file, sealed envelopes, search input rows)
+  are produced or read here.
 
 Non-goals
 
@@ -65,8 +68,8 @@ All state lives in a **work directory** (`--work DIR`, created 0700, files 0600)
 | `target.json` | operator | no |
 | `keys.json` | `keys` | **yes** (0600, never logged) |
 | `media/` + `media/manifest.json` | `media` | no |
-| `state/<db-fingerprint>/ledger.jsonl`, `run.json` | `build` | no |
-| `seal/channels.json` | `seal-prep` | no |
+| `state/ledger.jsonl`, `state/run.json` | `build` | no |
+| `seal/channels.json`, `seal/RUNBOOK.md` | `seal-prep` | no |
 | `search/docs.jsonl` | `search-input` | plaintext (0600, delete after the index build) |
 | `upload/` | `upload-plan` | no |
 
@@ -78,7 +81,7 @@ Full spec: `FORMAT.md`. Summary:
 archive/
   manifest.json        {"format":"nostr-bbs-bulk-import","version":1,"source":"keybase","source_id":"<team>",
                         "exported_at":<unix>,"counts":{…}}
-  authors.jsonl        {"id","handle","display_name"?,"about"?,"avatar"?:{"sha256","path"},"bot"?:bool}
+  authors.jsonl        {"id","handle","display_name"?,"about"?,"bot"?:bool}
   channels.jsonl       {"id","name","topic"?,"created_at"?}
   messages.jsonl       {"id","channel","author","created_at","text","reply_to"?,"edited_at"?,
                         "attachments"?:[{"sha256","path"?,"filename","mime","bytes","status"}]}
@@ -95,6 +98,13 @@ in any channel or one absent from the archive (the planner decides what an unres
 reply becomes); attachment `path` is relative and is canonicalised and confined to the
 archive root before any read; `status` is `ok` | `unavailable` | `skipped` (with
 `filename`, `mime`, `bytes` kept so a placeholder line can be written).
+
+Limits of v1, by design: no thread concept separate from the channel (a Slack
+`thread_ts`, Discord thread or Matrix `m.thread` maps to `reply_to` the thread's first
+message); mentions stay text (no `p`-tag rewriting); system messages (joins, pins) are
+dropped by the adapter; `sha256`/`path` exist only when `status` is `ok`; the writer
+holds the archive in memory (fine to a few hundred thousand messages; an external sort
+is a follow-up).
 
 Adapters: a Rust trait
 
@@ -172,6 +182,7 @@ different key.
 * **Section rule.** The forum client routes a kind-40 by its `section` tag: equal to a
   zone id or `<zone-id>-…`, otherwise it falls through to the first zone silently.
   The planner refuses any section that does not start with its thread's zone id.
+* Cross-thread replies become the note line (a `quote` must stay inside the thread).
 * New threads get a kind-40 signed by the archivist with `["section",…]` and
   `["zone",<zone id>]` tags (what the admin UI publishes), plus a `channel_creators`
   row and a `channel_zones` row (§7). Existing threads must already be stored in the
@@ -181,14 +192,15 @@ different key.
   `["e",<topic root>,"","reply"]`, `["p",<root author>]`, and for a reply to an imported
   message `["e",<parent>,"","quote"]` (+ `["p",<parent author>]`). An unresolved reply
   gets a first line `↪ reply to <handle> (<date>)` or `↪ reply to a message that was
-  not migrated`. A `["source","<source>:<source_id>#<message id>"]` tag records
-  provenance (the Node tool used `keybase`; the new tag name is source-neutral).
+  not migrated`. An `["import","<source>:<source_id>#<key>"]` tag on every emitted event
+  records provenance and rebuilds the ledger (§7; the Node tool used `keybase`; no kit
+  code reads either tag).
 * **Outer tags are the sealer's.** The build never writes `zk` or `sealed` tags;
   `seal_original` copies the reply link outward itself. A test asserts it.
 * **Reactions** are folded into the target message's text
   (`— reactions: 👍 ×3 (alice, bob, carol)`), never kind-7: the relay's retention
   sweep deletes kind 7 after 30 days.
-* Long text is truncated at 60 000 characters with a marker.
+* Long text is cut so the signed event fits the sealing budget (§7).
 
 ## 6. Media
 
@@ -202,167 +214,205 @@ different key.
   coders are refused, a policy-restricted environment is set, and an image that fails
   to strip is **never** uploaded raw (it may carry GPS). EXIF `DateTimeOriginal` and the
   first send time are kept in `media/manifest.json`, not in the stored bytes.
-* **Placement.** Zone media go to `pods/<owner>/media/zones/<zone>/<sha16>.webp` (+
-  `_thumb.webp`): only zone members can read them (pod zone ACL). The owner is the
-  archivist by default (one pod to provision and size), or each author's signing key
-  (`--media-owner author`). Zone containers accept only image types; other attachment
+* **Placement.** Zone media go to `pods/<archivist>/media/zones/<zone>/<sha16>.webp`
+  (+ `_thumb.webp`): only zone members can read them (pod zone ACL), and one pod is
+  provisioned and sized. (Per-author placement is a follow-up.) Zone containers accept only image types; other attachment
   kinds become `[video|audio|pdf|file not migrated: name, size, date]` lines. URLs are
   built from `target.json` (`pod.http`).
 * **Quota.** `media plan` totals bytes per owner pod and refuses when a pod exceeds
   `--pod-quota-mb` (default the kit's 50 MiB built-in, or the deployment's
   `POD_QUOTA_MB`), naming the admin `/.quota` override.
 * **Upload manifest.** `upload/r2-objects.jsonl`: `{key, file, content_type, bytes,
-  sha256, owner}`; the runbook turns it into `wrangler r2 object put` lines. A bulk
-  R2 put bypasses the pod's `quota_usage` accounting: the runbook says to set the owner
-  pod's admin limit first and records the gap (§14).
+  sha256, owner}`; the runbook turns it into `wrangler r2 object put` lines. A bulk R2
+  put bypasses the pod's accounting, so `upload/quota.sql` (for the auth database,
+  `REPLAY_DB`, which holds `quota_usage`) raises the archivist pod's `used_bytes` by the
+  uploaded total (`MAX`, idempotent). The pod must be provisioned through the pod API
+  (first sign-in) before its listing shows the objects.
 * **Cutover copy.** `upload/r2-copy.jsonl` lists objects that must move bucket to
   bucket at the identical key (e.g. verbatim live posts that link the old pod).
 
 ## 7. Build: local D1 with ingest parity
 
 Port of the Node `d1.mjs`/`fold-publish.mjs` (INGEST-PARITY.md), extended to the rows
-the offline target can no longer get from admin endpoints:
+the offline target can no longer get from admin endpoints. Written **directly into the
+local D1 SQLite file** (the miniflare file under `--persist-to`, or any SQLite built
+from the relay migrations), one `BEGIN IMMEDIATE` transaction per batch, with the stack
+**down** (the tool refuses a locked file). There is no SQL-file mode for the build:
+it could not know whether a chunk was applied.
 
 | Row | How |
 |---|---|
-| `events` | `INSERT … WHERE NOT EXISTS (deleted_events …) ON CONFLICT (id) DO NOTHING`; replaceable (0, 3, 10000–19999) and addressable kinds use the relay's insert-if-not-beaten + prune pair; `d_tag`, `received_at` = build time; `created_at` = original |
-| `event_tags` | **never by hand**: the relay trigger `trg_event_tags_ai_v3` fills it; `build` refuses without it |
+| `events` | `INSERT … WHERE NOT EXISTS (deleted_events …) ON CONFLICT (id) DO NOTHING`; replaceable kinds (0, 3, 10000–19999) use the relay's insert-if-not-beaten + prune pair; `d_tag`, `received_at` = build time; `created_at` = original |
+| `event_tags` | **never by hand**: the relay trigger `trg_event_tags_ai_v3` fills it (DISTINCT `(name, value)`, skips `probe`); `trg_event_tags_ad` removes them on delete. `build` refuses unless both exist |
 | `channel_creators` | kind 40, first write wins |
 | `profiles` | kind 0 upsert guarded on `last_kind0_at` |
-| `channel_zones` | the admin endpoint's upsert (`INSERT … ON CONFLICT (channel_id) DO UPDATE`), for every new thread; zone-migrate's offline sealer refuses unbound channels |
-| `whitelist` | `nostr_bbs_core::whitelist_sql::WHITELIST_GRANT_COHORTS_SQL` (merge-only cohorts) for every key that signs or must read; `is_admin = 1` only for the archivist and the operator; never the `agent` cohort |
-| `posts_created`, `last_active_at` | `MAX(…)` over the whole ledger, so resumed runs never under-count |
+| `channel_zones` | the admin endpoint's upsert, for every new thread (zone-migrate's offline sealer refuses unbound channels) |
+| `whitelist` | `nostr_bbs_core::whitelist_sql::WHITELIST_GRANT_COHORTS_SQL` (merge-only cohorts) for fresh keys, kept live keys, the operator and the archivist; then `UPDATE … SET is_admin = 1` for the archivist and operator only. **Archive keys get no row**: with zone cohorts, "Grant to members missing it" would wrap the zone key to keys whose secrets sit in `keys.json`. Never the `agent` cohort |
+| `posts_created`, `last_active_at` | `MAX(…)` from the counted kinds (1, 7, 9, 40, 42, 1984) the ledger holds per key, so resumed runs never under-count |
 | `pubkey_aliases` | archive key → live key, the relay's guarded upsert (no chains, keys lowercase) |
 
-Not written (as live ingest at import time would not matter): broadcast, push,
-search embeddings, moderation projections.
+Not written: broadcast, push, search embeddings, moderation projections. Not applicable
+to plaintext: `zone_epoch_keys` pinning (only with `ZONE_GROUPS_ENABLED`; the first `zk`
+pubkey seen for a zone epoch is pinned, which is the anchor the operator posts).
 
-**Apply modes.** `--apply sqlite --d1 FILE` writes the miniflare SQLite file directly
-in one `BEGIN IMMEDIATE` transaction per batch (the stack must be down; the tool
-refuses if the file is locked). `--apply sql-out DIR` writes numbered chunks for
-`wrangler d1 execute <db> --local --persist-to … --file`, which the operator (or
-`nostr-bbs-import apply`, which strips `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`
-and refuses `--remote`) runs.
+**Invariant: the archivist stays admin for good.** Sealed topics resolve only through
+envelopes signed by an `is_admin = 1` key (the relay's F2 rule), so revoking the
+archivist's admin flag hides every imported topic.
 
-**Ledger.** `state/<fp>/ledger.jsonl`: one line per committed event `{k:<source key>,
-id, pk, t, kind}`, appended and fsynced only after its batch committed; a torn final
-line is ignored. A re-run emits only what the ledger lacks; ids are pinned, so a
-growing archive never yields a second copy and children always cite the id actually
-stored. `run.json` records the target URLs and the D1 file fingerprint; a different
-target or database in the same state dir is refused (signed content embeds pod URLs;
-sealing freezes them).
+**Ledger.** Every emitted event carries `["import","<source>:<source_id>#<key>"]`
+(roots, thread headers and profiles included). At start the ledger is the union of
+`state/ledger.jsonl` and the `import` tags in D1 (the database is the truth; a crash
+between commit and the ledger append is healed by appending what D1 has). The file is
+kept because purge deletes the plaintext rows and their tags. A ledgered key is never
+re-signed: ids are pinned, so a changed plan or a growing archive never yields a second
+copy and children cite the id actually stored. `state/run.json` binds the state
+directory to the canonical D1 path and the target (`target.json` URLs, which signed
+content embeds and sealing freezes); a mismatch is refused.
 
-**Guards.** `build` refuses when the zone-migrate state file shows any `purged` entry
-(plaintext must never come back), when a thread kind-40 it needs is not stored, or when
-a section breaks the rule in §5. The `deleted_events` guard in every insert backs this
-up at the SQL level.
+**After purge.** Detected from D1 (tombstones in `deleted_events` for ledgered ids, or
+sealed envelopes in a target thread), not from a file path. Then a plain `build` is
+refused; only `build --deferred-only` may run, it emits only keys absent from the
+ledger, and it reports that a second seal round is required. Deferral is transitive: a
+message quoting a deferred one is deferred with it. The `deleted_events` guard in every
+insert backs this up at the SQL level.
 
-**Batching.** ≤ 500 statements per batch (D1 per-query limits); a batch is one
-transaction in sqlite mode and one file in sql-out mode.
+**Size budget.** The sealed envelope encrypts the whole signed original with NIP-44 v2
+(plaintext ≤ 65 535 bytes; after padding and base64 the relay's 64 KiB `content` cap
+leaves ≈ 40 960 bytes). Every kind-42 is therefore fitted so its serialised JSON is
+≤ 40 000 bytes: the text part is cut at a character boundary (multibyte-safe, JSON
+escaping counted) with a truncation marker. A message that cannot seal would block
+purge.
+
+**Batching.** ≤ 500 events per transaction.
 
 ## 8. Seal, verify, purge
 
 ### 8.1 Glue, not a second sealer
 
-`nostr-bbs-zone-migrate` owns sealing. This crate adds one thin module (`seal`) that:
+`nostr-bbs-zone-migrate` owns sealing; this crate drives it through its CLI contract.
+Its offline commands still need the **running local relay** (`--relay`, admin check,
+`--fetch-grants`), while `build` and `apply-direct` need it **down**. `seal-prep`:
 
-* writes `seal/channels.json` (`[{"id","zone"}]`, the tool denies unknown fields) for
-  every encrypted-zone thread the build touched;
-* checks preconditions offline and explains what is missing: the archivist is a
-  whitelisted non-agent admin; every thread is bound in `channel_zones`; an anchor
-  (a `zk`-tagged post of the zone) exists or the unanchored path is chosen;
-* prints the zone-migrate commands (`seal-offline`, apply, `seal-offline-commit`,
-  `verify`, `purge-offline`, apply, `purge-offline-commit`) with
-  `NOSTR_BBS_MIGRATE_KEY` taken from the archivist entry by the operator's shell (the
-  key is never passed on a command line);
-* `verify-parity` (§12) runs after each phase.
+* writes `seal/channels.json` (`[{"id","zone"}]`) for every encrypted-zone thread the
+  build touched;
+* checks preconditions in D1 and lists what is missing: the archivist is a whitelisted
+  non-agent admin; every thread is bound in `channel_zones` to its zone; **every thread
+  holds its own anchor** (a `zk`-tagged kind-42 of the zone; zone-migrate checks the
+  anchor per channel, so one anchor cannot vouch for another thread);
+* writes `seal/RUNBOOK.md` with the exact sequence, the relay URL restricted to
+  loopback (`ws://127.0.0.1…`, `ws://localhost…`; anything else is refused), and the
+  secret passed by `NOSTR_BBS_MIGRATE_KEY="$(cat FILE)"` from `keys export --label
+  archivist --out FILE` (0600, deleted afterwards):
 
-The library calls it makes (`offline::open_d1`, `read_channel_events`, state types) are
-confined to this module and written against the API at the branch point; the paging
-agent is changing zone-migrate (`binding_refusal`, `topic_refusal`, `PurgeItem`), so a
-small fix at rebase is expected and reported.
+```
+stack up    nostr-bbs-zone-migrate --relay ws://127.0.0.1:P --channels seal/channels.json --fetch-grants --state seal/state.json seal-offline --d1 D1 --sql-out seal/sql
+stack down  nostr-bbs-zone-migrate … apply-direct --d1 D1 seal/sql/seal-*.sql
+stack up    nostr-bbs-zone-migrate … seal-offline-commit --d1 D1 --manifest seal/sql/seal-manifest.json
+            nostr-bbs-zone-migrate … verify
+            nostr-bbs-import search-input …          (§9, before purge)
+            nostr-bbs-zone-migrate … purge-offline --d1 D1 --sql-out seal/purge --yes
+stack down  nostr-bbs-zone-migrate … apply-direct --d1 D1 seal/purge/purge-*.sql
+stack up    nostr-bbs-zone-migrate … purge-offline-commit --d1 D1 --manifest seal/purge/purge-manifest.json
+            nostr-bbs-import verify-parity --phase purged …
+```
+
+`verify-parity` (§12) runs after each phase.
 
 ### 8.2 Where the zone key comes from
 
 Sealing needs the zone's epoch key **before** upload, and the forum client is the only
-place keys are minted and granted. The workable order (the pilot's):
+place keys are minted and granted (no offline grant generator: that would be bespoke key
+distribution). The order (the pilot's):
 
-1. `build` into a local D1 that a local copy of the target stack (same zone config,
-   `RELAY_URL` set) serves.
-2. In the client, as the operator/archivist: Admin → Encryption → Create key (epoch 1),
-   then "Grant to members missing it". The grants are kind-1059 rows in this D1 and
-   travel with the upload.
-3. The archivist posts one zk-encrypted notice: the **anchor** that lets the sealer
-   confirm the key against a live encrypted post.
-4. Seal, verify, purge; then upload.
+1. `build` into a local D1 that a local copy of the target stack serves (same zone
+   config, `RELAY_URL` set to the local ws URL).
+2. In the client, as an admin: Admin → Encryption → Create key (epoch 1), then "Grant to
+   members missing it". The archivist is whitelisted with the zone cohorts, so it is
+   granted too; the grants are kind-1059 rows in this D1 and travel with the upload.
+3. As the archivist, post one zk-encrypted notice **in every imported thread** of the
+   zone: the anchors.
+4. Seal, verify, purge (§8.1); then upload (§10).
 
-Alternative without an anchor: zone-migrate's `--allow-unanchored-first-encryption
---expect-zone-key ZONE=EPOCH:PUBKEY` (the first encryption of an all-plaintext zone,
-refused unless the relay holds no encrypted post of the zone). Purge then needs a member
-post at the sealed key first. A key file (`--keys-file`) seals correctly but nobody can
-read the result until the same key is granted; rotate the zone afterwards if one was
-used.
+There is no unanchored offline path (`--allow-unanchored-first-encryption` is an online
+`seal` option only).
 
 ## 9. Search index hand-off
 
 `search-input` writes `search/docs.jsonl` (0600) for `nostr-bbs-search-build`: one
-`{"id","text","epoch","zone_pk"}` per sealed original, `id` = the **original** event id
-(what the sealed envelope's `sealed` tag names and what the client resolves), `text` =
-the plaintext from D1, `epoch` from the zone-migrate state entry, `zone_pk` from the
-key file or the operator-supplied pubkey. It must run **after** `seal-offline-commit`
-and **before** purge (the plaintext is gone afterwards) and refuses otherwise. The
-publisher is the archivist. Delete the file after the build.
+`{"id","text","epoch","zone_pk"}` per original that has a sealed envelope in D1. All of
+it comes from D1: `id` = the original id (the envelope's `sealed` tag; what the client
+resolves), `text` = the original's plaintext content, `epoch` and `zone_pk` from the
+envelope's outer `["zk", zone, epoch, zone_pk]` tag. It refuses when an envelope's
+original is already gone (run it after `seal-offline-commit` and before purge). Run
+the builder with `--dry-run --out DIR` (it otherwise uploads to a pod and publishes a
+manifest over the network) and `--relay-url` set to the **new** deployment's URL (it is
+bound into the manifest); `upload-plan` adds the built objects to `r2-objects.jsonl`
+under the archivist's `media/zones/<zone>/search/` folder. The publisher is the
+archivist. Delete `docs.jsonl` after the build.
 
 ## 10. Upload and cutover
 
-`upload-plan` writes `upload/RUNBOOK.md` and `upload/commands.sh` (never executed by
-the tool):
+`upload-plan` writes `upload/` (never executed by the tool):
 
-1. New stack alongside the old one (new worker names, new D1, new R2 bucket, new KV),
-   config projected from the same forum config. Boot the relay once so
-   `ensure_schema()` creates the schema and triggers.
-2. `wrangler d1 export <local db> --local --no-schema --output data.sql`, with
-   `event_tags` **excluded** (it has no primary key; dumped rows plus trigger rows would
-   double every tag): either `--table` per table, or a filter the tool applies to the
-   dump. `upload-rehearse` proves the chosen form locally: import the dump into a fresh
-   local relay D1 and compare per-table counts and the tag index (§12).
-3. `wrangler d1 execute <new db> --remote --file data.sql` (chunked under D1's request
-   limits), then the R2 object puts and the bucket-to-bucket copy list.
-4. One revertable website commit points the forum at the new stack; the old stack is
-   frozen read-only (not deleted) until the operator retires it. Roll-back = revert
-   that commit.
+* `data-NNNN.sql`: the tool's own **allowlisted** dump of the built D1, every row as
+  `INSERT OR IGNORE` (an ignored row fires no AFTER INSERT trigger, so re-running a
+  chunk is idempotent): `events`, `deleted_events`, `channel_creators`, `channel_zones`,
+  `profiles`, `pubkey_aliases`, `admin_log` (without its autoincrement `id`). `whitelist`
+  rows go through the merge-only grant upsert plus the admin flag and `MAX` counters.
+  Never dumped: `event_tags` (no primary key; the trigger rebuilds it from `events`, a
+  dumped copy would double every tag) and `settings` (boot marker rows). Chunks stay
+  under D1's statement and request limits. A raw `wrangler d1 export` is not used: it
+  emits plain `INSERT`s that collide with boot rows and duplicate `event_tags`.
+* `quota.sql` for the auth database (§6), `r2-objects.jsonl`, `r2-copy.jsonl`.
+* `RUNBOOK.md` and `commands.sh`:
+  1. New stack alongside the old one (new worker names, D1, R2 bucket, KV), config
+     projected from the same forum config.
+  2. `wrangler d1 migrations apply <new db> --remote` (0001–0016: `event_tags`, its
+     delete trigger and 0016 exist only there), then boot the relay once so
+     `ensure_schema()` installs the v3 trigger, `channel_zones`, `admin_log` and the
+     rest, then `wrangler d1 execute <new db> --remote --file data-NNNN.sql` per chunk.
+  3. R2 object puts, the bucket-to-bucket copy list, `quota.sql` on the auth database.
+  4. One revertable website commit points the forum at the new stack; the old stack is
+     frozen read-only (not deleted). Roll-back = revert that commit.
 
-Cost notes (README): D1 rows written/stored per event (≈ 1 `events` + n `event_tags`
-rows each), Workers Paid for D1 size beyond the free tier, R2 storage and class-A ops
-for the puts, pod quota.
+`upload-rehearse` proves the dump locally: a fresh SQLite from the migrations plus the
+boot SQL, every chunk applied twice, then per-table counts and the tag index compared
+with the source D1.
+
+Cost notes (README): D1 rows written/stored per event (1 `events` row + one
+`event_tags` row per distinct tag), Workers Paid for D1 beyond the free tier, R2
+storage and class-A operations for the puts, the pod quota (`POD_QUOTA_MB`).
 
 ## 11. DMs
 
-* **Verbatim copy** of kind-1059 wraps whose recipient keeps their key in the new
-  deployment (an `existing` identity, or the operator's old keys): same id, signature
-  and `created_at`; nothing decrypted. Grants (rumor 21453) cannot be told apart
-  without decrypting, so copies are refused unless the operator acknowledges stale
-  grants travel (`--allow-stale-grants`).
+* **Verbatim copy** of kind-1059 wraps (id and signature verified, exactly one `p`)
+  whose recipient keeps their key and is whitelisted in the new deployment (the relay
+  only accepts wraps to whitelisted recipients): same id, signature and `created_at`,
+  nothing decrypted. Zone-key grants (rumor 21453) cannot be told apart without
+  decrypting, so copies need `--allow-stale-grants` (stale epochs are noise, not a
+  leak: they are addressed to the same recipient).
 * **Re-wrap** only of DMs the operator **sent**: unwrap in memory with the operator's
   old key (0600 file), require rumor author = old key, re-seal with the old key (the
-  seal signer must be the rumor author), wrap to the new key. Rumors by anyone else are
-  skipped and counted: we never forge a sender. Only NIP-17 kinds (14, 7, 5, 15) travel.
-  Uses `nostr_bbs_core::gift_wrap`.
+  seal signer must be the rumor author), wrap to the new key. Rumors by anyone else
+  are skipped and counted: we never forge a sender. Only NIP-17 kinds (14, 7, 5, 15)
+  travel. Uses `nostr_bbs_core::gift_wrap`. Output goes into the D1 like any event.
 
 ## 12. Parity invariants (`verify-parity`, and the e2e test)
 
-Before seal:
+Phase `built`:
 
-* every message source key in the ledger maps to a stored event; counts match the plan;
-* 0 orphan e-tags: every `root` resolves to a stored kind-40, every `reply`/`quote` to a
-  stored kind-42 **in the same thread**;
-* `event_tags` rows = Σ tags of stored events (trigger fired once per insert);
-* `channel_creators`, `channel_zones`, `profiles` and `whitelist` rows as planned;
-  `posts_created` = ledger counts.
+* every ledgered key maps to a stored event; counts match the plan;
+* 0 orphan e-tags: every `root` resolves to a stored kind-40, every `reply`/`quote` to
+  a stored kind-42 in the same thread;
+* `event_tags` rows = Σ over stored events of the DISTINCT `(name, value)` pairs of
+  array tags, `probe` excluded (the v3 trigger's rule);
+* `channel_creators`, `channel_zones`, `profiles`, `whitelist`, `pubkey_aliases` as
+  planned; `posts_created` = ledger counts; no archive key whitelisted.
 
-After purge: no plaintext kind-42 in sealed threads; every original id is tombstoned in
-`deleted_events`; every `reply`/`quote` resolves through the relay's F2 rule (the stored
-kind-42 or an admin envelope whose `sealed` tag names it, in the same channel).
+Phase `purged`: no plaintext kind-42 left in sealed threads (only envelopes and the
+anchors); every original id tombstoned in `deleted_events`; no `event_tags` row of a
+purged id; every envelope's topic resolves by the relay's F2 rule (a stored kind-42,
+or an admin envelope whose `sealed` tag names it, in the same channel).
 
 Idempotence: a second `build` adds 0 rows (before and after purge); after purge it
 re-inserts no plaintext.
@@ -385,14 +435,36 @@ re-inserts no plaintext.
 
 ## 14. Deferred and known gaps
 
-* Discord, Slack, Matrix adapters.
+* Discord, Slack, Matrix adapters; thread/mention/system-message concepts in the
+  format; an external sort for very large exports.
 * Running the remote upload and the R2 copy (plans only).
-* Pod `quota_usage` is not updated by a bulk R2 put; per-pod provisioning (root
-  container markers, KV metadata) must happen through the pod API before the objects
-  are visible to its listing.
-* Anything that needs a zone-migrate change is a follow-up, not edited here.
-* Client limits for very long topics (KIT-FIXES.md) are client work, unchanged here.
+* Per-author media placement; avatars.
+* Importing verbatim live events (another deployment's signed posts, LIVE-MERGE.md's
+  "keep keys and posts as-is") beyond DMs.
+* Anything that needs a zone-migrate change is a follow-up, not edited here (for
+  example a no-network build of its library, or an offline unanchored path).
+* Client limits for very long topics (KIT-FIXES.md) are client work.
 
 ## 15. Reviews
 
-(appended)
+### 15.1 Architecture review (system-architect, 2026-11-24): accepted, design revised
+
+Blocking, all fixed in the sections above:
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1 | zone-migrate checks the anchor per channel; offline sealing has no unanchored path | one archivist anchor per thread, checked by `seal-prep`; unanchored alternative removed (§8) |
+| B2 | zone-migrate's offline commands need the running relay and its library links HTTP/WebSocket clients | drive it by CLI with a loopback-only `--relay`; documented up/down sequence; zone-migrate is a dev-dependency only (§1, §8.1) |
+| B3 | 60 000-character truncation can exceed what NIP-44 + the 64 KiB content cap can seal | fit the serialised original to ≤ 40 000 bytes, multibyte-safe (§7) |
+| B4 | a raw `wrangler d1 export` collides with boot `settings` rows, duplicates `event_tags`, and boot alone does not create `event_tags` | own allowlisted `INSERT OR IGNORE` dump; migrations, then boot, then import; `upload-rehearse` (§10) |
+
+Should-fix, adopted: no SQL-file build mode, ledger rebuilt from D1 `import` tags, a
+stable state binding (S1); the trigger's DISTINCT/probe rule and `trg_event_tags_ad`
+required (S2); no whitelist row for archive keys, separate admin UPDATE, the
+archivist-stays-admin invariant (S3); post-purge detection from D1, transitive deferral,
+`--deferred-only` after purge (S4); `zone_epoch_keys` noted, the kind-1059 recipient
+gate, `quota.sql` for the auth DB (S5); search-build run `--dry-run` with the new relay
+URL, objects routed to the R2 list (S6); v1 limits of the format stated (S7). Nits
+adopted: cross-thread replies become a note; `keys export --out` instead of shell
+extraction; `WRANGLER_SEND_METRICS=false`; per-author media dropped from v1. Not adopted:
+dropping the DM re-wrap (the operator asked for it).
