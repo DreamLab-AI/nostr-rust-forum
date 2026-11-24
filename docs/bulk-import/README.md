@@ -63,7 +63,11 @@ nostr-bbs-import plan --work W                  # validates, prints counts and t
   refuses anything else.
 * `target.json`: the pod URL that image links will embed. It is frozen into signed and then
   sealed content, so a pilot build cannot be reused for production: build again with the
-  production target.
+  production target. One work directory (archive, plan files, keys, media) serves both: pass
+  `--target FILE --state DIR` to `build`, `dm`, `seal-prep`, `search-input`, `verify-parity`,
+  `upload-plan` and `upload-rehearse` for the second target. The state directory is bound to one
+  database and one target (a mix-up is refused) and also holds that run's `seal/`, `search/` and
+  `upload/`.
 
 ### 3. Keys
 

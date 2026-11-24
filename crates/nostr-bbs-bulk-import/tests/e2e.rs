@@ -448,6 +448,48 @@ fn keybase_archive_to_sealed_upload_plan() {
     let again = pipeline::build(&w, &opts).unwrap();
     assert_eq!((again.signed, again.inserted), (0, 0));
 
+    // ── a second target (production) from the same work directory and keys:
+    //    its own target file, D1 and state directory
+    let prod_target = root.join("target-prod.json");
+    std::fs::write(
+        &prod_target,
+        r#"{"name":"production","pod":{"http":"https://pods.example.org"}}"#,
+    )
+    .unwrap();
+    let prod_db = root.join("prod.sqlite");
+    drop(relay_db(&prod_db));
+    let w_prod = Work::new(&w.dir)
+        .with_target(Some(prod_target.clone()))
+        .with_state(Some(root.join("state-prod")));
+    let prod = pipeline::build(
+        &w_prod,
+        &BuildOptions {
+            d1: prod_db.clone(),
+            ..opts.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prod.inserted, r.inserted,
+        "same plan, same rows, other database"
+    );
+    if magick {
+        let c = Connection::open(&prod_db).unwrap();
+        assert!(by_import(&c, &format!("#m:{C2}:1"))
+            .content
+            .contains("https://pods.example.org/pods/"));
+    }
+    assert!(w_prod.seal().starts_with(root.join("state-prod")));
+    // mixing targets in one state directory is refused (sealing freezes the URLs)
+    let mixed = pipeline::build(
+        &Work::new(&w.dir).with_target(Some(prod_target.clone())),
+        &opts,
+    );
+    assert!(
+        mixed.unwrap_err().to_string().contains("--state"),
+        "the pilot state directory is bound to the pilot target"
+    );
+
     // ── custody: export the archivist offline and retire it here; a re-run
     //    (which signs nothing as the archivist) still works
     let archivist_file = root.join("archivist.key");

@@ -41,6 +41,29 @@ mod cli {
         Keybase,
     }
 
+    /// The work directory plus the per-target overrides of a run.
+    #[derive(clap::Args)]
+    struct RunPaths {
+        /// The work directory.
+        #[arg(long)]
+        work: PathBuf,
+        /// Target file (default: WORK/target.json).
+        #[arg(long)]
+        target: Option<PathBuf>,
+        /// State directory for this database and target (default: WORK/state); it also holds
+        /// this run's seal/, search/ and upload/.
+        #[arg(long)]
+        state: Option<PathBuf>,
+    }
+
+    impl RunPaths {
+        fn work(&self) -> Work {
+            Work::new(&self.work)
+                .with_target(self.target.clone())
+                .with_state(self.state.clone())
+        }
+    }
+
     #[derive(Clone, Copy, ValueEnum)]
     enum PhaseArg {
         Built,
@@ -137,8 +160,8 @@ mod cli {
         },
         /// Sign and write the plan into the local D1 (stack DOWN).
         Build {
-            #[arg(long)]
-            work: PathBuf,
+            #[command(flatten)]
+            work: RunPaths,
             /// The relay's D1 SQLite file.
             #[arg(long)]
             d1: PathBuf,
@@ -157,8 +180,8 @@ mod cli {
         },
         /// Copy and re-wrap DMs into the local D1 (stack DOWN).
         Dm {
-            #[arg(long)]
-            work: PathBuf,
+            #[command(flatten)]
+            work: RunPaths,
             #[arg(long)]
             d1: PathBuf,
             /// Accept that zone-key grants among the wraps travel too.
@@ -170,8 +193,8 @@ mod cli {
         },
         /// Write seal/channels.json and seal/RUNBOOK.md and check the sealing preconditions.
         SealPrep {
-            #[arg(long)]
-            work: PathBuf,
+            #[command(flatten)]
+            work: RunPaths,
             #[arg(long)]
             d1: PathBuf,
             /// The LOCAL relay's ws URL (loopback only).
@@ -180,15 +203,15 @@ mod cli {
         },
         /// Write search/docs.jsonl for nostr-bbs-search-build (after seal commit, BEFORE purge).
         SearchInput {
-            #[arg(long)]
-            work: PathBuf,
+            #[command(flatten)]
+            work: RunPaths,
             #[arg(long)]
             d1: PathBuf,
         },
         /// Check the parity invariants for a phase.
         VerifyParity {
-            #[arg(long)]
-            work: PathBuf,
+            #[command(flatten)]
+            work: RunPaths,
             #[arg(long)]
             d1: PathBuf,
             #[arg(long, value_enum)]
@@ -201,8 +224,8 @@ mod cli {
         },
         /// Write WORK/upload: allowlisted dump, object list, quota SQL, runbook (never run).
         UploadPlan {
-            #[arg(long)]
-            work: PathBuf,
+            #[command(flatten)]
+            work: RunPaths,
             #[arg(long)]
             d1: PathBuf,
             /// nostr-bbs-search-build --dry-run --out directory to include.
@@ -214,8 +237,8 @@ mod cli {
         },
         /// Apply WORK/upload's dump twice to a fresh booted D1 and compare with the source.
         UploadRehearse {
-            #[arg(long)]
-            work: PathBuf,
+            #[command(flatten)]
+            work: RunPaths,
             /// The built (source) D1.
             #[arg(long)]
             d1: PathBuf,
@@ -370,7 +393,7 @@ mod cli {
                 unlock,
             } => {
                 let r = pipeline::build(
-                    &Work::new(&work),
+                    &work.work(),
                     &BuildOptions {
                         d1,
                         emit: if deferred_only {
@@ -392,7 +415,7 @@ mod cli {
                 rewrap_old_key,
             } => (
                 pipeline::import_dms(
-                    &Work::new(&work),
+                    &work.work(),
                     &d1,
                     allow_stale_grants,
                     rewrap_old_key.as_deref(),
@@ -400,17 +423,17 @@ mod cli {
                 true,
             ),
             Cmd::SealPrep { work, d1, relay } => {
-                let p = pipeline::seal_prep(&Work::new(&work), &d1, &relay)?;
+                let p = pipeline::seal_prep(&work.work(), &d1, &relay)?;
                 let ok = p.missing.is_empty();
                 (
-                    json!({"channels": p.channels, "missing": p.missing, "runbook": Work::new(&work).seal().join("RUNBOOK.md")}),
+                    json!({"channels": p.channels, "missing": p.missing, "runbook": work.work().seal().join("RUNBOOK.md")}),
                     ok,
                 )
             }
             Cmd::SearchInput { work, d1 } => {
-                let n = pipeline::search_input(&Work::new(&work), &d1)?;
+                let n = pipeline::search_input(&work.work(), &d1)?;
                 (
-                    json!({"rows": n, "file": Work::new(&work).search().join("docs.jsonl"), "next": "nostr-bbs-search-build --dry-run --out DIR --relay-url <NEW relay ws URL> …; then delete docs.jsonl"}),
+                    json!({"rows": n, "file": work.work().search().join("docs.jsonl"), "next": "nostr-bbs-search-build --dry-run --out DIR --relay-url <NEW relay ws URL> …; then delete docs.jsonl"}),
                     true,
                 )
             }
@@ -420,7 +443,7 @@ mod cli {
                     PhaseArg::Sealed => Phase::Sealed,
                     PhaseArg::Purged => Phase::Purged,
                 };
-                let r = pipeline::verify_parity(&Work::new(&work), &d1, ph)?;
+                let r = pipeline::verify_parity(&work.work(), &d1, ph)?;
                 let ok = r.problems.is_empty();
                 (json!({"report": r}), ok)
             }
@@ -434,17 +457,11 @@ mod cli {
                 search_out,
                 pod_quota_mb,
             } => {
-                let r = pipeline::upload_plan(
-                    &Work::new(&work),
-                    &d1,
-                    search_out.as_deref(),
-                    pod_quota_mb,
-                )?;
-                (json!({"report": r, "dir": Work::new(&work).upload()}), true)
+                let r =
+                    pipeline::upload_plan(&work.work(), &d1, search_out.as_deref(), pod_quota_mb)?;
+                (json!({"report": r, "dir": work.work().upload()}), true)
             }
-            Cmd::UploadRehearse { work, d1, fresh_d1 } => {
-                rehearse(&Work::new(&work), &d1, &fresh_d1)?
-            }
+            Cmd::UploadRehearse { work, d1, fresh_d1 } => rehearse(&work.work(), &d1, &fresh_d1)?,
         })
     }
 
