@@ -9,5 +9,7 @@ pub mod adapter;
 pub mod error;
 pub mod format;
 pub mod fsutil;
+pub mod identity;
+pub mod keystore;
 
 pub use error::ImportError;
