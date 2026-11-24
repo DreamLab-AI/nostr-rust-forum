@@ -18,6 +18,88 @@ Decisions: [ADR-2033](docs/adr/ADR-2033-nip09-tombstones-member-deletion-gate-an
 > Note 2026-11-23: kit tag `v1.0.0-beta.21-rc.3` (`fd31193`, #98) followed, and the operator has since run the
 > encrypted-zone cold link live on a deployment of `fd31193` (entry below). The rest of this section is not re-verified live.
 
+### Zone-key grant backlog paged past the relay's row cap (2026-11-24, PR #95)
+
+Forum client only. Not yet exercised in a browser or on a live relay; see "Not verified" below.
+
+- **Paging.** Every kind-1059 addressed to a member arrives through the grant sync, and the relay answers one REQ with at
+  most 1,000 rows, newest first; zone-key grants are usually the oldest. Each grant scope (identity, and inbox with
+  `RECIPIENT_KEYS_ENABLED`) now pages with an inclusive `until` at the oldest wrap seen, one page subscription at a time,
+  each closed at its EOSE, by the deletion sync's rule (`deletion_sync::next_page_within`). The state is
+  `zone_crypto::grant_paging::ScopePager` (`grant_paging.rs:357`); `ZoneKeyStore::run_scope` and `after_page`
+  (`store.rs:784`, `:841`) only open and close what it asks for. Bound: page 0 plus `GRANT_MAX_PAGES` = 50 pages
+  (51,000 wraps, `grant_paging.rs:108`), separate from the deletion sync's 20; giving up leaves the backlog unsettled
+  (keys-timed-out copy, never "not found") and writes no marker (KF-32). An empty later page is asked again with the
+  same inclusive `until`, then once past the boundary; a walk that steps past a boundary ends *unverified*: it settles
+  but writes no marker (KF-31).
+- **Backfill markers and warm stop.** A completion time per identity, scope and addressed key, written only after a
+  verified walk once every wrap has finished and none waits for a retry (`GrantBacklog::take_due_markers`,
+  `grant_backlog.rs:288`). A later session stops at a full, fully processed page lying more than eight days
+  (`WARM_STOP_MARGIN_SECS`: the relay's seven-day past drift, `nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS`, plus a
+  day of clock skew) below the marker and below its floor (see below); never while `GRANT_SWEEP_ENABLED` is on.
+- **A retryable wrap holds the backlog open.** `WrapOutcome::Retry` (admin check unanswered, key not persisted, ticket
+  bindings not loaded) and `WrapOutcome::Refused` now keep the backlog unsettled (`through`, `grant_backlog.rs:324`), so
+  a page waiting on that grant shows the keys-timed-out copy instead of "Topic Not Found". Before this, such a wrap still
+  let the backlog latch settled.
+- **NIP-07.** A signer decrypt failure under NIP-07 is `Refused` on the first attempt (a denied prompt, a locked
+  extension and an unreadable wrap look the same), parked, and queued once more after the extension decrypts another
+  wrap; failing again then, it is `UnreadableBySigner` (`unwrap_failure_outcome`, `grant_backlog.rs:144`): it no
+  longer holds the backlog, but its timestamp becomes the marker's floor. A refusable signer gets
+  one unwrap slot until its first success (one prompt, not four). A ticket's own decrypt now returns a typed error
+  (`TicketVerdict::SignerFailed`), so a refused prompt no longer marks a ticket processed for good. A wrap is opened only
+  with the key it is addressed to (`inbox_key::opener_for`), so an inbox wrap never prompts the NIP-07 identity.
+- **Unwrap queue** (`zone_crypto/wrap_queue.rs`): newest-queued first (a page's oldest wraps, and later pages, run
+  first), at most four at once, slots tagged by sign-in generation, a slot released after 60 s whatever its wrap is doing
+  (`UNWRAP_SLOT_TIMEOUT_MS`, `store.rs:65`; not a refusable signer's single slot before its first success, which waits
+  on a prompt), the admin check bounded at 10 s (`:70`). The 120 s cap now runs from the last
+  scope's delivery rather than the start of the sync.
+- **Security review fixes (2026-11-24, review of `63490f4`).** Each has a test, and each test fails with the fix
+  reverted.
+  1. *Warm-stop margin narrower than the relay's drift.* The relay accepts a kind-1059 dated up to seven days before
+     it lands, so a late grant could sort below a three-day stop. The margin is now the relay's bound plus a day,
+     eight days, from one constant shared with the relay (`nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS`; the relay's
+     `MAX_TIMESTAMP_DRIFT` is defined from it). Test: `a_page_inside_the_relay_drift_window_is_not_a_warm_stop`.
+  2. *A wrap refused twice was lost to the warm stop.* It is now `UnreadableBySigner`: it settles, but the marker
+     stores a floor (the oldest such wrap's timestamp) and a warm stop must lie below it, so the next session tries the
+     wrap again. Tests: `the_warm_stop_lies_below_the_floor`, and
+     `a_grant_refused_twice_is_reached_again_by_the_next_warm_session` (two sessions, with a no-floor control).
+  3. *One failed query inside a shared timestamp skipped wraps and still ended verified.* An empty page now repeats the
+     same inclusive `until` first; only a second empty answer steps to `until - 1`, and a walk that does so ends
+     unverified. Tests: `a_failed_query_inside_a_shared_timestamp_skips_nothing`,
+     `stepping_past_a_shared_timestamp_ends_unverified`.
+  4. *A forged ticket held the backlog every session.* A ticket whose signer the session's bindings bind to no zone is
+     `TicketVerdict::Unbound`: left unmarked, holding neither the backlog nor the marker. Only unloaded bindings still
+     hold it. Test: `a_forged_ticket_from_an_unbound_key_holds_nothing`.
+  5. *A whole walk could sit in the unwrap queue.* The next page is opened only while fewer than a page of wraps are
+     queued (`WrapQueue::has_page_room`); settled wraps leave `seen_wraps` (the processed set turns re-deliveries away),
+     except with the sweep on. Test: `paging_waits_while_a_page_is_queued` (the store's deferral itself is wasm glue).
+  6. *An old sign-in's wrap could count as the new one's first NIP-07 success.* Successes count only for the slot
+     generation they ran in, the signer kind travels with each queued wrap, and `note_signer_success` checks the
+     lease. Test: `a_success_from_before_a_switch_does_not_count`.
+  Recorded, not fixed here: KF-33 (junk wraps sharing one timestamp can make grant paging give up).
+- **Security re-review fix (2026-11-24, review of `76f1184`).** An empty page 0 ended the walk verified, but a failed D1
+  query looks the same (KF-31): the backlog settled and a fresh marker was written, which could put a wrap that landed
+  since below the next warm stop. An empty page 0 is now done but unverified (no marker; a member with no wraps loses
+  nothing). Tests: `empty_first_page_is_done_but_unverified`, and
+  `a_failed_page_zero_writes_no_marker_and_a_late_grant_is_still_reached` (two sessions, with a fresh-marker control).
+  The relay's `tests/nip_handlers_tests.rs` now takes its drift constant from core. Recorded: KF-34 (an Unbound
+  ticket whose binding appears later is lost on warm devices; blocks enabling `ZONE_GROUPS_ENABLED`) and KF-35 (a
+  junk wrap pins the floor, so NIP-07 members walk all newer history each session).
+- **Tests.** 1,119 forum-client tests on the rebased base, 1,157 after (one more ignored); 1,166 after the security
+  review fixes, 1,167 after the re-review fix. New: `ScopePager` against a fake
+  relay (just over a page, multi-page, shared timestamps at boundaries, a page of one timestamp, inside and beyond the
+  bound, 21 pages, deleted boundary, one and two failed queries, warm stop, a replayed page, live wraps);
+  `WrapQueue`; `GrantBacklog`; `grant_sync_sim` with real NIP-59 wraps and mock NIP-07 signers (cooperative, denied then
+  approved, locked mid-backlog, a junk wrap, all denied), a retry mid-backlog that writes no marker and recovers next
+  session, and a warm session that still finds a new grant. Each rule was checked by reverting it and watching its tests
+  fail. `scripts/tests/grant-paging-local-relay.sh` runs the ignored `grant_paging_local_relay` test against the relay
+  worker under `wrangler dev --local`: 2,231 wraps seeded over NIP-42-authenticated EVENT frames; page 0 alone has 1,000
+  rows and none of the 25 oldest grants; paged, all 2,231 are delivered over 4 pages and all 30 grants settle, with a
+  local key and with a mock NIP-07 signer that denies its first four prompts.
+- **Not verified.** The browser glue (`store.rs`: IndexedDB writes, `spawn_local`, timers, the forum's
+  `RelayConnection`) is compiled and linted for wasm32 but run by no test. No real NIP-07 extension was exercised; the
+  signer path is covered by mock signers. The live acceptance is the cold-link test on a repinned deployment.
+
 ### Documentation and comment drift corrected (2026-11-23)
 
 No behaviour change. Corrections found while re-verifying the VisionFlow corpus at `4a73a7a`:

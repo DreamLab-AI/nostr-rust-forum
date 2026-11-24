@@ -41,7 +41,7 @@ const MAX_CONTENT_SIZE: usize = 64 * 1024;
 const MAX_REGISTRATION_CONTENT_SIZE: usize = 8 * 1024;
 const MAX_TAG_COUNT: usize = 2000;
 const MAX_TAG_VALUE_SIZE: usize = 1024;
-const MAX_TIMESTAMP_DRIFT: u64 = 60 * 60 * 24 * 7;
+const MAX_TIMESTAMP_DRIFT: u64 = nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS;
 const MAX_SUBSCRIPTIONS: usize = 20;
 
 /// Whether a REQ must be refused for the per-session subscription cap. A REQ

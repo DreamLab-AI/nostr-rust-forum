@@ -12,6 +12,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// How far an event's `created_at` may lie from the relay's clock, in either
+/// direction, for the kit's relay to accept it: seven days.
+///
+/// The relay worker enforces it at ingress (only a sealed kind-42 original is
+/// exempt from the past bound). Clients that reason about when an event can
+/// have arrived use it too: a kind-1059 gift wrap may be dated anywhere up to
+/// this far before the moment it lands, whatever NIP-59 recommends, so a
+/// window meant to cover every wrap published after a given time must reach
+/// at least this far back.
+///
+/// ```
+/// assert_eq!(nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS, 604_800);
+/// ```
+pub const MAX_CREATED_AT_DRIFT_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Errors returned by event operations.
 #[derive(Debug, Error)]
 pub enum EventError {

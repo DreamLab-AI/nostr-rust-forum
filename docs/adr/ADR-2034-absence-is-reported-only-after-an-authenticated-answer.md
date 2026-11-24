@@ -71,6 +71,13 @@ discarded (`wire_id`, `:158`), so an answer is never credited to a REQ sent afte
   > an absence only once the keys have settled. The no-answer path (15 s) and unencrypted zones are unchanged. Live check
   > by the operator on 2026-11-22: "Fetching your keys for this zone…" from 9.2 s, the topic at 28.4 s, no "Topic Not
   > Found". KF-23 is closed. Line numbers in the Decision and Verification sections are as of `3c48e26`.
+
+  > Note 2026-11-24 (kit PR #95, this ADR's review trigger: a change to the grant sync and its cap): the backlog the
+  > decision waits on is now complete past the relay's row cap (the grant sync pages, `zone_crypto/grant_paging.rs`), a
+  > wrap left to retry keeps it unsettled (`grant_backlog.rs:324`), so the page reports the keys-timed-out copy rather
+  > than an absence, and the 120 s cap runs from the last grant scope's delivery (`grant_backlog.rs:49`). The 20 s stall
+  > window is unchanged. The decision itself (`Lookup::decide_with_keys`) is unchanged; a test pins that a grant left to
+  > retry never reads as "not found" (`utils/lookup.rs`, `a_grant_left_to_retry_never_reads_as_not_found`).
 - Known limits: the cap check at `nip_handlers.rs:1858-1869` precedes `wrap_read_set(...).await` at `:1907` and the
   insert at `:1931`, so concurrent REQs on one socket can both pass it (KF-22); a post made while the socket is closed is
   flushed on reopen before AUTH (KF-24).

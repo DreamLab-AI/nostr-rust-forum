@@ -192,3 +192,11 @@ bitcoin = { version = "0.32", features = ["secp-lowmemory"] }
 [dev-dependencies]
 # Single-threaded executor for the grant-ledger concurrency tests.
 futures = "0.3"
+
+# The local-relay grant paging test (`zone_crypto::grant_paging_local_relay`,
+# ignored by default; `scripts/tests/grant-paging-local-relay.sh` runs it).
+# Native only, plain ws:// to 127.0.0.1, so no TLS stack. Both versions are
+# already in the lockfile through the governance probe and poker citizen.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net", "io-util"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
