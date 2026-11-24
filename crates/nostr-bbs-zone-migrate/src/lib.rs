@@ -96,6 +96,11 @@ pub mod engine;
 pub mod grants;
 pub mod identity;
 pub mod keys;
+/// The WebSocket relay client (native only), shared with other tools that
+/// load zone keys the same way (`--fetch-grants`), such as the sealed-search
+/// builder.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod net;
 pub mod plan;
 pub mod relay;
 pub mod state;

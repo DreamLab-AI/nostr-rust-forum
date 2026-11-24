@@ -17,7 +17,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use nostr_bbs_core::keys::SecretKey;
 use nostr_bbs_core::{sign_event, NostrEvent, UnsignedEvent};
-use nostr_bbs_zone_migrate::relay::{DeleteOutcome, Filter, PublishOutcome, Relay, RelayError};
+use crate::relay::{DeleteOutcome, Filter, PublishOutcome, Relay, RelayError};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout_at, Instant};

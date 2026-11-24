@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use crate::net::NetRelay;
+use nostr_bbs_zone_migrate::net::NetRelay;
 
 /// Declare `$hooks`: engine hooks that save `$path` atomically after each
 /// change and log progress lines to stderr.
