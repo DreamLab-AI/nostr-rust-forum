@@ -299,7 +299,7 @@ impl DurableObject for NostrRelayDO {
                 self.handle_event(session_id, &ws, &ip, event).await;
             }
             "REQ" => {
-                let sub_id = match arr[1].as_str() {
+                let sub_id = match arr[1].as_str().filter(|s| sub_id_ok(s)) {
                     Some(s) => s.to_string(),
                     None => {
                         Self::send_notice(&ws, "Invalid subscription ID");
@@ -320,12 +320,16 @@ impl DurableObject for NostrRelayDO {
                 // CLOSE and AUTH are frames too: leaving them off the limiter let
                 // a client flood the DO for free. A CLOSE for a subscription the
                 // session holds is exempt: it only sheds load.
-                let sub_id = arr[1].as_str();
+                let sub_id = arr[1].as_str().filter(|s| sub_id_ok(s));
+                // A REQ still awaiting counts as held: its CLOSE must reach
+                // handle_close to cancel it even when the client is at its
+                // frame budget (review: a rate-limited CLOSE left the orphan).
                 let holds = sub_id.is_some_and(|id| {
                     self.sessions
                         .borrow()
                         .get(&session_id)
                         .is_some_and(|s| s.subscriptions.contains_key(id))
+                        || self.pending_reqs.borrow().contains(session_id, id)
                 });
                 if !close_admitted(holds, || self.check_rate_limit(&ip)) {
                     Self::send_notice(&ws, "rate limit exceeded");
@@ -355,7 +359,7 @@ impl DurableObject for NostrRelayDO {
                 self.handle_auth(session_id, &ws, auth_event).await;
             }
             "COUNT" => {
-                let sub_id = match arr[1].as_str() {
+                let sub_id = match arr[1].as_str().filter(|s| sub_id_ok(s)) {
                     Some(s) => s.to_string(),
                     None => {
                         Self::send_notice(&ws, "Invalid subscription ID");
@@ -481,5 +485,25 @@ mod connection_slot_tests {
         assert!(counts.is_empty());
         release_connection_slot(&mut counts, "9.9.9.9");
         assert!(counts.is_empty());
+    }
+}
+
+/// NIP-01/NIP-11: subscription ids are 1..=64 bytes (`max_subid_length` in
+/// our NIP-11 document). Longer ids were accepted and copied into session
+/// state, pending-REQ keys and persisted subscription records.
+pub(crate) fn sub_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64
+}
+
+#[cfg(test)]
+mod sub_id_tests {
+    use super::sub_id_ok;
+
+    #[test]
+    fn sub_ids_are_one_to_sixty_four_bytes() {
+        assert!(sub_id_ok("a"));
+        assert!(sub_id_ok(&"x".repeat(64)));
+        assert!(!sub_id_ok(""));
+        assert!(!sub_id_ok(&"x".repeat(65)));
     }
 }

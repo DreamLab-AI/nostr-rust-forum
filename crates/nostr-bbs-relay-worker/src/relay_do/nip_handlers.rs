@@ -1954,6 +1954,8 @@ impl NostrRelayDO {
                     // CLOSED, not only a NOTICE: NIP-01 clients treat CLOSED
                     // as the answer to this REQ; a bare NOTICE left them
                     // waiting for an EOSE that never came.
+                    drop(sessions);
+                    self.end_sub_id(session_id, sub_id);
                     Self::send_closed(
                         &ws,
                         sub_id,
@@ -1988,6 +1990,7 @@ impl NostrRelayDO {
         // live events against the un-gated filter. The historical read was
         // refused and every subsequent matching event was delivered anyway.
         if nip42::protected_read_blocked(&filters, session_pubkey.is_some(), self.auth_mode()) {
+            self.end_sub_id(session_id, sub_id);
             Self::send_closed(
                 &ws,
                 sub_id,
@@ -2013,8 +2016,10 @@ impl NostrRelayDO {
                 self.pending_reqs
                     .borrow_mut()
                     .finish(session_id, sub_id, pending_token);
-                Self::send_notice(
+                self.end_sub_id(session_id, sub_id);
+                Self::send_closed(
                     &ws,
+                    sub_id,
                     "auth-required: must authenticate to receive kind-1059 DMs",
                 );
                 return;
@@ -2028,6 +2033,20 @@ impl NostrRelayDO {
             .borrow_mut()
             .finish(session_id, sub_id, pending_token)
         {
+            return;
+        }
+
+        // Re-check the cap at insert time: concurrent REQs with distinct ids
+        // all passed the first check before any of them stored.
+        let over_cap = self.sessions.borrow().get(&session_id).is_some_and(|s| {
+            subscription_cap_reached(s.subscriptions.len(), s.subscriptions.contains_key(sub_id))
+        });
+        if over_cap {
+            Self::send_closed(
+                &ws,
+                sub_id,
+                "error: too many subscriptions on this connection",
+            );
             return;
         }
 
@@ -2206,6 +2225,16 @@ impl NostrRelayDO {
             .find(|t| t.len() >= 2 && t[0] == nostr_bbs_core::VENUE_TAG)
             .map(|t| t[1].clone());
         Some((zone, venue))
+    }
+
+    /// A REQ refused with CLOSED ends its id: a pending REQ for it must not
+    /// store afterwards, and a subscription it held under that id stops (the
+    /// client was just told it is closed).
+    pub(crate) fn end_sub_id(&self, session_id: u64, sub_id: &str) {
+        self.pending_reqs.borrow_mut().cancel(session_id, sub_id);
+        if let Some(s) = self.sessions.borrow_mut().get_mut(&session_id) {
+            s.subscriptions.remove(sub_id);
+        }
     }
 
     pub(crate) async fn handle_close(&self, session_id: u64, sub_id: &str) {

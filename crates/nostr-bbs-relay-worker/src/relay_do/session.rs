@@ -600,6 +600,11 @@ impl PendingReqs {
         }
     }
 
+    /// Whether a REQ for the id is in flight.
+    pub(crate) fn contains(&self, session_id: u64, sub_id: &str) -> bool {
+        self.live.contains_key(&(session_id, sub_id.to_string()))
+    }
+
     /// Forget every pending REQ of a closed connection.
     pub(crate) fn drop_session(&mut self, session_id: u64) {
         self.live.retain(|(sid, _), _| *sid != session_id);
@@ -657,6 +662,39 @@ mod pending_req_tests {
         );
         assert!(pending.finish(1, "s", newer));
         assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn a_rate_limited_close_for_a_pending_id_is_still_admitted() {
+        // Review item 1: the CLOSE exemption keyed on stored subscriptions
+        // only; a pending id must count as held so its CLOSE cancels it.
+        let mut pending = PendingReqs::default();
+        let token = pending.begin(1, "page");
+        let holds = pending.contains(1, "page");
+        assert!(
+            crate::relay_do::close_admitted(holds, || false),
+            "admitted at the frame budget"
+        );
+        pending.cancel(1, "page");
+        assert!(
+            !pending.finish(1, "page", token),
+            "and the REQ then stores nothing"
+        );
+    }
+
+    #[test]
+    fn a_refused_req_ends_an_older_pending_req_for_the_same_id() {
+        // Review item 2: REQ "s" awaits; a second REQ "s" is refused with
+        // CLOSED (end_sub_id cancels); the first must not store afterwards.
+        let mut pending = PendingReqs::default();
+        let mut subs: HashMap<String, ()> = HashMap::new();
+        let first = pending.begin(1, "s");
+        pending.cancel(1, "s");
+        subs.remove("s");
+        if pending.finish(1, "s", first) {
+            subs.insert("s".into(), ());
+        }
+        assert!(subs.is_empty());
     }
 
     #[test]
