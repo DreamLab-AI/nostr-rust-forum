@@ -172,6 +172,13 @@ pub(crate) fn alias_refusal(
     None
 }
 
+/// Whether an optional-table check marks a key live: an absent table holds
+/// no identity (false); a present table's failed lookup (`None`) is live
+/// (fail closed); otherwise the lookup's answer.
+pub(crate) fn live_from_optional_lookup(table_present: bool, found: Option<bool>) -> bool {
+    table_present && found.unwrap_or(true)
+}
+
 /// The cohorts inherited from the old key: its whitelist cohorts minus
 /// `admin` unless explicitly allowed. `None` for unparseable JSON.
 pub(crate) fn inheritable_cohorts(cohorts_json: &str, allow_admin: bool) -> Option<String> {
@@ -717,16 +724,66 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
         &crate::ingress::ingress_from_env(env),
         &old_pk,
     );
+    // device_keys exists only where device keys were ever used (the auth
+    // worker creates it on first registration, behind DEVICE_KEYS_ENABLED),
+    // and the relay itself treats its absence as "no device keys". An ABSENT
+    // table therefore holds no live identity and its check is skipped; a
+    // lookup on a table that exists and fails still counts as live (fail
+    // closed). Previously a missing table failed every lookup, so every old
+    // key was treated as live and needed force. agent_registry is always
+    // created by ensure_schema, so it stays strict.
+    #[derive(Deserialize)]
+    struct Name {
+        #[allow(dead_code)]
+        name: String,
+    }
+    let device_table = match db
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = 'device_keys'",
+        )
+        .all()
+        .await
+        .and_then(|r| r.results::<Name>())
+    {
+        Ok(rows) => !rows.is_empty(),
+        Err(_) => return json_response(env, &json!({ "error": "Alias lookup failed" }), 503),
+    };
+    let device_live = live_from_optional_lookup(
+        device_table,
+        if device_table {
+            exists(
+                "SELECT COUNT(*) AS n FROM device_keys WHERE (device_pubkey = ?1 OR owner_pubkey = ?1) AND revoked = 0",
+                old_pk.clone(),
+            )
+            .await
+            .ok()
+        } else {
+            None
+        },
+    );
     let facts = match (
-        exists("SELECT COUNT(*) AS n FROM whitelist WHERE pubkey = ?1", old_pk.clone()).await,
         exists(
-            "SELECT COUNT(*) AS n FROM device_keys WHERE (device_pubkey = ?1 OR owner_pubkey = ?1) AND revoked = 0",
+            "SELECT COUNT(*) AS n FROM whitelist WHERE pubkey = ?1",
             old_pk.clone(),
         )
         .await,
-        exists("SELECT COUNT(*) AS n FROM agent_registry WHERE pubkey = ?1 AND active = 1", old_pk.clone()).await,
-        exists("SELECT COUNT(*) AS n FROM pubkey_aliases WHERE new_pubkey = ?1", old_pk.clone()).await,
-        exists("SELECT COUNT(*) AS n FROM pubkey_aliases WHERE old_pubkey = ?1", new_pk.clone()).await,
+        device_live,
+        exists(
+            "SELECT COUNT(*) AS n FROM agent_registry WHERE pubkey = ?1 AND active = 1",
+            old_pk.clone(),
+        )
+        .await
+        .unwrap_or(true),
+        exists(
+            "SELECT COUNT(*) AS n FROM pubkey_aliases WHERE new_pubkey = ?1",
+            old_pk.clone(),
+        )
+        .await,
+        exists(
+            "SELECT COUNT(*) AS n FROM pubkey_aliases WHERE old_pubkey = ?1",
+            new_pk.clone(),
+        )
+        .await,
         db.prepare("SELECT new_pubkey FROM pubkey_aliases WHERE old_pubkey = ?1")
             .bind(&[js_str(&old_pk)])?
             .first::<Succ>(None)
@@ -734,9 +791,7 @@ pub async fn handle_alias_set(mut req: Request, env: &Env) -> Result<Response> {
     ) {
         (Ok(wl), dev, agent, Ok(succ), Ok(repl), Ok(cur)) => AliasFacts {
             old_is_system: static_admin || ingress,
-            // device_keys / agent_registry may be absent on older deployments:
-            // a failed lookup there counts as live (fail closed: needs force).
-            old_is_live: wl || dev.unwrap_or(true) || agent.unwrap_or(true),
+            old_is_live: wl || dev || agent,
             old_is_a_successor: succ,
             new_is_replaced: repl,
             old_current_successor: cur.map(|c| c.new_pubkey),
@@ -958,6 +1013,18 @@ mod alias_refusal_tests {
             ..Default::default()
         };
         assert_eq!(alias_refusal(&same, "new", false, false), None);
+    }
+
+    #[test]
+    fn an_absent_optional_table_never_makes_a_key_live_a_failed_lookup_does() {
+        use super::live_from_optional_lookup as live;
+        assert!(!live(false, None), "no device_keys table: skipped");
+        assert!(
+            live(true, None),
+            "table present, lookup failed: fail closed"
+        );
+        assert!(live(true, Some(true)));
+        assert!(!live(true, Some(false)));
     }
 
     #[test]
