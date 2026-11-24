@@ -6,7 +6,10 @@
 #![warn(missing_docs)]
 
 pub mod adapter;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod d1;
 pub mod error;
+pub mod events;
 pub mod format;
 pub mod fsutil;
 pub mod identity;
