@@ -1347,6 +1347,25 @@ impl ChannelStore {
         wait_auth: bool,
         on_done: PageDone,
     ) {
+        self.one_shot_attempt(relay, cid, filter, wait_auth, on_done, 1);
+    }
+
+    /// One attempt of [`Self::one_shot_page`]. A CLOSED answer (the relay
+    /// refused the REQ, e.g. too many subscriptions on this connection)
+    /// marks this attempt failed: its subscription is dropped, what it
+    /// buffered is forgotten, and with `retries` left the page is requested
+    /// again on a fresh subscription; otherwise the cursor is released so a
+    /// later scroll asks again.
+    fn one_shot_attempt(
+        &self,
+        relay: &RelayConnection,
+        cid: &str,
+        filter: Filter,
+        wait_auth: bool,
+        on_done: PageDone,
+        retries: u8,
+    ) {
+        let retry_filter = filter.clone();
         self.history.update(|m| {
             m.entry(cid.to_string()).or_default().loading = true;
         });
@@ -1428,7 +1447,52 @@ impl ChannelStore {
                 }
             })
         };
-        let id = relay.subscribe_with_receipt(vec![filter], on_event, on_receipt);
+        let on_closed = {
+            let buf = buf.clone();
+            let relay = relay.clone();
+            let key = key.clone();
+            Rc::new(move |reason: String| {
+                let (sub, buffered, done) = {
+                    let mut b = buf.borrow_mut();
+                    if b.done {
+                        return;
+                    }
+                    b.done = true;
+                    (
+                        b.sub.take(),
+                        std::mem::take(&mut b.events),
+                        b.on_done.take(),
+                    )
+                };
+                if let Some(id) = sub {
+                    relay.unsubscribe(&id);
+                }
+                if let Some(z) = zone_keys {
+                    let ids: Vec<String> = buffered.into_iter().map(|(_, ev)| ev.id).collect();
+                    z.forget(&ids);
+                }
+                web_sys::console::warn_1(
+                    &format!("[History] page request closed by relay: {reason}").into(),
+                );
+                let _ = store.history.try_update(|m| {
+                    if let Some(c) = m.get_mut(&key) {
+                        c.loading = false;
+                    }
+                });
+                if let (Some(on_done), true) = (done, retries > 0) {
+                    store.one_shot_attempt(
+                        &relay,
+                        &key,
+                        retry_filter.clone(),
+                        wait_auth,
+                        on_done,
+                        retries - 1,
+                    );
+                }
+            })
+        };
+        let id =
+            relay.subscribe_with_receipt_or_closed(vec![filter], on_event, on_receipt, on_closed);
         buf.borrow_mut().sub = Some(id);
 
         // `set_timeout_once` frees its closure once it has run (gloo's

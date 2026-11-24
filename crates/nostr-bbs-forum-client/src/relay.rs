@@ -110,6 +110,9 @@ pub type EoseCallback = Rc<dyn Fn()>;
 /// call a members-only thing "absent" on an anonymous answer use this.
 pub type ReceiptCallback = Rc<dyn Fn(bool)>;
 
+/// Called with the CLOSED reason (see `subscribe_with_receipt_or_closed`).
+pub type ClosedCallback = Rc<dyn Fn(String)>;
+
 /// Callback for a NIP-45 COUNT answer: the number of events matching the
 /// filters, as the relay counts them for this session.
 pub type CountCallback = Rc<dyn Fn(u64)>;
@@ -128,6 +131,10 @@ struct Subscription {
     on_event: EventCallback,
     on_eose: Option<EoseCallback>,
     on_receipt: Option<ReceiptCallback>,
+    /// Called with the reason when the relay refuses or ends this
+    /// subscription with CLOSED (one-shot history pages take it as their
+    /// answer: an over-cap REQ is refused with CLOSED, not EOSE).
+    on_closed: Option<ClosedCallback>,
     /// REQs sent for this subscription on the current socket and not yet
     /// answered, and whether the latest went out after AUTH was accepted.
     ledger: ReqLedger,
@@ -667,7 +674,7 @@ impl RelayConnection {
         on_event: EventCallback,
         on_eose: Option<EoseCallback>,
     ) -> String {
-        self.subscribe_inner(filters, on_event, on_eose, None)
+        self.subscribe_inner(filters, on_event, on_eose, None, None)
     }
 
     /// Like [`subscribe`](Self::subscribe), but the EOSE callback is told
@@ -679,7 +686,20 @@ impl RelayConnection {
         on_event: EventCallback,
         on_receipt: ReceiptCallback,
     ) -> String {
-        self.subscribe_inner(filters, on_event, None, Some(on_receipt))
+        self.subscribe_inner(filters, on_event, None, Some(on_receipt), None)
+    }
+
+    /// [`Self::subscribe_with_receipt`], plus `on_closed` with the reason if
+    /// the relay answers CLOSED instead (it refused the REQ, e.g. too many
+    /// subscriptions on this connection, or ended it).
+    pub fn subscribe_with_receipt_or_closed(
+        &self,
+        filters: Vec<Filter>,
+        on_event: EventCallback,
+        on_receipt: ReceiptCallback,
+        on_closed: ClosedCallback,
+    ) -> String {
+        self.subscribe_inner(filters, on_event, None, Some(on_receipt), Some(on_closed))
     }
 
     fn subscribe_inner(
@@ -688,6 +708,7 @@ impl RelayConnection {
         on_event: EventCallback,
         on_eose: Option<EoseCallback>,
         on_receipt: Option<ReceiptCallback>,
+        on_closed: Option<ClosedCallback>,
     ) -> String {
         let (sub_id, watch) = self.with_inner(|rc| {
             let mut inner = rc.borrow_mut();
@@ -706,6 +727,7 @@ impl RelayConnection {
                     on_event,
                     on_eose,
                     on_receipt,
+                    on_closed,
                     ledger,
                     wire_id: wire_id(&sub_id, 0),
                     wire_gen: 0,
@@ -1451,13 +1473,18 @@ fn handle_relay_message(inner_rc: &Rc<RefCell<RelayInner>>, text: &str) {
             // receipt, so no callback fires.
             // Under a retired wire id it answers an abandoned REQ: ignored.
             if let Some(wire) = arr.get(1).and_then(Value::as_str) {
-                if let Some(s) = inner_rc
+                let on_closed = inner_rc
                     .borrow_mut()
                     .subscriptions
                     .get_mut(logical_id(wire))
                     .filter(|s| route(wire, &s.wire_id) == Route::Current)
-                {
-                    s.ledger.answered();
+                    .and_then(|s| {
+                        s.ledger.answered();
+                        s.on_closed.clone()
+                    });
+                if let Some(cb) = on_closed {
+                    let reason = arr.get(2).and_then(Value::as_str).unwrap_or("").to_string();
+                    cb(reason);
                 }
             }
         }
