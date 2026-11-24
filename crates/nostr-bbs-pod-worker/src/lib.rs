@@ -732,6 +732,81 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
     // JSS-compatible pod creation surface: POST /.pods {"name":"<pubkey>"}.
     //
     // Unlike the native server's anonymous development path, the Worker keeps
+    // Admin: set or clear one pod's storage limit (e.g. for a migration's
+    // media backfill). POST {"pubkey": "<hex>", "limit_mb": <n> | null}; null
+    // returns the pod to the configured default (POD_QUOTA_MB). NIP-98 with
+    // body binding and replay protection; static ADMIN_PUBKEYS or the relay
+    // whitelist admin bit. The inbox quota is not affected.
+    if path == "/.quota" {
+        if req.method() != Method::Post {
+            return json_error(&env, "Method not allowed; use POST", 405);
+        }
+        let body = req.bytes().await.unwrap_or_default();
+        let auth_header = req.headers().get("Authorization").ok().flatten();
+        let request_url = url.to_string();
+        let Some(admin) = (match auth_header.as_deref() {
+            Some(header) => {
+                auth::verify_nip98_replay(header, &request_url, "POST", Some(&body), &env)
+                    .await
+                    .ok()
+                    .map(|token| token.pubkey)
+            }
+            None => None,
+        }) else {
+            return json_error(&env, "NIP-98 authentication required", 401);
+        };
+        let static_admin = zone_media::is_static_admin(
+            env.var("ADMIN_PUBKEYS")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+            &admin,
+        );
+        if !static_admin && !is_admin_user(&env, &admin).await {
+            return json_error(&env, "Admin required", 403);
+        }
+        let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return json_error(&env, "Invalid JSON body", 400),
+        };
+        let pubkey = parsed
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !is_valid_worker_pod_name(&pubkey) {
+            return json_error(&env, "pubkey must be a 64-character hex key", 400);
+        }
+        let limit = match parsed.get("limit_mb") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v
+                .as_u64()
+                .and_then(|mb| mb.checked_mul(1024 * 1024))
+                .filter(|b| *b <= quota::MAX_QUOTA)
+            {
+                Some(b) => Some(b),
+                None => {
+                    return json_error(
+                        &env,
+                        "limit_mb must be a whole number of MiB up to 1 TiB, or null",
+                        400,
+                    )
+                }
+            },
+        };
+        let quota_db = env
+            .d1("REPLAY_DB")
+            .map_err(|e| Error::RustError(format!("REPLAY_DB D1 binding missing: {e}")))?;
+        let info =
+            quota::set_quota_d1(&quota_db, &pubkey, limit, quota::default_quota(&env)).await?;
+        console_log!("[pod] admin {admin} set quota for {pubkey}: {:?}", limit);
+        return json_ok(
+            &env,
+            &serde_json::json!({ "pubkey": pubkey, "limit_bytes": info.limit, "used_bytes": info.used, "explicit": limit.is_some() }),
+            200,
+        );
+    }
+
     // creation authenticated and bound to the signing pubkey because its ACLs
     // and DID identities are keyed by did:nostr:<pubkey>.
     if path == "/.pods" {
@@ -1073,7 +1148,13 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
         // Release the freed bytes from the owner's quota (best-effort — a stale
         // quota row must not fail the teardown).
         if bytes_freed > 0 {
-            let _ = quota::update_usage_d1(&quota_db, &owner_pubkey, -bytes_freed).await;
+            let _ = quota::update_usage_d1(
+                &quota_db,
+                &owner_pubkey,
+                -bytes_freed,
+                quota::default_quota(&env),
+            )
+            .await;
         }
 
         return json_ok(
@@ -1466,7 +1547,14 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
             }
 
             // Atomic quota check + reserve (D1)
-            if let Err(e) = quota::check_and_reserve_d1(&quota_db, &owner_pubkey, data_len).await {
+            if let Err(e) = quota::check_and_reserve_d1(
+                &quota_db,
+                &owner_pubkey,
+                data_len,
+                quota::default_quota(&env),
+            )
+            .await
+            {
                 return json_error(&env, &e.to_string(), 413);
             }
 
@@ -1527,6 +1615,7 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                     &owner_pubkey,
                     requester_pubkey.as_deref(),
                     &resource_path,
+                    quota::default_quota(&env),
                 );
                 if let Err(e) = quota::check_and_reserve_with_limit_d1(
                     &quota_db,
@@ -1586,6 +1675,7 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                 &owner_pubkey,
                 requester_pubkey.as_deref(),
                 &resource_path,
+                quota::default_quota(&env),
             );
             if let Err(e) = quota::check_and_reserve_with_limit_d1(
                 &quota_db,
@@ -1677,6 +1767,7 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                 &owner_pubkey,
                 requester_pubkey.as_deref(),
                 &resource_path,
+                quota::default_quota(&env),
             );
             if size_delta > 0 {
                 if let Err(e) = quota::check_and_reserve_with_limit_d1(
@@ -1709,7 +1800,7 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
 
             // Release quota for shrinkage
             if size_delta < 0 {
-                quota::update_usage_d1(&quota_db, &quota_account, size_delta)
+                quota::update_usage_d1(&quota_db, &quota_account, size_delta, quota_limit)
                     .await
                     .ok();
             }
@@ -1739,14 +1830,20 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
             bucket.delete(&r2_key).await?;
 
             // Release quota (negative delta, D1 atomic)
-            let (quota_account, _) = quota::reservation_account(
+            let (quota_account, quota_limit) = quota::reservation_account(
                 &owner_pubkey,
                 requester_pubkey.as_deref(),
                 &resource_path,
+                quota::default_quota(&env),
             );
-            quota::update_usage_d1(&quota_db, &quota_account, -(deleted_size as i64))
-                .await
-                .ok();
+            quota::update_usage_d1(
+                &quota_db,
+                &quota_account,
+                -(deleted_size as i64),
+                quota_limit,
+            )
+            .await
+            .ok();
 
             // Fire notification webhooks (non-blocking)
             notifications::notify_change(&kv, &owner_pubkey, &resource_path, "Delete").await;
