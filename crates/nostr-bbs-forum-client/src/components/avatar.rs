@@ -67,12 +67,23 @@ pub(crate) fn Avatar(
     #[prop(optional)]
     online: bool,
 ) -> impl IntoView {
-    let bg = pubkey_color(&pubkey);
-    let initials = pubkey.chars().take(2).collect::<String>().to_uppercase();
+    // Colour and initials follow the displayed identity (an archive key's
+    // successor), so one person keeps one disc; tracked, so they update once
+    // the successor map loads.
+    let pk_for_disc = pubkey.clone();
+    let canonical =
+        Memo::new(move |_| crate::components::user_display::canonical_pubkey(&pk_for_disc));
+    let initials = move || canonical.with(|k| k.chars().take(2).collect::<String>().to_uppercase());
 
     let px = size.px();
     let dim = format!("width: {}px; height: {}px; min-width: {}px;", px, px, px);
-    let style = format!("background-color: {}; {}", bg, dim);
+    let style = move || {
+        format!(
+            "background-color: {}; {}",
+            canonical.with(|k| pubkey_color(k)),
+            dim
+        )
+    };
     let text_cls = size.text_class();
 
     let outer_class = format!("avatar-identicon text-white {} relative", text_cls,);

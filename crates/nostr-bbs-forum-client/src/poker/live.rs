@@ -935,7 +935,7 @@ impl LiveStore {
                 .map(|o| o.name)
                 .unwrap_or_else(|| "The house".to_string())
         } else {
-            crate::components::user_display::use_display_name(&opponent)
+            crate::components::user_display::use_display_name_tracked(&opponent)
         };
         let names: Vec<String> = (0..2)
             .map(|i| {

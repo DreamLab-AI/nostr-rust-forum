@@ -1320,7 +1320,7 @@ fn ChainTable(table: AssetTable) -> impl IntoView {
     // a pubkey shown as the member's display name; a house name as it is
     let display = |label: String| {
         if label.len() == 64 {
-            crate::components::user_display::use_display_name(&label)
+            crate::components::user_display::use_display_name_tracked(&label)
         } else {
             label
         }

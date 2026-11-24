@@ -207,15 +207,24 @@ impl ProfileCache {
         self.successors.with(|m| m.get(pubkey).cloned())
     }
 
+    /// The identity `pubkey` is shown as: its successor when the key was
+    /// replaced (an archive key linked to a live key), otherwise itself. One
+    /// hop only: a successor's own successor is not followed. Tracked, so the
+    /// enclosing reactive scope re-runs once the successor map loads. No
+    /// network: the map is fetched once per session at startup.
+    pub fn canonical_tracked(&self, pubkey: &str) -> String {
+        self.canonical(pubkey, true)
+    }
+
     /// The key whose profile should represent `pubkey`: its successor when it
-    /// has been replaced, otherwise itself.
+    /// has been replaced, otherwise itself (one hop, see [`resolve_one_hop`]).
     fn canonical(&self, pubkey: &str, tracked: bool) -> String {
         let succ = if tracked {
             self.successor_tracked(pubkey)
         } else {
             self.successor_of(pubkey)
         };
-        succ.unwrap_or_else(|| pubkey.to_string())
+        resolve_one_hop(pubkey, succ)
     }
 
     /// Look up a profile entry. Returns immediately. If the entry is missing,
@@ -568,6 +577,14 @@ fn persist_one(entry: &ProfileEntry) {
 }
 
 // --- Successor map ------------------------------------------------------------
+
+/// `pubkey`'s displayed identity given its successor lookup: the successor
+/// (one hop, never chained further), else the key itself.
+pub fn resolve_one_hop(pubkey: &str, successor: Option<String>) -> String {
+    successor
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| pubkey.to_string())
+}
 
 /// Fetch the relay's public replaced-key map. Empty on any failure: without
 /// it every key simply renders as itself, which is the pre-alias behaviour.
@@ -971,5 +988,24 @@ mod missing_retry_tests {
         assert!(recently_missing(&m, "pk", 1_000 + MISSING_RETRY_SECS - 1));
         assert!(!recently_missing(&m, "pk", 1_000 + MISSING_RETRY_SECS));
         assert!(!recently_missing(&m, "other", 1_000));
+    }
+}
+
+#[cfg(test)]
+mod successor_tests {
+    use super::resolve_one_hop;
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_replaced_key_resolves_one_hop_only() {
+        let map: HashMap<&str, &str> = HashMap::from([("archive", "live"), ("live", "newer")]);
+        let get = |k: &str| map.get(k).map(|s| s.to_string());
+        assert_eq!(
+            resolve_one_hop("archive", get("archive")),
+            "live",
+            "never chained to 'newer'"
+        );
+        assert_eq!(resolve_one_hop("plain", get("plain")), "plain");
+        assert_eq!(resolve_one_hop("x", Some(String::new())), "x");
     }
 }
