@@ -131,6 +131,9 @@ pub struct ChannelStore {
     /// The most messages one channel's history window holds
     /// ([`HISTORY_WINDOW`], or `window.__ENV__.HISTORY_WINDOW`).
     window_max: usize,
+    /// The most replies one thread's list holds ([`THREAD_WINDOW`], or
+    /// `window.__ENV__.THREAD_WINDOW`).
+    thread_window_max: usize,
     /// The zone-key store, set when it is provided
     /// (`provide_zone_key_store`). Relay callbacks run without a reactive
     /// owner, so `use_context` there returns `None`: eviction must reach the
@@ -191,6 +194,7 @@ impl ChannelStore {
             deletion_progress: StoredValue::new(DeletionProgress::new(deletions)),
             history: RwSignal::new(HashMap::new()),
             window_max: configured_window(),
+            thread_window_max: configured_thread_window(),
             zone_keys: StoredValue::new(None),
             totals: RwSignal::new(HashMap::new()),
             topic_targets: StoredValue::new(HashMap::new()),
@@ -1277,7 +1281,11 @@ impl ChannelStore {
     /// and their decrypt-cache entries and plaintext go with them
     /// ([`ZoneKeyStore::forget`](crate::zone_crypto::store::ZoneKeyStore::forget)).
     fn enforce_window(&self, cid: &str, side: EvictSide) {
-        let max = self.window_max;
+        let max = if cid.starts_with("topic:") {
+            self.thread_window_max
+        } else {
+            self.window_max
+        };
         if self
             .channel_messages
             .with_untracked(|m| m.get(cid).is_none_or(|l| l.len() <= max))
@@ -1869,6 +1877,12 @@ pub const PAGE_TIMEOUT_MS: u32 = 20_000;
 /// channel's history around 40 MB however long it is.
 pub const HISTORY_WINDOW: usize = 3_000;
 
+/// Default window of a single thread's reply list (`topic:<root>` lists).
+/// A reply card renders ~45 DOM nodes (about twice a topic row) and its
+/// controls, so a thread holds fewer rows: at 3,000 a 50k-reply thread
+/// peaked at 179 MB of the 256 MiB wasm heap.
+pub const THREAD_WINDOW: usize = 1_200;
+
 /// The smallest window accepted: ten pages, so the older and newer loaders
 /// are never both on screen evicting each other's pages.
 pub const HISTORY_WINDOW_MIN: usize = 10 * HISTORY_PAGE as usize;
@@ -1881,12 +1895,24 @@ pub fn clamp_window(n: usize) -> usize {
 /// The window size for this deployment: `window.__ENV__.HISTORY_WINDOW`
 /// (a number or numeric string) when set, else [`HISTORY_WINDOW`]; clamped.
 fn configured_window() -> usize {
+    env_window("HISTORY_WINDOW", HISTORY_WINDOW)
+}
+
+/// The thread window for this deployment: `window.__ENV__.THREAD_WINDOW`
+/// when set, else [`THREAD_WINDOW`]; clamped.
+fn configured_thread_window() -> usize {
+    env_window("THREAD_WINDOW", THREAD_WINDOW)
+}
+
+/// `window.__ENV__[name]` (a number or numeric string) when set, else
+/// `default`; clamped to [`HISTORY_WINDOW_MIN`].
+fn env_window(name: &str, default: usize) -> usize {
     #[cfg(target_arch = "wasm32")]
     {
         let configured = web_sys::window()
             .and_then(|w| js_sys::Reflect::get(&w, &"__ENV__".into()).ok())
             .filter(|env| env.is_object())
-            .and_then(|env| js_sys::Reflect::get(&env, &"HISTORY_WINDOW".into()).ok())
+            .and_then(|env| js_sys::Reflect::get(&env, &name.into()).ok())
             .and_then(|v| {
                 v.as_f64()
                     .map(|f| f as usize)
@@ -1896,7 +1922,9 @@ fn configured_window() -> usize {
             return clamp_window(n);
         }
     }
-    clamp_window(HISTORY_WINDOW)
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = name;
+    clamp_window(default)
 }
 
 /// What a history page request hands back once answered: the ingested
@@ -2907,6 +2935,7 @@ mod tests {
     fn the_window_size_is_clamped() {
         assert_eq!(clamp_window(10), HISTORY_WINDOW_MIN);
         assert_eq!(clamp_window(5_000), 5_000);
+        const { assert!(THREAD_WINDOW >= HISTORY_WINDOW_MIN && THREAD_WINDOW < HISTORY_WINDOW) };
         const { assert!(HISTORY_WINDOW >= HISTORY_WINDOW_MIN) };
     }
 

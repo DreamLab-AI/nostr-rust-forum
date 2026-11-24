@@ -2036,11 +2036,26 @@ fn ReplyCard(
     let cancel_edit = Callback::new(move |()| editing_id.set(None));
     let noop = Callback::new(|_: String| {});
 
+    // The per-card controls (edit, delete, tip) mount only once the reader
+    // engages with the card (hover, keyboard focus or a tap), then stay: a
+    // thread window holds up to THREAD_WINDOW cards and most are only read.
+    // An open edit keeps them mounted.
+    let engaged = RwSignal::new(false);
+    let controls_shown = move || engaged.get() || is_editing.get();
+    let edit_post_id = post_id.clone();
+    let edit_post_pubkey = post_pubkey.clone();
+    let delete_post_id = post_id.clone();
+    let delete_post_pubkey = post_pubkey.clone();
+    let tip_post_id = post_id.clone();
+    let tip_post_pubkey = post_pubkey.clone();
     view! {
         <div
             id=post_anchor_id(&post_id)
             data-anchor-id=post_id.clone()
             class="bg-gray-800/40 border border-gray-700/50 rounded-lg p-4 scroll-mt-20 transition-shadow"
+            on:mouseenter=move |_| engaged.set(true)
+            on:focusin=move |_| engaged.set(true)
+            on:touchstart=move |_| engaged.set(true)
         >
             <div class="flex items-start gap-3">
                 <Avatar pubkey=pk size=AvatarSize::Sm />
@@ -2052,20 +2067,22 @@ fn ReplyCard(
                         {edited.then(|| view! {
                             <span class="text-xs text-gray-600 italic">"(edited)"</span>
                         })}
-                        <EditControls
-                            post_id=post_id.clone()
-                            post_pubkey=post_pubkey.clone()
-                            my_pubkey=my_pubkey
-                            editing_id=editing_id
-                        />
-                        <DeleteControls
-                            post_id=post_id.clone()
-                            post_pubkey=post_pubkey.clone()
-                            is_root=false
-                            my_pubkey=my_pubkey
-                            is_admin=is_admin
-                            on_delete=on_delete
-                        />
+                        <Show when=controls_shown>
+                            <EditControls
+                                post_id=edit_post_id.clone()
+                                post_pubkey=edit_post_pubkey.clone()
+                                my_pubkey=my_pubkey
+                                editing_id=editing_id
+                            />
+                            <DeleteControls
+                                post_id=delete_post_id.clone()
+                                post_pubkey=delete_post_pubkey.clone()
+                                is_root=false
+                                my_pubkey=my_pubkey
+                                is_admin=is_admin
+                                on_delete=on_delete
+                            />
+                        </Show>
                         // The reply row: Reply, then tips at the far right
                         // (ADR-2021), away from the emoji reactions below.
                         <div class="ml-auto flex items-center gap-3">
@@ -2079,7 +2096,9 @@ fn ReplyCard(
                                     aria-label="Reply to this post"
                                 >"\u{21A9} Reply"</button>
                             </Show>
-                            <TipControl event_id=post_id.clone() author_pubkey=post_pubkey.clone() open_down=true />
+                            <Show when=controls_shown>
+                                <TipControl event_id=tip_post_id.clone() author_pubkey=tip_post_pubkey.clone() open_down=true />
+                            </Show>
                         </div>
                     </div>
                     {quote.map(|q| {
