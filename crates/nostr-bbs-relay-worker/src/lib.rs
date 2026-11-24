@@ -467,6 +467,9 @@ async fn route(req: Request, env: &Env, path: &str) -> Result<Response> {
     if path == "/api/admin/aliases" && method == Method::Get {
         return user_admin::handle_aliases_list(&req, env).await;
     }
+    if path == "/api/admin/alias/delete" && method == Method::Post {
+        return user_admin::handle_alias_delete(req, env).await;
+    }
     if path == "/api/admin/alias" && method == Method::Post {
         return user_admin::handle_alias_set(req, env).await;
     }
@@ -746,20 +749,22 @@ pub(crate) fn pubkey_aliases_need_upgrade(table_sql: &str) -> bool {
 }
 
 /// Rebuild `pubkey_aliases` with `old_pubkey` as the primary key (also
-/// migration 0016). Rows are copied oldest first with REPLACE, so a key that
+/// migration 0016), keys lowercased (and enforced by CHECK) and self-links
+/// dropped. Rows are copied oldest first with REPLACE, so a key that
 /// the earlier shape linked to several successors keeps its LATEST link (an
 /// old key now resolves to exactly one successor). Idempotent: on the new
 /// shape it rebuilds the same rows.
 pub(crate) const PUBKEY_ALIASES_UPGRADE_STMTS: [&str; 6] = [
     "DROP TABLE IF EXISTS pubkey_aliases_v2",
     "CREATE TABLE pubkey_aliases_v2 (\
-        old_pubkey TEXT PRIMARY KEY NOT NULL, \
-        new_pubkey TEXT NOT NULL, \
+        old_pubkey TEXT PRIMARY KEY NOT NULL CHECK (old_pubkey = lower(old_pubkey)), \
+        new_pubkey TEXT NOT NULL CHECK (new_pubkey = lower(new_pubkey)), \
         created_by TEXT NOT NULL, \
         created_at INTEGER NOT NULL, \
         reason TEXT)",
     "INSERT OR REPLACE INTO pubkey_aliases_v2 (old_pubkey, new_pubkey, created_by, created_at, reason) \
-     SELECT old_pubkey, new_pubkey, created_by, created_at, reason FROM pubkey_aliases \
+     SELECT lower(old_pubkey), lower(new_pubkey), created_by, created_at, reason FROM pubkey_aliases \
+     WHERE lower(old_pubkey) <> lower(new_pubkey) \
      ORDER BY created_at ASC, rowid ASC",
     "DROP TABLE pubkey_aliases",
     "ALTER TABLE pubkey_aliases_v2 RENAME TO pubkey_aliases",
@@ -1395,8 +1400,8 @@ async fn ensure_schema(env: &Env) -> bool {
         // successor may replace several keys (see PUBKEY_ALIASES_UPGRADE_STMTS
         // for deployments created with the earlier new_pubkey PK).
         "CREATE TABLE IF NOT EXISTS pubkey_aliases (\
-            old_pubkey TEXT PRIMARY KEY NOT NULL, \
-            new_pubkey TEXT NOT NULL, \
+            old_pubkey TEXT PRIMARY KEY NOT NULL CHECK (old_pubkey = lower(old_pubkey)), \
+            new_pubkey TEXT NOT NULL CHECK (new_pubkey = lower(new_pubkey)), \
             created_by TEXT NOT NULL, \
             created_at INTEGER NOT NULL, \
             reason TEXT\
@@ -2687,16 +2692,17 @@ mod pubkey_alias_many_to_one_tests {
         }
     }
 
-    /// The handler's upsert (user_admin.rs).
-    fn link(c: &Connection, old: &str, new: &str, at: i64) {
+    /// The handler's guarded upsert (user_admin.rs); returns rows written.
+    fn try_link(c: &Connection, old: &str, new: &str, at: i64) -> usize {
         c.execute(
-            "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at, reason) \
-             VALUES (?1, ?2, 'admin', ?3, NULL) \
-             ON CONFLICT (old_pubkey) DO UPDATE SET new_pubkey = excluded.new_pubkey, \
-             created_by = excluded.created_by, created_at = excluded.created_at, reason = excluded.reason",
-            params![new, old, at],
+            crate::user_admin::ALIAS_UPSERT_GUARDED_SQL,
+            params![new, old, "admin", at, Option::<String>::None],
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn link(c: &Connection, old: &str, new: &str, at: i64) {
+        assert_eq!(try_link(c, old, new, at), 1, "{old} -> {new}");
     }
 
     fn successors(c: &Connection) -> Vec<(String, String)> {
@@ -2740,6 +2746,50 @@ mod pubkey_alias_many_to_one_tests {
         upgrade(&c);
         c.execute_batch(MIGRATION_0016).unwrap();
         assert_eq!(successors(&c), vec![pair("a", "live3"), pair("b", "live2")]);
+    }
+
+    #[test]
+    fn the_guarded_write_refuses_chains_and_loops_at_write_time() {
+        // Review C2: the guards are re-checked in the INSERT itself, so a
+        // call that passed its reads before another committed cannot chain.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        upgrade(&c);
+        link(&c, "a", "b", 1);
+        assert_eq!(try_link(&c, "b", "a", 2), 0, "loop b -> a refused");
+        assert_eq!(try_link(&c, "b", "c", 3), 0, "chain a -> b -> c refused");
+        assert_eq!(
+            try_link(&c, "x", "a", 4),
+            0,
+            "successor a is itself replaced"
+        );
+        assert_eq!(successors(&c), vec![pair("a", "b")]);
+    }
+
+    #[test]
+    fn keys_are_stored_lowercase_and_the_upgrade_normalises_old_rows() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(MIGRATION_0003).unwrap();
+        for (new, old, at) in [("LIVE", "Arch", 1), ("same", "SAME", 2)] {
+            c.execute(
+                "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at) VALUES (?1, ?2, 'x', ?3)",
+                params![new, old, at],
+            )
+            .unwrap();
+        }
+        upgrade(&c);
+        assert_eq!(
+            successors(&c),
+            vec![pair("arch", "live")],
+            "lowercased, self-link dropped"
+        );
+        // Review C1: a mixed-case key can no longer be stored.
+        assert!(c
+            .execute(
+                "INSERT INTO pubkey_aliases (new_pubkey, old_pubkey, created_by, created_at) VALUES ('ok', 'MIXED', 'x', 1)",
+                [],
+            )
+            .is_err());
     }
 
     #[test]

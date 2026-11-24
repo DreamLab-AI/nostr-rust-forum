@@ -7,7 +7,8 @@
 -- exactly one successor) and `new_pubkey` is indexed (a successor's
 -- predecessors). Successors still resolve ONE hop.
 --
--- Data is kept: rows are copied oldest first with REPLACE, so an old key the
+-- Keys are lowercased (CHECK-enforced; every reader compares exactly) and
+-- self-links dropped. Data is otherwise kept: rows are copied oldest first with REPLACE, so an old key the
 -- earlier shape linked to several successors keeps its latest link.
 --
 -- The relay's ensure_schema performs the same rebuild at boot when it finds
@@ -17,14 +18,15 @@
 
 DROP TABLE IF EXISTS pubkey_aliases_v2;
 CREATE TABLE pubkey_aliases_v2 (
-    old_pubkey  TEXT PRIMARY KEY NOT NULL,
-    new_pubkey  TEXT NOT NULL,
+    old_pubkey  TEXT PRIMARY KEY NOT NULL CHECK (old_pubkey = lower(old_pubkey)),
+    new_pubkey  TEXT NOT NULL CHECK (new_pubkey = lower(new_pubkey)),
     created_by  TEXT NOT NULL,
     created_at  INTEGER NOT NULL,
     reason      TEXT
 );
 INSERT OR REPLACE INTO pubkey_aliases_v2 (old_pubkey, new_pubkey, created_by, created_at, reason)
-    SELECT old_pubkey, new_pubkey, created_by, created_at, reason FROM pubkey_aliases
+    SELECT lower(old_pubkey), lower(new_pubkey), created_by, created_at, reason FROM pubkey_aliases
+    WHERE lower(old_pubkey) <> lower(new_pubkey)
     ORDER BY created_at ASC, rowid ASC;
 DROP TABLE pubkey_aliases;
 ALTER TABLE pubkey_aliases_v2 RENAME TO pubkey_aliases;

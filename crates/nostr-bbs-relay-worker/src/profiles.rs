@@ -195,7 +195,7 @@ async fn resolve_aliased_profiles(
     let placeholders: Vec<String> = (1..=new_pubkeys.len()).map(|i| format!("?{i}")).collect();
     let alias_sql = format!(
         "SELECT new_pubkey, old_pubkey FROM pubkey_aliases WHERE new_pubkey IN ({}) \
-         ORDER BY created_at DESC",
+         ORDER BY created_at DESC, rowid DESC",
         placeholders.join(", ")
     );
     let binds: Vec<JsValue> = new_pubkeys.iter().map(|p| JsValue::from_str(p)).collect();
