@@ -66,6 +66,13 @@ pub enum ZoneMediaPath<'a> {
     Container { zone: &'a str },
     /// `/media/zones/<zone>/<name>`: an object.
     Object { zone: &'a str, name: &'a str },
+    /// `/media/zones/<zone>/search/`: the zone's sealed-search folder (owner
+    /// listing only; members find objects through the signed `m.json`).
+    SearchContainer { zone: &'a str },
+    /// `/media/zones/<zone>/search/<name>`: a sealed search index object
+    /// (sealed-search design §5). Written only by an admin or archivist into
+    /// their own pod; read exactly like zone media.
+    Search { zone: &'a str, name: &'a str },
     /// Under the prefix but not one of the shapes above (deeper nesting, a
     /// sidecar, a bad zone id or object name, a missing trailing slash).
     Invalid,
@@ -91,6 +98,15 @@ pub fn classify(resource_path: &str) -> Option<ZoneMediaPath<'_>> {
     }
     if tail.is_empty() {
         return Some(ZoneMediaPath::Container { zone });
+    }
+    if let Some(name) = tail.strip_prefix("search/") {
+        if name.is_empty() {
+            return Some(ZoneMediaPath::SearchContainer { zone });
+        }
+        if !is_valid_search_name(name) {
+            return Some(ZoneMediaPath::Invalid);
+        }
+        return Some(ZoneMediaPath::Search { zone, name });
     }
     if !is_valid_object_name(tail) {
         return Some(ZoneMediaPath::Invalid);
@@ -120,6 +136,50 @@ pub fn is_valid_object_name(name: &str) -> bool {
         && !name.ends_with(".meta")
         && b.iter()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+fn decimal(s: &str, max: u64) -> bool {
+    !s.is_empty()
+        && s.len() <= 20
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && (s == "0" || !s.starts_with('0'))
+        && s.parse::<u64>().is_ok_and(|n| n <= max)
+}
+
+/// Sealed-search object names: `m.json`, or
+/// `[bq]-<epoch u32>-<shard u32>-v<version u64>.age`, ASCII digits only, no
+/// leading zeros (security review L1). Mirrors
+/// `nostr_bbs_sealed_search::manifest::valid_object_name`.
+pub fn is_valid_search_name(name: &str) -> bool {
+    if name == "m.json" {
+        return true;
+    }
+    let Some(stem) = name.strip_suffix(".age") else {
+        return false;
+    };
+    let mut p = stem.splitn(4, '-');
+    let (Some(k), Some(e), Some(s), Some(v)) = (p.next(), p.next(), p.next(), p.next()) else {
+        return false;
+    };
+    (k == "b" || k == "q")
+        && decimal(e, u64::from(u32::MAX))
+        && decimal(s, u64::from(u32::MAX))
+        && v.strip_prefix('v').is_some_and(|v| decimal(v, u64::MAX))
+}
+
+/// Most bytes one sealed-search object may hold.
+pub const MAX_SEARCH_OBJECT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Whether a `PUT` to a search object carries the right media type for its
+/// name: `application/json` for `m.json`, `application/octet-stream` for an
+/// `.age` object.
+pub fn is_allowed_search_upload_type(content_type: &str, name: &str) -> bool {
+    let m = media_type(content_type);
+    if name == "m.json" {
+        m == "application/json"
+    } else {
+        m == "application/octet-stream"
+    }
 }
 
 /// The request classes a zone path distinguishes.
@@ -239,6 +299,9 @@ pub struct AccessRequest<'a> {
     pub requester: Option<&'a str>,
     /// Requester is in the static `ADMIN_PUBKEYS` list.
     pub static_admin: bool,
+    /// Requester is in `SEARCH_ARCHIVISTS` (may publish sealed search indexes
+    /// while their own whitelist row is active).
+    pub archivist: bool,
     /// Requester's own whitelist row.
     pub requester_row: Option<&'a WhitelistRow>,
     /// When the requester is a registered, unrevoked device key and device keys
@@ -267,6 +330,15 @@ pub enum Decision {
 /// Whether the decision needs whitelist rows at all (the caller skips the D1
 /// read for owners, static admins, anonymous requests and non-object paths).
 pub fn needs_whitelist(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> bool {
+    if let ZoneMediaPath::Search { .. } = path {
+        if req.static_admin {
+            return false;
+        }
+        return match req.access {
+            Access::Read => req.requester.is_some_and(|r| r != req.owner),
+            Access::Write | Access::Delete => req.requester == Some(req.owner),
+        };
+    }
     let ZoneMediaPath::Object { .. } = path else {
         return false;
     };
@@ -289,6 +361,28 @@ pub fn decide(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> Decision {
         return Decision::Unauthenticated;
     };
     let is_owner = requester == req.owner;
+
+    // Sealed search objects: decided before the member write branch below,
+    // which would otherwise let any member who may post write here.
+    if let ZoneMediaPath::Search { zone, .. } = path {
+        if req.access != Access::Read {
+            if !is_owner {
+                return Decision::Forbidden;
+            }
+            if req.static_admin {
+                return Decision::Allow;
+            }
+            // Admin row or archivist, either way with an active row of the
+            // raw key itself (device keys never qualify: the owner check is
+            // on the raw signing key).
+            let active = req.requester_row.filter(|r| r.is_active(req.now));
+            return match active {
+                Some(r) if r.is_admin || req.archivist => Decision::Allow,
+                _ => Decision::Forbidden,
+            };
+        }
+        return read_decision(zone, is_owner, req);
+    }
 
     // Writes and listings: the owner's raw key, nobody else.
     let ZoneMediaPath::Object { zone, .. } = path else {
@@ -329,6 +423,12 @@ pub fn decide(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> Decision {
         };
     }
 
+    read_decision(zone, is_owner, req)
+}
+
+/// The zone-media read rule (shared by objects and search objects): owner,
+/// admin, or an active member whose cohorts satisfy the zone.
+fn read_decision(zone: &str, is_owner: bool, req: &AccessRequest<'_>) -> Decision {
     if is_owner || req.static_admin {
         return Decision::Allow;
     }
@@ -356,7 +456,7 @@ pub fn decide(path: &ZoneMediaPath<'_>, req: &AccessRequest<'_>) -> Decision {
         return Decision::Forbidden;
     };
 
-    let Some(rule) = req.zones.and_then(|zs| zs.iter().find(|z| z.id == *zone)) else {
+    let Some(rule) = req.zones.and_then(|zs| zs.iter().find(|z| z.id == zone)) else {
         return Decision::Forbidden;
     };
     if rule.member_can_read(&row.cohorts) {
@@ -400,6 +500,10 @@ fn raster_type_for_name(name: &str) -> Option<&'static str> {
 /// raster types are served as themselves; everything else, SVG included, is
 /// `application/octet-stream` as an attachment.
 pub fn served_content_type(stored: &str, name: &str) -> (String, bool) {
+    if name.ends_with(".age") || name == "m.json" {
+        // Sealed search objects: always bytes, always a download.
+        return ("application/octet-stream".to_string(), true);
+    }
     let media = media_type(stored);
     if ALLOWED_IMAGE_TYPES.contains(&media.as_str()) {
         return (media, false);
@@ -475,11 +579,95 @@ mod tests {
             owner: OWNER,
             requester,
             static_admin: false,
+            archivist: false,
             requester_row: row,
             device_owner_row: None,
             zones: Some(zones),
             now: NOW,
         }
+    }
+
+    fn admin_row(cohorts: &[&str]) -> WhitelistRow {
+        WhitelistRow { is_admin: true, ..row(cohorts) }
+    }
+
+    // ── Sealed search objects ────────────────────────────────────────────
+
+    #[test]
+    fn search_paths_classify_strictly() {
+        assert_eq!(
+            classify("/media/zones/zone2/search/b-1-0-v3.age"),
+            Some(ZoneMediaPath::Search { zone: "zone2", name: "b-1-0-v3.age" })
+        );
+        assert_eq!(classify("/media/zones/zone2/search/m.json"), Some(ZoneMediaPath::Search { zone: "zone2", name: "m.json" }));
+        assert_eq!(classify("/media/zones/zone2/search/"), Some(ZoneMediaPath::SearchContainer { zone: "zone2" }));
+        for bad in [
+            "/media/zones/zone2/search/b-01-0-v3.age",
+            "/media/zones/zone2/search/b-1-0-v3.ag",
+            "/media/zones/zone2/search/x.webp",
+            "/media/zones/zone2/search/b-4294967296-0-v1.age",
+            "/media/zones/zone2/search/sub/m.json",
+            "/media/zones/zone2/search/.acl",
+            "/media/zones/zone2/search/b-\u{0661}-0-v1.age",
+        ] {
+            assert_eq!(classify(bad), Some(ZoneMediaPath::Invalid), "{bad}");
+        }
+    }
+
+    #[test]
+    fn search_writes_need_owner_and_admin_or_active_archivist() {
+        let z = zones();
+        let path = ZoneMediaPath::Search { zone: "zone2", name: "b-1-0-v1.age" };
+        let member = row(&["zone2"]);
+        let adm = admin_row(&["zone2"]);
+        let mut w = read(Some(OWNER), Some(&member), &z);
+        w.access = Access::Write;
+        // A zone member who may post in zone2 still cannot write search objects.
+        assert_eq!(decide(&path, &w), Decision::Forbidden);
+        // Archivist with an active row: allowed; without a row: refused.
+        w.archivist = true;
+        assert_eq!(decide(&path, &w), Decision::Allow);
+        assert!(needs_whitelist(&path, &w));
+        w.requester_row = None;
+        assert_eq!(decide(&path, &w), Decision::Forbidden);
+        // Admin row (delete), and static admin (write, no row needed).
+        let mut a = read(Some(OWNER), Some(&adm), &z);
+        a.access = Access::Delete;
+        assert_eq!(decide(&path, &a), Decision::Allow);
+        let mut s = read(Some(OWNER), None, &z);
+        s.access = Access::Write;
+        s.static_admin = true;
+        assert_eq!(decide(&path, &s), Decision::Allow);
+        assert!(!needs_whitelist(&path, &s));
+        // Never into someone else's pod, even as admin.
+        let mut other = read(Some(OTHER), Some(&adm), &z);
+        other.access = Access::Write;
+        assert_eq!(decide(&path, &other), Decision::Forbidden);
+    }
+
+    #[test]
+    fn search_reads_follow_the_zone_media_rule() {
+        let z = zones();
+        let path = ZoneMediaPath::Search { zone: "zone2", name: "m.json" };
+        let member = row(&["zone2"]);
+        let outsider = row(&["zone3"]);
+        assert_eq!(decide(&path, &read(Some(OTHER), Some(&member), &z)), Decision::Allow);
+        assert_eq!(decide(&path, &read(Some(OTHER), Some(&outsider), &z)), Decision::Forbidden);
+        assert_eq!(decide(&path, &read(None, None, &z)), Decision::Unauthenticated);
+        // Listing the folder: owner only.
+        let c = ZoneMediaPath::SearchContainer { zone: "zone2" };
+        assert_eq!(decide(&c, &read(Some(OTHER), Some(&member), &z)), Decision::Forbidden);
+        assert_eq!(decide(&c, &read(Some(OWNER), None, &z)), Decision::Allow);
+    }
+
+    #[test]
+    fn search_upload_types_and_served_type() {
+        assert!(is_allowed_search_upload_type("application/octet-stream", "b-1-0-v1.age"));
+        assert!(is_allowed_search_upload_type("application/json; charset=utf-8", "m.json"));
+        assert!(!is_allowed_search_upload_type("application/json", "b-1-0-v1.age"));
+        assert!(!is_allowed_search_upload_type("image/webp", "m.json"));
+        assert_eq!(served_content_type("application/json", "m.json"), ("application/octet-stream".into(), true));
+        assert_eq!(served_content_type("image/webp", "q-1-0-v1.age"), ("application/octet-stream".into(), true));
     }
 
     const Z2: ZoneMediaPath<'static> = ZoneMediaPath::Object {

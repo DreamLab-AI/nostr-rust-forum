@@ -1110,6 +1110,11 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
             requester_pubkey.as_deref(),
             nip98_reason.as_deref(),
             &content_type,
+            req.headers()
+                .get("Content-Length")
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<u64>().ok()),
         )
         .await?
         {
@@ -1250,7 +1255,8 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
             let stored_content_type = match &zone_path {
                 // Zone objects: allow-listed rasters only, never SVG; anything
                 // else is octet-stream (the wrapper adds the attachment header).
-                Some(zone_media::ZoneMediaPath::Object { name, .. }) => {
+                Some(zone_media::ZoneMediaPath::Object { name, .. })
+                | Some(zone_media::ZoneMediaPath::Search { name, .. }) => {
                     zone_media::served_content_type(&stored_content_type, name).0
                 }
                 _ => refine_image_content_type(&resource_path, stored_content_type),
@@ -1436,6 +1442,11 @@ async fn fetch_inner(mut req: Request, env: Env) -> Result<Response> {
                     &format!("Body exceeds {} byte limit", MAX_BODY_SIZE),
                     413,
                 );
+            }
+            if matches!(zone_path, Some(zone_media::ZoneMediaPath::Search { .. }))
+                && data_len > zone_media::MAX_SEARCH_OBJECT_BYTES
+            {
+                return json_error(&env, "Search object exceeds 32 MB", 413);
             }
 
             // Conditional check: If-Match for safe overwrites
@@ -2164,6 +2175,7 @@ async fn zone_media_gate(
     requester: Option<&str>,
     nip98_reason: Option<&str>,
     content_type: &str,
+    content_length: Option<u64>,
 ) -> Result<Option<Response>> {
     use zone_media::{Access, AccessRequest, Decision};
 
@@ -2185,12 +2197,22 @@ async fn zone_media_gate(
         )
     });
     let now = (js_sys::Date::now() / 1000.0) as i64;
+    let archivist = requester.is_some_and(|pk| {
+        zone_media::is_static_admin(
+            env.var("SEARCH_ARCHIVISTS")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+            pk,
+        )
+    });
 
     let mut req = AccessRequest {
         access,
         owner: owner_pubkey,
         requester,
         static_admin,
+        archivist,
         requester_row: None,
         device_owner_row: None,
         zones: zones.as_deref(),
@@ -2246,6 +2268,24 @@ async fn zone_media_gate(
         // (DELETE, its own access class); POST/PATCH have no meaning here.
         if *method != Method::Put {
             return json_error(env, "Method not allowed; use PUT or DELETE", 405).map(Some);
+        }
+        if let zone_media::ZoneMediaPath::Search { zone, name } = path {
+            if !zone_media::is_allowed_search_upload_type(content_type, name) {
+                return json_error(
+                    env,
+                    "Search objects: application/octet-stream (.age) or application/json (m.json)",
+                    415,
+                )
+                .map(Some);
+            }
+            if content_length.is_some_and(|n| n > zone_media::MAX_SEARCH_OBJECT_BYTES) {
+                return json_error(env, "Search object exceeds 32 MB", 413).map(Some);
+            }
+            let known = zones.as_deref().is_some_and(|zs| zs.iter().any(|z| z.id == *zone));
+            if !known {
+                return json_error(env, "Unknown zone", 400).map(Some);
+            }
+            return Ok(None);
         }
         if !zone_media::is_allowed_upload_type(content_type) {
             return json_error(
