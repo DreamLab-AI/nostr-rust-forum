@@ -588,7 +588,10 @@ mod tests {
     }
 
     fn admin_row(cohorts: &[&str]) -> WhitelistRow {
-        WhitelistRow { is_admin: true, ..row(cohorts) }
+        WhitelistRow {
+            is_admin: true,
+            ..row(cohorts)
+        }
     }
 
     // ── Sealed search objects ────────────────────────────────────────────
@@ -597,10 +600,22 @@ mod tests {
     fn search_paths_classify_strictly() {
         assert_eq!(
             classify("/media/zones/zone2/search/b-1-0-v3.age"),
-            Some(ZoneMediaPath::Search { zone: "zone2", name: "b-1-0-v3.age" })
+            Some(ZoneMediaPath::Search {
+                zone: "zone2",
+                name: "b-1-0-v3.age"
+            })
         );
-        assert_eq!(classify("/media/zones/zone2/search/m.json"), Some(ZoneMediaPath::Search { zone: "zone2", name: "m.json" }));
-        assert_eq!(classify("/media/zones/zone2/search/"), Some(ZoneMediaPath::SearchContainer { zone: "zone2" }));
+        assert_eq!(
+            classify("/media/zones/zone2/search/m.json"),
+            Some(ZoneMediaPath::Search {
+                zone: "zone2",
+                name: "m.json"
+            })
+        );
+        assert_eq!(
+            classify("/media/zones/zone2/search/"),
+            Some(ZoneMediaPath::SearchContainer { zone: "zone2" })
+        );
         for bad in [
             "/media/zones/zone2/search/b-01-0-v3.age",
             "/media/zones/zone2/search/b-1-0-v3.ag",
@@ -617,7 +632,10 @@ mod tests {
     #[test]
     fn search_writes_need_owner_and_admin_or_active_archivist() {
         let z = zones();
-        let path = ZoneMediaPath::Search { zone: "zone2", name: "b-1-0-v1.age" };
+        let path = ZoneMediaPath::Search {
+            zone: "zone2",
+            name: "b-1-0-v1.age",
+        };
         let member = row(&["zone2"]);
         let adm = admin_row(&["zone2"]);
         let mut w = read(Some(OWNER), Some(&member), &z);
@@ -648,26 +666,56 @@ mod tests {
     #[test]
     fn search_reads_follow_the_zone_media_rule() {
         let z = zones();
-        let path = ZoneMediaPath::Search { zone: "zone2", name: "m.json" };
+        let path = ZoneMediaPath::Search {
+            zone: "zone2",
+            name: "m.json",
+        };
         let member = row(&["zone2"]);
         let outsider = row(&["zone3"]);
-        assert_eq!(decide(&path, &read(Some(OTHER), Some(&member), &z)), Decision::Allow);
-        assert_eq!(decide(&path, &read(Some(OTHER), Some(&outsider), &z)), Decision::Forbidden);
-        assert_eq!(decide(&path, &read(None, None, &z)), Decision::Unauthenticated);
+        assert_eq!(
+            decide(&path, &read(Some(OTHER), Some(&member), &z)),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(&path, &read(Some(OTHER), Some(&outsider), &z)),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            decide(&path, &read(None, None, &z)),
+            Decision::Unauthenticated
+        );
         // Listing the folder: owner only.
         let c = ZoneMediaPath::SearchContainer { zone: "zone2" };
-        assert_eq!(decide(&c, &read(Some(OTHER), Some(&member), &z)), Decision::Forbidden);
+        assert_eq!(
+            decide(&c, &read(Some(OTHER), Some(&member), &z)),
+            Decision::Forbidden
+        );
         assert_eq!(decide(&c, &read(Some(OWNER), None, &z)), Decision::Allow);
     }
 
     #[test]
     fn search_upload_types_and_served_type() {
-        assert!(is_allowed_search_upload_type("application/octet-stream", "b-1-0-v1.age"));
-        assert!(is_allowed_search_upload_type("application/json; charset=utf-8", "m.json"));
-        assert!(!is_allowed_search_upload_type("application/json", "b-1-0-v1.age"));
+        assert!(is_allowed_search_upload_type(
+            "application/octet-stream",
+            "b-1-0-v1.age"
+        ));
+        assert!(is_allowed_search_upload_type(
+            "application/json; charset=utf-8",
+            "m.json"
+        ));
+        assert!(!is_allowed_search_upload_type(
+            "application/json",
+            "b-1-0-v1.age"
+        ));
         assert!(!is_allowed_search_upload_type("image/webp", "m.json"));
-        assert_eq!(served_content_type("application/json", "m.json"), ("application/octet-stream".into(), true));
-        assert_eq!(served_content_type("image/webp", "q-1-0-v1.age"), ("application/octet-stream".into(), true));
+        assert_eq!(
+            served_content_type("application/json", "m.json"),
+            ("application/octet-stream".into(), true)
+        );
+        assert_eq!(
+            served_content_type("image/webp", "q-1-0-v1.age"),
+            ("application/octet-stream".into(), true)
+        );
     }
 
     const Z2: ZoneMediaPath<'static> = ZoneMediaPath::Object {
