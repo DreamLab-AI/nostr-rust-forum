@@ -1164,6 +1164,23 @@ async fn ensure_schema(env: &Env) -> bool {
         }
     }
 
+    // --- Kanban approval claims (migration 0015) ---
+    for (name, sql) in [
+        (
+            "kanban_move_approvals",
+            relay_do::KANBAN_MOVE_APPROVALS_CREATE_SQL,
+        ),
+        (
+            "idx_kanban_move_approvals_card",
+            relay_do::KANBAN_MOVE_APPROVALS_INDEX_SQL,
+        ),
+    ] {
+        if let Err(e) = db.prepare(sql).run().await {
+            console_error!("ensure_schema: {name} create failed: {e}");
+            ok = false;
+        }
+    }
+
     // --- Governance tables (broker_cases, governance_receipts) ---
     // Must precede the ALTERs below for the same reason as events/whitelist: on a
     // fresh D1 the ALTERs otherwise fail and the effective_tier index is skipped.
