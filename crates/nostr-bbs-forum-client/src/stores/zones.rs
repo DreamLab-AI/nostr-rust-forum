@@ -126,6 +126,28 @@ pub struct Zone {
     /// kinds by zone tag regardless.
     #[serde(default)]
     pub kanban: bool,
+    /// Search mode (`"off" | "server" | "sealed"`), projected from
+    /// `nostr_bbs_config::schema::Zone::search`. Absent ⇒ derived by
+    /// [`Zone::effective_search`] exactly as the config does.
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+impl Zone {
+    /// The search mode in force: configured, else encrypted → `sealed`,
+    /// public → `off`, otherwise `server` (mirrors
+    /// `nostr_bbs_config::schema::Zone::effective_search`). An unknown value
+    /// reads as `off`.
+    pub fn effective_search(&self) -> &'static str {
+        match self.search.as_deref() {
+            Some("sealed") if self.encrypted => "sealed",
+            Some("server") if !self.encrypted => "server",
+            Some(_) => "off",
+            None if self.encrypted => "sealed",
+            None if self.visibility == ZoneVisibility::Public => "off",
+            None => "server",
+        }
+    }
 }
 
 impl Zone {
@@ -382,6 +404,7 @@ fn fallback_zones() -> Vec<Zone> {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         },
         Zone {
             id: "friends".to_string(),
@@ -396,6 +419,7 @@ fn fallback_zones() -> Vec<Zone> {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         },
         Zone {
             id: "family".to_string(),
@@ -410,6 +434,7 @@ fn fallback_zones() -> Vec<Zone> {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         },
         Zone {
             id: "business".to_string(),
@@ -424,6 +449,7 @@ fn fallback_zones() -> Vec<Zone> {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         },
     ]
 }
@@ -480,6 +506,7 @@ mod tests {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         }
     }
 

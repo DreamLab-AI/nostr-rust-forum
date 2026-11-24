@@ -473,6 +473,7 @@ mod tests {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         }
     }
 
@@ -490,6 +491,7 @@ mod tests {
             accent_hex: None,
             section_order: Vec::new(),
             kanban: false,
+            search: None,
         }
     }
 

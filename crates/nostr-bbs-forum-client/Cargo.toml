@@ -24,6 +24,9 @@ alloc-stats = []
 
 [dependencies]
 nostr-bbs-core = { workspace = true }
+# Sealed per-zone search: manifest verification + key derivation only (no age,
+# no model: those live in the separate search Web Worker).
+nostr-bbs-sealed-search = { path = "../nostr-bbs-sealed-search", default-features = false }
 # `EventBuilder::relay_list` builds the NIP-65 tags for the public-inbox opt-in.
 # Already in the wasm graph through nostr-bbs-core, so no new code ships.
 nostr = { workspace = true }
@@ -52,6 +55,7 @@ js-sys = { workspace = true }
 web-sys = { workspace = true, features = [
     "WebSocket",
     "MessageEvent",
+    "Worker",
     "CloseEvent",
     "ErrorEvent",
     "BinaryType",

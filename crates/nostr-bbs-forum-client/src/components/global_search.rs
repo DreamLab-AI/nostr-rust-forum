@@ -17,17 +17,14 @@
 use crate::app::base_href;
 use crate::components::copy_key::KeyGlyph;
 use crate::relay::{Filter, RelayConnection};
-use crate::utils::search_client;
 use gloo::events::EventListener;
 use gloo::storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
 
 /// A raw message search hit before relay hydration: `(event_id, score, content, label)`.
 /// Bodies are absent until the id→event hydration pass fills them in.
-type RawHit = (String, Option<f64>, Option<String>, Option<String>);
-
 /// Truncate `text` to at most `max_chars` characters, appending an ellipsis
 /// when it was shortened.
 ///
@@ -204,20 +201,6 @@ impl Hit {
 struct Recent {
     query: String,
 }
-#[derive(Clone, Deserialize)]
-struct SHit {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    label: Option<String>,
-}
-#[derive(Clone, Deserialize)]
-struct SResp {
-    #[serde(default)]
-    results: Vec<SHit>,
-}
 
 #[component]
 pub(crate) fn GlobalSearch() -> impl IntoView {
@@ -247,14 +230,26 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     // context lookup) is not guaranteed.
     let relay_handle = StoredValue::new(expect_context::<RelayConnection>());
 
-    // Check search API status on open
+    // Sealed per-zone search (encrypted zones): on open, load each sealed
+    // zone's verified index into the search worker. Nothing is sent to a
+    // search server; the query is embedded in the worker, on this device.
+    let zone_store = crate::zone_crypto::store::try_use_zone_key_store();
+    let auth = crate::auth::use_auth();
     Effect::new(move |_| {
         if is_open.get() {
+            let (Some(store), Some(signer)) = (zone_store, auth.get_signer()) else {
+                return;
+            };
             wasm_bindgen_futures::spawn_local(async move {
-                match search_client::get_search_status().await {
-                    Ok(_) => api_online.set(true),
-                    Err(_) => api_online.set(false),
+                let mut any = crate::utils::sealed_search::ready();
+                for zone in crate::utils::sealed_search::sealed_zones() {
+                    match crate::utils::sealed_search::ensure_zone(&zone, &store, &*signer).await {
+                        Ok(n) if n > 0 => any = true,
+                        Ok(_) => {}
+                        Err(e) => web_sys::console::warn_1(&format!("[sealed-search] {zone}: {e}").into()),
+                    }
                 }
+                api_online.set(any);
             });
         }
     });
@@ -302,7 +297,6 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
     let do_search = move || {
         let q = query.get_untracked();
         let t = tab.get_untracked();
-        let is_semantic = semantic_mode.get_untracked();
         if q.trim().is_empty() {
             results.set(Vec::new());
             loading.set(false);
@@ -322,16 +316,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                 // The search API responds with `{results:[{id,score},...]}` —
                 // event bodies are NOT included, so hits must be hydrated
                 // id→event via the relay below (QA HIGH bug #4: blank rows).
-                let mut raw: Vec<RawHit> = Vec::new();
-                let mut fetch_err: Option<String> = None;
 
-                let non_empty = |s: String| {
-                    if s.trim().is_empty() {
-                        None
-                    } else {
-                        Some(s)
-                    }
-                };
 
                 // Text search goes to the RELAY (NIP-50 `search` on kind-42),
                 // not to the vector worker. The worker's index is fed only by
@@ -355,87 +340,26 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                     });
                 }
 
-                // The worker is consulted in semantic mode, or when the relay
-                // returned nothing (a deployment whose relay predates NIP-50
-                // still gets whatever the index knows).
-                if is_semantic || relay_hits.is_empty() {
-                    match search_client::search_similar(&q, SEMANTIC_K, 0.3).await {
+                // Sealed per-zone search over the encrypted zones this member
+                // holds keys for: verified, decrypted events only.
+                if let Some(store) = zone_store.filter(|_| crate::utils::sealed_search::ready()) {
+                    match crate::utils::sealed_search::search(&relay, &store, &q, SEMANTIC_K).await {
                         Ok(hits) => {
                             for h in hits {
-                                let content = h.content.and_then(non_empty);
-                                raw.push((h.id, Some(h.score), content, h.label));
+                                if !seen.insert(h.event.id.clone()) {
+                                    continue;
+                                }
+                                out.push(Hit::SemanticMessage {
+                                    event_id: h.event.id.clone(),
+                                    id: channel_id_of(&h.event).unwrap_or_else(|| h.event.id.clone()),
+                                    content: h.event.content.clone(),
+                                    label: h.event.pubkey.clone(),
+                                    score: h.score,
+                                });
                             }
                         }
-                        Err(sem_err) => match semantic_search(&q).await {
-                            Ok(hits) => {
-                                for h in hits {
-                                    raw.push((h.id, None, non_empty(h.content), h.label));
-                                }
-                            }
-                            Err(txt_err) => {
-                                fetch_err = Some(format!("semantic: {sem_err}; text: {txt_err}"));
-                            }
-                        },
+                        Err(e) => errors.push(format!("Encrypted-zone search failed: {e}")),
                     }
-                }
-                raw = drop_seen_hits(raw, &mut seen);
-
-                // A worker failure is only worth surfacing when the relay
-                // found nothing either — otherwise the member has their
-                // results and a warning about the optional layer is noise.
-                if let (Some(e), true) = (fetch_err, relay_hits.is_empty()) {
-                    errors.push(format!("Message search failed: {e}"));
-                }
-
-                // Hydrate hits whose content is missing from the API response.
-                let need: Vec<String> = raw
-                    .iter()
-                    .filter(|(_, _, content, _)| content.is_none())
-                    .map(|(id, _, _, _)| id.clone())
-                    .collect();
-                let hydrated = hydrate_search_ids(&relay, need).await;
-
-                let mut missing = 0usize;
-                for (id, score, content, label) in raw {
-                    let event = hydrated.get(&id);
-                    let content = match content {
-                        Some(c) => c,
-                        None => match event {
-                            Some(ev) if crate::zone_crypto::has_zk_tag(&ev.tags) => continue,
-                            Some(ev) if !ev.content.trim().is_empty() => ev.content.clone(),
-                            _ => {
-                                missing += 1;
-                                continue;
-                            }
-                        },
-                    };
-                    let author = label
-                        .filter(|l| !l.is_empty())
-                        .or_else(|| event.map(|ev| ev.pubkey.clone()))
-                        .unwrap_or_default();
-                    // Link to the containing channel (kind-42 `e` tag) when
-                    // known; fall back to the raw id.
-                    let channel = event.and_then(channel_id_of).unwrap_or_else(|| id.clone());
-                    match score {
-                        Some(s) => out.push(Hit::SemanticMessage {
-                            event_id: id.clone(),
-                            id: channel,
-                            content,
-                            label: author,
-                            score: s,
-                        }),
-                        None => out.push(Hit::Message {
-                            event_id: id.clone(),
-                            content,
-                            author,
-                            channel_id: channel,
-                        }),
-                    }
-                }
-                if missing > 0 {
-                    errors.push(format!(
-                        "{missing} matching message(s) could not be loaded from the relay"
-                    ));
                 }
             }
 
@@ -681,7 +605,7 @@ pub(crate) fn GlobalSearch() -> impl IntoView {
                             // Search API status indicator
                             {move || if semantic_mode.get() {
                                 if api_online.get() {
-                                    view! { <span class="flex items-center gap-1 text-green-600"><span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>"RuVector"</span> }.into_any()
+                                    view! { <span class="flex items-center gap-1 text-green-600"><span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>"encrypted zones (on device)"</span> }.into_any()
                                 } else {
                                     view! { <span class="flex items-center gap-1 text-yellow-600"><span class="w-1.5 h-1.5 rounded-full bg-yellow-500"></span>"text only"</span> }.into_any()
                                 }
@@ -707,15 +631,6 @@ fn channel_id_of(ev: &nostr_bbs_core::NostrEvent) -> Option<String> {
 
 /// How many kind-42 events one NIP-50 text query asks the relay for.
 const RELAY_TEXT_LIMIT: u64 = 50;
-
-/// Drop worker hits whose event id the relay text search already returned, so
-/// a post is listed once even when both layers match it, and record every
-/// remaining id in `seen` for the same reason.
-fn drop_seen_hits(raw: Vec<RawHit>, seen: &mut std::collections::HashSet<String>) -> Vec<RawHit> {
-    raw.into_iter()
-        .filter(|(id, _, _, _)| seen.insert(id.clone()))
-        .collect()
-}
 
 /// NIP-50 text search over kind-42 messages on the relay.
 ///
@@ -761,78 +676,6 @@ async fn relay_text_search(
     let mut events = found.get_untracked();
     events.sort_by_key(|ev| std::cmp::Reverse(ev.created_at));
     events
-}
-
-/// Hydrate search-result event ids into full events via a relay `ids` REQ.
-///
-/// The search API only returns `{id, score}` pairs; the event body, author,
-/// and channel must be fetched from the relay. Waits up to 1.2s for results
-/// then unsubscribes. Missing ids (deleted or zone-withheld events) are
-/// simply absent from the returned map — callers surface the count.
-async fn hydrate_search_ids(
-    relay: &RelayConnection,
-    ids: Vec<String>,
-) -> HashMap<String, nostr_bbs_core::NostrEvent> {
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-    let found: RwSignal<HashMap<String, nostr_bbs_core::NostrEvent>> =
-        RwSignal::new(HashMap::new());
-    let cb = Rc::new(move |ev: nostr_bbs_core::NostrEvent| {
-        found.update(|m| {
-            m.insert(ev.id.clone(), ev);
-        });
-    });
-    let sid = relay.subscribe(
-        vec![Filter {
-            ids: Some(ids),
-            ..Default::default()
-        }],
-        cb,
-        None,
-    );
-    let delay = js_sys::Promise::new(&mut |resolve, _| {
-        let _ = web_sys::window()
-            .unwrap()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1_200);
-    });
-    let _ = JsFuture::from(delay).await;
-    relay.unsubscribe(&sid);
-    found.get_untracked()
-}
-
-/// POST `query` to the worker's `/search` and return its raw hits.
-///
-/// Both the base URL and the request body come from `utils::search_client` so
-/// this overlay and the `search_client` API path cannot drift apart again — they
-/// previously defaulted to two *different* hosts (this one to the real worker,
-/// `search_client` to the unresolvable `search.example.com`) and sent two
-/// different field names for the same thing.
-async fn semantic_search(query: &str) -> Result<Vec<SHit>, String> {
-    let url = format!("{}/search", search_client::search_api_base());
-    let body_str = search_client::build_query_search_body(query, SEMANTIC_K);
-    let window = web_sys::window().ok_or("No window")?;
-    let init = web_sys::RequestInit::new();
-    init.set_method("POST");
-    let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
-    headers
-        .set("Content-Type", "application/json")
-        .map_err(|e| format!("{e:?}"))?;
-    init.set_headers(&headers);
-    init.set_body(&JsValue::from_str(&body_str));
-    let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
-    let rv = JsFuture::from(window.fetch_with_request(&req))
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let resp: web_sys::Response = rv.unchecked_into();
-    if !resp.ok() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    let jv = JsFuture::from(resp.json().map_err(|e| format!("{e:?}"))?)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let data: SResp = serde_wasm_bindgen::from_value(jv).map_err(|e| format!("{e:?}"))?;
-    Ok(data.results)
 }
 
 fn load_recents() -> Vec<Recent> {
@@ -905,16 +748,6 @@ mod tests {
     // it depends on is pure, so it is pinned here on the host target.
 
     #[test]
-    fn overlay_semantic_body_uses_k_not_limit() {
-        // Regression guard for the original bug: the overlay POSTed
-        // `{"query":…,"limit":10}` while the worker's SearchRequest only has
-        // `k`, so the limit was silently discarded and `default_k()` applied.
-        let body = search_client::build_query_search_body("hello", SEMANTIC_K);
-        assert!(body.contains(r#""k":10"#), "body was {body}");
-        assert!(!body.contains("limit"), "stale `limit` key in {body}");
-    }
-
-    #[test]
     fn relay_text_filter_serialises_the_nip50_search_key() {
         // The relay-worker reads `search` (relay_do/filter.rs); a differently
         // spelled key would be silently ignored and the REQ would return the
@@ -934,28 +767,4 @@ mod tests {
         assert!(!plain.contains("search"), "was {plain}");
     }
 
-    #[test]
-    fn worker_hits_already_found_by_the_relay_are_dropped() {
-        let mut seen: std::collections::HashSet<String> =
-            ["a".to_string(), "b".to_string()].into_iter().collect();
-        let raw: Vec<RawHit> = vec![
-            ("a".into(), Some(0.9), None, None),
-            ("c".into(), Some(0.8), None, None),
-            ("c".into(), Some(0.7), None, None),
-            ("b".into(), None, Some("x".into()), None),
-        ];
-        let kept = drop_seen_hits(raw, &mut seen);
-        let ids: Vec<&str> = kept.iter().map(|(id, _, _, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["c"]);
-        assert!(seen.contains("c"));
-    }
-
-    #[test]
-    fn overlay_and_search_client_share_one_base_url() {
-        // This module no longer owns a base-URL constant; if one is
-        // reintroduced the two call sites can diverge again (they once
-        // defaulted to two different hosts, one of them unresolvable).
-        let base = search_client::resolve_search_base(Some("https://s.example.org"), None);
-        assert_eq!(format!("{base}/search"), "https://s.example.org/search");
-    }
 }

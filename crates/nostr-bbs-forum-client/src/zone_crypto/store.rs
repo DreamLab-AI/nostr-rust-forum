@@ -245,6 +245,9 @@ impl ZoneKeyStore {
         super::tickets::clear_group_identities();
         super::public_inbox::reset_sweep_tracker();
         super::conversation_keys::clear();
+        // Sealed search: stop the worker (its derived keys and index), then
+        // drop the cached sealed objects.
+        crate::utils::sealed_search::wipe();
         if let Some(relay) = self.app_relay.get_value() {
             relay.clear_verified();
         }

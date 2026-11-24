@@ -17,7 +17,7 @@ pub mod relay_url;
 pub mod restricted_media;
 pub mod sanitize;
 pub mod scroll_anchor;
-pub mod search_client;
+pub mod sealed_search;
 pub mod slug_hash;
 // zone_theme.rs is owned elsewhere (do-not-touch) and contains one genuinely
 // unused fn (`zone_accent_style`, superseded by `zone_accent_style_cfg`).
