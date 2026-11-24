@@ -3,7 +3,7 @@ id: ADR-2035
 title: A kanban agent column dispatches its cards to a registered agent, and the agent's result returns as a governed case
 date: 2026-11-23
 decision_status: proposed
-implementation_status: none
+implementation_status: partial
 activation_status: inactive
 supersedes: []
 superseded_by: []
@@ -45,6 +45,6 @@ acceptance_boundary:
 
 ## Verification
 - At `c8b8c4e`: `rg -n "approval_col|pending_move|column_needs_approval" crates --glob '!**/kanban.rs' --glob '!**/forum-client/**'` returns only the core re-export (`nostr-bbs-core/src/lib.rs:116`), so the relay holds no approval-column check.
-- `kanban.rs:802-845` builds the intent tags `p`, `a`, `board` and `card_d`, with no `actor`. `board.rs:1316` accepts only a 64-character key.
+- From `988873b`, `create_agent_intent_signer` (`kanban.rs`) builds the intent tags `p`, `actor` (= the agent key), `a`, `board` and `card_d`; a unit test pins `actor` equal to `p` and never the card d-tag, which closes AB-INTENT-ACTOR-FROM-CARD-DTAG on the producer side. The `prompt` tag is not built. `board.rs:1316` accepts only a 64-character key.
 - `rg -n "30302|kanban" agentbox/mcp/nostr-bridge` returns nothing at agentbox `59b1aca1c`, so there is no return path.
-- `implementation_status: none`: nothing in the Decision is built.
+- `implementation_status: partial`: nothing in the Decision is built.
