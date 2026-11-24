@@ -16,6 +16,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::Kind;
 
+/// Parse a publisher list (`__ENV__.SEARCH_PUBLISHERS`, builder
+/// `--publishers`): comma-separated 64-char hex pubkeys, whitespace ignored,
+/// lowercased, invalid entries dropped, order kept, duplicates removed.
+/// Typically `"<archivist pk>,<admin pk>"`.
+pub fn parse_publishers(list: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in list.split(',').map(|s| s.trim().to_lowercase()) {
+        if p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()) && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Event kind (NIP-78 application-specific data).
 pub const KIND: u64 = 30078;
 /// Largest accepted version jump (M2).
@@ -238,6 +252,20 @@ mod tests {
         assert!(Manifest::verify(signed(1, &other5, "ws://r"), "zone2", "ws://r", &pubs, Some(&hw)).is_err());
         assert!(Manifest::verify(signed(1, &content(5 + MAX_VERSION_JUMP + 1), "ws://r"), "zone2", "ws://r", &pubs, Some(&hw)).is_err());
         assert!(Manifest::verify(signed(1, &content(6), "ws://r"), "zone2", "ws://r", &pubs, Some(&hw)).is_ok());
+    }
+
+    #[test]
+    fn publisher_lists_parse_and_any_listed_key_is_accepted() {
+        let a = hex::encode(sk(1).verifying_key().to_bytes());
+        let b = hex::encode(sk(2).verifying_key().to_bytes());
+        let list = format!(" {} , {},nothex,{}, ", a.to_uppercase(), b, a);
+        assert_eq!(parse_publishers(&list), vec![a.clone(), b.clone()]);
+        assert!(parse_publishers("").is_empty());
+        let pubs = parse_publishers(&list);
+        // Archivist-signed and admin-signed manifests both verify; others do not.
+        assert!(Manifest::verify(signed(1, &content(1), "ws://r"), "zone2", "ws://r", &pubs, None).is_ok());
+        assert!(Manifest::verify(signed(2, &content(1), "ws://r"), "zone2", "ws://r", &pubs, None).is_ok());
+        assert!(Manifest::verify(signed(3, &content(1), "ws://r"), "zone2", "ws://r", &pubs, None).is_err());
     }
 
     #[test]

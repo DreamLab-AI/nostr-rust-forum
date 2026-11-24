@@ -85,6 +85,11 @@ mod native {
         /// Pod base URL (e.g. http://172.20.0.10:8789).
         #[arg(long)]
         pod: Option<String>,
+        /// Comma-separated publisher pubkeys clients accept (e.g.
+        /// "<archivist>,<admin>"); this key must be one of them. Defaults to
+        /// this key alone. Used to verify the previously published manifest.
+        #[arg(long)]
+        publishers: Option<String>,
         /// Index version (default: current pod version + 1, or 1).
         #[arg(long)]
         version: Option<u64>,
@@ -218,6 +223,13 @@ mod native {
         let model_q8 = req(&cli.model_q8, "model-q8")?;
         let me = identity_from_env().map_err(|_| Fail(format!("set {IDENTITY_ENV} to the publisher key (hex or nsec)")))?;
         let publisher = me.public_key().to_hex();
+        let publishers = match &cli.publishers {
+            Some(l) => nostr_bbs_sealed_search::manifest::parse_publishers(l),
+            None => vec![publisher.clone()],
+        };
+        if !publishers.contains(&publisher) {
+            return Err(Fail("this key is not in --publishers; clients would refuse its manifest".into()));
+        }
 
         // Rows.
         let exclude: HashSet<String> = match &cli.exclude {
@@ -317,7 +329,7 @@ mod native {
             let resp = pod_request(&http, &me, reqwest::Method::GET, &url, None).await?;
             if resp.status().is_success() {
                 let ev: nostr_bbs_core::NostrEvent = serde_json::from_slice(&resp.bytes().await?)?;
-                let m = Manifest::verify(ev, &zone, &relay_url, std::slice::from_ref(&publisher), None).map_err(Fail)?;
+                let m = Manifest::verify(ev, &zone, &relay_url, &publishers, None).map_err(Fail)?;
                 previous = Some(m.content);
             }
         }

@@ -91,12 +91,9 @@ fn set(o: &Object, k: &str, v: impl Into<JsValue>) {
 
 /// Publishers whose manifests are accepted (`__ENV__.SEARCH_PUBLISHERS`).
 pub fn publishers() -> Vec<String> {
-    crate::utils::relay_url::env_override("SEARCH_PUBLISHERS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-        .collect()
+    nostr_bbs_sealed_search::manifest::parse_publishers(
+        &crate::utils::relay_url::env_override("SEARCH_PUBLISHERS").unwrap_or_default(),
+    )
 }
 
 /// Zones whose effective search mode is `sealed`.
