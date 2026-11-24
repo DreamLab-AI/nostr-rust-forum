@@ -92,7 +92,7 @@ impl KeyEntry {
                 "the operator key is not unlocked: pass --operator-key FILE (0600)".into(),
             )),
             None => Err(ImportError::Refused(format!(
-                "key {}… is retired (no secret held)",
+                "key {}… is retired (no secret held): pass --key <label>=FILE (0600) to unlock it for this run",
                 &self.pk[..8]
             ))),
         }
@@ -336,16 +336,18 @@ impl Keystore {
         Ok(&self.keys[label])
     }
 
-    /// Hold the operator's secret for this run only, from its 0600 file;
-    /// its public key must equal the recorded one. Never saved.
+    /// Hold the secret of the operator key, or of a RETIRED key (for a later
+    /// `--deferred-only` round, say), for this run only, from its 0600 file;
+    /// its public key must equal the recorded one. Never saved: the label
+    /// stays retired on disk.
     pub fn unlock(&mut self, label: &str, file: &Path) -> Result<(), ImportError> {
         let sk = read_secret_file(file)?;
         let e = self.keys.get_mut(label).ok_or_else(|| {
             ImportError::Refused(format!("no {label:?} in the keystore: `keys import` first"))
         })?;
-        if e.role != Role::Operator {
+        if e.role != Role::Operator && e.retired_at.is_none() {
             return Err(ImportError::Refused(format!(
-                "{label:?} is not an operator key"
+                "{label:?} still holds its secret here; --key is for the operator and retired keys"
             )));
         }
         if sk.public_key().to_hex() != e.pk {

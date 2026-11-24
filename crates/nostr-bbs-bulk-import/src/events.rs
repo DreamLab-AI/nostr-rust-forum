@@ -202,7 +202,9 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
         emit,
     } = *input;
     let archivist = key_entry(keys, ARCHIVIST)?;
-    let archivist_sk = archivist.secret()?;
+    // The archivist's secret is needed only when it signs something (a new
+    // thread header, a topic root, its profile): a re-run, or a deferred
+    // round under a retired archivist, must not require it.
     let mut out = Signed::default();
     let mut id_of: HashMap<String, (String, String)> = HashMap::new(); // key -> (id, pk)
     for (k, r) in ledger {
@@ -261,7 +263,7 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
                         content: serde_json::json!({"name": name, "about": about, "picture": ""})
                             .to_string(),
                     },
-                    &signing_key(&archivist_sk)?,
+                    &signing_key(&archivist.secret()?)?,
                 )
                 .map_err(|e| ImportError::Key(e.to_string()))?;
                 note_signer(ARCHIVIST, ev.created_at);
@@ -293,7 +295,7 @@ pub fn sign(input: &SignInput<'_>) -> Result<Signed, ImportError> {
                 ],
                 content: r.content.clone(),
             },
-            &signing_key(&archivist_sk)?,
+            &signing_key(&archivist.secret()?)?,
         )
         .map_err(|e| ImportError::Key(e.to_string()))?;
         note_signer(ARCHIVIST, ev.created_at);

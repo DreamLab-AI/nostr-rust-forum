@@ -322,6 +322,7 @@ fn keybase_archive_to_sealed_upload_plan() {
         emit: Emit::Normal,
         require_media: magick,
         operator_key: None,
+        unlock: vec![],
     };
     let r = pipeline::build(&w, &opts).unwrap();
     assert!(r.inserted > 0 && r.unchanged == 0);
@@ -446,6 +447,42 @@ fn keybase_archive_to_sealed_upload_plan() {
     // ── idempotent re-run
     let again = pipeline::build(&w, &opts).unwrap();
     assert_eq!((again.signed, again.inserted), (0, 0));
+
+    // ── custody: export the archivist offline and retire it here; a re-run
+    //    (which signs nothing as the archivist) still works
+    let archivist_file = root.join("archivist.key");
+    {
+        let mut ks = nostr_bbs_bulk_import::keystore::Keystore::load(&w.keys()).unwrap();
+        ks.export("archivist", &archivist_file).unwrap();
+        ks.retire("archivist").unwrap();
+        ks.save().unwrap();
+    }
+    assert!(!std::fs::read_to_string(w.keys())
+        .unwrap()
+        .contains(&hex::encode(archivist.as_bytes())));
+    let retired = pipeline::build(&w, &opts).unwrap();
+    assert_eq!((retired.signed, retired.inserted), (0, 0));
+    // the retired archivist can be unlocked for one run from its exported file
+    let unlocked = pipeline::build(
+        &w,
+        &BuildOptions {
+            unlock: vec![("archivist".into(), archivist_file.clone())],
+            ..opts.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(unlocked.inserted, 0);
+    assert!(
+        pipeline::build(
+            &w,
+            &BuildOptions {
+                unlock: vec![("archivist".into(), op_file.clone())],
+                ..opts.clone()
+            },
+        )
+        .is_err(),
+        "a key file that is not the recorded key is refused"
+    );
 
     // ── the deferred operator history, signed by the operator key read for this run only
     assert!(

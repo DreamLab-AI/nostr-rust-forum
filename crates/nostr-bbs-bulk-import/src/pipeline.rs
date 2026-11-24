@@ -211,6 +211,8 @@ pub struct BuildOptions {
     pub require_media: bool,
     /// The operator's 0600 key file, read for this run only.
     pub operator_key: Option<PathBuf>,
+    /// `(label, 0600 key file)`: retired keys unlocked for this run only.
+    pub unlock: Vec<(String, PathBuf)>,
 }
 
 /// Sign and write the plan into the local D1 (see [`crate::d1`]).
@@ -226,6 +228,9 @@ pub fn build(work: &Work, opts: &BuildOptions) -> Result<BuildReport, ImportErro
         }
     }
     l.ids.check_keys(&ks)?;
+    for (label, file) in &opts.unlock {
+        ks.unlock(label, file)?;
+    }
     let operator_signs = l
         .plan
         .messages
@@ -239,6 +244,7 @@ pub fn build(work: &Work, opts: &BuildOptions) -> Result<BuildReport, ImportErro
         }
         match &opts.operator_key {
             Some(f) => ks.unlock(OPERATOR, f)?,
+            None if ks.get(OPERATOR).is_some_and(|e| e.has_secret()) => {}
             None => {
                 return Err(ImportError::Refused(
                     "this run signs operator messages: pass --operator-key FILE (0600)".into(),

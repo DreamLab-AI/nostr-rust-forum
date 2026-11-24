@@ -151,6 +151,9 @@ mod cli {
             /// The operator's 0600 key file (runs that sign operator messages).
             #[arg(long)]
             operator_key: Option<PathBuf>,
+            /// LABEL=FILE: unlock a retired key for this run only (repeatable).
+            #[arg(long = "key", value_name = "LABEL=FILE", value_parser = parse_unlock)]
+            unlock: Vec<(String, PathBuf)>,
         },
         /// Copy and re-wrap DMs into the local D1 (stack DOWN).
         Dm {
@@ -220,6 +223,14 @@ mod cli {
             #[arg(long)]
             fresh_d1: PathBuf,
         },
+    }
+
+    fn parse_unlock(s: &str) -> Result<(String, PathBuf), String> {
+        let (l, f) = s.split_once('=').ok_or("expected LABEL=FILE")?;
+        if l.is_empty() || f.is_empty() {
+            return Err("expected LABEL=FILE".into());
+        }
+        Ok((l.to_string(), PathBuf::from(f)))
     }
 
     fn need(work: &Option<PathBuf>) -> Result<Work, ImportError> {
@@ -356,6 +367,7 @@ mod cli {
                 deferred_only,
                 allow_missing_media,
                 operator_key,
+                unlock,
             } => {
                 let r = pipeline::build(
                     &Work::new(&work),
@@ -368,6 +380,7 @@ mod cli {
                         },
                         require_media: !allow_missing_media,
                         operator_key,
+                        unlock,
                     },
                 )?;
                 (json!({"report": r}), true)
