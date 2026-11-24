@@ -386,7 +386,9 @@ fn purge_sql_never_deletes_plaintext_whose_envelope_is_gone() {
         .unwrap();
     c.execute_batch(&sql).unwrap();
     assert_eq!(
-        offline::present_ids(&c, std::slice::from_ref(&o.id)).unwrap().len(),
+        offline::present_ids(&c, std::slice::from_ref(&o.id))
+            .unwrap()
+            .len(),
         1,
         "plaintext kept"
     );
@@ -505,4 +507,102 @@ fn chunk_directories_must_be_fresh_and_purge_chunks_stay_relay_sized() {
         offline::PURGE_CHUNK
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reseal_legacy_replaces_an_unrecorded_legacy_envelope_and_verify_passes() {
+    let c = db();
+    store(&c, &live_zk_post(CHANNEL, "zone3", 1, ZONE3_E1));
+    let root = post(AUTHOR, CHANNEL, 1_600_000_000, "root");
+    store(&c, &root);
+    let reply = sign(
+        AUTHOR,
+        42,
+        1_600_000_001,
+        vec![
+            tag(&["e", CHANNEL, "", "root"]),
+            tag(&["e", &root.id, "", "reply"]),
+        ],
+        "reply",
+    );
+    store(&c, &reply);
+    // A legacy envelope: the current one with the topic tag stripped (as the
+    // earlier sealer wrote it), re-signed by the migrator.
+    let current =
+        nostr_bbs_core::sealed::seal_original(&reply, "zone3", 1, &pk(ZONE3_E1), &sk(MIGRATOR))
+            .unwrap();
+    let legacy = sign(
+        MIGRATOR,
+        42,
+        reply.created_at,
+        current
+            .tags
+            .iter()
+            .filter(|t| !(t[0] == "e" && t.get(3).map(String::as_str) == Some("reply")))
+            .cloned()
+            .collect(),
+        &current.content,
+    );
+    assert!(offline::is_legacy_envelope(&legacy, &reply));
+    assert!(!offline::is_legacy_envelope(&current, &reply));
+    store(&c, &legacy);
+    c.execute(
+        "UPDATE whitelist SET posts_created = 1 WHERE pubkey = ?1",
+        [pk(MIGRATOR)],
+    )
+    .unwrap();
+
+    // Not recorded in the state file at all (killed mid-save).
+    let mut st = State::new(RELAY_URL, &pk(MIGRATOR));
+    let envs = offline::read_migrator_envelopes(&c, &channels(), &pk(MIGRATOR)).unwrap();
+    assert_eq!(envs.len(), 1);
+    let zones: HashMap<String, String> = [(CHANNEL.to_string(), "zone3".to_string())].into();
+    let topics_map = offline::read_topic_channels(&c, &[root.id.clone()].into()).unwrap();
+    let (items, failed) =
+        offline::reseal_legacy(&envs, &zones, &ring(), &sk(MIGRATOR), &topics_map);
+    assert_eq!((items.len(), failed.len()), (1, 0));
+    c.execute_batch(&offline::reseal_sql(&items, &pk(MIGRATOR), 9))
+        .unwrap();
+    // Old gone and tombstoned, new present with the topic tag, count unchanged.
+    assert!(offline::present_ids(&c, std::slice::from_ref(&legacy.id))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        offline::tombstoned_ids(&c, std::slice::from_ref(&legacy.id))
+            .unwrap()
+            .len(),
+        1
+    );
+    let new = offline::read_events_by_id(&c, std::slice::from_ref(&items[0].envelope.id)).unwrap();
+    assert_eq!(
+        nostr_bbs_core::sealed::reply_root_of(&new[&items[0].envelope.id]),
+        Some(root.id.as_str())
+    );
+    assert_eq!(posts_created(&c), 1);
+    // Re-applying is harmless.
+    c.execute_batch(&offline::reseal_sql(&items, &pk(MIGRATOR), 9))
+        .unwrap();
+    assert_eq!(posts_created(&c), 1);
+
+    // Commit adds the unrecorded entry; the online verify passes.
+    let manifest: Vec<offline::ManifestEntry> = items
+        .iter()
+        .map(|s| offline::ManifestEntry {
+            id: s.original_id.clone(),
+            outer_id: s.envelope.id.clone(),
+            epoch: s.epoch,
+            inner_sha256: s.inner_sha256.clone(),
+        })
+        .collect();
+    let r = offline::commit_sealed_with(&mut st, &manifest, &new, &ring(), true);
+    assert_eq!(r.committed, 1);
+    let mut relay = FakeRelay::with_admin(&pk(MIGRATOR));
+    for ev in all_events(&c) {
+        relay.insert(ev);
+    }
+    let mut sink = Sink::default();
+    let v = sink
+        .run(|h| block_on(engine::verify(&mut relay, &ring(), &mut st, h)))
+        .unwrap();
+    assert_eq!((v.verified, v.failed.len()), (1, 0));
 }

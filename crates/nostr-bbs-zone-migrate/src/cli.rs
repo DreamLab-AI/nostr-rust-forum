@@ -206,6 +206,19 @@ enum Command {
         #[arg(required = true, value_name = "SQL")]
         files: Vec<PathBuf>,
     },
+    /// Replace this sealer's envelopes that predate the outer topic tag (found
+    /// in D1, recorded or not) with current-format envelopes: writes
+    /// reseal-0001.sql (insert new, then tombstone + delete old, as the admin
+    /// delete) and a seal-manifest.json. Apply it, then run
+    /// seal-offline-commit --reseal, then verify.
+    ResealLegacy {
+        /// The relay's D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// Directory for reseal-0001.sql and seal-manifest.json (must be empty).
+        #[arg(long, value_name = "DIR")]
+        sql_out: PathBuf,
+    },
     /// After applying seal-offline's chunks: re-read each envelope from D1,
     /// re-open it, and mark the entry sealed. Unapplied entries stay planned.
     SealOfflineCommit {
@@ -215,6 +228,10 @@ enum Command {
         /// seal-manifest.json from seal-offline.
         #[arg(long, value_name = "FILE")]
         manifest: PathBuf,
+        /// The manifest is from reseal-legacy: re-record already-sealed entries
+        /// with their replacement envelope (they need verify again).
+        #[arg(long)]
+        reseal: bool,
     },
     /// Write SQL that purges the verified plaintext exactly as the relay's
     /// admin delete does (tombstone, delete, audit row). Re-checks every
@@ -255,6 +272,7 @@ impl Command {
             Command::Status => "status",
             Command::SealOffline { .. } => "seal-offline",
             Command::SealOfflineCommit { .. } => "seal-offline-commit",
+            Command::ResealLegacy { .. } => "reseal-legacy",
             Command::ApplyDirect { .. } => "apply-direct",
             Command::PurgeOffline { .. } => "purge-offline",
             Command::PurgeOfflineCommit { .. } => "purge-offline-commit",
@@ -498,7 +516,67 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             exit_for(report.failed.is_empty())
         }
         Command::ApplyDirect { .. } => unreachable!("handled above"),
-        Command::SealOfflineCommit { d1, manifest } => {
+        Command::ResealLegacy { d1, sql_out } => {
+            let channels = channels(&cli)?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            offline::check_schema(&db).map_err(Failure)?;
+            let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+            let bound = offline::read_channel_zones(&db, &ids)
+                .map_err(|e| Failure(format!("reading channel_zones: {e}")))?;
+            if let Some(why) = offline::binding_refusal(&channels, &bound) {
+                return Err(Failure(format!("refusing to reseal: {why}")));
+            }
+            let envelopes = offline::read_migrator_envelopes(&db, &channels, &me_pk)
+                .map_err(|e| Failure(format!("reading envelopes: {e}")))?;
+            let mut events = std::collections::HashMap::new();
+            for c in &channels {
+                events.insert(
+                    c.id.clone(),
+                    offline::read_channel_events(&db, &c.id).map_err(|e| Failure(e.to_string()))?,
+                );
+            }
+            // Topics of the ORIGINALS are inside the envelopes: resolve them
+            // after opening, from the channels' plaintext and envelopes.
+            let mut topics = offline::topics_of(&events);
+            let zones: std::collections::HashMap<String, String> = channels
+                .iter()
+                .map(|c| (c.id.clone(), c.zone.clone()))
+                .collect();
+            for (ch, outer) in &envelopes {
+                if let Some(k) = zones.get(ch).and_then(|z| keys.current(z)) {
+                    if let Ok(o) = nostr_bbs_core::sealed::open_sealed(outer, k.secret()) {
+                        if let Some(t) = nostr_bbs_core::sealed::reply_root_of(&o) {
+                            topics.insert(t.to_string());
+                        }
+                    }
+                }
+            }
+            let topic_channels = offline::read_topic_channels(&db, &topics)
+                .map_err(|e| Failure(format!("resolving reply topics: {e}")))?;
+            let (items, failed) =
+                offline::reseal_legacy(&envelopes, &zones, &keys, &me, &topic_channels);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let file = offline::write_reseal_sql(&sql_out, &items, &me_pk, now)
+                .map_err(|e| Failure(format!("{}: {e}", sql_out.display())))?;
+            eprintln!(
+                "reseal-legacy: {} of {} envelopes are legacy and were resealed, {} failed; wrote {}",
+                items.len(),
+                envelopes.len(),
+                failed.len(),
+                file.display()
+            );
+            out["result"] = json!({ "resealed": items.len(), "scanned": envelopes.len(), "failed": failed, "sql": file });
+            exit_for(failed.is_empty())
+        }
+        Command::SealOfflineCommit {
+            d1,
+            manifest,
+            reseal,
+        } => {
             let path = state_path(&cli)?;
             let mut st = load_existing(path, &relay_url, &me_pk)?;
             let entries: Vec<offline::ManifestEntry> = serde_json::from_slice(
@@ -510,7 +588,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             let outer_ids: Vec<String> = entries.iter().map(|m| m.outer_id.clone()).collect();
             let outers = offline::read_events_by_id(&db, &outer_ids)
                 .map_err(|e| Failure(format!("reading envelopes: {e}")))?;
-            let report = offline::commit_sealed(&mut st, &entries, &outers, &keys);
+            let report = offline::commit_sealed_with(&mut st, &entries, &outers, &keys, reseal);
             state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
             eprintln!(
                 "seal-offline-commit: {} marked sealed, {} left as they were",

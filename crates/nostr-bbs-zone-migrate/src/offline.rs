@@ -686,15 +686,45 @@ pub fn commit_sealed(
     outers: &HashMap<String, NostrEvent>,
     keys: &KeyRing,
 ) -> CommitReport {
+    commit_sealed_with(state, manifest, outers, keys, false)
+}
+
+/// [`commit_sealed`]; with `reseal`, entries already `sealed` or `verified`
+/// (under a legacy envelope) are re-recorded with the replacement and drop
+/// back to `sealed` for re-verification, and entries the state file lacks
+/// (an envelope published but never recorded) are added.
+pub fn commit_sealed_with(
+    state: &mut State,
+    manifest: &[ManifestEntry],
+    outers: &HashMap<String, NostrEvent>,
+    keys: &KeyRing,
+    reseal: bool,
+) -> CommitReport {
     let mut report = CommitReport::default();
     for m in manifest {
+        if reseal && !state.entries.contains_key(&m.id) {
+            if let Some(outer) = outers.get(&m.outer_id) {
+                let channel = channel_of(outer).unwrap_or_default().to_string();
+                let zone = outer
+                    .tags
+                    .iter()
+                    .find(|t| t.len() >= 2 && t[0] == "zk")
+                    .map(|t| t[1].clone())
+                    .unwrap_or_default();
+                state.entries.insert(
+                    m.id.clone(),
+                    Entry::planned(&channel, &zone, outer.created_at),
+                );
+            }
+        }
         let Some(e) = state.entries.get(&m.id) else {
             report
                 .skipped
                 .push((m.id.clone(), "not in the state file".into()));
             continue;
         };
-        if !needs_seal(&e.status) {
+        let replaceable = reseal && matches!(e.status, Status::Sealed | Status::Verified);
+        if !needs_seal(&e.status) && !replaceable {
             report
                 .skipped
                 .push((m.id.clone(), format!("already {}", e.status.label())));
@@ -1000,4 +1030,216 @@ pub fn apply_sql_direct(path: &Path, files: &[PathBuf]) -> Result<Vec<(PathBuf, 
         out.push((f.clone(), t.elapsed().as_millis()));
     }
     Ok(out)
+}
+
+/// A sealed envelope in the earlier format (no outer topic tag on a reply,
+/// no root marker on a topic root) and its current-format replacement.
+#[derive(Debug, Clone)]
+pub struct Reseal {
+    /// The original's id (unchanged).
+    pub original_id: String,
+    /// The legacy envelope's id (removed).
+    pub old_outer_id: String,
+    /// The original's `created_at`.
+    pub created_at: u64,
+    /// Epoch sealed to.
+    pub epoch: u32,
+    /// The replacement envelope.
+    pub envelope: NostrEvent,
+    /// SHA-256 of the original's canonical JSON.
+    pub inner_sha256: String,
+}
+
+/// Whether `outer` is an envelope sealed before the topic tag existed: its
+/// original replies to a topic but the envelope carries no outer `reply`
+/// tag, or its original is a topic root and the envelope carries no marker.
+pub fn is_legacy_envelope(outer: &NostrEvent, original: &NostrEvent) -> bool {
+    use nostr_bbs_core::sealed::{is_topic_root, reply_root_of, TOPIC_MARKER};
+    let has_marker = outer
+        .tags
+        .iter()
+        .any(|t| t.len() == 2 && t[0] == "t" && t[1] == TOPIC_MARKER);
+    match reply_root_of(original) {
+        Some(topic) => reply_root_of(outer) != Some(topic),
+        None => is_topic_root(original) && !has_marker,
+    }
+}
+
+/// Every sealed envelope by `migrator_pk` in the listed channels, from D1
+/// (whether or not the state file records it: an envelope published but
+/// never recorded is found too).
+pub fn read_migrator_envelopes(
+    db: &Connection,
+    channels: &[ChannelSpec],
+    migrator_pk: &str,
+) -> rusqlite::Result<Vec<(String, NostrEvent)>> {
+    let mut out = Vec::new();
+    for c in channels {
+        for ev in read_channel_events(db, &c.id)? {
+            if ev.pubkey.eq_ignore_ascii_case(migrator_pk)
+                && nostr_bbs_core::sealed::has_sealed_tag(&ev.tags)
+            {
+                out.push((c.id.clone(), ev));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Open each of `envelopes` (channel, envelope) with the zone key named by
+/// its `zk` tag, keep the legacy ones (see [`is_legacy_envelope`]) and seal
+/// their originals again in the current format, in parallel, self-checked.
+/// Failures (no key, does not open, F2 placement) are returned, not fatal.
+pub fn reseal_legacy(
+    envelopes: &[(String, NostrEvent)],
+    zones: &HashMap<String, String>,
+    keys: &KeyRing,
+    migrator: &SecretKey,
+    topic_channels: &HashMap<String, String>,
+) -> (Vec<Reseal>, Vec<(String, String)>) {
+    let migrator_pk = migrator.public_key().to_hex();
+    let results: Vec<Result<Option<Reseal>, (String, String)>> = envelopes
+        .par_iter()
+        .map(|(channel, outer)| {
+            let zone = zones.get(channel).ok_or_else(|| {
+                (
+                    outer.id.clone(),
+                    "channel not in the channels file".to_string(),
+                )
+            })?;
+            let epoch = outer
+                .tags
+                .iter()
+                .find(|t| t.len() >= 3 && t[0] == "zk" && t[1] == *zone)
+                .and_then(|t| t[2].parse::<u32>().ok())
+                .ok_or_else(|| {
+                    (
+                        outer.id.clone(),
+                        "envelope has no zk tag for its zone".to_string(),
+                    )
+                })?;
+            let key = keys
+                .get(zone, epoch)
+                .ok_or_else(|| (outer.id.clone(), format!("no key for {zone}:{epoch}")))?;
+            let original = nostr_bbs_core::sealed::open_sealed(outer, key.secret())
+                .map_err(|e| (outer.id.clone(), format!("does not open: {e}")))?;
+            if !is_legacy_envelope(outer, &original) {
+                return Ok(None);
+            }
+            if let Some(why) = topic_refusal(&original, channel, topic_channels) {
+                return Err((original.id.clone(), why));
+            }
+            let sk = SecretKey::from_bytes(*migrator.as_bytes())
+                .map_err(|e| (outer.id.clone(), e.to_string()))?;
+            let sealer = OriginalSealer::new(zone, epoch, key.pubkey(), sk)
+                .map_err(|e| (outer.id.clone(), e.to_string()))?;
+            let envelope = sealer
+                .seal(&original)
+                .map_err(|e| (original.id.clone(), e.to_string()))?;
+            let mpk = hex32(&migrator_pk).expect("hex pubkey");
+            let ck = zeroize::Zeroizing::new(
+                nostr_bbs_core::nip44::conversation_key(key.secret(), &mpk)
+                    .map_err(|e| (original.id.clone(), e.to_string()))?,
+            );
+            let expected = serde_json::to_string(&original).expect("event serialises");
+            self_check(
+                &envelope,
+                &original.id,
+                channel,
+                &migrator_pk,
+                &ck,
+                &expected,
+            )
+            .map_err(|r| (original.id.clone(), r))?;
+            if nostr_bbs_core::sealed::reply_root_of(&original).is_some()
+                && nostr_bbs_core::sealed::reply_root_of(&envelope).is_none()
+            {
+                return Err((
+                    original.id.clone(),
+                    "replacement still lacks the topic tag".into(),
+                ));
+            }
+            Ok(Some(Reseal {
+                original_id: original.id.clone(),
+                old_outer_id: outer.id.clone(),
+                created_at: original.created_at,
+                epoch,
+                inner_sha256: sha256_hex(expected.as_bytes()),
+                envelope,
+            }))
+        })
+        .collect();
+    let mut ok = Vec::new();
+    let mut failed = Vec::new();
+    for r in results {
+        match r {
+            Ok(Some(x)) => ok.push(x),
+            Ok(None) => {}
+            Err(e) => failed.push(e),
+        }
+    }
+    ok.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then(a.original_id.cmp(&b.original_id))
+    });
+    (ok, failed)
+}
+
+/// SQL replacing legacy envelopes: per item, insert the new envelope (as
+/// [`envelope_insert_sql`]) and only if it is now present, tombstone and
+/// delete the legacy envelope exactly as `POST /api/admin/events/delete`
+/// does (`TOMBSTONE_EVENT_ROW_SQL`, then `DELETE ... AND kind = 42`). The
+/// original's `sealed` index never empties (new before old), and a
+/// tombstone on the OLD envelope id never blocks the new one (different
+/// id). posts_created: +1 for the new, -1 for the removed (net 0, as a
+/// relay delete leaves the counter alone and the original counted once).
+pub fn reseal_sql(items: &[Reseal], migrator_pk: &str, now: u64) -> String {
+    let mut sql = String::new();
+    for it in items {
+        sql.push_str(&envelope_insert_sql(&it.envelope, now));
+        let guard = format!(
+            "EXISTS (SELECT 1 FROM events WHERE id = {} AND kind = 42 AND pubkey = {})",
+            q(&it.envelope.id),
+            q(migrator_pk)
+        );
+        let _ = writeln!(
+            sql,
+            "INSERT OR IGNORE INTO deleted_events (id, pubkey, deleted_at) \
+             SELECT id, pubkey, {now} FROM events WHERE id = {old} AND kind = 42 AND pubkey = {pk} AND {guard};\n\
+             DELETE FROM events WHERE id = {old} AND kind = 42 AND pubkey = {pk} AND {guard};\n\
+             UPDATE whitelist SET posts_created = posts_created - changes() WHERE pubkey = {pk};",
+            old = q(&it.old_outer_id),
+            pk = q(migrator_pk)
+        );
+    }
+    sql
+}
+
+/// Write [`reseal_sql`] to `reseal-0001.sql` in a fresh `dir`, plus a
+/// `seal-manifest.json` for the replacements (so `seal-offline-commit`
+/// records them).
+pub fn write_reseal_sql(
+    dir: &Path,
+    items: &[Reseal],
+    migrator_pk: &str,
+    now: u64,
+) -> std::io::Result<PathBuf> {
+    prepare_out_dir(dir)?;
+    let path = dir.join("reseal-0001.sql");
+    std::fs::write(&path, reseal_sql(items, migrator_pk, now))?;
+    let manifest: Vec<ManifestEntry> = items
+        .iter()
+        .map(|s| ManifestEntry {
+            id: s.original_id.clone(),
+            outer_id: s.envelope.id.clone(),
+            epoch: s.epoch,
+            inner_sha256: s.inner_sha256.clone(),
+        })
+        .collect();
+    std::fs::write(
+        dir.join("seal-manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest serialises"),
+    )?;
+    Ok(path)
 }
