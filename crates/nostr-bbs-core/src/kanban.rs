@@ -805,8 +805,11 @@ pub async fn create_agent_intent_signer(
     agent_pubkey: &str,
     instructions: &str,
 ) -> Result<NostrEvent, KanbanError> {
+    // `actor` names the agent explicitly. Without it a consumer that falls back
+    // to the `a` coordinate would read the card's own d-tag as the actor.
     let mut tags = vec![
         vec!["p".to_string(), agent_pubkey.to_string()],
+        vec!["actor".to_string(), agent_pubkey.to_string()],
         vec!["a".to_string(), card_coord(&card.pubkey, &card.d_tag)],
         vec!["board".to_string(), card.board.clone()],
         vec!["card_d".to_string(), card.d_tag.clone()],
@@ -1162,6 +1165,32 @@ mod tests {
             assert_eq!(body["type"], "kanban_card_task");
             assert_eq!(body["title"], "Fix the gate");
             assert_eq!(body["instructions"], "please fix");
+        });
+    }
+
+    /// The intent names the agent explicitly: `actor` equals `p` and is never
+    /// the card's d-tag (AB-INTENT-ACTOR-FROM-CARD-DTAG).
+    #[test]
+    fn agent_intent_actor_tag_is_the_agent_not_the_card() {
+        block_on(async {
+            let signer = test_signer();
+            let board = KanbanBoard::from_event(&make_board()).unwrap();
+            let card = KanbanCard::from_event(&make_card(&board, None, "todo", 10)).unwrap();
+            let agent = "12".repeat(32);
+            let intent = create_agent_intent_signer(&signer, &card, &agent, "please fix")
+                .await
+                .unwrap();
+            let values = |name: &str| -> Vec<&str> {
+                intent
+                    .tags
+                    .iter()
+                    .filter(|t| t[0] == name)
+                    .map(|t| t[1].as_str())
+                    .collect()
+            };
+            assert_eq!(values("actor"), vec![agent.as_str()]);
+            assert_eq!(values("actor"), values("p"));
+            assert!(!values("actor").contains(&card.d_tag.as_str()));
         });
     }
 
