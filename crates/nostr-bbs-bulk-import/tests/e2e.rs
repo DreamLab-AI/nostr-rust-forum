@@ -894,3 +894,218 @@ fn schema_and_sql_mirrors_have_not_drifted() {
     }
     assert!(squash(common::BOOT_SQL).contains("trg_event_tags_ai_v3"));
 }
+
+/// A title changes after the topics were built and sealed: `reset` removes
+/// exactly the imported roots, messages and their stale envelopes (dry run
+/// first), keeps the anchors, and the rebuilt root is the new title.
+#[test]
+fn reset_after_a_title_change_rebuilds_cleanly() {
+    let root = tmp("reset");
+    let team = root.join("team");
+    keybase_archive(&team, false);
+    let w = Work::new(&root.join("work"));
+    fsutil::create_private_dir(&w.dir).unwrap();
+    adapter::run(
+        &adapter::keybase::KeybaseAdapter,
+        &team,
+        "testteam",
+        &w.archive(),
+    )
+    .unwrap();
+    std::fs::write(
+        w.identities(),
+        json!({"version": 1, "default": "fresh", "authors": {"meetbot": {"decision": "drop"}}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        w.structure(),
+        json!({"version": 1,
+          "zones": [{"id": "zone2", "cohorts": ["zone2"], "encrypted": true}],
+          "threads": {"rants": {"zone": "zone2", "section": "zone2-rants", "channel": {"new": {"name": "Rants"}}}},
+          "channels": {C1: {"thread": "rants"}, C2: {"thread": "rants"}}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        w.target(),
+        r#"{"name":"pilot","pod":{"http":"http://127.0.0.1:8789"}}"#,
+    )
+    .unwrap();
+    pipeline::write_titles(&w).unwrap();
+    let l = pipeline::load(&w).unwrap();
+    pipeline::ensure_keys(&w, &l).unwrap();
+    let archivist = nostr_bbs_bulk_import::keystore::Keystore::load(&w.keys())
+        .unwrap()
+        .get("archivist")
+        .unwrap()
+        .secret()
+        .unwrap();
+    let archivist_pk = archivist.public_key().to_hex();
+    let db = root.join("relay.sqlite");
+    drop(relay_db(&db));
+    let opts = BuildOptions {
+        d1: db.clone(),
+        emit: Emit::Normal,
+        require_media: false,
+        operator_key: None,
+        unlock: vec![],
+    };
+    let first = pipeline::build(&w, &opts).unwrap();
+
+    // anchor + offline seal (not purged), as after a first sealing round
+    let zone_sk = nostr_bbs_core::keys::generate_keypair().unwrap().secret;
+    let zone_pk = zone_sk.public_key().to_hex();
+    let prep = pipeline::seal_prep(&w, &db, "ws://127.0.0.1:8787").unwrap();
+    let thread = prep.channels[0].0.clone();
+    let channels = vec![ChannelSpec {
+        id: thread.clone(),
+        zone: "zone2".into(),
+    }];
+    {
+        let c = Connection::open(&db).unwrap();
+        let anchor = signed(
+            &archivist,
+            42,
+            T0 + 1_000,
+            vec![
+                vec!["e".into(), thread.clone(), "".into(), "root".into()],
+                vec!["zk".into(), "zone2".into(), "1".into(), zone_pk.clone()],
+            ],
+            "ciphertext",
+        );
+        d1::insert_event(&c, &anchor, T0 + 1_000).unwrap();
+        let mut ring = KeyRing::new();
+        ring.insert(
+            ZoneKey::new(
+                "zone2",
+                1,
+                &hex::encode(zone_sk.as_bytes()),
+                &zone_pk,
+                KeySource::KeyFile,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let events: HashMap<String, Vec<NostrEvent>> = [(
+            thread.clone(),
+            offline::read_channel_events(&c, &thread).unwrap(),
+        )]
+        .into();
+        let topics = offline::read_topic_channels(&c, &offline::topics_of(&events)).unwrap();
+        let mut st = State::new("ws://127.0.0.1:8787", &archivist_pk);
+        let rep = with_hooks(|h| {
+            offline::seal_offline(
+                &channels, &events, &topics, &ring, &archivist, &mut st, None, h,
+            )
+        })
+        .unwrap();
+        assert!(!rep.sealed.is_empty() && rep.failed.is_empty());
+        let files = offline::write_seal_sql(
+            &w.seal().join("sql"),
+            &rep.sealed,
+            &archivist_pk,
+            100,
+            T0 + 2_000,
+        )
+        .unwrap();
+        for f in &files {
+            c.execute_batch(&std::fs::read_to_string(f).unwrap())
+                .unwrap();
+        }
+    }
+    let sealed_count = {
+        let c = Connection::open(&db).unwrap();
+        count(&c, "SELECT count(*) FROM event_tags WHERE name = 'sealed'")
+    };
+
+    // the operator renames a topic
+    let mut t = nostr_bbs_bulk_import::titles::Titles::load(&w.titles()).unwrap();
+    t.titles.insert(C1.into(), "Kids and shit".into());
+    std::fs::write(w.titles(), serde_json::to_vec(&t).unwrap()).unwrap();
+
+    // dry run: reports, changes nothing
+    let dry = pipeline::reset(&w, &db, false).unwrap();
+    assert!(!dry.executed);
+    assert_eq!(dry.roots, 2);
+    assert_eq!(dry.envelopes as i64, sealed_count);
+    assert_eq!(dry.anchors_kept, 1);
+    assert_eq!(
+        (dry.roots + dry.messages) as i64,
+        sealed_count,
+        "every imported kind-42 had an envelope"
+    );
+    {
+        let c = Connection::open(&db).unwrap();
+        assert_eq!(
+            count(&c, "SELECT count(*) FROM event_tags WHERE name = 'sealed'"),
+            sealed_count
+        );
+    }
+
+    // execute: exactly the imported kind-42s and their envelopes go; the rest stays
+    let done = pipeline::reset(&w, &db, true).unwrap();
+    assert!(done.executed && done.backup.as_ref().unwrap().join("seal").exists());
+    {
+        let c = Connection::open(&db).unwrap();
+        assert_eq!(
+            count(&c, "SELECT count(*) FROM events WHERE kind = 42"),
+            1,
+            "only the anchor is left"
+        );
+        assert_eq!(
+            count(&c, "SELECT count(*) FROM events WHERE kind = 40"),
+            1,
+            "the thread header stays"
+        );
+        assert!(
+            count(&c, "SELECT count(*) FROM events WHERE kind = 0") > 0,
+            "profiles stay"
+        );
+        assert_eq!(
+            count(
+                &c,
+                "SELECT count(*) FROM event_tags WHERE event_id NOT IN (SELECT id FROM events)"
+            ),
+            0
+        );
+    }
+
+    // rebuild: the root is the new title, the tree is whole again
+    let again = pipeline::build(&w, &opts).unwrap();
+    assert_eq!(
+        again.inserted,
+        done.roots + done.messages,
+        "the same roots and messages, re-signed; header and profiles kept"
+    );
+    assert!(first.inserted > again.inserted);
+    {
+        let c = Connection::open(&db).unwrap();
+        assert_eq!(
+            by_import(&c, &format!("#root:{C1}")).content,
+            "Kids and shit"
+        );
+    }
+    let parity = pipeline::verify_parity(&w, &db, Phase::Built).unwrap();
+    assert!(parity.problems.is_empty(), "{:?}", parity.problems);
+
+    // an envelope that is not an archivist seal of this import makes reset refuse
+    {
+        let c = Connection::open(&db).unwrap();
+        let stranger = nostr_bbs_core::keys::generate_keypair().unwrap().secret;
+        let fake = signed(
+            &stranger,
+            42,
+            T0 + 5_000,
+            vec![
+                vec!["e".into(), thread.clone(), "".into(), "root".into()],
+                vec!["sealed".into(), "ab".repeat(32), "1".into()],
+            ],
+            "x",
+        );
+        d1::insert_event(&c, &fake, T0 + 5_000).unwrap();
+    }
+    let err = pipeline::reset(&w, &db, false).unwrap_err().to_string();
+    assert!(err.contains("not an archivist seal"), "{err}");
+    std::fs::remove_dir_all(&root).unwrap();
+}

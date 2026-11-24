@@ -291,6 +291,20 @@ impl Ledger {
         Ok(())
     }
 
+    /// Keep only the rows `keep` accepts, rewriting the ledger file
+    /// atomically (used by `reset`).
+    pub fn retain(&mut self, keep: impl Fn(&LedgerRow) -> bool) -> Result<(), ImportError> {
+        self.rows.retain(|_, r| keep(r));
+        let mut rows: Vec<&LedgerRow> = self.rows.values().collect();
+        rows.sort_by(|a, b| a.k.cmp(&b.k));
+        let mut buf = String::new();
+        for r in rows {
+            buf.push_str(&serde_json::to_string(r).expect("row serialises"));
+            buf.push('\n');
+        }
+        fsutil::write_private_atomic(&self.path, buf.as_bytes())
+    }
+
     /// Ledgered ids that D1 has tombstoned: non-zero once a purge ran.
     pub fn purged_count(&self, c: &Connection) -> Result<usize, ImportError> {
         let mut s = c.prepare("SELECT 1 FROM deleted_events WHERE id = ?1 AND pubkey = ?2")?;

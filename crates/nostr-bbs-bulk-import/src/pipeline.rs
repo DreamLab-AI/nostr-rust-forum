@@ -1499,6 +1499,202 @@ Nothing here has been run. The tool never runs a remote command.
     )
 }
 
+/// What [`reset`] found or did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ResetReport {
+    /// Topic roots to delete (ledgered, stored).
+    pub roots: usize,
+    /// Messages to delete (ledgered, stored, deferred ones included).
+    pub messages: usize,
+    /// Stale sealed envelopes of those, signed by the archivist.
+    pub envelopes: usize,
+    /// Ledgered kind-42 ids no longer in D1 (nothing to delete).
+    pub absent: usize,
+    /// Zone-encrypted posts in the imported threads that stay (the anchors).
+    pub anchors_kept: usize,
+    /// Whether anything was changed.
+    pub executed: bool,
+    /// Where the ledger and the seal state were backed up.
+    pub backup: Option<PathBuf>,
+}
+
+/// Surgical reset of the imported history, so it can be built again after
+/// the roots changed (a new title gives the root a new id, and every reply
+/// names its root, so every reply is re-signed).
+///
+/// Deletes exactly the ledgered kind-42 events of this import (topic roots
+/// and messages, deferred ones included) plus the archivist's sealed
+/// envelopes of them; keeps thread headers, profiles, DMs, the anchors and
+/// every other event. Refuses (nothing written) when an envelope in an
+/// imported thread is anything but an archivist seal of a ledgered event,
+/// and after a purge (the plaintext would be gone; rebuild into a fresh
+/// D1 instead). With `execute = false` it only reports. On execute (stack
+/// down): backs up the ledger and moves the seal directory aside, deletes in
+/// one transaction (the delete trigger drops the tag rows), recomputes the
+/// affected `posts_created`, drops the ledger rows, and verifies.
+pub fn reset(work: &Work, d1_path: &Path, execute: bool) -> Result<ResetReport, ImportError> {
+    let l = load(work)?;
+    let ks = Keystore::load(&work.keys())?;
+    let archivist = ks
+        .get(ARCHIVIST)
+        .ok_or_else(|| ImportError::Refused("no archivist key".into()))?
+        .pk
+        .clone();
+    let mut c = if execute {
+        d1::open_rw(d1_path)?
+    } else {
+        d1::open_ro(d1_path)?
+    };
+    d1::check_schema(&c)?;
+    let mut ledger = Ledger::load(&work.state(), &c, &l.plan.provenance)?;
+    let root_tag = format!("{}#root:", l.plan.provenance);
+    let msg_tag = format!("{}#m:", l.plan.provenance);
+    let doomed_rows: Vec<LedgerRowRef> = ledger
+        .rows
+        .values()
+        .filter(|r| r.kind == 42 && (r.k.starts_with(&root_tag) || r.k.starts_with(&msg_tag)))
+        .map(|r| LedgerRowRef {
+            id: r.id.clone(),
+            pk: r.pk.clone(),
+            root: r.k.starts_with(&root_tag),
+        })
+        .collect();
+    let originals: BTreeSet<&str> = doomed_rows.iter().map(|r| r.id.as_str()).collect();
+    let mut report = ResetReport::default();
+    fn present(c: &Connection, id: &str) -> Result<bool, ImportError> {
+        Ok(c.prepare_cached("SELECT 1 FROM events WHERE id = ?1")?
+            .exists([id])?)
+    }
+    fn tombstoned(c: &Connection, id: &str) -> Result<bool, ImportError> {
+        Ok(
+            c.prepare_cached("SELECT 1 FROM deleted_events WHERE id = ?1")?
+                .exists([id])?,
+        )
+    }
+    let mut doomed: BTreeSet<String> = BTreeSet::new();
+    let mut affected: BTreeSet<String> = BTreeSet::new();
+    for r in &doomed_rows {
+        if tombstoned(&c, &r.id)? {
+            return Err(ImportError::Refused(format!(
+                "{} is tombstoned: this D1 has been purged, and a reset would leave sealed history without its plaintext. Build into a fresh D1 instead",
+                r.id
+            )));
+        }
+        if present(&c, &r.id)? {
+            doomed.insert(r.id.clone());
+            affected.insert(r.pk.clone());
+            if r.root {
+                report.roots += 1;
+            } else {
+                report.messages += 1;
+            }
+        } else {
+            report.absent += 1;
+        }
+    }
+    // every zone-encrypted kind-42 in an imported thread: stale envelopes or anchors
+    let threads: BTreeSet<String> = thread_ids(&l, &ledger).into_values().collect();
+    let channel_of = |e: &NostrEvent| -> Option<String> {
+        e.tags
+            .iter()
+            .find(|t| {
+                t.first().map(String::as_str) == Some("e")
+                    && t.get(3).map(String::as_str) == Some("root")
+            })
+            .and_then(|t| t.get(1).cloned())
+    };
+    let tag = |e: &NostrEvent, name: &str| -> Option<String> {
+        e.tags
+            .iter()
+            .find(|t| t.first().map(String::as_str) == Some(name))
+            .and_then(|t| t.get(1).cloned())
+    };
+    for e in d1::read_events(&c, "WHERE kind = 42 AND id IN (SELECT event_id FROM event_tags WHERE name IN ('zk', 'sealed'))")? {
+        if !channel_of(&e).is_some_and(|ch| threads.contains(&ch)) {
+            continue;
+        }
+        match tag(&e, "sealed") {
+            None => report.anchors_kept += 1,
+            Some(inner) if e.pubkey == archivist && originals.contains(inner.as_str()) => {
+                doomed.insert(e.id.clone());
+                affected.insert(e.pubkey.clone());
+                report.envelopes += 1;
+            }
+            Some(inner) => {
+                return Err(ImportError::Refused(format!(
+                    "envelope {} in an imported thread is not an archivist seal of an event of this import (it wraps {inner}): refusing, nothing written",
+                    e.id
+                )))
+            }
+        }
+    }
+    if !execute {
+        return Ok(report);
+    }
+
+    let stamp = fsutil::now();
+    let backup = work.state().join(format!("reset-backup-{stamp}"));
+    fsutil::create_private_dir(&backup)?;
+    let ledger_file = work.state().join("ledger.jsonl");
+    if ledger_file.exists() {
+        fsutil::copy_private(&ledger_file, &backup.join("ledger.jsonl"))?;
+    }
+    if work.seal().exists() {
+        std::fs::rename(work.seal(), backup.join("seal"))
+            .map_err(|e| ImportError::io(&work.seal(), e))?;
+    }
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for id in &doomed {
+        tx.prepare_cached("DELETE FROM events WHERE id = ?1")?
+            .execute([id])?;
+    }
+    let kinds = d1::COUNTS_AS_POST
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    for pk in &affected {
+        tx.prepare_cached(&format!(
+            "UPDATE whitelist SET posts_created = (SELECT count(*) FROM events WHERE pubkey = ?1 AND kind IN ({kinds})) WHERE pubkey = ?1"
+        ))?
+        .execute([pk])?;
+    }
+    tx.commit()?;
+    let doomed_keys: BTreeSet<String> = ledger
+        .rows
+        .values()
+        .filter(|r| originals.contains(r.id.as_str()))
+        .map(|r| r.k.clone())
+        .collect();
+    ledger.retain(|r| !doomed_keys.contains(&r.k))?;
+    for id in &doomed {
+        if present(&c, id)? {
+            return Err(ImportError::Db(format!(
+                "reset verification: {id} is still stored"
+            )));
+        }
+    }
+    let orphans: i64 = c.query_row(
+        "SELECT count(*) FROM event_tags WHERE event_id NOT IN (SELECT id FROM events)",
+        [],
+        |r| r.get(0),
+    )?;
+    if orphans > 0 {
+        return Err(ImportError::Db(format!(
+            "reset verification: {orphans} event_tags rows lost their event"
+        )));
+    }
+    report.executed = true;
+    report.backup = Some(backup);
+    Ok(report)
+}
+
+struct LedgerRowRef {
+    id: String,
+    pk: String,
+    root: bool,
+}
+
 /// After the purge: rewrite the D1 file so deleted plaintext does not
 /// linger in free pages or the WAL (`secure_delete`, `VACUUM`, a truncating
 /// checkpoint). The stack must be down. Filesystem-level copies (snapshots,

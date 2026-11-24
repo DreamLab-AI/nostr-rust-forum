@@ -147,6 +147,16 @@ mod cli {
             #[arg(long)]
             work: PathBuf,
         },
+        /// Delete the imported roots, messages and their stale envelopes so the history can be rebuilt (dry run unless --execute; stack DOWN to execute).
+        Reset {
+            #[command(flatten)]
+            work: RunPaths,
+            #[arg(long)]
+            d1: PathBuf,
+            /// Apply the reset (default: report only).
+            #[arg(long)]
+            execute: bool,
+        },
         /// Print the text a live key signs to prove it belongs to an author.
         LinkStatement {
             #[arg(long)]
@@ -378,6 +388,15 @@ mod cli {
                            "note": "a topic root is exactly its title: edit any value, then build (run `reset` first if the topics are already built)"}),
                     true,
                 )
+            }
+            Cmd::Reset { work, d1, execute } => {
+                let r = pipeline::reset(&work.work(), &d1, execute)?;
+                let next = if execute {
+                    "run build, then seal-prep and seal again"
+                } else {
+                    "dry run: pass --execute (stack down) to apply"
+                };
+                (json!({"report": r, "next": next}), true)
             }
             Cmd::LinkStatement { work, author } => {
                 let a = nostr_bbs_bulk_import::format::Archive::open(&Work::new(&work).archive())?;

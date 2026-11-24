@@ -106,6 +106,22 @@ Re-running is safe and adds nothing. The operator's deferred history is imported
 `build --deferred-only --operator-key op.key`. Copied or re-wrapped DMs:
 `nostr-bbs-import dm --work W --d1 D1 --allow-stale-grants [--rewrap-old-key old.key]`.
 
+#### Changing titles after a build: reset
+
+A new title gives the root a new id, and every reply names its root, so the topic must be built
+again. With the stack down:
+
+```sh
+nostr-bbs-import reset --work W --d1 D1              # dry run: what would go
+nostr-bbs-import reset --work W --d1 D1 --execute    # back up a copy of the D1 file first
+nostr-bbs-import build --work W --d1 D1
+```
+
+`reset` deletes exactly this import's topic roots and messages and the archivist's envelopes of
+them; thread headers, profiles, DMs and the anchors stay. It backs up the ledger and moves
+`seal/` aside (seal again afterwards). It refuses when an envelope in an imported thread is
+anything else, and after a purge: then build into a fresh D1.
+
 ### 6. Zone key and anchors (stack up, in the client)
 
 1. Sign in as an admin. Admin → Encryption → the zone → **Create key**, then **Grant to members

@@ -188,6 +188,14 @@ following symlinks, owner and mode checked) for the run only.
   shit`) for channels without an entry and never changes an existing one.
   Provenance lives only in tags (`["import","<source>:<source_id>#root:<channel>"]`).
   Several source channels may fold into one thread (section).
+* **Reset.** A changed title changes the root's id, and every reply names its root,
+  so the topic must be rebuilt. `reset` (dry run unless `--execute`, stack down)
+  deletes exactly the import's ledgered kind-42s (roots and messages) and the
+  archivist's envelopes of them, keeps thread headers, profiles, DMs and anchors,
+  recomputes the affected `posts_created`, drops those ledger rows, moves the seal
+  state aside, and verifies. It refuses (nothing written) when an envelope in an
+  imported thread is anything else, and after a purge (rebuild into a fresh D1). The
+  generalisation of the pilot's `reset-fold.mjs`.
 * **Section rule.** The forum client routes a kind-40 by its `section` tag: equal to a
   zone id or `<zone-id>-…`, otherwise it falls through to the first zone silently.
   The planner refuses any section that does not start with its thread's zone id.
