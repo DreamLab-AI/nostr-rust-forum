@@ -16,7 +16,9 @@
 //!   switch) starts a new one: jobs of the old sign-in that finish later
 //!   release nothing, so they cannot under-count the new sign-in's slots.
 //!   The store also releases a slot whose job has run too long
-//!   (`UNWRAP_SLOT_TIMEOUT_MS`), so one hung fetch or prompt cannot hold it.
+//!   (`UNWRAP_SLOT_TIMEOUT_MS`), so one hung fetch or prompt cannot hold it,
+//!   except a refusable signer's single slot before its first success: that
+//!   slot waits on a permission prompt, and releasing it would raise another.
 //! - **Refused wraps are parked** ([`WrapQueue::park`]) until the signer has
 //!   decrypted another wrap, then queued once more as
 //!   [`Attempt::AfterSignerSuccess`] (see

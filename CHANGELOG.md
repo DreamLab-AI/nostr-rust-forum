@@ -27,7 +27,7 @@ Forum client only. Not yet exercised in a browser or on a live relay; see "Not v
   `RECIPIENT_KEYS_ENABLED`) now pages with an inclusive `until` at the oldest wrap seen, one page subscription at a time,
   each closed at its EOSE, by the deletion sync's rule (`deletion_sync::next_page_within`). The state is
   `zone_crypto::grant_paging::ScopePager` (`grant_paging.rs:291`); `ZoneKeyStore::run_scope` and `after_page`
-  (`store.rs:766`, `:823`) only open and close what it asks for. Bound: page 0 plus `GRANT_MAX_PAGES` = 50 pages
+  (`store.rs:767`, `:824`) only open and close what it asks for. Bound: page 0 plus `GRANT_MAX_PAGES` = 50 pages
   (51,000 wraps, `grant_paging.rs:99`), separate from the deletion sync's 20; giving up leaves the backlog unsettled
   (keys-timed-out copy, never "not found") and writes no marker (KF-32). An empty later page is asked once more past
   the boundary; empty again ends the walk *unverified*: it settles but writes no marker (KF-31).
@@ -47,7 +47,8 @@ Forum client only. Not yet exercised in a browser or on a live relay; see "Not v
   with the key it is addressed to (`inbox_key::opener_for`), so an inbox wrap never prompts the NIP-07 identity.
 - **Unwrap queue** (`zone_crypto/wrap_queue.rs`): newest-queued first (a page's oldest wraps, and later pages, run
   first), at most four at once, slots tagged by sign-in generation, a slot released after 60 s whatever its wrap is doing
-  (`UNWRAP_SLOT_TIMEOUT_MS`, `store.rs:62`), the admin check bounded at 10 s (`:67`). The 120 s cap now runs from the last
+  (`UNWRAP_SLOT_TIMEOUT_MS`, `store.rs:63`; not a refusable signer's single slot before its first success, which waits
+  on a prompt), the admin check bounded at 10 s (`:68`). The 120 s cap now runs from the last
   scope's delivery rather than the start of the sync.
 - **Tests.** 1,119 forum-client tests on the rebased base, 1,157 after (one more ignored). New: `ScopePager` against a fake
   relay (just over a page, multi-page, shared timestamps at boundaries, a page of one timestamp, inside and beyond the
@@ -60,9 +61,8 @@ Forum client only. Not yet exercised in a browser or on a live relay; see "Not v
   rows and none of the 25 oldest grants; paged, all 2,231 are delivered over 4 pages and all 30 grants settle, with a
   local key and with a mock NIP-07 signer that denies its first four prompts.
 - **Not verified.** The browser glue (`store.rs`: IndexedDB writes, `spawn_local`, timers, the forum's
-  `RelayConnection`) is compiled and linted for wasm32 but run by no test. No real NIP-07 extension was used: the
-  browser sidecar's Podkey (0.0.11, pinned `bd39ce8`, implements `nip44.decrypt` only) holds the operator's identity,
-  so no throwaway key was imported into it. The live acceptance is the cold-link test on a repinned deployment.
+  `RelayConnection`) is compiled and linted for wasm32 but run by no test. No real NIP-07 extension was exercised; the
+  signer path is covered by mock signers. The live acceptance is the cold-link test on a repinned deployment.
 
 ### Documentation and comment drift corrected (2026-11-23)
 

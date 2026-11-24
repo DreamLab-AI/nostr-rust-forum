@@ -53,7 +53,8 @@ const KV_PROCESSED: &str = "processed_wraps";
 const PROCESSED_FLUSH_MS: i32 = 1_000;
 
 /// How long one wrap may hold an unwrap slot (see [`super::wrap_queue`])
-/// before the slot is given to the next wrap. The wrap itself is not
+/// before the slot is given to the next wrap; not applied to a refusable
+/// signer's single slot before its first success (see `pump_wraps`). The wrap itself is not
 /// abandoned: it is accounted for when it finishes, and holds the backlog
 /// open until then. One minute is three stall windows
 /// ([`super::grant_backlog::KEYS_STALL_MS`]), long enough for a person to
@@ -979,7 +980,13 @@ impl ZoneKeyStore {
             };
             let slot = Rc::new(Cell::new(Some(started.slot)));
             let store = *self;
-            {
+            // Not while a refusable signer has yet to succeed: its one slot is
+            // then waiting on a permission prompt (the admin check has its own
+            // bound), and releasing it would raise another prompt every minute
+            // for a person who has walked away.
+            let refusable_unproven = started.successes_at_start == 0
+                && self.wrap_queue.with_value(WrapQueue::signer) == SignerKind::CanRefuse;
+            if !refusable_unproven {
                 let slot = slot.clone();
                 crate::utils::set_timeout_once(
                     move || store.release_slot(&slot),
