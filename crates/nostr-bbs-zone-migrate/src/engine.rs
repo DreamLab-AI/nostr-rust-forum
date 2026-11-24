@@ -667,7 +667,7 @@ pub async fn purge<R: Relay>(
 
 // ── Internals ────────────────────────────────────────────────────────────────
 
-fn needs_seal(status: &Status) -> bool {
+pub(crate) fn needs_seal(status: &Status) -> bool {
     matches!(
         status,
         Status::Planned
@@ -687,7 +687,7 @@ fn chunk_hits(chunk: &[String], not_found: &[String], skipped: &[String]) -> usi
 
 /// Verify the outer signature and channel, open with `zone_sk`, and require
 /// the inner id to be `original_id`. Returns the inner event's canonical JSON.
-fn open_and_check(
+pub(crate) fn open_and_check(
     outer: &NostrEvent,
     original_id: &str,
     channel: &str,
@@ -709,7 +709,7 @@ fn open_and_check(
 /// Find an existing envelope for `original_id` that opens with a held key and
 /// wraps exactly the original (byte for byte when the original is still on the
 /// relay). Returns `(outer id, epoch, inner sha256)`.
-fn adopt(
+pub(crate) fn adopt(
     envelopes: &[NostrEvent],
     original_id: &str,
     channel: &str,
@@ -740,7 +740,11 @@ fn adopt(
 // a fresh zone, add an explicit `--allow-unanchored-first-encryption` opt-in
 // that permits sealing ONLY when no posts are observed (a populated zone must
 // still match its live ciphertext, flag or not).
-fn check_anchor(zone: &str, keys: &KeyRing, scans: &[ChannelScan]) -> Result<(), EngineError> {
+pub(crate) fn check_anchor(
+    zone: &str,
+    keys: &KeyRing,
+    scans: &[ChannelScan],
+) -> Result<(), EngineError> {
     let current = keys.current(zone).expect("checked above");
     let mut observed: std::collections::BTreeMap<u32, BTreeSet<&str>> =
         std::collections::BTreeMap::new();
@@ -943,7 +947,7 @@ fn zk_of(ev: &NostrEvent) -> Option<(String, u32)> {
     })
 }
 
-fn set_sealed(state: &mut State, id: &str, epoch: u32, outer_id: &str, digest: String) {
+pub(crate) fn set_sealed(state: &mut State, id: &str, epoch: u32, outer_id: &str, digest: String) {
     let e = state.entries.get_mut(id).expect("entry exists");
     e.status = Status::Sealed;
     e.epoch = Some(epoch);
@@ -951,7 +955,7 @@ fn set_sealed(state: &mut State, id: &str, epoch: u32, outer_id: &str, digest: S
     e.inner_sha256 = Some(digest);
 }
 
-fn fail(
+pub(crate) fn fail(
     state: &mut State,
     log: &mut Vec<(String, String)>,
     id: &str,
@@ -972,7 +976,11 @@ fn fail(
     log.push((id.to_string(), reason.to_string()));
 }
 
-fn require_keys(state: &State, keys: &KeyRing, ids: &[String]) -> Result<(), EngineError> {
+pub(crate) fn require_keys(
+    state: &State,
+    keys: &KeyRing,
+    ids: &[String],
+) -> Result<(), EngineError> {
     let missing: BTreeSet<String> = ids
         .iter()
         .filter_map(|id| {

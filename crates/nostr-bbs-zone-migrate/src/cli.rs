@@ -10,6 +10,7 @@ use nostr_bbs_zone_migrate::engine::{self, Hooks, Plan};
 use nostr_bbs_zone_migrate::grants::{fetch_grants_with, GroupBinding, RejectedGrant};
 use nostr_bbs_zone_migrate::identity::{identity_from_env, parse_identity, IDENTITY_ENV};
 use nostr_bbs_zone_migrate::keys::{parse_key_file, KeyRing};
+use nostr_bbs_zone_migrate::offline;
 use nostr_bbs_zone_migrate::relay::{fetch_all, http_origin, Filter, Relay};
 use nostr_bbs_zone_migrate::state::{self, State, Status};
 use serde::Serialize;
@@ -120,6 +121,63 @@ enum Command {
     },
     /// Print the state file's counts by status.
     Status,
+    /// Seal from the relay's local D1 on all cores and write SQL chunks plus a
+    /// manifest (apply with `wrangler d1 execute --local --file`, then run
+    /// seal-offline-commit). Same key ring and anchor check as seal.
+    SealOffline {
+        /// The relay's D1 SQLite file (under --persist-to .../d1/...).
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// Directory for seal-NNNN.sql and seal-manifest.json.
+        #[arg(long, value_name = "DIR")]
+        sql_out: PathBuf,
+        /// Envelopes per SQL chunk.
+        #[arg(long, default_value_t = offline::DEFAULT_CHUNK)]
+        chunk: usize,
+        /// Sealing threads (default: all cores).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Seal at most this many originals.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
+    /// After applying seal-offline's chunks: re-read each envelope from D1,
+    /// re-open it, and mark the entry sealed. Unapplied entries stay planned.
+    SealOfflineCommit {
+        /// The relay's D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// seal-manifest.json from seal-offline.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+    },
+    /// Write SQL that purges the verified plaintext exactly as the relay's
+    /// admin delete does (tombstone, delete, audit row). Re-checks every
+    /// envelope from D1 first. Writes nothing to D1 itself.
+    PurgeOffline {
+        /// The relay's D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// Directory for purge-NNNN.sql and purge-manifest.json.
+        #[arg(long, value_name = "DIR")]
+        sql_out: PathBuf,
+        /// Ids per SQL chunk.
+        #[arg(long, default_value_t = offline::DEFAULT_CHUNK)]
+        chunk: usize,
+        /// Confirm the irreversible deletion the SQL performs.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// After applying purge-offline's chunks: mark entries purged whose
+    /// plaintext is gone from D1 and tombstoned.
+    PurgeOfflineCommit {
+        /// The relay's D1 SQLite file.
+        #[arg(long, value_name = "FILE")]
+        d1: PathBuf,
+        /// purge-manifest.json from purge-offline.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+    },
 }
 
 impl Command {
@@ -130,6 +188,10 @@ impl Command {
             Command::Verify => "verify",
             Command::Purge { .. } => "purge",
             Command::Status => "status",
+            Command::SealOffline { .. } => "seal-offline",
+            Command::SealOfflineCommit { .. } => "seal-offline-commit",
+            Command::PurgeOffline { .. } => "purge-offline",
+            Command::PurgeOfflineCommit { .. } => "purge-offline-commit",
         }
     }
 }
@@ -281,6 +343,163 @@ async fn run(cli: Cli) -> Result<ExitCode, Failure> {
             exit_for(report.skipped.is_empty())
         }
         Command::Status => unreachable!("handled above"),
+        Command::SealOffline {
+            d1,
+            sql_out,
+            chunk,
+            threads,
+            limit,
+        } => {
+            let channels = channels(&cli)?;
+            let path = state_path(&cli)?;
+            let mut st = load_or_new(path, &relay_url, &me_pk)?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            offline::check_schema(&db).map_err(Failure)?;
+            let mut events = std::collections::HashMap::new();
+            for c in &channels {
+                let evs = offline::read_channel_events(&db, &c.id)
+                    .map_err(|e| Failure(format!("reading channel {}: {e}", c.id)))?;
+                eprintln!("read {} kind-42 rows for channel {}", evs.len(), c.id);
+                events.insert(c.id.clone(), evs);
+            }
+            if let Some(n) = threads {
+                let _ = rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build_global();
+            }
+            hooks!(hooks, path);
+            let report =
+                offline::seal_offline(&channels, &events, &keys, &me, &mut st, limit, &mut hooks)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let files = offline::write_seal_sql(&sql_out, &report.sealed, &me_pk, chunk, now)
+                .map_err(|e| Failure(format!("{}: {e}", sql_out.display())))?;
+            let rate = report.sealed.len() as f64 / report.seal_seconds.max(1e-9);
+            eprintln!(
+                "seal-offline: {} sealed in {:.2}s ({rate:.0}/s on {} threads), {} adopted, {} failed; \
+                 {} SQL chunks in {}. Apply them, then run seal-offline-commit.",
+                report.sealed.len(),
+                report.seal_seconds,
+                rayon::current_num_threads(),
+                report.adopted,
+                report.failed.len(),
+                files.len(),
+                sql_out.display()
+            );
+            out["result"] = json!({
+                "sealed": report.sealed.len(), "adopted": report.adopted,
+                "failed": report.failed, "seal_seconds": report.seal_seconds,
+                "events_per_second": rate, "threads": rayon::current_num_threads(),
+                "chunks": files,
+            });
+            exit_for(report.failed.is_empty())
+        }
+        Command::SealOfflineCommit { d1, manifest } => {
+            let path = state_path(&cli)?;
+            let mut st = load_existing(path, &relay_url, &me_pk)?;
+            let entries: Vec<offline::ManifestEntry> = serde_json::from_slice(
+                &std::fs::read(&manifest)
+                    .map_err(|e| Failure(format!("{}: {e}", manifest.display())))?,
+            )?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            let outer_ids: Vec<String> = entries.iter().map(|m| m.outer_id.clone()).collect();
+            let outers = offline::read_events_by_id(&db, &outer_ids)
+                .map_err(|e| Failure(format!("reading envelopes: {e}")))?;
+            let report = offline::commit_sealed(&mut st, &entries, &outers, &keys);
+            state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
+            eprintln!(
+                "seal-offline-commit: {} marked sealed, {} left as they were",
+                report.committed,
+                report.skipped.len()
+            );
+            out["result"] = serde_json::to_value(&report)?;
+            exit_for(report.skipped.is_empty())
+        }
+        Command::PurgeOffline {
+            d1,
+            sql_out,
+            chunk,
+            yes,
+        } => {
+            if !yes {
+                return Err(Failure(
+                    "purge deletes the plaintext originals irreversibly; re-run with --yes".into(),
+                ));
+            }
+            let path = state_path(&cli)?;
+            let mut st = load_existing(path, &relay_url, &me_pk)?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            let outer_ids: Vec<String> = st
+                .entries
+                .values()
+                .filter_map(|e| e.outer_id.clone())
+                .collect();
+            let outers = offline::read_events_by_id(&db, &outer_ids)
+                .map_err(|e| Failure(format!("reading envelopes: {e}")))?;
+            let mut zone_events = std::collections::HashMap::new();
+            for zone in st.unanchored_zones.keys() {
+                zone_events.insert(
+                    zone.clone(),
+                    offline::read_zone_events(&db, zone)
+                        .map_err(|e| Failure(format!("zone {zone}: {e}")))?,
+                );
+            }
+            let (ids, failed) = offline::purge_candidates(&mut st, &keys, &outers, &zone_events)?;
+            state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
+            if !failed.is_empty() {
+                return Err(Failure(format!(
+                    "{} envelopes no longer open and match (first: {} — {}); nothing written",
+                    failed.len(),
+                    failed[0].0,
+                    failed[0].1
+                )));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let files = offline::write_purge_sql(&sql_out, &ids, &me_pk, chunk, now)
+                .map_err(|e| Failure(format!("{}: {e}", sql_out.display())))?;
+            eprintln!(
+                "purge-offline: {} ids in {} SQL chunks in {}. Apply them, then run purge-offline-commit.",
+                ids.len(),
+                files.len(),
+                sql_out.display()
+            );
+            out["result"] = json!({ "ids": ids.len(), "chunks": files });
+            ExitCode::SUCCESS
+        }
+        Command::PurgeOfflineCommit { d1, manifest } => {
+            let path = state_path(&cli)?;
+            let mut st = load_existing(path, &relay_url, &me_pk)?;
+            let ids: Vec<String> = serde_json::from_slice(
+                &std::fs::read(&manifest)
+                    .map_err(|e| Failure(format!("{}: {e}", manifest.display())))?,
+            )?;
+            let db =
+                offline::open_d1(&d1).map_err(|e| Failure(format!("{}: {e}", d1.display())))?;
+            let present = offline::present_ids(&db, &ids).map_err(|e| Failure(e.to_string()))?;
+            let gone: std::collections::HashSet<String> = ids
+                .iter()
+                .filter(|i| !present.contains(*i))
+                .cloned()
+                .collect();
+            let tomb = offline::tombstoned_ids(&db, &ids).map_err(|e| Failure(e.to_string()))?;
+            let report = offline::commit_purged(&mut st, &ids, &gone, &tomb);
+            state::save_atomic(path, &st).map_err(|e| Failure(e.to_string()))?;
+            eprintln!(
+                "purge-offline-commit: {} marked purged, {} left as they were",
+                report.committed,
+                report.skipped.len()
+            );
+            out["result"] = serde_json::to_value(&report)?;
+            exit_for(report.skipped.is_empty())
+        }
     };
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&out)?);

@@ -101,6 +101,8 @@ pub mod keys;
 /// builder.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod net;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod offline;
 pub mod plan;
 pub mod relay;
 pub mod state;
