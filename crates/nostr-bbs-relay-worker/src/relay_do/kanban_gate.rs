@@ -26,14 +26,15 @@
 
 use nostr_bbs_core::event::NostrEvent;
 use nostr_bbs_core::{
-    check_approved_entry, entry_requires_approval, parse_approval_decision, parse_coord,
+    check_approved_entry, entry_requires_approval_at, parse_approval_decision, parse_coord,
     ApprovalFacts, ApprovalRefusal, ApprovedEntry, DecisionFacts, KanbanBoard, KanbanCard,
     KIND_KANBAN_BOARD, KIND_KANBAN_CARD,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use wasm_bindgen::JsValue;
 use worker::*;
 
-use super::receipts::correlate;
 use super::storage::EventRow;
 use super::NostrRelayDO;
 use crate::auth;
@@ -60,26 +61,30 @@ pub(crate) const KANBAN_MOVE_APPROVALS_INDEX_SQL: &str =
     ON kanban_move_approvals(board, card_d)";
 
 /// The board version at the exact coordinate named by the card's `a` tag.
-pub(crate) const SELECT_BOARD_SQL: &str = "SELECT * FROM events WHERE kind = 30301 \
+pub(crate) const SELECT_BOARD_SQL: &str =
+    "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events WHERE kind = 30301 \
     AND pubkey = ?1 AND d_tag = ?2 ORDER BY created_at DESC LIMIT 1";
 
 /// Stored versions of one card across authors, latest first, ties to the
-/// lowest id. `?3` excludes the incoming event. Re-checked in Rust against the
+/// lowest id, newest 20 (the true latest is always inside the limit, since
+/// the order is the fold order). `?3` excludes the incoming event. Re-checked in Rust against the
 /// card's board, because `d_tag` alone is not unique across boards.
-pub(crate) const SELECT_PRIOR_CARD_SQL: &str = "SELECT e.* FROM events e \
-    JOIN event_tags t ON t.event_id = e.id \
-    WHERE t.name = 'a' AND t.value = ?1 AND e.kind = 30302 AND e.d_tag = ?2 AND e.id <> ?3 \
-    ORDER BY e.created_at DESC, e.id ASC";
+pub(crate) const SELECT_PRIOR_CARD_SQL: &str = "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig FROM events e \
+    WHERE e.kind = 30302 AND e.d_tag = ?2 AND e.id <> ?3 \
+    AND EXISTS (SELECT 1 FROM event_tags t WHERE t.event_id = e.id AND t.name = 'a' AND t.value = ?1) \
+    ORDER BY e.created_at DESC, e.id ASC LIMIT 20";
 
 /// The stored kanban approval request, by id.
-pub(crate) const SELECT_REQUEST_SQL: &str = "SELECT * FROM events WHERE id = ?1 AND kind = 31402";
+pub(crate) const SELECT_REQUEST_SQL: &str =
+    "SELECT id, pubkey, created_at, kind, tags, content, sig FROM events \
+    WHERE id = ?1 AND kind = 31402";
 
-/// Stored 31403s whose `e` tag names a request. Narrowed to admin-signed,
+/// The newest 50 stored 31403s whose `e` tag names a request. Narrowed to admin-signed,
 /// request-bound, parseable decisions in Rust.
-pub(crate) const SELECT_DECISIONS_SQL: &str = "SELECT e.* FROM events e \
-    JOIN event_tags t ON t.event_id = e.id \
-    WHERE t.name = 'e' AND t.value = ?1 AND e.kind = 31403 \
-    ORDER BY e.created_at DESC, e.id ASC";
+pub(crate) const SELECT_DECISIONS_SQL: &str = "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig FROM events e \
+    WHERE e.kind = 31403 \
+    AND EXISTS (SELECT 1 FROM event_tags t WHERE t.event_id = e.id AND t.name = 'e' AND t.value = ?1) \
+    ORDER BY e.created_at DESC, e.id ASC LIMIT 50";
 
 /// Whether the incoming event id is already stored (a redelivery).
 pub(crate) const SELECT_EVENT_KNOWN_SQL: &str = "SELECT id FROM events WHERE id = ?1 LIMIT 1";
@@ -111,6 +116,32 @@ pub(crate) fn claim_verdict(
         Ok(Some(_)) => Err(ApprovalRefusal::Consumed),
         Ok(None) | Err(()) => Err(ApprovalRefusal::Unverifiable),
     }
+}
+
+/// Name of the relay var that sets how long an approval stays usable.
+pub(crate) const KANBAN_APPROVAL_TTL_VAR: &str = "KANBAN_APPROVAL_TTL_SECS";
+
+/// Default approval lifetime: 7 days, counted from the decision's `created_at`.
+pub(crate) const DEFAULT_APPROVAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Set once the mode has been logged in this isolate.
+static MODE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Parse `KANBAN_APPROVAL_TTL_SECS`. Unset, empty, non-numeric and zero values
+/// give [`DEFAULT_APPROVAL_TTL_SECS`] (a zero lifetime would refuse every move).
+pub(crate) fn kanban_approval_ttl_var(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_APPROVAL_TTL_SECS)
+}
+
+/// Whether a claim should be given back after `save_event` answered `false`.
+/// `stored_after` is whether the card event is now in the table: a duplicate
+/// copy of an event that another delivery stored keeps the claim, because the
+/// claim belongs to the stored event. Unknown (`None`) keeps it too: a leaked
+/// claim costs a new request, a wrongly released one re-arms the approval.
+pub(crate) fn should_release_claim(stored_after: Option<bool>) -> bool {
+    stored_after == Some(false)
 }
 
 /// Rollout mode of the gate.
@@ -170,10 +201,10 @@ pub(crate) struct DecisionCandidate {
 }
 
 /// The latest decision that may bind `request_id`: admin-signed, citing the
-/// request through the case-correlation rule (`correlate`: a `supersedes`
-/// marked `e` tag never counts as the request; an `appeal`-marked one does, as
-/// it does for case projection, and the admin-signer rule still applies), and
-/// parseable as Approve or Reject.
+/// request through the kanban link rule (`decision_request_link`: an `e` tag
+/// marked `request`, else the first unmarked one; `supersedes` and `appeal`
+/// markers never bind, so there is no appeal fallback here), and parseable as
+/// Approve or Reject.
 /// Latest `created_at` wins, ties to the lowest id. Returns the event and
 /// whether it approves.
 ///
@@ -185,12 +216,9 @@ pub(crate) fn latest_eligible_decision<'a>(
     candidates
         .iter()
         .filter(|c| c.signer_is_admin)
-        .filter(|c| {
-            correlate(&c.event)
-                .map(|r| r.request_event_id.as_deref() == Some(request_id))
-                .unwrap_or(false)
-        })
-        .filter_map(|c| parse_approval_decision(&c.event).map(|d| (&c.event, d.approved)))
+        .filter_map(|c| parse_approval_decision(&c.event).map(|d| (&c.event, d)))
+        .filter(|(_, d)| d.request_id == request_id)
+        .map(|(ev, d)| (ev, d.approved))
         .min_by(|(a, _), (b, _)| {
             b.created_at
                 .cmp(&a.created_at)
@@ -207,11 +235,34 @@ pub(crate) fn first_card_of_board(rows: Vec<NostrEvent>, board_coord: &str) -> O
 }
 
 impl NostrRelayDO {
-    /// The rollout mode from `KANBAN_APPROVAL_GATE`.
+    /// The rollout mode from `KANBAN_APPROVAL_GATE`. The first call in an
+    /// isolate logs the mode, and an unrecognised value loudly.
     pub(crate) fn kanban_approval_gate_mode(&self) -> GateMode {
-        kanban_approval_gate_mode_var(
+        let raw = self
+            .env
+            .var(KANBAN_APPROVAL_GATE_VAR)
+            .ok()
+            .map(|v| v.to_string());
+        let mode = kanban_approval_gate_mode_var(raw.as_deref());
+        if !MODE_LOGGED.swap(true, Ordering::Relaxed) {
+            match raw.as_deref() {
+                None | Some("warn") | Some("enforce") => {
+                    console_log!("kanban approval gate: mode {}", mode.as_str());
+                }
+                Some(other) => console_error!(
+                    "kanban approval gate: {KANBAN_APPROVAL_GATE_VAR}={other:?} is not \
+                     \"warn\" or \"enforce\"; running in warn"
+                ),
+            }
+        }
+        mode
+    }
+
+    /// The approval lifetime from `KANBAN_APPROVAL_TTL_SECS`.
+    pub(crate) fn kanban_approval_ttl_secs(&self) -> u64 {
+        kanban_approval_ttl_var(
             self.env
-                .var(KANBAN_APPROVAL_GATE_VAR)
+                .var(KANBAN_APPROVAL_TTL_VAR)
                 .ok()
                 .map(|v| v.to_string())
                 .as_deref(),
@@ -292,7 +343,8 @@ impl NostrRelayDO {
             Err(()) => return KanbanGate::Refused(ApprovalRefusal::Unverifiable),
         };
         let prior = first_card_of_board(prior_rows, &incoming.board);
-        if !entry_requires_approval(Some(&board), prior.as_ref(), &incoming) {
+        let now = auth::js_now_secs();
+        if !entry_requires_approval_at(Some(&board), prior.as_ref(), &incoming, now) {
             return KanbanGate::NotGated;
         }
 
@@ -304,12 +356,13 @@ impl NostrRelayDO {
             None => return KanbanGate::Refused(ApprovalRefusal::Unverifiable),
         }
 
+        let ttl_secs = self.kanban_approval_ttl_secs();
         let request_id = prior
             .as_ref()
             .and_then(|p| p.pending_move.as_ref())
             .map(|(_, r)| r.clone());
         let Some(request_id) = request_id else {
-            return self.kanban_check(&incoming, prior.as_ref(), None, None, None, None);
+            return self.kanban_check(&incoming, prior.as_ref(), None, now, ttl_secs);
         };
 
         let request = match self
@@ -320,7 +373,7 @@ impl NostrRelayDO {
             Err(()) => return KanbanGate::Refused(ApprovalRefusal::Unverifiable),
         };
         let Some(request) = request else {
-            return self.kanban_check(&incoming, prior.as_ref(), None, None, None, None);
+            return self.kanban_check(&incoming, prior.as_ref(), None, now, ttl_secs);
         };
 
         let decision_rows = match self
@@ -361,8 +414,11 @@ impl NostrRelayDO {
                 event_id: &ev.id,
                 approved,
                 decider_principal: decider_principal.as_deref().unwrap_or(&ev.pubkey),
+                signed_at: ev.created_at,
             }),
             consumed_by: consumed_by.as_deref(),
+            now,
+            ttl_secs,
         };
         match check_approved_entry(&facts) {
             Ok(entry) => KanbanGate::Admitted(entry),
@@ -370,24 +426,25 @@ impl NostrRelayDO {
         }
     }
 
-    /// `check_approved_entry` over the facts known when the request or its
-    /// decision could not be found.
+    /// `check_approved_entry` over the facts known when the request could not
+    /// be found: it fails before reading any of the missing ones.
     fn kanban_check(
         &self,
         incoming: &KanbanCard,
         prior: Option<&KanbanCard>,
         request: Option<&NostrEvent>,
-        requester_principal: Option<&str>,
-        decision: Option<DecisionFacts<'_>>,
-        consumed_by: Option<&str>,
+        now: u64,
+        ttl_secs: u64,
     ) -> KanbanGate {
         match check_approved_entry(&ApprovalFacts {
             incoming,
             prior,
             request,
-            requester_principal,
-            decision,
-            consumed_by,
+            requester_principal: None,
+            decision: None,
+            consumed_by: None,
+            now,
+            ttl_secs,
         }) {
             Ok(entry) => KanbanGate::Admitted(entry),
             Err(r) => KanbanGate::Refused(r),
@@ -395,7 +452,7 @@ impl NostrRelayDO {
     }
 
     /// Whether an event id is already stored. `None` on a D1 failure.
-    async fn kanban_event_known(&self, id: &str) -> Option<bool> {
+    pub(crate) async fn kanban_event_known(&self, id: &str) -> Option<bool> {
         let db = self.env.d1("DB").ok()?;
         let stmt = db
             .prepare(SELECT_EVENT_KNOWN_SQL)
@@ -477,6 +534,7 @@ impl NostrRelayDO {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay_do::receipts::correlate;
     use rusqlite::{params, Connection};
 
     // -- Fixtures ----------------------------------------------------------------
@@ -881,16 +939,107 @@ mod tests {
     }
 
     #[test]
-    fn appeal_marked_admin_approval_citing_the_request_is_eligible() {
-        // Design inaccuracy: `correlate` falls back to the appeal target, so an
-        // admin-signed 31403 whose only link is an `appeal`-marked `e` tag does
-        // bind the request. Pinned so a change here is deliberate.
+    fn appeal_marked_admin_approval_citing_the_request_is_not_eligible() {
+        // The case projection falls back to the appeal target, but a kanban
+        // decision binds only through a `request`-marked or unmarked `e` tag.
         let tags = vec![tag(&["d", "rand"]), tag(&["e", "r1", "", "appeal"])];
         let appeal = decision("d-app", "admin", 10, tags, r#"{"action":"approve"}"#);
-        let c = [cand(appeal.clone(), true)];
-        assert_eq!(latest_eligible_decision("r1", &c).unwrap().0.id, "d-app");
-        // A non-admin appeal-marked decision still does not count.
-        assert!(latest_eligible_decision("r1", &[cand(appeal, false)]).is_none());
+        assert!(latest_eligible_decision("r1", &[cand(appeal, true)]).is_none());
+        // A `request`-marked tag does bind.
+        let tags = vec![tag(&["d", "rand"]), tag(&["e", "r1", "", "request"])];
+        let marked = decision("d-req", "admin", 10, tags, r#"{"action":"approve"}"#);
+        assert!(latest_eligible_decision("r1", &[cand(marked, true)]).is_some());
+    }
+
+    #[test]
+    fn ttl_var_defaults_to_seven_days() {
+        assert_eq!(kanban_approval_ttl_var(None), 604_800);
+        assert_eq!(kanban_approval_ttl_var(Some("")), 604_800);
+        assert_eq!(kanban_approval_ttl_var(Some("junk")), 604_800);
+        assert_eq!(kanban_approval_ttl_var(Some("0")), 604_800);
+        assert_eq!(kanban_approval_ttl_var(Some(" 3600 ")), 3600);
+    }
+
+    #[test]
+    fn duplicate_a_tags_do_not_multiply_prior_rows_and_the_limit_keeps_the_latest() {
+        let conn = db();
+        // One card version with the board's `a` tag repeated 30 times.
+        let mut dup = card_event("dup", "c1", 50, BOARD_COORD, "todo");
+        for _ in 0..30 {
+            dup.tags.push(tag(&["a", BOARD_COORD]));
+        }
+        insert(&conn, &dup);
+        let ids = rows(
+            &conn,
+            SELECT_PRIOR_CARD_SQL,
+            &[&BOARD_COORD, &"card1", &"incoming"],
+        );
+        assert_eq!(ids, vec!["dup"], "one row per event, not per tag");
+
+        // Far more versions than the limit: the newest is still first.
+        for i in 0..40u64 {
+            insert(
+                &conn,
+                &card_event(
+                    &format!("v{i:02}"),
+                    &format!("w{i}"),
+                    i,
+                    BOARD_COORD,
+                    "todo",
+                ),
+            );
+        }
+        let ids = rows(
+            &conn,
+            SELECT_PRIOR_CARD_SQL,
+            &[&BOARD_COORD, &"card1", &"incoming"],
+        );
+        assert_eq!(ids.len(), 20);
+        assert_eq!(ids[0], "dup", "created_at 50 beats every v*");
+    }
+
+    #[test]
+    fn decision_query_is_bounded_and_newest_first() {
+        let conn = db();
+        for i in 0..80u64 {
+            insert(
+                &conn,
+                &decision(
+                    &format!("d{i:02}"),
+                    "admin",
+                    i,
+                    plain_tags("r1"),
+                    r#"{"action":"approve"}"#,
+                ),
+            );
+        }
+        let ids = rows(&conn, SELECT_DECISIONS_SQL, &[&"r1"]);
+        assert_eq!(ids.len(), 50);
+        assert_eq!(ids[0], "d79");
+    }
+
+    #[test]
+    fn a_duplicate_save_keeps_the_claim_of_the_stored_event() {
+        // M4: copies 1 and 2 of finalising event F both claim R (the second is
+        // a no-op, same card id). Copy 1 stores F; copy 2's save answers
+        // false. Releasing on copy 2's false would delete copy 1's claim.
+        let conn = db();
+        assert_eq!(claim(&conn, "r1", "F", "enforce"), 1);
+        assert_eq!(claim(&conn, "r1", "F", "enforce"), 0);
+        insert(&conn, &card_event("F", "c1", 20, BOARD_COORD, "done"));
+        let stored_after = Some(!rows(&conn, SELECT_EVENT_KNOWN_SQL, &[&"F"]).is_empty());
+        assert!(!should_release_claim(stored_after));
+        assert_eq!(consumed(&conn, "r1").as_deref(), Some("F"));
+
+        // A save that really failed (event absent) does release.
+        assert_eq!(claim(&conn, "r2", "G", "enforce"), 1);
+        let stored_after = Some(!rows(&conn, SELECT_EVENT_KNOWN_SQL, &[&"G"]).is_empty());
+        assert!(should_release_claim(stored_after));
+        conn.execute(DELETE_CLAIM_SQL, params!["r2", "G"]).unwrap();
+        assert_eq!(consumed(&conn, "r2"), None);
+
+        // An unreadable table keeps the claim.
+        assert!(!should_release_claim(None));
     }
 
     // -- 22: warn mode still claims -----------------------------------------------

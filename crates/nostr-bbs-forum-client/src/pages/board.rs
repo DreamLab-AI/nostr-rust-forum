@@ -61,8 +61,10 @@ enum PendingState {
 struct BoardCtx {
     /// Kanban 31402 requests by event id (admins respond to these).
     approval_requests: RwSignal<HashMap<String, NostrEvent>>,
-    /// 31403 decisions: request event id -> approved.
-    decisions: RwSignal<HashMap<String, bool>>,
+    /// Kanban 31403 decisions by the request event id they bind to (via
+    /// `decision_request_link`). Kept as events so the badge can apply the
+    /// relay's rules (admin signer, latest wins, no self-review).
+    decisions: RwSignal<HashMap<String, Vec<NostrEvent>>>,
     /// Card currently being dragged (HTML5 drag-and-drop). Set on `dragstart`
     /// by the card, consumed on `drop` by the target column.
     dragging: RwSignal<Option<KanbanCard>>,
@@ -382,7 +384,10 @@ pub fn BoardPage() -> impl IntoView {
             KIND_ACTION_RESPONSE => {
                 if let Some(decision) = parse_approval_decision(&event) {
                     ctx.decisions.update(|map| {
-                        map.insert(decision.request_id, decision.approved);
+                        let list = map.entry(decision.request_id).or_default();
+                        if !list.iter().any(|e| e.id == event.id) {
+                            list.push(event);
+                        }
                     });
                 }
             }
@@ -558,6 +563,7 @@ pub fn BoardPage() -> impl IntoView {
                                 };
                                 let cards = active_cards.get();
                                 let decisions_map = ctx.decisions.get();
+                                let requests_map = ctx.approval_requests.get();
                                 let admin = is_admin.get();
                                 board
                                     .columns
@@ -566,22 +572,13 @@ pub fn BoardPage() -> impl IntoView {
                                         let col_id = col.id.clone();
                                         let col_name = col.name.clone();
                                         let needs_approval = board.column_needs_approval(&col_id);
-                                        // A card renders in its pending TARGET column
-                                        // once approved; otherwise it stays put.
+                                        // A card is always drawn in the column its
+                                        // `s` tag names. A pending move is only a
+                                        // badge there: nothing a writer copies onto
+                                        // a card can relocate it.
                                         let col_cards: Vec<KanbanCard> = cards
                                             .iter()
-                                            .filter(|c| {
-                                                let effective = match &c.pending_move {
-                                                    Some((target, req)) => {
-                                                        match decisions_map.get(req) {
-                                                            Some(true) => target.clone(),
-                                                            _ => c.column.clone(),
-                                                        }
-                                                    }
-                                                    None => c.column.clone(),
-                                                };
-                                                effective == col_id
-                                            })
+                                            .filter(|c| c.column == col_id)
                                             .cloned()
                                             .collect();
                                         let count = col_cards.len();
@@ -646,13 +643,27 @@ pub fn BoardPage() -> impl IntoView {
                                                     {col_cards
                                                         .into_iter()
                                                         .map(|card| {
+                                                            // Same rules as the relay gate; the
+                                                            // client has no admin set, so the
+                                                            // signer check is left to the relay.
                                                             let pending_state = card
                                                                 .pending_move
                                                                 .as_ref()
-                                                                .map(|(_, req)| match decisions_map.get(req) {
-                                                                    Some(true) => PendingState::Approved,
-                                                                    Some(false) => PendingState::Rejected,
-                                                                    None => PendingState::Awaiting,
+                                                                .and_then(|(_, req)| {
+                                                                    nostr_bbs_core::evaluate_pending_move(
+                                                                        &card,
+                                                                        requests_map.get(req),
+                                                                        decisions_map
+                                                                            .get(req)
+                                                                            .map(Vec::as_slice)
+                                                                            .unwrap_or(&[]),
+                                                                        |_| true,
+                                                                    )
+                                                                })
+                                                                .map(|s| match s {
+                                                                    nostr_bbs_core::PendingMoveState::Approved => PendingState::Approved,
+                                                                    nostr_bbs_core::PendingMoveState::Rejected => PendingState::Rejected,
+                                                                    nostr_bbs_core::PendingMoveState::Awaiting => PendingState::Awaiting,
                                                                 });
                                                             view! {
                                                                 <CardView

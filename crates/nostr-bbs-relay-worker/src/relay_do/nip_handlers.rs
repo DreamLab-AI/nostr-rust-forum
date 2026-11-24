@@ -1676,8 +1676,14 @@ impl NostrRelayDO {
         let saved = self.save_event(&event, treatment).await;
         if !saved {
             if let Some(entry) = approved_entry.as_ref() {
-                self.release_kanban_approval(&entry.request_id, &event.id)
-                    .await;
+                // Two copies of one event can race: the duplicate's save may
+                // answer false while the other copy stored it. Only give the
+                // claim back when the event is really not stored.
+                let stored_after = self.kanban_event_known(&event.id).await;
+                if kanban_gate::should_release_claim(stored_after) {
+                    self.release_kanban_approval(&entry.request_id, &event.id)
+                        .await;
+                }
             }
         }
         if saved {

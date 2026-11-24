@@ -23,6 +23,11 @@ JEV_API_KEY_NAME = "TYPESAFE_API_KEY"
 # Admins bypass the gate in both modes. Switch to "enforce" only after the warn
 # logs show no honest divergence.
 KANBAN_APPROVAL_GATE = "warn"
+# How long an admin's approval stays usable, in seconds, counted from the
+# deciding 31403's created_at. Past it the entry is refused with
+# "kanban_approval_expired" and a new request is needed. Default 604800 (7 days);
+# unset, non-numeric and 0 mean the default.
+KANBAN_APPROVAL_TTL_SECS = "604800"
 
 RELAY_NAME = "Nostr BBS Relay"
 # NOTE: the relay sources admin status from D1 (whitelist.is_admin), not from

@@ -735,6 +735,20 @@ pub struct ApprovalDecision {
     pub target_col: Option<String>,
 }
 
+/// The request a kanban 31403 is bound to: the value of an `e` tag marked
+/// `request`, else the first unmarked `e` tag (the shape the forum client
+/// signs). A tag with any other marker (`supersedes`, `appeal`, ...) never
+/// binds a kanban decision, unlike the case projection's appeal fallback.
+/// The relay gate and the client both use this rule, so they agree on which
+/// request a decision decides.
+pub fn decision_request_link(event: &NostrEvent) -> Option<&str> {
+    let e_tags = || event.tags.iter().filter(|t| t.len() >= 2 && t[0] == "e");
+    e_tags()
+        .find(|t| t.get(3).is_some_and(|m| m == "request"))
+        .or_else(|| e_tags().find(|t| t.get(3).is_none_or(|m| m.is_empty())))
+        .map(|t| t[1].as_str())
+}
+
 /// Parse a kind-31403 ActionResponse into a kanban [`ApprovalDecision`].
 /// Returns `None` for other kinds, responses without an `e` reference, or
 /// contents that don't parse to Approve/Reject.
@@ -742,7 +756,7 @@ pub fn parse_approval_decision(event: &NostrEvent) -> Option<ApprovalDecision> {
     if event.kind != crate::governance::KIND_ACTION_RESPONSE {
         return None;
     }
-    let request_id = tag_value(event, "e")?.to_string();
+    let request_id = decision_request_link(event)?.to_string();
     let approved =
         match crate::governance::broker::DecisionOutcome::from_response_content(&event.content)? {
             crate::governance::broker::DecisionOutcome::Approve => true,
@@ -780,6 +794,27 @@ pub fn entry_requires_approval(
         && prior.map(|p| p.column != incoming.column).unwrap_or(true)
 }
 
+/// How far in the future a card version may be dated before the gate treats it
+/// as an entry regardless of the prior version (seconds). A future-dated
+/// version would otherwise win the fold over any later, legitimate move.
+pub const FUTURE_SKEW_SECS: u64 = 600;
+
+/// [`entry_requires_approval`], plus: a version dated more than
+/// [`FUTURE_SKEW_SECS`] after `now` that sits in an approval column is treated
+/// as an entry even when the prior version is in the same column.
+pub fn entry_requires_approval_at(
+    board: Option<&KanbanBoard>,
+    prior: Option<&KanbanCard>,
+    incoming: &KanbanCard,
+    now: u64,
+) -> bool {
+    if entry_requires_approval(board, prior, incoming) {
+        return true;
+    }
+    board.is_some_and(|b| b.column_needs_approval(&incoming.column))
+        && incoming.created_at > now.saturating_add(FUTURE_SKEW_SECS)
+}
+
 /// The latest admin-signed kind-31403 that cites an approval request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionFacts<'a> {
@@ -789,6 +824,8 @@ pub struct DecisionFacts<'a> {
     pub approved: bool,
     /// The decider's effective principal (device key resolved to its owner).
     pub decider_principal: &'a str,
+    /// The decision's `created_at`, from which the approval's lifetime runs.
+    pub signed_at: u64,
 }
 
 /// Everything [`check_approved_entry`] needs, gathered by the caller.
@@ -810,6 +847,11 @@ pub struct ApprovalFacts<'a> {
     pub decision: Option<DecisionFacts<'a>>,
     /// The card event id that already spent this approval, if any.
     pub consumed_by: Option<&'a str>,
+    /// The current time (unix seconds).
+    pub now: u64,
+    /// How long an approval stays usable, counted from the decision's
+    /// `created_at`.
+    pub ttl_secs: u64,
 }
 
 /// An entry the gate has admitted: the facts to record as spent.
@@ -851,6 +893,11 @@ pub enum ApprovalRefusal {
     Consumed,
     /// A storage error after the entry was found to be gated.
     Unverifiable,
+    /// The incoming version does not beat the prior one in fold order, so it
+    /// would not become the card's current version.
+    Stale,
+    /// The approval is older than its lifetime.
+    Expired,
 }
 
 impl ApprovalRefusal {
@@ -866,6 +913,8 @@ impl ApprovalRefusal {
             Self::SelfReview => "kanban_approval_self_review",
             Self::Consumed => "kanban_approval_consumed",
             Self::Unverifiable => "kanban_approval_unverifiable",
+            Self::Stale => "kanban_approval_stale",
+            Self::Expired => "kanban_approval_expired",
         }
     }
 }
@@ -883,7 +932,9 @@ impl ApprovalRefusal {
 /// [`Undecided`](ApprovalRefusal::Undecided),
 /// [`SelfReview`](ApprovalRefusal::SelfReview),
 /// [`Denied`](ApprovalRefusal::Denied),
-/// [`Consumed`](ApprovalRefusal::Consumed). Principals compare
+/// [`Consumed`](ApprovalRefusal::Consumed),
+/// [`Expired`](ApprovalRefusal::Expired); [`Stale`](ApprovalRefusal::Stale)
+/// follows the pending-target check. Principals compare
 /// case-insensitively. A redelivery of the card event that already spent the
 /// approval (`consumed_by == incoming.id`) is admitted.
 ///
@@ -899,6 +950,13 @@ pub fn check_approved_entry(f: &ApprovalFacts<'_>) -> Result<ApprovedEntry, Appr
     };
     if *pending_col != f.incoming.column {
         return Err(ApprovalRefusal::ColumnMismatch);
+    }
+    // Fold order: a version that would not become the card's current one must
+    // not claim an approval (a past-dated entry would burn it for nothing).
+    let beats_prior = f.incoming.created_at > prior.created_at
+        || (f.incoming.created_at == prior.created_at && f.incoming.id < prior.id);
+    if !beats_prior {
+        return Err(ApprovalRefusal::Stale);
     }
     let request = match f.request {
         Some(r) if is_kanban_approval_request(r) && r.id == *request_id => r,
@@ -922,10 +980,14 @@ pub fn check_approved_entry(f: &ApprovalFacts<'_>) -> Result<ApprovedEntry, Appr
     if !decision.approved {
         return Err(ApprovalRefusal::Denied);
     }
+    let redelivery = f.consumed_by == Some(f.incoming.id.as_str());
     if let Some(spent_on) = f.consumed_by {
         if spent_on != f.incoming.id {
             return Err(ApprovalRefusal::Consumed);
         }
+    }
+    if !redelivery && f.now > decision.signed_at.saturating_add(f.ttl_secs) {
+        return Err(ApprovalRefusal::Expired);
     }
     Ok(ApprovedEntry {
         request_id: request.id.clone(),
@@ -933,6 +995,61 @@ pub fn check_approved_entry(f: &ApprovalFacts<'_>) -> Result<ApprovedEntry, Appr
         board: f.incoming.board.clone(),
         card_d: f.incoming.d_tag.clone(),
         target_col: f.incoming.column.clone(),
+    })
+}
+
+/// What a client may show for a card's pending move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingMoveState {
+    /// No eligible decision yet.
+    Awaiting,
+    /// The latest eligible decision approves the move.
+    Approved,
+    /// The latest eligible decision rejects it.
+    Rejected,
+}
+
+/// The client-side mirror of the relay gate's decision rules, for badges and
+/// the finalise button. Returns `None` (show nothing) when the card has no
+/// pending move or `request` is not the kanban request for exactly this card
+/// and target column.
+///
+/// A decision counts only if `is_admin(signer)` holds and it binds the request
+/// through [`decision_request_link`]. The latest by `(created_at DESC, id ASC)`
+/// wins. A decision signed by the requester's own key is ignored (the relay
+/// refuses self-review). A client that cannot tell who is an admin passes
+/// `|_| true`; the relay stays the authority either way.
+pub fn evaluate_pending_move<F: Fn(&str) -> bool>(
+    card: &KanbanCard,
+    request: Option<&NostrEvent>,
+    decisions: &[NostrEvent],
+    is_admin: F,
+) -> Option<PendingMoveState> {
+    let (target, request_id) = card.pending_move.as_ref()?;
+    let request = request?;
+    if !is_kanban_approval_request(request)
+        || request.id != *request_id
+        || tag_value(request, "board") != Some(card.board.as_str())
+        || tag_value(request, "card_d") != Some(card.d_tag.as_str())
+        || tag_value(request, "target_col") != Some(target.as_str())
+    {
+        return None;
+    }
+    let latest = decisions
+        .iter()
+        .filter(|d| is_admin(&d.pubkey))
+        .filter(|d| d.pubkey != request.pubkey)
+        .filter_map(|d| parse_approval_decision(d).map(|p| (d, p)))
+        .filter(|(_, p)| p.request_id == *request_id)
+        .min_by(|(a, _), (b, _)| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    Some(match latest {
+        None => PendingMoveState::Awaiting,
+        Some((_, p)) if p.approved => PendingMoveState::Approved,
+        Some(_) => PendingMoveState::Rejected,
     })
 }
 
@@ -1539,6 +1656,7 @@ mod tests {
             event_id: "dec1",
             approved,
             decider_principal: decider,
+            signed_at: 100,
         })
     }
 
@@ -1550,7 +1668,11 @@ mod tests {
 
     fn honest() -> Honest {
         Honest {
-            incoming: gate_card("fin", "done", None),
+            incoming: {
+                let mut c = gate_card("fin", "done", None);
+                c.created_at = 20;
+                c
+            },
             prior: gate_card("pend", "doing", Some(("done", R))),
             request: gate_request(R, BOARD_COORD, "card1", "done", true),
         }
@@ -1564,6 +1686,8 @@ mod tests {
             requester_principal: None,
             decision,
             consumed_by: None,
+            now: 200,
+            ttl_secs: 1000,
         }
     }
 
@@ -1766,6 +1890,183 @@ mod tests {
     }
 
     #[test]
+    fn gate_stale_incoming_is_refused() {
+        // Older than the prior: it would not become the current version.
+        let mut h = honest();
+        h.incoming.created_at = 5;
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::Stale)
+        );
+        // Equal time: the lower id wins the fold; a higher id is stale.
+        let mut h = honest();
+        h.incoming.created_at = h.prior.created_at;
+        h.incoming.id = "zzz".into();
+        assert_eq!(
+            check_approved_entry(&facts(&h, decision(true, "ee"))),
+            Err(ApprovalRefusal::Stale)
+        );
+        h.incoming.id = "aaa".into();
+        assert!(check_approved_entry(&facts(&h, decision(true, "ee"))).is_ok());
+    }
+
+    #[test]
+    fn gate_expired_approval_is_refused_but_a_redelivery_is_not() {
+        let h = honest();
+        let mut f = facts(&h, decision(true, "ee"));
+        f.now = 100 + 1000; // exactly at the limit: still valid
+        assert!(check_approved_entry(&f).is_ok());
+        f.now = 100 + 1001;
+        assert_eq!(check_approved_entry(&f), Err(ApprovalRefusal::Expired));
+        f.consumed_by = Some("fin");
+        assert!(
+            check_approved_entry(&f).is_ok(),
+            "redelivery is not re-expired"
+        );
+    }
+
+    #[test]
+    fn gate_future_dated_version_in_the_column_is_an_entry() {
+        let board = gate_board(&["done"]);
+        let prior = gate_card("p", "done", None);
+        let mut future = gate_card("f", "done", None);
+        future.created_at = 1_000 + FUTURE_SKEW_SECS + 1;
+        assert!(entry_requires_approval_at(
+            Some(&board),
+            Some(&prior),
+            &future,
+            1_000
+        ));
+        future.created_at = 1_000 + FUTURE_SKEW_SECS;
+        assert!(!entry_requires_approval_at(
+            Some(&board),
+            Some(&prior),
+            &future,
+            1_000
+        ));
+        // Not an approval column: skew does not matter.
+        let mut other = gate_card("o", "todo", None);
+        other.created_at = u64::MAX;
+        assert!(!entry_requires_approval_at(
+            Some(&board),
+            Some(&prior),
+            &other,
+            1_000
+        ));
+    }
+
+    fn resp(id: &str, signer: &str, at: u64, tags: Vec<Vec<String>>, approve: bool) -> NostrEvent {
+        NostrEvent {
+            id: id.into(),
+            pubkey: signer.into(),
+            created_at: at,
+            kind: crate::governance::KIND_ACTION_RESPONSE,
+            tags,
+            content: if approve {
+                r#"{"action":"approve"}"#
+            } else {
+                r#"{"action":"reject"}"#
+            }
+            .into(),
+            sig: String::new(),
+        }
+    }
+
+    fn e_tag(parts: &[&str]) -> Vec<String> {
+        let mut t = vec!["e".to_string()];
+        t.extend(parts.iter().map(|s| s.to_string()));
+        t
+    }
+
+    #[test]
+    fn decision_link_rule_ignores_appeal_and_supersedes_markers() {
+        let plain = resp("a", "x", 1, vec![e_tag(&["r1"])], true);
+        assert_eq!(decision_request_link(&plain), Some("r1"));
+        let marked = resp("b", "x", 1, vec![e_tag(&["r1", "", "request"])], true);
+        assert_eq!(decision_request_link(&marked), Some("r1"));
+        // `request` wins over an earlier unmarked tag.
+        let both = resp(
+            "c",
+            "x",
+            1,
+            vec![e_tag(&["old"]), e_tag(&["r1", "", "request"])],
+            true,
+        );
+        assert_eq!(decision_request_link(&both), Some("r1"));
+        for marker in ["appeal", "supersedes"] {
+            let ev = resp("d", "x", 1, vec![e_tag(&["r1", "", marker])], true);
+            assert_eq!(decision_request_link(&ev), None, "{marker}");
+            assert!(parse_approval_decision(&ev).is_none(), "{marker}");
+        }
+    }
+
+    #[test]
+    fn evaluate_pending_move_follows_the_relay_rules() {
+        let card = gate_card("pend", "doing", Some(("done", R)));
+        let req = gate_request(R, BOARD_COORD, "card1", "done", true);
+        let ok = resp("d1", "ee", 10, vec![e_tag(&[R])], true);
+        let any = |_: &str| true;
+        assert_eq!(
+            evaluate_pending_move(&card, Some(&req), &[], any),
+            Some(PendingMoveState::Awaiting)
+        );
+        assert_eq!(
+            evaluate_pending_move(&card, Some(&req), std::slice::from_ref(&ok), any),
+            Some(PendingMoveState::Approved)
+        );
+        // A later reject wins.
+        let rej = resp("d2", "ee", 20, vec![e_tag(&[R])], false);
+        assert_eq!(
+            evaluate_pending_move(&card, Some(&req), &[ok.clone(), rej], any),
+            Some(PendingMoveState::Rejected)
+        );
+        // Non-admin signer, self-review and a foreign request id do not count.
+        assert_eq!(
+            evaluate_pending_move(&card, Some(&req), std::slice::from_ref(&ok), |_| false),
+            Some(PendingMoveState::Awaiting)
+        );
+        let own = resp("d3", "dd", 10, vec![e_tag(&[R])], true);
+        assert_eq!(
+            evaluate_pending_move(&card, Some(&req), &[own], any),
+            Some(PendingMoveState::Awaiting)
+        );
+        let other = resp("d4", "ee", 10, vec![e_tag(&["r2"])], true);
+        assert_eq!(
+            evaluate_pending_move(&card, Some(&req), &[other], any),
+            Some(PendingMoveState::Awaiting)
+        );
+    }
+
+    #[test]
+    fn evaluate_pending_move_ignores_an_approval_copied_onto_another_card() {
+        // H1: an approved R copied onto a different card must not show.
+        let ok = resp("d1", "ee", 10, vec![e_tag(&[R])], true);
+        let req = gate_request(R, BOARD_COORD, "card1", "done", true);
+        let mut other = gate_card("pend", "doing", Some(("done", R)));
+        other.d_tag = "someone-elses-card".into();
+        assert_eq!(
+            evaluate_pending_move(&other, Some(&req), std::slice::from_ref(&ok), |_| true),
+            None
+        );
+        // Wrong target column, unknown request, and no pending move at all.
+        let card = gate_card("pend", "doing", Some(("review", R)));
+        assert_eq!(
+            evaluate_pending_move(&card, Some(&req), std::slice::from_ref(&ok), |_| true),
+            None
+        );
+        let card = gate_card("pend", "doing", Some(("done", R)));
+        assert_eq!(
+            evaluate_pending_move(&card, None, std::slice::from_ref(&ok), |_| true),
+            None
+        );
+        let plain = gate_card("p", "doing", None);
+        assert_eq!(
+            evaluate_pending_move(&plain, Some(&req), &[ok], |_| true),
+            None
+        );
+    }
+
+    #[test]
     fn gate_refusal_tokens_are_stable() {
         use ApprovalRefusal::*;
         let all = [
@@ -1778,6 +2079,8 @@ mod tests {
             (SelfReview, "kanban_approval_self_review"),
             (Consumed, "kanban_approval_consumed"),
             (Unverifiable, "kanban_approval_unverifiable"),
+            (Stale, "kanban_approval_stale"),
+            (Expired, "kanban_approval_expired"),
         ];
         for (r, t) in all {
             assert_eq!(r.token(), t);
