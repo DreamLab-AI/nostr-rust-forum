@@ -19,6 +19,12 @@
 //!   (`UNWRAP_SLOT_TIMEOUT_MS`), so one hung fetch or prompt cannot hold it,
 //!   except a refusable signer's single slot before its first success: that
 //!   slot waits on a permission prompt, and releasing it would raise another.
+//! - **Successes count only for their own generation**: a wrap of an
+//!   earlier sign-in that finishes after a switch does not lift the new
+//!   sign-in's one-prompt rule or re-queue its refused wraps.
+//! - **Paging waits for room** ([`WrapQueue::has_page_room`]): the next page
+//!   is fetched only while fewer than a page of wraps wait, so a slow signer
+//!   does not pull a whole 51-page walk into memory.
 //! - **Refused wraps are parked** ([`WrapQueue::park`]) until the signer has
 //!   decrypted another wrap, then queued once more as
 //!   [`Attempt::AfterSignerSuccess`] (see
@@ -27,6 +33,10 @@
 //! Pure, so it unit-tests natively.
 
 use super::grant_backlog::{Attempt, SignerKind};
+use crate::stores::channels::RELAY_FILTER_LIMIT;
+
+/// Queued wraps below which the next page may be fetched: one page.
+pub const PAGE_ROOM: usize = RELAY_FILTER_LIMIT as usize;
 
 /// How many gift wraps are unwrapped and processed at once once the signer
 /// is known to work. Each wrap is one NIP-44 decrypt through the signer and,
@@ -150,9 +160,20 @@ impl<J> WrapQueue<J> {
         }
     }
 
-    /// The signer decrypted a wrap: refused wraps parked before this success
-    /// are queued again, once. Returns how many were queued.
-    pub fn signer_succeeded(&mut self) -> usize {
+    /// Whether fewer than [`PAGE_ROOM`] wraps wait to start, so the next
+    /// page may be fetched.
+    pub fn has_page_room(&self) -> bool {
+        self.stack.len() < PAGE_ROOM
+    }
+
+    /// The signer decrypted a wrap, in the job holding `slot`: refused wraps
+    /// parked before this success are queued again, once. Returns how many
+    /// were queued. A job of an earlier generation (a sign-in that has since
+    /// switched) counts for nothing.
+    pub fn signer_succeeded(&mut self, slot: Slot) -> usize {
+        if slot.generation != self.generation {
+            return 0;
+        }
         self.successes += 1;
         let parked = std::mem::take(&mut self.parked);
         parked
@@ -218,6 +239,13 @@ impl<J> WrapQueue<J> {
 
 #[cfg(test)]
 mod tests {
+    /// A slot of the queue's current generation.
+    fn live<J>(q: &WrapQueue<J>) -> Slot {
+        Slot {
+            generation: q.generation,
+        }
+    }
+
     use super::*;
 
     fn drain_order(q: &mut WrapQueue<u32>) -> Vec<u32> {
@@ -263,7 +291,7 @@ mod tests {
         }
         let first = q.start_next().unwrap();
         assert!(q.start_next().is_none(), "one prompt, not four");
-        q.signer_succeeded();
+        q.signer_succeeded(live(&q));
         q.release(first.slot);
         assert_eq!(std::iter::from_fn(|| q.start_next()).count(), 4);
     }
@@ -313,7 +341,7 @@ mod tests {
         assert!(!q.park(s.job, s.successes_at_start));
         assert_eq!((q.parked(), q.queued()), (1, 0));
         assert!(q.start_next().is_none(), "nothing to run until a success");
-        assert_eq!(q.signer_succeeded(), 1);
+        assert_eq!(q.signer_succeeded(live(&q)), 1);
         assert_eq!(q.parked(), 0);
         let again = q.start_next().unwrap();
         assert_eq!((again.job, again.attempt), (7, Attempt::AfterSignerSuccess));
@@ -326,12 +354,12 @@ mod tests {
     fn a_success_during_the_refused_attempt_requeues_at_once() {
         let mut q = WrapQueue::new();
         q.set_signer(SignerKind::CanRefuse);
-        q.signer_succeeded(); // the origin is trusted now; four slots
+        q.signer_succeeded(live(&q)); // the origin is trusted now; four slots
         q.push(1);
         q.push(2);
         let a = q.start_next().unwrap();
         let b = q.start_next().unwrap();
-        q.signer_succeeded(); // b opened
+        q.signer_succeeded(live(&q)); // b opened
         q.release(b.slot);
         q.release(a.slot);
         assert!(q.park(a.job, a.successes_at_start));
@@ -344,7 +372,41 @@ mod tests {
         let mut q = WrapQueue::new();
         q.park(1, 0);
         q.reset();
-        assert_eq!(q.signer_succeeded(), 0);
+        assert_eq!(q.signer_succeeded(live(&q)), 0);
         assert!(q.start_next().is_none());
+    }
+
+    /// Security review finding 6: a wrap of the previous sign-in that
+    /// finishes after a switch to a NIP-07 identity must not count as that
+    /// identity's first success.
+    #[test]
+    fn a_success_from_before_a_switch_does_not_count() {
+        let mut q = WrapQueue::new();
+        q.push(1);
+        let old = q.start_next().unwrap();
+        q.reset();
+        q.set_signer(SignerKind::CanRefuse);
+        q.park(9, 0);
+        assert_eq!(q.signer_succeeded(old.slot), 0, "stale success ignored");
+        assert_eq!(q.limit(), 1, "still one prompt at a time");
+        assert_eq!(q.parked(), 1, "the refused wrap still waits");
+        assert_eq!(q.signer_succeeded(live(&q)), 1);
+        assert_eq!(q.limit(), MAX_CONCURRENT_UNWRAPS);
+    }
+
+    /// Security review finding 5: the next page waits while a page of wraps
+    /// is still queued.
+    #[test]
+    fn paging_waits_while_a_page_is_queued() {
+        let mut q = WrapQueue::new();
+        for j in 0..PAGE_ROOM - 1 {
+            q.push(j);
+        }
+        assert!(q.has_page_room());
+        q.push(0);
+        assert!(!q.has_page_room());
+        let s = q.start_next().unwrap();
+        assert!(q.has_page_room());
+        q.release(s.slot);
     }
 }

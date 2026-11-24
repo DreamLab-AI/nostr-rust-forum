@@ -88,8 +88,15 @@ pub enum WrapOutcome {
     /// or a locked extension looks the same as a wrap it cannot read. Held
     /// like [`WrapOutcome::Retry`], and queued again once the signer has
     /// decrypted another wrap (see `WrapQueue::park`). Failing again then,
-    /// it is [`WrapOutcome::Unreadable`].
+    /// it is [`WrapOutcome::UnreadableBySigner`].
     Refused,
+    /// The refusable signer failed on it again after it had decrypted
+    /// another wrap. Settles like [`WrapOutcome::Unreadable`] (a junk wrap
+    /// must not hold every session open), but the failure may still have
+    /// been a lock or a refusal, so the wrap's `created_at` becomes the
+    /// marker's floor: the next session's warm stop must lie below it, and
+    /// that session tries the wrap again.
+    UnreadableBySigner,
 }
 
 impl WrapOutcome {
@@ -130,9 +137,10 @@ pub enum Attempt {
 /// from a wrap the key cannot read, and classing a refusal as unreadable
 /// would let the backlog settle (and a later warm stop skip) over a grant
 /// that was merely refused. Once the same signer has decrypted another wrap
-/// and this one still fails, the signer is evidently working and the wrap
-/// is unreadable; otherwise a single junk wrap addressed to a NIP-07 user
-/// would hold every session's backlog open for good.
+/// and this one still fails, it no longer holds this session open (a single
+/// junk wrap addressed to a NIP-07 user would otherwise hold every session's
+/// backlog open for good), but it is [`WrapOutcome::UnreadableBySigner`],
+/// not unreadable: it lowers the marker's floor, so it is not skipped later.
 pub fn unwrap_failure_outcome(
     error: &UnwrapError,
     signer: SignerKind,
@@ -140,6 +148,9 @@ pub fn unwrap_failure_outcome(
 ) -> WrapOutcome {
     match (error, signer, attempt) {
         (UnwrapError::Signer(_), SignerKind::CanRefuse, Attempt::First) => WrapOutcome::Refused,
+        (UnwrapError::Signer(_), SignerKind::CanRefuse, Attempt::AfterSignerSuccess) => {
+            WrapOutcome::UnreadableBySigner
+        }
         _ => WrapOutcome::Unreadable,
     }
 }
@@ -185,6 +196,9 @@ pub struct GrantBacklog {
     retrying: HashSet<String>,
     /// Scopes that finished a verified walk and await their backfill marker.
     markers_due: HashSet<GrantScope>,
+    /// The oldest `created_at` of a wrap that ended
+    /// [`WrapOutcome::UnreadableBySigner`] this sign-in.
+    floor: Option<u64>,
 }
 
 impl GrantBacklog {
@@ -206,6 +220,7 @@ impl GrantBacklog {
             latched: false,
             retrying: HashSet::new(),
             markers_due: HashSet::new(),
+            floor: None,
         }
     }
 
@@ -215,16 +230,25 @@ impl GrantBacklog {
         self.in_flight += 1;
     }
 
-    /// Wrap `id` finished processing at `now`, with `outcome` (a grant's key
-    /// is stored before this).
-    pub fn wrap_done(&mut self, now: f64, id: &str, outcome: WrapOutcome) {
+    /// Wrap `id` (dated `created_at`) finished processing at `now`, with
+    /// `outcome` (a grant's key is stored before this).
+    pub fn wrap_done(&mut self, now: f64, id: &str, created_at: u64, outcome: WrapOutcome) {
         self.in_flight = self.in_flight.saturating_sub(1);
         if outcome.retryable() {
             self.retrying.insert(id.to_string());
         } else {
             self.retrying.remove(id);
         }
+        if outcome == WrapOutcome::UnreadableBySigner {
+            self.floor = Some(self.floor.map_or(created_at, |f| f.min(created_at)));
+        }
         self.advance(now);
+    }
+
+    /// The floor to store with this sign-in's markers (see
+    /// [`WrapOutcome::UnreadableBySigner`]).
+    pub fn marker_floor(&self) -> Option<u64> {
+        self.floor
     }
 
     /// Wraps whose latest attempt was retryable.
@@ -360,9 +384,9 @@ mod tests {
         b.wrap_started();
         b.scope_delivered(GrantScope::Identity, true, 1.0);
         assert!(!b.settled());
-        b.wrap_done(1.0, "w", WrapOutcome::Settled);
+        b.wrap_done(1.0, "w", 1, WrapOutcome::Settled);
         assert!(!b.settled());
-        b.wrap_done(1.0, "w", WrapOutcome::Settled);
+        b.wrap_done(1.0, "w", 1, WrapOutcome::Settled);
         assert!(b.settled());
     }
 
@@ -388,7 +412,7 @@ mod tests {
     #[test]
     fn spurious_done_does_not_underflow() {
         let mut b = GrantBacklog::new(false, 0.0);
-        b.wrap_done(1.0, "w", WrapOutcome::Settled);
+        b.wrap_done(1.0, "w", 1, WrapOutcome::Settled);
         b.scope_delivered(GrantScope::Identity, true, 1.0);
         assert!(b.settled());
     }
@@ -405,7 +429,7 @@ mod tests {
         );
         // A wrap finishes at 15 s: the window restarts from there.
         b.wrap_started();
-        b.wrap_done(15_000.0, "w", WrapOutcome::Settled);
+        b.wrap_done(15_000.0, "w", 1, WrapOutcome::Settled);
         assert_eq!(
             b.phase(30_000.0),
             KeyPhase::Progressing {
@@ -437,7 +461,7 @@ mod tests {
         while t < KEYS_CAP_MS {
             t += 5_000.0;
             b.wrap_started();
-            b.wrap_done(t, "w", WrapOutcome::Settled);
+            b.wrap_done(t, "w", 1, WrapOutcome::Settled);
         }
         assert_eq!(b.phase(KEYS_CAP_MS), KeyPhase::Stalled);
         assert!(matches!(
@@ -464,7 +488,7 @@ mod tests {
             // One every ~3 s, the last at 75.9 s.
             t = 2_000.0 + f64::from(i + 1) * (73_900.0 / f64::from(wraps));
             assert!(matches!(b.phase(t), KeyPhase::Progressing { .. }), "{t}");
-            b.wrap_done(t, "w", WrapOutcome::Settled);
+            b.wrap_done(t, "w", 1, WrapOutcome::Settled);
         }
         assert!((t - 75_900.0).abs() < 1e-6);
         assert_eq!(b.phase(t), KeyPhase::Settled);
@@ -487,7 +511,7 @@ mod tests {
         b.wrap_started();
         assert!(b.settled(), "a live wrap does not reopen it");
         assert_eq!(b.phase(10.0 * KEYS_CAP_MS), KeyPhase::Settled);
-        b.wrap_done(2_000.0, "w", WrapOutcome::Settled);
+        b.wrap_done(2_000.0, "w", 1, WrapOutcome::Settled);
         assert!(b.settled());
     }
 
@@ -513,9 +537,9 @@ mod tests {
             !b.marker_writable(),
             "the last page's wraps are still opening"
         );
-        b.wrap_done(2_000.0, "w", WrapOutcome::Settled);
+        b.wrap_done(2_000.0, "w", 1, WrapOutcome::Settled);
         assert!(!b.marker_writable());
-        b.wrap_done(3_000.0, "w", WrapOutcome::Settled);
+        b.wrap_done(3_000.0, "w", 1, WrapOutcome::Settled);
         assert!(b.marker_writable());
     }
 
@@ -525,7 +549,7 @@ mod tests {
     fn a_transient_failure_withholds_the_marker() {
         let mut b = GrantBacklog::new(false, 0.0);
         b.wrap_started();
-        b.wrap_done(1_000.0, "w", WrapOutcome::Retry);
+        b.wrap_done(1_000.0, "w", 1, WrapOutcome::Retry);
         b.scope_delivered(GrantScope::Identity, true, 2_000.0);
         assert!(!b.marker_writable());
         assert!(b.take_due_markers().is_empty());
@@ -541,7 +565,7 @@ mod tests {
             let mut b = GrantBacklog::new(false, 0.0);
             b.wrap_started();
             b.scope_delivered(GrantScope::Identity, true, 1_000.0);
-            b.wrap_done(2_000.0, "g", outcome);
+            b.wrap_done(2_000.0, "g", 1, outcome);
             assert!(!b.settled(), "{outcome:?}");
             assert_eq!(b.phase(2_000.0 + KEYS_STALL_MS), KeyPhase::Stalled);
         }
@@ -555,13 +579,13 @@ mod tests {
         b.wrap_started();
         b.wrap_started();
         b.scope_delivered(GrantScope::Identity, true, 1_000.0);
-        b.wrap_done(1_500.0, "g", WrapOutcome::Refused);
-        b.wrap_done(1_600.0, "dm", WrapOutcome::Settled);
+        b.wrap_done(1_500.0, "g", 1, WrapOutcome::Refused);
+        b.wrap_done(1_600.0, "dm", 1, WrapOutcome::Settled);
         assert_eq!(b.retrying(), 1);
         assert!(!b.settled() && !b.marker_writable());
         // Queued again after the signer decrypted "dm", and it opens.
         b.wrap_started();
-        b.wrap_done(2_000.0, "g", WrapOutcome::Settled);
+        b.wrap_done(2_000.0, "g", 1, WrapOutcome::Settled);
         assert!(b.settled());
         assert_eq!(b.take_due_markers(), vec![GrantScope::Identity]);
         assert!(b.take_due_markers().is_empty(), "taken once");
@@ -571,7 +595,7 @@ mod tests {
     fn an_unreadable_wrap_does_not_withhold_the_marker() {
         let mut b = GrantBacklog::new(false, 0.0);
         b.wrap_started();
-        b.wrap_done(1_000.0, "w", WrapOutcome::Unreadable);
+        b.wrap_done(1_000.0, "w", 1, WrapOutcome::Unreadable);
         b.scope_delivered(GrantScope::Identity, true, 2_000.0);
         assert!(b.marker_writable());
         assert!(b.settled());
@@ -593,7 +617,7 @@ mod tests {
         b.wrap_started();
         b.scope_delivered(GrantScope::Identity, true, 1_000.0);
         assert!(b.take_due_markers().is_empty(), "a wrap is still opening");
-        b.wrap_done(1_100.0, "w", WrapOutcome::Settled);
+        b.wrap_done(1_100.0, "w", 1, WrapOutcome::Settled);
         assert_eq!(b.take_due_markers(), vec![GrantScope::Identity]);
         b.scope_delivered(GrantScope::Inbox, true, 1_200.0);
         assert_eq!(b.take_due_markers(), vec![GrantScope::Inbox]);
@@ -610,7 +634,7 @@ mod tests {
         while t < 200_000.0 {
             t += 10_000.0;
             b.wrap_started();
-            b.wrap_done(t, "w", WrapOutcome::Settled);
+            b.wrap_done(t, "w", 1, WrapOutcome::Settled);
             assert!(matches!(b.phase(t), KeyPhase::Progressing { .. }), "{t}");
         }
         assert_eq!(b.phase(100_000.0 + KEYS_CAP_MS), KeyPhase::Stalled);
@@ -650,7 +674,25 @@ mod tests {
         );
         assert_eq!(
             unwrap_failure_outcome(&e, SignerKind::CanRefuse, Attempt::AfterSignerSuccess),
-            WrapOutcome::Unreadable
+            WrapOutcome::UnreadableBySigner
         );
+    }
+
+    /// Security review finding 2: a wrap the refusable signer failed on
+    /// twice settles the backlog (a junk wrap must not hold it) but lowers
+    /// the marker's floor to its timestamp, so the next session reaches it.
+    #[test]
+    fn a_twice_refused_wrap_settles_but_floors_the_marker() {
+        let mut b = GrantBacklog::new(false, 0.0);
+        for _ in 0..3 {
+            b.wrap_started();
+        }
+        b.scope_delivered(GrantScope::Identity, true, 10.0);
+        b.wrap_done(20.0, "a", 5_000, WrapOutcome::UnreadableBySigner);
+        b.wrap_done(30.0, "b", 4_000, WrapOutcome::UnreadableBySigner);
+        b.wrap_done(40.0, "c", 1_000, WrapOutcome::Unreadable);
+        assert!(b.settled());
+        assert_eq!(b.take_due_markers(), vec![GrantScope::Identity]);
+        assert_eq!(b.marker_floor(), Some(4_000), "the oldest, not junk");
     }
 }

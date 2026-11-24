@@ -607,7 +607,7 @@ mod tests {
             let mut b = GrantBacklog::new(false, 0.0);
             b.wrap_started();
             b.scope_delivered(GrantScope::Identity, true, 500.0);
-            b.wrap_done(800.0, "grant", outcome);
+            b.wrap_done(800.0, "grant", 1, outcome);
             let early = key_state(true, Some(b.phase(900.0)), false);
             assert_ne!(
                 Lookup::decide_with_keys(false, true, early, false),

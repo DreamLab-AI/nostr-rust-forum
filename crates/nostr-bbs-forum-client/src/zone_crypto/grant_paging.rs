@@ -26,20 +26,22 @@
 //! An empty later page should not happen: the inclusive boundary wrap comes
 //! back unless it was deleted meanwhile (the old-grant sweep, another
 //! device) or the query failed (the relay currently answers a storage error
-//! with an empty result and an EOSE). The page is asked again once with an
-//! exclusive boundary (`until - 1`), which rides out one failed query. If
-//! that is empty too, there is nothing older, or the relay failed twice. The
-//! scope then counts as delivered but *unverified*: the backlog may settle,
-//! but no backfill marker is written, so the next session walks the scope
-//! again.
+//! with an empty result and an EOSE). The same inclusive `until` is asked
+//! again first, which rides out one failed query without skipping the
+//! unseen wraps that share the boundary timestamp. Empty twice, the page is
+//! asked once more past the boundary (`until - 1`); a walk that takes that
+//! step may have skipped wraps at the boundary, so however it ends it is
+//! *unverified*: the backlog may settle, but no backfill marker is written,
+//! so the next session walks the scope again.
 //!
 //! The walk is bounded at page 0 plus [`GRANT_MAX_PAGES`] pages. Reaching the
 //! bound gives up: the backlog never settles this session, so a page waiting
 //! on a key reports the keys-timed-out copy, never "not found", and no marker
 //! is written.
 //!
-//! NIP-59 randomises a wrap's `created_at` up to two days into the past. That
-//! is fine for paging (`until` steps through the wraps' own timestamps, which
+//! A wrap's `created_at` is not when it arrived: NIP-59 randomises it up to
+//! two days into the past, and the relay accepts any event dated up to
+//! seven days either side of its clock. That is fine for paging (`until` steps through the wraps' own timestamps, which
 //! is what the relay orders by), but "oldest seen" is the wrap's timestamp,
 //! never the rumour's.
 //!
@@ -49,12 +51,18 @@
 //! sign-in has been processed with no failure worth retrying (see
 //! `GrantBacklog::take_due_markers`). A later session may stop at a full page
 //! whose wraps were all already processed, but only once that page lies
-//! entirely below `completed_at - WARM_STOP_MARGIN_SECS` (NIP-59's two-day
-//! backdating plus a day for skew between this device's clock, which wrote
-//! `completed_at`, and the senders' clocks): a wrap published after the last
-//! backfill carries a `created_at` at most two days before its publication,
-//! so it always sorts above such a page, and was delivered (and processed)
-//! on an earlier page of this session. Stopping on processed wraps alone
+//! entirely below `completed_at - WARM_STOP_MARGIN_SECS` (the relay's
+//! accepted past drift, seven days, plus a day for skew between this
+//! device's clock, which wrote `completed_at`, and the relay's): a wrap that
+//! reached the relay after the last backfill carries a `created_at` at most
+//! seven days before it landed, whoever sent it and however (a mesh peer
+//! included), so it always sorts above such a page, and was delivered (and
+//! processed) on an earlier page of this session. NIP-59's own two-day
+//! backdating is not the bound: a sender may date a wrap anywhere the relay
+//! accepts. The page must also lie below the marker's *floor*, the oldest
+//! wrap the last session left unread after a refusable signer failed on it
+//! twice (see `GrantBacklog::take_due_markers`), so that wrap is reached
+//! and tried again. Stopping on processed wraps alone
 //! would be unsafe: an account that received more than a page of wraps
 //! while offline could have a fresh grant backdated below a fully processed
 //! page. Without a marker (a first backfill, or one that was interrupted)
@@ -78,16 +86,17 @@ use std::collections::HashSet;
 use crate::stores::channels::RELAY_FILTER_LIMIT;
 use crate::stores::deletion_sync::{self as deletion_sync, PageStep};
 
-/// How far into the past NIP-59 lets a gift wrap's `created_at` be
-/// randomised: two days.
-pub const NIP59_BACKDATE_SECS: u64 = 2 * 24 * 60 * 60;
+/// How far before it lands the relay accepts a wrap's `created_at`: the
+/// relay's own ingress bound, shared through core so the two cannot drift.
+pub const RELAY_PAST_DRIFT_SECS: u64 = nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS;
 
 /// Allowance for skew between this device's clock (which wrote the marker)
-/// and the clocks of the wraps' senders: one day.
+/// and the relay's clock: one day.
 pub const CLOCK_SKEW_SECS: u64 = 24 * 60 * 60;
 
-/// How far below the marker time a page must lie to be a warm stop.
-pub const WARM_STOP_MARGIN_SECS: u64 = NIP59_BACKDATE_SECS + CLOCK_SKEW_SECS;
+/// How far below the marker time a page must lie to be a warm stop: eight
+/// days.
+pub const WARM_STOP_MARGIN_SECS: u64 = RELAY_PAST_DRIFT_SECS + CLOCK_SKEW_SECS;
 
 /// Pages a grant scope may fetch after page 0 in one session: 51,000 wraps
 /// in all. Separate from the deletion sync's bound
@@ -100,12 +109,54 @@ pub const GRANT_MAX_PAGES: u32 = 50;
 
 /// The marker the warm stop may use: none while the grant sweep is on (see
 /// the module notes), else the persisted completion time.
-pub fn warm_marker(completed_at: Option<u64>, sweep_on: bool) -> Option<u64> {
+pub fn warm_marker(marker: Option<Marker>, sweep_on: bool) -> Option<Marker> {
     if sweep_on {
         None
     } else {
-        completed_at
+        marker
     }
+}
+
+/// A scope's persisted "backfill complete" marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Marker {
+    /// When the backfill completed (seconds, this device's clock).
+    pub done_at: u64,
+    /// The oldest `created_at` among wraps that session left unread after a
+    /// refusable signer failed on them twice (`WrapOutcome::UnreadableBySigner`):
+    /// a warm stop must lie below it, so the next session reaches them again.
+    pub floor: Option<u64>,
+}
+
+impl Marker {
+    /// The stored form: `"<done_at>"`, or `"<done_at>:<floor>"`.
+    pub fn encode(&self) -> String {
+        match self.floor {
+            Some(f) => format!("{}:{f}", self.done_at),
+            None => self.done_at.to_string(),
+        }
+    }
+
+    /// Whether a page whose newest wrap is `newest` lies below every wrap
+    /// that may have reached the relay since the backfill, and below the
+    /// floor.
+    fn covers(&self, newest: u64) -> bool {
+        newest < self.done_at.saturating_sub(WARM_STOP_MARGIN_SECS)
+            && self.floor.is_none_or(|f| newest < f)
+    }
+}
+
+/// What a page that came back empty is followed by (see the module notes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmptyRetry {
+    /// An ordinary page.
+    #[default]
+    No,
+    /// The same inclusive `until` asked again after an empty answer.
+    SameUntil,
+    /// `until - 1`, after the same `until` came back empty twice. Wraps at
+    /// `until` may have been skipped, so the walk ends unverified.
+    PastBoundary,
 }
 
 /// What to do after a scope's page reaches EOSE.
@@ -121,19 +172,24 @@ pub enum GrantStep {
     Next {
         /// `until` for the next page (inclusive).
         until: u64,
-        /// This next page is the exclusive re-ask after an empty page (see
-        /// the module notes); if it is empty too, the scope is done.
-        boundary_retry: bool,
+        /// Whether this page re-asks after an empty one.
+        retry: EmptyRetry,
     },
     /// Too many pages, or a full page of one timestamp: the scope cannot be
     /// completed this session.
     GiveUp,
 }
 
-/// Parse a stored marker: the completion time in seconds, or `None` for a
-/// missing, corrupt or zero value (treated as "no completed backfill").
-pub fn parse_marker(raw: Option<&str>) -> Option<u64> {
-    raw?.trim().parse::<u64>().ok().filter(|&t| t > 0)
+/// Parse a stored marker ([`Marker::encode`]), or `None` for a missing,
+/// corrupt or zero value (treated as "no completed backfill").
+pub fn parse_marker(raw: Option<&str>) -> Option<Marker> {
+    let raw = raw?.trim();
+    let (done, floor) = match raw.split_once(':') {
+        Some((d, f)) => (d, Some(f.parse::<u64>().ok()?)),
+        None => (raw, None),
+    };
+    let done_at = done.parse::<u64>().ok().filter(|&t| t > 0)?;
+    Some(Marker { done_at, floor })
 }
 
 /// One grant subscription scope, for the persisted backfill marker.
@@ -193,8 +249,7 @@ impl PageTally {
 ///
 /// `page` is 0 for the long-lived subscription's stored events (fetched with
 /// no `until`) and `n` for the `n`-th page subscription, fetched with `until`
-/// inclusive; `boundary_retry` marks the exclusive re-ask after an empty
-/// page. `warm` is [`warm_marker`]'s answer.
+/// inclusive; `retry` says whether it re-asks after an empty page. `warm` is [`warm_marker`]'s answer.
 ///
 /// - **Warm stop:** with a marker, a full page with nothing unprocessed whose
 ///   newest wrap is older than `warm - WARM_STOP_MARGIN_SECS`: done.
@@ -212,25 +267,31 @@ pub fn grant_page_step(
     page: u32,
     until: Option<u64>,
     tally: PageTally,
-    warm: Option<u64>,
-    boundary_retry: bool,
+    warm: Option<Marker>,
+    retry: EmptyRetry,
 ) -> GrantStep {
     let below_new_wraps = match (warm, tally.newest) {
-        (Some(done), Some(newest)) => newest < done.saturating_sub(WARM_STOP_MARGIN_SECS),
+        (Some(marker), Some(newest)) => marker.covers(newest),
         _ => false,
     };
     if below_new_wraps && tally.full() && tally.unprocessed == 0 {
         return GrantStep::Done { verified: true };
     }
     if tally.rows == 0 {
-        return match until {
+        return match (until, retry) {
             // Page 0 empty: the member has no wraps at all.
-            None => GrantStep::Done { verified: true },
-            Some(u) if !boundary_retry && u > 0 => GrantStep::Next {
-                until: u - 1,
-                boundary_retry: true,
+            (None, _) => GrantStep::Done { verified: true },
+            // Ask the same inclusive `until` again: one failed query must
+            // not skip the unseen wraps sharing the boundary timestamp.
+            (Some(u), EmptyRetry::No) => GrantStep::Next {
+                until: u,
+                retry: EmptyRetry::SameUntil,
             },
-            Some(_) => GrantStep::Done { verified: false },
+            (Some(u), EmptyRetry::SameUntil) if u > 0 => GrantStep::Next {
+                until: u - 1,
+                retry: EmptyRetry::PastBoundary,
+            },
+            (Some(_), _) => GrantStep::Done { verified: false },
         };
     }
     // Page 0 has no `until`: one past its newest row stands in, so every
@@ -247,7 +308,7 @@ pub fn grant_page_step(
         PageStep::GiveUp => GrantStep::GiveUp,
         PageStep::Next { until } => GrantStep::Next {
             until,
-            boundary_retry: false,
+            retry: EmptyRetry::No,
         },
     }
 }
@@ -291,7 +352,10 @@ pub struct PageEnd {
 pub struct ScopePager {
     page: u32,
     until: Option<u64>,
-    boundary_retry: bool,
+    retry: EmptyRetry,
+    /// The walk stepped past a boundary timestamp after two empty answers:
+    /// its end cannot be verified.
+    skipped: bool,
     tally: PageTally,
     page_ids: HashSet<String>,
     finished: bool,
@@ -322,36 +386,35 @@ impl ScopePager {
 
     /// Page `page`'s subscription reached EOSE; `warm` is [`warm_marker`]'s
     /// answer. `None` when it is not the current page's first EOSE.
-    pub fn eose(&mut self, page: u32, warm: Option<u64>) -> Option<PageEnd> {
+    pub fn eose(&mut self, page: u32, warm: Option<Marker>) -> Option<PageEnd> {
         if self.finished || page != self.page {
             return None;
         }
         let close = page > 0;
-        let then =
-            match grant_page_step(self.page, self.until, self.tally, warm, self.boundary_retry) {
-                GrantStep::Next {
+        let then = match grant_page_step(self.page, self.until, self.tally, warm, self.retry) {
+            GrantStep::Next { until, retry } => {
+                self.page += 1;
+                self.until = Some(until);
+                self.retry = retry;
+                self.skipped |= retry == EmptyRetry::PastBoundary;
+                self.tally = PageTally::default();
+                self.page_ids.clear();
+                PagerAction::Fetch {
+                    page: self.page,
                     until,
-                    boundary_retry,
-                } => {
-                    self.page += 1;
-                    self.until = Some(until);
-                    self.boundary_retry = boundary_retry;
-                    self.tally = PageTally::default();
-                    self.page_ids.clear();
-                    PagerAction::Fetch {
-                        page: self.page,
-                        until,
-                    }
                 }
-                GrantStep::Done { verified } => {
-                    self.finished = true;
-                    PagerAction::Done { verified }
+            }
+            GrantStep::Done { verified } => {
+                self.finished = true;
+                PagerAction::Done {
+                    verified: verified && !self.skipped,
                 }
-                GrantStep::GiveUp => {
-                    self.finished = true;
-                    PagerAction::GiveUp
-                }
-            };
+            }
+            GrantStep::GiveUp => {
+                self.finished = true;
+                PagerAction::GiveUp
+            }
+        };
         Some(PageEnd { close, then })
     }
 }
@@ -375,8 +438,15 @@ pub(crate) mod tests {
     fn next(until: u64) -> GrantStep {
         GrantStep::Next {
             until,
-            boundary_retry: false,
+            retry: EmptyRetry::No,
         }
+    }
+
+    fn warm(done_at: u64) -> Option<Marker> {
+        Some(Marker {
+            done_at,
+            floor: None,
+        })
     }
 
     const DONE: GrantStep = GrantStep::Done { verified: true };
@@ -385,7 +455,7 @@ pub(crate) mod tests {
     fn full_first_page_pages_on_from_its_oldest_row() {
         let t = page(LIMIT, 0, 1_000_000);
         assert_eq!(
-            grant_page_step(0, None, t, None, false),
+            grant_page_step(0, None, t, None, EmptyRetry::No),
             next(1_000_000 - (LIMIT as u64 - 1))
         );
     }
@@ -396,7 +466,7 @@ pub(crate) mod tests {
     #[test]
     fn short_first_page_with_rows_takes_one_more_page() {
         assert_eq!(
-            grant_page_step(0, None, page(37, 0, 500), None, false),
+            grant_page_step(0, None, page(37, 0, 500), None, EmptyRetry::No),
             next(464)
         );
     }
@@ -404,7 +474,7 @@ pub(crate) mod tests {
     #[test]
     fn empty_first_page_is_done() {
         assert_eq!(
-            grant_page_step(0, None, PageTally::default(), None, false),
+            grant_page_step(0, None, PageTally::default(), None, EmptyRetry::No),
             DONE
         );
     }
@@ -413,7 +483,7 @@ pub(crate) mod tests {
     fn full_later_page_pages_on() {
         let t = page(LIMIT, 0, 900_000);
         assert_eq!(
-            grant_page_step(1, Some(900_000), t, None, false),
+            grant_page_step(1, Some(900_000), t, None, EmptyRetry::No),
             next(900_000 - (LIMIT as u64 - 1))
         );
     }
@@ -421,7 +491,7 @@ pub(crate) mod tests {
     #[test]
     fn short_later_page_with_older_rows_takes_one_more_page() {
         assert_eq!(
-            grant_page_step(1, Some(900_000), page(12, 1, 900_000), None, false),
+            grant_page_step(1, Some(900_000), page(12, 1, 900_000), None, EmptyRetry::No),
             next(899_989)
         );
     }
@@ -430,33 +500,41 @@ pub(crate) mod tests {
     fn page_with_nothing_older_than_until_is_done() {
         // Only the inclusive boundary row came back.
         assert_eq!(
-            grant_page_step(2, Some(800), page(1, 1, 800), None, false),
+            grant_page_step(2, Some(800), page(1, 1, 800), None, EmptyRetry::No),
             DONE
         );
     }
 
     /// An empty later page (a failed query, or the boundary wrap deleted at
-    /// the true end): ask once more without the boundary rather than give
-    /// up for good. Empty again is done, but unverified: it may equally be
-    /// two failed queries.
+    /// the true end): ask the same inclusive `until` again first, then once
+    /// past the boundary, then give up as done but unverified (it may
+    /// equally be three failed queries).
     #[test]
-    fn empty_later_page_re_asks_past_the_boundary_once() {
+    fn empty_later_page_re_asks_the_same_until_then_past_the_boundary() {
+        let empty = PageTally::default();
         assert_eq!(
-            grant_page_step(2, Some(800), PageTally::default(), None, false),
+            grant_page_step(2, Some(800), empty, None, EmptyRetry::No),
             GrantStep::Next {
-                until: 799,
-                boundary_retry: true
+                until: 800,
+                retry: EmptyRetry::SameUntil
             }
         );
         assert_eq!(
-            grant_page_step(3, Some(799), PageTally::default(), None, true),
-            GrantStep::Done { verified: false },
-            "empty again: nothing older, or the relay failed twice"
+            grant_page_step(3, Some(800), empty, None, EmptyRetry::SameUntil),
+            GrantStep::Next {
+                until: 799,
+                retry: EmptyRetry::PastBoundary
+            }
         );
-        // The re-ask found older wraps: page on as usual.
         assert_eq!(
-            grant_page_step(3, Some(799), page(5, 0, 790), None, true),
-            next(786)
+            grant_page_step(4, Some(799), empty, None, EmptyRetry::PastBoundary),
+            GrantStep::Done { verified: false },
+            "empty again: nothing older, or the relay failed three times"
+        );
+        // A re-ask found wraps: page on as usual.
+        assert_eq!(
+            grant_page_step(3, Some(800), page(5, 0, 800), None, EmptyRetry::SameUntil),
+            next(796)
         );
     }
 
@@ -467,7 +545,7 @@ pub(crate) mod tests {
             t.observe(800, false);
         }
         assert_eq!(
-            grant_page_step(2, Some(800), t, None, false),
+            grant_page_step(2, Some(800), t, None, EmptyRetry::No),
             GrantStep::GiveUp
         );
     }
@@ -476,11 +554,11 @@ pub(crate) mod tests {
     fn page_bound_gives_up() {
         let t = page(LIMIT, 0, 500_000);
         assert_eq!(
-            grant_page_step(GRANT_MAX_PAGES, Some(500_000), t, None, false),
+            grant_page_step(GRANT_MAX_PAGES, Some(500_000), t, None, EmptyRetry::No),
             GrantStep::GiveUp
         );
         assert!(matches!(
-            grant_page_step(GRANT_MAX_PAGES - 1, Some(500_000), t, None, false),
+            grant_page_step(GRANT_MAX_PAGES - 1, Some(500_000), t, None, EmptyRetry::No),
             GrantStep::Next { .. }
         ));
     }
@@ -491,19 +569,27 @@ pub(crate) mod tests {
     #[test]
     fn warm_device_stops_at_a_fully_processed_old_full_page() {
         let t = page(LIMIT, LIMIT, 1_000_000);
-        assert_eq!(grant_page_step(0, None, t, Some(DONE_AT), false), DONE);
+        assert_eq!(
+            grant_page_step(0, None, t, warm(DONE_AT), EmptyRetry::No),
+            DONE
+        );
     }
 
-    /// The NIP-59 hole plus clock skew: a grant received while offline can
-    /// be backdated up to two days below a page of processed wraps, and the
-    /// device's clock may be a day out. A page that recent must not stop.
+    /// The relay's past drift plus clock skew: a grant received while
+    /// offline can be dated up to seven days below a page of processed
+    /// wraps, and the device's clock may be a day out. A page that recent
+    /// must not stop.
     #[test]
-    fn warm_device_pages_on_within_the_backdating_and_skew_margin() {
-        assert_eq!(WARM_STOP_MARGIN_SECS, 3 * 24 * 60 * 60);
+    fn warm_device_pages_on_within_the_relay_drift_and_skew_margin() {
+        assert_eq!(
+            WARM_STOP_MARGIN_SECS,
+            nostr_bbs_core::event::MAX_CREATED_AT_DRIFT_SECS + 24 * 60 * 60
+        );
+        assert_eq!(WARM_STOP_MARGIN_SECS, 8 * 24 * 60 * 60);
         let recent = DONE_AT - WARM_STOP_MARGIN_SECS + 10;
         let t = page(LIMIT, LIMIT, recent);
         assert!(matches!(
-            grant_page_step(0, None, t, Some(DONE_AT), false),
+            grant_page_step(0, None, t, warm(DONE_AT), EmptyRetry::No),
             GrantStep::Next { .. }
         ));
     }
@@ -514,7 +600,7 @@ pub(crate) mod tests {
         // are skipped (not unwrapped) but paging continues to the end.
         let t = page(LIMIT, LIMIT, 1_000_000);
         assert!(matches!(
-            grant_page_step(0, None, t, None, false),
+            grant_page_step(0, None, t, None, EmptyRetry::No),
             GrantStep::Next { .. }
         ));
     }
@@ -523,7 +609,7 @@ pub(crate) mod tests {
     fn warm_device_pages_on_while_a_page_has_new_wraps() {
         let t = page(LIMIT, LIMIT - 1, 1_000_000);
         assert!(matches!(
-            grant_page_step(0, None, t, Some(DONE_AT), false),
+            grant_page_step(0, None, t, warm(DONE_AT), EmptyRetry::No),
             GrantStep::Next { .. }
         ));
     }
@@ -532,21 +618,59 @@ pub(crate) mod tests {
     /// processed wraps and its verdict must not cover unexamined ones.
     #[test]
     fn grant_sweep_disables_the_warm_stop() {
-        assert_eq!(warm_marker(Some(DONE_AT), true), None);
-        assert_eq!(warm_marker(Some(DONE_AT), false), Some(DONE_AT));
+        assert_eq!(warm_marker(warm(DONE_AT), true), None);
+        assert_eq!(warm_marker(warm(DONE_AT), false), warm(DONE_AT));
         let t = page(LIMIT, LIMIT, 1_000_000);
         assert!(matches!(
-            grant_page_step(0, None, t, warm_marker(Some(DONE_AT), true), false),
+            grant_page_step(0, None, t, warm_marker(warm(DONE_AT), true), EmptyRetry::No),
             GrantStep::Next { .. }
         ));
     }
 
     #[test]
-    fn markers_parse_as_completion_times() {
-        assert_eq!(parse_marker(Some("1800000000")), Some(1_800_000_000));
+    fn markers_parse_as_completion_times_with_an_optional_floor() {
+        let plain = Marker {
+            done_at: 1_800_000_000,
+            floor: None,
+        };
+        let floored = Marker {
+            done_at: 1_800_000_000,
+            floor: Some(1_700_000_000),
+        };
+        assert_eq!(parse_marker(Some("1800000000")), Some(plain));
+        assert_eq!(parse_marker(Some(&plain.encode())), Some(plain));
+        assert_eq!(parse_marker(Some(&floored.encode())), Some(floored));
         assert_eq!(parse_marker(Some("0")), None);
         assert_eq!(parse_marker(Some("yes")), None);
+        assert_eq!(parse_marker(Some("1800000000:x")), None);
         assert_eq!(parse_marker(None), None);
+    }
+
+    /// Security review finding 2: a page that would be a warm stop by the
+    /// marker's time is not one while it lies at or above the floor (a wrap
+    /// the last session left unread after a refusable signer failed twice).
+    #[test]
+    fn the_warm_stop_lies_below_the_floor() {
+        let floor = 900_000;
+        let marker = Some(Marker {
+            done_at: DONE_AT,
+            floor: Some(floor),
+        });
+        let above = page(LIMIT, LIMIT, floor + 5_000);
+        assert!(matches!(
+            grant_page_step(0, None, above, marker, EmptyRetry::No),
+            GrantStep::Next { .. }
+        ));
+        let at = page(LIMIT, LIMIT, floor);
+        assert!(matches!(
+            grant_page_step(0, None, at, marker, EmptyRetry::No),
+            GrantStep::Next { .. }
+        ));
+        let below = page(LIMIT, LIMIT, floor - 1);
+        assert_eq!(
+            grant_page_step(0, None, below, marker, EmptyRetry::No),
+            DONE
+        );
     }
 
     #[test]
@@ -643,7 +767,7 @@ pub(crate) mod tests {
     /// page at a time, each page subscription closed at its EOSE.
     pub(crate) fn walk(
         relay: &mut FakeRelay,
-        warm: Option<u64>,
+        warm: Option<Marker>,
         processed: &HashSet<String>,
     ) -> Walk {
         let mut pager = ScopePager::new();
@@ -808,7 +932,7 @@ pub(crate) mod tests {
         assert_eq!(w.end, PagerAction::Done { verified: false });
     }
 
-    /// One failed query is ridden out by the exclusive re-ask.
+    /// One failed query is ridden out by asking the same `until` again.
     #[test]
     fn one_failed_query_is_ridden_out() {
         let mut relay = FakeRelay::counting_down(2_500, 2_000_000, 1);
@@ -843,7 +967,7 @@ pub(crate) mod tests {
             rows,
             ..FakeRelay::default()
         };
-        let w = walk(&mut relay, Some(done_at), &processed);
+        let w = walk(&mut relay, warm(done_at), &processed);
         assert_eq!(w.end, PagerAction::Done { verified: true });
         let got = distinct(&w.delivered);
         assert!((0..1_200).all(|i| got.contains(&format!("n{i:05}"))));
@@ -852,6 +976,46 @@ pub(crate) mod tests {
         relay.queries = 0;
         let cold = walk(&mut relay, None, &processed);
         assert!(cold.subscriptions >= 10);
+    }
+
+    /// Security review finding 1: the relay accepts a kind-1059 dated up to
+    /// seven days before it lands, so a grant can arrive after the marker
+    /// yet sort five days below it. A page that recent must not stop.
+    #[test]
+    fn a_page_inside_the_relay_drift_window_is_not_a_warm_stop() {
+        let done_at = 50_000_000;
+        let five_days = 5 * 24 * 60 * 60;
+        let t = page(LIMIT, LIMIT, done_at - five_days);
+        assert!(matches!(
+            grant_page_step(0, None, t, warm(done_at), EmptyRetry::No),
+            GrantStep::Next { .. }
+        ));
+    }
+
+    /// Security review finding 3: a full page ends on timestamp T with more
+    /// wraps at T unseen, and the next inclusive query fails (the relay
+    /// answers a storage error as empty). Stepping straight to `until - 1`
+    /// would skip the rest of T and still end verified.
+    #[test]
+    fn a_failed_query_inside_a_shared_timestamp_skips_nothing() {
+        // 3,000 wraps sharing each timestamp in runs of 700: page 0 ends
+        // inside a run, so page 1's inclusive `until` has unseen rows at it.
+        let mut relay = FakeRelay::counting_down(3_000, 2_000_000, 700);
+        relay.fail_queries = [1].into_iter().collect();
+        let want = all_ids(&relay);
+        let w = walk(&mut relay, None, &HashSet::new());
+        assert_eq!(distinct(&w.delivered), want, "nothing at T skipped");
+        assert_eq!(w.end, PagerAction::Done { verified: true });
+    }
+
+    /// Two failed inclusive queries in a row: only then the walk steps past
+    /// T, and it ends unverified, since rows at T may have been skipped.
+    #[test]
+    fn stepping_past_a_shared_timestamp_ends_unverified() {
+        let mut relay = FakeRelay::counting_down(3_000, 2_000_000, 700);
+        relay.fail_queries = [1, 2].into_iter().collect();
+        let w = walk(&mut relay, None, &HashSet::new());
+        assert_eq!(w.end, PagerAction::Done { verified: false });
     }
 
     /// A page re-delivered after a reconnect (its REQ replayed before its
@@ -902,17 +1066,25 @@ pub(crate) mod tests {
         assert!(!pager.observe(0, "live", 200, false), "page 0 is over");
         assert_eq!(pager.eose(0, None), None, "a replayed page-0 EOSE");
         assert_eq!(pager.current_page(), Some(1));
-        // Page 1 is empty → re-ask; then empty again → done (unverified).
-        assert!(matches!(
+        // Page 1 is empty → the same `until` again, then past it, then
+        // done (unverified).
+        assert_eq!(
             pager.eose(1, None).map(|e| e.then),
-            Some(PagerAction::Fetch { page: 2, until: 99 })
-        ));
+            Some(PagerAction::Fetch {
+                page: 2,
+                until: 100
+            })
+        );
         assert_eq!(
             pager.eose(2, None).map(|e| e.then),
+            Some(PagerAction::Fetch { page: 3, until: 99 })
+        );
+        assert_eq!(
+            pager.eose(3, None).map(|e| e.then),
             Some(PagerAction::Done { verified: false })
         );
         assert_eq!(pager.current_page(), None);
-        assert_eq!(pager.eose(2, None), None);
-        assert!(!pager.observe(2, "late", 1, false));
+        assert_eq!(pager.eose(3, None), None);
+        assert!(!pager.observe(3, "late", 1, false));
     }
 }

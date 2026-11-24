@@ -538,8 +538,16 @@ pub fn route(kind: u64, groups_enabled: bool) -> Route {
 pub enum TicketVerdict {
     /// Store this key.
     Accept(Box<ZoneKey>),
-    /// Not decidable yet (bindings not loaded): leave the wrap unmarked.
+    /// Not decidable yet (bindings not loaded): leave the wrap unmarked and
+    /// hold the grant backlog for it.
     Retry,
+    /// The relay's bindings, as loaded this session, bind the ticket's
+    /// signer to no single zone. They are fetched once per page load, so no
+    /// retry this session can change the answer, and anyone can address a
+    /// self-signed ticket to a member (the relay admits kind 1059 by
+    /// recipient). Left unmarked, so a later session with fresh bindings may
+    /// read it, but it holds neither the backlog nor the backfill marker.
+    Unbound,
     /// Final refusal, with the reason: mark the wrap processed.
     Refuse(String),
     /// The signer could not decrypt it: classify with
@@ -565,7 +573,11 @@ pub fn ticket_verdict(
             // and delivers a binding for only through owner tooling). Leave the
             // wrap unmarked so it is re-examined rather than lost forever
             // (ADR-2028, Phase 4 review finding 4).
-            Err(TicketError::BindingsUnavailable | TicketError::NoBinding) => TicketVerdict::Retry,
+            Err(TicketError::BindingsUnavailable) => TicketVerdict::Retry,
+            // Security review finding 4: holding the backlog for this let a
+            // forged ticket force a full walk and withhold the marker every
+            // session.
+            Err(TicketError::NoBinding) => TicketVerdict::Unbound,
             Err(e) => TicketVerdict::Refuse(e.to_string()),
         },
     }
@@ -989,6 +1001,26 @@ mod tests {
         assert_eq!(route(14, true), Route::Ignore);
     }
 
+    /// Security review finding 4 of PR #95: anyone can address a
+    /// self-signed ticket to a member (the relay admits kind 1059 by
+    /// recipient). One signed by a key bound to no zone must not be a Retry,
+    /// which would hold the member's backlog open and withhold the marker
+    /// every session. It is Unbound: unmarked, holding nothing.
+    #[test]
+    fn a_forged_ticket_from_an_unbound_key_holds_nothing() {
+        let (g, forger, member) = (signer(), signer(), signer());
+        let (sk, _) = epoch_key();
+        let b = bindings("z", g.public_key());
+        let forged = block_on(build_ticket(&forger, member.public_key(), 2, &sk, 5)).unwrap();
+        let wrap = block_on(wrap_ticket(&forger, member.public_key(), &forged, 5)).unwrap();
+        let opened = block_on(open_ticket(&wrap, None, &member));
+        assert!(opened.is_ok(), "it decrypts: it is addressed to the member");
+        assert_eq!(
+            ticket_verdict(opened, member.public_key(), Some(&b), 9),
+            TicketVerdict::Unbound
+        );
+    }
+
     #[test]
     fn wrap_reader_accepts_a_1014_and_still_opens_a_21453() {
         let (g, admin, member) = (signer(), signer(), signer());
@@ -1014,9 +1046,11 @@ mod tests {
             ticket_verdict(opened.clone(), member.public_key(), None, 9),
             TicketVerdict::Retry
         );
-        // An empty (or stale) binding set is transient, not final: the zone's
-        // binding may simply not be loaded yet, or be a Hidden zone the relay
-        // omits from NIP-11. Retry, so the ticket is not lost (finding 4).
+        // An empty (or stale) binding set: the zone may be Hidden from
+        // NIP-11, so the ticket is not refused or marked (ADR-2028 Phase 4
+        // finding 4), but bindings are loaded once per page, so it is
+        // Unbound: left for a later session, holding nothing in this one
+        // (security review finding 4 of PR #95).
         assert_eq!(
             ticket_verdict(
                 opened,
@@ -1024,7 +1058,7 @@ mod tests {
                 Some(&ZoneGroupBindings::default()),
                 9
             ),
-            TicketVerdict::Retry
+            TicketVerdict::Unbound
         );
         // 21453 still unwraps and routes to the grant path.
         let key = zone_key("z");

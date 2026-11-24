@@ -26,10 +26,10 @@ use nostr_bbs_core::{NostrEvent, UnsignedEvent};
 
 use super::grant_backlog::{Attempt, GrantBacklog, KeyPhase, SignerKind, WrapOutcome};
 use super::grant_paging::tests::FakeRelay;
-use super::grant_paging::{warm_marker, GrantScope, PagerAction, ScopePager};
+use super::grant_paging::{warm_marker, GrantScope, Marker, PagerAction, ScopePager};
 use super::inbox_key::{open_for_sync, Opener};
 use super::tickets::{route, Route};
-use super::wrap_queue::WrapQueue;
+use super::wrap_queue::{Slot, WrapQueue};
 use super::{build_grant_wrap, generate_zone_key, validate_grant};
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -203,6 +203,8 @@ pub(super) struct Outcome {
     pub(super) end: PagerAction,
     pub(super) markers: Vec<GrantScope>,
     pub(super) pages: u32,
+    /// The floor to store with the markers.
+    pub(super) floor: Option<u64>,
     /// Distinct wraps delivered.
     pub(super) delivered: usize,
     /// Fake clock at the end (ms).
@@ -216,6 +218,9 @@ pub(super) struct Session<'a> {
     signer: &'a dyn Signer,
     kind: SignerKind,
     events: HashMap<String, NostrEvent>,
+    /// The timestamp the relay ordered each wrap by (its `created_at` on a
+    /// real relay).
+    ordered_at: HashMap<String, u64>,
     admin: &'a dyn Fn(&str) -> Option<bool>,
     processed: &'a RefCell<HashSet<String>>,
     queue: WrapQueue<String>,
@@ -238,6 +243,7 @@ impl<'a> Session<'a> {
             signer,
             kind,
             events: HashMap::new(),
+            ordered_at: HashMap::new(),
             admin,
             processed,
             queue,
@@ -254,8 +260,9 @@ impl<'a> Session<'a> {
     }
 
     /// `ZoneKeyStore::wrap_handler`.
-    fn deliver(&mut self, ev: NostrEvent) {
+    fn deliver(&mut self, ev: NostrEvent, ts: u64) {
         let id = ev.id.clone();
+        self.ordered_at.insert(id.clone(), ts);
         self.events.entry(id.clone()).or_insert(ev);
         if !self.seen.insert(id.clone()) || self.processed.borrow().contains(&id) {
             return;
@@ -271,9 +278,10 @@ impl<'a> Session<'a> {
                 return;
             };
             let id = started.job.clone();
-            let outcome = self.process(&id, started.attempt);
+            let outcome = self.process(&id, started.attempt, started.slot);
             let now = self.tick();
-            self.backlog.wrap_done(now, &id, outcome);
+            let ts = self.ordered_at[&id];
+            self.backlog.wrap_done(now, &id, ts, outcome);
             self.queue.release(started.slot);
             match outcome {
                 WrapOutcome::Refused => {
@@ -284,13 +292,15 @@ impl<'a> Session<'a> {
                 WrapOutcome::Retry => {
                     self.seen.remove(&id);
                 }
-                WrapOutcome::Settled | WrapOutcome::Unreadable => {}
+                WrapOutcome::Settled
+                | WrapOutcome::Unreadable
+                | WrapOutcome::UnreadableBySigner => {}
             }
         }
     }
 
     /// `ZoneKeyStore::process_wrap`, minus IndexedDB.
-    fn process(&mut self, id: &str, attempt: Attempt) -> WrapOutcome {
+    fn process(&mut self, id: &str, attempt: Attempt, slot: Slot) -> WrapOutcome {
         let ev = self.events[id].clone();
         let opened = block_on(open_for_sync(&ev, None, self.signer, self.kind, attempt));
         let (sealer, rumor, opener) = match opened {
@@ -298,7 +308,7 @@ impl<'a> Session<'a> {
             Err(outcome) => return outcome,
         };
         if opener == Opener::Identity && self.kind == SignerKind::CanRefuse {
-            for _ in 0..self.queue.signer_succeeded() {
+            for _ in 0..self.queue.signer_succeeded(slot) {
                 self.backlog.wrap_started();
             }
         }
@@ -320,7 +330,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    pub(super) fn sync(mut self, relay: &mut dyn PageSource, marker: Option<u64>) -> Outcome {
+    pub(super) fn sync(mut self, relay: &mut dyn PageSource, marker: Option<Marker>) -> Outcome {
         let mut pager = ScopePager::new();
         let mut until = None;
         let mut pages = 1;
@@ -329,7 +339,7 @@ impl<'a> Session<'a> {
             for (ev, ts) in relay.page(until) {
                 let processed = self.processed.borrow().contains(&ev.id);
                 pager.observe(page, &ev.id, ts, processed);
-                self.deliver(ev);
+                self.deliver(ev, ts);
             }
             // Wraps open while the next page is in flight.
             self.run(25);
@@ -355,6 +365,7 @@ impl<'a> Session<'a> {
         self.run(usize::MAX);
         let markers = self.backlog.take_due_markers();
         Outcome {
+            floor: self.backlog.marker_floor(),
             delivered: self.events.len(),
             keys: self.keys,
             backlog: self.backlog,
@@ -573,9 +584,82 @@ fn a_warm_session_stops_early_and_still_finds_a_new_grant() {
     relay.rows.insert(0, (fresh.id.clone(), marker - 3_600));
     let fresh_admin = admin_signer.public_key().to_string();
     let admin2 = move |pk: &str| Some(pk == fresh_admin);
-    let warm = Session::new(&member, SignerKind::Local, &admin2, &processed)
-        .sync(&mut sim(relay, &events), Some(marker));
+    let warm = Session::new(&member, SignerKind::Local, &admin2, &processed).sync(
+        &mut sim(relay, &events),
+        Some(Marker {
+            done_at: marker,
+            floor: cold.floor,
+        }),
+    );
     assert_eq!(warm.keys, HashSet::from([("fresh".to_string(), 1)]));
     assert!(warm.backlog.settled());
     assert!(warm.pages < cold.pages, "{} < {}", warm.pages, cold.pages);
+}
+
+/// Security review finding 2, across two sessions. Session 1: the extension
+/// fails twice on one old grant (locked for both attempts, the second after
+/// it had decrypted other wraps). The grant ends UnreadableBySigner, the
+/// backlog settles and the marker is written, with the grant's timestamp as
+/// its floor. Session 2 (warm, extension working): 3,000 processed wraps sit
+/// above the fixture, a full processed page that would be a warm stop by
+/// the marker's time alone; the floor keeps the walk going down to the
+/// grant, which now opens.
+#[test]
+fn a_grant_refused_twice_is_reached_again_by_the_next_warm_session() {
+    let f = fixture();
+    let mut events = f.events();
+    let processed = RefCell::new(HashSet::new());
+    let admin = all_admin(f);
+    let mut relay = f.relay();
+    let top = relay.rows[0].1;
+    // Newer than the fixture, already processed by an earlier session.
+    for i in 0..3_000u64 {
+        let id = format!("new{i:05}");
+        processed.borrow_mut().insert(id.clone());
+        events.insert(
+            id.clone(),
+            NostrEvent {
+                id: id.clone(),
+                ..f.wraps[0].1.clone()
+            },
+        );
+        relay.rows.insert(0, (id, top + 1 + i));
+    }
+    let (grant_id, grant_wrap) = f.wraps[DMS + 5].clone();
+    let grant_sender = grant_wrap.pubkey.clone();
+    let locked_on_grant = Ext::new(f.member(), move |_, sender| sender == grant_sender);
+    let first = Session::new(&locked_on_grant, SignerKind::CanRefuse, &admin, &processed)
+        .sync(&mut sim(relay.clone(), &events), None);
+    assert!(
+        first.backlog.settled(),
+        "a twice-refused wrap does not hold it"
+    );
+    assert_eq!(first.markers, vec![GrantScope::Identity]);
+    let grant_ts = relay.rows.iter().find(|(id, _)| *id == grant_id).unwrap().1;
+    assert_eq!(first.floor, Some(grant_ts), "the marker carries the floor");
+    assert_eq!(first.keys.len(), GRANTS - 1);
+    assert!(!processed.borrow().contains(&grant_id));
+
+    let done_at = top + 3_000 + super::grant_paging::WARM_STOP_MARGIN_SECS + 10;
+    let marker = Marker {
+        done_at,
+        floor: first.floor,
+    };
+    let working = Ext::new(f.member(), |_, _| false);
+    let second = Session::new(&working, SignerKind::CanRefuse, &admin, &processed)
+        .sync(&mut sim(relay.clone(), &events), Some(marker));
+    assert_eq!(second.keys.len(), 1, "the refused grant is found");
+    assert!(second.backlog.settled());
+    assert_eq!(second.floor, None);
+
+    // Control: the same warm session without the floor stops at the first
+    // page and never reaches the grant.
+    let no_floor = Marker {
+        done_at,
+        floor: None,
+    };
+    let control = Session::new(&working, SignerKind::CanRefuse, &admin, &processed)
+        .sync(&mut sim(relay, &events), Some(no_floor));
+    assert_eq!(control.pages, 1);
+    assert!(control.keys.is_empty());
 }
